@@ -16,19 +16,19 @@ use cli_main::update::staging::{SystemStageVerifier, sha256_file, verified_pair_
 use cli_main::update::transaction::{
     InstallLayout, InstalledPairVerifier, NoFaults, PreparedTransaction, commit_pair, marker_path,
 };
-use haider_client::{
-    ClientConfig, ResolvedProfile, connect, signal_authenticated_peer, spawn_daemon_retained,
-};
+use haider_client::{ClientConfig, ResolvedProfile, connect, signal_authenticated_peer};
 use haider_rpc::{
     Capability, CapabilitySet, LifecyclePhase, WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec,
 };
 use haider_store::Store;
-use std::fs;
+use std::collections::VecDeque;
+use std::fs::{self, OpenOptions};
+use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
-use std::sync::{Mutex, OnceLock};
+use std::process::{Child, ChildStderr, Command};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -36,6 +36,9 @@ use tokio::time::{Instant, sleep};
 
 const DEADLINE: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(50);
+const STDERR_TAIL_LINES: usize = 80;
+const STDERR_LINE_BYTES: usize = 4096;
+const STDERR_FINISH_GRACE: Duration = Duration::from_secs(1);
 
 fn fixture_target() -> &'static str {
     cli_main::update::discovery::compiled_target().unwrap_or("aarch64-apple-darwin")
@@ -233,7 +236,12 @@ async fn truncated_archive_http_leaves_pair_and_live_daemon_unchanged() {
     assert_eq!(still_running.welcome.instance_id, old_instance);
     assert_eq!(still_running.welcome.daemon_generation, old_generation);
     stop_connected(still_running, &fixture.profile).await;
-    assert!(wait_child(&mut old_child).await.success());
+    let old_status = wait_child(&mut old_child).await;
+    assert!(
+        old_status.success(),
+        "unchanged daemon did not stop cleanly ({old_status}); {}",
+        old_child.evidence()
+    );
 }
 
 /// MUTATION CHECK: signal twice, skip matching drain/lock release, discard
@@ -278,7 +286,8 @@ async fn real_daemon_drains_once_releases_lock_and_restarts_exact_version() {
     let old_status = wait_child(&mut old_child).await;
     assert!(
         old_status.success(),
-        "one SIGTERM must produce graceful exit, not forced 130: {old_status}"
+        "one SIGTERM must produce graceful exit, not forced 130: {old_status}; {}",
+        old_child.evidence()
     );
     let new = wait_ready(&fixture.profile).await;
     assert_eq!(new.welcome.lifecycle_phase, LifecyclePhase::Ready);
@@ -361,7 +370,12 @@ async fn health_version_mismatch_stops_child_rolls_back_pair_and_restarts_old() 
         .await
         .expect_err("exact Welcome mismatch must roll back");
     assert!(matches!(error, UpdateError::Health(_)));
-    assert!(wait_child(&mut old_child).await.success());
+    let old_status = wait_child(&mut old_child).await;
+    assert!(
+        old_status.success(),
+        "old daemon did not drain cleanly ({old_status}); {}",
+        old_child.evidence()
+    );
     assert_eq!(pair_snapshot(&fixture.layout), old_pair);
     assert!(!marker_path(&fixture.layout).exists());
     let restarted_old = wait_ready(&fixture.profile).await;
@@ -407,9 +421,182 @@ impl RestartFixture {
         }
     }
 
-    fn spawn_installed(&self) -> Child {
-        spawn_daemon_retained(&self.profile, self.layout.haiderd.clone())
-            .expect("spawn installed daemon")
+    fn spawn_installed(&self) -> CapturedDaemon {
+        CapturedDaemon::spawn(&self.profile, &self.layout.haiderd)
+    }
+}
+
+struct CapturedDaemon {
+    child: Child,
+    log_path: PathBuf,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    stderr_completion: Option<mpsc::Receiver<()>>,
+    stderr_reader_note: Option<&'static str>,
+}
+
+impl CapturedDaemon {
+    fn spawn(profile: &ResolvedProfile, binary: &Path) -> Self {
+        let log_path = haider_platform::allocate_daemon_log_path(&profile.store_dir)
+            .expect("allocate installed daemon log");
+        let mut child =
+            haider_platform::spawn_daemon_with_piped_stderr(haider_platform::DaemonSpawn {
+                binary,
+                profile_id: &profile.profile_id,
+                store_dir: &profile.store_dir,
+                runtime_dir: &profile.runtime_dir,
+                log_path: &log_path,
+            })
+            .expect("spawn installed daemon");
+        let stderr = child.stderr.take().expect("installed daemon stderr pipe");
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
+        let reader_tail = Arc::clone(&stderr_tail);
+        let reader_log_path = log_path.clone();
+        let (completion_sender, stderr_completion) = mpsc::sync_channel(1);
+        let stderr_reader = std::thread::Builder::new()
+            .name("haiderd-stderr-capture".into())
+            .spawn(move || {
+                capture_stderr(stderr, &reader_log_path, &reader_tail);
+                let _ = completion_sender.send(());
+            })
+            .expect("spawn installed daemon stderr reader");
+        // Completion is observed through the bounded channel below. Detaching
+        // the handle keeps a descendant that inherited fd 2 from defeating the
+        // test's deadline by holding this reader open forever.
+        drop(stderr_reader);
+        Self {
+            child,
+            log_path,
+            stderr_tail,
+            stderr_completion: Some(stderr_completion),
+            stderr_reader_note: None,
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    fn finish_stderr(&mut self) {
+        let Some(completion) = self.stderr_completion.take() else {
+            return;
+        };
+        self.stderr_reader_note = match completion.recv_timeout(STDERR_FINISH_GRACE) {
+            Ok(()) => None,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                Some("<stderr reader still open after daemon exit; tail is a bounded snapshot>")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Some("<stderr reader stopped before reporting completion>")
+            }
+        };
+    }
+
+    fn evidence(&self) -> String {
+        daemon_failure_evidence(&self.log_path, &self.stderr_tail, self.stderr_reader_note)
+    }
+}
+
+fn capture_stderr(mut stderr: ChildStderr, log_path: &Path, tail: &Mutex<VecDeque<String>>) {
+    let mut log = OpenOptions::new().append(true).open(log_path).ok();
+    let mut buffer = [0_u8; 8192];
+    let mut line = Vec::new();
+    let mut line_truncated = false;
+    loop {
+        match stderr.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                if let Some(log) = log.as_mut() {
+                    let _ = log.write_all(&buffer[..read]);
+                }
+                for &byte in &buffer[..read] {
+                    if byte == b'\n' {
+                        retain_stderr_line(tail, &mut line, line_truncated);
+                        line_truncated = false;
+                    } else if line.len() < STDERR_LINE_BYTES {
+                        line.push(byte);
+                    } else {
+                        line_truncated = true;
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    if !line.is_empty() || line_truncated {
+        retain_stderr_line(tail, &mut line, line_truncated);
+    }
+    if let Some(log) = log.as_mut() {
+        let _ = log.flush();
+    }
+}
+
+fn retain_stderr_line(tail: &Mutex<VecDeque<String>>, line: &mut Vec<u8>, line_truncated: bool) {
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    let mut rendered = String::from_utf8_lossy(line).into_owned();
+    if line_truncated {
+        rendered.push_str("<line truncated>");
+    }
+    line.clear();
+    let mut tail = tail.lock().expect("stderr tail mutex");
+    if tail.len() == STDERR_TAIL_LINES {
+        tail.pop_front();
+    }
+    tail.push_back(rendered);
+}
+
+fn daemon_failure_evidence(
+    log_path: &Path,
+    stderr_tail: &Mutex<VecDeque<String>>,
+    stderr_reader_note: Option<&str>,
+) -> String {
+    let log = read_daemon_log(log_path);
+    let stderr = {
+        let tail = stderr_tail.lock().expect("stderr tail mutex");
+        if tail.is_empty() {
+            "<no stderr captured>".to_owned()
+        } else {
+            tail.iter().cloned().collect::<Vec<_>>().join("\n")
+        }
+    };
+    let reader_note = stderr_reader_note
+        .map(|note| format!("\n{note}"))
+        .unwrap_or_default();
+    format!(
+        "daemon process log:\n{log}\ndaemon stderr tail (last {STDERR_TAIL_LINES} lines):\n{stderr}{reader_note}"
+    )
+}
+
+fn read_daemon_log(log_path: &Path) -> String {
+    match fs::read_to_string(log_path) {
+        Ok(log) => log,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => format!(
+            "<daemon log is absent: {error}; containing directory entries (names only): {}>",
+            directory_entry_names(log_path.parent())
+        ),
+        Err(error) => format!("<cannot read daemon log: {error}>"),
+    }
+}
+
+fn directory_entry_names(directory: Option<&Path>) -> String {
+    let Some(directory) = directory else {
+        return "<no parent directory>".into();
+    };
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => return format!("<cannot list directory: {error}>"),
+    };
+    let mut names = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    if names.is_empty() {
+        "<empty>".into()
+    } else {
+        names.join(", ")
     }
 }
 
@@ -459,8 +646,7 @@ async fn wait_ready(profile: &ResolvedProfile) -> haider_client::Connected {
             Err(error) => panic!("daemon health connect failed: {error}"),
         }
         if Instant::now() + POLL > deadline {
-            let log = fs::read_to_string(profile.store_dir.join("daemon.log"))
-                .unwrap_or_else(|error| format!("<cannot read daemon log: {error}>"));
+            let log = read_daemon_log(&profile.store_dir.join("daemon.log"));
             panic!("daemon readiness timeout; daemon.log:\n{log}");
         }
         sleep(POLL).await;
@@ -469,7 +655,7 @@ async fn wait_ready(profile: &ResolvedProfile) -> haider_client::Connected {
 
 async fn wait_initial_ready(
     profile: &ResolvedProfile,
-    child: &mut Child,
+    child: &mut CapturedDaemon,
 ) -> Option<haider_client::Connected> {
     let deadline = Instant::now() + DEADLINE;
     loop {
@@ -482,15 +668,15 @@ async fn wait_initial_ready(
             Err(error) => panic!("daemon health connect failed: {error}"),
         }
         if let Some(status) = child.try_wait().expect("poll initial daemon") {
-            let log = fs::read_to_string(profile.store_dir.join("daemon.log"))
-                .unwrap_or_else(|error| format!("<cannot read daemon log: {error}>"));
-            if log.contains("Operation not permitted") {
+            child.finish_stderr();
+            let evidence = child.evidence();
+            if evidence.contains("Operation not permitted") {
                 // Hermetic product sandboxes can deny a spawned subprocess
                 // the Unix-listener syscall. Ordinary macOS CI executes the
                 // full acceptance; keep this as a sandbox skip, not a fake.
                 return None;
             }
-            panic!("initial daemon exited {status}; daemon.log:\n{log}");
+            panic!("initial daemon exited {status}; {evidence}");
         }
         assert!(
             Instant::now() + POLL <= deadline,
@@ -500,15 +686,48 @@ async fn wait_initial_ready(
     }
 }
 
-async fn wait_child(child: &mut Child) -> std::process::ExitStatus {
+async fn wait_child(child: &mut CapturedDaemon) -> std::process::ExitStatus {
     let deadline = Instant::now() + DEADLINE;
     loop {
         if let Some(status) = child.try_wait().expect("poll child") {
+            child.finish_stderr();
             return status;
         }
         assert!(Instant::now() + POLL <= deadline, "child exit timeout");
         sleep(POLL).await;
     }
+}
+
+#[test]
+fn absent_daemon_log_evidence_lists_names_and_captured_bounded_stderr_tail() {
+    let directory = tempfile::tempdir().expect("missing-log evidence directory");
+    let script = directory.path().join("stderr-fixture");
+    write_executable_bytes(
+        &script,
+        b"#!/bin/sh\nindex=0\nwhile [ \"$index\" -lt 81 ]; do\n  printf 'stderr-marker-%03d\\n' \"$index\" >&2\n  index=$((index + 1))\ndone\nprintf 'stderr-marker-081' >&2\nexit 70\n",
+    );
+    let profile = resolved_test_profile(directory.path().join("profile"));
+    let mut daemon = CapturedDaemon::spawn(&profile, &script);
+    let status = daemon.child.wait().expect("wait stderr fixture");
+    daemon.finish_stderr();
+    assert_eq!(status.code(), Some(70));
+
+    fs::remove_file(&daemon.log_path).expect("force missing daemon log evidence");
+    let log_directory = daemon.log_path.parent().expect("daemon log parent");
+    fs::write(log_directory.join("present.log"), "DO_NOT_RENDER").expect("write evidence sibling");
+    fs::create_dir(log_directory.join("runtime")).expect("create evidence sibling directory");
+
+    let evidence = daemon.evidence();
+
+    assert!(evidence.contains("daemon log is absent"));
+    assert!(evidence.contains("containing directory entries (names only): present.log, runtime"));
+    assert!(evidence.contains("stderr tail (last 80 lines)"));
+    assert!(!evidence.contains("stderr-marker-000"));
+    assert!(!evidence.contains("stderr-marker-001"));
+    assert!(evidence.contains("stderr-marker-002"));
+    assert!(evidence.contains("stderr-marker-081"));
+    assert!(!evidence.contains("stderr reader still open"));
+    assert!(!evidence.contains("DO_NOT_RENDER"));
 }
 
 async fn stop_connected(connected: haider_client::Connected, profile: &ResolvedProfile) {

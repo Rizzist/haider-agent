@@ -158,6 +158,24 @@ impl std::error::Error for DaemonSpawnError {
 /// Spawns the sibling daemon with its fixed argv/stdout/stderr contract and
 /// the platform's detach + inheritance hygiene.
 pub fn spawn_daemon(spec: DaemonSpawn<'_>) -> Result<Child, DaemonSpawnError> {
+    spawn_daemon_with_stderr(spec, false)
+}
+
+/// Test/diagnostic variant of [`spawn_daemon`] that leaves the child's stderr
+/// piped while preserving the ordinary argv, stdout log, process group, and
+/// inherited-descriptor hygiene.
+///
+/// The caller must continuously drain [`Child::stderr`] so a noisy daemon
+/// cannot block on a full pipe.
+#[doc(hidden)]
+pub fn spawn_daemon_with_piped_stderr(spec: DaemonSpawn<'_>) -> Result<Child, DaemonSpawnError> {
+    spawn_daemon_with_stderr(spec, true)
+}
+
+fn spawn_daemon_with_stderr(
+    spec: DaemonSpawn<'_>,
+    pipe_stderr: bool,
+) -> Result<Child, DaemonSpawnError> {
     let mut log_options = std::fs::OpenOptions::new();
     log_options.create(true).append(true);
     #[cfg(unix)]
@@ -168,7 +186,11 @@ pub fn spawn_daemon(spec: DaemonSpawn<'_>) -> Result<Child, DaemonSpawnError> {
     let log = log_options
         .open(spec.log_path)
         .map_err(DaemonSpawnError::OpenLog)?;
-    let log_err = log.try_clone().map_err(DaemonSpawnError::CloneLog)?;
+    let stderr = if pipe_stderr {
+        Stdio::piped()
+    } else {
+        Stdio::from(log.try_clone().map_err(DaemonSpawnError::CloneLog)?)
+    };
     let mut command = std::process::Command::new(spec.binary);
     command
         .arg("--profile")
@@ -179,7 +201,7 @@ pub fn spawn_daemon(spec: DaemonSpawn<'_>) -> Result<Child, DaemonSpawnError> {
         .arg(spec.runtime_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err));
+        .stderr(stderr);
     command.env(DAEMON_LOG_PATH_ENV, spec.log_path);
 
     #[cfg(unix)]

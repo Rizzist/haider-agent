@@ -48,6 +48,7 @@ pub use shutdown::{ShutdownInstallError, ShutdownSignal, ShutdownSignals, shutdo
 pub use spawn::{
     DAEMON_LOG_DIRECTORY, DAEMON_LOG_FILE, DAEMON_LOG_PATH_ENV, DAEMON_LOG_RETENTION, DaemonSpawn,
     DaemonSpawnError, allocate_daemon_log_path, publish_active_daemon_log, spawn_daemon,
+    spawn_daemon_with_piped_stderr,
 };
 pub use system::local_device_name;
 pub use user::{effective_user_id, is_owner_private_directory};
