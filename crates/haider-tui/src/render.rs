@@ -2720,14 +2720,20 @@ fn render_usage(
                         let mut spans = vec![
                             Span::styled(format!("    {name:<name_w$}  "), theme.text_style()),
                             Span::styled(
-                                crate::format::usage_bar(
+                                crate::format::remaining_bar(
                                     window.utilization,
                                     crate::format::USAGE_BAR_CELLS,
                                 ),
+                                // Tone still keys on CONSUMPTION: a nearly
+                                // spent window warns even though its bar is
+                                // nearly empty in remaining semantics.
                                 usage_bar_style(theme, window.utilization),
                             ),
                             Span::styled(
-                                format!("  {:>4}", crate::format::fmt_pct(window.utilization)),
+                                format!(
+                                    "  {:>9}",
+                                    crate::format::fmt_remaining(window.utilization)
+                                ),
                                 theme.bright_style(),
                             ),
                         ];

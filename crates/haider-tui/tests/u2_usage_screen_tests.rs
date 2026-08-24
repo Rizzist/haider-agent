@@ -19,7 +19,7 @@ use haider_protocol::usage::{
 use haider_tui::app::{AppModel, AppRequest, Hit, RuntimeMode, Screen};
 use haider_tui::commands::{COMMANDS, has_arg_slots, offers_arg_completions, palette_items};
 use haider_tui::format::{
-    USAGE_BAR_CELLS, UsageTone, fmt_pct, fmt_reset, mask_identity, usage_bar, usage_tone,
+    USAGE_BAR_CELLS, UsageTone, fmt_remaining, fmt_reset, mask_identity, remaining_bar, usage_tone,
 };
 use haider_tui::link::{CommandContext, map_response, request_body};
 use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};
@@ -169,39 +169,70 @@ fn live_gated_model() -> AppModel {
 
 // ---- bar math + formatting laws --------------------------------------
 
-/// BAR-MATH LAW: 0–1 → cells with clamping and floor-fill, plus the two
-/// honesty clamps (nonzero shows ≥ 1 cell, sub-1.0 never reads full).
+/// BAR-MATH LAW, remaining semantics (owner 2026-08-24: the bar DRAINS —
+/// runway going down, not consumption going up): 0–1 utilization → cells
+/// filled by the REMAINING fraction, clamped and floor-filled, with the
+/// mirrored honesty clamps (nonzero remaining shows ≥ 1 cell, nonzero
+/// consumption never reads full).
 ///
 /// MUTATION CHECK (executed): replace the floor fill with `.round()` in
-/// `usage_bar` — 0.96 rounds up to a full 10-cell bar and the
-/// `not-yet-exhausted` assertion fails.
+/// `remaining_bar` — 0.83 used rounds its 1.7-cell runway up to 2 and the
+/// `floors-runway` assertion fails; restore, green.
 #[test]
-fn usage_bar_math_clamps_and_floors() {
-    assert_eq!(usage_bar(0.83, 10), "▰▰▰▰▰▰▰▰▱▱", "0.83 floors to 8 cells");
-    assert_eq!(usage_bar(0.0, 10), "▱▱▱▱▱▱▱▱▱▱", "untouched renders empty");
-    assert_eq!(usage_bar(1.0, 10), "▰▰▰▰▰▰▰▰▰▰", "exhausted renders full");
-    assert_eq!(usage_bar(2.5, 10), "▰▰▰▰▰▰▰▰▰▰", "over-range clamps to 1.0");
-    assert_eq!(usage_bar(-0.5, 10), "▱▱▱▱▱▱▱▱▱▱", "negatives clamp to 0.0");
+fn remaining_bar_math_clamps_and_floors() {
     assert_eq!(
-        usage_bar(0.96, 10),
-        "▰▰▰▰▰▰▰▰▰▱",
-        "a not-yet-exhausted window never reads full"
-    );
-    assert_eq!(
-        usage_bar(0.87, 10),
-        "▰▰▰▰▰▰▰▰▱▱",
-        "FLOOR, never round: 0.87 stays at 8 cells (rounding would claim 9)"
-    );
-    assert_eq!(
-        usage_bar(0.001, 10),
+        remaining_bar(0.83, 10),
         "▰▱▱▱▱▱▱▱▱▱",
-        "any nonzero utilization shows at least one cell"
+        "0.83 used floors its 17% runway to 1 cell"
+    );
+    assert_eq!(
+        remaining_bar(0.0, 10),
+        "▰▰▰▰▰▰▰▰▰▰",
+        "untouched renders full runway"
+    );
+    assert_eq!(
+        remaining_bar(1.0, 10),
+        "▱▱▱▱▱▱▱▱▱▱",
+        "exhausted renders empty"
+    );
+    assert_eq!(
+        remaining_bar(2.5, 10),
+        "▱▱▱▱▱▱▱▱▱▱",
+        "over-range clamps to exhausted"
+    );
+    assert_eq!(
+        remaining_bar(-0.5, 10),
+        "▰▰▰▰▰▰▰▰▰▰",
+        "negatives clamp to untouched"
+    );
+    assert_eq!(
+        remaining_bar(0.04, 10),
+        "▰▰▰▰▰▰▰▰▰▱",
+        "any nonzero consumption never reads full"
+    );
+    assert_eq!(
+        remaining_bar(0.13, 10),
+        "▰▰▰▰▰▰▰▰▱▱",
+        "FLOOR the runway, never round: 87% left stays at 8 cells"
+    );
+    assert_eq!(
+        remaining_bar(0.999, 10),
+        "▰▱▱▱▱▱▱▱▱▱",
+        "any nonzero remaining shows at least one cell"
     );
     assert_eq!(USAGE_BAR_CELLS, 10, "the screen's bar width is pinned");
-    assert_eq!(fmt_pct(0.83), "83%");
-    assert_eq!(fmt_pct(0.005), "1%", "percent rounds half-up");
-    assert_eq!(fmt_pct(7.5), "100%", "percent clamps to 100");
-    assert_eq!(fmt_pct(-1.0), "0%", "percent clamps to 0");
+    assert_eq!(fmt_remaining(0.83), "17% left");
+    assert_eq!(
+        fmt_remaining(0.005),
+        "99% left",
+        "remaining floors — never overstate runway"
+    );
+    assert_eq!(
+        fmt_remaining(7.5),
+        "0% left",
+        "over-consumed clamps to none"
+    );
+    assert_eq!(fmt_remaining(-1.0), "100% left", "negatives clamp to all");
 }
 
 /// RESET-TIME LAW: `resets soon` under a minute (or elapsed), `{m}m`
@@ -301,10 +332,10 @@ fn metered_accounts_render_bars_percent_and_resets() {
     );
     assert!(text.contains("five_hour"), "window names render");
     assert!(
-        text.contains("▰▰▰▰▰▰▰▰▱▱"),
-        "0.83 renders the floor-filled 8/10 bar"
+        text.contains("▰▱▱▱▱▱▱▱▱▱"),
+        "0.83 used renders the 1/10 remaining bar (draining semantics)"
     );
-    assert!(text.contains("83%"), "the percent label renders");
+    assert!(text.contains("17% left"), "the remaining label renders");
     assert!(text.contains("resets in 2h 14m"), "the reset time renders");
     assert!(text.contains("seven_day"), "every window renders");
     assert!(text.contains("resets in 5d 3h"), "the weekly reset renders");

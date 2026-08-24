@@ -80,24 +80,29 @@ pub const METER_CELLS_DEFAULT: usize = 10;
 /// The `/usage` limit bars' width in cells (U2).
 pub const USAGE_BAR_CELLS: usize = 10;
 
-/// A `/usage` limit bar: the wire's 0.0–1.0 utilization fraction rendered
-/// as `▰▰▰▱▱▱▱▱▱▱` (U2).
+/// A `/usage` limit bar in REMAINING semantics: the wire's 0.0–1.0
+/// utilization fraction rendered as what is LEFT — the bar drains as the
+/// plan depletes (`▰▰▱▱▱▱▱▱▱▱` for a window 83% consumed). Owner call
+/// (2026-08-24): a plan is read as a budget, so the eye tracks runway
+/// going down, not consumption going up. The wire value stays verbatim
+/// utilization; the flip happens only here at the display layer.
 ///
-/// BAR-MATH LAW: input clamps to [0, 1] (the wire promises the range, the
-/// renderer re-proves it), fill is FLOOR-based — never rounding a 96%
-/// window up to a full bar — with two honesty clamps: any nonzero
-/// utilization shows at least one filled cell, and anything under 1.0
-/// keeps at least one empty cell. Only a genuinely exhausted window (≥ 1.0)
-/// renders full; only a genuinely untouched one (0.0) renders empty.
+/// BAR-MATH LAW, mirrored from the used-semantics original: input clamps
+/// to [0, 1], fill is FLOOR-based on the REMAINING fraction — never
+/// rounding a nearly-spent window up to more runway — with two honesty
+/// clamps: any nonzero remaining shows at least one filled cell, and any
+/// nonzero consumption keeps at least one empty cell. Only a genuinely
+/// untouched window (0.0 used) renders full; only a genuinely exhausted
+/// one (≥ 1.0 used) renders empty.
 #[must_use]
-pub fn usage_bar(utilization: f64, cells: usize) -> String {
-    let clamped = utilization.clamp(0.0, 1.0);
+pub fn remaining_bar(utilization: f64, cells: usize) -> String {
+    let remaining = 1.0 - utilization.clamp(0.0, 1.0);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let mut full = ((clamped * cells as f64).floor() as usize).min(cells);
-    if clamped > 0.0 && full == 0 {
+    let mut full = ((remaining * cells as f64).floor() as usize).min(cells);
+    if remaining > 0.0 && full == 0 {
         full = 1;
     }
-    if clamped < 1.0 && full == cells {
+    if remaining < 1.0 && full == cells {
         full = cells.saturating_sub(1);
     }
     let mut out = String::with_capacity(cells * "▰".len());
@@ -110,14 +115,16 @@ pub fn usage_bar(utilization: f64, cells: usize) -> String {
     out
 }
 
-/// The `/usage` percent label beside a bar: the 0.0–1.0 fraction as a
-/// whole percent, clamped to 0–100 and rounded half-up (`0.83` → `83%`).
+/// The `/usage` label beside a remaining bar: the runway as a whole
+/// percent with the word that names the semantics (`0.83` used →
+/// `17% left`). Remaining FLOORS where the old used-label rounded —
+/// the same never-overstate-runway rule `fmt_reset` applies to time.
 #[must_use]
-pub fn fmt_pct(utilization: f64) -> String {
-    let clamped = utilization.clamp(0.0, 1.0);
+pub fn fmt_remaining(utilization: f64) -> String {
+    let remaining = 1.0 - utilization.clamp(0.0, 1.0);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let pct = (clamped * 100.0).round() as u32;
-    format!("{pct}%")
+    let pct = (remaining * 100.0).floor() as u32;
+    format!("{pct}% left")
 }
 
 /// Reset-instant formatting for `/usage` windows (U2): the delta from the
