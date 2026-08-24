@@ -1548,6 +1548,8 @@ impl DemoDriver {
             // empty state (usage is daemon truth, never fabricated) and
             // the reducer's demo gate never pushes the read.
             | AppRequest::UsageRefresh
+            // 954: the heatmap window is daemon truth; demo never fetches.
+            | AppRequest::UsageHistoryRefresh
             // Fleet live-only vocabulary: demo synthesizes its snapshot
             // from the local chips at open and never pushes the read.
             | AppRequest::FleetRefresh

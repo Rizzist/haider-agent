@@ -236,6 +236,46 @@ fn remaining_bar_math_clamps_and_floors() {
     assert_eq!(fmt_remaining(-1.0), "100% left", "negatives clamp to all");
 }
 
+/// 954 date-math pins: the heatmap's civil-date algebra is pure and must
+/// hold at the boundaries clocks get wrong — leap days, year edges, and
+/// the epoch itself. `civil_from_days`/`days_from_civil` are exact
+/// inverses; weekday 0 is Sunday (1970-01-01 was a Thursday = 4).
+///
+/// MUTATION CHECK (executed): drop the `+ 1` in `civil_from_days`'s day
+/// term — every named date shifts a day and the epoch pin fails.
+#[test]
+fn heatmap_civil_date_algebra_round_trips_and_knows_its_weekdays() {
+    use haider_tui::format::{
+        civil_from_days, days_from_civil, days_from_iso_date, weekday_from_days,
+    };
+    assert_eq!(civil_from_days(0), (1970, 1, 1), "the epoch");
+    assert_eq!(weekday_from_days(0), 4, "1970-01-01 was a Thursday");
+    for (y, m, d) in [
+        (1970, 1, 1),
+        (2000, 2, 29),
+        (2024, 2, 29),
+        (2025, 12, 31),
+        (2026, 1, 1),
+        (2026, 8, 24),
+    ] {
+        let z = days_from_civil(y, m, d);
+        assert_eq!(
+            civil_from_days(z),
+            (y, m, d),
+            "round trip through days-since-epoch"
+        );
+    }
+    assert_eq!(
+        days_from_iso_date("2026-08-24"),
+        Some(days_from_civil(2026, 8, 24)),
+        "ISO parse agrees with the algebra"
+    );
+    assert_eq!(days_from_iso_date("2026-13-01"), None, "bad month refused");
+    assert_eq!(days_from_iso_date("garbage"), None, "garbage refused");
+    // 2026-08-23 was a Sunday: row zero of the grid.
+    assert_eq!(weekday_from_days(days_from_civil(2026, 8, 23)), 0);
+}
+
 /// RESET-TIME LAW: `resets soon` under a minute (or elapsed), `{m}m`
 /// under an hour, `{h}h {m}m` under a day, `{d}d {h}h` from a day up —
 /// minutes always floored.
@@ -358,6 +398,13 @@ fn s_cycles_scope_and_global_renders_compact_overview() {
     model.handle(key(KeyCode::Char('s')));
     let (rows, _) = draw(&model, 110, 30);
     assert!(
+        rows.join("\n").contains("· history"),
+        "the ring's third stop is history"
+    );
+
+    model.handle(key(KeyCode::Char('s')));
+    let (rows, _) = draw(&model, 110, 30);
+    assert!(
         rows.join("\n").contains("resets in"),
         "s cycles back to the accounts detail (reset lines return)"
     );
@@ -370,6 +417,90 @@ fn s_cycles_scope_and_global_renders_compact_overview() {
         model.usage.scope,
         UsageScope::Accounts,
         "re-entry resets to the accounts scope"
+    );
+}
+
+/// 954 heatmap laws on the History scope: an ABSENT day (`total: None`)
+/// renders the faint `·`, a PRESENT ZERO day renders `▫` (a measured
+/// zero is a fact), active days render `■`; the header stats fold only
+/// present days; a held window under a typed error stays visible and is
+/// never flattened into an empty grid.
+///
+/// MUTATION CHECK (executed): zero-fill absent days in the renderer
+/// (treat `None` as `Some(0)`) — the `absent vs zero` assertion fails
+/// because the absent cell renders `▫`; restore, green.
+#[test]
+fn history_scope_renders_absence_zero_and_activity_distinctly() {
+    use haider_protocol::usage::{UsageHistoryDailyTotalV1, UsageHistoryRangeDayV1};
+    let mut model = usage_model();
+    model.handle(key(KeyCode::Char('s')));
+    model.handle(key(KeyCode::Char('s')));
+    assert_eq!(model.usage.scope, UsageScope::History);
+
+    let total = |tokens: u64| UsageHistoryDailyTotalV1 {
+        sampled_slots: 4,
+        requests: 2,
+        input_tokens: tokens,
+        ..Default::default()
+    };
+    model.usage.apply_history(vec![
+        UsageHistoryRangeDayV1 {
+            date: "2026-08-20".into(),
+            total: Some(total(120_000)),
+        },
+        UsageHistoryRangeDayV1 {
+            date: "2026-08-21".into(),
+            total: None,
+        },
+        UsageHistoryRangeDayV1 {
+            date: "2026-08-22".into(),
+            total: Some(total(0)),
+        },
+        UsageHistoryRangeDayV1 {
+            date: "2026-08-23".into(),
+            total: Some(total(40_000)),
+        },
+    ]);
+    let (rows, _) = draw(&model, 110, 30);
+    let text = rows.join("\n");
+    assert!(text.contains("Token activity"), "the header renders");
+    assert!(
+        text.contains("lifetime 160k"),
+        "lifetime folds only present days: {text}"
+    );
+    assert!(text.contains("■"), "active days render squares");
+    // Row-scoped assertions: the stats line also carries middots, so the
+    // absence glyphs must be proven INSIDE the weekday grid rows.
+    // 2026-08-21 was a Friday (absent) and 2026-08-22 a Saturday (zero).
+    let grid_row = |name: &str| {
+        rows.iter()
+            .find(|row| row.trim_start().starts_with(name))
+            .cloned()
+            .unwrap_or_default()
+    };
+    assert!(
+        grid_row("Fr").contains("·"),
+        "the absent Friday renders the faint dot: {:?}",
+        grid_row("Fr")
+    );
+    assert!(
+        !grid_row("Fr").contains("▫"),
+        "the absent Friday must NOT read as a measured zero"
+    );
+    assert!(
+        grid_row("Sa").contains("▫"),
+        "the zero Saturday renders the measured-zero glyph: {:?}",
+        grid_row("Sa")
+    );
+
+    // A typed failure never flattens the held window.
+    model.usage.history_failed("socket lost");
+    let (rows, _) = draw(&model, 110, 30);
+    let text = rows.join("\n");
+    assert!(text.contains("history read failed"), "the error is typed");
+    assert!(
+        text.contains("Token activity"),
+        "the held window stays visible under the error"
     );
 }
 

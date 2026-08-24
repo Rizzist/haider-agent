@@ -593,6 +593,7 @@ pub struct CommandContext {
     /// This request was a `usage.report` read (U2). Same identity pattern
     /// as `hooks_list`: the error reply lands on the usage screen.
     usage_report: bool,
+    usage_history: bool,
     /// This request was a `session.fleet` read (fleet view). Same identity
     /// pattern: the error reply lands on the fleet screen.
     fleet: bool,
@@ -657,6 +658,7 @@ impl CommandContext {
             },
             hooks_list: matches!(command, LiveCommand::HooksList { .. }),
             usage_report: matches!(command, LiveCommand::UsageReport),
+            usage_history: matches!(command, LiveCommand::UsageHistoryRange { .. }),
             fleet: matches!(command, LiveCommand::SessionFleet { .. }),
             graph: match command {
                 LiveCommand::GraphStatus { session } => Some(session.clone()),
@@ -886,6 +888,10 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
         LiveCommand::HooksList { cwd } => RequestBody::HooksList { cwd },
         // U2: parameterless read (U1's wire) — CONSUMED, never redefined.
         LiveCommand::UsageReport => RequestBody::UsageReport,
+        // 954: the bounded heatmap read — CONSUMED, never redefined.
+        LiveCommand::UsageHistoryRange { through_date, days } => {
+            RequestBody::UsageHistoryRange { through_date, days }
+        }
         LiveCommand::SessionFleet { session } => RequestBody::SessionFleet {
             session_id: session,
         },
@@ -1341,6 +1347,11 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         ResponseBody::UsageReport { report, .. } => vec![LiveReply::UsageReport {
             report: Box::new(report),
         }],
+        // 954: absent days stay absent (`total: None` per cell) — the wire
+        // projection is carried verbatim, never zero-filled here.
+        ResponseBody::UsageHistoryRange { days, .. } => {
+            vec![LiveReply::UsageHistoryRange { days }]
+        }
         ResponseBody::SessionFleet { snapshot } => vec![LiveReply::Fleet {
             snapshot: Box::new(snapshot),
         }],
@@ -1694,6 +1705,13 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 // the same identity pattern.
                 if context.usage_report {
                     return vec![LiveReply::UsageReportFailed {
+                        message: message.clone(),
+                    }];
+                }
+                // 954: a history-read failure is typed, never flattened
+                // into an empty heatmap (the consumer-boundary law).
+                if context.usage_history {
+                    return vec![LiveReply::UsageHistoryRangeFailed {
                         message: message.clone(),
                     }];
                 }

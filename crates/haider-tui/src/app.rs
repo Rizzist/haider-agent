@@ -914,15 +914,19 @@ pub enum UsageScope {
     #[default]
     Accounts,
     Global,
+    /// The usage-history heatmap (954 headline's UI): daily totals from
+    /// the device-local ledger via `usage.history_range`.
+    History,
 }
 
 impl UsageScope {
-    /// The `s` key cycles scopes; two today, ledger scopes join the ring.
+    /// The `s` key cycles scopes; the ring grows as ledger scopes land.
     #[must_use]
     pub fn next(self) -> Self {
         match self {
             Self::Accounts => Self::Global,
-            Self::Global => Self::Accounts,
+            Self::Global => Self::History,
+            Self::History => Self::Accounts,
         }
     }
 }
@@ -963,6 +967,17 @@ pub struct UsageState {
     /// Armed by a cursor move: the next frame scrolls the cursor's group
     /// header into view, then clears the latch.
     pub follow_cursor: std::cell::Cell<bool>,
+    /// The last committed `usage.history_range` window (954): dated cells
+    /// where `total: None` is NO LOCAL SAMPLE for that date and a present
+    /// all-zero total is a measured zero day — the ledger's absence law,
+    /// carried into the model verbatim.
+    pub history: Option<Vec<haider_protocol::usage::UsageHistoryRangeDayV1>>,
+    /// A history read is in flight (History scope entry / `f`).
+    pub history_fetching: bool,
+    /// The last history read's typed failure — rendered in the History
+    /// scope, never flattened into an empty heatmap (the consumer-boundary
+    /// law: a read failure is not absence).
+    pub history_error: Option<String>,
 }
 
 impl UsageState {
@@ -984,6 +999,21 @@ impl UsageState {
     pub fn read_failed(&mut self, message: &str) {
         self.fetching = false;
         self.error = Some(message.to_owned());
+    }
+
+    /// Install a committed `usage.history_range` window (954). The ONLY
+    /// writer of `history`; clears the in-flight mark and any stale error.
+    pub fn apply_history(&mut self, days: Vec<haider_protocol::usage::UsageHistoryRangeDayV1>) {
+        self.history = Some(days);
+        self.history_fetching = false;
+        self.history_error = None;
+    }
+
+    /// A history read failed: typed message, held window stays visible —
+    /// older truth under an error line, never an empty heatmap.
+    pub fn history_failed(&mut self, message: &str) {
+        self.history_fetching = false;
+        self.history_error = Some(message.to_owned());
     }
 
     /// The FILTERED provider groups, report order preserved: accounts
@@ -2501,6 +2531,8 @@ pub enum AppRequest {
     /// pushed on screen entry and by `r`, live-only vocabulary: the demo
     /// opens an honest empty state and never fabricates a meter.
     UsageRefresh,
+    /// 954: the bounded heatmap read (`usage.history_range`).
+    UsageHistoryRefresh,
     /// Fetch/refresh the fleet snapshot (`session.fleet`) for the ACTIVE
     /// session. A READ — never outboxed; pushed at fleet-view open, then
     /// chased by the driver on the existing event cadence while the screen
@@ -8458,9 +8490,21 @@ impl AppModel {
                 self.dirty = true;
             }
             KeyCode::Char('s') => {
-                // 954: `s` cycles the viewing scope (accounts ⇄ global).
+                // 954: `s` cycles the viewing scope ring.
                 self.usage.scope = self.usage.scope.next();
                 self.usage.scroll.set(0);
+                // Entering History live with no held window: read it. The
+                // demo never fetches (usage is daemon truth) and a daemon
+                // without the feature gets the honest note at render.
+                if self.usage.scope == UsageScope::History
+                    && !self.mode.fabricates_locally()
+                    && self.daemon_serves(haider_rpc::FEATURE_USAGE_HISTORY_V1)
+                    && self.usage.history.is_none()
+                    && !self.usage.history_fetching
+                {
+                    self.usage.history_fetching = true;
+                    self.requests.push(AppRequest::UsageHistoryRefresh);
+                }
                 self.dirty = true;
             }
             // A manual re-read (live only — the demo has nothing to fetch

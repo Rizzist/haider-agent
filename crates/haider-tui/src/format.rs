@@ -236,3 +236,74 @@ pub fn usage_tone(utilization: f64) -> UsageTone {
         UsageTone::Ok
     }
 }
+
+/// Today's UTC date as `YYYY-MM-DD` — the ledger's day convention (UTC
+/// days always have 96 slots; local days lose or gain an hour on DST
+/// transitions). System-clock read isolated here; the math is
+/// [`civil_from_days`], pure and pinned.
+#[must_use]
+pub fn utc_date_today() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    #[allow(clippy::cast_possible_wrap)]
+    let (y, m, d) = civil_from_days((secs / 86_400) as i64);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Gregorian civil date from days since 1970-01-01 (Howard Hinnant's
+/// `civil_from_days`, the standard branch-free algorithm). Pure so the
+/// pin below can exercise real boundaries without touching a clock.
+#[must_use]
+pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
+}
+
+/// Days since 1970-01-01 for a Gregorian civil date (Hinnant's
+/// `days_from_civil`, the exact inverse of [`civil_from_days`] — the pin
+/// round-trips both).
+#[must_use]
+pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = i64::from(if m > 2 { m - 3 } else { m + 9 });
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Parse `YYYY-MM-DD` to days-since-epoch; `None` on any malformed date
+/// (a malformed ledger date must not panic a render).
+#[must_use]
+pub fn days_from_iso_date(date: &str) -> Option<i64> {
+    let mut parts = date.splitn(3, '-');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    let d: u32 = parts.next()?.parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some(days_from_civil(y, m, d))
+}
+
+/// Day-of-week for days-since-epoch: 0 = Sunday (the heatmap's top row).
+/// 1970-01-01 was a Thursday.
+#[must_use]
+pub fn weekday_from_days(z: i64) -> u32 {
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    {
+        (z.rem_euclid(7) as u32 + 4) % 7
+    }
+}

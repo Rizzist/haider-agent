@@ -2265,6 +2265,197 @@ fn render_providers(
 /// One `/usage` meter line's bar ink from its utilization (U2): the
 /// threshold law lives in [`crate::format::usage_tone`]; this only maps
 /// tones onto theme slots.
+/// The 954 History scope: a codex-style token-activity heatmap from the
+/// device-local ledger window (`usage.history_range`).
+///
+/// Cell honesty carries the ledger's absence law into pixels: an ABSENT
+/// day (`total: None`, no local sample) renders a faint `·`; a PRESENT
+/// all-zero day renders a faint `▫` (a measured zero is a fact); active
+/// days render `■` on a four-step ramp blended from the theme's accent
+/// over its ground (`gold.over(bg, …)`) so every theme derives its own
+/// ramp — never a hardcoded palette. Quartile thresholds come from the
+/// window's own nonzero days.
+fn render_usage_history(model: &AppModel, theme: &Theme, lines: &mut Vec<Line<'_>>) {
+    use crate::format::{days_from_iso_date, fmt_tok, weekday_from_days};
+
+    // Demo refuses FETCHES (the reducer never pushes the read), but a
+    // held window renders wherever it came from — hiding applied state
+    // would fabricate emptiness, the inverse sin.
+    if model.mode.fabricates_locally() && model.usage.history.is_none() {
+        lines.push(Line::styled(
+            "  demo — history is ledger truth, never fabricated; run bare `haider` against a daemon",
+            theme.dim_style(),
+        ));
+        return;
+    }
+    if let Some(error) = &model.usage.history_error {
+        lines.push(Line::from(vec![
+            Span::styled("  ✗ history read failed — ", theme.err_style()),
+            Span::styled(error.clone(), theme.err_style()),
+        ]));
+        if model.usage.history.is_some() {
+            lines.push(Line::styled(
+                "  showing the previously committed window (older truth, never fabricated)",
+                theme.dim_style(),
+            ));
+        }
+    }
+    let Some(days) = &model.usage.history else {
+        if model.usage.history_fetching {
+            lines.push(Line::styled("  fetching history…", theme.dim_style()));
+        } else if model.usage.history_error.is_none() {
+            lines.push(Line::styled(
+                "  no history window read yet — the daemon may predate usage_history_v1",
+                theme.dim_style(),
+            ));
+        }
+        return;
+    };
+
+    // Dated cells keyed by days-since-epoch; ISO dates sort lexically but
+    // the grid needs weekday math, so parse once. Malformed dates are
+    // dropped (never a panic in a render).
+    let mut cells: Vec<(i64, Option<u64>)> = days
+        .iter()
+        .filter_map(|day| {
+            let z = days_from_iso_date(&day.date)?;
+            let tokens = day
+                .total
+                .as_ref()
+                .map(|t| t.input_tokens + t.output_tokens + t.reasoning_tokens);
+            Some((z, tokens))
+        })
+        .collect();
+    cells.sort_by_key(|(z, _)| *z);
+    let Some(&(last_day, _)) = cells.last() else {
+        lines.push(Line::styled(
+            "  the window contains no days — an empty range, not an error",
+            theme.dim_style(),
+        ));
+        return;
+    };
+
+    // Header stats over PRESENT days only (absent days assert nothing).
+    let lifetime: u64 = cells.iter().filter_map(|(_, t)| *t).sum();
+    let peak: u64 = cells.iter().filter_map(|(_, t)| *t).max().unwrap_or(0);
+    // Best streak: the longest run of CONSECUTIVE calendar days with
+    // activity (a gap in the ledger breaks a run — absent days assert
+    // nothing, and a streak must not bridge them).
+    let (mut best, mut run, mut prev) = (0u32, 0u32, None::<i64>);
+    for (z, tokens) in &cells {
+        let active = tokens.is_some_and(|t| t > 0);
+        run = if active && prev == Some(*z - 1) {
+            run + 1
+        } else {
+            u32::from(active)
+        };
+        best = best.max(run);
+        prev = active.then_some(*z);
+    }
+    // Current streak: consecutive active days counting back from the
+    // window's last day.
+    let mut streak = 0u32;
+    for (z, tokens) in cells.iter().rev() {
+        if tokens.is_some_and(|t| t > 0) && *z == last_day - i64::from(streak) {
+            streak += 1;
+        } else {
+            break;
+        }
+    }
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  Token activity",
+            theme
+                .bright_style()
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "  lifetime {} · peak {} · streak {}d (best {}d)",
+                fmt_tok(lifetime),
+                fmt_tok(peak),
+                streak,
+                best
+            ),
+            theme.dim_style(),
+        ),
+    ]));
+    lines.push(Line::raw(""));
+
+    // Quartile thresholds over nonzero days.
+    let mut nonzero: Vec<u64> = cells
+        .iter()
+        .filter_map(|(_, t)| *t)
+        .filter(|t| *t > 0)
+        .collect();
+    nonzero.sort_unstable();
+    let q = |f: usize| {
+        nonzero
+            .get((nonzero.len().saturating_sub(1)) * f / 4)
+            .copied()
+            .unwrap_or(0)
+    };
+    let (q1, q2, q3) = (q(1), q(2), q(3));
+    let ramp = [
+        theme.gold.over(theme.bg, 280),
+        theme.gold.over(theme.bg, 520),
+        theme.gold.over(theme.bg, 760),
+        theme.gold,
+    ];
+    let by_day: std::collections::BTreeMap<i64, Option<u64>> = cells.iter().copied().collect();
+
+    // Grid: weeks as columns, Su..Sa rows, ending at the window's last day.
+    let first_day = cells.first().map(|(z, _)| *z).unwrap_or(last_day);
+    let last_col_start = last_day - i64::from(weekday_from_days(last_day));
+    let weeks: i64 =
+        (last_col_start - (first_day - i64::from(weekday_from_days(first_day)))) / 7 + 1;
+    let day_names = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
+    for row in 0..7u32 {
+        let mut spans = vec![Span::styled(
+            format!("  {} ", day_names[row as usize]),
+            theme.dim_style(),
+        )];
+        for week in 0..weeks {
+            let z = last_col_start - (weeks - 1 - week) * 7 + i64::from(row);
+            let (glyph, color) = match by_day.get(&z) {
+                None => ("· ", theme.faint),
+                Some(None) => ("· ", theme.faint),
+                Some(Some(0)) => ("▫ ", theme.faint),
+                Some(Some(t)) => {
+                    let idx = if *t <= q1 {
+                        0
+                    } else if *t <= q2 {
+                        1
+                    } else if *t <= q3 {
+                        2
+                    } else {
+                        3
+                    };
+                    ("■ ", ramp[idx])
+                }
+            };
+            spans.push(Span::styled(
+                glyph,
+                ratatui::style::Style::default().fg(color.into()),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::raw(""));
+    let mut legend = vec![Span::styled("     · none  ▫ zero  ", theme.dim_style())];
+    for color in ramp {
+        legend.push(Span::styled(
+            "■ ",
+            ratatui::style::Style::default().fg(color.into()),
+        ));
+    }
+    legend.push(Span::styled(
+        " more — daily · weekly and cumulative folds land next",
+        theme.dim_style(),
+    ));
+    lines.push(Line::from(legend));
+}
+
 fn usage_bar_style(theme: &Theme, utilization: f64) -> ratatui::style::Style {
     match crate::format::usage_tone(utilization) {
         crate::format::UsageTone::Ok => theme.ok_style(),
@@ -2297,6 +2488,7 @@ fn render_usage(
     let mut header_lines: Vec<usize> = Vec::new();
 
     let global = model.usage.scope == crate::app::UsageScope::Global;
+    let history = model.usage.scope == crate::app::UsageScope::History;
     lines.push(Line::from(vec![
         Span::styled(
             "USAGE",
@@ -2305,7 +2497,11 @@ fn render_usage(
                 .add_modifier(ratatui::style::Modifier::BOLD),
         ),
         Span::styled(
-            if global { " · global" } else { " · accounts" },
+            match model.usage.scope {
+                crate::app::UsageScope::Accounts => " · accounts",
+                crate::app::UsageScope::Global => " · global",
+                crate::app::UsageScope::History => " · history",
+            },
             theme.gold_style(),
         ),
         Span::styled(
@@ -2334,7 +2530,13 @@ fn render_usage(
     }
     lines.push(Line::raw(""));
 
-    if model.cache_usage.has_classified_usage() {
+    // 954 History scope: the heatmap replaces every report-based section
+    // below — it reads the ledger window, not the usage report.
+    if history {
+        render_usage_history(model, theme, &mut lines);
+    }
+
+    if !history && model.cache_usage.has_classified_usage() {
         let cache = model.cache_usage.totals();
         let all_input_share = cache
             .complete_hit_rate()
@@ -2607,7 +2809,7 @@ fn render_usage(
     }
 
     let groups = model.usage.groups();
-    if let Some(report) = &model.usage.report {
+    if !history && let Some(report) = &model.usage.report {
         if report.accounts.is_empty() {
             lines.push(Line::styled(
                 "  no accounts known — /login adds one",

@@ -243,6 +243,13 @@ pub enum LiveCommand {
     /// a socket loss simply leaves the screen on its honest fetching /
     /// stale state and `r` re-reads.
     UsageReport,
+    /// `usage.history_range` — the bounded heatmap READ (954): daily
+    /// totals through a UTC date. Receipt-free, never outboxed — a socket
+    /// loss leaves the History scope on its honest fetching/stale state.
+    UsageHistoryRange {
+        through_date: String,
+        days: u16,
+    },
     /// `session.fleet` — a READ of the daemon's bounded descendant-tree
     /// snapshot (the fleet view, `session_fleet_v1`). Receipt-free, never
     /// outboxed: the open issues one, the event-cadence chase re-reads
@@ -814,6 +821,8 @@ impl LiveCommand {
             | Self::HooksList { .. }
             // U2: the usage snapshot is a read (see above).
             | Self::UsageReport
+            // 954: the heatmap window is a read (see above).
+            | Self::UsageHistoryRange { .. }
             // The fleet snapshot is a read (see above).
             | Self::SessionFleet { .. }
             // The graph reduction is a read (see above).
@@ -1011,6 +1020,16 @@ pub enum LiveReply {
     /// context (the read has no durable command id — the hooks.list
     /// precedent): the typed message lands on the usage screen, never a
     /// bare flash.
+    /// 954: a committed `usage.history_range` window. Absent cells stay
+    /// absent — the model consumes the wire projection verbatim.
+    UsageHistoryRange {
+        days: Vec<haider_protocol::usage::UsageHistoryRangeDayV1>,
+    },
+    /// 954: the history read failed — typed onto the History scope, never
+    /// an empty heatmap (the consumer-boundary law).
+    UsageHistoryRangeFailed {
+        message: String,
+    },
     UsageReportFailed {
         message: String,
     },
@@ -2239,6 +2258,16 @@ impl LiveDriver {
             // daemon truth, installed whole.
             LiveReply::UsageReport { report } => {
                 model.usage.apply_report(*report);
+                model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::UsageHistoryRange { days } => {
+                model.usage.apply_history(days);
+                model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::UsageHistoryRangeFailed { message } => {
+                model.usage.history_failed(&message);
                 model.dirty = true;
                 Vec::new()
             }
@@ -4627,6 +4656,12 @@ impl LiveDriver {
                 LiveCommand::List { cursor: None },
                 LiveCommand::UsageReport,
             ],
+            // 954: the heatmap read — a year of daily totals through
+            // today's UTC date (the ledger's day convention).
+            AppRequest::UsageHistoryRefresh => vec![LiveCommand::UsageHistoryRange {
+                through_date: crate::format::utc_date_today(),
+                days: 366,
+            }],
             // Fleet: a read — never outboxed, single-flight (the chase
             // fold lives in `fleet_refresh`).
             AppRequest::FleetRefresh => self.fleet_refresh(model),
