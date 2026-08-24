@@ -2855,6 +2855,10 @@ pub enum Hit {
     /// producing prompt's first row at the viewport top (sim jumpToSticky:
     /// stay AT the prompt, tui.js:2637-2645).
     StickyJump(u16),
+    /// 954 owner item: the bottom jump band — click returns the transcript
+    /// to follow (scroll-back 0); the unseen counter clears through the
+    /// watermark the next FOLLOWING frame stamps.
+    JumpToBottom,
     /// One `/tree` row, by VALUE (B2b-m3): the click validates the carried
     /// row against the freshly built rows and selects it (sim
     /// tui.js:3375-3377 onClick = setTreeSel) — a stale hit whose row was
@@ -3740,6 +3744,11 @@ pub struct AppModel {
     /// (reconcile-then-apply, review r5 P2-2). Starts at 0 (review r2
     /// P2-6).
     pub scroll_max: std::cell::Cell<u16>,
+    /// Entry-count watermark for the bottom jump band's "new" counter —
+    /// renderer-written (the same frame-feedback `Cell` discipline):
+    /// every FOLLOWING frame (scroll-back 0) stamps the transcript entry
+    /// count; while scrolled back, the difference is what arrived unseen.
+    pub bottom_watermark: std::cell::Cell<usize>,
     /// The transcript viewport of the LAST rendered frame — written by
     /// the renderer beside [`Self::scroll_max`] (the same frame-feedback
     /// `Cell` discipline). The drag-autoscroll edge test reads it at the
@@ -4001,6 +4010,7 @@ impl Default for AppModel {
             requests: Vec::new(),
             turn_active: false,
             scroll_back: std::cell::Cell::new(0),
+            bottom_watermark: std::cell::Cell::new(0),
             scroll_max: std::cell::Cell::new(0),
             transcript_view: std::cell::Cell::new(ratatui::layout::Rect::default()),
             status_width: std::cell::Cell::new(0),
@@ -13157,6 +13167,13 @@ impl AppModel {
                 // other hit arm (Fable review D3-12).
                 self.scroll_back.set(scroll_back.min(self.scroll_max.get()));
                 self.sticky_suppressed.set(true);
+                self.note_session_view();
+            }
+            Hit::JumpToBottom if matches!(self.screen, Screen::Session | Screen::Subagent) => {
+                // 954: return to follow; the next FOLLOWING frame stamps
+                // the watermark, which is what clears the unseen counter —
+                // the reducer never fabricates a "seen" count itself.
+                self.scroll_back.set(0);
                 self.note_session_view();
             }
             // A hit whose owning surface is gone: dropped, never acted on.

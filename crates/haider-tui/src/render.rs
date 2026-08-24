@@ -4017,6 +4017,48 @@ fn render_session(
         }
     }
 
+    // 954 owner item: the BOTTOM complement of the sticky band. Every
+    // FOLLOWING frame stamps the watermark (render is the single scroll
+    // authority, so "seen" is defined by what a following frame showed);
+    // while scrolled back, a right-aligned chip on the transcript's last
+    // row names how much arrived unseen and clicks back to follow. Same
+    // plan-menu suppression as the sticky band (surface ownership law).
+    if model.scroll_back.get() == 0 {
+        model.bottom_watermark.set(model.projection.entries().len());
+    } else if plan_menu.is_none() && transcript_area.height > 1 {
+        let unseen = model
+            .projection
+            .entries()
+            .len()
+            .saturating_sub(model.bottom_watermark.get());
+        let label = if unseen > 0 {
+            format!(" {unseen} new · Jump to bottom ↓ ")
+        } else {
+            " Jump to bottom ↓ ".to_owned()
+        };
+        let width = (label.chars().count() as u16).min(transcript_area.width);
+        let band_rect = Rect {
+            x: transcript_area.x + transcript_area.width.saturating_sub(width),
+            y: transcript_area.y + transcript_area.height - 1,
+            width,
+            height: 1,
+        };
+        let hovered = model.hovered == Some(Hit::JumpToBottom);
+        let style = if hovered {
+            theme.sticky_hover_style()
+        } else {
+            theme.sticky_style()
+        };
+        frame.render_widget(
+            Paragraph::new(Line::raw(ellipsize(&label, transcript_area.width as usize)))
+                .style(style),
+            band_rect,
+        );
+        // First-match dispatch: the chip paints over the transcript row
+        // beneath it, so its hit must lead (the sticky-band precedent).
+        hits.insert(0, (band_rect, Hit::JumpToBottom));
+    }
+
     if let Some(todos) = model.projection.todos().filter(|t| t.pinned) {
         // Sim TodoPanel (tui.js:2863-2888, 4667-4709): the header is a BUTTON
         // that toggles collapse, and the collapsed form summarises the item

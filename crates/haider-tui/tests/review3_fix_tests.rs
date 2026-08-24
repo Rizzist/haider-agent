@@ -239,6 +239,77 @@ fn sticky_jump_suppresses_the_bar_until_a_real_wheel() {
     );
 }
 
+// ---- 954: bottom jump band + unseen counter ----
+
+/// The bottom complement of the sticky band (954 owner item): scrolled
+/// back, a right-aligned chip offers "Jump to bottom ↓"; entries that land
+/// while scrolled back count as "N new"; clicking returns to follow and
+/// the next FOLLOWING frame stamps the watermark, clearing the counter.
+/// At follow, no band renders.
+///
+/// MUTATION CHECK (executed): stamp the watermark on EVERY frame (drop the
+/// scroll_back == 0 guard in render) — the `2 new` assertion fails at 0;
+/// restore, green.
+#[test]
+fn bottom_band_counts_unseen_and_click_returns_to_follow() {
+    let mut model = session_model();
+    model.handle(AppEvent::Envelope(Box::new(agent_message(
+        "long-reply",
+        "line\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline\nline",
+    ))));
+    // Following: watermark stamps, no band.
+    let (_, hits, _) = draw(&model, 90, 14);
+    assert!(
+        !hits.iter().any(|(_, h)| matches!(h, Hit::JumpToBottom)),
+        "no band while following"
+    );
+    // Scroll back, then two entries land unseen.
+    model.handle_wheel(true);
+    let (_, hits, _) = draw(&model, 90, 14);
+    assert!(
+        hits.iter().any(|(_, h)| matches!(h, Hit::JumpToBottom)),
+        "scrolled back offers the band"
+    );
+    model.handle(AppEvent::Envelope(Box::new(EventPayload::UserMessage {
+        text: "unseen prompt".to_owned(),
+        attachments: vec![],
+        mode: haider_protocol::DeliveryMode::Steer,
+    })));
+    model.handle(AppEvent::Envelope(Box::new(agent_message(
+        "unseen-reply",
+        "unseen answer",
+    ))));
+    let (rows, hits, _) = draw(&model, 90, 14);
+    let band_row = rows.last().map(String::as_str).unwrap_or_default();
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("2 new · Jump to bottom ↓")),
+        "two unseen entries count on the band: {band_row:?}"
+    );
+    // Click: back to follow; the following frame stamps the watermark.
+    model.handle_hit(Hit::JumpToBottom);
+    assert_eq!(model.scroll_back.get(), 0, "click returns to follow");
+    let (_, hits_after, _) = draw(&model, 90, 14);
+    assert!(
+        !hits_after
+            .iter()
+            .any(|(_, h)| matches!(h, Hit::JumpToBottom)),
+        "no band at follow"
+    );
+    // Scrolling back again with nothing new: the label carries no count.
+    model.handle_wheel(true);
+    let (rows, _, _) = draw(&model, 90, 14);
+    assert!(
+        rows.iter().any(|row| row.contains("Jump to bottom ↓")),
+        "band returns on scroll-back"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("new · Jump to bottom")),
+        "seen entries do not count"
+    );
+    let _ = hits;
+}
+
 // ---- P2-5: true pre-wrap ----
 
 #[test]
