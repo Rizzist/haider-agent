@@ -5,20 +5,21 @@
 
 #![allow(clippy::expect_used)]
 
-use crate::session_hub::{SessionHub, SessionHubConfig};
+use crate::session_hub::{SessionHub, SessionHubConfig, SessionHubError};
 use crate::worker::{
     BrokerToolFactory, ProviderFactory, ResolvedTurnProvider, WorkerDependencies, WorkerManager,
 };
 use haider_core::{
     ProviderAttemptDecision, ProviderAttemptResolver, ProviderPairSwitchCause,
-    ProviderPairSwitchTarget, SessionCreateCommand, SessionSelectEffortCommand,
-    SessionSelectEffortOutcome, SessionSelectFastCommand, SessionSelectFastOutcome,
-    SessionSelectModelCommand, SessionSelectModelOutcome, SqliteStoreHandle, StoreHandle,
-    TurnAcceptCommand, TurnAdmissionDisposition,
+    ProviderPairSwitchTarget, QueueConsumeCommand, QueuePromoteCommand, SessionCreateCommand,
+    SessionSelectEffortCommand, SessionSelectEffortOutcome, SessionSelectFastCommand,
+    SessionSelectFastOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
+    SqliteStoreHandle, StoreHandle, TurnAcceptCommand, TurnAdmissionDisposition,
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::cache::{CacheEpochTransitionReason, CacheEpochTransitionV1};
+use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{CredentialAlias, DeviceId, EventId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
@@ -1213,6 +1214,288 @@ async fn steer_during_manual_compaction_blocks_and_never_reaches_the_summarizer(
     );
 
     world.shutdown().await;
+}
+
+/// A fenced promotion crosses the live harness before the session actor can
+/// accept a competing terminal append. The exact submitted bytes appear in
+/// the next provider request once, while a response-loss retry is stale and
+/// cannot enqueue a second steer.
+///
+/// MUTATION CHECK: remove the actor-to-supervisor promotion barrier or move
+/// it after the actor completes the command. Expected runtime failure: the
+/// promoted request is absent or `live_delivered` is false under the forced
+/// finish race.
+#[tokio::test]
+async fn queue_promote_delivers_verbatim_as_exactly_one_live_steer() {
+    let promoted_text = "  PROMOTED_STEER\nverbatim  ";
+    let fake_a = Arc::new(FakeProvider::new(vec![
+        FakeStep::Delay { ms: 1000 },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::EmitText {
+            text: "promotion received".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let fake_b = Arc::new(FakeProvider::new(Vec::new()));
+    let world = PairSwitchWorld::boot("queue-promote-live", fake_a.clone(), fake_b).await;
+    let (active_run, disposition) = world
+        .submit_turn(
+            "queue-promote-active",
+            "hold the live turn",
+            DeliveryMode::Queue,
+        )
+        .await;
+    assert_eq!(disposition, TurnAdmissionDisposition::Started);
+    timeout(Duration::from_secs(5), async {
+        while fake_a.requests().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("active provider request starts");
+
+    let (queued_run, disposition) = world
+        .submit_turn("queue-promote-held", promoted_text, DeliveryMode::Queue)
+        .await;
+    assert_eq!(disposition, TurnAdmissionDisposition::Queued);
+    let snapshot = world
+        .hub
+        .queue_snapshot(world.session_id.clone())
+        .await
+        .expect("held snapshot");
+    let command = QueuePromoteCommand {
+        session_id: world.session_id.clone(),
+        id: EventId::new("queue-promote-held-user"),
+        revision: snapshot.revision,
+        expected_active_run_id: None,
+        cancelling_event_id: EventId::new("queue-promote-live-cancelling"),
+        delivery_event_id: EventId::new("queue-promote-live-delivery"),
+        delta_event_id: EventId::new("queue-promote-live-delta"),
+        device_id: world.device_id.clone(),
+    };
+    let (promoted, live_delivered) = world
+        .hub
+        .queue_promote_steer(command.clone())
+        .await
+        .expect("promotion commits and delivers");
+    assert!(live_delivered, "promotion crosses the live harness barrier");
+    assert_eq!(promoted.text, promoted_text);
+
+    let stale = world
+        .hub
+        .queue_promote_steer(command)
+        .await
+        .expect_err("response-loss retry is stale");
+    assert!(matches!(
+        stale,
+        SessionHubError::Store(ref error) if error.code == ErrorCode::RevisionConflict
+    ));
+    world.await_done(&active_run).await;
+    world
+        .await_run_state(&queued_run, RunState::Cancelled)
+        .await;
+
+    let requests = fake_a.requests();
+    assert_eq!(requests.len(), 2, "promotion creates one steer round");
+    let promoted_copies = requests[1]
+        .messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter(|block| matches!(block, Block::Text { text } if text == promoted_text))
+        .count();
+    assert_eq!(promoted_copies, 1, "provider receives verbatim text once");
+
+    world.shutdown().await;
+}
+
+/// A crash after `Consumed` commits but before `start_turn` must resume the
+/// already-owned run, not mistake its missing row for a remove/promote win.
+/// This plants that exact durable prefix, then hands it to the normal queued
+/// recovery path and requires provider delivery.
+///
+/// MUTATION CHECK: treat `queue_consume == None` as unconditional skip in the
+/// supervisor. Expected runtime failure: the recovered run never reaches
+/// Done and the provider receives no request.
+#[tokio::test]
+async fn consumed_before_start_recovers_and_delivers_after_the_crash_boundary() {
+    let root = tempfile::tempdir().expect("temp profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    hub.install_creatable_providers(BTreeSet::from(["fake-a".to_owned(), "fake-b".to_owned()]))
+        .expect("install creatable providers");
+    let session_id = SessionId::new("queue-consume-crash-session");
+    let device_id = DeviceId::new("queue-consume-crash-device");
+    let generation = store.worker_generation();
+    let cwd = std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+        .expect("canonical cwd")
+        .to_string_lossy()
+        .into_owned();
+    hub.create_internal_session(SessionCreateCommand {
+        command_id: "create-queue-consume-crash".into(),
+        request_digest: "create-queue-consume-crash-digest".into(),
+        request_json: r#"{"session":"queue-consume-crash"}"#.into(),
+        session_id: session_id.clone(),
+        cwd,
+        provider: "fake-a".into(),
+        model: "model-a".into(),
+        max_tokens: 4096,
+        permission_overrides: None,
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+        event_id: EventId::new("created-queue-consume-crash"),
+        device_id: device_id.clone(),
+    })
+    .await
+    .expect("create session");
+
+    let active_run = RunId::new("queue-consume-crash-active");
+    hub.accept_internal_turn(TurnAcceptCommand {
+        command_id: "accept-queue-consume-crash-active".into(),
+        request_digest: "accept-queue-consume-crash-active-digest".into(),
+        request_json: r#"{"turn":"active"}"#.into(),
+        session_id: session_id.clone(),
+        worker_generation: generation,
+        run_id: active_run.clone(),
+        agent_id: None,
+        branch_id: None,
+        text: "prior active turn".into(),
+        attachments: Vec::new(),
+        mode: DeliveryMode::Queue,
+        queued_event_id: EventId::new("queue-consume-crash-active-queued"),
+        user_event_id: EventId::new("queue-consume-crash-active-user"),
+        active_event_id: EventId::new("queue-consume-crash-active-session"),
+        device_id: device_id.clone(),
+    })
+    .await
+    .expect("accept active turn");
+    let state_envelope = |event_id: &str, run_id: RunId, state: RunState| EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new(event_id),
+        seq: 0,
+        session_id: session_id.clone(),
+        branch_id: None,
+        run_id: Some(run_id),
+        agent_id: None,
+        device_id: device_id.clone(),
+        authority_epoch: 0,
+        worker_generation: generation,
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::to_value(EventPayload::RunState(state)).expect("state payload"),
+    };
+    let mut thinking = [state_envelope(
+        "queue-consume-crash-thinking",
+        active_run.clone(),
+        RunState::Thinking,
+    )];
+    hub.append(&mut thinking).await.expect("active turn starts");
+
+    let queued_text = "deliver after consumed crash";
+    let queued_run = RunId::new("queue-consume-crash-held");
+    let queued = hub
+        .accept_internal_turn(TurnAcceptCommand {
+            command_id: "accept-queue-consume-crash-held".into(),
+            request_digest: "accept-queue-consume-crash-held-digest".into(),
+            request_json: r#"{"turn":"held"}"#.into(),
+            session_id: session_id.clone(),
+            worker_generation: generation,
+            run_id: queued_run.clone(),
+            agent_id: None,
+            branch_id: None,
+            text: queued_text.into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+            queued_event_id: EventId::new("queue-consume-crash-held-queued"),
+            user_event_id: EventId::new("queue-consume-crash-held-user"),
+            active_event_id: EventId::new("queue-consume-crash-held-session"),
+            device_id: device_id.clone(),
+        })
+        .await
+        .expect("accept held turn");
+    assert_eq!(queued.disposition, TurnAdmissionDisposition::Queued);
+    store
+        .queue_consume(QueueConsumeCommand {
+            session_id: session_id.clone(),
+            run_id: queued_run.clone(),
+            delta_event_id: EventId::new("queue-consume-crash-delta"),
+            device_id: device_id.clone(),
+        })
+        .await
+        .expect("consume boundary commits")
+        .expect("held row exists");
+    let mut done = [state_envelope(
+        "queue-consume-crash-active-done",
+        active_run,
+        RunState::Done,
+    )];
+    hub.append(&mut done).await.expect("prior run completes");
+
+    let fake_a = Arc::new(FakeProvider::new(text_turn("recovered answer")));
+    let fake_b = Arc::new(FakeProvider::new(Vec::new()));
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            diagnostics: None,
+            provider_factory: Arc::new(RoutingProviderFactory {
+                providers: HashMap::from([
+                    ("fake-a".to_owned(), fake_a.clone()),
+                    ("fake-b".to_owned(), fake_b),
+                ]),
+                cache_reconciliations: Arc::new(Mutex::new(Vec::new())),
+                fallback_enabled: false,
+            }),
+            tool_factory: Arc::new(BrokerToolFactory),
+            delegation: None,
+            web_search: None,
+        },
+        false,
+    );
+    hub.install_worker_manager(manager.handle())
+        .expect("install manager");
+    manager
+        .handle()
+        .recover_queued(queued)
+        .await
+        .expect("recovery handoff");
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let events = store.read(&session_id, 0, 1024).await.expect("journal");
+            if events.iter().any(|event| {
+                event.run_id.as_ref() == Some(&queued_run)
+                    && serde_json::from_value::<EventPayload>(event.payload.clone())
+                        .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Done))
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("consumed run recovers to Done");
+    let requests = fake_a.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].messages.iter().any(|message| {
+        message
+            .blocks
+            .iter()
+            .any(|block| matches!(block, Block::Text { text } if text == queued_text))
+    }));
+
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
 }
 
 /// LAW (switch_during_manual_compaction_lands_after_it, F3): a pair switch

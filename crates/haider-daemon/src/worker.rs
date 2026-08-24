@@ -103,6 +103,7 @@ use haider_protocol::provider::{
     CacheStatAvailability, CapabilityDoc, FeatureResolve, FinishReason, PrefixDigests,
     RequestUsage, StreamEvent, Usage, UsageRequestKind, UsageScope,
 };
+use haider_protocol::queue::QueueChange;
 use haider_protocol::retry::RunRetryEventPayload;
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
@@ -2349,7 +2350,7 @@ async fn supervisor_for(
     })?;
     let (cancellation_wake, cancellation_wakes) = tokio::sync::watch::channel(0_u64);
     let lease = hub
-        .acquire_worker_lease_with_cancellation_wake(session_id.clone(), cancellation_wake)
+        .acquire_worker_lease_with_wakes(session_id.clone(), cancellation_wake)
         .await
         .map_err(hub_error)?;
     let (sender, receiver) = mpsc::channel(SUPERVISOR_CAPACITY);
@@ -2429,9 +2430,10 @@ impl<T> FutureTurn for T where
 }
 
 /// One session's turn loop: strictly serial turns from the bounded queue,
-/// with three live inputs while a turn runs — submissions (queued behind the
+/// with four live inputs while a turn runs — submissions (queued behind the
 /// active run), the hub's cancellation wake (durable `Cancelling` reconciled
-/// from the journal, active token cancelled), and the active turn's outcome
+/// from the journal, active token cancelled), the actor-ordered promoted-steer
+/// lane, and the active turn's outcome
 /// (dispatcher closed, harness stopped and joined, then the store-side
 /// conditional Idle settle — `Store::settle_session_idle` owns that law).
 /// Shutdown cancels ordinary active turns, but silently parks a durable input,
@@ -2516,8 +2518,60 @@ async fn run_supervisor(
                 let mut pending = pending;
                 let run_id = pending.accepted.run_id.clone();
                 let branch_id = pending.accepted.branch_id.clone();
-                let recovery_ready = pending.recovery_ready.take();
+                let mut recovery_ready = pending.recovery_ready.take();
                 let recovering = pending.recovering;
+                if pending.accepted.disposition == haider_core::TurnAdmissionDisposition::Queued {
+                    match lease
+                        .consume_queued_turn(run_id.clone(), event_ids.next(), device_id.clone())
+                        .await
+                    {
+                        Ok(Some(_)) => {}
+                        Ok(None) => match durable_queue_consumed(&lease, &run_id).await {
+                            Ok(true) => {
+                                // Crash recovery after the durable consumption
+                                // boundary: the row is already gone, but this
+                                // exact queued run still owns delivery and must
+                                // continue into start_turn without a second
+                                // delta.
+                            }
+                            Ok(false) => {
+                                // A fenced remove/promote won the same durable
+                                // race. This stale in-memory hint must never
+                                // start.
+                                if let Some(ready) = recovery_ready.take() {
+                                    let _ = ready.send(Ok(()));
+                                }
+                                continue;
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    session_id = %lease.session_id(),
+                                    %run_id,
+                                    ?error,
+                                    "queued turn consumption truth could not be recovered"
+                                );
+                                if let Some(ready) = recovery_ready.take() {
+                                    let _ = ready.send(Err(error));
+                                }
+                                let _ = lease.unregister_worker().await;
+                                return false;
+                            }
+                        },
+                        Err(error) => {
+                            tracing::error!(
+                                session_id = %lease.session_id(),
+                                %run_id,
+                                ?error,
+                                "queued turn could not cross its durable consumption boundary"
+                            );
+                            if let Some(ready) = recovery_ready.take() {
+                                let _ = ready.send(Err(error));
+                            }
+                            let _ = lease.unregister_worker().await;
+                            return false;
+                        }
+                    }
+                }
                 // R6 extension (F1): the pair is re-read per logical turn, so
                 // a committed `session.select_model` reaches the NEXT turn
                 // without a worker restart. A failed read fails the turn
@@ -2689,27 +2743,15 @@ async fn run_supervisor(
                             mode,
                             completed,
                         }) => {
-                            let result = if run_id == active_run {
-                                if delivered_nudges.insert(accepted_seq) {
-                                    match mode {
-                                        DeliveryMode::Steer => turn.harness.nudge(text),
-                                        DeliveryMode::Subturn => turn.harness.subturn(text),
-                                        DeliveryMode::Queue => Err(HaiderError::new(
-                                            ErrorCode::InvalidArgument,
-                                            "queue-mode input cannot target an active harness",
-                                            false,
-                                        )),
-                                    }
-                                } else {
-                                    Ok(())
-                                }
-                            } else {
-                                Err(HaiderError::new(
-                                    ErrorCode::RunNotActive,
-                                    "daemon steer targeted a different active run",
-                                    false,
-                                ))
-                            };
+                            let result = deliver_mid_turn_to_active(
+                                turn,
+                                &active_run,
+                                &mut delivered_nudges,
+                                run_id,
+                                accepted_seq,
+                                text,
+                                mode,
+                            );
                             let _ = completed.send(result);
                         }
                         Some(SupervisorCommand::Compact { completed, .. }) => {
@@ -3094,6 +3136,40 @@ async fn run_supervisor(
     }
     let _ = lease.unregister_worker().await;
     !parked_checkpoint
+}
+
+fn deliver_mid_turn_to_active(
+    turn: &mut ActiveTurn,
+    active_run: &RunId,
+    delivered_nudges: &mut HashSet<u64>,
+    run_id: RunId,
+    accepted_seq: u64,
+    text: String,
+    mode: DeliveryMode,
+) -> Result<(), HaiderError> {
+    if &run_id != active_run {
+        return Err(HaiderError::new(
+            ErrorCode::RunNotActive,
+            "daemon steer targeted a different active run",
+            false,
+        ));
+    }
+    if delivered_nudges.contains(&accepted_seq) {
+        return Ok(());
+    }
+    let result = match mode {
+        DeliveryMode::Steer => turn.harness.nudge(text),
+        DeliveryMode::Subturn => turn.harness.subturn(text),
+        DeliveryMode::Queue => Err(HaiderError::new(
+            ErrorCode::InvalidArgument,
+            "queue-mode input cannot target an active harness",
+            false,
+        )),
+    };
+    if result.is_ok() {
+        delivered_nudges.insert(accepted_seq);
+    }
+    result
 }
 
 /// Chooses the one `Idle { interrupted }` meaning after a live outcome.
@@ -3821,6 +3897,39 @@ async fn durable_run_state(store: &HubStoreHandle, run_id: &RunId) -> Option<Run
         runs.into_iter()
             .find_map(|(candidate, state, _, _, _)| (candidate == *run_id).then_some(state))
     })
+}
+
+async fn durable_queue_consumed(
+    store: &HubStoreHandle,
+    run_id: &RunId,
+) -> Result<bool, HaiderError> {
+    let mut cursor = 0;
+    let mut consumed = false;
+    loop {
+        let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
+        if page.is_empty() {
+            return Ok(consumed);
+        }
+        cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+        for envelope in page {
+            if envelope.run_id.as_ref() != Some(run_id) {
+                continue;
+            }
+            let Ok(EventPayload::QueueChanged(delta)) =
+                serde_json::from_value::<EventPayload>(envelope.payload)
+            else {
+                continue;
+            };
+            match delta.change {
+                QueueChange::Consumed { .. } => consumed = true,
+                QueueChange::Enqueued { .. }
+                | QueueChange::Removed { .. }
+                | QueueChange::PromotedSteer { .. } => consumed = false,
+                QueueChange::Unknown => {}
+                _ => {}
+            }
+        }
+    }
 }
 
 async fn durable_workspace_mutation(

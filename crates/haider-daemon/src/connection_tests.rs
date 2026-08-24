@@ -133,6 +133,10 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// MUTATION CHECK: remove `FEATURE_USAGE_HISTORY_V1`. Expected RUNTIME
 /// failure: clients cannot discover the two served device-local history reads.
 ///
+/// MUTATION CHECK: remove `FEATURE_QUEUE_CONTROL_V1`. Expected RUNTIME
+/// failure: clients cannot distinguish an unsupported queue-control surface
+/// from a supported session whose held-message snapshot is empty.
+///
 /// MUTATION CHECK: remove `FEATURE_SESSION_RENAME_V1`. Expected RUNTIME
 /// failure: clients cannot discover the served receipted `session.rename`
 /// surface (G2) and the TUI keeps its stale-daemon notice forever.
@@ -252,6 +256,7 @@ fn welcome_features_pin_served_management_families() {
             FEATURE_TURN_CONTROL_V1.to_owned(),
             haider_rpc::FEATURE_USAGE_REPORT_V1.to_owned(),
             haider_rpc::FEATURE_USAGE_HISTORY_V1.to_owned(),
+            haider_rpc::FEATURE_QUEUE_CONTROL_V1.to_owned(),
             haider_rpc::FEATURE_COMPUTER_PERMISSION_ACTIONS_V1.to_owned(),
             FEATURE_VAULT_STAGE_V1.to_owned(),
         ])

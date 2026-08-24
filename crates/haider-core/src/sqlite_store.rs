@@ -23,11 +23,13 @@ use haider_store::{
     GraphRunSetOpenCommand, GraphRunSetOpenOutcome, GraphSwitchCommand, GraphSwitchOutcome,
     HookTrustChange, HookTrustCommand, JournalAppendBatch, MenuResolutionCommand,
     MenuResolutionOutcome, ProcessSignalCommand, ProcessSignalOutcome, ProfileLease,
-    RunRetryCommand, RunRetryOutcome, SessionCreateCommand, SessionCreateOutcome,
-    SessionForkCommand, SessionForkOutcome, SessionProjectionCheckpoint, SessionRenameCommand,
-    SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome, SessionSelectModelCommand,
-    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, Store,
-    TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand, TurnCancelOutcome,
+    QueueConsumeCommand, QueueConsumeOutcome, QueuePromoteCommand, QueuePromoteOutcome,
+    QueuePromotePreview, QueueRemoveCommand, QueueRemoveOutcome, QueueSnapshot, RunRetryCommand,
+    RunRetryOutcome, SessionCreateCommand, SessionCreateOutcome, SessionForkCommand,
+    SessionForkOutcome, SessionProjectionCheckpoint, SessionRenameCommand, SessionRenameOutcome,
+    SessionSeenCommand, SessionSeenOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
+    ShellExecAcceptCommand, ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome,
+    TurnCancelCommand, TurnCancelOutcome,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::{Path, PathBuf};
@@ -908,6 +910,46 @@ impl SqliteStoreHandle {
     ) -> Result<TurnAcceptOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.accept_turn(&command))).await
+    }
+
+    pub async fn queue_snapshot(
+        &self,
+        session_id: SessionId,
+    ) -> Result<QueueSnapshot, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.queue_snapshot(&session_id))).await
+    }
+
+    pub async fn queue_remove(
+        &self,
+        command: QueueRemoveCommand,
+    ) -> Result<QueueRemoveOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.queue_remove(&command))).await
+    }
+
+    pub async fn queue_promote_steer(
+        &self,
+        command: QueuePromoteCommand,
+    ) -> Result<QueuePromoteOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.queue_promote_steer(&command))).await
+    }
+
+    pub async fn queue_promote_preview(
+        &self,
+        command: QueuePromoteCommand,
+    ) -> Result<QueuePromotePreview, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.queue_promote_preview(&command))).await
+    }
+
+    pub async fn queue_consume(
+        &self,
+        command: QueueConsumeCommand,
+    ) -> Result<Option<QueueConsumeOutcome>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.queue_consume(&command))).await
     }
 
     /// Unfenced `run.retry` receipt lookup for response-loss recovery.

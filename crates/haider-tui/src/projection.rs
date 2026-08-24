@@ -409,6 +409,11 @@ impl SessionProjection {
     pub fn apply(&mut self, payload: &EventPayload) {
         self.render_revision = self.render_revision.wrapping_add(1);
         match payload {
+            // 954 queue deltas: consumed by the composer's queue panel
+            // (next workstream); until it lands the projection observes
+            // and deliberately holds no state — an explicit arm so the
+            // exhaustive match forces the panel author (me) to wire it.
+            EventPayload::QueueChanged(_) => {}
             EventPayload::HarnessStatus(status) => self.harness = Some(status.clone()),
             EventPayload::SessionState(state) => {
                 if let haider_protocol::state::SessionState::Idle { interrupted } = state {

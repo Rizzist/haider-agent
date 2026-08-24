@@ -10,9 +10,10 @@ use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::graph::{GraphInspectSnapshot, GraphStatus as ConvergenceGraphStatus};
 use haider_protocol::ids::{
-    AgentId, ArtifactRef, BranchId, CredentialAlias, GraphId, GraphRunSetId, ItemId, MenuId,
-    NodeId, RunId, SessionId,
+    AgentId, ArtifactRef, BranchId, CredentialAlias, EventId, GraphId, GraphRunSetId, ItemId,
+    MenuId, NodeId, RunId, SessionId,
 };
+use haider_protocol::queue::QueueRow;
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::session_fork::{SessionMetaforkProposal, SessionMetaforkReviewManifest};
 use haider_protocol::tool::{AttachmentBlock, ToolInventorySnapshot};
@@ -375,6 +376,9 @@ pub const FEATURE_USAGE_REPORT_V1: &str = "usage_report_v1";
 /// Daemon serves device-local append-only usage history by UTC day and a
 /// bounded, absence-preserving daily-total range.
 pub const FEATURE_USAGE_HISTORY_V1: &str = "usage_history_v1";
+/// Daemon serves revision-fenced held-message listing, removal, promotion to
+/// steer, and revision-bearing deltas on the attached session event stream.
+pub const FEATURE_QUEUE_CONTROL_V1: &str = "queue_control_v1";
 /// Daemon publishes typed, provider-owned Haider Code plan/account status to
 /// clients attached to sessions currently using the provider.
 pub const FEATURE_HAIDER_CODE_PLAN_STATUS_V1: &str = "haider_code_plan_status_v1";
@@ -1988,6 +1992,26 @@ pub enum RequestBody {
         attachments: Vec<AttachmentBlock>,
         mode: DeliveryMode,
     },
+    /// Complete render-ready snapshot of messages held behind this session's
+    /// active turn. Failure or feature absence is never an empty snapshot.
+    #[serde(rename = "queue.list")]
+    QueueList { session_id: SessionId },
+    /// Removes exactly the stable row named by `id` if `revision` still names
+    /// the current queue snapshot.
+    #[serde(rename = "queue.remove")]
+    QueueRemove {
+        session_id: SessionId,
+        id: EventId,
+        revision: u64,
+    },
+    /// Converts one held row to active-turn steer delivery, fenced by the
+    /// queue revision exactly like [`Self::QueueRemove`].
+    #[serde(rename = "queue.promote_steer")]
+    QueuePromoteSteer {
+        session_id: SessionId,
+        id: EventId,
+        revision: u64,
+    },
     /// Durably records cancellation intent before waking the worker.
     #[serde(rename = "turn.cancel")]
     TurnCancel {
@@ -2428,6 +2452,27 @@ pub enum ResponseBody {
     SessionObserveBatch { digests: Vec<SessionObserveDigest> },
     #[serde(rename = "session.fleet")]
     SessionFleet { snapshot: SessionFleetSnapshot },
+    /// One atomic snapshot cut. `rows` are complete display values and ordered
+    /// by their one-based ordinal.
+    #[serde(rename = "queue.list")]
+    QueueList {
+        session_id: SessionId,
+        revision: u64,
+        #[serde(default)]
+        rows: Vec<QueueRow>,
+    },
+    #[serde(rename = "queue.remove")]
+    QueueRemove {
+        session_id: SessionId,
+        id: EventId,
+        revision: u64,
+    },
+    #[serde(rename = "queue.promote_steer")]
+    QueuePromoteSteer {
+        session_id: SessionId,
+        id: EventId,
+        revision: u64,
+    },
     #[serde(rename = "graph.pin")]
     GraphPin {
         session_id: SessionId,
@@ -3041,7 +3086,7 @@ pub enum ErrorData {
         /// Sequence of the envelope recording the winning resolution.
         resolution_seq: u64,
     },
-    /// A management compare-and-set request observed a newer snapshot
+    /// A revision-fenced compare-and-set request observed a newer snapshot
     /// ([`ERROR_CODE_REVISION_CONFLICT`]).
     RevisionConflict {
         expected_revision: u64,

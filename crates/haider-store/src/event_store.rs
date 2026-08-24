@@ -64,6 +64,7 @@ use haider_protocol::loom::{
 use haider_protocol::menu::{Menu, MenuAnswer, MenuCloseReason, MenuKind};
 use haider_protocol::permission::PermissionEventPayload;
 use haider_protocol::project_instructions::ProjectInstructionsLoaded;
+use haider_protocol::queue::{QueueChange, QueueDelta, QueueRow};
 use haider_protocol::retry::RunRetryEventPayload;
 use haider_protocol::session::{
     EffortSelected, FastModeSelected, ModelSelected, SessionMetadataV1,
@@ -1418,6 +1419,81 @@ pub enum TurnCancelOutcome {
     IdempotentReplay {
         cancelled: CancelledTurn,
     },
+}
+
+/// One coherent held-message snapshot and its mutation fence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueSnapshot {
+    pub revision: u64,
+    pub rows: Vec<QueueRow>,
+}
+
+/// Stable coordinates for a revision-fenced removal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueRemoveCommand {
+    pub session_id: SessionId,
+    pub id: EventId,
+    pub revision: u64,
+    pub cancelling_event_id: EventId,
+    pub delta_event_id: EventId,
+    pub device_id: DeviceId,
+}
+
+/// Stable coordinates for a revision-fenced promotion into the active run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuePromoteCommand {
+    pub session_id: SessionId,
+    pub id: EventId,
+    pub revision: u64,
+    /// Filled by the daemon after its read-only preview and live-harness
+    /// reservation. The commit rechecks it inside the write transaction.
+    pub expected_active_run_id: Option<RunId>,
+    pub cancelling_event_id: EventId,
+    pub delivery_event_id: EventId,
+    pub delta_event_id: EventId,
+    pub device_id: DeviceId,
+}
+
+/// Read-only half of a promotion used to reserve the exact live harness
+/// before the revision-fenced mutation commits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuePromotePreview {
+    pub active_run_id: RunId,
+    pub text: String,
+}
+
+/// Worker-owned transition from held to delivery-attempted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueConsumeCommand {
+    pub session_id: SessionId,
+    pub run_id: RunId,
+    pub delta_event_id: EventId,
+    pub device_id: DeviceId,
+}
+
+/// Committed removal plus the revision-bearing event to publish.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueueRemoveOutcome {
+    pub revision: u64,
+    pub envelopes: Vec<RawEnvelope>,
+}
+
+/// Committed promotion coordinates. `delivery_seq` is the one live-worker
+/// deduplication key for the newly journaled steer delivery.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueuePromoteOutcome {
+    pub revision: u64,
+    pub active_run_id: RunId,
+    pub delivery_seq: u64,
+    pub text: String,
+    pub envelopes: Vec<RawEnvelope>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueueConsumeOutcome {
+    pub revision: u64,
+    pub id: EventId,
+    pub envelope: Box<RawEnvelope>,
 }
 
 impl CommittedSeqRange {
@@ -7665,6 +7741,37 @@ impl Store {
                 PromptRender::Omit,
             )?);
         }
+        if disposition == TurnAdmissionDisposition::Queued {
+            let ordinal = u32::try_from(queue_entries(&transaction, &command.session_id)?.1.len())
+                .map_err(|_| {
+                    store_error(ErrorCode::Busy, "queue ordinal space is exhausted", true)
+                })?
+                .checked_add(1)
+                .ok_or_else(|| {
+                    store_error(ErrorCode::Busy, "queue ordinal space is exhausted", true)
+                })?;
+            envelopes.push(unstamped_command_envelope(
+                EventId::new(format!("queue-enqueued-{}", command.user_event_id)),
+                &command.session_id,
+                command.branch_id.clone(),
+                Some(command.run_id.clone()),
+                command.device_id.clone(),
+                self.worker_generation,
+                EventPayload::QueueChanged(QueueDelta {
+                    revision: 0,
+                    change: QueueChange::Enqueued {
+                        row: QueueRow {
+                            id: command.user_event_id.clone(),
+                            text: command.text.clone(),
+                            mode: command.mode,
+                            ordinal,
+                            created_at_ms: 0,
+                        },
+                    },
+                }),
+                PromptRender::Omit,
+            )?);
+        }
         let trust_hooks = serde_json::from_str::<serde_json::Value>(&command.request_json)
             .ok()
             .and_then(|request| {
@@ -7743,6 +7850,211 @@ impl Store {
             accepted,
             envelopes,
         })
+    }
+
+    /// Reads one coherent queue snapshot from the durable held-turn state.
+    pub fn queue_snapshot(&self, session_id: &SessionId) -> StoreResult<QueueSnapshot> {
+        let connection = self.connection()?;
+        require_typed_session(&connection, session_id)?;
+        let (revision, entries) = queue_entries(&connection, session_id)?;
+        Ok(QueueSnapshot {
+            revision,
+            rows: entries.into_iter().map(|entry| entry.row).collect(),
+        })
+    }
+
+    /// Revision-fenced removal. The comparison and cancelling transition are
+    /// one IMMEDIATE transaction; a stale request cannot reach id lookup or
+    /// mutate any durable or live queue state.
+    pub fn queue_remove(&self, command: &QueueRemoveCommand) -> StoreResult<QueueRemoveOutcome> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        require_typed_session(&transaction, &command.session_id)?;
+        let (current_revision, entries) = queue_entries(&transaction, &command.session_id)?;
+        // MUTATION CHECK: drop this comparison and the stale-revision and
+        // concurrent-remove pins allow an old snapshot to mutate a new queue.
+        if command.revision != current_revision {
+            return Err(queue_revision_conflict(command.revision, current_revision));
+        }
+        let entry = entries
+            .into_iter()
+            .find(|entry| entry.row.id == command.id)
+            .ok_or_else(|| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("queue item {} is not held", command.id),
+                    false,
+                )
+            })?;
+        let now = now_ms()?;
+        let mut envelopes = vec![
+            unstamped_command_envelope(
+                command.cancelling_event_id.clone(),
+                &command.session_id,
+                entry.branch_id.clone(),
+                Some(entry.run_id.clone()),
+                command.device_id.clone(),
+                self.worker_generation,
+                EventPayload::RunState(RunState::Cancelling),
+                PromptRender::Omit,
+            )?,
+            unstamped_command_envelope(
+                command.delta_event_id.clone(),
+                &command.session_id,
+                entry.branch_id,
+                Some(entry.run_id),
+                command.device_id.clone(),
+                self.worker_generation,
+                EventPayload::QueueChanged(QueueDelta {
+                    revision: 0,
+                    change: QueueChange::Removed {
+                        id: command.id.clone(),
+                    },
+                }),
+                PromptRender::Omit,
+            )?,
+        ];
+        append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
+        let revision = envelopes[1].seq;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(QueueRemoveOutcome {
+            revision,
+            envelopes,
+        })
+    }
+
+    /// Revision-fenced conversion of one queued turn into a steer delivery
+    /// for the currently active response.
+    pub fn queue_promote_preview(
+        &self,
+        command: &QueuePromoteCommand,
+    ) -> StoreResult<QueuePromotePreview> {
+        let connection = self.connection()?;
+        require_typed_session(&connection, &command.session_id)?;
+        let (entry, active_run_id, _) = queue_promote_target(&connection, command)?;
+        Ok(QueuePromotePreview {
+            active_run_id,
+            text: entry.row.text,
+        })
+    }
+
+    /// Revision-fenced conversion of one queued turn into a steer delivery
+    /// for the currently active response.
+    pub fn queue_promote_steer(
+        &self,
+        command: &QueuePromoteCommand,
+    ) -> StoreResult<QueuePromoteOutcome> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        require_typed_session(&transaction, &command.session_id)?;
+        let (entry, active_run_id, active_branch_id) = queue_promote_target(&transaction, command)?;
+        let now = now_ms()?;
+        let mut delivery = unstamped_command_envelope(
+            command.delivery_event_id.clone(),
+            &command.session_id,
+            active_branch_id,
+            Some(active_run_id.clone()),
+            command.device_id.clone(),
+            self.worker_generation,
+            EventPayload::UserMessage {
+                text: entry.row.text.clone(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Steer,
+            },
+            PromptRender::Verbatim,
+        )?;
+        // The original user event is the sole visible rendering. This second
+        // fact is durable delivery truth for crash recovery and deduplication.
+        delivery.render.ui = false;
+        let mut envelopes = vec![
+            unstamped_command_envelope(
+                command.cancelling_event_id.clone(),
+                &command.session_id,
+                entry.branch_id.clone(),
+                Some(entry.run_id.clone()),
+                command.device_id.clone(),
+                self.worker_generation,
+                EventPayload::RunState(RunState::Cancelling),
+                PromptRender::Omit,
+            )?,
+            delivery,
+            unstamped_command_envelope(
+                command.delta_event_id.clone(),
+                &command.session_id,
+                entry.branch_id,
+                Some(entry.run_id),
+                command.device_id.clone(),
+                self.worker_generation,
+                EventPayload::QueueChanged(QueueDelta {
+                    revision: 0,
+                    change: QueueChange::PromotedSteer {
+                        id: command.id.clone(),
+                    },
+                }),
+                PromptRender::Omit,
+            )?,
+        ];
+        append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
+        let delivery_seq = envelopes[1].seq;
+        let revision = envelopes[2].seq;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(QueuePromoteOutcome {
+            revision,
+            active_run_id,
+            delivery_seq,
+            text: entry.row.text,
+            envelopes,
+        })
+    }
+
+    /// Removes a queued row exactly once when its worker takes ownership for
+    /// delivery. A concurrent remove/promote that committed first leaves no
+    /// row and therefore produces no consumption event.
+    pub fn queue_consume(
+        &self,
+        command: &QueueConsumeCommand,
+    ) -> StoreResult<Option<QueueConsumeOutcome>> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        require_typed_session(&transaction, &command.session_id)?;
+        let (_, entries) = queue_entries(&transaction, &command.session_id)?;
+        let Some(entry) = entries
+            .into_iter()
+            .find(|entry| entry.run_id == command.run_id)
+        else {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(None);
+        };
+        let mut envelopes = [unstamped_command_envelope(
+            command.delta_event_id.clone(),
+            &command.session_id,
+            entry.branch_id,
+            Some(entry.run_id),
+            command.device_id.clone(),
+            self.worker_generation,
+            EventPayload::QueueChanged(QueueDelta {
+                revision: 0,
+                change: QueueChange::Consumed {
+                    id: entry.row.id.clone(),
+                },
+            }),
+            PromptRender::Omit,
+        )?];
+        append_transaction_envelopes(&transaction, &command.session_id, now_ms()?, &mut envelopes)?;
+        let [envelope] = envelopes;
+        let revision = envelope.seq;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(Some(QueueConsumeOutcome {
+            revision,
+            id: entry.row.id,
+            envelope: Box::new(envelope),
+        }))
     }
 
     /// Looks up a committed `turn.cancel` response before in-memory routing.
@@ -12182,6 +12494,170 @@ fn latest_run_states(
     Ok(states)
 }
 
+#[derive(Clone)]
+struct QueuedEntry {
+    row: QueueRow,
+    run_id: RunId,
+    branch_id: Option<BranchId>,
+    accepted_seq: u64,
+}
+
+fn queue_entries(
+    connection: &Connection,
+    session_id: &SessionId,
+) -> StoreResult<(u64, Vec<QueuedEntry>)> {
+    let states = latest_run_states(connection, session_id)?;
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT seq, envelope_json FROM events
+             WHERE session_id = ?1
+               AND payload_kind IN ('user_message', 'queue_changed')
+             ORDER BY seq ASC",
+        )
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query([session_id.as_str()])
+        .map_err(map_sqlite_error)?;
+    let mut revision = 0_u64;
+    let mut messages = HashMap::<RunId, QueuedEntry>::new();
+    let mut held_ids = HashSet::<EventId>::new();
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let seq = sql_u64(row.get(0).map_err(map_sqlite_error)?).map_err(map_sqlite_error)?;
+        let envelope = decode_envelope_column(row, 1).map_err(|error| {
+            corrupt(format!(
+                "invalid queue envelope for session {session_id}, seq {seq}: {error}"
+            ))
+        })?;
+        match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
+            Ok(EventPayload::UserMessage { text, mode, .. }) => {
+                let Some(run_id) = envelope.run_id.clone() else {
+                    continue;
+                };
+                if states
+                    .get(&run_id)
+                    .is_some_and(|(state, _, _)| *state == RunState::Queued)
+                {
+                    messages.entry(run_id.clone()).or_insert(QueuedEntry {
+                        row: QueueRow {
+                            id: envelope.event_id,
+                            text,
+                            mode,
+                            ordinal: 0,
+                            created_at_ms: envelope.committed_at_ms,
+                        },
+                        run_id,
+                        branch_id: envelope.branch_id,
+                        accepted_seq: seq,
+                    });
+                }
+            }
+            Ok(EventPayload::QueueChanged(delta)) => {
+                revision = revision.max(delta.revision.max(seq));
+                match delta.change {
+                    QueueChange::Enqueued { row } => {
+                        held_ids.insert(row.id);
+                    }
+                    QueueChange::Removed { id }
+                    | QueueChange::PromotedSteer { id }
+                    | QueueChange::Consumed { id } => {
+                        held_ids.remove(&id);
+                    }
+                    QueueChange::Unknown => {}
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut entries = messages
+        .into_values()
+        .filter(|entry| held_ids.contains(&entry.row.id))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.accepted_seq);
+    for (index, entry) in entries.iter_mut().enumerate() {
+        entry.row.ordinal = u32::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(1))
+            .ok_or_else(|| {
+                store_error(ErrorCode::Busy, "queue ordinal space is exhausted", true)
+            })?;
+    }
+    Ok((revision, entries))
+}
+
+fn queue_revision_conflict(expected_revision: u64, current_revision: u64) -> HaiderError {
+    let mut error = store_error(
+        ErrorCode::RevisionConflict,
+        format!(
+            "queue revision {expected_revision} is stale; current revision is {current_revision}"
+        ),
+        true,
+    );
+    error.details = Some(serde_json::json!({
+        "expected_revision": expected_revision,
+        "current_revision": current_revision,
+    }));
+    error
+}
+
+fn queue_promote_target(
+    connection: &Connection,
+    command: &QueuePromoteCommand,
+) -> StoreResult<(QueuedEntry, RunId, Option<BranchId>)> {
+    let (current_revision, entries) = queue_entries(connection, &command.session_id)?;
+    // MUTATION CHECK: this fence is shared by preview and commit. Removing it
+    // lets a stale id reservation target a row after another mutation moved
+    // the queue, and the stale-refusal pin must fail.
+    if command.revision != current_revision {
+        return Err(queue_revision_conflict(command.revision, current_revision));
+    }
+    let entry = entries
+        .into_iter()
+        .find(|entry| entry.row.id == command.id)
+        .ok_or_else(|| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("queue item {} is not held", command.id),
+                false,
+            )
+        })?;
+    let states = latest_run_states(connection, &command.session_id)?;
+    let (active_run_id, active_branch_id) = states
+        .iter()
+        .filter(|(run_id, (state, _, _))| {
+            **run_id != entry.run_id
+                && !state.is_terminal()
+                && !matches!(
+                    state,
+                    RunState::Queued
+                        | RunState::Cancelling
+                        | RunState::Compacting
+                        | RunState::EffectOutcomeUnknown
+                )
+        })
+        .max_by_key(|(_, (_, seq, _))| *seq)
+        .map(|(run_id, (_, _, branch_id))| (run_id.clone(), branch_id.clone()))
+        .ok_or_else(|| {
+            store_error(
+                ErrorCode::RunNotActive,
+                "queue promotion requires an active turn",
+                false,
+            )
+        })?;
+    if command
+        .expected_active_run_id
+        .as_ref()
+        .is_some_and(|expected| expected != &active_run_id)
+    {
+        return Err(store_error(
+            ErrorCode::RunNotActive,
+            "active turn changed before queue promotion committed",
+            true,
+        ));
+    }
+    Ok((entry, active_run_id, active_branch_id))
+}
+
 /// Resolves the exact main-timeline `Retrying` event currently named by the
 /// run-state reduction. Returning `None` keeps branch/agent backoffs outside
 /// the main-session `run.retry` command family.
@@ -12480,6 +12956,7 @@ fn append_transaction_envelopes(
             .checked_add(offset)
             .ok_or_else(|| corrupt("event sequence space is exhausted"))?;
         envelope.committed_at_ms = committed_at_ms;
+        stamp_queue_delta(envelope)?;
         stamp_workspace_mutation(transaction, envelope)?;
         let bytes = encode_envelope(envelope).map_err(|error| {
             store_error(
@@ -13579,6 +14056,7 @@ fn append_envelopes_in_transaction(
             let mut envelope = envelope.clone();
             envelope.seq = seq;
             envelope.committed_at_ms = committed_at_ms;
+            stamp_queue_delta(&mut envelope)?;
             stamp_workspace_mutation(transaction, &mut envelope)?;
             let envelope_bytes = encode_envelope(&envelope).map_err(|error| {
                 store_error(
@@ -13643,6 +14121,48 @@ fn isolatable_append_error(error: &HaiderError) -> bool {
 
 fn workspace_revision_for_seq(seq: u64) -> WorkspaceRevision {
     WorkspaceRevision::new(format!("workspace-revision:{seq}"))
+}
+
+fn stamp_queue_delta(envelope: &mut RawEnvelope) -> StoreResult<()> {
+    if envelope
+        .payload
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        != Some("queue_changed")
+    {
+        return Ok(());
+    }
+    // MUTATION CHECK: making this decode fail-open permits a reserved
+    // queue_changed payload without its required revision to commit and ride
+    // the ordinary attachment stream.
+    let EventPayload::QueueChanged(mut delta) =
+        serde_json::from_value::<EventPayload>(envelope.payload.clone()).map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("invalid reserved queue_changed payload: {error}"),
+                false,
+            )
+        })?
+    else {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            "reserved queue_changed payload decoded as another event type",
+            false,
+        ));
+    };
+    delta.revision = envelope.seq;
+    if let QueueChange::Enqueued { row } = &mut delta.change {
+        row.created_at_ms = envelope.committed_at_ms;
+    }
+    envelope.payload =
+        serde_json::to_value(EventPayload::QueueChanged(delta)).map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize stamped queue delta: {error}"),
+                false,
+            )
+        })?;
+    Ok(())
 }
 
 #[allow(clippy::result_large_err)]

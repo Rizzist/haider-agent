@@ -31,6 +31,7 @@ pub mod permission;
 pub mod pipe;
 pub mod project_instructions;
 pub mod provider;
+pub mod queue;
 pub mod retry;
 pub mod rpc;
 pub mod session;
@@ -85,6 +86,9 @@ pub enum EventPayload {
         #[serde(default)]
         mode: DeliveryMode,
     },
+    /// Volatile-looking queue control is journaled because its revision fence
+    /// and watch delta must share the same serialized session truth.
+    QueueChanged(queue::QueueDelta),
     /// Turn content flows as the ITEM lifecycle (started/delta/completed) —
     /// never a flat per-kind begin/end taxonomy (codex regret, ADR-1).
     Item(item::ItemEvent),

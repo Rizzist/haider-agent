@@ -2640,6 +2640,76 @@ impl HubConnection {
                 )
                 .await
             }
+            RequestBody::QueueList { session_id } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.queue_list(request_id, session_id).await
+            }
+            RequestBody::QueueRemove {
+                session_id,
+                id,
+                revision,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "queue removal requires a control attachment to this session",
+                        false,
+                        None,
+                    );
+                }
+                self.queue_remove(request_id, session_id, id, revision)
+                    .await
+            }
+            RequestBody::QueuePromoteSteer {
+                session_id,
+                id,
+                revision,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "queue promotion requires a control attachment to this session",
+                        false,
+                        None,
+                    );
+                }
+                self.queue_promote_steer(request_id, session_id, id, revision)
+                    .await
+            }
             RequestBody::TurnCancel {
                 command_id,
                 session_id,
@@ -7801,6 +7871,114 @@ impl HubConnection {
         })
     }
 
+    async fn queue_list(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+    ) -> Result<(), SessionHubError> {
+        let snapshot = match self.hub.queue_snapshot(session_id.clone()).await {
+            Ok(snapshot) => snapshot,
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_queue_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::QueueList {
+                session_id,
+                revision: snapshot.revision,
+                rows: snapshot.rows,
+            },
+        })
+    }
+
+    async fn queue_remove(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+        id: EventId,
+        revision: u64,
+    ) -> Result<(), SessionHubError> {
+        let outcome = match self
+            .hub
+            .queue_remove(QueueRemoveCommand {
+                session_id: session_id.clone(),
+                id: id.clone(),
+                revision,
+                cancelling_event_id: EventId::new(random_id("queue-remove-cancelling")?),
+                delta_event_id: EventId::new(random_id("queue-remove-delta")?),
+                device_id: self.hub.inner.device_id.clone(),
+            })
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_queue_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::QueueRemove {
+                session_id,
+                id,
+                revision: outcome.revision,
+            },
+        })
+    }
+
+    async fn queue_promote_steer(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+        id: EventId,
+        revision: u64,
+    ) -> Result<(), SessionHubError> {
+        let (outcome, live_delivered) = match self
+            .hub
+            .queue_promote_steer(QueuePromoteCommand {
+                session_id: session_id.clone(),
+                id: id.clone(),
+                revision,
+                expected_active_run_id: None,
+                cancelling_event_id: EventId::new(random_id("queue-promote-cancelling")?),
+                delivery_event_id: EventId::new(random_id("queue-promote-delivery")?),
+                delta_event_id: EventId::new(random_id("queue-promote-delta")?),
+                device_id: self.hub.inner.device_id.clone(),
+            })
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_queue_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        if !live_delivered
+            && let Err(error) = self
+                .hub
+                .worker_manager()?
+                .nudge(
+                    session_id.clone(),
+                    outcome.active_run_id,
+                    outcome.delivery_seq,
+                    outcome.text,
+                )
+                .await
+        {
+            return self.respond_queue_error(request_id, error);
+        }
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::QueuePromoteSteer {
+                session_id,
+                id,
+                revision: outcome.revision,
+            },
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn turn_submit(
         &self,
@@ -8605,6 +8783,40 @@ impl HubConnection {
             _ => ERROR_CODE_INVALID_ARGUMENT,
         };
         self.respond_error(request_id, code, &error.message, error.retryable, None)
+    }
+
+    fn respond_queue_error(
+        &self,
+        request_id: RequestId,
+        error: HaiderError,
+    ) -> Result<(), SessionHubError> {
+        if error.code == ErrorCode::RevisionConflict {
+            let expected_revision = error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("expected_revision"))
+                .and_then(serde_json::Value::as_u64);
+            let current_revision = error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("current_revision"))
+                .and_then(serde_json::Value::as_u64);
+            if let (Some(expected_revision), Some(current_revision)) =
+                (expected_revision, current_revision)
+            {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_REVISION_CONFLICT,
+                    &error.message,
+                    error.retryable,
+                    Some(ErrorData::RevisionConflict {
+                        expected_revision,
+                        current_revision,
+                    }),
+                );
+            }
+        }
+        self.respond_turn_error(request_id, error)
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -188,6 +188,24 @@
       "response": {"method":"computer.permission_open_settings","permission":"screen_recording"}
     },
     {
+      "request_method": "queue.list",
+      "response_method": "queue.list",
+      "request": {"method":"queue.list","session_id":"session-1"},
+      "response": {"method":"queue.list","session_id":"session-1","revision":31,"rows":[{"id":"user-queued-1","text":"  keep this text\nverbatim  ","mode":"queue","ordinal":1,"created_at_ms":1753500000000}]}
+    },
+    {
+      "request_method": "queue.remove",
+      "response_method": "queue.remove",
+      "request": {"method":"queue.remove","session_id":"session-1","id":"user-queued-1","revision":31},
+      "response": {"method":"queue.remove","session_id":"session-1","id":"user-queued-1","revision":33}
+    },
+    {
+      "request_method": "queue.promote_steer",
+      "response_method": "queue.promote_steer",
+      "request": {"method":"queue.promote_steer","session_id":"session-1","id":"user-queued-2","revision":33},
+      "response": {"method":"queue.promote_steer","session_id":"session-1","id":"user-queued-2","revision":36}
+    },
+    {
       "request_method": "usage.history_day",
       "response_method": "usage.history_day",
       "request": {"method":"usage.history_day","date":"2026-08-24"},

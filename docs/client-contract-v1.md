@@ -3,7 +3,7 @@
 Status: authoritative for wire protocol `v = 1`  
 Source snapshot: package `0.0.943` plus the additive snapshot-availability field in this tree  
 N-1 compatibility baseline: `0.0.942`  
-Contract revision date: 2026-08-23
+Contract revision date: 2026-08-25
 
 This document is the client-facing contract of `haider-rpc`,
 `haider-client`, and the daemon producers behind them. Rust types and golden
@@ -208,6 +208,7 @@ affordance before the response exists.
 | `session_mutation_v1` | `session.create` and typed create metadata |
 | `session_permission_overrides_v1` | `session.create.permission_overrides` and metadata permission overrides |
 | `turn_control_v1` | `turn.submit`, `turn.cancel` |
+| `queue_control_v1` | `queue.list`, `queue.remove`, `queue.promote_steer`, and durable `QueueChanged` events on an attached session |
 | `run_retry_v1` | `run.retry` |
 | `context_compaction_v1` | `session.compact` |
 | `fallback_chain_v1` | durable fallback-lane events and next-lane continuation; no separate method |
@@ -334,6 +335,7 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | Descendant fleet | `session.fleet` | `SessionFleet` | bounded snapshot | durable delegation records plus child journals |
 | Transcript replay/live tail | `session.attach` | `SessionAttach`, `Event*`, `AttachCaughtUp` | replay then live stream | raw journal envelopes |
 | End replay/live tail | `session.detach` | `SessionDetach` | connection-local command | attachment registry |
+| Held queue | `queue.list` | `QueueList` | non-subscribing revisioned snapshot; attach separately for deltas | durable queued user-message events and queue-change events |
 | Native transcript path | `session.pipe_path` | `SessionPipePath` | snapshot | daemon-resolved absolute path; never derive it |
 | Commands | `command.list` | `CommandList` | context snapshot | daemon `COMMANDS` catalog plus request slots |
 | Command execution | `command.invoke` | `CommandInvoke` | correlated result: receipt, parked, client-owned, or unsupported | listed ownership and canonical nested receipt |
@@ -361,6 +363,8 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | `session.metafork` | `SessionMetafork` | write-free review, then durable receipt after digest acceptance |
 | `turn.submit`, `turn.submit_from_cli`, `turn.submit_with_hook_trust` | `TurnSubmit` or `TurnSubmitOnBranch` | durable receipt |
 | `turn.cancel` | `TurnCancel` | durable receipt |
+| `queue.remove` | `QueueRemove` | revision-fenced durable mutation |
+| `queue.promote_steer` | `QueuePromoteSteer` | revision-fenced durable mutation followed by Steer delivery |
 | `run.retry` | `RunRetry` | durable receipt |
 | `session.compact` | `SessionCompact` or `SessionCompactOnBranch` | durable receipt |
 | `session.select_model` | `SessionSelectModel` | durable receipt |
@@ -389,7 +393,7 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 The golden matrix at
 `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`, combined
 with the historical `wire_transcript.json`, pins a request and successful
-response for every one of the 73 v1 request methods. `menu.answer` and resident
+response for every one of the 76 v1 request methods. `menu.answer` and resident
 binding are top-level frames, not `RequestBody` methods.
 
 ## 6. Snapshot, watch, invalidation, push, and replay laws
@@ -397,7 +401,8 @@ binding are top-level frames, not `RequestBody` methods.
 - `session.list`, `session.read`, `session.observe`, `session.observe_batch`,
   `session.fleet`, `command.list`, `account.list`, `account.oauth_import_sources`, `provider.list`,
   `usage.report`, `usage.history_day`, `usage.history_range`, `loom.list`, `tools.inventory`, `hooks.list`, graph reads,
-  and `session.pipe_path` are snapshots. Calling them does not subscribe.
+  `queue.list`, and `session.pipe_path` are snapshots. Calling them does not
+  subscribe.
 - `session.list_watch` subscribes before acknowledging. Its first
   `SessionRosterDelta` set is the current changed/new baseline, chunked at 64;
   later pushes are coalesced by session/head. Deltas deliberately omit
@@ -420,7 +425,68 @@ binding are top-level frames, not `RequestBody` methods.
   `after_seq`, through the captured `replay_through_seq`, emits
   `AttachCaughtUp`, then continues live. `session.read` never subscribes.
 
-### 6.1 OAuth import-source catalog
+### 6.1 Held-message queue control
+
+`queue.list` is the complete held-queue snapshot for one session. It returns a
+queue-level `revision` and rows in delivery order. Every row carries:
+
+- `id`: the durable user-message event id. It is stable across list calls,
+  survives other rows being removed, and is the only mutation coordinate;
+- `text`: exactly the text the user submitted, without trimming,
+  normalization, or reconstruction from another turn payload;
+- `mode`: the `DeliveryMode` under which that message was submitted;
+- `ordinal`: its one-based position in this snapshot. Ordinals may change when
+  an earlier row leaves and are never mutation coordinates; and
+- `created_at_ms`: the durable commit time of the submitted user message.
+
+Rows are render-complete. A consumer displays `row.text` directly. If a client
+must reconstruct display text from a turn or prompt payload, the contract is
+broken: two clients could display different strings for the same queued
+message.
+
+`queue.remove` and `queue.promote_steer` require the row `id` and the exact
+snapshot `revision`. The daemon compares the revision before looking up or
+mutating the id. A stale request is refused with
+`revision_conflict`/`ErrorData::RevisionConflict`, whose `current_revision`
+field is the current queue revision. Refusal changes no event, run state,
+delivery cache, or queue revision. The client re-lists and makes a new
+user-authorized choice; it never retries against a guessed ordinal or
+substitutes the returned revision into the old choice.
+
+A successful removal makes that row absent immediately. A successful promote
+removes the held row and schedules its exact `text` under Steer semantics for
+the active run's next safe delivery boundary. Promotion is one durable
+transition: a retry carrying the now-stale revision is refused and cannot
+double-deliver the message.
+
+Queue changes from every submitting client, explicit remove/promote mutations,
+and delivery consumption are durable `QueueChanged` event payloads on the
+ordinary per-session `session.attach` replay/live stream. Every delta carries
+the new required queue `revision`; an enqueue delta additionally carries the
+render-complete row. The revision is the committing session-event sequence, so
+it is strictly increasing for queue changes but need not be numerically
+consecutive when non-queue events commit between them.
+
+An attached client installs a list snapshot at revision `R`, ignores replayed
+queue deltas at or below `R`, and applies later deltas in session-event order.
+Response delivery is not a stream barrier: a delta committed after the
+snapshot may reach the attached event sink before the `QueueList` response is
+observed. Clients buffer queue deltas while a list is in flight, install the
+returned snapshot, then apply buffered deltas whose revision is greater than
+`R` in session-event order.
+The attachment's existing sequence/replay laws, including reconnecting after
+an event-stream gap, are the ordering authority; clients must not infer a gap
+from a nonconsecutive queue revision. A consumed delta means delivery has
+claimed the held row, and the next successful list cannot contain it.
+
+The complete surface is gated by `queue_control_v1`. Without that Welcome
+feature, no queue-control affordance is safe. A failed `queue.list`, a missing
+feature, or an unattached/failed watch is not an empty queue. Only a successful
+`QueueList` response with `rows: []` establishes emptiness at its returned
+revision. This is a consumer-boundary law: error-erasing adapters such as
+`.ok()` must not collapse unavailable queue truth into an empty collection.
+
+### 6.2 OAuth import-source catalog
 
 `account.oauth_import_sources` has no request fields and returns the
 daemon-owned list accepted by `account.oauth_import`:
@@ -930,6 +996,9 @@ They are not subsystem-unavailable sentinels.
   baseline—those cases are intentionally indistinguishable, but neither means
   the hook subsystem is unavailable. The provider legacy ambiguity is the
   explicit exception in §9.5.
+- Queue revisions are durable session-event sequence numbers stamped on queue
+  deltas. They are comparable only within one session, may skip values, and
+  must be supplied unchanged as the fence for remove/promote mutations.
 - Surface revision zero is a publisher-local revision value. Whether a publish
   was accepted is expressed by the optional accepted-revision field, not by
   testing the number for zero.
@@ -1284,7 +1353,7 @@ The machine-checkable contract lives in these fixtures/tests:
   receipts.
 - `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`: the
   methods added after the historical matrix, completing golden request and
-  successful response coverage for all 73 request methods and all five
+  successful response coverage for all 76 request methods and all five
   command dynamic slots.
 - `crates/haider-rpc/tests/fixtures/snapshot_availability_compat_v1.json`:
   old and new account/provider/usage response bytes.

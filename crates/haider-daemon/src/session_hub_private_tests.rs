@@ -12,13 +12,14 @@ use haider_protocol::graph::{EvidenceVerdict, GraphPhase, SHIP_LOOP_TEMPLATE};
 use haider_protocol::ids::{AgentId, BranchId, EventId, GraphId, ItemId, MenuId, RunId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{Menu, MenuCloseReason, MenuKind, MenuOption, MenuScope};
+use haider_protocol::queue::QueueChange;
 use haider_protocol::session_fork::{
     SessionMetaforkProposal, SessionMetaforkRemoval, SessionMetaforkReviewManifest,
 };
 use haider_protocol::state::RunState;
 use haider_store::{
-    GraphEvidenceCommand, GraphPinCommand, SessionCreateCommand, ShellExecAcceptCommand,
-    ShellExecAcceptOutcome, TurnAcceptCommand,
+    GraphEvidenceCommand, GraphPinCommand, QueuePromoteCommand, QueueRemoveCommand,
+    SessionCreateCommand, ShellExecAcceptCommand, ShellExecAcceptOutcome, TurnAcceptCommand,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -594,6 +595,284 @@ impl FrameSink for CapturingFrameSink {
         self.0.lock().expect("capturing sink").push(frame);
         Ok(())
     }
+}
+
+/// Queue-control changes share the existing attachment pipe. Each durable
+/// queue transition must publish exactly one typed delta whose revision is
+/// the committing envelope sequence; no queue-specific polling path exists.
+#[tokio::test]
+async fn queue_changes_publish_revisioned_attachment_deltas() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let session_id = SessionId::new("queue-watch-session");
+    let active_run = RunId::new("queue-watch-active");
+    let generation = store.worker_generation();
+    hub.create_internal_session(create_command(&session_id, "queue-watch"))
+        .await
+        .expect("session created");
+    hub.accept_internal_turn(accept_command(
+        &session_id,
+        &active_run,
+        generation,
+        "queue-watch-active",
+    ))
+    .await
+    .expect("active turn accepted");
+    let mut thinking = [run_state_envelope(
+        &session_id,
+        &active_run,
+        generation,
+        "queue-watch-thinking",
+        RunState::Thinking,
+    )];
+    hub.append(&mut thinking).await.expect("active run starts");
+
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::View,
+                haider_rpc::Capability::Control,
+            ]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection opens");
+    let head = store.latest_seq(&session_id).await.expect("head");
+    connection
+        .request(
+            haider_rpc::RequestId::new("queue-watch-attach"),
+            haider_rpc::RequestBody::SessionAttach {
+                session_id: session_id.clone(),
+                after_seq: head,
+                mode: haider_rpc::AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("control attachment opens");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if sink
+                .0
+                .lock()
+                .expect("frames")
+                .iter()
+                .any(|frame| matches!(frame, WireFrame::AttachCaughtUp { .. }))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("attachment catches up");
+    sink.0.lock().expect("frames").clear();
+
+    let queued = |suffix: &str, text: &str| {
+        let mut command = accept_command(
+            &session_id,
+            &RunId::new(format!("queue-watch-{suffix}")),
+            generation,
+            &format!("queue-watch-{suffix}"),
+        );
+        command.text = text.into();
+        command
+    };
+
+    let first = hub
+        .accept_internal_turn(queued("remove", "remove me"))
+        .await
+        .expect("first row enqueued");
+    let snapshot = hub
+        .queue_snapshot(session_id.clone())
+        .await
+        .expect("first snapshot");
+    hub.queue_remove(QueueRemoveCommand {
+        session_id: session_id.clone(),
+        id: EventId::new("user-queue-watch-remove"),
+        revision: snapshot.revision,
+        cancelling_event_id: EventId::new("queue-watch-remove-cancelling"),
+        delta_event_id: EventId::new("queue-watch-remove-delta"),
+        device_id: DeviceId::new("queue-watch-device"),
+    })
+    .await
+    .expect("row removed");
+
+    let promoted_text = "  promote\nverbatim  ";
+    hub.accept_internal_turn(queued("promote", promoted_text))
+        .await
+        .expect("second row enqueued");
+    let snapshot = hub
+        .queue_snapshot(session_id.clone())
+        .await
+        .expect("second snapshot");
+    let (promoted, live_delivered) = hub
+        .queue_promote_steer(QueuePromoteCommand {
+            session_id: session_id.clone(),
+            id: EventId::new("user-queue-watch-promote"),
+            revision: snapshot.revision,
+            expected_active_run_id: None,
+            cancelling_event_id: EventId::new("queue-watch-promote-cancelling"),
+            delivery_event_id: EventId::new("queue-watch-promote-delivery"),
+            delta_event_id: EventId::new("queue-watch-promote-delta"),
+            device_id: DeviceId::new("queue-watch-device"),
+        })
+        .await
+        .expect("row promoted");
+    assert_eq!(promoted.text, promoted_text);
+    assert!(!live_delivered, "this fixture has no live supervisor");
+
+    let consumed = hub
+        .accept_internal_turn(queued("consume", "consume me"))
+        .await
+        .expect("third row enqueued");
+    let lease = hub
+        .acquire_worker_lease(session_id.clone())
+        .await
+        .expect("worker lease");
+    lease
+        .consume_queued_turn(
+            consumed.run_id,
+            EventId::new("queue-watch-consumed-delta"),
+            DeviceId::new("queue-watch-worker"),
+        )
+        .await
+        .expect("consumption commits")
+        .expect("held row exists");
+    assert_ne!(first.run_id, active_run);
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let count = sink
+                .0
+                .lock()
+                .expect("frames")
+                .iter()
+                .filter(|frame| {
+                    matches!(frame, WireFrame::Event { envelope, .. }
+                    if serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                        .is_ok_and(|payload| matches!(payload, EventPayload::QueueChanged(_))))
+                })
+                .count();
+            if count >= 6 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all queue deltas publish");
+
+    let frames = sink.0.lock().expect("frames").clone();
+    let deltas = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            WireFrame::Event { envelope, .. } => {
+                let EventPayload::QueueChanged(delta) =
+                    serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?
+                else {
+                    return None;
+                };
+                Some((envelope.seq, delta))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(deltas.len(), 6);
+    assert!(
+        deltas
+            .windows(2)
+            .all(|pair| pair[0].1.revision < pair[1].1.revision)
+    );
+    assert!(deltas.iter().all(|(seq, delta)| *seq == delta.revision));
+    assert!(matches!(&deltas[0].1.change, QueueChange::Enqueued { .. }));
+    assert!(matches!(&deltas[1].1.change, QueueChange::Removed { .. }));
+    assert!(matches!(&deltas[2].1.change, QueueChange::Enqueued { .. }));
+    assert!(matches!(
+        &deltas[3].1.change,
+        QueueChange::PromotedSteer { .. }
+    ));
+    assert!(matches!(&deltas[4].1.change, QueueChange::Enqueued { .. }));
+    assert!(matches!(&deltas[5].1.change, QueueChange::Consumed { .. }));
+    assert!(
+        hub.queue_snapshot(session_id.clone())
+            .await
+            .expect("final snapshot")
+            .rows
+            .is_empty()
+    );
+
+    let stale_revision = deltas[0].1.revision;
+    let current_revision = deltas[5].1.revision;
+    let head_before_stale = store
+        .latest_seq(&session_id)
+        .await
+        .expect("head before stale");
+    connection
+        .request(
+            haider_rpc::RequestId::new("queue-watch-list"),
+            haider_rpc::RequestBody::QueueList {
+                session_id: session_id.clone(),
+            },
+        )
+        .await
+        .expect("queue list responds");
+    connection
+        .request(
+            haider_rpc::RequestId::new("queue-watch-stale-remove"),
+            haider_rpc::RequestBody::QueueRemove {
+                session_id: session_id.clone(),
+                id: EventId::new("user-queue-watch-remove"),
+                revision: stale_revision,
+            },
+        )
+        .await
+        .expect("stale removal is typed");
+    let frames = sink.0.lock().expect("frames").clone();
+    assert!(frames.iter().any(|frame| matches!(
+        frame,
+        WireFrame::Response {
+            request_id,
+            body: haider_rpc::ResponseBody::QueueList {
+                revision,
+                rows,
+                ..
+            },
+        } if request_id.as_str() == "queue-watch-list"
+            && *revision == current_revision
+            && rows.is_empty()
+    )));
+    assert!(frames.iter().any(|frame| matches!(
+        frame,
+        WireFrame::Response {
+            request_id,
+            body: haider_rpc::ResponseBody::Error {
+                code,
+                data: Some(haider_rpc::ErrorData::RevisionConflict {
+                    expected_revision,
+                    current_revision: refused_current,
+                }),
+                ..
+            },
+        } if request_id.as_str() == "queue-watch-stale-remove"
+            && code == haider_rpc::ERROR_CODE_REVISION_CONFLICT
+            && *expected_revision == stale_revision
+            && *refused_current == current_revision
+    )));
+    assert_eq!(
+        store
+            .latest_seq(&session_id)
+            .await
+            .expect("head after stale"),
+        head_before_stale,
+        "typed stale refusal mutates nothing"
+    );
+
+    drop(connection);
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
 }
 
 /// Whole-subsystem absence must not masquerade as a measured zero/empty

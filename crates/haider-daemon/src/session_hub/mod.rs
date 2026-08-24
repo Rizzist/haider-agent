@@ -110,16 +110,17 @@ use haider_core::{
     GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome, GraphSwitchCommand,
     GraphSwitchOutcome, HarnessHandle, MenuResolutionCommand, MenuResolutionOutcome,
     OpenedGraphRunSet, PinnedGraph, ProcessSignalCommand, ProcessSignalOutcome, ProfileStoreFault,
-    PromptHistoryCache, RenamedSession, RunRetryCommand, RunRetryOutcome, SeenSession,
-    SelectedAgentType, SelectedEffort, SelectedFast, SelectedModel, SessionCreateCommand,
-    SessionCreateOutcome, SessionForkCommand, SessionForkOutcome, SessionMetaforkCommit,
-    SessionProjectionCheckpoint, SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand,
-    SessionSeenOutcome, SessionSelectAgentTypeCommand, SessionSelectAgentTypeOutcome,
-    SessionSelectEffortCommand, SessionSelectEffortOutcome, SessionSelectFastCommand,
-    SessionSelectFastOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
-    ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle, StoreHandle, SwitchedGraph,
-    TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
-    TurnCancelOutcome, TurnCancellationStatus,
+    PromptHistoryCache, QueueConsumeCommand, QueueConsumeOutcome, QueuePromoteCommand,
+    QueuePromoteOutcome, QueueRemoveCommand, QueueRemoveOutcome, QueueSnapshot, RenamedSession,
+    RunRetryCommand, RunRetryOutcome, SeenSession, SelectedAgentType, SelectedEffort, SelectedFast,
+    SelectedModel, SessionCreateCommand, SessionCreateOutcome, SessionForkCommand,
+    SessionForkOutcome, SessionMetaforkCommit, SessionProjectionCheckpoint, SessionRenameCommand,
+    SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome, SessionSelectAgentTypeCommand,
+    SessionSelectAgentTypeOutcome, SessionSelectEffortCommand, SessionSelectEffortOutcome,
+    SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
+    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle,
+    StoreHandle, SwitchedGraph, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
+    TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::branch::BranchDescriptor;
@@ -142,13 +143,14 @@ use haider_rpc::{
     ERROR_CODE_GRAPH_ALREADY_ACTIVE, ERROR_CODE_GRAPH_NOT_ACTIVE, ERROR_CODE_GRAPH_WRONG_NODE,
     ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_INVALID_CURSOR, ERROR_CODE_NOT_FOUND,
     ERROR_CODE_OVERLOADED, ERROR_CODE_PDF_MALFORMED, ERROR_CODE_PDF_TOO_LARGE,
-    ERROR_CODE_PDF_TOO_MANY_PAGES, ERROR_CODE_PROVIDER_MODELS_UNKNOWN, ERROR_CODE_RUN_NOT_ACTIVE,
-    ERROR_CODE_STALE_GENERATION, ERROR_CODE_SURFACE_TEXT_TOO_LARGE,
-    ERROR_CODE_TOO_MANY_ATTACHMENTS, ERROR_CODE_UNSUPPORTED_SHELL_BUILTIN,
-    ERROR_CODE_VISION_UNSUPPORTED, ErrorData, MenuInput, ProtocolError, RequestBody, RequestId,
-    ResponseBody, SURFACE_INPUT_MAX_BYTES, SURFACE_STATUS_MAX_BYTES, SeqRange, SessionReadResult,
-    SessionSummary, SubmitDisposition, SurfaceInjectOp, SurfaceInputPublishWire, SurfaceInputWire,
-    SurfaceStatusPublishWire, SurfaceStatusWire, TodoGraphOpenedWire, WireFrame,
+    ERROR_CODE_PDF_TOO_MANY_PAGES, ERROR_CODE_PROVIDER_MODELS_UNKNOWN,
+    ERROR_CODE_REVISION_CONFLICT, ERROR_CODE_RUN_NOT_ACTIVE, ERROR_CODE_STALE_GENERATION,
+    ERROR_CODE_SURFACE_TEXT_TOO_LARGE, ERROR_CODE_TOO_MANY_ATTACHMENTS,
+    ERROR_CODE_UNSUPPORTED_SHELL_BUILTIN, ERROR_CODE_VISION_UNSUPPORTED, ErrorData, MenuInput,
+    ProtocolError, RequestBody, RequestId, ResponseBody, SURFACE_INPUT_MAX_BYTES,
+    SURFACE_STATUS_MAX_BYTES, SeqRange, SessionReadResult, SessionSummary, SubmitDisposition,
+    SurfaceInjectOp, SurfaceInputPublishWire, SurfaceInputWire, SurfaceStatusPublishWire,
+    SurfaceStatusWire, TodoGraphOpenedWire, WireFrame,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -1285,6 +1287,22 @@ enum ActorCommand {
     AcceptTurn {
         command: TurnAcceptCommand,
         completed: oneshot::Sender<Result<TurnAcceptOutcome, HaiderError>>,
+    },
+    QueueList {
+        completed: oneshot::Sender<Result<QueueSnapshot, HaiderError>>,
+    },
+    QueueRemove {
+        command: QueueRemoveCommand,
+        completed: oneshot::Sender<Result<QueueRemoveOutcome, HaiderError>>,
+    },
+    QueuePromoteSteer {
+        command: QueuePromoteCommand,
+        completed: oneshot::Sender<Result<(QueuePromoteOutcome, bool), HaiderError>>,
+    },
+    QueueConsume {
+        lease_id: WorkerLeaseId,
+        command: QueueConsumeCommand,
+        completed: oneshot::Sender<Result<Option<QueueConsumeOutcome>, HaiderError>>,
     },
     AcceptRunRetry {
         command: RunRetryCommand,
@@ -3018,6 +3036,57 @@ impl SessionHub {
             .map_err(Into::into)
     }
 
+    pub(crate) async fn queue_snapshot(
+        &self,
+        session_id: SessionId,
+    ) -> Result<QueueSnapshot, SessionHubError> {
+        let actor = self.actor_for(session_id).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::QueueList { completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    async fn queue_remove(
+        &self,
+        command: QueueRemoveCommand,
+    ) -> Result<QueueRemoveOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::QueueRemove { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn queue_promote_steer(
+        &self,
+        command: QueuePromoteCommand,
+    ) -> Result<(QueuePromoteOutcome, bool), SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::QueuePromoteSteer { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
     async fn run_retry_receipt(
         &self,
         command_id: &CommandId,
@@ -3156,7 +3225,7 @@ impl SessionHub {
         self.acquire_worker_lease_inner(session_id, None).await
     }
 
-    pub(crate) async fn acquire_worker_lease_with_cancellation_wake(
+    pub(crate) async fn acquire_worker_lease_with_wakes(
         &self,
         session_id: SessionId,
         cancellation_wake: watch::Sender<u64>,
@@ -4351,6 +4420,35 @@ fn inject_test_done_append_failure(envelopes: &[RawEnvelope]) -> bool {
 }
 
 impl HubStoreHandle {
+    pub(crate) async fn consume_queued_turn(
+        &self,
+        run_id: RunId,
+        delta_event_id: EventId,
+        device_id: DeviceId,
+    ) -> Result<Option<QueueConsumeOutcome>, HaiderError> {
+        let actor = self
+            .hub
+            .existing_actor(&self.session_id)
+            .map_err(hub_error_as_store)?
+            .ok_or_else(hub_closed_store_error)?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::QueueConsume {
+                lease_id: self.lease_id.clone(),
+                command: QueueConsumeCommand {
+                    session_id: self.session_id.clone(),
+                    run_id,
+                    delta_event_id,
+                    device_id,
+                },
+                completed,
+            })
+            .await
+            .map_err(|_| hub_closed_store_error())?;
+        result.await.map_err(|_| hub_closed_store_error())?
+    }
+
     /// Appends a worker batch only while the session journal still has the
     /// exact head observed by the caller. The session actor performs the
     /// comparison and append without yielding to another session command.

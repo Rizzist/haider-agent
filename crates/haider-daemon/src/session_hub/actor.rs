@@ -278,14 +278,15 @@ fn effect_recovery_payloads(
 
 /// One session's entire command order, in one loop, in one task.
 ///
-/// Both §5.5 invariants (module doc) hold by code shape here: the only awaits
-/// inside any arm are durable store calls (`append`, `create_session`,
-/// `accept_turn`, `cancel_turn`, `settle_session_idle`, `resolve_menu`). Native
-/// pipe maintenance is only a nonblocking post-commit wake; publication is a
-/// synchronous call after durable return in the same arm, and
-/// the `Register` arm contains no await at all. Adding an await between a
-/// store return and its `publish`, or anywhere in `Register`, breaks a law —
-/// the forced-boundary tests in `tests/session_hub_tests.rs` will catch it.
+/// Both §5.5 invariants (module doc) hold by code shape here: awaits inside an
+/// arm are durable store calls. Queue promotion's live reservation is a
+/// synchronous mutex fence on the registered harness; it adds no actor-loop
+/// await. Native pipe maintenance is only a nonblocking
+/// post-commit wake; publication is a synchronous call after durable return
+/// in the same arm, and the `Register` arm contains no await at all. Adding an
+/// await between a store return and its `publish`, or anywhere in `Register`,
+/// breaks a law — the forced-boundary tests in `tests/session_hub_tests.rs`
+/// will catch it.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_session_actor(
     session_id: SessionId,
@@ -849,6 +850,150 @@ pub(super) async fn run_session_actor(
                     publish(
                         &mut attachments,
                         envelopes,
+                        catch_up_byte_budget,
+                        &metrics,
+                        &hooks,
+                    );
+                    observer.observe(HubObservation::Published {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                }
+                let _ = completed.send(result);
+            }
+            ActorCommand::QueueList { completed } => {
+                let _ = completed.send(store.queue_snapshot(session_id.clone()).await);
+            }
+            ActorCommand::QueueRemove { command, completed } => {
+                let result = store.queue_remove(command).await;
+                if let Ok(outcome) = &result {
+                    if let Some(last) = outcome.envelopes.last() {
+                        head = last.seq;
+                        authority_epoch = last.authority_epoch;
+                    }
+                    observer.observe(HubObservation::Persisted {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                    pipe_sidecar.enqueue(Arc::from(outcome.envelopes.clone()));
+                    publish(
+                        &mut attachments,
+                        &outcome.envelopes,
+                        catch_up_byte_budget,
+                        &metrics,
+                        &hooks,
+                    );
+                    observer.observe(HubObservation::Published {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                    if let Some(wake) = worker
+                        .as_ref()
+                        .and_then(|worker| worker.cancellation_wake.as_ref())
+                    {
+                        wake.send_modify(|generation| {
+                            *generation = generation.saturating_add(1);
+                        });
+                    }
+                }
+                let _ = completed.send(result);
+            }
+            ActorCommand::QueuePromoteSteer {
+                mut command,
+                completed,
+            } => {
+                let result = match store.queue_promote_preview(command.clone()).await {
+                    Ok(preview) => {
+                        command.expected_active_run_id = Some(preview.active_run_id.clone());
+                        if let Some(harness) =
+                            worker.as_ref().and_then(|worker| worker.harness.as_ref())
+                        {
+                            match harness.reserve_promoted_steer(preview.text) {
+                                Ok(reservation) => match store.queue_promote_steer(command).await {
+                                    Ok(outcome) => {
+                                        // Durable-before-delivery: only a
+                                        // committed promotion releases the
+                                        // core-side reservation. Dropping it
+                                        // on every error leaves the queue row
+                                        // and provider input untouched.
+                                        reservation.commit().map(|()| (outcome, true))
+                                    }
+                                    Err(error) => Err(error),
+                                },
+                                Err(error) => Err(error),
+                            }
+                        } else {
+                            // A durable active run can temporarily have no
+                            // registered harness during recovery. Commit the
+                            // same fenced delivery fact; the RPC layer hands
+                            // it to the worker manager, and journal recovery
+                            // retains the exact steer text if that handoff
+                            // loses a process boundary.
+                            store
+                                .queue_promote_steer(command)
+                                .await
+                                .map(|outcome| (outcome, false))
+                        }
+                    }
+                    Err(error) => Err(error),
+                };
+                if let Ok((outcome, _)) = &result {
+                    if let Some(last) = outcome.envelopes.last() {
+                        head = last.seq;
+                        authority_epoch = last.authority_epoch;
+                    }
+                    observer.observe(HubObservation::Persisted {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                    pipe_sidecar.enqueue(Arc::from(outcome.envelopes.clone()));
+                    publish(
+                        &mut attachments,
+                        &outcome.envelopes,
+                        catch_up_byte_budget,
+                        &metrics,
+                        &hooks,
+                    );
+                    observer.observe(HubObservation::Published {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                    if let Some(wake) = worker
+                        .as_ref()
+                        .and_then(|worker| worker.cancellation_wake.as_ref())
+                    {
+                        wake.send_modify(|generation| {
+                            *generation = generation.saturating_add(1);
+                        });
+                    }
+                }
+                let _ = completed.send(result);
+            }
+            ActorCommand::QueueConsume {
+                lease_id,
+                command,
+                completed,
+            } => {
+                if worker.as_ref().map(|worker| &worker.lease_id) != Some(&lease_id) {
+                    let _ = completed.send(Err(HaiderError::new(
+                        ErrorCode::SingleWriterViolation,
+                        "worker lease was superseded",
+                        false,
+                    )));
+                    continue;
+                }
+                let result = store.queue_consume(command).await;
+                if let Ok(Some(outcome)) = &result {
+                    head = outcome.envelope.seq;
+                    authority_epoch = outcome.envelope.authority_epoch;
+                    observer.observe(HubObservation::Persisted {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                    pipe_sidecar.enqueue(Arc::from(vec![(*outcome.envelope).clone()]));
+                    publish(
+                        &mut attachments,
+                        std::slice::from_ref(outcome.envelope.as_ref()),
                         catch_up_byte_budget,
                         &metrics,
                         &hooks,

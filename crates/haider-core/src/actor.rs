@@ -1000,6 +1000,7 @@ pub struct HarnessHandle {
     state: watch::Receiver<Option<RunState>>,
     committed_menus: watch::Sender<Option<RawEnvelope>>,
     provider_retry_wake: Arc<ProviderRetryWake>,
+    promoted_steers: Arc<PromotedSteerMailbox>,
 }
 
 impl HarnessHandle {
@@ -1055,6 +1056,19 @@ impl HarnessHandle {
     /// with this input so it can revise or confirm the call first.
     pub fn subturn(&self, text: impl Into<String>) -> Result<(), HaiderError> {
         self.deliver_mid_turn(text.into(), DeliveryMode::Subturn)
+    }
+
+    /// Reserves one daemon-promoted steer before its durable queue mutation.
+    ///
+    /// The reservation and the turn's final `Done` fence share one mutex:
+    /// either this call wins and terminalization waits for `commit`/drop, or
+    /// terminalization wins and the queue mutation can be refused untouched.
+    pub fn reserve_promoted_steer(
+        &self,
+        text: impl Into<String>,
+    ) -> Result<PromotedSteerReservation, HaiderError> {
+        self.promoted_steers
+            .reserve(text.into(), self.commands.clone())
     }
 
     fn deliver_mid_turn(&self, text: String, mode: DeliveryMode) -> Result<(), HaiderError> {
@@ -1195,9 +1209,44 @@ enum ActorCommand {
         text: String,
         mode: DeliveryMode,
     },
+    PromotedSteerWake {
+        reservation_id: u64,
+    },
     Stop {
         completed: oneshot::Sender<()>,
     },
+}
+
+/// Prepared half of a queue promotion. Dropping it aborts without exposing
+/// text to the provider; committing it makes the durable steer available at
+/// the next safe provider boundary.
+#[derive(Debug)]
+pub struct PromotedSteerReservation {
+    id: u64,
+    mailbox: Arc<PromotedSteerMailbox>,
+    commands: mpsc::Sender<ActorCommand>,
+    resolved: bool,
+}
+
+impl PromotedSteerReservation {
+    pub fn commit(mut self) -> Result<(), HaiderError> {
+        self.mailbox.commit(self.id)?;
+        self.resolved = true;
+        // A full command lane only delays delivery until the mandatory
+        // terminal fence drains the mailbox; durable text is never dropped.
+        let _ = self.commands.try_send(ActorCommand::PromotedSteerWake {
+            reservation_id: self.id,
+        });
+        Ok(())
+    }
+}
+
+impl Drop for PromotedSteerReservation {
+    fn drop(&mut self) {
+        if !self.resolved {
+            self.mailbox.abort(self.id);
+        }
+    }
 }
 
 enum TurnSubmission {
@@ -1230,6 +1279,133 @@ struct ProviderRetryWakeState {
     armed_event_id: Option<EventId>,
     fired: bool,
     consumed_commands: HashSet<String>,
+}
+
+#[derive(Debug, Default)]
+struct PromotedSteerMailbox {
+    state: Mutex<PromotedSteerMailboxState>,
+    changed: Notify,
+}
+
+#[derive(Debug, Default)]
+struct PromotedSteerMailboxState {
+    accepting: bool,
+    next_id: u64,
+    reserved: HashMap<u64, String>,
+    committed: VecDeque<(u64, String)>,
+}
+
+impl PromotedSteerMailbox {
+    fn state(&self) -> std::sync::MutexGuard<'_, PromotedSteerMailboxState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn begin_turn(&self) {
+        let mut state = self.state();
+        state.accepting = true;
+        state.reserved.clear();
+        state.committed.clear();
+    }
+
+    fn close_turn(&self) {
+        let mut state = self.state();
+        state.accepting = false;
+        state.reserved.clear();
+        state.committed.clear();
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
+    fn reserve(
+        self: &Arc<Self>,
+        text: String,
+        commands: mpsc::Sender<ActorCommand>,
+    ) -> Result<PromotedSteerReservation, HaiderError> {
+        let id = {
+            let mut state = self.state();
+            if !state.accepting {
+                return Err(HaiderError::new(
+                    ErrorCode::RunNotActive,
+                    "active turn crossed its promotion boundary",
+                    false,
+                ));
+            }
+            state.next_id = state.next_id.checked_add(1).ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::Busy,
+                    "promoted steer reservation space is exhausted",
+                    true,
+                )
+            })?;
+            let id = state.next_id;
+            state.reserved.insert(id, text);
+            id
+        };
+        Ok(PromotedSteerReservation {
+            id,
+            mailbox: Arc::clone(self),
+            commands,
+            resolved: false,
+        })
+    }
+
+    fn commit(&self, id: u64) -> Result<(), HaiderError> {
+        let mut state = self.state();
+        let text = state.reserved.remove(&id).ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::RunNotActive,
+                "promoted steer reservation is no longer active",
+                false,
+            )
+        })?;
+        state.committed.push_back((id, text));
+        drop(state);
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
+    fn abort(&self, id: u64) {
+        let removed = self.state().reserved.remove(&id).is_some();
+        if removed {
+            self.changed.notify_waiters();
+        }
+    }
+
+    fn take_committed(&self, id: u64) -> Option<String> {
+        let mut state = self.state();
+        let position = state
+            .committed
+            .iter()
+            .position(|(candidate, _)| *candidate == id)?;
+        state.committed.remove(position).map(|(_, text)| text)
+    }
+
+    fn drain_committed(&self) -> Vec<String> {
+        self.state()
+            .committed
+            .drain(..)
+            .map(|(_, text)| text)
+            .collect()
+    }
+
+    async fn finish_boundary(&self) -> Vec<String> {
+        loop {
+            // Register before inspecting the reservation set so commit/drop
+            // cannot land between the predicate and the wait.
+            let changed = self.changed.notified();
+            {
+                let mut state = self.state();
+                if !state.committed.is_empty() {
+                    return state.committed.drain(..).map(|(_, text)| text).collect();
+                }
+                if state.reserved.is_empty() {
+                    state.accepting = false;
+                    return Vec::new();
+                }
+            }
+            changed.await;
+        }
+    }
 }
 
 impl ProviderRetryWake {
@@ -1302,6 +1478,7 @@ pub struct HarnessActor {
     state: watch::Sender<Option<RunState>>,
     committed_menus: watch::Receiver<Option<RawEnvelope>>,
     provider_retry_wake: Arc<ProviderRetryWake>,
+    promoted_steers: Arc<PromotedSteerMailbox>,
     next_run: u64,
     event_ids: Arc<EventIdGenerator>,
     /// Actor start instant (ms) — embedded in event ids for global uniqueness.
@@ -1373,12 +1550,14 @@ impl HarnessActor {
         let (state, state_receiver) = watch::channel(None);
         let (committed_menus, committed_menu_receiver) = watch::channel(None);
         let provider_retry_wake = Arc::new(ProviderRetryWake::default());
+        let promoted_steers = Arc::new(PromotedSteerMailbox::default());
         let handle = HarnessHandle {
             commands: command_sender,
             events: events.clone(),
             state: state_receiver,
             committed_menus,
             provider_retry_wake: Arc::clone(&provider_retry_wake),
+            promoted_steers: Arc::clone(&promoted_steers),
         };
         (
             Self {
@@ -1394,6 +1573,7 @@ impl HarnessActor {
                 state,
                 committed_menus: committed_menu_receiver,
                 provider_retry_wake,
+                promoted_steers,
                 next_run: 0,
                 event_ids,
                 started_at_ms,
@@ -1637,7 +1817,9 @@ impl HarnessActor {
                         // drop the turn un-run rather than run it unowned.
                         continue;
                     }
+                    self.promoted_steers.begin_turn();
                     let outcome = self.drive_turn(request, cancel).await;
+                    self.promoted_steers.close_turn();
                     let _ = outcome_sender.send(outcome);
                 }
                 ActorCommand::AnswerMenu { completed, .. } => {
@@ -1651,6 +1833,10 @@ impl HarnessActor {
                     // The target turn crossed its terminal boundary before
                     // this command was observed. Durable run state wins; a
                     // stale nudge must not create a new logical turn.
+                }
+                ActorCommand::PromotedSteerWake { .. } => {
+                    // The finalization fence already closed this turn. A
+                    // committed promotion remains durable for recovery.
                 }
                 ActorCommand::Stop { completed } => {
                     let _ = completed.send(());
@@ -1999,6 +2185,8 @@ impl HarnessActor {
         let mut tool_json_repair_used = false;
 
         'requests: loop {
+            self.pending_nudges
+                .extend(self.promoted_steers.drain_committed());
             let previous_cache_request_completed = pending_previous_cache_request.is_some();
             if let Some(completed) = pending_previous_cache_request.take() {
                 previous_cache_request = Some(completed);
@@ -3477,6 +3665,34 @@ impl HarnessActor {
                                 }
                             }
                         }
+                        let promoted = self.promoted_steers.finish_boundary().await;
+                        if !promoted.is_empty() {
+                            // MUTATION CHECK: this is the final atomic fence
+                            // between provider Finish and durable Done. A
+                            // queue promotion reserved before this point must
+                            // force another request; deleting this check makes
+                            // the finish-boundary promotion pin lose text.
+                            if let Err(error) =
+                                finalize_request_usage(&mut completed_usage, &mut request_usage)
+                            {
+                                return self
+                                    .drive_error_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        error,
+                                    )
+                                    .await;
+                            }
+                            messages.extend(promoted.into_iter().map(Message::user_text));
+                            provider_attempt = 0;
+                            if let Err(error) = self.commit_state(&run_id, RunState::Thinking).await
+                            {
+                                return self.errored_state_outcome(&run_id, error).await;
+                            }
+                            continue 'requests;
+                        }
                         return self.finish_outcome(&run_id, reason).await;
                     }
                 };
@@ -4789,7 +5005,9 @@ impl HarnessActor {
                 MenuWake::Command(command @ ActorCommand::Submit { .. }) => {
                     self.defer_submit_or_reject(command);
                 }
-                MenuWake::Command(command @ ActorCommand::Nudge { .. }) => {
+                MenuWake::Command(
+                    command @ (ActorCommand::Nudge { .. } | ActorCommand::PromotedSteerWake { .. }),
+                ) => {
                     self.service_command_without_menu(command);
                 }
                 MenuWake::Command(ActorCommand::AnswerMenu { completed, .. }) => {
@@ -4895,7 +5113,9 @@ impl HarnessActor {
                     self.defer_submit_or_reject(command);
                     continue;
                 }
-                MenuWake::Command(command @ ActorCommand::Nudge { .. }) => {
+                MenuWake::Command(
+                    command @ (ActorCommand::Nudge { .. } | ActorCommand::PromotedSteerWake { .. }),
+                ) => {
                     self.service_command_without_menu(command);
                     continue;
                 }
@@ -5276,7 +5496,9 @@ impl HarnessActor {
                     self.defer_submit_or_reject(command);
                     continue;
                 }
-                MenuWake::Command(command @ ActorCommand::Nudge { .. }) => {
+                MenuWake::Command(
+                    command @ (ActorCommand::Nudge { .. } | ActorCommand::PromotedSteerWake { .. }),
+                ) => {
                     self.service_command_without_menu(command);
                     continue;
                 }
@@ -5426,7 +5648,9 @@ impl HarnessActor {
                     self.defer_submit_or_reject(command);
                     continue;
                 }
-                MenuWake::Command(command @ ActorCommand::Nudge { .. }) => {
+                MenuWake::Command(
+                    command @ (ActorCommand::Nudge { .. } | ActorCommand::PromotedSteerWake { .. }),
+                ) => {
                     self.service_command_without_menu(command);
                     continue;
                 }
@@ -6617,6 +6841,11 @@ impl HarnessActor {
                 ..
             } => {
                 unreachable!("queue-mode input is admitted as a later logical turn")
+            }
+            ActorCommand::PromotedSteerWake { reservation_id } => {
+                if let Some(text) = self.promoted_steers.take_committed(reservation_id) {
+                    self.pending_nudges.push(text);
+                }
             }
             ActorCommand::AnswerMenu { completed, .. } => {
                 let _ = completed.send(Err(HaiderError::new(
