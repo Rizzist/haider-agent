@@ -1550,6 +1550,7 @@ impl DemoDriver {
             | AppRequest::UsageRefresh
             // 954: the heatmap window is daemon truth; demo never fetches.
             | AppRequest::UsageHistoryRefresh
+            | AppRequest::UsageTodayRefresh
             // Fleet live-only vocabulary: demo synthesizes its snapshot
             // from the local chips at open and never pushes the read.
             | AppRequest::FleetRefresh

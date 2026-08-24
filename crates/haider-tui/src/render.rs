@@ -2265,6 +2265,180 @@ fn render_providers(
 /// One `/usage` meter line's bar ink from its utilization (U2): the
 /// threshold law lives in [`crate::format::usage_tone`]; this only maps
 /// tones onto theme slots.
+/// The 954 Models scope: today's UTC day read folded by lane descriptor
+/// and grouped by MODEL across providers — the comparison the plan/price
+/// questions need. Root and subagent lanes fold separately; effort and
+/// speed annotate where the descriptor carries them; a lane with no model
+/// (generic failure rows) folds under `(unattributed)`.
+fn render_usage_models(model: &AppModel, theme: &Theme, lines: &mut Vec<Line<'_>>) {
+    use crate::format::fmt_tok;
+    use haider_protocol::usage::UsageHistoryRoleV1;
+
+    // Demo refuses FETCHES; applied state — including the daemon's
+    // honest "no file yet" ANSWER — renders wherever it came from.
+    if model.mode.fabricates_locally()
+        && model.usage.today.is_none()
+        && !model.usage.today_absent
+        && model.usage.today_error.is_none()
+    {
+        lines.push(Line::styled(
+            "  demo — history is ledger truth, never fabricated; run bare `haider` against a daemon",
+            theme.dim_style(),
+        ));
+        return;
+    }
+    if let Some(error) = &model.usage.today_error {
+        lines.push(Line::from(vec![
+            Span::styled("  ✗ day read failed — ", theme.err_style()),
+            Span::styled(error.clone(), theme.err_style()),
+        ]));
+        if model.usage.today.is_some() {
+            lines.push(Line::styled(
+                "  showing the previously committed day (older truth, never fabricated)",
+                theme.dim_style(),
+            ));
+        }
+    }
+    let Some(day) = &model.usage.today else {
+        if model.usage.today_fetching {
+            lines.push(Line::styled("  fetching today…", theme.dim_style()));
+        } else if model.usage.today_absent {
+            // The daemon ANSWERED: no file for today yet. A fact, not an
+            // error and not never-asked.
+            lines.push(Line::styled(
+                "  no ledger file for today yet — the first sampled slot creates it",
+                theme.dim_style(),
+            ));
+        } else if model.usage.today_error.is_none() {
+            lines.push(Line::styled(
+                "  no day read yet — the daemon may predate usage_history_v1",
+                theme.dim_style(),
+            ));
+        }
+        return;
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  Models",
+            theme
+                .bright_style()
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  {} (UTC) — this device's ledger", day.date),
+            theme.dim_style(),
+        ),
+    ]));
+    lines.push(Line::raw(""));
+
+    // Fold sampled slots by key, then group by model NAME across
+    // providers. (model, role) → [requests, errors, in, out, cache_read,
+    // reasoning]; providers/efforts collected for the annotation line.
+    let key_by_id: std::collections::BTreeMap<u32, &haider_protocol::usage::UsageHistoryKeyV1> =
+        day.keys.iter().map(|k| (k.id, k)).collect();
+    #[derive(Default)]
+    struct ModelFold {
+        providers: std::collections::BTreeSet<String>,
+        efforts: std::collections::BTreeSet<String>,
+        speeds: std::collections::BTreeSet<String>,
+        root: [u64; 6],
+        sub: [u64; 6],
+    }
+    let mut folds: std::collections::BTreeMap<String, ModelFold> =
+        std::collections::BTreeMap::new();
+    for slot in day.slots.iter().flatten() {
+        for row in &slot.rows {
+            let key = key_by_id.get(&row.key_id);
+            let name = key
+                .and_then(|k| k.model.clone())
+                .unwrap_or_else(|| "(unattributed)".to_owned());
+            let fold = folds.entry(name).or_default();
+            if let Some(k) = key {
+                if let Some(p) = &k.provider {
+                    fold.providers.insert(p.clone());
+                }
+                if let Some(e) = &k.effort {
+                    fold.efforts.insert(e.clone());
+                }
+                if let Some(sp) = &k.speed {
+                    fold.speeds.insert(sp.clone());
+                }
+            }
+            let cell = if row.role == UsageHistoryRoleV1::Subagent {
+                &mut fold.sub
+            } else {
+                &mut fold.root
+            };
+            cell[0] += row.requests;
+            cell[1] += row.errors;
+            cell[2] += row.input_tokens;
+            cell[3] += row.output_tokens;
+            cell[4] += row.cache_read_tokens;
+            cell[5] += row.reasoning_tokens;
+        }
+    }
+    if folds.is_empty() {
+        lines.push(Line::styled(
+            "  the day has sampled slots but no lane rows — a measured quiet day",
+            theme.dim_style(),
+        ));
+        return;
+    }
+    let mut ordered: Vec<(String, ModelFold)> = folds.into_iter().collect();
+    ordered.sort_by_key(|(_, f)| {
+        std::cmp::Reverse(f.root[2] + f.root[3] + f.root[5] + f.sub[2] + f.sub[3] + f.sub[5])
+    });
+    for (name, fold) in &ordered {
+        let mut annot = fold
+            .providers
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !fold.efforts.is_empty() {
+            annot.push_str(&format!(
+                " · {}",
+                fold.efforts.iter().cloned().collect::<Vec<_>>().join("/")
+            ));
+        }
+        if !fold.speeds.is_empty() {
+            annot.push_str(&format!(
+                " · {}",
+                fold.speeds.iter().cloned().collect::<Vec<_>>().join("/")
+            ));
+        }
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {name}"), theme.bright_style()),
+            Span::styled(format!("  {annot}"), theme.dim_style()),
+        ]));
+        let row_line = |label: &str, c: &[u64; 6]| {
+            format!(
+                "    {label} — req {} (err {}) · in {} · out {} · cached {} · reasoning {}",
+                c[0],
+                c[1],
+                fmt_tok(c[2]),
+                fmt_tok(c[3]),
+                fmt_tok(c[4]),
+                fmt_tok(c[5]),
+            )
+        };
+        if fold.root.iter().any(|v| *v > 0) {
+            lines.push(Line::styled(
+                row_line("root", &fold.root),
+                theme.text_style(),
+            ));
+        }
+        if fold.sub.iter().any(|v| *v > 0) {
+            lines.push(Line::styled(
+                row_line("subs", &fold.sub),
+                theme.text_style(),
+            ));
+        }
+        lines.push(Line::raw(""));
+    }
+}
+
 /// The 954 History scope: a codex-style token-activity heatmap from the
 /// device-local ledger window (`usage.history_range`).
 ///
@@ -2489,6 +2663,7 @@ fn render_usage(
 
     let global = model.usage.scope == crate::app::UsageScope::Global;
     let history = model.usage.scope == crate::app::UsageScope::History;
+    let models = model.usage.scope == crate::app::UsageScope::Models;
     lines.push(Line::from(vec![
         Span::styled(
             "USAGE",
@@ -2501,6 +2676,7 @@ fn render_usage(
                 crate::app::UsageScope::Accounts => " · accounts",
                 crate::app::UsageScope::Global => " · global",
                 crate::app::UsageScope::History => " · history",
+                crate::app::UsageScope::Models => " · models",
             },
             theme.gold_style(),
         ),
@@ -2535,8 +2711,11 @@ fn render_usage(
     if history {
         render_usage_history(model, theme, &mut lines);
     }
+    if models {
+        render_usage_models(model, theme, &mut lines);
+    }
 
-    if !history && model.cache_usage.has_classified_usage() {
+    if !history && !models && model.cache_usage.has_classified_usage() {
         let cache = model.cache_usage.totals();
         let all_input_share = cache
             .complete_hit_rate()
@@ -2809,7 +2988,10 @@ fn render_usage(
     }
 
     let groups = model.usage.groups();
-    if !history && let Some(report) = &model.usage.report {
+    if !history
+        && !models
+        && let Some(report) = &model.usage.report
+    {
         if report.accounts.is_empty() {
             lines.push(Line::styled(
                 "  no accounts known — /login adds one",

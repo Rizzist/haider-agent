@@ -250,6 +250,10 @@ pub enum LiveCommand {
         through_date: String,
         days: u16,
     },
+    /// `usage.history_day` — one full day READ (954 Models scope).
+    UsageHistoryDay {
+        date: String,
+    },
     /// `session.fleet` — a READ of the daemon's bounded descendant-tree
     /// snapshot (the fleet view, `session_fleet_v1`). Receipt-free, never
     /// outboxed: the open issues one, the event-cadence chase re-reads
@@ -823,6 +827,7 @@ impl LiveCommand {
             | Self::UsageReport
             // 954: the heatmap window is a read (see above).
             | Self::UsageHistoryRange { .. }
+            | Self::UsageHistoryDay { .. }
             // The fleet snapshot is a read (see above).
             | Self::SessionFleet { .. }
             // The graph reduction is a read (see above).
@@ -1028,6 +1033,14 @@ pub enum LiveReply {
     /// 954: the history read failed — typed onto the History scope, never
     /// an empty heatmap (the consumer-boundary law).
     UsageHistoryRangeFailed {
+        message: String,
+    },
+    /// 954 Models: today's committed day answer. `day: None` is the
+    /// daemon's honest "no file yet" — a fact, carried as such.
+    UsageHistoryDay {
+        day: Option<Box<haider_protocol::usage::UsageHistoryDayV1>>,
+    },
+    UsageHistoryDayFailed {
         message: String,
     },
     UsageReportFailed {
@@ -2268,6 +2281,16 @@ impl LiveDriver {
             }
             LiveReply::UsageHistoryRangeFailed { message } => {
                 model.usage.history_failed(&message);
+                model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::UsageHistoryDay { day } => {
+                model.usage.apply_today(day.map(|d| *d));
+                model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::UsageHistoryDayFailed { message } => {
+                model.usage.today_failed(&message);
                 model.dirty = true;
                 Vec::new()
             }
@@ -4661,6 +4684,10 @@ impl LiveDriver {
             AppRequest::UsageHistoryRefresh => vec![LiveCommand::UsageHistoryRange {
                 through_date: crate::format::utc_date_today(),
                 days: 366,
+            }],
+            // 954 Models: today's full day, UTC by the ledger convention.
+            AppRequest::UsageTodayRefresh => vec![LiveCommand::UsageHistoryDay {
+                date: crate::format::utc_date_today(),
             }],
             // Fleet: a read — never outboxed, single-flight (the chase
             // fold lives in `fleet_refresh`).

@@ -405,6 +405,13 @@ fn s_cycles_scope_and_global_renders_compact_overview() {
     model.handle(key(KeyCode::Char('s')));
     let (rows, _) = draw(&model, 110, 30);
     assert!(
+        rows.join("\n").contains("· models"),
+        "the ring's fourth stop is models"
+    );
+
+    model.handle(key(KeyCode::Char('s')));
+    let (rows, _) = draw(&model, 110, 30);
+    assert!(
         rows.join("\n").contains("resets in"),
         "s cycles back to the accounts detail (reset lines return)"
     );
@@ -417,6 +424,101 @@ fn s_cycles_scope_and_global_renders_compact_overview() {
         model.usage.scope,
         UsageScope::Accounts,
         "re-entry resets to the accounts scope"
+    );
+}
+
+/// 954 Models scope: today's day folds by key and groups by MODEL across
+/// providers — one line per model even when two providers served it; root
+/// and subagent lanes fold separately; the daemon's honest "no file yet"
+/// answer renders as the fact it is.
+///
+/// MUTATION CHECK (executed): group by key id instead of model name in
+/// the fold — the cross-provider assertion fails (two gpt-5.6-sol lines).
+#[test]
+fn models_scope_groups_across_providers_and_splits_roles() {
+    use haider_protocol::usage::{
+        UsageHistoryDayV1, UsageHistoryKeyV1, UsageHistoryRoleV1, UsageHistoryRowV1,
+        UsageHistorySlotV1,
+    };
+    let mut model = usage_model();
+    for _ in 0..3 {
+        model.handle(key(KeyCode::Char('s')));
+    }
+    assert_eq!(model.usage.scope, UsageScope::Models);
+
+    // The honest no-file-yet FACT before any day is held.
+    model.usage.apply_today(None);
+    let (rows, _) = draw(&model, 110, 34);
+    assert!(
+        rows.join("\n").contains("no ledger file for today yet"),
+        "the daemon's None answer renders as a fact"
+    );
+
+    let hkey = |id: u32, provider: &str, role_model: &str| UsageHistoryKeyV1 {
+        id,
+        account: Some(format!("{provider}-acct")),
+        provider: Some(provider.into()),
+        model: Some(role_model.into()),
+        api_family: None,
+        effort: Some("xhigh".into()),
+        speed: None,
+    };
+    let row = |key_id: u32, role: UsageHistoryRoleV1, tokens: u64| UsageHistoryRowV1 {
+        key_id,
+        role,
+        requests: 2,
+        errors: 1,
+        input_tokens: tokens,
+        output_tokens: tokens / 10,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        reasoning_tokens: 0,
+    };
+    let mut slots: Vec<Option<UsageHistorySlotV1>> = vec![None; 96];
+    slots[40] = Some(UsageHistorySlotV1 {
+        rows: vec![
+            row(1, UsageHistoryRoleV1::Root, 50_000),
+            row(2, UsageHistoryRoleV1::Subagent, 30_000),
+        ],
+        subagents_spawned: 1,
+    });
+    model.usage.apply_today(Some(UsageHistoryDayV1 {
+        date: "2026-08-25".into(),
+        device_id: "dev-test".into(),
+        backfilled: false,
+        keys: vec![
+            hkey(1, "openai-oauth", "gpt-5.6-sol"),
+            hkey(2, "haider-code", "gpt-5.6-sol"),
+        ],
+        slots,
+        meter_samples: vec![],
+        version_changes: vec![],
+    }));
+    let (rows, _) = draw(&model, 110, 34);
+    let text = rows.join("\n");
+    assert_eq!(
+        text.matches("gpt-5.6-sol").count(),
+        1,
+        "ONE grouped line for the model served by two providers: {text}"
+    );
+    assert!(
+        text.contains("haider-code, openai-oauth"),
+        "both providers annotate the grouped model"
+    );
+    assert!(text.contains("root — req 2"), "the root lane folds");
+    assert!(
+        text.contains("subs — req 2"),
+        "the subagent lane folds separately"
+    );
+
+    // A typed failure never flattens the held day.
+    model.usage.today_failed("socket lost");
+    let (rows, _) = draw(&model, 110, 34);
+    let text = rows.join("\n");
+    assert!(text.contains("day read failed"), "the error is typed");
+    assert!(
+        text.contains("gpt-5.6-sol"),
+        "the held day stays visible under the error"
     );
 }
 

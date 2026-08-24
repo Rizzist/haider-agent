@@ -917,6 +917,9 @@ pub enum UsageScope {
     /// The usage-history heatmap (954 headline's UI): daily totals from
     /// the device-local ledger via `usage.history_range`.
     History,
+    /// Per-model across providers (954): today's UTC day read
+    /// (`usage.history_day`) folded by lane descriptor, grouped by model.
+    Models,
 }
 
 impl UsageScope {
@@ -926,7 +929,8 @@ impl UsageScope {
         match self {
             Self::Accounts => Self::Global,
             Self::Global => Self::History,
-            Self::History => Self::Accounts,
+            Self::History => Self::Models,
+            Self::Models => Self::Accounts,
         }
     }
 }
@@ -978,6 +982,15 @@ pub struct UsageState {
     /// scope, never flattened into an empty heatmap (the consumer-boundary
     /// law: a read failure is not absence).
     pub history_error: Option<String>,
+    /// Today's committed `usage.history_day` (954 Models scope): the full
+    /// day — key dictionary, sampled slots, roles — consumed verbatim.
+    pub today: Option<haider_protocol::usage::UsageHistoryDayV1>,
+    /// `None` day answer for today: the daemon answered "no file yet",
+    /// which is a fact distinct from never-asked and from failed.
+    pub today_absent: bool,
+    pub today_fetching: bool,
+    /// Typed failure for the day read — never flattened into absence.
+    pub today_error: Option<String>,
 }
 
 impl UsageState {
@@ -1014,6 +1027,22 @@ impl UsageState {
     pub fn history_failed(&mut self, message: &str) {
         self.history_fetching = false;
         self.history_error = Some(message.to_owned());
+    }
+
+    /// Install today's committed day answer (954 Models). `day: None` is
+    /// the daemon's honest "no local file for today yet" — recorded as a
+    /// FACT (`today_absent`), never conflated with a failed read.
+    pub fn apply_today(&mut self, day: Option<haider_protocol::usage::UsageHistoryDayV1>) {
+        self.today_absent = day.is_none();
+        self.today = day;
+        self.today_fetching = false;
+        self.today_error = None;
+    }
+
+    /// The day read failed: typed message; held state stays.
+    pub fn today_failed(&mut self, message: &str) {
+        self.today_fetching = false;
+        self.today_error = Some(message.to_owned());
     }
 
     /// The FILTERED provider groups, report order preserved: accounts
@@ -2533,6 +2562,8 @@ pub enum AppRequest {
     UsageRefresh,
     /// 954: the bounded heatmap read (`usage.history_range`).
     UsageHistoryRefresh,
+    /// 954 Models scope: today's full day read (`usage.history_day`).
+    UsageTodayRefresh,
     /// Fetch/refresh the fleet snapshot (`session.fleet`) for the ACTIVE
     /// session. A READ — never outboxed; pushed at fleet-view open, then
     /// chased by the driver on the existing event cadence while the screen
@@ -8504,6 +8535,16 @@ impl AppModel {
                 {
                     self.usage.history_fetching = true;
                     self.requests.push(AppRequest::UsageHistoryRefresh);
+                }
+                if self.usage.scope == UsageScope::Models
+                    && !self.mode.fabricates_locally()
+                    && self.daemon_serves(haider_rpc::FEATURE_USAGE_HISTORY_V1)
+                    && self.usage.today.is_none()
+                    && !self.usage.today_absent
+                    && !self.usage.today_fetching
+                {
+                    self.usage.today_fetching = true;
+                    self.requests.push(AppRequest::UsageTodayRefresh);
                 }
                 self.dirty = true;
             }

@@ -594,6 +594,7 @@ pub struct CommandContext {
     /// as `hooks_list`: the error reply lands on the usage screen.
     usage_report: bool,
     usage_history: bool,
+    usage_today: bool,
     /// This request was a `session.fleet` read (fleet view). Same identity
     /// pattern: the error reply lands on the fleet screen.
     fleet: bool,
@@ -659,6 +660,7 @@ impl CommandContext {
             hooks_list: matches!(command, LiveCommand::HooksList { .. }),
             usage_report: matches!(command, LiveCommand::UsageReport),
             usage_history: matches!(command, LiveCommand::UsageHistoryRange { .. }),
+            usage_today: matches!(command, LiveCommand::UsageHistoryDay { .. }),
             fleet: matches!(command, LiveCommand::SessionFleet { .. }),
             graph: match command {
                 LiveCommand::GraphStatus { session } => Some(session.clone()),
@@ -892,6 +894,7 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
         LiveCommand::UsageHistoryRange { through_date, days } => {
             RequestBody::UsageHistoryRange { through_date, days }
         }
+        LiveCommand::UsageHistoryDay { date } => RequestBody::UsageHistoryDay { date },
         LiveCommand::SessionFleet { session } => RequestBody::SessionFleet {
             session_id: session,
         },
@@ -1352,6 +1355,11 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         ResponseBody::UsageHistoryRange { days, .. } => {
             vec![LiveReply::UsageHistoryRange { days }]
         }
+        // 954 Models: `day: None` is the daemon's honest "no file yet" —
+        // carried as the fact it is, never invented into an empty day.
+        ResponseBody::UsageHistoryDay { day, .. } => vec![LiveReply::UsageHistoryDay {
+            day: day.map(Box::new),
+        }],
         ResponseBody::SessionFleet { snapshot } => vec![LiveReply::Fleet {
             snapshot: Box::new(snapshot),
         }],
@@ -1712,6 +1720,11 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 // into an empty heatmap (the consumer-boundary law).
                 if context.usage_history {
                     return vec![LiveReply::UsageHistoryRangeFailed {
+                        message: message.clone(),
+                    }];
+                }
+                if context.usage_today {
+                    return vec![LiveReply::UsageHistoryDayFailed {
                         message: message.clone(),
                     }];
                 }
