@@ -254,19 +254,21 @@ try:
             # zero is consistent with two very different causes: the store the
             # probe opened contains none of this run's events, or it contains
             # them and no sentinel matched. Those need opposite fixes, and the
-            # counts alone cannot tell them apart. `rows_read` discriminates in
-            # one CI run: zero means the store is empty or unreadable to this
-            # reader; thousands means the store is fine and the matchers are
-            # wrong. Reported unconditionally — a diagnostic behind an env var
-            # is a diagnostic nobody has.
+            # counts alone cannot tell them apart. `rows_read`, `decoded`, and
+            # `blob_skipped_no_msgpack` discriminate in one CI run: zero rows
+            # means the store is empty or unreadable; skipped blobs mean the
+            # dependency is absent; decoded rows with no match mean journaling,
+            # stream placement, or matcher shape needs inspection. Reported
+            # unconditionally — a diagnostic behind an env var is a diagnostic
+            # nobody has.
             "rows_read": 0,
             "decoded": 0,
+            "blob_skipped_no_msgpack": 0,
         }
         connection = sqlite3.connect(
             "file:" + os.path.join(store, "store.sqlite") + "?mode=ro", uri=True
         )
         try:
-            blob_rows = 0
             envelopes = []
             for (envelope,) in connection.execute("select envelope_json from events"):
                 counts["rows_read"] += 1
@@ -279,7 +281,7 @@ try:
 
                         decoded = msgpack.unpackb(envelope, raw=False)
                     except ImportError:
-                        blob_rows += 1
+                        counts["blob_skipped_no_msgpack"] += 1
                         continue
                 else:
                     decoded = json.loads(envelope)
@@ -288,9 +290,15 @@ try:
 
             def is_sentinel_menu(payload):
                 options = payload.get("options", [])
+                kind = payload.get("kind")
                 return (
                     payload.get("type") == "menu_opened"
-                    and payload.get("kind") == "choice"
+                    # MenuKind has serialized as the nested
+                    # {"kind": {"kind": "choice"}} since v0.0.2. The
+                    # v0.0.950 scoped matcher accidentally assumed a flat
+                    # string; the durable payload shape itself never moved.
+                    and isinstance(kind, dict)
+                    and kind.get("kind") == "choice"
                     and payload.get("title") == f"{CARD} choose a target"
                     and payload.get("body") == ["the daemon owns this list"]
                     and payload.get("origin") == "request_input"
@@ -347,9 +355,10 @@ try:
                     in run_coordinates
                     for envelope in envelopes
                 )
-            if blob_rows:
+            if counts["blob_skipped_no_msgpack"]:
                 print(
-                    f"[probe] {blob_rows} msgpack envelope rows skipped — "
+                    f"[probe] {counts['blob_skipped_no_msgpack']} "
+                    "msgpack envelope rows skipped — "
                     "`pip install msgpack` for full coverage"
                 )
         finally:
@@ -661,17 +670,21 @@ for key, label, expected in (
 # defect this line exists to end.
 #
 # Always True: it reports, it does not gate. Zero rows means the store held
-# none of this run's events; many rows means the store was fine and the
-# matchers are wrong. Those need opposite fixes and the counts alone cannot
-# separate them.
+# none of this run's events; many decoded rows mean the store was readable and
+# journaling, stream placement, or matcher shape needs inspection. Those need
+# different fixes and the counts alone cannot separate them.
 _rows = journal["rows_read"] if journal is not None else None
 _decoded = journal["decoded"] if journal is not None else None
+_blob_skipped = journal["blob_skipped_no_msgpack"] if journal is not None else None
 checks.append(
     (
         f"[diagnostic] journal reader saw rows_read="
         f"{_rows if _rows is not None else 'UNAVAILABLE'}"
         f" decoded={_decoded if _decoded is not None else 'UNAVAILABLE'}"
-        f" (0 => store empty/unreadable; many => matchers wrong)",
+        f" blob_skipped_no_msgpack="
+        f"{_blob_skipped if _blob_skipped is not None else 'UNAVAILABLE'}"
+        f" (0 rows => store empty/unreadable; decoded rows with no match => "
+        "inspect journaling/stream/matcher)",
         True,
     )
 )
