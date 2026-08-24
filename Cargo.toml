@@ -77,6 +77,14 @@ expect_used = "warn"
 result_large_err = "allow"
 large_enum_variant = "allow"
 
+[profile.dev]
+# Line tables, not full debuginfo: backtraces still resolve file:line, which
+# is what test triage actually uses, while the debug tree shrinks by tens of
+# gigabytes -- full-variable debuginfo across ~17 crates of test binaries had
+# grown target/debug to 37G, and the resulting disk pressure caused real
+# mid-build cache corruption. Release has used this level all along.
+debug = "line-tables-only"
+
 [profile.release]
 lto = "thin"
 # Emit a separate dSYM (Mach-O), DWP (ELF), or PDB (MSVC), while retaining the
