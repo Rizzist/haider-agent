@@ -3182,7 +3182,11 @@ async fn handle_remove_account(
         }
     }
     // Resolver publication deliberately precedes vault deletion. The public
-    // management snapshot waits for the receipt/revision transaction.
+    // management snapshot waits for the receipt/revision transaction. If the
+    // daemon dies after this projection change but before the durable delete,
+    // the already-durable pending receipt + alias reservation makes startup
+    // repeat both removals. We finalize the durable tombstone only after the
+    // vault delete so an acknowledged remove can never retain live material.
     if let Err(error) = try_refresh_resolver_snapshot(snapshot, accounts) {
         respond_management_error(&job.route, &error);
         return;
@@ -7522,6 +7526,192 @@ fn rotation_trigger_from_error(error: &HaiderError) -> Option<RotationTrigger> {
 
 // ─────────────────────── startup receipt reconciliation ─────────────────────
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DurableAccountMutation {
+    Add,
+    Remove,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DurableAccountHead {
+    command_id: String,
+    revision: u64,
+    mutation: DurableAccountMutation,
+}
+
+fn record_durable_account_head(
+    heads: &mut HashMap<String, DurableAccountHead>,
+    alias: String,
+    candidate: DurableAccountHead,
+) -> Result<(), HaiderError> {
+    match heads.entry(alias) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(candidate);
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            let current = entry.get();
+            if candidate.revision == current.revision
+                && (candidate.command_id != current.command_id
+                    || candidate.mutation != current.mutation)
+            {
+                return Err(HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    "two account mutations share one management revision",
+                    false,
+                ));
+            }
+            if candidate.revision > current.revision {
+                entry.insert(candidate);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reconstructs the durable account lifecycle head for every alias.
+///
+/// Committed login/account.add receipts are durable adds; a committed
+/// account.remove receipt is the corresponding durable tombstone. Receipts
+/// remain replayable, so startup must select by the revision allocated in the
+/// same transaction as each commit instead of treating every historical add
+/// as current state.
+async fn durable_account_heads(
+    store: &SqliteStoreHandle,
+) -> Result<HashMap<String, DurableAccountHead>, HaiderError> {
+    let mut heads = HashMap::new();
+    for row in store.login_receipts().await? {
+        if row.state != "committed" {
+            continue;
+        }
+        let identity: LoginIdentity = serde_json::from_str(&row.request_json).map_err(|error| {
+            HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                format!(
+                    "login receipt {} has undecodable request coordinates: {error}",
+                    row.command_id
+                ),
+                false,
+            )
+        })?;
+        let revision = match row.final_revision {
+            Some(revision) => revision,
+            None => {
+                store
+                    .ensure_committed_management_revision(
+                        row.command_id.clone(),
+                        "account.login_api".to_owned(),
+                    )
+                    .await?
+            }
+        };
+        record_durable_account_head(
+            &mut heads,
+            identity.physical_alias,
+            DurableAccountHead {
+                command_id: row.command_id,
+                revision,
+                mutation: DurableAccountMutation::Add,
+            },
+        )?;
+    }
+    for row in store.account_add_receipts().await? {
+        if row.state != "committed" {
+            continue;
+        }
+        let identity: OAuthReceiptIdentity =
+            serde_json::from_str(&row.request_json).map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    format!(
+                        "OAuth account receipt {} has undecodable coordinates: {error}",
+                        row.command_id
+                    ),
+                    false,
+                )
+            })?;
+        let revision = match row.final_revision {
+            Some(revision) => revision,
+            None => {
+                store
+                    .ensure_committed_management_revision(
+                        row.command_id.clone(),
+                        "account.add".to_owned(),
+                    )
+                    .await?
+            }
+        };
+        record_durable_account_head(
+            &mut heads,
+            identity.alias().to_owned(),
+            DurableAccountHead {
+                command_id: row.command_id,
+                revision,
+                mutation: DurableAccountMutation::Add,
+            },
+        )?;
+    }
+    for row in store
+        .management_receipts(ACCOUNT_REMOVE_METHOD.to_owned())
+        .await?
+    {
+        if row.state != "committed" {
+            continue;
+        }
+        let identity: RemoveIdentity =
+            serde_json::from_str(&row.request_json).map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    format!(
+                        "account.remove receipt {} has undecodable request coordinates: {error}",
+                        row.command_id
+                    ),
+                    false,
+                )
+            })?;
+        let receipt: RemoveReceipt = row
+            .response_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok())
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    format!(
+                        "committed account.remove receipt {} has no response",
+                        row.command_id
+                    ),
+                    false,
+                )
+            })?;
+        if receipt.removed_alias.as_str() != identity.alias {
+            return Err(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                format!(
+                    "committed account.remove receipt {} does not match its fenced alias",
+                    row.command_id
+                ),
+                false,
+            ));
+        }
+        let revision = row.final_revision.ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "committed account.remove receipt has no final revision",
+                false,
+            )
+        })?;
+        record_durable_account_head(
+            &mut heads,
+            identity.alias,
+            DurableAccountHead {
+                command_id: row.command_id,
+                revision,
+                mutation: DurableAccountMutation::Remove,
+            },
+        )?;
+    }
+    Ok(heads)
+}
+
 /// The R10 step-10 `run_inner` startup phase: reconcile pending AND
 /// committed login receipts against vault + descriptor truth.
 ///
@@ -7540,6 +7730,7 @@ pub(crate) async fn reconcile_login_receipts(
     vault: &VaultProvision,
 ) -> Result<(), HaiderError> {
     let rows = store.login_receipts().await?;
+    let durable_heads = durable_account_heads(store).await?;
     let reserved = store
         .reserved_account_aliases()
         .await?
@@ -7565,6 +7756,12 @@ pub(crate) async fn reconcile_login_receipts(
         }
         match row.state.as_str() {
             "committed" => {
+                if !durable_heads.get(alias.as_str()).is_some_and(|head| {
+                    head.mutation == DurableAccountMutation::Add
+                        && head.command_id == row.command_id
+                }) {
+                    continue;
+                }
                 let response: LoginReceiptResponse = match row
                     .response_json
                     .as_deref()
@@ -7625,6 +7822,7 @@ pub(crate) async fn reconcile_oauth_add_receipts(
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: &VaultProvision,
 ) -> Result<(), HaiderError> {
+    let durable_heads = durable_account_heads(store).await?;
     let reserved = store
         .reserved_account_aliases()
         .await?
@@ -7650,6 +7848,12 @@ pub(crate) async fn reconcile_oauth_add_receipts(
         }
         match row.state.as_str() {
             "committed" => {
+                if !durable_heads.get(alias.as_str()).is_some_and(|head| {
+                    head.mutation == DurableAccountMutation::Add
+                        && head.command_id == row.command_id
+                }) {
+                    continue;
+                }
                 let response: AccountAddReceiptResponse = row
                     .response_json
                     .as_deref()
@@ -7772,6 +7976,18 @@ async fn reconcile_remove_receipts(
                 },
             )
             .await?;
+    }
+    // The committed receipt is the durable delete paired with the add
+    // receipts above. Apply only the lifecycle head: an older remove cannot
+    // erase a later re-add of the same alias, and no neighboring alias is
+    // selected by the revision fence.
+    for (alias, head) in durable_account_heads(store).await? {
+        if head.mutation == DurableAccountMutation::Remove {
+            let alias = CredentialAlias::new(alias);
+            if accounts.get(&alias).is_some() {
+                accounts.remove(&alias)?;
+            }
+        }
     }
     Ok(())
 }

@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
-use haider_accounts::{MemoryVault, StoreLike, Vault};
+use haider_accounts::{FileVault, MemoryVault, StoreLike, Vault};
 use haider_daemon::{
     AccountsDependencies, CredentialValidator, DaemonConfig, DaemonDependencies, ValidatedIdentity,
     ValidationError, ValidationFailureKind, VaultProvision,
@@ -625,6 +625,143 @@ async fn committed_receipt_self_heals_a_missing_descriptor_on_restart() {
 
     task.shutdown_handle().request("test complete");
     let _ = task.join().await;
+}
+
+// MUTATION CHECK: replace the production `vault.delete` in account.remove
+// with success/no-op. Expected runtime failure after the fresh daemon reaches
+// Ready: its FileVault still resolves the resurrected durable entry for
+// `restart-removed-account`.
+#[tokio::test]
+async fn account_remove_survives_a_fresh_daemon_on_the_same_profile() {
+    let root = test_root("hacR");
+    let store_dir = root.path().join("store");
+    let config = DaemonConfig::new("profile-remove-restart", &store_dir, root.path());
+    let validator = ScriptedValidator::new(Vec::new());
+    let dependencies = DaemonDependencies {
+        accounts: AccountsDependencies {
+            validator,
+            // Production defaults are intentional: FileVault plus the real
+            // accounts.json projection must both cross this restart.
+            ..AccountsDependencies::default()
+        },
+        ..DaemonDependencies::default()
+    };
+    let task = ready_with_dependencies(&config, dependencies.clone()).await;
+    let mut client = control_client(&config).await;
+
+    let reference = stage_secret(&mut client, "stage-remove-restart", "sk-remove-restart").await;
+    let added = expect_descriptor(
+        request(
+            &mut client,
+            "req-add-remove-restart",
+            login_body(
+                "command-add-remove-restart",
+                &reference,
+                Some("restart-removed-account"),
+            ),
+        )
+        .await,
+    );
+    let revision = match request(
+        &mut client,
+        "req-list-before-remove-restart",
+        RequestBody::AccountList { provider: None },
+    )
+    .await
+    {
+        ResponseBody::AccountList {
+            descriptors,
+            revision: Some(revision),
+            ..
+        } => {
+            assert!(
+                descriptors
+                    .iter()
+                    .any(|account| account.alias == added.alias)
+            );
+            revision
+        }
+        other => panic!("expected revisioned account.list response, got {other:?}"),
+    };
+    match request(
+        &mut client,
+        "req-remove-before-restart",
+        RequestBody::AccountRemove {
+            command_id: CommandId::new("command-remove-before-restart"),
+            alias: added.alias.as_str().to_owned(),
+            expected_revision: Some(revision),
+        },
+    )
+    .await
+    {
+        ResponseBody::AccountRemove {
+            removed_alias,
+            revision: removed_revision,
+            ..
+        } => {
+            assert_eq!(removed_alias, added.alias);
+            assert_eq!(removed_revision, revision + 1);
+        }
+        other => panic!("expected account.remove response, got {other:?}"),
+    }
+
+    // Do not inspect the live list or projection here: those assertions were
+    // the old false-positive premise. Only the successor is allowed to prove
+    // that the durable removal won.
+    drop(client);
+    task.shutdown_handle()
+        .request("restart remove durability test");
+    task.join()
+        .await
+        .unwrap_or_else(|error| panic!("first daemon joins: {error:?}"));
+
+    let restarted = ready_with_dependencies(&config, dependencies).await;
+    let mut after_restart = control_client(&config).await;
+    match request(
+        &mut after_restart,
+        "req-list-after-remove-restart",
+        RequestBody::AccountList { provider: None },
+    )
+    .await
+    {
+        ResponseBody::AccountList { descriptors, .. } => assert!(
+            descriptors
+                .iter()
+                .all(|account| account.alias != added.alias),
+            "fresh daemon resurrected account `{}`",
+            added.alias
+        ),
+        other => panic!("expected account.list after restart, got {other:?}"),
+    }
+    let projection_bytes = std::fs::read(store_dir.join("accounts.json"))
+        .unwrap_or_else(|error| panic!("rewritten account projection: {error}"));
+    let projection: Vec<CredentialDescriptor> = serde_json::from_slice(&projection_bytes)
+        .unwrap_or_else(|error| panic!("accounts.json decodes: {error}"));
+    assert!(
+        projection
+            .iter()
+            .all(|account| account.alias != added.alias),
+        "rewritten projection resurrected account `{}`",
+        added.alias
+    );
+    let file_vault = FileVault::new(store_dir.join("vault"));
+    let physical_alias = haider_daemon::scoped_vault_alias(
+        "profile-remove-restart",
+        &CredentialAlias::new(added.alias.as_str()),
+    );
+    assert!(
+        file_vault.resolve(&physical_alias).is_err(),
+        "fresh daemon retained the durable FileVault entry for removed account `{}`",
+        added.alias
+    );
+
+    restarted
+        .shutdown_handle()
+        .request("remove restart test complete");
+    restarted
+        .join()
+        .await
+        .unwrap_or_else(|error| panic!("restarted daemon joins: {error:?}"));
 }
 
 // R10 platform gate: a vaultless daemon rejects staging AND login with the

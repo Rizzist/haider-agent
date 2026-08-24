@@ -136,8 +136,19 @@ impl Vault for FileVault {
 
     fn delete(&self, alias: &CredentialAlias) -> AccountsResult<()> {
         match std::fs::remove_file(self.path_for(alias)) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            // Match `put`'s durability boundary: unlink is not committed
+            // across a crash until the containing directory is synced.
+            Ok(()) => sync_deleted_root(&self.root),
+            // A retry after an earlier unlink's directory sync failed also
+            // lands here, so sync the still-present root before declaring the
+            // idempotent delete durable.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match self.root.try_exists() {
+                    Ok(true) => sync_deleted_root(&self.root),
+                    Ok(false) => Ok(()),
+                    Err(error) => Err(io_error("inspect vault deletion", &error)),
+                }
+            }
             Err(error) => Err(io_error("delete vault secret", &error)),
         }
     }
@@ -190,6 +201,10 @@ impl Vault for FileVault {
             }
         }
     }
+}
+
+fn sync_deleted_root(root: &std::path::Path) -> AccountsResult<()> {
+    haider_platform::sync_directory(root).map_err(|error| io_error("sync vault deletion", &error))
 }
 
 fn missing(alias: &CredentialAlias) -> haider_protocol::error::HaiderError {

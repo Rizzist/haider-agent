@@ -3528,6 +3528,249 @@ async fn oauth_reconciliation_closes_crash_before_and_after_vault_put() {
     store.close().await.expect("close");
 }
 
+/// The revision-ordered durable lifecycle, not the historical add receipts,
+/// is the authority used to rebuild the account projection.
+///
+/// MUTATION CHECK: stop recording/applying `DurableAccountMutation::Remove`
+/// in startup reconciliation. Expected runtime failure: the fresh projection
+/// below resurrects `removed-on-restart`; the neighbor/re-add assertions also
+/// pin that the tombstone selects only its exact older incarnation.
+#[tokio::test]
+async fn committed_remove_tombstone_beats_only_the_fenced_add_incarnation() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let removed_alias = CredentialAlias::new("removed-on-restart");
+    let neighbor_alias = CredentialAlias::new("neighbor-survives");
+    let login_identity = |alias: &CredentialAlias| LoginIdentity {
+        provider: "anthropic".into(),
+        resolved_model: "claude-test".into(),
+        display_alias: Some(alias.as_str().to_owned()),
+        physical_alias: alias.as_str().to_owned(),
+    };
+    let descriptor = |alias: &CredentialAlias, identity: &str, active: bool| CredentialDescriptor {
+        alias: alias.clone(),
+        provider: "anthropic".into(),
+        base_url: None,
+        auth_method: AuthMethod::ApiKey,
+        identity: identity.into(),
+        status: CredentialStatus::Ok,
+        active,
+        label: None,
+    };
+
+    for (command, alias, identity, active) in [
+        (
+            "add-removed-old",
+            &removed_alias,
+            "removed old incarnation",
+            true,
+        ),
+        (
+            "add-neighbor",
+            &neighbor_alias,
+            "neighbor incarnation",
+            false,
+        ),
+    ] {
+        let coordinates = login_identity(alias);
+        let request_json = coordinates.canonical_json().expect("login coordinates");
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        assert!(matches!(
+            store
+                .login_claim_receipt(command.into(), request_digest, request_json)
+                .await
+                .expect("claim login"),
+            LoginClaim::Fresh
+        ));
+        store
+            .finalize_login_receipt(
+                command.into(),
+                LoginReceiptResponse {
+                    descriptor: descriptor(alias, identity, active),
+                },
+            )
+            .await
+            .expect("finalize login");
+    }
+
+    let remove_identity = RemoveIdentity {
+        alias: removed_alias.as_str().to_owned(),
+        expected_revision: Some(2),
+    };
+    let (request_json, request_digest) = command_json(&remove_identity).expect("remove identity");
+    let recovery_json = serde_json::to_string(&RemoveRecovery {
+        provider: "anthropic".into(),
+        was_active: true,
+    })
+    .expect("remove recovery");
+    assert!(matches!(
+        store
+            .account_remove_claim_receipt::<RemoveReceipt>(
+                "remove-fenced-account".into(),
+                request_digest,
+                request_json,
+                recovery_json,
+                Some(2),
+                removed_alias.as_str().to_owned(),
+                "anthropic".into(),
+                true,
+            )
+            .await
+            .expect("claim remove"),
+        ManagementClaim::Fresh
+    ));
+    assert_eq!(
+        store
+            .finalize_account_remove_receipt(
+                "remove-fenced-account".into(),
+                RemoveReceipt {
+                    removed_alias: removed_alias.clone(),
+                    replacement_active_alias: Some(neighbor_alias.clone()),
+                },
+            )
+            .await
+            .expect("finalize remove"),
+        3
+    );
+
+    // Even a stale/tampered projection is rewritten from the committed head:
+    // only the fenced alias is deleted and its neighbor is promoted.
+    let mut stale_projection = memory_accounts();
+    stale_projection
+        .add(descriptor(&removed_alias, "stale projection", true))
+        .expect("stale removed descriptor");
+    stale_projection
+        .add(descriptor(&neighbor_alias, "neighbor incarnation", false))
+        .expect("neighbor descriptor");
+    reconcile_remove_receipts(
+        &store,
+        &mut stale_projection,
+        &VaultProvision::Available(Arc::new(MemoryVault::new()) as Arc<dyn Vault>),
+    )
+    .await
+    .expect("apply committed tombstone");
+    assert!(stale_projection.get(&removed_alias).is_none());
+    assert!(
+        stale_projection
+            .get(&neighbor_alias)
+            .is_some_and(|neighbor| neighbor.active)
+    );
+
+    let mut restarted = memory_accounts();
+    let vault = VaultProvision::Available(Arc::new(MemoryVault::new()) as Arc<dyn Vault>);
+    reconcile_login_receipts(&store, &mut restarted, &vault)
+        .await
+        .expect("rebuild after remove");
+    assert!(
+        restarted.get(&removed_alias).is_none(),
+        "the durable tombstone must beat the historical add receipt"
+    );
+    assert!(restarted.get(&neighbor_alias).is_some());
+
+    // A later OAuth add receives a later revision and is therefore a distinct
+    // live incarnation, even across add families; the old API-key remove must
+    // not become a permanent alias ban.
+    let readd_identity = OAuthAddIdentity {
+        provider: "fake-oauth".into(),
+        display_alias: removed_alias.as_str().to_owned(),
+        physical_alias: removed_alias.as_str().to_owned(),
+        auth_method: "oauth".into(),
+    };
+    let request_json = readd_identity.canonical_json().expect("re-add coordinates");
+    let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+    assert_eq!(
+        store
+            .account_add_claim_receipt("readd-removed".into(), request_digest, request_json)
+            .await
+            .expect("claim re-add"),
+        AccountAddClaim::Fresh
+    );
+    assert_eq!(
+        store
+            .finalize_account_add_receipt(
+                "readd-removed".into(),
+                AccountAddReceiptResponse {
+                    descriptor: CredentialDescriptor {
+                        alias: removed_alias.clone(),
+                        provider: "fake-oauth".into(),
+                        base_url: None,
+                        auth_method: AuthMethod::OAuth,
+                        identity: "new OAuth incarnation".into(),
+                        status: CredentialStatus::Ok,
+                        active: true,
+                        label: None,
+                    },
+                },
+            )
+            .await
+            .expect("finalize re-add"),
+        4
+    );
+    let mut restarted_after_readd = memory_accounts();
+    reconcile_login_receipts(&store, &mut restarted_after_readd, &vault)
+        .await
+        .expect("rebuild after re-add");
+    reconcile_oauth_add_receipts(&store, &mut restarted_after_readd, &vault)
+        .await
+        .expect("rebuild OAuth re-add");
+    assert!(restarted_after_readd.get(&neighbor_alias).is_some());
+    assert!(
+        restarted_after_readd
+            .get(&removed_alias)
+            .is_some_and(|account| account.identity == "new OAuth incarnation")
+    );
+
+    // The request identity is the revision-fenced authority. A corrupt
+    // response naming a neighbor must fail closed before projection mutation.
+    let corrupt_identity = RemoveIdentity {
+        alias: "fenced-alias-not-neighbor".into(),
+        expected_revision: Some(4),
+    };
+    let (request_json, request_digest) =
+        command_json(&corrupt_identity).expect("corrupt remove identity");
+    let recovery_json = serde_json::to_string(&RemoveRecovery {
+        provider: "anthropic".into(),
+        was_active: false,
+    })
+    .expect("corrupt remove recovery");
+    assert!(matches!(
+        store
+            .account_remove_claim_receipt::<RemoveReceipt>(
+                "corrupt-remove-response".into(),
+                request_digest,
+                request_json,
+                recovery_json,
+                Some(4),
+                corrupt_identity.alias.clone(),
+                "anthropic".into(),
+                false,
+            )
+            .await
+            .expect("claim corrupt fixture"),
+        ManagementClaim::Fresh
+    ));
+    store
+        .finalize_account_remove_receipt(
+            "corrupt-remove-response".into(),
+            RemoveReceipt {
+                removed_alias: neighbor_alias.clone(),
+                replacement_active_alias: None,
+            },
+        )
+        .await
+        .expect("finalize corrupt fixture");
+    let error = reconcile_remove_receipts(&store, &mut restarted_after_readd, &vault)
+        .await
+        .expect_err("mismatched remove alias must fail closed");
+    assert_eq!(error.code, ErrorCode::StoreCorrupt);
+    assert!(
+        restarted_after_readd.get(&neighbor_alias).is_some(),
+        "a corrupt remove response must never select its named neighbor"
+    );
+
+    store.close().await.expect("close");
+}
+
 #[tokio::test]
 async fn refresh_cas_ignores_benign_status_and_selection_changes() {
     let revision_dir = test_store_dir();
