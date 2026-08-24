@@ -1403,7 +1403,12 @@ fn render_launcher(
 /// The custom-provider card lines (add, edit, or the HF preset) —
 /// shared by the /accounts and /providers renderers (W10b: the card
 /// opens from either screen and must be VISIBLE from either).
-fn push_custom_card_lines<'a>(model: &'a AppModel, theme: &Theme, lines_out: &mut Vec<Line<'a>>) {
+fn push_custom_card_lines<'a>(
+    model: &'a AppModel,
+    theme: &Theme,
+    lines_out: &mut Vec<Line<'a>>,
+    rects_out: &mut Vec<(usize, u16, u16, Hit)>,
+) {
     if let Some(card) = &model.custom_add {
         // G4b: the enterprise kinds retitle the SAME card and relabel its
         // fields; Generic stays byte-for-byte.
@@ -1440,7 +1445,6 @@ fn push_custom_card_lines<'a>(model: &'a AppModel, theme: &Theme, lines_out: &mu
             if let crate::app::CustomPhase::Editing { error: Some(error) } = &card.phase {
                 lines_out.push(Line::styled(format!("  ✗ {error}"), theme.err_style()));
             }
-            let caret = |focused: bool| if focused { "▏" } else { "" };
             use crate::app::CustomCardKind;
             // Per-kind field roster: (label, value, field).
             let fields: Vec<(&str, &String, crate::app::CustomField)> = match card.kind {
@@ -1472,12 +1476,30 @@ fn push_custom_card_lines<'a>(model: &'a AppModel, theme: &Theme, lines_out: &mu
                 } else {
                     theme.text_style()
                 };
+                let prefix = format!("  {label} ❯ ");
+                if card.can_edit_field(field) {
+                    rects_out.push((
+                        lines_out.len(),
+                        u16::try_from(prefix.chars().count()).unwrap_or(u16::MAX),
+                        u16::MAX,
+                        Hit::CustomProviderField {
+                            attempt: card.attempt,
+                            field,
+                        },
+                    ));
+                }
+                let rendered_value = if editing && card.focus == field && card.can_edit_field(field)
+                {
+                    let byte = value
+                        .char_indices()
+                        .nth(card.cursor)
+                        .map_or(value.len(), |(byte, _)| byte);
+                    format!("{}▏{}", &value[..byte], &value[byte..])
+                } else {
+                    value.clone()
+                };
                 lines_out.push(Line::styled(
-                    format!(
-                        "  {label} ❯ {}{}",
-                        value,
-                        caret(editing && card.focus == field)
-                    ),
+                    format!("{prefix}{rendered_value}"),
                     field_style,
                 ));
             }
@@ -1886,7 +1908,7 @@ fn render_accounts(
     // tui.js:3629-3682). Demo = the sim's verbatim fabrication card; live
     // = the editable name/origin fields (the provider.configure front
     // door).
-    push_custom_card_lines(model, theme, &mut footer_lines);
+    push_custom_card_lines(model, theme, &mut footer_lines, &mut add_button_rects);
     push_account_add_buttons(model, theme, &mut footer_lines, &mut add_button_rects);
     footer_lines.push(Line::raw(""));
     footer_lines.push(Line::styled(
@@ -1972,7 +1994,7 @@ fn render_providers(
             theme.dim_style(),
         ),
     ]));
-    push_custom_card_lines(model, theme, &mut lines);
+    push_custom_card_lines(model, theme, &mut lines, &mut chip_hits);
     if let Some(message) = &model.providers.message {
         lines.push(Line::styled(message.clone(), theme.gold_style()));
     }

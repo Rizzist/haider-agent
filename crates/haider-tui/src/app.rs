@@ -626,13 +626,17 @@ pub struct CustomProviderCard {
     /// the card asks for the one the server actually serves.
     pub model: String,
     pub focus: CustomField,
+    /// Caret offset in the focused field, counted in Unicode scalar values
+    /// rather than bytes. Every edit converts this to a byte boundary only
+    /// at the final `String` operation, so UTF-8 is never split.
+    pub cursor: usize,
     pub phase: CustomPhase,
     /// Attempt identity (the card discipline): every driver reply must
     /// correlate to it or die silently.
     pub attempt: u64,
-    /// W10b: editing an EXISTING provider — identity fields (name, origin)
-    /// are locked; only the model line is typed (`provider.configure`
-    /// update semantics: supplied identity must match exactly).
+    /// W10b: editing an EXISTING provider — the provider NAME is the locked
+    /// identity; origin and model are mutable. Create cards keep all of their
+    /// prefilled fields editable.
     pub edit: bool,
     /// G4a: an auth-None (keyless) preset — the configure carries
     /// `auth_requirement: none` and commit SKIPS the key card, going
@@ -642,6 +646,132 @@ pub struct CustomProviderCard {
     pub kind: CustomCardKind,
     /// G4b: the vertex LOCATION field; empty for every other kind.
     pub extra: String,
+}
+
+impl CustomProviderCard {
+    fn has_field(&self, field: CustomField) -> bool {
+        matches!(
+            (self.kind, field),
+            (
+                CustomCardKind::Generic | CustomCardKind::Azure,
+                CustomField::Name | CustomField::Origin | CustomField::Model
+            ) | (CustomCardKind::Bedrock, CustomField::Origin)
+                | (
+                    CustomCardKind::Vertex,
+                    CustomField::Origin | CustomField::Extra
+                )
+        )
+    }
+
+    /// The single field-lock authority used by keyboard, paste, mouse, and
+    /// rendering. `provider` is the update identity, so edit-mode Name never
+    /// reaches a mutation operation; create-mode prefills remain ordinary
+    /// editable values.
+    pub(crate) fn can_edit_field(&self, field: CustomField) -> bool {
+        matches!(self.phase, CustomPhase::Editing { .. })
+            && self.has_field(field)
+            && !(self.edit && field == CustomField::Name)
+    }
+
+    fn field_value(&self, field: CustomField) -> &str {
+        match field {
+            CustomField::Name => &self.name,
+            CustomField::Origin => &self.origin,
+            CustomField::Model => &self.model,
+            CustomField::Extra => &self.extra,
+        }
+    }
+
+    fn field_value_mut(&mut self, field: CustomField) -> &mut String {
+        match field {
+            CustomField::Name => &mut self.name,
+            CustomField::Origin => &mut self.origin,
+            CustomField::Model => &mut self.model,
+            CustomField::Extra => &mut self.extra,
+        }
+    }
+
+    fn focus_at(&mut self, field: CustomField, character: usize) -> bool {
+        if !self.can_edit_field(field) {
+            return false;
+        }
+        self.focus = field;
+        self.cursor = character.min(self.field_value(field).chars().count());
+        true
+    }
+
+    fn focus_end(&mut self, field: CustomField) {
+        self.focus = field;
+        self.cursor = self.field_value(field).chars().count();
+    }
+
+    fn insert_char(&mut self, character: char) -> bool {
+        if !self.can_edit_field(self.focus) {
+            return false;
+        }
+        let cursor = self
+            .cursor
+            .min(self.field_value(self.focus).chars().count());
+        let byte = byte_index_at_character(self.field_value(self.focus), cursor);
+        self.field_value_mut(self.focus).insert(byte, character);
+        self.cursor = cursor + 1;
+        true
+    }
+
+    fn backspace(&mut self) -> bool {
+        if !self.can_edit_field(self.focus) || self.cursor == 0 {
+            return false;
+        }
+        let cursor = self
+            .cursor
+            .min(self.field_value(self.focus).chars().count());
+        if cursor == 0 {
+            return false;
+        }
+        let start = byte_index_at_character(self.field_value(self.focus), cursor - 1);
+        let end = byte_index_at_character(self.field_value(self.focus), cursor);
+        self.field_value_mut(self.focus)
+            .replace_range(start..end, "");
+        self.cursor = cursor - 1;
+        true
+    }
+
+    fn delete_forward(&mut self) -> bool {
+        if !self.can_edit_field(self.focus) {
+            return false;
+        }
+        let characters = self.field_value(self.focus).chars().count();
+        let cursor = self.cursor.min(characters);
+        if cursor == characters {
+            return false;
+        }
+        let start = byte_index_at_character(self.field_value(self.focus), cursor);
+        let end = byte_index_at_character(self.field_value(self.focus), cursor + 1);
+        self.field_value_mut(self.focus)
+            .replace_range(start..end, "");
+        self.cursor = cursor;
+        true
+    }
+
+    fn move_left(&mut self) -> bool {
+        if !self.can_edit_field(self.focus) || self.cursor == 0 {
+            return false;
+        }
+        self.cursor -= 1;
+        true
+    }
+
+    fn move_right(&mut self) -> bool {
+        if !self.can_edit_field(self.focus) {
+            return false;
+        }
+        let end = self.field_value(self.focus).chars().count();
+        if self.cursor >= end {
+            return false;
+        }
+        self.cursor += 1;
+        true
+    }
 }
 
 /// The `/providers` screen state (report §5.2). Same daemon-truth law as
@@ -1893,6 +2023,22 @@ fn alias_char(c: char) -> Option<char> {
     (c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-')).then_some(c)
 }
 
+fn byte_index_at_character(value: &str, character: usize) -> usize {
+    value
+        .char_indices()
+        .nth(character)
+        .map_or(value.len(), |(byte, _)| byte)
+}
+
+fn insert_custom_card_character(card: &mut CustomProviderCard, character: char) -> bool {
+    match card.focus {
+        CustomField::Name => alias_char(character).is_some_and(|c| card.insert_char(c)),
+        CustomField::Origin | CustomField::Model | CustomField::Extra => {
+            !character.is_control() && card.insert_char(character)
+        }
+    }
+}
+
 /// The smallest free alias on `base`: `base`, then `base-2`, `base-3`, …
 /// against the CURRENT management snapshot (§5.3). The daemon recanonizes
 /// and rechecks at commit, so a concurrent client losing this race gets a
@@ -2423,9 +2569,9 @@ pub enum AppRequest {
     },
     /// Cancel the card's flow (`account.oauth_cancel` when one is bound).
     OAuthAddCancel { attempt: u64 },
-    /// Create a custom OpenAI-compatible provider (`provider.configure`,
-    /// W5g-4). Always a CREATE from the card: identity fields ride along
-    /// and the daemon rejects a collision with an existing profile.
+    /// Create or edit a custom OpenAI-compatible provider
+    /// (`provider.configure`, W5g-4/W10b). The provider name is the stable
+    /// identity; origin and model are mutable under the daemon revision CAS.
     ProviderConfigure {
         attempt: u64,
         name: String,
@@ -2710,6 +2856,13 @@ pub enum Hit {
         surface: DraftKey,
         revision: u64,
         epoch: u64,
+    },
+    /// One editable custom-provider field. The attempt binds a one-frame-old
+    /// hit to the exact card that rendered it; mouse dispatch derives the
+    /// character offset from the paired rect's value-column origin.
+    CustomProviderField {
+        attempt: u64,
+        field: CustomField,
     },
     /// One `/accounts` row, by its GLOBAL alias (value-carrying: a stale
     /// rect can only ever select the row it was measured on).
@@ -4835,6 +4988,17 @@ impl AppModel {
                 // draft, no ring).
                 if let Some(card) = self.login.as_mut() {
                     card.push_str(text);
+                    return;
+                }
+                // The custom-provider card owns paste exactly as it owns
+                // typing. Insert at its character-indexed caret; demo cards
+                // remain the sim's non-editable fabrication menu.
+                if let Some(card) = self.custom_add.as_mut() {
+                    if !self.mode.fabricates_locally() {
+                        for character in text.chars() {
+                            insert_custom_card_character(card, character);
+                        }
+                    }
                     return;
                 }
                 // The `/talk` setup card: paste lands in the FOCUSED field
@@ -8781,11 +8945,14 @@ impl AppModel {
             .collect();
         self.custom_attempt_seq += 1;
         self.accounts.message = None;
+        let name = smallest_free_alias("custom", &taken);
+        let cursor = name.chars().count();
         self.custom_add = Some(CustomProviderCard {
-            name: smallest_free_alias("custom", &taken),
+            name,
             origin: "http://127.0.0.1:8000/v1".to_owned(),
             model: String::new(),
             focus: CustomField::Name,
+            cursor,
             phase: CustomPhase::Editing { error: None },
             attempt: self.custom_attempt_seq,
             edit: false,
@@ -8797,8 +8964,8 @@ impl AppModel {
     }
 
     /// W10b: the edit card — the SAME custom card prefilled from the
-    /// summary with identity locked; ⏎ re-configures mutable fields under
-    /// the current revision (the daemon refuses identity drift with a
+    /// summary with its name locked; ⏎ re-configures origin/model under the
+    /// current revision (the daemon refuses unsupported origin drift with a
     /// typed reason — builtins included; the client never pre-judges).
     fn open_custom_edit(&mut self, summary: &haider_rpc::ProviderSummaryWire) {
         if self.custom_add.is_some() || self.oauth_add.is_some() {
@@ -8812,15 +8979,18 @@ impl AppModel {
             return;
         }
         self.custom_attempt_seq += 1;
+        let model = summary
+            .default_model
+            .clone()
+            .or_else(|| summary.models.first().cloned())
+            .unwrap_or_default();
+        let cursor = model.chars().count();
         self.custom_add = Some(CustomProviderCard {
             name: summary.provider.clone(),
             origin: summary.endpoint.clone().unwrap_or_default(),
-            model: summary
-                .default_model
-                .clone()
-                .or_else(|| summary.models.first().cloned())
-                .unwrap_or_default(),
+            model,
             focus: CustomField::Model,
+            cursor,
             phase: CustomPhase::Editing { error: None },
             attempt: self.custom_attempt_seq,
             edit: true,
@@ -8904,6 +9074,7 @@ impl AppModel {
             origin: "https://".to_owned(),
             model: String::new(),
             focus: CustomField::Origin,
+            cursor: "https://".chars().count(),
             phase: CustomPhase::Editing { error: None },
             attempt: self.custom_attempt_seq,
             edit: false,
@@ -8977,11 +9148,13 @@ impl AppModel {
             }
         };
         self.custom_attempt_seq += 1;
+        let cursor = origin.chars().count();
         self.custom_add = Some(CustomProviderCard {
             name: provider.to_owned(),
             origin,
             model: String::new(),
             focus: CustomField::Origin,
+            cursor,
             phase: CustomPhase::Editing { error: None },
             attempt: self.custom_attempt_seq,
             edit: false,
@@ -9036,6 +9209,7 @@ impl AppModel {
             origin: origin.to_owned(),
             model: String::new(),
             focus: CustomField::Model,
+            cursor: 0,
             phase: CustomPhase::Editing { error: None },
             attempt: self.custom_attempt_seq,
             edit: false,
@@ -9085,12 +9259,12 @@ impl AppModel {
             return;
         }
         if !account_alias_ok(&card.name) {
-            card.focus = CustomField::Name;
+            card.focus_end(CustomField::Name);
             self.dirty = true;
             return;
         }
         if card.origin.trim().is_empty() {
-            card.focus = CustomField::Origin;
+            card.focus_end(CustomField::Origin);
             self.dirty = true;
             return;
         }
@@ -9101,7 +9275,7 @@ impl AppModel {
         if matches!(card.kind, CustomCardKind::Generic | CustomCardKind::Azure)
             && card.model.trim().is_empty()
         {
-            card.focus = CustomField::Model;
+            card.focus_end(CustomField::Model);
             self.dirty = true;
             return;
         }
@@ -9250,7 +9424,7 @@ impl AppModel {
                 if let Some(card) = self.custom_add.as_mut()
                     && matches!(card.phase, CustomPhase::Editing { .. })
                 {
-                    card.focus = if card.edit {
+                    let next = if card.edit {
                         // A custom provider's endpoint is repointable in
                         // place: NAME stays the locked stable identity, but
                         // Origin and Model both take focus so the endpoint
@@ -9272,6 +9446,7 @@ impl AppModel {
                             (_, CustomField::Model | CustomField::Extra) => CustomField::Name,
                         }
                     };
+                    card.focus_end(next);
                     self.dirty = true;
                 }
             }
@@ -9279,7 +9454,7 @@ impl AppModel {
                 if let Some(card) = self.custom_add.as_mut()
                     && matches!(card.phase, CustomPhase::Editing { .. })
                 {
-                    card.focus = if card.edit {
+                    let next = if card.edit {
                         // Mirror Tab in edit mode: origin ↔ model only, the
                         // identity line stays locked in both directions.
                         match card.focus {
@@ -9296,66 +9471,86 @@ impl AppModel {
                             (_, CustomField::Model | CustomField::Extra) => CustomField::Origin,
                         }
                     };
+                    card.focus_end(next);
                     self.dirty = true;
                 }
             }
             KeyCode::Backspace => {
                 if let Some(card) = self.custom_add.as_mut()
-                    && matches!(card.phase, CustomPhase::Editing { .. })
+                    && card.backspace()
                 {
-                    match card.focus {
-                        CustomField::Name => {
-                            card.name.pop();
-                        }
-                        CustomField::Origin => {
-                            card.origin.pop();
-                        }
-                        CustomField::Model => {
-                            card.model.pop();
-                        }
-                        CustomField::Extra => {
-                            card.extra.pop();
-                        }
-                    }
                     self.dirty = true;
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(card) = self.custom_add.as_mut()
+                    && card.delete_forward()
+                {
+                    self.dirty = true;
+                }
+            }
+            KeyCode::Left => {
+                if let Some(card) = self.custom_add.as_mut()
+                    && card.move_left()
+                {
+                    self.dirty = true;
+                }
+            }
+            KeyCode::Right => {
+                if let Some(card) = self.custom_add.as_mut()
+                    && card.move_right()
+                {
+                    self.dirty = true;
+                }
+            }
+            KeyCode::Home => {
+                if let Some(card) = self.custom_add.as_mut()
+                    && card.can_edit_field(card.focus)
+                    && card.cursor != 0
+                {
+                    card.cursor = 0;
+                    self.dirty = true;
+                }
+            }
+            KeyCode::End => {
+                if let Some(card) = self.custom_add.as_mut()
+                    && card.can_edit_field(card.focus)
+                {
+                    let end = card.field_value(card.focus).chars().count();
+                    if card.cursor != end {
+                        card.cursor = end;
+                        self.dirty = true;
+                    }
                 }
             }
             KeyCode::Char(c) => {
                 if let Some(card) = self.custom_add.as_mut()
-                    && matches!(card.phase, CustomPhase::Editing { .. })
+                    && insert_custom_card_character(card, c)
                 {
-                    match card.focus {
-                        // The name is a provider id — alias grammar.
-                        CustomField::Name => {
-                            if let Some(c) = alias_char(c) {
-                                card.name.push(c);
-                                self.dirty = true;
-                            }
-                        }
-                        // The origin is a URL, the model a free-form
-                        // server id (`llama3.1:8b`) — any printable.
-                        CustomField::Origin => {
-                            if !c.is_control() {
-                                card.origin.push(c);
-                                self.dirty = true;
-                            }
-                        }
-                        CustomField::Model => {
-                            if !c.is_control() {
-                                card.model.push(c);
-                                self.dirty = true;
-                            }
-                        }
-                        CustomField::Extra => {
-                            if !c.is_control() {
-                                card.extra.push(c);
-                                self.dirty = true;
-                            }
-                        }
-                    }
+                    self.dirty = true;
                 }
             }
             _ => {}
+        }
+    }
+
+    /// A mouse press inside a rendered custom-provider value. The hit's
+    /// attempt rejects stale frames, and `focus_at` clamps clicks beyond the
+    /// current character count while retaining the edit-mode Name lock.
+    pub(crate) fn custom_provider_field_press(
+        &mut self,
+        attempt: u64,
+        field: CustomField,
+        character: usize,
+    ) {
+        if !matches!(self.screen, Screen::Accounts | Screen::Providers) {
+            return;
+        }
+        if let Some(card) = self.custom_add.as_mut()
+            && card.attempt == attempt
+            && card.focus_at(field, character)
+        {
+            self.dirty = true;
         }
     }
 

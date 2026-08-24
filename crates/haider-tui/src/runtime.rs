@@ -739,6 +739,13 @@ pub fn dispatch_input(
                         model.composer_press(start, &content, col, surface, revision, epoch);
                         return;
                     }
+                    if let Some((rect, crate::app::Hit::CustomProviderField { attempt, field })) =
+                        hit_rect_at(hit_map, mouse.column, mouse.row)
+                    {
+                        let character = usize::from(mouse.column.saturating_sub(rect.x));
+                        model.custom_provider_field_press(attempt, field, character);
+                        return;
+                    }
                     model.mouse_down = Some((mouse.column, mouse.row));
                 }
                 // Movement with the button held: meaningful movement (a

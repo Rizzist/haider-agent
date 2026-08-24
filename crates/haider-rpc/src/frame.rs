@@ -2275,9 +2275,11 @@ pub enum RequestBody {
     #[serde(rename = "provider.models_refresh")]
     ProviderModelsRefresh { provider: String },
     /// Creates a custom provider or safely updates mutable fields on an
-    /// existing profile. Identity fields are required on create and may be
-    /// omitted on update; when supplied for an existing profile they must
-    /// match exactly.
+    /// existing profile. API family and auth requirement are create-only;
+    /// the `provider` key remains the stable identity. A custom provider's
+    /// origin may be changed on update (under `expected_revision`); fixed
+    /// release-owned origins remain immutable except for explicitly
+    /// shape-validated enterprise configuration surfaces.
     #[serde(rename = "provider.configure")]
     ProviderConfigure {
         command_id: CommandId,

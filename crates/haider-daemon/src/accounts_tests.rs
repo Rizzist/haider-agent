@@ -4762,6 +4762,114 @@ async fn custom_provider_origin_repoint_updates_stored_origin_and_revision() {
     store.close().await.expect("close store");
 }
 
+/// MUTATION-CHECK (origin CAS): ignore `expected_revision` in both the fresh
+/// configure preflight and receipt claim. Expected RUNTIME failure: the stale
+/// origin-only repoint below succeeds at revision 2 instead of returning the
+/// typed `revision_conflict`, and the stored endpoint changes.
+#[tokio::test]
+async fn stale_expected_revision_refuses_origin_only_repoint() {
+    let original_origin = "https://original-models.example.invalid/v1";
+    let current_origin = "https://current-models.example.invalid/v1";
+    let stale_origin = "https://stale-models.example.invalid/v1";
+    let provider_store =
+        EndpointEditProviderStore::new(vec![endpoint_edit_profile("custom", original_origin)]);
+    let providers = endpoint_edit_registry(provider_store.clone(), &["custom"]);
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let validation_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
+    let mut actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts: memory_accounts(),
+        vault: Arc::new(MemoryVault::new()),
+        validator: Arc::new(ProviderCredentialValidator),
+        snapshot: Arc::new(StdMutex::new(Vec::new())),
+        management: Some(management),
+        profile_id: "endpoint-repoint-stale".to_owned(),
+        default_model: "unused".to_owned(),
+        providers,
+        provider_endpoint_validator: Arc::new(EndpointEditCanonicalValidator {
+            calls: Arc::clone(&validation_calls),
+        }),
+        reserved_aliases: HashSet::new(),
+        refresh_fences: RefreshFenceRegistry::default(),
+    });
+    let commands = actor.commands();
+    let (sink, mut frames) = channel_sink();
+
+    commands
+        .send(endpoint_configure_command(
+            &sink,
+            "custom-origin-current",
+            endpoint_repoint_input("custom", current_origin),
+            0,
+        ))
+        .await
+        .expect("send current repoint");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("current repoint deadline")
+            .expect("current repoint response"),
+        WireFrame::Response {
+            body: ResponseBody::ProviderConfigure { revision: 1, .. },
+            ..
+        }
+    ));
+
+    // Every semantic field except origin is unchanged. The revision is the
+    // stale snapshot observed before the successful repoint above.
+    commands
+        .send(endpoint_configure_command(
+            &sink,
+            "custom-origin-stale",
+            endpoint_repoint_input("custom", stale_origin),
+            0,
+        ))
+        .await
+        .expect("send stale repoint");
+    match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("stale repoint deadline")
+        .expect("stale repoint response")
+    {
+        WireFrame::Response {
+            body:
+                ResponseBody::Error {
+                    code,
+                    retryable,
+                    data:
+                        Some(ErrorData::RevisionConflict {
+                            expected_revision,
+                            current_revision,
+                        }),
+                    ..
+                },
+            ..
+        } => {
+            assert_eq!(code, ERROR_CODE_REVISION_CONFLICT);
+            assert!(retryable);
+            assert_eq!(expected_revision, 0);
+            assert_eq!(current_revision, 1);
+        }
+        other => panic!("unexpected stale repoint response: {other:?}"),
+    }
+    assert_eq!(
+        validation_calls.load(Ordering::SeqCst),
+        1,
+        "the stale command is refused before endpoint validation"
+    );
+    assert_eq!(store.management_revision().await.expect("revision"), 1);
+    assert_eq!(
+        provider_store.snapshot()[0].base_url.as_deref(),
+        Some(current_origin),
+        "a stale origin is never merged"
+    );
+
+    actor.shutdown().await;
+    store.close().await.expect("close store");
+}
+
 /// MUTATION-CHECK: remove the changed-custom-origin arm from
 /// `handle_provider_configure`. Expected RUNTIME failure: the link-local
 /// repoint bypasses `ProductionProviderEndpointValidator`, succeeds, and

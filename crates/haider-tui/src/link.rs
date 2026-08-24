@@ -1107,9 +1107,10 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             worker_generation,
             agent_type,
         },
-        // W5g-4: the card CREATES — identity fields are fixed here, never
-        // typed. The origin string is data on the wire only; it is never
-        // interpolated into a shell or browser command (report §4.4).
+        // W5g-4/W10b: the card creates or edits under a fixed provider
+        // name; custom origins may be repointed. The origin string is data
+        // on the wire only; it is never interpolated into a shell or browser
+        // command (report §4.4).
         // G4a: keyless presets carry `auth_requirement: none` — the only
         // identity difference from a keyed custom.
         LiveCommand::ConfigureProvider {

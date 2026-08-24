@@ -512,12 +512,12 @@ pub enum LiveCommand {
         agent_type: Option<String>,
     },
     /// `provider.configure` for a custom OpenAI-compatible provider
-    /// (W5g-4) or a G4b enterprise builtin. Identity fields are fixed by
-    /// the card: the stated family, api-key auth (or auth NONE for the G4a
-    /// keyless presets), enabled. The served model seeds the inventory and
-    /// the default in one stroke (an enabled create requires both — daemon
-    /// law, W5g-5); the G4b enterprise cards echo an EXPLICIT inventory
-    /// instead.
+    /// (W5g-4) or a G4b enterprise builtin. The provider name stays fixed on
+    /// edit while a custom origin may be repointed under the revision CAS;
+    /// family and auth requirement remain create-only. The served model
+    /// seeds the inventory and default in one stroke (an enabled create
+    /// requires both — daemon law, W5g-5); G4b enterprise cards echo an
+    /// EXPLICIT inventory instead.
     ConfigureProvider {
         command_id: CommandId,
         provider: String,

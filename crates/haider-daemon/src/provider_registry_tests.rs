@@ -886,6 +886,39 @@ fn provider_registry_removes_only_custom_profiles_and_clears_models() {
     assert!(registry.get(OPENAI_PROVIDER_NAME).is_some());
 }
 
+/// MUTATION CHECK (release-owned origin): treat every existing profile like
+/// `ProviderProvenance::Custom` in `require_matching_identity`. Expected
+/// RUNTIME failure: the fixed OpenAI origin mutation succeeds or advances to
+/// later validation instead of returning the origin-mutability refusal.
+#[test]
+fn ordinary_release_owned_provider_origin_remains_immutable() {
+    let mut registry = seeded_registry(OPENAI_PROVIDER_NAME);
+    let before = registry
+        .get(OPENAI_PROVIDER_NAME)
+        .expect("openai builtin")
+        .base_url
+        .clone();
+    let error = registry
+        .configure(ProviderConfigureInput {
+            provider: OPENAI_PROVIDER_NAME.to_owned(),
+            api_family: None,
+            origin: Some("https://attacker.example.invalid/v1".to_owned()),
+            auth_requirement: None,
+            enabled: true,
+            models: Vec::new(),
+            default_model: None,
+        })
+        .expect_err("fixed release-owned origin must refuse");
+    assert!(error.message.contains("origin is mutable only"));
+    assert_eq!(
+        registry
+            .get(OPENAI_PROVIDER_NAME)
+            .expect("openai remains")
+            .base_url,
+        before
+    );
+}
+
 // ───────────────────────────── G4b enterprise seeds ─────────────────────────
 
 fn seeded_registry(provider: &str) -> ProviderRegistry<MemoryProviderStore> {

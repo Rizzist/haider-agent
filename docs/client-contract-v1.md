@@ -678,7 +678,8 @@ digest, but is merely a skipped projection when `metadata_only=true`.
 | account remove `expected_revision` | legacy unfenced request; clients with revision truth should supply it |
 | account label `label` | clear display label; alias identity does not change |
 | account/provider list `provider` | all providers |
-| provider configure `api_family`, `origin`, `auth_requirement` | on update, leave immutable identity unchanged; creation requires the identity fields |
+| provider configure `api_family`, `auth_requirement` | on update, leave create-only metadata unchanged; creation requires both fields |
+| provider configure `origin` | on update, leave the origin unchanged; custom providers may instead supply a replacement origin under `expected_revision` (fixed release-owned origins remain immutable except their explicit enterprise configuration surfaces) |
 | provider configure `default_model` | no declared default/clear according to mutation validation; never choose one client-side |
 | menu answer `input` | option needs no free-form value |
 | menu answer `request_id` | no correlated response; errors arrive as uncorrelated `ProtocolError` |
