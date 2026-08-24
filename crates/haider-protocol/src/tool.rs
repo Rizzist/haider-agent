@@ -152,6 +152,7 @@ pub enum ToolResultStatus {
     Conflict,
     Failed,
     Cancelled,
+    #[serde(other)]
     Unknown,
 }
 

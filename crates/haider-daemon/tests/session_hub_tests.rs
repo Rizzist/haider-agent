@@ -739,7 +739,7 @@ fn expected_sidecar_batches(
     batches: &[&[RawEnvelope]],
 ) -> String {
     let mut expected = format!(
-        "{{\"pipe\":\"haider.session.jsonl\",\"version\":5,\"session_id\":\"{session_id}\",\"generation\":{generation}}}\n"
+        "{{\"pipe\":\"haider.session.jsonl\",\"version\":6,\"session_id\":\"{session_id}\",\"generation\":{generation}}}\n"
     );
     for batch in batches {
         expected.push_str(&expected_sidecar_body(batch));
@@ -2244,7 +2244,7 @@ async fn a_stale_v4_file_rebuilds_with_the_reasoning_compat_flag_cleared() {
     let rebuilt = std::fs::read_to_string(&path).expect("rebuilt reads");
     let header: serde_json::Value =
         serde_json::from_str(rebuilt.lines().next().expect("header")).expect("header JSON");
-    assert_eq!(header["version"], 5, "the bump forced a rebuild");
+    assert_eq!(header["version"], 6, "the bump forced a rebuild");
 
     let reasoning_row: serde_json::Value = rebuilt
         .lines()
@@ -2256,6 +2256,88 @@ async fn a_stale_v4_file_rebuilds_with_the_reasoning_compat_flag_cleared() {
         reasoning_row.get("compat").is_none(),
         "the rebuild must land the CORRECTED flag, not reproduce the stale one: {reasoning_row}"
     );
+}
+
+/// V6 must rewrite files already projected by v5; otherwise the daemon can
+/// advertise typed tool status while the cold file at EOF still omits it.
+/// The authoritative old journal has no node field either, so the rebuild
+/// must recover Rejected from the preceding completed tool item.
+///
+/// MUTATION CHECK: revert `SIDECAR_VERSION` to 5. Expected runtime failure:
+/// the stale v5 row remains current and has no typed `status` field.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_v5_file_rebuilds_with_rejected_tool_status() {
+    let (root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("native-pipe-tool-status-reach");
+    let generation = store.worker_generation();
+    let run_id = RunId::new("tool-status-reach-run");
+
+    let mut completed = pipe_event(
+        &session_id,
+        "tool-status-reach-item",
+        generation,
+        EventPayload::Item(ItemEvent::Completed {
+            item_id: ItemId::new("tool-status-reach-item"),
+            item: TurnItem::ToolCall {
+                call_id: "tool-status-reach-call".into(),
+                name: "fs_write".into(),
+                args: serde_json::json!({"path": "guarded"}),
+                status: ToolStatus::Rejected,
+            },
+        }),
+    );
+    completed.run_id = Some(run_id.clone());
+    let mut legacy_node = pipe_event(
+        &session_id,
+        "tool-status-reach-node",
+        generation,
+        EventPayload::NodeCommitted(TreeNode {
+            node: NodeId::new("tool-status-reach-node"),
+            parent: None,
+            kind: NodeKind::ToolExchange {
+                tool: "fs_write".into(),
+                summary: "tool call settled as Rejected".into(),
+                artifact: None,
+            },
+        }),
+    );
+    legacy_node.run_id = Some(run_id);
+    let mut seed = vec![completed, legacy_node];
+    hub.append(&mut seed).await.expect("legacy journal commits");
+    hub.shutdown().await.expect("hub stops");
+
+    let path = sidecar_path(&root, &session_id);
+    let head = seed.last().expect("head").seq;
+    std::fs::write(
+        &path,
+        format!(
+            "{{\"pipe\":\"haider.session.jsonl\",\"version\":5,\"session_id\":\"{session_id}\",\"generation\":{generation}}}\n\
+             {{\"role\":\"tool\",\"name\":\"fs_write\",\"summary\":\"tool call settled as Rejected\",\"at_ms\":1,\"seq\":{head},\"ordinal\":0}}\n"
+        ),
+    )
+    .expect("stale v5 sidecar writes");
+
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub restarts");
+    let mut trigger = vec![user_pipe_event(
+        &session_id,
+        "tool-status-reach-trigger",
+        generation,
+        "next",
+    )];
+    hub.append(&mut trigger).await.expect("trigger commits");
+    hub.shutdown().await.expect("second hub stops");
+
+    let rebuilt = std::fs::read_to_string(&path).expect("rebuilt reads");
+    let header: serde_json::Value =
+        serde_json::from_str(rebuilt.lines().next().expect("header")).expect("header JSON");
+    assert_eq!(header["version"], 6, "the bump forced a rebuild");
+    let tool_row: serde_json::Value = rebuilt
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|row| row.get("name").is_some_and(|name| name == "fs_write"))
+        .expect("rebuilt tool row");
+    assert_eq!(tool_row["status"], "rejected");
+    assert_eq!(tool_row["summary"], "tool call settled as Rejected");
 }
 
 /// MUTATION CHECK: bypass daemon CAS ingress, return a caller-provided ref,
@@ -8326,7 +8408,7 @@ async fn native_pipe_corrupt_tail_rebuilds_atomically_from_the_journal() {
     std::fs::write(
         &path,
         format!(
-            "{{\"pipe\":\"haider.session.jsonl\",\"version\":5,\"session_id\":\"{session_id}\",\"generation\":1}}\ngarbage\n"
+            "{{\"pipe\":\"haider.session.jsonl\",\"version\":6,\"session_id\":\"{session_id}\",\"generation\":1}}\ngarbage\n"
         ),
     )
     .expect("corruption writes");
@@ -8430,7 +8512,7 @@ async fn native_pipe_version_rebuild_sweeps_previous_generation_successor() {
     assert!(old_successor.exists(), "old successor fixture exists");
     std::fs::write(
         &base,
-        old_root.replacen("\"version\":5", "\"version\":4", 1),
+        old_root.replacen("\"version\":6", "\"version\":5", 1),
     )
     .expect("old-version root fixture writes");
 
@@ -8646,7 +8728,7 @@ async fn native_pipe_v3_header_rebuilds_to_current_with_generation_bump() {
     let root_segment = std::fs::read_to_string(&path).expect("rebuilt root reads");
     let header: serde_json::Value =
         serde_json::from_str(root_segment.lines().next().expect("v4 header")).expect("header JSON");
-    assert_eq!(header["version"], 5);
+    assert_eq!(header["version"], 6);
     assert_eq!(header["generation"], 5);
     assert!(root_segment.contains("\"reasoning\":\"sealed v3 summary\""));
     assert!(!root_segment.contains("v3 partial"));
@@ -8690,7 +8772,7 @@ async fn native_pipe_io_failure_never_fails_the_journal_append() {
     std::fs::create_dir(root.path().join("pipe")).expect("sidecar directory creates");
     std::fs::write(
         sidecar_path(&root, &session_id),
-        b"{\"pipe\":\"haider.session.jsonl\",\"version\":5,\"session_id\":\"native-pipe-io-failure\",\"generation\":9}\n{\"role\":\"user\",\"text\":\"ahead\",\"at_ms\":999,\"seq\":999}\n",
+        b"{\"pipe\":\"haider.session.jsonl\",\"version\":6,\"session_id\":\"native-pipe-io-failure\",\"generation\":9}\n{\"role\":\"user\",\"text\":\"ahead\",\"at_ms\":999,\"seq\":999}\n",
     )
     .expect("stale sidecar writes");
     append_one(&hub, &session_id, generation, "retry-trigger").await;

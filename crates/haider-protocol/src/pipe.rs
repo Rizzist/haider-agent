@@ -3,9 +3,9 @@
 use crate::EventPayload;
 use crate::envelope::RawEnvelope;
 use crate::history::NodeKind;
-use crate::item::{ItemDelta, ItemEvent, TurnItem};
+use crate::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
 use crate::state::RunState;
-use crate::tool::BoundedResult;
+use crate::tool::{BoundedResult, ToolResultStatus};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 
@@ -38,6 +38,7 @@ struct PendingCompaction {
 pub struct ToolExchangeJoin {
     pub call_id: String,
     pub args: serde_json::Value,
+    pub status: ToolStatus,
     pub result: Option<BoundedResult>,
     pub tool_call_seq: u64,
     pub tool_result_seq: Option<u64>,
@@ -53,6 +54,14 @@ impl ToolExchangeJoin {
     pub fn result_preview(&self) -> Option<String> {
         self.result.as_ref().and_then(result_preview)
     }
+
+    #[must_use]
+    pub fn result_status(&self) -> Option<ToolResultStatus> {
+        self.result.as_ref().map_or_else(
+            || terminal_tool_status(self.status),
+            |result| Some(result.status),
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +70,7 @@ struct PendingToolCall {
     name: String,
     call_id: String,
     args: serde_json::Value,
+    status: ToolStatus,
     branch_id: Option<String>,
     run_id: Option<String>,
 }
@@ -212,7 +222,7 @@ impl TranscriptProjector {
                 .iter_mut()
                 .find(|buffered| buffered.unresolved_tool.as_ref() == Some(&key))
         {
-            buffered.row.set_result_preview(result_preview(&result));
+            buffered.row.set_result(&result);
             buffered.unresolved_tool = None;
             self.joiner.remove_result(&key);
         }
@@ -541,7 +551,7 @@ impl TranscriptJoiner {
                         call_id,
                         name,
                         args,
-                        ..
+                        status,
                     },
                 ..
             }) => {
@@ -550,6 +560,7 @@ impl TranscriptJoiner {
                     name,
                     call_id,
                     args,
+                    status,
                     branch_id: envelope
                         .branch_id
                         .as_ref()
@@ -574,6 +585,7 @@ impl TranscriptJoiner {
                 Some(ToolExchangeJoin {
                     call_id: call.call_id,
                     args: call.args,
+                    status: call.status,
                     result: result.as_ref().map(|(_, result)| result.clone()),
                     tool_call_seq: call.seq,
                     tool_result_seq: result.map(|(seq, _)| seq),
@@ -708,6 +720,8 @@ struct ToolRow {
     name: String,
     summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<ToolResultStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     args_preview: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     result_preview: Option<String>,
@@ -745,9 +759,10 @@ enum SidecarRowKind {
 }
 
 impl SidecarRow {
-    fn set_result_preview(&mut self, preview: Option<String>) {
+    fn set_result(&mut self, result: &BoundedResult) {
         if let SidecarRowKind::Tool(row) = &mut self.0 {
-            row.result_preview = preview;
+            row.result_preview = result_preview(result);
+            row.status = Some(result.status);
         }
     }
 
@@ -855,6 +870,10 @@ impl SidecarRow {
                     escape_pipe_field(&row.name),
                     escape_pipe_field(&row.summary)
                 );
+                if let Some(status) = row.status {
+                    line.push_str(" status=");
+                    line.push_str(tool_result_status_wire_name(status));
+                }
                 if let Some(args) = &row.args_preview {
                     line.push_str(" args=");
                     line.push_str(&escape_pipe_field(args));
@@ -869,6 +888,29 @@ impl SidecarRow {
                 format!("C  {} {} |compaction boundary|", row.seq, row.at_ms)
             }
         }
+    }
+}
+
+fn terminal_tool_status(status: ToolStatus) -> Option<ToolResultStatus> {
+    match status {
+        ToolStatus::Pending | ToolStatus::InProgress => None,
+        ToolStatus::Completed => Some(ToolResultStatus::Completed),
+        ToolStatus::Failed => Some(ToolResultStatus::Failed),
+        ToolStatus::Cancelled => Some(ToolResultStatus::Cancelled),
+        ToolStatus::Rejected => Some(ToolResultStatus::Rejected),
+        ToolStatus::Conflict => Some(ToolResultStatus::Conflict),
+        ToolStatus::Unknown => Some(ToolResultStatus::Unknown),
+    }
+}
+
+fn tool_result_status_wire_name(status: ToolResultStatus) -> &'static str {
+    match status {
+        ToolResultStatus::Completed => "completed",
+        ToolResultStatus::Rejected => "rejected",
+        ToolResultStatus::Conflict => "conflict",
+        ToolResultStatus::Failed => "failed",
+        ToolResultStatus::Cancelled => "cancelled",
+        ToolResultStatus::Unknown => "unknown",
     }
 }
 
@@ -1010,6 +1052,9 @@ fn sidecar_projection(
                     role: "tool",
                     name: tool,
                     summary,
+                    status: tool_join
+                        .as_ref()
+                        .and_then(ToolExchangeJoin::result_status),
                     args_preview: tool_join.as_ref().and_then(ToolExchangeJoin::args_preview),
                     result_preview: tool_join
                         .as_ref()
@@ -1233,6 +1278,79 @@ mod tests {
             ErrorScope::Turn,
             [ErrorAction::Retry],
         )
+    }
+
+    /// MUTATION CHECK: remove `#[serde(other)]` from the published result
+    /// status enum's `Unknown` arm. Expected runtime failure: the future wire
+    /// literal below fails to decode instead of remaining visible.
+    #[test]
+    fn tool_result_status_decodes_unknown_future_values() {
+        assert_eq!(
+            serde_json::from_str::<crate::tool::ToolResultStatus>(r#""future_result_state""#,)
+                .expect("future tool result status decodes"),
+            crate::tool::ToolResultStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn pipe_tool_result_status_wire_names_cover_the_daemon_set() {
+        for (status, wire) in [
+            (ToolResultStatus::Completed, "completed"),
+            (ToolResultStatus::Rejected, "rejected"),
+            (ToolResultStatus::Conflict, "conflict"),
+            (ToolResultStatus::Failed, "failed"),
+            (ToolResultStatus::Cancelled, "cancelled"),
+            (ToolResultStatus::Unknown, "unknown"),
+        ] {
+            assert_eq!(tool_result_status_wire_name(status), wire);
+            assert_eq!(
+                serde_json::to_value(status).expect("tool status serializes"),
+                wire
+            );
+        }
+        assert_eq!(terminal_tool_status(ToolStatus::Pending), None);
+        assert_eq!(terminal_tool_status(ToolStatus::InProgress), None);
+    }
+
+    /// A v6 rebuild reads the typed fact from the completed item immediately
+    /// preceding the presentation-only history node.
+    ///
+    /// MUTATION CHECK: map `ToolStatus::Rejected` to
+    /// `ToolResultStatus::Completed` in `terminal_tool_status`. Expected
+    /// runtime failure: this rejected row publishes `completed`, recreating
+    /// the cold-history defect.
+    #[test]
+    fn legacy_tool_node_recovers_rejected_status_from_completed_item() {
+        let mut completed = envelope(
+            1,
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("legacy-rejected-item"),
+                item: TurnItem::ToolCall {
+                    call_id: "legacy-rejected-call".into(),
+                    name: "fs_write".into(),
+                    args: serde_json::json!({"path": "guarded"}),
+                    status: ToolStatus::Rejected,
+                },
+            }),
+        );
+        completed.run_id = Some(RunId::new("legacy-rejected-run"));
+        let mut legacy_node = node(
+            2,
+            NodeKind::ToolExchange {
+                tool: "fs_write".into(),
+                summary: "tool call settled as Rejected".into(),
+                artifact: None,
+            },
+        );
+        legacy_node.run_id = completed.run_id.clone();
+
+        let mut projector = TranscriptProjector::default();
+        assert!(projector.push(&completed).is_empty());
+        assert!(projector.push(&legacy_node).is_empty());
+        let rows = projector.flush_unresolved_tools();
+        let row = serde_json::to_value(rows.first().expect("tool row")).expect("row serializes");
+        assert_eq!(row["status"], "rejected");
+        assert_eq!(row["summary"], "tool call settled as Rejected");
     }
 
     /// MUTATION CHECK (v0.0.935 #3): peek a wrong tag name, skip the peek's

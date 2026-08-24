@@ -169,6 +169,10 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// MUTATION CHECK: remove `FEATURE_HAIDER_CODE_PLAN_STATUS_V1`. Expected
 /// runtime failure: clients cannot discover the typed provider-plan stream
 /// and would have to guess account health from percentages.
+///
+/// MUTATION CHECK: remove `FEATURE_PIPE_TOOL_STATUS_V1` from
+/// `welcome_features`. Expected runtime failure: cold-history clients cannot
+/// discover the typed tool outcome and fall back to parsing summary prose.
 #[test]
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
@@ -204,6 +208,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_LOOM_V1.to_owned(),
             haider_rpc::FEATURE_MODELS_LIST_V1.to_owned(),
             haider_rpc::FEATURE_PIPE_NATIVE_V2.to_owned(),
+            haider_rpc::FEATURE_PIPE_TOOL_STATUS_V1.to_owned(),
             haider_rpc::FEATURE_INPUT_MIRROR_ATTACHMENTS_V1.to_owned(),
             haider_rpc::FEATURE_INPUT_MIRROR_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_ATTACH_SEALED_V1.to_owned(),
@@ -246,6 +251,14 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_COMPUTER_PERMISSION_ACTIONS_V1.to_owned(),
             FEATURE_VAULT_STAGE_V1.to_owned(),
         ])
+    );
+}
+
+#[test]
+fn welcome_advertises_typed_pipe_tool_status() {
+    assert!(
+        welcome_features().contains(haider_rpc::FEATURE_PIPE_TOOL_STATUS_V1),
+        "the daemon publishes typed native-pipe tool status"
     );
 }
 

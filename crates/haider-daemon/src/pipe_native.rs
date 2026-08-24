@@ -43,7 +43,8 @@ const SIDECAR_MAGIC: &str = "haider.session.jsonl";
 // V2 added coverage lines and `(seq, ordinal)` row identity. V3 guarantees
 // cold tool preview projection. V4 adds sealed reasoning, compaction boundary
 // rows, and physical segments. V5 carries no new row shape at all — it exists
-// solely to REWRITE what v4 already wrote.
+// solely to REWRITE what v4 already wrote. V6 adds typed tool status and
+// rewrites older rows so rejected/conflicted outcomes stop looking successful.
 //
 // v0.0.940 stopped marking reasoning-bearing rows `compat` (a row whose loss
 // costs data is not redundant), but a producer-side contract fix does not
@@ -56,7 +57,7 @@ const SIDECAR_MAGIC: &str = "haider.session.jsonl";
 // Every bump intentionally forces existing at-head files (including every
 // sealed segment) through a journal rebuild so old projections cannot remain
 // silently "current" at EOF.
-const SIDECAR_VERSION: u64 = 5;
+const SIDECAR_VERSION: u64 = 6;
 
 #[derive(Debug, Clone, Copy)]
 struct SidecarCursor {

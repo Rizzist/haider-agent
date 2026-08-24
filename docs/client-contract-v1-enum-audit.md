@@ -1,7 +1,7 @@
 # Client contract v1 — wire enum audit
 
 Status: normative appendix to [Haider client contract revision 1](client-contract-v1.md)  
-Audited source snapshot: 2026-08-23
+Audited source snapshot: 2026-08-24
 
 This audit covers every serialized enum reachable from the v1 client frame
 surface in `haider-rpc` and `haider-protocol`, including typed decoders layered
@@ -77,6 +77,7 @@ Provider-row health (`ProviderAvailabilityWire`) and whole-subsystem health
 | `session_fork` | `SessionForkMode`, `ForkContextEpoch`, `SessionForkEventPayload` | each has a serde catch-all; unknown event remains non-actionable |
 | `usage` | `HaiderCodeAllowanceStateV1` | custom string decoder preserves the exact unknown provider string |
 | `usage` | `HaiderCodePlanOutcomeV1` | unknown outcome is not available/healthy |
+| `tool` | `ToolResultStatus` | unknown terminal result is not completed or successful |
 
 ## haider-protocol enums: raw-preserved
 
@@ -106,14 +107,12 @@ not know the new shape.
 | `session` | `SessionConfigEventPayload` |
 | `state` | `HarnessStatus`, `SessionState` |
 | `task` | `TaskTerminalState`, `TaskCompletionDelivery`, `TaskEventPayload` |
-| `tool` | `ToolResultStatus` |
 | `verify` | `VerifyVerdict`, `Severity` |
 
 Important consequences:
 
-- `EffectOutcome::Unknown`, `ToolStatus::Unknown`, and
-  `ToolResultStatus::Unknown` accept only their known `"unknown"` literal.
-  They are not serde catch-alls.
+- `EffectOutcome::Unknown` and `ToolStatus::Unknown` accept only their known
+  `"unknown"` literals. They are not serde catch-alls.
 - `TurnItem::Extension { kind, data }`, whose wire tag is `item: "extension"`,
   is the preferred additive carrier for new item-level facts. The `data` value
   stays raw.
@@ -442,7 +441,7 @@ appendix list every spelling in context.
   `"not_applicable"` | `"allow"` | `"ask"` | `"deny"`.
 - `RememberedGrantScope` (`crates/haider-protocol/src/tool.rs:75`; `scope` tag): `"class"` | `"command_shape"`.
 - `ToolResultStatus` (`crates/haider-protocol/src/tool.rs:147`):
-  `"completed"` | `"rejected"` | `"conflict"` | `"failed"` | `"cancelled"` | `"unknown"`.
+  `"completed"` | `"rejected"` | `"conflict"` | `"failed"` | `"cancelled"` | `"unknown"`; any other string → Rust `Unknown`.
 - `AttachmentBlock` (`crates/haider-protocol/src/tool.rs:180`; `kind` tag):
   `"image"` | `"pasted_text"` | `"file"` | `"pdf"` | `"skill"`.
 - `PdfDeliveryMode` (`crates/haider-protocol/src/tool.rs:223`): `"native_document"` | `"extracted_text"`.

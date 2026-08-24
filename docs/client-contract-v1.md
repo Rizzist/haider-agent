@@ -275,7 +275,8 @@ affordance before the response exists.
 | `wire_msgpack_v1` | post-Welcome MessagePack selection |
 | `session_attach_sealed_v1` | `session.attach.sealed_replay` |
 | `export_seq_v1` | CLI export `seq`, `head_seq`, and exact `--since`; no RPC method |
-| `pipe_native_v2` | `session.pipe_path` plus v2-or-newer native sidecar laws (current file version is 5) |
+| `pipe_native_v2` | `session.pipe_path` plus v2-or-newer native sidecar laws (current file version is 6) |
+| `pipe_tool_status_v1` | typed `status` on native-pipe tool rows and the explicit `status=` coordinate in pipe-style tool lines |
 
 ### 4.1 The one feature with an explicit withheld marker
 
@@ -1055,10 +1056,10 @@ journal append.
 Start at the returned stable root. Its first JSONL line is:
 
 ```json
-{"pipe":"haider.session.jsonl","version":5,"session_id":"…","generation":G,"segment":0,"starts_after":0}
+{"pipe":"haider.session.jsonl","version":6,"session_id":"…","generation":G,"segment":0,"starts_after":0}
 ```
 
-Current producers write version 5. `pipe_native_v2` is the capability name
+Current producers write version 6. `pipe_native_v2` is the capability name
 because v2 established coverage and `(seq, ordinal)` identity. Later versions
 are additive/rebuild revisions. A v2-aware reader ignores unknown row keys and
 unknown line kinds.
@@ -1097,6 +1098,18 @@ item-canonical client. A row carrying reasoning is producer-guaranteed not to
 be marked compat. `args_preview`/`result_preview` absence means unavailable,
 not empty output. `branch_id` absence means main. Ordinal distinguishes
 multiple rows from the same sequence.
+
+When `pipe_tool_status_v1` is advertised, a terminal tool row carries `status`
+with one of `completed`, `rejected`, `conflict`, `failed`, `cancelled`, or
+`unknown`. A missing field on such a daemon means the row is a pending proposal
+without a terminal result, not success. The enum is unknown-tolerant: an
+unrecognized future literal is rendered as unknown and MUST NOT be treated as
+completed. The existing `summary` remains present for display compatibility,
+but a client MUST NOT parse that prose for outcome. Summary is a presentation
+layer, and recovering a typed fact from presentation prose is what caused
+rejected and conflicted cold-history tools to be rendered as successful. A
+client-owned trajectory projection MUST carry this typed value into each tool
+point's metadata; there is no separate daemon trajectory-point wire type.
 
 `reasoning` has no independent sequence position. It is a field on the
 assistant row, not an item in the ordering. Therefore no client rendering

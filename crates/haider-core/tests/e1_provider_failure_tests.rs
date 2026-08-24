@@ -7,9 +7,11 @@ use haider_core::{
 };
 use haider_protocol::EventPayload;
 use haider_protocol::error::{ErrorAction, ErrorPresentation, ErrorScope, HaiderError};
+use haider_protocol::history::NodeKind;
 use haider_protocol::ids::{CredentialAlias, DeviceId, ItemId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{AnswerVia, ErrorRecoveryCardKind, MenuAnswer, MenuKind};
+use haider_protocol::pipe::TranscriptProjector;
 use haider_protocol::provider::{Block, FinishReason};
 use haider_protocol::state::RunState;
 use haider_protocol::tool::{BoundedResult, ToolResultStatus};
@@ -73,9 +75,18 @@ fn spawn(
     (handle, store, provider)
 }
 
-/// LAW E1a: the actor copies the dispatcher terminal status instead of
-/// unconditionally closing the tool as Completed. MUTATION: hard-code
-/// `ToolStatus::Completed` at that join and the rejected assertion fails.
+/// LAW E1a: the actor copies the dispatcher terminal status into the completed
+/// item, and the cold-history pipe joins that typed fact to the presentation
+/// node instead of unconditionally closing the tool as Completed.
+///
+/// MUTATION CHECK: map `ToolStatus::Rejected` to
+/// `ToolResultStatus::Completed` in the pipe's terminal-status mapping.
+/// Expected runtime failure: the rejected native-pipe row below becomes
+/// indistinguishable from the completed row.
+///
+/// MUTATION CHECK: clear or replace the existing `tool call settled as ...`
+/// summary. Expected runtime failure: the exact summary assertion below fails;
+/// typed status is additive and does not remove the presentation prose.
 #[tokio::test]
 async fn e1a_actor_preserves_failed_and_successful_tool_status() {
     for (suffix, result_status, expected) in [
@@ -117,11 +128,10 @@ async fn e1a_actor_preserves_failed_and_successful_tool_status() {
             .await
             .expect("outcome");
         assert_eq!(outcome.state, RunState::Done);
-        let payloads = store
-            .events(&session)
-            .await
-            .into_iter()
-            .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload).ok())
+        let events = store.events(&session).await;
+        let payloads = events
+            .iter()
+            .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload.clone()).ok())
             .collect::<Vec<_>>();
         let completed = payloads
             .iter()
@@ -134,6 +144,33 @@ async fn e1a_actor_preserves_failed_and_successful_tool_status() {
             })
             .expect("completed tool row");
         assert_eq!(completed, expected);
+        let node_summary = payloads
+            .iter()
+            .find_map(|payload| match payload {
+                EventPayload::NodeCommitted(node) => match &node.kind {
+                    NodeKind::ToolExchange { summary, .. } => Some(summary.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("cold-history tool node");
+        assert_eq!(node_summary, format!("tool call settled as {expected:?}"));
+
+        let mut projector = TranscriptProjector::default();
+        let rows = events
+            .iter()
+            .flat_map(|event| projector.push(event))
+            .collect::<Vec<_>>();
+        let tool_row = rows
+            .iter()
+            .map(|row| serde_json::to_value(row).expect("pipe row serializes"))
+            .find(|row| row["role"] == "tool")
+            .expect("native-pipe tool row");
+        assert_eq!(
+            tool_row["status"],
+            serde_json::to_value(expected).expect("status serializes")
+        );
+        assert_eq!(tool_row["summary"], node_summary);
         let result = payloads
             .iter()
             .find_map(|payload| match payload {
