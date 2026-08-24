@@ -2,7 +2,7 @@
 
 use super::{
     CapturedBytes, HookDefinition, HookEngine, HookKind, HookMatcher, HookService, HookSource,
-    HookTrustPolicy, MatchEvent, classify, discover, hook_digest, make_output,
+    HookTrustPolicy, MatchEvent, classify, discover, hook_command, hook_digest, make_output,
     next_subscriber_backoff, prepare_hook_input, run_command,
 };
 use crate::session_hub::{SessionHub, SessionHubConfig};
@@ -67,6 +67,34 @@ fn marker_lines(path: &Path) -> usize {
     std::fs::read_to_string(path)
         .map(|content| content.lines().count())
         .unwrap_or(0)
+}
+
+/// MUTATION CHECK (Android POSIX-shell resolution): restore `/bin/sh` in
+/// `hook_command`. Expected failure: both program assertions report `/bin/sh`
+/// instead of the executable selected by `$SHELL` or the PATH-resolved `sh`.
+#[test]
+#[cfg(unix)]
+fn hook_shell_resolution_avoids_a_hardcoded_bin_sh() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().expect("shell fixture");
+    let configured = root.path().join("sh");
+    std::fs::write(&configured, "").expect("write shell fixture");
+    std::fs::set_permissions(&configured, std::fs::Permissions::from_mode(0o700))
+        .expect("make shell fixture executable");
+
+    let selected = hook_command(":", Some(configured.clone().into_os_string()));
+    assert_eq!(selected.as_std().get_program(), configured.as_os_str());
+
+    let platform_default = hook_command(":", None);
+    assert_eq!(platform_default.as_std().get_program(), "sh");
+
+    let incompatible = root.path().join("fish");
+    std::fs::write(&incompatible, "").expect("write incompatible shell fixture");
+    std::fs::set_permissions(&incompatible, std::fs::Permissions::from_mode(0o700))
+        .expect("make incompatible shell fixture executable");
+    let rejected = hook_command(":", Some(incompatible.into_os_string()));
+    assert_eq!(rejected.as_std().get_program(), "sh");
 }
 
 #[cfg(unix)]

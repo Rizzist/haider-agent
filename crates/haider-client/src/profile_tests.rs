@@ -90,26 +90,16 @@ fn malformed_profile_config_is_loud() {
     assert!(matches!(error, Err(ProfileError::InvalidConfig { .. })));
 }
 
-// MUTATION CHECK (R8/D1 short-private-directory rule): honor a
-// HAIDER_RUNTIME_DIR-style override or an unverified XDG value in
-// `runtime_dir`. Expected failure: the resolved runtime dir below moves
-// off /tmp/haider-<uid>.
+// MUTATION CHECK (R8/D1 short-private-directory rule): change endpoint
+// derivation so it escapes the selected runtime directory. Expected failure:
+// the containment or fixed-length socket-name assertion below fails.
 #[test]
-fn runtime_dir_is_never_env_overridable_and_defaults_to_tmp_uid() {
+fn endpoint_stays_inside_the_resolved_runtime_directory() {
     let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
-    let mut env = env_for(root.path());
-    // Even a hostile XDG value on macOS must not move the runtime dir;
-    // on Linux only a VERIFIED owner-private dir may.
-    env.xdg_runtime_dir = Some(PathBuf::from("/definitely/not/private"));
-    let profile = resolve_profile(&env).unwrap_or_else(|error| panic!("{error}"));
-    #[cfg(unix)]
-    let expected = PathBuf::from("/tmp").join(format!("haider-{}", effective_uid()));
-    #[cfg(windows)]
-    let expected = std::env::temp_dir().join("haider");
-    assert_eq!(profile.runtime_dir, expected);
+    let profile = resolve_profile(&env_for(root.path())).unwrap_or_else(|error| panic!("{error}"));
     #[cfg(unix)]
     {
-        assert!(profile.endpoint_path.starts_with(&expected));
+        assert!(profile.endpoint_path.starts_with(&profile.runtime_dir));
         let name = profile
             .endpoint_path
             .file_name()
@@ -126,4 +116,75 @@ fn runtime_dir_is_never_env_overridable_and_defaults_to_tmp_uid() {
         // Fixed-length pipe name: prefix + 32 hex.
         assert_eq!(endpoint.len(), r"\\.\pipe\haider-".len() + 32);
     }
+}
+
+/// MUTATION CHECK (TMPDIR portability): restore the unconditional
+/// `/tmp/haider-<uid>` return in `runtime_dir`. Expected failure: the left
+/// path starts with `/tmp`, not the private TMPDIR fixture.
+#[test]
+#[cfg(unix)]
+fn runtime_dir_honors_a_verified_private_tmpdir() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let tmpdir = root.path().join("private-tmp");
+    std::fs::create_dir(&tmpdir).unwrap_or_else(|error| panic!("create TMPDIR: {error}"));
+    std::fs::set_permissions(&tmpdir, std::fs::Permissions::from_mode(0o700))
+        .unwrap_or_else(|error| panic!("chmod TMPDIR: {error}"));
+    let runtime_env = RuntimeEnv {
+        tmpdir: Some(tmpdir.clone()),
+        prefix: None,
+    };
+
+    assert_eq!(
+        runtime_dir(&env_for(root.path()), &runtime_env),
+        tmpdir.join("haider")
+    );
+}
+
+/// MUTATION CHECK (TMPDIR trust boundary): accept `TMPDIR` without calling
+/// `verified_owner_private`. Expected failure: the left path uses the 0755
+/// fixture instead of the per-UID `/tmp` fallback.
+#[test]
+#[cfg(unix)]
+fn runtime_dir_refuses_a_non_private_tmpdir_and_falls_back() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let tmpdir = root.path().join("shared-tmp");
+    std::fs::create_dir(&tmpdir).unwrap_or_else(|error| panic!("create TMPDIR: {error}"));
+    std::fs::set_permissions(&tmpdir, std::fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|error| panic!("chmod TMPDIR: {error}"));
+    let runtime_env = RuntimeEnv {
+        tmpdir: Some(tmpdir),
+        prefix: None,
+    };
+
+    assert_eq!(
+        runtime_dir(&env_for(root.path()), &runtime_env),
+        PathBuf::from("/tmp").join(format!("haider-{}", effective_uid()))
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn runtime_dir_uses_a_verified_prefix_tmp_when_tmpdir_is_unavailable() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let prefix = root.path().join("prefix");
+    let prefix_tmp = prefix.join("tmp");
+    std::fs::create_dir_all(&prefix_tmp)
+        .unwrap_or_else(|error| panic!("create PREFIX/tmp: {error}"));
+    std::fs::set_permissions(&prefix_tmp, std::fs::Permissions::from_mode(0o700))
+        .unwrap_or_else(|error| panic!("chmod PREFIX/tmp: {error}"));
+    let runtime_env = RuntimeEnv {
+        tmpdir: None,
+        prefix: Some(prefix),
+    };
+
+    assert_eq!(
+        runtime_dir(&env_for(root.path()), &runtime_env),
+        prefix_tmp.join("haider")
+    );
 }

@@ -9,11 +9,11 @@
 //! - The store directory is made absolute, created if absent, then
 //!   canonicalized; `profile_id` is the lowercase BLAKE3 hex digest of a
 //!   version tag plus the canonical store-path bytes.
-//! - The runtime directory is NEVER environment-overridable
+//! - The runtime directory is NEVER directly environment-overridable
 //!   (`HAIDER_RUNTIME_DIR` is deliberately not read — D1's short
-//!   private-directory rule): on Linux a verified owner-private
-//!   `XDG_RUNTIME_DIR/haider` is used when available, otherwise (and always
-//!   on macOS) the short constant base `/tmp` plus `haider-<effective-uid>`.
+//!   private-directory rule). A verified owner-private `XDG_RUNTIME_DIR` on
+//!   Linux, `TMPDIR`, or `$PREFIX/tmp` supplies the base when available;
+//!   otherwise the short per-UID `/tmp` fallback is retained.
 //! - The default model is a release-owned FULL Anthropic model ID: profile
 //!   config (`config.json`) or `HAIDER_MODEL` may override the packaged
 //!   value; the TUI's short product labels never enter this seam.
@@ -65,6 +65,28 @@ impl ProfileEnv {
                 .ok()
                 .filter(|m| !m.trim().is_empty()),
             xdg_runtime_dir: std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+        }
+    }
+}
+
+/// Platform temp inputs captured separately so the public `ProfileEnv` shape
+/// remains compatible while tests can exercise resolution without mutating
+/// process-global environment variables.
+#[derive(Debug, Clone, Default)]
+struct RuntimeEnv {
+    #[cfg(unix)]
+    tmpdir: Option<PathBuf>,
+    #[cfg(unix)]
+    prefix: Option<PathBuf>,
+}
+
+impl RuntimeEnv {
+    fn capture() -> Self {
+        Self {
+            #[cfg(unix)]
+            tmpdir: std::env::var_os("TMPDIR").map(PathBuf::from),
+            #[cfg(unix)]
+            prefix: std::env::var_os("PREFIX").map(PathBuf::from),
         }
     }
 }
@@ -179,7 +201,7 @@ pub fn resolve_profile(env: &ProfileEnv) -> Result<ResolvedProfile, ProfileError
     hasher.update(store_text.as_bytes());
     let profile_id = hasher.finalize().to_hex().to_string();
 
-    let runtime_dir = runtime_dir(env);
+    let runtime_dir = runtime_dir(env, &RuntimeEnv::capture());
     let endpoint_path = endpoint_path_for(&runtime_dir, &profile_id);
     let default_model = resolve_default_model(&store_dir, env)?;
 
@@ -206,21 +228,34 @@ pub fn endpoint_path_for(runtime_dir: &Path, profile_id: &str) -> PathBuf {
     haider_platform::Endpoint::new(runtime_dir, profile_id).into_address()
 }
 
-/// Resolves the runtime directory (never environment-overridable).
-fn runtime_dir(env: &ProfileEnv) -> PathBuf {
+/// Resolves the runtime directory from verified platform temp bases.
+fn runtime_dir(env: &ProfileEnv, runtime_env: &RuntimeEnv) -> PathBuf {
     #[cfg(target_os = "linux")]
     if let Some(xdg) = &env.xdg_runtime_dir
         && verified_owner_private(xdg)
     {
         return xdg.join("haider");
     }
-    #[cfg(all(not(target_os = "linux"), unix))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     let _ = env;
     #[cfg(unix)]
-    return PathBuf::from("/tmp").join(format!("haider-{}", effective_uid()));
+    {
+        if let Some(tmpdir) = &runtime_env.tmpdir
+            && verified_owner_private(tmpdir)
+        {
+            return tmpdir.join("haider");
+        }
+        if let Some(prefix) = &runtime_env.prefix {
+            let prefix_tmp = prefix.join("tmp");
+            if verified_owner_private(&prefix_tmp) {
+                return prefix_tmp.join("haider");
+            }
+        }
+        PathBuf::from("/tmp").join(format!("haider-{}", effective_uid()))
+    }
     #[cfg(windows)]
     {
-        let _ = env;
+        let _ = (env, runtime_env);
         std::env::temp_dir().join("haider")
     }
 }
@@ -238,9 +273,9 @@ pub fn effective_uid() -> u32 {
     0
 }
 
-/// A directory qualifies as an XDG runtime base only when it is a real
+/// A directory qualifies as a Unix runtime base only when it is a real
 /// directory owned by this UID with no group/other access.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn verified_owner_private(path: &Path) -> bool {
     haider_platform::is_owner_private_directory(path)
 }

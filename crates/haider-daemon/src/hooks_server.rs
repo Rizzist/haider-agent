@@ -486,6 +486,9 @@ fn spawn_server(
 ) -> Result<ServerProcess, String> {
     let cwd_fd = open_canonical_directory(&definition.workspace_cwd)
         .ok_or_else(|| "workspace cwd is no longer canonical".to_owned())?;
+    #[cfg(unix)]
+    let mut command = hook_command(&definition.command, std::env::var_os("SHELL"));
+    #[cfg(windows)]
     let mut command = hook_command(&definition.command);
     command
         .env_clear()

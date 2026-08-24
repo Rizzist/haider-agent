@@ -2235,6 +2235,9 @@ async fn run_command(
     let Some(cwd_fd) = cwd_fd else {
         return failed_process_output("workspace cwd is no longer canonical");
     };
+    #[cfg(unix)]
+    let mut command = hook_command(&definition.command, std::env::var_os("SHELL"));
+    #[cfg(windows)]
     let mut command = hook_command(&definition.command);
     command
         .env_clear()
@@ -2688,6 +2691,9 @@ fn spawn_subscriber(
     definition: &HookDefinition,
 ) -> Option<(tokio::process::Child, haider_platform::ProcessGroup)> {
     let cwd_fd = open_canonical_directory(&definition.workspace_cwd)?;
+    #[cfg(unix)]
+    let mut command = hook_command(&definition.command, std::env::var_os("SHELL"));
+    #[cfg(windows)]
     let mut command = hook_command(&definition.command);
     command
         .env_clear()
@@ -3174,10 +3180,32 @@ fn duration_ms(duration: Duration) -> u64 {
 }
 
 #[cfg(unix)]
-fn hook_command(script: &str) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new("/bin/sh");
+fn hook_command(
+    script: &str,
+    configured_shell: Option<std::ffi::OsString>,
+) -> tokio::process::Command {
+    let shell = configured_shell
+        .filter(|shell| trustworthy_posix_shell(std::path::Path::new(shell)))
+        .unwrap_or_else(|| std::ffi::OsString::from("sh"));
+    let mut command = tokio::process::Command::new(shell);
     command.arg("-c").arg(script);
     command
+}
+
+#[cfg(unix)]
+fn trustworthy_posix_shell(shell: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if !shell.is_absolute()
+        || !matches!(
+            shell.file_name().and_then(|name| name.to_str()),
+            Some("sh" | "ash" | "bash" | "dash" | "ksh" | "mksh")
+        )
+    {
+        return false;
+    }
+    std::fs::metadata(shell)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(windows)]
