@@ -636,16 +636,6 @@ finally:
 # line separates them without another guess: the store is WAL-mode and the probe
 # opens it read-only while the daemon is still writing, so an empty read is a
 # live hypothesis rather than a wild one.
-_rows = journal["rows_read"] if journal is not None else None
-_decoded = journal["decoded"] if journal is not None else None
-print(
-    f"  [diagnostic] journal reader: rows_read="
-    f"{_rows if _rows is not None else 'UNAVAILABLE'}"
-    f" decoded={_decoded if _decoded is not None else 'UNAVAILABLE'}"
-    f"  (0 rows => store empty or unreadable to this reader;"
-    f" many rows => matchers are wrong)"
-)
-
 for key, label, expected in (
     ("menu_opened", "sentinel menu_opened events", 1),
     ("menu_answered", "sentinel menu_answered events", 1),
@@ -663,6 +653,28 @@ for key, label, expected in (
     )
 
 # No secret may ever ride a live frame (the M3 sentinel leg's PTY half).
+# The reader's OWN visibility, reported as a check so it lands inside the
+# window ladder.sh actually shows. v0.0.951 printed this with a bare print()
+# BEFORE the verdicts — it executed and was discarded, because ladder.sh tails
+# only the last 25 lines of a failing probe (ladder.sh:73, :89). A diagnostic
+# outside the visible window is a diagnostic nobody has, which is the exact
+# defect this line exists to end.
+#
+# Always True: it reports, it does not gate. Zero rows means the store held
+# none of this run's events; many rows means the store was fine and the
+# matchers are wrong. Those need opposite fixes and the counts alone cannot
+# separate them.
+_rows = journal["rows_read"] if journal is not None else None
+_decoded = journal["decoded"] if journal is not None else None
+checks.append(
+    (
+        f"[diagnostic] journal reader saw rows_read="
+        f"{_rows if _rows is not None else 'UNAVAILABLE'}"
+        f" decoded={_decoded if _decoded is not None else 'UNAVAILABLE'}"
+        f" (0 => store empty/unreadable; many => matchers wrong)",
+        True,
+    )
+)
 checks.append(("no `sk-` key material in any frame", not re.search(r"sk-[A-Za-z0-9_\-]{8,}", text)))
 
 child_clean = probelib.reap(pid) if pid is not None else False
