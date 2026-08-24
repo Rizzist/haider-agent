@@ -254,6 +254,24 @@ pub enum LiveCommand {
     UsageHistoryDay {
         date: String,
     },
+    /// `queue.list` — the composer panel's held-message READ (954).
+    QueueList {
+        session: SessionId,
+    },
+    /// `queue.promote_steer` — fenced promotion (954). Not outboxed: a
+    /// socket loss drops the click; the panel re-reads on reattach and
+    /// the user clicks again against fresh truth.
+    QueuePromoteSteer {
+        session: SessionId,
+        id: haider_protocol::ids::EventId,
+        revision: u64,
+    },
+    /// `queue.remove` — leg one of the panel's mode toggle (954).
+    QueueRemove {
+        session: SessionId,
+        id: haider_protocol::ids::EventId,
+        revision: u64,
+    },
     /// `session.fleet` — a READ of the daemon's bounded descendant-tree
     /// snapshot (the fleet view, `session_fleet_v1`). Receipt-free, never
     /// outboxed: the open issues one, the event-cadence chase re-reads
@@ -828,6 +846,9 @@ impl LiveCommand {
             // 954: the heatmap window is a read (see above).
             | Self::UsageHistoryRange { .. }
             | Self::UsageHistoryDay { .. }
+            | Self::QueueList { .. }
+            | Self::QueuePromoteSteer { .. }
+            | Self::QueueRemove { .. }
             // The fleet snapshot is a read (see above).
             | Self::SessionFleet { .. }
             // The graph reduction is a read (see above).
@@ -1041,6 +1062,25 @@ pub enum LiveReply {
         day: Option<Box<haider_protocol::usage::UsageHistoryDayV1>>,
     },
     UsageHistoryDayFailed {
+        message: String,
+    },
+    /// 954 queue panel: a committed list snapshot.
+    QueueListed {
+        rows: Vec<haider_protocol::queue::QueueRow>,
+        revision: u64,
+    },
+    /// 954: a fenced queue mutation committed (remove or promote).
+    QueueMutated {
+        id: haider_protocol::ids::EventId,
+        revision: u64,
+        removed_for_toggle: bool,
+    },
+    /// 954: a fenced mutation refused stale — carries the daemon's
+    /// CURRENT revision (the client re-reads; it never guesses).
+    QueueConflicted {
+        current_revision: u64,
+    },
+    QueueFailed {
         message: String,
     },
     UsageReportFailed {
@@ -2148,6 +2188,16 @@ impl LiveDriver {
                 if let Some(after_seq) = self.attaching.remove(&session) {
                     model.seed_cursor(&session, after_seq);
                 }
+                // 954 queue panel: one initial list per attach, feature-
+                // gated. Deltas maintain it from here; a daemon without
+                // the bit renders the panel's honest unsupported state.
+                let mut queue_read = Vec::new();
+                if model.daemon_serves(haider_rpc::FEATURE_QUEUE_CONTROL_V1) {
+                    model.queue_panel.fetching = true;
+                    queue_read.push(LiveCommand::QueueList {
+                        session: session.clone(),
+                    });
+                }
                 self.generations.insert(session.clone(), worker_generation);
                 self.routes.insert(attachment.clone(), session.clone());
                 self.attachments.insert(session.clone(), attachment);
@@ -2168,6 +2218,7 @@ impl LiveDriver {
                     // can exist before it.
                     commands.push(self.submit(model, &session, text, None, Vec::new()));
                 }
+                commands.extend(queue_read);
                 commands
             }
             LiveReply::Detached { attachment } => {
@@ -2291,6 +2342,47 @@ impl LiveDriver {
             }
             LiveReply::UsageHistoryDayFailed { message } => {
                 model.usage.today_failed(&message);
+                model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::QueueListed { rows, revision } => {
+                model.queue_panel.apply_list(rows, revision);
+                model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::QueueMutated {
+                id,
+                revision,
+                removed_for_toggle,
+            } => {
+                model.queue_panel.revision = Some(revision);
+                model.queue_panel.rows.retain(|row| row.id != id);
+                model.dirty = true;
+                // Leg two of the mode toggle: the fenced remove committed,
+                // so the held text resubmits VERBATIM under its next mode.
+                // submit_explicit bypasses the composer's standing flags —
+                // the row's toggled mode is the whole point.
+                if removed_for_toggle
+                    && let Some((pending_id, text, mode)) = model.queue_panel.pending_toggle.take()
+                    && pending_id == id
+                    && let Some(session) = model.active_session.clone()
+                {
+                    return vec![self.submit_explicit(&session, text, mode)];
+                }
+                Vec::new()
+            }
+            LiveReply::QueueConflicted { current_revision } => {
+                model.queue_panel.conflicted(current_revision);
+                model.dirty = true;
+                // Re-read against the named current revision — the fence's
+                // whole point is that the client refreshes, never guesses.
+                match model.active_session.clone() {
+                    Some(session) => vec![LiveCommand::QueueList { session }],
+                    None => Vec::new(),
+                }
+            }
+            LiveReply::QueueFailed { message } => {
+                model.queue_panel.failed(&message);
                 model.dirty = true;
                 Vec::new()
             }
@@ -4689,6 +4781,26 @@ impl LiveDriver {
             AppRequest::UsageTodayRefresh => vec![LiveCommand::UsageHistoryDay {
                 date: crate::format::utc_date_today(),
             }],
+            AppRequest::QueueList => match model.active_session.clone() {
+                Some(session) => vec![LiveCommand::QueueList { session }],
+                None => Vec::new(),
+            },
+            AppRequest::QueuePromoteSteer { id, revision } => match model.active_session.clone() {
+                Some(session) => vec![LiveCommand::QueuePromoteSteer {
+                    session,
+                    id,
+                    revision,
+                }],
+                None => Vec::new(),
+            },
+            AppRequest::QueueToggleRemove { id, revision } => match model.active_session.clone() {
+                Some(session) => vec![LiveCommand::QueueRemove {
+                    session,
+                    id,
+                    revision,
+                }],
+                None => Vec::new(),
+            },
             // Fleet: a read — never outboxed, single-flight (the chase
             // fold lives in `fleet_refresh`).
             AppRequest::FleetRefresh => self.fleet_refresh(model),
@@ -4896,6 +5008,29 @@ impl LiveDriver {
             // this RPC translator. This arm keeps direct harness calls inert.
             AppRequest::RevealPath { .. } => Vec::new(),
         }
+    }
+
+    /// 954 queue panel: a submit whose DeliveryMode is EXPLICIT — the
+    /// toggle's resubmit leg must carry the row's chosen mode, not the
+    /// composer's standing flags. Main branch, no attachments: a queued
+    /// row is plain text by construction (render-complete law).
+    fn submit_explicit(
+        &mut self,
+        session: &SessionId,
+        text: String,
+        mode: DeliveryMode,
+    ) -> LiveCommand {
+        let command_id = self.mint();
+        let worker_generation = self.generations.get(session).copied().unwrap_or_default();
+        self.enqueue(LiveCommand::Submit {
+            command_id,
+            session: session.clone(),
+            worker_generation,
+            text,
+            mode,
+            branch: None,
+            attachments: Vec::new(),
+        })
     }
 
     fn submit(

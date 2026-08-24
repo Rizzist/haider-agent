@@ -892,6 +892,73 @@ impl ProvidersState {
     }
 }
 
+/// The composer queue panel (954): daemon-held mid-turn messages, listed
+/// render-complete and maintained by `QueueChanged` deltas. The revision
+/// rides every mutation; a `RevisionConflict` refusal names the current
+/// revision and this state re-reads — it never guesses.
+#[derive(Debug, Default)]
+pub struct QueuePanelState {
+    pub rows: Vec<haider_protocol::queue::QueueRow>,
+    pub revision: Option<u64>,
+    pub fetching: bool,
+    pub error: Option<String>,
+    /// A mode toggle in flight: remove committed, resubmit pending. The
+    /// text is held HERE so a crash between the two legs cannot lose it
+    /// silently — the error path renders it.
+    pub pending_toggle: Option<(
+        haider_protocol::ids::EventId,
+        String,
+        haider_protocol::DeliveryMode,
+    )>,
+}
+
+impl QueuePanelState {
+    /// Install a committed list snapshot. The ONLY full-state writer.
+    pub fn apply_list(&mut self, rows: Vec<haider_protocol::queue::QueueRow>, revision: u64) {
+        self.rows = rows;
+        self.revision = Some(revision);
+        self.fetching = false;
+        self.error = None;
+    }
+
+    /// Apply one revision-bearing delta. Enqueued carries the COMPLETE row
+    /// (the render-complete law), so the panel maintains itself without
+    /// re-reads; an Unknown change means a newer daemon said something we
+    /// cannot interpret — the honest response is a fresh list, requested
+    /// by the caller when this returns true.
+    pub fn apply_delta(&mut self, delta: &haider_protocol::queue::QueueDelta) -> bool {
+        use haider_protocol::queue::QueueChange;
+        self.revision = Some(delta.revision);
+        match &delta.change {
+            QueueChange::Enqueued { row } => {
+                self.rows.retain(|held| held.id != row.id);
+                self.rows.push(row.clone());
+                false
+            }
+            QueueChange::Removed { id }
+            | QueueChange::PromotedSteer { id }
+            | QueueChange::Consumed { id } => {
+                self.rows.retain(|held| held.id != *id);
+                false
+            }
+            _ => true,
+        }
+    }
+
+    /// A mutation was refused stale: record the daemon's CURRENT revision
+    /// and drop any in-flight toggle (its leg-one premise is gone).
+    pub fn conflicted(&mut self, current_revision: u64) {
+        self.revision = Some(current_revision);
+        self.pending_toggle = None;
+    }
+
+    /// A queue read/mutation failed: typed message, held rows stay.
+    pub fn failed(&mut self, message: &str) {
+        self.fetching = false;
+        self.error = Some(message.to_owned());
+    }
+}
+
 /// One `/usage` provider group: a provider and the report indices of its
 /// accounts, both in REPORT order (daemon truth — never re-sorted).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2564,6 +2631,19 @@ pub enum AppRequest {
     UsageHistoryRefresh,
     /// 954 Models scope: today's full day read (`usage.history_day`).
     UsageTodayRefresh,
+    /// 954 queue panel: list the daemon-held messages.
+    QueueList,
+    /// 954 queue panel: promote a held message to steer (fenced).
+    QueuePromoteSteer {
+        id: haider_protocol::ids::EventId,
+        revision: u64,
+    },
+    /// 954 queue panel mode toggle, leg one: fenced remove; on the OK
+    /// reply the held text resubmits under the next mode (leg two).
+    QueueToggleRemove {
+        id: haider_protocol::ids::EventId,
+        revision: u64,
+    },
     /// Fetch/refresh the fleet snapshot (`session.fleet`) for the ACTIVE
     /// session. A READ — never outboxed; pushed at fleet-view open, then
     /// chased by the driver on the existing event cadence while the screen
@@ -2922,6 +3002,12 @@ pub enum Hit {
     /// to follow (scroll-back 0); the unseen counter clears through the
     /// watermark the next FOLLOWING frame stamps.
     JumpToBottom,
+    /// 954 queue panel: deliver this held message at the next safe
+    /// boundary (queue.promote_steer, fenced).
+    QueueRowSteer(haider_protocol::ids::EventId),
+    /// 954 queue panel: cycle this held message's delivery mode
+    /// (turn end ⇄ next tool call) — fenced remove + verbatim resubmit.
+    QueueRowToggle(haider_protocol::ids::EventId),
     /// One `/tree` row, by VALUE (B2b-m3): the click validates the carried
     /// row against the freshly built rows and selects it (sim
     /// tui.js:3375-3377 onClick = setTreeSel) — a stale hit whose row was
@@ -3529,6 +3615,8 @@ pub struct AppModel {
     /// Mid-turn input held for turn end (sim queue mode, §4.4): the ⧗
     /// panel's rows; consumed by the driver's `finish_turn` with no idle.
     pub msg_queue: Vec<String>,
+    /// 954: the live composer queue panel (daemon-held messages).
+    pub queue_panel: QueuePanelState,
     /// `/queue turn` — mid-turn input queues instead of steering.
     pub queue_mode: bool,
     /// `/queue subturn` — hold for the next tool boundary and re-prompt.
@@ -3989,6 +4077,7 @@ impl Default for AppModel {
             // voice); real sessions claim theirs from the roster.
             session_head: ("Hasan".to_owned(), "(a)".to_owned()),
             msg_queue: Vec::new(),
+            queue_panel: QueuePanelState::default(),
             queue_mode: false,
             subturn_mode: false,
             voice: VoiceState::default(),
@@ -11546,6 +11635,16 @@ impl AppModel {
         if let EventPayload::Usage(usage) = payload {
             self.cache_usage.note(usage);
         }
+        // 954 queue panel: deltas maintain the panel in place (Enqueued
+        // carries the complete row — the render-complete law). A delta the
+        // panel cannot interpret (a newer daemon's Unknown change) forces
+        // an honest fresh list instead of a silently wrong panel.
+        if let EventPayload::QueueChanged(delta) = payload {
+            if self.queue_panel.apply_delta(delta) {
+                self.requests.push(AppRequest::QueueList);
+            }
+            self.dirty = true;
+        }
         match self.branch_state.scope_of(payload, branch) {
             BranchScope::Aggregate => {
                 self.branch_state.apply_aggregate_to_parked(payload);
@@ -13260,6 +13359,42 @@ impl AppModel {
                 // the reducer never fabricates a "seen" count itself.
                 self.scroll_back.set(0);
                 self.note_session_view();
+            }
+            Hit::QueueRowSteer(id) if matches!(self.screen, Screen::Session | Screen::Subagent) => {
+                // Fenced: the revision we hold rides the mutation; a stale
+                // one comes back as a typed conflict and the panel re-reads.
+                if let Some(revision) = self.queue_panel.revision {
+                    self.requests
+                        .push(AppRequest::QueuePromoteSteer { id, revision });
+                    self.dirty = true;
+                }
+            }
+            Hit::QueueRowToggle(id)
+                if matches!(self.screen, Screen::Session | Screen::Subagent) =>
+            {
+                // Leg one of remove+resubmit. The held text and its NEXT
+                // mode park in pending_toggle so no crash window between
+                // the legs can silently lose the user's words.
+                let staged = self
+                    .queue_panel
+                    .rows
+                    .iter()
+                    .find(|row| row.id == id)
+                    .map(|row| {
+                        let next = match row.mode {
+                            haider_protocol::DeliveryMode::Queue => {
+                                haider_protocol::DeliveryMode::Subturn
+                            }
+                            _ => haider_protocol::DeliveryMode::Queue,
+                        };
+                        (row.text.clone(), next)
+                    });
+                if let (Some((text, next)), Some(revision)) = (staged, self.queue_panel.revision) {
+                    self.queue_panel.pending_toggle = Some((id.clone(), text, next));
+                    self.requests
+                        .push(AppRequest::QueueToggleRemove { id, revision });
+                    self.dirty = true;
+                }
             }
             // A hit whose owning surface is gone: dropped, never acted on.
             _ => {}

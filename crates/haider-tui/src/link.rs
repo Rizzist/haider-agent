@@ -595,6 +595,8 @@ pub struct CommandContext {
     usage_report: bool,
     usage_history: bool,
     usage_today: bool,
+    queue_list: bool,
+    queue_mutation: Option<(haider_protocol::ids::EventId, bool)>,
     /// This request was a `session.fleet` read (fleet view). Same identity
     /// pattern: the error reply lands on the fleet screen.
     fleet: bool,
@@ -661,6 +663,12 @@ impl CommandContext {
             usage_report: matches!(command, LiveCommand::UsageReport),
             usage_history: matches!(command, LiveCommand::UsageHistoryRange { .. }),
             usage_today: matches!(command, LiveCommand::UsageHistoryDay { .. }),
+            queue_list: matches!(command, LiveCommand::QueueList { .. }),
+            queue_mutation: match command {
+                LiveCommand::QueueRemove { id, .. } => Some((id.clone(), true)),
+                LiveCommand::QueuePromoteSteer { id, .. } => Some((id.clone(), false)),
+                _ => None,
+            },
             fleet: matches!(command, LiveCommand::SessionFleet { .. }),
             graph: match command {
                 LiveCommand::GraphStatus { session } => Some(session.clone()),
@@ -895,6 +903,27 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             RequestBody::UsageHistoryRange { through_date, days }
         }
         LiveCommand::UsageHistoryDay { date } => RequestBody::UsageHistoryDay { date },
+        LiveCommand::QueueList { session } => RequestBody::QueueList {
+            session_id: session,
+        },
+        LiveCommand::QueueRemove {
+            session,
+            id,
+            revision,
+        } => RequestBody::QueueRemove {
+            session_id: session,
+            id,
+            revision,
+        },
+        LiveCommand::QueuePromoteSteer {
+            session,
+            id,
+            revision,
+        } => RequestBody::QueuePromoteSteer {
+            session_id: session,
+            id,
+            revision,
+        },
         LiveCommand::SessionFleet { session } => RequestBody::SessionFleet {
             session_id: session,
         },
@@ -1360,6 +1389,19 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         ResponseBody::UsageHistoryDay { day, .. } => vec![LiveReply::UsageHistoryDay {
             day: day.map(Box::new),
         }],
+        ResponseBody::QueueList { rows, revision, .. } => {
+            vec![LiveReply::QueueListed { rows, revision }]
+        }
+        ResponseBody::QueueRemove { id, revision, .. } => vec![LiveReply::QueueMutated {
+            id,
+            revision,
+            removed_for_toggle: true,
+        }],
+        ResponseBody::QueuePromoteSteer { id, revision, .. } => vec![LiveReply::QueueMutated {
+            id,
+            revision,
+            removed_for_toggle: false,
+        }],
         ResponseBody::SessionFleet { snapshot } => vec![LiveReply::Fleet {
             snapshot: Box::new(snapshot),
         }],
@@ -1725,6 +1767,25 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 }
                 if context.usage_today {
                     return vec![LiveReply::UsageHistoryDayFailed {
+                        message: message.clone(),
+                    }];
+                }
+                if context.queue_list {
+                    return vec![LiveReply::QueueFailed {
+                        message: message.clone(),
+                    }];
+                }
+                if context.queue_mutation.is_some() {
+                    // A stale fence comes back as RevisionConflict CARRYING
+                    // the current revision in its message tail. The reply
+                    // layer re-reads; parsing the number here would be a
+                    // fragile substitute — the list read IS the refresh.
+                    if code == "revision_conflict" {
+                        return vec![LiveReply::QueueConflicted {
+                            current_revision: 0,
+                        }];
+                    }
+                    return vec![LiveReply::QueueFailed {
                         message: message.clone(),
                     }];
                 }

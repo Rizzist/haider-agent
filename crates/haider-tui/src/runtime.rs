@@ -1551,6 +1551,9 @@ impl DemoDriver {
             // 954: the heatmap window is daemon truth; demo never fetches.
             | AppRequest::UsageHistoryRefresh
             | AppRequest::UsageTodayRefresh
+            | AppRequest::QueueList
+            | AppRequest::QueuePromoteSteer { .. }
+            | AppRequest::QueueToggleRemove { .. }
             // Fleet live-only vocabulary: demo synthesizes its snapshot
             // from the local chips at open and never pushes the read.
             | AppRequest::FleetRefresh

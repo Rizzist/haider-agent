@@ -239,6 +239,129 @@ fn sticky_jump_suppresses_the_bar_until_a_real_wheel() {
     );
 }
 
+// ---- 954: the composer queue panel ----
+
+/// The live queue panel (954 owner spec): daemon-held rows render above
+/// the composer oldest-top/latest-bottom with a mode label, a mode
+/// toggle, and a steer button; clicking steer issues the fenced
+/// promotion with the HELD revision; clicking toggle stages the row's
+/// verbatim text + next mode (leg two resubmits after the fenced remove
+/// commits, so no crash window can silently lose the words); a delta
+/// removal drops exactly its row; a conflict clears the staged toggle.
+///
+/// MUTATION CHECK (executed): make `apply_delta`'s removal arm retain
+/// everything (drop the retain) — the `delta removal drops its row`
+/// assertion fails; restore, green.
+#[test]
+fn queue_panel_rows_render_and_act_with_the_held_revision() {
+    use haider_protocol::DeliveryMode;
+    use haider_protocol::ids::EventId;
+    use haider_protocol::queue::{QueueChange, QueueDelta, QueueRow};
+    use haider_tui::app::AppRequest;
+
+    let mut model = session_model();
+    let row = |suffix: &str, text: &str, mode: DeliveryMode, ordinal: u32| QueueRow {
+        id: EventId::new(format!("evt-{suffix}")),
+        text: text.into(),
+        mode,
+        ordinal,
+        created_at_ms: 1_000 + u64::from(ordinal),
+    };
+    model.queue_panel.apply_list(
+        vec![
+            row("a", "first queued message", DeliveryMode::Queue, 1),
+            row("b", "second queued message", DeliveryMode::Subturn, 2),
+        ],
+        7,
+    );
+    let (rows, hits, _) = draw(&model, 110, 20);
+    let text = rows.join("\n");
+    assert!(text.contains("2 held"), "the header counts held rows");
+    let first_line = rows
+        .iter()
+        .position(|line| line.contains("first queued message"))
+        .expect("first row renders");
+    let second_line = rows
+        .iter()
+        .position(|line| line.contains("second queued message"))
+        .expect("second row renders");
+    assert!(
+        first_line < second_line,
+        "oldest renders above latest (owner spec)"
+    );
+    assert!(text.contains("(turn end)"), "queue mode labels turn end");
+    assert!(
+        text.contains("(next tool)"),
+        "subturn mode labels next tool"
+    );
+    let steer_a = hits
+        .iter()
+        .find_map(|(_, h)| match h {
+            Hit::QueueRowSteer(id) if id.as_str() == "evt-a" => Some(h.clone()),
+            _ => None,
+        })
+        .expect("steer hit for row a");
+    let toggle_a = hits
+        .iter()
+        .find_map(|(_, h)| match h {
+            Hit::QueueRowToggle(id) if id.as_str() == "evt-a" => Some(h.clone()),
+            _ => None,
+        })
+        .expect("toggle hit for row a");
+
+    // Steer: the fenced promotion carries the HELD revision.
+    model.handle_hit(steer_a);
+    assert!(
+        model.requests.iter().any(|request| matches!(
+            request,
+            AppRequest::QueuePromoteSteer { id, revision: 7 } if id.as_str() == "evt-a"
+        )),
+        "steer issues the fenced promotion at revision 7"
+    );
+
+    // Toggle: leg one removes (fenced), the verbatim text + NEXT mode park
+    // in pending_toggle for leg two.
+    model.handle_hit(toggle_a);
+    let staged = model.queue_panel.pending_toggle.clone().expect("staged");
+    assert_eq!(staged.1, "first queued message", "text parks verbatim");
+    assert_eq!(
+        staged.2,
+        DeliveryMode::Subturn,
+        "queue toggles to next tool call"
+    );
+    assert!(
+        model.requests.iter().any(|request| matches!(
+            request,
+            AppRequest::QueueToggleRemove { id, revision: 7 } if id.as_str() == "evt-a"
+        )),
+        "leg one is the fenced remove"
+    );
+
+    // A delta removal drops exactly its row and carries the new revision.
+    let needs_refresh = model.queue_panel.apply_delta(&QueueDelta {
+        revision: 8,
+        change: QueueChange::Removed {
+            id: EventId::new("evt-b"),
+        },
+    });
+    assert!(!needs_refresh, "a typed removal needs no re-read");
+    assert_eq!(model.queue_panel.revision, Some(8));
+    assert_eq!(
+        model.queue_panel.rows.len(),
+        1,
+        "delta removal drops its row"
+    );
+    assert_eq!(model.queue_panel.rows[0].id.as_str(), "evt-a");
+
+    // A conflict names the current revision and clears the staged toggle.
+    model.queue_panel.conflicted(11);
+    assert_eq!(model.queue_panel.revision, Some(11));
+    assert!(
+        model.queue_panel.pending_toggle.is_none(),
+        "a stale toggle premise is dropped, never replayed blind"
+    );
+}
+
 // ---- 954: bottom jump band + unseen counter ----
 
 /// The bottom complement of the sticky band (954 owner item): scrolled

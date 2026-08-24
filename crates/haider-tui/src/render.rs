@@ -3927,7 +3927,13 @@ fn render_session(
                 u16::try_from(t.items.len() + 1).unwrap_or(4)
             }
         });
-    let mut queue_height = if model.msg_queue.is_empty() {
+    // 954: the live queue panel (daemon-held rows) and the demo's local
+    // msg_queue share the slot; live rows win when present.
+    let live_queue_rows = model.queue_panel.rows.len();
+    let queue_error_line = usize::from(model.queue_panel.error.is_some());
+    let mut queue_height = if live_queue_rows + queue_error_line > 0 {
+        u16::try_from(live_queue_rows + queue_error_line + 1).unwrap_or(6)
+    } else if model.msg_queue.is_empty() {
         0
     } else {
         u16::try_from(model.msg_queue.len() + 1).unwrap_or(4)
@@ -4651,7 +4657,93 @@ fn render_session(
             screen_control_area,
         );
     }
-    if queue_height > 0 {
+    if queue_height > 0 && (live_queue_rows > 0 || model.queue_panel.error.is_some()) {
+        // 954: the LIVE queue panel — daemon-held rows, render-complete
+        // (oldest top, latest bottom), each with its delivery-mode toggle
+        // and a steer button. Mutations ride the held revision; a stale
+        // fence re-reads (never guesses), so these buttons cannot act on
+        // a row the list shifted under.
+        let mut queue_lines = vec![Line::from(vec![
+            Span::styled("⧗ queued", theme.gold_style()),
+            Span::styled(
+                format!(
+                    " — {live_queue_rows} held · daemon-timed · steer sends now · mode cycles turn end ⇄ next tool",
+                ),
+                theme.dim_style(),
+            ),
+        ])];
+        if let Some(error) = &model.queue_panel.error {
+            queue_lines.push(Line::styled(format!("  ✗ {error}"), theme.err_style()));
+        }
+        let button_w = "  [⇄ next tool]  [steer]".chars().count();
+        for (index, row) in model.queue_panel.rows.iter().enumerate() {
+            let mode_label = match row.mode {
+                haider_protocol::DeliveryMode::Queue => "turn end",
+                haider_protocol::DeliveryMode::Subturn => "next tool",
+                haider_protocol::DeliveryMode::Steer => "steer soon",
+            };
+            let toggle_label = match row.mode {
+                haider_protocol::DeliveryMode::Queue => "[⇄ next tool]",
+                _ => "[⇄ turn end]",
+            };
+            let text_budget =
+                (queue_area.width as usize).saturating_sub(button_w + mode_label.len() + 10);
+            let shown = ellipsize(&row.text.replace('\n', " "), text_budget.max(8));
+            let left = format!("  {}. {shown}", index + 1);
+            let left_width = left.chars().count() + mode_label.len() + 3;
+            let pad = (queue_area.width as usize)
+                .saturating_sub(left_width + button_w)
+                .max(1);
+            let row_y = queue_area.y
+                + 1
+                + u16::from(model.queue_panel.error.is_some())
+                + u16::try_from(index).unwrap_or(u16::MAX);
+            let toggle_hovered = model.hovered == Some(Hit::QueueRowToggle(row.id.clone()));
+            let steer_hovered = model.hovered == Some(Hit::QueueRowSteer(row.id.clone()));
+            queue_lines.push(Line::from(vec![
+                Span::styled(left, theme.dim_style()),
+                Span::styled(format!(" ({mode_label})"), theme.gold_style()),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(
+                    toggle_label.to_owned(),
+                    if toggle_hovered {
+                        theme.bright_style()
+                    } else {
+                        theme.dim_style()
+                    },
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    "[steer]".to_owned(),
+                    if steer_hovered {
+                        theme.bright_style()
+                    } else {
+                        theme.gold_style()
+                    },
+                ),
+            ]));
+            if row_y < queue_area.y + queue_height {
+                let toggle_x = queue_area.x
+                    + u16::try_from((queue_area.width as usize).saturating_sub(button_w))
+                        .unwrap_or(0);
+                let toggle_rect = Rect {
+                    x: toggle_x,
+                    y: row_y,
+                    width: 15,
+                    height: 1,
+                };
+                let steer_rect = Rect {
+                    x: toggle_x + 17,
+                    y: row_y,
+                    width: 7,
+                    height: 1,
+                };
+                hits.push((toggle_rect, Hit::QueueRowToggle(row.id.clone())));
+                hits.push((steer_rect, Hit::QueueRowSteer(row.id.clone())));
+            }
+        }
+        frame.render_widget(Paragraph::new(Text::from(queue_lines)), queue_area);
+    } else if queue_height > 0 {
         // The ⧗ queued panel (sim tui.js:2891-2906): header + numbered
         // rows, text truncated at 72 chars.
         let count = model.msg_queue.len();
