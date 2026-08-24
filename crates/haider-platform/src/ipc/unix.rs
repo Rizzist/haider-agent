@@ -444,8 +444,24 @@ async fn remove_verified_stale(
     }
 }
 
-#[cfg(target_os = "linux")]
 fn probe_failure(operation: &'static str, path: &Path, error: std::io::Error) -> EndpointError {
+    if is_synthesized_probe_timeout(&error) {
+        // This timeout is synthesized by our probe wrapper, not reported by
+        // the kernel, so historical platform errno preservation does not apply.
+        return ambiguous_probe_failure(operation, path, error);
+    }
+    platform_probe_failure(operation, path, error)
+}
+
+fn is_synthesized_probe_timeout(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::TimedOut && error.raw_os_error().is_none()
+}
+
+fn ambiguous_probe_failure(
+    operation: &'static str,
+    path: &Path,
+    error: std::io::Error,
+) -> EndpointError {
     EndpointError::Endpoint {
         message: format!(
             "{operation} for endpoint {} was ambiguous ({error}); treating it as live",
@@ -454,8 +470,21 @@ fn probe_failure(operation: &'static str, path: &Path, error: std::io::Error) ->
     }
 }
 
+#[cfg(target_os = "linux")]
+fn platform_probe_failure(
+    operation: &'static str,
+    path: &Path,
+    error: std::io::Error,
+) -> EndpointError {
+    ambiguous_probe_failure(operation, path, error)
+}
+
 #[cfg(not(target_os = "linux"))]
-fn probe_failure(operation: &'static str, path: &Path, error: std::io::Error) -> EndpointError {
+fn platform_probe_failure(
+    operation: &'static str,
+    path: &Path,
+    error: std::io::Error,
+) -> EndpointError {
     EndpointError::io(operation, path, error)
 }
 
@@ -672,5 +701,40 @@ pub fn write_immediate(stream: &IpcStream, bytes: &[u8]) {
             Err(Errno::INTR) => {}
             Err(_) => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EndpointError, is_synthesized_probe_timeout, probe_failure};
+    use rustix::io::Errno;
+    use std::io::{Error, ErrorKind};
+    use std::path::Path;
+
+    /// MUTATION CHECK (executed): restore the raw-I/O mapping for `TimedOut`
+    /// in `probe_failure` — this test fails at the unexpected-variant panic.
+    #[test]
+    fn synthesized_probe_timeout_is_a_typed_ambiguous_refusal() {
+        let failure = probe_failure(
+            "probe Unix socket",
+            Path::new("/tmp/haider-timeout.sock"),
+            Error::new(ErrorKind::TimedOut, "synthetic probe timeout"),
+        );
+
+        match failure {
+            EndpointError::Endpoint { message } => {
+                assert!(message.contains("was ambiguous (synthetic probe timeout)"));
+                assert!(message.contains("treating it as live"));
+            }
+            other => panic!("expected typed endpoint refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kernel_timeout_is_not_classified_as_synthesized() {
+        let kernel_timeout: Error = Errno::TIMEDOUT.into();
+
+        assert_eq!(kernel_timeout.kind(), ErrorKind::TimedOut);
+        assert!(!is_synthesized_probe_timeout(&kernel_timeout));
     }
 }
