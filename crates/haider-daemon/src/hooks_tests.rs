@@ -2669,10 +2669,33 @@ fn server_command(workspace: &Path, spawn_log: &Path, kind: TestServerKind) -> S
     format!("\"{}\"", script.display())
 }
 
+/// Counts spawns recorded in the fixture's log.
+///
+/// This used to end in `.unwrap_or(0)`, which conflated TWO different facts: the
+/// hook server never spawned, and the log could not be read. Those are opposite
+/// diagnoses and the assertion reported both as `left: 0`.
+///
+/// That matters on Windows specifically, where the log is appended by a child
+/// `.cmd` process and can be locked or unflushed when the parent reads it. Three
+/// `server_mode_*` tests fail there with `left: 0, right: 2`, and with the old
+/// helper there was no way to tell a product failure from an unreadable file.
+///
+/// A read failure now panics with the OS error instead of masquerading as zero.
+/// A test that cannot observe the thing it asserts on must say so, not guess.
 fn spawn_count(log: &Path) -> usize {
-    std::fs::read_to_string(log)
-        .map(|content| content.lines().count())
-        .unwrap_or(0)
+    match std::fs::read_to_string(log) {
+        Ok(content) => content.lines().count(),
+        // Not-found is a REAL zero: the fixture creates the log lazily on first
+        // spawn, so its absence means nothing was spawned.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => panic!(
+            "spawn log at {} could not be read: {error} (kind {:?}). \
+             This is NOT the same as zero spawns — the assertion that follows \
+             would have reported it as `left: 0` and blamed the product.",
+            log.display(),
+            error.kind()
+        ),
+    }
 }
 
 async fn fired_count(fixture: &EngineFixture) -> usize {
