@@ -26,7 +26,9 @@ use haider_provider::Provider as _;
 use haider_provider::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
 use haider_rpc::{
     ERROR_CODE_BUSY, OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId,
-    OAuthFlowStatusWire, OAuthReadyRefWire, RequestId, ResponseBody, WireFrame,
+    OAuthFlowStatusWire, OAuthImportSourceUnavailableCodeWire,
+    OAuthImportSourceUnavailableReasonWire, OAuthImportSourceWire, OAuthReadyRefWire, RequestId,
+    ResponseBody, WireFrame,
 };
 use reqwest::redirect::Policy;
 use serde::de::Visitor;
@@ -1009,46 +1011,57 @@ pub(crate) struct OAuthImportSourceSpec {
     home_relative_path: &'static str,
 }
 
+const OAUTH_IMPORT_SOURCE_SPECS: [OAuthImportSourceSpec; 4] = [
+    OAuthImportSourceSpec {
+        source: "codex",
+        provider: haider_provider::OPENAI_OAUTH_PROVIDER_NAME,
+        default_alias: haider_provider::OPENAI_OAUTH_PROVIDER_NAME,
+        env_override: "HAIDER_CODEX_AUTH_PATH",
+        home_relative_path: ".codex/auth.json",
+    },
+    OAuthImportSourceSpec {
+        source: "claude-code",
+        provider: haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME,
+        default_alias: haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME,
+        env_override: "HAIDER_CLAUDE_CREDS_PATH",
+        home_relative_path: ".claude/.credentials.json",
+    },
+    OAuthImportSourceSpec {
+        source: "kimi-code",
+        provider: haider_provider::KIMI_OAUTH_PROVIDER_NAME,
+        default_alias: haider_provider::KIMI_OAUTH_PROVIDER_NAME,
+        env_override: "HAIDER_KIMI_CREDS_PATH",
+        home_relative_path: ".kimi/credentials/kimi-code.json",
+    },
+    OAuthImportSourceSpec {
+        source: "grok-cli",
+        provider: haider_provider::GROK_OAUTH_PROVIDER_NAME,
+        default_alias: haider_provider::GROK_OAUTH_PROVIDER_NAME,
+        env_override: "HAIDER_GROK_AUTH_PATH",
+        home_relative_path: ".grok/auth.json",
+    },
+];
+
 pub(crate) fn oauth_import_source_spec(source: &str) -> Result<OAuthImportSourceSpec, HaiderError> {
-    match source {
-        "codex" => Ok(OAuthImportSourceSpec {
-            source: "codex",
-            provider: haider_provider::OPENAI_OAUTH_PROVIDER_NAME,
-            default_alias: haider_provider::OPENAI_OAUTH_PROVIDER_NAME,
-            env_override: "HAIDER_CODEX_AUTH_PATH",
-            home_relative_path: ".codex/auth.json",
-        }),
-        "claude-code" => Ok(OAuthImportSourceSpec {
-            source: "claude-code",
-            provider: haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME,
-            default_alias: haider_provider::ANTHROPIC_OAUTH_PROVIDER_NAME,
-            env_override: "HAIDER_CLAUDE_CREDS_PATH",
-            home_relative_path: ".claude/.credentials.json",
-        }),
-        "kimi-code" => Ok(OAuthImportSourceSpec {
-            source: "kimi-code",
-            provider: haider_provider::KIMI_OAUTH_PROVIDER_NAME,
-            default_alias: haider_provider::KIMI_OAUTH_PROVIDER_NAME,
-            env_override: "HAIDER_KIMI_CREDS_PATH",
-            home_relative_path: ".kimi/credentials/kimi-code.json",
-        }),
-        "grok-cli" => Ok(OAuthImportSourceSpec {
-            source: "grok-cli",
-            provider: haider_provider::GROK_OAUTH_PROVIDER_NAME,
-            default_alias: haider_provider::GROK_OAUTH_PROVIDER_NAME,
-            env_override: "HAIDER_GROK_AUTH_PATH",
-            home_relative_path: ".grok/auth.json",
-        }),
-        _ => Err(HaiderError::new(
-            ErrorCode::InvalidArgument,
-            "OAuth import source must be codex, claude-code, kimi-code, or grok-cli",
-            false,
-        )),
-    }
+    OAUTH_IMPORT_SOURCE_SPECS
+        .iter()
+        .copied()
+        .find(|spec| spec.source == source)
+        .ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "OAuth import source must be codex, claude-code, kimi-code, or grok-cli",
+                false,
+            )
+        })
 }
 
 pub(crate) fn oauth_import_path(source: &str) -> Result<PathBuf, HaiderError> {
     let spec = oauth_import_source_spec(source)?;
+    oauth_import_path_for_spec(spec)
+}
+
+fn oauth_import_path_for_spec(spec: OAuthImportSourceSpec) -> Result<PathBuf, HaiderError> {
     if let Some(path) = std::env::var_os(spec.env_override).filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(path));
     }
@@ -1063,6 +1076,101 @@ pub(crate) fn oauth_import_path(source: &str) -> Result<PathBuf, HaiderError> {
         ));
     };
     Ok(PathBuf::from(home).join(spec.home_relative_path))
+}
+
+/// Returns the complete daemon-owned import catalog. Availability is sampled
+/// during this call. Available sources sort first; both groups retain the
+/// declaration order in [`OAUTH_IMPORT_SOURCE_SPECS`].
+pub(crate) fn oauth_import_source_catalog(
+    claude_native: &dyn ClaudeNativeCredentialStore,
+) -> Vec<OAuthImportSourceWire> {
+    let mut sources = OAUTH_IMPORT_SOURCE_SPECS
+        .iter()
+        .copied()
+        .map(|spec| {
+            if spec.source == "claude-code" {
+                match claude_native.probe() {
+                    Ok(()) => return available_oauth_import_source(spec),
+                    Err(ClaudeNativeCredentialFailure::Missing) => {}
+                    Err(_) => {
+                        return unavailable_oauth_import_source(
+                            spec,
+                            OAuthImportSourceUnavailableCodeWire::Unreadable,
+                        );
+                    }
+                }
+            }
+            oauth_import_source_file_entry(spec, oauth_import_path_for_spec(spec).ok())
+        })
+        .collect::<Vec<_>>();
+    sources.sort_by_key(|source| !source.available);
+    sources
+}
+
+fn oauth_import_source_file_entry(
+    spec: OAuthImportSourceSpec,
+    path: Option<PathBuf>,
+) -> OAuthImportSourceWire {
+    let Some(path) = path else {
+        return unavailable_oauth_import_source(
+            spec,
+            OAuthImportSourceUnavailableCodeWire::NotFound,
+        );
+    };
+    let readable = std::fs::File::open(path).and_then(|file| {
+        if file.metadata()?.is_file() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                "credential store is not a regular file",
+            ))
+        }
+    });
+    match readable {
+        Ok(()) => available_oauth_import_source(spec),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            unavailable_oauth_import_source(spec, OAuthImportSourceUnavailableCodeWire::NotFound)
+        }
+        Err(_) => {
+            unavailable_oauth_import_source(spec, OAuthImportSourceUnavailableCodeWire::Unreadable)
+        }
+    }
+}
+
+fn available_oauth_import_source(spec: OAuthImportSourceSpec) -> OAuthImportSourceWire {
+    OAuthImportSourceWire {
+        source: spec.source.to_owned(),
+        provider: spec.provider.to_owned(),
+        default_alias: spec.default_alias.to_owned(),
+        available: true,
+        unavailable_reason: None,
+    }
+}
+
+fn unavailable_oauth_import_source(
+    spec: OAuthImportSourceSpec,
+    code: OAuthImportSourceUnavailableCodeWire,
+) -> OAuthImportSourceWire {
+    let message = match code {
+        OAuthImportSourceUnavailableCodeWire::NotFound => format!(
+            "No credentials were found for OAuth import source `{}`; sign in with that CLI and refresh.",
+            spec.source
+        ),
+        OAuthImportSourceUnavailableCodeWire::Unreadable => format!(
+            "Credentials for OAuth import source `{}` are present but the daemon cannot read them; check access permissions and refresh.",
+            spec.source
+        ),
+        _ => {
+            "OAuth import credentials are currently unavailable; refresh and try again.".to_owned()
+        }
+    };
+    OAuthImportSourceWire {
+        source: spec.source.to_owned(),
+        provider: spec.provider.to_owned(),
+        default_alias: spec.default_alias.to_owned(),
+        available: false,
+        unavailable_reason: Some(OAuthImportSourceUnavailableReasonWire { code, message }),
+    }
 }
 
 pub(crate) fn oauth_home_dir() -> Option<std::ffi::OsString> {
@@ -1125,6 +1233,12 @@ pub(crate) trait ClaudeNativeCredentialStore: Send + Sync {
         &self,
         event: ClaudeNativeReadEvent,
     ) -> Result<ClaudeCredentialInput, ClaudeNativeCredentialFailure>;
+
+    /// Non-interactive availability probe. Implementations must not display
+    /// an OS credential prompt; catalog refreshes are observational reads.
+    fn probe(&self) -> Result<(), ClaudeNativeCredentialFailure> {
+        self.read(ClaudeNativeReadEvent::Ordinary).map(drop)
+    }
 }
 
 /// Raw platform store. The macOS implementation performs a no-UI query first
@@ -1144,6 +1258,10 @@ impl ClaudeNativeCredentialStore for PlatformClaudeNativeCredentialStore {
         _event: ClaudeNativeReadEvent,
     ) -> Result<ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
         platform_claude_credential(self)
+    }
+
+    fn probe(&self) -> Result<(), ClaudeNativeCredentialFailure> {
+        platform_claude_credential_probe(self)
     }
 }
 
@@ -1209,6 +1327,58 @@ impl ClaudeNativeCredentialStore for ClaudeNativeCredentialAccess {
             }
         }
     }
+
+    fn probe(&self) -> Result<(), ClaudeNativeCredentialFailure> {
+        self.store.probe()
+    }
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn platform_claude_credential_probe(
+    _store: &PlatformClaudeNativeCredentialStore,
+) -> Result<(), ClaudeNativeCredentialFailure> {
+    use security_framework::item::{ItemClass, ItemSearchOptions, SearchResult};
+
+    ItemSearchOptions::new()
+        .class(ItemClass::generic_password())
+        .service(CLAUDE_CODE_CREDENTIAL_SERVICE)
+        .load_attributes(true)
+        .search()
+        .map_err(|error| classify_macos_keychain_status(error.code()))?;
+
+    match ItemSearchOptions::new()
+        .class(ItemClass::generic_password())
+        .service(CLAUDE_CODE_CREDENTIAL_SERVICE)
+        .load_data(true)
+        .skip_authenticated_items(true)
+        .search()
+    {
+        Ok(results) => {
+            if results
+                .into_iter()
+                .any(|item| matches!(item, SearchResult::Data(_)))
+            {
+                Ok(())
+            } else {
+                Err(ClaudeNativeCredentialFailure::Denied)
+            }
+        }
+        Err(error) => Err(classify_macos_keychain_status(error.code())),
+    }
+}
+
+#[cfg(all(target_os = "windows", not(test)))]
+fn platform_claude_credential_probe(
+    store: &PlatformClaudeNativeCredentialStore,
+) -> Result<(), ClaudeNativeCredentialFailure> {
+    platform_claude_credential(store).map(drop)
+}
+
+#[cfg(any(test, not(any(target_os = "macos", target_os = "windows"))))]
+fn platform_claude_credential_probe(
+    _store: &PlatformClaudeNativeCredentialStore,
+) -> Result<(), ClaudeNativeCredentialFailure> {
+    Err(ClaudeNativeCredentialFailure::Missing)
 }
 
 #[cfg(all(target_os = "macos", not(test)))]

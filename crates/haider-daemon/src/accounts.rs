@@ -75,7 +75,7 @@ use crate::oauth::{
     OAuthInferenceHeaderSet, OAuthProviderCatalog, OAuthReadyClaim,
     PlatformClaudeNativeCredentialStore, RefreshFenceRegistry, is_claude_native_owner_identity,
     load_claude_native_import_material, load_oauth_import_material_with_native,
-    oauth_import_source_spec, sanctioned_inference,
+    oauth_import_source_catalog, oauth_import_source_spec, sanctioned_inference,
 };
 use crate::provider_registry::{
     CachedProviderModelSource, JsonProviderRegistryStore, ProductionProviderEndpointValidator,
@@ -987,6 +987,9 @@ pub(crate) enum OAuthImportHealResult {
 pub(crate) enum AccountCommand {
     Login(Box<LoginJob>),
     AddOAuth(Box<OAuthAddJob>),
+    OAuthImportSources {
+        completed: LoginRoute,
+    },
     ImportOAuth(Box<OAuthImportJob>),
     DeviceCandidates {
         discovery_disabled: bool,
@@ -1357,6 +1360,14 @@ async fn run_account_actor(
                     *job,
                 )
                 .await;
+            }
+            AccountCommand::OAuthImportSources { completed } => {
+                respond(
+                    &completed,
+                    ResponseBody::AccountOAuthImportSources {
+                        sources: oauth_import_source_catalog(claude_native.as_ref()),
+                    },
+                );
             }
             AccountCommand::ImportOAuth(job) => {
                 handle_oauth_import(

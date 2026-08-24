@@ -230,6 +230,7 @@ affordance before the response exists.
 | `account_oauth_pkce_v1` | browser/loopback `account.oauth_start/status/cancel` |
 | `account_oauth_device_v1` | device-code forms of the same OAuth methods and `user_code` |
 | `account_oauth_import_v1` | `account.oauth_import` |
+| `account_oauth_import_sources_v1` | `account.oauth_import_sources` |
 | `account_device_discovery_v1` | `account.device_candidates`, `account.import_device` |
 | `account_management_v1` | `account.add/list/set_active/remove/set_default_model` and management revision fields |
 | `account_rotation_v1` | live same-provider active-account rotation behavior |
@@ -373,7 +374,7 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | `loom.register_agent_type`, `loom.register_workflow` | `LoomRegistered` (`method: "loom.registered"`) | registry mutation/no-op receipt |
 | `vault.stage` | `VaultStage` | connection-local ephemeral dedupe, deliberately not durable |
 | `account.login_api`, `account.oauth_import`, `account.import_device`, `account.add`, `account.set_active`, `account.remove`, `account.set_default_model` | same-named response | durable account mutation |
-| `account.oauth_start/status/cancel`, `account.device_candidates` | same-named response | connection-bound flow reads/actions |
+| `account.oauth_start/status/cancel`, `account.oauth_import_sources`, `account.device_candidates` | same-named response | connection-bound flow/catalog reads/actions |
 | `account.set_label` | `AccountSetLabel` | control mutation; alias remains identity |
 | `provider.models_refresh` | `ProviderModelsRefresh` | provider snapshot refresh |
 | `provider.configure`, `provider.remove` | same-named response | durable provider mutation |
@@ -382,13 +383,13 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 The golden matrix at
 `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`, combined
 with the historical `wire_transcript.json`, pins a request and successful
-response for every one of the 70 v1 request methods. `menu.answer` and resident
+response for every one of the 71 v1 request methods. `menu.answer` and resident
 binding are top-level frames, not `RequestBody` methods.
 
 ## 6. Snapshot, watch, invalidation, push, and replay laws
 
 - `session.list`, `session.read`, `session.observe`, `session.observe_batch`,
-  `session.fleet`, `command.list`, `account.list`, `provider.list`,
+  `session.fleet`, `command.list`, `account.list`, `account.oauth_import_sources`, `provider.list`,
   `usage.report`, `loom.list`, `tools.inventory`, `hooks.list`, graph reads,
   and `session.pipe_path` are snapshots. Calling them does not subscribe.
 - `session.list_watch` subscribes before acknowledging. Its first
@@ -412,6 +413,63 @@ binding are top-level frames, not `RequestBody` methods.
 - only `session.attach` begins raw event delivery. It replays strictly after
   `after_seq`, through the captured `replay_through_seq`, emits
   `AttachCaughtUp`, then continues live. `session.read` never subscribes.
+
+### 6.1 OAuth import-source catalog
+
+`account.oauth_import_sources` has no request fields and returns the
+daemon-owned list accepted by `account.oauth_import`:
+
+```json
+{"method":"account.oauth_import_sources"}
+{"method":"account.oauth_import_sources","sources":[{
+  "source":"codex",
+  "provider":"openai-oauth",
+  "default_alias":"openai-oauth",
+  "available":false,
+  "unavailable_reason":{
+    "code":"not_found",
+    "message":"No credentials were found for OAuth import source `codex`; sign in with that CLI and refresh."
+  }
+}]}
+```
+
+Each entry has this contract:
+
+| Field | Meaning |
+|---|---|
+| `source` | Opaque daemon-owned key to pass back unchanged as `account.oauth_import.source` |
+| `provider` | Provider the import creates/selects; clients may render or preselect from this value |
+| `default_alias` | Alias the daemon uses when the source does not resolve to an existing imported identity |
+| `available` | Whether the daemon-local credential store is present and readable at the instant of this response |
+| `unavailable_reason` | Required when `available=false`, absent when `available=true`; contains branchable `code` plus authoritative display `message` |
+
+`available` is a point-in-time observation made during this call; there is no
+watch or liveness promise, so a client refreshes by issuing the request again.
+It does not promise that credential content is valid, unexpired, or accepted by
+the provider; those facts are checked by `account.oauth_import`.
+
+The defined reason codes are exactly:
+
+| Code | Detection |
+|---|---|
+| `not_found` | The configured file location cannot be resolved or opens as not found, and for Claude Code its native credential store also reports missing |
+| `unreadable` | The file exists but cannot be opened/read as a regular file, or the Claude Code native store exists but its non-interactive probe cannot read it |
+| `unknown` | Client-side decode of a newer daemon code; render the paired `message` and do not infer an action |
+
+The catalog does not parse credential content, so it cannot distinguish
+expired, malformed, or otherwise invalid credentials and publishes no reason
+codes for those states. In particular, clients MUST branch on the code and
+MUST NOT pattern-match `message` prose.
+
+Ordering is stable and defined: available sources come first, and sources
+within the available and unavailable groups retain daemon declaration order.
+A client may preserve this preferred order without sorting.
+
+A client MUST NOT hardcode or merge an OAuth import-source list. The source
+set can grow in a daemon release without a client release; a client-owned
+mirror silently drops the new source and makes a supported import path
+unreachable. Filesystem paths and environment overrides are deliberately not
+published and must not be reconstructed client-side.
 
 ## 7. Sequence, gap, and command identity
 
@@ -459,6 +517,7 @@ generation, or surface owner/revision as if they were one observation.
 | Transcript display rows | a current-generation native pipe followed to full coverage | Raw item/node events are the durable fallback. At equal coverage, do not show both pipe and fallback rows. Pipe is not authority for run, account, roster, or permission state. |
 | Current todo panel | latest open `TurnItem` lifecycle whose `item` is `"plan"`, at the applied raw-event cursor | There is no summary/digest todo projection. Use the exact reducer in §12; do not infer a plan from tool text. |
 | Accounts/defaults/active aliases | `account.list` snapshot | `AccountsChanged` only invalidates. Provider rows do not replace descriptors. |
+| OAuth import sources | `account.oauth_import_sources` snapshot | Never mirror the source list or infer daemon filesystem paths. |
 | Provider/model inventory | `provider.list` snapshot | Account rows and a client hardcoded model list do not override it. `provider.models_refresh` produces a newer snapshot. |
 | Cross-account usage | `usage.report` | Session summaries contain only per-session promoted cache metrics, not the account report. |
 | Per-session cache health | `SessionSummary.cache_reread_hit_basis_points`; use `cache_lifetime_hit_basis_points` only for the separately labeled lifetime/all-input share | The same-summary nested `agent_metrics.usage.cache_reread_hit_basis_points` and `cache_hit_basis_points` are compatibility sources only when their promoted field is absent. Never calculate a substitute from token counts. |
@@ -1148,7 +1207,7 @@ The machine-checkable contract lives in these fixtures/tests:
   receipts.
 - `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`: the
   methods added after the historical matrix, completing golden request and
-  successful response coverage for all 70 request methods and all five
+  successful response coverage for all 71 request methods and all five
   command dynamic slots.
 - `crates/haider-rpc/tests/fixtures/snapshot_availability_compat_v1.json`:
   old and new account/provider/usage response bytes.

@@ -3280,6 +3280,18 @@ impl HubConnection {
                 }
                 self.account_oauth_cancel(request_id, flow_id, attempt_id)
             }
+            RequestBody::AccountOAuthImportSources => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.account_oauth_import_sources(request_id)
+            }
             RequestBody::AccountOAuthImport { command_id, source } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
                     return self.respond_error(
@@ -4557,6 +4569,33 @@ impl HubConnection {
         Ok(Some(facade))
     }
 
+    fn oauth_import_source_facade(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<Option<crate::accounts::AccountsFacade>, SessionHubError> {
+        if self.transport != crate::accounts::ConnectionTransport::LocalSameUid {
+            self.respond_error(
+                request_id.clone(),
+                ERROR_CODE_CAPABILITY_DENIED,
+                "OAuth import-source discovery is only served on authenticated same-UID local connections",
+                false,
+                None,
+            )?;
+            return Ok(None);
+        }
+        let Some(facade) = self.hub.accounts()? else {
+            self.respond_error(
+                request_id.clone(),
+                ERROR_CODE_DRAINING,
+                "account actor is unavailable",
+                true,
+                None,
+            )?;
+            return Ok(None);
+        };
+        Ok(Some(facade))
+    }
+
     /// `vault.stage`: connection-scoped, non-durable, inline (no I/O). The
     /// secret enters zeroizing storage here and the wire frame drops
     /// (zeroized) with this call.
@@ -4930,12 +4969,12 @@ impl HubConnection {
             return Ok(());
         };
         if command_id.as_str().trim().is_empty()
-            || !matches!(source.as_str(), "codex" | "claude-code" | "kimi-code")
+            || crate::oauth::oauth_import_source_spec(&source).is_err()
         {
             return self.respond_error(
                 request_id,
                 ERROR_CODE_INVALID_ARGUMENT,
-                "account.oauth_import requires a command id and source `codex`, `claude-code`, or `kimi-code`",
+                "account.oauth_import requires a command id and a source published by account.oauth_import_sources",
                 false,
                 None,
             );
@@ -4974,6 +5013,21 @@ impl HubConnection {
                 None,
             ),
         }
+    }
+
+    fn account_oauth_import_sources(&self, request_id: RequestId) -> Result<(), SessionHubError> {
+        let Some(_facade) = self.oauth_import_source_facade(&request_id)? else {
+            return Ok(());
+        };
+        self.send_management_command(
+            request_id.clone(),
+            crate::accounts::AccountCommand::OAuthImportSources {
+                completed: crate::accounts::LoginRoute {
+                    request_id,
+                    sink: Arc::clone(&self.sink),
+                },
+            },
+        )
     }
 
     fn account_device_candidates(&self, request_id: RequestId) -> Result<(), SessionHubError> {

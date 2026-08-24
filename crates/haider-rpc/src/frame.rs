@@ -266,6 +266,9 @@ pub const FEATURE_ACCOUNT_OAUTH_PKCE_V1: &str = "account_oauth_pkce_v1";
 pub const FEATURE_ACCOUNT_OAUTH_DEVICE_V1: &str = "account_oauth_device_v1";
 /// Daemon imports OAuth credentials from approved, daemon-local CLI stores.
 pub const FEATURE_ACCOUNT_OAUTH_IMPORT_V1: &str = "account_oauth_import_v1";
+/// Daemon publishes the approved OAuth import-source catalog and its
+/// point-in-time credential-store availability.
+pub const FEATURE_ACCOUNT_OAUTH_IMPORT_SOURCES_V1: &str = "account_oauth_import_sources_v1";
 /// Daemon implements metadata-only device credential discovery and receipted
 /// candidate import. There is no wire refresh action: same-alias re-login or
 /// re-import replaces tokens, and broker-internal refresh stays daemon-owned.
@@ -792,6 +795,39 @@ pub struct OAuthAvailabilityWire {
     pub available: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+/// Machine-readable reason an OAuth import source is not currently
+/// available. The paired human message remains authoritative for display;
+/// `Unknown` lets an older client render that message for a newer code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum OAuthImportSourceUnavailableCodeWire {
+    NotFound,
+    Unreadable,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Typed and displayable explanation for an unavailable OAuth import source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OAuthImportSourceUnavailableReasonWire {
+    pub code: OAuthImportSourceUnavailableCodeWire,
+    pub message: String,
+}
+
+/// One daemon-owned OAuth import source and its point-in-time availability.
+/// Internal environment-variable and filesystem-path details never cross the
+/// wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OAuthImportSourceWire {
+    pub source: String,
+    pub provider: String,
+    pub default_alias: String,
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<OAuthImportSourceUnavailableReasonWire>,
 }
 
 /// Provider adapter family. Unlike the frozen account enums, this enum is
@@ -2142,6 +2178,10 @@ pub enum RequestBody {
         flow_id: OAuthFlowId,
         attempt_id: String,
     },
+    /// Lists the daemon-owned sanctioned import sources and whether each
+    /// daemon-local credential store is present and readable at call time.
+    #[serde(rename = "account.oauth_import_sources")]
+    AccountOAuthImportSources,
     /// Imports a sanctioned OAuth bundle from a daemon-local CLI credential
     /// store. Only the source name crosses the wire; token material is read
     /// and retained by the daemon.
@@ -2726,6 +2766,8 @@ pub enum ResponseBody {
         flow_id: OAuthFlowId,
         status: OAuthFlowStatusWire,
     },
+    #[serde(rename = "account.oauth_import_sources")]
+    AccountOAuthImportSources { sources: Vec<OAuthImportSourceWire> },
     #[serde(rename = "account.oauth_import")]
     AccountOAuthImport {
         descriptor: haider_protocol::credential::CredentialDescriptor,

@@ -7518,6 +7518,7 @@ async fn remote_control_connection_cannot_reach_any_oauth_secret_surface() {
             flow_id: flow_id.clone(),
             attempt_id: "remote-attempt".into(),
         },
+        RequestBody::AccountOAuthImportSources,
         RequestBody::AccountOAuthImport {
             command_id: CommandId::new("remote-import-command"),
             source: "codex".into(),

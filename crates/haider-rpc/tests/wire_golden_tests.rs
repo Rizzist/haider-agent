@@ -185,6 +185,7 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "account.login_api",
         "account.oauth_cancel",
         "account.oauth_import",
+        "account.oauth_import_sources",
         "account.oauth_start",
         "account.oauth_status",
         "account.remove",
@@ -412,6 +413,46 @@ fn snapshot_availability_is_compatible_in_both_n_minus_one_directions() {
     )
     .expect("unknown future availability state remains decodable");
     assert_eq!(future_state, haider_rpc::SnapshotAvailabilityWire::Unknown);
+}
+
+/// OAuth import-source reason codes are extensible while their prose remains
+/// displayable.
+///
+/// MUTATION CHECK: remove `#[serde(other)]` from
+/// `OAuthImportSourceUnavailableCodeWire::Unknown`. Expected runtime failure:
+/// decoding the synthetic future code below fails instead of preserving the
+/// human message.
+#[test]
+fn unknown_oauth_import_source_reason_code_preserves_prose() {
+    let future = r#"{
+        "method":"account.oauth_import_sources",
+        "sources":[{
+            "source":"codex",
+            "provider":"openai-oauth",
+            "default_alias":"openai-oauth",
+            "available":false,
+            "unavailable_reason":{
+                "code":"credential_store_moved",
+                "message":"The credential store moved; update the daemon and refresh."
+            }
+        }]
+    }"#;
+    let body: ResponseBody = serde_json::from_str(future).expect("future reason code decodes");
+    let ResponseBody::AccountOAuthImportSources { sources } = body else {
+        panic!("expected OAuth import-source catalog response");
+    };
+    let reason = sources[0]
+        .unavailable_reason
+        .as_ref()
+        .expect("future unavailable reason remains present");
+    assert_eq!(
+        reason.code,
+        haider_rpc::OAuthImportSourceUnavailableCodeWire::Unknown
+    );
+    assert_eq!(
+        reason.message,
+        "The credential store moved; update the daemon and refresh."
+    );
 }
 
 /// MUTATION CHECK: make `accepted_proposal_digest` required or serialize it as

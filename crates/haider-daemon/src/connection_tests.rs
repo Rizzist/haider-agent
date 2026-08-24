@@ -74,6 +74,10 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// `welcome_features`. Expected runtime failure: the exact feature-set
 /// assertion reports that `account_oauth_import_v1` is missing.
 ///
+/// MUTATION CHECK: remove `FEATURE_ACCOUNT_OAUTH_IMPORT_SOURCES_V1` from
+/// `welcome_features`. Expected runtime failure: the exact feature-set
+/// assertion reports that `account_oauth_import_sources_v1` is missing.
+///
 /// MUTATION CHECK: remove `FEATURE_CONTEXT_COMPACTION_V1`. Expected runtime
 /// failure: clients cannot discover the served `session.compact` method.
 /// Verified by revert on 2026-07-30.
@@ -175,6 +179,7 @@ fn welcome_features_pin_served_management_families() {
             FEATURE_ACCOUNT_LOGIN_API_V1.to_owned(),
             haider_rpc::FEATURE_ACCOUNT_MANAGEMENT_V1.to_owned(),
             haider_rpc::FEATURE_ACCOUNT_OAUTH_DEVICE_V1.to_owned(),
+            haider_rpc::FEATURE_ACCOUNT_OAUTH_IMPORT_SOURCES_V1.to_owned(),
             haider_rpc::FEATURE_ACCOUNT_OAUTH_IMPORT_V1.to_owned(),
             haider_rpc::FEATURE_ACCOUNT_OAUTH_PKCE_V1.to_owned(),
             FEATURE_ACCOUNT_ROTATION_V1.to_owned(),
@@ -241,6 +246,14 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_COMPUTER_PERMISSION_ACTIONS_V1.to_owned(),
             FEATURE_VAULT_STAGE_V1.to_owned(),
         ])
+    );
+}
+
+#[test]
+fn welcome_advertises_oauth_import_source_catalog() {
+    assert!(
+        welcome_features().contains(haider_rpc::FEATURE_ACCOUNT_OAUTH_IMPORT_SOURCES_V1),
+        "the daemon serves account.oauth_import_sources and must advertise it"
     );
 }
 

@@ -29,6 +29,69 @@ const CLAUDE_SECURE_STORE_FIXTURE: &[u8] = br#"{
   }
 }"#;
 
+/// Catalog/spec drift pin.
+///
+/// MUTATION CHECK: drop any entry from `oauth_import_source_catalog` before
+/// returning it. Expected runtime failure: this exact four-source assertion
+/// reports the missing source (including `grok-cli`).
+#[test]
+fn oauth_import_source_catalog_contains_every_supported_spec() {
+    let native = OAuthTestClaudeNative::unavailable();
+    let catalog = oauth_import_source_catalog(&native);
+    let mut sources = catalog
+        .iter()
+        .map(|entry| entry.source.as_str())
+        .collect::<Vec<_>>();
+    sources.sort_unstable();
+    assert_eq!(
+        sources,
+        ["claude-code", "codex", "grok-cli", "kimi-code"],
+        "the published catalog must contain all four sanctioned import sources"
+    );
+    for entry in catalog {
+        let spec = oauth_import_source_spec(&entry.source).expect("catalog source has a spec");
+        assert_eq!(entry.provider, spec.provider);
+        assert_eq!(entry.default_alias, spec.default_alias);
+    }
+}
+
+/// Missing-source availability pin.
+///
+/// MUTATION CHECK: construct an unavailable entry with
+/// `unavailable_reason: None`. Expected runtime failure: the reason-presence
+/// assertion below fails before a client can lose its branchable code.
+#[test]
+fn absent_oauth_import_credentials_have_a_typed_reason() {
+    let directory = tempfile::tempdir().expect("catalog fixture directory");
+    let spec = oauth_import_source_spec("codex").expect("codex spec");
+    let entry =
+        oauth_import_source_file_entry(spec, Some(directory.path().join("missing-auth.json")));
+
+    assert!(!entry.available);
+    let reason = entry
+        .unavailable_reason
+        .expect("available=false always carries a reason");
+    assert_eq!(reason.code, OAuthImportSourceUnavailableCodeWire::NotFound);
+    assert!(!reason.message.is_empty());
+}
+
+/// Present-source availability pin.
+///
+/// MUTATION CHECK: attach an unavailable reason to the successful branch of
+/// `oauth_import_source_file_entry`. Expected runtime failure: the final
+/// assertion observes the contradictory reason.
+#[test]
+fn present_oauth_import_credentials_have_no_unavailable_reason() {
+    let directory = tempfile::tempdir().expect("catalog fixture directory");
+    let path = directory.path().join("auth.json");
+    std::fs::write(&path, b"credential-present").expect("write credential fixture");
+    let spec = oauth_import_source_spec("codex").expect("codex spec");
+    let entry = oauth_import_source_file_entry(spec, Some(path));
+
+    assert!(entry.available);
+    assert_eq!(entry.unavailable_reason, None);
+}
+
 struct OAuthTestClaudeNative {
     bytes: Option<Vec<u8>>,
     reads: AtomicUsize,

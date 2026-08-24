@@ -164,6 +164,12 @@
       "response": {"method":"account.oauth_import","descriptor":{"alias":"openai-0123456789abcdef01234567","provider":"openai","auth_method":"oauth","identity":"person@example.invalid","status":{"status":"ok"},"active":true},"revision":23}
     },
     {
+      "request_method": "account.oauth_import_sources",
+      "response_method": "account.oauth_import_sources",
+      "request": {"method":"account.oauth_import_sources"},
+      "response": {"method":"account.oauth_import_sources","sources":[{"source":"grok-cli","provider":"grok-oauth","default_alias":"grok-oauth","available":false,"unavailable_reason":{"code":"not_found","message":"No credentials were found for OAuth import source `grok-cli`; sign in with that CLI and refresh."}}]}
+    },
+    {
       "request_method": "account.set_label",
       "response_method": "account.set_label",
       "request": {"method":"account.set_label","alias":"openai-0123456789abcdef01234567","label":"Work"},
