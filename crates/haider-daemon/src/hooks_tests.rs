@@ -1,8 +1,10 @@
 #![allow(clippy::expect_used)]
 
+#[cfg(unix)]
+use super::hook_command;
 use super::{
     CapturedBytes, HookDefinition, HookEngine, HookKind, HookMatcher, HookService, HookSource,
-    HookTrustPolicy, MatchEvent, classify, discover, hook_command, hook_digest, make_output,
+    HookTrustPolicy, MatchEvent, classify, discover, hook_digest, make_output,
     next_subscriber_backoff, prepare_hook_input, run_command,
 };
 use crate::session_hub::{SessionHub, SessionHubConfig};
