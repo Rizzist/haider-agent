@@ -2,5 +2,12 @@
 # serializers (serde_json, etc.). Force LF on checkout everywhere so a
 # Windows autocrlf clone never rewrites them to CRLF and breaks a golden.
 *.json text eol=lf
+# Tests compare these source/docs with LF-bearing substring assertions;
+# pin their checkout EOL so Windows autocrlf cannot change the test inputs.
+# (include_str! bakes checkout-time EOL into the binary, so the attribute,
+# not runtime normalization, is the load-bearing fix for frame.rs.)
+docs/client-contract-v1.md text eol=lf
+docs/client-contract-v1-enum-audit.md text eol=lf
+crates/haider-rpc/src/frame.rs text eol=lf
 crates/**/tests/fixtures/** text eol=lf
 crates/**/tests/goldens/** text eol=lf

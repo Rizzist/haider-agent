@@ -67,6 +67,8 @@ fn provider_auth_oauth_wire_wart_is_stable_and_documented() {
     );
     let contract = std::fs::read_to_string(workspace.join("docs/client-contract-v1.md"))
         .expect("read client contract");
+    // Lane 953b: defend the LF-bearing assertion against a Windows CRLF checkout.
+    let contract = contract.replace("\r\n", "\n");
     assert!(
         contract.contains("Rust `OAuth` becomes\n`\"o_auth\"`"),
         "the contract must warn that source-derived snake case splits OAuth"
@@ -1145,7 +1147,8 @@ fn session_summary_workspace_is_additive_and_old_decoder_tolerant() {
 /// required explicit annotation by itself.
 #[test]
 fn session_summary_without_top_level_provider_still_decodes() {
-    let frame = include_str!("../src/frame.rs");
+    // Lane 953b: defend the LF-bearing assertion against a Windows CRLF checkout.
+    let frame = include_str!("../src/frame.rs").replace("\r\n", "\n");
     assert!(
         frame.contains(
             "#[serde(default, skip_serializing_if = \"Option::is_none\")]\n    pub provider: Option<String>"
@@ -1188,7 +1191,8 @@ fn session_summary_without_top_level_provider_still_decodes() {
 /// decode alone) is what turns this mutation red.
 #[test]
 fn v0_0_942_session_summary_without_promoted_cache_rates_still_decodes() {
-    let frame = include_str!("../src/frame.rs");
+    // Lane 953b: defend the LF-bearing assertion against a Windows CRLF checkout.
+    let frame = include_str!("../src/frame.rs").replace("\r\n", "\n");
     for declaration in [
         "#[serde(default, skip_serializing_if = \"Option::is_none\")]\n    pub cache_lifetime_hit_basis_points: Option<u32>",
         "#[serde(default, skip_serializing_if = \"Option::is_none\")]\n    pub cache_reread_hit_basis_points: Option<u32>",
