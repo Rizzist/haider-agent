@@ -53,6 +53,7 @@ pub const HAIDER_CODE_ACCOUNT_URL: &str = "https://haidercode.ai/v1/account";
 pub const HAIDER_CODE_SEED_MODELS: [&str; 2] = ["Go", "Go Max"];
 pub const XAI_PROVIDER_NAME: &str = "xai";
 pub const XAI_BASE_URL: &str = "https://api.x.ai/v1";
+const XAI_CONVERSATION_ID_HEADER: &str = "x-grok-conv-id";
 pub const XAI_SEED_MODELS: [&str; 4] = ["grok-4.6", "grok-4.5", "grok-4.3", "grok-build-0.1"];
 pub const XAI_SEED_MODEL_CONTEXT_WINDOWS: [(&str, u64); 4] = [
     ("grok-4.6", 500_000),
@@ -1191,6 +1192,36 @@ impl OpenAiCompatibleProvider {
         )
     }
 
+    #[cfg(test)]
+    fn new_xai_api_with_dns_resolver(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: &str,
+        resolver: Arc<dyn FixedDnsResolver>,
+    ) -> Result<Self, ProviderError> {
+        if base_url != XAI_BASE_URL {
+            return Err(invalid_request("xAI inference base URL is not sanctioned"));
+        }
+        let endpoints = compatible_endpoints(base_url, CompatibleOriginPolicy::Strict)?;
+        let http = OpenAiHttp::new_fixed_origins(
+            credential,
+            model,
+            &[&endpoints.chat_url, &endpoints.models_url],
+            XAI_HOST,
+            resolver,
+            false,
+        )?;
+        Ok(Self {
+            http,
+            base_url: endpoints.base_url,
+            chat_url: endpoints.chat_url,
+            models_url: endpoints.models_url,
+            dialect: CompatibleDialect::XaiApi,
+            kimi_thinking: None,
+            kimi_reasoning_effort: None,
+        })
+    }
+
     /// Constructs Haider Code's fixed API-key Chat Completions adapter.
     pub fn new_haider_code_api(
         credential: SecretHandle,
@@ -1431,6 +1462,23 @@ impl OpenAiCompatibleProvider {
         &self,
         request: &TurnRequest,
     ) -> Result<reqwest::Response, ProviderError> {
+        let opening = async {
+            let outbound = self.inference_request(request).await?;
+            self.http
+                .client
+                .execute(outbound)
+                .await
+                .map_err(transport_error)
+        };
+        tokio::time::timeout(TRANSPORT_CONFIG.response_open_timeout, opening)
+            .await
+            .map_err(|_| response_open_timeout_error(TRANSPORT_CONFIG.response_open_timeout))?
+    }
+
+    async fn inference_request(
+        &self,
+        request: &TurnRequest,
+    ) -> Result<reqwest::Request, ProviderError> {
         let mut payload = match crate::take_prepared_wire_payload() {
             Some(prepared) => prepared.payload,
             None => self.request_payload(request)?,
@@ -1454,7 +1502,21 @@ impl OpenAiCompatibleProvider {
                 object.remove("prompt_cache_key");
             }
         }
-        self.http.post_json(&self.chat_url, &payload).await
+        let mut outbound = self
+            .http
+            .post_json_request(&self.chat_url, &payload)
+            .await?;
+        if self.dialect == CompatibleDialect::XaiApi
+            && let Some(conversation_id) = xai_prompt_cache_conversation_id(request)
+        {
+            outbound.headers_mut().insert(
+                XAI_CONVERSATION_ID_HEADER,
+                HeaderValue::from_bytes(conversation_id.as_bytes()).map_err(|_| {
+                    internal("derived xAI conversation ID was not a valid HTTP header value")
+                })?,
+            );
+        }
+        Ok(outbound)
     }
 }
 
@@ -4243,11 +4305,56 @@ fn compatible_cache_control_observation(
             };
             CacheControlObservationV1::NotEmitted { reason }
         }
+        CompatibleDialect::XaiApi if xai_prompt_cache_conversation_id(request).is_some() => {
+            CacheControlObservationV1::Emitted { ttl_ms: None }
+        }
+        CompatibleDialect::XaiApi => {
+            let Some(metadata) = request.cache_metadata.as_ref() else {
+                return CacheControlObservationV1::NotEmitted {
+                    reason: CacheControlOmissionReasonV1::AdapterUnavailable,
+                };
+            };
+            let reason = if !metadata.boundaries_valid(request.messages.len()) {
+                CacheControlOmissionReasonV1::InvalidBoundaries
+            } else if metadata.account_scope.is_none() {
+                CacheControlOmissionReasonV1::MissingAccountScope
+            } else if metadata.provider != XAI_PROVIDER_NAME {
+                CacheControlOmissionReasonV1::ProviderMismatch
+            } else {
+                CacheControlOmissionReasonV1::AdapterUnavailable
+            };
+            CacheControlObservationV1::NotEmitted { reason }
+        }
         CompatibleDialect::Generic
         | CompatibleDialect::HaiderCodeApi
-        | CompatibleDialect::XaiApi
         | CompatibleDialect::GrokOAuth => CacheControlObservationV1::Unavailable,
     }
+}
+
+/// xAI Chat Completions caches matching message prefixes automatically, but
+/// `x-grok-conv-id` provides the sticky server routing needed for reliable
+/// reuse. Hash the non-secret cache coordinates rather than exposing Haider's
+/// internal session identifier, and deliberately omit prefix digests so the
+/// route stays stable through append-only turns and compaction epochs.
+fn xai_prompt_cache_conversation_id(request: &TurnRequest) -> Option<String> {
+    let metadata = request.cache_metadata.as_ref()?;
+    if !metadata.boundaries_valid(request.messages.len())
+        || metadata.provider != XAI_PROVIDER_NAME
+        || metadata.session_scope.is_empty()
+        || metadata.account_scope.is_none()
+    {
+        return None;
+    }
+    let domain = serde_json::json!({
+        "schema": "haider.xai-conversation-id.v1",
+        "provider": metadata.provider,
+        "model": request.model,
+        "session_scope": metadata.session_scope,
+        "account_scope": metadata.account_scope,
+    });
+    serde_json::to_vec(&domain)
+        .ok()
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
 }
 
 fn derive_prompt_cache_key(request: &TurnRequest, metadata: &crate::PromptCacheMetadata) -> String {

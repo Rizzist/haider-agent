@@ -2381,10 +2381,9 @@ async fn wh2_deepseek_request_golden_uses_chat_completions_bearer_and_model() {
     assert!(payload.get("temperature").is_none());
 
     let outbound = provider
-        .http
-        .post_json_request(&provider.chat_url, &payload)
+        .inference_request(&request)
         .await
-        .expect("build fixed DeepSeek request");
+        .expect("build fixed DeepSeek inference request");
     assert_eq!(
         outbound.url().as_str(),
         "https://api.deepseek.com/chat/completions"
@@ -2398,6 +2397,10 @@ async fn wh2_deepseek_request_golden_uses_chat_completions_bearer_and_model() {
         b"Bearer DEEPSEEK_API_KEY_SENTINEL_3d72"
     );
     assert!(authorization.is_sensitive());
+    assert!(
+        !outbound.headers().contains_key(XAI_CONVERSATION_ID_HEADER),
+        "healthy non-xAI Chat Completions requests remain unchanged"
+    );
 }
 
 /// MUTATION CHECK: route Haider Code through a configurable origin, omit the
@@ -2526,6 +2529,104 @@ async fn grok_oauth_proxy_request_pins_complete_header_contract() {
         .expect("build Grok catalog request");
     assert!(discovery.headers().contains_key("x-grok-client-version"));
     assert!(!discovery.headers().contains_key("x-grok-model-override"));
+}
+
+/// HAIDER952XAI(a). MUTATION CHECK: remove the xAI inference header, derive it
+/// from a turn-varying prefix component, expose the raw session scope, or
+/// apply it to model discovery. The exact header, stability, isolation,
+/// opacity, and discovery assertions below fail independently.
+#[tokio::test]
+async fn xai_inference_uses_stable_opaque_session_cache_route() {
+    use haider_protocol::provider::CacheControlObservationV1;
+
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("xai-cache-route");
+    vault
+        .put(&alias, b"XAI_API_KEY_SENTINEL_952")
+        .expect("store xAI key");
+    let resolver = Arc::new(StubDnsResolver::new([vec![SocketAddr::from((
+        [93, 184, 216, 34],
+        443,
+    ))]]));
+    let provider = OpenAiCompatibleProvider::new_xai_api_with_dns_resolver(
+        vault.resolve(&alias).expect("resolve xAI key"),
+        "grok-4.6",
+        XAI_BASE_URL,
+        resolver,
+    )
+    .expect("construct xAI adapter");
+    let mut request = probe_request("grok-4.6");
+    request.cache_metadata = Some(cm2_cache_metadata(XAI_PROVIDER_NAME, 1));
+
+    let payload = provider.request_payload(&request).expect("xAI payload");
+    assert!(
+        payload.get("prompt_cache_key").is_none(),
+        "Chat Completions uses a routing header, not the Responses body key"
+    );
+    assert_eq!(payload["messages"][0]["role"], "system");
+    let first = provider
+        .inference_request(&request)
+        .await
+        .expect("first xAI inference request");
+    let first_id = first
+        .headers()
+        .get(XAI_CONVERSATION_ID_HEADER)
+        .expect("xAI conversation routing header")
+        .to_str()
+        .expect("ASCII conversation ID")
+        .to_owned();
+    assert_eq!(first_id.len(), 64, "conversation ID is BLAKE3 hex");
+    assert!(first_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_ne!(first_id, "session-a", "raw session scope stays private");
+    let prepared = crate::Provider::prepare_turn(&provider, &request).expect("prepared xAI turn");
+    assert_eq!(
+        *prepared.cache_control(),
+        CacheControlObservationV1::Emitted { ttl_ms: None }
+    );
+
+    request
+        .messages
+        .push(crate::Message::assistant(vec![Block::Text {
+            text: "PINGACK".into(),
+        }]));
+    request.messages.push(crate::Message::user_text("again"));
+    let metadata = request.cache_metadata.as_mut().expect("cache metadata");
+    metadata.compaction_epoch = "new-compaction-epoch".into();
+    metadata.prefix_digests.immutable_history = "grown-history".into();
+    let next = provider
+        .inference_request(&request)
+        .await
+        .expect("next xAI inference request");
+    assert_eq!(
+        next.headers()[XAI_CONVERSATION_ID_HEADER],
+        first_id,
+        "one session keeps its route across append-only turns and cache epochs"
+    );
+
+    request
+        .cache_metadata
+        .as_mut()
+        .expect("cache metadata")
+        .session_scope = "session-b".into();
+    let other = provider
+        .inference_request(&request)
+        .await
+        .expect("other xAI session request");
+    assert_ne!(
+        other.headers()[XAI_CONVERSATION_ID_HEADER],
+        first_id,
+        "concurrent sessions must not share xAI routing"
+    );
+
+    let discovery = provider
+        .http
+        .get_request(&provider.models_url)
+        .await
+        .expect("xAI discovery request");
+    assert!(
+        !discovery.headers().contains_key(XAI_CONVERSATION_ID_HEADER),
+        "conversation routing applies only to inference"
+    );
 }
 
 /// MUTATION CHECK: treating the hard version gate as billing/transport or
