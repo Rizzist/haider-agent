@@ -114,3 +114,86 @@ permissions UX, Play-policy constraints (SMS and AccessibilityService will not
 pass review; sideload or F-Droid is the path), and a security review of the
 localhost surface the Diff Forge PWA would reach — a browser cannot open a unix
 socket, so that surface is new, not a transport swap.
+
+---
+
+# The Android concept: what we are actually building
+
+Written 2026-08-24 as the architectural frame for the phases below. Nothing here
+is implemented — this records the shape and the reasoning so the first lane does
+not have to re-derive it.
+
+## Two artifacts, two pipelines
+
+These get conflated and should not be:
+
+| | Toolchain | Output | Installs into |
+|---|---|---|---|
+| CLI + daemon | Rust, `aarch64-linux-android`, NDK | tarball of two binaries | Termux |
+| Companion app | Gradle, Android SDK | APK | Android directly |
+
+CI can produce both, as separate jobs. The first is a fifth entry in the
+existing release matrix. The second is a new project with its own language,
+review process and store policy.
+
+**AAB is probably never needed.** AAB is a Play Store format, and Play will
+reject SMS permissions and an AccessibilityService used for automation — their
+policy requires accessibility services to be *for* accessibility. Sideloaded APK
+or F-Droid is the distribution path. That is how Termux itself ships.
+
+## The companion app needs UI, for structural reasons
+
+Not product UI — Android forces it:
+
+- runtime permissions can only be requested from an Activity; there is no
+  headless way to ask
+- long-running background work requires a foreground service, which requires a
+  persistent notification
+- **an AccessibilityService cannot be enabled programmatically at all.** The
+  user must open Settings and turn it on. Without guidance nobody completes it.
+
+So the minimum is one screen: permission states with grant actions, a service
+on/off control, and the daemon's local address. A control panel, not an app.
+The real UI is the PWA; the APK is a permission broker and service host.
+
+## The design question, and the answer
+
+**How does a Rust daemon reach Android capabilities it has no permission to
+touch?** Three options:
+
+1. **Embed the daemon in the APK via JNI.** Cleanest capability access, but
+   couples the Rust to Android's lifecycle and makes Termux a second
+   implementation.
+2. **APK as a capability broker over a local socket.** ← RECOMMENDED. The daemon
+   asks for "screenshot", "tap at x,y", "send SMS"; the APK executes with its
+   granted permissions and returns a result. The daemon stays a plain Unix
+   process and does not know it is on Android.
+3. **Shell out to `termux-*`.** Works with no APK, but caps at what Termux:API
+   declares — which excludes screen capture and input injection, i.e. everything
+   that makes phone-use *phone-use*.
+
+The broker wins because **it mirrors what computer-use already does**: a tool
+interface with a platform-specific implementation behind it. Phone-use becomes
+another backend rather than a new subsystem, and Termux and the APK can coexist
+— Termux for development, APK for the product — without two daemons.
+
+## Phases
+
+**Phase 1 — the port.** Daemon and CLI run under Termux. No Android
+capabilities. Proves `/proc`, sockets, process groups and paths work under
+Bionic. This is the ~15 sites above.
+
+**Phase 2 — the broker.** APK ships permissions, a foreground service and a
+capability socket. Daemon gains phone-use tools. SMS, screenshot and input
+injection arrive here.
+
+**Phase 3 — the PWA.** Diff Forge on the phone talks to the local daemon. Needs
+a localhost surface with origin checks, because a browser cannot open a unix
+socket. That is a new security surface, not a transport swap.
+
+## The failure mode to guard against
+
+**Do not treat a green Phase 1 build as evidence the port works.** Android
+compiles today by falling into `not(target_os = "linux")` branches — it would
+build, run, and be quietly wrong. Every widened cfg needs a stated reason why
+the Linux implementation is correct under Bionic, not merely that it compiles.
