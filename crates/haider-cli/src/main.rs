@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+pub(crate) mod account;
 pub(crate) mod export;
 pub(crate) mod graph;
 pub(crate) mod hooks;
@@ -130,6 +131,7 @@ async fn dispatch() -> ExitCode {
             session_item::session_item_command(session_id, seq, rest).await
         }
         [command, rest @ ..] if command == "session" => observe::session_command(rest).await,
+        [command, rest @ ..] if command == "account" => account::account_command(rest).await,
         [command, rest @ ..] if command == "models" => models::models_command(rest).await,
         [command, rest @ ..] if command == "fleet" => observe::fleet_command(rest).await,
         [command, rest @ ..] if command == "events" => observe::events_command(rest).await,
@@ -180,6 +182,7 @@ async fn dispatch() -> ExitCode {
                  session <id> config [--json] [--model <model|provider/model>] [--effort <level>] [--speed <fast|normal>] [--account <alias>], \
                  session <id> seen, session <id> recover [--json] [--probe|--mark-done|--retry|--abandon], \
                  session <id> item <seq> --json [--masked] [--no-spawn], \
+                 account list [--json], account remove <alias> --confirm, \
                  models [--json], \
                  fleet [<session-id>] [--json] [--no-spawn], \
                  events [--follow] [--no-spawn], \

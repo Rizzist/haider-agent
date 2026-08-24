@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 #[path = "../src/main.rs"]
 mod cli_main;
 
+use cli_main::account::{AccountCommand, parse_account_command};
 use cli_main::hooks::{HooksCommand, parse_hooks_command};
 use cli_main::run::{
     EX_BLOCKED, EX_CANCELLED, EX_IOERR, EX_PROTOCOL, EX_PROVIDER, EX_SOFTWARE, EX_TIMEOUT,
@@ -189,6 +190,172 @@ fn self_test_reports_ok_json() {
 fn unknown_command_exits_2() {
     let out = haider().arg("frobnicate").output().expect("binary runs");
     assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn account_parser_pins_list_and_remove_grammar() {
+    assert_eq!(
+        parse_account_command(&["list".into()]),
+        Ok(AccountCommand::List { json: false })
+    );
+    assert_eq!(
+        parse_account_command(&["list".into(), "--json".into()]),
+        Ok(AccountCommand::List { json: true })
+    );
+    assert_eq!(
+        parse_account_command(&["remove".into(), "probe".into()]),
+        Ok(AccountCommand::Remove {
+            alias: "probe".into(),
+            confirm: false,
+        })
+    );
+    assert_eq!(
+        parse_account_command(&["remove".into(), "probe".into(), "--confirm".into()]),
+        Ok(AccountCommand::Remove {
+            alias: "probe".into(),
+            confirm: true,
+        })
+    );
+    assert!(parse_account_command(&["list".into(), "--yaml".into()]).is_err());
+    assert!(parse_account_command(&["remove".into(), "--confirm".into()]).is_err());
+}
+
+fn seed_cli_account(command: &mut HaiderCommand, alias: &str) -> Vec<u8> {
+    let runtime_dir = command._profile_root.path().to_path_buf();
+    command
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("TMPDIR", runtime_dir);
+    let descriptors = vec![haider_protocol::credential::CredentialDescriptor {
+        alias: haider_protocol::ids::CredentialAlias::new(alias),
+        provider: "anthropic".into(),
+        base_url: Some("https://SECRET-ENDPOINT.invalid/TOKEN-SENTINEL".into()),
+        auth_method: haider_protocol::credential::AuthMethod::ApiKey,
+        identity: "SECRET-IDENTITY-SENTINEL".into(),
+        status: haider_protocol::credential::CredentialStatus::NeedsAttention {
+            reason: haider_protocol::credential::CredentialAttentionReason::KeychainMissing,
+        },
+        active: true,
+        label: Some("SECRET-LABEL-SENTINEL".into()),
+    }];
+    let mut bytes = serde_json::to_vec_pretty(&descriptors).expect("account fixture JSON");
+    bytes.push(b'\n');
+    std::fs::create_dir_all(&command.profile).expect("profile directory");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&command.profile, std::fs::Permissions::from_mode(0o700))
+            .expect("secure profile permissions");
+    }
+    let accounts = command.profile.join("accounts.json");
+    std::fs::write(&accounts, &bytes).expect("seed accounts");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&accounts, std::fs::Permissions::from_mode(0o600))
+            .expect("secure accounts permissions");
+    }
+    bytes
+}
+
+fn daemon_logs(profile: &Path) -> String {
+    let directory = profile.join("daemon-logs");
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return "<no daemon log>".into();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The real sibling daemon answers `account.list`; the CLI projection must
+/// never widen to descriptor Debug/serde fields when human or JSON evolves.
+#[test]
+fn account_list_json_uses_daemon_rpc_and_exposes_only_the_safe_projection() {
+    let mut command = haider();
+    seed_cli_account(&mut command, "probe-json");
+    let output = command
+        .args(["account", "list", "--json"])
+        .output()
+        .expect("account list runs");
+    assert!(
+        output.status.success(),
+        "stderr: {}\ndaemon log:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        daemon_logs(&command.profile)
+    );
+    assert!(output.stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("list JSON");
+    assert_eq!(value["schema"], "haider.accounts.v1");
+    let account = value["accounts"][0].as_object().expect("account object");
+    assert_eq!(account.len(), 4, "only the four sanctioned fields");
+    assert_eq!(account["alias"], "probe-json");
+    assert_eq!(account["provider"], "anthropic");
+    assert_eq!(account["auth_kind"], "api_key");
+    assert!(account["created"].is_null());
+    let output = String::from_utf8(output.stdout).expect("UTF-8 output");
+    for secret in [
+        "SECRET-ENDPOINT",
+        "TOKEN-SENTINEL",
+        "SECRET-IDENTITY-SENTINEL",
+        "SECRET-LABEL-SENTINEL",
+        "keychain_missing",
+    ] {
+        assert!(!output.contains(secret), "list leaked {secret}: {output}");
+    }
+}
+
+/// MUTATION CHECK: delete/invert the `--confirm` gate. Expected RUNTIME
+/// failure: this command succeeds, starts a daemon, or changes accounts.json.
+#[test]
+fn account_remove_without_confirm_cannot_reach_the_daemon_or_mutate() {
+    let mut command = haider();
+    let before = seed_cli_account(&mut command, "probe-unconfirmed");
+    let output = command
+        .args(["account", "remove", "probe-unconfirmed"])
+        .output()
+        .expect("unconfirmed account remove runs");
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(stderr.contains("would remove account `probe-unconfirmed`"));
+    assert!(stderr.contains("--confirm"));
+    assert!(
+        daemon_pid(&command.profile).is_none(),
+        "daemon must not start"
+    );
+    assert_eq!(
+        std::fs::read(command.profile.join("accounts.json")).expect("accounts remain"),
+        before
+    );
+}
+
+#[test]
+fn account_remove_confirmed_uses_the_daemon_and_commits_removal() {
+    let mut command = haider();
+    seed_cli_account(&mut command, "probe-confirmed");
+    let output = command
+        .args(["account", "remove", "probe-confirmed", "--confirm"])
+        .output()
+        .expect("confirmed account remove runs");
+    assert!(
+        output.status.success(),
+        "stderr: {}\ndaemon log:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        daemon_logs(&command.profile)
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+        "removed account `probe-confirmed`\n"
+    );
+    let descriptors: Vec<haider_protocol::credential::CredentialDescriptor> =
+        serde_json::from_slice(
+            &std::fs::read(command.profile.join("accounts.json")).expect("accounts projection"),
+        )
+        .expect("accounts JSON");
+    assert!(descriptors.is_empty(), "confirmed removal must commit");
 }
 
 /// MUTATION CHECK: route `codex` to `ClaudeCode`. Expected runtime failure:
