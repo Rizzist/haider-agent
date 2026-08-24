@@ -1845,6 +1845,71 @@ fn cm2d_gpt56_uses_explicit_breakpoints_before_the_volatile_suffix() {
     );
 }
 
+/// HAIDER953. The public Responses API spells an explicit content marker
+/// `prompt_cache_breakpoint: {"mode":"explicit"}`, but the 947 law forbids
+/// treating that surface as evidence for HTTPS responses-lite. Exercise the
+/// environment split in isolated child processes so parallel tests cannot
+/// observe a process-global environment mutation.
+///
+/// MUTATION CHECK: delete the environment-gate check (making the marker
+/// unconditional), or make the gate inert; the default-off or enabled child
+/// respectively fails. The API-key assertion also pins transport isolation.
+#[test]
+fn haider953_openai_lite_cache_breakpoint_is_explicitly_gated() {
+    const CHILD_MARKER: &str = "HAIDER_OPENAI_LITE_CACHE_BREAKPOINT_TEST_CHILD";
+    const EXPECTED_MARKER: &str = "HAIDER_OPENAI_LITE_CACHE_BREAKPOINT_TEST_EXPECTED";
+
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        let expected = std::env::var_os(EXPECTED_MARKER).is_some();
+        let mut lite_request = probe_request("gpt-5.6-sol");
+        lite_request.cache_metadata = Some(cm2_cache_metadata(OPENAI_OAUTH_PROVIDER_NAME, 1));
+        let lite = responses_request_json(&lite_request, true, None, false).expect("lite wire");
+        let marker = lite["input"][0]["content"][0]
+            .get("prompt_cache_breakpoint")
+            .cloned();
+        assert_eq!(
+            marker,
+            expected.then(|| serde_json::json!({"mode": "explicit"})),
+            "the HTTPS lite marker must exactly follow the default-off environment gate: {lite}"
+        );
+
+        let api_key = responses_request_json(&probe_request("gpt-5.6-sol"), false, None, false)
+            .expect("API-key wire");
+        assert!(
+            api_key["input"][0]["content"][0]
+                .get("prompt_cache_breakpoint")
+                .is_none(),
+            "the lite experiment gate must not annotate public API-key requests: {api_key}"
+        );
+        return;
+    }
+
+    for enabled in [false, true] {
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"));
+        child
+            .arg("haider953_openai_lite_cache_breakpoint_is_explicitly_gated")
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env_remove(OPENAI_LITE_CACHE_BREAKPOINT_ENV)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if enabled {
+            child
+                .env(OPENAI_LITE_CACHE_BREAKPOINT_ENV, "1")
+                .env(EXPECTED_MARKER, "1");
+        } else {
+            child.env_remove(EXPECTED_MARKER);
+        }
+        let output = child.output().expect("run isolated breakpoint child");
+        assert!(
+            output.status.success(),
+            "breakpoint child (enabled={enabled}) failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 /// CM2f — the HTTPS responses-lite transport rejects
 /// `prompt_cache_retention`, even though it appeared in a WebSocket codex
 /// capture. Haider keeps its stable cache key and puts the system prompt in

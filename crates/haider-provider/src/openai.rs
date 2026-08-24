@@ -98,6 +98,7 @@ pub const OPENAI_SUBSCRIPTION_RESPONSES_URL: &str =
     "https://chatgpt.com/backend-api/codex/responses";
 pub const OPENAI_CODEX_RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
 pub const OPENAI_CODEX_RESPONSES_LITE_VALUE: &str = "true";
+const OPENAI_LITE_CACHE_BREAKPOINT_ENV: &str = "HAIDER_OPENAI_LITE_CACHE_BREAKPOINT";
 /// W-B (decision 3): the UNOFFICIAL codex search endpoint the client
 /// `web_search` tool executes against on lite pairs — same origin and
 /// Bearer as subscription turns. Source-verified against codex main
@@ -3620,6 +3621,9 @@ fn responses_request_json_with_boundary(
     ));
     let attachments = attachment_index(request)?;
     let native_computer_results = native_computer_result_index(request)?;
+    let lite_cache_breakpoint = codex_responses_lite
+        && request.cache_metadata.is_some()
+        && openai_lite_cache_breakpoint_enabled();
     let computer_result_call_ids = request
         .messages
         .iter()
@@ -3634,10 +3638,20 @@ fn responses_request_json_with_boundary(
     // input item and leaves the top-level `instructions` parameter null. Keep
     // the API-key Responses shape unchanged.
     if codex_responses_lite && let Some(instructions) = &request.system_prompt {
+        let mut instruction_block = serde_json::json!({"type": "input_text", "text": instructions});
+        if lite_cache_breakpoint {
+            instruction_block
+                .as_object_mut()
+                .ok_or_else(|| internal("OpenAI instruction block was not a JSON object"))?
+                .insert(
+                    "prompt_cache_breakpoint".into(),
+                    serde_json::json!({"mode": "explicit"}),
+                );
+        }
         input.push(serde_json::json!({
             "type": "message",
             "role": "developer",
-            "content": [{"type": "input_text", "text": instructions}],
+            "content": [instruction_block],
         }));
     }
     let stable_history_end = stable_history_end.min(request.messages.len());
@@ -4198,6 +4212,14 @@ fn openai_explicit_cache_enabled(request: &TurnRequest, codex_responses_lite: bo
                 && metadata.account_scope.is_some()
                 && (request.model == "gpt-5.6" || request.model.starts_with("gpt-5.6-"))
         })
+}
+
+fn openai_lite_cache_breakpoint_enabled() -> bool {
+    // HAIDER953 experiment, default OFF. The v0.0.947 law applies: acceptance
+    // on public api.openai.com or the Codex WSS transport is zero evidence for
+    // the HTTPS responses-lite surface. Keep this gated until a live HTTPS
+    // POST to chatgpt.com/backend-api/codex/responses accepts the field.
+    std::env::var(OPENAI_LITE_CACHE_BREAKPOINT_ENV).is_ok_and(|value| value == "1")
 }
 
 fn openai_automatic_cache_key_supported(model: &str) -> bool {
