@@ -55,6 +55,27 @@ fn golden(name: &str, actual: &str) {
     assert_eq!(expected, actual);
 }
 
+fn status_golden(actual: &str, profile_path: &str) {
+    let path = fixture_path("observe_status.json");
+    if std::env::var("UPDATE_FIXTURES").is_ok() {
+        std::fs::create_dir_all(path.parent().expect("fixture parent")).expect("fixture directory");
+        std::fs::write(&path, actual).expect("write fixture");
+    }
+    let expected = std::fs::read_to_string(&path).expect("read observe fixture");
+    let native_pipe_dir = PathBuf::from(profile_path).join("pipe");
+    let native_pipe_dir_json =
+        serde_json::to_string(&native_pipe_dir.display().to_string()).expect("serialize pipe dir");
+
+    // `pipe_dir` is a published native filesystem path, not a portable URL.
+    // Build the expected field with the same platform-aware join contract as
+    // the product; normalizing the actual output would hide path regressions.
+    let expected = expected.replacen("\"/tmp/haider-profile/pipe\"", &native_pipe_dir_json, 1);
+    #[cfg(windows)]
+    assert_eq!(expected.replace("\r\n", "\n"), actual.replace("\r\n", "\n"));
+    #[cfg(not(windows))]
+    assert_eq!(expected, actual);
+}
+
 fn digest(
     id: &str,
     run_state: ObserveRunStateWire,
@@ -316,7 +337,7 @@ fn observe_json_schemas_are_goldened_and_secret_free() {
     let status = serde_json::to_string(&status.json()).expect("status serializes") + "\n";
     let sessions = serde_json::to_string(&sessions.json()).expect("sessions serialize") + "\n";
     let session = serde_json::to_string(&session.json()).expect("session serializes") + "\n";
-    golden("observe_status.json", &status);
+    status_golden(&status, "/tmp/haider-profile");
     golden("observe_sessions.json", &sessions);
     golden("observe_session.json", &session);
     for output in [&status, &sessions, &session] {

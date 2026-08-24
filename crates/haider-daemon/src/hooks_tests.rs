@@ -2642,8 +2642,15 @@ async fn server_fixture(
         "run_started",
     )
     .await;
-    let spawn_log = fixture.workspace.join("spawns.log");
-    let command = server_command(&fixture.workspace, &spawn_log, kind);
+    // The hook engine keeps a canonical workspace for its cwd identity, but a
+    // fixture path embedded in shell command text needs the spelling accepted
+    // by that shell. In particular, Windows canonicalization produces a
+    // `\\?\` verbatim path, which `cmd.exe` does not reliably accept on its
+    // command line or in batch-file redirections. The retained tempfile path
+    // names the same directory without crossing that API/shell boundary.
+    let fixture_workspace = fixture._workspace_guard.path();
+    let spawn_log = fixture_workspace.join("spawns.log");
+    let command = server_command(fixture_workspace, &spawn_log, kind);
     write_server_hook(&fixture.workspace, &command, idle_timeout_ms);
     let (_, _, hooks) = fixture
         .service
