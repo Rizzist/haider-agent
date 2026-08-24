@@ -2690,20 +2690,26 @@ fn server_command(_workspace: &Path, spawn_log: &Path, kind: TestServerKind) -> 
 }
 
 #[cfg(windows)]
-fn server_command(workspace: &Path, spawn_log: &Path, kind: TestServerKind) -> String {
-    let script = workspace.join("server.cmd");
-    let body = match kind {
-        TestServerKind::Resident => format!(
-            "@echo off\r\n>>\"{}\" echo spawn\r\n:read\r\nset \"line=\"\r\nset /p \"line=\" || exit /b 0\r\necho \"ok\"\r\ngoto read\r\n",
-            spawn_log.display()
-        ),
-        TestServerKind::OneShot => format!(
-            "@echo off\r\n>>\"{}\" echo spawn\r\nset \"line=\"\r\nset /p \"line=\" || exit /b 0\r\necho \"ok\"\r\n",
-            spawn_log.display()
-        ),
+fn server_command(_workspace: &Path, spawn_log: &Path, kind: TestServerKind) -> String {
+    let spawn_log = spawn_log.display().to_string().replace('\'', "''");
+    // Lane 953j: cmd.exe's interactive `set /p` did not remain a reusable
+    // redirected JSONL reader across events, so the correct engine eventually
+    // saw an exited fixture and respawned it. Use an actual stream reader whose
+    // ReadLine blocks for every event and returns null only when stdin closes.
+    let prefix = format!(
+        "$log='{spawn_log}';[IO.File]::AppendAllText($log,('spawn'+[char]10),[Text.Encoding]::ASCII);\
+         $stdin=[IO.StreamReader]::new([Console]::OpenStandardInput(),[Text.Encoding]::UTF8,$false,4096,$true);"
+    );
+    let respond = "[Console]::Out.WriteLine('\"ok\"');[Console]::Out.Flush()";
+    let script = match kind {
+        TestServerKind::Resident => {
+            format!("{prefix}while($null -ne $stdin.ReadLine()){{{respond}}}")
+        }
+        TestServerKind::OneShot => {
+            format!("{prefix}if($null -ne $stdin.ReadLine()){{{respond}}}")
+        }
     };
-    std::fs::write(&script, body).expect("write Windows server script");
-    format!("\"{}\"", script.display())
+    powershell_command(&script)
 }
 
 /// Counts spawns recorded in the fixture's log.
@@ -2713,7 +2719,7 @@ fn server_command(workspace: &Path, spawn_log: &Path, kind: TestServerKind) -> S
 /// diagnoses and the assertion reported both as `left: 0`.
 ///
 /// That matters on Windows specifically, where the log is appended by a child
-/// `.cmd` process and can be locked or unflushed when the parent reads it. Three
+/// process and can be locked or unflushed when the parent reads it. Three
 /// `server_mode_*` tests fail there with `left: 0, right: 2`, and with the old
 /// helper there was no way to tell a product failure from an unreadable file.
 ///
