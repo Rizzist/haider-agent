@@ -249,6 +249,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "turn.submit_from_cli",
         "turn.submit_with_hook_trust",
         "usage.report",
+        "usage.history_day",
+        "usage.history_range",
         "vault.stage",
     ];
 
@@ -2948,6 +2950,72 @@ fn usage_report_goldens_are_additive_normalized_and_secret_free() {
             ..
         }
     ));
+}
+
+/// LAW (usage_history_wire_preserves_absence): the two read doors are behind
+/// one exact feature literal; day grids keep `null` distinct from a present
+/// zero slot, range cells keep an absent total distinct from present zero,
+/// and meter basis points remain integer bytes.
+///
+/// MUTATION CHECK: zero-fill the missing slot/range total or serialize meter
+/// basis points through a float; the exact Value assertions below fail.
+#[test]
+fn usage_history_wire_preserves_absence() {
+    use haider_protocol::usage::{
+        UsageHistoryDailyTotalV1, UsageHistoryDayV1, UsageHistoryMeterSampleV1,
+        UsageHistoryRangeDayV1, UsageHistorySlotV1,
+    };
+
+    assert_eq!(haider_rpc::FEATURE_USAGE_HISTORY_V1, "usage_history_v1");
+    let mut slots = vec![None; 96];
+    slots[1] = Some(UsageHistorySlotV1::default());
+    let body = ResponseBody::UsageHistoryDay {
+        date: "2026-08-24".into(),
+        device_id: "dev-0123456789abcdef0123456789abcdef".into(),
+        day: Some(UsageHistoryDayV1 {
+            date: "2026-08-24".into(),
+            device_id: "dev-0123456789abcdef0123456789abcdef".into(),
+            backfilled: true,
+            keys: Vec::new(),
+            slots,
+            meter_samples: vec![UsageHistoryMeterSampleV1 {
+                account: "work".into(),
+                window: "five_hour".into(),
+                basis_points: 6_789,
+                resets_at_ms: None,
+                sampled_at_ms: 1,
+                plan: None,
+                stale: None,
+            }],
+            version_changes: Vec::new(),
+        }),
+        availability: Some(haider_rpc::SnapshotAvailabilityWire::Available),
+    };
+    let value = serde_json::to_value(body).expect("encode history day");
+    assert_eq!(value["device_id"], "dev-0123456789abcdef0123456789abcdef");
+    assert!(value["day"]["slots"][0].is_null());
+    assert!(value["day"]["slots"][1].is_object());
+    assert_eq!(value["day"]["meter_samples"][0]["basis_points"], 6_789);
+
+    let range = ResponseBody::UsageHistoryRange {
+        through_date: "2026-08-24".into(),
+        device_id: "dev-0123456789abcdef0123456789abcdef".into(),
+        days: vec![
+            UsageHistoryRangeDayV1 {
+                date: "2026-08-23".into(),
+                total: None,
+            },
+            UsageHistoryRangeDayV1 {
+                date: "2026-08-24".into(),
+                total: Some(UsageHistoryDailyTotalV1::default()),
+            },
+        ],
+        availability: Some(haider_rpc::SnapshotAvailabilityWire::Available),
+    };
+    let value = serde_json::to_value(range).expect("encode history range");
+    assert_eq!(value["device_id"], "dev-0123456789abcdef0123456789abcdef");
+    assert!(value["days"][0].get("total").is_none());
+    assert!(value["days"][1]["total"].is_object());
 }
 
 #[test]

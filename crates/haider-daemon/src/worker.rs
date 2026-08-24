@@ -4180,7 +4180,7 @@ async fn perform_manual_compaction(
         "fast": metadata.fast,
     }))
     .unwrap_or_default();
-    let usage_scope = usage_scope_for(
+    let mut usage_scope = usage_scope_for(
         &resolved.provider_name,
         &resolved.model,
         usage_account.clone(),
@@ -4189,6 +4189,7 @@ async fn perform_manual_compaction(
         &Some(post_compaction_system_prompt.clone()),
         &post_compaction_tools,
     );
+    stamp_usage_lane_dimensions(&mut usage_scope, resolved.provider.usage_lane_dimensions());
     let (mut messages, latest_compaction_summary_end) =
         PromptHistoryCompiler::compile_idle_with_artifacts_and_boundary(
             lease,
@@ -5166,6 +5167,10 @@ async fn start_turn(
         &config.system_prompt,
         &config.tools,
     );
+    stamp_usage_lane_dimensions(
+        &mut config.usage_scope,
+        resolved.provider.usage_lane_dimensions(),
+    );
     config.usage_scope.cache_boundaries = Some(CacheBoundaryIdentity {
         instructions: digest_json(
             &instructions
@@ -5428,6 +5433,9 @@ fn usage_scope_for(
         model: model.to_owned(),
         account_scope,
         auth_scope: auth_scope.to_owned(),
+        api_family: None,
+        effort: None,
+        speed: None,
         cache_epoch,
         stable_prefix_tokens: 0,
         cache_boundaries: None,
@@ -5436,6 +5444,15 @@ fn usage_scope_for(
         agent: None,
         prefix_digests: None,
     }
+}
+
+fn stamp_usage_lane_dimensions(
+    scope: &mut UsageScope,
+    dimensions: haider_protocol::provider::UsageLaneDimensions,
+) {
+    scope.api_family = dimensions.api_family;
+    scope.effort = dimensions.effort;
+    scope.speed = dimensions.speed;
 }
 
 /// Returns the observed wall-clock gap since the latest completed request in

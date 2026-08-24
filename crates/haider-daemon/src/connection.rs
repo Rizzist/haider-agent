@@ -1816,6 +1816,7 @@ fn welcome_features() -> BTreeSet<String> {
         FEATURE_TURN_CONTROL_V1.to_owned(),
         FEATURE_RESIDENT_TURN_SUBMIT_V1.to_owned(),
         haider_rpc::FEATURE_USAGE_REPORT_V1.to_owned(),
+        haider_rpc::FEATURE_USAGE_HISTORY_V1.to_owned(),
         haider_rpc::FEATURE_COMPUTER_PERMISSION_ACTIONS_V1.to_owned(),
         FEATURE_VAULT_STAGE_V1.to_owned(),
     ])

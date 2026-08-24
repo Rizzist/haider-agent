@@ -28,6 +28,11 @@ fn usage(run: &str, provider: &str, kind: UsageRequestKind, normalized: Normaliz
             model: "fixture-model".into(),
             account_scope: None,
             auth_scope: "api_key".into(),
+            // 954 ledger dimensions: absent here as on any pre-ledger
+            // fact — the fixture pins the shape, not the new lanes.
+            api_family: None,
+            effort: None,
+            speed: None,
             cache_epoch: "epoch-fixture".into(),
             stable_prefix_tokens: 0,
             cache_boundaries: None,

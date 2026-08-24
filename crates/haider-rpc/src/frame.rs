@@ -372,6 +372,9 @@ pub const FEATURE_TRANSCRIPTION_V1: &str = "transcription_v1";
 /// per-account OAuth meters (normalized 0–1 utilization) plus journal-derived
 /// local counters. Never carries secret material.
 pub const FEATURE_USAGE_REPORT_V1: &str = "usage_report_v1";
+/// Daemon serves device-local append-only usage history by UTC day and a
+/// bounded, absence-preserving daily-total range.
+pub const FEATURE_USAGE_HISTORY_V1: &str = "usage_history_v1";
 /// Daemon publishes typed, provider-owned Haider Code plan/account status to
 /// clients attached to sessions currently using the provider.
 pub const FEATURE_HAIDER_CODE_PLAN_STATUS_V1: &str = "haider_code_plan_status_v1";
@@ -2331,6 +2334,13 @@ pub enum RequestBody {
     /// and parameterless in v1.
     #[serde(rename = "usage.report")]
     UsageReport,
+    /// Reads one device-local UTC day. `YYYY-MM-DD` validation is performed
+    /// by the store; a missing day is a successful `day: null` response.
+    #[serde(rename = "usage.history_day")]
+    UsageHistoryDay { date: String },
+    /// Reads exactly `days` dated heatmap cells ending at `through_date`.
+    #[serde(rename = "usage.history_range")]
+    UsageHistoryRange { through_date: String, days: u16 },
     /// Opens the server-known System Settings pane for an unresolved durable
     /// computer permission request. No caller-provided URL is accepted.
     #[serde(rename = "computer.permission_open_settings")]
@@ -2881,6 +2891,25 @@ pub enum ResponseBody {
         report: haider_protocol::usage::UsageReportV1,
         /// Omitted by older daemons. Do not interpret a legacy
         /// `generated_at_ms: 0` report as subsystem absence when omitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        availability: Option<SnapshotAvailabilityWire>,
+    },
+    #[serde(rename = "usage.history_day")]
+    UsageHistoryDay {
+        date: String,
+        /// Profile installation identity, present even when `day` is absent.
+        device_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        day: Option<haider_protocol::usage::UsageHistoryDayV1>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        availability: Option<SnapshotAvailabilityWire>,
+    },
+    #[serde(rename = "usage.history_range")]
+    UsageHistoryRange {
+        through_date: String,
+        /// One profile-scoped provenance identity for every returned cell.
+        device_id: String,
+        days: Vec<haider_protocol::usage::UsageHistoryRangeDayV1>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         availability: Option<SnapshotAvailabilityWire>,
     },

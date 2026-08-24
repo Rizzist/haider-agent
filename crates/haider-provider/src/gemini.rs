@@ -440,6 +440,14 @@ impl Provider for GeminiProvider {
         crate::ProviderCredentialSurface::ApiKey
     }
 
+    fn usage_lane_dimensions(&self) -> haider_protocol::provider::UsageLaneDimensions {
+        haider_protocol::provider::UsageLaneDimensions {
+            api_family: Some("gemini_generate_content".into()),
+            effort: self.effort.clone(),
+            speed: None,
+        }
+    }
+
     fn rendered_cache_prefix_digests(
         &self,
         request: &TurnRequest,

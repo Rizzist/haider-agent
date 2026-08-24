@@ -14,7 +14,7 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 18;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 19;
 
 struct Migration {
     version: u32,
@@ -352,6 +352,14 @@ const MIGRATIONS: &[Migration] = &[
                 FOREIGN KEY (session_id, through_seq)
                     REFERENCES events(session_id, seq)
             );
+        ",
+    },
+    Migration {
+        version: 19,
+        sql: "
+            ALTER TABLE profile_meta ADD COLUMN installation_id TEXT;
+            ALTER TABLE profile_meta ADD COLUMN usage_backfill_version INTEGER
+                NOT NULL DEFAULT 0 CHECK (usage_backfill_version >= 0);
         ",
     },
 ];

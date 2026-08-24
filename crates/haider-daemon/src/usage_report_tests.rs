@@ -210,6 +210,19 @@ async fn oauth_meter_reading_normalizes_and_respects_the_poll_floor() {
     assert_eq!(windows[1].window, "seven_day");
     assert!((windows[1].utilization - 0.12).abs() < 1e-9);
     assert_eq!(http.calls(), 1);
+    let history = store
+        .usage_history_day("1970-01-01".into())
+        .await
+        .expect("meter history read")
+        .expect("meter history day");
+    assert_eq!(
+        history
+            .meter_samples
+            .iter()
+            .map(|sample| sample.basis_points)
+            .collect::<Vec<_>>(),
+        [6_000, 1_200]
+    );
 
     // Inside the floor: served from cache, no second call.
     clock.store(1_000_000 + 179_999, Ordering::SeqCst);
@@ -219,11 +232,36 @@ async fn oauth_meter_reading_normalizes_and_respects_the_poll_floor() {
         AccountMeterStateV1::Metered { .. }
     ));
     assert_eq!(http.calls(), 1, "the poll floor forbids a refetch");
+    assert_eq!(
+        store
+            .usage_history_day("1970-01-01".into())
+            .await
+            .expect("cached meter history read")
+            .expect("cached meter history day")
+            .meter_samples
+            .len(),
+        2,
+        "cached report assembly must not duplicate meter samples"
+    );
 
     // At the floor: refetched.
     clock.store(1_000_000 + 180_000, Ordering::SeqCst);
     let _ = service.report(&store).await.expect("refetched report");
     assert_eq!(http.calls(), 2);
+    assert_eq!(
+        store
+            .usage_history_day("1970-01-01".into())
+            .await
+            .expect("refetched meter history read")
+            .expect("refetched meter history day")
+            .meter_samples
+            .len(),
+        4
+    );
+
+    // MUTATION CHECK: deriving basis points from a rounded display percent
+    // breaks the exact vector; appending cached readings makes the length-2
+    // assertion fail before the poll floor expires.
 }
 
 /// LAW (meter_failures_are_typed_cached_and_never_hammered): an HTTP 429
@@ -413,6 +451,9 @@ fn account_scope(account: &str) -> UsageScope {
             "oauth_subscription"
         }
         .into(),
+        api_family: None,
+        effort: None,
+        speed: None,
         cache_epoch: "usage-report-fixture".into(),
         stable_prefix_tokens: 0,
         cache_boundaries: None,
@@ -656,6 +697,9 @@ fn cm1_session_folder_uses_latest_full_cache_lane_snapshot() {
             model: "gpt-5".into(),
             account_scope: Some(CredentialAlias::new(scope_account)),
             auth_scope: auth.into(),
+            api_family: None,
+            effort: None,
+            speed: None,
             cache_epoch: "epoch-a".into(),
             stable_prefix_tokens: 0,
             cache_boundaries: None,
@@ -775,6 +819,9 @@ fn cache_requests_fold_by_ordinal_with_response_local_counters() {
             model: "gpt-5.6-terra".into(),
             account_scope: Some(account.clone()),
             auth_scope: "api_key".into(),
+            api_family: None,
+            effort: None,
+            speed: None,
             cache_epoch: "epoch-request-local".into(),
             stable_prefix_tokens: 4_096,
             cache_boundaries: None,
@@ -852,6 +899,9 @@ fn metrics_usage(logical: u64, output: u64, model: &str, request_kind: UsageRequ
             model: model.into(),
             account_scope: Some(CredentialAlias::new("billing-key")),
             auth_scope: "api_key".into(),
+            api_family: None,
+            effort: None,
+            speed: None,
             cache_epoch: "metrics-epoch".into(),
             stable_prefix_tokens: 0,
             cache_boundaries: None,

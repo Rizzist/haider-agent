@@ -444,12 +444,34 @@ pub struct PrefixDigests {
 
 /// Coordinates of one usage snapshot's cache domain and cumulative lane.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageLaneDimensions {
+    /// Exact adapter family selected by the provider implementation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_family: Option<String>,
+    /// Exact selected effort. Absent means default, unknown, or inapplicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Exact selected speed tier. Absent means unknown or inapplicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<String>,
+}
+
+/// Coordinates of one usage snapshot's cache domain and cumulative lane.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageScope {
     pub provider: String,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_scope: Option<CredentialAlias>,
     pub auth_scope: String,
+    /// Non-secret adapter-owned dimensions captured with this exact request.
+    /// Old journal facts omit them, which backfill preserves as unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<String>,
     pub cache_epoch: String,
     /// Exact compiler estimate for the stable prefix behind this epoch.
     #[serde(default, skip_serializing_if = "is_zero")]

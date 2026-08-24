@@ -17,6 +17,9 @@
 use crate::cas::FileCas;
 use crate::migrations;
 use crate::profile_lock::ProfileLock;
+use crate::usage_ledger::{
+    UsageLedgerWriter, read_usage_day, reduce_journal_usage, slot_start_ms as usage_slot_start_ms,
+};
 use crate::{Cas, StoreResult, now_ms, store_error, to_sqlite_integer, validate_image_block};
 use haider_protocol::agent::{AgentManifest, ChildReport, ReportVerification};
 use haider_protocol::branch::{BranchCreated, BranchDescriptor};
@@ -78,8 +81,8 @@ use rusqlite::{
     Connection, Error as SqliteError, ErrorCode as SqliteErrorCode, OptionalExtension, Transaction,
     TransactionBehavior, params, types::ValueRef,
 };
-use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -1621,6 +1624,246 @@ impl Store {
             .map_err(map_sqlite_error)?;
         u64::try_from(revision)
             .map_err(|_| corrupt("database contains a negative management revision"))
+    }
+
+    /// Returns the durable profile installation identity used by usage-day
+    /// provenance. It is minted lazily from the OS RNG and never shares the
+    /// journal's deliberately per-process [`DeviceId`] semantics.
+    pub fn profile_installation_id(&self) -> StoreResult<String> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let stored: Option<String> = transaction
+            .query_row(
+                "SELECT installation_id FROM profile_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+        if let Some(stored) = stored {
+            validate_profile_installation_id(&stored)?;
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(stored);
+        }
+
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).map_err(|error| {
+            store_error(
+                ErrorCode::Internal,
+                format!("OS randomness unavailable for profile installation id: {error}"),
+                false,
+            )
+        })?;
+        let installation_id = format!("dev-{}", hex::encode(random));
+        let updated = transaction
+            .execute(
+                "UPDATE profile_meta SET installation_id = ?1
+                 WHERE singleton = 1 AND installation_id IS NULL",
+                [&installation_id],
+            )
+            .map_err(map_sqlite_error)?;
+        if updated != 1 {
+            return Err(corrupt(
+                "profile installation id lost its singleton initialization claim",
+            ));
+        }
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(installation_id)
+    }
+
+    /// Runs the v1 journal backfill once, then reconciles any closed slots a
+    /// prior process left only in the journal. Files are complete before the
+    /// SQLite version marker advances, so a crash retries the reducer.
+    pub fn initialize_usage_history(&self) -> StoreResult<()> {
+        let installation_id = self.profile_installation_id()?;
+        let backfill_version = self.usage_backfill_version()?;
+        let envelopes = self.all_journal_envelopes()?;
+        let slots = reduce_journal_usage(&envelopes);
+        let now = now_ms()?;
+        if backfill_version < 1 {
+            self.install_usage_backfill(&installation_id, &slots, now)?;
+            self.set_usage_backfill_version(1)?;
+        }
+        let writer = UsageLedgerWriter::new(&self.root, installation_id, env!("CARGO_PKG_VERSION"));
+        for (address, slot) in slots {
+            let address_start = usage_slot_start_ms(&address.date, address.slot)?;
+            if address_start.saturating_add(15 * 60 * 1_000) <= now {
+                writer.append_slot(&address, &slot, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-scans authoritative journals and appends only newly closed slots.
+    /// Existing slot records make the operation idempotent across restarts.
+    pub fn reconcile_usage_history(&self) -> StoreResult<()> {
+        let installation_id = self.profile_installation_id()?;
+        let writer = UsageLedgerWriter::new(&self.root, installation_id, env!("CARGO_PKG_VERSION"));
+        let now = now_ms()?;
+        for (address, slot) in reduce_journal_usage(&self.all_journal_envelopes()?) {
+            let address_start = usage_slot_start_ms(&address.date, address.slot)?;
+            if address_start.saturating_add(15 * 60 * 1_000) <= now {
+                writer.append_slot(&address, &slot, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn usage_history_day(
+        &self,
+        date: &str,
+    ) -> StoreResult<Option<haider_protocol::usage::UsageHistoryDayV1>> {
+        let expected_device_id = self.profile_installation_id()?;
+        let day = crate::usage_ledger::read_usage_day(&self.root, date)?;
+        if let Some(day) = &day
+            && day.device_id != expected_device_id
+        {
+            return Err(corrupt(format!(
+                "usage-history day {date} belongs to device {}, expected {expected_device_id}",
+                day.device_id
+            )));
+        }
+        Ok(day)
+    }
+
+    pub fn usage_history_range(
+        &self,
+        through_date: &str,
+        days: u16,
+    ) -> StoreResult<Vec<haider_protocol::usage::UsageHistoryRangeDayV1>> {
+        let expected_device_id = self.profile_installation_id()?;
+        crate::usage_ledger::read_usage_range_for_device(
+            &self.root,
+            through_date,
+            days,
+            &expected_device_id,
+        )
+    }
+
+    pub fn append_usage_meter_sample(
+        &self,
+        sample: &haider_protocol::usage::UsageHistoryMeterSampleV1,
+    ) -> StoreResult<()> {
+        let installation_id = self.profile_installation_id()?;
+        UsageLedgerWriter::new(&self.root, installation_id, env!("CARGO_PKG_VERSION"))
+            .append_meter_sample(sample)
+    }
+
+    fn usage_backfill_version(&self) -> StoreResult<u32> {
+        let connection = self.connection()?;
+        let version: i64 = connection
+            .query_row(
+                "SELECT usage_backfill_version FROM profile_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)?;
+        u32::try_from(version)
+            .map_err(|_| corrupt("database contains an invalid usage backfill version"))
+    }
+
+    fn set_usage_backfill_version(&self, version: u32) -> StoreResult<()> {
+        let connection = self.connection()?;
+        let updated = connection
+            .execute(
+                "UPDATE profile_meta SET usage_backfill_version = ?1
+                 WHERE singleton = 1 AND usage_backfill_version < ?1",
+                [version],
+            )
+            .map_err(map_sqlite_error)?;
+        if updated != 1 {
+            return Err(corrupt(
+                "usage backfill version did not advance exactly once",
+            ));
+        }
+        Ok(())
+    }
+
+    fn all_journal_envelopes(&self) -> StoreResult<Vec<RawEnvelope>> {
+        let mut envelopes = Vec::new();
+        for session_id in self.session_ids()? {
+            envelopes.extend(self.journal_replay(&session_id)?);
+        }
+        Ok(envelopes)
+    }
+
+    fn install_usage_backfill(
+        &self,
+        installation_id: &str,
+        slots: &BTreeMap<
+            crate::usage_ledger::UsageSlotAddress,
+            crate::usage_ledger::UsageLedgerSlot,
+        >,
+        now_ms: u64,
+    ) -> StoreResult<()> {
+        let mut random = [0_u8; 8];
+        getrandom::fill(&mut random).map_err(|error| {
+            store_error(
+                ErrorCode::Internal,
+                format!("OS randomness unavailable for usage backfill staging: {error}"),
+                false,
+            )
+        })?;
+        let staging_root = self
+            .root
+            .join(format!(".usage-backfill-{}", hex::encode(random)));
+        fs::create_dir_all(&staging_root)
+            .map_err(|error| store_io_error("create usage backfill staging directory", error))?;
+        let writer = UsageLedgerWriter::new(
+            &staging_root,
+            installation_id.to_owned(),
+            env!("CARGO_PKG_VERSION"),
+        );
+        for (address, slot) in slots {
+            let address_start = usage_slot_start_ms(&address.date, address.slot)?;
+            if address_start.saturating_add(15 * 60 * 1_000) <= now_ms {
+                writer.append_slot(address, slot, true)?;
+            } else {
+                writer.ensure_day(&address.date, true)?;
+            }
+        }
+
+        let source_dir = staging_root.join("usage");
+        let destination_dir = self.root.join("usage");
+        fs::create_dir_all(&destination_dir)
+            .map_err(|error| store_io_error("create usage history directory", error))?;
+        if source_dir.exists() {
+            let entries = fs::read_dir(&source_dir)
+                .map_err(|error| store_io_error("list staged usage backfill", error))?;
+            for entry in entries {
+                let entry = entry
+                    .map_err(|error| store_io_error("read staged usage backfill entry", error))?;
+                let destination = destination_dir.join(entry.file_name());
+                if destination.exists() {
+                    let date = entry
+                        .file_name()
+                        .to_string_lossy()
+                        .strip_suffix(".jsonl")
+                        .map(str::to_owned)
+                        .ok_or_else(|| corrupt("staged usage backfill has an invalid filename"))?;
+                    let existing = read_usage_day(&self.root, &date)?.ok_or_else(|| {
+                        corrupt("existing usage backfill file vanished during validation")
+                    })?;
+                    if !existing.backfilled || existing.device_id != installation_id {
+                        return Err(corrupt(
+                            "usage backfill would replace a non-backfill or foreign-device day",
+                        ));
+                    }
+                    fs::remove_file(&destination).map_err(|error| {
+                        store_io_error("remove incomplete usage backfill day", error)
+                    })?;
+                }
+                fs::rename(entry.path(), destination)
+                    .map_err(|error| store_io_error("publish usage backfill day", error))?;
+            }
+            File::open(&destination_dir)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| store_io_error("sync usage history directory", error))?;
+        }
+        fs::remove_dir_all(&staging_root)
+            .map_err(|error| store_io_error("remove usage backfill staging directory", error))?;
+        Ok(())
     }
 
     /// Advances the management revision for an actor-owned state transition
@@ -15022,6 +15265,30 @@ fn validate_agent_type(record: &LoomAgentType) -> StoreResult<()> {
 
 fn corrupt(message: impl Into<String>) -> HaiderError {
     store_error(ErrorCode::StoreCorrupt, message, false)
+}
+
+fn validate_profile_installation_id(value: &str) -> StoreResult<()> {
+    let suffix = value.strip_prefix("dev-").ok_or_else(|| {
+        corrupt("profile installation id does not begin with the required `dev-` prefix")
+    })?;
+    if suffix.len() != 32
+        || !suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(corrupt(
+            "profile installation id is not 32 lowercase hexadecimal digits",
+        ));
+    }
+    Ok(())
+}
+
+fn store_io_error(operation: &str, error: std::io::Error) -> HaiderError {
+    store_error(
+        ErrorCode::Internal,
+        format!("cannot {operation}: {error}"),
+        error.kind() == std::io::ErrorKind::Interrupted,
+    )
 }
 
 #[cfg(test)]

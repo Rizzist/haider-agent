@@ -11,6 +11,134 @@ use crate::ids::{CredentialAlias, RunId};
 use crate::provider::{CacheStatAvailability, RequestUsage, UsageRequestKind};
 use serde::{Deserialize, Serialize};
 
+/// The fixed number of UTC quarter-hour cells in one usage-history day.
+pub const USAGE_HISTORY_SLOTS_PER_DAY: usize = 96;
+
+/// The largest heatmap range accepted by the v1 history RPC.
+pub const USAGE_HISTORY_MAX_RANGE_DAYS: u16 = 366;
+
+/// Root-vs-delegated accounting lane for one usage-history row.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum UsageHistoryRoleV1 {
+    #[default]
+    Root,
+    Subagent,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Append-only dictionary entry referenced by compact slot rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageHistoryKeyV1 {
+    pub id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<String>,
+}
+
+/// One lane's measured counters in a sampled quarter-hour slot.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageHistoryRowV1 {
+    pub key_id: u32,
+    pub role: UsageHistoryRoleV1,
+    pub requests: u64,
+    pub errors: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub reasoning_tokens: u64,
+}
+
+/// One sampled quarter-hour cell. A present all-zero row is sampled zero;
+/// the enclosing day uses `None` for a cell that was not sampled.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageHistorySlotV1 {
+    #[serde(default)]
+    pub rows: Vec<UsageHistoryRowV1>,
+    #[serde(default)]
+    pub subagents_spawned: u64,
+}
+
+/// One provider meter reading frozen in the day ledger.
+///
+/// `basis_points` is the published integer carried into the writer. Readers
+/// must not reconstruct it from a normalized floating-point percentage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageHistoryMeterSampleV1 {
+    pub account: String,
+    pub window: String,
+    pub basis_points: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at_ms: Option<u64>,
+    pub sampled_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale: Option<bool>,
+}
+
+/// A daemon-version transition observed within one day file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageHistoryVersionChangeV1 {
+    pub daemon_version: String,
+    pub changed_at_ms: u64,
+}
+
+/// Device-local truth for one UTC day.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageHistoryDayV1 {
+    pub date: String,
+    pub device_id: String,
+    #[serde(default)]
+    pub backfilled: bool,
+    #[serde(default)]
+    pub keys: Vec<UsageHistoryKeyV1>,
+    /// Exactly 96 entries. `None` is not-sampled; `Some` may contain zeros.
+    pub slots: Vec<Option<UsageHistorySlotV1>>,
+    #[serde(default)]
+    pub meter_samples: Vec<UsageHistoryMeterSampleV1>,
+    #[serde(default)]
+    pub version_changes: Vec<UsageHistoryVersionChangeV1>,
+}
+
+/// Folded daily counters for the bounded heatmap read. Dollars, rates,
+/// sessions, and durations deliberately do not exist in this projection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageHistoryDailyTotalV1 {
+    pub sampled_slots: u16,
+    pub requests: u64,
+    pub errors: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub subagents_spawned: u64,
+}
+
+/// One dated heatmap cell. `total=None` is no local sample for that date;
+/// a present all-zero total is a measured zero day.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageHistoryRangeDayV1 {
+    pub date: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<UsageHistoryDailyTotalV1>,
+}
+
 /// Provider-native allowance state from Haider Code's account endpoint.
 ///
 /// Known values may grow over time. Unknown strings are preserved verbatim

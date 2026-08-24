@@ -764,6 +764,14 @@ impl Provider for OpenAiProvider {
         }
     }
 
+    fn usage_lane_dimensions(&self) -> haider_protocol::provider::UsageLaneDimensions {
+        haider_protocol::provider::UsageLaneDimensions {
+            api_family: Some("openai_responses".into()),
+            effort: self.effort.clone(),
+            speed: None,
+        }
+    }
+
     fn rendered_cache_prefix_digests(
         &self,
         request: &TurnRequest,
@@ -1532,6 +1540,18 @@ impl Provider for OpenAiCompatibleProvider {
             CompatibleDialect::KimiOAuth | CompatibleDialect::GrokOAuth => {
                 crate::ProviderCredentialSurface::OAuthSubscriptionBearer
             }
+        }
+    }
+
+    fn usage_lane_dimensions(&self) -> haider_protocol::provider::UsageLaneDimensions {
+        haider_protocol::provider::UsageLaneDimensions {
+            api_family: Some("openai_chat_completions".into()),
+            effort: self
+                .kimi_thinking
+                .as_ref()
+                .and_then(|thinking| thinking.effort.clone())
+                .or_else(|| self.kimi_reasoning_effort.clone()),
+            speed: None,
         }
     }
 

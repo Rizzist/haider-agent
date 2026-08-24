@@ -19,6 +19,7 @@ mod cas;
 mod event_store;
 mod migrations;
 mod profile_lock;
+mod usage_ledger;
 
 pub use cas::{FileCas, validate_image_block};
 pub use event_store::{
@@ -51,6 +52,10 @@ pub use event_store::{
     TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
 };
 pub use haider_protocol::error::{ErrorCode, HaiderError};
+pub use usage_ledger::{
+    UsageLedgerCounters, UsageLedgerLane, UsageLedgerSlot, UsageLedgerWriter, UsageSlotAddress,
+    read_usage_day, read_usage_range, reduce_journal_usage, slot_address,
+};
 
 use haider_protocol::ids::ArtifactRef;
 use haider_protocol::tool::ImageBlockRef;

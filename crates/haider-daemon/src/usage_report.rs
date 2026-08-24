@@ -224,6 +224,9 @@ pub(crate) fn openai_token_identity(token: &[u8]) -> OpenAiTokenIdentity {
 struct MeterCacheEntry {
     fetched_at_ms: u64,
     outcome: Result<MeterReading, MeterUnavailable>,
+    /// True only for the call that performed the provider read. Cached report
+    /// assembly must not append the same meter sample again.
+    fresh: bool,
     /// openai-oauth enrichment captured at fetch time.
     token_identity: OpenAiTokenIdentity,
 }
@@ -299,7 +302,26 @@ impl UsageReportService {
                     match entry.outcome {
                         Ok(reading) => {
                             if reading.plan.is_some() {
-                                plan = reading.plan;
+                                plan.clone_from(&reading.plan);
+                            }
+                            if entry.fresh {
+                                for (window, basis_points) in
+                                    reading.windows.iter().zip(&reading.basis_points)
+                                {
+                                    store
+                                        .append_usage_meter_sample(
+                                            haider_protocol::usage::UsageHistoryMeterSampleV1 {
+                                                account: descriptor.alias.as_str().to_owned(),
+                                                window: window.window.clone(),
+                                                basis_points: *basis_points,
+                                                resets_at_ms: window.resets_at_ms,
+                                                sampled_at_ms: entry.fetched_at_ms,
+                                                plan: plan.clone(),
+                                                stale: None,
+                                            },
+                                        )
+                                        .await?;
+                                }
                             }
                             AccountMeterStateV1::Metered {
                                 windows: reading.windows,
@@ -344,6 +366,7 @@ impl UsageReportService {
             return MeterCacheEntry {
                 fetched_at_ms: entry.fetched_at_ms,
                 outcome: entry.outcome.clone(),
+                fresh: false,
                 token_identity: OpenAiTokenIdentity {
                     email: entry.token_identity.email.clone(),
                     plan: entry.token_identity.plan.clone(),
@@ -356,6 +379,7 @@ impl UsageReportService {
             MeterCacheEntry {
                 fetched_at_ms: now,
                 outcome: outcome.clone(),
+                fresh: false,
                 token_identity: OpenAiTokenIdentity {
                     email: token_identity.email.clone(),
                     plan: token_identity.plan.clone(),
@@ -365,6 +389,7 @@ impl UsageReportService {
         MeterCacheEntry {
             fetched_at_ms: now,
             outcome,
+            fresh: true,
             token_identity,
         }
     }

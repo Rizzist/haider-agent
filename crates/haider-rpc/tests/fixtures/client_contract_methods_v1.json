@@ -186,6 +186,18 @@
       "response_method": "computer.permission_open_settings",
       "request": {"method":"computer.permission_open_settings","session_id":"session-1","request_id":"permission-1","permission":"screen_recording"},
       "response": {"method":"computer.permission_open_settings","permission":"screen_recording"}
+    },
+    {
+      "request_method": "usage.history_day",
+      "response_method": "usage.history_day",
+      "request": {"method":"usage.history_day","date":"2026-08-24"},
+      "response": {"method":"usage.history_day","date":"2026-08-24","device_id":"dev-0123456789abcdef0123456789abcdef","availability":{"state":"available"}}
+    },
+    {
+      "request_method": "usage.history_range",
+      "response_method": "usage.history_range",
+      "request": {"method":"usage.history_range","through_date":"2026-08-24","days":2},
+      "response": {"method":"usage.history_range","through_date":"2026-08-24","device_id":"dev-0123456789abcdef0123456789abcdef","days":[{"date":"2026-08-23"},{"date":"2026-08-24","total":{"sampled_slots":1,"requests":0,"errors":0,"input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0,"reasoning_tokens":0,"subagents_spawned":0}}],"availability":{"state":"available"}}
     }
   ]
 }

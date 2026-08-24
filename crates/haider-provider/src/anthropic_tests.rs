@@ -246,6 +246,28 @@ fn model_payload_provider(oauth: bool, model: &str) -> AnthropicProvider {
     }
 }
 
+#[test]
+fn usage_lane_dimensions_are_adapter_owned_and_api_keys_omit_speed() {
+    let fast = model_payload_provider(true, "claude-opus-5")
+        .with_effort(Some("xhigh".into()))
+        .with_fast(true)
+        .usage_lane_dimensions();
+    assert_eq!(fast.api_family.as_deref(), Some("anthropic_messages"));
+    assert_eq!(fast.effort.as_deref(), Some("xhigh"));
+    assert_eq!(fast.speed.as_deref(), Some("fast"));
+
+    let standard = model_payload_provider(true, "claude-opus-5").usage_lane_dimensions();
+    assert_eq!(standard.speed.as_deref(), Some("standard"));
+
+    let api_key = model_payload_provider(false, "claude-opus-5")
+        .with_fast(true)
+        .usage_lane_dimensions();
+    assert!(api_key.speed.is_none());
+
+    // MUTATION CHECK: returning the adapter default or inferring speed from
+    // the fast flag alone fails the exact effort/standard/API-key assertions.
+}
+
 fn payload_request(system_prompt: Option<&str>) -> TurnRequest {
     TurnRequest {
         messages: vec![Message::user_text("Reply with exactly: payload-audit")],

@@ -130,6 +130,9 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// failure: clients cannot discover the served cross-provider `usage.report`
 /// snapshot (U1).
 ///
+/// MUTATION CHECK: remove `FEATURE_USAGE_HISTORY_V1`. Expected RUNTIME
+/// failure: clients cannot discover the two served device-local history reads.
+///
 /// MUTATION CHECK: remove `FEATURE_SESSION_RENAME_V1`. Expected RUNTIME
 /// failure: clients cannot discover the served receipted `session.rename`
 /// surface (G2) and the TUI keeps its stale-daemon notice forever.
@@ -248,6 +251,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_TRANSCRIPTION_V1.to_owned(),
             FEATURE_TURN_CONTROL_V1.to_owned(),
             haider_rpc::FEATURE_USAGE_REPORT_V1.to_owned(),
+            haider_rpc::FEATURE_USAGE_HISTORY_V1.to_owned(),
             haider_rpc::FEATURE_COMPUTER_PERMISSION_ACTIONS_V1.to_owned(),
             FEATURE_VAULT_STAGE_V1.to_owned(),
         ])
@@ -1541,6 +1545,12 @@ async fn terminal_fake_turn_finishes_over_the_paired_connection() {
 // stop updating `last_read` on reads). Expected failure: this paused-time
 // test never observes the close and times out at its outer bound / the
 // elapsed window assertion fails.
+//
+// MUTATION CHECK (usage-ledger timer isolation): revert
+// `usage_history_runtime()?.spawn` to `tokio::spawn`. Expected RUNTIME
+// failure: the hub's live 15-minute ledger timer captures this connection
+// runtime's paused-time auto-advance and the socket close is observed
+// hundreds of virtual seconds after the 45-second breach.
 #[tokio::test]
 async fn silent_negotiated_peer_is_closed_at_the_read_idle_deadline() {
     let (_dir, hub) = liveness_hub().await;

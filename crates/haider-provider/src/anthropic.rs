@@ -915,6 +915,22 @@ impl Provider for AnthropicProvider {
         }
     }
 
+    fn usage_lane_dimensions(&self) -> haider_protocol::provider::UsageLaneDimensions {
+        let speed = matches!(self.auth_mode, AnthropicAuthMode::OAuthBearer)
+            .then(|| {
+                crate::effort::anthropic_fast_mode_supported(&self.model)
+                    .then(|| if self.fast { "fast" } else { "standard" }.to_owned())
+            })
+            .flatten();
+        haider_protocol::provider::UsageLaneDimensions {
+            api_family: Some("anthropic_messages".into()),
+            effort: self.effort.clone(),
+            // API-key and cloud lanes deliberately have no speed tier in the
+            // usage contract, even if a future wire surface grows one.
+            speed,
+        }
+    }
+
     fn rendered_cache_prefix_digests(
         &self,
         request: &TurnRequest,

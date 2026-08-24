@@ -3527,6 +3527,31 @@ impl HubConnection {
                 }
                 self.usage_report(request_id).await
             }
+            RequestBody::UsageHistoryDay { date } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.usage_history_day(request_id, date).await
+            }
+            RequestBody::UsageHistoryRange { through_date, days } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.usage_history_range(request_id, through_date, days)
+                    .await
+            }
             RequestBody::ComputerPermissionOpenSettings {
                 session_id,
                 request_id: permission_request_id,
@@ -8161,6 +8186,73 @@ impl HubConnection {
             request_id,
             body: ResponseBody::UsageReport {
                 report,
+                availability: Some(haider_rpc::SnapshotAvailabilityWire::Available),
+            },
+        })
+    }
+
+    async fn usage_history_day(
+        &self,
+        request_id: RequestId,
+        date: String,
+    ) -> Result<(), SessionHubError> {
+        let device_id = self.hub.inner.store.profile_installation_id().await?;
+        let day = match self.hub.inner.store.usage_history_day(date.clone()).await {
+            Ok(day) => day,
+            Err(error) if error.code == ErrorCode::InvalidArgument => {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    &error.message,
+                    false,
+                    None,
+                );
+            }
+            Err(error) => return Err(error.into()),
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::UsageHistoryDay {
+                date,
+                device_id,
+                day,
+                availability: Some(haider_rpc::SnapshotAvailabilityWire::Available),
+            },
+        })
+    }
+
+    async fn usage_history_range(
+        &self,
+        request_id: RequestId,
+        through_date: String,
+        requested_days: u16,
+    ) -> Result<(), SessionHubError> {
+        let device_id = self.hub.inner.store.profile_installation_id().await?;
+        let days = match self
+            .hub
+            .inner
+            .store
+            .usage_history_range(through_date.clone(), requested_days)
+            .await
+        {
+            Ok(days) => days,
+            Err(error) if error.code == ErrorCode::InvalidArgument => {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    &error.message,
+                    false,
+                    None,
+                );
+            }
+            Err(error) => return Err(error.into()),
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::UsageHistoryRange {
+                through_date,
+                device_id,
+                days,
                 availability: Some(haider_rpc::SnapshotAvailabilityWire::Available),
             },
         })

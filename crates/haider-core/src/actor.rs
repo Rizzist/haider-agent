@@ -3847,6 +3847,10 @@ impl HarnessActor {
         self.config.usage_scope.model = target.model.clone();
         self.config.usage_scope.account_scope = Some(target.account.clone());
         self.config.usage_scope.auth_scope = target.auth_scope.clone();
+        let dimensions = target.provider.usage_lane_dimensions();
+        self.config.usage_scope.api_family = dimensions.api_family;
+        self.config.usage_scope.effort = dimensions.effort;
+        self.config.usage_scope.speed = dimensions.speed;
         let tool_pack_digest = canonical_tool_definitions_digest(&self.config.tools);
         if let Some(boundaries) = self.config.usage_scope.cache_boundaries.as_mut() {
             boundaries.tool_pack = tool_pack_digest.clone();

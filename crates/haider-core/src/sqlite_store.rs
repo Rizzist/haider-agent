@@ -169,6 +169,55 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(Store::advance_daemon_generation)).await
     }
 
+    /// Lazily mints or reads the durable per-profile installation id used by
+    /// usage-history provenance.
+    pub async fn profile_installation_id(&self) -> Result<String, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(Store::profile_installation_id)).await
+    }
+
+    /// Completes the one-time journal backfill and reconciles closed slots
+    /// before the daemon advertises the usage-history read door.
+    pub async fn initialize_usage_history(&self) -> Result<(), HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(Store::initialize_usage_history)).await
+    }
+
+    /// Reconciles newly closed journal slots into append-only day files.
+    pub async fn reconcile_usage_history(&self) -> Result<(), HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(Store::reconcile_usage_history)).await
+    }
+
+    pub async fn usage_history_day(
+        &self,
+        date: String,
+    ) -> Result<Option<haider_protocol::usage::UsageHistoryDayV1>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.usage_history_day(&date))).await
+    }
+
+    pub async fn usage_history_range(
+        &self,
+        through_date: String,
+        days: u16,
+    ) -> Result<Vec<haider_protocol::usage::UsageHistoryRangeDayV1>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.usage_history_range(&through_date, days))
+        })
+        .await
+    }
+
+    pub async fn append_usage_meter_sample(
+        &self,
+        sample: haider_protocol::usage::UsageHistoryMeterSampleV1,
+    ) -> Result<(), HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.append_usage_meter_sample(&sample)))
+            .await
+    }
+
     /// Lists every durable session in stable order.
     ///
     /// W3b1 daemon seam: drives the startup recovery scan

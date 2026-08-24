@@ -165,6 +165,29 @@ const REPLAY_PAGE_SIZE: usize = 256;
 const MAX_LIST_PAGE: usize = 100;
 const MAX_READ_ENVELOPES: usize = 1_024;
 
+/// Real-time home for the UTC-aligned usage-ledger timer.
+///
+/// Session hubs also run under paused Tokio clocks in deterministic protocol
+/// tests. A wall-derived deadline installed on that same clock gives its
+/// auto-advance loop a far-future target and can postpone observation of
+/// already-ready socket I/O by hundreds of virtual seconds. Keeping this
+/// wall-clock service on one process-global real-time runtime preserves the
+/// production schedule without coupling unrelated connection clocks to it.
+fn usage_history_runtime() -> Result<&'static tokio::runtime::Runtime, SessionHubError> {
+    static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_time()
+                .thread_name("haider-usage-history")
+                .build()
+                .map_err(|error| format!("cannot start usage-history timer runtime: {error}"))
+        })
+        .as_ref()
+        .map_err(|message| SessionHubError::Task(message.clone()))
+}
+
 /// Exact image MIME declarations accepted on durable turn submission.
 pub const IMAGE_ATTACHMENT_MIME_ALLOWLIST: [&str; 4] =
     ["image/jpeg", "image/png", "image/gif", "image/webp"];
@@ -1595,7 +1618,36 @@ impl SessionHub {
         });
         let hub = Self { inner };
         hub.spawn_profile_fault_watcher();
+        hub.spawn_usage_history_reconciler()?;
         Ok(hub)
+    }
+
+    fn spawn_usage_history_reconciler(&self) -> Result<(), SessionHubError> {
+        let weak = Arc::downgrade(&self.inner);
+        usage_history_runtime()?.spawn(async move {
+            const PERIOD_MS: u64 = 15 * 60 * 1_000;
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+                .unwrap_or(0);
+            let until_boundary_ms = PERIOD_MS - (now_ms % PERIOD_MS);
+            let start =
+                tokio::time::Instant::now() + std::time::Duration::from_millis(until_boundary_ms);
+            let mut ticker =
+                tokio::time::interval_at(start, std::time::Duration::from_millis(PERIOD_MS));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let Some(inner) = weak.upgrade() else {
+                    break;
+                };
+                if let Err(error) = inner.store.reconcile_usage_history().await {
+                    tracing::warn!(?error, "usage-history reconciliation failed");
+                }
+            }
+        });
+        Ok(())
     }
 
     fn spawn_profile_fault_watcher(&self) {

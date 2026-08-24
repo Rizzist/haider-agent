@@ -259,6 +259,7 @@ affordance before the response exists.
 | `status_segment_structured_v1` | status `state` and `detail` |
 | `transcription_v1` | `transcription.secret_get/set` |
 | `usage_report_v1` | `usage.report` |
+| `usage_history_v1` | `usage.history_day`, `usage.history_range` |
 | `haider_code_plan_status_v1` | unsolicited `HaiderCodePlanStatus` |
 | `computer_permission_actions_v1` | `computer.permission_open_settings` and permission action fields |
 | `effect_recovery_v1` | typed effect-unknown state and recovery-card coordinates in events/observation |
@@ -310,7 +311,10 @@ with the `custom_commands` slot of `command.list`.
 
 The additive `availability` field on `account.list`, `provider.list`, and
 `usage.report` has no separate token. Field presence is its feature test.
-Likewise, promoted roster fields without a token are usable only when present.
+The history responses are gated by `usage_history_v1`; once that feature is
+present, their separate `availability` field must still be interpreted as
+specified in §9.6.1. Likewise, promoted roster fields without a token are
+usable only when present.
 
 ## 5. Door and delivery map
 
@@ -339,6 +343,7 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | Account changes | `account.list_watch` | `AccountListWatch`, then `AccountsChanged` | watch invalidation, no baseline body and no descriptors in push | re-read `account.list` |
 | Providers/models | `provider.list` | `ProviderList` | cached snapshot; no inline probe | provider registry publication |
 | Usage/cache health | `usage.report` | `UsageReport` | snapshot | account meter readings plus journal-derived local ledger |
+| Device-local usage history | `usage.history_day`, `usage.history_range` | `UsageHistoryDay`, `UsageHistoryRange` | snapshot | append-only per-profile UTC day ledger |
 | Resident binding | top-level `ResidentSessionBinding` | same top-level frame fanned out; no response | required unsolicited baseline and pushes | profile-global most-recent live publisher |
 | Volatile input/status | `session.surface_watch` | `SessionSurfaceWatching`, then `SessionSurfaceDelta` | complete baseline then complete latest snapshots | live publisher registry; not journaled |
 | Volatile input action | `session.input_inject` | `SessionInputInjectAck`, then owner receives `SessionInputInjected` | routed action | current live input owner |
@@ -384,14 +389,14 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 The golden matrix at
 `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`, combined
 with the historical `wire_transcript.json`, pins a request and successful
-response for every one of the 71 v1 request methods. `menu.answer` and resident
+response for every one of the 73 v1 request methods. `menu.answer` and resident
 binding are top-level frames, not `RequestBody` methods.
 
 ## 6. Snapshot, watch, invalidation, push, and replay laws
 
 - `session.list`, `session.read`, `session.observe`, `session.observe_batch`,
   `session.fleet`, `command.list`, `account.list`, `account.oauth_import_sources`, `provider.list`,
-  `usage.report`, `loom.list`, `tools.inventory`, `hooks.list`, graph reads,
+  `usage.report`, `usage.history_day`, `usage.history_range`, `loom.list`, `tools.inventory`, `hooks.list`, graph reads,
   and `session.pipe_path` are snapshots. Calling them does not subscribe.
 - `session.list_watch` subscribes before acknowledging. Its first
   `SessionRosterDelta` set is the current changed/new baseline, chunked at 64;
@@ -521,6 +526,7 @@ generation, or surface owner/revision as if they were one observation.
 | OAuth import sources | `account.oauth_import_sources` snapshot | Never mirror the source list or infer daemon filesystem paths. |
 | Provider/model inventory | `provider.list` snapshot | Account rows and a client hardcoded model list do not override it. `provider.models_refresh` produces a newer snapshot. |
 | Cross-account usage | `usage.report` | Session summaries contain only per-session promoted cache metrics, not the account report. |
+| Historical device-local usage | `usage.history_day` for a day or `usage.history_range` for heatmap totals | A missing day/slot is absence, not zero. Session summaries and `usage.report` are current projections and do not replace the ledger. Cross-device aggregation belongs to the client/cloud layer. |
 | Per-session cache health | `SessionSummary.cache_reread_hit_basis_points`; use `cache_lifetime_hit_basis_points` only for the separately labeled lifetime/all-input share | The same-summary nested `agent_metrics.usage.cache_reread_hit_basis_points` and `cache_hit_basis_points` are compatibility sources only when their promoted field is absent. Never calculate a substitute from token counts. |
 | Volatile composer/status | surface watch response/delta | Journal and terminal scraping are not fallback sources. Reconnect/watch again after owner loss. |
 | Resident profile binding and client-minted surface correlation | `ResidentSessionBinding` baseline/push and optional `binding_token` | OSC 7791 is compatibility output, not an authority or required per-pane source; see §11. |
@@ -783,6 +789,63 @@ independent facts. Inside hold, only `api_locked=Some(true)` or
 prove neither health nor failure. The outer `state: "available"`,
 `state: "indeterminate"`, and `state: "halted"` outcome is the health
 classification—never derive it from the partial snapshot.
+
+#### 9.6.1 Device-local usage history
+
+`usage_history_v1` gates both `usage.history_day` and
+`usage.history_range`. These are reads of a device-local, profile-scoped
+ledger, not billing statements and not a cloud-synchronized account history.
+The day door addresses one UTC date. The range door returns at most 366 UTC
+dates ending at and including `through_date`; it is the bounded heatmap door
+and returns daily folds, never a second stored rollup.
+
+The day projection contains exactly 96 quarter-hour grid positions. A null
+position means the slot was not sampled. A present slot whose counters are all
+zero means sampled zero. These states are deliberately distinct and a client
+must not zero-fill the former. A range element follows the same law:
+`total=None` means no slot was sampled on that date, while a present all-zero
+total means at least one slot was sampled and folded to zero. Hourly and daily
+views are folds on read over slot records; clients must not expect or create
+duplicate stored rollups.
+
+Lane descriptors are an append-only dictionary. `role` separates `root` and
+`subagent` lanes, including when every other descriptor field matches. An
+absent account alias, provider, model, API family, effort, or speed is unknown
+or inapplicable and stays absent; it must not be fabricated from current
+configuration. New request facts capture API family and any named
+effort/speed tier from the exact provider adapter that issued the request;
+older facts remain absent rather than being reconstructed. Backfill-created
+day headers carry `backfilled=true` because
+older journal facts may not contain all current descriptor dimensions. A
+backfill neither fills those dimensions nor turns missing slots into zeros.
+
+Meter samples preserve the provider-adapter's published integer basis points
+without denominator arithmetic. Reset time, plan tier, and staleness remain
+independent optional facts. The ledger stores no dollars, session ids, derived
+cache rates, latency, or duration. Session journals remain the drill-down.
+
+Each profile lazily creates one durable installation identity in the form
+`dev-` followed by 32 lowercase hexadecimal characters from the operating
+system random source. It is generated once, when first needed, and survives
+store close/reopen, daemon restart, upgrade, and backfill. Profile scope is
+deliberate: each ledger stream has exactly one writer, and two profiles on one
+machine are distinct devices by design. This identity is the day header's
+provenance/merge key. It does not change the journal's existing per-process
+`DeviceId`; aligning those identities is future work.
+
+The ledger and both RPC doors are device-local truth. Both responses repeat the
+profile `device_id` at top level, including for an absent day, and a present
+day's header identity must match it. Cross-device aggregation belongs to the
+client/cloud layer and must merge by this identity, not by assuming filesystem
+dates identify a global stream. In particular, two different devices may both
+have a `usage/2026-08-24.jsonl` without colliding in a correct merge.
+
+The `availability` field is separate from the optional payload. `available`
+with no `day` means that no local file exists for that date; an unavailable or
+failed read is not absence. This is a consumer-boundary law: consumers must
+not flatten a read failure or `Unavailable { reason }` into a missing day,
+slot, or total. Error-erasing adapters such as `.ok()` at this boundary are a
+contract defect.
 
 ### 9.7 Other optional response fields
 
@@ -1221,7 +1284,7 @@ The machine-checkable contract lives in these fixtures/tests:
   receipts.
 - `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`: the
   methods added after the historical matrix, completing golden request and
-  successful response coverage for all 71 request methods and all five
+  successful response coverage for all 73 request methods and all five
   command dynamic slots.
 - `crates/haider-rpc/tests/fixtures/snapshot_availability_compat_v1.json`:
   old and new account/provider/usage response bytes.

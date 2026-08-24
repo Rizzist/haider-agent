@@ -246,6 +246,10 @@ async fn run_inner(
     // this may a listener bind or Ready be advertised.
     states.publish(DaemonState::Recovering);
     let store = SqliteStoreHandle::open_locked(lease).await?;
+    if let Err(error) = store.initialize_usage_history().await {
+        let _ = store.close().await;
+        return Err(error.into());
+    }
     let (effect_diagnostics, prior_unexpected_exits) =
         EffectDiagnostics::open(config.store_dir.clone())
             .await

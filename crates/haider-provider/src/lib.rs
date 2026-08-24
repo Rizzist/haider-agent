@@ -1091,6 +1091,13 @@ pub trait Provider: Send + Sync {
         ProviderCredentialSurface::Opaque
     }
 
+    /// Returns non-secret dimensions of the exact adapter configuration used
+    /// for usage attribution. The default keeps injected and older adapters
+    /// honest by reporting these dimensions as unknown.
+    fn usage_lane_dimensions(&self) -> haider_protocol::provider::UsageLaneDimensions {
+        haider_protocol::provider::UsageLaneDimensions::default()
+    }
+
     /// Returns non-secret hashes of the exact adapter-rendered stable
     /// components. `None` retains the normalized CM1 hashes for injected or
     /// unknown providers.

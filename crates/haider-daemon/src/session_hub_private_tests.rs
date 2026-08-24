@@ -675,6 +675,98 @@ async fn missing_snapshot_subsystems_publish_reasoned_unavailability() {
     store.close().await.expect("store closes");
 }
 
+/// An available empty history read is successful absence, not subsystem
+/// unavailability. Store errors take the correlated error path in the router
+/// and therefore cannot be flattened into this response shape.
+#[tokio::test]
+async fn usage_history_routes_preserve_available_absence() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([haider_rpc::Capability::View]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection opens");
+    sink.0.lock().expect("frames").clear();
+
+    connection
+        .request(
+            haider_rpc::RequestId::new("history-day"),
+            haider_rpc::RequestBody::UsageHistoryDay {
+                date: "2026-08-24".into(),
+            },
+        )
+        .await
+        .expect("day request routes");
+    connection
+        .request(
+            haider_rpc::RequestId::new("history-range"),
+            haider_rpc::RequestBody::UsageHistoryRange {
+                through_date: "2026-08-24".into(),
+                days: 2,
+            },
+        )
+        .await
+        .expect("range request routes");
+
+    {
+        let frames = sink.0.lock().expect("frames");
+        let day = frames.iter().find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id,
+                body:
+                    haider_rpc::ResponseBody::UsageHistoryDay {
+                        device_id,
+                        day,
+                        availability,
+                        ..
+                    },
+            } if request_id.as_str() == "history-day" => Some((device_id, day, availability)),
+            _ => None,
+        });
+        let (day_device_id, day, day_availability) = day.expect("day response");
+        assert_eq!(day, &None);
+        assert_eq!(
+            day_availability,
+            &Some(haider_rpc::SnapshotAvailabilityWire::Available)
+        );
+        let range = frames.iter().find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id,
+                body:
+                    haider_rpc::ResponseBody::UsageHistoryRange {
+                        device_id,
+                        days,
+                        availability,
+                        ..
+                    },
+            } if request_id.as_str() == "history-range" => Some((device_id, days, availability)),
+            _ => None,
+        });
+        let (range_device_id, days, availability) = range.expect("range response");
+        assert_eq!(range_device_id, day_device_id);
+        assert!(day_device_id.starts_with("dev-"));
+        assert_eq!(day_device_id.len(), 36);
+        assert_eq!(
+            availability,
+            &Some(haider_rpc::SnapshotAvailabilityWire::Available)
+        );
+        assert_eq!(days.len(), 2);
+        assert!(days.iter().all(|day| day.total.is_none()));
+
+        // MUTATION CHECK: zero-filling range cells makes the final assertion
+        // fail; reporting empty-day success as unavailable breaks the exact day
+        // availability assertion.
+    }
+    drop(connection);
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
 /// Regression pin: a command-response capture borrows the live caller's
 /// identity. Dropping that short-lived capture must not unregister the real
 /// connection's resident binding or either volatile surface it owns.

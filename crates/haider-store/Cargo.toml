@@ -9,8 +9,10 @@ rust-version.workspace = true
 [dependencies]
 blake3.workspace = true
 crc32fast.workspace = true
+getrandom.workspace = true
 haider-platform = { path = "../haider-platform" }
 haider-protocol = { path = "../haider-protocol" }
+hex.workspace = true
 image.workspace = true
 rusqlite.workspace = true
 rmp-serde.workspace = true

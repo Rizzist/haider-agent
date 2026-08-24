@@ -54,6 +54,10 @@ use serde::Deserialize;
 pub struct MeterReading {
     /// Normalized windows (utilization always 0.0–1.0).
     pub windows: Vec<UsageWindowV1>,
+    /// Integer basis points captured at the provider parsing boundary, in
+    /// exactly the same order as `windows`. The history ledger stores these
+    /// values directly and never reconstructs them from display floats.
+    pub basis_points: Vec<u32>,
     /// Subscription plan when the meter reports one (codex `plan_type`).
     pub plan: Option<String>,
 }
@@ -313,6 +317,10 @@ pub fn parse_openai_wham_usage(body: &[u8]) -> Result<MeterReading, MeterUnavail
         return Err(MeterUnavailable::new("no_windows_reported"));
     }
     Ok(MeterReading {
+        basis_points: windows
+            .iter()
+            .map(|window| utilization_basis_points(window.utilization))
+            .collect(),
         windows,
         plan: usage.plan_type,
     })
@@ -391,6 +399,10 @@ pub fn parse_anthropic_oauth_usage(body: &[u8]) -> Result<MeterReading, MeterUna
         return Err(MeterUnavailable::new("no_windows_reported"));
     }
     Ok(MeterReading {
+        basis_points: windows
+            .iter()
+            .map(|window| utilization_basis_points(window.utilization))
+            .collect(),
         windows,
         plan: None,
     })
@@ -499,6 +511,10 @@ pub fn parse_kimi_usages(body: &[u8]) -> Result<MeterReading, MeterUnavailable> 
         return Err(MeterUnavailable::new("no_windows_reported"));
     }
     Ok(MeterReading {
+        basis_points: windows
+            .iter()
+            .map(|window| utilization_basis_points(window.utilization))
+            .collect(),
         windows,
         plan: None,
     })
@@ -605,9 +621,22 @@ pub fn parse_grok_billing(body: &[u8]) -> Result<MeterReading, MeterUnavailable>
         return Err(MeterUnavailable::new("no_windows_reported"));
     }
     Ok(MeterReading {
+        basis_points: windows
+            .iter()
+            .map(|window| utilization_basis_points(window.utilization))
+            .collect(),
         windows,
         plan: billing.subscription_tier,
     })
+}
+
+fn utilization_basis_points(utilization: f64) -> u32 {
+    if !utilization.is_finite() {
+        return 0;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let points = (utilization.clamp(0.0, 1.0) * 10_000.0).round() as u32;
+    points.min(10_000)
 }
 
 // --- RFC 3339 -------------------------------------------------------------
@@ -741,6 +770,7 @@ mod grok_billing_tests {
         let reading = parse_grok_billing(body).expect("credits shape parses");
         assert_eq!(reading.plan.as_deref(), Some("SuperGrok"));
         assert_eq!(reading.windows.len(), 2);
+        assert_eq!(reading.basis_points, [4_250, 1_200]);
         assert_eq!(reading.windows[0].window, "weekly");
         assert!((reading.windows[0].utilization - 0.425).abs() < 1e-9);
         assert!(reading.windows[0].resets_at_ms.is_some(), "weekly reset");
@@ -759,6 +789,7 @@ mod grok_billing_tests {
         }"#;
         let reading = parse_grok_billing(body).expect("omission shape parses");
         assert_eq!(reading.windows.len(), 1, "zero cap = no on-demand window");
+        assert_eq!(reading.basis_points, [0]);
         assert!(
             reading.windows[0].utilization.abs() < f64::EPSILON,
             "absent = 0%"
@@ -774,6 +805,7 @@ mod grok_billing_tests {
         }"#;
         let reading = parse_grok_billing(body).expect("legacy shape parses");
         assert_eq!(reading.windows[0].window, "monthly");
+        assert_eq!(reading.basis_points, [6_170]);
         assert!((reading.windows[0].utilization - 0.617).abs() < 1e-9);
 
         // Nothing usable = honest unavailability, never a fabricated bar.
