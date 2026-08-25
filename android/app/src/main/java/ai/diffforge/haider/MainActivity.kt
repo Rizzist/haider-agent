@@ -38,6 +38,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import ai.diffforge.haider.transport.DaemonConnection
 import ai.diffforge.haider.ui.chat.ChatViewModel
 import ai.diffforge.haider.ui.chat.Composer
 import ai.diffforge.haider.ui.chat.ConnectionState
@@ -51,6 +52,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        // Connects if a daemon endpoint is already configured; a no-op otherwise.
+        DaemonConnection.start(applicationContext)
         setContent {
             ForgeTheme {
                 AppRoot()
