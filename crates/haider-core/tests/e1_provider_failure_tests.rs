@@ -6,7 +6,7 @@ use haider_core::{
     ToolDispatchResult, ToolDispatcher, retry_jittered_backoff_ms,
 };
 use haider_protocol::EventPayload;
-use haider_protocol::error::{ErrorAction, ErrorPresentation, ErrorScope, HaiderError};
+use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
 use haider_protocol::history::NodeKind;
 use haider_protocol::ids::{CredentialAlias, DeviceId, ItemId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
@@ -311,6 +311,51 @@ async fn e1e_premature_eof_before_content_retries_and_recovers() {
     );
 }
 
+/// v0.0.959: once content is visible, a premature transport EOF cannot be
+/// replayed safely and is not a user decision. It terminates with RunFailed
+/// and never parks the run on InputRequired.
+#[tokio::test]
+async fn premature_eof_after_content_is_run_failed_not_input_required() {
+    let sleeper = Arc::new(RecordingSleeper::default());
+    let (handle, store, provider) = spawn(
+        "e1-midstream-eof",
+        vec![
+            FakeStep::EmitText {
+                text: "partial response".into(),
+            },
+            FakeStep::PrematureEof,
+        ],
+        sleeper,
+    );
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("disconnect"))
+        .await
+        .expect("accepted")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+    assert_eq!(provider.requests().len(), 1);
+    let payloads = store
+        .events(&SessionId::new("e1-midstream-eof"))
+        .await
+        .into_iter()
+        .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload).ok())
+        .collect::<Vec<_>>();
+    assert!(payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::RunFailed {
+            code: ErrorCode::ProviderError,
+            retryable: true,
+            ..
+        }
+    )));
+    assert!(!payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::RunState(RunState::InputRequired { .. })
+    )));
+}
+
 /// LAW E1c: quota never spends retry budget even if a broken classifier marks
 /// it retryable. MUTATION: removing the kind gate yields another attempt.
 #[tokio::test]
@@ -472,9 +517,9 @@ async fn e3b_oauth_expired_produces_relogin_card() {
     assert_eq!(durable.detail, PROVIDER_DETAIL);
 }
 
-/// LAW E4a: a post-content EOF closes the exact item as incomplete and parks
-/// on a choice card instead of silently committing Done. MUTATION: completing
-/// the accumulator as AgentMessage makes the marker assertion fail.
+/// LAW E4a: a post-content non-transport provider failure closes the exact item
+/// as incomplete and parks on a choice card instead of silently committing
+/// Done. Transport faults have a separate finite RunFailed path.
 #[tokio::test]
 async fn e4a_midstream_failure_journals_incomplete_item_and_choice_card() {
     let sleeper = Arc::new(RecordingSleeper::default());
@@ -484,7 +529,11 @@ async fn e4a_midstream_failure_journals_incomplete_item_and_choice_card() {
             FakeStep::EmitText {
                 text: "partial response".into(),
             },
-            FakeStep::PrematureEof,
+            FakeStep::Error {
+                kind: ProviderErrorKind::InvalidRequest,
+                message: "provider rejected the partial response".into(),
+                retry_after_ms: None,
+            },
             FakeStep::EmitText {
                 text: "fresh response".into(),
             },
@@ -661,9 +710,9 @@ async fn e4a_midstream_failure_preserves_provider_explanation() {
     );
 }
 
-/// LAW E4b: ContinuePartial primes the new request with the exact partial and
-/// continuation instruction once. MUTATION: pushing either message twice is
-/// caught by the exact counts below.
+/// LAW E4b: for an explicitly recoverable non-transport failure,
+/// ContinuePartial primes the new request with the exact partial and
+/// continuation instruction once.
 #[tokio::test]
 async fn e4b_continue_partial_primes_followup_exactly_once() {
     const PARTIAL: &str = "alpha beta";
@@ -675,7 +724,11 @@ async fn e4b_continue_partial_primes_followup_exactly_once() {
             FakeStep::EmitText {
                 text: PARTIAL.into(),
             },
-            FakeStep::PrematureEof,
+            FakeStep::Error {
+                kind: ProviderErrorKind::InvalidRequest,
+                message: "provider rejected the partial response".into(),
+                retry_after_ms: None,
+            },
             FakeStep::EmitText {
                 text: " gamma".into(),
             },

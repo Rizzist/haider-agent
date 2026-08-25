@@ -18,9 +18,10 @@
 //!   attempts per individual provider request, only retryable transport/
 //!   rate-limit/overload errors, and never after that request emitted a stream
 //!   event — which also fences effects, since a tool can only run after
-//!   events. `wait_before_provider_retry` commits durable `Retrying` state
-//!   (W-C M4: a visible `attempt K/max` counter, Claude-Code style) around the
-//!   backoff and cancellation wins every wait. The backoff is a PURE function
+//!   events. `wait_before_provider_retry` commits durable provider `Waiting`
+//!   telemetry followed by `Retrying` (W-C M4: a visible `attempt K/max`
+//!   counter, Claude-Code style) around the backoff, and cancellation wins
+//!   every wait. The backoff is a PURE function
 //!   of the attempt (`retry_backoff_ms`), and the wait is served through the
 //!   injected [`RetrySleeper`] so laws assert the sequence without waiting.
 //!
@@ -2179,11 +2180,6 @@ impl HarnessActor {
         // exactly once, under the finished message.
         let mut server_calls: HashMap<String, (String, serde_json::Value)> = HashMap::new();
         let mut web_sources: Vec<WebSource> = Vec::new();
-        // E8a: one repair request for malformed model-authored tool JSON per
-        // logical turn. This lives outside the request loop so a retry cannot
-        // reset the bound into an unbounded repair cycle.
-        let mut tool_json_repair_used = false;
-
         'requests: loop {
             self.pending_nudges
                 .extend(self.promoted_steers.drain_committed());
@@ -2723,6 +2719,23 @@ impl HarnessActor {
                         continue 'requests;
                     }
                     Err(error) => {
+                        // A network disconnect or idle timeout is not a user
+                        // decision. Once provider content is visible we cannot
+                        // safely replay the request, so terminate through the
+                        // typed RunFailed/Errored path instead of opening a
+                        // partial-stream input menu. Non-transport response
+                        // failures retain the explicit recovery menu below.
+                        if provider_error_is_transport_fault(&error) {
+                            return self
+                                .provider_failure_outcome_with_items(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut tools,
+                                    error,
+                                )
+                                .await;
+                        }
                         if message
                             .as_ref()
                             .is_some_and(|partial| !partial.text.is_empty())
@@ -3024,36 +3037,13 @@ impl HarnessActor {
                             }
                             Err(DriveError::Provider(error))
                                 if error.presentation.subcode.as_str()
-                                    == "malformed-tool-arguments"
-                                    && !tool_json_repair_used =>
+                                    == "malformed-tool-arguments" =>
                             {
-                                tool_json_repair_used = true;
-                                let repair = match self
-                                    .close_malformed_tool_for_repair(
-                                        &run_id, &mut tools, &call_id, error,
+                                if let Err(close_error) = self
+                                    .close_malformed_tool_failure(
+                                        &run_id, &mut tools, &call_id, &error,
                                     )
                                     .await
-                                {
-                                    Ok(repair) => repair,
-                                    Err(error) => {
-                                        return self
-                                            .drive_error_outcome_with_items(
-                                                &run_id,
-                                                &mut message,
-                                                &mut reasoning,
-                                                &mut tools,
-                                                error,
-                                            )
-                                            .await;
-                                    }
-                                };
-                                assistant_blocks.push(repair.0);
-                                messages.push(Message::assistant(std::mem::take(
-                                    &mut assistant_blocks,
-                                )));
-                                messages.push(repair.1);
-                                if let Err(error) =
-                                    finalize_request_usage(&mut completed_usage, &mut request_usage)
                                 {
                                     return self
                                         .drive_error_outcome_with_items(
@@ -3061,17 +3051,19 @@ impl HarnessActor {
                                             &mut message,
                                             &mut reasoning,
                                             &mut tools,
-                                            error,
+                                            close_error,
                                         )
                                         .await;
                                 }
-                                provider_attempt = 0;
-                                if let Err(error) =
-                                    self.commit_state(&run_id, RunState::Thinking).await
-                                {
-                                    return self.errored_state_outcome(&run_id, error).await;
-                                }
-                                continue 'requests;
+                                return self
+                                    .provider_failure_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        error,
+                                    )
+                                    .await;
                             }
                             Err(error) => Err(error),
                         }
@@ -4399,7 +4391,8 @@ impl HarnessActor {
         Ok(true)
     }
 
-    /// Commits `Retrying { attempt, max, delay_ms, reason }` (W-C M4: the
+    /// Commits adapter-visible `Waiting { reason }` telemetry immediately
+    /// before `Retrying { attempt, max, delay_ms, reason }` (W-C M4: the
     /// visible `attempt K/max` counter), waits through the injected sleeper,
     /// then commits `Thinking` — the R6 backoff between provider attempts.
     ///
@@ -4443,6 +4436,9 @@ impl HarnessActor {
         let delay_ms = error
             .retry_after_ms
             .unwrap_or_else(|| retry_jittered_backoff_ms(run_id, failed_attempt));
+        let waiting = RunState::Waiting {
+            reason: reason.clone(),
+        };
         let retrying = RunState::Retrying {
             attempt: u32::try_from(failed_attempt.saturating_add(1)).unwrap_or(u32::MAX),
             max: u32::try_from(MAX_API_RETRIES).unwrap_or(u32::MAX),
@@ -4452,14 +4448,21 @@ impl HarnessActor {
         // Arm against the actor-minted event id BEFORE the append becomes
         // visible. A daemon can therefore never observe this durable
         // `Retrying` fact in the small gap before its wake seam exists.
-        let mut envelopes = [self
-            .uncommitted_envelope(
+        let mut envelopes = [
+            self.uncommitted_envelope(
+                run_id,
+                EventPayload::RunState(waiting),
+                prompt_omit_render(),
+            )
+            .map_err(DriveError::Store)?,
+            self.uncommitted_envelope(
                 run_id,
                 EventPayload::RunState(retrying.clone()),
                 prompt_omit_render(),
             )
-            .map_err(DriveError::Store)?];
-        let retrying_event_id = envelopes[0].event_id.clone();
+            .map_err(DriveError::Store)?,
+        ];
+        let retrying_event_id = envelopes[1].event_id.clone();
         let retry_wake = Arc::clone(&self.provider_retry_wake);
         self.flush_pending_item_delta()
             .await
@@ -4469,8 +4472,9 @@ impl HarnessActor {
             retry_wake.disarm(&retrying_event_id);
             return Err(DriveError::Store(error));
         }
-        let [committed] = envelopes;
-        let _ = self.events.send(committed);
+        for committed in envelopes {
+            let _ = self.events.send(committed);
+        }
         self.state.send_replace(Some(retrying));
         // Clone the sleeper Arc into a local so the pinned backoff future
         // borrows IT, not `self` — the loop below services commands through
@@ -4645,32 +4649,35 @@ impl HarnessActor {
         Ok(())
     }
 
-    async fn close_malformed_tool_for_repair(
+    /// Closes a provider-authored tool call whose streamed argument buffer is
+    /// not valid JSON. The failed tool result is durable before the caller
+    /// terminalizes the run; malformed provider output is never dispatched and
+    /// can never be followed by a successful Done state.
+    async fn close_malformed_tool_failure(
         &mut self,
         run_id: &RunId,
         tools: &mut Vec<ToolAccumulator>,
         call_id: &str,
-        error: ProviderError,
-    ) -> Result<(Block, Message), DriveError> {
+        error: &ProviderError,
+    ) -> Result<(), DriveError> {
         let Some(index) = tools.iter().position(|tool| tool.call_id == call_id) else {
             return Err(DriveError::Provider(provider_protocol_error(format!(
                 "provider ended unknown tool call `{call_id}`",
             ))));
         };
         let tool = &tools[index];
-        let safe_detail = format!(
-            "Tool `{}` arguments could not be parsed. Return the same call with one valid JSON object; this is the only repair attempt.",
-            tool.name
-        );
         let result = BoundedResult {
-            preview: safe_detail.clone(),
+            preview: format!(
+                "Tool `{}` arguments could not be parsed as valid JSON.",
+                tool.name
+            ),
             truncated: false,
             artifact: None,
             images: Vec::new(),
             cursor: None,
             status: ToolResultStatus::Failed,
-            reason: Some("malformed JSON — repair attempt 1/1".into()),
-            presentation: Some(error.presentation),
+            reason: Some("malformed JSON tool arguments".into()),
+            presentation: Some(error.presentation.clone()),
         };
         self.commit_payload(
             run_id,
@@ -4684,28 +4691,8 @@ impl HarnessActor {
         .map_err(DriveError::Store)?;
         self.commit_tool_completed(run_id, tool, ToolStatus::Failed)
             .await?;
-        self.commit_ui_extension_marker(
-            run_id,
-            "tool_json_repair",
-            serde_json::json!({
-                "attempt": 1,
-                "max_attempts": 1,
-                "call_id": tool.call_id,
-                "tool": tool.name,
-            }),
-        )
-        .await
-        .map_err(DriveError::Store)?;
-        let tool = tools.remove(index);
-        let message = Message::tool_result(tool.call_id.clone(), safe_detail, false);
-        let block = Block::ToolCall {
-            call_id: tool.call_id,
-            name: tool.name,
-            // Keep the provider protocol pair valid without pretending the
-            // malformed fragment was a successfully parsed argument object.
-            args: serde_json::json!({ "_malformed_json": tool.args }),
-        };
-        Ok((block, message))
+        tools.remove(index);
+        Ok(())
     }
 
     /// Closes the matching tool item for a provider `ToolCallEnd`.
@@ -7146,11 +7133,12 @@ fn submit_busy_error(capacity: usize) -> HaiderError {
 }
 
 fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {
-    let mut error = HaiderError::new(
-        ErrorCode::ProviderError,
-        provider_error.to_string(),
-        provider_error.retryable,
-    );
+    let code = if provider_error.presentation.subcode.as_str() == "provider-timeout" {
+        ErrorCode::ProviderTimeout
+    } else {
+        ErrorCode::ProviderError
+    };
+    let mut error = HaiderError::new(code, provider_error.to_string(), provider_error.retryable);
     error.details = Some(serde_json::json!({
         "provider_error_kind": format!("{:?}", provider_error.kind),
         "retry_after_ms": provider_error.retry_after_ms,
@@ -7420,6 +7408,17 @@ fn provider_error_allows_retry(error: &ProviderError) -> bool {
                 | ProviderErrorKind::RateLimited
                 | ProviderErrorKind::Overloaded
         )
+}
+
+/// Transport failures never require a user decision. Before any provider
+/// content they may follow the bounded automatic retry path; after content has
+/// streamed they must terminate as a typed run failure because replay could
+/// duplicate visible output or side effects.
+fn provider_error_is_transport_fault(error: &ProviderError) -> bool {
+    matches!(
+        error.kind,
+        ProviderErrorKind::Transport | ProviderErrorKind::StreamInterrupted
+    )
 }
 
 fn provider_error_allows_rotation(error: &ProviderError) -> bool {
@@ -8752,6 +8751,56 @@ mod cu1_actor_tests {
         );
         config.tool_result_images_supported = images_supported;
         config
+    }
+
+    #[test]
+    fn malformed_tool_argument_buffer_is_a_typed_provider_failure() {
+        let tool = ToolAccumulator {
+            item_id: ItemId::new("item-malformed-args"),
+            call_id: "call-malformed-args".into(),
+            name: "shell".into(),
+            args: r#"{"command":"#.into(),
+        };
+        let error = parse_tool_args(&tool).expect_err("truncated JSON must fail");
+        let DriveError::Provider(error) = error else {
+            panic!("tool JSON parse failure must retain provider classification")
+        };
+        assert_eq!(error.kind, ProviderErrorKind::MalformedFrame);
+        assert_eq!(
+            error.presentation.subcode.as_str(),
+            "malformed-tool-arguments"
+        );
+    }
+
+    #[test]
+    fn transport_fault_classifier_is_narrow() {
+        for kind in [
+            ProviderErrorKind::Transport,
+            ProviderErrorKind::StreamInterrupted,
+        ] {
+            assert!(provider_error_is_transport_fault(&ProviderError::new(
+                kind,
+                "transport fixture"
+            )));
+        }
+        assert!(!provider_error_is_transport_fault(&ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "a response fault may retain explicit recovery"
+        )));
+    }
+
+    #[test]
+    fn provider_timeout_presentation_maps_to_existing_timeout_error_code() {
+        let provider_error = ProviderError::new(ProviderErrorKind::Transport, "timed out")
+            .with_presentation(ErrorPresentation::new(
+                "provider-timeout",
+                "Provider request timed out",
+                "The local deadline expired.",
+                ErrorScope::Turn,
+                [ErrorAction::Retry],
+            ));
+        let error = provider_error_to_haider(provider_error);
+        assert_eq!(error.code, ErrorCode::ProviderTimeout);
     }
 
     #[tokio::test]

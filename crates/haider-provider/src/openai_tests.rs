@@ -310,11 +310,59 @@ async fn hanging_openai_fixture_times_out_only_the_idle_chunk_await() {
         .expect("idle deadline emits one item")
         .expect_err("idle deadline is typed");
     assert_eq!(error.kind, ProviderErrorKind::Transport);
-    assert!(error.retryable);
+    assert!(
+        !error.retryable,
+        "an idle deadline must terminalize before an outer process timeout"
+    );
     assert!(error.message.contains("90 seconds"));
     assert!(receiver.recv().await.is_none());
     stream_task.await.expect("stream task exits");
     assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[test]
+fn openai_silent_phase_deadlines_precede_common_run_supervisors() {
+    let config = OpenAiProvider::transport_config();
+    let supervisor_deadline = Duration::from_secs(15);
+    assert_eq!(config.connect_timeout, Duration::from_secs(5));
+    assert_eq!(config.response_open_timeout, Duration::from_secs(5));
+    assert_eq!(config.chunk_idle_timeout, Duration::from_secs(5));
+    assert!(config.response_open_timeout < supervisor_deadline);
+    assert!(config.chunk_idle_timeout < supervisor_deadline);
+
+    let open = response_open_timeout_error(config.response_open_timeout);
+    assert_eq!(open.kind, ProviderErrorKind::Transport);
+    assert_eq!(open.presentation.subcode.as_str(), "provider-timeout");
+    assert!(
+        !open.retryable,
+        "a silent request must not start a 10-try loop"
+    );
+    let idle = stream_idle_error(config.chunk_idle_timeout);
+    assert_eq!(idle.kind, ProviderErrorKind::Transport);
+    assert_eq!(idle.presentation.subcode.as_str(), "provider-timeout");
+    assert!(
+        !idle.retryable,
+        "an idle stream must become a finite failure"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn response_open_deadline_expires_a_silent_request() {
+    let opening = tokio::spawn(response_before_deadline(
+        Duration::from_secs(5),
+        future::pending::<Result<(), ProviderError>>(),
+    ));
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(4)).await;
+    assert!(!opening.is_finished());
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let error = opening
+        .await
+        .expect("timeout task exits")
+        .expect_err("the local request deadline fires");
+    assert_eq!(error.kind, ProviderErrorKind::Transport);
+    assert!(!error.retryable);
+    assert!(error.message.contains("5 seconds"));
 }
 
 #[tokio::test]

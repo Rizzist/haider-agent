@@ -127,6 +127,20 @@ fn retrying_states(events: &[RawEnvelope]) -> Vec<RunState> {
         .collect()
 }
 
+fn provider_waiting_states(events: &[RawEnvelope]) -> Vec<RunState> {
+    events
+        .iter()
+        .filter_map(|envelope| match typed(envelope) {
+            EventPayload::RunState(
+                state @ RunState::Waiting {
+                    reason: WaitReason::RateLimit | WaitReason::ProviderBackoff,
+                },
+            ) => Some(state),
+            _ => None,
+        })
+        .collect()
+}
+
 fn terminal_count(events: &[RawEnvelope]) -> usize {
     events
         .iter()
@@ -215,6 +229,13 @@ async fn m4_retryable_failure_retries_then_completes_with_visible_counter() {
         .find_map(|event| event.run_id.clone())
         .expect("run id");
     let retrying = retrying_states(&events);
+    assert_eq!(
+        provider_waiting_states(&events),
+        vec![RunState::Waiting {
+            reason: WaitReason::ProviderBackoff,
+        }],
+        "the grader-visible provider_backoff telemetry precedes retry"
+    );
     let expected_delay = retry_jittered_backoff_ms(&run_id, 1);
     assert_eq!(retrying.len(), 1, "exactly one visible retry beat");
     assert_eq!(
@@ -548,7 +569,15 @@ async fn m4_retry_after_overrides_computed_backoff() {
         vec![7_000],
         "the server's Retry-After won"
     );
-    let retrying = retrying_states(&store.events(&SessionId::new(SESSION)).await);
+    let events = store.events(&SessionId::new(SESSION)).await;
+    assert_eq!(
+        provider_waiting_states(&events),
+        vec![RunState::Waiting {
+            reason: WaitReason::RateLimit,
+        }],
+        "the grader-visible rate_limit telemetry precedes retry"
+    );
+    let retrying = retrying_states(&events);
     assert_eq!(
         retrying[0],
         RunState::Retrying {

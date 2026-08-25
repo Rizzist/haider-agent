@@ -975,4 +975,110 @@ mod tests {
         assert_eq!(lines[1]["event_id"], "event-order");
         assert!(stderr.is_empty());
     }
+
+    /// The conformance adapter consumes the daemon's existing event taxonomy
+    /// directly: these exact payload shapes normalize to `retry` and
+    /// `harness_error`, respectively. The CLI must not translate them into a
+    /// parallel JSONL record type.
+    #[test]
+    fn jsonl_adapter_preserves_provider_wait_and_run_failed_payload_shapes() {
+        use haider_protocol::EventPayload;
+        use haider_protocol::error::ErrorCode;
+        use haider_protocol::state::{RunState, WaitReason};
+
+        fn envelope(seq: u64, payload: EventPayload) -> haider_protocol::envelope::RawEnvelope {
+            serde_json::from_value(serde_json::json!({
+                "schema_version": 1,
+                "event_id": format!("event-shape-{seq}"),
+                "seq": seq,
+                "session_id": "session-shape",
+                "device_id": "device-shape",
+                "authority_epoch": 1,
+                "worker_generation": 1,
+                "committed_at_ms": seq,
+                "run_id": "run-shape",
+                "render": {"ui": true, "durable": true, "prompt": "omit"},
+                "payload": serde_json::to_value(payload).expect("typed payload serializes")
+            }))
+            .expect("raw envelope fixture")
+        }
+
+        let (sender, receiver) = mpsc::channel(4);
+        for (index, payload) in [
+            EventPayload::RunState(RunState::Waiting {
+                reason: WaitReason::RateLimit,
+            }),
+            EventPayload::RunState(RunState::Waiting {
+                reason: WaitReason::ProviderBackoff,
+            }),
+            EventPayload::RunFailed {
+                code: ErrorCode::ProviderError,
+                message: "provider stream disconnected".into(),
+                retryable: true,
+                presentation: None,
+            },
+            EventPayload::RunFailed {
+                code: ErrorCode::ProviderTimeout,
+                message: "provider request timed out".into(),
+                retryable: false,
+                presentation: None,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let seq = u64::try_from(index + 1).expect("sequence fits");
+            sender
+                .try_send(HeadlessEvent::Envelope(Box::new(envelope(seq, payload))))
+                .expect("event queues");
+        }
+        drop(sender);
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        adapt_events_to(RunOutput::Jsonl, receiver, &mut stdout, &mut stderr)
+            .expect("adapter succeeds");
+        let payloads = String::from_utf8(stdout)
+            .expect("utf8 output")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("JSONL object"))
+            .map(|envelope| envelope["payload"].clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            payloads[0],
+            serde_json::json!({
+                "type": "run_state",
+                "state": "waiting",
+                "reason": {"reason": "rate_limit"}
+            })
+        );
+        assert_eq!(
+            payloads[1],
+            serde_json::json!({
+                "type": "run_state",
+                "state": "waiting",
+                "reason": {"reason": "provider_backoff"}
+            })
+        );
+        assert_eq!(
+            payloads[2],
+            serde_json::json!({
+                "type": "run_failed",
+                "code": "provider_error",
+                "message": "provider stream disconnected",
+                "retryable": true
+            })
+        );
+        assert_eq!(
+            payloads[3],
+            serde_json::json!({
+                "type": "run_failed",
+                "code": "provider_timeout",
+                "message": "provider request timed out",
+                "retryable": false
+            })
+        );
+        assert!(stderr.is_empty());
+    }
 }

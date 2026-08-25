@@ -2203,11 +2203,11 @@ async fn malformed_frame_is_errored_with_typed_error() {
     ));
 }
 
-/// E8a mutation law: moving the repair-used flag inside the provider-request
-/// loop makes this request a third time (or forever); removing the repair arm
-/// makes only one request and omits the durable repair marker.
+/// v0.0.959 conformance: malformed model-authored tool JSON is a structured
+/// failed tool plus a typed terminal failure. It is never dispatched, repaired
+/// into a second provider request, or allowed to end as a clean success.
 #[tokio::test]
-async fn e8a_malformed_tool_json_repairs_exactly_once_then_typed_failure() {
+async fn malformed_tool_json_fails_the_tool_and_run_without_dispatch_or_repair() {
     let (handle, store, provider) = runtime(vec![
         FakeStep::EmitToolCallStart {
             call_id: "bad-1".into(),
@@ -2223,19 +2223,10 @@ async fn e8a_malformed_tool_json_repairs_exactly_once_then_typed_failure() {
         FakeStep::Finish {
             reason: FinishReason::ToolUse,
         },
-        FakeStep::EmitToolCallStart {
-            call_id: "bad-2".into(),
-            name: "demo".into(),
-        },
-        FakeStep::EmitToolArgsDelta {
-            call_id: "bad-2".into(),
-            fragment: "[still-broken".into(),
-        },
-        FakeStep::EmitToolCallEnd {
-            call_id: "bad-2".into(),
-        },
+        // A regression that treats the malformed call as recoverable reaches
+        // this second response and incorrectly reports Done.
         FakeStep::Finish {
-            reason: FinishReason::ToolUse,
+            reason: FinishReason::EndTurn,
         },
     ]);
     let turn = handle
@@ -2244,19 +2235,27 @@ async fn e8a_malformed_tool_json_repairs_exactly_once_then_typed_failure() {
         .expect("submit");
     let outcome = timeout(Duration::from_secs(2), turn.wait())
         .await
-        .expect("malformed JSON recovery must remain bounded")
+        .expect("malformed JSON failure must remain bounded")
         .expect("outcome");
     assert_eq!(outcome.state, RunState::Errored);
-    assert_eq!(provider.requests().len(), 2, "exactly one repair request");
+    assert_eq!(provider.requests().len(), 1, "no repair request is issued");
     let events = store.events(&SessionId::new(SESSION)).await;
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| completed_extension(event, "tool_json_repair"))
-            .count(),
-        1,
-        "repair is visibly journaled once"
-    );
+    assert!(events.iter().any(|event| matches!(
+        typed(event),
+        EventPayload::Item(ItemEvent::Completed {
+            item: TurnItem::ToolCall {
+                ref call_id,
+                status: ToolStatus::Failed,
+                ..
+            },
+            ..
+        }) if call_id == "bad-1"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        typed(event),
+        EventPayload::ToolResult { ref result, .. }
+            if result.status == haider_protocol::tool::ToolResultStatus::Failed
+    )));
     assert!(events.iter().any(|event| matches!(
         typed(event),
         EventPayload::RunFailed {
@@ -2346,8 +2345,8 @@ async fn retry_after_above_respect_cap_terminalizes_retryable_exhaustion() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn provider_error_after_first_event_is_never_retried() {
-    let (handle, _store, provider) = runtime(vec![
+async fn transport_error_after_first_event_is_typed_failure_not_input_required() {
+    let (handle, store, provider) = runtime(vec![
         FakeStep::EmitText {
             text: "observable".into(),
         },
@@ -2364,28 +2363,26 @@ async fn provider_error_after_first_event_is_never_retried() {
         .submit_turn(SubmitTurn::new("do not duplicate output"))
         .await
         .expect("turn accepted");
-    let mut state = handle.state_receiver();
-    let parked = state
-        .wait_for(|state| matches!(state, Some(RunState::InputRequired { .. })))
-        .await
-        .expect("actor remains available")
-        .clone();
-    let RunState::InputRequired { menu } = parked.expect("input state") else {
-        panic!("expected partial-stream menu");
-    };
+    assert_eq!(turn.wait().await.expect("outcome").state, RunState::Errored);
     assert_eq!(provider.requests().len(), 1);
-    handle
-        .answer_menu(MenuAnswer {
-            menu,
-            option_key: Some("retry_fresh".into()),
-            option_index: 1,
-            value: None,
-            via: AnswerVia::Rpc,
-        })
+    let payloads = store
+        .events(&SessionId::new(SESSION))
         .await
-        .expect("retry-fresh answer");
-    assert_eq!(turn.wait().await.expect("outcome").state, RunState::Done);
-    assert_eq!(provider.requests().len(), 2);
+        .into_iter()
+        .map(|event| typed(&event))
+        .collect::<Vec<_>>();
+    assert!(payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::RunFailed {
+            code: ErrorCode::ProviderError,
+            retryable: true,
+            ..
+        }
+    )));
+    assert!(!payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::RunState(RunState::InputRequired { .. })
+    )));
 }
 
 #[tokio::test]

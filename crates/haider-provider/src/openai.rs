@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,6 +18,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use haider_accounts::SecretHandle;
 use haider_protocol::computer::{ComputerAction, ScreenPoint, ScrollDirection};
+use haider_protocol::error::{ErrorAction, ErrorPresentation, ErrorScope};
 use haider_protocol::ids::CredentialAlias;
 use haider_protocol::provider::{
     Block, CacheStatAvailability, CapabilityDoc, FeatureResolve, FinishReason, NormalizedUsage,
@@ -133,9 +135,13 @@ const MODELS_BODY_LIMIT: usize = 1024 * 1024;
 const ERROR_BODY_LIMIT: usize = crate::HTTP_ERROR_BODY_LIMIT;
 const TRANSPORT_CONFIG: OpenAiTransportConfig = OpenAiTransportConfig {
     retry_policy: OpenAiRetryPolicy::Never,
-    connect_timeout: Duration::from_secs(10),
-    response_open_timeout: Duration::from_secs(30),
-    chunk_idle_timeout: Duration::from_secs(90),
+    // `haider run` must fail under its own control before common 15-second
+    // process supervisors intervene. Request-open and idle waits are separate:
+    // an active stream may run indefinitely as long as it keeps producing
+    // chunks, but either silent phase is bounded well below that deadline.
+    connect_timeout: Duration::from_secs(5),
+    response_open_timeout: Duration::from_secs(5),
+    chunk_idle_timeout: Duration::from_secs(5),
 };
 
 static SHARED_OPENAI_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
@@ -511,9 +517,7 @@ impl OpenAiHttp {
             let request = self.post_json_request(url, payload).await?;
             self.client.execute(request).await.map_err(transport_error)
         };
-        tokio::time::timeout(TRANSPORT_CONFIG.response_open_timeout, opening)
-            .await
-            .map_err(|_| response_open_timeout_error(TRANSPORT_CONFIG.response_open_timeout))?
+        response_before_deadline(TRANSPORT_CONFIG.response_open_timeout, opening).await
     }
 
     async fn post_json_request(
@@ -545,9 +549,7 @@ impl OpenAiHttp {
             let request = self.get_request(url).await?;
             self.client.execute(request).await.map_err(transport_error)
         };
-        tokio::time::timeout(TRANSPORT_CONFIG.response_open_timeout, opening)
-            .await
-            .map_err(|_| response_open_timeout_error(TRANSPORT_CONFIG.response_open_timeout))?
+        response_before_deadline(TRANSPORT_CONFIG.response_open_timeout, opening).await
     }
 
     async fn get_request(&self, url: &str) -> Result<reqwest::Request, ProviderError> {
@@ -1479,9 +1481,7 @@ impl OpenAiCompatibleProvider {
                 .await
                 .map_err(transport_error)
         };
-        tokio::time::timeout(TRANSPORT_CONFIG.response_open_timeout, opening)
-            .await
-            .map_err(|_| response_open_timeout_error(TRANSPORT_CONFIG.response_open_timeout))?
+        response_before_deadline(TRANSPORT_CONFIG.response_open_timeout, opening).await
     }
 
     async fn inference_request(
@@ -5029,10 +5029,10 @@ pub async fn validate_openai_compatible_endpoint(
         .get(&endpoints.models_url)
         .header(ACCEPT, "application/json")
         .send();
-    let response = tokio::time::timeout(TRANSPORT_CONFIG.response_open_timeout, opening)
-        .await
-        .map_err(|_| response_open_timeout_error(TRANSPORT_CONFIG.response_open_timeout))?
-        .map_err(transport_error)?;
+    let response = response_before_deadline(TRANSPORT_CONFIG.response_open_timeout, async {
+        opening.await.map_err(transport_error)
+    })
+    .await?;
     if response.status().is_redirection() {
         return Err(invalid_request(
             "OpenAI-compatible endpoint redirects are not allowed; configure the final origin",
@@ -5606,23 +5606,51 @@ fn transport_error(error: reqwest::Error) -> ProviderError {
     crate::reqwest_transport_error("OpenAI", error)
 }
 
+async fn response_before_deadline<T>(
+    timeout: Duration,
+    opening: impl Future<Output = Result<T, ProviderError>>,
+) -> Result<T, ProviderError> {
+    tokio::time::timeout(timeout, opening)
+        .await
+        .map_err(|_| response_open_timeout_error(timeout))?
+}
+
 fn response_open_timeout_error(timeout: Duration) -> ProviderError {
-    ProviderError::new(
+    let mut error = ProviderError::new(
         ProviderErrorKind::Transport,
         format!(
             "OpenAI response did not open within {} seconds",
             timeout.as_secs()
         ),
     )
+    .with_presentation(provider_timeout_presentation());
+    // A local deadline is already the bounded recovery policy. Retrying ten
+    // identical silent requests would outlive the CLI/process deadline and
+    // convert a typed failure into an external SIGKILL.
+    error.retryable = false;
+    error
 }
 
 fn stream_idle_error(timeout: Duration) -> ProviderError {
-    ProviderError::new(
+    let mut error = ProviderError::new(
         ProviderErrorKind::Transport,
         format!(
             "OpenAI SSE stream received no data for {} seconds",
             timeout.as_secs()
         ),
+    )
+    .with_presentation(provider_timeout_presentation());
+    error.retryable = false;
+    error
+}
+
+fn provider_timeout_presentation() -> ErrorPresentation {
+    ErrorPresentation::new(
+        "provider-timeout",
+        "Provider request timed out",
+        "Haider stopped waiting for the provider before the run deadline.",
+        ErrorScope::Turn,
+        [ErrorAction::Retry],
     )
 }
 
