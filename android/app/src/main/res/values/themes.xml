@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Framework NoActionBar theme so the ComponentActivity hosts Compose with
+         no app bar. Colors mirror the Session Deck dark ground (#07090d) so the
+         splash-to-Compose handoff has no light flash. -->
+    <style name="Theme.Haider" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#07090d</item>
+        <item name="android:statusBarColor">#07090d</item>
+        <item name="android:navigationBarColor">#07090d</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>
