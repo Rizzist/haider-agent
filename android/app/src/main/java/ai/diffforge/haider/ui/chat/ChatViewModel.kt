@@ -39,7 +39,7 @@ class ChatViewModel : ViewModel() {
         )
     }
 
-    fun setConnection(state: ConnectionState) {
+    fun onConnectionChanged(state: ConnectionState) {
         connection = state
     }
 }
