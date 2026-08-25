@@ -746,7 +746,7 @@ impl OpenAiProvider {
             None => self.request_payload(request)?,
         };
         if let Some(object) = payload.as_object_mut() {
-            if let Some(key) = openai_prompt_cache_key(request, self.http.codex_responses_lite) {
+            if let Some(key) = openai_prompt_cache_key(request) {
                 object.insert("prompt_cache_key".into(), serde_json::Value::String(key));
             } else {
                 object.remove("prompt_cache_key");
@@ -4083,7 +4083,7 @@ fn responses_request_json_with_boundary(
     if !tools.is_empty() {
         object.insert("tools".into(), serde_json::Value::Array(tools));
     }
-    if let Some(key) = openai_prompt_cache_key(request, codex_responses_lite) {
+    if let Some(key) = openai_prompt_cache_key(request) {
         object.insert("prompt_cache_key".into(), serde_json::Value::String(key));
         if openai_explicit_cache_enabled(request, codex_responses_lite) {
             object.insert(
@@ -4293,6 +4293,7 @@ fn openai_explicit_cache_enabled(request: &TurnRequest, codex_responses_lite: bo
         && request.cache_metadata.as_ref().is_some_and(|metadata| {
             metadata.boundaries_valid(request.messages.len())
                 && metadata.provider == OPENAI_PROVIDER_NAME
+                && !metadata.session_scope.is_empty()
                 && metadata.account_scope.is_some()
                 && (request.model == "gpt-5.6" || request.model.starts_with("gpt-5.6-"))
         })
@@ -4328,11 +4329,10 @@ fn openai_automatic_cache_key_supported(model: &str) -> bool {
 /// hits: without it OpenAI's implicit prefix cache is best-effort and
 /// shard-routed, and fast agentic rounds always outran its async warm-up
 /// (observed 0%-cached rounds on live sessions, 2026-08-21). codex 0.145
-/// sends a stable per-thread key; the derived key below is stable per
-/// session prefix basis (session + system/tool digests + compaction epoch),
-/// which is the same contract.
-fn openai_prompt_cache_key(request: &TurnRequest, codex_responses_lite: bool) -> Option<String> {
-    let _ = codex_responses_lite;
+/// sends a stable per-thread key. Prefix bytes still decide whether a cached
+/// entry matches; the key only keeps one session on a consistent cache route,
+/// so prefix-version data must not rotate it between turns.
+fn openai_prompt_cache_key(request: &TurnRequest) -> Option<String> {
     if !openai_automatic_cache_key_supported(&request.model) {
         return None;
     }
@@ -4342,6 +4342,7 @@ fn openai_prompt_cache_key(request: &TurnRequest, codex_responses_lite: bool) ->
             metadata.provider.as_str(),
             OPENAI_PROVIDER_NAME | OPENAI_OAUTH_PROVIDER_NAME
         )
+        && !metadata.session_scope.is_empty()
         && metadata.account_scope.is_some())
     .then(|| derive_prompt_cache_key(request, metadata))
 }
@@ -4467,32 +4468,12 @@ fn xai_prompt_cache_conversation_id(request: &TurnRequest) -> Option<String> {
 }
 
 fn derive_prompt_cache_key(request: &TurnRequest, metadata: &crate::PromptCacheMetadata) -> String {
-    // `PromptCacheMetadata` represents a missing/default session scope as an
-    // empty string rather than `Option::None`. Do not route every such caller
-    // into one shared cache bucket: without a session identity, safe reuse is
-    // impossible, so give that individual derivation an isolated key instead.
-    let session_scope = if metadata.session_scope.is_empty() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static ANONYMOUS_SCOPE_ORDINAL: AtomicU64 = AtomicU64::new(0);
-        let ordinal = ANONYMOUS_SCOPE_ORDINAL.fetch_add(1, Ordering::Relaxed);
-        let created_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        format!("anonymous:{}:{created_at}:{ordinal}", std::process::id())
-    } else {
-        metadata.session_scope.clone()
-    };
     let domain = serde_json::json!({
-        "schema": "haider.prompt-cache-key.v1",
+        "schema": "haider.prompt-cache-key.v2",
         "provider": metadata.provider,
         "model": request.model,
-        "session_scope": session_scope,
+        "session_scope": metadata.session_scope,
         "account_scope": metadata.account_scope,
-        "system_digest": metadata.prefix_digests.system,
-        "tool_digest": metadata.prefix_digests.tools,
-        "compaction_epoch": metadata.compaction_epoch,
     });
     serde_json::to_vec(&domain).map_or_else(
         |_| {

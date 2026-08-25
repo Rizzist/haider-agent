@@ -1827,40 +1827,41 @@ fn cache_diagnostic_openai_hashes_current_wire_through_previous_history_length()
     );
 }
 
-/// CM2d — the routing key is a cache-domain key, not a turn/run key. It is
-/// stable under append-only history and changes for every required domain
-/// component.
+/// CM2d — the routing key identifies a stable provider lane within one
+/// session. Prefix bytes decide whether an entry matches, so prompt-version
+/// data must not rotate the routing key.
 ///
-/// MUTATION CHECK (executed): add message count to the domain, or omit the
-/// system/tool/compaction component; one of these assertions fails.
+/// MUTATION CHECK: put a prefix digest or compaction epoch back into the key;
+/// one of the equality assertions fails.
 #[test]
 fn cm2d_openai_prompt_cache_key_is_stable_and_domain_sensitive() {
     let mut request = probe_request("gpt-5.6");
     request.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
     let metadata = request.cache_metadata.as_ref().expect("metadata");
     let first = derive_prompt_cache_key(&request, metadata);
-    request.messages.push(Message::assistant(vec![Block::Text {
-        text: "append-only answer".into(),
-    }]));
-    let second =
-        derive_prompt_cache_key(&request, request.cache_metadata.as_ref().expect("metadata"));
-    assert_eq!(first, second, "history growth is outside the cache domain");
 
-    for mutate in ["account", "system", "tools", "compaction"] {
+    for mutate in ["system", "tools", "history", "compaction"] {
         let mut changed = request.cache_metadata.clone().expect("metadata");
         match mutate {
-            "account" => changed.account_scope = Some("account-b".into()),
             "system" => changed.prefix_digests.system.push_str("-changed"),
             "tools" => changed.prefix_digests.tools.push_str("-changed"),
+            "history" => changed
+                .prefix_digests
+                .immutable_history
+                .push_str("-changed"),
             "compaction" => changed.compaction_epoch.push_str("-changed"),
             _ => unreachable!(),
         }
-        assert_ne!(
+        assert_eq!(
             first,
             derive_prompt_cache_key(&request, &changed),
-            "{mutate}"
+            "{mutate} is prefix-match state, not routing identity"
         );
     }
+
+    let mut other_account = request.cache_metadata.clone().expect("metadata");
+    other_account.account_scope = Some("account-b".into());
+    assert_ne!(first, derive_prompt_cache_key(&request, &other_account));
 }
 
 /// HAIDER949(a). MUTATION CHECK: drop `session_scope` from
@@ -1870,14 +1871,14 @@ fn cm2d_openai_prompt_cache_key_is_stable_and_domain_sensitive() {
 fn openai_prompt_cache_key_differs_across_session_scopes() {
     let mut request = probe_request("gpt-5.6");
     request.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
-    let first = derive_prompt_cache_key(
-        &request,
-        request.cache_metadata.as_ref().expect("first metadata"),
-    );
+    let first = openai_prompt_cache_key(&request).expect("first session key");
 
-    let mut other_session = request.cache_metadata.clone().expect("metadata");
-    other_session.session_scope = "session-b".into();
-    let second = derive_prompt_cache_key(&request, &other_session);
+    request
+        .cache_metadata
+        .as_mut()
+        .expect("metadata")
+        .session_scope = "session-b".into();
+    let second = openai_prompt_cache_key(&request).expect("second session key");
 
     assert_ne!(
         first, second,
@@ -1892,10 +1893,7 @@ fn openai_prompt_cache_key_differs_across_session_scopes() {
 fn openai_prompt_cache_key_is_stable_across_turns_in_one_session() {
     let mut first_turn = probe_request("gpt-5.6");
     first_turn.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
-    let first = derive_prompt_cache_key(
-        &first_turn,
-        first_turn.cache_metadata.as_ref().expect("first metadata"),
-    );
+    let first = openai_prompt_cache_key(&first_turn).expect("first turn key");
 
     let mut second_turn = first_turn.clone();
     second_turn
@@ -1914,14 +1912,11 @@ fn openai_prompt_cache_key_is_stable_across_turns_in_one_session() {
     metadata.previous_stable_history_end = Some(metadata.stable_history_end);
     metadata.stable_history_end = second_stable_history_end;
     metadata.current_user_start = second_stable_history_end;
+    metadata.prefix_digests.system = "rendered-system-b".into();
+    metadata.prefix_digests.tools = "rendered-tools-b".into();
     metadata.prefix_digests.immutable_history = "history-b".into();
-    let second = derive_prompt_cache_key(
-        &second_turn,
-        second_turn
-            .cache_metadata
-            .as_ref()
-            .expect("second metadata"),
-    );
+    metadata.compaction_epoch = "compaction-b".into();
+    let second = openai_prompt_cache_key(&second_turn).expect("second turn key");
 
     assert_eq!(
         first, second,
@@ -1929,11 +1924,112 @@ fn openai_prompt_cache_key_is_stable_across_turns_in_one_session() {
     );
 }
 
-/// HAIDER949(c). `PromptCacheMetadata` uses the default empty string for an
-/// absent session scope. Such a request still receives a valid OpenAI key,
-/// but consecutive anonymous derivations must not share a cache bucket.
+fn openai_model_prefix_bytes(payload: &serde_json::Value, input_end: usize) -> Vec<u8> {
+    let input = payload["input"].as_array().expect("Responses input");
+    serde_json::to_vec(&serde_json::json!({
+        "instructions": payload.get("instructions"),
+        "tools": payload.get("tools"),
+        "immutable_history": &input[..input_end],
+    }))
+    .expect("serialize OpenAI model prefix")
+}
+
+/// The model-visible prefix is append-only on both Responses dialects. Cache
+/// controls are stripped because they select/write a prefix without becoming
+/// model input; every system, tool, and old-history byte must still match.
 #[test]
-fn openai_prompt_cache_key_is_usable_and_isolated_without_session_scope() {
+fn openai_rendered_prefix_bytes_are_stable_across_turns() {
+    for codex_responses_lite in [false, true] {
+        let mut first_turn = TurnRequest {
+            messages: vec![
+                Message::user_text("stable question"),
+                Message::assistant(vec![Block::Text {
+                    text: "stable answer".into(),
+                }]),
+                Message::user_text("current question"),
+            ],
+            model: "gpt-5.6".into(),
+            max_tokens: 256,
+            system_prompt: Some("stable system".into()),
+            tools: vec![ToolDefinition {
+                name: "lookup".into(),
+                description: "stable tool".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                }),
+            }],
+            attachments: Vec::new(),
+            cache_metadata: Some(cm2_cache_metadata(
+                if codex_responses_lite {
+                    OPENAI_OAUTH_PROVIDER_NAME
+                } else {
+                    OPENAI_PROVIDER_NAME
+                },
+                2,
+            )),
+        };
+        let (mut first_payload, first_wire_end, _) =
+            responses_request_json_with_boundary(&first_turn, codex_responses_lite, None, false, 2)
+                .expect("first OpenAI wire");
+
+        let mut second_turn = first_turn.clone();
+        second_turn
+            .messages
+            .push(Message::assistant(vec![Block::Text {
+                text: "current answer".into(),
+            }]));
+        second_turn
+            .messages
+            .push(Message::user_text("next question"));
+        let metadata = second_turn.cache_metadata.as_mut().expect("metadata");
+        metadata.previous_stable_history_end = Some(2);
+        metadata.stable_history_end = 4;
+        metadata.current_user_start = 4;
+        metadata.prefix_digests.immutable_history = "grown-history".into();
+        let (mut second_payload, _, previous_wire_end) = responses_request_json_with_boundary(
+            &second_turn,
+            codex_responses_lite,
+            None,
+            false,
+            4,
+        )
+        .expect("second OpenAI wire");
+
+        assert_eq!(
+            first_payload["prompt_cache_key"], second_payload["prompt_cache_key"],
+            "one session keeps its routing key on the lite={codex_responses_lite} path"
+        );
+        remove_openai_cache_metadata(&mut first_payload);
+        remove_openai_cache_metadata(&mut second_payload);
+        assert_eq!(
+            openai_model_prefix_bytes(&first_payload, first_wire_end),
+            openai_model_prefix_bytes(
+                &second_payload,
+                previous_wire_end.expect("previous wire boundary"),
+            ),
+            "system, tools, and immutable history stay byte-identical on the lite={codex_responses_lite} path"
+        );
+
+        first_turn
+            .cache_metadata
+            .as_mut()
+            .expect("metadata")
+            .session_scope = "session-b".into();
+        assert_ne!(
+            openai_prompt_cache_key(&first_turn),
+            openai_prompt_cache_key(&second_turn),
+            "a different session must use a different cache route"
+        );
+    }
+}
+
+/// HAIDER949(c). `PromptCacheMetadata` uses the default empty string for an
+/// absent session scope. Without stable routing identity the adapter must
+/// omit the key rather than inventing a request-varying anonymous value.
+#[test]
+fn openai_prompt_cache_key_is_omitted_without_session_scope() {
     let mut request = probe_request("gpt-5.6");
     request.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
     request
@@ -1942,16 +2038,15 @@ fn openai_prompt_cache_key_is_usable_and_isolated_without_session_scope() {
         .expect("metadata")
         .session_scope
         .clear();
-    let metadata = request.cache_metadata.as_ref().expect("metadata");
-
-    let first = derive_prompt_cache_key(&request, metadata);
-    let second = derive_prompt_cache_key(&request, metadata);
-
-    assert_eq!(first.len(), 64, "OpenAI cache keys remain BLAKE3 hex");
-    assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    assert_ne!(
-        first, second,
-        "anonymous requests must not collapse into one shared cache bucket"
+    assert_eq!(
+        openai_prompt_cache_key(&request),
+        None,
+        "anonymous requests cannot provide stable cache routing"
+    );
+    let payload = responses_request_json(&request, false, None, false).expect("OpenAI wire");
+    assert!(
+        !payload.to_string().contains("prompt_cache"),
+        "no cache control may be emitted without stable session identity: {payload}"
     );
 }
 
@@ -2145,7 +2240,7 @@ fn cm2f_openai_oauth_omits_https_retention_and_is_separate_from_api_key() {
 
     let mut api_key_request = probe_request("gpt-5.6-sol");
     api_key_request.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
-    let api_key = openai_prompt_cache_key(&api_key_request, false)
+    let api_key = openai_prompt_cache_key(&api_key_request)
         .expect("API-key request carries prompt_cache_key");
     assert_ne!(
         oauth_key, api_key,
