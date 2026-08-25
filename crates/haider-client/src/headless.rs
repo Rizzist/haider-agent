@@ -15,6 +15,7 @@ use std::io::Read as _;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use haider_rpc::haider_protocol::EventPayload;
@@ -36,9 +37,16 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::client::{ClientConfig, ClientError, ConnectionState, DisconnectReason, RpcClient};
+use crate::client::{
+    ClientConfig, ClientError, ConnectionState, DisconnectReason, RpcClient, connect,
+};
 use crate::profile::ResolvedProfile;
-use crate::spawn::{EnsureError, EnsureOptions, ensure_daemon, required_live_features};
+#[cfg(unix)]
+use crate::profile::effective_uid;
+use crate::spawn::{
+    DaemonLifetime, DaemonOwnershipToken, EnsureError, EnsureOptions, ensure_daemon,
+    required_live_features, signal_authenticated_peer,
+};
 
 /// Default time allowed for a durable cancellation to reach a correlated
 /// terminal after timeout or blocked-input detection.
@@ -51,6 +59,8 @@ pub const ERROR_CODE_NO_DEFAULT_MODEL: &str = "no_default_model";
 
 const MAX_RECONNECTS: u8 = 3;
 const ATTACH_HEALTH_POLL: Duration = Duration::from_millis(10);
+const EPHEMERAL_DRAIN_ALLOWANCE: Duration = Duration::from_secs(5);
+const EPHEMERAL_REAP_GRACE: Duration = Duration::from_millis(250);
 static COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 const MAX_HEADLESS_ATTACHMENTS: usize = 5;
@@ -604,9 +614,19 @@ impl std::error::Error for HeadlessRunError {}
 struct HeadlessConnection {
     client: RpcClient,
     events: mpsc::Receiver<WireFrame>,
+    daemon_ownership: Arc<Mutex<Option<DaemonOwnershipToken>>>,
     attachment_id: Option<AttachmentId>,
     worker_generation: u64,
     observed_lost_events: u64,
+}
+
+fn lock_daemon_ownership(
+    ownership: &Mutex<Option<DaemonOwnershipToken>>,
+) -> std::sync::MutexGuard<'_, Option<DaemonOwnershipToken>> {
+    match ownership.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 fn headless_submit_body(
@@ -649,17 +669,29 @@ impl HeadlessConnection {
     fn open<'a>(
         profile: &'a ResolvedProfile,
         options: EnsureOptions,
+        daemon_ownership: Arc<Mutex<Option<DaemonOwnershipToken>>>,
     ) -> Pin<Box<dyn Future<Output = Result<Self, HeadlessRunError>> + Send + 'a>> {
-        Box::pin(Self::open_inner(profile, options))
+        Box::pin(Self::open_inner(profile, options, daemon_ownership))
     }
 
     async fn open_inner(
         profile: &ResolvedProfile,
         options: EnsureOptions,
+        daemon_ownership: Arc<Mutex<Option<DaemonOwnershipToken>>>,
     ) -> Result<Self, HeadlessRunError> {
-        let ensured = ensure_daemon(profile, options)
+        let mut ensured = ensure_daemon(profile, options)
             .await
             .map_err(HeadlessRunError::Ensure)?;
+        if let Some(ownership) = ensured.ownership.take() {
+            let mut slot = lock_daemon_ownership(&daemon_ownership);
+            let replace = match slot.as_mut() {
+                None => true,
+                Some(existing) => existing.child.try_wait().ok().flatten().is_some(),
+            };
+            if replace {
+                *slot = Some(ownership);
+            }
+        }
         let events = ensured
             .client
             .take_events()
@@ -671,6 +703,7 @@ impl HeadlessConnection {
         Ok(Self {
             client: ensured.client,
             events,
+            daemon_ownership,
             attachment_id: None,
             worker_generation: 0,
             observed_lost_events,
@@ -1019,6 +1052,8 @@ pub async fn run_headless_with_session_config(
     session_config: HeadlessSessionConfig,
     output: mpsc::Sender<HeadlessEvent>,
 ) -> Result<HeadlessRunResult, HeadlessRunError> {
+    let daemon_lifetime = ensure.daemon_lifetime;
+    let daemon_ownership = Arc::new(Mutex::new(None));
     let (reducer_output, mut pending_output) = mpsc::unbounded_channel();
     let forwarder = tokio::spawn(async move {
         while let Some(event) = pending_output.recv().await {
@@ -1027,9 +1062,207 @@ pub async fn run_headless_with_session_config(
             }
         }
     });
-    let result = run_headless_inner(profile, ensure, request, session_config, reducer_output).await;
+    let result = run_headless_inner(
+        profile,
+        ensure.clone(),
+        request,
+        session_config,
+        reducer_output,
+        Arc::clone(&daemon_ownership),
+    )
+    .await;
     let _ = forwarder.await;
-    result
+    let teardown = if daemon_lifetime == DaemonLifetime::EphemeralIfSpawned {
+        teardown_owned_daemon(profile, &ensure, &daemon_ownership).await
+    } else {
+        Ok(())
+    };
+    match (result, teardown) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Ok(_), Err(error)) | (Err(error), _) => Err(error),
+    }
+}
+
+async fn teardown_owned_daemon(
+    profile: &ResolvedProfile,
+    ensure: &EnsureOptions,
+    daemon_ownership: &Mutex<Option<DaemonOwnershipToken>>,
+) -> Result<(), HeadlessRunError> {
+    let Some(mut ownership) = lock_daemon_ownership(daemon_ownership).take() else {
+        return Ok(());
+    };
+    if ownership
+        .child
+        .try_wait()
+        .map_err(|error| teardown_protocol(format!("could not inspect owned child: {error}")))?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let request_deadline = Instant::now() + EPHEMERAL_DRAIN_ALLOWANCE;
+    let shutdown = shutdown_owned_daemon_peer(profile, ensure, &ownership, request_deadline).await;
+    let reap_deadline = shutdown.as_ref().copied().unwrap_or(request_deadline);
+    let reap = reap_owned_daemon(&mut ownership, reap_deadline).await;
+    match (shutdown, reap) {
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        (Ok(_), Ok(())) => Ok(()),
+    }
+}
+
+async fn shutdown_owned_daemon_peer(
+    profile: &ResolvedProfile,
+    ensure: &EnsureOptions,
+    ownership: &DaemonOwnershipToken,
+    request_deadline: Instant,
+) -> Result<Instant, HeadlessRunError> {
+    let connected = tokio::time::timeout_at(
+        request_deadline,
+        connect(&profile.endpoint_path, ensure.client.clone()),
+    )
+    .await
+    .map_err(|_| teardown_protocol("timed out reconnecting to owned daemon"))?
+    .map_err(|error| teardown_protocol(format!("could not reconnect to owned daemon: {error}")))?;
+    #[cfg(unix)]
+    let uid_changed = connected.peer_credentials.uid != effective_uid();
+    #[cfg(not(unix))]
+    let uid_changed = false;
+    if connected.welcome.profile_id != profile.profile_id
+        || connected.welcome.instance_id != ownership.instance_id
+        || connected.welcome.daemon_generation != ownership.daemon_generation
+        || uid_changed
+        || connected.peer_credentials.pid != Some(ownership.authenticated_pid)
+    {
+        connected.client.close();
+        return Err(teardown_protocol(
+            "owned daemon identity changed before one-shot teardown",
+        ));
+    }
+    let mut events = connected
+        .client
+        .take_events()
+        .ok_or_else(|| teardown_protocol("one-shot teardown could not retain daemon events"))?;
+
+    let request = tokio::time::timeout_at(
+        request_deadline,
+        connected.client.request(RequestBody::DaemonShutdown {}),
+    )
+    .await;
+    let request_failure = match request {
+        Ok(Ok(ResponseBody::DaemonShutdown {})) => None,
+        Ok(Ok(ResponseBody::Error { code, message, .. }))
+            if code == "unknown_method"
+                || (code == "invalid_argument" && message == "unknown session method") =>
+        {
+            #[cfg(unix)]
+            {
+                signal_authenticated_peer(ownership.authenticated_pid).map_err(|error| {
+                    teardown_protocol(format!(
+                        "could not signal authenticated owned daemon: {error}"
+                    ))
+                })?;
+                None
+            }
+            #[cfg(not(unix))]
+            {
+                Some("daemon does not support graceful shutdown RPC".to_owned())
+            }
+        }
+        Ok(Ok(ResponseBody::Error { code, message, .. })) => Some(format!(
+            "daemon refused graceful shutdown ({code}): {message}"
+        )),
+        Ok(Ok(_)) => Some("daemon returned the wrong shutdown response method".to_owned()),
+        Ok(Err(error)) => Some(format!("shutdown RPC transport failed: {error}")),
+        Err(_) => Some("shutdown RPC response timed out".to_owned()),
+    };
+
+    // The daemon's drain allowance begins only after it handles the RPC (or
+    // signal), not when this client began reconnecting. Give publication of
+    // ServerDraining the daemon's full legal window from that acknowledgment.
+    let notice_deadline = Instant::now() + EPHEMERAL_DRAIN_ALLOWANCE + EPHEMERAL_REAP_GRACE;
+    let notice = tokio::time::timeout_at(notice_deadline, async {
+        while let Some(frame) = events.recv().await {
+            if let WireFrame::ServerDraining {
+                instance_id,
+                daemon_generation,
+                deadline_unix_ms,
+                ..
+            } = frame
+            {
+                return Some((instance_id, daemon_generation, deadline_unix_ms));
+            }
+        }
+        None
+    })
+    .await
+    .map_err(|_| {
+        teardown_protocol(
+            request_failure
+                .as_deref()
+                .unwrap_or("owned daemon drain notice timed out"),
+        )
+    })?
+    .ok_or_else(|| {
+        teardown_protocol(
+            request_failure
+                .as_deref()
+                .unwrap_or("owned daemon disconnected without a drain notice"),
+        )
+    })?;
+    if notice.0 != ownership.instance_id || notice.1 != ownership.daemon_generation {
+        connected.client.close();
+        return Err(teardown_protocol(
+            "owned daemon drain notice did not match its authenticated Welcome",
+        ));
+    }
+    let drain_deadline = daemon_drain_deadline(notice.2);
+    tokio::time::timeout_at(drain_deadline, connected.client.disconnected())
+        .await
+        .map_err(|_| teardown_protocol("owned daemon disconnect timed out"))?;
+    Ok(drain_deadline)
+}
+
+fn daemon_drain_deadline(deadline_unix_ms: u64) -> Instant {
+    let now_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let remaining = Duration::from_millis(deadline_unix_ms.saturating_sub(now_unix_ms))
+        .min(EPHEMERAL_DRAIN_ALLOWANCE);
+    Instant::now() + remaining + EPHEMERAL_REAP_GRACE
+}
+
+async fn reap_owned_daemon(
+    ownership: &mut DaemonOwnershipToken,
+    deadline: Instant,
+) -> Result<(), HeadlessRunError> {
+    loop {
+        match ownership.child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok(None) => {
+                return Err(teardown_protocol(
+                    "owned daemon did not exit before drain deadline",
+                ));
+            }
+            Err(error) => {
+                return Err(teardown_protocol(format!(
+                    "could not reap owned daemon: {error}"
+                )));
+            }
+        }
+    }
+}
+
+fn teardown_protocol(message: impl Into<String>) -> HeadlessRunError {
+    HeadlessRunError::Protocol {
+        stage: "daemon teardown",
+        message: message.into(),
+    }
 }
 
 async fn run_headless_inner(
@@ -1038,6 +1271,7 @@ async fn run_headless_inner(
     request: HeadlessRunRequest,
     session_config: HeadlessSessionConfig,
     output: mpsc::UnboundedSender<HeadlessEvent>,
+    daemon_ownership: Arc<Mutex<Option<DaemonOwnershipToken>>>,
 ) -> Result<HeadlessRunResult, HeadlessRunError> {
     if request.attachments.len() > MAX_HEADLESS_ATTACHMENTS {
         return Err(attachment_error(
@@ -1062,7 +1296,7 @@ async fn run_headless_inner(
     let mut connection = before_acceptance_deadline(
         timeout_deadline,
         "connect",
-        HeadlessConnection::open(profile, ensure.clone()),
+        HeadlessConnection::open(profile, ensure.clone(), daemon_ownership),
     )
     .await?;
     let (explicit_provider, explicit_model, selected_provider) = before_acceptance_deadline(
@@ -1075,7 +1309,7 @@ async fn run_headless_inner(
             &mut reconnects,
             request.provider.clone(),
             request.model.clone(),
-            session_config.model.as_deref(),
+            session_config.model.as_deref().or(request.model.as_deref()),
         ),
     )
     .await?;
@@ -1681,14 +1915,11 @@ async fn resolve_run_identity(
     match summary {
         Some(summary) => summary
             .default_model
-            .or_else(|| summary.models.into_iter().next())
             .map(|model| (provider.clone(), model))
             .ok_or_else(|| HeadlessRunError::Bootstrap {
                 stage: "provider.list",
                 code: ERROR_CODE_NO_DEFAULT_MODEL,
-                message: format!(
-                    "provider `{provider}` publishes neither a default model nor a model catalog"
-                ),
+                message: format!("provider `{provider}` publishes no default model"),
                 retryable: false,
             }),
         // An explicit unknown provider must reach session.create so the
@@ -2048,7 +2279,17 @@ async fn reconnect_before_session(
 ) -> Result<(), HeadlessRunError> {
     let reason = client_error(stage, error)?;
     reconnects.spend(stage, reason)?;
-    *connection = HeadlessConnection::open(profile, ensure.clone()).await?;
+    reopen_headless_connection(profile, ensure, connection).await?;
+    Ok(())
+}
+
+async fn reopen_headless_connection(
+    profile: &ResolvedProfile,
+    ensure: &EnsureOptions,
+    connection: &mut HeadlessConnection,
+) -> Result<(), HeadlessRunError> {
+    let daemon_ownership = Arc::clone(&connection.daemon_ownership);
+    *connection = HeadlessConnection::open(profile, ensure.clone(), daemon_ownership).await?;
     Ok(())
 }
 
@@ -2081,7 +2322,7 @@ async fn reconnect_for_submit(
 ) -> Result<(), HeadlessRunError> {
     let reason = client_error(stage, error)?;
     reconnects.spend(stage, reason)?;
-    *connection = HeadlessConnection::open(profile, ensure.clone()).await?;
+    reopen_headless_connection(profile, ensure, connection).await?;
     attach_buffered_with_recovery(profile, ensure, connection, reducer, reconnects, buffered).await
 }
 
@@ -2095,7 +2336,7 @@ async fn reconnect_after_disconnect(
     reason: DisconnectReason,
 ) -> Result<(), HeadlessRunError> {
     reconnects.spend(stage, reason)?;
-    *connection = HeadlessConnection::open(profile, ensure.clone()).await?;
+    reopen_headless_connection(profile, ensure, connection).await?;
     attach_with_recovery(profile, ensure, connection, reducer, reconnects).await
 }
 
@@ -2112,7 +2353,7 @@ async fn attach_with_recovery(
             Ok(false) => {}
             Err(HeadlessRunError::Transport { stage, reason }) => {
                 reconnects.spend(stage, reason)?;
-                *connection = HeadlessConnection::open(profile, ensure.clone()).await?;
+                reopen_headless_connection(profile, ensure, connection).await?;
             }
             Err(error) => return Err(error),
         }
@@ -2134,7 +2375,7 @@ async fn attach_buffered_with_recovery(
             Ok(false) => {}
             Err(HeadlessRunError::Transport { stage, reason }) => {
                 reconnects.spend(stage, reason)?;
-                *connection = HeadlessConnection::open(profile, ensure.clone()).await?;
+                reopen_headless_connection(profile, ensure, connection).await?;
             }
             Err(error) => return Err(error),
         }

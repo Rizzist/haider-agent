@@ -131,6 +131,7 @@ fn connection_context(
         writers,
         owner_uid: u32::MAX,
         hub,
+        shutdown: crate::lifecycle::ShutdownHandle::channel().0,
         endpoint_path: std::path::PathBuf::from("duplex://cancellation"),
     }
 }

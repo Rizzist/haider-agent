@@ -200,6 +200,7 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "command.invoke",
         "command.list",
         "computer.permission_open_settings",
+        "daemon.shutdown",
         "graph.abandon",
         "graph.inspect",
         "graph.pin",

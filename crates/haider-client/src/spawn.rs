@@ -57,6 +57,15 @@ pub const STARTUP_DEADLINE: Duration = Duration::from_secs(30);
 /// The race loser's expected exit code (`EX_TEMPFAIL`).
 pub const RACE_LOSER_EXIT_CODE: i32 = 75;
 
+/// Whether a caller keeps an auto-spawned daemon persistent or tears down
+/// only the exact authenticated child it launched.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DaemonLifetime {
+    #[default]
+    Persistent,
+    EphemeralIfSpawned,
+}
+
 /// Returns whether the authenticated endpoint is served by this launcher's
 /// retained daemon candidate. Kept public only so the no-wait law can run in
 /// a socket-independent test sandbox.
@@ -78,6 +87,9 @@ pub struct EnsureOptions {
     pub daemon_binary: Option<PathBuf>,
     /// Connection parameters for every dial attempt.
     pub client: ClientConfig,
+    /// Lifetime policy consumed by higher-level one-shot clients. Daemon
+    /// discovery itself never infers ownership from this value.
+    pub daemon_lifetime: DaemonLifetime,
 }
 
 impl Default for EnsureOptions {
@@ -87,8 +99,19 @@ impl Default for EnsureOptions {
             startup_deadline: STARTUP_DEADLINE,
             daemon_binary: None,
             client: ClientConfig::default(),
+            daemon_lifetime: DaemonLifetime::Persistent,
         }
     }
+}
+
+/// Proof that this launcher owns the authenticated daemon currently serving
+/// the endpoint. The retained child handle makes the PID non-reusable until
+/// the owner either observes exit or drops the token.
+pub struct DaemonOwnershipToken {
+    pub(crate) child: Child,
+    pub(crate) authenticated_pid: u32,
+    pub(crate) instance_id: String,
+    pub(crate) daemon_generation: u64,
 }
 
 /// Outcome of [`ensure_daemon`].
@@ -100,6 +123,9 @@ pub struct EnsuredDaemon {
     pub spawned: bool,
     /// A spawned candidate exited 75: another daemon won the race.
     pub race_lost: bool,
+    /// Present only when the authenticated endpoint peer PID exactly equals
+    /// this launcher's retained child PID.
+    pub ownership: Option<DaemonOwnershipToken>,
 }
 
 /// Typed failure of the auto-spawn front door.
@@ -280,13 +306,21 @@ pub async fn ensure_daemon(
                 // process is long-running from W3c3 on — an unreaped child
                 // would linger as a zombie for the parent's lifetime (W3c2
                 // review finding 6). One bounded grace poll, then release.
+                let mut ownership = None;
                 if let Some(mut active) = child.take() {
                     // The authenticated endpoint PID distinguishes our
                     // healthy winner from a candidate that lost to another
                     // launcher. Waiting for the healthy child to exit would
                     // add the entire one-second loser grace to every cold
                     // launch even though that daemon is meant to outlive us.
-                    if !authenticated_peer_is_candidate(peer_credentials.pid, active.id()) {
+                    if authenticated_peer_is_candidate(peer_credentials.pid, active.id()) {
+                        ownership = Some(DaemonOwnershipToken {
+                            authenticated_pid: active.id(),
+                            child: active,
+                            instance_id: welcome.instance_id.clone(),
+                            daemon_generation: welcome.daemon_generation,
+                        });
+                    } else {
                         for _ in 0..40u8 {
                             match active.try_wait() {
                                 Ok(Some(status)) => {
@@ -306,6 +340,7 @@ pub async fn ensure_daemon(
                     welcome,
                     spawned,
                     race_lost,
+                    ownership,
                 });
             }
             Attach::Fatal(error) => return Err(*error),

@@ -6,10 +6,10 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use haider_client::{
-    ConnectError, ERROR_CODE_NO_ACTIVE_ACCOUNT, ERROR_CODE_NO_DEFAULT_MODEL, EnsureError,
-    EnsureOptions, HeadlessEvent, HeadlessFailureCode, HeadlessOutcome, HeadlessRunError,
-    HeadlessRunRequest, HeadlessRunResult, HeadlessSessionConfig, ProfileEnv, load_attachment,
-    resolve_profile, run_headless_with_session_config,
+    ConnectError, DaemonLifetime, ERROR_CODE_NO_ACTIVE_ACCOUNT, ERROR_CODE_NO_DEFAULT_MODEL,
+    EnsureError, EnsureOptions, HeadlessEvent, HeadlessFailureCode, HeadlessOutcome,
+    HeadlessRunError, HeadlessRunRequest, HeadlessRunResult, HeadlessSessionConfig, ProfileEnv,
+    load_attachment, resolve_profile, run_headless_with_session_config,
 };
 use haider_protocol::error::ErrorCode;
 use haider_protocol::session::SessionPermissionOverridesV1;
@@ -201,7 +201,11 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
     };
     let prompt = prompt.ok_or_else(|| "a prompt argument is required".to_owned())?;
     let session_config = HeadlessSessionConfig {
-        model: model.clone(),
+        // `--model` is the session.create selection carried by
+        // HeadlessRunRequest below. Re-applying it with session.select_model
+        // would redundantly subject a custom compatible wire id to catalog
+        // membership validation after the session already accepted it.
+        model: None,
         effort,
         fast,
         account,
@@ -252,9 +256,18 @@ fn parse_timeout(value: &str) -> Result<Duration, String> {
 }
 
 pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
+    let jsonl_requested = requests_jsonl_output(rest);
     let parsed = match parse_run_options_with_config(rest) {
         Ok(parsed) => parsed,
         Err(message) => {
+            let failure = ClassifiedRunError::bootstrap("invalid_argument", message.clone());
+            if jsonl_requested
+                && let Err(error) =
+                    write_run_error(io::stdout().lock(), RunOutput::Jsonl, &failure, None, None)
+            {
+                eprintln!("haider: stdout failed: {error}");
+                return ExitCode::from(EX_IOERR);
+            }
             eprintln!("haider run: {message}");
             return ExitCode::from(EX_USAGE);
         }
@@ -264,6 +277,13 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
     let profile = match resolve_profile(&ProfileEnv::capture()) {
         Ok(profile) => profile,
         Err(error) => {
+            let failure = ClassifiedRunError::bootstrap("protocol_mismatch", error.to_string());
+            if let Err(io_error) =
+                write_run_error(io::stdout().lock(), options.output, &failure, None, None)
+            {
+                eprintln!("haider: stdout failed: {io_error}");
+                return ExitCode::from(EX_IOERR);
+            }
             eprintln!("haider: {error}");
             return ExitCode::from(EX_PROTOCOL);
         }
@@ -272,20 +292,36 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
         .provider
         .as_ref()
         .map(|selection| selection.as_str().to_owned());
-    let model = options.model.clone().or_else(|| {
-        options
-            .provider
-            .as_ref()
-            .is_some_and(ProviderSelection::is_fake)
-            .then(|| "fake-model".into())
-    });
+    let model = options
+        .model
+        .clone()
+        .or_else(|| {
+            options
+                .provider
+                .as_ref()
+                .is_some_and(ProviderSelection::is_fake)
+                .then(|| "fake-model".into())
+        })
+        .or_else(|| Some(profile.default_model.clone()));
     let cwd = match std::env::current_dir()
         .ok()
         .and_then(|path| path.into_os_string().into_string().ok())
     {
         Some(cwd) => cwd,
         None => {
-            eprintln!("haider: current directory is unavailable or is not valid UTF-8");
+            let message = "current directory is unavailable or is not valid UTF-8";
+            let failure = ClassifiedRunError::bootstrap("internal", message);
+            if let Err(io_error) = write_run_error(
+                io::stdout().lock(),
+                options.output,
+                &failure,
+                provider.as_deref(),
+                model.as_deref(),
+            ) {
+                eprintln!("haider: stdout failed: {io_error}");
+                return ExitCode::from(EX_IOERR);
+            }
+            eprintln!("haider: {message}");
             return ExitCode::from(EX_SOFTWARE);
         }
     };
@@ -297,14 +333,14 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
         match loaded {
             Ok(attachment) => attachments.push(attachment),
             Err(error) => {
-                if options.output == RunOutput::Json
-                    && let Err(io_error) = write_error_json(
-                        io::stdout().lock(),
-                        &error,
-                        provider.as_deref(),
-                        model.as_deref(),
-                    )
-                {
+                let failure = classify_headless_error(&error);
+                if let Err(io_error) = write_run_error(
+                    io::stdout().lock(),
+                    options.output,
+                    &failure,
+                    provider.as_deref(),
+                    model.as_deref(),
+                ) {
                     eprintln!("haider: stdout failed: {io_error}");
                     return ExitCode::from(EX_IOERR);
                 }
@@ -333,19 +369,28 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
     let (events, receiver) = mpsc::channel(OUTPUT_BUFFER);
     let output_mode = options.output;
     let adapter = tokio::task::spawn_blocking(move || adapt_events(output_mode, receiver));
-    let result = run_headless_with_session_config(
-        &profile,
-        EnsureOptions::default(),
-        request,
-        session_config,
-        events,
-    )
-    .await;
+    let ensure = EnsureOptions {
+        daemon_lifetime: DaemonLifetime::EphemeralIfSpawned,
+        ..EnsureOptions::default()
+    };
+    let result =
+        run_headless_with_session_config(&profile, ensure, request, session_config, events).await;
     let adapter_result = match adapter.await {
         Ok(result) => result,
         Err(error) => Err(io::Error::other(format!("output adapter failed: {error}"))),
     };
     if let Err(error) = adapter_result {
+        let failure = ClassifiedRunError::bootstrap("internal", error.to_string());
+        if let Err(io_error) = write_run_error(
+            io::stdout().lock(),
+            options.output,
+            &failure,
+            provider.as_deref(),
+            model.as_deref(),
+        ) {
+            eprintln!("haider: stdout failed: {io_error}");
+            return ExitCode::from(EX_IOERR);
+        }
         eprintln!("haider: stdout failed: {error}");
         return ExitCode::from(EX_IOERR);
     }
@@ -397,14 +442,14 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
             // The v1 object is the json contract for EVERY outcome — a
             // pre-acceptance timeout or transport failure still emits one
             // (null ids: no run was accepted), never a bare stderr line.
-            if options.output == RunOutput::Json
-                && let Err(io_error) = write_error_json(
-                    io::stdout().lock(),
-                    &error,
-                    provider.as_deref(),
-                    model.as_deref(),
-                )
-            {
+            let failure = classify_headless_error(&error);
+            if let Err(io_error) = write_run_error(
+                io::stdout().lock(),
+                options.output,
+                &failure,
+                provider.as_deref(),
+                model.as_deref(),
+            ) {
                 eprintln!("haider: stdout failed: {io_error}");
                 return ExitCode::from(EX_IOERR);
             }
@@ -425,16 +470,32 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
     }
 }
 
-/// The `haider.run.v1` object for a run that never produced a
-/// [`HeadlessRunResult`] — ids are null, the outcome is `timeout` only
-/// for the pre-acceptance wall-clock class, and the error carries the
-/// typed code.
-fn write_error_json(
-    mut output: impl Write,
-    error: &HeadlessRunError,
-    provider: Option<&str>,
-    model: Option<&str>,
-) -> io::Result<()> {
+fn requests_jsonl_output(rest: &[String]) -> bool {
+    rest.iter().any(|argument| argument == "--jsonl")
+        || rest
+            .windows(2)
+            .any(|arguments| arguments[0] == "--output" && arguments[1] == "jsonl")
+}
+
+struct ClassifiedRunError {
+    outcome: &'static str,
+    code: String,
+    message: String,
+    retryable: bool,
+}
+
+impl ClassifiedRunError {
+    fn bootstrap(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            outcome: "errored",
+            code: code.into(),
+            message: message.into(),
+            retryable: false,
+        }
+    }
+}
+
+fn classify_headless_error(error: &HeadlessRunError) -> ClassifiedRunError {
     let (outcome, code, retryable) = match error {
         HeadlessRunError::Attachment { code, .. } => ("errored", code.clone(), false),
         HeadlessRunError::Rpc {
@@ -455,10 +516,80 @@ fn write_error_json(
         | HeadlessRunError::Protocol { .. } => ("errored", "protocol_mismatch".to_owned(), false),
         _ => ("errored", "internal".to_owned(), false),
     };
-    let message = serde_json::to_string(&error.to_string()).map_err(io::Error::other)?;
-    let code = serde_json::to_string(&code).map_err(io::Error::other)?;
+    ClassifiedRunError {
+        outcome,
+        code,
+        message: error.to_string(),
+        retryable,
+    }
+}
+
+#[derive(Serialize)]
+struct JsonlErrorRecord<'a> {
+    event: &'static str,
+    stage: &'static str,
+    outcome: &'static str,
+    provider: Option<&'a str>,
+    model: Option<&'a str>,
+    error: JsonlErrorBody<'a>,
+}
+
+#[derive(Serialize)]
+struct JsonlErrorBody<'a> {
+    code: &'a str,
+    message: &'a str,
+    retryable: bool,
+}
+
+fn write_run_error(
+    mut output: impl Write,
+    mode: RunOutput,
+    failure: &ClassifiedRunError,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> io::Result<()> {
+    match mode {
+        RunOutput::Print => return Ok(()),
+        RunOutput::Json => write_error_json(&mut output, failure, provider, model)?,
+        RunOutput::Jsonl => {
+            serde_json::to_writer(
+                &mut output,
+                &JsonlErrorRecord {
+                    event: "error",
+                    stage: "bootstrap",
+                    outcome: failure.outcome,
+                    provider,
+                    model,
+                    error: JsonlErrorBody {
+                        code: &failure.code,
+                        message: &failure.message,
+                        retryable: failure.retryable,
+                    },
+                },
+            )
+            .map_err(io::Error::other)?;
+            output.write_all(b"\n")?;
+        }
+    }
+    output.flush()
+}
+
+/// The `haider.run.v1` object for a run that never produced a
+/// [`HeadlessRunResult`] — ids are null, the outcome is `timeout` only
+/// for the pre-acceptance wall-clock class, and the error carries the
+/// typed code.
+fn write_error_json(
+    mut output: impl Write,
+    failure: &ClassifiedRunError,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> io::Result<()> {
+    let message = serde_json::to_string(&failure.message).map_err(io::Error::other)?;
+    let code = serde_json::to_string(&failure.code).map_err(io::Error::other)?;
     let provider = serde_json::to_string(&provider).map_err(io::Error::other)?;
     let model = serde_json::to_string(&model).map_err(io::Error::other)?;
+    let outcome = failure.outcome;
+    let retryable = failure.retryable;
     let line = format!(
         "{{\"schema\":\"haider.run.v1\",\"session_id\":null,\"run_id\":null,\"provider\":{provider},\"model\":{model},\"attachments\":{{\"count\":0,\"refs\":[]}},\"outcome\":\"{outcome}\",\"response\":null,\"usage\":null,\"permission_denials\":[],\"error\":{{\"code\":{code},\"message\":{message},\"retryable\":{retryable}}}}}"
     );
@@ -722,8 +853,76 @@ pub(crate) fn exit_code_for_error(error: &HeadlessRunError) -> u8 {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// `--model` selects the model used by session.create. It must not also
+    /// schedule a redundant post-create session.select_model, whose picker
+    /// validation would make a custom endpoint's catalog authoritative.
+    #[test]
+    fn cli_model_is_not_duplicated_into_post_create_session_config() {
+        let parsed = parse_run_options_with_config(&[
+            "--model".into(),
+            "bench-proxy/deepseek-v4-flash".into(),
+            "hello".into(),
+        ])
+        .expect("run options");
+        assert_eq!(
+            parsed.options.model.as_deref(),
+            Some("bench-proxy/deepseek-v4-flash")
+        );
+        assert!(parsed.session_config.model.is_none());
+    }
+
+    /// Even daemon-unavailable, wire-incompatible, and no-default failures
+    /// use the same terminal JSONL schema/classifier as the live command
+    /// path; none may fall back to stderr-only output.
+    #[test]
+    fn jsonl_emitter_covers_unavailable_incompatible_and_no_default_failures() {
+        let cases = [
+            (
+                HeadlessRunError::Ensure(EnsureError::Spawn {
+                    binary: PathBuf::from("missing-haiderd"),
+                    message: "daemon unavailable".into(),
+                }),
+                "internal",
+            ),
+            (
+                HeadlessRunError::Ensure(EnsureError::ProtocolMismatch(
+                    haider_rpc::ProtocolError {
+                        code: "protocol_version_mismatch".into(),
+                        message: "no wire overlap".into(),
+                        fatal: true,
+                        presentation: None,
+                        failed_write_ids: Vec::new(),
+                    },
+                )),
+                "protocol_mismatch",
+            ),
+            (
+                HeadlessRunError::Bootstrap {
+                    stage: "provider.list",
+                    code: ERROR_CODE_NO_DEFAULT_MODEL,
+                    message: "provider publishes no default model".into(),
+                    retryable: false,
+                },
+                ERROR_CODE_NO_DEFAULT_MODEL,
+            ),
+        ];
+        for (error, expected_code) in cases {
+            let failure = classify_headless_error(&error);
+            let mut output = Vec::new();
+            write_run_error(&mut output, RunOutput::Jsonl, &failure, None, None)
+                .expect("JSONL error");
+            assert!(output.ends_with(b"\n"));
+            let value: serde_json::Value =
+                serde_json::from_slice(&output).expect("one JSONL object");
+            assert_eq!(value["event"], "error");
+            assert_eq!(value["stage"], "bootstrap");
+            assert_eq!(value["error"]["code"], expected_code);
+        }
+    }
 
     /// MUTATION CHECK: buffering the accepted event behind an envelope makes
     /// the first JSONL object a journal row instead of the head proof.

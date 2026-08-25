@@ -69,9 +69,9 @@ pub use shell::{
     required_user_command_features, shell_exec,
 };
 pub use spawn::{
-    DAEMON_LOG_FILE, EnsureError, EnsureOptions, EnsuredDaemon, RACE_LOSER_EXIT_CODE,
-    STARTUP_DEADLINE, ensure_daemon, required_live_features, signal_authenticated_peer,
-    spawn_daemon_retained,
+    DAEMON_LOG_FILE, DaemonLifetime, DaemonOwnershipToken, EnsureError, EnsureOptions,
+    EnsuredDaemon, RACE_LOSER_EXIT_CODE, STARTUP_DEADLINE, ensure_daemon, required_live_features,
+    signal_authenticated_peer, spawn_daemon_retained,
 };
 pub use surface::{
     SurfaceClientError, SurfaceInjectAck, SurfaceInjectOp, SurfaceInputPublishWire,

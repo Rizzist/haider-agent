@@ -728,6 +728,107 @@ fn authenticated_daemon_candidate_is_not_treated_as_a_race_loser() {
     assert!(!authenticated_peer_is_candidate(None, 41));
 }
 
+/// A launcher may spawn a candidate and then attach to another launcher's
+/// authenticated winner. The losing child exiting 75 is not ownership proof,
+/// so an ephemeral caller must receive no token capable of shutting down the
+/// winner.
+///
+/// MUTATION CHECK: infer ownership from `spawned && !race_lost`, or retain the
+/// losing child as the winner. Expected runtime failure: `ownership` becomes
+/// `Some` even though the authenticated peer PID is this test process rather
+/// than the spawned candidate PID.
+#[tokio::test]
+async fn racing_launcher_never_owns_the_other_launchers_winner() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = short_dir();
+    let probe = dir.path().join("probe.sock");
+    match std::os::unix::net::UnixListener::bind(&probe) {
+        Ok(listener) => drop(listener),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("local IPC is sandbox-denied; race-loser host pin skipped");
+            return;
+        }
+        Err(error) => panic!("probe Unix listener: {error}"),
+    }
+    let _ = std::fs::remove_file(&probe);
+
+    let store = dir.path().join("store");
+    let env = ProfileEnv {
+        profile_dir: Some(store),
+        home: None,
+        model: None,
+        xdg_runtime_dir: None,
+    };
+    let mut profile = resolve_profile(&env).expect("resolve profile");
+    profile.endpoint_path = dir.path().join("race.sock");
+    let marker = dir.path().join("candidate-started");
+    let candidate = dir.path().join("losing-haiderd");
+    std::fs::write(
+        &candidate,
+        format!(
+            "#!/bin/sh\n: > '{}'\nsleep 0.2\nexit {}\n",
+            marker.display(),
+            haider_client::RACE_LOSER_EXIT_CODE
+        ),
+    )
+    .expect("write losing candidate");
+    let mut permissions = std::fs::metadata(&candidate)
+        .expect("candidate metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&candidate, permissions).expect("candidate executable");
+
+    let endpoint = profile.endpoint_path.clone();
+    let profile_id = profile.profile_id.clone();
+    let winner = tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !marker.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "losing candidate start marker deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Bind the winner's endpoint once the losing candidate has started.
+        // spawn_fake_daemon returns the JoinHandle of an INFINITE accept loop
+        // that only resolves when the listener closes; awaiting it here would
+        // hang the winner task (and `winner.await` below) forever. Hold the
+        // handle in scope for intent — dropping it detaches the loop, which
+        // keeps serving the endpoint for the rest of the test.
+        let _daemon = spawn_fake_daemon(
+            &endpoint,
+            Arc::new(AtomicUsize::new(0)),
+            HelloReply::Welcome(welcome(
+                &profile_id,
+                haider_client::required_live_features(),
+            )),
+            echo_serve,
+        );
+    });
+
+    let ensured = ensure_daemon(
+        &profile,
+        EnsureOptions {
+            startup_deadline: Duration::from_secs(5),
+            daemon_binary: Some(candidate),
+            ..EnsureOptions::default()
+        },
+    )
+    .await
+    .expect("losing launcher attaches to winner");
+    // The winner task detaches the fake daemon internally and returns unit;
+    // await it only to surface a panic (e.g. the start-marker deadline).
+    winner.await.expect("winner binds after candidate spawn");
+    assert!(ensured.spawned);
+    assert!(ensured.race_lost);
+    assert!(
+        ensured.ownership.is_none(),
+        "a losing launcher must never own the authenticated winner"
+    );
+    ensured.client.close();
+}
+
 /// MUTATION CHECK: remove the `pre_exec` descriptor sweep from
 /// `spawn_daemon`. Expected RUNTIME failure: a non-CLOEXEC socket end
 /// planted at a high descriptor (the macOS `pipe()`+`fcntl` race shape)

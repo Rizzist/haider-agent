@@ -5687,7 +5687,13 @@ async fn pre_v8_pending_provider_receipts_reconcile_without_a_discovered_cache()
         .summary("legacy-configure", &|_| false)
         .expect("legacy summary");
     assert!(summary.models.is_empty());
-    assert_eq!(summary.default_model, None);
+    // A custom OpenAI-compatible provider's configured default survives an empty
+    // discovered catalog (v0.0.958 defect-1 fix: discovery is advisory inventory,
+    // it cannot erase the configured wire model). Pre-958 this was erroneously None.
+    assert_eq!(
+        summary.default_model,
+        Some("frontier-legacy-new".to_owned())
+    );
     store.close().await.expect("close");
 }
 

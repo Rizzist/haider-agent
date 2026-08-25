@@ -480,23 +480,150 @@ async fn flagless_bootstrap_creates_on_active_provider_and_published_default_mod
     assert_eq!(result.outcome, HeadlessOutcome::Done);
 }
 
-/// MUTATION CHECK: require default_model instead of falling back to the first
-/// published slug. Expected RUNTIME failure: no create arrives with
-/// `gpt-first`, or the runner returns a typed bootstrap failure.
+/// MUTATION CHECK: stop routing `HeadlessRunRequest.model` through the shared
+/// selector or treat a slash as unconditionally literal. Expected runtime
+/// failure: session.create receives the provider-prefixed selector instead of
+/// the endpoint's bare wire model id.
 #[tokio::test]
-async fn flagless_bootstrap_falls_back_to_first_published_model() {
+async fn configured_provider_model_selector_reaches_create_as_bare_wire_id() {
     let (_root, profile) = profile();
     let peer = spawn_peer(&profile, |mut peer| async move {
-        serve_flagless_done(&mut peer, None, &["gpt-first", "gpt-second"], "gpt-first").await;
+        let (provider_request, provider_body) = peer.request().await;
+        assert_eq!(
+            provider_body,
+            RequestBody::ProviderList {
+                provider: Some("bench-proxy".into())
+            }
+        );
+        peer.respond(
+            provider_request,
+            ResponseBody::ProviderList {
+                providers: vec![provider_summary_fixture(
+                    "bench-proxy",
+                    Some("deepseek-v4-flash"),
+                    &["canonical-other"],
+                )],
+                revision: 1,
+                availability: None,
+            },
+        )
+        .await;
+        let (create_request, create_body) = peer.request().await;
+        let RequestBody::SessionCreateWithPermissionOverrides {
+            provider,
+            model,
+            permission_overrides,
+            ..
+        } = create_body
+        else {
+            panic!("selector bootstrap must be followed by session.create");
+        };
+        assert_eq!(provider, "bench-proxy");
+        assert_eq!(model, "deepseek-v4-flash");
+        assert_eq!(permission_overrides, None);
+        let (session_id, attachment_id) = respond_create_and_attach(
+            &mut peer,
+            create_request,
+            "bench-proxy",
+            "deepseek-v4-flash",
+        )
+        .await;
+        let (submit_request, run_id) = accept_submit(&mut peer, &session_id).await;
+        peer.respond(
+            submit_request,
+            ResponseBody::TurnSubmit {
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                accepted_seq: 1,
+                worker_generation: 7,
+                disposition: SubmitDisposition::Started,
+            },
+        )
+        .await;
+        send_event(
+            &mut peer,
+            &attachment_id,
+            envelope(
+                &session_id,
+                &run_id,
+                1,
+                EventPayload::RunState(RunState::Done),
+            ),
+        )
+        .await;
+    });
+    let mut run = request(None);
+    run.provider = Some("bench-proxy".into());
+    run.model = Some("bench-proxy/deepseek-v4-flash".into());
+
+    let (result, _events) = run_with_events(profile, run, 4, Duration::ZERO).await;
+    peer.await.expect("peer");
+    assert_eq!(result.provider, "bench-proxy");
+    assert_eq!(result.model, "deepseek-v4-flash");
+}
+
+/// MUTATION CHECK: restore catalog-first fallback. Expected RUNTIME failure:
+/// the peer sees an unexpected session.create instead of the exact typed
+/// no-default bootstrap refusal.
+#[tokio::test]
+async fn flagless_bootstrap_without_published_default_is_typed_even_with_catalog() {
+    let (_root, profile) = profile();
+    let peer = spawn_peer(&profile, |mut peer| async move {
+        let (account_request, account_body) = peer.request().await;
+        assert_eq!(account_body, RequestBody::AccountList { provider: None });
+        peer.respond(
+            account_request,
+            ResponseBody::AccountList {
+                descriptors: vec![active_account("openai-oauth")],
+                revision: Some(4),
+                provider_active: Vec::new(),
+                provider_defaults: Vec::new(),
+                availability: None,
+            },
+        )
+        .await;
+        let (provider_request, provider_body) = peer.request().await;
+        assert_eq!(
+            provider_body,
+            RequestBody::ProviderList {
+                provider: Some("openai-oauth".into())
+            }
+        );
+        peer.respond(
+            provider_request,
+            ResponseBody::ProviderList {
+                providers: vec![provider_summary_fixture(
+                    "openai-oauth",
+                    None,
+                    &["canonical-other"],
+                )],
+                revision: 4,
+                availability: None,
+            },
+        )
+        .await;
     });
     let mut run = request(None);
     run.provider = None;
     run.model = None;
-
-    let (result, _events) = run_with_events(profile, run, 4, Duration::ZERO).await;
+    let (sender, _receiver) = mpsc::channel(1);
+    let error = tokio::time::timeout(
+        BOUND,
+        run_headless(&profile, EnsureOptions::default(), run, sender),
+    )
+    .await
+    .expect("runner bound")
+    .expect_err("catalog without default must refuse");
     peer.await.expect("peer");
-    assert_eq!(result.provider, "openai-oauth");
-    assert_eq!(result.model, "gpt-first");
+    assert!(matches!(
+        error,
+        HeadlessRunError::Bootstrap {
+            stage: "provider.list",
+            code: haider_client::ERROR_CODE_NO_DEFAULT_MODEL,
+            retryable: false,
+            ..
+        }
+    ));
 }
 
 /// MUTATION CHECK: fall back to profile defaults or continue to provider.list

@@ -8,8 +8,10 @@ use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorSco
 use haider_protocol::ids::{ArtifactRef, RunId, SessionId};
 use haider_protocol::item::{ItemDelta, ItemEvent, TurnItem};
 use haider_protocol::state::RunState;
+#[cfg(unix)]
 use std::fs::{OpenOptions, TryLockError};
-use std::io::Read;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -75,6 +77,7 @@ fn haider() -> HaiderCommand {
     command
         .current_dir(&workspace)
         .env("HAIDER_PROFILE_DIR", &profile)
+        .env_remove("HAIDER_MODEL")
         // Hermetic accounts: startup auto-adoption (A2) would otherwise read
         // the HOST machine's real codex/Claude credentials into this
         // throwaway profile — "no active account" tests stop being true.
@@ -155,6 +158,278 @@ fn terminate_daemon_checked(profile: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     haider_platform::kill_process_tree(pid, true)?;
     Ok(())
+}
+
+fn assert_terminal_jsonl_error(output: &std::process::Output) -> Vec<serde_json::Value> {
+    assert!(
+        !output.status.success(),
+        "expected nonzero exit; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.ends_with(b"\n"), "JSONL must end with LF");
+    let values = String::from_utf8(output.stdout.clone())
+        .expect("JSONL stdout is UTF-8")
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).expect("every stdout line is one JSON object"))
+        .collect::<Vec<serde_json::Value>>();
+    assert!(
+        values.iter().all(serde_json::Value::is_object),
+        "every nonempty JSONL line must be an object"
+    );
+    let terminal = values.last().expect("terminal JSONL record");
+    assert_eq!(terminal["event"], "error");
+    assert_eq!(terminal["stage"], "bootstrap");
+    assert!(terminal["outcome"].as_str().is_some());
+    assert!(terminal["error"]["code"].as_str().is_some());
+    assert!(terminal["error"]["message"].as_str().is_some());
+    assert!(terminal["error"]["retryable"].as_bool().is_some());
+    values
+}
+
+#[cfg(unix)]
+fn wait_for_daemon_pid(profile: &Path) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(pid) = daemon_pid(profile) {
+            return pid;
+        }
+        assert!(Instant::now() < deadline, "daemon PID publication deadline");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+fn wait_for_profile_lock(profile: &Path, should_be_free: bool) {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(profile.join("lock"))
+        .expect("profile lock file");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match lock.try_lock() {
+            Ok(()) if should_be_free => {
+                lock.unlock().expect("release profile lock probe");
+                return;
+            }
+            Ok(()) => {
+                lock.unlock()
+                    .expect("release unexpected profile lock probe");
+                panic!("incumbent profile lock was unexpectedly free");
+            }
+            Err(TryLockError::WouldBlock) if !should_be_free => return,
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Error(error)) => panic!("profile lock proof failed: {error}"),
+        }
+        assert!(Instant::now() < deadline, "profile lock release deadline");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+fn configure_isolated_runtime(command: &mut HaiderCommand) -> PathBuf {
+    let mut environment = haider_client::ProfileEnv::capture();
+    environment.profile_dir = Some(command.profile.clone());
+    environment.home = None;
+    haider_client::resolve_profile(&environment)
+        .expect("resolve profile identity")
+        .endpoint_path
+}
+
+fn read_http_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("request read timeout");
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    let mut expected = None;
+    loop {
+        let read = stream.read(&mut chunk).expect("read proxy request");
+        assert!(read > 0, "proxy request closed before headers/body");
+        bytes.extend_from_slice(&chunk[..read]);
+        if expected.is_none()
+            && let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+        {
+            let header_end = header_end + 4;
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().expect("content length"))
+                })
+                .unwrap_or(0);
+            expected = Some((header_end, header_end + content_length));
+        }
+        if expected.is_some_and(|(_, total)| bytes.len() >= total) {
+            break;
+        }
+    }
+    let (header_end, total) = expected.expect("complete request headers");
+    let request_line = String::from_utf8_lossy(&bytes[..header_end])
+        .lines()
+        .next()
+        .expect("request line")
+        .to_owned();
+    (request_line, bytes[header_end..total].to_vec())
+}
+
+fn write_http_response(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]) {
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    )
+    .expect("write response headers");
+    stream.write_all(body).expect("write response body");
+    stream.flush().expect("flush response");
+}
+
+fn spawn_compatible_proxy(
+    catalog: Option<&'static [u8]>,
+) -> (
+    String,
+    std::sync::mpsc::Receiver<serde_json::Value>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind compatible proxy");
+    let origin = format!(
+        "http://{}/v1",
+        listener.local_addr().expect("proxy address")
+    );
+    let (captured, receiver) = std::sync::mpsc::channel();
+    let task = thread::spawn(move || {
+        for incoming in listener.incoming() {
+            let mut stream = incoming.expect("accept proxy request");
+            let (request_line, body) = read_http_request(&mut stream);
+            if request_line.starts_with("POST ") && request_line.contains("/chat/completions") {
+                let value = serde_json::from_slice(&body).expect("chat request JSON");
+                captured.send(value).expect("capture chat request");
+                let sse = concat!(
+                    "data: {\"id\":\"chatcmpl-bench\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"chatcmpl-bench\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: {\"id\":\"chatcmpl-bench\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                write_http_response(&mut stream, "200 OK", "text/event-stream", sse.as_bytes());
+                return;
+            }
+            if request_line.contains("/models") {
+                match catalog {
+                    Some(body) => {
+                        write_http_response(&mut stream, "200 OK", "application/json", body)
+                    }
+                    None => write_http_response(
+                        &mut stream,
+                        "404 Not Found",
+                        "application/json",
+                        br#"{"error":"no catalog"}"#,
+                    ),
+                }
+            } else {
+                write_http_response(&mut stream, "200 OK", "application/json", b"{}");
+            }
+        }
+    });
+    (origin, receiver, task)
+}
+
+fn run_custom_model_wire_case(
+    profile_default: &str,
+    explicit_model: Option<&str>,
+    cached_models: &[&str],
+    catalog: Option<&'static [u8]>,
+) -> serde_json::Value {
+    let mut command = haider();
+    // This case exercises the REAL OpenAI-compatible HTTP path against a fake
+    // proxy to capture the wire model. The default fake-provider script the
+    // `haider()` helper installs would short-circuit the turn and never emit a
+    // `/chat/completions` request, so it must be removed for this one case.
+    command.env_remove("HAIDER_TEST_FAKE_PROVIDER");
+    #[cfg(unix)]
+    let _endpoint = configure_isolated_runtime(&mut command);
+    let (origin, captured, proxy) = spawn_compatible_proxy(catalog);
+    std::fs::create_dir_all(&command.profile).expect("profile directory");
+    std::fs::write(
+        command.profile.join("config.json"),
+        serde_json::to_vec(&serde_json::json!({"default_model": profile_default}))
+            .expect("profile config JSON"),
+    )
+    .expect("profile config");
+    std::fs::write(
+        command.profile.join("providers.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "providers": [{
+                "provider_id": "bench-proxy",
+                "display_name": "Bench Proxy",
+                "api_family": "openai_chat_completions",
+                "base_url": origin,
+                "enabled": true,
+                "auth_requirement": "none",
+                "configured_models": ["deepseek-v4-flash"],
+                "default_model": null,
+                "promotion_model": null,
+                "provenance": "custom"
+            }],
+            "fallback_chain": []
+        }))
+        .expect("providers JSON"),
+    )
+    .expect("providers registry");
+    let discovered = cached_models
+        .iter()
+        .map(|slug| haider_provider::DiscoveredModel {
+            slug: (*slug).to_owned(),
+            display_name: (*slug).to_owned(),
+            context_window: None,
+            description: None,
+            default_effort: None,
+            supported_efforts: Vec::new(),
+            visible: true,
+            priority: None,
+            extensions: None,
+        })
+        .collect::<Vec<_>>();
+    {
+        let store = haider_store::Store::open(&command.profile).expect("seed provider cache");
+        store
+            .put_provider_models(
+                "bench-proxy",
+                &serde_json::to_string(&discovered).expect("catalog cache JSON"),
+                None,
+                1,
+            )
+            .expect("put provider cache");
+    }
+    let mut args = vec!["run", "--provider", "bench-proxy", "--jsonl", "wire model"];
+    if let Some(model) = explicit_model {
+        args.splice(3..3, ["--model", model]);
+    }
+    let output = command.args(args).output().expect("custom model run exits");
+    assert!(
+        output.status.success(),
+        "stderr: {}; stdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let request = captured
+        .recv_timeout(Duration::from_secs(10))
+        .expect("captured chat request");
+    proxy.join().expect("proxy joins");
+    request
 }
 
 #[cfg(unix)]
@@ -452,6 +727,270 @@ fn run_jsonl_announces_acceptance_before_lf_framed_envelopes() {
     assert_eq!(response.as_deref(), Some("fake response: hello"));
 }
 
+/// MUTATION CHECK: remove the raw JSONL pre-scan, restrict the typed emitter
+/// to single JSON, or omit the final post-acceptance write. Expected runtime
+/// failure: one case has empty/non-JSON stdout or does not end in `error`.
+#[test]
+fn run_jsonl_bootstrap_failures_always_end_in_a_typed_error_record() {
+    let malformed = haider()
+        .args(["run", "--bogus", "--output", "jsonl"])
+        .output()
+        .expect("malformed run executes");
+    let values = assert_terminal_jsonl_error(&malformed);
+    assert_eq!(
+        values.last().expect("error")["error"]["code"],
+        "invalid_argument"
+    );
+
+    let mut invalid_profile = haider();
+    std::fs::create_dir_all(&invalid_profile.profile).expect("profile directory");
+    std::fs::write(invalid_profile.profile.join("config.json"), b"{")
+        .expect("malformed profile config");
+    let invalid_profile = invalid_profile
+        .args(["run", "--jsonl", "hello"])
+        .output()
+        .expect("invalid profile run executes");
+    let values = assert_terminal_jsonl_error(&invalid_profile);
+    assert_eq!(
+        values.last().expect("error")["error"]["code"],
+        "protocol_mismatch"
+    );
+
+    let missing_attachment = haider()
+        .args([
+            "run",
+            "--provider",
+            "fake",
+            "--jsonl",
+            "--attach",
+            "missing-fixture.txt",
+            "hello",
+        ])
+        .output()
+        .expect("missing attachment run executes");
+    let values = assert_terminal_jsonl_error(&missing_attachment);
+    assert_eq!(
+        values.last().expect("error")["error"]["code"],
+        "attachment_io"
+    );
+
+    let mut no_account_command = haider();
+    let no_account = no_account_command
+        .args(["run", "--jsonl", "hello"])
+        .output()
+        .expect("no-account run executes");
+    let no_account_logs = daemon_logs(&no_account_command.profile);
+    if no_account.status.code() == Some(69)
+        && no_account_logs.contains("bind Unix socket")
+        && no_account_logs.contains("Operation not permitted")
+    {
+        eprintln!("local IPC is sandbox-denied; daemon JSONL cases skipped");
+        return;
+    }
+    let values = assert_terminal_jsonl_error(&no_account);
+    assert_eq!(
+        values.last().expect("error")["error"]["code"],
+        haider_client::ERROR_CODE_NO_ACTIVE_ACCOUNT
+    );
+
+    let create_refusal = haider()
+        .args([
+            "run",
+            "--provider",
+            "unknown",
+            "--model",
+            "fixture-model",
+            "--jsonl",
+            "hello",
+        ])
+        .output()
+        .expect("create-refusal run executes");
+    let values = assert_terminal_jsonl_error(&create_refusal);
+    assert_eq!(
+        values.last().expect("error")["error"]["code"],
+        "invalid_argument"
+    );
+
+    let accepted_then_refused = haider()
+        .args([
+            "run",
+            "--provider",
+            "fake",
+            "--model",
+            "fake-model",
+            "--effort",
+            "definitely-unsupported",
+            "--jsonl",
+            "hello",
+        ])
+        .output()
+        .expect("post-acceptance refusal executes");
+    let values = assert_terminal_jsonl_error(&accepted_then_refused);
+    assert_eq!(values[0]["event"], "accepted");
+    assert_eq!(
+        values.last().expect("error")["error"]["code"],
+        "effort_unsupported"
+    );
+}
+
+/// MUTATION CHECK: change the one-shot lifetime back to Persistent or drop
+/// the authenticated ownership token. Expected runtime failure: either PID
+/// remains live, the socket/owner file survives, or the profile lock stays
+/// held after the command exits.
+#[cfg(unix)]
+#[test]
+fn one_shot_reaps_only_the_daemon_it_spawned_on_success_and_bootstrap_failure() {
+    let delayed_fake = concat!(
+        r#"[{"step":"delay","ms":300},{"step":"emit_text","text":"done"},{"step":"finish","reason":"end_turn"},"#,
+        r#"{"step":"emit_text","text":"done"},{"step":"finish","reason":"end_turn"}]"#,
+    );
+    let mut success = haider();
+    let success_endpoint = configure_isolated_runtime(&mut success);
+    success
+        .env("HAIDER_TEST_FAKE_PROVIDER", delayed_fake)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args(["run", "--provider", "fake", "--jsonl", "hello"]);
+    let success_child = success.spawn().expect("spawn successful one-shot");
+    let success_pid = wait_for_daemon_pid(&success.profile);
+    let success_output = success_child
+        .wait_with_output()
+        .expect("successful one-shot exits");
+    let success_logs = daemon_logs(&success.profile);
+    if !success_output.status.success()
+        && success_logs.contains("bind Unix socket")
+        && success_logs.contains("Operation not permitted")
+    {
+        eprintln!("local IPC is sandbox-denied; owned-daemon host pin skipped");
+        return;
+    }
+    assert!(
+        success_output.status.success(),
+        "stdout: {}; stderr: {}; daemon logs: {}",
+        String::from_utf8_lossy(&success_output.stdout),
+        String::from_utf8_lossy(&success_output.stderr),
+        success_logs
+    );
+    assert!(
+        !process_is_alive(success_pid),
+        "owned daemon must be reaped"
+    );
+    assert!(!success_endpoint.exists(), "owned socket must be removed");
+    assert!(!success.profile.join("lock.owner").exists());
+    wait_for_profile_lock(&success.profile, true);
+
+    let mut bootstrap_failure = haider();
+    let failure_endpoint = configure_isolated_runtime(&mut bootstrap_failure);
+    bootstrap_failure
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args(["run", "--jsonl", "hello"]);
+    let failure_child = bootstrap_failure
+        .spawn()
+        .expect("spawn bootstrap-failing one-shot");
+    let failure_pid = wait_for_daemon_pid(&bootstrap_failure.profile);
+    let failure_output = failure_child
+        .wait_with_output()
+        .expect("bootstrap-failing one-shot exits");
+    assert_eq!(failure_output.status.code(), Some(65));
+    assert_terminal_jsonl_error(&failure_output);
+    assert!(
+        !process_is_alive(failure_pid),
+        "owned daemon must be reaped"
+    );
+    assert!(!failure_endpoint.exists(), "owned socket must be removed");
+    assert!(!bootstrap_failure.profile.join("lock.owner").exists());
+    wait_for_profile_lock(&bootstrap_failure.profile, true);
+}
+
+/// An attached one-shot has no ownership token and must leave the exact
+/// incumbent generation serving after completion.
+#[cfg(unix)]
+#[test]
+fn one_shot_never_shuts_down_a_prestarted_incumbent() {
+    let mut incumbent = haider();
+    let endpoint = configure_isolated_runtime(&mut incumbent);
+    let ready = incumbent.output().expect("prestart incumbent");
+    let incumbent_logs = daemon_logs(&incumbent.profile);
+    if !ready.status.success()
+        && incumbent_logs.contains("bind Unix socket")
+        && incumbent_logs.contains("Operation not permitted")
+    {
+        eprintln!("local IPC is sandbox-denied; incumbent host pin skipped");
+        return;
+    }
+    assert!(
+        ready.status.success(),
+        "stderr: {}; daemon logs: {}",
+        String::from_utf8_lossy(&ready.stderr),
+        incumbent_logs
+    );
+    let pid = daemon_pid(&incumbent.profile).expect("incumbent PID");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_haider"))
+        .args(["run", "--provider", "fake", "--jsonl", "hello"])
+        .env("HAIDER_PROFILE_DIR", &incumbent.profile)
+        .env("HAIDER_DISCOVERY_DISABLED", "1")
+        .env("HAIDER_TEST_FAKE_PROVIDER", DEFAULT_FAKE_SCRIPT)
+        .output()
+        .expect("attached one-shot exits");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(daemon_pid(&incumbent.profile), Some(pid));
+    assert!(process_is_alive(pid));
+    assert!(endpoint.exists());
+    wait_for_profile_lock(&incumbent.profile, false);
+    terminate_daemon_checked(&incumbent.profile).expect("stop incumbent fixture");
+}
+
+/// MUTATION CHECK: drop the profile-default fallback, restore catalog-first
+/// substitution, restore the custom summary membership filter, or bypass the
+/// selector path. Expected runtime failure: the captured OpenAI-compatible
+/// chat body contains `canonical-other`, a provider prefix, or no request.
+#[test]
+fn configured_custom_model_reaches_chat_wire_verbatim_despite_catalog() {
+    const CATALOG: &[u8] =
+        br#"{"object":"list","data":[{"id":"canonical-other","object":"model"}]}"#;
+    match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => drop(listener),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("local loopback listeners are sandbox-denied; host proxy pin skipped");
+            return;
+        }
+        Err(error) => panic!("probe compatible proxy bind: {error}"),
+    }
+
+    let unqualified = run_custom_model_wire_case(
+        "deepseek-v4-flash",
+        None,
+        &["canonical-other"],
+        Some(CATALOG),
+    );
+    assert_eq!(unqualified["model"], "deepseek-v4-flash");
+
+    let qualified = run_custom_model_wire_case(
+        "bench-proxy/deepseek-v4-flash",
+        None,
+        &["canonical-other"],
+        Some(CATALOG),
+    );
+    assert_eq!(qualified["model"], "deepseek-v4-flash");
+
+    let explicit = run_custom_model_wire_case(
+        "bench-proxy/deepseek-v4-flash",
+        Some("explicit-wire-model"),
+        &["canonical-other"],
+        Some(CATALOG),
+    );
+    assert_eq!(explicit["model"], "explicit-wire-model");
+
+    let no_catalog = run_custom_model_wire_case("bench-proxy/deepseek-v4-flash", None, &[], None);
+    assert_eq!(no_catalog["model"], "deepseek-v4-flash");
+}
+
 /// MUTATION CHECK: make print depend on a TTY/TERM, leak progress to stdout,
 /// omit the one trailing LF, or put the final response on stderr. Expected
 /// RUNTIME failure: redirected subprocess bytes differ from this exact split.
@@ -570,7 +1109,7 @@ fn flagless_run_without_an_active_account_exits_65_with_remedy() {
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("error JSON");
     assert_eq!(value["error"]["code"], "no_active_account");
     assert!(value["provider"].is_null());
-    assert!(value["model"].is_null());
+    assert_eq!(value["model"], haider_client::PACKAGED_DEFAULT_MODEL);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("no_active_account"));
     assert!(stderr.contains("remedy:"));
@@ -629,7 +1168,7 @@ fn anthropic_missing_credential_exits_65_without_network_access() {
 }
 
 #[test]
-fn sequential_cli_runs_use_profile_owned_worker_generations() {
+fn sequential_ephemeral_cli_runs_advance_profile_owned_worker_generations() {
     ensure_haiderd_present();
     let profile_parent = tempfile::tempdir().expect("temporary CLI profile parent");
     let profile = profile_parent.path().join("profile");
@@ -656,37 +1195,10 @@ fn sequential_cli_runs_use_profile_owned_worker_generations() {
             .iter()
             .all(|envelope| envelope.worker_generation == first_generation)
     );
-    terminate_daemon_checked(&profile).expect("terminate first daemon generation");
-    // Endpoint removal precedes store close during an orderly drain. Waiting
-    // for the endpoint therefore races the successor into the intentional
-    // endpoint-gone/profile-lock-held interval, where it must exit 75. Prove
-    // release of the actual singleton authority instead. Acquiring and
-    // releasing this non-mutating probe does not open the store, rewrite the
-    // sibling owner diagnostics, or consume a worker generation.
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(profile.join("lock"))
-        .expect("profile lock file");
-    // The product's five-second drain barrier bounds the reported outcome,
-    // but an already-started blocking close may release the OS lock just
-    // after it. Use the existing startup observation bound so this fixture
-    // waits beyond that honest forced-close edge without changing the law.
-    let deadline = Instant::now() + haider_client::STARTUP_DEADLINE;
-    loop {
-        match lock.try_lock() {
-            Ok(()) => {
-                lock.unlock().expect("release profile lock probe");
-                break;
-            }
-            Err(TryLockError::WouldBlock) => {}
-            Err(TryLockError::Error(error)) => panic!("profile lock proof failed: {error}"),
-        }
-        assert!(Instant::now() < deadline, "profile lock release deadline");
-        thread::sleep(Duration::from_millis(20));
-    }
+    assert!(daemon_pid(&profile).is_none());
+    #[cfg(unix)]
+    wait_for_profile_lock(&profile, true);
     let second_output = run("restarted process");
-    terminate_daemon_checked(&profile).expect("terminate second daemon generation");
     assert!(
         second_output.status.success(),
         "stderr: {}",
@@ -703,6 +1215,7 @@ fn sequential_cli_runs_use_profile_owned_worker_generations() {
         second_generation > first_generation,
         "CLI reused profile generation {first_generation}"
     );
+    assert!(daemon_pid(&profile).is_none());
 }
 
 /// Runs `haider` with ONE bounded retry when the autospawned daemon misses

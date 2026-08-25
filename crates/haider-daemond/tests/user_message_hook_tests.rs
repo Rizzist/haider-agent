@@ -397,6 +397,7 @@ async fn user_message_hook_fires_for_headless_and_rpc_submissions_identically() 
         startup_deadline: Duration::from_secs(5),
         daemon_binary: None,
         client: haider_client::ClientConfig::default(),
+        daemon_lifetime: haider_client::DaemonLifetime::Persistent,
     };
     let (output, mut events) = mpsc::channel::<HeadlessEvent>(64);
     let drain = tokio::spawn(async move { while events.recv().await.is_some() {} });

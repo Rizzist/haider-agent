@@ -885,6 +885,7 @@ fn connection_context(
         writers,
         owner_uid: rustix::process::geteuid().as_raw(),
         hub,
+        shutdown: crate::lifecycle::ShutdownHandle::channel().0,
         endpoint_path: std::path::PathBuf::from("/tmp/liveness-test.sock"),
     }
 }
@@ -1012,6 +1013,11 @@ impl PairedClient {
     }
 
     async fn handshake(&mut self) {
+        self.handshake_with(CapabilitySet::from([Capability::View, Capability::Control]))
+            .await;
+    }
+
+    async fn handshake_with(&mut self, capabilities: CapabilitySet) {
         self.send(&WireFrame::Hello(haider_rpc::Hello {
             protocol_min: haider_rpc::WIRE_PROTOCOL_VERSION,
             protocol_max: haider_rpc::WIRE_PROTOCOL_VERSION,
@@ -1019,7 +1025,7 @@ impl PairedClient {
             client_version: "test".into(),
             client_instance_id: "paired-client".into(),
             client_kind: haider_rpc::ClientKind::Headless,
-            capabilities_requested: CapabilitySet::from([Capability::View, Capability::Control]),
+            capabilities_requested: capabilities,
             max_receive_frame: 1024 * 1024,
             encodings: Vec::new(),
         }))
@@ -1071,6 +1077,64 @@ impl PairedClient {
             body,
         })
         .await;
+    }
+}
+
+/// MUTATION CHECK: remove the Control gate or the single ShutdownHandle
+/// request in `handle_frame`. Expected runtime failure: the view-only peer
+/// starts draining, or the control peer never advances the lifecycle watch.
+#[tokio::test]
+async fn daemon_shutdown_rpc_requires_control_and_requests_graceful_once() {
+    for (capabilities, accepted) in [
+        (CapabilitySet::from([Capability::View]), false),
+        (
+            CapabilitySet::from([Capability::View, Capability::Control]),
+            true,
+        ),
+    ] {
+        let (_dir, hub) = liveness_hub().await;
+        let (server, client) = UnixStream::pair().expect("socket pair");
+        let (shutdown, shutdown_rx, _observer) = crate::lifecycle::ShutdownHandle::channel();
+        let mut context = liveness_context(hub.clone());
+        context.shutdown = shutdown;
+        let (_drain_tx, drain_rx) = watch::channel(Option::<DrainNotice>::None);
+        let serve_task = tokio::spawn(serve(server, context, drain_rx));
+        let mut client = PairedClient::new(client);
+        client.handshake_with(capabilities).await;
+        client
+            .request("shutdown", RequestBody::DaemonShutdown {})
+            .await;
+
+        let response = client.next().await.expect("shutdown response");
+        if accepted {
+            assert!(matches!(
+                response,
+                WireFrame::Response {
+                    body: ResponseBody::DaemonShutdown {},
+                    ..
+                }
+            ));
+            assert!(matches!(
+                &*shutdown_rx.borrow(),
+                crate::lifecycle::ShutdownRequest::Graceful { .. }
+            ));
+        } else {
+            assert!(matches!(
+                response,
+                WireFrame::Response {
+                    body: ResponseBody::Error { ref code, .. },
+                    ..
+                } if code == haider_rpc::ERROR_CODE_CAPABILITY_DENIED
+            ));
+            assert!(matches!(
+                &*shutdown_rx.borrow(),
+                crate::lifecycle::ShutdownRequest::None
+            ));
+        }
+
+        drop(client);
+        let _ = serve_task.await.expect("serve joins");
+        hub.shutdown().await.expect("hub shutdown");
     }
 }
 

@@ -1761,6 +1761,7 @@ impl UdsControlClient {
             writers,
             owner_uid: rustix::process::geteuid().as_raw(),
             hub,
+            shutdown: crate::lifecycle::ShutdownHandle::channel().0,
             endpoint_path: PathBuf::from("/tmp/w6d-child-control.sock"),
         };
         let (drain_sender, drain) = watch::channel(Option::<DrainNotice>::None);

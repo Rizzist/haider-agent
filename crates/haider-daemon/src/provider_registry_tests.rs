@@ -489,6 +489,53 @@ fn summaries_report_pickable_discovered_models_not_profile_literals() {
     assert_eq!(summary.availability, ProviderAvailabilityWire::Available);
 }
 
+/// A custom OpenAI-compatible model id is endpoint vocabulary, while the
+/// discovered catalog is only advisory picker inventory.
+///
+/// MUTATION CHECK: restore the discovered-membership filter in
+/// `provider_summary`. Expected runtime failure: the configured default below
+/// becomes `None` for both the mismatched and empty catalogs.
+#[test]
+fn custom_summary_preserves_configured_default_across_mismatched_and_empty_catalog() {
+    let profile = ProviderProfileV1 {
+        provider_id: "bench-proxy".to_owned(),
+        display_name: "Bench Proxy".to_owned(),
+        api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
+        base_url: Some("https://bench.example.invalid/v1".to_owned()),
+        enabled: true,
+        auth_requirement: ProviderAuthRequirementWire::None,
+        configured_models: vec!["deepseek-v4-flash".to_owned()],
+        default_model: Some("deepseek-v4-flash".to_owned()),
+        promotion_model: None,
+        provenance: ProviderProvenance::Custom,
+    };
+    let store = MemoryProviderStore::default();
+    store
+        .save(std::slice::from_ref(&profile))
+        .expect("seed store");
+    let source = model_source([(
+        "bench-proxy",
+        vec![discovered("canonical-other", true, None)],
+    )]);
+    let registry = ProviderRegistry::new(store, Vec::new(), source.clone()).expect("registry");
+
+    let mismatched = registry
+        .summary("bench-proxy", &|_| true)
+        .expect("mismatched summary");
+    assert_eq!(mismatched.models, ["canonical-other"]);
+    assert_eq!(
+        mismatched.default_model.as_deref(),
+        Some("deepseek-v4-flash")
+    );
+
+    source.remove("bench-proxy");
+    let empty = registry
+        .summary("bench-proxy", &|_| true)
+        .expect("empty summary");
+    assert!(empty.models.is_empty());
+    assert_eq!(empty.default_model.as_deref(), Some("deepseek-v4-flash"));
+}
+
 /// MUTATION CHECK: build `model_details` from raw or independently ordered
 /// discovered models instead of the pickable inventory used for `models`.
 /// Expected runtime failure: the hidden row appears or the exact ordered

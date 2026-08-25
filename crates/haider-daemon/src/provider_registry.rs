@@ -935,11 +935,22 @@ fn provider_summary(
         && !matches!(profile.api_family, ProviderApiFamilyWire::Unknown)
         && !discovered_models.is_empty()
         && seeded_ready;
-    let default_model = profile
-        .default_model
-        .as_ref()
-        .filter(|default| discovered_models.iter().any(|model| model == *default))
-        .cloned();
+    let default_model = if matches!(profile.provenance, ProviderProvenance::Custom)
+        && matches!(
+            profile.api_family,
+            ProviderApiFamilyWire::OpenAiChatCompletions
+        ) {
+        // A custom compatible endpoint owns its wire model vocabulary.
+        // Discovery remains advisory inventory for pickers and availability;
+        // it cannot rewrite or erase the configured passthrough id.
+        profile.default_model.clone()
+    } else {
+        profile
+            .default_model
+            .as_ref()
+            .filter(|default| discovered_models.iter().any(|model| model == *default))
+            .cloned()
+    };
     ProviderSummaryWire {
         provider: profile.provider_id.clone(),
         api_family: profile.api_family,

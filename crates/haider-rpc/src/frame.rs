@@ -1653,6 +1653,10 @@ pub enum HookTrustStateWire {
 #[serde(tag = "method")]
 #[non_exhaustive]
 pub enum RequestBody {
+    /// Requests graceful shutdown of this authenticated profile daemon.
+    /// The daemon accepts it only from a connection granted Control.
+    #[serde(rename = "daemon.shutdown")]
+    DaemonShutdown {},
     /// Lists the shared command catalog for the requesting surface's exact
     /// current context.
     #[serde(rename = "command.list")]
@@ -2384,6 +2388,10 @@ pub enum RequestBody {
 #[serde(tag = "method")]
 #[non_exhaustive]
 pub enum ResponseBody {
+    /// The graceful shutdown request was accepted. `ServerDraining` and
+    /// disconnect remain the authoritative completion sequence.
+    #[serde(rename = "daemon.shutdown")]
+    DaemonShutdown {},
     #[serde(rename = "command.list")]
     CommandList {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

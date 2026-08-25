@@ -39,11 +39,11 @@ mod connection_duplex_tests;
 #[path = "connection_tests.rs"]
 mod connection_tests;
 
-use crate::DaemonError;
 use crate::session_hub::{
     AdmissionTicket, FrameSendError, FrameSink, HubConnection, PreparedFrame, SendAdmission,
     SessionHub,
 };
+use crate::{DaemonError, ShutdownHandle};
 use haider_platform::IpcStream;
 use haider_rpc::{
     AttachmentId, Capability, CapabilitySet, ERROR_CODE_OVERLOADED, FEATURE_ACCOUNT_LOGIN_API_V1,
@@ -61,8 +61,8 @@ use haider_rpc::{
     FEATURE_SESSION_OBSERVE_BATCH_V1, FEATURE_SESSION_OBSERVE_V1,
     FEATURE_SESSION_PERMISSION_OVERRIDES_V1, FEATURE_SESSION_RUN_ID_V1, FEATURE_SHELL_EXEC_V1,
     FEATURE_TOOL_INVENTORY_V1, FEATURE_TURN_CONTROL_V1, FEATURE_USER_COMMAND_V1,
-    FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, ProtocolError, RequestId, ServerRange, Welcome,
-    WireEncoding, WireFrame, negotiate, uds_codec,
+    FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, ProtocolError, RequestBody, RequestId,
+    ResponseBody, ServerRange, Welcome, WireEncoding, WireFrame, negotiate, uds_codec,
 };
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::IoSlice;
@@ -1063,6 +1063,9 @@ pub(crate) struct ConnectionContext {
     pub(crate) owner_uid: u32,
     /// Profile session hub shared by all negotiated connections.
     pub(crate) hub: SessionHub,
+    /// Graceful daemon-lifetime control. Only the authenticated Control RPC
+    /// below may invoke it from a connection task.
+    pub(crate) shutdown: ShutdownHandle,
     /// For error context only; the stream is already accepted.
     pub(crate) endpoint_path: PathBuf,
 }
@@ -1577,6 +1580,38 @@ async fn handle_frame(
     match frame {
         WireFrame::Ping { nonce } => {
             enqueue(lane, &WireFrame::Pong { nonce }, *outbound_limit, *encoding)?;
+            Ok(false)
+        }
+        WireFrame::Request {
+            request_id,
+            body: RequestBody::DaemonShutdown {},
+        } => {
+            let granted = grant
+                .as_ref()
+                .is_some_and(|grant| grant.capabilities.contains(&Capability::Control));
+            let body = if granted {
+                ResponseBody::DaemonShutdown {}
+            } else {
+                ResponseBody::Error {
+                    code: haider_rpc::ERROR_CODE_CAPABILITY_DENIED.into(),
+                    message: "daemon.shutdown requires control capability".into(),
+                    retryable: false,
+                    data: None,
+                }
+            };
+            enqueue(
+                lane,
+                &WireFrame::Response { request_id, body },
+                *outbound_limit,
+                *encoding,
+            )?;
+            if granted {
+                // Exactly one request: a second call would select the forced
+                // lifecycle path, so fallback decisions remain client-side.
+                context
+                    .shutdown
+                    .request("authenticated daemon.shutdown RPC");
+            }
             Ok(false)
         }
         WireFrame::Request { request_id, body } => {

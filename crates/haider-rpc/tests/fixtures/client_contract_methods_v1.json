@@ -2,6 +2,12 @@
   "contract": "haider-client-wire/v1",
   "methods": [
     {
+      "request_method": "daemon.shutdown",
+      "response_method": "daemon.shutdown",
+      "request": {"method":"daemon.shutdown"},
+      "response": {"method":"daemon.shutdown"}
+    },
+    {
       "request_method": "command.list",
       "response_method": "command.list",
       "request": {"method":"command.list","query":"model ","in_session":true,"slots":{"providers":[["openai","OpenAI"]],"models":[["gpt-test","OpenAI · gpt-test"]],"accounts":[["work","Work account"]],"efforts":[["high","High effort"]],"custom_commands":[["review","Review changes"]]}},
