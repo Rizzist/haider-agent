@@ -4957,9 +4957,10 @@ async fn fresh_turn_metadata(lease: &HubStoreHandle) -> Result<SessionMetadataV1
 /// wake; one committed between registration and the scan is sent TWICE (hub
 /// wake at commit, then the scan's apply). The duplicate is safe because
 /// both sends land in the harness's latest-value committed-menu watch before
-/// the checkpoint turn's waiter performs its first read, which collapses
-/// them into one observation — missing the answer is the failure mode this
-/// ordering exists to prevent.
+/// the checkpoint handler performs its first read. A blocking waiter
+/// collapses them into one observation; an autonomous plan recognizes that
+/// settlement before returning its fixed accepted result. Missing the answer
+/// is the failure mode this ordering exists to prevent.
 async fn start_turn(
     dependencies: &WorkerDependencies,
     metadata: &SessionMetadataV1,
@@ -5636,8 +5637,8 @@ async fn prior_cache_domain_gap_ms(
     Ok(Some(now.saturating_sub(latest)))
 }
 
-/// E2 — every `plan` proposal body the human ACCEPTED on this branch. The
-/// scan pairs durable MenuOpened(origin="plan") bodies with their committed
+/// E2 — every autonomously accepted `plan` proposal body on this branch. The
+/// scan pairs durable MenuOpened(origin="plan") bodies with their actor-owned
 /// accept answers (key preferred; index 0 is the accept slot).
 async fn accepted_plan_bodies(
     store: &HubStoreHandle,
@@ -7018,7 +7019,8 @@ pub(crate) fn registered_tools() -> Vec<RegisteredTool> {
             RegisteredToolRoute::RequestInput,
         ),
         // D4: actor-owned like request_input — presenting a proposal is not
-        // a side effect; the run parks on the durable plan menu.
+        // a side effect; unlike request_input, the durable plan presentation
+        // auto-accepts without parking the run.
         registered_tool(
             plan_definition(),
             vec![],
@@ -7026,9 +7028,9 @@ pub(crate) fn registered_tools() -> Vec<RegisteredTool> {
             ToolPermissionDefault::NotApplicable,
             RegisteredToolRoute::Plan,
         ),
-        // E2: registration is plan-gated, not broker-gated — the ACCEPTED
-        // plan carrying the exact registration IS the human authorization,
-        // so no effect class rides here.
+        // E2: registration is plan-gated, not broker-gated — the presented
+        // and automatically accepted plan carries the exact registration, so
+        // no effect class rides here.
         registered_tool(
             loom_register_definition(),
             vec![],
@@ -7562,10 +7564,10 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
             "request_input(kind, title, body?, options?) — ask the user one blocking prompt; options=[{key, label, detail?}] for a choice"
         }
         "loom_register" => {
-            "loom_register(kind, source?|record?) — register a Loom workflow (kind=workflow, source=pipe text `name: In -> Out` + node lines) or agent type (kind=agent_type, record={id,name,job,in_type,out_type,clis,apis,skills,scripts,color,glyph}); refused unless a human-ACCEPTED plan body contains the registration content"
+            "loom_register(kind, source?|record?) — register a Loom workflow (kind=workflow, source=pipe text `name: In -> Out` + node lines) or agent type (kind=agent_type, record={id,name,job,in_type,out_type,clis,apis,skills,scripts,color,glyph}); refused unless a previously presented plan body contains the registration content"
         }
         "plan" => {
-            "plan(title, body) — present a full markdown plan/proposal for review before acting; the user answers accept / revise (with a note) / reject and the result is {decision, note}. Use for designs, migrations, architectures — anything that deserves approval first"
+            "plan(title, body) — present and record a full markdown plan/proposal, then proceed autonomously without an approval gate; returns immediately with {decision: \"accept\", note: \"\"}. Use for designs, migrations, and architectures that benefit from a visible structured plan"
         }
         _ => return None,
     })
@@ -9360,7 +9362,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             }
                         } else {
                             Ok(refusal(
-                                "registration requires a plan the human ACCEPTED whose body \
+                                "registration requires a previously presented plan whose body \
                                  contains this exact pipe source — present one with the `plan` \
                                  tool first"
                                     .into(),
@@ -9410,7 +9412,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             }
                         } else {
                             Ok(refusal(
-                                "registration requires a plan the human ACCEPTED whose body \
+                                "registration requires a previously presented plan whose body \
                                  contains the type id, its job text, and its `In -> Out` \
                                  signature — present one with the `plan` tool first"
                                     .into(),
@@ -10900,12 +10902,11 @@ fn request_input_definition() -> ToolDefinition {
 }
 
 /// E2: plan-gated Loom registration. The gate law: the registration's
-/// content must appear inside a plan proposal the human ACCEPTED — the
-/// review the plan tool already provides IS the permission.
+/// content must appear inside a presented, automatically accepted plan.
 fn loom_register_definition() -> ToolDefinition {
     ToolDefinition {
         name: "loom_register".into(),
-        description: "Register a Loom workflow (kind=workflow, source=pipe text) or agent type                       (kind=agent_type, record object). Requires a plan the human ACCEPTED whose                       body contains the registration content; present one first."
+        description: "Register a Loom workflow (kind=workflow, source=pipe text) or agent type                       (kind=agent_type, record object). Requires a previously presented plan whose                       body contains the registration content; present one first."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -10992,14 +10993,14 @@ pub(crate) fn loom_inventory_line(
     Some(line)
 }
 
-/// D4: the generic plan tool. The full markdown proposal parks the run on a
-/// durable menu the client renders full screen; the decision comes back as
-/// the tool result.
+/// D4: the generic plan tool. The full markdown proposal is journaled in a
+/// durable non-blocking presentation for clients, then the actor immediately
+/// returns its automatic acceptance as the tool result.
 fn plan_definition() -> ToolDefinition {
     ToolDefinition {
         name: "plan".into(),
-        description: "Present a full plan/proposal (markdown) for human review before acting; \
-                      returns {decision: accept|revise|reject, note}"
+        description: "Present and record a full plan/proposal (markdown), then proceed \
+                      autonomously without approval; returns {decision: accept, note: \"\"}"
             .into(),
         input_schema: serde_json::json!({
             "type": "object",

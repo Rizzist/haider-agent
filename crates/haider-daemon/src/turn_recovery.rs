@@ -9,12 +9,15 @@
 //! - durable `Cancelling` becomes `Cancelled` (items close `Cancelled`, an
 //!   open menu closes `Cancelled`, no `RunFailed` — cancellation is not an
 //!   error);
-//! - a run parked at a durable tool-menu checkpoint (an open `request_input`
-//!   or broker-approved mutating tool without its `ToolResult`, matching
-//!   historical `InputRequired` or canonical `PermissionRequired` state and
-//!   open menu) is reconstructed as a waiter — its
-//!   menu stays PENDING, and neither the provider request that produced it
-//!   nor any dispatched effect is ever repeated;
+//! - a run parked at a durable blocking tool-menu checkpoint (an open
+//!   `request_input` or broker-approved mutating tool without its
+//!   `ToolResult`, matching historical `InputRequired` or canonical
+//!   `PermissionRequired` state and open menu) is reconstructed as a waiter —
+//!   its menu stays PENDING, and neither the provider request that produced
+//!   it nor any dispatched effect is ever repeated;
+//! - an autonomous `plan` interrupted after its non-blocking `MenuOpened` is
+//!   reconstructed from `Streaming` (or legacy `InputRequired`) so the actor
+//!   immediately journals acceptance and continues without a waiter;
 //! - an active delegated child is left nonterminal for its recovered parent's
 //!   durable child-wait coordinator. W6c re-arms the progress deadline from
 //!   committed envelope time, delivers at most one steer, and then uses the
@@ -373,8 +376,20 @@ pub(crate) async fn recover_interrupted_turns(
 
 fn checkpoint_state_matches(state: &RunState, checkpoint: &RequestInputCheckpoint) -> bool {
     match state {
+        // A present-and-proceed plan can crash after MenuOpened but before its
+        // automatic answer/result. It deliberately never writes
+        // InputRequired, so the open non-blocking plan document plus its open
+        // tool item is the durable checkpoint while the run remains Streaming.
+        RunState::Streaming
+            if checkpoint.tool_name == "plan"
+                && checkpoint.menu.origin == haider_tools::PLAN_ORIGIN
+                && !checkpoint.menu.blocking =>
+        {
+            true
+        }
         // Dual-read migration: old broker approvals and actor-owned input
-        // checkpoints both used InputRequired.
+        // checkpoints both used InputRequired. This also resumes legacy plan
+        // menus written before plans became autonomous.
         RunState::InputRequired { menu } => *menu == checkpoint.menu.id,
         // New permission vocabulary is valid only for an actual committed
         // permission menu; accepting another kind would hide corruption.
@@ -582,8 +597,9 @@ fn pending_checkpoint(reduction: &RunReduction) -> Option<RequestInputCheckpoint
                         haider_protocol::menu::MenuKind::Permission { .. } => {
                             name != "request_input" && name != "plan"
                         }
-                        // `plan` parks on the same InputRequired machinery as
-                        // `request_input`; both reconstruct their checkpoint.
+                        // `request_input` parks; an interrupted autonomous
+                        // `plan` uses the same checkpoint carrier so recovery
+                        // can journal its acceptance and continue.
                         _ => name == "request_input" || name == "plan",
                     } =>
             {
@@ -1094,12 +1110,12 @@ mod plan_recovery_tests {
     use haider_protocol::item::ToolStatus;
     use haider_protocol::menu::{MenuOption, MenuScope};
 
-    /// D4 MUTATION CHECK: narrow the pending-checkpoint predicate back to
-    /// `request_input` only. Expected RUNTIME failure: a daemon restart while
-    /// a `plan` proposal is open would drop the parked turn instead of
-    /// reconstructing its checkpoint.
+    /// D4 MUTATION CHECK: require InputRequired or narrow the pending
+    /// checkpoint predicate back to `request_input` only. Expected RUNTIME
+    /// failure: a daemon restart between plan presentation and automatic
+    /// acceptance would drop the continuing turn.
     #[test]
-    fn restart_reconstructs_a_parked_plan_checkpoint() {
+    fn restart_reconstructs_an_interrupted_autonomous_plan_checkpoint() {
         let session_id = SessionId::new("plan-restart");
         let run_id = RunId::new("run-plan-restart");
         let item_id = ItemId::new("plan-item");
@@ -1133,9 +1149,7 @@ mod plan_recovery_tests {
                 },
             }),
             EventPayload::MenuOpened(menu),
-            EventPayload::RunState(RunState::InputRequired {
-                menu: menu_id.clone(),
-            }),
+            EventPayload::RunState(RunState::Streaming),
         ];
         let mut envelopes = recovery_envelopes(
             7,
@@ -1159,6 +1173,8 @@ mod plan_recovery_tests {
         assert_eq!(checkpoint.call_id, "plan-call");
         assert_eq!(checkpoint.menu.id, menu_id);
         assert_eq!(checkpoint.menu.origin, "plan");
+        assert!(!checkpoint.menu.blocking);
+        assert!(checkpoint_state_matches(&RunState::Streaming, &checkpoint));
         // The durable menu still carries the full document for the client.
         assert_eq!(checkpoint.menu.body[0], "# Tiers");
         let _ = (

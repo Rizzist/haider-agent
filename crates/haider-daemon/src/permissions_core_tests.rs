@@ -1333,9 +1333,10 @@ fn loom_inventory_rides_the_tail_bounded() {
     assert!(capped.ends_with('…'), "truncation must be marked");
 }
 
-/// E2 MUTATION CHECK: let loom_register through without an accepted plan
-/// containing the registration (drop a needle, or admit any body). Expected
-/// RUNTIME failure below — the accepted plan IS the human authorization.
+/// E2 MUTATION CHECK: let loom_register through without a presented,
+/// automatically accepted plan containing the registration (drop a needle,
+/// or admit any body). Expected RUNTIME failure below — the plan body is the
+/// durable content gate.
 #[test]
 fn loom_register_binds_to_an_accepted_plan() {
     let source = "clip: SourceURL -> Transcript\nresearch @researcher \"pull\" :cmd";
@@ -1343,7 +1344,7 @@ fn loom_register_binds_to_an_accepted_plan() {
         "# Register the clip workflow\n\n```\n{source}\n```\nWhy: automation."
     )];
     assert!(plan_gate_admits(&accepted, &[source]));
-    // A plan that never showed this source does not authorize it.
+    // A plan that never showed this source does not satisfy the content gate.
     assert!(!plan_gate_admits(
         &["# Some other proposal entirely".to_owned()],
         &[source]

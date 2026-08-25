@@ -1,18 +1,16 @@
-//! The generic `plan` tool — review-before-commit for any deliverable.
+//! The generic `plan` tool — present-and-proceed for any deliverable.
 //!
 //! Like `request_input`, `plan` deliberately never enters the effect
 //! permission broker: presenting a proposal is not a side effect. The owning
-//! actor journals `MenuOpened`/`MenuAnswered`, parks the run in
-//! `InputRequired`, and returns the decision as the tool result. What makes
-//! it distinct from `request_input` is the payload: a full markdown document
-//! (an architecture proposal, a migration plan, an agent-type design) carried
-//! in the durable menu body, rendered by clients as a full-screen reviewable
-//! surface with the fixed decision vocabulary accept / revise / reject.
+//! actor journals `MenuOpened`/`MenuAnswered` and immediately returns the
+//! automatic acceptance as the tool result. Unlike `request_input`, a plan
+//! never parks the run or waits for a human. Its payload remains a full
+//! markdown document (an architecture proposal, a migration plan, an
+//! agent-type design) carried in the durable menu body for clients to render.
 
-use crate::request_input::RequestInputAnswer;
 use crate::{ToolError, ToolResult};
 use haider_protocol::ids::MenuId;
-use haider_protocol::menu::{Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
+use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
 use serde::{Deserialize, Serialize};
 
 /// Menu origin tag clients key their plan surfaces on.
@@ -23,15 +21,20 @@ pub const PLAN_TITLE_MAX_BYTES: usize = 120;
 pub const PLAN_BODY_MAX_BYTES: usize = 32 * 1024;
 
 pub const PLAN_DECISION_ACCEPT: &str = "accept";
-pub const PLAN_DECISION_REVISE: &str = "revise";
-pub const PLAN_DECISION_REJECT: &str = "reject";
 
-/// One proposed plan awaiting the human decision.
+/// One plan document presented before the agent proceeds autonomously.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
     pub title: String,
-    /// The full markdown document under review.
+    /// The full markdown document presented to clients.
     pub body: String,
+}
+
+/// The fixed provider-facing result of presenting a valid plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanResult {
+    pub decision: String,
+    pub note: String,
 }
 
 impl Plan {
@@ -64,9 +67,9 @@ impl Plan {
         Ok(())
     }
 
-    /// The durable blocking menu: the markdown body rides `body` line by line
-    /// (clients reassemble and render it), the decision vocabulary is fixed
-    /// and server-enumerated.
+    /// The durable non-blocking presentation: the markdown body rides `body`
+    /// line by line for clients to reassemble and render. The sole option is
+    /// the actor-owned automatic settlement target, not a human decision.
     #[must_use]
     pub fn menu(&self, id: MenuId) -> Menu {
         Menu {
@@ -74,27 +77,13 @@ impl Plan {
             kind: MenuKind::Choice,
             title: self.title.clone(),
             body: self.body.lines().map(str::to_owned).collect(),
-            options: vec![
-                MenuOption {
-                    key: PLAN_DECISION_ACCEPT.into(),
-                    label: "Accept".into(),
-                    detail: Some("approve the plan — the agent proceeds".into()),
-                    decision: None,
-                },
-                MenuOption {
-                    key: PLAN_DECISION_REVISE.into(),
-                    label: "Revise".into(),
-                    detail: Some("send it back with a note — the agent reworks it".into()),
-                    decision: None,
-                },
-                MenuOption {
-                    key: PLAN_DECISION_REJECT.into(),
-                    label: "Reject".into(),
-                    detail: Some("decline the plan — the agent stops this path".into()),
-                    decision: None,
-                },
-            ],
-            blocking: true,
+            options: vec![MenuOption {
+                key: PLAN_DECISION_ACCEPT.into(),
+                label: "Proceeding automatically".into(),
+                detail: Some("the plan is recorded and the agent continues immediately".into()),
+                decision: None,
+            }],
+            blocking: false,
             scope: MenuScope::Session,
             origin: PLAN_ORIGIN.into(),
             ttl_ms: None,
@@ -102,34 +91,40 @@ impl Plan {
         }
     }
 
-    /// Validates a committed answer against the durable menu. The carrier is
-    /// [`RequestInputAnswer`] so the actor's one wait loop serves both tools:
-    /// `option_key` is the decision, `value` an optional revise/chat note.
-    pub fn resolve(&self, menu: &Menu, answer: &MenuAnswer) -> ToolResult<RequestInputAnswer> {
-        if answer.menu != menu.id {
+    /// Builds the actor-owned durable settlement for this presentation.
+    /// There is deliberately no API for resolving a human decision.
+    pub fn automatic_answer(&self, menu: &Menu) -> ToolResult<MenuAnswer> {
+        let Some((index, option)) = menu
+            .options
+            .iter()
+            .enumerate()
+            .find(|(_, option)| option.key == PLAN_DECISION_ACCEPT)
+        else {
             return Err(ToolError::InvalidMenuAnswer {
-                menu: answer.menu.clone(),
-                message: format!(
-                    "answer targets {}, but open menu is {}",
-                    answer.menu, menu.id
-                ),
+                menu: menu.id.clone(),
+                message: "plan presentation has no automatic accept settlement".into(),
             });
-        }
-        let option = if let Some(key) = answer.option_key.as_deref() {
-            menu.options.iter().find(|option| option.key == key)
-        } else {
-            usize::try_from(answer.option_index)
-                .ok()
-                .and_then(|index| menu.options.get(index))
-        }
-        .ok_or_else(|| ToolError::InvalidMenuAnswer {
-            menu: answer.menu.clone(),
-            message: "answer does not select a plan decision".into(),
+        };
+        let option_index = u32::try_from(index).map_err(|_| ToolError::InvalidMenuAnswer {
+            menu: menu.id.clone(),
+            message: "plan acceptance index exceeds protocol bounds".into(),
         })?;
-        Ok(RequestInputAnswer {
-            value: answer.value.clone().unwrap_or_default(),
+        Ok(MenuAnswer {
+            menu: menu.id.clone(),
             option_key: Some(option.key.clone()),
+            option_index,
+            value: None,
+            via: AnswerVia::Hook,
         })
+    }
+
+    /// Every valid plan call has the same immediate provider-facing result.
+    #[must_use]
+    pub fn accepted_result(&self) -> PlanResult {
+        PlanResult {
+            decision: PLAN_DECISION_ACCEPT.into(),
+            note: String::new(),
+        }
     }
 }
 
@@ -137,7 +132,6 @@ impl Plan {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use haider_protocol::menu::AnswerVia;
 
     fn plan() -> Plan {
         Plan {
@@ -146,29 +140,16 @@ mod tests {
         }
     }
 
-    fn answer(menu: &Menu, key: &str, value: Option<&str>) -> MenuAnswer {
-        MenuAnswer {
-            menu: menu.id.clone(),
-            option_key: Some(key.into()),
-            option_index: menu
-                .options
-                .iter()
-                .position(|option| option.key == key)
-                .map(|index| u32::try_from(index).unwrap())
-                .unwrap_or(u32::MAX),
-            value: value.map(str::to_owned),
-            via: AnswerVia::Tui,
-        }
-    }
-
-    /// MUTATION CHECK: drop a decision option, change the origin tag, or stop
-    /// carrying the markdown body line by line. Expected RUNTIME failure.
+    /// MUTATION CHECK: make the presentation blocking, expose a human
+    /// decision, change the origin tag, or drop the markdown body. Expected
+    /// RUNTIME failure.
     #[test]
-    fn plan_menu_carries_document_and_fixed_decisions() {
-        let menu = plan().menu(MenuId::new("plan-1"));
+    fn plan_presentation_is_nonblocking_and_auto_accepts() {
+        let plan = plan();
+        let menu = plan.menu(MenuId::new("plan-1"));
         assert_eq!(menu.origin, PLAN_ORIGIN);
         assert_eq!(menu.kind, MenuKind::Choice);
-        assert!(menu.blocking);
+        assert!(!menu.blocking);
         assert_eq!(menu.body.len(), 4);
         assert_eq!(menu.body[0], "# Tiers");
         let keys: Vec<_> = menu
@@ -176,30 +157,21 @@ mod tests {
             .iter()
             .map(|option| option.key.as_str())
             .collect();
-        assert_eq!(keys, vec!["accept", "revise", "reject"]);
-    }
+        assert_eq!(keys, vec!["accept"]);
 
-    /// MUTATION CHECK: stop passing the note through, or accept an answer for
-    /// a different menu / unknown option. Expected RUNTIME failure.
-    #[test]
-    fn resolve_maps_decisions_and_carries_the_revise_note() {
-        let plan = plan();
-        let menu = plan.menu(MenuId::new("plan-2"));
-        let accepted = plan.resolve(&menu, &answer(&menu, "accept", None)).unwrap();
-        assert_eq!(accepted.option_key.as_deref(), Some("accept"));
-        assert!(accepted.value.is_empty());
-        let revised = plan
-            .resolve(&menu, &answer(&menu, "revise", Some("tighten tier 2")))
-            .unwrap();
-        assert_eq!(revised.option_key.as_deref(), Some("revise"));
-        assert_eq!(revised.value, "tighten tier 2");
-        let mut foreign = answer(&menu, "accept", None);
-        foreign.menu = MenuId::new("other");
-        assert!(plan.resolve(&menu, &foreign).is_err());
-        let mut ghost = answer(&menu, "accept", None);
-        ghost.option_key = Some("ship".into());
-        ghost.option_index = u32::MAX;
-        assert!(plan.resolve(&menu, &ghost).is_err());
+        let answer = plan.automatic_answer(&menu).unwrap();
+        assert_eq!(answer.menu, menu.id);
+        assert_eq!(answer.option_key.as_deref(), Some("accept"));
+        assert_eq!(answer.option_index, 0);
+        assert_eq!(answer.via, AnswerVia::Hook);
+
+        assert_eq!(
+            plan.accepted_result(),
+            PlanResult {
+                decision: "accept".into(),
+                note: String::new(),
+            }
+        );
     }
 
     /// MUTATION CHECK: drop a validation bound. Expected RUNTIME failure.
@@ -207,6 +179,11 @@ mod tests {
     fn args_validation_rejects_empty_and_oversized() {
         assert!(Plan::from_tool_args(serde_json::json!({"title": " ", "body": "x"})).is_err());
         assert!(Plan::from_tool_args(serde_json::json!({"title": "t", "body": ""})).is_err());
+        let oversized_title = "x".repeat(PLAN_TITLE_MAX_BYTES + 1);
+        assert!(
+            Plan::from_tool_args(serde_json::json!({"title": oversized_title, "body": "x"}))
+                .is_err()
+        );
         let oversized = "x".repeat(PLAN_BODY_MAX_BYTES + 1);
         assert!(
             Plan::from_tool_args(serde_json::json!({"title": "t", "body": oversized})).is_err()

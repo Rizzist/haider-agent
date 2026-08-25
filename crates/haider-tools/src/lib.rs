@@ -57,8 +57,7 @@ pub use mobile::{
     MobileResult, UnavailableMobileBackend, mobile_manifest, platform_mobile_backend,
 };
 pub use plan::{
-    PLAN_BODY_MAX_BYTES, PLAN_DECISION_ACCEPT, PLAN_DECISION_REJECT, PLAN_DECISION_REVISE,
-    PLAN_ORIGIN, PLAN_TITLE_MAX_BYTES, Plan,
+    PLAN_BODY_MAX_BYTES, PLAN_DECISION_ACCEPT, PLAN_ORIGIN, PLAN_TITLE_MAX_BYTES, Plan, PlanResult,
 };
 pub use process::{
     CommandOutputSink, NoopCommandOutputSink, PROCESS_OUTPUT_CHUNK_BYTES, ProcessBounds,

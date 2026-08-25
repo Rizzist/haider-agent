@@ -27,12 +27,13 @@
 //!
 //! General tool calls run through the injected [`ToolDispatcher`] (W3c);
 //! with no dispatcher installed they are surfaced completed-as-
-//! `ToolStatus::Pending`, the pre-W3c standalone behavior. `request_input`
-//! is the intentional exception: the actor owns its blocking menu round trip
-//! because only the actor may journal the session's
-//! `MenuOpened`/`MenuAnswered` and run-state envelopes. Event ids come from
-//! the [`EventIdGenerator`] namespace: supervisor-installed and shared with
-//! the effect journal in the daemon, self-minted in standalone use.
+//! `ToolStatus::Pending`, the pre-W3c standalone behavior. The actor owns the
+//! two presentation tools because only it may journal the session's menu and
+//! run-state envelopes: `request_input` keeps its blocking round trip, while
+//! `plan` journals an immediate automatic acceptance without parking. Event
+//! ids come from the [`EventIdGenerator`] namespace: supervisor-installed and
+//! shared with the effect journal in the daemon, self-minted in standalone
+//! use.
 
 use crate::{ArtifactReader, PromptHistoryCompiler, StoreHandle, unix_time_ms};
 use async_trait::async_trait;
@@ -81,7 +82,7 @@ use haider_provider::{
     ToolDefinition, TurnRequest, apply_tool_result_image_budget, canonical_tool_definitions_digest,
     degrade_tool_result_images_to_placeholders,
 };
-use haider_tools::{Plan, RequestInput, RequestInputAnswer, TodoWrite};
+use haider_tools::{Plan, RequestInput, TodoWrite};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -455,7 +456,7 @@ pub struct SubmitCommittedTurn {
     pub messages: Vec<Message>,
 }
 
-/// Durable `request_input` checkpoint reconstructed after daemon restart.
+/// Durable actor-owned menu checkpoint reconstructed after daemon restart.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RequestInputCheckpoint {
     pub menu: Menu,
@@ -463,8 +464,9 @@ pub struct RequestInputCheckpoint {
     pub opening_generation: u64,
     pub tool_item_id: ItemId,
     pub call_id: String,
-    /// `request_input` for question checkpoints, or the mutating tool whose
-    /// broker approval is waiting on the same durable menu CAS.
+    /// `request_input` for a blocking question, `plan` for an interrupted
+    /// automatic settlement, or the mutating tool whose broker approval is
+    /// waiting on the same durable menu CAS.
     pub tool_name: String,
     pub args: String,
 }
@@ -474,58 +476,6 @@ pub struct SubmitCheckpointTurn {
     pub run_id: RunId,
     pub messages: Vec<Message>,
     pub checkpoint: RequestInputCheckpoint,
-}
-
-/// The two actor-owned ask tools share one durable park/answer/resume loop;
-/// this small sum keeps their per-tool parsing, menus and result shapes typed.
-enum InputAsk {
-    Ask(RequestInput),
-    Plan(Plan),
-}
-
-impl InputAsk {
-    fn parse(name: &str, args: serde_json::Value) -> haider_tools::ToolResult<Self> {
-        if name == "plan" {
-            Plan::from_tool_args(args).map(Self::Plan)
-        } else {
-            RequestInput::from_tool_args(args).map(Self::Ask)
-        }
-    }
-
-    fn menu(&self, id: MenuId) -> Menu {
-        match self {
-            Self::Ask(request) => request.menu(id),
-            Self::Plan(plan) => plan.menu(id),
-        }
-    }
-
-    fn resolve(
-        &self,
-        menu: &Menu,
-        answer: &MenuAnswer,
-    ) -> haider_tools::ToolResult<RequestInputAnswer> {
-        match self {
-            Self::Ask(request) => request.resolve(menu, answer),
-            Self::Plan(plan) => plan.resolve(menu, answer),
-        }
-    }
-
-    /// The provider-facing result. `request_input` keeps its historical
-    /// `{value, option_key}` shape; `plan` answers `{decision, note}`.
-    fn result_json(&self, resolved: &RequestInputAnswer) -> String {
-        match self {
-            Self::Ask(_) => serde_json::json!({
-                "value": resolved.value,
-                "option_key": resolved.option_key,
-            })
-            .to_string(),
-            Self::Plan(_) => serde_json::json!({
-                "decision": resolved.option_key,
-                "note": (!resolved.value.is_empty()).then_some(resolved.value.as_str()),
-            })
-            .to_string(),
-        }
-    }
 }
 
 /// Durable post-content stream interruption reconstructed after restart.
@@ -5324,7 +5274,21 @@ impl HarnessActor {
     ) -> Result<Message, DriveError> {
         let args = parse_tool_args(&tools[index])?;
         let name = tools[index].name.clone();
-        let request = InputAsk::parse(&name, args).map_err(tool_error_to_drive)?;
+        if name == "plan" {
+            let plan = Plan::from_tool_args(args).map_err(tool_error_to_drive)?;
+            let menu = plan.menu(self.next_menu_id());
+            self.commit_payload(
+                run_id,
+                EventPayload::MenuOpened(menu.clone()),
+                prompt_omit_render(),
+            )
+            .await
+            .map_err(DriveError::Store)?;
+            return self
+                .complete_plan(run_id, tools, index, &plan, &menu, false)
+                .await;
+        }
+        let request = RequestInput::from_tool_args(args).map_err(tool_error_to_drive)?;
         let menu = request.menu(self.next_menu_id());
         self.commit_payload(
             run_id,
@@ -5346,6 +5310,57 @@ impl HarnessActor {
             .await
     }
 
+    /// Journals the automatic settlement of a presented plan and returns its
+    /// fixed accepted result without entering `InputRequired` or a wait loop.
+    async fn complete_plan(
+        &mut self,
+        run_id: &RunId,
+        tools: &mut Vec<ToolAccumulator>,
+        index: usize,
+        plan: &Plan,
+        menu: &Menu,
+        answer_already_committed: bool,
+    ) -> Result<Message, DriveError> {
+        if !answer_already_committed {
+            let answer = plan.automatic_answer(menu).map_err(tool_error_to_drive)?;
+            self.commit_payload(
+                run_id,
+                EventPayload::MenuAnswered(answer),
+                prompt_omit_render(),
+            )
+            .await
+            .map_err(DriveError::Store)?;
+        }
+        let result = serde_json::json!(plan.accepted_result()).to_string();
+        let call_id = tools[index].call_id.clone();
+        self.commit_payload(
+            run_id,
+            EventPayload::ToolResult {
+                call_id: call_id.clone(),
+                result: BoundedResult {
+                    preview: result.clone(),
+                    truncated: false,
+                    artifact: None,
+                    images: Vec::new(),
+                    cursor: None,
+                    status: ToolResultStatus::Completed,
+                    reason: None,
+                    presentation: None,
+                },
+            },
+            prompt_verbatim_render(),
+        )
+        .await
+        .map_err(DriveError::Store)?;
+        self.commit_tool_completed(run_id, &tools[index], ToolStatus::Completed)
+            .await?;
+        tools.remove(index);
+        self.commit_state(run_id, RunState::Streaming)
+            .await
+            .map_err(DriveError::Store)?;
+        Ok(Message::tool_result(call_id, result, false))
+    }
+
     async fn resume_request_input(
         &mut self,
         run_id: &RunId,
@@ -5356,7 +5371,24 @@ impl HarnessActor {
     ) -> Result<Message, DriveError> {
         let args = parse_tool_args(&tools[index])?;
         let name = tools[index].name.clone();
-        let request = InputAsk::parse(&name, args).map_err(tool_error_to_drive)?;
+        if name == "plan" {
+            let plan = Plan::from_tool_args(args).map_err(tool_error_to_drive)?;
+            let answer_already_committed = self
+                .committed_menus
+                .borrow_and_update()
+                .as_ref()
+                .is_some_and(|envelope| {
+                    serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+                        |payload| {
+                            matches!(payload, EventPayload::MenuAnswered(answer) if answer.menu == menu.id)
+                        },
+                    )
+                });
+            return self
+                .complete_plan(run_id, tools, index, &plan, &menu, answer_already_committed)
+                .await;
+        }
+        let request = RequestInput::from_tool_args(args).map_err(tool_error_to_drive)?;
         self.wait_for_request_input(run_id, tools, index, cancel, request, menu)
             .await
     }
@@ -5578,7 +5610,7 @@ impl HarnessActor {
         tools: &mut Vec<ToolAccumulator>,
         index: usize,
         cancel: &CancelToken,
-        request: InputAsk,
+        request: RequestInput,
         menu: Menu,
     ) -> Result<Message, DriveError> {
         loop {
@@ -5729,7 +5761,11 @@ impl HarnessActor {
                 }
                 return Err(DriveError::Store(error));
             }
-            let result = request.result_json(&resolved);
+            let result = serde_json::json!({
+                "value": resolved.value,
+                "option_key": resolved.option_key,
+            })
+            .to_string();
             let call_id = tools[index].call_id.clone();
             if let Err(error) = self
                 .commit_payload(
