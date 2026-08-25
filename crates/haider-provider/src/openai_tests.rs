@@ -858,6 +858,7 @@ async fn metadata_origin_guard_prevents_credential_bearing_request() {
         chat_url: endpoints.chat_url,
         models_url: endpoints.models_url,
         dialect: CompatibleDialect::Generic,
+        catalog_model: None,
         kimi_thinking: None,
         kimi_reasoning_effort: None,
     };
@@ -900,6 +901,111 @@ fn compatible_provider_with_resolver(
     OpenAiCompatibleProvider::new_with_dns_resolver(credential, "audit-model", base_url, resolver)
         .expect("construct compatible provider")
         .with_account(alias)
+}
+
+/// A session turn already carries its pinned wire model. Generic compatible
+/// capability resolution must therefore remain local: its `/models` shape
+/// contributes only membership, and an invalid pinned model belongs to the
+/// subsequent chat response.
+///
+/// MUTATION CHECK: restore `probe_capabilities()` for the generic dialect.
+/// Expected runtime failure: the resolver call count becomes one before the
+/// guarded models request is refused.
+#[tokio::test]
+async fn pinned_compatible_capabilities_do_not_discover_models() {
+    let resolver = Arc::new(StubDnsResolver::new([vec![SocketAddr::from((
+        [169, 254, 169, 254],
+        443,
+    ))]]));
+    let provider = compatible_provider_with_resolver(
+        b"pinned-model-sentinel",
+        "https://models-pinned.test",
+        Arc::clone(&resolver),
+    );
+
+    let capabilities = Provider::capabilities(&provider).await;
+    assert_eq!(
+        capabilities,
+        compatible_capabilities(OPENAI_COMPATIBLE_PROVIDER_NAME)
+    );
+    assert_eq!(resolver.calls(), 0, "pinned turns must not discover");
+}
+
+/// Kimi and Grok publish richer per-model facts than a generic compatible
+/// list. Pinned turns consume those facts from the daemon's typed catalog
+/// cache and still perform no request-time discovery.
+#[tokio::test]
+async fn pinned_subscription_capabilities_use_cached_catalog_without_discovery() {
+    let kimi_model = crate::parse_catalog(
+        CatalogSource::KimiOAuth,
+        &serde_json::from_slice(include_bytes!("../tests/fixtures/catalog/kimi_models.json"))
+            .expect("decode Kimi catalog fixture"),
+    )
+    .expect("parse Kimi catalog fixture")
+    .into_iter()
+    .find(|model| model.slug == "kimi-coding-a")
+    .expect("Kimi fixture model");
+    let kimi_resolver = Arc::new(StubDnsResolver::new([vec![SocketAddr::from((
+        [169, 254, 169, 254],
+        443,
+    ))]]));
+    let kimi_vault = MemoryVault::new();
+    let kimi_alias = CredentialAlias::new("pinned-kimi-capabilities");
+    kimi_vault
+        .put(&kimi_alias, b"KIMI_PINNED_SENTINEL_2c91")
+        .expect("store Kimi fixture credential");
+    let kimi = OpenAiCompatibleProvider::new_kimi_subscription_with_dns_resolver(
+        kimi_vault
+            .resolve(&kimi_alias)
+            .expect("resolve Kimi fixture credential"),
+        "kimi-coding-a",
+        KIMI_OAUTH_BASE_URL,
+        Arc::clone(&kimi_resolver),
+    )
+    .expect("construct Kimi adapter")
+    .with_cached_catalog_model(Some(&kimi_model));
+    assert_eq!(
+        Provider::capabilities(&kimi).await,
+        kimi_capabilities_from_model(&kimi_model).expect("Kimi cached capabilities")
+    );
+    assert_eq!(kimi_resolver.calls(), 0, "pinned Kimi must not discover");
+
+    let grok_model = crate::parse_catalog(
+        CatalogSource::GrokOAuth,
+        &serde_json::json!({"data": [{
+            "id": "grok-pinned",
+            "context_window": 500_000,
+            "supports_reasoning_effort": true
+        }]}),
+    )
+    .expect("parse Grok catalog fixture")
+    .into_iter()
+    .next()
+    .expect("Grok fixture model");
+    let grok_resolver = Arc::new(StubDnsResolver::new([vec![SocketAddr::from((
+        [169, 254, 169, 254],
+        443,
+    ))]]));
+    let grok_vault = MemoryVault::new();
+    let grok_alias = CredentialAlias::new("pinned-grok-capabilities");
+    grok_vault
+        .put(&grok_alias, b"GROK_PINNED_SENTINEL_a032")
+        .expect("store Grok fixture credential");
+    let grok = OpenAiCompatibleProvider::new_grok_subscription_with_dns_resolver(
+        grok_vault
+            .resolve(&grok_alias)
+            .expect("resolve Grok fixture credential"),
+        "grok-pinned",
+        GROK_OAUTH_BASE_URL,
+        Arc::clone(&grok_resolver),
+    )
+    .expect("construct Grok adapter")
+    .with_cached_catalog_model(Some(&grok_model));
+    assert_eq!(
+        Provider::capabilities(&grok).await,
+        grok_capabilities_from_model(&grok_model)
+    );
+    assert_eq!(grok_resolver.calls(), 0, "pinned Grok must not discover");
 }
 
 /// LAW (LK1 golden half — the placeholder Bearer is SENT): a custom adapter

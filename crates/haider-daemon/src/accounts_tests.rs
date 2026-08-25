@@ -335,6 +335,7 @@ fn wh1_deepseek_factory_builds_api_key_adapter() {
         &alias,
         &ProviderTuning::default(),
         None,
+        None,
     )
     .expect("build DeepSeek adapter");
     assert_eq!(
@@ -351,6 +352,7 @@ fn wh1_deepseek_factory_builds_api_key_adapter() {
         "deepseek-reasoner",
         &alias,
         &ProviderTuning::default(),
+        None,
         None,
     );
     let Err(oauth) = oauth else {
@@ -381,6 +383,7 @@ fn haider_code_factory_builds_only_the_api_key_adapter() {
         &alias,
         &ProviderTuning::default(),
         None,
+        None,
     )
     .expect("build Haider Code adapter");
     assert_eq!(
@@ -399,6 +402,7 @@ fn haider_code_factory_builds_only_the_api_key_adapter() {
         "Go",
         &alias,
         &ProviderTuning::default(),
+        None,
         None,
     );
     assert!(matches!(oauth, Err(error) if error.code == ErrorCode::InvalidArgument));
@@ -1829,6 +1833,7 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         "gpt-oauth",
         &wrong_alias,
         &crate::accounts::ProviderTuning::default(),
+        None,
         None,
     );
     let Err(error) = result else {
