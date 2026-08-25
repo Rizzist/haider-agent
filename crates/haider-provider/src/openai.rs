@@ -880,6 +880,9 @@ pub struct OpenAiCompatibleProvider {
     chat_url: String,
     models_url: String,
     dialect: CompatibleDialect,
+    /// Provider-declared facts from the daemon's durable catalog cache for
+    /// this already-pinned model. Turn startup must never refetch them.
+    catalog_model: Option<crate::DiscoveredModel>,
     kimi_thinking: Option<KimiThinkingConfig>,
     /// Kimi k3-style top-level `reasoning_effort` (G3): always-thinking
     /// models whose catalog declares an effort ladder but NO thinking-type
@@ -1007,6 +1010,7 @@ impl OpenAiCompatibleProvider {
             chat_url: endpoints.chat_url,
             models_url: endpoints.models_url,
             dialect: CompatibleDialect::Generic,
+            catalog_model: None,
             kimi_thinking: None,
             kimi_reasoning_effort: None,
         })
@@ -1052,6 +1056,7 @@ impl OpenAiCompatibleProvider {
             chat_url: endpoints.chat_url,
             models_url: endpoints.models_url,
             dialect: CompatibleDialect::Generic,
+            catalog_model: None,
             kimi_thinking: None,
             kimi_reasoning_effort: None,
         })
@@ -1082,6 +1087,7 @@ impl OpenAiCompatibleProvider {
             chat_url: endpoints.chat_url,
             models_url: endpoints.models_url,
             dialect: CompatibleDialect::KimiOAuth,
+            catalog_model: None,
             kimi_thinking: None,
             kimi_reasoning_effort: None,
         })
@@ -1114,6 +1120,7 @@ impl OpenAiCompatibleProvider {
             chat_url: endpoints.chat_url,
             models_url: endpoints.models_url,
             dialect: CompatibleDialect::KimiOAuth,
+            catalog_model: None,
             kimi_thinking: None,
             kimi_reasoning_effort: None,
         })
@@ -1147,6 +1154,7 @@ impl OpenAiCompatibleProvider {
             chat_url,
             models_url,
             dialect: CompatibleDialect::DeepSeekApi,
+            catalog_model: None,
             kimi_thinking: None,
             kimi_reasoning_effort: None,
         })
@@ -1180,6 +1188,7 @@ impl OpenAiCompatibleProvider {
             chat_url,
             models_url,
             dialect: CompatibleDialect::DeepSeekApi,
+            catalog_model: None,
             kimi_thinking: None,
             kimi_reasoning_effort: None,
         })
@@ -1228,6 +1237,7 @@ impl OpenAiCompatibleProvider {
             chat_url: endpoints.chat_url,
             models_url: endpoints.models_url,
             dialect: CompatibleDialect::XaiApi,
+            catalog_model: None,
             kimi_thinking: None,
             kimi_reasoning_effort: None,
         })
@@ -1280,6 +1290,7 @@ impl OpenAiCompatibleProvider {
             chat_url: endpoints.chat_url,
             models_url: endpoints.models_url,
             dialect: CompatibleDialect::HaiderCodeApi,
+            catalog_model: None,
             kimi_thinking: None,
             kimi_reasoning_effort: None,
         })
@@ -1328,6 +1339,7 @@ impl OpenAiCompatibleProvider {
             chat_url: endpoints.chat_url,
             models_url: endpoints.models_url,
             dialect,
+            catalog_model: None,
             kimi_thinking: None,
             kimi_reasoning_effort: None,
         })
@@ -1361,6 +1373,7 @@ impl OpenAiCompatibleProvider {
             chat_url: endpoints.chat_url,
             models_url: endpoints.models_url,
             dialect: CompatibleDialect::GrokOAuth,
+            catalog_model: None,
             kimi_thinking: None,
             kimi_reasoning_effort: None,
         })
@@ -1408,6 +1421,19 @@ impl OpenAiCompatibleProvider {
         self
     }
 
+    /// Supplies the already-discovered record for this pinned model.
+    ///
+    /// Kimi and Grok publish capability facts in their catalogs. The daemon
+    /// hydrates this record from its durable catalog cache, so ordinary turn
+    /// startup can retain those facts without issuing another `/models`
+    /// request. A stale/mismatched record is ignored and never substitutes a
+    /// different model for the caller's explicit selection.
+    #[must_use]
+    pub fn with_cached_catalog_model(mut self, model: Option<&crate::DiscoveredModel>) -> Self {
+        self.catalog_model = model.filter(|model| model.slug == self.http.model).cloned();
+        self
+    }
+
     #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
@@ -1431,9 +1457,13 @@ impl OpenAiCompatibleProvider {
         )
     }
 
-    /// Probes `GET /models` and derives only conservative capabilities from
-    /// the presence and name of the configured model. The models endpoint does
-    /// not itself prove tool/vision/reasoning support.
+    /// Explicitly probes `GET /models` for discovery-backed capability facts.
+    ///
+    /// Ordinary pinned turns do not use this merely to validate model
+    /// membership: the chat request is the authority for an explicitly
+    /// selected model. Kimi and Grok receive any richer capability facts
+    /// from the daemon's cached catalog through
+    /// [`Self::with_cached_catalog_model`].
     pub async fn probe_capabilities(&self) -> Result<CapabilityDoc, ProviderError> {
         let response = self.http.get(&self.models_url).await?;
         if !response.status().is_success() {
@@ -1622,9 +1652,31 @@ impl Provider for OpenAiCompatibleProvider {
             CompatibleDialect::XaiApi => XAI_PROVIDER_NAME,
             CompatibleDialect::GrokOAuth => GROK_OAUTH_PROVIDER_NAME,
         };
-        self.probe_capabilities()
-            .await
-            .unwrap_or_else(|_| unavailable_compatible_capabilities(provider))
+        match self.dialect {
+            // These catalogs contribute model-specific capability facts, so
+            // consume the daemon's typed cache rather than refetching during
+            // a pinned turn. Missing/stale facts degrade locally; they never
+            // trigger model substitution or request-time discovery.
+            CompatibleDialect::KimiOAuth => self
+                .catalog_model
+                .as_ref()
+                .and_then(|model| kimi_capabilities_from_model(model).ok())
+                .unwrap_or_else(|| unavailable_compatible_capabilities(provider)),
+            CompatibleDialect::GrokOAuth => self
+                .catalog_model
+                .as_ref()
+                .map(grok_capabilities_from_model)
+                .unwrap_or_else(|| unavailable_compatible_capabilities(provider)),
+            // For every other compatible dialect a successful /models probe
+            // returns this exact conservative document and contributes only
+            // a membership check. Session models are already pinned before a
+            // turn reaches the adapter, so avoid the redundant request and
+            // let the chat endpoint report an invalid explicit model.
+            CompatibleDialect::Generic
+            | CompatibleDialect::DeepSeekApi
+            | CompatibleDialect::HaiderCodeApi
+            | CompatibleDialect::XaiApi => compatible_capabilities(provider),
+        }
     }
 
     async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError> {
@@ -3247,10 +3299,15 @@ pub fn replay_grok_models_response(
         .into_iter()
         .find(|entry| entry.slug == model)
         .ok_or_else(|| invalid_request("Grok does not advertise the configured model"))?;
+    Ok(grok_capabilities_from_model(&model))
+}
+
+fn grok_capabilities_from_model(model: &crate::DiscoveredModel) -> CapabilityDoc {
     let reasoning = model
         .extensions
+        .as_ref()
         .is_some_and(|extension| extension.supports_reasoning_effort);
-    Ok(CapabilityDoc {
+    CapabilityDoc {
         provider: GROK_OAUTH_PROVIDER_NAME.into(),
         parallel_tools: FeatureResolve::Unsupported,
         streaming_tool_args: FeatureResolve::Unsupported,
@@ -3262,7 +3319,7 @@ pub fn replay_grok_models_response(
             FeatureResolve::Unsupported
         },
         context_limit: model.context_window.unwrap_or(0),
-    })
+    }
 }
 
 fn replay_compatible_models_response(
@@ -3297,8 +3354,15 @@ pub fn replay_kimi_models_response(
         .into_iter()
         .find(|entry| entry.slug == model)
         .ok_or_else(|| invalid_request("Kimi does not advertise the configured model"))?;
+    kimi_capabilities_from_model(&model)
+}
+
+fn kimi_capabilities_from_model(
+    model: &crate::DiscoveredModel,
+) -> Result<CapabilityDoc, ProviderError> {
     let extensions = model
         .extensions
+        .as_ref()
         .ok_or_else(|| malformed("Kimi model capability flags are missing"))?;
     Ok(CapabilityDoc {
         provider: KIMI_OAUTH_PROVIDER_NAME.into(),
@@ -4850,9 +4914,9 @@ fn native_capabilities(model: &str) -> CapabilityDoc {
 fn compatible_capabilities(provider: &str) -> CapabilityDoc {
     CapabilityDoc {
         provider: provider.into(),
-        // The models endpoint proves availability only. The generic OpenAI schema
-        // carries none of these feature or limit facts, so do not infer them
-        // from a vendor-controlled model identifier.
+        // The generic OpenAI schema and its model-list shape carry none of
+        // these feature or limit facts, so do not infer them from a
+        // vendor-controlled model identifier.
         parallel_tools: FeatureResolve::Unsupported,
         streaming_tool_args: FeatureResolve::Unsupported,
         vision: FeatureResolve::Unsupported,

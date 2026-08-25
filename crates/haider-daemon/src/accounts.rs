@@ -48,11 +48,12 @@ use haider_protocol::ids::CredentialAlias;
 use haider_provider::{
     ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, AnthropicProvider,
     BEDROCK_PROVIDER_NAME, BUILTIN_PROVIDER_NAMES, CatalogError, CatalogSource, DEEPSEEK_BASE_URL,
-    DEEPSEEK_PROVIDER_NAME, DiscoveredCatalog, GEMINI_PROVIDER_NAME, GROK_OAUTH_PROVIDER_NAME,
-    GeminiProvider, HAIDER_CODE_BASE_URL, HAIDER_CODE_PROVIDER_NAME, KIMI_OAUTH_PROVIDER_NAME,
-    Message, OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME,
-    OpenAiCompatibleProvider, OpenAiProvider, Provider, ProviderErrorKind, TurnRequest,
-    VERTEX_PROVIDER_NAME, XAI_BASE_URL, XAI_PROVIDER_NAME, azure_openai_origin, discover_models,
+    DEEPSEEK_PROVIDER_NAME, DiscoveredCatalog, DiscoveredModel, GEMINI_PROVIDER_NAME,
+    GROK_OAUTH_PROVIDER_NAME, GeminiProvider, HAIDER_CODE_BASE_URL, HAIDER_CODE_PROVIDER_NAME,
+    KIMI_OAUTH_PROVIDER_NAME, Message, OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME,
+    OPENAI_PROVIDER_NAME, OpenAiCompatibleProvider, OpenAiProvider, Provider, ProviderErrorKind,
+    TurnRequest, VERTEX_PROVIDER_NAME, XAI_BASE_URL, XAI_PROVIDER_NAME, azure_openai_origin,
+    discover_models,
 };
 use haider_rpc::{
     ERROR_CODE_BUSY, ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_INVALID_ARGUMENT,
@@ -6038,6 +6039,7 @@ pub trait AccountProviderBuilder: Send + Sync {
 
     /// CM2 Gemini resource ownership. Injected builders remain source
     /// compatible and ignore the registry through this default.
+    #[allow(clippy::too_many_arguments)]
     fn build_tuned_with_cache(
         &self,
         profile: Option<&ProviderSummaryWire>,
@@ -6045,8 +6047,10 @@ pub trait AccountProviderBuilder: Send + Sync {
         credential: haider_accounts::SecretHandle,
         model: &str,
         tuning: &ProviderTuning,
+        catalog_model: Option<&DiscoveredModel>,
         gemini_cache_registry: Arc<haider_provider::GeminiCacheRegistry>,
     ) -> Result<Arc<dyn Provider>, HaiderError> {
+        let _ = catalog_model;
         let _ = gemini_cache_registry;
         self.build_tuned(profile, descriptor, credential, model, tuning)
     }
@@ -6080,6 +6084,7 @@ impl AccountProviderBuilder for ProductionAccountBuilder {
             alias,
             &ProviderTuning::default(),
             None,
+            None,
         )
     }
 
@@ -6098,6 +6103,7 @@ impl AccountProviderBuilder for ProductionAccountBuilder {
             model,
             &descriptor.alias,
             &ProviderTuning::default(),
+            None,
             None,
         )
     }
@@ -6118,6 +6124,7 @@ impl AccountProviderBuilder for ProductionAccountBuilder {
             model,
             &descriptor.alias,
             &ProviderTuning::default(),
+            None,
             None,
         )
     }
@@ -6140,9 +6147,11 @@ impl AccountProviderBuilder for ProductionAccountBuilder {
             &descriptor.alias,
             tuning,
             None,
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_tuned_with_cache(
         &self,
         profile: Option<&ProviderSummaryWire>,
@@ -6150,6 +6159,7 @@ impl AccountProviderBuilder for ProductionAccountBuilder {
         credential: haider_accounts::SecretHandle,
         model: &str,
         tuning: &ProviderTuning,
+        catalog_model: Option<&DiscoveredModel>,
         gemini_cache_registry: Arc<haider_provider::GeminiCacheRegistry>,
     ) -> Result<Arc<dyn Provider>, HaiderError> {
         build_account_provider(
@@ -6161,6 +6171,7 @@ impl AccountProviderBuilder for ProductionAccountBuilder {
             model,
             &descriptor.alias,
             tuning,
+            catalog_model,
             Some(gemini_cache_registry),
         )
     }
@@ -6176,6 +6187,7 @@ fn build_account_provider(
     model: &str,
     alias: &CredentialAlias,
     tuning: &ProviderTuning,
+    catalog_model: Option<&DiscoveredModel>,
     gemini_cache_registry: Option<Arc<haider_provider::GeminiCacheRegistry>>,
 ) -> Result<Arc<dyn Provider>, HaiderError> {
     let compatible_base_url = account_openai_compatible_base_url(provider, profile, base_url);
@@ -6407,7 +6419,8 @@ fn build_account_provider(
                 inference.base_url,
             )
             .map_err(|error| adapter_construction_error(provider, error))?
-            .with_account(alias.clone());
+            .with_account(alias.clone())
+            .with_cached_catalog_model(catalog_model);
             // G3: inject ONLY what the kimi catalog declared for this model
             // (think_efforts membership), in the shape it declared: models
             // with a thinking-type toggle take `thinking.effort`; k3-style
@@ -6461,7 +6474,8 @@ fn build_account_provider(
                     inference.base_url,
                 )
                 .map_err(|error| adapter_construction_error(provider, error))?
-                .with_account(alias.clone()),
+                .with_account(alias.clone())
+                .with_cached_catalog_model(catalog_model),
             )
         }
         _ => {
@@ -6662,6 +6676,7 @@ fn provider_tuning_with_web_degrade(
 pub(crate) struct AccountsProviderFactory {
     snapshot: AccountsSnapshot,
     management: Option<ManagementSnapshot>,
+    model_source: Option<Arc<CachedProviderModelSource>>,
     vault: VaultProvision,
     builder: Arc<dyn AccountProviderBuilder>,
     broker: Option<CredentialBroker>,
@@ -6700,6 +6715,7 @@ impl AccountsProviderFactory {
         Self {
             snapshot,
             management: None,
+            model_source: None,
             vault,
             builder,
             broker: None,
@@ -6717,6 +6733,7 @@ impl AccountsProviderFactory {
         Self {
             snapshot,
             management: None,
+            model_source: None,
             vault,
             builder,
             broker: Some(broker),
@@ -6734,6 +6751,7 @@ impl AccountsProviderFactory {
         Self {
             snapshot,
             management: Some(management),
+            model_source: None,
             vault,
             builder,
             broker: None,
@@ -6752,6 +6770,7 @@ impl AccountsProviderFactory {
         Self {
             snapshot,
             management: Some(management),
+            model_source: None,
             vault,
             builder,
             broker: Some(broker),
@@ -6762,6 +6781,17 @@ impl AccountsProviderFactory {
 
     pub(crate) fn with_resilience(mut self, resilience: AccountsResilienceConfig) -> Self {
         self.resilience = resilience;
+        self
+    }
+
+    /// Shares the daemon's typed durable-catalog projection with per-turn
+    /// adapters. This is capability metadata only: the session's pinned
+    /// model remains authoritative even when no matching record exists.
+    pub(crate) fn with_model_source(
+        mut self,
+        model_source: Arc<CachedProviderModelSource>,
+    ) -> Self {
+        self.model_source = Some(model_source);
         self
     }
 
@@ -6891,12 +6921,22 @@ impl AccountsProviderFactory {
         tuning: &ProviderTuning,
     ) -> Result<Arc<dyn Provider>, HaiderError> {
         let profile = self.provider_profile(&descriptor.provider);
+        let catalog_model = self
+            .model_source
+            .as_ref()
+            .and_then(|source| source.models(&descriptor.provider))
+            .and_then(|models| {
+                models
+                    .into_iter()
+                    .find(|model| model.slug == metadata.model)
+            });
         self.builder.build_tuned_with_cache(
             profile.as_ref(),
             descriptor,
             credential,
             &metadata.model,
             tuning,
+            catalog_model.as_ref(),
             Arc::clone(&self.gemini_cache_registry),
         )
     }
@@ -8282,6 +8322,10 @@ async fn finalize_reconciled(
 pub(crate) struct AccountsRuntime {
     pub facade: AccountsFacade,
     pub actor: Option<AccountActorHandle>,
+    /// Typed projection of the durable provider catalog, shared with the
+    /// turn factory so pinned adapters never need to refetch capability
+    /// metadata.
+    pub model_source: Arc<CachedProviderModelSource>,
     /// The vault provision the production provider factory shares.
     pub vault: VaultProvision,
     pub broker: Option<CredentialBroker>,
@@ -8509,6 +8553,7 @@ impl AccountsRuntime {
                         vault: Some(Arc::clone(scoped)),
                     },
                     actor: Some(actor),
+                    model_source: Arc::clone(&model_source),
                     vault,
                     broker: Some(broker),
                     resilience,
@@ -8531,6 +8576,7 @@ impl AccountsRuntime {
                         vault: None,
                     },
                     actor: Some(actor),
+                    model_source: Arc::clone(&model_source),
                     vault: VaultProvision::Unsupported,
                     broker: None,
                     resilience,

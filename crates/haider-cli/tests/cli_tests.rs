@@ -15,6 +15,8 @@ use std::net::{TcpListener, TcpStream};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -303,6 +305,7 @@ fn spawn_compatible_proxy(
 ) -> (
     String,
     std::sync::mpsc::Receiver<serde_json::Value>,
+    Arc<AtomicUsize>,
     thread::JoinHandle<()>,
 ) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind compatible proxy");
@@ -311,6 +314,8 @@ fn spawn_compatible_proxy(
         listener.local_addr().expect("proxy address")
     );
     let (captured, receiver) = std::sync::mpsc::channel();
+    let model_list_requests = Arc::new(AtomicUsize::new(0));
+    let observed_model_list_requests = Arc::clone(&model_list_requests);
     let task = thread::spawn(move || {
         for incoming in listener.incoming() {
             let mut stream = incoming.expect("accept proxy request");
@@ -328,6 +333,7 @@ fn spawn_compatible_proxy(
                 return;
             }
             if request_line.contains("/models") {
+                observed_model_list_requests.fetch_add(1, Ordering::SeqCst);
                 match catalog {
                     Some(body) => {
                         write_http_response(&mut stream, "200 OK", "application/json", body)
@@ -344,7 +350,7 @@ fn spawn_compatible_proxy(
             }
         }
     });
-    (origin, receiver, task)
+    (origin, receiver, model_list_requests, task)
 }
 
 fn run_custom_model_wire_case(
@@ -352,7 +358,7 @@ fn run_custom_model_wire_case(
     explicit_model: Option<&str>,
     cached_models: &[&str],
     catalog: Option<&'static [u8]>,
-) -> serde_json::Value {
+) -> (serde_json::Value, usize) {
     let mut command = haider();
     // This case exercises the REAL OpenAI-compatible HTTP path against a fake
     // proxy to capture the wire model. The default fake-provider script the
@@ -361,7 +367,7 @@ fn run_custom_model_wire_case(
     command.env_remove("HAIDER_TEST_FAKE_PROVIDER");
     #[cfg(unix)]
     let _endpoint = configure_isolated_runtime(&mut command);
-    let (origin, captured, proxy) = spawn_compatible_proxy(catalog);
+    let (origin, captured, model_list_requests, proxy) = spawn_compatible_proxy(catalog);
     std::fs::create_dir_all(&command.profile).expect("profile directory");
     std::fs::write(
         command.profile.join("config.json"),
@@ -429,7 +435,7 @@ fn run_custom_model_wire_case(
         .recv_timeout(Duration::from_secs(10))
         .expect("captured chat request");
     proxy.join().expect("proxy joins");
-    request
+    (request, model_list_requests.load(Ordering::SeqCst))
 }
 
 #[cfg(unix)]
@@ -947,9 +953,11 @@ fn one_shot_never_shuts_down_a_prestarted_incumbent() {
 }
 
 /// MUTATION CHECK: drop the profile-default fallback, restore catalog-first
-/// substitution, restore the custom summary membership filter, or bypass the
-/// selector path. Expected runtime failure: the captured OpenAI-compatible
-/// chat body contains `canonical-other`, a provider prefix, or no request.
+/// substitution, restore the custom summary membership filter, bypass the
+/// selector path, or restore the per-turn model-list membership probe.
+/// Expected runtime failure: the captured OpenAI-compatible chat body contains
+/// `canonical-other`, a provider prefix, no request, or a discovery count is
+/// nonzero.
 #[test]
 fn configured_custom_model_reaches_chat_wire_verbatim_despite_catalog() {
     const CATALOG: &[u8] =
@@ -963,32 +971,37 @@ fn configured_custom_model_reaches_chat_wire_verbatim_despite_catalog() {
         Err(error) => panic!("probe compatible proxy bind: {error}"),
     }
 
-    let unqualified = run_custom_model_wire_case(
+    let (unqualified, unqualified_discoveries) = run_custom_model_wire_case(
         "deepseek-v4-flash",
         None,
         &["canonical-other"],
         Some(CATALOG),
     );
     assert_eq!(unqualified["model"], "deepseek-v4-flash");
+    assert_eq!(unqualified_discoveries, 0);
 
-    let qualified = run_custom_model_wire_case(
+    let (qualified, qualified_discoveries) = run_custom_model_wire_case(
         "bench-proxy/deepseek-v4-flash",
         None,
         &["canonical-other"],
         Some(CATALOG),
     );
     assert_eq!(qualified["model"], "deepseek-v4-flash");
+    assert_eq!(qualified_discoveries, 0);
 
-    let explicit = run_custom_model_wire_case(
+    let (explicit, explicit_discoveries) = run_custom_model_wire_case(
         "bench-proxy/deepseek-v4-flash",
         Some("explicit-wire-model"),
         &["canonical-other"],
         Some(CATALOG),
     );
     assert_eq!(explicit["model"], "explicit-wire-model");
+    assert_eq!(explicit_discoveries, 0);
 
-    let no_catalog = run_custom_model_wire_case("bench-proxy/deepseek-v4-flash", None, &[], None);
+    let (no_catalog, no_catalog_discoveries) =
+        run_custom_model_wire_case("bench-proxy/deepseek-v4-flash", None, &[], None);
     assert_eq!(no_catalog["model"], "deepseek-v4-flash");
+    assert_eq!(no_catalog_discoveries, 0);
 }
 
 /// MUTATION CHECK: make print depend on a TTY/TERM, leak progress to stdout,
