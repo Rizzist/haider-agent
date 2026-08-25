@@ -27,6 +27,7 @@ pub mod image;
 pub mod item;
 pub mod loom;
 pub mod menu;
+pub mod mobile;
 pub mod permission;
 pub mod pipe;
 pub mod project_instructions;

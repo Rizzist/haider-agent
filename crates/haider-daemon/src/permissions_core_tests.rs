@@ -115,6 +115,7 @@ fn canonical_inventory_equals_advertised_dispatchable_set() {
     assert!(advertised.contains(&"process_exec"));
     assert!(advertised.contains(&"message_subagent"));
     assert!(advertised.contains(&"computer"));
+    assert!(advertised.contains(&"mobile"));
     assert!(!advertised.contains(&"exec"));
     assert!(
         advertised
@@ -149,6 +150,10 @@ fn canonical_inventory_equals_advertised_dispatchable_set() {
     assert_eq!(
         registered_tool_route("computer"),
         Some(RegisteredToolRoute::Computer)
+    );
+    assert_eq!(
+        registered_tool_route("mobile"),
+        Some(RegisteredToolRoute::Mobile)
     );
 }
 
@@ -286,6 +291,10 @@ fn session_permission_overrides_replace_only_write_and_exec_ask_defaults() {
         decision(&baseline, EffectClass::ScreenControl),
         ToolPermissionDefault::Ask
     );
+    assert_eq!(
+        decision(&baseline, EffectClass::ReadSms),
+        ToolPermissionDefault::Ask
+    );
 
     let writes = metadata(Some(SessionPermissionOverridesV1 {
         allow_writes: true,
@@ -323,6 +332,11 @@ fn session_permission_overrides_replace_only_write_and_exec_ask_defaults() {
         decision(&exec, EffectClass::ScreenControl),
         ToolPermissionDefault::Ask,
         "allow_exec must never imply screen control"
+    );
+    assert_eq!(
+        decision(&exec, EffectClass::ReadSms),
+        ToolPermissionDefault::Ask,
+        "allow_exec must never imply SMS access"
     );
 }
 
@@ -368,6 +382,7 @@ fn auto_allow_promotes_every_ask_class_including_computer_and_fetch() {
         decision(EffectClass::ScreenControl),
         ToolPermissionDefault::Allow
     );
+    assert_eq!(decision(EffectClass::ReadSms), ToolPermissionDefault::Allow);
     assert_eq!(decision(EffectClass::FsWrite), ToolPermissionDefault::Allow);
     assert_eq!(
         decision(EffectClass::ProcessExec),
@@ -583,7 +598,7 @@ async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
     // FsWrite grant, not the workflow-author grant, so it must not surface.
     let registry: Vec<_> = registered_tools()
         .into_iter()
-        .filter(|entry| entry.manifest.name != "workflow_author")
+        .filter(|entry| !matches!(entry.manifest.name.as_str(), "workflow_author" | "mobile"))
         .collect();
     assert_eq!(snapshot.tools.len(), registry.len());
     for (projected, registered) in snapshot.tools.iter().zip(registry) {
@@ -609,6 +624,13 @@ fn computer_is_absent_from_default_child_grant() {
     assert!(!grant.tools.iter().any(|tool| tool == "computer"));
     assert!(!grant.effect_ceiling.contains(&EffectClass::ScreenObserve));
     assert!(!grant.effect_ceiling.contains(&EffectClass::ScreenControl));
+}
+
+#[test]
+fn mobile_is_absent_from_default_child_grant() {
+    let grant = crate::worker::default_child_grant();
+    assert!(!grant.tools.iter().any(|tool| tool == "mobile"));
+    assert!(!grant.effect_ceiling.contains(&EffectClass::ReadSms));
 }
 
 /// MUTATION CHECK: ignore terminal freshness or use first-write-wins during

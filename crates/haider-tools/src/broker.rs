@@ -44,7 +44,7 @@
 //!   same session-scoped outcomes before the next turn creates its dispatcher.
 
 use crate::process::ProcessRegistry;
-use crate::{ComputerCancelToken, ToolError, ToolResult};
+use crate::{ComputerCancelToken, MobileCancelToken, ToolError, ToolResult};
 use async_trait::async_trait;
 use haider_protocol::EventPayload;
 use haider_protocol::effect::{
@@ -877,6 +877,7 @@ pub struct EffectBroker {
     finalizers: tokio::task::JoinSet<(u64, Option<ToolError>)>,
     observed_finalizers: Arc<Mutex<HashSet<u64>>>,
     computer_cancellations: HashMap<EffectId, ComputerCancelToken>,
+    mobile_cancellations: HashMap<EffectId, MobileCancelToken>,
     pub(crate) processes: ProcessRegistry,
 }
 
@@ -942,6 +943,7 @@ impl EffectBroker {
             finalizers: tokio::task::JoinSet::new(),
             observed_finalizers: Arc::new(Mutex::new(HashSet::new())),
             computer_cancellations: HashMap::new(),
+            mobile_cancellations: HashMap::new(),
             processes: ProcessRegistry::default(),
         })
     }
@@ -1047,6 +1049,10 @@ impl EffectBroker {
                     .computer_cancellations
                     .get(&intent.effect)
                     .is_some_and(ComputerCancelToken::is_cancelled)
+                || self
+                    .mobile_cancellations
+                    .get(&intent.effect)
+                    .is_some_and(MobileCancelToken::is_cancelled)
             {
                 EffectOutcome::Cancelled
             } else {
@@ -1316,6 +1322,18 @@ impl EffectBroker {
         self.dispatch_terminal(intent, outcome, None, None).await
     }
 
+    /// Terminalizes a mobile effect after relinquishing cancellation
+    /// ownership, preserving an honest `Unknown` if outcome journaling is
+    /// interrupted after the backend returned.
+    pub async fn journal_mobile_outcome(
+        &mut self,
+        intent: &EffectIntent,
+        outcome: EffectOutcome,
+    ) -> ToolResult<()> {
+        self.mobile_cancellations.remove(&intent.effect);
+        self.dispatch_terminal(intent, outcome, None, None).await
+    }
+
     /// Reconciles a dispatch/outcome recovery window explicitly.
     ///
     /// `Unknown` is reserved for orderly-shutdown and startup reconciliation;
@@ -1389,6 +1407,41 @@ impl EffectBroker {
         for cancel in self.computer_cancellations.values() {
             cancel.cancel();
         }
+    }
+
+    /// Signals only genuinely user-cancelled in-flight mobile actions.
+    pub fn cancel_mobile_actions(&mut self) {
+        for cancel in self.mobile_cancellations.values() {
+            cancel.cancel();
+        }
+    }
+
+    /// Journals and authorizes a mobile intent without crossing the durable
+    /// dispatch boundary.
+    pub async fn authorize_mobile(
+        &mut self,
+        operation: &crate::MobileOperation,
+        policy: &PermissionPolicy,
+    ) -> ToolResult<EffectIntent> {
+        let intent = self.normalize(operation).await?;
+        match self.authorize(&intent, policy).await? {
+            AuthorizationVerdict::Allow | AuthorizationVerdict::PreAuthorized { .. } => Ok(intent),
+            AuthorizationVerdict::Ask { menu } => Err(ToolError::AuthorizationRequired { menu }),
+            AuthorizationVerdict::Deny { reason } => Err(ToolError::PermissionDenied { reason }),
+        }
+    }
+
+    /// Crosses the mobile effect's durable dispatch boundary and transfers
+    /// cooperative cancellation ownership to the broker.
+    pub async fn dispatch_mobile(
+        &mut self,
+        intent: &EffectIntent,
+        cancel: MobileCancelToken,
+    ) -> ToolResult<()> {
+        self.journal_dispatched(intent).await?;
+        self.mobile_cancellations
+            .insert(intent.effect.clone(), cancel);
+        Ok(())
     }
 
     /// Begins the short `AgentSpawn` effect. The caller must establish the

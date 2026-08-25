@@ -1737,7 +1737,8 @@ async fn effect_probe_observation(
         | EffectClass::CredentialAccess
         | EffectClass::GuiAct
         | EffectClass::ScreenObserve
-        | EffectClass::ScreenControl => {
+        | EffectClass::ScreenControl
+        | EffectClass::ReadSms => {
             "inconclusive — no safe automatic probe exists for this effect class".into()
         }
     }

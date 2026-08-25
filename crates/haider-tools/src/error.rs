@@ -73,6 +73,7 @@ pub enum ToolError {
         message: String,
     },
     Computer(crate::ComputerError),
+    Mobile(crate::MobileError),
     Lifecycle {
         message: String,
     },
@@ -184,6 +185,7 @@ impl std::fmt::Display for ToolError {
             Self::Ledger { message } => write!(formatter, "change ledger failed: {message}"),
             Self::Runtime { message } => write!(formatter, "tool runtime failed: {message}"),
             Self::Computer(error) => write!(formatter, "computer tool failed: {error}"),
+            Self::Mobile(error) => write!(formatter, "mobile tool failed: {error}"),
             Self::Lifecycle { message } => write!(formatter, "invalid effect lifecycle: {message}"),
         }
     }
@@ -194,5 +196,11 @@ impl std::error::Error for ToolError {}
 impl From<crate::ComputerError> for ToolError {
     fn from(error: crate::ComputerError) -> Self {
         Self::Computer(error)
+    }
+}
+
+impl From<crate::MobileError> for ToolError {
+    fn from(error: crate::MobileError) -> Self {
+        Self::Mobile(error)
     }
 }

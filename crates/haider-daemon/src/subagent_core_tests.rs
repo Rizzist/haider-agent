@@ -898,6 +898,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
             tasks: crate::tasks::TaskFacade::new(hub.clone()),
             agent_id: None,
             grant: None,
+            mobile_use_active: false,
             cli_scope: None,
             web_search: None,
         },

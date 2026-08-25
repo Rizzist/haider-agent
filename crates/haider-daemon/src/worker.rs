@@ -35,6 +35,9 @@ mod g1_todo_runtime_tests;
 #[path = "image_event_runtime_tests.rs"]
 mod image_event_runtime_tests;
 #[cfg(test)]
+#[path = "mobile_runtime_tests.rs"]
+mod mobile_runtime_tests;
+#[cfg(test)]
 #[path = "pair_switch_runtime_tests.rs"]
 mod pair_switch_runtime_tests;
 #[cfg(test)]
@@ -125,9 +128,10 @@ use haider_tools::{
     CasSink, ChangeLedger, CommandOutputSink, ComputerBackend, ComputerCancelToken, ComputerError,
     ComputerOperation, ComputerOutput, ComputerPermissionPoll, EffectBroker, FsCaseMode, FsEdit,
     FsEditChange, FsGlob, FsPath, FsPathOperation, FsRead, FsSearch, FsSearchMode, FsWrite,
-    GraphEvidence, JournalSink, MessageSubagent, PermissionPolicy, ProcessBounds, ProcessExec,
-    ProcessResult, ResultBounds, ScreenshotRedactionPolicy, SessionGrant, SessionGrantScope,
-    ShellSession, SpawnSubagent, ToolError, ToolResult, TurnAttribution, WebFetch, WorkflowAuthor,
+    GraphEvidence, JournalSink, MessageSubagent, MobileBackend, MobileCancelToken, MobileError,
+    MobileOperation, PermissionPolicy, ProcessBounds, ProcessExec, ProcessResult, ResultBounds,
+    ScreenshotRedactionPolicy, SessionGrant, SessionGrantScope, ShellSession, SpawnSubagent,
+    ToolError, ToolResult, TurnAttribution, WebFetch, WorkflowAuthor,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -977,6 +981,9 @@ pub struct WorkerToolContext {
     pub agent_id: Option<AgentId>,
     /// Durable child capability ceiling; root sessions have no ceiling here.
     pub grant: Option<Grant>,
+    /// One turn-start snapshot shared by provider advertisement and runtime
+    /// dispatch so a concurrent activation cannot split their authority.
+    pub(crate) mobile_use_active: bool,
     /// B3 — the typed child's declared-CLI exec scope. `None` = unfenced
     /// (untyped); `Some(vec![])` = deny-all (typed record unresolvable).
     pub cli_scope: Option<Vec<String>>,
@@ -4262,11 +4269,15 @@ async fn perform_manual_compaction(
     let handoff_dir = delegation
         .handoff_dir_for_child_session(lease.session_id(), &metadata.cwd)
         .await?;
-    let post_compaction_tools = advertised_tool_definitions(
+    let mobile_use_active = durable_session_tool_state(lease, lease.session_id())
+        .await?
+        .mobile_use_active;
+    let post_compaction_tools = advertised_tool_definitions_for_mobile_state(
         &dependencies.tool_factory,
         grant,
         &resolved.provider_name,
         web_degrade,
+        mobile_use_active,
     );
     let post_compaction_system_prompt = {
         let mut prompt = SystemPromptBuilder::build_with_handoff(
@@ -5182,6 +5193,9 @@ async fn start_turn(
             .collect();
         (!parts.is_empty()).then(|| parts.join("\n"))
     };
+    let mobile_use_active = durable_session_tool_state(lease, lease.session_id())
+        .await?
+        .mobile_use_active;
     let dispatcher = dependencies
         .tool_factory
         .create(WorkerToolContext {
@@ -5195,6 +5209,7 @@ async fn start_turn(
             tasks: crate::tasks::TaskFacade::new(lease.hub().clone()),
             agent_id: agent_id.clone(),
             grant: grant.clone(),
+            mobile_use_active,
             cli_scope,
             web_search: dependencies.web_search.clone(),
             diagnostics: dependencies.diagnostics.clone(),
@@ -5242,8 +5257,11 @@ async fn start_turn(
         handoff_dir.as_deref(),
     ));
     config.volatile_user_tail = graph_brief;
-    let provider_tool_base =
-        authorized_tool_definitions(&dependencies.tool_factory, grant.as_ref());
+    let provider_tool_base = authorized_tool_definitions(
+        &dependencies.tool_factory,
+        grant.as_ref(),
+        mobile_use_active,
+    );
     config.provider_local_web_tools = provider_tool_base
         .iter()
         .filter(|definition| is_local_web_tool(&definition.name))
@@ -6883,6 +6901,11 @@ pub(crate) struct InjectedComputerBrokerToolFactory {
 }
 
 #[cfg(test)]
+pub(crate) struct InjectedMobileBrokerToolFactory {
+    backend: Arc<dyn MobileBackend>,
+}
+
+#[cfg(test)]
 impl BrokerToolFactory {
     /// Test/integration seam for deterministic computer actions. Production
     /// continues to use the unit factory and the cfg-selected platform backend.
@@ -6906,6 +6929,14 @@ impl BrokerToolFactory {
             backend,
             screenshot_redaction,
         }
+    }
+
+    /// Test/integration seam for deterministic mobile actions. Production
+    /// continues to use the unavailable platform stub in this lane.
+    pub(crate) fn with_mobile_backend(
+        backend: Arc<dyn MobileBackend>,
+    ) -> InjectedMobileBrokerToolFactory {
+        InjectedMobileBrokerToolFactory { backend }
     }
 }
 
@@ -6931,6 +6962,7 @@ pub(crate) enum RegisteredToolRoute {
     WebFetch,
     WebSearch,
     Computer,
+    Mobile,
 }
 
 #[derive(Debug, Clone)]
@@ -7139,6 +7171,16 @@ pub(crate) fn registered_tools() -> Vec<RegisteredTool> {
                 route: RegisteredToolRoute::Computer,
             }
         },
+        {
+            // Mobile-use is both capability-gated and effect-brokered. Ask is
+            // fail-closed once the session has explicitly activated it.
+            let manifest = haider_tools::mobile_manifest();
+            RegisteredTool {
+                manifest,
+                default: ToolPermissionDefault::Ask,
+                route: RegisteredToolRoute::Mobile,
+            }
+        },
     ]
 }
 
@@ -7159,6 +7201,7 @@ pub(crate) fn default_child_grant() -> Grant {
                         | RegisteredToolRoute::Plan
                         | RegisteredToolRoute::LoomRegister
                         | RegisteredToolRoute::Computer
+                        | RegisteredToolRoute::Mobile
                 )
             })
             .map(|entry| entry.manifest.name.clone())
@@ -7174,6 +7217,7 @@ pub(crate) fn default_child_grant() -> Grant {
                         | RegisteredToolRoute::Plan
                         | RegisteredToolRoute::LoomRegister
                         | RegisteredToolRoute::Computer
+                        | RegisteredToolRoute::Mobile
                 )
             })
             .flat_map(|entry| entry.manifest.effects.iter().cloned())
@@ -7460,6 +7504,9 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
         "computer" => {
             "computer(action, x?, y?, from?, to?, text?, keys?, direction?, amount?, ms?) — control the local desktop. Call screenshot first; x/y and from/to are pixels in the latest screenshot; text=type, keys=shortcut like cmd+shift+4; direction+amount scroll; ms=wait ≤60000"
         }
+        "mobile" => {
+            "mobile(action, folder?, since?, limit?) — use the explicitly activated mobile capability; sms_read returns SMS data as JSON"
+        }
         "fs_read" => {
             "fs_read(path, offset?, limit?) — read a bounded UTF-8 file slice; a directory path lists it"
         }
@@ -7604,13 +7651,30 @@ fn provider_definition(manifest: ToolManifest) -> ToolDefinition {
 /// LOCAL `web_fetch` client tool is withheld there (two tools cannot share
 /// the name); every other pair advertises it. Subagents inherit the same
 /// derivation — this is the single advertisement seam.
+#[cfg(test)]
 pub(crate) fn advertised_tool_definitions(
     tool_factory: &Arc<dyn TurnToolFactory>,
     grant: Option<&Grant>,
     provider_name: &str,
     web_degrade: WebCapabilityDegrade,
 ) -> Vec<ToolDefinition> {
-    let mut definitions = authorized_tool_definitions(tool_factory, grant);
+    advertised_tool_definitions_for_mobile_state(
+        tool_factory,
+        grant,
+        provider_name,
+        web_degrade,
+        false,
+    )
+}
+
+fn advertised_tool_definitions_for_mobile_state(
+    tool_factory: &Arc<dyn TurnToolFactory>,
+    grant: Option<&Grant>,
+    provider_name: &str,
+    web_degrade: WebCapabilityDegrade,
+    mobile_use_active: bool,
+) -> Vec<ToolDefinition> {
+    let mut definitions = authorized_tool_definitions(tool_factory, grant, mobile_use_active);
     let (local_web_tool_names, _) = provider_web_tool_names(provider_name, web_degrade);
     definitions.retain(|definition| {
         !is_local_web_tool(&definition.name)
@@ -7624,8 +7688,10 @@ pub(crate) fn advertised_tool_definitions(
 fn authorized_tool_definitions(
     tool_factory: &Arc<dyn TurnToolFactory>,
     grant: Option<&Grant>,
+    mobile_use_active: bool,
 ) -> Vec<ToolDefinition> {
     let mut definitions = tool_factory.definitions();
+    definitions.retain(|definition| mobile_use_active || definition.name != "mobile");
     if let Some(grant) = grant {
         let registry = registered_tools();
         definitions.retain(|definition| {
@@ -7706,6 +7772,7 @@ impl TurnToolFactory for BrokerToolFactory {
         create_broker_tool_dispatcher(
             context,
             haider_tools::platform_computer_backend(),
+            haider_tools::platform_mobile_backend(),
             redaction,
         )
         .await
@@ -7729,7 +7796,32 @@ impl TurnToolFactory for InjectedComputerBrokerToolFactory {
         create_broker_tool_dispatcher(
             context,
             Arc::clone(&self.backend),
+            haider_tools::platform_mobile_backend(),
             Arc::clone(&self.screenshot_redaction),
+        )
+        .await
+    }
+}
+
+#[async_trait]
+#[cfg(test)]
+impl TurnToolFactory for InjectedMobileBrokerToolFactory {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        registered_tools()
+            .into_iter()
+            .map(|entry| provider_definition(entry.manifest))
+            .collect()
+    }
+
+    async fn create(
+        &self,
+        context: WorkerToolContext,
+    ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
+        create_broker_tool_dispatcher(
+            context,
+            Arc::new(haider_tools::UnavailableComputerBackend::new("mobile-test")),
+            Arc::clone(&self.backend),
+            Arc::new(haider_tools::PassthroughScreenshotRedaction),
         )
         .await
     }
@@ -7738,6 +7830,7 @@ impl TurnToolFactory for InjectedComputerBrokerToolFactory {
 async fn create_broker_tool_dispatcher(
     context: WorkerToolContext,
     computer: Arc<dyn ComputerBackend>,
+    mobile: Arc<dyn MobileBackend>,
     screenshot_redaction: Arc<dyn ScreenshotRedactionPolicy>,
 ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
     let durable_permissions =
@@ -7778,6 +7871,7 @@ async fn create_broker_tool_dispatcher(
         broker: Mutex::new(Some(broker)),
         web_search: context.web_search.clone(),
         computer,
+        mobile,
         screenshot_redaction,
         active_computer_turn_cancel: StdMutex::new(None),
         os_permission_menus: Mutex::new(HashMap::new()),
@@ -7797,6 +7891,7 @@ async fn create_broker_tool_dispatcher(
         delegation: context.delegation,
         tasks: context.tasks,
         grant: context.grant,
+        mobile_use_active: context.mobile_use_active,
         cli_scope: context.cli_scope,
         deferred: Mutex::new(HashMap::new()),
         active_tool_name,
@@ -7848,6 +7943,7 @@ struct BrokerToolDispatcher {
     broker: Mutex<Option<EffectBroker>>,
     web_search: Option<Arc<dyn WebSearchExecutor>>,
     computer: Arc<dyn ComputerBackend>,
+    mobile: Arc<dyn MobileBackend>,
     screenshot_redaction: Arc<dyn ScreenshotRedactionPolicy>,
     /// Core's authoritative turn cancellation signal for the currently
     /// dispatched computer action. It survives cancellation dropping the
@@ -7869,6 +7965,7 @@ struct BrokerToolDispatcher {
     delegation: DelegationHandle,
     tasks: crate::tasks::TaskFacade,
     grant: Option<Grant>,
+    mobile_use_active: bool,
     cli_scope: Option<Vec<String>>,
     deferred: Mutex<HashMap<AgentId, DeferredTicket>>,
     /// The journal sink reads this only while `broker` is held. Setting it
@@ -8449,6 +8546,7 @@ impl BrokerToolDispatcher {
             && let Some(broker) = broker_guard.as_mut()
         {
             broker.cancel_computer_actions();
+            broker.cancel_mobile_actions();
         }
         let broker = broker_guard.take();
         drop(broker_guard);
@@ -8513,6 +8611,11 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 ErrorCode::Internal,
                 "tool dispatch was cancelled before start",
                 false,
+            ));
+        }
+        if name == "mobile" && !self.mobile_use_active {
+            return Ok(ToolDispatchResult::Completed(
+                mobile_capability_denied_result(),
             ));
         }
         if let Some(grant) = &self.grant {
@@ -9854,6 +9957,74 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 }
                 .await
             }
+            RegisteredToolRoute::Mobile => {
+                async {
+                    let operation = MobileOperation::from_tool_args(args)?;
+                    let action_cancel = MobileCancelToken::new();
+                    let intent = broker.authorize_mobile(&operation, &policy).await?;
+                    self.mobile
+                        .prepare(operation.action(), &action_cancel)
+                        .await
+                        .map_err(ToolError::Mobile)?;
+                    broker
+                        .dispatch_mobile(&intent, action_cancel.clone())
+                        .await?;
+                    match self.mobile.execute(operation.action(), &action_cancel).await {
+                        Ok(output) => {
+                            let preview = match serde_json::to_string(&output) {
+                                Ok(preview) => preview,
+                                Err(error) => {
+                                    let error = ToolError::Runtime {
+                                        message: format!(
+                                            "could not encode mobile action output: {error}"
+                                        ),
+                                    };
+                                    broker
+                                        .journal_mobile_outcome(
+                                            &intent,
+                                            EffectOutcome::Failed {
+                                                error: error.to_string(),
+                                            },
+                                        )
+                                        .await?;
+                                    return Err(error);
+                                }
+                            };
+                            broker
+                                .journal_mobile_outcome(&intent, EffectOutcome::Ok)
+                                .await?;
+                            Ok(BoundedResult {
+                                preview,
+                                truncated: false,
+                                artifact: None,
+                                images: Vec::new(),
+                                cursor: None,
+                                status: ToolResultStatus::Completed,
+                                reason: None,
+                                presentation: None,
+                            })
+                        }
+                        Err(MobileError::Cancelled) => {
+                            broker
+                                .journal_mobile_outcome(&intent, EffectOutcome::Cancelled)
+                                .await?;
+                            Err(ToolError::Mobile(MobileError::Cancelled))
+                        }
+                        Err(error) => {
+                            broker
+                                .journal_mobile_outcome(
+                                    &intent,
+                                    EffectOutcome::Failed {
+                                        error: error.to_string(),
+                                    },
+                                )
+                                .await?;
+                            Ok(mobile_failure_result(&error))
+                        }
+                    }
+                }
+                .await
+            }
             RegisteredToolRoute::RequestInput
             | RegisteredToolRoute::Plan
             | RegisteredToolRoute::TodoWrite
@@ -10040,6 +10211,7 @@ pub(crate) struct DurableToolState {
     pub(crate) grants: Vec<SessionGrant>,
     pub(crate) bindings: HashMap<MenuId, (EffectClass, String)>,
     pub(crate) freshness: HashMap<String, FileFreshness>,
+    pub(crate) mobile_use_active: bool,
 }
 
 /// Set to `0`, `false`, `no`, or `off` to keep every computer effect on the
@@ -10074,6 +10246,20 @@ pub(crate) fn explicit_computer_use_intent(text: &str) -> bool {
         .is_some_and(|tail| tail.is_empty() || tail.starts_with(char::is_whitespace))
 }
 
+/// Conservative user-authored mobile capability activation classifier.
+/// Consent is the command-like `mobile-use` marker at the start of a root
+/// user message, never an inference from prose that mentions the marker.
+pub(crate) fn explicit_mobile_use_intent(text: &str) -> bool {
+    let normalized = text.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    let command = normalized.strip_prefix('/').unwrap_or(&normalized);
+    command
+        .strip_prefix("mobile-use")
+        .is_some_and(|tail| tail.is_empty() || tail.starts_with(char::is_whitespace))
+}
+
 fn add_explicit_computer_session_grants(grants: &mut Vec<SessionGrant>) {
     for class in [EffectClass::ScreenObserve, EffectClass::ScreenControl] {
         let grant = SessionGrant::for_effect(class, "explicit-user-computer-use");
@@ -10094,6 +10280,7 @@ pub(crate) async fn durable_session_tool_state(
     let mut bindings = HashMap::new();
     let mut freshness = HashMap::new();
     let mut explicit_computer_intent = false;
+    let mut mobile_use_active = false;
     loop {
         let page = store.read(session_id, cursor, 256).await?;
         if page.is_empty() {
@@ -10104,6 +10291,7 @@ pub(crate) async fn durable_session_tool_state(
                 grants,
                 bindings,
                 freshness,
+                mobile_use_active,
             });
         }
         cursor = page.last().map_or(cursor, |envelope| envelope.seq);
@@ -10158,6 +10346,11 @@ pub(crate) async fn durable_session_tool_state(
                 {
                     explicit_computer_intent = true;
                 }
+                EventPayload::UserMessage { text, .. }
+                    if envelope.agent_id.is_none() && explicit_mobile_use_intent(&text) =>
+                {
+                    mobile_use_active = true;
+                }
                 _ => {}
             }
         }
@@ -10169,6 +10362,7 @@ pub(crate) async fn tool_inventory_snapshot(
     session_id: &SessionId,
 ) -> Result<ToolInventorySnapshot, HaiderError> {
     let durable = durable_session_tool_state(store, session_id).await?;
+    let mobile_use_active = durable.mobile_use_active;
     // M2e: `workflow_author` is a GATED child capability — it is surfaced only
     // to a workflow-enabled child through the turn-tools grant path (see the
     // `retain(name != "workflow_author")` on the grantless branch above), never
@@ -10176,7 +10370,10 @@ pub(crate) async fn tool_inventory_snapshot(
     // session's inventory does not advertise it.
     let tools = registered_tools()
         .into_iter()
-        .filter(|entry| entry.manifest.name != "workflow_author")
+        .filter(|entry| {
+            entry.manifest.name != "workflow_author"
+                && (mobile_use_active || entry.manifest.name != "mobile")
+        })
         .map(|entry| ToolInventoryEntry {
             manifest: entry.manifest,
             default: entry.default,
@@ -10185,6 +10382,7 @@ pub(crate) async fn tool_inventory_snapshot(
     let remembered_grants = durable
         .grants
         .into_iter()
+        .filter(|grant| mobile_use_active || grant.class != EffectClass::ReadSms)
         .map(|grant| RememberedSessionGrant {
             class: grant.class,
             scope: match grant.scope {
@@ -10216,6 +10414,9 @@ fn selected_menu_option<'a>(
 pub(crate) fn typed_tool_result(error: &haider_tools::ToolError) -> Option<BoundedResult> {
     if let haider_tools::ToolError::Computer(error) = error {
         return Some(computer_failure_result(error));
+    }
+    if let haider_tools::ToolError::Mobile(error) = error {
+        return Some(mobile_failure_result(error));
     }
     if let haider_tools::ToolError::StaleRead {
         recorded_digest,
@@ -10257,6 +10458,7 @@ pub(crate) fn typed_tool_result(error: &haider_tools::ToolError) -> Option<Bound
         haider_tools::ToolError::Cas { .. } => ("failed", "output_store"),
         haider_tools::ToolError::Runtime { .. } => ("failed", "runtime"),
         haider_tools::ToolError::Computer(_) => unreachable!("handled above"),
+        haider_tools::ToolError::Mobile(_) => unreachable!("handled above"),
         haider_tools::ToolError::StaleRead { .. } => ("conflict", "stale_read"),
         haider_tools::ToolError::AuthorizationRequired { .. }
         | haider_tools::ToolError::Journal { .. }
@@ -10324,6 +10526,69 @@ fn computer_failure_result(error: &ComputerError) -> BoundedResult {
         status,
         reason: Some(bounded_failure_reason(&reason)),
         presentation,
+    }
+}
+
+fn mobile_failure_result(error: &MobileError) -> BoundedResult {
+    let (status, reason, subcode, title, actions) = match error {
+        MobileError::InvalidAction { message } => (
+            ToolResultStatus::Rejected,
+            message.clone(),
+            "mobile-invalid-action",
+            "Mobile action rejected",
+            vec![ErrorAction::Retry],
+        ),
+        MobileError::Cancelled => (
+            ToolResultStatus::Cancelled,
+            "mobile action was cancelled".into(),
+            "mobile-cancelled",
+            "Mobile action cancelled",
+            vec![ErrorAction::None],
+        ),
+        MobileError::Unavailable { message } => (
+            ToolResultStatus::Failed,
+            message.clone(),
+            "mobile-backend-unavailable",
+            "Mobile backend unavailable",
+            vec![ErrorAction::Retry],
+        ),
+        MobileError::Backend { message } => (
+            ToolResultStatus::Failed,
+            message.clone(),
+            "mobile-backend-failed",
+            "Mobile action failed",
+            vec![ErrorAction::Retry],
+        ),
+    };
+    let error_json = serde_json::to_value(error).unwrap_or_else(|_| {
+        serde_json::json!({
+            "kind": "backend",
+            "message": error.to_string(),
+        })
+    });
+    BoundedResult {
+        preview: serde_json::json!({
+            "status": match status {
+                ToolResultStatus::Rejected => "rejected",
+                ToolResultStatus::Cancelled => "cancelled",
+                _ => "failed",
+            },
+            "error": error_json,
+        })
+        .to_string(),
+        truncated: false,
+        artifact: None,
+        images: Vec::new(),
+        cursor: None,
+        status,
+        reason: Some(bounded_failure_reason(&reason)),
+        presentation: Some(ErrorPresentation::new(
+            subcode,
+            title,
+            reason,
+            ErrorScope::Tool,
+            actions,
+        )),
     }
 }
 
@@ -10451,6 +10716,36 @@ fn grant_ceiling_result(name: &str) -> BoundedResult {
         status: ToolResultStatus::Rejected,
         reason: Some(reason),
         presentation: None,
+    }
+}
+
+fn mobile_capability_denied_result() -> BoundedResult {
+    let reason = bounded_failure_reason(
+        "mobile capability is inactive; begin a root user message with `mobile-use` to activate it",
+    );
+    BoundedResult {
+        preview: serde_json::json!({
+            "status": "rejected",
+            "error": {
+                "kind": "capability_denied",
+                "message": reason,
+                "details": { "tool": "mobile" },
+            }
+        })
+        .to_string(),
+        truncated: false,
+        artifact: None,
+        images: Vec::new(),
+        cursor: None,
+        status: ToolResultStatus::Rejected,
+        reason: Some(reason.clone()),
+        presentation: Some(ErrorPresentation::new(
+            "capability-denied",
+            "Mobile capability inactive",
+            reason,
+            ErrorScope::Tool,
+            [ErrorAction::None],
+        )),
     }
 }
 

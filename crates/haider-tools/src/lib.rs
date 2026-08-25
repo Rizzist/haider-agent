@@ -12,6 +12,7 @@ mod filesystem;
 mod graph_evidence;
 mod ledger;
 mod message_subagent;
+mod mobile;
 mod plan;
 mod process;
 mod request_input;
@@ -45,8 +46,13 @@ pub use filesystem::{
 };
 pub use graph_evidence::{GraphEvidence, graph_evidence_manifest};
 pub use haider_protocol::computer::{ComputerAction, ScreenPoint, ScrollDirection};
+pub use haider_protocol::mobile::{MobileAction, MobileOutput, MobilePermission, SmsMessage};
 pub use ledger::{ChangeLedger, ChangeLedgerSink, FsWriteRecord, TurnChanges};
 pub use message_subagent::{MessageSubagent, message_subagent_manifest};
+pub use mobile::{
+    MobileBackend, MobileCancelToken, MobileError, MobileOperation, MobileResult,
+    UnavailableMobileBackend, mobile_manifest, platform_mobile_backend,
+};
 pub use plan::{
     PLAN_BODY_MAX_BYTES, PLAN_DECISION_ACCEPT, PLAN_DECISION_REJECT, PLAN_DECISION_REVISE,
     PLAN_ORIGIN, PLAN_TITLE_MAX_BYTES, Plan,

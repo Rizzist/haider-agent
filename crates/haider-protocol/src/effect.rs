@@ -48,6 +48,8 @@ pub enum EffectClass {
     ScreenObserve,
     /// Actuate the pointer, keyboard, scroll wheel, or an interactive wait.
     ScreenControl,
+    /// Read SMS data from an explicitly activated mobile capability.
+    ReadSms,
 }
 
 /// Journaled BEFORE dispatch — the durable pre-image of every side effect.
