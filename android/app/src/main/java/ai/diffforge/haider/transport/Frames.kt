@@ -12,6 +12,27 @@ import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 
 /**
+ * One item in a streamed chat reply. A `chat.send` request is followed by zero or more [Delta]
+ * frames and exactly one terminal [Done] or [Error] frame with the same envelope ID. Chat does not
+ * use single request/response correlation.
+ */
+sealed interface ChatReply {
+    val id: Long
+
+    data class Delta(
+        override val id: Long,
+        val text: String,
+    ) : ChatReply
+
+    data class Done(override val id: Long) : ChatReply
+
+    data class Error(
+        override val id: Long,
+        val message: String,
+    ) : ChatReply
+}
+
+/**
  * Reads and writes protocol frames shaped as a four-byte unsigned big-endian length followed by a
  * UTF-8 JSON envelope: `{\"id\": <long>, \"body\": {\"type\": <name>, ...}}`.
  */
@@ -101,6 +122,39 @@ object Frames {
             .put("apkVersion", apkVersion),
     )
 
+    /** Builds `{"type":"chat.send","text":"..."}` for an APK-originated chat turn. */
+    fun chatSend(text: String): JSONObject = JSONObject()
+        .put("type", "chat.send")
+        .put("text", text)
+
+    fun isChat(body: JSONObject): Boolean = body.optString("type").startsWith(CHAT_TYPE_PREFIX)
+
+    /**
+     * Parses one streamed daemon reply body: `chat.delta` carries `text`, while `chat.done` is
+     * terminal and `chat.error` is terminal with a `message`.
+     */
+    @Throws(ProtocolException::class)
+    fun parseChatReply(envelope: Envelope): ChatReply {
+        return try {
+            when (val type = envelope.body.getString("type")) {
+                "chat.delta" -> ChatReply.Delta(
+                    id = envelope.id,
+                    text = envelope.body.getString("text"),
+                )
+                "chat.done" -> ChatReply.Done(envelope.id)
+                "chat.error" -> ChatReply.Error(
+                    id = envelope.id,
+                    message = envelope.body.getString("message"),
+                )
+                else -> throw ProtocolException("Unsupported chat frame type: $type")
+            }
+        } catch (error: ProtocolException) {
+            throw error
+        } catch (error: Exception) {
+            throw ProtocolException("Invalid chat reply frame").also { it.initCause(error) }
+        }
+    }
+
     fun ack(ok: Boolean): JSONObject = JSONObject()
         .put("type", "ack")
         .put("ok", ok)
@@ -114,6 +168,7 @@ object Frames {
         .put("reason", reason)
 
     private const val LENGTH_PREFIX_BYTES = 4
+    private const val CHAT_TYPE_PREFIX = "chat."
 }
 
 /** Compares secret token bytes without returning early on content or length differences. */

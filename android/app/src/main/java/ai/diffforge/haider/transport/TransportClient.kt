@@ -9,7 +9,11 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.drop
@@ -23,6 +27,7 @@ import java.io.IOException
 import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.util.concurrent.atomic.AtomicLong
 
 sealed interface TransportState {
     data object Disconnected : TransportState
@@ -48,8 +53,9 @@ class NoDeviceHandler : CapabilityHandler {
 }
 
 /**
- * Persistent loopback client for envelope-framed daemon requests and APK pushes. Calls [start] to
- * connect. Outbound pushes are always wrapped with `id = 0`; handler responses preserve request IDs.
+ * Persistent client for envelope-framed daemon requests and APK pushes. Calls [start] to connect.
+ * Outbound pushes are always wrapped with `id = 0`; handler responses preserve request IDs. Chat
+ * replies are streamed separately through [chatReplies], never dispatched to [handler].
  */
 class TransportClient(
     private val host: String,
@@ -61,8 +67,13 @@ class TransportClient(
     private val lifecycleMutex = Any()
     private val writeMutex = Mutex()
     private val _state = MutableStateFlow<TransportState>(TransportState.Disconnected)
+    private val _chatReplies = MutableSharedFlow<ChatReply>(
+        replay = CHAT_REPLY_REPLAY,
+        extraBufferCapacity = 64,
+    )
 
-    val state = _state.asStateFlow()
+    val state: StateFlow<TransportState> = _state.asStateFlow()
+    val chatReplies: SharedFlow<ChatReply> = _chatReplies.asSharedFlow()
 
     @Volatile
     private var runner: Job? = null
@@ -75,7 +86,7 @@ class TransportClient(
     private var activeOutput: OutputStream? = null
 
     init {
-        require(host == LOOPBACK_HOST) { "Transport host must be the IPv4 loopback address" }
+        require(host.isNotBlank()) { "Transport host must not be blank" }
         require(port in 1..65535) { "Transport port is outside the valid range" }
         require(token.isNotEmpty()) { "Transport token must not be empty" }
     }
@@ -138,6 +149,26 @@ class TransportClient(
         }
     }
 
+    /**
+     * Sends `{"id":<n>,"body":{"type":"chat.send","text":"..."}}` and returns `<n>`.
+     * The response is a stream of [ChatReply] values on [chatReplies], not a single correlated
+     * response. Throws [IllegalStateException] while the transport is unauthenticated.
+     */
+    suspend fun sendChat(text: String): Long = writeMutex.withLock {
+        val output = activeOutput
+        if (_state.value !is TransportState.Authenticated || output == null) {
+            throw IllegalStateException("Daemon transport is not authenticated")
+        }
+        val id = allocateOutboundId()
+        try {
+            Frames.write(output, Frames.envelope(id, Frames.chatSend(text)))
+            id
+        } catch (error: IOException) {
+            activeSocket?.closeQuietly()
+            throw error
+        }
+    }
+
     private suspend fun reconnectLoop() {
         var backoffMs = MIN_BACKOFF_MS
         while (currentCoroutineContext().isActive) {
@@ -169,7 +200,7 @@ class TransportClient(
         val socket = Socket()
         activeSocket = socket
         socket.tcpNoDelay = true
-        socket.connect(InetSocketAddress(LOOPBACK_HOST, port), CONNECT_TIMEOUT_MS)
+        socket.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
         val input = socket.getInputStream()
         val output = socket.getOutputStream()
         writeMutex.withLock {
@@ -198,6 +229,10 @@ class TransportClient(
             if (request.id == 0L) {
                 throw Frames.ProtocolException("Daemon request uses the reserved push ID")
             }
+            if (Frames.isChat(request.body)) {
+                _chatReplies.emit(Frames.parseChatReply(request))
+                continue
+            }
             val response = try {
                 handler.handle(request.body)
             } catch (cancelled: CancellationException) {
@@ -220,6 +255,14 @@ class TransportClient(
         }
     }
 
+    private fun allocateOutboundId(): Long {
+        while (true) {
+            val id = nextOutboundId.get()
+            val next = if (id == Long.MAX_VALUE) 2L else id + 1L
+            if (nextOutboundId.compareAndSet(id, next)) return id
+        }
+    }
+
     private fun Socket.closeQuietly() {
         try {
             close()
@@ -231,10 +274,11 @@ class TransportClient(
     private class AuthRejectedException : Exception()
 
     private companion object {
-        const val LOOPBACK_HOST = "127.0.0.1"
         const val HELLO_ID = 1L
         const val CONNECT_TIMEOUT_MS = 5_000
         const val MIN_BACKOFF_MS = 500L
         const val MAX_BACKOFF_MS = 8_000L
+        const val CHAT_REPLY_REPLAY = 64
+        val nextOutboundId = AtomicLong(2L)
     }
 }
