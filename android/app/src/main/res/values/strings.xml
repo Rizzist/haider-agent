@@ -1,3 +1,8 @@
 <resources>
     <string name="app_name">Haider</string>
+    <string name="accessibility_service_description">Lets Haider inspect app interfaces and perform explicitly authorized gestures.</string>
+    <string name="screen_capture_channel_name">Screen capture</string>
+    <string name="screen_capture_channel_description">Shows when Haider has active screen-capture consent.</string>
+    <string name="screen_capture_notification_title">Haider screen capture</string>
+    <string name="screen_capture_notification_text">Screen capture is ready for one frame.</string>
 </resources>
