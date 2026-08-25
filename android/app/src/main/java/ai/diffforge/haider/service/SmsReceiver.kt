@@ -4,7 +4,6 @@ import android.Manifest
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.provider.Telephony
 import ai.diffforge.haider.transport.CapabilityBus
 import ai.diffforge.haider.transport.IncomingSms
@@ -90,22 +89,16 @@ fun refreshSmsCapabilities(context: Context) {
     )
 }
 
-/** Watches this package's runtime SMS grants for process-lifetime capability pushes. */
+/**
+ * Refreshes this package's SMS grant state and pushes any change via
+ * [refreshSmsCapabilities] → CapabilityBus. Android exposes no PUBLIC live
+ * permission-change callback to a normal app (PackageManager's
+ * OnPermissionsChangedListener is @SystemApi / hidden), so callers refresh on
+ * natural boundaries — service start and whenever the app returns to foreground.
+ */
 object SmsPermissionMonitor {
-    private var listener: PackageManager.OnPermissionsChangedListener? = null
-
-    @Synchronized
     fun start(context: Context) {
-        if (listener != null) return
-        val appContext = context.applicationContext
-        val packageManager = appContext.packageManager
-        val appUid = appContext.applicationInfo.uid
-        refreshSmsCapabilities(appContext)
-        val newListener = PackageManager.OnPermissionsChangedListener { changedUid ->
-            if (changedUid == appUid) refreshSmsCapabilities(appContext)
-        }
-        packageManager.addOnPermissionsChangeListener(newListener)
-        listener = newListener
+        refreshSmsCapabilities(context.applicationContext)
     }
 }
 
