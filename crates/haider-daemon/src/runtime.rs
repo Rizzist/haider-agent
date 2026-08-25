@@ -331,6 +331,13 @@ async fn run_inner(
         operation_micros = turn_recovery_started.elapsed().as_micros(),
         "pre-ready recovery phase completed"
     );
+    let mut mobile_server = match crate::mobile_transport::start_if_enabled(config).await {
+        Ok(server) => server,
+        Err(error) => {
+            let _ = store.close().await;
+            return Err(error);
+        }
+    };
 
     // W3c2 R10 startup phase: load the descriptor store and reconcile
     // pending/committed LOGIN receipts against vault + descriptor truth
@@ -620,6 +627,9 @@ async fn run_inner(
         // cancellation to workers and without appending terminal run events.
         // The next generation alone interprets the durable prefix.
         endpoint.close_listener();
+        if let Some(server) = mobile_server.as_mut() {
+            server.shutdown().await;
+        }
         runtime.crash().await;
         worker_manager.crash().await;
         if let Some(poller) = haider_code_plan_poller.as_mut() {
@@ -660,6 +670,9 @@ async fn run_inner(
         // Unreachable: the loop above only breaks with a real request.
         ShutdownRequest::None => ("internal shutdown".into(), true),
     };
+    if let Some(server) = mobile_server.as_mut() {
+        server.shutdown().await;
+    }
     let barrier_deadline = tokio::time::Instant::now() + config.drain_timeout;
     let deadline_unix_ms = unix_time_ms().saturating_add(duration_ms(config.drain_timeout));
     // R9 EXTERNAL ADMISSION GATE: this one flag closes every actor-CREATING

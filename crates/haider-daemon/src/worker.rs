@@ -7783,7 +7783,7 @@ impl TurnToolFactory for BrokerToolFactory {
         create_broker_tool_dispatcher(
             context,
             haider_tools::platform_computer_backend(),
-            haider_tools::platform_mobile_backend(),
+            crate::mobile_transport::platform_mobile_backend(),
             redaction,
         )
         .await

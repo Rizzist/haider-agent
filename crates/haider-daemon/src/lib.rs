@@ -75,6 +75,7 @@ mod loom_seed;
 mod loom_seed_tests;
 #[cfg(test)]
 mod manual_retry_tests;
+mod mobile_transport;
 mod model_select;
 mod oauth;
 #[cfg(test)]
