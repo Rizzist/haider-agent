@@ -7,7 +7,6 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-cpal.workspace = true
 futures-util.workspace = true
 hex.workspace = true
 reqwest.workspace = true
@@ -19,6 +18,9 @@ tokio.workspace = true
 tokio-tungstenite.workspace = true
 url.workspace = true
 zeroize.workspace = true
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+cpal.workspace = true
 
 [dev-dependencies]
 

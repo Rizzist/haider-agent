@@ -422,9 +422,14 @@ impl CaptureState {
 }
 
 enum WorkerMessage {
-    Audio { data: Vec<f32>, channels: usize },
+    #[cfg(not(target_os = "android"))]
+    Audio {
+        data: Vec<f32>,
+        channels: usize,
+    },
     StartRecording,
     StopRecording(mpsc::Sender<Vec<f32>>),
+    #[cfg(not(target_os = "android"))]
     StreamError(String),
     Shutdown,
 }
@@ -442,6 +447,7 @@ impl CaptureWorker {
     /// Every capture event flows through `events`. This is the ONLY
     /// cpal-touching seam in the crate; failures map to
     /// [`SttError::MicUnavailable`] with an honest hint.
+    #[cfg(not(target_os = "android"))]
     pub fn spawn(events: mpsc::Sender<CaptureEvent>) -> Result<Self, SttError> {
         use cpal::traits::{DeviceTrait as _, HostTrait as _};
         let host = cpal::default_host();
@@ -599,6 +605,15 @@ impl CaptureWorker {
         }
     }
 
+    /// Android Phase 1 deliberately ships without audio capture; keeping this
+    /// typed stub preserves the public API without linking cpal/Oboe/JNI/NDK.
+    #[cfg(target_os = "android")]
+    pub fn spawn(_events: mpsc::Sender<CaptureEvent>) -> Result<Self, SttError> {
+        Err(SttError::MicUnavailable {
+            hint: "audio capture is unavailable on Android (Phase 1)".into(),
+        })
+    }
+
     /// The device's native sample rate (frames are emitted at this rate).
     #[must_use]
     pub fn sample_rate(&self) -> u32 {
@@ -630,5 +645,21 @@ impl Drop for CaptureWorker {
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
+    }
+}
+
+#[cfg(all(test, not(target_os = "android")))]
+mod capture_worker_compile_tests {
+    use super::{CaptureEvent, CaptureWorker};
+    use crate::SttError;
+
+    /// Host pin: the non-Android cpal constructor remains available with the
+    /// public signature mirrored by the Android `MicUnavailable` stub.
+    #[test]
+    fn non_android_capture_worker_constructor_is_available() {
+        let constructor: fn(
+            std::sync::mpsc::Sender<CaptureEvent>,
+        ) -> Result<CaptureWorker, SttError> = CaptureWorker::spawn;
+        let _ = constructor;
     }
 }

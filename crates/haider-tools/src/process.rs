@@ -1990,15 +1990,38 @@ fn same_directory_identity(left: &DirectoryIdentity, right: &DirectoryIdentity) 
 
 #[cfg(unix)]
 pub(crate) fn shell_command(script: &str) -> Command {
-    let executable = unix_shell_executable(is_executable_file(Path::new("/bin/zsh")));
+    let executable = unix_shell_executable(env::var_os("SHELL"), is_executable_file);
     let mut command = Command::new(executable);
     command.arg("-c").arg(script);
     command
 }
 
 #[cfg(unix)]
-fn unix_shell_executable(zsh_available: bool) -> &'static str {
-    if zsh_available { "/bin/zsh" } else { "/bin/sh" }
+fn unix_shell_executable(
+    configured_shell: Option<std::ffi::OsString>,
+    is_executable: impl Fn(&Path) -> bool,
+) -> std::ffi::OsString {
+    for shell in [Path::new("/bin/zsh"), Path::new("/bin/sh")] {
+        if is_executable(shell) {
+            return shell.as_os_str().to_owned();
+        }
+    }
+    if let Some(shell) = configured_shell
+        && trustworthy_posix_shell(Path::new(&shell), &is_executable)
+    {
+        return shell;
+    }
+    std::ffi::OsString::from("sh")
+}
+
+#[cfg(unix)]
+fn trustworthy_posix_shell(shell: &Path, is_executable: &impl Fn(&Path) -> bool) -> bool {
+    shell.is_absolute()
+        && matches!(
+            shell.file_name().and_then(|name| name.to_str()),
+            Some("sh" | "ash" | "bash" | "dash" | "ksh" | "mksh")
+        )
+        && is_executable(shell)
 }
 
 #[cfg(unix)]
@@ -2051,16 +2074,48 @@ mod shell_command_tests {
         let script = "printf ' exact bytes é\n'";
         let command = shell_command(script);
         let command = command.as_std();
-        let expected = super::unix_shell_executable(super::is_executable_file(
-            std::path::Path::new("/bin/zsh"),
-        ));
+        let expected =
+            super::unix_shell_executable(std::env::var_os("SHELL"), super::is_executable_file);
         assert_eq!(command.get_program(), expected);
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             [std::ffi::OsStr::new("-c"), std::ffi::OsStr::new(script)]
         );
-        assert_eq!(super::unix_shell_executable(true), "/bin/zsh");
-        assert_eq!(super::unix_shell_executable(false), "/bin/sh");
+        assert_eq!(
+            super::unix_shell_executable(None, |path| path == std::path::Path::new("/bin/zsh")),
+            "/bin/zsh"
+        );
+        assert_eq!(
+            super::unix_shell_executable(None, |path| path == std::path::Path::new("/bin/sh")),
+            "/bin/sh"
+        );
+    }
+
+    /// Android/Termux has neither `/bin/zsh` nor `/bin/sh`; prefer a
+    /// trustworthy executable `$SHELL`, then let PATH resolve `sh`.
+    ///
+    /// MUTATION CHECK: replace the configured-shell return with `"sh"`.
+    /// Expected runtime failure: the first assertion receives `"sh"` instead
+    /// of the executable Termux-style `$SHELL` path.
+    #[cfg(unix)]
+    #[test]
+    fn unix_shell_resolution_falls_back_to_path_sh_when_bin_shells_are_absent() {
+        let configured = std::path::PathBuf::from("/data/data/com.termux/files/usr/bin/bash");
+        let selected =
+            super::unix_shell_executable(Some(configured.clone().into_os_string()), |path| {
+                path == configured
+            });
+        assert_eq!(selected, configured.as_os_str());
+
+        let path_default = super::unix_shell_executable(None, |_| false);
+        assert_eq!(path_default, "sh");
+
+        let incompatible = std::path::PathBuf::from("/data/data/com.termux/files/usr/bin/fish");
+        let rejected =
+            super::unix_shell_executable(Some(incompatible.clone().into_os_string()), |path| {
+                path == incompatible
+            });
+        assert_eq!(rejected, "sh");
     }
 
     #[cfg(windows)]

@@ -43,3 +43,35 @@ jobs:
       - name: test (per-crate)
         shell: bash
         run: bash scripts/ci-test.sh
+
+  android-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - name: install Android Rust target
+        run: rustup target add aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+          add-to-path: false
+      - name: configure Android NDK toolchain
+        shell: bash
+        env:
+          NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          toolchain="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "$toolchain" >> "$GITHUB_PATH"
+          echo "ANDROID_NDK=$NDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$NDK_ROOT" >> "$GITHUB_ENV"
+          echo "CC_aarch64_linux_android=$toolchain/aarch64-linux-android21-clang" >> "$GITHUB_ENV"
+          echo "CXX_aarch64_linux_android=$toolchain/aarch64-linux-android21-clang++" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$toolchain/llvm-ar" >> "$GITHUB_ENV"
+          echo "RANLIB_aarch64_linux_android=$toolchain/llvm-ranlib" >> "$GITHUB_ENV"
+      - name: build Android Phase 1 binaries
+        run: cargo build --locked --target aarch64-linux-android -p haider-cli -p haider-daemond

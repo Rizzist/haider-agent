@@ -484,6 +484,51 @@ fn voice_card_is_verbatim_and_answers_apply() {
     )));
 }
 
+/// Narrow-terminal pin (retires OPTIMIZATIONS.md D3-10): the persistent voice
+/// route chip moved from the status bar to the header top-right
+/// (`render_header_voice_chip`). It draws into a rect sized exactly to the chip
+/// (so a mid-chip clip is structurally impossible) and — the real fix — DROPS
+/// the chip whole when the header's product line leaves no room, instead of
+/// overwriting that line the way the old status-bar chip clipped at 90 cols.
+///
+/// The wide leg proves the chip renders whole when it fits (non-vacuous). The
+/// sub-threshold leg proves the drop: at 100 cols this fixture's header (a
+/// breadcrumb + logo + `haider vX · <path>`) fills the row, so the chip is
+/// ABSENT rather than painted over the product line.
+///
+/// MUTATION CHECK: drop the `<= header_area.width` guard in
+/// `render_header_voice_chip` → at 100 cols the chip renders right-aligned over
+/// the product line, so "absent at 100" fails here. (Verified red-then-green.)
+#[test]
+fn voice_chip_drops_whole_when_the_header_is_too_narrow() {
+    let mut model = session_model();
+    // Enable voice (answer 2 → deepgram → elevenlabs), same setup as the card test.
+    submit(&mut model, "/voice");
+    model.handle(key(KeyCode::Char('2')));
+    echo_answer(&mut model);
+    assert!(
+        model.voice.enabled,
+        "voice is on, so the header chip is eligible to render"
+    );
+
+    // Fits on a wide terminal → the whole chip renders (non-vacuous).
+    assert!(
+        draw(&model, 120, 12)
+            .iter()
+            .any(|row| row.contains("[ ◉ voice") && row.contains(" ]")),
+        "at 120 cols the whole voice chip renders"
+    );
+
+    // The header's product line fills a 100-col row, so the chip must DROP whole
+    // rather than clip/overwrite it (the D3-10 fix): absent, never a fragment.
+    assert!(
+        !draw(&model, 100, 12)
+            .iter()
+            .any(|row| row.contains("◉ voice")),
+        "at 100 cols the voice chip drops whole rather than overwriting the header (D3-10)"
+    );
+}
+
 #[test]
 fn tools_card_is_verbatim_and_registers_with_dispatch_notes() {
     let mut model = session_model();

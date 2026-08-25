@@ -183,6 +183,13 @@ another backend rather than a new subsystem, and Termux and the APK can coexist
 capabilities. Proves `/proc`, sockets, process groups and paths work under
 Bionic. This is the ~15 sites above.
 
+**Phase 1 status.** An `aarch64-linux-android` CI full-link build now proves the
+CLI and daemon compile against the NDK; process tools resolve a Termux shell
+through executable `$SHELL` or PATH when `/bin` shells are absent, and Android
+excludes cpal behind an honest `MicUnavailable` capture stub. The no-op
+socket-inode anchor and kill-probe process-group check (rather than `/proc`
+member scanning) remain intentional conservative Unix fallbacks for Phase 1.
+
 **Phase 2 — the broker.** APK ships permissions, a foreground service and a
 capability socket. Daemon gains phone-use tools. SMS, screenshot and input
 injection arrive here.
