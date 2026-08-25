@@ -185,7 +185,7 @@ fn write_mobile_token(home: &Path, token: &str) -> Result<PathBuf, TransportErro
     let path = home.join(TOKEN_FILE_NAME);
     #[cfg(unix)]
     {
-        return write_mobile_token_unix(home, path, token);
+        write_mobile_token_unix(home, path, token)
     }
     #[cfg(not(unix))]
     {
@@ -1036,7 +1036,7 @@ impl ApkMobileBackend {
                 folder: "inbox".into(),
             });
         }
-        messages.sort_by(|left, right| right.date_ms.cmp(&left.date_ms));
+        messages.sort_by_key(|message| std::cmp::Reverse(message.date_ms));
         if let Ok(limit) = usize::try_from(limit.unwrap_or(DEFAULT_SMS_LIMIT)) {
             messages.truncate(limit);
         }
@@ -1367,7 +1367,6 @@ fn unexpected_response(expected: &str, response: &Value) -> MobileError {
 mod tests {
     use super::*;
     use haider_protocol::mobile::Point;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     #[tokio::test]
     async fn frame_codec_round_trips_big_endian_json_without_a_socket() {
