@@ -50,20 +50,61 @@ fn new_broker() -> (
 }
 
 #[test]
-fn sms_read_manifest_and_parser_pin_the_read_sms_effect() {
+fn mobile_manifest_and_parser_pin_all_dynamic_effects() {
     let manifest = mobile_manifest();
     assert_eq!(manifest.name, "mobile");
-    assert_eq!(manifest.effects, [EffectClass::ReadSms]);
+    assert_eq!(
+        manifest.effects,
+        [
+            EffectClass::ReadSms,
+            EffectClass::MobileObserve,
+            EffectClass::MobileControl
+        ]
+    );
     assert_eq!(
         manifest.input_schema["properties"]["action"]["enum"],
-        serde_json::json!(["sms_read"])
+        serde_json::json!([
+            "screenshot",
+            "a11y_tree",
+            "inspect",
+            "tap",
+            "long_press",
+            "swipe",
+            "type",
+            "key",
+            "open_app",
+            "list_apps",
+            "sms_read"
+        ])
     );
     assert_eq!(operation().action().effect_class(), EffectClass::ReadSms);
+    assert_eq!(
+        MobileOperation::from_tool_args(serde_json::json!({"action": "screenshot"}))
+            .expect("screenshot operation")
+            .action()
+            .effect_class(),
+        EffectClass::MobileObserve
+    );
+    assert_eq!(
+        MobileOperation::from_tool_args(serde_json::json!({
+            "action": "tap",
+            "x": 10,
+            "y": 20
+        }))
+        .expect("tap operation")
+        .action()
+        .effect_class(),
+        EffectClass::MobileControl
+    );
     assert!(matches!(
         MobileOperation::from_tool_args(serde_json::json!({
             "action": "sms_read",
             "future": true
         })),
+        Err(ToolError::InvalidArgument { .. })
+    ));
+    assert!(matches!(
+        MobileOperation::from_tool_args(serde_json::json!({"action": "tap"})),
         Err(ToolError::InvalidArgument { .. })
     ));
 }

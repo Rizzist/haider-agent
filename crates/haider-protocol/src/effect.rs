@@ -48,6 +48,10 @@ pub enum EffectClass {
     ScreenObserve,
     /// Actuate the pointer, keyboard, scroll wheel, or an interactive wait.
     ScreenControl,
+    /// Read pixels or structured accessibility state from an activated mobile capability.
+    MobileObserve,
+    /// Actuate an explicitly activated mobile capability.
+    MobileControl,
     /// Read SMS data from an explicitly activated mobile capability.
     ReadSms,
 }

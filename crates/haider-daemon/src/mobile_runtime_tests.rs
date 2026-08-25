@@ -4,51 +4,16 @@
 
 use super::*;
 use crate::session_hub::{SessionHub, SessionHubConfig};
-use async_trait::async_trait;
 use haider_core::{CancelToken, EventIdGenerator, MemoryStore, SqliteStoreHandle, StoreHandle};
+use haider_protocol::agent::Grant;
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
-use haider_protocol::mobile::{MobileAction, MobileOutput, SmsMessage};
+use haider_protocol::mobile::{MobileAction, MobileKey, MobileOutput, SmsMessage};
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_store::{SessionCreateCommand, TurnAcceptCommand};
-use haider_tools::{MobileBackend, MobileCancelToken, MobileResult};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-
-#[derive(Debug)]
-struct FakeMobileBackend {
-    output: MobileOutput,
-    calls: AtomicUsize,
-    actions: Mutex<Vec<MobileAction>>,
-}
-
-impl FakeMobileBackend {
-    fn new(output: MobileOutput) -> Self {
-        Self {
-            output,
-            calls: AtomicUsize::new(0),
-            actions: Mutex::new(Vec::new()),
-        }
-    }
-}
-
-#[async_trait]
-impl MobileBackend for FakeMobileBackend {
-    async fn execute(
-        &self,
-        action: &MobileAction,
-        cancel: &MobileCancelToken,
-    ) -> MobileResult<MobileOutput> {
-        cancel.check()?;
-        self.calls.fetch_add(1, Ordering::AcqRel);
-        self.actions
-            .lock()
-            .expect("mobile actions lock")
-            .push(action.clone());
-        Ok(self.output.clone())
-    }
-}
+use haider_tools::{FakeMobileBackend, MobileBackend};
+use std::sync::Arc;
 
 fn canned_sms() -> MobileOutput {
     MobileOutput::SmsList(vec![
@@ -103,7 +68,7 @@ fn memory_envelope(
     }
 }
 
-/// MUTATION PIN: removing the unconditional mobile retain must make the
+/// MUTATION PIN: removing the conditional mobile retain must make the
 /// inactive assertion fail by exposing the schema.
 #[test]
 fn mobile_authorized_definitions_omit_inactive_include_active() {
@@ -118,7 +83,19 @@ fn mobile_authorized_definitions_omit_inactive_include_active() {
         .expect("active session advertises mobile exactly once");
     assert_eq!(
         mobile.input_schema["properties"]["action"]["enum"],
-        serde_json::json!(["sms_read"])
+        serde_json::json!([
+            "screenshot",
+            "a11y_tree",
+            "inspect",
+            "tap",
+            "long_press",
+            "swipe",
+            "type",
+            "key",
+            "open_app",
+            "list_apps",
+            "sms_read"
+        ])
     );
     assert_eq!(
         active.iter().filter(|tool| tool.name == "mobile").count(),
@@ -257,6 +234,15 @@ async fn mobile_dispatcher_fixture(
     user_text: &str,
     backend: Arc<dyn MobileBackend>,
 ) -> MobileDispatcherFixture {
+    mobile_dispatcher_fixture_with_grant(label, user_text, backend, None).await
+}
+
+async fn mobile_dispatcher_fixture_with_grant(
+    label: &str,
+    user_text: &str,
+    backend: Arc<dyn MobileBackend>,
+    grant: Option<Grant>,
+) -> MobileDispatcherFixture {
     let profile = tempfile::tempdir().expect("profile");
     let workspace = tempfile::tempdir().expect("workspace");
     let cwd = std::fs::canonicalize(workspace.path())
@@ -347,7 +333,7 @@ async fn mobile_dispatcher_fixture(
             delegation: crate::delegation::DelegationHandle::new(hub.clone()),
             tasks: crate::tasks::TaskFacade::new(hub.clone()),
             agent_id: None,
-            grant: None,
+            grant,
             mobile_use_active,
             cli_scope: None,
             web_search: None,
@@ -381,7 +367,7 @@ async fn close_fixture(fixture: MobileDispatcherFixture) {
 /// because this fixture independently auto-allows ordinary effect policy.
 #[tokio::test]
 async fn mobile_dispatch_fence_rejects_inactive_without_backend() {
-    let backend = Arc::new(FakeMobileBackend::new(canned_sms()));
+    let backend = Arc::new(FakeMobileBackend::default());
     let fixture = mobile_dispatcher_fixture(
         "mobile-inactive-fence",
         "read my messages",
@@ -395,7 +381,7 @@ async fn mobile_dispatch_fence_rejects_inactive_without_backend() {
             &ItemId::new("mobile-inactive-item"),
             "mobile-inactive-call",
             "mobile",
-            serde_json::json!({"action": "sms_read", "limit": 2}),
+            serde_json::json!({"action": "tap", "x": 10, "y": 20}),
             &CancelToken::new(),
         )
         .await
@@ -403,7 +389,7 @@ async fn mobile_dispatch_fence_rejects_inactive_without_backend() {
     let ToolDispatchResult::Completed(result) = outcome else {
         panic!("inactive mobile dispatch must complete with a refusal");
     };
-    assert_eq!(backend.calls.load(Ordering::Acquire), 0);
+    assert_eq!(backend.call_count(), 0);
     assert_eq!(result.status, ToolResultStatus::Rejected);
     let preview: serde_json::Value =
         serde_json::from_str(&result.preview).expect("refusal preview JSON");
@@ -427,7 +413,7 @@ async fn mobile_dispatch_fence_rejects_inactive_without_backend() {
             matches!(
                 payload,
                 EventPayload::Effect(EffectPhase::Intent(EffectIntent {
-                    class: EffectClass::ReadSms,
+                    class: EffectClass::MobileControl,
                     ..
                 }))
             )
@@ -439,7 +425,7 @@ async fn mobile_dispatch_fence_rejects_inactive_without_backend() {
 #[tokio::test]
 async fn mobile_sms_read_fast_path_serializes_json_without_images() {
     let expected = canned_sms();
-    let backend = Arc::new(FakeMobileBackend::new(expected.clone()));
+    let backend = Arc::new(FakeMobileBackend::default());
     let fixture = mobile_dispatcher_fixture(
         "mobile-active-fast-path",
         "mobile-use read my messages",
@@ -473,13 +459,9 @@ async fn mobile_sms_read_fast_path_serializes_json_without_images() {
     assert!(result.images.is_empty());
     assert!(result.artifact.is_none());
     assert!(result.cursor.is_none());
-    assert_eq!(backend.calls.load(Ordering::Acquire), 1);
+    assert_eq!(backend.call_count(), 1);
     assert_eq!(
-        backend
-            .actions
-            .lock()
-            .expect("mobile actions lock")
-            .as_slice(),
+        backend.actions().expect("mobile actions"),
         [MobileAction::SmsRead {
             folder: Some("inbox".into()),
             since: None,
@@ -519,5 +501,185 @@ async fn mobile_sms_read_fast_path_serializes_json_without_images() {
             ..
         } if completed == &effect
     )));
+    close_fixture(fixture).await;
+}
+
+#[tokio::test]
+async fn mobile_screenshot_routes_mock_png_through_cu1_cas() {
+    let backend = Arc::new(FakeMobileBackend::default());
+    let fixture = mobile_dispatcher_fixture(
+        "mobile-screenshot",
+        "mobile-use inspect the screen",
+        Arc::clone(&backend) as Arc<dyn MobileBackend>,
+    )
+    .await;
+    let outcome = fixture
+        .dispatcher
+        .execute(
+            &fixture.run_id,
+            &ItemId::new("mobile-screenshot-item"),
+            "mobile-screenshot-call",
+            "mobile",
+            serde_json::json!({"action": "screenshot"}),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("mobile screenshot dispatch");
+    let ToolDispatchResult::Completed(result) = outcome else {
+        panic!("mobile screenshot must complete");
+    };
+    assert_eq!(result.status, ToolResultStatus::Completed);
+    assert_eq!(result.images.len(), 1);
+    let image = result.images.first().expect("CAS-routed image");
+    assert_eq!((image.width, image.height), (1, 1));
+    assert_eq!(image.media_type, "image/png");
+    let cas_bytes = fixture
+        .store
+        .get(&image.artifact)
+        .await
+        .expect("mobile screenshot CAS bytes");
+    assert!(cas_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(backend.call_count(), 1);
+    assert_eq!(
+        backend.actions().expect("mobile actions"),
+        [MobileAction::Screenshot {}]
+    );
+    close_fixture(fixture).await;
+}
+
+#[tokio::test]
+async fn mobile_a11y_tree_is_json_text_without_images() {
+    let backend = Arc::new(FakeMobileBackend::default());
+    let fixture = mobile_dispatcher_fixture(
+        "mobile-a11y",
+        "mobile-use inspect accessibility",
+        Arc::clone(&backend) as Arc<dyn MobileBackend>,
+    )
+    .await;
+    let outcome = fixture
+        .dispatcher
+        .execute(
+            &fixture.run_id,
+            &ItemId::new("mobile-a11y-item"),
+            "mobile-a11y-call",
+            "mobile",
+            serde_json::json!({"action": "a11y_tree"}),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("mobile a11y dispatch");
+    let ToolDispatchResult::Completed(result) = outcome else {
+        panic!("mobile a11y must complete");
+    };
+    assert_eq!(result.status, ToolResultStatus::Completed);
+    assert!(result.images.is_empty());
+    let output: MobileOutput =
+        serde_json::from_str(&result.preview).expect("a11y preview is typed JSON");
+    assert!(matches!(output, MobileOutput::A11yTree(nodes) if nodes.len() == 3));
+    assert_eq!(backend.call_count(), 1);
+    close_fixture(fixture).await;
+}
+
+#[tokio::test]
+async fn mobile_active_controls_return_ack_and_reach_mock_backend() {
+    let backend = Arc::new(FakeMobileBackend::default());
+    let fixture = mobile_dispatcher_fixture(
+        "mobile-controls",
+        "mobile-use control the device",
+        Arc::clone(&backend) as Arc<dyn MobileBackend>,
+    )
+    .await;
+    let calls = [
+        serde_json::json!({"action": "tap", "element_id": "compose"}),
+        serde_json::json!({"action": "type", "text": "hello"}),
+        serde_json::json!({"action": "key", "key": "enter"}),
+    ];
+    for (index, arguments) in calls.into_iter().enumerate() {
+        let outcome = fixture
+            .dispatcher
+            .execute(
+                &fixture.run_id,
+                &ItemId::new(format!("mobile-control-item-{index}")),
+                &format!("mobile-control-call-{index}"),
+                "mobile",
+                arguments,
+                &CancelToken::new(),
+            )
+            .await
+            .expect("mobile control dispatch");
+        let ToolDispatchResult::Completed(result) = outcome else {
+            panic!("mobile control must complete");
+        };
+        assert_eq!(result.status, ToolResultStatus::Completed);
+        assert_eq!(
+            result.preview,
+            serde_json::to_string(&MobileOutput::Ack).expect("Ack JSON")
+        );
+        assert!(result.images.is_empty());
+    }
+    assert_eq!(backend.call_count(), 3);
+    assert_eq!(
+        backend.actions().expect("mobile actions"),
+        [
+            MobileAction::Tap {
+                element_id: Some("compose".into()),
+                x: None,
+                y: None,
+            },
+            MobileAction::Type {
+                text: "hello".into(),
+            },
+            MobileAction::Key {
+                key: MobileKey::Enter,
+            },
+        ]
+    );
+    close_fixture(fixture).await;
+}
+
+/// MUTATION PIN: classify `tap` as MobileObserve or remove the exact-action
+/// grant fence and this call reaches the fake backend instead of refusing.
+#[tokio::test]
+async fn mobile_observe_only_grant_rejects_control_action() {
+    let grant = Grant {
+        tools: vec!["mobile".into()],
+        effect_ceiling: vec![EffectClass::MobileObserve],
+    };
+    let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
+    assert!(
+        authorized_tool_definitions(&factory, Some(&grant), true)
+            .iter()
+            .any(|tool| tool.name == "mobile"),
+        "the partial dynamic manifest must be admitted before exact-action fencing"
+    );
+
+    let backend = Arc::new(FakeMobileBackend::default());
+    let fixture = mobile_dispatcher_fixture_with_grant(
+        "mobile-effect-ceiling",
+        "mobile-use attempt delegated control",
+        Arc::clone(&backend) as Arc<dyn MobileBackend>,
+        Some(grant),
+    )
+    .await;
+    let outcome = fixture
+        .dispatcher
+        .execute(
+            &fixture.run_id,
+            &ItemId::new("mobile-effect-ceiling-item"),
+            "mobile-effect-ceiling-call",
+            "mobile",
+            serde_json::json!({"action": "tap", "x": 10, "y": 20}),
+            &CancelToken::new(),
+        )
+        .await
+        .expect("effect ceiling returns typed refusal");
+    let ToolDispatchResult::Completed(result) = outcome else {
+        panic!("effect ceiling refusal must complete");
+    };
+    assert_eq!(result.status, ToolResultStatus::Rejected);
+    assert_eq!(backend.call_count(), 0);
+    let preview: serde_json::Value =
+        serde_json::from_str(&result.preview).expect("grant refusal JSON");
+    assert_eq!(preview["error"]["kind"], "grant_ceiling_violation");
     close_fixture(fixture).await;
 }

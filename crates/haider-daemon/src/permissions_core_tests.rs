@@ -295,6 +295,14 @@ fn session_permission_overrides_replace_only_write_and_exec_ask_defaults() {
         decision(&baseline, EffectClass::ReadSms),
         ToolPermissionDefault::Ask
     );
+    assert_eq!(
+        decision(&baseline, EffectClass::MobileObserve),
+        ToolPermissionDefault::Ask
+    );
+    assert_eq!(
+        decision(&baseline, EffectClass::MobileControl),
+        ToolPermissionDefault::Ask
+    );
 
     let writes = metadata(Some(SessionPermissionOverridesV1 {
         allow_writes: true,
@@ -337,6 +345,16 @@ fn session_permission_overrides_replace_only_write_and_exec_ask_defaults() {
         decision(&exec, EffectClass::ReadSms),
         ToolPermissionDefault::Ask,
         "allow_exec must never imply SMS access"
+    );
+    assert_eq!(
+        decision(&exec, EffectClass::MobileObserve),
+        ToolPermissionDefault::Ask,
+        "allow_exec must never imply mobile observation"
+    );
+    assert_eq!(
+        decision(&exec, EffectClass::MobileControl),
+        ToolPermissionDefault::Ask,
+        "allow_exec must never imply mobile control"
     );
 }
 
@@ -383,6 +401,14 @@ fn auto_allow_promotes_every_ask_class_including_computer_and_fetch() {
         ToolPermissionDefault::Allow
     );
     assert_eq!(decision(EffectClass::ReadSms), ToolPermissionDefault::Allow);
+    assert_eq!(
+        decision(EffectClass::MobileObserve),
+        ToolPermissionDefault::Allow
+    );
+    assert_eq!(
+        decision(EffectClass::MobileControl),
+        ToolPermissionDefault::Allow
+    );
     assert_eq!(decision(EffectClass::FsWrite), ToolPermissionDefault::Allow);
     assert_eq!(
         decision(EffectClass::ProcessExec),
@@ -631,6 +657,8 @@ fn mobile_is_absent_from_default_child_grant() {
     let grant = crate::worker::default_child_grant();
     assert!(!grant.tools.iter().any(|tool| tool == "mobile"));
     assert!(!grant.effect_ceiling.contains(&EffectClass::ReadSms));
+    assert!(!grant.effect_ceiling.contains(&EffectClass::MobileObserve));
+    assert!(!grant.effect_ceiling.contains(&EffectClass::MobileControl));
 }
 
 /// MUTATION CHECK: ignore terminal freshness or use first-write-wins during

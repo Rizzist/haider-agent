@@ -129,9 +129,9 @@ use haider_tools::{
     ComputerOperation, ComputerOutput, ComputerPermissionPoll, EffectBroker, FsCaseMode, FsEdit,
     FsEditChange, FsGlob, FsPath, FsPathOperation, FsRead, FsSearch, FsSearchMode, FsWrite,
     GraphEvidence, JournalSink, MessageSubagent, MobileBackend, MobileCancelToken, MobileError,
-    MobileOperation, PermissionPolicy, ProcessBounds, ProcessExec, ProcessResult, ResultBounds,
-    ScreenshotRedactionPolicy, SessionGrant, SessionGrantScope, ShellSession, SpawnSubagent,
-    ToolError, ToolResult, TurnAttribution, WebFetch, WorkflowAuthor,
+    MobileOperation, MobileOutput, PermissionPolicy, ProcessBounds, ProcessExec, ProcessResult,
+    ResultBounds, ScreenshotRedactionPolicy, SessionGrant, SessionGrantScope, ShellSession,
+    SpawnSubagent, ToolError, ToolResult, TurnAttribution, WebFetch, WorkflowAuthor,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -7356,6 +7356,22 @@ pub(crate) fn grant_admits_manifest_effect(grant: &Grant, effect: &EffectClass) 
             .any(|ceiling| matches!(ceiling, EffectClass::Network { .. }))
 }
 
+/// Multi-action mobile declarations advertise their complete static upper
+/// bound, while delegated authority may intentionally admit only one dynamic
+/// action class. Every parsed mobile action is fenced again at its exact
+/// effect before authorization. Other tools retain the all-effects law.
+fn grant_admits_tool_manifest(grant: &Grant, name: &str, effects: &[EffectClass]) -> bool {
+    if name == "mobile" {
+        effects
+            .iter()
+            .any(|effect| grant_admits_manifest_effect(grant, effect))
+    } else {
+        effects
+            .iter()
+            .all(|effect| grant_admits_manifest_effect(grant, effect))
+    }
+}
+
 /// B2 — the use-site fence: under a grant whose network ceilings are ALL
 /// host-scoped, a fetch may touch only a declared host. A family ceiling
 /// (empty host) keeps today's behavior.
@@ -7380,11 +7396,11 @@ pub(crate) fn intersect_grant(requested: Grant, ceiling: &Grant) -> Grant {
                     .iter()
                     .find(|entry| entry.manifest.name == *name)
                     .is_some_and(|entry| {
-                        entry
-                            .manifest
-                            .effects
-                            .iter()
-                            .all(|effect| grant_admits_manifest_effect(ceiling, effect))
+                        grant_admits_tool_manifest(
+                            ceiling,
+                            &entry.manifest.name,
+                            &entry.manifest.effects,
+                        )
                     })
             })
             .collect(),
@@ -7404,12 +7420,7 @@ pub(crate) fn validate_grant(grant: &Grant) -> Result<(), HaiderError> {
                 "delegated manifest grants unknown tool `{name}`"
             )));
         };
-        if !entry
-            .manifest
-            .effects
-            .iter()
-            .all(|effect| grant_admits_manifest_effect(grant, effect))
-        {
+        if !grant_admits_tool_manifest(grant, &entry.manifest.name, &entry.manifest.effects) {
             return Err(grant_corrupt(format!(
                 "delegated manifest grants tool `{name}` above its effect ceiling"
             )));
@@ -7505,7 +7516,7 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
             "computer(action, x?, y?, from?, to?, text?, keys?, direction?, amount?, ms?) — control the local desktop. Call screenshot first; x/y and from/to are pixels in the latest screenshot; text=type, keys=shortcut like cmd+shift+4; direction+amount scroll; ms=wait ≤60000"
         }
         "mobile" => {
-            "mobile(action, folder?, since?, limit?) — use the explicitly activated mobile capability; sms_read returns SMS data as JSON"
+            "mobile(action, element_id?, x?, y?, from?, to?, text?, key?, package?, name?, folder?, since?, limit?) — observe or control an explicitly activated mobile capability; screenshot returns an image, accessibility/apps/SMS return JSON"
         }
         "fs_read" => {
             "fs_read(path, offset?, limit?) — read a bounded UTF-8 file slice; a directory path lists it"
@@ -7700,11 +7711,11 @@ fn authorized_tool_definitions(
                     .iter()
                     .find(|entry| entry.manifest.name == definition.name)
                     .is_some_and(|entry| {
-                        entry
-                            .manifest
-                            .effects
-                            .iter()
-                            .all(|effect| grant_admits_manifest_effect(grant, effect))
+                        grant_admits_tool_manifest(
+                            grant,
+                            &entry.manifest.name,
+                            &entry.manifest.effects,
+                        )
                     })
         });
     } else {
@@ -8435,6 +8446,30 @@ impl BrokerToolDispatcher {
         cas.put_image(&redacted, "image/png").await
     }
 
+    async fn admit_mobile_screenshot(
+        &self,
+        png: Vec<u8>,
+        cancel: &MobileCancelToken,
+    ) -> ToolResult<ImageBlockRef> {
+        cancel.check().map_err(ToolError::Mobile)?;
+        let policy = Arc::clone(&self.screenshot_redaction);
+        let redacted = tokio::task::spawn_blocking(move || {
+            policy.redact_png(&png).map(std::borrow::Cow::into_owned)
+        })
+        .await
+        .map_err(|error| ToolError::Runtime {
+            message: format!("mobile screenshot redaction worker failed: {error}"),
+        })?
+        .map_err(|error| {
+            ToolError::Mobile(MobileError::Backend {
+                message: format!("mobile screenshot redaction failed: {error}"),
+            })
+        })?;
+        cancel.check().map_err(ToolError::Mobile)?;
+        let mut cas = self.cas.lock().await;
+        cas.put_image(&redacted, "image/png").await
+    }
+
     async fn record_computer_observation(
         &self,
         record: ComputerObservationRecord<'_>,
@@ -8624,11 +8659,11 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     .into_iter()
                     .find(|entry| entry.manifest.name == name)
                     .is_some_and(|entry| {
-                        entry
-                            .manifest
-                            .effects
-                            .iter()
-                            .all(|effect| grant_admits_manifest_effect(grant, effect))
+                        grant_admits_tool_manifest(
+                            grant,
+                            &entry.manifest.name,
+                            &entry.manifest.effects,
+                        )
                     });
             if !allowed {
                 return Ok(ToolDispatchResult::Completed(grant_ceiling_result(name)));
@@ -9960,6 +9995,11 @@ impl ToolDispatcher for BrokerToolDispatcher {
             RegisteredToolRoute::Mobile => {
                 async {
                     let operation = MobileOperation::from_tool_args(args)?;
+                    if self.grant.as_ref().is_some_and(|grant| {
+                        !effect_within_grant(grant, &operation.action().effect_class())
+                    }) {
+                        return Ok(grant_ceiling_result("mobile"));
+                    }
                     let action_cancel = MobileCancelToken::new();
                     let intent = broker.authorize_mobile(&operation, &policy).await?;
                     self.mobile
@@ -9970,7 +10010,50 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         .dispatch_mobile(&intent, action_cancel.clone())
                         .await?;
                     match self.mobile.execute(operation.action(), &action_cancel).await {
-                        Ok(output) => {
+                        Ok(MobileOutput::Screenshot(png)) => {
+                            let stored = self.admit_mobile_screenshot(png, &action_cancel).await;
+                            match stored {
+                                Ok(image) => {
+                                    broker
+                                        .journal_mobile_outcome(&intent, EffectOutcome::Ok)
+                                        .await?;
+                                    Ok(BoundedResult {
+                                        preview: format!(
+                                            "mobile screenshot captured ({}x{})",
+                                            image.width, image.height
+                                        ),
+                                        truncated: false,
+                                        artifact: None,
+                                        images: vec![image],
+                                        cursor: None,
+                                        status: ToolResultStatus::Completed,
+                                        reason: None,
+                                        presentation: None,
+                                    })
+                                }
+                                Err(ToolError::Mobile(MobileError::Cancelled)) => {
+                                    broker
+                                        .journal_mobile_outcome(&intent, EffectOutcome::Cancelled)
+                                        .await?;
+                                    Err(ToolError::Mobile(MobileError::Cancelled))
+                                }
+                                Err(error) => {
+                                    broker
+                                        .journal_mobile_outcome(
+                                            &intent,
+                                            EffectOutcome::Failed {
+                                                error: error.to_string(),
+                                            },
+                                        )
+                                        .await?;
+                                    Err(error)
+                                }
+                            }
+                        }
+                        Ok(output @ (MobileOutput::A11yTree(_)
+                        | MobileOutput::AppList(_)
+                        | MobileOutput::Ack
+                        | MobileOutput::SmsList(_))) => {
                             let preview = match serde_json::to_string(&output) {
                                 Ok(preview) => preview,
                                 Err(error) => {
@@ -10382,7 +10465,13 @@ pub(crate) async fn tool_inventory_snapshot(
     let remembered_grants = durable
         .grants
         .into_iter()
-        .filter(|grant| mobile_use_active || grant.class != EffectClass::ReadSms)
+        .filter(|grant| {
+            mobile_use_active
+                || !matches!(
+                    grant.class,
+                    EffectClass::ReadSms | EffectClass::MobileObserve | EffectClass::MobileControl
+                )
+        })
         .map(|grant| RememberedSessionGrant {
             class: grant.class,
             scope: match grant.scope {
