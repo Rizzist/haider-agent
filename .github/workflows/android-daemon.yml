@@ -1,0 +1,64 @@
+name: android-daemon
+
+# Publishes the phone-side haiderd (+ haider CLI) as an aarch64-linux-android
+# binary so it can be installed in Termux on the device (APK-6). Mirrors the
+# proven android-build job in xplat.yml; the linker comes from .cargo/config.toml.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/config.toml'
+      - '.github/workflows/android-daemon.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android-daemon:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - name: install Android Rust target
+        run: rustup target add aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+          add-to-path: false
+      - name: configure Android NDK toolchain
+        shell: bash
+        env:
+          NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          toolchain="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "$toolchain" >> "$GITHUB_PATH"
+          echo "ANDROID_NDK=$NDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$NDK_ROOT" >> "$GITHUB_ENV"
+          echo "CC_aarch64_linux_android=$toolchain/aarch64-linux-android21-clang" >> "$GITHUB_ENV"
+          echo "CXX_aarch64_linux_android=$toolchain/aarch64-linux-android21-clang++" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$toolchain/llvm-ar" >> "$GITHUB_ENV"
+          echo "RANLIB_aarch64_linux_android=$toolchain/llvm-ranlib" >> "$GITHUB_ENV"
+      - name: build release daemon + CLI for Android
+        run: cargo build --release --locked --target aarch64-linux-android -p haider-cli -p haider-daemond
+      - name: stage binaries
+        run: |
+          mkdir -p dist-android
+          cp target/aarch64-linux-android/release/haiderd dist-android/haiderd-aarch64-linux-android
+          cp target/aarch64-linux-android/release/haider dist-android/haider-aarch64-linux-android
+          (cd dist-android && sha256sum * > SHA256SUMS)
+      - name: upload Android daemon artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: haiderd-aarch64-linux-android
+          path: dist-android/**
+          if-no-files-found: error
