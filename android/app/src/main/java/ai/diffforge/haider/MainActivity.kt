@@ -6,7 +6,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -19,13 +19,13 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.ArrowUpward
-import androidx.compose.material.icons.rounded.MoreHoriz
+import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.Icon
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -37,7 +37,12 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.material3.Text
+import androidx.lifecycle.viewmodel.compose.viewModel
+import ai.diffforge.haider.ui.chat.ChatViewModel
+import ai.diffforge.haider.ui.chat.Composer
+import ai.diffforge.haider.ui.chat.ConnectionState
+import ai.diffforge.haider.ui.chat.Transcript
+import ai.diffforge.haider.ui.onboarding.OnboardingScreen
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.ui.theme.ForgeShapes
 import ai.diffforge.haider.ui.theme.ForgeTheme
@@ -48,18 +53,25 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             ForgeTheme {
-                SessionDeckScreen()
+                AppRoot()
             }
         }
     }
 }
 
-private enum class DeckView(val label: String) {
-    Chat("Chat"), Shell("Shell"), Traj("Traj")
+@Composable
+private fun AppRoot() {
+    var showOnboarding by remember { mutableStateOf(false) }
+    val vm: ChatViewModel = viewModel()
+    if (showOnboarding) {
+        OnboardingScreen(onDone = { showOnboarding = false })
+    } else {
+        SessionDeckScreen(vm = vm, onOpenSetup = { showOnboarding = true })
+    }
 }
 
 @Composable
-private fun SessionDeckScreen() {
+private fun SessionDeckScreen(vm: ChatViewModel, onOpenSetup: () -> Unit) {
     val colors = Forge.colors
     Column(
         modifier = Modifier
@@ -67,24 +79,24 @@ private fun SessionDeckScreen() {
             .background(colors.bg)
             .windowInsetsPadding(WindowInsets.safeDrawing),
     ) {
-        HeaderRow()
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f),
-            contentAlignment = Alignment.Center,
-        ) {
-            HomeState()
+        HeaderRow(connection = vm.connection, onOpenSetup = onOpenSetup)
+        Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
+            if (vm.messages.isEmpty()) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    HomeState(onOpenSetup = onOpenSetup)
+                }
+            } else {
+                Transcript(messages = vm.messages, modifier = Modifier.fillMaxSize())
+            }
         }
-        Composer()
+        Composer(onSend = vm::send)
     }
 }
 
 @Composable
-private fun HeaderRow() {
+private fun HeaderRow(connection: ConnectionState, onOpenSetup: () -> Unit) {
     val colors = Forge.colors
     val type = Forge.type
-    var view by remember { mutableStateOf(DeckView.Chat) }
     Column {
         Row(
             modifier = Modifier
@@ -93,64 +105,40 @@ private fun HeaderRow() {
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text("Haider", style = type.h4, color = colors.text)
-            Spacer(Modifier.width(6.dp))
-            Icon(
-                Icons.Rounded.MoreHoriz,
-                contentDescription = "Session menu",
-                tint = colors.textMuted,
-                modifier = Modifier.size(18.dp),
-            )
             Spacer(Modifier.weight(1f))
-            SegmentedToggle(view) { view = it }
-            Spacer(Modifier.width(12.dp))
-            StatusPill(dot = colors.textMuted, label = "idle")
-        }
-        Box(
-            Modifier
-                .fillMaxWidth()
-                .height(1.dp)
-                .background(colors.border),
-        )
-    }
-}
-
-@Composable
-private fun SegmentedToggle(selected: DeckView, onSelect: (DeckView) -> Unit) {
-    val colors = Forge.colors
-    val type = Forge.type
-    Row(
-        modifier = Modifier
-            .clip(ForgeShapes.pill)
-            .background(colors.surfaceControl)
-            .border(1.dp, colors.border, ForgeShapes.pill)
-            .padding(2.dp),
-    ) {
-        DeckView.entries.forEach { v ->
-            val active = v == selected
+            StatusPill(connection)
+            Spacer(Modifier.width(10.dp))
             Box(
                 modifier = Modifier
-                    .clip(ForgeShapes.pill)
-                    .background(if (active) colors.accent.copy(alpha = 0.22f) else Color.Transparent)
-                    .then(
-                        if (active) Modifier.border(1.dp, colors.accentSoft.copy(alpha = 0.35f), ForgeShapes.pill)
-                        else Modifier,
-                    )
-                    .padding(horizontal = 12.dp, vertical = 5.dp),
+                    .size(32.dp)
+                    .clip(CircleShape)
+                    .background(colors.surfaceControl)
+                    .border(1.dp, colors.border, CircleShape)
+                    .clickable { onOpenSetup() },
+                contentAlignment = Alignment.Center,
             ) {
-                Text(
-                    v.label,
-                    style = type.chip,
-                    color = if (active) colors.text else colors.textMuted,
+                Icon(
+                    Icons.Rounded.Tune,
+                    contentDescription = "Setup",
+                    tint = colors.textSoft,
+                    modifier = Modifier.size(17.dp),
                 )
             }
         }
+        Box(Modifier.fillMaxWidth().height(1.dp).background(colors.border))
     }
 }
 
 @Composable
-private fun StatusPill(dot: Color, label: String) {
+private fun StatusPill(connection: ConnectionState) {
     val colors = Forge.colors
     val type = Forge.type
+    val dot = when (connection) {
+        ConnectionState.Idle -> colors.textMuted
+        ConnectionState.Connecting -> colors.amber
+        ConnectionState.Connected -> colors.green
+        ConnectionState.Error -> colors.red
+    }
     Row(
         modifier = Modifier
             .clip(ForgeShapes.pill)
@@ -159,26 +147,19 @@ private fun StatusPill(dot: Color, label: String) {
             .padding(horizontal = 10.dp, vertical = 5.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Box(
-            Modifier
-                .size(6.dp)
-                .clip(CircleShape)
-                .background(dot),
-        )
+        Box(Modifier.size(6.dp).clip(CircleShape).background(dot))
         Spacer(Modifier.width(6.dp))
-        Text(label, style = type.statusPill, color = colors.textSoft)
+        Text(connection.label, style = type.statusPill, color = colors.textSoft)
     }
 }
 
 @Composable
-private fun HomeState() {
+private fun HomeState(onOpenSetup: () -> Unit) {
     val colors = Forge.colors
     val type = Forge.type
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
-        modifier = Modifier
-            .widthIn(max = 480.dp)
-            .padding(horizontal = 24.dp),
+        modifier = Modifier.widthIn(max = 480.dp).padding(horizontal = 24.dp),
     ) {
         Text("Haider", style = type.h1, color = colors.text)
         Spacer(Modifier.height(8.dp))
@@ -188,49 +169,16 @@ private fun HomeState() {
             color = colors.textMuted,
             textAlign = TextAlign.Center,
         )
-    }
-}
-
-@Composable
-private fun Composer() {
-    val colors = Forge.colors
-    val type = Forge.type
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
+        Spacer(Modifier.height(20.dp))
         Row(
             modifier = Modifier
-                .weight(1f)
-                .clip(ForgeShapes.composer)
-                .background(colors.surfaceControl)
-                .border(1.dp, colors.border, ForgeShapes.composer)
-                .padding(horizontal = 16.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically,
+                .clip(ForgeShapes.pill)
+                .background(colors.accent.copy(alpha = 0.16f))
+                .border(1.dp, colors.accentSoft.copy(alpha = 0.35f), ForgeShapes.pill)
+                .clickable { onOpenSetup() }
+                .padding(horizontal = 16.dp, vertical = 9.dp),
         ) {
-            Text(
-                "Message Haider…",
-                style = type.chatBody,
-                color = colors.textDisabled,
-                modifier = Modifier.weight(1f),
-            )
-        }
-        Spacer(Modifier.width(10.dp))
-        Box(
-            modifier = Modifier
-                .size(40.dp)
-                .clip(CircleShape)
-                .background(colors.accent),
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(
-                Icons.Rounded.ArrowUpward,
-                contentDescription = "Send",
-                tint = Color.White,
-                modifier = Modifier.size(20.dp),
-            )
+            Text("Set up permissions", style = type.chip, color = colors.accentSoft)
         }
     }
 }
