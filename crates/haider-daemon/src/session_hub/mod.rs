@@ -2165,6 +2165,7 @@ impl SessionHub {
     /// Narrow daemon-internal session creation used by local delegation.
     /// It preserves the same unfenced receipt preflight and actor-routed
     /// transaction as the wire method without fabricating an RPC connection.
+    #[cfg(test)]
     pub(crate) async fn create_internal_session(
         &self,
         command: SessionCreateCommand,

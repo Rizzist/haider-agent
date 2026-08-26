@@ -452,6 +452,7 @@ fn autonomous_effect_defaults_preserve_explicit_grant_precedence() {
     let explicit = metadata(Some(SessionPermissionOverridesV1 {
         allow_writes: true,
         allow_exec: true,
+        allow_mobile: false,
         auto_allow: false,
     }));
     assert_eq!(

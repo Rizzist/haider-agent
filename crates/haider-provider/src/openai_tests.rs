@@ -960,7 +960,7 @@ async fn pinned_subscription_capabilities_use_cached_catalog_without_discovery()
             .expect("resolve Kimi fixture credential"),
         "kimi-coding-a",
         KIMI_OAUTH_BASE_URL,
-        Arc::clone(&kimi_resolver),
+        Arc::clone(&kimi_resolver) as Arc<dyn FixedDnsResolver>,
     )
     .expect("construct Kimi adapter")
     .with_cached_catalog_model(Some(&kimi_model));
@@ -997,7 +997,7 @@ async fn pinned_subscription_capabilities_use_cached_catalog_without_discovery()
             .expect("resolve Grok fixture credential"),
         "grok-pinned",
         GROK_OAUTH_BASE_URL,
-        Arc::clone(&grok_resolver),
+        Arc::clone(&grok_resolver) as Arc<dyn FixedDnsResolver>,
     )
     .expect("construct Grok adapter")
     .with_cached_catalog_model(Some(&grok_model));

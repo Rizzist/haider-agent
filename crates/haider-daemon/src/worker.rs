@@ -5121,7 +5121,7 @@ async fn start_turn(
         (Some(status), Some(workflow)) => {
             let expected_type = (status.phase == GraphPhase::Active)
                 .then_some(())
-                .and_then(|()| status.current_node.as_ref())
+                .and(status.current_node.as_ref())
                 .filter(|node| status.node_is_ready(node))
                 .and_then(|node| workflow.meta.iter().find(|meta| &meta.node == node))
                 .and_then(|meta| meta.agent_type.as_deref());
@@ -7845,10 +7845,10 @@ pub(crate) fn intersect_grant(requested: Grant, ceiling: &Grant) -> Grant {
                     }
                 }
             }
-            effect if effect_within_grant(ceiling, &effect) => {
-                if !effect_ceiling.contains(&effect) {
-                    effect_ceiling.push(effect);
-                }
+            effect
+                if effect_within_grant(ceiling, &effect) && !effect_ceiling.contains(&effect) =>
+            {
+                effect_ceiling.push(effect);
             }
             _ => {}
         }
@@ -8811,7 +8811,7 @@ impl BrokerToolDispatcher {
         let loom_tail = Some(loom_run_tail(&workflow));
         let expected_type = (status.phase == GraphPhase::Active)
             .then_some(())
-            .and_then(|()| status.current_node.as_ref())
+            .and(status.current_node.as_ref())
             .filter(|node| status.node_is_ready(node))
             .and_then(|node| workflow.meta.iter().find(|meta| &meta.node == node))
             .and_then(|meta| meta.agent_type.as_deref());

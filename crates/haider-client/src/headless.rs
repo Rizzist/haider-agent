@@ -45,9 +45,11 @@ use crate::client::{
 use crate::profile::ResolvedProfile;
 #[cfg(unix)]
 use crate::profile::effective_uid;
+#[cfg(unix)]
+use crate::spawn::signal_authenticated_peer;
 use crate::spawn::{
     DaemonLifetime, DaemonOwnershipToken, EnsureError, EnsureOptions, ensure_daemon,
-    required_live_features, signal_authenticated_peer,
+    required_live_features,
 };
 
 /// Default time allowed for a durable cancellation to reach a correlated

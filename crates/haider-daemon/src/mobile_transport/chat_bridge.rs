@@ -1238,7 +1238,7 @@ fn initial_pair(
                 .filter(usable)
                 .find(|provider| provider.default_model.is_some())
         })
-        .or_else(|| providers.iter().filter(usable).next());
+        .or_else(|| providers.iter().find(usable));
     selected.map_or_else(
         || {
             (
