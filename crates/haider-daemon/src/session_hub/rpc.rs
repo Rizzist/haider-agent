@@ -3869,6 +3869,34 @@ impl HubConnection {
                 )
                 .await
             }
+            RequestBody::LoomInstallRetry { job_id } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.loom_install_retry(request_id, job_id).await
+            }
+            RequestBody::LoomInstallWatch {
+                job_id,
+                after_cursor,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.loom_install_watch(request_id, job_id, after_cursor)
+                    .await
+            }
             // `Unknown` and any future method decode alike: a typed,
             // correlated rejection instead of a dropped request.
             _ => self.respond_error(
@@ -7145,9 +7173,12 @@ impl HubConnection {
         record: haider_protocol::loom::LoomAgentType,
     ) -> Result<(), SessionHubError> {
         match self.hub.loom_register_agent_type(record).await {
-            Ok(registration) => self.send(WireFrame::Response {
+            Ok(outcome) => self.send(WireFrame::Response {
                 request_id,
-                body: ResponseBody::LoomRegistered { registration },
+                body: ResponseBody::LoomRegistered {
+                    registration: outcome.registration,
+                    install_job_id: outcome.install_job_id,
+                },
             }),
             Err(error) => self.respond_error(
                 request_id,
@@ -7190,6 +7221,100 @@ impl HubConnection {
         })
     }
 
+    async fn loom_install_retry(
+        &self,
+        request_id: RequestId,
+        job_id: String,
+    ) -> Result<(), SessionHubError> {
+        let outcome = match self.hub.typed_agent_install_retry(job_id.clone()).await {
+            Ok(haider_core::TypedAgentInstallRetryResult::Requeued(job)) => {
+                haider_rpc::TypedAgentInstallRetryOutcomeWire::Requeued { job }
+            }
+            Ok(haider_core::TypedAgentInstallRetryResult::JobNotFound) => {
+                haider_rpc::TypedAgentInstallRetryOutcomeWire::Rejected {
+                    rejection: haider_rpc::TypedAgentInstallRetryRejectionWire::JobNotFound,
+                }
+            }
+            Ok(haider_core::TypedAgentInstallRetryResult::StateNotRetryable { state }) => {
+                haider_rpc::TypedAgentInstallRetryOutcomeWire::Rejected {
+                    rejection: haider_rpc::TypedAgentInstallRetryRejectionWire::StateNotRetryable {
+                        state,
+                    },
+                }
+            }
+            Ok(haider_core::TypedAgentInstallRetryResult::ContractNotCurrent) => {
+                haider_rpc::TypedAgentInstallRetryOutcomeWire::Rejected {
+                    rejection: haider_rpc::TypedAgentInstallRetryRejectionWire::ContractNotCurrent,
+                }
+            }
+            Err(error) => {
+                return self.respond_error(
+                    request_id,
+                    error.code.as_str(),
+                    &error.message,
+                    error.retryable,
+                    None,
+                );
+            }
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::LoomInstallRetry {
+                receipt: haider_rpc::TypedAgentInstallRetryReceiptWire { job_id, outcome },
+            },
+        })
+    }
+
+    async fn loom_install_watch(
+        &self,
+        request_id: RequestId,
+        job_id: String,
+        after_cursor: u64,
+    ) -> Result<(), SessionHubError> {
+        let outcome = match self
+            .hub
+            .typed_agent_install_watch(job_id.clone(), after_cursor)
+            .await
+        {
+            Ok(haider_core::TypedAgentInstallWatchResult::Watching(page)) => {
+                haider_rpc::TypedAgentInstallWatchOutcomeWire::Watching {
+                    requested_after_cursor: page.requested_after_cursor,
+                    replay_through_cursor: page.replay_through_cursor,
+                    next_cursor: page.next_cursor,
+                    events: page.events,
+                }
+            }
+            Ok(haider_core::TypedAgentInstallWatchResult::JobNotFound) => {
+                haider_rpc::TypedAgentInstallWatchOutcomeWire::Rejected {
+                    rejection: haider_rpc::TypedAgentInstallWatchRejectionWire::JobNotFound,
+                }
+            }
+            Ok(haider_core::TypedAgentInstallWatchResult::CursorAhead { requested, head }) => {
+                haider_rpc::TypedAgentInstallWatchOutcomeWire::Rejected {
+                    rejection: haider_rpc::TypedAgentInstallWatchRejectionWire::CursorAhead {
+                        requested,
+                        head,
+                    },
+                }
+            }
+            Err(error) => {
+                return self.respond_error(
+                    request_id,
+                    error.code.as_str(),
+                    &error.message,
+                    error.retryable,
+                    None,
+                );
+            }
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::LoomInstallWatch {
+                receipt: haider_rpc::TypedAgentInstallWatchReceiptWire { job_id, outcome },
+            },
+        })
+    }
+
     /// B1 — workflow registration from pipe source; the daemon compiles.
     async fn loom_register_workflow(
         &self,
@@ -7199,7 +7324,10 @@ impl HubConnection {
         match self.hub.inner.store.loom_register_workflow(source).await {
             Ok(registration) => self.send(WireFrame::Response {
                 request_id,
-                body: ResponseBody::LoomRegistered { registration },
+                body: ResponseBody::LoomRegistered {
+                    registration,
+                    install_job_id: None,
+                },
             }),
             Err(error) => self.respond_error(
                 request_id,

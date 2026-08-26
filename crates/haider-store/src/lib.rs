@@ -52,7 +52,8 @@ pub use event_store::{
     SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, Store,
     SwitchedGraph, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
     TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus, TypedAgentInstallCas,
-    TypedAgentInstallItemCas, TypedAgentInstallSnapshot,
+    TypedAgentInstallItemCas, TypedAgentInstallRetryResult, TypedAgentInstallSnapshot,
+    TypedAgentInstallWatchPage, TypedAgentInstallWatchResult,
 };
 pub use haider_protocol::error::{ErrorCode, HaiderError};
 pub use usage_ledger::{

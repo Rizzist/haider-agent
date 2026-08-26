@@ -104,16 +104,28 @@
       "response": {"method":"loom.list"}
     },
     {
+      "request_method": "loom.install.retry",
+      "response_method": "loom.install.retry",
+      "request": {"method":"loom.install.retry","job_id":"install:reviewer:1"},
+      "response": {"method":"loom.install.retry","receipt":{"job_id":"install:reviewer:1","outcome":{"status":"requeued","job":{"job_id":"install:reviewer:1","agent_type_id":"reviewer","agent_type_rev":1,"agent_type_digest":"0123456789abcdef0123456789abcdef","state":"queued","progress":{"total":1,"completed":0},"created_at_ms":1753500000000,"updated_at_ms":1753500000000}}}}
+    },
+    {
       "request_method": "loom.install.status",
       "response_method": "loom.install.status",
       "request": {"method":"loom.install.status","job_id":"install:reviewer:1","agent_type_id":"reviewer"},
       "response": {"method":"loom.install.status","jobs":[{"job_id":"install:reviewer:1","agent_type_id":"reviewer","agent_type_rev":1,"agent_type_digest":"0123456789abcdef0123456789abcdef","state":"queued","progress":{"total":1,"completed":0},"created_at_ms":1753500000000,"updated_at_ms":1753500000000}],"items":[{"job_id":"install:reviewer:1","ordinal":0,"required_cli":{"program":"rg"},"state":"queued","created_at_ms":1753500000000,"updated_at_ms":1753500000000}]}
     },
     {
+      "request_method": "loom.install.watch",
+      "response_method": "loom.install.watch",
+      "request": {"method":"loom.install.watch","job_id":"install:reviewer:1","after_cursor":0},
+      "response": {"method":"loom.install.watch","receipt":{"job_id":"install:reviewer:1","outcome":{"status":"watching","requested_after_cursor":0,"replay_through_cursor":1,"next_cursor":1,"events":[{"cursor":1,"job":{"job_id":"install:reviewer:1","agent_type_id":"reviewer","agent_type_rev":1,"agent_type_digest":"0123456789abcdef0123456789abcdef","state":"queued","progress":{"total":1,"completed":0},"created_at_ms":1753500000000,"updated_at_ms":1753500000000}}]}}}
+    },
+    {
       "request_method": "loom.register_agent_type",
       "response_method": "loom.registered",
-      "request": {"method":"loom.register_agent_type","record":{"id":"reviewer","name":"Reviewer","job":"Review changes","in_type":"Patch","out_type":"Verdict","rev":0}},
-      "response": {"method":"loom.registered","registration":{"id":"reviewer","rev":1,"digest":"digest-agent","updated":true}}
+      "request": {"method":"loom.register_agent_type","record":{"id":"reviewer","name":"Reviewer","job":"Review changes","in_type":"Patch","out_type":"Verdict","clis":["rg"],"rev":0}},
+      "response": {"method":"loom.registered","registration":{"id":"reviewer","rev":1,"digest":"digest-agent","updated":true},"install_job_id":"install:reviewer:1"}
     },
     {
       "request_method": "loom.register_workflow",

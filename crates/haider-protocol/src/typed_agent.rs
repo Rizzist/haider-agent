@@ -31,6 +31,10 @@ pub const TYPED_AGENT_INSTALL_ERROR_MAX_BYTES: usize = 512;
 /// snapshot. Exact-job polling is unaffected; every inventory query (global
 /// or type-filtered) is bounded so an old profile cannot exceed the frame.
 pub const TYPED_AGENT_INSTALL_STATUS_MAX_JOBS: usize = 32;
+/// Maximum durable progress snapshots returned by one install-watch page.
+/// A client advances with the returned cursor until it reaches the sealed
+/// replay-through cursor.
+pub const TYPED_AGENT_INSTALL_WATCH_PAGE_MAX_EVENTS: usize = 128;
 
 /// Stable machine-readable classification for contract validation failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,7 +212,9 @@ impl TypedAgentContract {
     }
 }
 
-/// Durable installation lifecycle. Succeeded and failed are terminal.
+/// Durable installation lifecycle. Succeeded and failed are terminal for the
+/// ordinary installer CAS. The separately negotiated install-control door may
+/// atomically reset a failed aggregate to queued for an explicit retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TypedAgentInstallState {
@@ -477,6 +483,27 @@ impl TypedAgentInstallItem {
             ));
         }
         self.state.validate_transition_to(next.state)
+    }
+}
+
+/// One immutable, cursor-addressed snapshot in an install job's durable
+/// progress history. The cursor is store-issued replay authority; it is not a
+/// job id, agent id, registry revision, or timestamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedAgentInstallEvent {
+    pub cursor: u64,
+    pub job: TypedAgentInstallJob,
+}
+
+impl TypedAgentInstallEvent {
+    pub fn validate(&self) -> Result<(), TypedAgentContractError> {
+        if self.cursor == 0 {
+            return Err(TypedAgentContractError::new(
+                TypedAgentContractErrorCode::InvalidInstallProgress,
+                "typed-agent install event cursor must be positive",
+            ));
+        }
+        self.job.validate()
     }
 }
 

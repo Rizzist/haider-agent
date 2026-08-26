@@ -78,9 +78,9 @@ use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::task::TaskEventPayload;
 use haider_protocol::tool::{AttachmentBlock, ImageBlockRef};
 use haider_protocol::typed_agent::{
-    TYPED_AGENT_INSTALL_STATUS_MAX_JOBS, TypedAgentContract, TypedAgentContractError,
-    TypedAgentInstallItem, TypedAgentInstallJob, TypedAgentInstallProgress, TypedAgentInstallState,
-    TypedAgentRequiredCli,
+    TYPED_AGENT_INSTALL_STATUS_MAX_JOBS, TYPED_AGENT_INSTALL_WATCH_PAGE_MAX_EVENTS,
+    TypedAgentContract, TypedAgentContractError, TypedAgentInstallEvent, TypedAgentInstallItem,
+    TypedAgentInstallJob, TypedAgentInstallProgress, TypedAgentInstallState, TypedAgentRequiredCli,
 };
 use haider_protocol::{DeliveryMode, EventPayload};
 use rusqlite::{
@@ -1399,14 +1399,16 @@ pub struct CachedModels {
     pub fetched_at_ms: u64,
 }
 
-/// Atomic result of registering one typed Loom specialist. A changed or new
-/// type with required CLIs carries the durable install job created in the same
-/// transaction as its frozen registry revision. Idempotent registrations and
-/// types without required CLIs carry no job.
+/// Atomic result of registering one typed Loom specialist. `install_job` is
+/// present only when this transaction created the job and therefore owns
+/// daemon-runner adoption. `install_job_id` also projects an already-existing
+/// exact-revision job for an idempotent registration; types without required
+/// CLIs carry neither.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoomAgentTypeRegistration {
     pub registration: LoomRegistration,
     pub install_job: Option<TypedAgentInstallJob>,
+    pub install_job_id: Option<String>,
 }
 
 /// Compare-and-swap coordinates for one optional per-program transition.
@@ -1431,6 +1433,33 @@ pub struct TypedAgentInstallCas {
 pub struct TypedAgentInstallSnapshot {
     pub jobs: Vec<TypedAgentInstallJob>,
     pub items: Vec<TypedAgentInstallItem>,
+}
+
+/// Result of the explicit failed-install reset. Rejections are facts returned
+/// as typed data by the RPC layer, not errors whose prose must be parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypedAgentInstallRetryResult {
+    Requeued(TypedAgentInstallJob),
+    JobNotFound,
+    StateNotRetryable { state: TypedAgentInstallState },
+    ContractNotCurrent,
+}
+
+/// One bounded, exact-job page from the durable progress history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedAgentInstallWatchPage {
+    pub requested_after_cursor: u64,
+    pub replay_through_cursor: u64,
+    pub next_cursor: u64,
+    pub events: Vec<TypedAgentInstallEvent>,
+}
+
+/// Lookup result for the replayable install progress door.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypedAgentInstallWatchResult {
+    Watching(TypedAgentInstallWatchPage),
+    JobNotFound,
+    CursorAhead { requested: u64, head: u64 },
 }
 
 /// Definitive login failure persisted in a failed receipt (401/403 class):
@@ -2298,10 +2327,20 @@ impl Store {
                 enqueue_typed_agent_install(&transaction, &contract, now)?
             }
         };
+        let install_job_id = transaction
+            .query_row(
+                "SELECT job_id FROM loom_cli_install_jobs
+                 WHERE agent_type_id = ?1 AND agent_type_rev = ?2",
+                params![outcome.id.as_str(), i64::from(outcome.rev)],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(LoomAgentTypeRegistration {
             registration: outcome,
             install_job,
+            install_job_id,
         })
     }
 
@@ -2341,6 +2380,154 @@ impl Store {
         let items = typed_agent_install_status_items_tx(&transaction, job_id, agent_type_id)?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(TypedAgentInstallSnapshot { jobs, items })
+    }
+
+    /// Reset one failed, current-contract install aggregate to queued. This is
+    /// deliberately separate from the monotonic installer CAS: only an
+    /// explicit negotiated retry may reopen failure, and every CLI item is
+    /// reset in the same transaction before a daemon runner is adopted.
+    pub fn typed_agent_install_retry(
+        &self,
+        job_id: &str,
+    ) -> StoreResult<TypedAgentInstallRetryResult> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let Some(actual) = typed_agent_install_job_tx(&transaction, job_id)? else {
+            return Ok(TypedAgentInstallRetryResult::JobNotFound);
+        };
+        if actual.state != TypedAgentInstallState::Failed {
+            return Ok(TypedAgentInstallRetryResult::StateNotRetryable {
+                state: actual.state,
+            });
+        }
+        let current_contract = transaction
+            .query_row(
+                "SELECT rev, digest FROM loom_agent_types WHERE id = ?1",
+                [actual.agent_type_id.as_str()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?;
+        let is_current = current_contract.is_some_and(|(rev, digest)| {
+            u32::try_from(rev).ok() == Some(actual.agent_type_rev)
+                && digest == actual.agent_type_digest
+        });
+        if !is_current {
+            return Ok(TypedAgentInstallRetryResult::ContractNotCurrent);
+        }
+
+        let mut reset_items = typed_agent_install_items_tx(&transaction, Some(job_id), None)?;
+        let retry_at_ms = reset_items
+            .iter()
+            .map(|item| item.updated_at_ms)
+            .fold(now_ms()?.max(actual.updated_at_ms), u64::max);
+        let mut next = actual.clone();
+        next.state = TypedAgentInstallState::Queued;
+        next.progress.completed = 0;
+        next.progress.current_cli = None;
+        next.error = None;
+        next.updated_at_ms = retry_at_ms;
+        next.validate()
+            .map_err(typed_agent_install_validation_error)?;
+        for item in &mut reset_items {
+            item.state = TypedAgentInstallState::Queued;
+            item.error = None;
+            item.updated_at_ms = retry_at_ms;
+            item.validate()
+                .map_err(typed_agent_install_validation_error)?;
+        }
+        validate_typed_agent_install_snapshot(&next, &reset_items).map_err(|message| {
+            corrupt(format!(
+                "typed-agent install retry for `{job_id}` is inconsistent: {message}"
+            ))
+        })?;
+
+        let reset_job = transaction
+            .execute(
+                "UPDATE loom_cli_install_jobs
+                 SET state = 'queued', completed = 0, current_cli = NULL,
+                     error = NULL, updated_at_ms = ?2
+                 WHERE job_id = ?1 AND state = 'failed' AND updated_at_ms = ?3",
+                params![
+                    job_id,
+                    to_sqlite_integer(retry_at_ms)?,
+                    to_sqlite_integer(actual.updated_at_ms)?,
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+        if reset_job != 1 {
+            return Err(typed_agent_install_conflict(format!(
+                "typed-agent install job `{job_id}` lost its retry race"
+            )));
+        }
+        let reset_items_count = transaction
+            .execute(
+                "UPDATE loom_cli_install_items
+                 SET state = 'queued', error = NULL, updated_at_ms = ?2
+                 WHERE job_id = ?1",
+                params![job_id, to_sqlite_integer(retry_at_ms)?],
+            )
+            .map_err(map_sqlite_error)?;
+        if reset_items_count != usize::from(next.progress.total) {
+            return Err(corrupt(format!(
+                "typed-agent install retry for `{job_id}` reset {reset_items_count} items; expected {}",
+                next.progress.total
+            )));
+        }
+        insert_typed_agent_install_event(&transaction, &next)?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(TypedAgentInstallRetryResult::Requeued(next))
+    }
+
+    /// Read one exact job's durable progress snapshots strictly after the
+    /// caller's applied cursor. The response seals a replay-through cursor and
+    /// returns at most 128 events; callers page until `next_cursor` reaches it.
+    pub fn typed_agent_install_watch(
+        &self,
+        job_id: &str,
+        after_cursor: u64,
+    ) -> StoreResult<TypedAgentInstallWatchResult> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(map_sqlite_error)?;
+        if typed_agent_install_job_tx(&transaction, job_id)?.is_none() {
+            return Ok(TypedAgentInstallWatchResult::JobNotFound);
+        }
+        let head = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(cursor), 0)
+                 FROM loom_cli_install_events WHERE job_id = ?1",
+                [job_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(map_sqlite_error)
+            .and_then(|cursor| {
+                u64::try_from(cursor)
+                    .map_err(|_| corrupt("typed-agent install event cursor is negative"))
+            })?;
+        if head == 0 {
+            return Err(corrupt(format!(
+                "typed-agent install job `{job_id}` has no progress history"
+            )));
+        }
+        if after_cursor > head {
+            return Ok(TypedAgentInstallWatchResult::CursorAhead {
+                requested: after_cursor,
+                head,
+            });
+        }
+        let events = typed_agent_install_events_tx(&transaction, job_id, after_cursor)?;
+        let next_cursor = events.last().map_or(after_cursor, |event| event.cursor);
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(TypedAgentInstallWatchResult::Watching(
+            TypedAgentInstallWatchPage {
+                requested_after_cursor: after_cursor,
+                replay_through_cursor: head,
+                next_cursor,
+                events,
+            },
+        ))
     }
 
     /// Atomically compare and replace one durable install job plus an
@@ -2460,6 +2647,7 @@ impl Store {
                 )));
             }
         }
+        insert_typed_agent_install_event(&transaction, &update.next_job)?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(update.next_job.clone())
     }
@@ -16621,7 +16809,107 @@ fn enqueue_typed_agent_install(
             )
             .map_err(map_sqlite_error)?;
     }
+    insert_typed_agent_install_event(transaction, &job)?;
     Ok(Some(job))
+}
+
+fn insert_typed_agent_install_event(
+    connection: &Connection,
+    job: &TypedAgentInstallJob,
+) -> StoreResult<()> {
+    job.validate()
+        .map_err(typed_agent_install_validation_error)?;
+    let inserted = connection
+        .execute(
+            "INSERT INTO loom_cli_install_events(
+                 job_id, agent_type_id, agent_type_rev, agent_type_digest,
+                 state, total, completed, current_cli, error,
+                 created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                job.job_id.as_str(),
+                job.agent_type_id.as_str(),
+                i64::from(job.agent_type_rev),
+                job.agent_type_digest.as_str(),
+                typed_agent_install_state_str(job.state),
+                i64::from(job.progress.total),
+                i64::from(job.progress.completed),
+                job.progress.current_cli.as_deref(),
+                job.error.as_deref(),
+                to_sqlite_integer(job.created_at_ms)?,
+                to_sqlite_integer(job.updated_at_ms)?,
+            ],
+        )
+        .map_err(map_sqlite_error)?;
+    if inserted != 1 {
+        return Err(corrupt(format!(
+            "typed-agent install event for `{}` affected no row",
+            job.job_id
+        )));
+    }
+    Ok(())
+}
+
+fn typed_agent_install_events_tx(
+    connection: &Connection,
+    job_id: &str,
+    after_cursor: u64,
+) -> StoreResult<Vec<TypedAgentInstallEvent>> {
+    let limit = i64::try_from(TYPED_AGENT_INSTALL_WATCH_PAGE_MAX_EVENTS)
+        .map_err(|_| corrupt("typed-agent install watch page bound exceeds SQLite INTEGER"))?;
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT cursor, job_id, agent_type_id, agent_type_rev,
+                    agent_type_digest, state, total, completed, current_cli,
+                    error, created_at_ms, updated_at_ms
+             FROM loom_cli_install_events
+             WHERE job_id = ?1 AND cursor > ?2
+             ORDER BY cursor
+             LIMIT ?3",
+        )
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query(params![job_id, to_sqlite_integer(after_cursor)?, limit])
+        .map_err(map_sqlite_error)?;
+    let mut events = Vec::new();
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let cursor = u64::try_from(row.get::<_, i64>(0).map_err(map_sqlite_error)?)
+            .map_err(|_| corrupt("typed-agent install event cursor is negative"))?;
+        let agent_type_rev = u32::try_from(row.get::<_, i64>(3).map_err(map_sqlite_error)?)
+            .map_err(|_| corrupt("typed-agent install event revision is out of range"))?;
+        let total = u16::try_from(row.get::<_, i64>(6).map_err(map_sqlite_error)?)
+            .map_err(|_| corrupt("typed-agent install event total is out of range"))?;
+        let completed = u16::try_from(row.get::<_, i64>(7).map_err(map_sqlite_error)?)
+            .map_err(|_| corrupt("typed-agent install event completion count is out of range"))?;
+        let created_at_ms = u64::try_from(row.get::<_, i64>(10).map_err(map_sqlite_error)?)
+            .map_err(|_| corrupt("typed-agent install event creation timestamp is negative"))?;
+        let updated_at_ms = u64::try_from(row.get::<_, i64>(11).map_err(map_sqlite_error)?)
+            .map_err(|_| corrupt("typed-agent install event update timestamp is negative"))?;
+        let state: String = row.get(5).map_err(map_sqlite_error)?;
+        let event = TypedAgentInstallEvent {
+            cursor,
+            job: TypedAgentInstallJob {
+                job_id: row.get(1).map_err(map_sqlite_error)?,
+                agent_type_id: row.get(2).map_err(map_sqlite_error)?,
+                agent_type_rev,
+                agent_type_digest: row.get(4).map_err(map_sqlite_error)?,
+                state: typed_agent_install_state(&state)?,
+                progress: TypedAgentInstallProgress {
+                    total,
+                    completed,
+                    current_cli: row.get(8).map_err(map_sqlite_error)?,
+                },
+                error: row.get(9).map_err(map_sqlite_error)?,
+                created_at_ms,
+                updated_at_ms,
+            },
+        };
+        event
+            .validate()
+            .map_err(typed_agent_install_validation_error)?;
+        events.push(event);
+    }
+    Ok(events)
 }
 
 fn typed_agent_install_jobs_tx(

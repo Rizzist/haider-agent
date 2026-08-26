@@ -717,15 +717,16 @@ fn migration_backfill_and_legacy_heal_preserve_the_pinned_digest() {
     )
     .expect("plant pre-stamp row");
     raw.execute_batch(
-        "DROP TABLE loom_workflow_revisions;
-         DELETE FROM schema_migrations WHERE version = 21;
+        "DROP TABLE loom_cli_install_events;
+         DROP TABLE loom_workflow_revisions;
+         DELETE FROM schema_migrations WHERE version >= 21;
          PRAGMA user_version = 20;",
     )
     .expect("rewind migration 21 fixture");
     drop(raw);
 
     let store = Store::open(root.path()).expect("migrate legacy database");
-    assert_eq!(store.schema_version().expect("schema version"), 21);
+    assert_eq!(store.schema_version().expect("schema version"), 22);
     let legacy = store
         .loom_workflow("legacy-retained")
         .expect("read migrated current")

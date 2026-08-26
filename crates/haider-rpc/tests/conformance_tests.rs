@@ -10,8 +10,12 @@ use haider_rpc::haider_protocol::typed_agent::{
 };
 use haider_rpc::{
     AttachmentId, CodecError, CommandId, FEATURE_ACCOUNT_OAUTH_IMPORT_V1, FEATURE_MONITOR_V1,
-    FEATURE_TYPED_AGENT_INSTALL_V1, RequestBody, RequestId, ResponseBody, WireEncoding, WireFrame,
-    decode_msgpack, encode_msgpack, haider_protocol::ids::SessionId, uds_codec, ws_codec,
+    FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1, FEATURE_TYPED_AGENT_INSTALL_V1, RequestBody, RequestId,
+    ResponseBody, TypedAgentInstallRetryOutcomeWire, TypedAgentInstallRetryReceiptWire,
+    TypedAgentInstallRetryRejectionWire, TypedAgentInstallWatchOutcomeWire,
+    TypedAgentInstallWatchReceiptWire, TypedAgentInstallWatchRejectionWire, WireEncoding,
+    WireFrame, decode_msgpack, encode_msgpack, haider_protocol::ids::SessionId, uds_codec,
+    ws_codec,
 };
 
 #[test]
@@ -199,6 +203,165 @@ fn typed_agent_install_status_round_trips_and_feature_is_pinned() {
         let uds = uds_codec::encode(&frame, TEST_FRAME_LIMIT).expect("UDS encode");
         assert_eq!(uds_decode(&uds), frame);
     }
+}
+
+/// MUTATION CHECK: remove the control feature, either tail-added method, the
+/// retry receipt job, or any watch cursor. Expected runtime failure: the exact
+/// values or codec round trips below no longer describe a recoverable replay.
+#[test]
+fn typed_agent_install_control_receipts_and_watch_cursors_round_trip() {
+    assert_eq!(
+        FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1,
+        "typed_agent_install_control_v1"
+    );
+    let job = TypedAgentInstallJob {
+        job_id: "install:reviewer:1".into(),
+        agent_type_id: "reviewer".into(),
+        agent_type_rev: 1,
+        agent_type_digest: "0123456789abcdef0123456789abcdef".into(),
+        state: TypedAgentInstallState::Queued,
+        progress: TypedAgentInstallProgress {
+            total: 1,
+            completed: 0,
+            current_cli: None,
+        },
+        error: None,
+        created_at_ms: 1_753_500_000_000,
+        updated_at_ms: 1_753_500_000_000,
+    };
+    let event = haider_rpc::haider_protocol::typed_agent::TypedAgentInstallEvent {
+        cursor: 41,
+        job: job.clone(),
+    };
+    let frames = [
+        WireFrame::Request {
+            request_id: RequestId::new("request-install-retry"),
+            body: RequestBody::LoomInstallRetry {
+                job_id: job.job_id.clone(),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-install-retry"),
+            body: ResponseBody::LoomInstallRetry {
+                receipt: TypedAgentInstallRetryReceiptWire {
+                    job_id: job.job_id.clone(),
+                    outcome: TypedAgentInstallRetryOutcomeWire::Requeued { job: job.clone() },
+                },
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId::new("request-install-watch"),
+            body: RequestBody::LoomInstallWatch {
+                job_id: job.job_id.clone(),
+                after_cursor: 0,
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-install-watch"),
+            body: ResponseBody::LoomInstallWatch {
+                receipt: TypedAgentInstallWatchReceiptWire {
+                    job_id: job.job_id,
+                    outcome: TypedAgentInstallWatchOutcomeWire::Watching {
+                        requested_after_cursor: 0,
+                        replay_through_cursor: 41,
+                        next_cursor: 41,
+                        events: vec![event],
+                    },
+                },
+            },
+        },
+    ];
+    for frame in frames {
+        let ws = ws_codec::encode(&frame, TEST_FRAME_LIMIT).expect("WS encode");
+        assert_eq!(
+            ws_codec::decode(&ws, TEST_FRAME_LIMIT).expect("WS decode"),
+            frame
+        );
+        let uds = uds_codec::encode(&frame, TEST_FRAME_LIMIT).expect("UDS encode");
+        assert_eq!(uds_decode(&uds), frame);
+    }
+
+    let retry_rejections = [
+        (
+            TypedAgentInstallRetryRejectionWire::JobNotFound,
+            serde_json::json!({"reason": "job_not_found"}),
+        ),
+        (
+            TypedAgentInstallRetryRejectionWire::StateNotRetryable {
+                state: TypedAgentInstallState::Succeeded,
+            },
+            serde_json::json!({"reason": "state_not_retryable", "state": "succeeded"}),
+        ),
+        (
+            TypedAgentInstallRetryRejectionWire::ContractNotCurrent,
+            serde_json::json!({"reason": "contract_not_current"}),
+        ),
+    ];
+    for (rejection, expected) in retry_rejections {
+        assert_eq!(
+            serde_json::to_value(rejection).expect("retry rejection JSON"),
+            expected
+        );
+    }
+    let watch_rejections = [
+        (
+            TypedAgentInstallWatchRejectionWire::JobNotFound,
+            serde_json::json!({"reason": "job_not_found"}),
+        ),
+        (
+            TypedAgentInstallWatchRejectionWire::CursorAhead {
+                requested: 42,
+                head: 41,
+            },
+            serde_json::json!({"reason": "cursor_ahead", "requested": 42, "head": 41}),
+        ),
+    ];
+    for (rejection, expected) in watch_rejections {
+        assert_eq!(
+            serde_json::to_value(rejection).expect("watch rejection JSON"),
+            expected
+        );
+    }
+
+    let retry_rejected = TypedAgentInstallRetryReceiptWire {
+        job_id: "missing-install".into(),
+        outcome: TypedAgentInstallRetryOutcomeWire::Rejected {
+            rejection: TypedAgentInstallRetryRejectionWire::JobNotFound,
+        },
+    };
+    assert_eq!(
+        serde_json::to_value(retry_rejected).expect("retry rejected receipt JSON"),
+        serde_json::json!({
+            "job_id": "missing-install",
+            "outcome": {
+                "status": "rejected",
+                "rejection": {"reason": "job_not_found"}
+            }
+        })
+    );
+    let watch_rejected = TypedAgentInstallWatchReceiptWire {
+        job_id: "install:reviewer:1".into(),
+        outcome: TypedAgentInstallWatchOutcomeWire::Rejected {
+            rejection: TypedAgentInstallWatchRejectionWire::CursorAhead {
+                requested: 42,
+                head: 41,
+            },
+        },
+    };
+    assert_eq!(
+        serde_json::to_value(watch_rejected).expect("watch rejected receipt JSON"),
+        serde_json::json!({
+            "job_id": "install:reviewer:1",
+            "outcome": {
+                "status": "rejected",
+                "rejection": {
+                    "reason": "cursor_ahead",
+                    "requested": 42,
+                    "head": 41
+                }
+            }
+        })
+    );
 }
 
 #[test]

@@ -425,6 +425,9 @@ pub const FEATURE_LOOM_CLI_PRESENCE_V1: &str = "loom_cli_presence_v1";
 /// Typed-agent registrations create durable required-CLI install jobs whose
 /// progress can be queried after disconnect or daemon restart.
 pub const FEATURE_TYPED_AGENT_INSTALL_V1: &str = "typed_agent_install_v1";
+/// Daemon returns install-job coordinates from typed registration and serves
+/// typed failed-job retry plus cursor-replayable progress pages.
+pub const FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1: &str = "typed_agent_install_control_v1";
 /// Session observe projections carry the active pinned workflow so a
 /// client can render workflow state without issuing a separate graph.status
 /// read (the workflow remains distinct from a child spawn's selector).
@@ -2193,6 +2196,84 @@ pub struct MonitorWatchReceiptWire {
     pub outcome: MonitorWatchOutcomeWire,
 }
 
+/// Stable rejection reasons for `loom.install.retry`. Job lookup, lifecycle
+/// state, and current-contract identity remain distinct facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum TypedAgentInstallRetryRejectionWire {
+    JobNotFound,
+    StateNotRetryable {
+        state: haider_protocol::typed_agent::TypedAgentInstallState,
+    },
+    ContractNotCurrent,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Typed result of explicitly retrying one durable install job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum TypedAgentInstallRetryOutcomeWire {
+    Requeued {
+        job: haider_protocol::typed_agent::TypedAgentInstallJob,
+    },
+    Rejected {
+        rejection: TypedAgentInstallRetryRejectionWire,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// Typed `loom.install.retry` receipt. `job_id` is the opaque install-job
+/// coordinate supplied by the client, never an agent/workflow id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedAgentInstallRetryReceiptWire {
+    pub job_id: String,
+    pub outcome: TypedAgentInstallRetryOutcomeWire,
+}
+
+/// Stable rejection reasons for the exact-job progress watch door.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum TypedAgentInstallWatchRejectionWire {
+    JobNotFound,
+    CursorAhead {
+        requested: u64,
+        head: u64,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// One replay page from an install job's durable progress history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum TypedAgentInstallWatchOutcomeWire {
+    Watching {
+        requested_after_cursor: u64,
+        replay_through_cursor: u64,
+        next_cursor: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        events: Vec<haider_protocol::typed_agent::TypedAgentInstallEvent>,
+    },
+    Rejected {
+        rejection: TypedAgentInstallWatchRejectionWire,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// Typed `loom.install.watch` receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedAgentInstallWatchReceiptWire {
+    pub job_id: String,
+    pub outcome: TypedAgentInstallWatchOutcomeWire,
+}
+
 /// Report terminal/match status from the durable monitor subsystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -3074,6 +3155,12 @@ pub enum RequestBody {
         session_id: SessionId,
         after_cursor: u64,
     },
+    /// Explicitly reset one failed, current-contract install job to queued.
+    #[serde(rename = "loom.install.retry")]
+    LoomInstallRetry { job_id: String },
+    /// Read durable progress snapshots strictly after the applied cursor.
+    #[serde(rename = "loom.install.watch")]
+    LoomInstallWatch { job_id: String, after_cursor: u64 },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline). W3b answers it with a protocol error, not a panic.
     #[serde(other)]
@@ -3250,6 +3337,10 @@ pub enum ResponseBody {
     #[serde(rename = "loom.registered")]
     LoomRegistered {
         registration: haider_protocol::loom::LoomRegistration,
+        /// Present only under `typed_agent_install_control_v1` and only when
+        /// this agent-type revision has a durable required-CLI install job.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        install_job_id: Option<String>,
     },
     #[serde(rename = "loom.install.status")]
     LoomInstallStatus {
@@ -3721,6 +3812,14 @@ pub enum ResponseBody {
     MonitorRemove { receipt: MonitorRemoveReceiptWire },
     #[serde(rename = "monitor.watch")]
     MonitorWatch { receipt: MonitorWatchReceiptWire },
+    #[serde(rename = "loom.install.retry")]
+    LoomInstallRetry {
+        receipt: TypedAgentInstallRetryReceiptWire,
+    },
+    #[serde(rename = "loom.install.watch")]
+    LoomInstallWatch {
+        receipt: TypedAgentInstallWatchReceiptWire,
+    },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline).
     #[serde(other)]

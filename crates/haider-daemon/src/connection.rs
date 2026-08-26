@@ -62,9 +62,10 @@ use haider_rpc::{
     FEATURE_SESSION_MUTATION_V1, FEATURE_SESSION_OBSERVE_BATCH_V1, FEATURE_SESSION_OBSERVE_V1,
     FEATURE_SESSION_PERMISSION_OVERRIDES_V1, FEATURE_SESSION_RUN_ID_V1,
     FEATURE_SESSION_WORKFLOW_STATE_V1, FEATURE_SHELL_EXEC_V1, FEATURE_TOOL_INVENTORY_V1,
-    FEATURE_TURN_CONTROL_V1, FEATURE_TYPED_AGENT_INSTALL_V1, FEATURE_USER_COMMAND_V1,
-    FEATURE_VAULT_STAGE_V1, Hello, LifecyclePhase, ProtocolError, RequestBody, RequestId,
-    ResponseBody, ServerRange, Welcome, WireEncoding, WireFrame, negotiate, uds_codec,
+    FEATURE_TURN_CONTROL_V1, FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1,
+    FEATURE_TYPED_AGENT_INSTALL_V1, FEATURE_USER_COMMAND_V1, FEATURE_VAULT_STAGE_V1, Hello,
+    LifecyclePhase, ProtocolError, RequestBody, RequestId, ResponseBody, ServerRange, Welcome,
+    WireEncoding, WireFrame, negotiate, uds_codec,
 };
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::IoSlice;
@@ -1890,6 +1891,7 @@ fn welcome_features() -> BTreeSet<String> {
         haider_rpc::FEATURE_WORKFLOW_INSTANCE_V1.to_owned(),
         FEATURE_LOOM_CLI_PRESENCE_V1.to_owned(),
         FEATURE_TYPED_AGENT_INSTALL_V1.to_owned(),
+        FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1.to_owned(),
         FEATURE_SESSION_WORKFLOW_STATE_V1.to_owned(),
         FEATURE_SESSION_RUN_ID_V1.to_owned(),
         FEATURE_PIPE_NATIVE_V2.to_owned(),
