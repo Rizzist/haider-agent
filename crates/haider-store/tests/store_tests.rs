@@ -264,6 +264,19 @@ fn projection_checkpoint_lookup_is_timeline_exact_and_corruption_is_reported() {
         error.message.contains("prompt_history") && error.message.contains("branch-a"),
         "corruption evidence must identify the disabled checkpoint: {error:?}"
     );
+
+    must(connection.execute(
+        "UPDATE session_projection_checkpoints SET payload = 7 WHERE session_id = ?1",
+        [session.as_str()],
+    ));
+    let error = match store.session_projection_checkpoint(&session, "prompt_history", "branch-a") {
+        Err(error) => error,
+        Ok(checkpoint) => {
+            panic!("storage-class-invalid checkpoint must be reported, got {checkpoint:?}")
+        }
+    };
+    assert_eq!(error.code, ErrorCode::StoreCorrupt);
+    assert!(!error.retryable);
 }
 
 /// MUTATION CHECK: remove the global UNIQUE law on `events.event_id`.
@@ -571,12 +584,12 @@ fn migrations_apply_fresh_and_are_idempotent_on_reopen() {
     let root = test_root();
     let database_path = {
         let store = must(Store::open(root.path()));
-        assert_eq!(must(store.schema_version()), 22);
+        assert_eq!(must(store.schema_version()), 23);
         store.database_path().to_path_buf()
     };
 
     let reopened = must(Store::open(root.path()));
-    assert_eq!(must(reopened.schema_version()), 22);
+    assert_eq!(must(reopened.schema_version()), 23);
     let connection = must(Connection::open(database_path));
     let registered: u32 = must(connection.query_row(
         "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 1 AND 14",
@@ -597,6 +610,8 @@ fn migrations_apply_fresh_and_are_idempotent_on_reopen() {
         "branches",
         "hook_dispatch_outbox",
         "session_projection_checkpoints",
+        "run_head_sessions",
+        "run_heads",
         "loom_cli_install_jobs",
         "loom_cli_install_items",
         "loom_cli_install_events",
@@ -657,7 +672,7 @@ fn typed_agent_install_job_schema_is_durable_and_bounded() {
     drop(connection);
 
     let reopened = must(Store::open(root.path()));
-    assert_eq!(must(reopened.schema_version()), 22);
+    assert_eq!(must(reopened.schema_version()), 23);
     let connection = must(Connection::open(reopened.database_path()));
     let retained: (String, u32, u32) = must(connection.query_row(
         "SELECT state, completed, total FROM loom_cli_install_jobs WHERE job_id = ?1",
@@ -939,7 +954,8 @@ fn reducer_payload_filters_match_full_scan_for_every_declared_kind_set() {
         let mut cursor = 0;
         let mut filtered_scan = Vec::new();
         loop {
-            let page = must(store.read_reducer_page(&session, cursor, 2, payload_kinds));
+            let page =
+                must(store.read_reducer_page(&session, cursor, 2, usize::MAX, payload_kinds));
             if page.is_empty() {
                 break;
             }
@@ -991,13 +1007,57 @@ fn reducer_page_decode_failure_falls_back_to_full_scan() {
     ));
     drop(connection);
 
-    let fallback = must(store.read_reducer_page(&session, 0, 1, &["run_state"]));
+    let fallback = must(store.read_reducer_page(&session, 0, 1, usize::MAX, &["run_state"]));
     assert_eq!(fallback, vec![batch[0].clone()]);
     let filtered_error =
-        must_err(store.read_reducer_page(&session, fallback[0].seq, 1, &["run_state"]));
+        must_err(store.read_reducer_page(&session, fallback[0].seq, 1, usize::MAX, &["run_state"]));
     let full_scan_error = must_err(store.read(&session, fallback[0].seq, 1));
     assert_eq!(filtered_error.code, ErrorCode::StoreCorrupt);
     assert_eq!(filtered_error, full_scan_error);
+}
+
+/// MUTATION CHECK: derive the checkpoint boundary from the last selected row
+/// or fetch the irrelevant tail envelope to advance it. The filtered page
+/// must expose the committed head as metadata while decoding only run-state.
+#[test]
+fn reducer_page_observes_an_irrelevant_suffix_without_materializing_it() {
+    let root = test_root();
+    let store = must(Store::open(root.path()));
+    let session = SessionId::new("reducer-observed-head");
+    let mut batch = vec![
+        envelope(
+            &session,
+            "reducer-observed-state",
+            json!({"type": "run_state", "state": "queued"}),
+        ),
+        envelope(
+            &session,
+            "reducer-observed-irrelevant",
+            json!({"type": "irrelevant"}),
+        ),
+    ];
+    must(store.append(&mut batch));
+
+    let first =
+        must(store.read_reducer_page_with_boundary(&session, 0, 16, usize::MAX, &["run_state"]));
+    assert_eq!(first.envelopes, vec![batch[0].clone()]);
+    assert_eq!(
+        first.observed_head,
+        Some((batch[1].seq, batch[1].event_id.clone()))
+    );
+
+    let suffix = must(store.read_reducer_page_with_boundary(
+        &session,
+        batch[0].seq,
+        16,
+        usize::MAX,
+        &["run_state"],
+    ));
+    assert!(suffix.envelopes.is_empty());
+    assert_eq!(
+        suffix.observed_head,
+        Some((batch[1].seq, batch[1].event_id.clone()))
+    );
 }
 
 /// v0.0.936 attention state: `seen_at_ms` is monotone under ANY candidate —

@@ -50,16 +50,21 @@ mod runtime_tests;
 use crate::connection::{ConnectionContext, ConnectionExit, DrainNotice, reject_over_limit, serve};
 use crate::diagnostics::EffectDiagnostics;
 use crate::endpoint;
+use crate::hooks::HookStartupHydrator;
 use crate::lifecycle::{ShutdownObserver, ShutdownRequest, StatePublisher};
-use crate::turn_recovery::{RecoveredWork, recover_interrupted_turns_report};
+use crate::pipe_native::{PipeBootSession, PipeNativeWriter};
+use crate::turn_recovery::{
+    RecoveredWork, StartupJournalVisitor, recover_interrupted_turns_report_with_visitor,
+};
 use crate::worker::WorkerManager;
 use crate::{
     DaemonConfig, DaemonDependencies, DaemonError, DaemonState, IncumbentDiagnostics, Readiness,
     SessionHub, ShutdownHandle, ShutdownOutcome,
 };
-use haider_core::{SqliteStoreHandle, reconcile_dispatched_effects};
-use haider_protocol::error::ErrorCode;
-use haider_protocol::ids::DeviceId;
+use haider_core::{SqliteStoreHandle, StoreHandle, reconcile_dispatched_effects};
+use haider_protocol::envelope::RawEnvelope;
+use haider_protocol::error::{ErrorCode, HaiderError};
+use haider_protocol::ids::{DeviceId, SessionId};
 use std::fs;
 use std::future::Future;
 use std::path::Path;
@@ -70,6 +75,22 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
+const STARTUP_JOURNAL_PAGE_ENVELOPES: usize = 512;
+const STARTUP_JOURNAL_PAGE_BYTES: usize = 4 * 1_024 * 1_024;
+const STARTUP_VISITOR_PAYLOAD_KINDS: &[&str] = &[
+    "effect",
+    "hook_run_trust",
+    "item",
+    "item_tool_call",
+    "menu_answered",
+    "menu_closed",
+    "menu_opened",
+    "node_committed",
+    "run_failed",
+    "run_state",
+    "tool_result",
+];
+
 /// Handle to one spawned daemon: observe its phases, request shutdown, and
 /// join for the typed outcome.
 pub struct DaemonTask {
@@ -77,6 +98,132 @@ pub struct DaemonTask {
     shutdown: ShutdownHandle,
     crash: watch::Sender<bool>,
     task: JoinHandle<Result<ShutdownOutcome, DaemonError>>,
+}
+
+/// One-session-at-a-time fan-out for the pre-Ready journal scan. Pages feed
+/// hook state and the native-pipe projector immediately; decoded envelopes
+/// are dropped before the next bounded page is read.
+struct StartupHydration {
+    store: SqliteStoreHandle,
+    hooks: HookStartupHydrator,
+    pipe_native: Arc<PipeNativeWriter>,
+    pipe_session: Option<PipeBootSession>,
+}
+
+impl StartupHydration {
+    async fn prepare(store: &SqliteStoreHandle) -> Result<Self, HaiderError> {
+        Ok(Self {
+            store: store.clone(),
+            hooks: HookStartupHydrator::prepare(store).await?,
+            pipe_native: Arc::new(PipeNativeWriter::new(store.root())),
+            pipe_session: None,
+        })
+    }
+
+    fn into_parts(self) -> (HookStartupHydrator, Arc<PipeNativeWriter>) {
+        (self.hooks, self.pipe_native)
+    }
+}
+
+#[async_trait::async_trait]
+impl StartupJournalVisitor for StartupHydration {
+    async fn start_session(&mut self, session_id: &SessionId) -> Result<u64, HaiderError> {
+        debug_assert!(self.pipe_session.is_none());
+        let hook_cursor = self.hooks.scan_start(session_id);
+        let pipe_cursor = match self
+            .pipe_native
+            .begin_boot_session(&self.store, session_id)
+            .await
+        {
+            Ok(session) => {
+                let cursor = session.scan_start();
+                self.pipe_session = Some(session);
+                cursor
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    %error,
+                    "boot native pipe cursor inspection failed; requesting full shared replay"
+                );
+                0
+            }
+        };
+        Ok(hook_cursor.min(pipe_cursor))
+    }
+
+    async fn visit_page(
+        &mut self,
+        session_id: &SessionId,
+        page: &[RawEnvelope],
+    ) -> Result<(), HaiderError> {
+        self.hooks.fold_page(session_id, page);
+        if let Some(pipe_session) = &mut self.pipe_session
+            && let Err(error) = pipe_session.fold_page(page).await
+        {
+            self.pipe_native.invalidate(session_id);
+            self.pipe_session = None;
+            tracing::warn!(
+                session_id = %session_id,
+                %error,
+                "boot native pipe page fold failed; journal remains authoritative"
+            );
+        }
+        Ok(())
+    }
+
+    async fn finish_session(
+        &mut self,
+        store: &SqliteStoreHandle,
+        session_id: &SessionId,
+    ) -> Result<(), HaiderError> {
+        // Turn recovery can append terminal facts after the main scan. Read
+        // that suffix once and fan each bounded page to both remaining
+        // consumers before either publishes its startup state.
+        loop {
+            let mut cursor = self.hooks.scan_start(session_id);
+            if let Some(pipe_session) = &self.pipe_session {
+                cursor = cursor.min(pipe_session.through_seq());
+            }
+            let page = store
+                .read_reducer_page_with_boundary(
+                    session_id,
+                    cursor,
+                    STARTUP_JOURNAL_PAGE_ENVELOPES,
+                    STARTUP_JOURNAL_PAGE_BYTES,
+                    STARTUP_VISITOR_PAYLOAD_KINDS,
+                )
+                .await?;
+            if page.envelopes.is_empty() {
+                if let Some((through_seq, boundary_event_id)) = page.observed_head {
+                    self.hooks
+                        .advance_through(session_id, through_seq, &boundary_event_id);
+                    if let Some(pipe_session) = &mut self.pipe_session {
+                        pipe_session.advance_through(through_seq);
+                    }
+                }
+                break;
+            }
+            self.visit_page(session_id, &page.envelopes).await?;
+        }
+        if let Some(pipe_session) = self.pipe_session.take() {
+            if let Err(error) = self
+                .pipe_native
+                .finish_boot_session(session_id, pipe_session)
+                .await
+            {
+                self.pipe_native.invalidate(session_id);
+                tracing::warn!(
+                    session_id = %session_id,
+                    %error,
+                    "boot native pipe sidecar reconciliation failed; journal remains authoritative"
+                );
+            } else {
+                self.pipe_native.release_clean(session_id);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl DaemonTask {
@@ -316,8 +463,21 @@ async fn run_inner(
         let request = shutdown.borrow().clone();
         return shutdown_before_listener(config, states, store, request, &mut shutdown).await;
     }
+    let mut startup_hydration = match StartupHydration::prepare(&store).await {
+        Ok(hydration) => hydration,
+        Err(error) => {
+            let _ = store.close().await;
+            return Err(error.into());
+        }
+    };
     let turn_recovery_started = Instant::now();
-    let turn_recovery = match recover_interrupted_turns_report(&store, &device_id).await {
+    let turn_recovery = match recover_interrupted_turns_report_with_visitor(
+        &store,
+        &device_id,
+        &mut startup_hydration,
+    )
+    .await
+    {
         Ok(recovery) => recovery,
         Err(error) => {
             let _ = store.close().await;
@@ -328,6 +488,7 @@ async fn run_inner(
         target: "haider.recovery",
         phase = "turns",
         recovered_work = turn_recovery.work.len(),
+        touched_sessions = turn_recovery.touched_sessions.len(),
         operation_micros = turn_recovery_started.elapsed().as_micros(),
         "pre-ready recovery phase completed"
     );
@@ -369,24 +530,15 @@ async fn run_inner(
         let _ = store.close().await;
         return Err(error.into());
     }
-    let hub = SessionHub::new(store.clone(), config.session_hub).map_err(DaemonError::from)?;
-    // Startup turn recovery commits directly through the store before a hub
-    // exists. Reconcile every journal it changed now: otherwise a terminal E
-    // row can remain absent forever when no later append touches the session.
-    // Ship-gate round 2: the FULL sweep, not just recovery-touched sessions
-    // — a prior life's failed reconcile left no durable retry state, so
-    // every boot re-establishes the sidecar law for every session before
-    // the endpoint binds.
-    let _ = &turn_recovery.touched_sessions;
-    hub.reconcile_all_pipe_sidecars(&turn_recovery.journals)
-        .await;
+    let (hook_hydration, pipe_native) = startup_hydration.into_parts();
+    let hub = SessionHub::new_with_pipe_native(store.clone(), config.session_hub, pipe_native)
+        .map_err(DaemonError::from)?;
     let recovered_work = turn_recovery.work;
-    let boot_journals = turn_recovery.journals;
-    let (hook_service, hook_engine) = crate::hooks::HookEngine::start_with_boot_journals(
+    let (hook_service, hook_engine) = crate::hooks::HookEngine::start_hydrated(
         config.store_dir.clone(),
         store.clone(),
         hub.clone(),
-        Some(&boot_journals),
+        hook_hydration,
     )
     .await
     .map_err(DaemonError::from)?;

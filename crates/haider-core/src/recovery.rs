@@ -112,6 +112,7 @@ async fn gather_effect_recovery_evidence<S: StoreHandle + ?Sized>(
                 session_id,
                 cursor,
                 RECOVERY_PAGE_SIZE,
+                usize::MAX,
                 RECOVERY_EVIDENCE_PAYLOAD_KINDS,
             )
             .await?;
@@ -518,6 +519,7 @@ async fn read_startup_recovery_page<S: StoreHandle + ?Sized>(
             session_id,
             cursor,
             RECOVERY_PAGE_SIZE,
+            usize::MAX,
             RECOVERY_REDUCER_PAYLOAD_KINDS,
         )
         .await
@@ -707,6 +709,7 @@ mod reducer_filter_tests {
             session_id: &SessionId,
             since_seq: u64,
             limit: usize,
+            _byte_budget: usize,
             _payload_kinds: &'static [&'static str],
         ) -> Result<Vec<RawEnvelope>, HaiderError> {
             self.read(session_id, since_seq, limit).await

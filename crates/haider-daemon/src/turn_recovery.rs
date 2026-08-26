@@ -36,8 +36,8 @@
 
 use haider_core::{
     AcceptedRunRetry, AcceptedTurn, ChildWaitCheckpoint, DeferredTicket, DeferredToolCheckpoint,
-    PartialStreamCheckpoint, RequestInputCheckpoint, SqliteStoreHandle, StoreHandle,
-    TurnAdmissionDisposition,
+    PartialStreamCheckpoint, RequestInputCheckpoint, SessionProjectionCheckpoint,
+    SqliteStoreHandle, StoreHandle, TurnAdmissionDisposition,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::{
@@ -51,9 +51,32 @@ use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{Menu, MenuCloseReason, MenuKind};
 use haider_protocol::retry::RunRetryEventPayload;
 use haider_protocol::state::{RunState, SessionState, WaitReason};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 const PAGE_SIZE: usize = 512;
+const PAGE_BYTES: usize = 4 * 1_024 * 1_024;
+const RUN_STATE_PAYLOAD_KINDS: &[&str] = &["run_state"];
+pub(crate) const STARTUP_HYDRATION_PAYLOAD_KINDS: &[&str] = &[
+    "agent_report",
+    "effect",
+    "hook_run_trust",
+    "item",
+    "item_tool_call",
+    "menu_answered",
+    "menu_closed",
+    "menu_opened",
+    "node_committed",
+    "run_failed",
+    "run_retried",
+    "run_state",
+    "tool_result",
+    "user_message",
+];
+const CHECKPOINT_PROJECTION: &str = "startup_turn_recovery";
+const CHECKPOINT_TIMELINE: &str = "session";
+const CHECKPOINT_SHAPE_VERSION: u32 = 1;
+const CHECKPOINT_REDUCER_VERSION: &str = "startup-turn-recovery-v1";
 
 pub(crate) enum RecoveredWork {
     Queued(AcceptedTurn),
@@ -80,7 +103,7 @@ pub(crate) struct RecoveredCheckpoint {
     pub(crate) committed_answer: Option<RawEnvelope>,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct RunReduction {
     branch_id: Option<BranchId>,
     branch_observed: bool,
@@ -99,6 +122,7 @@ struct RunReduction {
     child_results: HashSet<AgentId>,
 }
 
+#[derive(Serialize, Deserialize)]
 struct RecoveredToolCall {
     item_id: ItemId,
     name: String,
@@ -107,6 +131,7 @@ struct RecoveredToolCall {
     completed: bool,
 }
 
+#[derive(Serialize, Deserialize)]
 struct OpenItem {
     item: TurnItem,
     started_seq: u64,
@@ -114,7 +139,7 @@ struct OpenItem {
     args: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct OpenMenu {
     menu: Menu,
     request_seq: u64,
@@ -124,37 +149,149 @@ struct OpenMenu {
 pub(crate) struct StartupTurnRecovery {
     pub(crate) work: Vec<RecoveredWork>,
     pub(crate) touched_sessions: Vec<SessionId>,
-    /// The sealed boot journals already consumed by turn recovery. Hook
-    /// hydration reuses these prefixes and reads only recovery-appended
-    /// suffixes, avoiding a second cold scan.
-    pub(crate) journals: HashMap<SessionId, Vec<RawEnvelope>>,
 }
 
+#[derive(Deserialize)]
+struct DurableTurnRecoveryCheckpoint {
+    shape_version: u32,
+    reducer_version: String,
+    through_seq: u64,
+    reductions: HashMap<RunId, RunReduction>,
+}
+
+#[derive(Serialize)]
+struct DurableTurnRecoveryCheckpointRef<'a> {
+    shape_version: u32,
+    reducer_version: &'static str,
+    through_seq: u64,
+    reductions: &'a HashMap<RunId, RunReduction>,
+}
+
+/// Neutral consumer for journal pages already decoded by startup recovery.
+///
+/// Runtime uses this seam to hydrate native sidecars and hook reducer state
+/// from the same per-session scan. The visitor may request an earlier cursor
+/// than the turn reducer's checkpoint, but it never owns recovery decisions
+/// or writes run state.
+#[async_trait::async_trait]
+pub(crate) trait StartupJournalVisitor: Send {
+    async fn start_session(&mut self, session_id: &SessionId) -> Result<u64, HaiderError>;
+
+    async fn visit_page(
+        &mut self,
+        session_id: &SessionId,
+        page: &[RawEnvelope],
+    ) -> Result<(), HaiderError>;
+
+    async fn finish_session(
+        &mut self,
+        store: &SqliteStoreHandle,
+        session_id: &SessionId,
+    ) -> Result<(), HaiderError>;
+}
+
+struct NoopStartupJournalVisitor;
+
+#[async_trait::async_trait]
+impl StartupJournalVisitor for NoopStartupJournalVisitor {
+    async fn start_session(&mut self, _session_id: &SessionId) -> Result<u64, HaiderError> {
+        Ok(u64::MAX)
+    }
+
+    async fn visit_page(
+        &mut self,
+        _session_id: &SessionId,
+        _page: &[RawEnvelope],
+    ) -> Result<(), HaiderError> {
+        Ok(())
+    }
+
+    async fn finish_session(
+        &mut self,
+        _store: &SqliteStoreHandle,
+        _session_id: &SessionId,
+    ) -> Result<(), HaiderError> {
+        Ok(())
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn recover_interrupted_turns_report(
     store: &SqliteStoreHandle,
     device_id: &DeviceId,
 ) -> Result<StartupTurnRecovery, HaiderError> {
+    recover_interrupted_turns_report_with_visitor(store, device_id, &mut NoopStartupJournalVisitor)
+        .await
+}
+
+pub(crate) async fn recover_interrupted_turns_report_with_visitor(
+    store: &SqliteStoreHandle,
+    device_id: &DeviceId,
+    visitor: &mut dyn StartupJournalVisitor,
+) -> Result<StartupTurnRecovery, HaiderError> {
     let mut recovered = Vec::new();
     let mut touched_sessions = Vec::new();
-    let mut journals = HashMap::new();
     for session_id in store.session_ids().await? {
         let mut touched = false;
         let runnable_metadata = store.session_metadata(&session_id).await?.is_some();
-        let mut cursor = 0;
-        let mut reductions = HashMap::<RunId, RunReduction>::new();
+        let (mut reductions, turn_cursor) = load_recovery_checkpoint(store, &session_id).await?;
+        let visitor_cursor = visitor.start_session(&session_id).await?;
+        let mut cursor = turn_cursor.min(visitor_cursor);
+        let mut boundary = None;
         loop {
-            let page = store.read(&session_id, cursor, PAGE_SIZE).await?;
-            if page.is_empty() {
+            let page = store
+                .read_reducer_page_with_boundary(
+                    &session_id,
+                    cursor,
+                    PAGE_SIZE,
+                    PAGE_BYTES,
+                    STARTUP_HYDRATION_PAYLOAD_KINDS,
+                )
+                .await?;
+            if page.envelopes.is_empty() {
+                if let Some((through_seq, boundary_event_id)) = page.observed_head
+                    && through_seq > turn_cursor
+                {
+                    boundary = Some((through_seq, boundary_event_id));
+                }
                 break;
             }
-            cursor = page.last().map_or(cursor, |envelope| envelope.seq);
-            for envelope in &page {
-                reduce(&mut reductions, envelope.clone());
+            cursor = page
+                .envelopes
+                .last()
+                .map_or(cursor, |envelope| envelope.seq);
+            for envelope in page
+                .envelopes
+                .iter()
+                .filter(|envelope| envelope.seq > turn_cursor)
+            {
+                reduce(&mut reductions, envelope);
             }
-            journals
-                .entry(session_id.clone())
-                .or_insert_with(Vec::new)
-                .extend(page);
+            visitor.visit_page(&session_id, &page.envelopes).await?;
+            reductions.retain(|_, reduction| {
+                reduction.branch_mismatch
+                    || !reduction
+                        .state
+                        .as_ref()
+                        .is_some_and(|(state, _)| state.is_terminal())
+            });
+            if let Some(last) = page
+                .envelopes
+                .last()
+                .filter(|envelope| envelope.seq > turn_cursor)
+            {
+                boundary = Some((last.seq, last.event_id.clone()));
+            }
+        }
+        if let Some((through_seq, boundary_event_id)) = boundary {
+            put_recovery_checkpoint(
+                store,
+                &session_id,
+                through_seq,
+                boundary_event_id,
+                &reductions,
+            )
+            .await?;
         }
         let mut runs = reductions.into_iter().collect::<Vec<_>>();
         runs.sort_by_key(|(_, reduction)| {
@@ -350,14 +487,79 @@ pub(crate) async fn recover_interrupted_turns_report(
             touched = true;
         }
         if touched {
-            touched_sessions.push(session_id);
+            touched_sessions.push(session_id.clone());
         }
+        visitor.finish_session(store, &session_id).await?;
     }
     Ok(StartupTurnRecovery {
         work: recovered,
         touched_sessions,
-        journals,
     })
+}
+
+async fn load_recovery_checkpoint(
+    store: &SqliteStoreHandle,
+    session_id: &SessionId,
+) -> Result<(HashMap<RunId, RunReduction>, u64), HaiderError> {
+    let checkpoint = match store
+        .projection_checkpoint(
+            session_id,
+            CHECKPOINT_PROJECTION.to_owned(),
+            CHECKPOINT_TIMELINE.to_owned(),
+        )
+        .await
+    {
+        Ok(checkpoint) => checkpoint,
+        Err(error) if error.code == ErrorCode::StoreCorrupt => return Ok(Default::default()),
+        Err(error) => return Err(error),
+    };
+    let Some(checkpoint) = checkpoint else {
+        return Ok(Default::default());
+    };
+    let decoded = match rmp_serde::from_slice::<DurableTurnRecoveryCheckpoint>(&checkpoint.payload)
+    {
+        Ok(decoded) => decoded,
+        Err(_) => return Ok(Default::default()),
+    };
+    if decoded.shape_version != CHECKPOINT_SHAPE_VERSION
+        || decoded.reducer_version != CHECKPOINT_REDUCER_VERSION
+        || decoded.through_seq != checkpoint.through_seq
+    {
+        return Ok(Default::default());
+    }
+    Ok((decoded.reductions, decoded.through_seq))
+}
+
+async fn put_recovery_checkpoint(
+    store: &SqliteStoreHandle,
+    session_id: &SessionId,
+    through_seq: u64,
+    boundary_event_id: EventId,
+    reductions: &HashMap<RunId, RunReduction>,
+) -> Result<(), HaiderError> {
+    let payload = rmp_serde::to_vec_named(&DurableTurnRecoveryCheckpointRef {
+        shape_version: CHECKPOINT_SHAPE_VERSION,
+        reducer_version: CHECKPOINT_REDUCER_VERSION,
+        through_seq,
+        reductions,
+    })
+    .map_err(|error| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            format!("cannot encode startup turn-recovery checkpoint: {error}"),
+            false,
+        )
+    })?;
+    store
+        .put_projection_checkpoint(SessionProjectionCheckpoint {
+            session_id: session_id.clone(),
+            projection: CHECKPOINT_PROJECTION.to_owned(),
+            timeline_key: CHECKPOINT_TIMELINE.to_owned(),
+            through_seq,
+            boundary_event_id,
+            payload,
+        })
+        .await
 }
 
 #[cfg(test)]
@@ -417,7 +619,15 @@ async fn latest_run_state(
     let mut cursor = 0;
     let mut state = None;
     loop {
-        let page = store.read(session_id, cursor, PAGE_SIZE).await?;
+        let page = store
+            .read_reducer_page(
+                session_id,
+                cursor,
+                PAGE_SIZE,
+                PAGE_BYTES,
+                RUN_STATE_PAYLOAD_KINDS,
+            )
+            .await?;
         if page.is_empty() {
             return Ok(state);
         }
@@ -436,7 +646,7 @@ async fn latest_run_state(
     }
 }
 
-fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: RawEnvelope) {
+fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope) {
     let Some(run_id) = envelope.run_id.clone() else {
         return;
     };
@@ -449,6 +659,23 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: RawEnvelope) 
     // the aggregate transition. Route it by payload type before enforcing
     // the immutable branch coordinate of run-scoped history.
     if matches!(payload.as_ref(), Some(EventPayload::SessionState(_))) {
+        return;
+    }
+    let recovery_relevant = retry_payload.is_some()
+        || matches!(
+            payload.as_ref(),
+            Some(
+                EventPayload::RunState(_)
+                    | EventPayload::UserMessage { .. }
+                    | EventPayload::Item(_)
+                    | EventPayload::MenuOpened(_)
+                    | EventPayload::MenuAnswered(_)
+                    | EventPayload::MenuClosed { .. }
+                    | EventPayload::ToolResult { .. }
+                    | EventPayload::AgentReport(_)
+            )
+        );
+    if !recovery_relevant {
         return;
     }
     let reduction = reductions.entry(run_id).or_default();
@@ -572,7 +799,7 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: RawEnvelope) 
             });
         }
         EventPayload::MenuAnswered(answer) => {
-            reduction.menu_answers.insert(answer.menu, envelope);
+            reduction.menu_answers.insert(answer.menu, envelope.clone());
         }
         EventPayload::MenuClosed { menu, .. }
             if reduction
@@ -795,7 +1022,7 @@ async fn resumption_terminal_payloads(
             break;
         }
         cursor = page.last().map_or(cursor, |envelope| envelope.seq);
-        for envelope in page {
+        for envelope in &page {
             if envelope.run_id.as_ref() == Some(run_id) {
                 let mut reductions = HashMap::from([(run_id.clone(), reduction)]);
                 reduce(&mut reductions, envelope);
@@ -996,6 +1223,284 @@ fn recovery_envelopes(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
+mod streaming_checkpoint_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingVisitor {
+        active_session: Option<SessionId>,
+        counts: HashMap<SessionId, usize>,
+        pages: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl StartupJournalVisitor for RecordingVisitor {
+        async fn start_session(&mut self, session_id: &SessionId) -> Result<u64, HaiderError> {
+            assert!(self.active_session.replace(session_id.clone()).is_none());
+            Ok(0)
+        }
+
+        async fn visit_page(
+            &mut self,
+            session_id: &SessionId,
+            page: &[RawEnvelope],
+        ) -> Result<(), HaiderError> {
+            assert_eq!(self.active_session.as_ref(), Some(session_id));
+            *self.counts.entry(session_id.clone()).or_default() += page.len();
+            self.pages += 1;
+            Ok(())
+        }
+
+        async fn finish_session(
+            &mut self,
+            _store: &SqliteStoreHandle,
+            session_id: &SessionId,
+        ) -> Result<(), HaiderError> {
+            assert_eq!(self.active_session.take().as_ref(), Some(session_id));
+            Ok(())
+        }
+    }
+
+    fn fact(
+        store: &SqliteStoreHandle,
+        session_id: &SessionId,
+        run_id: &RunId,
+        event_id: &str,
+        payload: EventPayload,
+    ) -> RawEnvelope {
+        EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new(event_id),
+            seq: 0,
+            session_id: session_id.clone(),
+            branch_id: None,
+            run_id: Some(run_id.clone()),
+            agent_id: None,
+            device_id: DeviceId::new("turn-checkpoint-test"),
+            authority_epoch: 0,
+            worker_generation: store.worker_generation(),
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: RenderTargets {
+                ui: false,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: serde_json::to_value(payload).expect("encode recovery fact"),
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_recovery_checkpoint_resumes_at_its_journal_high_water() {
+        let root = tempfile::tempdir().expect("profile");
+        let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+        let session_id = SessionId::new("turn-checkpoint-resume");
+        let run_id = RunId::new("turn-checkpoint-run");
+        let mut prefix = [
+            fact(
+                &store,
+                &session_id,
+                &run_id,
+                "turn-checkpoint-user",
+                EventPayload::UserMessage {
+                    text: "hello".into(),
+                    attachments: Vec::new(),
+                    mode: haider_protocol::DeliveryMode::Steer,
+                },
+            ),
+            fact(
+                &store,
+                &session_id,
+                &run_id,
+                "turn-checkpoint-thinking",
+                EventPayload::RunState(RunState::Thinking),
+            ),
+        ];
+        StoreHandle::append(&store, &mut prefix)
+            .await
+            .expect("append prefix");
+        let mut reductions = HashMap::new();
+        for envelope in &prefix {
+            reduce(&mut reductions, envelope);
+        }
+        let boundary = prefix.last().expect("prefix boundary");
+        put_recovery_checkpoint(
+            &store,
+            &session_id,
+            boundary.seq,
+            boundary.event_id.clone(),
+            &reductions,
+        )
+        .await
+        .expect("persist checkpoint");
+        let mut suffix = [fact(
+            &store,
+            &session_id,
+            &run_id,
+            "turn-checkpoint-streaming",
+            EventPayload::RunState(RunState::Streaming),
+        )];
+        StoreHandle::append(&store, &mut suffix)
+            .await
+            .expect("append suffix");
+
+        let (resumed, cursor) = load_recovery_checkpoint(&store, &session_id)
+            .await
+            .expect("load checkpoint");
+        assert_eq!(cursor, 2, "only the suffix remains to fold");
+        let resumed_bytes = rmp_serde::to_vec_named(&DurableTurnRecoveryCheckpointRef {
+            shape_version: CHECKPOINT_SHAPE_VERSION,
+            reducer_version: CHECKPOINT_REDUCER_VERSION,
+            through_seq: cursor,
+            reductions: &resumed,
+        })
+        .expect("encode resumed state");
+        let checkpoint = store
+            .projection_checkpoint(
+                &session_id,
+                CHECKPOINT_PROJECTION.to_owned(),
+                CHECKPOINT_TIMELINE.to_owned(),
+            )
+            .await
+            .expect("read checkpoint")
+            .expect("checkpoint exists");
+        assert_eq!(resumed_bytes, checkpoint.payload);
+
+        let recovery = recover_interrupted_turns_report(
+            &store,
+            &DeviceId::new("turn-checkpoint-resume-device"),
+        )
+        .await
+        .expect("fold checkpoint suffix");
+        assert!(recovery.work.is_empty());
+        let (resumed, cursor) = load_recovery_checkpoint(&store, &session_id)
+            .await
+            .expect("load advanced checkpoint");
+        assert_eq!(cursor, 3);
+        let reduction = resumed.get(&run_id).expect("resumed run reduction");
+        assert_eq!(reduction.user_seq, Some(1));
+        assert_eq!(
+            reduction.state.as_ref().map(|(state, _)| state),
+            Some(&RunState::Streaming)
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_turn_recovery_checkpoint_falls_back_to_streaming_from_zero() {
+        let root = tempfile::tempdir().expect("profile");
+        let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+        let session_id = SessionId::new("turn-checkpoint-corrupt");
+        let run_id = RunId::new("turn-checkpoint-corrupt-run");
+        let mut envelope = [fact(
+            &store,
+            &session_id,
+            &run_id,
+            "turn-checkpoint-corrupt-fact",
+            EventPayload::RunState(RunState::Thinking),
+        )];
+        StoreHandle::append(&store, &mut envelope)
+            .await
+            .expect("append journal fact");
+        store
+            .put_projection_checkpoint(SessionProjectionCheckpoint {
+                session_id: session_id.clone(),
+                projection: CHECKPOINT_PROJECTION.to_owned(),
+                timeline_key: CHECKPOINT_TIMELINE.to_owned(),
+                through_seq: envelope[0].seq,
+                boundary_event_id: envelope[0].event_id.clone(),
+                payload: b"not a turn reducer checkpoint".to_vec(),
+            })
+            .await
+            .expect("install corrupt checkpoint payload");
+
+        let (reductions, cursor) = load_recovery_checkpoint(&store, &session_id)
+            .await
+            .expect("corrupt checkpoint is a cache miss");
+        assert_eq!(cursor, 0);
+        assert!(reductions.is_empty());
+
+        recover_interrupted_turns_report(&store, &DeviceId::new("turn-checkpoint-corrupt-device"))
+            .await
+            .expect("full streaming fallback repairs checkpoint");
+        let (reductions, cursor) = load_recovery_checkpoint(&store, &session_id)
+            .await
+            .expect("load repaired checkpoint");
+        assert_eq!(cursor, 1);
+        assert_eq!(
+            reductions
+                .get(&run_id)
+                .and_then(|reduction| reduction.state.as_ref())
+                .map(|(state, _)| state),
+            Some(&RunState::Thinking)
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_visitor_receives_each_multi_session_page_once() {
+        let root = tempfile::tempdir().expect("profile");
+        let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+        let mut expected = HashMap::new();
+        for name in ["shared-stream-alpha", "shared-stream-beta"] {
+            let session_id = SessionId::new(name);
+            let first_run_id = RunId::new(format!("{name}-run-0"));
+            let mut envelopes = (0..=PAGE_SIZE)
+                .map(|index| {
+                    let run_id = RunId::new(format!("{name}-run-{index}"));
+                    fact(
+                        &store,
+                        &session_id,
+                        &run_id,
+                        &format!("{name}-{index}"),
+                        EventPayload::RunState(RunState::Done),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut post_terminal_hook = fact(
+                &store,
+                &session_id,
+                &first_run_id,
+                &format!("{name}-post-terminal-hook"),
+                EventPayload::RunState(RunState::Done),
+            );
+            post_terminal_hook.payload = haider_protocol::hook::HookEventPayload::HookNotice(
+                haider_protocol::hook::HookNotice {
+                    hook: Some("post-terminal".into()),
+                    digest: None,
+                    source: "startup-test".into(),
+                    reason: "valid asynchronous suffix".into(),
+                },
+            )
+            .to_payload_value()
+            .expect("encode hook suffix");
+            envelopes.push(post_terminal_hook);
+            let selected_envelopes = envelopes.len() - 1;
+            StoreHandle::append(&store, &mut envelopes)
+                .await
+                .expect("append page-crossing recovery journal");
+            expected.insert(session_id, selected_envelopes);
+        }
+
+        let mut visitor = RecordingVisitor::default();
+        let recovery = recover_interrupted_turns_report_with_visitor(
+            &store,
+            &DeviceId::new("shared-stream-device"),
+            &mut visitor,
+        )
+        .await
+        .expect("shared startup scan");
+        assert!(recovery.work.is_empty());
+        assert_eq!(visitor.counts, expected);
+        assert!(
+            visitor.pages >= 4,
+            "each session must cross a page boundary"
+        );
+        assert!(visitor.active_session.is_none());
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod partial_stream_recovery_tests {
     use super::*;
@@ -1079,7 +1584,7 @@ mod partial_stream_recovery_tests {
             envelope.seq = u64::try_from(index + 1).expect("small sequence");
         }
         let mut reductions = HashMap::new();
-        for envelope in envelopes {
+        for envelope in &envelopes {
             reduce(&mut reductions, envelope);
         }
         let reduction = reductions.get(&run_id).expect("reduced run");
@@ -1183,7 +1688,7 @@ mod plan_recovery_tests {
             envelope.seq = u64::try_from(index + 1).expect("small sequence");
         }
         let mut reductions = HashMap::new();
-        for envelope in envelopes {
+        for envelope in &envelopes {
             reduce(&mut reductions, envelope);
         }
         let reduction = reductions.get(&run_id).expect("reduced run");
@@ -1253,7 +1758,7 @@ mod plan_recovery_tests {
             envelope.seq = u64::try_from(index + 1).expect("small sequence");
         }
         let mut reductions = HashMap::new();
-        for envelope in envelopes {
+        for envelope in &envelopes {
             reduce(&mut reductions, envelope);
         }
         let reduction = reductions.get(&run_id).expect("reduced run");

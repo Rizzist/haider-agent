@@ -3637,11 +3637,30 @@ async fn reconcile_durable_cancellations(
     }
 }
 
-/// Reduces the committed journal to `(run, latest state, accepted seq)` in
-/// acceptance order — the durable truth every admission/cancellation/refill
-/// decision reads instead of trusting in-memory hints (module charter).
-/// Its intentional O(journal) cost and projection trigger are ledgered in
-/// `docs/OPTIMIZATIONS.md` under W3c1.
+const RUN_HEADS_PROJECTION: &str = "run_heads_v1";
+const RUN_HEADS_TIMELINE: &str = "session";
+const RUN_HEADS_PAYLOAD_VERSION: u32 = 1;
+
+#[derive(serde::Deserialize)]
+struct DurableRunHeadsProjection {
+    version: u32,
+    heads: Vec<DurableRunHeadRow>,
+}
+
+#[derive(serde::Deserialize)]
+struct DurableRunHeadRow {
+    run_id: String,
+    state: RunState,
+    #[allow(dead_code)]
+    state_seq: Option<u64>,
+    accepted_seq: Option<u64>,
+    branch_id: Option<String>,
+    prompt_run_id: Option<String>,
+}
+
+/// Reads `(run, latest state, accepted seq)` in acceptance order from the
+/// transaction-coupled run-head projection. Journal-only test stores and an
+/// unreadable wire payload retain the exact historical full-reduction fallback.
 async fn durable_runs(
     store: &HubStoreHandle,
 ) -> Result<
@@ -3654,6 +3673,30 @@ async fn durable_runs(
     )>,
     HaiderError,
 > {
+    if let Some(checkpoint) = store
+        .projection_checkpoint(store.session_id(), RUN_HEADS_PROJECTION, RUN_HEADS_TIMELINE)
+        .await?
+        && let Ok(projection) =
+            rmp_serde::from_slice::<DurableRunHeadsProjection>(&checkpoint.payload)
+        && projection.version == RUN_HEADS_PAYLOAD_VERSION
+    {
+        let mut runs = projection
+            .heads
+            .into_iter()
+            .map(|head| {
+                (
+                    RunId::new(head.run_id),
+                    head.state,
+                    head.accepted_seq,
+                    head.branch_id.map(BranchId::new),
+                    head.prompt_run_id.map(RunId::new),
+                )
+            })
+            .collect::<Vec<_>>();
+        runs.sort_by_key(|(_, _, accepted, _, _)| accepted.unwrap_or(u64::MAX));
+        return Ok(runs);
+    }
+
     let mut cursor = 0;
     let mut runs =
         HashMap::<RunId, (RunState, Option<u64>, Option<BranchId>, Option<RunId>)>::new();

@@ -1639,52 +1639,14 @@ impl SessionHub {
         Self::with_observer(store, config, Arc::new(NoopObserver))
     }
 
-    /// Ship-gate round 2: reconcile EVERY session's sidecar at boot — not
-    /// just the ones startup recovery touched. The dirty state is
-    /// memory-only, so a reconcile that failed in a PRIOR life left no
-    /// durable retry obligation; the full sweep is the obligation. Cost is
-    /// one tail read per current session (catch-up work only where a file
-    /// is actually behind), before the endpoint binds.
-    pub(crate) async fn reconcile_all_pipe_sidecars(
-        &self,
-        boot_journals: &HashMap<SessionId, Vec<RawEnvelope>>,
-    ) {
-        for (session_id, journal) in boot_journals {
-            if let Err(error) = self
-                .inner
-                .pipe_native
-                .maintain_from_boot_journal(&self.inner.store, session_id, journal)
-                .await
-            {
-                tracing::warn!(
-                    session_id = %session_id,
-                    %error,
-                    "boot native pipe sidecar reconciliation failed; journal remains authoritative"
-                );
-            }
-        }
-    }
-
-    /// Reconciles journals committed by startup recovery before this hub
-    /// existed. Sidecar projection is best-effort, just like post-commit actor
-    /// maintenance: journal recovery remains authoritative if filesystem I/O
-    /// fails.
-    #[cfg(test)]
-    pub(crate) async fn reconcile_pipe_sidecars(&self, session_ids: &[SessionId]) {
-        for session_id in session_ids {
-            if let Err(error) = self
-                .inner
-                .pipe_native
-                .maintain(&self.inner.store, session_id, &[])
-                .await
-            {
-                tracing::warn!(
-                    session_id = %session_id,
-                    %error,
-                    "startup-recovered native pipe sidecar reconciliation failed; journal remains authoritative"
-                );
-            }
-        }
+    /// Builds the live hub around the exact native-pipe writer used by the
+    /// shared pre-Ready journal fold.
+    pub(crate) fn new_with_pipe_native(
+        store: SqliteStoreHandle,
+        config: SessionHubConfig,
+        pipe_native: Arc<crate::pipe_native::PipeNativeWriter>,
+    ) -> Result<Self, SessionHubError> {
+        Self::with_observer_and_pipe_native(store, config, Arc::new(NoopObserver), pipe_native)
     }
 
     /// Creates a hub with a semantic-boundary observer.
@@ -1693,13 +1655,22 @@ impl SessionHub {
         config: SessionHubConfig,
         observer: Arc<dyn SessionHubObserver>,
     ) -> Result<Self, SessionHubError> {
+        let pipe_native = Arc::new(crate::pipe_native::PipeNativeWriter::new(store.root()));
+        Self::with_observer_and_pipe_native(store, config, observer, pipe_native)
+    }
+
+    fn with_observer_and_pipe_native(
+        store: SqliteStoreHandle,
+        config: SessionHubConfig,
+        observer: Arc<dyn SessionHubObserver>,
+        pipe_native: Arc<crate::pipe_native::PipeNativeWriter>,
+    ) -> Result<Self, SessionHubError> {
         config.validate().map_err(SessionHubError::InvalidConfig)?;
         let cache_diagnostic_key =
             load_or_create_cache_diagnostic_key(store.root()).map_err(|error| {
                 SessionHubError::Task(format!("cannot load cache diagnostic key: {error}"))
             })?;
         let device_id = DeviceId::new(format!("daemon-session-hub-{}", store.worker_generation()));
-        let pipe_native = Arc::new(crate::pipe_native::PipeNativeWriter::new(store.root()));
         let (append_requests, append_receiver) = mpsc::unbounded_channel();
         let append_committer = AppendCommitter {
             requests: append_requests,
@@ -5100,13 +5071,36 @@ impl StoreHandle for HubStoreHandle {
         session_id: &SessionId,
         since_seq: u64,
         limit: usize,
+        byte_budget: usize,
         payload_kinds: &'static [&'static str],
     ) -> Result<Vec<RawEnvelope>, HaiderError> {
         self.ensure_session(session_id)?;
         self.hub
             .inner
             .store
-            .read_reducer_page(session_id, since_seq, limit, payload_kinds)
+            .read_reducer_page(session_id, since_seq, limit, byte_budget, payload_kinds)
+            .await
+    }
+
+    async fn read_reducer_page_with_boundary(
+        &self,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+        byte_budget: usize,
+        payload_kinds: &'static [&'static str],
+    ) -> Result<haider_core::ReducerPage, HaiderError> {
+        self.ensure_session(session_id)?;
+        self.hub
+            .inner
+            .store
+            .read_reducer_page_with_boundary(
+                session_id,
+                since_seq,
+                limit,
+                byte_budget,
+                payload_kinds,
+            )
             .await
     }
 

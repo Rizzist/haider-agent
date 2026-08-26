@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::path::Component;
 use std::path::{Path, PathBuf};
@@ -68,6 +68,16 @@ type DirectoryOpenError = std::io::Error;
 
 const HOOKS_FILE: &str = "hooks.json";
 const MAX_HOOK_CONFIG_BYTES: usize = 1024 * 1024;
+const HOOK_HYDRATION_PAGE_ENVELOPES: usize = 1_024;
+const HOOK_HYDRATION_PAGE_BYTES: usize = 4 * 1_024 * 1_024;
+pub(crate) const HOOK_HYDRATION_PAYLOAD_KINDS: &[&str] = &[
+    "effect",
+    "hook_run_trust",
+    "menu_opened",
+    "menu_answered",
+    "menu_closed",
+    "run_state",
+];
 const MAX_HOOK_ANCESTORS: usize = 256;
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 300_000;
@@ -666,14 +676,25 @@ impl HookEngine {
         store: haider_core::SqliteStoreHandle,
         hub: SessionHub,
     ) -> Result<(HookService, Self), haider_protocol::error::HaiderError> {
-        Self::start_with_boot_journals(profile_root, store, hub, None).await
+        let mut hydration = HookStartupHydrator::prepare(&store).await?;
+        hydration.catch_up_all(&store).await?;
+        Self::start_with_state(profile_root, store, hub, hydration.into_state()).await
     }
 
-    pub(crate) async fn start_with_boot_journals(
+    pub(crate) async fn start_hydrated(
         profile_root: PathBuf,
         store: haider_core::SqliteStoreHandle,
         hub: SessionHub,
-        boot_journals: Option<&HashMap<SessionId, Vec<RawEnvelope>>>,
+        hydration: HookStartupHydrator,
+    ) -> Result<(HookService, Self), haider_protocol::error::HaiderError> {
+        Self::start_with_state(profile_root, store, hub, hydration.into_state()).await
+    }
+
+    async fn start_with_state(
+        profile_root: PathBuf,
+        store: haider_core::SqliteStoreHandle,
+        hub: SessionHub,
+        state: EngineState,
     ) -> Result<(HookService, Self), haider_protocol::error::HaiderError> {
         let changes = store.hook_trust_changes().await?;
         let mut pins = HashSet::new();
@@ -706,7 +727,6 @@ impl HookEngine {
                 next_event: AtomicU64::new(0),
             }),
         };
-        let state = hydrate_engine_state(&service.inner.store, boot_journals).await?;
         if let Err(error) = persist_engine_snapshot(&service.inner.store, &state).await {
             tracing::warn!(target: "haider.hooks", %error, "hook-engine snapshot persistence failed; journal rebuild remains authoritative");
         }
@@ -761,6 +781,7 @@ enum EngineMessage {
 struct EngineState {
     sessions: HashMap<SessionId, DecisionState>,
     run_trust: HashSet<(SessionId, RunId)>,
+    terminal_run_trust: HashSet<(SessionId, RunId)>,
     through_seq: HashMap<SessionId, u64>,
     through_digest: HashMap<SessionId, String>,
     notice_dedup: HashSet<String>,
@@ -889,106 +910,248 @@ struct DecisionContext {
 
 const HOOK_ENGINE_SNAPSHOT_VERSION: u32 = 2;
 const HOOK_ENGINE_SNAPSHOT_FILE: &str = "hook-engine.snapshot.msgpack";
+const HOOK_BOUNDARY_EVENT_ID_PREFIX: &str = "event-id:";
 
 #[derive(Serialize, Deserialize)]
 struct HookEngineSnapshot {
     version: u32,
     sessions: HashMap<SessionId, DecisionState>,
     run_trust: HashSet<(SessionId, RunId)>,
+    #[serde(default)]
+    terminal_run_trust: HashSet<(SessionId, RunId)>,
+    #[serde(default)]
+    terminal_run_trust_complete: bool,
     through_seq: HashMap<SessionId, u64>,
     through_digest: HashMap<SessionId, String>,
 }
 
-async fn hydrate_engine_state(
-    store: &haider_core::SqliteStoreHandle,
-    boot_journals: Option<&HashMap<SessionId, Vec<RawEnvelope>>>,
-) -> Result<EngineState, haider_protocol::error::HaiderError> {
-    let snapshot = load_engine_snapshot(store).await;
-    let mut state = EngineState {
-        sessions: snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.sessions.clone())
-            .unwrap_or_default(),
-        run_trust: snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.run_trust.clone())
-            .unwrap_or_default(),
-        through_seq: snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.through_seq.clone())
-            .unwrap_or_default(),
-        through_digest: snapshot
-            .map(|snapshot| snapshot.through_digest)
-            .unwrap_or_default(),
-        notice_dedup: HashSet::new(),
-        subscribers: HashMap::new(),
-    };
-    let session_ids = store.session_ids().await?;
-    let current_sessions = session_ids.iter().cloned().collect::<HashSet<_>>();
-    state
-        .sessions
-        .retain(|session_id, _| current_sessions.contains(session_id));
-    state
-        .through_seq
-        .retain(|session_id, _| current_sessions.contains(session_id));
-    state
-        .through_digest
-        .retain(|session_id, _| current_sessions.contains(session_id));
-    state
-        .run_trust
-        .retain(|(session_id, _)| current_sessions.contains(session_id));
-    for session_id in session_ids {
-        let mut since_seq = state.through_seq.get(&session_id).copied().unwrap_or(0);
-        if since_seq > 0 {
-            let cursor = if let Some(journal) =
-                boot_journals.and_then(|journals| journals.get(&session_id))
-            {
-                journal
-                    .iter()
-                    .find(|envelope| envelope.seq == since_seq)
-                    .cloned()
+#[derive(Serialize)]
+struct HookEngineSnapshotRef<'a> {
+    version: u32,
+    sessions: &'a HashMap<SessionId, DecisionState>,
+    run_trust: &'a HashSet<(SessionId, RunId)>,
+    terminal_run_trust: &'a HashSet<(SessionId, RunId)>,
+    terminal_run_trust_complete: bool,
+    through_seq: &'a HashMap<SessionId, u64>,
+    through_digest: &'a HashMap<SessionId, String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HookEngineSnapshotFile {
+    payload: Vec<u8>,
+    digest: String,
+}
+
+/// Compact hook reducer state prepared before the shared startup scan.
+/// Runtime feeds it the same decoded pages as turn recovery; standalone hook
+/// tests use `catch_up_all`, which preserves the public start seam.
+pub(crate) struct HookStartupHydrator {
+    state: EngineState,
+    session_ids: Vec<SessionId>,
+}
+
+impl HookStartupHydrator {
+    pub(crate) async fn prepare(
+        store: &haider_core::SqliteStoreHandle,
+    ) -> Result<Self, haider_protocol::error::HaiderError> {
+        let snapshot = load_engine_snapshot(store).await;
+        let (sessions, run_trust, terminal_run_trust, through_seq, through_digest) = snapshot
+            .map_or_else(
+                || {
+                    (
+                        HashMap::new(),
+                        HashSet::new(),
+                        HashSet::new(),
+                        HashMap::new(),
+                        HashMap::new(),
+                    )
+                },
+                |snapshot| {
+                    (
+                        snapshot.sessions,
+                        snapshot.run_trust,
+                        snapshot.terminal_run_trust,
+                        snapshot.through_seq,
+                        snapshot.through_digest,
+                    )
+                },
+            );
+        let mut state = EngineState {
+            sessions,
+            run_trust,
+            terminal_run_trust,
+            through_seq,
+            through_digest,
+            notice_dedup: HashSet::new(),
+            subscribers: HashMap::new(),
+        };
+        let session_ids = store.session_ids().await?;
+        let current_sessions = session_ids.iter().cloned().collect::<HashSet<_>>();
+        state
+            .sessions
+            .retain(|session_id, _| current_sessions.contains(session_id));
+        state
+            .through_seq
+            .retain(|session_id, _| current_sessions.contains(session_id));
+        state
+            .through_digest
+            .retain(|session_id, _| current_sessions.contains(session_id));
+        state
+            .run_trust
+            .retain(|(session_id, _)| current_sessions.contains(session_id));
+        state
+            .terminal_run_trust
+            .retain(|(session_id, _)| current_sessions.contains(session_id));
+        for session_id in &session_ids {
+            let has_decision_state = state.sessions.contains_key(session_id);
+            let has_run_trust = state
+                .run_trust
+                .iter()
+                .any(|(candidate, _)| candidate == session_id);
+            let has_terminal_run_trust = state
+                .terminal_run_trust
+                .iter()
+                .any(|(candidate, _)| candidate == session_id);
+            let through_seq = state.through_seq.get(session_id).copied();
+            let through_digest = state.through_digest.get(session_id);
+            let cursor_coordinates_match = matches!(
+                (through_seq, through_digest),
+                (Some(_), Some(_)) | (None, None)
+            );
+            let retained_state_has_cursor =
+                (!has_decision_state && !has_run_trust && !has_terminal_run_trust)
+                    || through_seq.is_some();
+            let structurally_valid = cursor_coordinates_match && retained_state_has_cursor;
+            let boundary_valid = if structurally_valid {
+                if let (Some(through_seq), Some(through_digest)) = (through_seq, through_digest) {
+                    store
+                        .read(session_id, through_seq.saturating_sub(1), 1)
+                        .await?
+                        .into_iter()
+                        .find(|envelope| envelope.seq == through_seq)
+                        .is_some_and(|envelope| hook_cursor_matches(&envelope, through_digest))
+                } else {
+                    true
+                }
             } else {
-                store
-                    .read(&session_id, since_seq.saturating_sub(1), 1)
-                    .await?
-                    .into_iter()
-                    .find(|envelope| envelope.seq == since_seq)
+                false
             };
-            let valid = cursor.as_ref().is_some_and(|envelope| {
-                state.through_digest.get(&session_id) == Some(&hook_envelope_digest(envelope))
-            });
-            if !valid {
-                state.sessions.remove(&session_id);
-                state
-                    .run_trust
-                    .retain(|(candidate, _)| candidate != &session_id);
-                state.through_seq.remove(&session_id);
-                state.through_digest.remove(&session_id);
-                since_seq = 0;
+            if !boundary_valid {
+                clear_hook_session(&mut state, session_id);
             }
         }
-        if let Some(journal) = boot_journals.and_then(|journals| journals.get(&session_id)) {
-            for envelope in journal.iter().filter(|envelope| envelope.seq > since_seq) {
-                reduce_durable_state(&mut state, envelope);
+        Ok(Self { state, session_ids })
+    }
+
+    pub(crate) fn scan_start(&self, session_id: &SessionId) -> u64 {
+        self.state.through_seq.get(session_id).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn fold_page(&mut self, session_id: &SessionId, page: &[RawEnvelope]) {
+        let mut since_seq = self.scan_start(session_id);
+        for envelope in page {
+            if envelope.seq <= since_seq {
+                continue;
             }
-            since_seq = state
-                .through_seq
-                .get(&session_id)
-                .copied()
-                .unwrap_or(since_seq);
-        }
-        loop {
-            let page = store.read(&session_id, since_seq, 1_024).await?;
-            if page.is_empty() {
-                break;
-            }
-            for envelope in &page {
-                reduce_durable_state(&mut state, envelope);
-            }
-            since_seq = page.last().map_or(since_seq, |envelope| envelope.seq);
+            reduce_durable_state(&mut self.state, envelope);
+            since_seq = envelope.seq;
         }
     }
-    Ok(state)
+
+    /// Advances the reducer checkpoint across a suffix whose payload kinds
+    /// are irrelevant to hook state. The event id is an immutable journal
+    /// coordinate, so this retains checkpoint validation without fetching or
+    /// decoding the suffix merely to hash its final envelope.
+    pub(crate) fn advance_through(
+        &mut self,
+        session_id: &SessionId,
+        through_seq: u64,
+        boundary_event_id: &EventId,
+    ) {
+        if through_seq > self.scan_start(session_id) {
+            self.state
+                .through_seq
+                .insert(session_id.clone(), through_seq);
+            self.state.through_digest.insert(
+                session_id.clone(),
+                hook_boundary_event_id_digest(boundary_event_id),
+            );
+        }
+    }
+
+    pub(crate) async fn catch_up_session(
+        &mut self,
+        store: &haider_core::SqliteStoreHandle,
+        session_id: &SessionId,
+    ) -> Result<(), haider_protocol::error::HaiderError> {
+        loop {
+            let since_seq = self.scan_start(session_id);
+            let page = store
+                .read_reducer_page_with_boundary(
+                    session_id,
+                    since_seq,
+                    HOOK_HYDRATION_PAGE_ENVELOPES,
+                    HOOK_HYDRATION_PAGE_BYTES,
+                    HOOK_HYDRATION_PAYLOAD_KINDS,
+                )
+                .await?;
+            if page.envelopes.is_empty() {
+                if let Some((through_seq, boundary_event_id)) = page.observed_head {
+                    self.advance_through(session_id, through_seq, &boundary_event_id);
+                }
+                return Ok(());
+            }
+            self.fold_page(session_id, &page.envelopes);
+        }
+    }
+
+    async fn catch_up_all(
+        &mut self,
+        store: &haider_core::SqliteStoreHandle,
+    ) -> Result<(), haider_protocol::error::HaiderError> {
+        for session_id in self.session_ids.clone() {
+            self.catch_up_session(store, &session_id).await?;
+        }
+        Ok(())
+    }
+
+    fn into_state(self) -> EngineState {
+        self.state
+    }
+}
+
+#[derive(Debug)]
+enum HookSnapshotPersistError {
+    Encode(rmp_serde::encode::Error),
+    Io {
+        operation: &'static str,
+        source: std::io::Error,
+    },
+    Task(tokio::task::JoinError),
+}
+
+impl std::fmt::Display for HookSnapshotPersistError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Encode(error) => write!(formatter, "hook snapshot encode failed: {error}"),
+            Self::Io { operation, source } => {
+                write!(formatter, "hook snapshot {operation} failed: {source}")
+            }
+            Self::Task(error) => write!(formatter, "hook snapshot writer task failed: {error}"),
+        }
+    }
+}
+
+fn clear_hook_session(state: &mut EngineState, session_id: &SessionId) {
+    state.sessions.remove(session_id);
+    state
+        .run_trust
+        .retain(|(candidate, _)| candidate != session_id);
+    state
+        .terminal_run_trust
+        .retain(|(candidate, _)| candidate != session_id);
+    state.through_seq.remove(session_id);
+    state.through_digest.remove(session_id);
 }
 
 async fn load_engine_snapshot(
@@ -997,31 +1160,84 @@ async fn load_engine_snapshot(
     let bytes = tokio::fs::read(store.root().join(HOOK_ENGINE_SNAPSHOT_FILE))
         .await
         .ok()?;
-    let snapshot = rmp_serde::from_slice::<HookEngineSnapshot>(&bytes).ok()?;
-    (snapshot.version == HOOK_ENGINE_SNAPSHOT_VERSION).then_some(snapshot)
+    let file = rmp_serde::from_slice::<HookEngineSnapshotFile>(&bytes).ok()?;
+    if file.digest != hook_snapshot_payload_digest(&file.payload) {
+        return None;
+    }
+    let snapshot = rmp_serde::from_slice::<HookEngineSnapshot>(&file.payload).ok()?;
+    (snapshot.version == HOOK_ENGINE_SNAPSHOT_VERSION && snapshot.terminal_run_trust_complete)
+        .then_some(snapshot)
+}
+
+fn hook_snapshot_payload_digest(payload: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"haider.hook-engine.snapshot-file.v1\0");
+    hasher.update(
+        &u64::try_from(payload.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    hasher.update(payload);
+    hasher.finalize().to_hex().to_string()
+}
+
+fn encode_hook_snapshot_file(payload: Vec<u8>) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+    let digest = hook_snapshot_payload_digest(&payload);
+    rmp_serde::to_vec_named(&HookEngineSnapshotFile { payload, digest })
 }
 
 async fn persist_engine_snapshot(
     store: &haider_core::SqliteStoreHandle,
     state: &EngineState,
-) -> Result<(), String> {
-    let snapshot = HookEngineSnapshot {
+) -> Result<(), HookSnapshotPersistError> {
+    let payload = rmp_serde::to_vec_named(&HookEngineSnapshotRef {
         version: HOOK_ENGINE_SNAPSHOT_VERSION,
-        sessions: state.sessions.clone(),
-        run_trust: state.run_trust.clone(),
-        through_seq: state.through_seq.clone(),
-        through_digest: state.through_digest.clone(),
-    };
-    let bytes = rmp_serde::to_vec_named(&snapshot)
-        .map_err(|error| format!("hook snapshot encode failed: {error}"))?;
-    let path = store.root().join(HOOK_ENGINE_SNAPSHOT_FILE);
-    let temporary = store.root().join("hook-engine.snapshot.tmp");
-    tokio::fs::write(&temporary, bytes)
-        .await
-        .map_err(|error| format!("hook snapshot write failed: {error}"))?;
-    tokio::fs::rename(&temporary, &path)
-        .await
-        .map_err(|error| format!("hook snapshot install failed: {error}"))
+        sessions: &state.sessions,
+        run_trust: &state.run_trust,
+        terminal_run_trust: &state.terminal_run_trust,
+        terminal_run_trust_complete: true,
+        through_seq: &state.through_seq,
+        through_digest: &state.through_digest,
+    })
+    .map_err(HookSnapshotPersistError::Encode)?;
+    let bytes = encode_hook_snapshot_file(payload).map_err(HookSnapshotPersistError::Encode)?;
+    let root = store.root().to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let path = root.join(HOOK_ENGINE_SNAPSHOT_FILE);
+        let temporary = root.join("hook-engine.snapshot.tmp");
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|source| HookSnapshotPersistError::Io {
+                operation: "temporary-file open",
+                source,
+            })?;
+        file.write_all(&bytes)
+            .map_err(|source| HookSnapshotPersistError::Io {
+                operation: "write",
+                source,
+            })?;
+        file.sync_all()
+            .map_err(|source| HookSnapshotPersistError::Io {
+                operation: "file sync",
+                source,
+            })?;
+        drop(file);
+        haider_platform::replace_file(&temporary, &path).map_err(|source| {
+            HookSnapshotPersistError::Io {
+                operation: "install",
+                source,
+            }
+        })?;
+        haider_platform::sync_directory(&root).map_err(|source| HookSnapshotPersistError::Io {
+            operation: "directory sync",
+            source,
+        })
+    })
+    .await
+    .map_err(HookSnapshotPersistError::Task)?
 }
 
 fn reduce_durable_state(
@@ -1035,13 +1251,30 @@ fn reduce_durable_state(
     {
         let key = (envelope.session_id.clone(), run_id);
         if enabled {
-            state.run_trust.insert(key);
+            state.run_trust.insert(key.clone());
         } else {
             state.run_trust.remove(&key);
+            state.terminal_run_trust.remove(&key);
         }
         return None;
     }
+    if let Ok(EventPayload::RunState(run_state)) =
+        serde_json::from_value::<EventPayload>(envelope.payload.clone())
+        && run_state.is_terminal()
+        && let Some(run_id) = envelope.run_id.clone()
+    {
+        let key = (envelope.session_id.clone(), run_id);
+        if state.run_trust.contains(&key) {
+            state.terminal_run_trust.insert(key);
+        }
+    }
     absorb_decision_fact(state, envelope)
+}
+
+fn prune_terminal_run_trust(state: &mut EngineState) {
+    for key in state.terminal_run_trust.drain() {
+        state.run_trust.remove(&key);
+    }
 }
 
 fn advance_durable_cursor(state: &mut EngineState, envelope: &RawEnvelope) {
@@ -1067,6 +1300,19 @@ fn hook_envelope_digest(envelope: &RawEnvelope) -> String {
         .to_string()
 }
 
+fn hook_boundary_event_id_digest(event_id: &EventId) -> String {
+    format!("{HOOK_BOUNDARY_EVENT_ID_PREFIX}{}", event_id.as_str())
+}
+
+fn hook_cursor_matches(envelope: &RawEnvelope, digest: &str) -> bool {
+    digest
+        .strip_prefix(HOOK_BOUNDARY_EVENT_ID_PREFIX)
+        .map_or_else(
+            || digest == hook_envelope_digest(envelope),
+            |event_id| event_id == envelope.event_id.as_str(),
+        )
+}
+
 async fn run_engine(
     mut messages: mpsc::UnboundedReceiver<EngineMessage>,
     service: HookService,
@@ -1079,6 +1325,11 @@ async fn run_engine(
         while jobs.join_next().await.is_some() {}
         return;
     }
+    prune_terminal_run_trust(&mut state);
+    if let Err(error) = persist_engine_snapshot(&service.inner.store, &state).await {
+        tracing::warn!(target: "haider.hooks", %error, "hook-engine post-replay snapshot persistence failed; journal rebuild remains authoritative");
+    }
+    let mut blocked_run_acks = HashSet::new();
     loop {
         tokio::select! {
             biased;
@@ -1093,6 +1344,8 @@ async fn run_engine(
                 // never grows unbounded under sustained commit load.
                 let mut next = Some(message);
                 let mut acks: Vec<(SessionId, u64)> = Vec::new();
+                let mut ordered_ack_scopes = HashSet::new();
+                let mut terminal_trust_acks = HashSet::new();
                 let mut snapshot_dirty = false;
                 let control = loop {
                     match next.take() {
@@ -1100,13 +1353,43 @@ async fn run_engine(
                             snapshot_dirty = true;
                             let mut aborted = false;
                             for envelope in envelopes {
+                                let terminal_scope = terminal_run_scope(&envelope);
+                                // Run-scoped trust must remain replayable until
+                                // every earlier row in that run is acknowledged.
+                                // Handle those server hooks synchronously so
+                                // their outbox ACKs preserve journal order.
+                                let ordered_run_scope = envelope.run_id.as_ref().and_then(|run_id| {
+                                    let scope = (envelope.session_id.clone(), run_id.clone());
+                                    state.run_trust.contains(&scope).then_some(scope)
+                                });
+                                let ack_count = acks.len();
                                 if !handle_and_complete(
-                                    &service, &mut state, &mut jobs, envelope, true, &mut acks,
+                                    &service,
+                                    &mut state,
+                                    &mut jobs,
+                                    envelope,
+                                    ordered_run_scope.is_none(),
+                                    &mut acks,
                                 )
                                 .await
                                 {
+                                    if let Some(scope) = ordered_run_scope {
+                                        blocked_run_acks.insert(scope);
+                                    }
                                     aborted = true;
                                     break;
+                                }
+                                if acks.len() > ack_count
+                                    && let Some(scope) = &ordered_run_scope
+                                {
+                                    ordered_ack_scopes.insert(scope.clone());
+                                }
+                                if acks.len() > ack_count
+                                    && let Some(scope) = terminal_scope
+                                    && state.terminal_run_trust.contains(&scope)
+                                    && !blocked_run_acks.contains(&scope)
+                                {
+                                    terminal_trust_acks.insert(scope);
                                 }
                             }
                             if aborted || acks.len() >= HOOK_ACK_BATCH_MAX {
@@ -1120,7 +1403,14 @@ async fn run_engine(
                         other => break other,
                     }
                 };
-                let _ = flush_hook_dispatch_acks(&service, acks).await;
+                if flush_hook_dispatch_acks(&service, acks).await {
+                    for scope in terminal_trust_acks {
+                        state.terminal_run_trust.remove(&scope);
+                        state.run_trust.remove(&scope);
+                    }
+                } else {
+                    blocked_run_acks.extend(ordered_ack_scopes);
+                }
                 if snapshot_dirty
                     && let Err(error) = persist_engine_snapshot(&service.inner.store, &state).await
                 {
@@ -1140,6 +1430,10 @@ async fn run_engine(
                         state
                             .run_trust
                             .retain(|(candidate, _)| candidate != &session_id);
+                        state
+                            .terminal_run_trust
+                            .retain(|(candidate, _)| candidate != &session_id);
+                        blocked_run_acks.retain(|(candidate, _)| candidate != &session_id);
                         state.subscribers.retain(|_, handle| {
                             handle
                                 .run_scope
@@ -1167,6 +1461,16 @@ async fn run_engine(
             _ = jobs.join_next(), if !jobs.is_empty() => {}
         }
     }
+}
+
+fn terminal_run_scope(envelope: &RawEnvelope) -> Option<(SessionId, RunId)> {
+    let terminal = serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+        |payload| matches!(payload, EventPayload::RunState(state) if state.is_terminal()),
+    );
+    if !terminal {
+        return None;
+    }
+    Some((envelope.session_id.clone(), envelope.run_id.clone()?))
 }
 
 /// Upper bound on outbox acknowledgements folded into one drain-cycle
@@ -1248,17 +1552,21 @@ async fn handle_and_complete(
         let service = service.clone();
         jobs.spawn(async move {
             let handled = complete_server_fires(&service, pending).await;
-            if let Some(scope) = terminal_scope {
-                service.inner.servers.kill_scope(&scope);
+            if let Some(scope) = &terminal_scope {
+                service.inner.servers.kill_scope(scope);
             }
-            if handled
-                && let Err(error) = service
+            if handled {
+                match service
                     .inner
                     .store
                     .complete_hook_dispatch(&envelope.session_id, envelope.seq)
                     .await
-            {
-                tracing::warn!(target: "haider.hooks", ?error, "hook recovery outbox acknowledgement failed");
+                {
+                    Ok(()) => {}
+                    Err(error) => {
+                        tracing::warn!(target: "haider.hooks", ?error, "hook recovery outbox acknowledgement failed");
+                    }
+                }
             }
         });
         return true;
@@ -1722,6 +2030,11 @@ fn absorb_decision_fact(
                 session.bindings.insert(menu, intent);
             }
         }
+        EventPayload::Effect(EffectPhase::Authorized { effect, .. })
+        | EventPayload::Effect(EffectPhase::Outcome { effect, .. }) => {
+            session.intents.remove(&effect);
+            session.bindings.retain(|_, intent| intent.effect != effect);
+        }
         EventPayload::MenuOpened(menu) if matches!(menu.kind, MenuKind::Permission { .. }) => {
             session.menus.insert(
                 menu.id.clone(),
@@ -1738,11 +2051,15 @@ fn absorb_decision_fact(
         }
         EventPayload::MenuAnswered(answer) => {
             let menu = answer.menu;
-            session.bindings.remove(&menu);
+            if let Some(intent) = session.bindings.remove(&menu) {
+                session.intents.remove(&intent.effect);
+            }
             session.menus.remove(&menu);
         }
         EventPayload::MenuClosed { menu, .. } => {
-            session.bindings.remove(&menu);
+            if let Some(intent) = session.bindings.remove(&menu) {
+                session.intents.remove(&intent.effect);
+            }
             session.menus.remove(&menu);
         }
         _ => {}

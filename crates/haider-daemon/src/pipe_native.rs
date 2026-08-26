@@ -34,6 +34,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const RECONCILE_PAGE_ENVELOPES: usize = 1_024;
 const RECONCILE_PAGE_BYTES: usize = 4 * 1_024 * 1_024;
+pub(crate) const PIPE_PROJECTION_PAYLOAD_KINDS: &[&str] = &[
+    "item",
+    "item_tool_call",
+    "node_committed",
+    "run_failed",
+    "run_state",
+    "tool_result",
+];
 const JOIN_PREWARM_ENVELOPES: u64 = 1_024;
 const COVERAGE_COALESCE_ENVELOPES: u64 = 256;
 const TAIL_SCAN_BYTES: usize = 8 * 1_024;
@@ -79,6 +87,255 @@ struct ReconciledSidecar {
     /// Any maintenance error evicts the entry, dropping (closing) the handle;
     /// the next touch re-inspects and reopens from the durable tail.
     file: File,
+}
+
+/// One page-fed native-sidecar fold. Runtime owns at most one of these while
+/// startup recovery visits a session, so decoded journal memory is bounded by
+/// the shared scan's current page.
+pub(crate) struct PipeBootSession {
+    session_id: SessionId,
+    base_path: PathBuf,
+    read_cursor: u64,
+    mode: PipeBootMode,
+}
+
+enum PipeBootMode {
+    Reconcile {
+        durable_cursor: SidecarCursor,
+        prewarm_start: u64,
+        file: Option<File>,
+        segment: u64,
+        sealed_root: Option<File>,
+        projector: TranscriptProjector,
+    },
+    Rebuild {
+        generation: u64,
+        file: Option<File>,
+        segment: u64,
+        sealed_root: Option<File>,
+        projector: TranscriptProjector,
+        temporary: RebuildTemporary,
+    },
+}
+
+struct RebuildTemporary {
+    path: Option<PathBuf>,
+}
+
+impl RebuildTemporary {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn path(&self) -> Result<PathBuf, PipeNativeError> {
+        self.path
+            .clone()
+            .ok_or_else(|| PipeNativeError("boot rebuild temporary is unavailable".into()))
+    }
+
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for RebuildTemporary {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+impl PipeBootSession {
+    pub(crate) fn scan_start(&self) -> u64 {
+        match &self.mode {
+            PipeBootMode::Reconcile { prewarm_start, .. } => *prewarm_start,
+            PipeBootMode::Rebuild { .. } => 0,
+        }
+    }
+
+    pub(crate) fn through_seq(&self) -> u64 {
+        self.read_cursor
+    }
+
+    pub(crate) fn advance_through(&mut self, through_seq: u64) {
+        self.read_cursor = self.read_cursor.max(through_seq);
+    }
+
+    pub(crate) async fn fold_page(&mut self, page: &[RawEnvelope]) -> Result<(), PipeNativeError> {
+        if let Some(last) = page.last() {
+            self.read_cursor = self.read_cursor.max(last.seq);
+        }
+        match &mut self.mode {
+            PipeBootMode::Reconcile {
+                durable_cursor,
+                prewarm_start,
+                file,
+                segment,
+                sealed_root,
+                projector,
+            } => {
+                for envelope in ordered_after(page, *prewarm_start) {
+                    if envelope.seq > durable_cursor.seq {
+                        break;
+                    }
+                    projector.prewarm(envelope);
+                }
+                let chunk = render_rows_after(page, durable_cursor.seq, projector);
+                if !chunk.is_empty() {
+                    let open = file.take().ok_or_else(|| {
+                        PipeNativeError("boot sidecar append handle is unavailable".into())
+                    })?;
+                    let (next, next_segment) = write_segmented_open(
+                        open,
+                        chunk,
+                        &self.base_path,
+                        &self.session_id,
+                        durable_cursor.generation,
+                        *segment,
+                        false,
+                        sealed_root,
+                    )
+                    .await?;
+                    *file = Some(next);
+                    *segment = next_segment;
+                }
+            }
+            PipeBootMode::Rebuild {
+                generation,
+                file,
+                segment,
+                sealed_root,
+                projector,
+                ..
+            } => {
+                let chunk = render_rows_after(page, 0, projector);
+                if !chunk.is_empty() {
+                    let open = file.take().ok_or_else(|| {
+                        PipeNativeError("boot sidecar rebuild handle is unavailable".into())
+                    })?;
+                    let (next, next_segment) = write_segmented_open(
+                        open,
+                        chunk,
+                        &self.base_path,
+                        &self.session_id,
+                        *generation,
+                        *segment,
+                        true,
+                        sealed_root,
+                    )
+                    .await?;
+                    *file = Some(next);
+                    *segment = next_segment;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn finish(self) -> Result<ReconciledSidecar, PipeNativeError> {
+        let session_id = self.session_id;
+        let base_path = self.base_path;
+        let read_cursor = self.read_cursor;
+        match self.mode {
+            PipeBootMode::Reconcile {
+                durable_cursor,
+                mut file,
+                mut segment,
+                mut sealed_root,
+                mut projector,
+                ..
+            } => {
+                let mut open = file.take().ok_or_else(|| {
+                    PipeNativeError("boot sidecar append handle is unavailable".into())
+                })?;
+                let trailing = render_projected_rows(projector.flush_unresolved_tools());
+                if !trailing.is_empty() {
+                    (open, segment) = write_segmented_open(
+                        open,
+                        trailing,
+                        &base_path,
+                        &session_id,
+                        durable_cursor.generation,
+                        segment,
+                        false,
+                        &mut sealed_root,
+                    )
+                    .await?;
+                }
+                let covered = projector
+                    .blocked_seq()
+                    .map_or(read_cursor, |seq| seq.saturating_sub(1));
+                open = write_open(open, coverage_line(covered, durable_cursor.generation)?).await?;
+                let file = sync_open(open).await?;
+                Ok(ReconciledSidecar {
+                    cursor: SidecarCursor {
+                        seq: covered,
+                        pending_seq: read_cursor,
+                        generation: durable_cursor.generation,
+                        segment,
+                    },
+                    projector,
+                    base_path,
+                    file,
+                })
+            }
+            PipeBootMode::Rebuild {
+                generation,
+                mut file,
+                mut segment,
+                mut sealed_root,
+                mut projector,
+                mut temporary,
+            } => {
+                let mut open = file.take().ok_or_else(|| {
+                    PipeNativeError("boot sidecar rebuild handle is unavailable".into())
+                })?;
+                let trailing = render_projected_rows(projector.flush_unresolved_tools());
+                if !trailing.is_empty() {
+                    (open, segment) = write_segmented_open(
+                        open,
+                        trailing,
+                        &base_path,
+                        &session_id,
+                        generation,
+                        segment,
+                        true,
+                        &mut sealed_root,
+                    )
+                    .await?;
+                }
+                let covered = projector
+                    .blocked_seq()
+                    .map_or(read_cursor, |seq| seq.saturating_sub(1));
+                open = write_open(open, coverage_line(covered, generation)?).await?;
+                let file = if segment == 0 {
+                    finish_temp(open, temporary.path()?, base_path.clone()).await?;
+                    temporary.disarm();
+                    open_append(base_path.clone()).await?
+                } else {
+                    let file = sync_open(open).await?;
+                    let root_file = sealed_root.take().ok_or_else(|| {
+                        PipeNativeError("segmented boot rebuild lost its sealed root handle".into())
+                    })?;
+                    finish_temp(root_file, temporary.path()?, base_path.clone()).await?;
+                    temporary.disarm();
+                    file
+                };
+                Ok(ReconciledSidecar {
+                    cursor: SidecarCursor {
+                        seq: covered,
+                        pending_seq: read_cursor,
+                        generation,
+                        segment,
+                    },
+                    projector,
+                    base_path,
+                    file,
+                })
+            }
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -163,6 +420,78 @@ impl PipeNativeWriter {
             .insert(session_id.clone());
     }
 
+    /// Opens a page-fed sidecar reducer for the shared startup scan. A ready
+    /// sidecar requests only its bounded join prewarm; missing, corrupt, or
+    /// journal-ahead state rebuilds into a temporary root from sequence zero.
+    pub(crate) async fn begin_boot_session(
+        &self,
+        store: &SqliteStoreHandle,
+        session_id: &SessionId,
+    ) -> Result<PipeBootSession, PipeNativeError> {
+        let path = self.sidecar_path(session_id)?;
+        let state = inspect_sidecar(path.clone(), session_id.clone()).await?;
+        let latest_seq = store.latest_seq(session_id).await.map_err(|error| {
+            PipeNativeError(format!("journal head inspection failed: {error:?}"))
+        })?;
+        match state {
+            SidecarState::Ready(cursor) if cursor.seq <= latest_seq => {
+                let prewarm_start = cursor.seq.saturating_sub(JOIN_PREWARM_ENVELOPES);
+                let active_path = segment_path(&path, cursor.generation, cursor.segment)?;
+                let file = open_append(active_path).await?;
+                Ok(PipeBootSession {
+                    session_id: session_id.clone(),
+                    base_path: path,
+                    read_cursor: prewarm_start,
+                    mode: PipeBootMode::Reconcile {
+                        durable_cursor: cursor,
+                        prewarm_start,
+                        file: Some(file),
+                        segment: cursor.segment,
+                        sealed_root: None,
+                        projector: TranscriptProjector::default(),
+                    },
+                })
+            }
+            other => {
+                let generation = other
+                    .generation()
+                    .checked_add(1)
+                    .ok_or_else(|| PipeNativeError("sidecar generation exhausted".into()))?;
+                let (mut file, temp_path) = create_temp(path.clone()).await?;
+                let temporary = RebuildTemporary::new(temp_path);
+                file = write_temp(file, header_line(session_id, generation, 0, 0)?).await?;
+                Ok(PipeBootSession {
+                    session_id: session_id.clone(),
+                    base_path: path,
+                    read_cursor: 0,
+                    mode: PipeBootMode::Rebuild {
+                        generation,
+                        file: Some(file),
+                        segment: 0,
+                        sealed_root: None,
+                        projector: TranscriptProjector::default(),
+                        temporary,
+                    },
+                })
+            }
+        }
+    }
+
+    /// Drops a clean boot-only writer without marking the durable sidecar
+    /// dirty. The first live actor reopens it from its self-describing cursor;
+    /// keeping every profile session's file open before Ready would defeat the
+    /// bounded startup fold on mature profiles.
+    pub(crate) fn release_clean(&self, session_id: &SessionId) {
+        self.reconciled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+        self.dirty
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+    }
+
     /// Maintains one session after its journal batch has committed. Ordinary
     /// appends are intentionally not fsynced: the journal owns durability and
     /// boot reconciliation heals a lost or torn sidecar tail. Errors are
@@ -180,39 +509,20 @@ impl PipeNativeWriter {
         result
     }
 
-    /// Cold-boot reconciliation using the journal page already read by turn
-    /// recovery. Only a suffix committed after that sealed boot page is read
-    /// from SQLite; missing/corrupt sidecars rebuild from the shared bytes.
-    pub(crate) async fn maintain_from_boot_journal(
+    /// Publishes one completed shared boot fold into the live writer map. The
+    /// caller feeds recovery-appended suffix pages before invoking this.
+    pub(crate) async fn finish_boot_session(
         &self,
-        store: &SqliteStoreHandle,
         session_id: &SessionId,
-        journal: &[RawEnvelope],
+        boot: PipeBootSession,
     ) -> Result<(), PipeNativeError> {
-        let path = self.sidecar_path(session_id)?;
-        let state = inspect_sidecar(path.clone(), session_id.clone()).await?;
-        let boot_head = journal.last().map_or(0, |envelope| envelope.seq);
-        let latest_seq = store.latest_seq(session_id).await.map_err(|error| {
-            PipeNativeError(format!("journal head inspection failed: {error:?}"))
-        })?;
-        let reconciled = match state {
-            SidecarState::Ready(cursor) if cursor.seq <= boot_head && cursor.seq <= latest_seq => {
-                self.reconcile_from_boot(store, session_id, path, cursor, journal)
-                    .await?
-            }
-            SidecarState::Ready(cursor) => {
-                self.rebuild_from_boot(store, session_id, path, cursor.generation, journal)
-                    .await?
-            }
-            SidecarState::Missing => {
-                self.rebuild_from_boot(store, session_id, path, 0, journal)
-                    .await?
-            }
-            SidecarState::Corrupt { generation } => {
-                self.rebuild_from_boot(store, session_id, path, generation, journal)
-                    .await?
-            }
-        };
+        if &boot.session_id != session_id {
+            return Err(PipeNativeError(format!(
+                "boot sidecar session mismatch: expected {}, got {}",
+                boot.session_id, session_id
+            )));
+        }
+        let reconciled = boot.finish().await?;
         sweep_orphan_segments_best_effort(&reconciled.base_path, session_id).await;
         self.reconciled
             .lock()
@@ -223,179 +533,6 @@ impl PipeNativeWriter {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(session_id);
         Ok(())
-    }
-
-    async fn reconcile_from_boot(
-        &self,
-        store: &SqliteStoreHandle,
-        session_id: &SessionId,
-        path: PathBuf,
-        cursor: SidecarCursor,
-        journal: &[RawEnvelope],
-    ) -> Result<ReconciledSidecar, PipeNativeError> {
-        let mut projector = TranscriptProjector::default();
-        let prewarm_start = cursor.seq.saturating_sub(JOIN_PREWARM_ENVELOPES);
-        for envelope in ordered_after(journal, prewarm_start) {
-            if envelope.seq > cursor.seq {
-                break;
-            }
-            projector.prewarm(envelope);
-        }
-        let active_path = segment_path(&path, cursor.generation, cursor.segment)?;
-        let mut file = open_append(active_path).await?;
-        let mut segment = cursor.segment;
-        let mut sealed_root = None;
-        let boot_tail = render_rows_after(journal, cursor.seq, &mut projector);
-        if !boot_tail.is_empty() {
-            (file, segment) = write_segmented_open(
-                file,
-                boot_tail,
-                &path,
-                session_id,
-                cursor.generation,
-                segment,
-                false,
-                &mut sealed_root,
-            )
-            .await?;
-        }
-        let mut read_cursor = journal
-            .last()
-            .map_or(cursor.seq, |envelope| envelope.seq.max(cursor.seq));
-        (file, segment) = append_store_suffix(
-            store,
-            session_id,
-            path.clone(),
-            file,
-            segment,
-            cursor.generation,
-            &mut projector,
-            &mut read_cursor,
-        )
-        .await?;
-        let trailing = render_projected_rows(projector.flush_unresolved_tools());
-        if !trailing.is_empty() {
-            (file, segment) = write_segmented_open(
-                file,
-                trailing,
-                &path,
-                session_id,
-                cursor.generation,
-                segment,
-                false,
-                &mut sealed_root,
-            )
-            .await?;
-        }
-        let covered = projector
-            .blocked_seq()
-            .map_or(read_cursor, |seq| seq.saturating_sub(1));
-        file = write_open(file, coverage_line(covered, cursor.generation)?).await?;
-        let file = sync_open(file).await?;
-        Ok(ReconciledSidecar {
-            cursor: SidecarCursor {
-                seq: covered,
-                pending_seq: read_cursor,
-                generation: cursor.generation,
-                segment,
-            },
-            projector,
-            base_path: path,
-            file,
-        })
-    }
-
-    async fn rebuild_from_boot(
-        &self,
-        store: &SqliteStoreHandle,
-        session_id: &SessionId,
-        path: PathBuf,
-        generation: u64,
-        journal: &[RawEnvelope],
-    ) -> Result<ReconciledSidecar, PipeNativeError> {
-        let (mut file, temp_path) = create_temp(path.clone()).await?;
-        let generation = generation
-            .checked_add(1)
-            .ok_or_else(|| PipeNativeError("sidecar generation exhausted".into()))?;
-        file = write_temp(file, header_line(session_id, generation, 0, 0)?).await?;
-        let mut segment = 0;
-        let mut sealed_root = None;
-        let mut projector = TranscriptProjector::default();
-        (file, segment) = write_segmented_open(
-            file,
-            render_rows_after(journal, 0, &mut projector),
-            &path,
-            session_id,
-            generation,
-            segment,
-            true,
-            &mut sealed_root,
-        )
-        .await?;
-        let mut read_cursor = journal.last().map_or(0, |envelope| envelope.seq);
-        loop {
-            let page = store
-                .read_page(
-                    session_id,
-                    read_cursor,
-                    RECONCILE_PAGE_ENVELOPES,
-                    RECONCILE_PAGE_BYTES,
-                )
-                .await
-                .map_err(|error| PipeNativeError(format!("journal rebuild failed: {error:?}")))?;
-            let Some(last) = page.last() else {
-                break;
-            };
-            read_cursor = last.seq;
-            (file, segment) = write_segmented_open(
-                file,
-                render_rows_after(&page, 0, &mut projector),
-                &path,
-                session_id,
-                generation,
-                segment,
-                true,
-                &mut sealed_root,
-            )
-            .await?;
-        }
-        (file, segment) = write_segmented_open(
-            file,
-            render_projected_rows(projector.flush_unresolved_tools()),
-            &path,
-            session_id,
-            generation,
-            segment,
-            true,
-            &mut sealed_root,
-        )
-        .await?;
-        let covered = projector
-            .blocked_seq()
-            .map_or(read_cursor, |seq| seq.saturating_sub(1));
-        file = write_open(file, coverage_line(covered, generation)?).await?;
-        let file = if segment == 0 {
-            finish_temp(file, temp_path, path.clone()).await?;
-            open_append(path.clone()).await?
-        } else {
-            let file = sync_open(file).await?;
-            let root_file = sealed_root.take().ok_or_else(|| {
-                PipeNativeError("segmented rebuild lost its sealed root handle".into())
-            })?;
-            finish_temp(root_file, temp_path, path.clone()).await?;
-            file
-        };
-        Ok(ReconciledSidecar {
-            cursor: SidecarCursor {
-                seq: covered,
-                pending_seq: read_cursor,
-                generation,
-                segment,
-            },
-            projector,
-            base_path: path,
-            file,
-        })
     }
 
     async fn maintain_inner(
@@ -500,21 +637,25 @@ impl PipeNativeWriter {
         let mut sealed_root = None;
         loop {
             let page = store
-                .read_page(
+                .read_reducer_page_with_boundary(
                     session_id,
                     read_cursor,
                     RECONCILE_PAGE_ENVELOPES,
                     RECONCILE_PAGE_BYTES,
+                    PIPE_PROJECTION_PAYLOAD_KINDS,
                 )
                 .await
                 .map_err(|error| {
                     PipeNativeError(format!("journal reconciliation failed: {error:?}"))
                 })?;
-            let Some(last) = page.last() else {
+            let Some(last) = page.envelopes.last() else {
+                if let Some((through_seq, _)) = page.observed_head {
+                    read_cursor = read_cursor.max(through_seq);
+                }
                 break;
             };
             read_cursor = last.seq;
-            let chunk = render_rows_after(&page, cursor.seq, &mut projector);
+            let chunk = render_rows_after(&page.envelopes, cursor.seq, &mut projector);
             if !chunk.is_empty() {
                 (file, segment) = write_segmented_open(
                     file,
@@ -581,19 +722,23 @@ impl PipeNativeWriter {
         let mut projector = TranscriptProjector::default();
         loop {
             let page = store
-                .read_page(
+                .read_reducer_page_with_boundary(
                     session_id,
                     read_cursor,
                     RECONCILE_PAGE_ENVELOPES,
                     RECONCILE_PAGE_BYTES,
+                    PIPE_PROJECTION_PAYLOAD_KINDS,
                 )
                 .await
                 .map_err(|error| PipeNativeError(format!("journal rebuild failed: {error:?}")))?;
-            let Some(last) = page.last() else {
+            let Some(last) = page.envelopes.last() else {
+                if let Some((through_seq, _)) = page.observed_head {
+                    read_cursor = read_cursor.max(through_seq);
+                }
                 break;
             };
             read_cursor = last.seq;
-            let chunk = render_rows_after(&page, 0, &mut projector);
+            let chunk = render_rows_after(&page.envelopes, 0, &mut projector);
             (file, segment) = write_segmented_open(
                 file,
                 chunk,
@@ -683,11 +828,12 @@ async fn prewarm_projector(
     let mut read_cursor = through_seq.saturating_sub(JOIN_PREWARM_ENVELOPES);
     while read_cursor < through_seq {
         let page = store
-            .read_page(
+            .read_reducer_page(
                 session_id,
                 read_cursor,
                 RECONCILE_PAGE_ENVELOPES,
                 RECONCILE_PAGE_BYTES,
+                PIPE_PROJECTION_PAYLOAD_KINDS,
             )
             .await
             .map_err(|error| PipeNativeError(format!("journal join prewarm failed: {error:?}")))?;
@@ -708,51 +854,6 @@ async fn prewarm_projector(
         }
     }
     Ok(projector)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn append_store_suffix(
-    store: &SqliteStoreHandle,
-    session_id: &SessionId,
-    base_path: PathBuf,
-    mut file: File,
-    mut segment: u64,
-    generation: u64,
-    projector: &mut TranscriptProjector,
-    read_cursor: &mut u64,
-) -> Result<(File, u64), PipeNativeError> {
-    let mut sealed_root = None;
-    loop {
-        let page = store
-            .read_page(
-                session_id,
-                *read_cursor,
-                RECONCILE_PAGE_ENVELOPES,
-                RECONCILE_PAGE_BYTES,
-            )
-            .await
-            .map_err(|error| {
-                PipeNativeError(format!("journal reconciliation failed: {error:?}"))
-            })?;
-        let Some(last) = page.last() else {
-            return Ok((file, segment));
-        };
-        *read_cursor = last.seq;
-        let chunk = render_rows_after(&page, 0, projector);
-        if !chunk.is_empty() {
-            (file, segment) = write_segmented_open(
-                file,
-                chunk,
-                &base_path,
-                session_id,
-                generation,
-                segment,
-                false,
-                &mut sealed_root,
-            )
-            .await?;
-        }
-    }
 }
 
 fn ordered_after(envelopes: &[RawEnvelope], cursor: u64) -> Vec<&RawEnvelope> {
@@ -1838,13 +1939,22 @@ mod tests {
         )
         .expect("orphan fixture writes");
 
+        let boot = writer
+            .begin_boot_session(&store, &session_id)
+            .await
+            .expect("boot reconciliation begins");
         writer
-            .maintain_from_boot_journal(&store, &session_id, &[])
+            .finish_boot_session(&session_id, boot)
             .await
             .expect("boot reconciliation succeeds");
+        writer.release_clean(&session_id);
 
         assert!(base.exists(), "live root survives boot sweep");
         assert!(!orphan.exists(), "old-generation orphan is swept");
+        assert!(
+            writer.reconciled.lock().expect("reconciled map").is_empty(),
+            "boot-only sidecar handles are released before Ready"
+        );
         drop(writer);
         store.close().await.expect("store closes");
     }

@@ -14,7 +14,7 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 22;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 23;
 
 struct Migration {
     version: u32,
@@ -474,6 +474,41 @@ const MIGRATIONS: &[Migration] = &[
                    created_at_ms, updated_at_ms
             FROM loom_cli_install_jobs
             ORDER BY created_at_ms, job_id;
+        ",
+    },
+    Migration {
+        version: 23,
+        sql: "
+            CREATE TABLE run_head_sessions (
+                session_id        TEXT PRIMARY KEY,
+                through_seq       INTEGER NOT NULL CHECK (through_seq >= 0),
+                run_count         INTEGER NOT NULL CHECK (run_count >= 0),
+                nonterminal_count INTEGER NOT NULL CHECK (nonterminal_count >= 0),
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            );
+
+            CREATE TABLE run_heads (
+                session_id    TEXT NOT NULL,
+                run_id        TEXT NOT NULL,
+                state_json    TEXT NOT NULL CHECK (length(state_json) > 0),
+                state_seq     INTEGER CHECK (state_seq IS NULL OR state_seq > 0),
+                terminal      INTEGER NOT NULL CHECK (terminal IN (0, 1)),
+                accepted_seq  INTEGER CHECK (accepted_seq IS NULL OR accepted_seq > 0),
+                branch_id     TEXT,
+                prompt_run_id TEXT,
+                checksum      BLOB NOT NULL CHECK (length(checksum) = 32),
+                PRIMARY KEY (session_id, run_id),
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            );
+
+            CREATE INDEX run_heads_nonterminal
+            ON run_heads(session_id, state_seq DESC)
+            WHERE terminal = 0 AND state_seq IS NOT NULL;
+
+            INSERT OR IGNORE INTO run_head_sessions(
+                session_id, through_seq, run_count, nonterminal_count
+            )
+            SELECT id, 0, 0, 0 FROM sessions;
         ",
     },
 ];

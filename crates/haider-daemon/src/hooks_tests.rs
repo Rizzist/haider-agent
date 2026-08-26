@@ -3,9 +3,12 @@
 #[cfg(unix)]
 use super::hook_command;
 use super::{
-    CapturedBytes, HookDefinition, HookEngine, HookKind, HookMatcher, HookService, HookSource,
-    HookTrustPolicy, MatchEvent, classify, discover, hook_digest, make_output,
-    next_subscriber_backoff, prepare_hook_input, run_command,
+    CapturedBytes, DecisionState, EngineState, HOOK_ENGINE_SNAPSHOT_FILE,
+    HOOK_ENGINE_SNAPSHOT_VERSION, HookDefinition, HookEngine, HookEngineSnapshot,
+    HookEngineSnapshotFile, HookKind, HookMatcher, HookService, HookSource, HookStartupHydrator,
+    HookTrustPolicy, MatchEvent, classify, discover, encode_hook_snapshot_file, hook_digest,
+    make_output, next_subscriber_backoff, prepare_hook_input, prune_terminal_run_trust,
+    reduce_durable_state, run_command,
 };
 use crate::session_hub::{SessionHub, SessionHubConfig};
 #[cfg(windows)]
@@ -396,6 +399,298 @@ fn permission_menu(options: Vec<MenuOption>) -> Menu {
         ttl_ms: None,
         timeout_option: None,
     }
+}
+
+#[tokio::test]
+async fn structurally_inconsistent_hook_snapshot_replays_from_zero_cleanly() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let session_id = SessionId::new("hook-snapshot-corrupt-session");
+    let run_id = RunId::new("hook-snapshot-corrupt-run");
+    let mut journal = [raw_hook_event(
+        &session_id,
+        &run_id,
+        store.worker_generation(),
+        "hook-snapshot-trust",
+        HookEventPayload::HookRunTrust { enabled: true },
+    )];
+    StoreHandle::append(&store, &mut journal)
+        .await
+        .expect("append authoritative hook fact");
+
+    let mut stale_sessions = std::collections::HashMap::new();
+    stale_sessions.insert(session_id.clone(), DecisionState::default());
+    let corrupt = HookEngineSnapshot {
+        version: HOOK_ENGINE_SNAPSHOT_VERSION,
+        sessions: stale_sessions,
+        run_trust: std::collections::HashSet::new(),
+        terminal_run_trust: std::collections::HashSet::new(),
+        terminal_run_trust_complete: true,
+        through_seq: std::collections::HashMap::new(),
+        through_digest: std::collections::HashMap::new(),
+    };
+    std::fs::write(
+        root.path().join(HOOK_ENGINE_SNAPSHOT_FILE),
+        encode_hook_snapshot_file(
+            rmp_serde::to_vec_named(&corrupt).expect("encode corrupt snapshot payload"),
+        )
+        .expect("encode corrupt snapshot fixture"),
+    )
+    .expect("write corrupt snapshot fixture");
+
+    let mut hydration = HookStartupHydrator::prepare(&store)
+        .await
+        .expect("corrupt snapshot is a cache miss");
+    assert_eq!(hydration.scan_start(&session_id), 0);
+    assert!(!hydration.state.sessions.contains_key(&session_id));
+    hydration
+        .catch_up_session(&store, &session_id)
+        .await
+        .expect("full hook fallback");
+    assert_eq!(hydration.scan_start(&session_id), journal[0].seq);
+    assert!(hydration.state.run_trust.contains(&(session_id, run_id)));
+    store.close().await.expect("store close");
+}
+
+#[tokio::test]
+async fn checksum_mismatched_hook_snapshot_replays_from_zero_cleanly() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let session_id = SessionId::new("hook-snapshot-checksum-session");
+    let run_id = RunId::new("hook-snapshot-checksum-run");
+    let mut journal = [raw_hook_event(
+        &session_id,
+        &run_id,
+        store.worker_generation(),
+        "hook-snapshot-checksum-trust",
+        HookEventPayload::HookRunTrust { enabled: true },
+    )];
+    StoreHandle::append(&store, &mut journal)
+        .await
+        .expect("append authoritative hook fact");
+    let mut state = EngineState {
+        sessions: std::collections::HashMap::new(),
+        run_trust: std::collections::HashSet::new(),
+        terminal_run_trust: std::collections::HashSet::new(),
+        through_seq: std::collections::HashMap::new(),
+        through_digest: std::collections::HashMap::new(),
+        notice_dedup: std::collections::HashSet::new(),
+        subscribers: std::collections::HashMap::new(),
+    };
+    reduce_durable_state(&mut state, &journal[0]);
+    let payload = rmp_serde::to_vec_named(&HookEngineSnapshot {
+        version: HOOK_ENGINE_SNAPSHOT_VERSION,
+        sessions: state.sessions,
+        run_trust: state.run_trust,
+        terminal_run_trust: state.terminal_run_trust,
+        terminal_run_trust_complete: true,
+        through_seq: state.through_seq,
+        through_digest: state.through_digest,
+    })
+    .expect("encode checksum snapshot payload");
+    std::fs::write(
+        root.path().join(HOOK_ENGINE_SNAPSHOT_FILE),
+        rmp_serde::to_vec_named(&HookEngineSnapshotFile {
+            payload,
+            digest: "validly-decodable-but-wrong".into(),
+        })
+        .expect("encode checksum-mismatched snapshot file"),
+    )
+    .expect("write checksum-mismatched snapshot file");
+
+    let mut hydration = HookStartupHydrator::prepare(&store)
+        .await
+        .expect("checksum mismatch is a cache miss");
+    assert_eq!(hydration.scan_start(&session_id), 0);
+    hydration
+        .catch_up_session(&store, &session_id)
+        .await
+        .expect("full checksum fallback");
+    assert!(hydration.state.run_trust.contains(&(session_id, run_id)));
+    store.close().await.expect("store close");
+}
+
+#[tokio::test]
+async fn valid_hook_snapshot_preserves_intent_until_ask_suffix_binds_it() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let session_id = SessionId::new("hook-snapshot-intent-session");
+    let run_id = RunId::new("hook-snapshot-intent-run");
+    let effect_id = EffectId::new("hook-snapshot-intent-effect");
+    let menu = permission_menu(vec![]);
+    let mut prefix = [raw_event(
+        &session_id,
+        &run_id,
+        store.worker_generation(),
+        "hook-snapshot-intent",
+        EventPayload::Effect(EffectPhase::Intent(EffectIntent {
+            effect: effect_id.clone(),
+            class: EffectClass::ProcessExec,
+            summary: "pending permission".into(),
+            args_digest: "pending-permission-args".into(),
+            workspace_revision: None,
+        })),
+    )];
+    StoreHandle::append(&store, &mut prefix)
+        .await
+        .expect("append intent prefix");
+    let mut state = EngineState {
+        sessions: std::collections::HashMap::new(),
+        run_trust: std::collections::HashSet::new(),
+        terminal_run_trust: std::collections::HashSet::new(),
+        through_seq: std::collections::HashMap::new(),
+        through_digest: std::collections::HashMap::new(),
+        notice_dedup: std::collections::HashSet::new(),
+        subscribers: std::collections::HashMap::new(),
+    };
+    reduce_durable_state(&mut state, &prefix[0]);
+    let snapshot = HookEngineSnapshot {
+        version: HOOK_ENGINE_SNAPSHOT_VERSION,
+        sessions: state.sessions,
+        run_trust: state.run_trust,
+        terminal_run_trust: state.terminal_run_trust,
+        terminal_run_trust_complete: true,
+        through_seq: state.through_seq,
+        through_digest: state.through_digest,
+    };
+    std::fs::write(
+        root.path().join(HOOK_ENGINE_SNAPSHOT_FILE),
+        encode_hook_snapshot_file(
+            rmp_serde::to_vec_named(&snapshot).expect("encode valid intent snapshot payload"),
+        )
+        .expect("encode valid intent snapshot"),
+    )
+    .expect("write valid intent snapshot");
+
+    let mut suffix = [raw_event(
+        &session_id,
+        &run_id,
+        store.worker_generation(),
+        "hook-snapshot-ask",
+        EventPayload::Effect(EffectPhase::Authorized {
+            effect: effect_id.clone(),
+            verdict: AuthorizationVerdict::Ask {
+                menu: menu.id.clone(),
+            },
+        }),
+    )];
+    StoreHandle::append(&store, &mut suffix)
+        .await
+        .expect("append ask suffix");
+
+    let mut hydration = HookStartupHydrator::prepare(&store)
+        .await
+        .expect("load valid intent snapshot");
+    assert_eq!(hydration.scan_start(&session_id), prefix[0].seq);
+    hydration
+        .catch_up_session(&store, &session_id)
+        .await
+        .expect("fold ask suffix");
+    let decision = hydration
+        .state
+        .sessions
+        .get(&session_id)
+        .expect("session decision state");
+    assert_eq!(
+        decision.bindings.get(&menu.id).map(|intent| &intent.effect),
+        Some(&effect_id)
+    );
+    store.close().await.expect("store close");
+}
+
+#[test]
+fn completed_permission_decisions_release_effect_reducer_state() {
+    let session_id = SessionId::new("hook-effect-reducer-session");
+    let run_id = RunId::new("hook-effect-reducer-run");
+    let effect_id = EffectId::new("hook-effect-reducer-effect");
+    let menu = permission_menu(vec![]);
+    let mut state = EngineState {
+        sessions: std::collections::HashMap::new(),
+        run_trust: std::collections::HashSet::new(),
+        terminal_run_trust: std::collections::HashSet::new(),
+        through_seq: std::collections::HashMap::new(),
+        through_digest: std::collections::HashMap::new(),
+        notice_dedup: std::collections::HashSet::new(),
+        subscribers: std::collections::HashMap::new(),
+    };
+    for event in [
+        raw_event(
+            &session_id,
+            &run_id,
+            1,
+            "hook-effect-intent",
+            EventPayload::Effect(EffectPhase::Intent(EffectIntent {
+                effect: effect_id.clone(),
+                class: EffectClass::ProcessExec,
+                summary: "bounded reducer".into(),
+                args_digest: "bounded-reducer-args".into(),
+                workspace_revision: None,
+            })),
+        ),
+        raw_event(
+            &session_id,
+            &run_id,
+            1,
+            "hook-effect-ask",
+            EventPayload::Effect(EffectPhase::Authorized {
+                effect: effect_id,
+                verdict: AuthorizationVerdict::Ask {
+                    menu: menu.id.clone(),
+                },
+            }),
+        ),
+        raw_event(
+            &session_id,
+            &run_id,
+            1,
+            "hook-effect-menu",
+            EventPayload::MenuOpened(menu.clone()),
+        ),
+        raw_event(
+            &session_id,
+            &run_id,
+            1,
+            "hook-effect-answer",
+            EventPayload::MenuAnswered(haider_protocol::menu::MenuAnswer {
+                menu: menu.id,
+                option_key: None,
+                option_index: 0,
+                value: None,
+                via: AnswerVia::Hook,
+            }),
+        ),
+    ] {
+        reduce_durable_state(&mut state, &event);
+    }
+    let session = state.sessions.get(&session_id).expect("session reducer");
+    assert!(session.intents.is_empty());
+    assert!(session.bindings.is_empty());
+    assert!(session.menus.is_empty());
+
+    reduce_durable_state(
+        &mut state,
+        &raw_hook_event(
+            &session_id,
+            &run_id,
+            1,
+            "hook-run-trust-enable",
+            HookEventPayload::HookRunTrust { enabled: true },
+        ),
+    );
+    reduce_durable_state(
+        &mut state,
+        &raw_event(
+            &session_id,
+            &run_id,
+            1,
+            "hook-run-terminal",
+            EventPayload::RunState(RunState::Done),
+        ),
+    );
+    assert_eq!(state.terminal_run_trust.len(), 1);
+    prune_terminal_run_trust(&mut state);
+    assert!(state.run_trust.is_empty());
+    assert!(state.terminal_run_trust.is_empty());
 }
 
 struct BrokerJournal;

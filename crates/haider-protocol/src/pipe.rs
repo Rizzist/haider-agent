@@ -88,6 +88,7 @@ pub struct TranscriptJoiner {
 #[derive(Default)]
 pub struct TranscriptProjector {
     joiner: TranscriptJoiner,
+    last_observed_seq: Option<u64>,
     buffered: VecDeque<BufferedRow>,
     open_reasoning: HashMap<ProjectionRunKey, OpenReasoning>,
     pending_reasoning: HashMap<ProjectionRunKey, VecDeque<PendingReasoning>>,
@@ -118,6 +119,10 @@ impl TranscriptProjector {
     /// already durable. Rows after that cursor still enter through [`Self::push`]
     /// and may wait for a later result as usual.
     pub fn prewarm(&mut self, envelope: &RawEnvelope) {
+        self.last_observed_seq = Some(
+            self.last_observed_seq
+                .map_or(envelope.seq, |seq| seq.max(envelope.seq)),
+        );
         self.note_item_run(envelope);
         let _ = self.joiner.observe(envelope);
     }
@@ -141,9 +146,17 @@ impl TranscriptProjector {
     /// without reordering the transcript. The fact bound makes corruption or
     /// an absent result degrade to an args-only row with bounded memory.
     pub fn push(&mut self, envelope: &RawEnvelope) -> Vec<SidecarRow> {
+        let elapsed = self
+            .last_observed_seq
+            .map_or(1, |seq| envelope.seq.saturating_sub(seq).max(1));
+        self.last_observed_seq = Some(
+            self.last_observed_seq
+                .map_or(envelope.seq, |seq| seq.max(envelope.seq)),
+        );
+        let elapsed = usize::try_from(elapsed).unwrap_or(usize::MAX);
         for buffered in &mut self.buffered {
             if buffered.unresolved_tool.is_some() {
-                buffered.remaining_facts = buffered.remaining_facts.saturating_sub(1);
+                buffered.remaining_facts = buffered.remaining_facts.saturating_sub(elapsed);
                 if buffered.remaining_facts == 0 {
                     buffered.unresolved_tool = None;
                 }
@@ -1349,6 +1362,62 @@ mod tests {
         let row = serde_json::to_value(rows.first().expect("tool row")).expect("row serializes");
         assert_eq!(row["status"], "rejected");
         assert_eq!(row["summary"], "tool call settled as Rejected");
+    }
+
+    /// MUTATION CHECK: decrement the unresolved-tool bound by one decoded
+    /// page item instead of the journal sequence gap. A payload-kind-filtered
+    /// rebuild would then join a result that arrived more than the historical
+    /// fact bound after its tool row and change the sidecar bytes.
+    #[test]
+    fn filtered_sequence_gaps_preserve_the_unresolved_tool_fact_bound() {
+        let mut completed = envelope(
+            1,
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("filtered-gap-item"),
+                item: TurnItem::ToolCall {
+                    call_id: "filtered-gap-call".into(),
+                    name: "shell".into(),
+                    args: serde_json::json!({"cmd": "true"}),
+                    status: ToolStatus::Completed,
+                },
+            }),
+        );
+        completed.run_id = Some(RunId::new("filtered-gap-run"));
+        let mut legacy_node = node(
+            2,
+            NodeKind::ToolExchange {
+                tool: "shell".into(),
+                summary: "bounded join".into(),
+                artifact: None,
+            },
+        );
+        legacy_node.run_id = completed.run_id.clone();
+        let mut late_result = envelope(
+            u64::try_from(MAX_PENDING_TOOL_RESULTS).expect("fact bound fits u64") + 3,
+            EventPayload::ToolResult {
+                call_id: "filtered-gap-call".into(),
+                result: BoundedResult {
+                    preview: "too late".into(),
+                    truncated: false,
+                    artifact: None,
+                    images: Vec::new(),
+                    cursor: None,
+                    status: ToolResultStatus::Completed,
+                    reason: None,
+                    presentation: None,
+                },
+            },
+        );
+        late_result.run_id = completed.run_id.clone();
+
+        let mut projector = TranscriptProjector::default();
+        assert!(projector.push(&completed).is_empty());
+        assert!(projector.push(&legacy_node).is_empty());
+        let rows = projector.push(&late_result);
+        let row = serde_json::to_value(rows.first().expect("expired tool row"))
+            .expect("tool row serializes");
+        assert_eq!(row["summary"], "bounded join");
+        assert!(row.get("result_preview").is_none());
     }
 
     /// MUTATION CHECK (v0.0.935 #3): peek a wrong tag name, skip the peek's

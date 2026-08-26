@@ -22,13 +22,14 @@ fn shutdown_channel() -> (
     })
 }
 
-/// A startup terminalizer writes through the store before the session hub
-/// exists. The new hub must explicitly reconcile that session; no later
-/// append is allowed to hide the recovery-ordering hole this test pins.
+/// The shared startup scan feeds turn recovery, hooks, and the native sidecar
+/// before a session hub exists. Recovery-appended terminal facts must be
+/// caught up by that same session fold; no later append may hide the ordering
+/// hole this test pins.
 #[tokio::test]
 async fn startup_recovery_run_failed_reaches_sidecar_without_later_append() {
     use crate::SessionHubConfig;
-    use crate::turn_recovery::recover_interrupted_turns_report;
+    use crate::turn_recovery::recover_interrupted_turns_report_with_visitor;
     use haider_core::{SqliteStoreHandle, StoreHandle};
     use haider_protocol::EventPayload;
     use haider_protocol::envelope::{
@@ -75,9 +76,16 @@ async fn startup_recovery_run_failed_reaches_sidecar_without_later_append() {
     let recovered = SqliteStoreHandle::open(root.path())
         .await
         .expect("open recovery generation");
-    let recovery = recover_interrupted_turns_report(&recovered, &DeviceId::new("new-daemon"))
+    let mut hydration = StartupHydration::prepare(&recovered)
         .await
-        .expect("terminalize interrupted run");
+        .expect("prepare shared hydration");
+    let recovery = recover_interrupted_turns_report_with_visitor(
+        &recovered,
+        &DeviceId::new("new-daemon"),
+        &mut hydration,
+    )
+    .await
+    .expect("terminalize interrupted run");
     assert_eq!(recovery.touched_sessions, vec![session_id.clone()]);
     let events = StoreHandle::read(&recovered, &session_id, 0, 64)
         .await
@@ -93,9 +101,18 @@ async fn startup_recovery_run_failed_reaches_sidecar_without_later_append() {
         .expect("recovery committed RunFailed");
     let expected_error_row = sidecar_row_line(failed).expect("RunFailed projects to sidecar");
 
-    let hub = SessionHub::new(recovered.clone(), SessionHubConfig::default()).expect("hub");
-    hub.reconcile_pipe_sidecars(&recovery.touched_sessions)
-        .await;
+    let (hook_hydration, pipe_native) = hydration.into_parts();
+    assert_eq!(
+        hook_hydration.scan_start(&session_id),
+        events.last().map_or(0, |envelope| envelope.seq),
+        "hook reducer must catch up through the recovery-appended suffix"
+    );
+    let hub = SessionHub::new_with_pipe_native(
+        recovered.clone(),
+        SessionHubConfig::default(),
+        pipe_native,
+    )
+    .expect("hub");
     let sidecar =
         std::fs::read_to_string(root.path().join("pipe").join(format!("{session_id}.pipe")))
             .expect("startup reconcile creates sidecar");
@@ -103,6 +120,82 @@ async fn startup_recovery_run_failed_reaches_sidecar_without_later_append() {
         sidecar.lines().any(|line| line == expected_error_row),
         "recovery error row must be present without a subsequent append"
     );
+    hub.shutdown().await.expect("hub shutdown");
+    recovered.close().await.expect("store close");
+}
+
+#[tokio::test]
+async fn shared_startup_hydration_is_page_bounded_across_sessions() {
+    use crate::turn_recovery::recover_interrupted_turns_report_with_visitor;
+    use haider_core::{SqliteStoreHandle, StoreHandle};
+    use haider_protocol::EventPayload;
+    use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+    use haider_protocol::ids::{DeviceId, EventId, RunId, SessionId};
+    use haider_protocol::state::RunState;
+
+    const EVENTS_PER_SESSION: usize = 513;
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let mut sessions = Vec::new();
+    for name in ["shared-hydration-alpha", "shared-hydration-beta"] {
+        let session_id = SessionId::new(name);
+        let mut events = (0..EVENTS_PER_SESSION)
+            .map(|index| EventEnvelope {
+                schema_version: SCHEMA_VERSION,
+                event_id: EventId::new(format!("{name}-{index}")),
+                seq: 0,
+                session_id: session_id.clone(),
+                branch_id: None,
+                run_id: Some(RunId::new(format!("{name}-run-{index}"))),
+                agent_id: None,
+                device_id: DeviceId::new("shared-hydration-device"),
+                authority_epoch: 0,
+                worker_generation: store.worker_generation(),
+                causation_id: None,
+                correlation_id: None,
+                committed_at_ms: 0,
+                render: RenderTargets {
+                    ui: true,
+                    durable: true,
+                    prompt: PromptRender::Omit,
+                },
+                payload: serde_json::to_value(EventPayload::RunState(RunState::Done))
+                    .expect("terminal payload"),
+            })
+            .collect::<Vec<_>>();
+        StoreHandle::append(&store, &mut events)
+            .await
+            .expect("append page-crossing journal");
+        sessions.push(session_id);
+    }
+
+    let mut hydration = StartupHydration::prepare(&store)
+        .await
+        .expect("prepare shared hydration");
+    recover_interrupted_turns_report_with_visitor(
+        &store,
+        &DeviceId::new("shared-hydration-recovery"),
+        &mut hydration,
+    )
+    .await
+    .expect("page-fed shared hydration");
+    let (hooks, _pipe_native) = hydration.into_parts();
+    for session_id in sessions {
+        assert_eq!(
+            hooks.scan_start(&session_id),
+            u64::try_from(EVENTS_PER_SESSION).expect("small event count")
+        );
+        let sidecar =
+            std::fs::read_to_string(root.path().join("pipe").join(format!("{session_id}.pipe")))
+                .expect("page-fed sidecar exists");
+        assert!(sidecar.lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|value| value.get("coverage").and_then(serde_json::Value::as_u64))
+                == Some(u64::try_from(EVENTS_PER_SESSION).expect("small event count"))
+        }));
+    }
+    store.close().await.expect("store close");
 }
 
 #[tokio::test]

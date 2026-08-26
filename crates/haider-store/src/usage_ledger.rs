@@ -15,7 +15,7 @@ use haider_protocol::usage::{
     UsageHistoryDayV1, UsageHistoryKeyV1, UsageHistoryMeterSampleV1, UsageHistoryRangeDayV1,
     UsageHistoryRoleV1, UsageHistoryRowV1, UsageHistorySlotV1, UsageHistoryVersionChangeV1,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
@@ -27,7 +27,7 @@ const MILLIS_PER_DAY: u64 = 86_400_000;
 const MILLIS_PER_SLOT: u64 = 15 * 60 * 1_000;
 
 /// Optional dimensions for one compact dictionary lane.
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct UsageLedgerLane {
     pub account: Option<String>,
     pub provider: Option<String>,
@@ -39,7 +39,7 @@ pub struct UsageLedgerLane {
 }
 
 /// Additive counters carried by one lane in one slot.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageLedgerCounters {
     pub requests: u64,
     pub errors: u64,
@@ -67,14 +67,14 @@ impl UsageLedgerCounters {
 }
 
 /// One closed UTC quarter-hour ready to append.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageLedgerSlot {
     pub rows: BTreeMap<UsageLedgerLane, UsageLedgerCounters>,
     pub subagents_spawned: u64,
 }
 
 /// UTC day and quarter-hour address for a journal fact.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct UsageSlotAddress {
     pub date: String,
     pub slot: u8,
@@ -685,17 +685,8 @@ pub fn reduce_journal_usage(
 ) -> BTreeMap<UsageSlotAddress, UsageLedgerSlot> {
     let fork_boundaries = envelopes
         .iter()
-        .filter(|envelope| {
-            envelope.payload.get("type").and_then(Value::as_str) == Some("session_forked")
-        })
-        .filter_map(
-            |envelope| match SessionForkEventPayload::deserialize(&envelope.payload) {
-                Ok(SessionForkEventPayload::SessionForked(_)) => {
-                    Some((envelope.session_id.clone(), envelope.seq))
-                }
-                Ok(SessionForkEventPayload::Unknown) | Err(_) => None,
-            },
-        )
+        .filter(|envelope| is_session_fork_audit(envelope))
+        .map(|envelope| (envelope.session_id.clone(), envelope.seq))
         .collect::<HashMap<_, _>>();
     let mut chunks = BTreeMap::<ChunkKey, ObservedChunk>::new();
     let mut spawns = BTreeMap::<UsageSlotAddress, u64>::new();
@@ -705,102 +696,160 @@ pub fn reduce_journal_usage(
             .get(&envelope.session_id)
             .is_some_and(|audit_seq| envelope.seq < *audit_seq)
         {
+            continue;
+        }
+        fold_usage_envelope(&mut chunks, &mut spawns, &mut errors, envelope);
+    }
+    let mut slots = BTreeMap::<UsageSlotAddress, UsageLedgerSlot>::new();
+    merge_usage_state(chunks, spawns, errors, &mut slots);
+    slots
+}
+
+/// Page-fed usage reduction for one session.
+///
+/// The state is serializable so startup reconciliation can durably anchor it
+/// to an immutable journal envelope and resume from only the missing suffix.
+/// A fork audit clears the inherited physical prefix as soon as it is seen;
+/// if malformed history contains several audits, the last one wins exactly as
+/// it does in the retained-journal oracle above.
+#[derive(Default, Serialize, Deserialize)]
+pub(crate) struct UsageJournalReducer {
+    chunks: BTreeMap<ChunkKey, ObservedChunk>,
+    spawns: BTreeMap<UsageSlotAddress, u64>,
+    errors: BTreeMap<(UsageSlotAddress, UsageLedgerLane), u64>,
+}
+
+impl UsageJournalReducer {
+    pub(crate) fn fold(&mut self, envelope: &RawEnvelope) {
+        if is_session_fork_audit(envelope) {
             // Forks physically copy the source prefix. The audit immediately
             // after that prefix is the boundary between inherited history and
             // work truly performed by the child; counting the prefix again
             // would duplicate the source device's usage.
-            continue;
+            self.chunks.clear();
+            self.spawns.clear();
+            self.errors.clear();
         }
-        if envelope.payload.get("type").and_then(Value::as_str) == Some("session_forked") {
-            continue;
-        }
-        let Ok(payload) = EventPayload::deserialize(&envelope.payload) else {
-            continue;
-        };
-        match payload {
-            EventPayload::Usage(usage) => {
-                let request_ordinal = usage.request.as_ref().map(|request| request.ordinal);
-                if let Some(request) = usage.request {
-                    let scope = usage.scope.as_ref();
-                    let account = request.account.or(usage.account);
+        fold_usage_envelope(
+            &mut self.chunks,
+            &mut self.spawns,
+            &mut self.errors,
+            envelope,
+        );
+    }
+
+    pub(crate) fn merge_into(self, slots: &mut BTreeMap<UsageSlotAddress, UsageLedgerSlot>) {
+        merge_usage_state(self.chunks, self.spawns, self.errors, slots);
+    }
+}
+
+fn is_session_fork_audit(envelope: &RawEnvelope) -> bool {
+    envelope.payload.get("type").and_then(Value::as_str) == Some("session_forked")
+        && matches!(
+            SessionForkEventPayload::deserialize(&envelope.payload),
+            Ok(SessionForkEventPayload::SessionForked(_))
+        )
+}
+
+fn fold_usage_envelope(
+    chunks: &mut BTreeMap<ChunkKey, ObservedChunk>,
+    spawns: &mut BTreeMap<UsageSlotAddress, u64>,
+    errors: &mut BTreeMap<(UsageSlotAddress, UsageLedgerLane), u64>,
+    envelope: &RawEnvelope,
+) {
+    let Ok(payload) = EventPayload::deserialize(&envelope.payload) else {
+        return;
+    };
+    match payload {
+        EventPayload::Usage(usage) => {
+            let request_ordinal = usage.request.as_ref().map(|request| request.ordinal);
+            if let Some(request) = usage.request {
+                let scope = usage.scope.as_ref();
+                let account = request.account.or(usage.account);
+                let counters = usage_counters(
+                    request.input,
+                    request.output,
+                    request.reasoning.unwrap_or(0),
+                    request.cached.unwrap_or(0),
+                    request.normalized.as_ref(),
+                );
+                insert_chunk(
+                    chunks,
+                    envelope,
+                    scope,
+                    account.map(|alias| alias.as_str().to_owned()),
+                    request_ordinal,
+                    counters,
+                );
+            } else if !usage.accounts.is_empty() {
+                for subtotal in usage.accounts {
                     let counters = usage_counters(
-                        request.input,
-                        request.output,
-                        request.reasoning.unwrap_or(0),
-                        request.cached.unwrap_or(0),
-                        request.normalized.as_ref(),
+                        subtotal.input,
+                        subtotal.output,
+                        subtotal.reasoning,
+                        subtotal.cached,
+                        subtotal.normalized.as_ref(),
                     );
                     insert_chunk(
-                        &mut chunks,
+                        chunks,
                         envelope,
-                        scope,
-                        account.map(|alias| alias.as_str().to_owned()),
-                        request_ordinal,
-                        counters,
-                    );
-                } else if !usage.accounts.is_empty() {
-                    for subtotal in usage.accounts {
-                        let counters = usage_counters(
-                            subtotal.input,
-                            subtotal.output,
-                            subtotal.reasoning,
-                            subtotal.cached,
-                            subtotal.normalized.as_ref(),
-                        );
-                        insert_chunk(
-                            &mut chunks,
-                            envelope,
-                            subtotal.scope.as_ref(),
-                            Some(subtotal.account.as_str().to_owned()),
-                            request_ordinal,
-                            counters,
-                        );
-                    }
-                } else if let Some(account) = usage.account {
-                    let counters = usage_counters(
-                        usage.input,
-                        usage.output,
-                        usage.reasoning,
-                        usage.cached,
-                        usage.normalized.as_ref(),
-                    );
-                    insert_chunk(
-                        &mut chunks,
-                        envelope,
-                        usage.scope.as_ref(),
-                        Some(account.as_str().to_owned()),
+                        subtotal.scope.as_ref(),
+                        Some(subtotal.account.as_str().to_owned()),
                         request_ordinal,
                         counters,
                     );
                 }
+            } else if let Some(account) = usage.account {
+                let counters = usage_counters(
+                    usage.input,
+                    usage.output,
+                    usage.reasoning,
+                    usage.cached,
+                    usage.normalized.as_ref(),
+                );
+                insert_chunk(
+                    chunks,
+                    envelope,
+                    usage.scope.as_ref(),
+                    Some(account.as_str().to_owned()),
+                    request_ordinal,
+                    counters,
+                );
             }
-            EventPayload::AgentSpawned(_) => {
-                let address = slot_address(envelope.committed_at_ms);
-                let count = spawns.entry(address).or_default();
-                *count = count.saturating_add(1);
-            }
-            EventPayload::RunFailed { .. } => {
-                // RunFailed has no request/account/provider/model coordinates
-                // and also represents recovery and tool failures. Assigning it
-                // to the most recent request would fabricate dimensions after
-                // rotation, so preserve only the exact role coordinate.
-                let lane = UsageLedgerLane {
-                    role: if envelope.agent_id.is_some() {
-                        UsageHistoryRoleV1::Subagent
-                    } else {
-                        UsageHistoryRoleV1::Root
-                    },
-                    ..UsageLedgerLane::default()
-                };
-                let count = errors
-                    .entry((slot_address(envelope.committed_at_ms), lane))
-                    .or_default();
-                *count = count.saturating_add(1);
-            }
-            _ => {}
         }
+        EventPayload::AgentSpawned(_) => {
+            let address = slot_address(envelope.committed_at_ms);
+            let count = spawns.entry(address).or_default();
+            *count = count.saturating_add(1);
+        }
+        EventPayload::RunFailed { .. } => {
+            // RunFailed has no request/account/provider/model coordinates
+            // and also represents recovery and tool failures. Assigning it
+            // to the most recent request would fabricate dimensions after
+            // rotation, so preserve only the exact role coordinate.
+            let lane = UsageLedgerLane {
+                role: if envelope.agent_id.is_some() {
+                    UsageHistoryRoleV1::Subagent
+                } else {
+                    UsageHistoryRoleV1::Root
+                },
+                ..UsageLedgerLane::default()
+            };
+            let count = errors
+                .entry((slot_address(envelope.committed_at_ms), lane))
+                .or_default();
+            *count = count.saturating_add(1);
+        }
+        _ => {}
     }
-    let mut slots = BTreeMap::<UsageSlotAddress, UsageLedgerSlot>::new();
+}
+
+fn merge_usage_state(
+    chunks: BTreeMap<ChunkKey, ObservedChunk>,
+    spawns: BTreeMap<UsageSlotAddress, u64>,
+    errors: BTreeMap<(UsageSlotAddress, UsageLedgerLane), u64>,
+    slots: &mut BTreeMap<UsageSlotAddress, UsageLedgerSlot>,
+) {
     for chunk in chunks.into_values() {
         slots
             .entry(chunk.address)
@@ -811,7 +860,8 @@ pub fn reduce_journal_usage(
             .add(&chunk.counters);
     }
     for (address, spawned) in spawns {
-        slots.entry(address).or_default().subagents_spawned = spawned;
+        let count = &mut slots.entry(address).or_default().subagents_spawned;
+        *count = count.saturating_add(spawned);
     }
     for ((address, lane), count) in errors {
         let counters = slots
@@ -822,10 +872,9 @@ pub fn reduce_journal_usage(
             .or_default();
         counters.errors = counters.errors.saturating_add(count);
     }
-    slots
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct ChunkKey {
     session: String,
     run: String,
@@ -838,6 +887,7 @@ struct ChunkKey {
     account: String,
 }
 
+#[derive(Serialize, Deserialize)]
 struct ObservedChunk {
     address: UsageSlotAddress,
     lane: UsageLedgerLane,

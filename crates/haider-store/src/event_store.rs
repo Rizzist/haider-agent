@@ -18,7 +18,7 @@ use crate::cas::FileCas;
 use crate::migrations;
 use crate::profile_lock::ProfileLock;
 use crate::usage_ledger::{
-    UsageLedgerWriter, read_usage_day, reduce_journal_usage, slot_start_ms as usage_slot_start_ms,
+    UsageJournalReducer, UsageLedgerWriter, read_usage_day, slot_start_ms as usage_slot_start_ms,
 };
 use crate::{Cas, StoreResult, now_ms, store_error, to_sqlite_integer, validate_image_block};
 use haider_protocol::agent::{AgentManifest, ChildReport, ReportVerification};
@@ -100,11 +100,31 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const REPLAY_PAGE_SIZE: usize = 1_024;
 const USAGE_REDUCER_PAYLOAD_KINDS: &[&str] =
     &["usage", "agent_spawned", "run_failed", "session_forked"];
-const RUN_STATE_REDUCER_PAYLOAD_KINDS: &[&str] = &["run_state"];
 const QUEUE_REDUCER_PAYLOAD_KINDS: &[&str] = &["user_message", "queue_changed"];
 const RUN_PROMPT_SOURCE_PAYLOAD_KINDS: &[&str] = &["user_message", "run_retried"];
 const FAILED_TURN_REDUCER_PAYLOAD_KINDS: &[&str] = &["user_message", "run_failed", "run_retried"];
 const TREE_HEAD_REDUCER_PAYLOAD_KINDS: &[&str] = &["node_committed"];
+const USAGE_REPLAY_PAGE_BYTES: usize = 4 * 1_024 * 1_024;
+const USAGE_CHECKPOINT_PROJECTION: &str = "usage_history";
+const USAGE_CHECKPOINT_TIMELINE: &str = "session";
+const USAGE_CHECKPOINT_SHAPE_VERSION: u32 = 1;
+const USAGE_CHECKPOINT_REDUCER_VERSION: &str = "usage-history-v1";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DurableUsageCheckpoint {
+    shape_version: u32,
+    reducer_version: String,
+    through_seq: u64,
+    reducer: UsageJournalReducer,
+}
+
+#[derive(serde::Serialize)]
+struct DurableUsageCheckpointRef<'a> {
+    shape_version: u32,
+    reducer_version: &'static str,
+    through_seq: u64,
+    reducer: &'a UsageJournalReducer,
+}
 
 /// Deployment escape hatch for the journal connection's SQLite `synchronous`
 /// pragma. Accepted values are the lower-case strings `normal` and `full`.
@@ -151,6 +171,16 @@ pub struct CommittedSeqRange {
     pub session_id: SessionId,
     pub first_seq: u64,
     pub last_seq: u64,
+}
+
+/// One payload-kind-filtered reducer page plus the committed journal head
+/// observed under the same connection lock. The head carries only indexed
+/// coordinates, so a reducer can advance across an irrelevant suffix without
+/// fetching or decoding that suffix's envelopes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReducerPage {
+    pub envelopes: Vec<RawEnvelope>,
+    pub observed_head: Option<(u64, EventId)>,
 }
 
 /// Opaque, rebuildable projection state anchored to one immutable journal
@@ -1733,6 +1763,7 @@ impl Store {
         let mut connection = open_connection(&database_path)?;
         migrations::migrate(&mut connection)?;
         backfill_payload_kinds(&mut connection)?;
+        backfill_run_head_projections(&mut connection)?;
         connection.set_prepared_statement_cache_capacity(16);
         let cas = FileCas::open(&root)?;
         let worker_generation = next_worker_generation(&mut connection)?;
@@ -1864,8 +1895,7 @@ impl Store {
     pub fn initialize_usage_history(&self) -> StoreResult<()> {
         let installation_id = self.profile_installation_id()?;
         let backfill_version = self.usage_backfill_version()?;
-        let envelopes = self.all_usage_reducer_envelopes()?;
-        let slots = reduce_journal_usage(&envelopes);
+        let slots = self.fold_usage_journals()?;
         let now = now_ms()?;
         if backfill_version < 1 {
             self.install_usage_backfill(&installation_id, &slots, now)?;
@@ -1887,7 +1917,7 @@ impl Store {
         let installation_id = self.profile_installation_id()?;
         let writer = UsageLedgerWriter::new(&self.root, installation_id, env!("CARGO_PKG_VERSION"));
         let now = now_ms()?;
-        for (address, slot) in reduce_journal_usage(&self.all_usage_reducer_envelopes()?) {
+        for (address, slot) in self.fold_usage_journals()? {
             let address_start = usage_slot_start_ms(&address.date, address.slot)?;
             if address_start.saturating_add(15 * 60 * 1_000) <= now {
                 writer.append_slot(&address, &slot, false)?;
@@ -1966,6 +1996,107 @@ impl Store {
         Ok(())
     }
 
+    /// Folds each session a page at a time. The only profile-wide allocation
+    /// is the compact slot result; decoded envelopes are dropped after their
+    /// page is reduced. Each completed session advances a journal-anchored
+    /// checkpoint through the observed committed journal head so later
+    /// restarts read only that session's missing suffix. Filtering happens in
+    /// SQLite before envelope materialization; the returned boundary is read
+    /// under the same connection lock so a concurrent group commit can never
+    /// be checkpointed before its reducer facts are visible.
+    fn fold_usage_journals(
+        &self,
+    ) -> StoreResult<
+        BTreeMap<crate::usage_ledger::UsageSlotAddress, crate::usage_ledger::UsageLedgerSlot>,
+    > {
+        let mut slots = BTreeMap::new();
+        for session_id in self.session_ids()? {
+            let (mut reducer, mut cursor) = self.load_usage_checkpoint(&session_id)?;
+            let checkpoint_cursor = cursor;
+            let mut boundary = None;
+            loop {
+                let page = self.read_reducer_page_with_boundary(
+                    &session_id,
+                    cursor,
+                    REPLAY_PAGE_SIZE,
+                    USAGE_REPLAY_PAGE_BYTES,
+                    USAGE_REDUCER_PAYLOAD_KINDS,
+                )?;
+                let Some(last) = page.envelopes.last() else {
+                    boundary = page.observed_head.or(boundary);
+                    break;
+                };
+                for envelope in &page.envelopes {
+                    reducer.fold(envelope);
+                }
+                cursor = last.seq;
+                boundary = Some((last.seq, last.event_id.clone()));
+            }
+            if let Some((through_seq, boundary_event_id)) = boundary
+                && through_seq > checkpoint_cursor
+            {
+                self.put_usage_checkpoint(&session_id, through_seq, boundary_event_id, &reducer)?;
+            }
+            reducer.merge_into(&mut slots);
+        }
+        Ok(slots)
+    }
+
+    fn load_usage_checkpoint(
+        &self,
+        session_id: &SessionId,
+    ) -> StoreResult<(UsageJournalReducer, u64)> {
+        let checkpoint = match self.session_projection_checkpoint(
+            session_id,
+            USAGE_CHECKPOINT_PROJECTION,
+            USAGE_CHECKPOINT_TIMELINE,
+        ) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) if error.code == ErrorCode::StoreCorrupt => return Ok(Default::default()),
+            Err(error) => return Err(error),
+        };
+        let Some(checkpoint) = checkpoint else {
+            return Ok(Default::default());
+        };
+        let decoded = match rmp_serde::from_slice::<DurableUsageCheckpoint>(&checkpoint.payload) {
+            Ok(decoded) => decoded,
+            Err(_) => return Ok(Default::default()),
+        };
+        if decoded.shape_version != USAGE_CHECKPOINT_SHAPE_VERSION
+            || decoded.reducer_version != USAGE_CHECKPOINT_REDUCER_VERSION
+            || decoded.through_seq != checkpoint.through_seq
+        {
+            return Ok(Default::default());
+        }
+        Ok((decoded.reducer, decoded.through_seq))
+    }
+
+    fn put_usage_checkpoint(
+        &self,
+        session_id: &SessionId,
+        through_seq: u64,
+        boundary_event_id: EventId,
+        reducer: &UsageJournalReducer,
+    ) -> StoreResult<()> {
+        let payload = rmp_serde::to_vec_named(&DurableUsageCheckpointRef {
+            shape_version: USAGE_CHECKPOINT_SHAPE_VERSION,
+            reducer_version: USAGE_CHECKPOINT_REDUCER_VERSION,
+            through_seq,
+            reducer,
+        })
+        .map_err(|error| corrupt(format!("usage checkpoint encode failed: {error}")))?;
+        self.put_session_projection_checkpoint(&SessionProjectionCheckpoint {
+            session_id: session_id.clone(),
+            projection: USAGE_CHECKPOINT_PROJECTION.to_owned(),
+            timeline_key: USAGE_CHECKPOINT_TIMELINE.to_owned(),
+            through_seq,
+            boundary_event_id,
+            payload,
+        })
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::expect_used)]
     fn all_usage_reducer_envelopes(&self) -> StoreResult<Vec<RawEnvelope>> {
         let mut envelopes = Vec::new();
         for session_id in self.session_ids()? {
@@ -1975,6 +2106,7 @@ impl Store {
                     &session_id,
                     cursor,
                     REPLAY_PAGE_SIZE,
+                    USAGE_REPLAY_PAGE_BYTES,
                     USAGE_REDUCER_PAYLOAD_KINDS,
                 )?;
                 if page.is_empty() {
@@ -1983,6 +2115,16 @@ impl Store {
                 cursor = page.last().map_or(cursor, |envelope| envelope.seq);
                 envelopes.extend(page);
             }
+        }
+        Ok(envelopes)
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::expect_used)]
+    fn all_journal_envelopes(&self) -> StoreResult<Vec<RawEnvelope>> {
+        let mut envelopes = Vec::new();
+        for session_id in self.session_ids()? {
+            envelopes.extend(self.journal_replay(&session_id)?);
         }
         Ok(envelopes)
     }
@@ -3045,6 +3187,9 @@ impl Store {
         timeline_key: &str,
     ) -> StoreResult<Option<SessionProjectionCheckpoint>> {
         let connection = self.connection()?;
+        if projection == RUN_HEADS_PROJECTION && timeline_key == RUN_HEADS_TIMELINE {
+            return run_heads_projection_checkpoint(&connection, session_id).map(Some);
+        }
         let row = connection
             .query_row(
                 "SELECT checkpoint.through_seq, checkpoint.boundary_event_id,
@@ -3068,7 +3213,9 @@ impl Store {
                 },
             )
             .optional()
-            .map_err(map_sqlite_error)?;
+            .map_err(|error| {
+                map_projection_checkpoint_row_error(error, session_id, projection, timeline_key)
+            })?;
         let Some((through_seq, boundary_event_id, payload, digest, event_id)) = row else {
             return Ok(None);
         };
@@ -3199,6 +3346,8 @@ impl Store {
             .map_err(map_sqlite_error)?;
         require_session(&transaction, session_id)?;
         for statement in [
+            "DELETE FROM run_heads WHERE session_id = ?1",
+            "DELETE FROM run_head_sessions WHERE session_id = ?1",
             "DELETE FROM session_projection_checkpoints WHERE session_id = ?1",
             "DELETE FROM graph_telemetry_dirty WHERE session_id = ?1",
             "DELETE FROM graph_telemetry_projection WHERE session_id = ?1",
@@ -6497,6 +6646,14 @@ impl Store {
             )
             .map_err(map_sqlite_error)?;
         enqueue_hook_dispatch(&transaction, &envelope)?;
+        transaction
+            .execute(
+                "INSERT INTO run_head_sessions(
+                     session_id, through_seq, run_count, nonterminal_count
+                 ) VALUES (?1, 1, 0, 0)",
+                [command.session_id.as_str()],
+            )
+            .map_err(map_sqlite_error)?;
 
         let created = CreatedSession {
             session_id: command.session_id.clone(),
@@ -6955,6 +7112,7 @@ impl Store {
                 "session-fork"
             },
         )?;
+        rebuild_run_head_projection(&transaction, &command.session_id)?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(SessionForkOutcome::Committed {
             created,
@@ -8416,10 +8574,7 @@ impl Store {
                 false,
             ));
         }
-        if latest_run_states(&transaction, &command.session_id)?
-            .values()
-            .any(|(state, _, _)| !state.is_terminal())
-        {
+        if has_nonterminal_run(&transaction, &command.session_id)? {
             return Err(store_error(
                 ErrorCode::Busy,
                 "direct shell execution requires an idle session",
@@ -9154,8 +9309,9 @@ impl Store {
             return Ok(TurnCancelOutcome::IdempotentReplay { cancelled });
         }
         require_session(&transaction, &command.session_id)?;
-        let states = latest_run_states(&transaction, &command.session_id)?;
-        let Some((state, state_seq, branch_id)) = states.get(&command.run_id) else {
+        let Some((state, state_seq, branch_id)) =
+            latest_run_state(&transaction, &command.session_id, &command.run_id)?
+        else {
             return Err(store_error(
                 ErrorCode::RunNotActive,
                 format!(
@@ -9181,11 +9337,11 @@ impl Store {
                     session_id: command.session_id.clone(),
                     run_id: command.run_id.clone(),
                     status: TurnCancellationStatus::AlreadyTerminal,
-                    terminal_seq: Some(*state_seq),
+                    terminal_seq: Some(state_seq),
                 },
                 None,
             )
-        } else if *state == RunState::Cancelling {
+        } else if state == RunState::Cancelling {
             (
                 CancelledTurn {
                     session_id: command.session_id.clone(),
@@ -9199,7 +9355,7 @@ impl Store {
             let mut envelopes = vec![unstamped_command_envelope(
                 command.cancelling_event_id.clone(),
                 &command.session_id,
-                branch_id.clone(),
+                branch_id,
                 Some(command.run_id.clone()),
                 command.device_id.clone(),
                 self.worker_generation,
@@ -10198,8 +10354,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite_error)?;
         require_session(&transaction, &session_id)?;
-        let states = latest_run_states(&transaction, &session_id)?;
-        if states.values().any(|(state, _, _)| !state.is_terminal()) {
+        if has_nonterminal_run(&transaction, &session_id)? {
             transaction.commit().map_err(map_sqlite_error)?;
             return Ok(false);
         }
@@ -10387,6 +10542,7 @@ impl Store {
         session: &SessionId,
         since_seq: u64,
         limit: usize,
+        byte_budget: usize,
         payload_kinds: &[&str],
     ) -> StoreResult<Vec<RawEnvelope>> {
         if limit == 0 || payload_kinds.is_empty() {
@@ -10398,12 +10554,59 @@ impl Store {
             session,
             since_seq,
             limit,
+            byte_budget,
             payload_kinds,
         );
         drop(connection);
         match filtered {
             Ok(envelopes) => Ok(envelopes),
-            Err(FilteredReadError::Decode) => self.read(session, since_seq, limit),
+            Err(FilteredReadError::Decode) => {
+                self.read_page(session, since_seq, limit, byte_budget)
+            }
+            Err(FilteredReadError::Store(error)) => Err(error),
+        }
+    }
+
+    /// Byte-bounded variant used by durable streamed reducers. The journal
+    /// boundary is sampled while the same connection lock guards the filtered
+    /// read, so callers may checkpoint an empty filtered suffix without
+    /// racing a committed append whose relevant fact was not folded.
+    pub fn read_reducer_page_with_boundary(
+        &self,
+        session: &SessionId,
+        since_seq: u64,
+        limit: usize,
+        byte_budget: usize,
+        payload_kinds: &[&str],
+    ) -> StoreResult<ReducerPage> {
+        if limit == 0 || payload_kinds.is_empty() {
+            return Ok(ReducerPage {
+                envelopes: Vec::new(),
+                observed_head: None,
+            });
+        }
+        let connection = self.connection()?;
+        let boundary = journal_boundary_with_connection(&connection, session)?;
+        let filtered = read_reducer_page_with_connection(
+            &connection,
+            session,
+            since_seq,
+            limit,
+            byte_budget,
+            payload_kinds,
+        );
+        drop(connection);
+        match filtered {
+            Ok(envelopes) => Ok(ReducerPage {
+                envelopes,
+                observed_head: boundary,
+            }),
+            Err(FilteredReadError::Decode) => self
+                .read_page(session, since_seq, limit, byte_budget)
+                .map(|envelopes| ReducerPage {
+                    envelopes,
+                    observed_head: None,
+                }),
             Err(FilteredReadError::Store(error)) => Err(error),
         }
     }
@@ -13653,53 +13856,890 @@ fn graph_finalization_envelope(
     )
 }
 
+const RUN_HEADS_PROJECTION: &str = "run_heads_v1";
+const RUN_HEADS_TIMELINE: &str = "session";
+const RUN_HEADS_PAYLOAD_VERSION: u32 = 1;
+
 type DurableRunHead = (RunState, u64, Option<BranchId>);
+
+#[derive(Clone, Debug, PartialEq)]
+struct ProjectedRunHead {
+    state: RunState,
+    state_seq: Option<u64>,
+    accepted_seq: Option<u64>,
+    branch_id: Option<BranchId>,
+    prompt_run_id: Option<RunId>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RunHeadsCheckpointPayload {
+    version: u32,
+    heads: Vec<RunHeadCheckpointRow>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RunHeadCheckpointRow {
+    run_id: String,
+    state: RunState,
+    state_seq: Option<u64>,
+    accepted_seq: Option<u64>,
+    branch_id: Option<String>,
+    prompt_run_id: Option<String>,
+}
+
+struct RunHeadProjectionMeta {
+    through_seq: u64,
+    run_count: u64,
+    nonterminal_count: u64,
+}
+
+struct StoredRunHead {
+    run_id: String,
+    state_json: String,
+    state_seq: Option<i64>,
+    terminal: i64,
+    accepted_seq: Option<i64>,
+    branch_id: Option<String>,
+    prompt_run_id: Option<String>,
+    checksum: Vec<u8>,
+}
+
+fn map_run_head_row_error(error: SqliteError) -> HaiderError {
+    if matches!(
+        &error,
+        SqliteError::FromSqlConversionFailure(..)
+            | SqliteError::IntegralValueOutOfRange(..)
+            | SqliteError::InvalidColumnType(..)
+    ) {
+        return corrupt(format!("run-head projection row is malformed: {error}"));
+    }
+    map_sqlite_error(error)
+}
+
+fn map_projection_checkpoint_row_error(
+    error: SqliteError,
+    session_id: &SessionId,
+    projection: &str,
+    timeline_key: &str,
+) -> HaiderError {
+    if matches!(
+        &error,
+        SqliteError::FromSqlConversionFailure(..)
+            | SqliteError::IntegralValueOutOfRange(..)
+            | SqliteError::InvalidColumnType(..)
+    ) {
+        return corrupt(format!(
+            "projection checkpoint {projection}/{timeline_key} for session {session_id} has malformed storage: {error}"
+        ));
+    }
+    map_sqlite_error(error)
+}
 
 fn latest_run_states(
     connection: &Connection,
     session_id: &SessionId,
 ) -> StoreResult<HashMap<RunId, DurableRunHead>> {
-    let mut statement = connection
-        .prepare_cached(
-            "SELECT seq, envelope_json
-             FROM events INDEXED BY events_payload_kind_session_seq
-             WHERE session_id = ?1
-               AND (payload_kind = ?2 OR payload_kind IS NULL)
-             ORDER BY seq ASC",
+    Ok(load_projected_run_heads(connection, session_id)?
+        .into_iter()
+        .filter_map(|(run_id, head)| {
+            head.state_seq
+                .map(|state_seq| (run_id, (head.state, state_seq, head.branch_id)))
+        })
+        .collect())
+}
+
+fn journal_latest_seq(connection: &Connection, session_id: &SessionId) -> StoreResult<u64> {
+    let latest = connection
+        .query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?1",
+            [session_id.as_str()],
+            |row| row.get::<_, i64>(0),
         )
         .map_err(map_sqlite_error)?;
-    let mut rows = statement
-        .query(params![
-            session_id.as_str(),
-            RUN_STATE_REDUCER_PAYLOAD_KINDS[0]
-        ])
+    u64::try_from(latest).map_err(|_| corrupt("database contains a negative event sequence"))
+}
+
+fn run_head_projection_meta(
+    connection: &Connection,
+    session_id: &SessionId,
+) -> StoreResult<Option<RunHeadProjectionMeta>> {
+    let row = connection
+        .query_row(
+            "SELECT through_seq, run_count, nonterminal_count
+             FROM run_head_sessions WHERE session_id = ?1",
+            [session_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_run_head_row_error)?;
+    row.map(|(through_seq, run_count, nonterminal_count)| {
+        Ok(RunHeadProjectionMeta {
+            through_seq: u64::try_from(through_seq)
+                .map_err(|_| corrupt("run-head projection has a negative journal watermark"))?,
+            run_count: u64::try_from(run_count)
+                .map_err(|_| corrupt("run-head projection has a negative row count"))?,
+            nonterminal_count: u64::try_from(nonterminal_count)
+                .map_err(|_| corrupt("run-head projection has a negative live-run count"))?,
+        })
+    })
+    .transpose()
+}
+
+fn projected_run_head_counts(heads: &HashMap<RunId, ProjectedRunHead>) -> StoreResult<(u64, u64)> {
+    let run_count =
+        u64::try_from(heads.len()).map_err(|_| corrupt("too many durable run heads"))?;
+    let nonterminal_count = u64::try_from(
+        heads
+            .values()
+            .filter(|head| head.state_seq.is_some() && !head.state.is_terminal())
+            .count(),
+    )
+    .map_err(|_| corrupt("too many nonterminal durable run heads"))?;
+    Ok((run_count, nonterminal_count))
+}
+
+fn ensure_run_head_projection(
+    connection: &Connection,
+    session_id: &SessionId,
+) -> StoreResult<RunHeadProjectionMeta> {
+    let journal_head = journal_latest_seq(connection, session_id)?;
+    let metadata = match run_head_projection_meta(connection, session_id) {
+        Ok(metadata) => metadata,
+        Err(error) if error.code == ErrorCode::StoreCorrupt => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(metadata) = metadata
+        && metadata.through_seq == journal_head
+    {
+        return Ok(metadata);
+    }
+    rebuild_run_head_projection(connection, session_id)?;
+    run_head_projection_meta(connection, session_id)?.ok_or_else(|| {
+        corrupt(format!(
+            "run-head projection rebuild omitted session {session_id}"
+        ))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_head_checksum(
+    session_id: &SessionId,
+    run_id: &str,
+    state_json: &str,
+    state_seq: Option<u64>,
+    terminal: bool,
+    accepted_seq: Option<u64>,
+    branch_id: Option<&str>,
+    prompt_run_id: Option<&str>,
+) -> blake3::Hash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"haider-run-head-v1\0");
+    for value in [
+        Some(session_id.as_str()),
+        Some(run_id),
+        Some(state_json),
+        branch_id,
+        prompt_run_id,
+    ] {
+        match value {
+            Some(value) => {
+                hasher.update(&[1]);
+                hasher.update(&u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+                hasher.update(value.as_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+    }
+    for value in [state_seq, accepted_seq] {
+        match value {
+            Some(value) => {
+                hasher.update(&[1]);
+                hasher.update(&value.to_be_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+    }
+    hasher.update(&[u8::from(terminal)]);
+    hasher.finalize()
+}
+
+fn decode_stored_run_head(
+    session_id: &SessionId,
+    stored: StoredRunHead,
+) -> StoreResult<(RunId, ProjectedRunHead)> {
+    let state = serde_json::from_str::<RunState>(&stored.state_json).map_err(|error| {
+        corrupt(format!(
+            "run-head projection for session {session_id}, run {} has invalid state: {error}",
+            stored.run_id
+        ))
+    })?;
+    let terminal = match stored.terminal {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(corrupt(format!(
+                "run-head projection for session {session_id}, run {} has invalid terminal flag",
+                stored.run_id
+            )));
+        }
+    };
+    if terminal != state.is_terminal() {
+        return Err(corrupt(format!(
+            "run-head projection for session {session_id}, run {} disagrees on terminal state",
+            stored.run_id
+        )));
+    }
+    let state_seq = stored
+        .state_seq
+        .map(|value| {
+            u64::try_from(value)
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| corrupt("run-head projection has an invalid state sequence"))
+        })
+        .transpose()?;
+    let accepted_seq = stored
+        .accepted_seq
+        .map(|value| {
+            u64::try_from(value)
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| corrupt("run-head projection has an invalid accepted sequence"))
+        })
+        .transpose()?;
+    let checksum = run_head_checksum(
+        session_id,
+        &stored.run_id,
+        &stored.state_json,
+        state_seq,
+        terminal,
+        accepted_seq,
+        stored.branch_id.as_deref(),
+        stored.prompt_run_id.as_deref(),
+    );
+    if stored.checksum.as_slice() != checksum.as_bytes() {
+        return Err(corrupt(format!(
+            "run-head projection for session {session_id}, run {} has an invalid checksum",
+            stored.run_id
+        )));
+    }
+    Ok((
+        RunId::new(stored.run_id),
+        ProjectedRunHead {
+            state,
+            state_seq,
+            accepted_seq,
+            branch_id: stored.branch_id.map(BranchId::new),
+            prompt_run_id: stored.prompt_run_id.map(RunId::new),
+        },
+    ))
+}
+
+fn stored_run_head(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRunHead> {
+    Ok(StoredRunHead {
+        run_id: row.get(0)?,
+        state_json: row.get(1)?,
+        state_seq: row.get(2)?,
+        terminal: row.get(3)?,
+        accepted_seq: row.get(4)?,
+        branch_id: row.get(5)?,
+        prompt_run_id: row.get(6)?,
+        checksum: row.get(7)?,
+    })
+}
+
+fn try_load_projected_run_heads(
+    connection: &Connection,
+    session_id: &SessionId,
+) -> StoreResult<HashMap<RunId, ProjectedRunHead>> {
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT run_id, state_json, state_seq, terminal, accepted_seq,
+                    branch_id, prompt_run_id, checksum
+             FROM run_heads WHERE session_id = ?1 ORDER BY run_id",
+        )
         .map_err(map_sqlite_error)?;
+    let rows = statement
+        .query_map([session_id.as_str()], stored_run_head)
+        .map_err(map_sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_run_head_row_error)?;
+    rows.into_iter()
+        .map(|stored| decode_stored_run_head(session_id, stored))
+        .collect()
+}
+
+fn load_projected_run_heads(
+    connection: &Connection,
+    session_id: &SessionId,
+) -> StoreResult<HashMap<RunId, ProjectedRunHead>> {
+    let metadata = ensure_run_head_projection(connection, session_id)?;
+    match try_load_projected_run_heads(connection, session_id) {
+        Ok(heads) => {
+            if projected_run_head_counts(&heads)?
+                == (metadata.run_count, metadata.nonterminal_count)
+            {
+                Ok(heads)
+            } else {
+                rebuild_run_head_projection(connection, session_id)?;
+                try_load_projected_run_heads(connection, session_id)
+            }
+        }
+        Err(error) if error.code == ErrorCode::StoreCorrupt => {
+            rebuild_run_head_projection(connection, session_id)?;
+            try_load_projected_run_heads(connection, session_id)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn try_load_projected_run_head(
+    connection: &Connection,
+    session_id: &SessionId,
+    run_id: &RunId,
+) -> StoreResult<Option<ProjectedRunHead>> {
+    connection
+        .query_row(
+            "SELECT run_id, state_json, state_seq, terminal, accepted_seq,
+                    branch_id, prompt_run_id, checksum
+             FROM run_heads WHERE session_id = ?1 AND run_id = ?2",
+            params![session_id.as_str(), run_id.as_str()],
+            stored_run_head,
+        )
+        .optional()
+        .map_err(map_run_head_row_error)?
+        .map(|stored| decode_stored_run_head(session_id, stored).map(|(_, head)| head))
+        .transpose()
+}
+
+fn projected_run_head(
+    connection: &Connection,
+    session_id: &SessionId,
+    run_id: &RunId,
+) -> StoreResult<Option<ProjectedRunHead>> {
+    let metadata = ensure_run_head_projection(connection, session_id)?;
+    match try_load_projected_run_head(connection, session_id, run_id) {
+        Ok(Some(head)) => Ok(Some(head)),
+        Ok(None) if metadata.run_count == 0 => Ok(None),
+        Ok(None) => {
+            rebuild_run_head_projection(connection, session_id)?;
+            try_load_projected_run_head(connection, session_id, run_id)
+        }
+        Err(error) if error.code == ErrorCode::StoreCorrupt => {
+            rebuild_run_head_projection(connection, session_id)?;
+            try_load_projected_run_head(connection, session_id, run_id)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn latest_run_state(
+    connection: &Connection,
+    session_id: &SessionId,
+    run_id: &RunId,
+) -> StoreResult<Option<DurableRunHead>> {
+    Ok(
+        projected_run_head(connection, session_id, run_id)?.and_then(|head| {
+            head.state_seq
+                .map(|state_seq| (head.state, state_seq, head.branch_id))
+        }),
+    )
+}
+
+fn try_latest_run_states_for(
+    connection: &Connection,
+    session_id: &SessionId,
+    run_ids: &HashSet<RunId>,
+) -> StoreResult<(HashMap<RunId, DurableRunHead>, bool)> {
     let mut states = HashMap::new();
-    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-        let seq = sql_u64(row.get(0).map_err(map_sqlite_error)?).map_err(map_sqlite_error)?;
-        let envelope = decode_envelope_column(row, 1).map_err(|error| {
-            corrupt(format!(
-                "invalid envelope JSON for session {session_id}, seq {seq}: {error}"
-            ))
-        })?;
-        let Some(run_id) = envelope.run_id else {
+    let mut missing = false;
+    for run_id in run_ids {
+        let Some(head) = try_load_projected_run_head(connection, session_id, run_id)? else {
+            missing = true;
             continue;
         };
-        if let Ok(EventPayload::RunState(state)) =
-            serde_json::from_value::<EventPayload>(envelope.payload)
-        {
-            let branch_id = envelope.branch_id;
-            if let Some((_, _, accepted_branch)) = states.get(&run_id)
-                && accepted_branch != &branch_id
-            {
+        if let Some(state_seq) = head.state_seq {
+            states.insert(run_id.clone(), (head.state, state_seq, head.branch_id));
+        }
+    }
+    Ok((states, missing))
+}
+
+fn latest_run_states_for<'a>(
+    connection: &Connection,
+    session_id: &SessionId,
+    run_ids: impl IntoIterator<Item = &'a RunId>,
+    projection_run_count: u64,
+) -> StoreResult<HashMap<RunId, DurableRunHead>> {
+    let run_ids = run_ids.into_iter().cloned().collect::<HashSet<_>>();
+    match try_latest_run_states_for(connection, session_id, &run_ids) {
+        Ok((states, false)) => Ok(states),
+        Ok((states, true)) if projection_run_count == 0 => Ok(states),
+        Ok(_) => {
+            rebuild_run_head_projection(connection, session_id)?;
+            try_latest_run_states_for(connection, session_id, &run_ids).map(|(states, _)| states)
+        }
+        Err(error) if error.code == ErrorCode::StoreCorrupt => {
+            rebuild_run_head_projection(connection, session_id)?;
+            try_latest_run_states_for(connection, session_id, &run_ids).map(|(states, _)| states)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn try_load_one_nonterminal_run(
+    connection: &Connection,
+    session_id: &SessionId,
+) -> StoreResult<Option<(RunId, ProjectedRunHead)>> {
+    connection
+        .query_row(
+            "SELECT run_id, state_json, state_seq, terminal, accepted_seq,
+                    branch_id, prompt_run_id, checksum
+             FROM run_heads
+             WHERE session_id = ?1 AND terminal = 0 AND state_seq IS NOT NULL
+             ORDER BY state_seq DESC LIMIT 1",
+            [session_id.as_str()],
+            stored_run_head,
+        )
+        .optional()
+        .map_err(map_run_head_row_error)?
+        .map(|stored| decode_stored_run_head(session_id, stored))
+        .transpose()
+}
+
+fn has_nonterminal_run(connection: &Connection, session_id: &SessionId) -> StoreResult<bool> {
+    let metadata = ensure_run_head_projection(connection, session_id)?;
+    let loaded = try_load_one_nonterminal_run(connection, session_id);
+    match loaded {
+        Ok(head) if head.is_some() == (metadata.nonterminal_count > 0) => Ok(head.is_some()),
+        Ok(_) => {
+            rebuild_run_head_projection(connection, session_id)?;
+            Ok(try_load_one_nonterminal_run(connection, session_id)?.is_some())
+        }
+        Err(error) if error.code == ErrorCode::StoreCorrupt => {
+            rebuild_run_head_projection(connection, session_id)?;
+            Ok(try_load_one_nonterminal_run(connection, session_id)?.is_some())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn apply_run_head_envelope(
+    heads: &mut HashMap<RunId, ProjectedRunHead>,
+    envelope: &RawEnvelope,
+) -> StoreResult<()> {
+    let Some(run_id) = envelope.run_id.clone() else {
+        return Ok(());
+    };
+    let Some(kind) = envelope
+        .payload
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(());
+    };
+    if kind == "run_retried" {
+        let Ok(RunRetryEventPayload::RunRetried { prompt_run_id, .. }) =
+            RunRetryEventPayload::from_payload_value(envelope.payload.clone())
+        else {
+            return Ok(());
+        };
+        let head = heads
+            .entry(run_id.clone())
+            .or_insert_with(|| ProjectedRunHead {
+                state: RunState::Queued,
+                state_seq: None,
+                accepted_seq: None,
+                branch_id: envelope.branch_id.clone(),
+                prompt_run_id: None,
+            });
+        if head.branch_id != envelope.branch_id {
+            return Err(corrupt(format!(
+                "run {run_id} crosses branch scopes in durable history"
+            )));
+        }
+        head.accepted_seq = Some(envelope.seq);
+        head.prompt_run_id = Some(prompt_run_id);
+        return Ok(());
+    }
+    if !matches!(kind, "run_state" | "user_message") {
+        return Ok(());
+    }
+    let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+        return Ok(());
+    };
+    match payload {
+        EventPayload::RunState(state) => {
+            let head = heads
+                .entry(run_id.clone())
+                .or_insert_with(|| ProjectedRunHead {
+                    state: state.clone(),
+                    state_seq: None,
+                    accepted_seq: None,
+                    branch_id: envelope.branch_id.clone(),
+                    prompt_run_id: None,
+                });
+            if head.branch_id != envelope.branch_id {
                 return Err(corrupt(format!(
                     "run {run_id} crosses branch scopes in durable history"
                 )));
             }
-            states.insert(run_id, (state, seq, branch_id));
+            head.state = state;
+            head.state_seq = Some(envelope.seq);
+        }
+        EventPayload::UserMessage { .. } => {
+            let head = heads
+                .entry(run_id.clone())
+                .or_insert_with(|| ProjectedRunHead {
+                    state: RunState::Queued,
+                    state_seq: None,
+                    accepted_seq: None,
+                    branch_id: envelope.branch_id.clone(),
+                    prompt_run_id: None,
+                });
+            if head.branch_id != envelope.branch_id {
+                return Err(corrupt(format!(
+                    "run {run_id} crosses branch scopes in durable history"
+                )));
+            }
+            head.accepted_seq = Some(envelope.seq);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn write_projected_run_head(
+    connection: &Connection,
+    session_id: &SessionId,
+    run_id: &RunId,
+    head: &ProjectedRunHead,
+) -> StoreResult<()> {
+    let state_json = serde_json::to_string(&head.state).map_err(|error| {
+        corrupt(format!(
+            "cannot serialize run-head state for session {session_id}, run {run_id}: {error}"
+        ))
+    })?;
+    let terminal = head.state.is_terminal();
+    let checksum = run_head_checksum(
+        session_id,
+        run_id.as_str(),
+        &state_json,
+        head.state_seq,
+        terminal,
+        head.accepted_seq,
+        head.branch_id.as_ref().map(BranchId::as_str),
+        head.prompt_run_id.as_ref().map(RunId::as_str),
+    );
+    connection
+        .execute(
+            "INSERT INTO run_heads(
+                 session_id, run_id, state_json, state_seq, terminal,
+                 accepted_seq, branch_id, prompt_run_id, checksum
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(session_id, run_id) DO UPDATE SET
+                 state_json = excluded.state_json,
+                 state_seq = excluded.state_seq,
+                 terminal = excluded.terminal,
+                 accepted_seq = excluded.accepted_seq,
+                 branch_id = excluded.branch_id,
+                 prompt_run_id = excluded.prompt_run_id,
+                 checksum = excluded.checksum",
+            params![
+                session_id.as_str(),
+                run_id.as_str(),
+                state_json,
+                head.state_seq.map(to_sqlite_integer).transpose()?,
+                i64::from(u8::from(terminal)),
+                head.accepted_seq.map(to_sqlite_integer).transpose()?,
+                head.branch_id.as_ref().map(BranchId::as_str),
+                head.prompt_run_id.as_ref().map(RunId::as_str),
+                checksum.as_bytes().as_slice(),
+            ],
+        )
+        .map_err(map_sqlite_error)?;
+    Ok(())
+}
+
+fn replace_run_head_projection(
+    connection: &Connection,
+    session_id: &SessionId,
+    through_seq: u64,
+    heads: &HashMap<RunId, ProjectedRunHead>,
+) -> StoreResult<()> {
+    connection
+        .execute(
+            "DELETE FROM run_heads WHERE session_id = ?1",
+            [session_id.as_str()],
+        )
+        .map_err(map_sqlite_error)?;
+    for (run_id, head) in heads {
+        write_projected_run_head(connection, session_id, run_id, head)?;
+    }
+    let (run_count, nonterminal_count) = projected_run_head_counts(heads)?;
+    connection
+        .execute(
+            "INSERT INTO run_head_sessions(
+                 session_id, through_seq, run_count, nonterminal_count
+             ) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(session_id) DO UPDATE SET
+                 through_seq = excluded.through_seq,
+                 run_count = excluded.run_count,
+                 nonterminal_count = excluded.nonterminal_count",
+            params![
+                session_id.as_str(),
+                to_sqlite_integer(through_seq)?,
+                to_sqlite_integer(run_count)?,
+                to_sqlite_integer(nonterminal_count)?,
+            ],
+        )
+        .map_err(map_sqlite_error)?;
+    Ok(())
+}
+
+fn rebuild_run_head_projection(connection: &Connection, session_id: &SessionId) -> StoreResult<()> {
+    let derived = (|| {
+        let mut statement = connection
+            .prepare_cached(
+                "SELECT seq, envelope_json, event_id, committed_at_ms
+                 FROM events WHERE session_id = ?1 ORDER BY seq ASC",
+            )
+            .map_err(map_sqlite_error)?;
+        let mut rows = statement
+            .query([session_id.as_str()])
+            .map_err(map_sqlite_error)?;
+        let mut through_seq = 0;
+        let mut heads = HashMap::new();
+        while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+            let stored_seq = row.get::<_, i64>(0).map_err(map_sqlite_error)?;
+            let stored_event_id = row.get::<_, String>(2).map_err(map_sqlite_error)?;
+            let stored_committed_at_ms = row.get::<_, i64>(3).map_err(map_sqlite_error)?;
+            let envelope = decode_envelope_column(row, 1).map_err(|error| {
+                corrupt(format!(
+                    "invalid envelope for run-head rebuild in session {session_id}, seq {stored_seq}: {error}"
+                ))
+            })?;
+            validate_stored_envelope(
+                session_id,
+                stored_seq,
+                &stored_event_id,
+                stored_committed_at_ms,
+                &envelope,
+            )?;
+            through_seq = envelope.seq;
+            apply_run_head_envelope(&mut heads, &envelope)?;
+        }
+        Ok((through_seq, heads))
+    })()?;
+
+    // Append, group-commit, fork, and backfill callers already own a rollback
+    // boundary. Autocommit read-side repair needs its own atomic savepoint.
+    if !connection.is_autocommit() {
+        return replace_run_head_projection(connection, session_id, derived.0, &derived.1);
+    }
+    connection
+        .execute_batch("SAVEPOINT rebuild_run_heads")
+        .map_err(map_sqlite_error)?;
+    match replace_run_head_projection(connection, session_id, derived.0, &derived.1) {
+        Ok(()) => connection
+            .execute_batch("RELEASE rebuild_run_heads")
+            .map_err(map_sqlite_error),
+        Err(error) => {
+            let _ = connection
+                .execute_batch("ROLLBACK TO rebuild_run_heads; RELEASE rebuild_run_heads");
+            Err(error)
         }
     }
-    Ok(states)
+}
+
+fn update_run_head_projection_after_append(
+    connection: &Connection,
+    session_id: &SessionId,
+    envelopes: &[RawEnvelope],
+) -> StoreResult<()> {
+    let Some(last) = envelopes.last() else {
+        return Ok(());
+    };
+    let metadata = run_head_projection_meta(connection, session_id)?;
+    let expected_previous = envelopes
+        .first()
+        .and_then(|envelope| envelope.seq.checked_sub(1));
+    let Some(metadata) =
+        metadata.filter(|metadata| Some(metadata.through_seq) == expected_previous)
+    else {
+        return rebuild_run_head_projection(connection, session_id);
+    };
+    let mut original = HashMap::<RunId, Option<ProjectedRunHead>>::new();
+    let mut changed = HashMap::<RunId, ProjectedRunHead>::new();
+    for envelope in envelopes {
+        let Some(run_id) = envelope.run_id.as_ref() else {
+            continue;
+        };
+        let changes_projection = matches!(
+            envelope
+                .payload
+                .get("type")
+                .and_then(serde_json::Value::as_str),
+            Some("run_retried" | "run_state" | "user_message")
+        );
+        if !changes_projection {
+            continue;
+        }
+        if !original.contains_key(run_id) {
+            let head = match try_load_projected_run_head(connection, session_id, run_id) {
+                Ok(head) => head,
+                Err(error) if error.code == ErrorCode::StoreCorrupt => {
+                    return rebuild_run_head_projection(connection, session_id);
+                }
+                Err(error) => return Err(error),
+            };
+            original.insert(run_id.clone(), head.clone());
+            if let Some(head) = head {
+                changed.insert(run_id.clone(), head);
+            }
+        }
+        apply_run_head_envelope(&mut changed, envelope)?;
+    }
+
+    let mut run_count = metadata.run_count;
+    let mut nonterminal_count = metadata.nonterminal_count;
+    for (run_id, head) in &changed {
+        let previous = original.get(run_id).and_then(Option::as_ref);
+        if previous.is_none() {
+            run_count = run_count
+                .checked_add(1)
+                .ok_or_else(|| corrupt("run-head row count is exhausted"))?;
+        }
+        if previous.is_some_and(|head| head.state_seq.is_some() && !head.state.is_terminal()) {
+            nonterminal_count = nonterminal_count
+                .checked_sub(1)
+                .ok_or_else(|| corrupt("run-head live count is inconsistent"))?;
+        }
+        if head.state_seq.is_some() && !head.state.is_terminal() {
+            nonterminal_count = nonterminal_count
+                .checked_add(1)
+                .ok_or_else(|| corrupt("run-head live count is exhausted"))?;
+        }
+        write_projected_run_head(connection, session_id, run_id, head)?;
+    }
+    connection
+        .execute(
+            "UPDATE run_head_sessions
+             SET through_seq = ?2, run_count = ?3, nonterminal_count = ?4
+             WHERE session_id = ?1",
+            params![
+                session_id.as_str(),
+                to_sqlite_integer(last.seq)?,
+                to_sqlite_integer(run_count)?,
+                to_sqlite_integer(nonterminal_count)?,
+            ],
+        )
+        .map_err(map_sqlite_error)?;
+    Ok(())
+}
+
+fn backfill_run_head_projections(connection: &mut Connection) -> StoreResult<()> {
+    let session_ids = {
+        let mut statement = connection
+            .prepare(
+                "SELECT session.id
+                 FROM sessions AS session
+                 LEFT JOIN run_head_sessions AS projection
+                   ON projection.session_id = session.id
+                 WHERE projection.session_id IS NULL
+                    OR projection.through_seq != COALESCE(
+                        (SELECT MAX(event.seq) FROM events AS event
+                         WHERE event.session_id = session.id),
+                        0
+                    )
+                 ORDER BY session.id",
+            )
+            .map_err(map_sqlite_error)?;
+        let session_ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(map_sqlite_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sqlite_error)?;
+        drop(statement);
+        session_ids
+    };
+    for session_id in session_ids {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        rebuild_run_head_projection(&transaction, &SessionId::new(session_id))?;
+        transaction.commit().map_err(map_sqlite_error)?;
+    }
+    Ok(())
+}
+
+fn run_heads_projection_checkpoint(
+    connection: &Connection,
+    session_id: &SessionId,
+) -> StoreResult<SessionProjectionCheckpoint> {
+    require_session(connection, session_id)?;
+    let heads = load_projected_run_heads(connection, session_id)?;
+    let through_seq = journal_latest_seq(connection, session_id)?;
+    if through_seq == 0 {
+        return Err(corrupt(format!(
+            "session {session_id} has no journal boundary for its run-head projection"
+        )));
+    }
+    let boundary_event_id = connection
+        .query_row(
+            "SELECT event_id FROM events WHERE session_id = ?1 AND seq = ?2",
+            params![session_id.as_str(), to_sqlite_integer(through_seq)?],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(map_sqlite_error)?;
+    let mut rows = heads
+        .into_iter()
+        .map(|(run_id, head)| RunHeadCheckpointRow {
+            run_id: run_id.as_str().to_owned(),
+            state: head.state,
+            state_seq: head.state_seq,
+            accepted_seq: head.accepted_seq,
+            branch_id: head
+                .branch_id
+                .map(|branch_id| branch_id.as_str().to_owned()),
+            prompt_run_id: head
+                .prompt_run_id
+                .map(|prompt_run_id| prompt_run_id.as_str().to_owned()),
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left.accepted_seq
+            .unwrap_or(u64::MAX)
+            .cmp(&right.accepted_seq.unwrap_or(u64::MAX))
+            .then_with(|| left.run_id.cmp(&right.run_id))
+    });
+    let payload = rmp_serde::to_vec_named(&RunHeadsCheckpointPayload {
+        version: RUN_HEADS_PAYLOAD_VERSION,
+        heads: rows,
+    })
+    .map_err(|error| {
+        corrupt(format!(
+            "cannot encode run-head projection for session {session_id}: {error}"
+        ))
+    })?;
+    Ok(SessionProjectionCheckpoint {
+        session_id: session_id.clone(),
+        projection: RUN_HEADS_PROJECTION.to_owned(),
+        timeline_key: RUN_HEADS_TIMELINE.to_owned(),
+        through_seq,
+        boundary_event_id: EventId::new(boundary_event_id),
+        payload,
+    })
 }
 
 #[derive(Clone)]
@@ -14183,6 +15223,7 @@ fn append_transaction_envelopes(
     committed_at_ms: u64,
     envelopes: &mut [RawEnvelope],
 ) -> StoreResult<()> {
+    ensure_run_head_projection(transaction, session_id)?;
     let latest: i64 = transaction
         .query_row(
             "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?1",
@@ -14229,6 +15270,7 @@ fn append_transaction_envelopes(
         enqueue_hook_dispatch(transaction, envelope)?;
     }
     drop(insert);
+    update_run_head_projection_after_append(transaction, session_id, envelopes)?;
     if envelopes
         .iter()
         .any(|envelope| graph_telemetry_event(&envelope.payload))
@@ -15273,9 +16315,6 @@ fn append_envelopes_in_transaction(
     let changes_graph_telemetry = envelopes
         .iter()
         .any(|envelope| graph_telemetry_event(&envelope.payload));
-    if validate_worker_transitions {
-        validate_worker_run_transitions(transaction, &session, envelopes)?;
-    }
     let committed_at_ms = now_ms()?;
     let committed_at_sql = to_sqlite_integer(committed_at_ms)?;
     transaction
@@ -15286,6 +16325,15 @@ fn append_envelopes_in_transaction(
             statement.execute(params![session.as_str(), committed_at_sql, "{}"])
         })
         .map_err(map_sqlite_error)?;
+    let run_head_metadata = ensure_run_head_projection(transaction, &session)?;
+    if validate_worker_transitions {
+        validate_worker_run_transitions(
+            transaction,
+            &session,
+            envelopes,
+            run_head_metadata.run_count,
+        )?;
+    }
     let latest: i64 = transaction
         .prepare_cached("SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?1")
         .and_then(|mut statement| statement.query_row([session.as_str()], |row| row.get(0)))
@@ -15333,6 +16381,7 @@ fn append_envelopes_in_transaction(
             stamped.push(envelope);
         }
     }
+    update_run_head_projection_after_append(transaction, &session, &stamped)?;
     update_branch_heads(transaction, &stamped)?;
     Ok(AppendTransactionOutcome {
         range: CommittedSeqRange {
@@ -15578,8 +16627,16 @@ fn validate_worker_run_transitions(
     transaction: &Connection,
     session_id: &SessionId,
     envelopes: &[RawEnvelope],
+    projection_run_count: u64,
 ) -> StoreResult<()> {
-    let mut states = latest_run_states(transaction, session_id)?;
+    let mut states = latest_run_states_for(
+        transaction,
+        session_id,
+        envelopes
+            .iter()
+            .filter_map(|envelope| envelope.run_id.as_ref()),
+        projection_run_count,
+    )?;
     // Manual idle compaction is an internal maintenance run. Its atomic final
     // batch carries the projection-switch node and `Done`, but that `Done`
     // does not finalize provider work or discharge graph obligations.
@@ -16900,10 +17957,9 @@ fn live_delegation_count(connection: &Connection) -> StoreResult<u64> {
     let mut live = 0_u64;
     for stored in rows {
         let record = decode_delegation(stored)?;
-        let states = latest_run_states(connection, &record.child_session_id)?;
-        let terminal = states
-            .get(&record.child_run_id)
-            .is_some_and(|(state, _, _)| state.is_terminal());
+        let terminal =
+            latest_run_state(connection, &record.child_session_id, &record.child_run_id)?
+                .is_some_and(|(state, _, _)| state.is_terminal());
         if !terminal {
             live = live.saturating_add(1);
         }
@@ -17088,6 +18144,7 @@ fn read_reducer_page_with_connection(
     session: &SessionId,
     since_seq: u64,
     limit: usize,
+    byte_budget: usize,
     payload_kinds: &[&str],
 ) -> Result<Vec<RawEnvelope>, FilteredReadError> {
     let (sql, parameter_capacity) = reducer_page_sql(payload_kinds.len())?;
@@ -17112,6 +18169,7 @@ fn read_reducer_page_with_connection(
         .map_err(map_sqlite_error)
         .map_err(FilteredReadError::Store)?;
     let mut envelopes = Vec::new();
+    let mut spent = 0_usize;
     while let Some(row) = rows
         .next()
         .map_err(map_sqlite_error)
@@ -17138,9 +18196,40 @@ fn read_reducer_page_with_connection(
             &envelope,
         )
         .map_err(FilteredReadError::Store)?;
+        let weight = envelope_weight_bytes(&envelope);
+        if !envelopes.is_empty() && spent.saturating_add(weight) > byte_budget {
+            break;
+        }
+        spent = spent.saturating_add(weight);
         envelopes.push(envelope);
+        if spent >= byte_budget {
+            break;
+        }
     }
     Ok(envelopes)
+}
+
+fn journal_boundary_with_connection(
+    connection: &Connection,
+    session: &SessionId,
+) -> StoreResult<Option<(u64, EventId)>> {
+    connection
+        .query_row(
+            "SELECT seq, event_id FROM events
+             WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1",
+            [session.as_str()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(map_sqlite_error)?
+        .map(|(seq, event_id)| {
+            let seq = u64::try_from(seq)
+                .ok()
+                .filter(|seq| *seq > 0)
+                .ok_or_else(|| corrupt("database contains an invalid event sequence"))?;
+            Ok((seq, EventId::new(event_id)))
+        })
+        .transpose()
 }
 
 fn reducer_page_sql(payload_kind_count: usize) -> Result<(String, usize), FilteredReadError> {
@@ -18059,6 +19148,7 @@ fn store_io_error(operation: &str, error: std::io::Error) -> HaiderError {
 #[allow(clippy::expect_used)]
 mod reducer_filter_tests {
     use super::*;
+    use crate::usage_ledger::reduce_journal_usage;
 
     #[derive(Debug, PartialEq)]
     struct ReducerOutputs {
@@ -18425,6 +19515,945 @@ mod reducer_filter_tests {
                 .iter()
                 .all(|detail| !detail.contains("sqlite_autoindex_events_1"))
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod run_head_projection_tests {
+    use super::*;
+
+    fn raw_event(
+        seq: u64,
+        run_id: Option<&str>,
+        branch_id: Option<&str>,
+        payload: serde_json::Value,
+    ) -> RawEnvelope {
+        EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new(format!("run-head-event-{seq}")),
+            seq,
+            session_id: SessionId::new("run-head-session"),
+            branch_id: branch_id.map(BranchId::new),
+            run_id: run_id.map(RunId::new),
+            agent_id: None,
+            device_id: DeviceId::new("run-head-device"),
+            authority_epoch: 0,
+            worker_generation: 1,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: seq,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload,
+        }
+    }
+
+    fn event(
+        seq: u64,
+        run_id: Option<&str>,
+        branch_id: Option<&str>,
+        payload: EventPayload,
+    ) -> RawEnvelope {
+        raw_event(
+            seq,
+            run_id,
+            branch_id,
+            serde_json::to_value(payload).expect("serialize run-head test payload"),
+        )
+    }
+
+    fn state(seq: u64, run_id: &str, branch_id: Option<&str>, state: RunState) -> RawEnvelope {
+        event(seq, Some(run_id), branch_id, EventPayload::RunState(state))
+    }
+
+    fn user(seq: u64, run_id: &str, branch_id: Option<&str>) -> RawEnvelope {
+        event(
+            seq,
+            Some(run_id),
+            branch_id,
+            EventPayload::UserMessage {
+                text: format!("message-{seq}"),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+        )
+    }
+
+    fn legacy_run_states(journal: &[RawEnvelope]) -> StoreResult<HashMap<RunId, DurableRunHead>> {
+        let mut states = HashMap::new();
+        for envelope in journal {
+            let Some(run_id) = envelope.run_id.clone() else {
+                continue;
+            };
+            let Ok(EventPayload::RunState(state)) =
+                serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            else {
+                continue;
+            };
+            if states
+                .get(&run_id)
+                .is_some_and(|(_, _, branch_id)| branch_id != &envelope.branch_id)
+            {
+                return Err(corrupt("legacy run crossed branch scopes"));
+            }
+            states.insert(run_id, (state, envelope.seq, envelope.branch_id.clone()));
+        }
+        Ok(states)
+    }
+
+    fn legacy_durable_runs(
+        journal: &[RawEnvelope],
+    ) -> StoreResult<HashMap<RunId, ProjectedRunHead>> {
+        let mut runs = HashMap::<RunId, ProjectedRunHead>::new();
+        for envelope in journal {
+            let Some(run_id) = envelope.run_id.clone() else {
+                continue;
+            };
+            if let Ok(RunRetryEventPayload::RunRetried { prompt_run_id, .. }) =
+                RunRetryEventPayload::from_payload_value(envelope.payload.clone())
+            {
+                let head = runs
+                    .entry(run_id.clone())
+                    .or_insert_with(|| ProjectedRunHead {
+                        state: RunState::Queued,
+                        state_seq: None,
+                        accepted_seq: None,
+                        branch_id: envelope.branch_id.clone(),
+                        prompt_run_id: None,
+                    });
+                if head.branch_id != envelope.branch_id {
+                    return Err(corrupt("legacy retry crossed branch scopes"));
+                }
+                head.accepted_seq = Some(envelope.seq);
+                head.prompt_run_id = Some(prompt_run_id);
+                continue;
+            }
+            let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            else {
+                continue;
+            };
+            match payload {
+                EventPayload::RunState(state) => {
+                    let head = runs
+                        .entry(run_id.clone())
+                        .or_insert_with(|| ProjectedRunHead {
+                            state: state.clone(),
+                            state_seq: None,
+                            accepted_seq: None,
+                            branch_id: envelope.branch_id.clone(),
+                            prompt_run_id: None,
+                        });
+                    if head.branch_id != envelope.branch_id {
+                        return Err(corrupt("legacy state crossed branch scopes"));
+                    }
+                    head.state = state;
+                    head.state_seq = Some(envelope.seq);
+                }
+                EventPayload::UserMessage { .. } => {
+                    let head = runs
+                        .entry(run_id.clone())
+                        .or_insert_with(|| ProjectedRunHead {
+                            state: RunState::Queued,
+                            state_seq: None,
+                            accepted_seq: None,
+                            branch_id: envelope.branch_id.clone(),
+                            prompt_run_id: None,
+                        });
+                    if head.branch_id != envelope.branch_id {
+                        return Err(corrupt("legacy user message crossed branch scopes"));
+                    }
+                    head.accepted_seq = Some(envelope.seq);
+                }
+                _ => {}
+            }
+        }
+        Ok(runs)
+    }
+
+    fn projected_from_journal(
+        journal: &[RawEnvelope],
+    ) -> StoreResult<HashMap<RunId, ProjectedRunHead>> {
+        let mut projected = HashMap::new();
+        for envelope in journal {
+            apply_run_head_envelope(&mut projected, envelope)?;
+        }
+        Ok(projected)
+    }
+
+    fn assert_projection_equivalent(journal: &[RawEnvelope]) {
+        let projected = projected_from_journal(journal).expect("project journal");
+        assert_eq!(
+            projected,
+            legacy_durable_runs(journal).expect("legacy durable reduction")
+        );
+        let projected_states = projected
+            .into_iter()
+            .filter_map(|(run_id, head)| {
+                head.state_seq
+                    .map(|state_seq| (run_id, (head.state, state_seq, head.branch_id)))
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            projected_states,
+            legacy_run_states(journal).expect("legacy state reduction")
+        );
+    }
+
+    fn representative_journal() -> Vec<RawEnvelope> {
+        let compaction_item = TurnItem::Extension {
+            kind: COMPACTION_INTENT_EXTENSION_KIND.into(),
+            data: serde_json::json!({
+                "operation_id": "compact-op",
+                "covers_from": "node-a",
+                "covers_to": "node-b",
+                "resume_cause": "manual_idle"
+            }),
+        };
+        vec![
+            state(1, "run-a", None, RunState::Queued),
+            user(2, "run-a", None),
+            state(3, "run-a", None, RunState::Thinking),
+            state(4, "run-b", Some("branch-b"), RunState::Queued),
+            user(5, "run-b", Some("branch-b")),
+            state(6, "run-b", Some("branch-b"), RunState::Cancelling),
+            state(7, "run-b", Some("branch-b"), RunState::Cancelled),
+            state(8, "run-a", None, RunState::Errored),
+            raw_event(
+                9,
+                Some("run-retry"),
+                None,
+                RunRetryEventPayload::RunRetried {
+                    failed_run_id: RunId::new("run-a"),
+                    prompt_run_id: RunId::new("run-a"),
+                    user_seq: 2,
+                }
+                .to_payload_value()
+                .expect("serialize retry"),
+            ),
+            state(10, "run-retry", None, RunState::Thinking),
+            state(11, "run-retry", None, RunState::Done),
+            event(
+                12,
+                Some("run-compact"),
+                Some("branch-compact"),
+                EventPayload::Item(ItemEvent::Started {
+                    item_id: ItemId::new("compact-intent"),
+                    item: compaction_item,
+                }),
+            ),
+            state(
+                13,
+                "run-compact",
+                Some("branch-compact"),
+                RunState::Compacting,
+            ),
+            state(14, "run-compact", Some("branch-compact"), RunState::Done),
+        ]
+    }
+
+    fn generated_journal(seed: u64) -> Vec<RawEnvelope> {
+        let run_ids = ["run-0", "run-1", "run-2", "run-3"];
+        let branch_ids = [None, Some("branch-a"), Some("branch-b"), None];
+        let mut entropy = seed.wrapping_add(1);
+        let mut journal = Vec::new();
+        for seq in 1..=48 {
+            entropy = entropy
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let run_index = usize::try_from((entropy >> 17) % 4).expect("run index");
+            let run_id = run_ids[run_index];
+            let branch_id = branch_ids[run_index];
+            let envelope = match entropy % 10 {
+                0 => user(seq, run_id, branch_id),
+                1 => raw_event(
+                    seq,
+                    Some(run_id),
+                    branch_id,
+                    RunRetryEventPayload::RunRetried {
+                        failed_run_id: RunId::new(format!("failed-{run_id}")),
+                        prompt_run_id: RunId::new(format!("prompt-{run_id}")),
+                        user_seq: seq.saturating_sub(1).max(1),
+                    }
+                    .to_payload_value()
+                    .expect("serialize generated retry"),
+                ),
+                2 => event(
+                    seq,
+                    Some(run_id),
+                    branch_id,
+                    EventPayload::Item(ItemEvent::Started {
+                        item_id: ItemId::new(format!("generated-item-{seq}")),
+                        item: TurnItem::Extension {
+                            kind: COMPACTION_INTENT_EXTENSION_KIND.into(),
+                            data: serde_json::json!({"seed": seed, "seq": seq}),
+                        },
+                    }),
+                ),
+                3 => raw_event(
+                    seq,
+                    Some(run_id),
+                    branch_id,
+                    serde_json::json!({"type": "future_run_fact", "seed": seed}),
+                ),
+                variant => {
+                    let run_state = match variant {
+                        4 => RunState::Queued,
+                        5 => RunState::Thinking,
+                        6 => RunState::Compacting,
+                        7 => RunState::Cancelling,
+                        8 => RunState::Cancelled,
+                        _ if entropy & 1 == 0 => RunState::Done,
+                        _ => RunState::Errored,
+                    };
+                    state(seq, run_id, branch_id, run_state)
+                }
+            };
+            journal.push(envelope);
+        }
+        journal
+    }
+
+    fn insert_journal(connection: &Connection, journal: &[RawEnvelope]) {
+        connection
+            .execute(
+                "INSERT INTO sessions(id, created_at_ms, meta_json) VALUES (?1, 1, '{}')",
+                ["run-head-session"],
+            )
+            .expect("insert test session");
+        for envelope in journal {
+            connection
+                .execute(
+                    "INSERT INTO events(
+                         session_id, seq, envelope_json, event_id,
+                         committed_at_ms, payload_kind
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        envelope.session_id.as_str(),
+                        to_sqlite_integer(envelope.seq).expect("event seq"),
+                        encode_envelope(envelope).expect("encode event"),
+                        envelope.event_id.as_str(),
+                        to_sqlite_integer(envelope.committed_at_ms).expect("commit time"),
+                        payload_kind(envelope),
+                    ],
+                )
+                .expect("insert test event");
+        }
+    }
+
+    #[test]
+    fn projection_matches_both_full_reducers_for_prefixes_branches_retries_and_compaction() {
+        let journal = representative_journal();
+        for prefix in 0..=journal.len() {
+            assert_projection_equivalent(&journal[..prefix]);
+        }
+
+        let mut forked = journal;
+        for envelope in &mut forked {
+            envelope.session_id = SessionId::new("forked-session");
+            envelope.branch_id = None;
+        }
+        assert_projection_equivalent(&forked);
+
+        for seed in 0..64 {
+            let generated = generated_journal(seed);
+            for prefix in 0..=generated.len() {
+                assert_projection_equivalent(&generated[..prefix]);
+            }
+        }
+    }
+
+    #[test]
+    fn committed_append_batches_incrementally_match_full_recomputation() {
+        let mut connection = Connection::open_in_memory().expect("open in-memory database");
+        migrations::migrate(&mut connection).expect("migrate database");
+        connection
+            .execute(
+                "INSERT INTO sessions(id, created_at_ms, meta_json) VALUES (?1, 1, '{}')",
+                ["run-head-session"],
+            )
+            .expect("insert append-test session");
+        let session_id = SessionId::new("run-head-session");
+        let source = generated_journal(17);
+        let mut journal = Vec::new();
+        let mut offset = 0;
+        for batch_len in [1, 5, 2, 9, 3, 11, 7, 10] {
+            let mut batch = source[offset..offset + batch_len].to_vec();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .expect("begin append transaction");
+            append_transaction_envelopes(&transaction, &session_id, 99, &mut batch)
+                .expect("append projected batch");
+            transaction.commit().expect("commit projected batch");
+            journal.extend(batch);
+            offset += batch_len;
+            assert_eq!(
+                load_projected_run_heads(&connection, &session_id)
+                    .expect("load incremental projection"),
+                legacy_durable_runs(&journal).expect("recompute appended journal")
+            );
+        }
+        assert_eq!(offset, source.len());
+    }
+
+    #[test]
+    fn stateful_nonterminal_lookup_ignores_user_and_retry_only_heads() {
+        let mut connection = Connection::open_in_memory().expect("open in-memory database");
+        migrations::migrate(&mut connection).expect("migrate database");
+        let user_only = [user(1, "run-user-only", None)];
+        insert_journal(&connection, &user_only);
+        let session_id = SessionId::new("run-head-session");
+        backfill_run_head_projections(&mut connection).expect("backfill user-only journal");
+
+        assert!(!has_nonterminal_run(&connection, &session_id).expect("query user-only head"));
+        let user_head = projected_run_head(&connection, &session_id, &RunId::new("run-user-only"))
+            .expect("load user-only head")
+            .expect("user-only head exists for daemon reduction");
+        assert_eq!(user_head.state, RunState::Queued);
+        assert_eq!(user_head.state_seq, None);
+
+        let mut retry_only = [raw_event(
+            0,
+            Some("run-retry-only"),
+            None,
+            RunRetryEventPayload::RunRetried {
+                failed_run_id: RunId::new("run-user-only"),
+                prompt_run_id: RunId::new("run-user-only"),
+                user_seq: 1,
+            }
+            .to_payload_value()
+            .expect("serialize retry-only head"),
+        )];
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin retry-only append");
+        append_transaction_envelopes(&transaction, &session_id, 99, &mut retry_only)
+            .expect("append retry-only head");
+        transaction.commit().expect("commit retry-only head");
+        assert!(!has_nonterminal_run(&connection, &session_id).expect("query retry-only head"));
+
+        let mut stateful = [state(0, "run-user-only", None, RunState::Queued)];
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin stateful append");
+        append_transaction_envelopes(&transaction, &session_id, 100, &mut stateful)
+            .expect("append stateful head");
+        transaction.commit().expect("commit stateful head");
+        assert!(has_nonterminal_run(&connection, &session_id).expect("query stateful head"));
+
+        let mut terminal = [state(99, "run-user-only", None, RunState::Done)];
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin terminal append");
+        append_transaction_envelopes(&transaction, &session_id, 101, &mut terminal)
+            .expect("append terminal head");
+        transaction.commit().expect("commit terminal head");
+        assert!(!has_nonterminal_run(&connection, &session_id).expect("query terminal head"));
+    }
+
+    #[test]
+    fn group_commit_updates_and_rolls_back_stateful_projections_with_the_journal() {
+        let root = tempfile::tempdir().expect("profile");
+        let store = Store::open(root.path()).expect("open store");
+        let session_a = SessionId::new("run-head-group-a");
+        let session_b = SessionId::new("run-head-group-b");
+        let mut envelope_a = state(0, "run-a", None, RunState::Queued);
+        envelope_a.session_id = session_a.clone();
+        envelope_a.event_id = EventId::new("run-head-group-event-a");
+        let mut envelope_b = state(0, "run-b", None, RunState::Thinking);
+        envelope_b.session_id = session_b.clone();
+        envelope_b.event_id = EventId::new("run-head-group-event-b");
+        let mut batches = vec![
+            JournalAppendBatch {
+                envelopes: vec![envelope_a],
+                validate_worker_transitions: false,
+            },
+            JournalAppendBatch {
+                envelopes: vec![envelope_b],
+                validate_worker_transitions: false,
+            },
+        ];
+        let reject_once = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let reject = std::sync::Arc::clone(&reject_once);
+        store
+            .connection()
+            .expect("journal connection")
+            .commit_hook(Some(move || {
+                reject.swap(false, std::sync::atomic::Ordering::SeqCst)
+            }))
+            .expect("install rejecting commit hook");
+
+        store
+            .append_group(&mut batches)
+            .expect_err("reject stateful outer commit");
+        {
+            let connection = store
+                .connection()
+                .expect("journal connection after rollback");
+            let event_count = connection
+                .query_row("SELECT COUNT(*) FROM events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count rolled-back events");
+            let projection_count = connection
+                .query_row("SELECT COUNT(*) FROM run_heads", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("count rolled-back projections");
+            assert_eq!((event_count, projection_count), (0, 0));
+        }
+
+        let outcomes = store
+            .append_group(&mut batches)
+            .expect("retry stateful group commit");
+        assert!(outcomes.iter().all(Result::is_ok));
+        let connection = store.connection().expect("journal connection after commit");
+        assert_eq!(
+            latest_run_state(&connection, &session_a, &RunId::new("run-a"))
+                .expect("load committed run a")
+                .map(|(state, _, _)| state),
+            Some(RunState::Queued)
+        );
+        assert_eq!(
+            latest_run_state(&connection, &session_b, &RunId::new("run-b"))
+                .expect("load committed run b")
+                .map(|(state, _, _)| state),
+            Some(RunState::Thinking)
+        );
+    }
+
+    #[test]
+    fn store_open_migrates_and_backfills_a_v22_journal_idempotently() {
+        let root = tempfile::tempdir().expect("profile");
+        let database_path;
+        let mut journal = representative_journal();
+        let expected = legacy_durable_runs(&journal).expect("reduce v22 fixture");
+        {
+            let store = Store::open(root.path()).expect("open current store");
+            database_path = store.database_path().to_path_buf();
+            store
+                .append(&mut journal)
+                .expect("append v22 fixture journal");
+        }
+        let raw = Connection::open(&database_path).expect("open raw v22 fixture");
+        raw.execute_batch(
+            "DROP TABLE run_heads;
+             DROP TABLE run_head_sessions;
+             DELETE FROM schema_migrations WHERE version = 23;
+             PRAGMA user_version = 22;",
+        )
+        .expect("rewind fixture to v22");
+        drop(raw);
+
+        for pass in 0..2 {
+            let store = Store::open(root.path()).expect("migrate v22 store");
+            assert_eq!(store.schema_version().expect("schema version"), 23);
+            let connection = store.connection().expect("migrated journal connection");
+            assert_eq!(
+                load_projected_run_heads(&connection, &SessionId::new("run-head-session"))
+                    .expect("load migrated projection"),
+                expected,
+                "migration pass {pass}"
+            );
+        }
+    }
+
+    #[test]
+    fn projection_backfill_is_resumable_and_corruption_rebuilds_transactionally() {
+        let mut connection = Connection::open_in_memory().expect("open in-memory database");
+        migrations::migrate(&mut connection).expect("migrate database");
+        let mut journal = representative_journal();
+        insert_journal(&connection, &journal);
+        let session_id = SessionId::new("run-head-session");
+        let expected = legacy_durable_runs(&journal).expect("legacy reduction");
+
+        backfill_run_head_projections(&mut connection).expect("initial resumable backfill");
+        assert_eq!(
+            load_projected_run_heads(&connection, &session_id).expect("load backfill"),
+            expected
+        );
+        backfill_run_head_projections(&mut connection).expect("idempotent backfill");
+
+        connection
+            .execute(
+                "DELETE FROM run_heads WHERE session_id = ?1 AND run_id = 'run-b'",
+                [session_id.as_str()],
+            )
+            .expect("delete projected row");
+        assert_eq!(
+            load_projected_run_heads(&connection, &session_id).expect("rebuild missing row"),
+            expected
+        );
+
+        connection
+            .execute(
+                "UPDATE run_heads SET checksum = zeroblob(32)
+                 WHERE session_id = ?1 AND run_id = 'run-a'",
+                [session_id.as_str()],
+            )
+            .expect("corrupt projected row");
+        assert_eq!(
+            load_projected_run_heads(&connection, &session_id).expect("rebuild corrupt row"),
+            expected
+        );
+
+        connection
+            .execute(
+                "UPDATE run_heads SET checksum = printf('%032d', 0)
+                 WHERE session_id = ?1 AND run_id = 'run-b'",
+                [session_id.as_str()],
+            )
+            .expect("replace projected checksum with wrong SQLite storage class");
+        assert_eq!(
+            load_projected_run_heads(&connection, &session_id)
+                .expect("rebuild malformed row storage class"),
+            expected
+        );
+
+        connection
+            .execute(
+                "UPDATE run_head_sessions SET through_seq = 'corrupt'
+                 WHERE session_id = ?1",
+                [session_id.as_str()],
+            )
+            .expect("replace projection watermark with wrong SQLite storage class");
+        assert_eq!(
+            load_projected_run_heads(&connection, &session_id)
+                .expect("rebuild malformed metadata storage class"),
+            expected
+        );
+
+        connection
+            .execute(
+                "UPDATE run_heads SET run_id = 'damaged-run-a'
+                 WHERE session_id = ?1 AND run_id = 'run-a'",
+                [session_id.as_str()],
+            )
+            .expect("damage projected primary-key identity");
+        assert_eq!(
+            projected_run_head(&connection, &session_id, &RunId::new("run-a"))
+                .expect("rebuild missing targeted head"),
+            expected.get(&RunId::new("run-a")).cloned()
+        );
+
+        let next_seq = u64::try_from(journal.len()).expect("journal length") + 1;
+        let new_head = state(next_seq, "run-new", None, RunState::Queued);
+        connection
+            .execute(
+                "INSERT INTO events(
+                     session_id, seq, envelope_json, event_id,
+                     committed_at_ms, payload_kind
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    session_id.as_str(),
+                    to_sqlite_integer(next_seq).expect("new seq"),
+                    encode_envelope(&new_head).expect("encode new head"),
+                    new_head.event_id.as_str(),
+                    to_sqlite_integer(new_head.committed_at_ms).expect("new commit time"),
+                    payload_kind(&new_head),
+                ],
+            )
+            .expect("insert crash-truncated journal suffix");
+        journal.push(new_head);
+        let expected_after_suffix = legacy_durable_runs(&journal).expect("legacy suffix reduction");
+        assert_eq!(
+            load_projected_run_heads(&connection, &session_id).expect("rebuild stale watermark"),
+            expected_after_suffix
+        );
+
+        let before_seq = journal_latest_seq(&connection, &session_id).expect("journal head");
+        let mut rolled_back = [state(0, "rolled-back-run", None, RunState::Queued)];
+        {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .expect("begin append transaction");
+            append_transaction_envelopes(&transaction, &session_id, 99, &mut rolled_back)
+                .expect("append inside uncommitted transaction");
+        }
+        assert_eq!(
+            journal_latest_seq(&connection, &session_id).expect("journal head after rollback"),
+            before_seq
+        );
+        assert_eq!(
+            load_projected_run_heads(&connection, &session_id).expect("projection after rollback"),
+            expected_after_suffix
+        );
+
+        let checkpoint =
+            run_heads_projection_checkpoint(&connection, &session_id).expect("checkpoint");
+        let payload = rmp_serde::from_slice::<RunHeadsCheckpointPayload>(&checkpoint.payload)
+            .expect("decode checkpoint");
+        assert_eq!(payload.version, RUN_HEADS_PAYLOAD_VERSION);
+        assert_eq!(payload.heads.len(), expected_after_suffix.len());
+        let nonterminal_plan = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT run_id, state_json, state_seq, terminal, accepted_seq,
+                        branch_id, prompt_run_id, checksum
+                 FROM run_heads
+                 WHERE session_id = ?1 AND terminal = 0 AND state_seq IS NOT NULL
+                 ORDER BY state_seq DESC LIMIT 1",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map([session_id.as_str()], |row| row.get::<_, String>(3))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .expect("explain nonterminal lookup");
+        assert!(
+            nonterminal_plan
+                .iter()
+                .any(|detail| detail.contains("run_heads_nonterminal")),
+            "nonterminal lookup plan: {nonterminal_plan:?}"
+        );
+        let cancellation_plan = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT run_id, state_json, state_seq, terminal, accepted_seq,
+                        branch_id, prompt_run_id, checksum
+                 FROM run_heads WHERE session_id = ?1 AND run_id = ?2",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params![session_id.as_str(), "run-a"], |row| {
+                        row.get::<_, String>(3)
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .expect("explain targeted cancellation lookup");
+        assert!(
+            cancellation_plan
+                .iter()
+                .any(|detail| detail.contains("sqlite_autoindex_run_heads_1")),
+            "targeted cancellation plan: {cancellation_plan:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod streaming_usage_checkpoint_tests {
+    use super::*;
+    use crate::usage_ledger::reduce_journal_usage;
+
+    fn usage_envelope(
+        store: &Store,
+        session_id: &SessionId,
+        event_id: &str,
+        input: u64,
+        model: &str,
+    ) -> RawEnvelope {
+        EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new(event_id),
+            seq: 0,
+            session_id: session_id.clone(),
+            branch_id: None,
+            run_id: Some(RunId::new(format!("run-{session_id}"))),
+            agent_id: None,
+            device_id: DeviceId::new("usage-checkpoint-test"),
+            authority_epoch: 0,
+            worker_generation: store.worker_generation(),
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: RenderTargets {
+                ui: false,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: serde_json::json!({
+                "type": "usage",
+                "input": input,
+                "output": input / 2,
+                "reasoning": 0,
+                "cached": 0,
+                "source": "provider_reported",
+                "account": "account-main",
+                "scope": {
+                    "provider": "test-provider",
+                    "model": model,
+                    "auth_scope": "api_key",
+                    "cache_epoch": "epoch-1"
+                }
+            }),
+        }
+    }
+
+    fn append_usage(
+        store: &Store,
+        session_id: &SessionId,
+        event_id: &str,
+        input: u64,
+        model: &str,
+    ) {
+        let mut envelope = [usage_envelope(store, session_id, event_id, input, model)];
+        store.append(&mut envelope).expect("append usage envelope");
+    }
+
+    fn append_fork_audit(store: &Store, session_id: &SessionId, source: &SessionId) {
+        let mut envelope = [usage_envelope(
+            store,
+            session_id,
+            "beta-fork-audit",
+            0,
+            "unused",
+        )];
+        envelope[0].run_id = None;
+        envelope[0].payload = serde_json::json!({
+            "type": "session_forked",
+            "source_session_id": source,
+            "fork_node_id": "fork-node",
+            "fork_seq": 2,
+            "mode": "fork",
+            "context_epoch": "fresh"
+        });
+        store.append(&mut envelope).expect("append fork audit");
+    }
+
+    #[test]
+    fn streamed_multi_session_fold_matches_retained_vector_bytes() {
+        let root = tempfile::tempdir().expect("profile");
+        let store = Store::open(root.path()).expect("store");
+        let alpha = SessionId::new("usage-stream-alpha");
+        let beta = SessionId::new("usage-stream-beta");
+        let mut alpha_pages = (0..=REPLAY_PAGE_SIZE)
+            .map(|index| {
+                usage_envelope(
+                    &store,
+                    &alpha,
+                    &format!("alpha-{index}"),
+                    10 + u64::try_from(index).expect("page index fits u64"),
+                    "model-a",
+                )
+            })
+            .collect::<Vec<_>>();
+        store
+            .append(&mut alpha_pages)
+            .expect("append page-crossing usage journal");
+        append_usage(&store, &beta, "beta-inherited", 99, "model-inherited");
+        append_fork_audit(&store, &beta, &alpha);
+        append_usage(&store, &beta, "beta-1", 20, "model-b");
+
+        let retained = reduce_journal_usage(
+            &store
+                .all_journal_envelopes()
+                .expect("retained profile journal"),
+        );
+        assert!(
+            alpha_pages.len() > REPLAY_PAGE_SIZE,
+            "fixture must cross the reducer page boundary"
+        );
+        let streamed = store.fold_usage_journals().expect("streamed usage fold");
+        assert_eq!(streamed, retained);
+        assert_eq!(
+            rmp_serde::to_vec_named(&streamed).expect("encode streamed result"),
+            rmp_serde::to_vec_named(&retained).expect("encode retained result")
+        );
+    }
+
+    #[test]
+    fn usage_checkpoint_resumes_from_the_previous_session_head() {
+        let root = tempfile::tempdir().expect("profile");
+        let store = Store::open(root.path()).expect("store");
+        let session_id = SessionId::new("usage-checkpoint-resume");
+        append_usage(&store, &session_id, "resume-1", 10, "model-a");
+        append_usage(&store, &session_id, "resume-2", 12, "model-a");
+        store.fold_usage_journals().expect("initial fold");
+        append_usage(&store, &session_id, "resume-3", 14, "model-a");
+
+        let (_, cursor) = store
+            .load_usage_checkpoint(&session_id)
+            .expect("load checkpoint");
+        assert_eq!(cursor, 2, "only the newly appended suffix remains");
+        let streamed = store.fold_usage_journals().expect("resume fold");
+        let retained = reduce_journal_usage(
+            &store
+                .all_journal_envelopes()
+                .expect("retained profile journal"),
+        );
+        assert_eq!(streamed, retained);
+        let checkpoint = store
+            .session_projection_checkpoint(
+                &session_id,
+                USAGE_CHECKPOINT_PROJECTION,
+                USAGE_CHECKPOINT_TIMELINE,
+            )
+            .expect("checkpoint read")
+            .expect("checkpoint exists");
+        assert_eq!(checkpoint.through_seq, 3);
+    }
+
+    #[test]
+    fn corrupt_usage_checkpoint_falls_back_to_a_full_streaming_fold() {
+        let root = tempfile::tempdir().expect("profile");
+        let store = Store::open(root.path()).expect("store");
+        let session_id = SessionId::new("usage-checkpoint-corrupt");
+        append_usage(&store, &session_id, "corrupt-1", 10, "model-a");
+        append_usage(&store, &session_id, "corrupt-2", 16, "model-a");
+        store.fold_usage_journals().expect("initial fold");
+        let head = store
+            .read(&session_id, 1, 1)
+            .expect("read head")
+            .pop()
+            .expect("head envelope");
+        store
+            .put_session_projection_checkpoint(&SessionProjectionCheckpoint {
+                session_id: session_id.clone(),
+                projection: USAGE_CHECKPOINT_PROJECTION.to_owned(),
+                timeline_key: USAGE_CHECKPOINT_TIMELINE.to_owned(),
+                through_seq: head.seq,
+                boundary_event_id: head.event_id,
+                payload: b"not a reducer checkpoint".to_vec(),
+            })
+            .expect("install corrupt checkpoint payload");
+
+        let (_, cursor) = store
+            .load_usage_checkpoint(&session_id)
+            .expect("corrupt checkpoint is a cache miss");
+        assert_eq!(cursor, 0);
+        let streamed = store
+            .fold_usage_journals()
+            .expect("full streaming fallback");
+        let retained = reduce_journal_usage(
+            &store
+                .all_journal_envelopes()
+                .expect("retained profile journal"),
+        );
+        assert_eq!(streamed, retained);
+        let (_, cursor) = store
+            .load_usage_checkpoint(&session_id)
+            .expect("load repaired checkpoint");
+        assert_eq!(cursor, 2);
+
+        let connection = Connection::open(store.database_path()).expect("checkpoint connection");
+        connection
+            .execute(
+                "UPDATE session_projection_checkpoints
+                 SET payload = 7
+                 WHERE session_id = ?1 AND projection = ?2 AND timeline_key = ?3",
+                params![
+                    session_id.as_str(),
+                    USAGE_CHECKPOINT_PROJECTION,
+                    USAGE_CHECKPOINT_TIMELINE
+                ],
+            )
+            .expect("corrupt checkpoint storage class");
+        let (_, cursor) = store
+            .load_usage_checkpoint(&session_id)
+            .expect("malformed checkpoint storage is a cache miss");
+        assert_eq!(cursor, 0);
+        let repaired = store
+            .fold_usage_journals()
+            .expect("malformed storage falls back to full streaming fold");
+        assert_eq!(repaired, retained);
+        let (_, cursor) = store
+            .load_usage_checkpoint(&session_id)
+            .expect("load storage-class-repaired checkpoint");
+        assert_eq!(cursor, 2);
     }
 }
 

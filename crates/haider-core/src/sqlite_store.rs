@@ -4,7 +4,7 @@
 //! runs on Tokio's blocking pool. The wrapped [`Store`] owns one connection and
 //! the profile lock until [`SqliteStoreHandle::close`] or final fallback drop.
 
-use crate::{ArtifactReader, CommittedRange, StoreHandle};
+use crate::{ArtifactReader, CommittedRange, ReducerPage, StoreHandle};
 use async_trait::async_trait;
 use haider_protocol::agent::ChildReport;
 use haider_protocol::branch::BranchDescriptor;
@@ -1917,13 +1917,38 @@ impl StoreHandle for SqliteStoreHandle {
         session_id: &SessionId,
         since_seq: u64,
         limit: usize,
+        byte_budget: usize,
         payload_kinds: &'static [&'static str],
     ) -> Result<Vec<RawEnvelope>, HaiderError> {
         let owner = Arc::clone(&self.owner);
         let session_id = session_id.clone();
         run_blocking(move || {
             owner.with_store(|store| {
-                store.read_reducer_page(&session_id, since_seq, limit, payload_kinds)
+                store.read_reducer_page(&session_id, since_seq, limit, byte_budget, payload_kinds)
+            })
+        })
+        .await
+    }
+
+    async fn read_reducer_page_with_boundary(
+        &self,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+        byte_budget: usize,
+        payload_kinds: &'static [&'static str],
+    ) -> Result<ReducerPage, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.read_reducer_page_with_boundary(
+                    &session_id,
+                    since_seq,
+                    limit,
+                    byte_budget,
+                    payload_kinds,
+                )
             })
         })
         .await

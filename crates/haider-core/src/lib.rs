@@ -61,9 +61,9 @@ pub use haider_store::{
     PROVIDER_CONFIGURE_METHOD, PROVIDER_REMOVE_METHOD, PinnedGraph, ProcessSignalCommand,
     ProcessSignalOutcome, QueueConsumeCommand, QueueConsumeOutcome, QueuePromoteCommand,
     QueuePromoteOutcome, QueueRemoveCommand, QueueRemoveOutcome, QueueSnapshot,
-    RecordedGraphEvidence, RecordedProcessSignal, RenamedSession, RunRetryCommand, RunRetryOutcome,
-    SUBAGENT_LIVE_LIMIT, SeenSession, SelectedAgentType, SelectedEffort, SelectedFast,
-    SelectedModel, SessionCreateCommand, SessionCreateOutcome, SessionForkCommand,
+    RecordedGraphEvidence, RecordedProcessSignal, ReducerPage, RenamedSession, RunRetryCommand,
+    RunRetryOutcome, SUBAGENT_LIVE_LIMIT, SeenSession, SelectedAgentType, SelectedEffort,
+    SelectedFast, SelectedModel, SessionCreateCommand, SessionCreateOutcome, SessionForkCommand,
     SessionForkOutcome, SessionMetaforkCommit, SessionProjectionCheckpoint, SessionRenameCommand,
     SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome, SessionSelectAgentTypeCommand,
     SessionSelectAgentTypeOutcome, SessionSelectEffortCommand, SessionSelectEffortOutcome,
@@ -83,7 +83,7 @@ pub use sqlite_store::{AppendGroupBatch, ProfileStoreFault, SqliteStoreHandle};
 
 use async_trait::async_trait;
 use haider_protocol::branch::BranchDescriptor;
-use haider_protocol::envelope::RawEnvelope;
+use haider_protocol::envelope::{RawEnvelope, envelope_weight_bytes};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{BranchId, SessionId};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -143,6 +143,7 @@ pub trait StoreHandle: Send + Sync {
         session_id: &SessionId,
         since_seq: u64,
         limit: usize,
+        byte_budget: usize,
         payload_kinds: &'static [&'static str],
     ) -> Result<Vec<RawEnvelope>, HaiderError> {
         if limit == 0 || payload_kinds.is_empty() {
@@ -150,6 +151,7 @@ pub trait StoreHandle: Send + Sync {
         }
         let mut cursor = since_seq;
         let mut selected = Vec::new();
+        let mut spent = 0_usize;
         loop {
             let page = self.read(session_id, cursor, limit).await?;
             if page.is_empty() {
@@ -165,18 +167,44 @@ pub trait StoreHandle: Send + Sync {
                 ));
             }
             cursor = next_cursor;
-            selected.extend(
-                page.into_iter()
-                    .filter(|envelope| payload_kinds.contains(&envelope_payload_kind(envelope))),
-            );
-            if selected.len() >= limit {
-                selected.truncate(limit);
-                return Ok(selected);
+            for envelope in page
+                .into_iter()
+                .filter(|envelope| payload_kinds.contains(&envelope_payload_kind(envelope)))
+            {
+                let weight = envelope_weight_bytes(&envelope);
+                if !selected.is_empty() && spent.saturating_add(weight) > byte_budget {
+                    return Ok(selected);
+                }
+                spent = spent.saturating_add(weight);
+                selected.push(envelope);
+                if selected.len() >= limit || spent >= byte_budget {
+                    return Ok(selected);
+                }
             }
             if scan_complete {
                 return Ok(selected);
             }
         }
+    }
+
+    /// Reads a filtered page together with a transactionally compatible
+    /// journal-head observation when the store can provide one. Journal-only
+    /// adapters return no head and remain correct by retaining their reducer
+    /// cursor at the last decoded relevant envelope.
+    async fn read_reducer_page_with_boundary(
+        &self,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+        byte_budget: usize,
+        payload_kinds: &'static [&'static str],
+    ) -> Result<ReducerPage, HaiderError> {
+        self.read_reducer_page(session_id, since_seq, limit, byte_budget, payload_kinds)
+            .await
+            .map(|envelopes| ReducerPage {
+                envelopes,
+                observed_head: None,
+            })
     }
 
     async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError>;
