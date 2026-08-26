@@ -1752,6 +1752,7 @@ fn assert_user_command_wire_text(text: &str, output: &str) {
 fn cm2_cache_metadata(provider: &str, stable_history_end: usize) -> PromptCacheMetadata {
     PromptCacheMetadata {
         stable_history_end,
+        cacheable_history_end: None,
         current_user_start: stable_history_end,
         previous_stable_history_end: None,
         latest_compaction_summary_end: Some(1),
@@ -1764,6 +1765,7 @@ fn cm2_cache_metadata(provider: &str, stable_history_end: usize) -> PromptCacheM
             reasoning_settings: "reasoning-a".into(),
         },
         cache_epoch: "epoch-a".into(),
+        header_epoch: String::new(),
         compaction_epoch: "compaction-a".into(),
         provider: provider.into(),
         session_scope: "session-a".into(),
@@ -1827,16 +1829,21 @@ fn cache_diagnostic_openai_hashes_current_wire_through_previous_history_length()
     );
 }
 
-/// CM2d — the routing key identifies a stable provider lane within one
-/// session. Prefix bytes decide whether an entry matches, so prompt-version
-/// data must not rotate the routing key.
+/// CM2d — the routing key identifies a stable provider/header lane within one
+/// session. Append-only history and compaction do not rotate it; an explicit
+/// stable-header ABI change does.
 ///
-/// MUTATION CHECK: put a prefix digest or compaction epoch back into the key;
-/// one of the equality assertions fails.
+/// MUTATION CHECK: put a moving history/compaction digest back into the key,
+/// or remove the header epoch; one of the assertions fails.
 #[test]
 fn cm2d_openai_prompt_cache_key_is_stable_and_domain_sensitive() {
     let mut request = probe_request("gpt-5.6");
     request.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
+    request
+        .cache_metadata
+        .as_mut()
+        .expect("metadata")
+        .header_epoch = "provider-header-a".into();
     let metadata = request.cache_metadata.as_ref().expect("metadata");
     let first = derive_prompt_cache_key(&request, metadata);
 
@@ -1862,6 +1869,14 @@ fn cm2d_openai_prompt_cache_key_is_stable_and_domain_sensitive() {
     let mut other_account = request.cache_metadata.clone().expect("metadata");
     other_account.account_scope = Some("account-b".into());
     assert_ne!(first, derive_prompt_cache_key(&request, &other_account));
+
+    let mut other_header = request.cache_metadata.clone().expect("metadata");
+    other_header.header_epoch = "provider-header-b".into();
+    assert_ne!(
+        first,
+        derive_prompt_cache_key(&request, &other_header),
+        "stable-header ABI changes must select a new cache route"
+    );
 }
 
 /// HAIDER949(a). MUTATION CHECK: drop `session_scope` from

@@ -101,6 +101,7 @@ fn cache_metadata(
 ) -> PromptCacheMetadata {
     PromptCacheMetadata {
         stable_history_end,
+        cacheable_history_end: None,
         current_user_start,
         previous_stable_history_end: None,
         latest_compaction_summary_end: Some(1),
@@ -113,6 +114,7 @@ fn cache_metadata(
             reasoning_settings: "stable-reasoning".into(),
         },
         cache_epoch: "cache-epoch-a".into(),
+        header_epoch: String::new(),
         compaction_epoch: "compaction-epoch-a".into(),
         provider: provider.into(),
         session_scope: "prefix-session".into(),

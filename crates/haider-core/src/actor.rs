@@ -47,7 +47,8 @@ use haider_protocol::EventPayload;
 use haider_protocol::agent::{AgentManifest, ChildReport, ChipState, ReportVerification};
 use haider_protocol::cache::{
     CACHE_REQUEST_ATTEMPT_EXTENSION_KIND, CacheEpochTransitionReason, CacheEpochTransitionV1,
-    CacheRequestAttemptV1,
+    CacheRequestAttemptV1, PROVIDER_VIEW_ATTEMPT_EXTENSION_KIND, ProviderViewAttemptV1,
+    ProviderViewLedgerV1,
 };
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::credential::RotationEvent;
@@ -82,8 +83,9 @@ use haider_protocol::tool::{
 use haider_protocol::verify::VerifyVerdict;
 use haider_provider::{
     Message, PromptCacheMetadata, Provider, ProviderError, ProviderErrorKind, ResolvedAttachment,
-    ToolDefinition, TurnRequest, apply_tool_result_image_budget, canonical_tool_definitions_digest,
-    degrade_tool_result_images_to_placeholders,
+    ToolDefinition, TurnRequest, apply_tool_result_image_budget, canonical_tool_definitions,
+    canonical_tool_definitions_digest, degrade_tool_result_images_to_placeholders,
+    validate_provider_view_prefix,
 };
 use haider_tools::{Plan, RequestInput, TodoWrite};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -252,6 +254,10 @@ pub struct HarnessConfig {
     /// Last completed provider request in this cache lane, when durable
     /// request-level telemetry exists.
     pub cache_previous_request: Option<PreviousCacheRequest>,
+    /// Exact immutable provider view from the preceding durable send. Unlike
+    /// request diagnostics, this survives restart so same-epoch middle
+    /// mutations can stop before provider traffic.
+    pub cache_previous_provider_view: Option<ProviderViewLedgerV1>,
     /// Deliberate cold-boundary marker consumed by the first request that
     /// actually yields usage telemetry.
     pub cache_initial_rewarm: Option<CacheRewarmReasonV1>,
@@ -344,6 +350,7 @@ impl HarnessConfig {
             cache_reuse_gap_ms: None,
             cache_diagnostic_key,
             cache_previous_request: None,
+            cache_previous_provider_view: None,
             cache_initial_rewarm: None,
             reasoning_settings: String::new(),
             initial_rotation: None,
@@ -396,20 +403,20 @@ impl HarnessConfig {
     /// rest of the turn-authorized tool pack byte-for-byte.
     pub fn install_provider_derived_request_state(&mut self, state: &ProviderDerivedRequestState) {
         if let Some(base) = self.provider_tool_base.as_ref() {
-            self.tools = select_provider_tools(
+            self.tools = canonical_tool_definitions(&select_provider_tools(
                 base,
                 &self.provider_local_web_tools,
                 &state.local_web_tool_names,
-            );
+            ));
             self.provider_tool_fallback_tools =
                 if state.provider_fallback_local_web_tool_names.is_empty() {
                     Vec::new()
                 } else {
-                    select_provider_tools(
+                    canonical_tool_definitions(&select_provider_tools(
                         base,
                         &self.provider_local_web_tools,
                         &state.provider_fallback_local_web_tool_names,
-                    )
+                    ))
                 };
         } else {
             self.provider_tool_fallback_tools.clear();
@@ -1834,6 +1841,13 @@ impl HarnessActor {
         // failure may end that turn before a boundary; never leak its input
         // into a later queued turn.
         self.pending_subturns.clear();
+        // Tool definitions are a provider cache ABI. Freeze their order and
+        // recursively canonicalize schemas once at the conversation-store
+        // boundary so standalone harnesses receive the same stability as
+        // daemon-built turns.
+        self.config.tools = canonical_tool_definitions(&self.config.tools);
+        self.config.provider_tool_fallback_tools =
+            canonical_tool_definitions(&self.config.provider_tool_fallback_tools);
         let (run_id, mut messages, checkpoint, partial_stream, child_wait) = match submit {
             TurnSubmission::Local(submit) => {
                 let run_id = self.next_run_id();
@@ -2139,9 +2153,15 @@ impl HarnessActor {
         // even when a fallback chain revisits the same provider/model pair.
         let mut provider_pair_switch_ordinal = 0u32;
         let mut provider_attempt = 0usize;
+        // Freeze the cacheable boundary for every physical retry of one
+        // logical provider request. Advancing or retreating this boundary on
+        // a transport retry would change the wire body underneath an exact
+        // replay and invalidate both the provider-view ledger and cache key.
+        let mut logical_request_cacheable_history_end = stable_history_end;
         let mut completed_usage: Option<Usage> = None;
         let mut provider_request_ordinal = 0_u64;
         let mut previous_cache_request = self.config.cache_previous_request.clone();
+        let mut previous_provider_view = self.config.cache_previous_provider_view.clone();
         let mut pending_previous_cache_request: Option<PreviousCacheRequest> = None;
         let mut previous_cache_request_sent_at: Option<tokio::time::Instant> = None;
         let mut cache_rewarm_pending = self.config.cache_initial_rewarm;
@@ -2175,6 +2195,7 @@ impl HarnessActor {
                     }
                 }
             }
+            let newest_volatile_history_start = messages.len();
             messages.extend(
                 std::mem::take(&mut self.pending_nudges)
                     .into_iter()
@@ -2218,6 +2239,19 @@ impl HarnessActor {
                 cache_rewarm_pending = Some(CacheRewarmReasonV1::PlannedCompaction);
             }
             if provider_attempt == 0 {
+                logical_request_cacheable_history_end =
+                    if !request_projection_compacted && provider_request_count > 0 {
+                        // A completed provider/tool round is immutable input for
+                        // the next round. Advance the cache marker without
+                        // changing the accepted current-user boundary used by
+                        // compaction.
+                        newest_volatile_history_start
+                    } else {
+                        stable_history_end
+                    };
+            }
+            let cacheable_history_end = logical_request_cacheable_history_end;
+            if provider_attempt == 0 {
                 provider_request_count = provider_request_count.saturating_add(1);
             }
             if provider_request_count > self.config.max_provider_requests_per_turn {
@@ -2236,12 +2270,17 @@ impl HarnessActor {
             }
             provider_attempt = provider_attempt.saturating_add(1);
             provider_request_ordinal = provider_request_ordinal.saturating_add(1);
-            let previous_stable_history_end = previous_cache_request
+            let previous_stable_history_end = previous_provider_view
                 .as_ref()
-                .map(|previous| previous.history_message_count);
+                .and_then(|view| usize::try_from(view.stable_history_end).ok())
+                .or_else(|| {
+                    previous_cache_request
+                        .as_ref()
+                        .map(|previous| previous.history_message_count)
+                });
             let mut prefix_digests = usage_prefix_digests(
                 &self.config,
-                &messages[..stable_history_end.min(messages.len())],
+                &messages[..cacheable_history_end.min(messages.len())],
             );
             let mut previous_prefix_digests = previous_stable_history_end
                 .filter(|previous| *previous <= messages.len())
@@ -2282,6 +2321,7 @@ impl HarnessActor {
                 &messages,
                 PromptCacheBoundaries {
                     stable_history_end,
+                    cacheable_history_end,
                     current_user_start: current_turn_start,
                     previous_stable_history_end,
                     latest_compaction_summary_end,
@@ -2314,6 +2354,7 @@ impl HarnessActor {
                     &messages,
                     PromptCacheBoundaries {
                         stable_history_end,
+                        cacheable_history_end,
                         current_user_start: current_turn_start,
                         previous_stable_history_end,
                         latest_compaction_summary_end,
@@ -2322,6 +2363,61 @@ impl HarnessActor {
                     usage_account.as_ref(),
                 );
                 provider_request.cache_metadata = Some(cache_metadata.clone());
+            }
+            if let Some(provider_view) = prepared
+                .as_ref()
+                .and_then(|prepared| prepared.provider_view())
+            {
+                if let Some(previous) = previous_provider_view.as_ref()
+                    && let Err(error) = validate_provider_view_prefix(previous, provider_view)
+                {
+                    return self
+                        .errored_outcome_with_items(
+                            &run_id,
+                            &mut message,
+                            &mut reasoning,
+                            &mut tools,
+                            provider_view_invariant_error(error),
+                        )
+                        .await;
+                }
+                cache_metadata
+                    .header_epoch
+                    .clone_from(&provider_view.ledger().header_epoch);
+                provider_request.cache_metadata = Some(cache_metadata.clone());
+                let provider_view_attempt = ProviderViewAttemptV1 {
+                    ordinal: provider_request_ordinal,
+                    view: provider_view.ledger().clone(),
+                };
+                let provider_view_data = match serde_json::to_value(provider_view_attempt) {
+                    Ok(data) => data,
+                    Err(error) => {
+                        return self
+                            .errored_outcome_with_items(
+                                &run_id,
+                                &mut message,
+                                &mut reasoning,
+                                &mut tools,
+                                HaiderError::new(
+                                    ErrorCode::Internal,
+                                    format!("provider-view ledger could not serialize: {error}"),
+                                    false,
+                                ),
+                            )
+                            .await;
+                    }
+                };
+                if let Err(error) = self
+                    .commit_hidden_extension_marker(
+                        &run_id,
+                        PROVIDER_VIEW_ATTEMPT_EXTENSION_KIND,
+                        provider_view_data,
+                    )
+                    .await
+                {
+                    return self.errored_state_outcome(&run_id, error).await;
+                }
+                previous_provider_view = Some(provider_view.ledger().clone());
             }
             let cache_control = prepared
                 .as_ref()
@@ -2336,7 +2432,7 @@ impl HarnessActor {
                 &prefix_digests,
                 previous_prefix_digests.as_ref(),
                 previous_cache_request.as_ref(),
-                stable_history_end,
+                cacheable_history_end,
                 cache_metadata.stable_prefix_tokens,
                 cache_metadata.reuse_gap_ms,
                 cache_control,
@@ -3166,7 +3262,7 @@ impl HarnessActor {
                             cache: Some(cache_diagnostic.clone()),
                         });
                         pending_previous_cache_request = Some(PreviousCacheRequest {
-                            history_message_count: stable_history_end,
+                            history_message_count: cacheable_history_end,
                             breakpoint_hashes: cache_diagnostic.breakpoint_hashes,
                             cache_domain_hash: cache_diagnostic.cache_domain_hash,
                         });
@@ -7369,6 +7465,23 @@ fn provider_protocol_error(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ProviderErrorKind::MalformedFrame, message)
 }
 
+fn provider_view_invariant_error(
+    error: haider_provider::ProviderViewInvariantError,
+) -> HaiderError {
+    HaiderError::new(
+        ErrorCode::Internal,
+        format!("provider request blocked before send: {error}"),
+        false,
+    )
+    .with_presentation(ErrorPresentation::new(
+        "provider-prefix-invariant",
+        "Provider cache prefix changed unexpectedly",
+        "Haider blocked this request because previously sent provider bytes changed inside a live cache epoch. Start a deliberate new cache epoch or repair the conversation store before retrying.",
+        ErrorScope::Turn,
+        [ErrorAction::RetryFresh],
+    ))
+}
+
 fn provider_stream_interrupted(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ProviderErrorKind::StreamInterrupted, message)
 }
@@ -8059,6 +8172,7 @@ pub fn classify_cache_request(
 #[derive(Clone, Copy)]
 struct PromptCacheBoundaries {
     stable_history_end: usize,
+    cacheable_history_end: usize,
     current_user_start: usize,
     previous_stable_history_end: Option<usize>,
     latest_compaction_summary_end: Option<usize>,
@@ -8073,11 +8187,15 @@ fn prompt_cache_metadata(
 ) -> PromptCacheMetadata {
     let PromptCacheBoundaries {
         stable_history_end,
+        cacheable_history_end,
         current_user_start,
         previous_stable_history_end,
         latest_compaction_summary_end,
     } = boundaries;
     let stable_history_end = stable_history_end.min(messages.len());
+    let cacheable_history_end = cacheable_history_end
+        .max(stable_history_end)
+        .min(messages.len());
     let current_user_start = current_user_start.min(messages.len());
     let latest_compaction_summary_end = latest_compaction_summary_end
         .filter(|boundary| *boundary > 0 && *boundary <= stable_history_end);
@@ -8096,14 +8214,17 @@ fn prompt_cache_metadata(
         "compaction_epoch": compaction_epoch,
     }));
     let stable_prefix_tokens =
-        estimated_request_input_tokens(config, &messages[..stable_history_end]);
+        estimated_request_input_tokens(config, &messages[..cacheable_history_end]);
     PromptCacheMetadata {
         stable_history_end,
+        cacheable_history_end: (cacheable_history_end != stable_history_end)
+            .then_some(cacheable_history_end),
         current_user_start,
         previous_stable_history_end,
         latest_compaction_summary_end,
         prefix_digests,
         cache_epoch,
+        header_epoch: String::new(),
         compaction_epoch,
         provider: config.usage_scope.provider.clone(),
         session_scope: config.session_id.as_str().to_owned(),

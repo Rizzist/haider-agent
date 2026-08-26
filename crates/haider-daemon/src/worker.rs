@@ -71,6 +71,7 @@ use haider_core::{
 use haider_protocol::agent::Grant;
 use haider_protocol::cache::{
     CacheEpochTransitionReason, CacheEpochTransitionV1, CacheRequestAttemptV1,
+    ProviderViewAttemptV1, ProviderViewLedgerV1,
 };
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::effect::{
@@ -346,6 +347,58 @@ impl std::fmt::Debug for DaemonContextCompactor {
 }
 
 impl DaemonContextCompactor {
+    async fn record_provider_view_attempt(
+        &self,
+        run_id: &RunId,
+        ordinal: u64,
+        view: &ProviderViewLedgerV1,
+    ) -> Result<(), HaiderError> {
+        let item = ProviderViewAttemptV1 {
+            ordinal,
+            view: view.clone(),
+        }
+        .extension_item()
+        .map_err(|error| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                format!("provider-view ledger could not serialize: {error}"),
+                false,
+            )
+        })?;
+        let item_id = ItemId::new(format!(
+            "provider-view-attempt-{}-{ordinal}",
+            self.event_ids.next()
+        ));
+        let mut envelopes = vec![
+            supervisor_envelope(
+                &self.store,
+                &self.device_id,
+                self.branch_id.clone(),
+                Some(run_id.clone()),
+                self.event_ids.next(),
+                EventPayload::Item(ItemEvent::Started {
+                    item_id: item_id.clone(),
+                    item: item.clone(),
+                }),
+            )?,
+            supervisor_envelope(
+                &self.store,
+                &self.device_id,
+                self.branch_id.clone(),
+                Some(run_id.clone()),
+                self.event_ids.next(),
+                EventPayload::Item(ItemEvent::Completed { item_id, item }),
+            )?,
+        ];
+        for envelope in &mut envelopes {
+            envelope.agent_id = self.agent_id.clone();
+            envelope.render.ui = false;
+        }
+        StoreHandle::append(&self.store, &mut envelopes)
+            .await
+            .map(|_| ())
+    }
+
     async fn record_cache_request_attempt(
         &self,
         run_id: &RunId,
@@ -433,11 +486,13 @@ impl DaemonContextCompactor {
         );
         PromptCacheMetadata {
             stable_history_end,
+            cacheable_history_end: None,
             current_user_start: stable_history_end,
             previous_stable_history_end,
             latest_compaction_summary_end,
             prefix_digests,
             cache_epoch,
+            header_epoch: String::new(),
             compaction_epoch,
             provider: self.usage_scope.provider.clone(),
             session_scope: self.store.session_id().as_str().to_owned(),
@@ -556,11 +611,21 @@ impl ContextCompactor for DaemonContextCompactor {
         attachments: Vec<haider_provider::ResolvedAttachment>,
         latest_compaction_summary_end: Option<usize>,
     ) -> Result<Message, HaiderError> {
-        let (previous_cache_request, _) =
-            prior_cache_request_context(&self.store, &self.usage_scope).await?;
-        let previous_stable_history_end = previous_cache_request
+        let (previous_cache_request, previous_provider_view, _) = prior_cache_request_context(
+            &self.store,
+            &self.usage_scope,
+            self.branch_id.as_ref(),
+            self.agent_id.as_ref(),
+        )
+        .await?;
+        let previous_stable_history_end = previous_provider_view
             .as_ref()
-            .map(|previous| previous.history_message_count);
+            .and_then(|view| usize::try_from(view.stable_history_end).ok())
+            .or_else(|| {
+                previous_cache_request
+                    .as_ref()
+                    .map(|previous| previous.history_message_count)
+            });
         let immutable_history_digest = digest_json(&covered_messages);
         let covered_history_end = covered_messages.len();
         let mut replay_messages = covered_messages.clone();
@@ -623,6 +688,35 @@ impl ContextCompactor for DaemonContextCompactor {
                 latest_compaction_summary_end,
             );
             request.cache_metadata = Some(cache_metadata.clone());
+        }
+        if let Some(provider_view) = prepared
+            .as_ref()
+            .and_then(|prepared| prepared.provider_view())
+        {
+            if let Some(previous) = previous_provider_view.as_ref()
+                // A committed compaction intent deliberately summarizes a
+                // prefix shorter than the newest tool-loop marker. That cut
+                // is declared lifecycle work; the post-summary request gets
+                // a new compaction epoch and mandatory rewarm classification.
+                && usize::try_from(previous.stable_history_end)
+                    .is_ok_and(|boundary| boundary <= covered_history_end)
+            {
+                haider_provider::validate_provider_view_prefix(previous, provider_view).map_err(
+                    |error| {
+                        HaiderError::new(
+                            ErrorCode::Internal,
+                            format!("context summarization blocked before send: {error}"),
+                            false,
+                        )
+                    },
+                )?;
+            }
+            cache_metadata
+                .header_epoch
+                .clone_from(&provider_view.ledger().header_epoch);
+            request.cache_metadata = Some(cache_metadata.clone());
+            self.record_provider_view_attempt(run_id, 1, provider_view.ledger())
+                .await?;
         }
         let cache_control = prepared
             .as_ref()
@@ -5485,10 +5579,17 @@ async fn start_turn(
         &config.usage_scope,
     )
     .await?;
-    let (previous_cache_request, cache_initial_rewarm) =
-        prior_cache_request_context(lease, &config.usage_scope).await?;
+    let (previous_cache_request, previous_provider_view, cache_initial_rewarm) =
+        prior_cache_request_context(
+            lease,
+            &config.usage_scope,
+            config.branch_id.as_ref(),
+            config.agent_id.as_ref(),
+        )
+        .await?;
     config.cache_diagnostic_key = lease.hub().cache_diagnostic_key();
     config.cache_previous_request = previous_cache_request;
+    config.cache_previous_provider_view = previous_provider_view;
     config.cache_initial_rewarm = cache_initial_rewarm;
     config.cache_reuse_gap_ms =
         prior_cache_domain_gap_ms(lease, &accepted.run_id, &config.usage_scope).await?;
@@ -6635,9 +6736,19 @@ async fn latest_main_usage_scope(
 async fn prior_cache_request_context(
     store: &HubStoreHandle,
     lane: &UsageScope,
-) -> Result<(Option<PreviousCacheRequest>, Option<CacheRewarmReasonV1>), HaiderError> {
+    branch_id: Option<&BranchId>,
+    agent_id: Option<&AgentId>,
+) -> Result<
+    (
+        Option<PreviousCacheRequest>,
+        Option<ProviderViewLedgerV1>,
+        Option<CacheRewarmReasonV1>,
+    ),
+    HaiderError,
+> {
     let mut latest_main_usage_seq = 0_u64;
     let mut previous_request = None;
+    let mut previous_provider_view = None;
     let mut latest_deliberate_boundary = None::<(u64, CacheRewarmReasonV1)>;
     let mut cursor = 0_u64;
     loop {
@@ -6649,9 +6760,15 @@ async fn prior_cache_request_context(
         for envelope in page {
             if let Ok(EventPayload::Usage(usage)) =
                 serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                && envelope.branch_id.as_ref() == branch_id
                 && usage.scope.as_ref().is_some_and(|scope| {
-                    scope.request_kind == UsageRequestKind::MainTurn
-                        && scope.agent.is_none()
+                    scope.request_kind
+                        == if agent_id.is_some() {
+                            UsageRequestKind::DelegatedAgent
+                        } else {
+                            UsageRequestKind::MainTurn
+                        }
+                        && scope.agent.as_ref() == agent_id
                         && scope.provider == lane.provider
                         && scope.model == lane.model
                         && scope.account_scope == lane.account_scope
@@ -6683,6 +6800,27 @@ async fn prior_cache_request_context(
             else {
                 continue;
             };
+            if envelope.branch_id.as_ref() == branch_id && envelope.agent_id.as_ref() == agent_id {
+                match ProviderViewAttemptV1::try_from_extension_item(&item) {
+                    Ok(Some(attempt))
+                        if attempt.view.provider == lane.provider
+                            && attempt.view.model == lane.model
+                            && attempt.view.account_scope.as_deref()
+                                == lane.account_scope.as_ref().map(|scope| scope.as_str()) =>
+                    {
+                        previous_provider_view = Some(attempt.view);
+                        continue;
+                    }
+                    Ok(Some(_)) | Ok(None) => {}
+                    Err(error) => {
+                        return Err(HaiderError::new(
+                            ErrorCode::Internal,
+                            format!("durable provider-view ledger is malformed: {error}"),
+                            false,
+                        ));
+                    }
+                }
+            }
             let Some(transition) = CacheEpochTransitionV1::from_extension_item(&item) else {
                 continue;
             };
@@ -6699,7 +6837,7 @@ async fn prior_cache_request_context(
     let pending = latest_deliberate_boundary
         .filter(|(seq, _)| *seq > latest_main_usage_seq)
         .map(|(_, reason)| reason);
-    Ok((previous_request, pending))
+    Ok((previous_request, previous_provider_view, pending))
 }
 
 async fn cache_transition_was_emitted(

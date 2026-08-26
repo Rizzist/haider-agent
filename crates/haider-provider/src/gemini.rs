@@ -398,7 +398,7 @@ impl GeminiProvider {
                     .cache_metadata
                     .as_ref()
                     .map_or(request.messages.len(), |metadata| {
-                        metadata.stable_history_end
+                        metadata.cacheable_history_end()
                     });
                 let (payload, boundary, _) = gemini_request_json_with_boundary(
                     request,
@@ -457,7 +457,7 @@ impl Provider for GeminiProvider {
     }
 
     fn prepare_turn(&self, request: &TurnRequest) -> Option<crate::PreparedTurn> {
-        let boundary = request.cache_metadata.as_ref()?.stable_history_end;
+        let boundary = request.cache_metadata.as_ref()?.cacheable_history_end();
         self.validate_model(request).ok()?;
         let (full_payload, history_boundary, previous_history_boundary) =
             gemini_request_json_with_boundary(
@@ -477,10 +477,37 @@ impl Provider for GeminiProvider {
             "system_instruction",
             "tools",
         )?;
+        let contents = payload_contents(&full_payload)?;
+        let history_blocks = gemini_provider_view_blocks(contents, history_boundary)?;
+        let previous_history_blocks = match previous_history_boundary {
+            Some(boundary) => Some(gemini_provider_view_blocks(contents, boundary)?),
+            None => None,
+        };
+        let metadata = request.cache_metadata.as_ref()?;
+        let boundaries = (metadata.cacheable_history_end() > 0)
+            .then(|| haider_protocol::cache::ProviderViewBoundaryV1 {
+                section: "history".into(),
+                message_end: Some(
+                    u64::try_from(metadata.cacheable_history_end()).unwrap_or(u64::MAX),
+                ),
+            })
+            .into_iter()
+            .collect();
+        let provider_view = crate::cachemaxxing::prepared_serialized_provider_view(
+            request,
+            &full_payload,
+            "gemini_generate_content",
+            "system_instruction",
+            "tools",
+            history_blocks,
+            previous_history_blocks,
+            boundaries,
+        );
         Some(crate::PreparedTurn {
             prefix_digests,
             previous_immutable_history_digest,
             cache_control: haider_protocol::provider::CacheControlObservationV1::Unavailable,
+            provider_view,
             wire: Some(crate::PreparedWire {
                 payload: full_payload,
                 history_boundary: Some(history_boundary),
@@ -702,7 +729,7 @@ impl GeminiCacheRegistry {
                 .cache_metadata
                 .as_ref()
                 .map_or(request.messages.len(), |metadata| {
-                    metadata.stable_history_end
+                    metadata.cacheable_history_end()
                 }),
         )
         .ok()
@@ -779,8 +806,8 @@ impl GeminiCacheRegistry {
         if metadata.stable_prefix_tokens < minimum
             || metadata.expected_later_reads < 2
             || web_builtins
-            || metadata.stable_history_end == 0
-            || metadata.stable_history_end > request.messages.len()
+            || metadata.cacheable_history_end() == 0
+            || metadata.cacheable_history_end() > request.messages.len()
         {
             return full_payload;
         }
@@ -1312,6 +1339,18 @@ fn gemini_history_digest(
     Some(crate::exact_optional_wire_digest(Some(
         &GeminiContentsPrefix { contents, boundary },
     )))
+}
+
+fn gemini_provider_view_blocks(
+    contents: &[serde_json::Value],
+    boundary: crate::PreparedHistoryBoundary,
+) -> Option<Vec<Vec<u8>>> {
+    serde_json::to_value(GeminiContentsPrefix { contents, boundary })
+        .ok()?
+        .as_array()?
+        .iter()
+        .map(|content| serde_json::to_vec(content).ok())
+        .collect()
 }
 
 fn gemini_cacheable_contents(

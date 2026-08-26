@@ -1061,6 +1061,7 @@ fn openai_shape_request(with_cache_metadata: bool) -> TurnRequest {
         attachments: Vec::new(),
         cache_metadata: with_cache_metadata.then(|| PromptCacheMetadata {
             stable_history_end: 1,
+            cacheable_history_end: None,
             current_user_start: 1,
             previous_stable_history_end: None,
             latest_compaction_summary_end: Some(1),
@@ -1073,6 +1074,7 @@ fn openai_shape_request(with_cache_metadata: bool) -> TurnRequest {
                 reasoning_settings: "reasoning-shape-pin".into(),
             },
             cache_epoch: "cache-shape-pin".into(),
+            header_epoch: String::new(),
             compaction_epoch: "compaction-shape-pin".into(),
             provider: OPENAI_OAUTH_PROVIDER_NAME.into(),
             session_scope: "session-shape-pin".into(),
