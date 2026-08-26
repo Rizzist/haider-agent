@@ -1620,7 +1620,9 @@ pub trait EventStore: Send + Sync {
 ///
 /// The group-commit coordinator may mix ordinary and live-worker appends from
 /// different sessions. Each batch keeps its own validation, timestamp, and
-/// result boundary; only the final SQLite commit is shared.
+/// result boundary; only the final SQLite commit is shared. The caller must
+/// supply batches in arrival order and only after they are already available:
+/// this type is not a license to delay a lone append for speculative batching.
 pub struct JournalAppendBatch {
     pub envelopes: Vec<RawEnvelope>,
     pub validate_worker_transitions: bool,
@@ -6026,12 +6028,19 @@ impl Store {
         append_envelopes(self, envelopes, true)
     }
 
-    /// Commits queued actor appends under one outer SQLite transaction.
+    /// Commits already-queued actor appends under one outer SQLite transaction.
     ///
     /// A savepoint isolates each logical request, preserving the pre-batching
     /// behavior where a semantically invalid append does not reject valid
     /// requests queued before or after it. Results become observable only after
-    /// the outer transaction commits.
+    /// the outer transaction commits. Fatal transaction failures remain the
+    /// outer `Err`; request-local failures occupy their matching nested result,
+    /// including when the group contains one request.
+    ///
+    /// This method does not wait for more work. A singleton uses the ordinary
+    /// immediate append path. Receipt-backed mutations remain on their
+    /// method-specific transactions so their receipt and accepted envelopes
+    /// keep one indivisible durability boundary.
     pub fn append_group(
         &self,
         batches: &mut [JournalAppendBatch],
@@ -6044,12 +6053,15 @@ impl Store {
             ));
         }
         if let [batch] = batches {
-            return append_envelopes(
+            return match append_envelopes(
                 self,
                 &mut batch.envelopes,
                 batch.validate_worker_transitions,
-            )
-            .map(|range| vec![Ok(range)]);
+            ) {
+                Ok(range) => Ok(vec![Ok(range)]),
+                Err(error) if isolatable_append_error(&error) => Ok(vec![Err(error)]),
+                Err(error) => Err(error),
+            };
         }
 
         let mut connection = self.connection()?;
@@ -17640,3 +17652,7 @@ mod store_synchronous_tests {
         assert!(error.message.contains(STORE_SYNCHRONOUS_ENV));
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod group_commit_tests;
