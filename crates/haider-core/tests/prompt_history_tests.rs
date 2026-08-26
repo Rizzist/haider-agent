@@ -9,7 +9,7 @@ use haider_core::{
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
-use haider_protocol::branch::BranchDescriptor;
+use haider_protocol::branch::{BranchCreated, BranchDescriptor};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::history::{
     COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume, NodeKind, TreeNode,
@@ -862,10 +862,10 @@ async fn idle_compaction_input_includes_completed_user_command_after_the_tree_he
     assert!(text.contains("tail output"));
 }
 
-/// MUTATION CHECK: delete the same-run exact-prefix extension and fall back to
-/// a full tree compile. Expected runtime failure: the second cached compile
-/// performs another lineage read. Appending only the suffix must remain
-/// byte-identical to the full oracle without rebuilding ancestry.
+/// MUTATION CHECK: delete the exact-prefix extensions, or extend a completed
+/// tree request with every raw suffix envelope. Expected runtime failure: a
+/// cached compile rereads lineage, or the next run resurrects the replaced
+/// sibling. Selected suffixes must remain byte-identical to the full oracle.
 #[tokio::test]
 async fn prompt_cache_matches_fresh_compile_after_append() {
     let store = MemoryStore::new();
@@ -873,6 +873,7 @@ async fn prompt_cache_matches_fresh_compile_after_append() {
     let cache = PromptHistoryCompiler::cache();
     let session_id = SessionId::new("prompt-cache-append-session");
     let run_id = RunId::new("prompt-cache-append-run");
+    let next_run = RunId::new("prompt-cache-next-run");
     let mut initial = vec![
         envelope(
             &session_id,
@@ -1025,6 +1026,76 @@ async fn prompt_cache_matches_fresh_compile_after_append() {
         )
     }));
 
+    // The next run extends the selected sibling ancestry, not every raw event
+    // appended after the original request boundary. The discarded steer must
+    // stay discarded across the run transition without rereading lineage.
+    let lineage_reads_before_next_run = recording.lineage_read_count();
+    let mut next = vec![
+        envelope(
+            &session_id,
+            &run_id,
+            "prompt-cache-prior-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &next_run,
+            "prompt-cache-next-user",
+            EventPayload::UserMessage {
+                text: "continue from the replacement".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &next_run,
+            "prompt-cache-next-node",
+            Some("prompt-cache-sibling-node"),
+            NodeKind::UserTurn {
+                text: "continue from the replacement".into(),
+                attachments: Vec::new(),
+            },
+        ),
+    ];
+    StoreHandle::append(&store, &mut next)
+        .await
+        .expect("append next run after sibling replacement");
+    let cached_next = PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &cache,
+        &recording,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &next_run,
+    )
+    .await
+    .expect("extend cached sibling into next run");
+    let fresh_next = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &next_run,
+    )
+    .await
+    .expect("fully compile next run after sibling replacement");
+    assert_eq!(cached_next, fresh_next);
+    assert_eq!(
+        recording.lineage_read_count(),
+        lineage_reads_before_next_run,
+        "an indexed cross-run extension must reuse its lineage"
+    );
+    assert!(cached_next.messages.iter().all(|message| {
+        message.blocks.iter().all(
+            |block| !matches!(block, Block::Text { text } if text == "include the invalidation law"),
+        )
+    }));
+
     // Structural corruption discovered in an appended suffix must have the
     // same typed error as rebuilding the complete tree.
     let mut duplicate = vec![envelope(
@@ -1067,6 +1138,254 @@ async fn prompt_cache_matches_fresh_compile_after_append() {
     .expect_err("fresh duplicate node is corruption");
     assert_eq!(cached_error.code, fresh_error.code);
     assert_eq!(cached_error.message, fresh_error.message);
+}
+
+/// MUTATION CHECK: unconditionally seed the cross-run prefix from the first
+/// cached compile. Expected runtime failure: because that compile occurs after
+/// the live run's assistant item, the next-run cache omits `late answer` while
+/// the fresh projection includes it.
+#[tokio::test]
+async fn prompt_cache_does_not_seed_a_late_lossy_live_run_prefix() {
+    let store = MemoryStore::new();
+    let artifacts = TestArtifacts(HashMap::new());
+    let cache = PromptHistoryCompiler::cache();
+    let session_id = SessionId::new("prompt-cache-late-prefix-session");
+    let live = RunId::new("prompt-cache-late-prefix-live");
+    let next = RunId::new("prompt-cache-late-prefix-next");
+    let mut live_events = vec![
+        envelope(
+            &session_id,
+            &live,
+            "prompt-cache-late-prefix-user",
+            EventPayload::UserMessage {
+                text: "start late-prefix test".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &live,
+            "prompt-cache-late-prefix-answer",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("prompt-cache-late-prefix-answer-item"),
+                item: TurnItem::AgentMessage {
+                    text: "late answer".into(),
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &live,
+            "prompt-cache-late-prefix-user-node",
+            None,
+            NodeKind::UserTurn {
+                text: "start late-prefix test".into(),
+                attachments: Vec::new(),
+            },
+        ),
+        node(
+            &session_id,
+            &live,
+            "prompt-cache-late-prefix-answer-node",
+            Some("prompt-cache-late-prefix-user-node"),
+            NodeKind::AssistantCommit {
+                text: "late answer".into(),
+                verdict: VerifyVerdict::NotApplicable,
+            },
+        ),
+    ];
+    StoreHandle::append(&store, &mut live_events)
+        .await
+        .expect("append completed live-run output before first cached compile");
+    PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &cache,
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &live,
+    )
+    .await
+    .expect("compile live run after its assistant output");
+
+    let mut transition = vec![
+        envelope(
+            &session_id,
+            &live,
+            "prompt-cache-late-prefix-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &next,
+            "prompt-cache-late-prefix-next-user",
+            EventPayload::UserMessage {
+                text: "continue after late answer".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &next,
+            "prompt-cache-late-prefix-next-node",
+            Some("prompt-cache-late-prefix-answer-node"),
+            NodeKind::UserTurn {
+                text: "continue after late answer".into(),
+                attachments: Vec::new(),
+            },
+        ),
+    ];
+    StoreHandle::append(&store, &mut transition)
+        .await
+        .expect("append next run after late first cache compile");
+    let cached = PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &cache,
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &next,
+    )
+    .await
+    .expect("compile next run without a lossy live prefix");
+    let fresh = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &next,
+    )
+    .await
+    .expect("fully compile next run after late first cache compile");
+
+    assert_eq!(cached, fresh);
+    assert!(cached.messages.iter().any(|message| {
+        message
+            .blocks
+            .iter()
+            .any(|block| matches!(block, Block::Text { text } if text == "late answer"))
+    }));
+}
+
+/// MUTATION CHECK: promote a live prefix to prior history without checking its
+/// suffix-final run state. Expected runtime failure: cached output retains the
+/// old user while a fresh fold omits that nonterminal run.
+#[tokio::test]
+async fn prompt_cache_requires_a_terminal_prefix_before_cross_run_extension() {
+    let store = MemoryStore::new();
+    let artifacts = TestArtifacts(HashMap::new());
+    let cache = PromptHistoryCompiler::cache();
+    let session_id = SessionId::new("prompt-cache-nonterminal-prefix-session");
+    let prior = RunId::new("prompt-cache-nonterminal-prefix-prior");
+    let current = RunId::new("prompt-cache-nonterminal-prefix-current");
+    let mut initial = vec![
+        envelope(
+            &session_id,
+            &prior,
+            "prompt-cache-nonterminal-prefix-user",
+            EventPayload::UserMessage {
+                text: "must disappear while nonterminal".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &prior,
+            "prompt-cache-nonterminal-prefix-node",
+            None,
+            NodeKind::UserTurn {
+                text: "must disappear while nonterminal".into(),
+                attachments: Vec::new(),
+            },
+        ),
+    ];
+    StoreHandle::append(&store, &mut initial)
+        .await
+        .expect("append live prefix");
+    PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &cache,
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &prior,
+    )
+    .await
+    .expect("prime live prefix");
+
+    let mut transition = vec![
+        envelope(
+            &session_id,
+            &prior,
+            "prompt-cache-nonterminal-prefix-thinking",
+            EventPayload::RunState(RunState::Thinking),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &current,
+            "prompt-cache-nonterminal-current-user",
+            EventPayload::UserMessage {
+                text: "current after invalid transition".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &current,
+            "prompt-cache-nonterminal-current-node",
+            Some("prompt-cache-nonterminal-prefix-node"),
+            NodeKind::UserTurn {
+                text: "current after invalid transition".into(),
+                attachments: Vec::new(),
+            },
+        ),
+    ];
+    StoreHandle::append(&store, &mut transition)
+        .await
+        .expect("append nonterminal cross-run transition");
+    let cached = PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &cache,
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &current,
+    )
+    .await
+    .expect("rebuild nonterminal prior run");
+    let fresh = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &current,
+    )
+    .await
+    .expect("fully compile nonterminal prior run");
+
+    assert_eq!(cached, fresh);
+    assert!(cached.messages.iter().all(|message| {
+        message.blocks.iter().all(
+            |block| !matches!(block, Block::Text { text } if text == "must disappear while nonterminal"),
+        )
+    }));
 }
 
 /// MUTATION CHECK: clear every exact projection when either agent advances,
@@ -1251,9 +1570,10 @@ async fn prompt_cache_extends_interleaved_agents_from_exact_heads() {
     );
 }
 
-/// MUTATION CHECK: apply suffix facts only to suffix envelopes. Expected
-/// runtime failure: the cached projection omits the newly terminal prior run
-/// while the full projection retroactively includes it.
+/// MUTATION CHECK: apply suffix facts only to suffix envelopes, or ignore every
+/// fact whose envelope belongs to the current run. Expected runtime failure:
+/// the cached projection omits the newly terminal prior run or its reclassified
+/// user command while the full projection retroactively includes it.
 #[tokio::test]
 async fn prompt_cache_rebuilds_when_suffix_facts_revise_the_prefix() {
     let store = MemoryStore::new();
@@ -1262,6 +1582,12 @@ async fn prompt_cache_rebuilds_when_suffix_facts_revise_the_prefix() {
     let session_id = SessionId::new("prompt-cache-retroactive-session");
     let prior = RunId::new("prompt-cache-retroactive-prior");
     let current = RunId::new("prompt-cache-retroactive-current");
+    let command_item = ItemId::new("prompt-cache-retroactive-command");
+    let command_origin = UserCommandOriginV1 {
+        origin: CommandExecutionOrigin::UserCommand,
+        command_item_id: command_item.clone(),
+        call_id: "prompt-cache-retroactive-call".into(),
+    };
     let mut events = vec![
         envelope(
             &session_id,
@@ -1272,6 +1598,34 @@ async fn prompt_cache_rebuilds_when_suffix_facts_revise_the_prefix() {
                 attachments: Vec::new(),
                 mode: DeliveryMode::Queue,
             },
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &prior,
+            "prompt-cache-retroactive-output",
+            EventPayload::Item(ItemEvent::Delta {
+                item_id: command_item.clone(),
+                delta: ItemDelta::CommandOutput {
+                    stream: OutputStream::Stdout,
+                    chunk_b64: BASE64.encode("retroactive output"),
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &prior,
+            "prompt-cache-retroactive-command-completed",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: command_item,
+                item: TurnItem::CommandExecution {
+                    call_id: "prompt-cache-retroactive-call".into(),
+                    command: "printf retroactive output".into(),
+                    status: ToolStatus::Completed,
+                    exit_code: Some(0),
+                },
+            }),
             PromptRender::Verbatim,
         ),
         node(
@@ -1358,6 +1712,50 @@ async fn prompt_cache_rebuilds_when_suffix_facts_revise_the_prefix() {
             .blocks
             .iter()
             .any(|block| matches!(block, Block::Text { text } if text == "previously unfinished"))
+    }));
+
+    // The fact envelope belongs to the current run but classifies command
+    // events selected from the prior run. Treating every current-run fact as
+    // suffix-local would leave the cached prefix stale.
+    let mut origin = vec![envelope(
+        &session_id,
+        &current,
+        "prompt-cache-retroactive-command-origin",
+        EventPayload::Item(ItemEvent::Completed {
+            item_id: ItemId::new("prompt-cache-retroactive-origin-item"),
+            item: command_origin.extension_item().expect("origin item"),
+        }),
+        PromptRender::Omit,
+    )];
+    StoreHandle::append(&store, &mut origin)
+        .await
+        .expect("append current-run retroactive origin");
+    let cached = PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &cache,
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &current,
+    )
+    .await
+    .expect("rebuild cached projection after current-run fact");
+    let fresh = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &current,
+    )
+    .await
+    .expect("fully compile current-run retroactive fact");
+    assert_eq!(cached, fresh);
+    assert!(cached.messages.iter().any(|message| {
+        message.blocks.iter().any(
+            |block| matches!(block, Block::Text { text } if text.contains("origin: user_command")),
+        )
     }));
 }
 
@@ -1636,6 +2034,8 @@ async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
     let first = RunId::new("compacted-first");
     let second = RunId::new("compacted-second");
     let current = RunId::new("compacted-current");
+    let after_restart = RunId::new("compacted-after-restart");
+    let rewound = RunId::new("compacted-rewound-before-anchor");
     store
         .create_session(SessionCreateCommand {
             command_id: "create-compacted-session".into(),
@@ -1906,7 +2306,286 @@ async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
         serde_json::to_vec(&first_projection.messages).expect("serialize first compile"),
         serde_json::to_vec(&restarted_projection.messages).expect("serialize restarted compile")
     );
+
+    // The checkpoint anchor remains a valid exact-prefix seam when the same
+    // current run appends a descendant. This must extend the resident suffix,
+    // not fall through to a truncated-tree compile or replay from sequence 0.
+    let mut same_current = vec![
+        envelope(
+            &session_id,
+            &current,
+            "compacted-current-steer",
+            EventPayload::UserMessage {
+                text: "same current after restart".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Steer,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &current,
+            "compact-current-steer-node",
+            Some("compact-n5"),
+            NodeKind::UserTurn {
+                text: "same current after restart".into(),
+                attachments: Vec::new(),
+            },
+        ),
+    ];
+    StoreHandle::append(&restarted, &mut same_current)
+        .await
+        .expect("append same-current descendant after checkpoint restart");
+    let cached_same_current =
+        PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+            &restarted_cache,
+            &recording,
+            &restarted,
+            &session_id,
+            None,
+            None,
+            &current,
+        )
+        .await
+        .expect("extend exact checkpoint prefix for the same current run");
+    let fresh_same_current = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        &restarted,
+        &restarted,
+        &session_id,
+        None,
+        None,
+        &current,
+    )
+    .await
+    .expect("fully compile same-current checkpoint descendant");
+    assert_eq!(cached_same_current, fresh_same_current);
+    assert!(
+        !recording.read_cursors().contains(&0),
+        "a same-current descendant must extend the checkpoint suffix: {:?}",
+        recording.read_cursors()
+    );
+
+    // Force sibling replacements before the next run. Raw suffix replay would
+    // resurrect both discarded steers; the checkpoint anchor must follow only
+    // the selected ancestry without rereading the compacted prefix.
+    let mut post_checkpoint = vec![
+        envelope(
+            &session_id,
+            &current,
+            "compacted-discarded-steer",
+            EventPayload::UserMessage {
+                text: "discarded post-checkpoint steer".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Steer,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &current,
+            "compact-discarded-node",
+            Some("compact-n5"),
+            NodeKind::UserTurn {
+                text: "discarded post-checkpoint steer".into(),
+                attachments: Vec::new(),
+            },
+        ),
+        envelope(
+            &session_id,
+            &current,
+            "compacted-selected-steer",
+            EventPayload::UserMessage {
+                text: "selected post-checkpoint steer".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Steer,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &current,
+            "compact-selected-node",
+            Some("compact-n5"),
+            NodeKind::UserTurn {
+                text: "selected post-checkpoint steer".into(),
+                attachments: Vec::new(),
+            },
+        ),
+        envelope(
+            &session_id,
+            &current,
+            "compacted-current-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &after_restart,
+            "compacted-after-restart-user",
+            EventPayload::UserMessage {
+                text: "continue after restart".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &after_restart,
+            "compact-after-restart-node",
+            Some("compact-selected-node"),
+            NodeKind::UserTurn {
+                text: "continue after restart".into(),
+                attachments: Vec::new(),
+            },
+        ),
+    ];
+    StoreHandle::append(&restarted, &mut post_checkpoint)
+        .await
+        .expect("append post-checkpoint sibling transition");
+    let cached_after_restart =
+        PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+            &restarted_cache,
+            &recording,
+            &restarted,
+            &session_id,
+            None,
+            None,
+            &after_restart,
+        )
+        .await
+        .expect("compile post-checkpoint sibling transition from cache");
+    let fresh_after_restart = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        &restarted,
+        &restarted,
+        &session_id,
+        None,
+        None,
+        &after_restart,
+    )
+    .await
+    .expect("fully compile post-checkpoint sibling transition");
+    assert_eq!(cached_after_restart, fresh_after_restart);
+    assert!(
+        !recording.read_cursors().contains(&0),
+        "a selected checkpoint descendant must not replay from zero: {:?}",
+        recording.read_cursors()
+    );
+    assert!(cached_after_restart.messages.iter().all(|message| {
+        message.blocks.iter().all(
+            |block| !matches!(block, Block::Text { text } if text == "discarded post-checkpoint steer" || text == "same current after restart"),
+        )
+    }));
     restarted.close().await.expect("close restarted store");
+
+    // Reopen again so the sibling-rich suffix is present before the first
+    // cache request. This pins first-resume ancestry selection, not merely a
+    // warm transition that learned the siblings incrementally.
+    let second_restart = SqliteStoreHandle::open(root.path())
+        .await
+        .expect("reopen store with sibling-rich checkpoint suffix");
+    let second_recording = RecordingStore::new(&second_restart);
+    let second_cache = PromptHistoryCompiler::cache();
+    let second_resumed = PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &second_cache,
+        &second_recording,
+        &second_restart,
+        &session_id,
+        None,
+        None,
+        &after_restart,
+    )
+    .await
+    .expect("first cache compile selects checkpoint suffix ancestry");
+    let second_fresh = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        &second_restart,
+        &second_restart,
+        &session_id,
+        None,
+        None,
+        &after_restart,
+    )
+    .await
+    .expect("fully compile sibling-rich checkpoint suffix");
+    assert_eq!(second_resumed, second_fresh);
+    assert!(
+        !second_recording.read_cursors().contains(&0),
+        "first resume must select siblings from the compaction anchor: {:?}",
+        second_recording.read_cursors()
+    );
+    assert!(second_resumed.messages.iter().all(|message| {
+        message.blocks.iter().all(
+            |block| !matches!(block, Block::Text { text } if text == "discarded post-checkpoint steer" || text == "same current after restart"),
+        )
+    }));
+
+    // A selected suffix may validly rewind to ancestry older than the
+    // checkpoint anchor. The truncated index cannot prove that parent, so it
+    // must replay the oracle instead of reporting missing-parent corruption.
+    let mut rewind = vec![
+        envelope(
+            &session_id,
+            &after_restart,
+            "compacted-after-restart-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &rewound,
+            "compacted-rewound-user",
+            EventPayload::UserMessage {
+                text: "rewind before the checkpoint anchor".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &rewound,
+            "compacted-rewound-node",
+            Some("compact-n2"),
+            NodeKind::UserTurn {
+                text: "rewind before the checkpoint anchor".into(),
+                attachments: Vec::new(),
+            },
+        ),
+    ];
+    StoreHandle::append(&second_restart, &mut rewind)
+        .await
+        .expect("append valid rewind before checkpoint anchor");
+    let cached_rewind = PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &second_cache,
+        &second_recording,
+        &second_restart,
+        &session_id,
+        None,
+        None,
+        &rewound,
+    )
+    .await
+    .expect("checkpoint rewind replays complete ancestry");
+    let fresh_rewind = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        &second_restart,
+        &second_restart,
+        &session_id,
+        None,
+        None,
+        &rewound,
+    )
+    .await
+    .expect("fully compile rewind before checkpoint anchor");
+    assert_eq!(cached_rewind, fresh_rewind);
+    assert!(
+        second_recording.read_cursors().contains(&0),
+        "an unprovable pre-anchor rewind must replay from zero: {:?}",
+        second_recording.read_cursors()
+    );
+    second_restart
+        .close()
+        .await
+        .expect("close second restarted store");
 }
 
 /// MUTATION CHECK: replace the `Ok(stored) => stored?` cache-miss arm with
@@ -1963,54 +2642,503 @@ async fn session_without_compaction_folds_from_zero_without_a_checkpoint() {
     );
 }
 
+/// MUTATION CHECK: omit `prefix_node_ids` from the durable checkpoint or skip
+/// its suffix collision check. Expected runtime failure: cached compilation
+/// accepts a node ID reused from omitted ancestry while the fresh tree reports
+/// typed duplicate-node corruption.
+#[tokio::test]
+async fn checkpoint_membership_detects_a_suffix_duplicate_node() {
+    let store = MemoryStore::new();
+    let artifacts = TestArtifacts(HashMap::new());
+    let session_id = SessionId::new("checkpoint-duplicate-node-session");
+    let prior = RunId::new("checkpoint-duplicate-node-prior");
+    let current = RunId::new("checkpoint-duplicate-node-current");
+    let anchor = "checkpoint-duplicate-anchor";
+    let mut events = vec![
+        node(
+            &session_id,
+            &prior,
+            "checkpoint-duplicate-covered-from",
+            None,
+            NodeKind::UserTurn {
+                text: "covered user".into(),
+                attachments: Vec::new(),
+            },
+        ),
+        node(
+            &session_id,
+            &prior,
+            "checkpoint-duplicate-covered-to",
+            Some("checkpoint-duplicate-covered-from"),
+            NodeKind::AssistantCommit {
+                text: "covered answer".into(),
+                verdict: VerifyVerdict::NotApplicable,
+            },
+        ),
+        node(
+            &session_id,
+            &prior,
+            anchor,
+            Some("checkpoint-duplicate-covered-to"),
+            NodeKind::Compaction {
+                covers_from: NodeId::new("checkpoint-duplicate-covered-from"),
+                covers_to: NodeId::new("checkpoint-duplicate-covered-to"),
+                summary_artifact: ArtifactRef::new(format!("blake3:{}", "9".repeat(64))),
+                tokens_before: 10,
+                tokens_after: 1,
+                resume_cause: CompactionResume::ManualIdle,
+            },
+        ),
+        envelope(
+            &session_id,
+            &prior,
+            "checkpoint-duplicate-prior-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &current,
+            "checkpoint-duplicate-current-user",
+            EventPayload::UserMessage {
+                text: "reuse the omitted node id".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &current,
+            anchor,
+            Some(anchor),
+            NodeKind::UserTurn {
+                text: "reuse the omitted node id".into(),
+                attachments: Vec::new(),
+            },
+        ),
+    ];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append suffix duplicate of checkpoint node");
+    let checkpoint_message = Message::user_text("checkpoint summary");
+    let checkpoint = SessionProjectionCheckpoint {
+        session_id: session_id.clone(),
+        projection: "prompt_history".into(),
+        timeline_key: "checkpoint-duplicate-fixture".into(),
+        through_seq: 4,
+        boundary_event_id: events[3].event_id.clone(),
+        payload: serde_json::to_vec(&serde_json::json!({
+            "shape_version": 1,
+            "reducer_version": "prompt-history-v1",
+            "through_seq": 4,
+            "boundary_event_id": events[3].event_id,
+            "boundary_run_id": prior,
+            "compaction_epoch": 3,
+            "prefix_node_ids": [
+                "checkpoint-duplicate-covered-from",
+                "checkpoint-duplicate-covered-to",
+                anchor
+            ],
+            "prefix_run_ids": [prior],
+            "messages": [serde_json::to_value(checkpoint_message).expect("message value")],
+            "stable_history_end": 1,
+            "current_user_start": 1,
+            "latest_compaction_summary_end": 1
+        }))
+        .expect("encode duplicate-membership checkpoint"),
+    };
+    let recording = RecordingStore::with_checkpoint(&store, checkpoint);
+    let cached_error = PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &PromptHistoryCompiler::cache(),
+        &recording,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &current,
+    )
+    .await
+    .expect_err("checkpoint suffix duplicate is corruption");
+    let fresh_error = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &current,
+    )
+    .await
+    .expect_err("fresh suffix duplicate is corruption");
+
+    assert_eq!(cached_error.code, fresh_error.code);
+    assert_eq!(cached_error.message, fresh_error.message);
+    assert!(recording.read_cursors().contains(&0));
+}
+
+/// MUTATION CHECK: remove the checkpoint-prefix run membership guard in
+/// `suffix_revises_prior_facts`. Expected runtime failure: the resumed fold
+/// omits the late assistant item because its terminal fact is before the
+/// checkpoint boundary, while the fresh fold renders it.
+#[tokio::test]
+async fn checkpoint_replays_a_late_envelope_for_a_covered_run() {
+    let store = MemoryStore::new();
+    let session_id = SessionId::new("checkpoint-late-covered-run-session");
+    let prior = RunId::new("checkpoint-late-covered-prior");
+    let current = RunId::new("checkpoint-late-covered-current");
+    let summary_artifact = ArtifactRef::new(format!("blake3:{}", "8".repeat(64)));
+    let artifacts = TestArtifacts(HashMap::from([(
+        summary_artifact.clone(),
+        b"checkpoint summary".to_vec(),
+    )]));
+    let mut events = vec![
+        envelope(
+            &session_id,
+            &prior,
+            "checkpoint-late-covered-user",
+            EventPayload::UserMessage {
+                text: "covered user".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &prior,
+            "checkpoint-late-covered-user-node",
+            None,
+            NodeKind::UserTurn {
+                text: "covered user".into(),
+                attachments: Vec::new(),
+            },
+        ),
+        envelope(
+            &session_id,
+            &prior,
+            "checkpoint-late-covered-first-answer",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("checkpoint-late-covered-first-answer-item"),
+                item: TurnItem::AgentMessage {
+                    text: "covered answer".into(),
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &prior,
+            "checkpoint-late-covered-answer-node",
+            Some("checkpoint-late-covered-user-node"),
+            NodeKind::AssistantCommit {
+                text: "covered answer".into(),
+                verdict: VerifyVerdict::NotApplicable,
+            },
+        ),
+        node(
+            &session_id,
+            &prior,
+            "checkpoint-late-covered-anchor",
+            Some("checkpoint-late-covered-answer-node"),
+            NodeKind::Compaction {
+                covers_from: NodeId::new("checkpoint-late-covered-user-node"),
+                covers_to: NodeId::new("checkpoint-late-covered-answer-node"),
+                summary_artifact: summary_artifact.clone(),
+                tokens_before: 10,
+                tokens_after: 1,
+                resume_cause: CompactionResume::ManualIdle,
+            },
+        ),
+        envelope(
+            &session_id,
+            &prior,
+            "checkpoint-late-covered-prior-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
+            &prior,
+            "checkpoint-late-covered-second-answer",
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new("checkpoint-late-covered-second-answer-item"),
+                item: TurnItem::AgentMessage {
+                    text: "late terminal answer".into(),
+                },
+            }),
+            PromptRender::Verbatim,
+        ),
+        envelope(
+            &session_id,
+            &current,
+            "checkpoint-late-covered-current-user",
+            EventPayload::UserMessage {
+                text: "current user".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &current,
+            "checkpoint-late-covered-current-node",
+            Some("checkpoint-late-covered-anchor"),
+            NodeKind::UserTurn {
+                text: "current user".into(),
+                attachments: Vec::new(),
+            },
+        ),
+    ];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append late covered-run envelope");
+    let checkpoint = SessionProjectionCheckpoint {
+        session_id: session_id.clone(),
+        projection: "prompt_history".into(),
+        timeline_key: "checkpoint-late-covered-run-fixture".into(),
+        through_seq: 6,
+        boundary_event_id: events[5].event_id.clone(),
+        payload: serde_json::to_vec(&serde_json::json!({
+            "shape_version": 1,
+            "reducer_version": "prompt-history-v1",
+            "through_seq": 6,
+            "boundary_event_id": events[5].event_id,
+            "boundary_run_id": prior,
+            "compaction_epoch": 5,
+            "prefix_node_ids": [
+                "checkpoint-late-covered-user-node",
+                "checkpoint-late-covered-answer-node",
+                "checkpoint-late-covered-anchor"
+            ],
+            "prefix_run_ids": [prior],
+            "messages": [serde_json::to_value(Message::user_text("checkpoint summary"))
+                .expect("message value")],
+            "stable_history_end": 1,
+            "current_user_start": 1,
+            "latest_compaction_summary_end": 1
+        }))
+        .expect("encode late covered-run checkpoint"),
+    };
+    let recording = RecordingStore::with_checkpoint(&store, checkpoint);
+    let resumed = PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &PromptHistoryCompiler::cache(),
+        &recording,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &current,
+    )
+    .await
+    .expect("resume after a late covered-run envelope");
+    let fresh = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &current,
+    )
+    .await
+    .expect("fully compile a late covered-run envelope");
+
+    assert_eq!(resumed, fresh);
+    assert!(resumed.messages.iter().any(|message| {
+        message
+            .blocks
+            .iter()
+            .any(|block| matches!(block, Block::Text { text } if text == "late terminal answer"))
+    }));
+    assert!(
+        recording.read_cursors().contains(&0),
+        "continuing a covered run must replay its omitted facts: {:?}",
+        recording.read_cursors()
+    );
+}
+
 /// MUTATION CHECK: remove `decoded.branch_id != timeline.branch_id` from the
 /// checkpoint validator. Expected runtime failure: the branch-A summary is
 /// prepended to branch B and the full/resumed equality assertion fails.
 #[tokio::test]
 async fn checkpoint_from_another_branch_is_rejected() {
     let store = MemoryStore::new();
-    let artifacts = TestArtifacts(HashMap::new());
     let session_id = SessionId::new("cross-branch-checkpoint-session");
     let branch_a = BranchId::new("checkpoint-branch-a");
     let branch_b = BranchId::new("requested-branch-b");
     let compacting = RunId::new("branch-a-compaction");
     let current = RunId::new("branch-b-current");
-    let mut compact_node = node(
-        &session_id,
-        &compacting,
-        "branch-a-compaction-node",
-        None,
-        NodeKind::Compaction {
-            covers_from: NodeId::new("branch-a-covered-from"),
-            covers_to: NodeId::new("branch-a-covered-to"),
-            summary_artifact: ArtifactRef::new(format!("blake3:{}", "a".repeat(64))),
-            tokens_before: 40,
-            tokens_after: 4,
-            resume_cause: CompactionResume::ManualIdle,
+    let summary_artifact = ArtifactRef::new(format!("blake3:{}", "a".repeat(64)));
+    let artifacts = TestArtifacts(HashMap::from([(
+        summary_artifact.clone(),
+        b"real branch A summary".to_vec(),
+    )]));
+    let scoped = |mut event: haider_protocol::envelope::RawEnvelope, branch: &BranchId| {
+        event.branch_id = Some(branch.clone());
+        event
+    };
+    let registry = |event_id: &str, branch: BranchDescriptor| EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new(event_id),
+        seq: 0,
+        session_id: session_id.clone(),
+        branch_id: None,
+        run_id: None,
+        agent_id: None,
+        device_id: DeviceId::new("checkpoint-branch-test"),
+        authority_epoch: 0,
+        worker_generation: 1,
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
         },
-    );
-    compact_node.branch_id = Some(branch_a.clone());
-    let mut terminal = envelope(
-        &session_id,
-        &compacting,
-        "branch-a-compaction-done",
-        EventPayload::RunState(RunState::Done),
-        PromptRender::Omit,
-    );
-    terminal.branch_id = Some(branch_a.clone());
-    let mut current_user = envelope(
-        &session_id,
-        &current,
-        "branch-b-current-user",
-        EventPayload::UserMessage {
-            text: "branch B only".into(),
-            attachments: Vec::new(),
-            mode: DeliveryMode::Queue,
-        },
-        PromptRender::Verbatim,
-    );
-    current_user.branch_id = Some(branch_b.clone());
-    let mut events = vec![compact_node, terminal, current_user];
+        payload: BranchCreated { branch }
+            .to_payload_value()
+            .expect("branch payload"),
+    };
+    let mut events = vec![
+        scoped(
+            envelope(
+                &session_id,
+                &compacting,
+                "branch-a-covered-user",
+                EventPayload::UserMessage {
+                    text: "covered branch A user".into(),
+                    attachments: Vec::new(),
+                    mode: DeliveryMode::Queue,
+                },
+                PromptRender::Verbatim,
+            ),
+            &branch_a,
+        ),
+        scoped(
+            node(
+                &session_id,
+                &compacting,
+                "branch-a-covered-from",
+                None,
+                NodeKind::UserTurn {
+                    text: "covered branch A user".into(),
+                    attachments: Vec::new(),
+                },
+            ),
+            &branch_a,
+        ),
+        scoped(
+            envelope(
+                &session_id,
+                &compacting,
+                "branch-a-covered-answer",
+                EventPayload::Item(ItemEvent::Completed {
+                    item_id: ItemId::new("branch-a-covered-answer-item"),
+                    item: TurnItem::AgentMessage {
+                        text: "covered branch A answer".into(),
+                    },
+                }),
+                PromptRender::Verbatim,
+            ),
+            &branch_a,
+        ),
+        scoped(
+            node(
+                &session_id,
+                &compacting,
+                "branch-a-covered-to",
+                Some("branch-a-covered-from"),
+                NodeKind::AssistantCommit {
+                    text: "covered branch A answer".into(),
+                    verdict: VerifyVerdict::NotApplicable,
+                },
+            ),
+            &branch_a,
+        ),
+        scoped(
+            node(
+                &session_id,
+                &compacting,
+                "branch-a-compaction-node",
+                Some("branch-a-covered-to"),
+                NodeKind::Compaction {
+                    covers_from: NodeId::new("branch-a-covered-from"),
+                    covers_to: NodeId::new("branch-a-covered-to"),
+                    summary_artifact,
+                    tokens_before: 40,
+                    tokens_after: 4,
+                    resume_cause: CompactionResume::ManualIdle,
+                },
+            ),
+            &branch_a,
+        ),
+        scoped(
+            envelope(
+                &session_id,
+                &compacting,
+                "branch-a-compaction-done",
+                EventPayload::RunState(RunState::Done),
+                PromptRender::Omit,
+            ),
+            &branch_a,
+        ),
+        scoped(
+            envelope(
+                &session_id,
+                &current,
+                "branch-b-current-user",
+                EventPayload::UserMessage {
+                    text: "branch B only".into(),
+                    attachments: Vec::new(),
+                    mode: DeliveryMode::Queue,
+                },
+                PromptRender::Verbatim,
+            ),
+            &branch_b,
+        ),
+        scoped(
+            node(
+                &session_id,
+                &current,
+                "branch-b-current-node",
+                Some("branch-a-compaction-node"),
+                NodeKind::UserTurn {
+                    text: "branch B only".into(),
+                    attachments: Vec::new(),
+                },
+            ),
+            &branch_b,
+        ),
+        registry(
+            "checkpoint-branch-a-created",
+            BranchDescriptor {
+                branch_id: branch_a.clone(),
+                name: "Checkpoint A".into(),
+                source_branch_id: None,
+                fork_node_id: NodeId::new("branch-a-covered-from"),
+                fork_seq: 2,
+                created_seq: 9,
+                created_at_ms: 1,
+                head_node_id: NodeId::new("branch-a-compaction-node"),
+                head_seq: 5,
+            },
+        ),
+        registry(
+            "checkpoint-branch-b-created",
+            BranchDescriptor {
+                branch_id: branch_b.clone(),
+                name: "Checkpoint B".into(),
+                source_branch_id: Some(branch_a.clone()),
+                fork_node_id: NodeId::new("branch-a-compaction-node"),
+                fork_seq: 5,
+                created_seq: 10,
+                created_at_ms: 2,
+                head_node_id: NodeId::new("branch-b-current-node"),
+                head_seq: 8,
+            },
+        ),
+    ];
     StoreHandle::append(&store, &mut events)
         .await
         .expect("append divergent timelines");
@@ -2025,16 +3153,22 @@ async fn checkpoint_from_another_branch_is_rejected() {
         session_id: session_id.clone(),
         projection: "prompt_history".into(),
         timeline_key: "branch-a-key-returned-adversarially".into(),
-        through_seq: 2,
-        boundary_event_id: events[1].event_id.clone(),
+        through_seq: 6,
+        boundary_event_id: events[5].event_id.clone(),
         payload: serde_json::to_vec(&serde_json::json!({
             "shape_version": 1,
             "reducer_version": "prompt-history-v1",
-            "through_seq": 2,
-            "boundary_event_id": events[1].event_id,
+            "through_seq": 6,
+            "boundary_event_id": events[5].event_id,
             "boundary_run_id": compacting,
             "branch_id": branch_a,
-            "compaction_epoch": 1,
+            "compaction_epoch": 5,
+            "prefix_node_ids": [
+                "branch-a-covered-from",
+                "branch-a-covered-to",
+                "branch-a-compaction-node"
+            ],
+            "prefix_run_ids": [compacting],
             "messages": [serde_json::to_value(wrong_message).expect("message value")],
             "stable_history_end": 1,
             "current_user_start": 1,
@@ -2222,6 +3356,12 @@ async fn compaction_on_another_branch_does_not_invalidate_the_checkpoint() {
             "boundary_event_id": events[5].event_id,
             "boundary_run_id": prior,
             "compaction_epoch": 5,
+            "prefix_node_ids": [
+                "main-prior-user-node",
+                "main-prior-assistant-node",
+                "main-prior-compaction-node"
+            ],
+            "prefix_run_ids": [prior],
             "messages": [serde_json::to_value(checkpoint_message).expect("message value")],
             "stable_history_end": 1,
             "current_user_start": 1,
@@ -3420,6 +4560,12 @@ async fn branch_agent_and_nonterminal_history_are_excluded_structurally() {
     let matching_node = NodeId::new("named-matching-node");
     let interrupted_node = NodeId::new("named-interrupted-node");
     let current_node = NodeId::new("named-current-node");
+    let inherited_command = ItemId::new("named-inherited-command");
+    let inherited_origin = UserCommandOriginV1 {
+        origin: CommandExecutionOrigin::UserCommand,
+        command_item_id: inherited_command.clone(),
+        call_id: "named-inherited-call".into(),
+    };
     let tree_scoped = |mut raw: haider_protocol::envelope::RawEnvelope,
                        branch: Option<&BranchId>,
                        owner: &AgentId| {
@@ -3464,6 +4610,25 @@ async fn branch_agent_and_nonterminal_history_are_excluded_structurally() {
     let mut tree_events = vec![
         tree_scoped(
             tree_user(&source_run, "source-user", "source prefix"),
+            None,
+            &agent,
+        ),
+        tree_scoped(
+            envelope(
+                &tree_session,
+                &source_run,
+                "source-command",
+                EventPayload::Item(ItemEvent::Completed {
+                    item_id: inherited_command,
+                    item: TurnItem::CommandExecution {
+                        call_id: "named-inherited-call".into(),
+                        command: "printf inherited".into(),
+                        status: ToolStatus::Completed,
+                        exit_code: Some(0),
+                    },
+                }),
+                PromptRender::Verbatim,
+            ),
             None,
             &agent,
         ),
@@ -3600,11 +4765,11 @@ async fn branch_agent_and_nonterminal_history_are_excluded_structurally() {
                 name: "Plan A".into(),
                 source_branch_id: None,
                 fork_node_id: source_node,
-                fork_seq: 2,
+                fork_seq: 3,
                 created_seq,
                 created_at_ms: 1,
                 head_node_id: current_node.clone(),
-                head_seq: 20,
+                head_seq: 21,
             },
         }
         .to_payload_value()
@@ -3718,6 +4883,76 @@ async fn branch_agent_and_nonterminal_history_are_excluded_structurally() {
         lineage_reads_before_increment,
         "an exact branch+agent+run suffix must reuse its indexed ancestry"
     );
+
+    // Facts are timeline-wide within each ancestry owner, not fork-limited.
+    // A main-branch origin appended after the fork can therefore reclassify a
+    // command in the inherited prefix; the named-branch cache must rebuild.
+    let mut inherited_fact = vec![
+        tree_scoped(
+            envelope(
+                &tree_session,
+                &source_run,
+                "source-command-origin-after-fork",
+                EventPayload::Item(ItemEvent::Completed {
+                    item_id: ItemId::new("named-inherited-origin-item"),
+                    item: inherited_origin.extension_item().expect("origin item"),
+                }),
+                PromptRender::Omit,
+            ),
+            None,
+            &agent,
+        ),
+        tree_scoped(
+            tree_user(
+                &current,
+                "named-current-steer-after-origin",
+                "branch current after inherited origin",
+            ),
+            Some(&branch),
+            &agent,
+        ),
+        tree_scoped(
+            tree_node(
+                &current,
+                "named-current-steer-after-origin-node",
+                Some(&NodeId::new("named-current-steer-node")),
+            ),
+            Some(&branch),
+            &agent,
+        ),
+    ];
+    StoreHandle::append(&tree_store, &mut inherited_fact)
+        .await
+        .expect("append inherited-owner retroactive fact");
+    let inherited_cached =
+        PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+            &cache,
+            &recording,
+            &artifacts,
+            &tree_session,
+            Some(&branch),
+            Some(&agent),
+            &current,
+        )
+        .await
+        .expect("rebuild named branch after inherited-owner fact");
+    let inherited_fresh = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        &tree_store,
+        &artifacts,
+        &tree_session,
+        Some(&branch),
+        Some(&agent),
+        &current,
+    )
+    .await
+    .expect("fully compile inherited-owner fact");
+    assert_eq!(inherited_cached, inherited_fresh);
+    assert!(inherited_cached.messages.iter().any(|message| {
+        message
+            .blocks
+            .iter()
+            .any(|block| matches!(block, Block::Text { text } if text.contains("printf inherited")))
+    }));
     let cached_other_agent_error =
         PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
             &cache,
