@@ -781,10 +781,21 @@ fn cancellable_exec_command() -> String {
 
 #[cfg(windows)]
 fn cancellable_exec_command() -> String {
+    // Windows PowerShell 5.1 `Start-Process` defaults to shell activation.
+    // This fixture needs a direct child so it inherits the daemon-owned Job
+    // Object; the ready marker proves that child ran in the workspace.
     windows_powershell_command(concat!(
         "$cmd=Join-Path ([Environment]::SystemDirectory) 'cmd.exe';",
-        "Start-Process -FilePath $cmd -ArgumentList '/D','/S','/C',",
-        "'ping -n 2 127.0.0.1 >nul & echo survived>descendant-survived.log';",
+        "$start=[Diagnostics.ProcessStartInfo]::new();$start.FileName=$cmd;",
+        "$start.Arguments='/D /S /C \"echo ready>descendant-started.log & ",
+        "ping -n 2 127.0.0.1 >nul & ",
+        "echo survived>descendant-survived.log\"';",
+        "$start.WorkingDirectory=(Get-Location).Path;$start.UseShellExecute=$false;",
+        "$start.CreateNoWindow=$true;$child=[Diagnostics.Process]::Start($start);",
+        "if($null -eq $child){throw 'descendant process did not start'};",
+        "while(-not [IO.File]::Exists('descendant-started.log')){",
+        "if($child.HasExited){throw 'descendant exited before its ready marker'};",
+        "Start-Sleep -Milliseconds 10};$child.Dispose();",
         "[IO.File]::AppendAllText('heartbeat.log','x',[Text.Encoding]::ASCII);",
         "[Console]::Out.Write('started');[Console]::Out.Flush();",
         "while($true){[IO.File]::AppendAllText('heartbeat.log','x',[Text.Encoding]::ASCII);",
