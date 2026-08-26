@@ -880,7 +880,7 @@ fn sweep_orphan_segments_blocking(
     let parent = base_path
         .parent()
         .ok_or_else(|| PipeNativeError("sidecar path has no parent".into()))?;
-    File::open(parent)?.sync_all()?;
+    haider_platform::sync_directory(parent)?;
     Ok(swept)
 }
 
@@ -1785,13 +1785,15 @@ async fn write_temp(mut file: File, data: String) -> Result<File, PipeNativeErro
 async fn finish_temp(file: File, temp_path: PathBuf, path: PathBuf) -> Result<(), PipeNativeError> {
     tokio::task::spawn_blocking(move || {
         file.sync_data()?;
-        std::fs::rename(&temp_path, &path).inspect_err(|_error| {
+        // Windows replacement requires the staged file handle to be closed.
+        drop(file);
+        haider_platform::replace_file(&temp_path, &path).inspect_err(|_error| {
             let _ = std::fs::remove_file(&temp_path);
         })?;
         let parent = path
             .parent()
             .ok_or_else(|| PipeNativeError("sidecar path has no parent".into()))?;
-        File::open(parent)?.sync_all()?;
+        haider_platform::sync_directory(parent)?;
         Ok(())
     })
     .await
