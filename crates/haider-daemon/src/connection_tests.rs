@@ -611,11 +611,17 @@ async fn ordered_stream_preserves_response_report_and_caught_up_order() {
     assert_eq!(response.bytes, b"watch-response");
     lane.credit(&response);
     assert_eq!(
-        lane.offer(ordered, b"monitor-caught-up".to_vec(), None),
-        SendAdmission::Sent
+        lane.offer(ordered.clone(), b"monitor-caught-up".to_vec(), None),
+        SendAdmission::Busy,
+        "the queued report still occupies the ordered lane's sole slot"
     );
     let report = lane.recv().await.expect("report second");
     assert_eq!(report.bytes, b"monitor-report");
+    assert_eq!(
+        lane.offer(ordered, b"monitor-caught-up".to_vec(), None),
+        SendAdmission::Sent,
+        "popping the report releases the ordered lane before byte credit"
+    );
     lane.credit(&report);
     let caught_up = lane.recv().await.expect("caught-up last");
     assert_eq!(caught_up.bytes, b"monitor-caught-up");

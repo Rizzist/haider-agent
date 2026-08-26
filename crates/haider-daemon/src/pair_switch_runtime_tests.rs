@@ -498,7 +498,29 @@ fn text_turn(text: &str) -> Vec<FakeStep> {
 /// revision named by GraphPinned, not the registry's newer current row.
 #[tokio::test]
 async fn pinned_loom_workflow_runs_its_next_turn_after_registry_edit() {
-    let fake_a = Arc::new(FakeProvider::new(text_turn("retained revision ran")));
+    let fake_a = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "retained-workflow-green".into(),
+            name: "graph_evidence".into(),
+            args: serde_json::json!({
+                "node": "STEP",
+                "verdict": "green",
+                "detail": "retained workflow revision completed"
+            }),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "retained-workflow-green".into(),
+        },
+        FakeStep::EmitText {
+            text: "retained revision ran".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
     let world = PairSwitchWorld::boot(
         "retained-workflow-edit",
         Arc::clone(&fake_a),
@@ -572,10 +594,27 @@ async fn pinned_loom_workflow_runs_its_next_turn_after_registry_edit() {
             "continue the pinned workflow",
         )
         .await;
+    let requests = fake_a.requests();
     assert_eq!(
-        fake_a.requests().len(),
-        1,
-        "the edited registry must not strand the pinned run before provider execution"
+        requests.len(),
+        2,
+        "the retained workflow must complete its evidence tool round-trip"
+    );
+    let first_request_text = requests[0]
+        .messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            Block::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        first_request_text.contains("loom runtime-retained rev 1")
+            && first_request_text.contains("step \"one\"")
+            && !first_request_text.contains("step \"two\""),
+        "the next turn must execute the exact retained rev 1 bytes: {first_request_text}"
     );
 
     connection.close().await.expect("connection closes");

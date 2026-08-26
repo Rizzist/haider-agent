@@ -2436,12 +2436,13 @@ fn device_discovery_goldens_are_additive_and_tolerance_re_proved() {
     // have moved.
     assert_eq!(
         frames.len() - d1_start,
-        6 + 7 + 3 + 3 + 4 + 3 + 4 + 1,
+        6 + 7 + 3 + 3 + 4 + 3 + 4 + 1 + 2,
         "six D1 frames, then T1's seven transcription frames, then U1's \
          three usage frames, then G2's three session-rename frames, then \
          G3's four session-tuning frames, F1's three fleet frames, then \
-         WIRE-GAPS' four read frames, then Slice 2's folded response — the \
-         accounted tail pins that nothing before d1_start moved"
+         WIRE-GAPS' four read frames, Slice 2's folded response, then #6's \
+         two monitor-delivery frames — the accounted tail pins that nothing \
+         before d1_start moved"
     );
     for frame in &frames[d1_start..d1_start + 6] {
         let encoded = ws_codec::encode(frame, TEST_FRAME_LIMIT).expect("encode D1 frame");
@@ -3367,7 +3368,12 @@ fn session_fleet_frames_are_additive_and_unknown_tolerant() {
             )
         })
         .expect("fleet feature welcome");
-    assert_eq!(frames.len() - fleet_start, 3 + 4 + 1);
+    assert_eq!(
+        frames.len() - fleet_start,
+        3 + 4 + 1 + 2,
+        "three fleet frames, then WIRE-GAPS' four read frames, Slice 2's \
+         folded response, and #6's two monitor-delivery frames"
+    );
     assert!(matches!(
         &frames[fleet_start],
         WireFrame::Welcome(welcome)

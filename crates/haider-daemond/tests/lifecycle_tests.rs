@@ -1780,11 +1780,10 @@ async fn drain_reason_is_truncated_to_fit_a_small_client_frame_limit() {
     let task = spawn(config.clone());
     wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
 
-    // Big enough for the REAL Welcome (its feature list grows with every
-    // wave — W7a's context-compaction feature pushed it past the old 512
-    // and the daemon rightly refused to send an over-limit frame), small
-    // enough that the 4KiB drain reason below still MUST truncate.
-    let announced = 2048;
+    // Big enough for the REAL Welcome (the additive workflow, descendant,
+    // and monitor feature tokens pushed it past 2048), but still smaller
+    // than the 4KiB-plus-label drain reason below, which MUST truncate.
+    let announced = 4096;
     let mut client = TestClient::connect(&config.endpoint_path(), config.frame_limit)
         .await
         .expect("connect");
