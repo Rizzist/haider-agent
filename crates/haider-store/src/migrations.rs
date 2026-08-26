@@ -14,7 +14,7 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 20;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 21;
 
 struct Migration {
     version: u32,
@@ -411,6 +411,25 @@ const MIGRATIONS: &[Migration] = &[
                 FOREIGN KEY (job_id) REFERENCES loom_cli_install_jobs(job_id)
                     ON DELETE CASCADE
             );
+        ",
+    },
+    Migration {
+        version: 21,
+        sql: "
+            CREATE TABLE loom_workflow_revisions (
+                id             TEXT NOT NULL,
+                rev            INTEGER NOT NULL CHECK (rev > 0),
+                digest         TEXT NOT NULL,
+                record_json    TEXT NOT NULL,
+                created_at_ms  INTEGER NOT NULL,
+                PRIMARY KEY (id, rev)
+            );
+
+            INSERT INTO loom_workflow_revisions(
+                id, rev, digest, record_json, created_at_ms
+            )
+            SELECT id, rev, digest, record_json, created_at_ms
+            FROM loom_workflows;
         ",
     },
 ];

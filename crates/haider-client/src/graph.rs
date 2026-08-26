@@ -4,9 +4,14 @@
 //! worker generation from a control attachment, while `graph.status` is a
 //! receipt-free view and needs no attachment.
 
+use std::collections::BTreeSet;
+
 use haider_protocol::graph::{GraphInspectSnapshot, GraphStatus as ConvergenceGraphStatus};
 use haider_protocol::ids::{GraphId, GraphRunSetId, ItemId, SessionId};
-use haider_rpc::{CommandId, RequestBody, ResponseBody, TodoGraphOpenedWire};
+use haider_rpc::{
+    CommandId, ERROR_CODE_REVISION_CONFLICT, ErrorData, FEATURE_WORKFLOW_INSTANCE_V1, RequestBody,
+    ResponseBody, TodoGraphOpenedWire, WorkflowInstanceV1,
+};
 
 use crate::{ClientError, RpcClient};
 
@@ -74,6 +79,14 @@ pub enum GraphClientError {
         message: String,
         retryable: bool,
     },
+    WorkflowRevisionConflict {
+        expected_digest: String,
+        current_digest: String,
+        current_revision: u32,
+        message: String,
+        retryable: bool,
+    },
+    MissingFeature(&'static str),
     Protocol(&'static str),
 }
 
@@ -82,6 +95,21 @@ impl std::fmt::Display for GraphClientError {
         match self {
             Self::Client(error) => error.fmt(formatter),
             Self::Rpc { code, message, .. } => write!(formatter, "{code}: {message}"),
+            Self::WorkflowRevisionConflict {
+                current_digest,
+                current_revision,
+                message,
+                ..
+            } => write!(
+                formatter,
+                "{message} (current workflow revision {current_revision}, digest {current_digest})"
+            ),
+            Self::MissingFeature(feature) => {
+                write!(
+                    formatter,
+                    "daemon does not advertise required feature `{feature}`"
+                )
+            }
             Self::Protocol(message) => formatter.write_str(message),
         }
     }
@@ -101,6 +129,25 @@ fn rpc_error(body: ResponseBody) -> Result<ResponseBody, GraphClientError> {
             code,
             message,
             retryable,
+            data:
+                Some(ErrorData::WorkflowRevisionConflict {
+                    expected_digest,
+                    current_digest,
+                    current_revision,
+                }),
+        } if code == ERROR_CODE_REVISION_CONFLICT => {
+            Err(GraphClientError::WorkflowRevisionConflict {
+                expected_digest,
+                current_digest,
+                current_revision,
+                message,
+                retryable,
+            })
+        }
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
             ..
         } => Err(GraphClientError::Rpc {
             code,
@@ -108,6 +155,46 @@ fn rpc_error(body: ResponseBody) -> Result<ResponseBody, GraphClientError> {
             retryable,
         }),
         body => Ok(body),
+    }
+}
+
+fn negotiated_expected_digest(
+    features: &BTreeSet<String>,
+    expected_digest: String,
+) -> Option<String> {
+    features
+        .contains(FEATURE_WORKFLOW_INSTANCE_V1)
+        .then_some(expected_digest)
+}
+
+/// Reads either the daemon's current instance for `workflow_id` or the exact
+/// retained revision named by a pinned graph's template digest.
+pub async fn workflow_instance(
+    client: &RpcClient,
+    workflow_id: String,
+    template_digest: Option<String>,
+) -> Result<Option<WorkflowInstanceV1>, GraphClientError> {
+    if !client
+        .welcome()
+        .features
+        .contains(FEATURE_WORKFLOW_INSTANCE_V1)
+    {
+        return Err(GraphClientError::MissingFeature(
+            FEATURE_WORKFLOW_INSTANCE_V1,
+        ));
+    }
+    match rpc_error(
+        client
+            .request(RequestBody::WorkflowInstance {
+                workflow_id,
+                template_digest,
+            })
+            .await?,
+    )? {
+        ResponseBody::WorkflowInstance { instance } => Ok(instance),
+        _ => Err(GraphClientError::Protocol(
+            "workflow.instance response method mismatch",
+        )),
     }
 }
 
@@ -183,6 +270,47 @@ pub async fn graph_pin_template(
     worker_generation: u64,
     template: String,
 ) -> Result<GraphPinResult, GraphClientError> {
+    graph_pin_template_with_fence(
+        client,
+        command_id,
+        session_id,
+        worker_generation,
+        template,
+        None,
+    )
+    .await
+}
+
+/// Pins with a digest fence when `workflow_instance_v1` is negotiated. An
+/// older daemon receives the legacy request with no fabricated digest.
+pub async fn graph_pin_template_fenced(
+    client: &RpcClient,
+    command_id: CommandId,
+    session_id: SessionId,
+    worker_generation: u64,
+    template: String,
+    expected_digest: String,
+) -> Result<GraphPinResult, GraphClientError> {
+    let expected_digest = negotiated_expected_digest(&client.welcome().features, expected_digest);
+    graph_pin_template_with_fence(
+        client,
+        command_id,
+        session_id,
+        worker_generation,
+        template,
+        expected_digest,
+    )
+    .await
+}
+
+async fn graph_pin_template_with_fence(
+    client: &RpcClient,
+    command_id: CommandId,
+    session_id: SessionId,
+    worker_generation: u64,
+    template: String,
+    expected_digest: Option<String>,
+) -> Result<GraphPinResult, GraphClientError> {
     match rpc_error(
         client
             .request(RequestBody::GraphPin {
@@ -190,6 +318,7 @@ pub async fn graph_pin_template(
                 session_id,
                 worker_generation,
                 template,
+                expected_digest,
             })
             .await?,
     )? {
@@ -276,6 +405,51 @@ pub async fn graph_switch(
     old_graph_id: GraphId,
     template: String,
 ) -> Result<GraphSwitchResult, GraphClientError> {
+    graph_switch_with_fence(
+        client,
+        command_id,
+        session_id,
+        worker_generation,
+        old_graph_id,
+        template,
+        None,
+    )
+    .await
+}
+
+/// Switches with a digest fence when supported, otherwise sends the exact
+/// legacy unfenced request.
+pub async fn graph_switch_fenced(
+    client: &RpcClient,
+    command_id: CommandId,
+    session_id: SessionId,
+    worker_generation: u64,
+    old_graph_id: GraphId,
+    template: String,
+    expected_digest: String,
+) -> Result<GraphSwitchResult, GraphClientError> {
+    let expected_digest = negotiated_expected_digest(&client.welcome().features, expected_digest);
+    graph_switch_with_fence(
+        client,
+        command_id,
+        session_id,
+        worker_generation,
+        old_graph_id,
+        template,
+        expected_digest,
+    )
+    .await
+}
+
+async fn graph_switch_with_fence(
+    client: &RpcClient,
+    command_id: CommandId,
+    session_id: SessionId,
+    worker_generation: u64,
+    old_graph_id: GraphId,
+    template: String,
+    expected_digest: Option<String>,
+) -> Result<GraphSwitchResult, GraphClientError> {
     match rpc_error(
         client
             .request(RequestBody::GraphSwitch {
@@ -284,6 +458,7 @@ pub async fn graph_switch(
                 worker_generation,
                 old_graph_id,
                 template,
+                expected_digest,
             })
             .await?,
     )? {
@@ -346,5 +521,25 @@ pub async fn graph_abandon(
         _ => Err(GraphClientError::Protocol(
             "graph.abandon response method mismatch",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absent_workflow_instance_feature_omits_fence_instead_of_fabricating_one() {
+        assert_eq!(
+            negotiated_expected_digest(&BTreeSet::new(), "observed-digest".into()),
+            None
+        );
+        assert_eq!(
+            negotiated_expected_digest(
+                &BTreeSet::from([FEATURE_WORKFLOW_INSTANCE_V1.to_owned()]),
+                "observed-digest".into(),
+            ),
+            Some("observed-digest".into())
+        );
     }
 }

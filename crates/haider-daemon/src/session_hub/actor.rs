@@ -627,8 +627,19 @@ pub(super) async fn run_session_actor(
                 );
                 let _ = completed.send(result);
             }
-            ActorCommand::SwitchGraph { command, completed } => {
-                let result = store.switch_graph(command).await;
+            ActorCommand::SwitchGraph {
+                command,
+                expected_digest,
+                completed,
+            } => {
+                let result = match expected_digest {
+                    Some(expected_digest) => {
+                        store
+                            .switch_graph_matching_digest(command, expected_digest)
+                            .await
+                    }
+                    None => store.switch_graph(command).await,
+                };
                 let envelopes = match &result {
                     Ok(GraphSwitchOutcome::Committed { envelopes, .. }) => {
                         Some(envelopes.as_slice())

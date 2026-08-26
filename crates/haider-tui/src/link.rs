@@ -966,6 +966,7 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             // fallback for callers that never chose.
             template: template
                 .unwrap_or_else(|| haider_protocol::graph::SHIP_LOOP_TEMPLATE.to_owned()),
+            expected_digest: None,
         },
         LiveCommand::GraphAbandon {
             command_id,

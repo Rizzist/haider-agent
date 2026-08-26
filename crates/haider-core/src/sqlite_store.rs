@@ -469,6 +469,18 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.switch_graph(&command))).await
     }
 
+    pub async fn switch_graph_matching_digest(
+        &self,
+        command: GraphSwitchCommand,
+        expected_digest: String,
+    ) -> Result<GraphSwitchOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.switch_graph_matching_digest(&command, &expected_digest))
+        })
+        .await
+    }
+
     pub async fn graph_abandon_receipt(
         &self,
         command_id: String,
@@ -1335,6 +1347,18 @@ impl SqliteStoreHandle {
     ) -> Result<Option<haider_protocol::loom::LoomWorkflow>, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.loom_workflow(&id))).await
+    }
+
+    pub async fn loom_workflow_revision(
+        &self,
+        id: String,
+        template_digest: String,
+    ) -> Result<Option<haider_protocol::loom::LoomWorkflow>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.loom_workflow_revision(&id, &template_digest))
+        })
+        .await
     }
 
     pub async fn loom_agent_type(

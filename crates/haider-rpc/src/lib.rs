@@ -83,8 +83,8 @@ pub use frame::{
     FEATURE_STORE_HEALTH_V1, FEATURE_TOOL_INVENTORY_V1, FEATURE_TRANSCRIPTION_V1,
     FEATURE_TUI_ATTACH_ANNOUNCE_V1, FEATURE_TURN_CONTROL_V1, FEATURE_TYPED_AGENT_INSTALL_V1,
     FEATURE_USAGE_HISTORY_V1, FEATURE_USAGE_REPORT_V1, FEATURE_USER_COMMAND_V1,
-    FEATURE_VAULT_STAGE_V1, FEATURE_WIRE_MSGPACK_V1, FLEET_MAX_DEPTH, FLEET_MAX_NODES,
-    FleetAgentStateWire, FleetMetricsTotalsWire, FleetNodeWire, FleetRollupWire,
+    FEATURE_VAULT_STAGE_V1, FEATURE_WIRE_MSGPACK_V1, FEATURE_WORKFLOW_INSTANCE_V1, FLEET_MAX_DEPTH,
+    FLEET_MAX_NODES, FleetAgentStateWire, FleetMetricsTotalsWire, FleetNodeWire, FleetRollupWire,
     FleetStateCountsWire, Hello, HookSummaryWire, HookTrustStateWire, LifecyclePhase, MenuInput,
     ModelDetailWire, NeedsInputKindWire, NeedsInputWire, OAuthAuthorizationWire,
     OAuthAvailabilityWire, OAuthFlowId, OAuthFlowStatusWire, OAuthImportSourceUnavailableCodeWire,
@@ -98,7 +98,7 @@ pub use frame::{
     SnapshotAvailabilityWire, StagePurpose, SubmitDisposition, SurfaceInjectOp,
     SurfaceInputPublishWire, SurfaceInputWire, SurfaceStatusPublishWire, SurfaceStatusWire,
     TodoGraphOpenedWire, WIRE_PROTOCOL_VERSION, WaitingWhyKindWire, WaitingWhyWire, Welcome,
-    WireFrame, resident_binding_token_is_valid,
+    WireFrame, WorkflowInstanceSourceV1, WorkflowInstanceV1, resident_binding_token_is_valid,
 };
 pub use haider_protocol::queue::{QueueChange, QueueDelta, QueueRow};
 pub use negotiation::{Negotiated, ServerRange, negotiate};

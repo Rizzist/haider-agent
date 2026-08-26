@@ -2192,6 +2192,22 @@ impl HubConnection {
                 }
                 self.graph_status(request_id, session_id).await
             }
+            RequestBody::WorkflowInstance {
+                workflow_id,
+                template_digest,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.workflow_instance(request_id, workflow_id, template_digest)
+                    .await
+            }
             RequestBody::LoomList {} => {
                 if let Err(message) = authorize(&self.capabilities, Operation::View) {
                     return self.respond_error(
@@ -2982,6 +2998,7 @@ impl HubConnection {
                 session_id,
                 worker_generation,
                 template,
+                expected_digest,
             } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
                     return self.respond_error(
@@ -2998,6 +3015,7 @@ impl HubConnection {
                     session_id,
                     worker_generation,
                     template,
+                    expected_digest,
                 )
                 .await
             }
@@ -3033,6 +3051,7 @@ impl HubConnection {
                 worker_generation,
                 old_graph_id,
                 template,
+                expected_digest,
             } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
                     return self.respond_error(
@@ -3050,6 +3069,7 @@ impl HubConnection {
                     worker_generation,
                     old_graph_id,
                     template,
+                    expected_digest,
                 )
                 .await
             }
@@ -6860,6 +6880,58 @@ impl HubConnection {
         })
     }
 
+    async fn workflow_instance(
+        &self,
+        request_id: RequestId,
+        workflow_id: String,
+        template_digest: Option<String>,
+    ) -> Result<(), SessionHubError> {
+        let instance = if let Some(template) = haider_protocol::graph::graph_template(&workflow_id)
+        {
+            let current_digest = haider_protocol::graph::graph_template_digest(&template);
+            template_digest
+                .as_deref()
+                .is_none_or(|expected| expected == current_digest)
+                .then(|| WorkflowInstanceV1 {
+                    id: template.name.clone(),
+                    revision: template.version,
+                    digest: None,
+                    template_digest: current_digest,
+                    pipe_version: None,
+                    source: WorkflowInstanceSourceV1::BuiltIn,
+                    node_metadata: None,
+                    compiled_template: template,
+                })
+        } else {
+            let workflow = match template_digest {
+                Some(template_digest) => {
+                    self.hub
+                        .loom_workflow_revision(&workflow_id, &template_digest)
+                        .await?
+                }
+                None => self.hub.loom_workflow(&workflow_id).await?,
+            };
+            workflow.map(|workflow| {
+                let template_digest =
+                    haider_protocol::graph::graph_template_digest(&workflow.template);
+                WorkflowInstanceV1 {
+                    id: workflow.id,
+                    revision: workflow.rev,
+                    digest: Some(workflow.digest),
+                    template_digest,
+                    pipe_version: Some(workflow.pipe_version),
+                    source: WorkflowInstanceSourceV1::User,
+                    node_metadata: Some(workflow.meta),
+                    compiled_template: workflow.template,
+                }
+            })
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::WorkflowInstance { instance },
+        })
+    }
+
     /// B1 — the Loom registry read.
     async fn loom_list(&self, request_id: RequestId) -> Result<(), SessionHubError> {
         let agent_types = match self.hub.inner.store.loom_agent_types().await {
@@ -7013,6 +7085,7 @@ impl HubConnection {
         session_id: SessionId,
         worker_generation: u64,
         template: String,
+        expected_digest: Option<String>,
     ) -> Result<(), SessionHubError> {
         if command_id.as_str().trim().is_empty() {
             return self.respond_error(
@@ -7023,12 +7096,16 @@ impl HubConnection {
                 None,
             );
         }
-        let request_json = serde_json::to_string(&serde_json::json!({
+        let mut request_value = serde_json::json!({
             "session_id": &session_id,
             "worker_generation": worker_generation,
             "template": &template,
-        }))
-        .map_err(|error| SessionHubError::Task(format!("cannot encode graph pin: {error}")))?;
+        });
+        if let Some(expected_digest) = expected_digest.as_ref() {
+            request_value["expected_digest"] = serde_json::Value::String(expected_digest.clone());
+        }
+        let request_json = serde_json::to_string(&request_value)
+            .map_err(|error| SessionHubError::Task(format!("cannot encode graph pin: {error}")))?;
         let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
         match self
             .hub
@@ -7085,7 +7162,15 @@ impl HubConnection {
             template,
             device_id: self.hub.inner.device_id.clone(),
         };
-        let pinned = match self.hub.pin_graph(command).await {
+        let result = match expected_digest {
+            Some(expected_digest) => {
+                self.hub
+                    .pin_graph_matching_digest(command, expected_digest)
+                    .await
+            }
+            None => self.hub.pin_graph(command).await,
+        };
+        let pinned = match result {
             Ok(GraphPinOutcome::Committed { pinned, .. })
             | Ok(GraphPinOutcome::IdempotentReplay { pinned }) => pinned,
             Err(SessionHubError::Store(error)) => {
@@ -7230,6 +7315,7 @@ impl HubConnection {
         worker_generation: u64,
         old_graph_id: GraphId,
         template: String,
+        expected_digest: Option<String>,
     ) -> Result<(), SessionHubError> {
         if command_id.as_str().trim().is_empty() {
             return self.respond_error(
@@ -7240,13 +7326,18 @@ impl HubConnection {
                 None,
             );
         }
-        let request_json = serde_json::to_string(&serde_json::json!({
+        let mut request_value = serde_json::json!({
             "session_id": &session_id,
             "worker_generation": worker_generation,
             "old_graph_id": &old_graph_id,
             "template": &template,
-        }))
-        .map_err(|error| SessionHubError::Task(format!("cannot encode graph switch: {error}")))?;
+        });
+        if let Some(expected_digest) = expected_digest.as_ref() {
+            request_value["expected_digest"] = serde_json::Value::String(expected_digest.clone());
+        }
+        let request_json = serde_json::to_string(&request_value).map_err(|error| {
+            SessionHubError::Task(format!("cannot encode graph switch: {error}"))
+        })?;
         let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
         match self
             .hub
@@ -7298,7 +7389,15 @@ impl HubConnection {
             template_spec: None,
             device_id: self.hub.inner.device_id.clone(),
         };
-        let switched = match self.hub.switch_graph(command).await {
+        let result = match expected_digest {
+            Some(expected_digest) => {
+                self.hub
+                    .switch_graph_matching_digest(command, expected_digest)
+                    .await
+            }
+            None => self.hub.switch_graph(command).await,
+        };
+        let switched = match result {
             Ok(GraphSwitchOutcome::Committed { switched, .. })
             | Ok(GraphSwitchOutcome::IdempotentReplay { switched }) => switched,
             Err(SessionHubError::Store(error)) => {
@@ -7421,6 +7520,39 @@ impl HubConnection {
         request_id: RequestId,
         error: HaiderError,
     ) -> Result<(), SessionHubError> {
+        if error.code == ErrorCode::RevisionConflict {
+            let expected_digest = error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("expected_digest"))
+                .and_then(serde_json::Value::as_str);
+            let current_digest = error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("current_digest"))
+                .and_then(serde_json::Value::as_str);
+            let current_revision = error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("current_revision"))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|revision| u32::try_from(revision).ok());
+            if let (Some(expected_digest), Some(current_digest), Some(current_revision)) =
+                (expected_digest, current_digest, current_revision)
+            {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_REVISION_CONFLICT,
+                    &error.message,
+                    error.retryable,
+                    Some(ErrorData::WorkflowRevisionConflict {
+                        expected_digest: expected_digest.to_owned(),
+                        current_digest: current_digest.to_owned(),
+                        current_revision,
+                    }),
+                );
+            }
+        }
         let code = match error.code {
             ErrorCode::SingleWriterViolation => ERROR_CODE_STALE_GENERATION,
             ErrorCode::SessionNotFound => ERROR_CODE_NOT_FOUND,

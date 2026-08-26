@@ -820,6 +820,7 @@ async fn run_retry_and_graph_switch_cannot_cross_the_provider_authority_boundary
             session_id: world.session_id.clone(),
             worker_generation: world.store.worker_generation(),
             template: haider_protocol::graph::SHIP_LOOP_TEMPLATE.into(),
+            expected_digest: None,
         },
     )
     .await;
@@ -848,6 +849,7 @@ async fn run_retry_and_graph_switch_cannot_cross_the_provider_authority_boundary
                 worker_generation: world.store.worker_generation(),
                 old_graph_id,
                 template: haider_protocol::graph::STAGGERED_TEMPLATE.into(),
+                expected_digest: None,
             },
         ),
     );

@@ -1,8 +1,8 @@
 # Haider client contract — revision 1
 
 Status: authoritative for wire protocol `v = 1`  
-Source snapshot: package `0.0.961`  
-N-1 compatibility baseline: `0.0.960`  
+Source snapshot: package `0.0.962` \
+N-1 compatibility baseline: `0.0.961` \
 Contract revision date: 2026-08-26
 
 This document is the client-facing contract of `haider-rpc`,
@@ -203,10 +203,10 @@ An operation not listed here is part of the v1 base surface. “Field” means t
 client may use that field only when it is present; the named token permits an
 affordance before the response exists.
 
-The ordinary v0.0.961 `welcome_features()` set contains all 78 tokens below.
+The ordinary v0.0.962 `welcome_features()` set contains all 79 tokens below.
 The re-verification anchors are
 `crates/haider-daemon/src/connection.rs:1784-1864` for the assembled set and
-`crates/haider-rpc/src/frame.rs:246-480` for the exact string constants. The
+`crates/haider-rpc/src/frame.rs:246-483` for the exact string constants. The
 one peer-specific withholding exception is §4.1.
 
 | Feature token | Methods, frames, or fields it publishes |
@@ -277,6 +277,7 @@ one peer-specific withholding exception is §4.1.
 | `convergence_graph_v3` | `graph.inspect` |
 | `convergence_graph_v4` | `graph.run_set.open` and todo child-graph telemetry |
 | `loom_v1` | `loom.list/register_agent_type/register_workflow` |
+| `workflow_instance_v1` | immutable `workflow.instance` descriptors and optional `expected_digest` fences on `graph.pin`/`graph.switch` |
 | `loom_cli_presence_v1` | `loom.list.cli_present` |
 | `typed_agent_install_v1` | `loom.install.status` and the durable required-CLI install lifecycle started by agent-type registration |
 | `session_workflow_state_v1` | `SessionObserveDigest.workflow` on `session.observe` and `session.observe_batch` |
@@ -363,6 +364,7 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | Volatile input/status | `session.surface_watch` | `SessionSurfaceWatching`, then `SessionSurfaceDelta` | complete baseline then complete latest snapshots | live publisher registry; not journaled |
 | Volatile input action | `session.input_inject` | `SessionInputInjectAck`, then owner receives `SessionInputInjected` | routed action | current live input owner |
 | Workflows and agent types | `loom.list` | `LoomList` | snapshot | persisted Loom registry; pipe source is workflow structure of record |
+| Exact workflow instance | `workflow.instance` | `WorkflowInstance` | snapshot | current registry/catalog instance by id, or an exact retained user revision by template digest |
 | Typed-agent install readiness | `loom.install.status` | `LoomInstallStatus` | reconnectable, bounded snapshot | durable install jobs and per-CLI items read from one store snapshot |
 | Todos | raw `ItemEvent` envelopes (`TurnItem` with `item: "plan"`) | no independent snapshot response | attach replay/live lifecycle | durable item lifecycle; reducer in §12 |
 
@@ -393,7 +395,8 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | `tools.inventory` | `ToolsInventory` | snapshot |
 | `hooks.list` | `HooksList` | snapshot |
 | `hooks.trust`, `hooks.revoke` | `HooksTrust`, `HooksRevoke` | durable receipts |
-| `graph.pin`, `graph.run_set.open`, `graph.switch`, `graph.abandon` | same-named response | durable receipts |
+| `graph.pin`, `graph.switch` | same-named response | durable receipts; optionally template-digest-fenced under `workflow_instance_v1` |
+| `graph.run_set.open`, `graph.abandon` | same-named response | durable receipts |
 | `graph.status`, `graph.inspect` | same-named response | snapshots |
 | `loom.register_agent_type`, `loom.register_workflow` | `LoomRegistered` (`method: "loom.registered"`) | registry mutation/no-op receipt |
 | `vault.stage` | `VaultStage` | connection-local ephemeral dedupe, deliberately not durable |
@@ -407,7 +410,7 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 The golden matrix at
 `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`, combined
 with the historical `wire_transcript.json`, pins a request and successful
-response for every one of the 78 v1 request methods. `menu.answer` and resident
+response for every one of the 79 v1 request methods. `menu.answer` and resident
 binding are top-level frames, not `RequestBody` methods.
 
 ### 5.3 Advertised runtime with no client method
@@ -792,6 +795,8 @@ or metadata-only digest.
 | create `permission_overrides` | daemon defaults |
 | create `cache_policy` | daemon/default policy |
 | create `interaction_mode` | the source-defined `interactive` enum value. A client may send `"autonomous"` only when `autonomous_interaction_v1` is advertised |
+| `workflow.instance.template_digest` | select the current instance by `workflow_id`; presence asks for that exact retained template digest |
+| `graph.pin.expected_digest`, `graph.switch.expected_digest` | legacy unfenced selection; a client MUST omit this field when `workflow_instance_v1` is absent |
 | surface publish `input` or `status` | leave that surface unchanged; empty text/line is a value |
 | branch-scoped `branch_id` | implicit main branch |
 | branch/fork `source_branch_id` | source main branch |
@@ -1629,6 +1634,73 @@ The concepts are intentionally disjoint:
   plus `parent_session_id`. It is not the workflow DAG and MUST NOT be folded
   into one client graph.
 
+### 13.4 Immutable workflow instances and selection fences
+
+`workflow_instance_v1` adds one read door and two optional mutation fences. It
+does not change `GraphStatus`, and it does not turn a registry selection into
+execution authority.
+
+The read request is `workflow.instance` with
+`workflow_id: String` and optional `template_digest: String`. Omission selects
+the current daemon catalog/registry instance by id. Presence selects the exact
+retained user-workflow revision whose compiled-template digest equals those
+bytes. The successful `WorkflowInstance` response carries
+`instance: Option<WorkflowInstanceV1>`; `None` means the requested id/digest
+does not exist in this advertised snapshot. A client MUST NOT replace `None`
+with a current row, a built-in template, or locally compiled source.
+
+`WorkflowInstanceV1` carries these independent daemon facts verbatim:
+
+| Field | Meaning |
+|---|---|
+| `id: String` | workflow/catalog id |
+| `revision: u32` | user registry revision, or the built-in compiled-template version |
+| `digest: Option<String>` | user-workflow content digest; `None` for a built-in, which has no user-registry digest |
+| `template_digest: String` | digest of the exact `compiled_template`; this is the graph-selection fence |
+| `pipe_version: Option<String>` | exact user pipe/grammar version; `None` for a built-in |
+| `source: WorkflowInstanceSourceV1` | `"built_in"`, `"user"`, or unknown-future source classification |
+| `node_metadata: Option<Vec<LoomNodeMeta>>` | exact user Loom node metadata; `None` for a built-in, not an invented empty registry record |
+| `compiled_template: GraphTemplateSpec` | exact compiled graph template selected by the daemon |
+
+The two digests MUST NOT be collapsed. `digest` binds the user workflow source
+and resolved typed-agent contracts. `template_digest` binds the compiled graph
+bytes and is the value frozen in `GraphPinned`. For built-ins, the first fact
+does not exist; copying `template_digest` into `digest` would fabricate a
+registry fact. Likewise, `node_metadata=None` and `pipe_version=None` are
+typed absence, not empty/default pipe facts.
+
+Under the advertised feature, `graph.pin` and `graph.switch` accept the
+additive optional field `expected_digest: String`. A client that presents an
+instance MUST copy its `template_digest` verbatim into that field. Resolution
+and comparison happen inside the same durable store transaction as the graph
+mutation. A mismatch returns `method: "error"`,
+`code: "revision_conflict"`, and
+`ErrorData::WorkflowRevisionConflict` with
+`kind: "workflow_revision_conflict"`, the submitted `expected_digest`, and
+the daemon's `current_digest: String` plus `current_revision: u32`. The client
+MUST re-read `workflow.instance`; it MUST NOT retry by substituting the current
+digest behind the user's selection.
+
+Committed user-workflow revisions are append-only. Editing a workflow advances
+the current revision used by new selections but retains the older compiled
+record. Runtime paths that start from a `GraphPinned` fact resolve by its
+`(template, digest)`, so an already-pinned run continues on the exact revision
+it selected. Current-by-name lookup remains the authority only for a new
+unfenced selection.
+
+Absence law: when `workflow_instance_v1` is absent, a client MUST NOT call
+`workflow.instance`, MUST omit `expected_digest`, and may use only the legacy
+unfenced `graph.pin`/`graph.switch` shape. It MUST NOT compile source, hash a
+template, copy `LoomWorkflow.digest`, or otherwise fabricate a fence. The
+unfenced fallback preserves compatibility but provides no promise that the
+registry did not move between display and selection.
+
+A workflow-instance descriptor is observation, not authority to execute an
+agent type, CLI, API, graph node, or model tool. Execution still requires the
+durable `GraphPinned` fact, the current graph reduction, and the daemon's
+typed-agent contract/install/grant checks. The workflow instance is also not
+the delegation/agent-lineage graph described above.
+
 ## 14. Forward compatibility and raw preservation
 
 Top-level unknown fields, frame kinds, request methods, and response methods
@@ -1670,7 +1742,7 @@ The machine-checkable contract lives in these fixtures/tests:
   receipts.
 - `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`: the
   methods added after the historical matrix, completing golden request and
-  successful response coverage for all 78 request methods and all five
+  successful response coverage for all 79 request methods and all five
   command dynamic slots.
 - `crates/haider-rpc/tests/fixtures/snapshot_availability_compat_v1.json`:
   old and new account/provider/usage response bytes.

@@ -5082,23 +5082,12 @@ async fn start_turn(
         .await
         .map_err(hub_error)?;
     let loom_workflow = match graph_status.as_ref() {
-        Some(status) => match lease.hub().loom_workflow(&status.template).await? {
-            Some(workflow)
-                if haider_protocol::graph::graph_template_digest(&workflow.template)
-                    == status.digest =>
-            {
-                Some(workflow)
-            }
-            Some(_) => {
-                return Err(HaiderError::new(
-                    ErrorCode::RevisionConflict,
-                    format!(
-                        "pinned Loom workflow `{}` no longer matches its registry revision; switch or re-pin it",
-                        status.template
-                    ),
-                    true,
-                ));
-            }
+        Some(status) => match lease
+            .hub()
+            .pinned_loom_workflow(&status.template, &status.digest)
+            .await?
+        {
+            Some(workflow) => Some(workflow),
             // Built-ins and one-off authored GraphTemplateSpec pins have no
             // Loom registry row and therefore no typed-node metadata.
             None => None,
@@ -8779,13 +8768,10 @@ impl BrokerToolDispatcher {
             .output
             .store
             .hub()
-            .loom_workflow(&status.template)
+            .pinned_loom_workflow(&status.template, &status.digest)
             .await?
         {
-            Some(workflow)
-                if haider_protocol::graph::graph_template_digest(&workflow.template)
-                    == status.digest =>
-            {
+            Some(workflow) => {
                 if status.is_unfinished() && !self.loom_provider_fenced {
                     return Err(HaiderError::new(
                         ErrorCode::RevisionConflict,
@@ -8794,16 +8780,6 @@ impl BrokerToolDispatcher {
                     ));
                 }
                 workflow
-            }
-            Some(_) => {
-                return Err(HaiderError::new(
-                    ErrorCode::RevisionConflict,
-                    format!(
-                        "pinned Loom workflow `{}` no longer matches its registry revision; switch or re-pin it",
-                        status.template
-                    ),
-                    true,
-                ));
             }
             None => {
                 return Ok(graph_brief.unwrap_or_default());
@@ -9463,28 +9439,18 @@ impl ToolDispatcher for BrokerToolDispatcher {
         if !status.is_unfinished() {
             return Ok(());
         }
-        let Some(workflow) = self
+        let Some(_) = self
             .output
             .store
             .hub()
-            .loom_workflow(&status.template)
+            .pinned_loom_workflow(&status.template, &status.digest)
             .await?
         else {
             return Ok(());
         };
-        if haider_protocol::graph::graph_template_digest(&workflow.template) == status.digest {
-            return Err(HaiderError::new(
-                ErrorCode::RevisionConflict,
-                "a Loom workflow was pinned after this provider turn started; retry so every tool route is rebuilt under the workflow fence",
-                true,
-            ));
-        }
         Err(HaiderError::new(
             ErrorCode::RevisionConflict,
-            format!(
-                "pinned Loom workflow `{}` no longer matches its registry revision; switch or re-pin it",
-                status.template
-            ),
+            "a Loom workflow was pinned after this provider turn started; retry so every tool route is rebuilt under the workflow fence",
             true,
         ))
     }

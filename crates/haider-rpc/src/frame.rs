@@ -404,6 +404,9 @@ pub const FEATURE_CONVERGENCE_GRAPH_V4: &str = "convergence_graph_v4";
 /// Daemon implements the Loom registry: agent types + pipe-source workflows
 /// (`loom.list`, `loom.register_agent_type`, `loom.register_workflow`).
 pub const FEATURE_LOOM_V1: &str = "loom_v1";
+/// Daemon exposes immutable built-in/user workflow-instance descriptors and
+/// accepts template-digest fences on `graph.pin` and `graph.switch`.
+pub const FEATURE_WORKFLOW_INSTANCE_V1: &str = "workflow_instance_v1";
 /// W-flow — `loom.list` carries the declared-CLI device presence map.
 pub const FEATURE_LOOM_CLI_PRESENCE_V1: &str = "loom_cli_presence_v1";
 /// Typed-agent registrations create durable required-CLI install jobs whose
@@ -495,6 +498,38 @@ pub struct TodoGraphOpenedWire {
     pub pinned_seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opened_seq: Option<u64>,
+}
+
+/// Registry class of one immutable workflow instance. This is not session
+/// lineage and does not grant execution authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WorkflowInstanceSourceV1 {
+    BuiltIn,
+    User,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Exact daemon-owned bytes describing one pinnable workflow revision.
+///
+/// `digest` is the user-workflow content digest. Built-ins have no such
+/// registry fact, so it is absent rather than copied from `template_digest`.
+/// The template digest is the fence accepted by graph selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowInstanceV1 {
+    pub id: String,
+    pub revision: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    pub template_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipe_version: Option<String>,
+    pub source: WorkflowInstanceSourceV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_metadata: Option<Vec<haider_protocol::loom::LoomNodeMeta>>,
+    pub compiled_template: haider_protocol::graph::GraphTemplateSpec,
 }
 
 /// Kind of client taking part in the handshake.
@@ -1815,6 +1850,8 @@ pub enum RequestBody {
         session_id: SessionId,
         worker_generation: u64,
         template: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_digest: Option<String>,
     },
     #[serde(rename = "graph.run_set.open")]
     GraphRunSetOpen {
@@ -1831,6 +1868,8 @@ pub enum RequestBody {
         worker_generation: u64,
         old_graph_id: GraphId,
         template: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_digest: Option<String>,
     },
     #[serde(rename = "graph.abandon")]
     GraphAbandon {
@@ -2407,6 +2446,14 @@ pub enum RequestBody {
         session_id: SessionId,
         request_id: String,
         permission: haider_protocol::permission::SystemPermission,
+    },
+    /// Resolves the current instance by id, or an exact retained revision
+    /// when `template_digest` comes from a pinned graph fact.
+    #[serde(rename = "workflow.instance")]
+    WorkflowInstance {
+        workflow_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        template_digest: Option<String>,
     },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline). W3b answers it with a protocol error, not a panic.
@@ -3035,6 +3082,11 @@ pub enum ResponseBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         data: Option<ErrorData>,
     },
+    #[serde(rename = "workflow.instance")]
+    WorkflowInstance {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance: Option<WorkflowInstanceV1>,
+    },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline).
     #[serde(other)]
@@ -3184,6 +3236,12 @@ pub enum ErrorData {
         reason: ProviderRemoveRefusalReasonWire,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         blocking_aliases: Vec<String>,
+    },
+    /// A workflow selection digest no longer names the current revision.
+    WorkflowRevisionConflict {
+        expected_digest: String,
+        current_digest: String,
+        current_revision: u32,
     },
     /// Decode artifact for a data kind this crate does not know (tolerance
     /// discipline).

@@ -39,8 +39,10 @@ pub use client::{
 pub use graph::{
     GraphAbandonResult, GraphClientError, GraphInspectPage, GraphPinResult, GraphRunSetOpenResult,
     GraphSwitchResult, graph_abandon, graph_inspect, graph_pin, graph_pin_template,
-    graph_run_set_open, graph_status, graph_switch,
+    graph_pin_template_fenced, graph_run_set_open, graph_status, graph_switch, graph_switch_fenced,
+    workflow_instance,
 };
+pub use haider_rpc::{WorkflowInstanceSourceV1, WorkflowInstanceV1};
 pub use headless::{
     DEFAULT_TERMINAL_GRACE, ERROR_CODE_NO_ACTIVE_ACCOUNT, ERROR_CODE_NO_DEFAULT_MODEL,
     HeadlessAttachment, HeadlessBackgroundTask, HeadlessBlockingReason, HeadlessEvent,

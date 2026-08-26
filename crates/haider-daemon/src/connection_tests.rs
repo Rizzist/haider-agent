@@ -214,6 +214,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_TYPED_AGENT_INSTALL_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_RUN_ID_V1.to_owned(),
             haider_rpc::FEATURE_LOOM_V1.to_owned(),
+            haider_rpc::FEATURE_WORKFLOW_INSTANCE_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_WORKFLOW_STATE_V1.to_owned(),
             haider_rpc::FEATURE_MODELS_LIST_V1.to_owned(),
             haider_rpc::FEATURE_PIPE_NATIVE_V2.to_owned(),

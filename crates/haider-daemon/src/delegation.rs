@@ -1918,13 +1918,10 @@ impl DelegationHandle {
                         let Some(status) = rollup_graph_status(&reductions, &payload) else {
                             break 'rollup;
                         };
-                        let workflow =
-                            self.hub
-                                .loom_workflow(&status.template)
-                                .await?
-                                .filter(|workflow| {
-                                    graph_template_digest(&workflow.template) == status.digest
-                                });
+                        let workflow = self
+                            .hub
+                            .pinned_loom_workflow(&status.template, &status.digest)
+                            .await?;
                         let Some(rollup) = graph_rollup(
                             &record.agent_id,
                             status,

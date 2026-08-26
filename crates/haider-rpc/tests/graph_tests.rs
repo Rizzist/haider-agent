@@ -5,9 +5,9 @@ use haider_protocol::graph::{
 };
 use haider_protocol::ids::{GraphId, GraphRunSetId, ItemId, MenuId, SessionId};
 use haider_rpc::{
-    CommandId, FEATURE_CONVERGENCE_GRAPH_V1, FEATURE_CONVERGENCE_GRAPH_V2,
-    FEATURE_CONVERGENCE_GRAPH_V3, FEATURE_CONVERGENCE_GRAPH_V4, RequestBody, ResponseBody,
-    TodoGraphOpenedWire,
+    CommandId, ErrorData, FEATURE_CONVERGENCE_GRAPH_V1, FEATURE_CONVERGENCE_GRAPH_V2,
+    FEATURE_CONVERGENCE_GRAPH_V3, FEATURE_CONVERGENCE_GRAPH_V4, FEATURE_WORKFLOW_INSTANCE_V1,
+    RequestBody, ResponseBody, TodoGraphOpenedWire, WorkflowInstanceSourceV1, WorkflowInstanceV1,
 };
 
 #[test]
@@ -16,8 +16,13 @@ fn graph_request_and_response_family_has_exact_additive_wire_shapes() {
     assert_eq!(FEATURE_CONVERGENCE_GRAPH_V2, "convergence_graph_v2");
     assert_eq!(FEATURE_CONVERGENCE_GRAPH_V3, "convergence_graph_v3");
     assert_eq!(FEATURE_CONVERGENCE_GRAPH_V4, "convergence_graph_v4");
+    assert_eq!(FEATURE_WORKFLOW_INSTANCE_V1, "workflow_instance_v1");
     let session_id = SessionId::new("session-graph");
     let graph_id = GraphId::new("graph-1");
+    let builtin_template =
+        haider_protocol::graph::graph_template(haider_protocol::graph::SHIP_LOOP_TEMPLATE)
+            .expect("built-in template");
+    let builtin_digest = haider_protocol::graph::graph_template_digest(&builtin_template);
     let cases = vec![
         (
             serde_json::to_value(RequestBody::GraphPin {
@@ -25,6 +30,7 @@ fn graph_request_and_response_family_has_exact_additive_wire_shapes() {
                 session_id: session_id.clone(),
                 worker_generation: 7,
                 template: "ship-loop".into(),
+                expected_digest: None,
             })
             .expect("pin request"),
             serde_json::json!({
@@ -33,6 +39,24 @@ fn graph_request_and_response_family_has_exact_additive_wire_shapes() {
                 "session_id": "session-graph",
                 "worker_generation": 7,
                 "template": "ship-loop"
+            }),
+        ),
+        (
+            serde_json::to_value(RequestBody::GraphPin {
+                command_id: CommandId::new("pin-command-fenced"),
+                session_id: session_id.clone(),
+                worker_generation: 7,
+                template: "ship-loop".into(),
+                expected_digest: Some("blake3:observed".into()),
+            })
+            .expect("fenced pin request"),
+            serde_json::json!({
+                "method": "graph.pin",
+                "command_id": "pin-command-fenced",
+                "session_id": "session-graph",
+                "worker_generation": 7,
+                "template": "ship-loop",
+                "expected_digest": "blake3:observed"
             }),
         ),
         (
@@ -55,11 +79,71 @@ fn graph_request_and_response_family_has_exact_additive_wire_shapes() {
         ),
         (
             serde_json::to_value(RequestBody::GraphSwitch {
+                command_id: CommandId::new("switch-command-fenced"),
+                session_id: session_id.clone(),
+                worker_generation: 7,
+                old_graph_id: graph_id.clone(),
+                template: "staggered".into(),
+                expected_digest: Some("blake3:observed-replacement".into()),
+            })
+            .expect("fenced switch request"),
+            serde_json::json!({
+                "method": "graph.switch",
+                "command_id": "switch-command-fenced",
+                "session_id": "session-graph",
+                "worker_generation": 7,
+                "old_graph_id": "graph-1",
+                "template": "staggered",
+                "expected_digest": "blake3:observed-replacement"
+            }),
+        ),
+        (
+            serde_json::to_value(RequestBody::WorkflowInstance {
+                workflow_id: "ship-loop".into(),
+                template_digest: Some(builtin_digest.clone()),
+            })
+            .expect("workflow instance request"),
+            serde_json::json!({
+                "method": "workflow.instance",
+                "workflow_id": "ship-loop",
+                "template_digest": builtin_digest
+            }),
+        ),
+        (
+            serde_json::to_value(ResponseBody::WorkflowInstance {
+                instance: Some(WorkflowInstanceV1 {
+                    id: builtin_template.name.clone(),
+                    revision: builtin_template.version,
+                    digest: None,
+                    template_digest: haider_protocol::graph::graph_template_digest(
+                        &builtin_template,
+                    ),
+                    pipe_version: None,
+                    source: WorkflowInstanceSourceV1::BuiltIn,
+                    node_metadata: None,
+                    compiled_template: builtin_template.clone(),
+                }),
+            })
+            .expect("workflow instance response"),
+            serde_json::json!({
+                "method": "workflow.instance",
+                "instance": {
+                    "id": builtin_template.name,
+                    "revision": builtin_template.version,
+                    "template_digest": haider_protocol::graph::graph_template_digest(&builtin_template),
+                    "source": "built_in",
+                    "compiled_template": builtin_template
+                }
+            }),
+        ),
+        (
+            serde_json::to_value(RequestBody::GraphSwitch {
                 command_id: CommandId::new("switch-command"),
                 session_id: session_id.clone(),
                 worker_generation: 7,
                 old_graph_id: graph_id.clone(),
                 template: "staggered".into(),
+                expected_digest: None,
             })
             .expect("switch request"),
             serde_json::json!({
@@ -363,5 +447,40 @@ fn old_method_decoders_and_new_graph_decoders_remain_tolerant() {
         "future_field": {"ignored": true}
     }))
     .expect("new graph decoder ignores future object fields");
-    assert!(matches!(pin, RequestBody::GraphPin { .. }));
+    assert!(matches!(
+        pin,
+        RequestBody::GraphPin {
+            expected_digest: None,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn workflow_revision_conflict_is_typed_and_carries_current_authority() {
+    let body = ResponseBody::Error {
+        code: haider_rpc::ERROR_CODE_REVISION_CONFLICT.into(),
+        message: "workflow changed before selection".into(),
+        retryable: false,
+        data: Some(ErrorData::WorkflowRevisionConflict {
+            expected_digest: "old-template-digest".into(),
+            current_digest: "current-template-digest".into(),
+            current_revision: 9,
+        }),
+    };
+    assert_eq!(
+        serde_json::to_value(body).expect("conflict encodes"),
+        serde_json::json!({
+            "method": "error",
+            "code": "revision_conflict",
+            "message": "workflow changed before selection",
+            "retryable": false,
+            "data": {
+                "kind": "workflow_revision_conflict",
+                "expected_digest": "old-template-digest",
+                "current_digest": "current-template-digest",
+                "current_revision": 9
+            }
+        })
+    );
 }

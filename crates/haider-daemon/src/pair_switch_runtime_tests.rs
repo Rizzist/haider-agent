@@ -494,6 +494,94 @@ fn text_turn(text: &str) -> Vec<FakeStep> {
     ]
 }
 
+/// ITEM #3 strand regression: `start_turn` must resolve the immutable Loom
+/// revision named by GraphPinned, not the registry's newer current row.
+#[tokio::test]
+async fn pinned_loom_workflow_runs_its_next_turn_after_registry_edit() {
+    let fake_a = Arc::new(FakeProvider::new(text_turn("retained revision ran")));
+    let world = PairSwitchWorld::boot(
+        "retained-workflow-edit",
+        Arc::clone(&fake_a),
+        Arc::new(FakeProvider::new(Vec::new())),
+    )
+    .await;
+    world
+        .store
+        .loom_register_workflow("runtime-retained: A -> A\nstep \"one\" :cmd".into())
+        .await
+        .expect("register rev 1");
+    let first = world
+        .store
+        .loom_workflow("runtime-retained".into())
+        .await
+        .expect("read rev 1")
+        .expect("rev 1 exists");
+    let first_digest = haider_protocol::graph::graph_template_digest(&first.template);
+
+    let sink = Arc::new(GraphSelectionSink::default());
+    let connection = world
+        .hub
+        .open_connection(
+            BTreeSet::from([Capability::View, Capability::Control]),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("graph control connection");
+    connection
+        .request(
+            RequestId::new("retained-workflow-attach"),
+            RequestBody::SessionAttach {
+                session_id: world.session_id.clone(),
+                after_seq: 0,
+                mode: AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("attach graph control");
+    connection
+        .request(
+            RequestId::new("retained-workflow-pin"),
+            RequestBody::GraphPin {
+                command_id: CommandId::new("retained-workflow-pin-command"),
+                session_id: world.session_id.clone(),
+                worker_generation: world.store.worker_generation(),
+                template: "runtime-retained".into(),
+                expected_digest: Some(first_digest.clone()),
+            },
+        )
+        .await
+        .expect("fenced graph pin routes");
+    let Some(ResponseBody::GraphPin { digest, .. }) =
+        graph_response(&sink, "retained-workflow-pin")
+    else {
+        panic!("rev 1 graph pin succeeds")
+    };
+    assert_eq!(digest, first_digest);
+
+    let revised = world
+        .store
+        .loom_register_workflow("runtime-retained: A -> A\nstep \"two\" :cmd".into())
+        .await
+        .expect("register rev 2");
+    assert_eq!(revised.rev, 2);
+
+    world
+        .run_turn(
+            "retained-workflow-next-turn",
+            "continue the pinned workflow",
+        )
+        .await;
+    assert_eq!(
+        fake_a.requests().len(),
+        1,
+        "the edited registry must not strand the pinned run before provider execution"
+    );
+
+    connection.close().await.expect("connection closes");
+    world.shutdown().await;
+}
+
 /// LAW: an authentication wall with no within-provider alternate commits the
 /// exact receipted pair-selection transaction, surfaces both the cold epoch
 /// and human-readable hop reason, and finishes the SAME run on provider B.
@@ -1128,6 +1216,7 @@ async fn manual_compaction_and_graph_switch_cannot_cross_the_idle_boundary() {
                 session_id: world.session_id.clone(),
                 worker_generation: world.store.worker_generation(),
                 template: haider_protocol::graph::SHIP_LOOP_TEMPLATE.into(),
+                expected_digest: None,
             },
         )
         .await
@@ -1157,6 +1246,7 @@ async fn manual_compaction_and_graph_switch_cannot_cross_the_idle_boundary() {
                     worker_generation: world.store.worker_generation(),
                     old_graph_id,
                     template: haider_protocol::graph::STAGGERED_TEMPLATE.into(),
+                    expected_digest: None,
                 },
             )
             .await

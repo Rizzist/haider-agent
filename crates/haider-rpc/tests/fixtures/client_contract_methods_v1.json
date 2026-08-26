@@ -86,6 +86,12 @@
       "response": {"method":"graph.status"}
     },
     {
+      "request_method": "workflow.instance",
+      "response_method": "workflow.instance",
+      "request": {"method":"workflow.instance","workflow_id":"review","template_digest":"template-digest-review-v4"},
+      "response": {"method":"workflow.instance","instance":{"id":"review","revision":4,"digest":"workflow-digest-review-v4","template_digest":"template-digest-review-v4","pipe_version":"pipe/v1","source":"user","node_metadata":[{"source_name":"check","node":"CHECK","task":"Review exactly"}],"compiled_template":{"name":"review","version":4,"start_node":"CHECK","nodes":[{"name":"CHECK","gate":{"kind":"command-green"},"executor":"inline","max_attempts":4}]}}}
+    },
+    {
       "request_method": "loom.list",
       "response_method": "loom.list",
       "request": {"method":"loom.list"},

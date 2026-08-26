@@ -1889,6 +1889,7 @@ async fn graph_pin_rpc_replays_its_receipt_before_control_attachment_validation(
         session_id: session_id.clone(),
         worker_generation: store.worker_generation(),
         template: haider_protocol::graph::SHIP_LOOP_TEMPLATE.into(),
+        expected_digest: None,
     };
     first
         .request(RequestId::new("graph-pin-first"), request.clone())
@@ -1929,6 +1930,175 @@ async fn graph_pin_rpc_replays_its_receipt_before_control_attachment_validation(
     store.close().await.expect("store closes");
 }
 
+/// ITEM #3 harness: a pinned rev remains addressable after registry edit,
+/// while fresh pin/switch requests fenced to that stale digest return the
+/// typed current digest + revision instead of selecting different bytes.
+#[tokio::test]
+async fn workflow_instance_rpc_retains_pinned_revision_and_fences_pin_and_switch() {
+    let (_root, store, hub) = open_hub(None, 16).await;
+    store
+        .loom_register_workflow("rpc-retained: A -> A\nstep \"one\" :cmd".into())
+        .await
+        .expect("register rev 1");
+    let first = store
+        .loom_workflow("rpc-retained".into())
+        .await
+        .expect("read rev 1")
+        .expect("rev 1 exists");
+    let first_digest = haider_protocol::graph::graph_template_digest(&first.template);
+
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    let pinned_session = SessionId::new("workflow-instance-pinned");
+    create_and_attach_typed_session(&store, &connection, &sink, &pinned_session, "fake").await;
+    connection
+        .request(
+            RequestId::new("workflow-instance-pin-rev-1"),
+            RequestBody::GraphPin {
+                command_id: CommandId::new("workflow-instance-pin-rev-1-command"),
+                session_id: pinned_session.clone(),
+                worker_generation: store.worker_generation(),
+                template: "rpc-retained".into(),
+                expected_digest: Some(first_digest.clone()),
+            },
+        )
+        .await
+        .expect("fenced pin routes");
+    let (old_graph_id, pinned_digest) = loop {
+        if let WireFrame::Response {
+            body: ResponseBody::GraphPin {
+                graph_id, digest, ..
+            },
+            ..
+        } = sink.next().await
+        {
+            break (graph_id, digest);
+        }
+    };
+    assert_eq!(pinned_digest, first_digest);
+
+    store
+        .loom_register_workflow("rpc-retained: A -> A\nstep \"two\" :cmd".into())
+        .await
+        .expect("register rev 2");
+    let current = store
+        .loom_workflow("rpc-retained".into())
+        .await
+        .expect("read rev 2")
+        .expect("rev 2 exists");
+    let current_digest = haider_protocol::graph::graph_template_digest(&current.template);
+
+    connection
+        .request(
+            RequestId::new("workflow-instance-read-pinned"),
+            RequestBody::WorkflowInstance {
+                workflow_id: "rpc-retained".into(),
+                template_digest: Some(pinned_digest.clone()),
+            },
+        )
+        .await
+        .expect("historical instance read routes");
+    let WireFrame::Response {
+        body: ResponseBody::WorkflowInstance { instance },
+        ..
+    } = sink.next().await
+    else {
+        panic!("expected workflow.instance response");
+    };
+    let instance = instance.expect("retained revision descriptor");
+    assert_eq!(instance.id, "rpc-retained");
+    assert_eq!(instance.revision, 1);
+    assert_eq!(instance.digest.as_deref(), Some(first.digest.as_str()));
+    assert_eq!(instance.template_digest, pinned_digest);
+    assert_eq!(
+        instance.pipe_version.as_deref(),
+        Some(first.pipe_version.as_str())
+    );
+    assert_eq!(instance.source, haider_rpc::WorkflowInstanceSourceV1::User);
+    assert_eq!(instance.node_metadata.as_ref(), Some(&first.meta));
+    assert_eq!(instance.compiled_template, first.template);
+
+    let stale_session = SessionId::new("workflow-instance-stale-pin");
+    create_and_attach_typed_session(&store, &connection, &sink, &stale_session, "fake").await;
+    connection
+        .request(
+            RequestId::new("workflow-instance-stale-pin"),
+            RequestBody::GraphPin {
+                command_id: CommandId::new("workflow-instance-stale-pin-command"),
+                session_id: stale_session,
+                worker_generation: store.worker_generation(),
+                template: "rpc-retained".into(),
+                expected_digest: Some(pinned_digest.clone()),
+            },
+        )
+        .await
+        .expect("stale pin routes");
+    let WireFrame::Response {
+        body:
+            ResponseBody::Error {
+                code,
+                data:
+                    Some(ErrorData::WorkflowRevisionConflict {
+                        expected_digest,
+                        current_digest: reported_digest,
+                        current_revision,
+                    }),
+                ..
+            },
+        ..
+    } = sink.next().await
+    else {
+        panic!("expected typed stale-pin conflict");
+    };
+    assert_eq!(code, haider_rpc::ERROR_CODE_REVISION_CONFLICT);
+    assert_eq!(expected_digest, pinned_digest);
+    assert_eq!(reported_digest, current_digest);
+    assert_eq!(current_revision, 2);
+
+    connection
+        .request(
+            RequestId::new("workflow-instance-stale-switch"),
+            RequestBody::GraphSwitch {
+                command_id: CommandId::new("workflow-instance-stale-switch-command"),
+                session_id: pinned_session,
+                worker_generation: store.worker_generation(),
+                old_graph_id,
+                template: "rpc-retained".into(),
+                expected_digest: Some(pinned_digest.clone()),
+            },
+        )
+        .await
+        .expect("stale switch routes");
+    let WireFrame::Response {
+        body:
+            ResponseBody::Error {
+                data:
+                    Some(ErrorData::WorkflowRevisionConflict {
+                        current_digest: reported_digest,
+                        current_revision,
+                        ..
+                    }),
+                ..
+            },
+        ..
+    } = sink.next().await
+    else {
+        panic!("expected typed stale-switch conflict");
+    };
+    assert_eq!(reported_digest, current_digest);
+    assert_eq!(current_revision, 2);
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
 /// Native workflow selection and turn admission share one serialization
 /// boundary: once the accepted run is nonterminal, neither pin nor switch can
 /// alter the authority of an already assembled provider request.
@@ -1964,6 +2134,7 @@ async fn graph_pin_and_switch_refuse_nonterminal_sessions() {
                 session_id: pin_session.clone(),
                 worker_generation: store.worker_generation(),
                 template: haider_protocol::graph::SHIP_LOOP_TEMPLATE.into(),
+                expected_digest: None,
             },
         )
         .await
@@ -1991,6 +2162,7 @@ async fn graph_pin_and_switch_refuse_nonterminal_sessions() {
                 session_id: switch_session.clone(),
                 worker_generation: store.worker_generation(),
                 template: haider_protocol::graph::SHIP_LOOP_TEMPLATE.into(),
+                expected_digest: None,
             },
         )
         .await
@@ -2022,6 +2194,7 @@ async fn graph_pin_and_switch_refuse_nonterminal_sessions() {
                 worker_generation: store.worker_generation(),
                 old_graph_id,
                 template: haider_protocol::graph::SHIP_LOOP_TEMPLATE.into(),
+                expected_digest: None,
             },
         )
         .await
@@ -2066,6 +2239,7 @@ async fn graph_abandon_rpc_replays_its_receipt_before_control_attachment_validat
                 session_id: session_id.clone(),
                 worker_generation: store.worker_generation(),
                 template: haider_protocol::graph::SHIP_LOOP_TEMPLATE.into(),
+                expected_digest: None,
             },
         )
         .await

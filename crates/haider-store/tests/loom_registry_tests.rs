@@ -8,8 +8,8 @@ use haider_protocol::ids::{DeviceId, EventId, GraphId, SessionId};
 use haider_protocol::loom::LoomAgentType;
 use haider_protocol::typed_agent::{TYPED_AGENT_INSTALL_STATUS_MAX_JOBS, TypedAgentInstallState};
 use haider_store::{
-    ErrorCode, GraphPinCommand, GraphPinOutcome, SessionCreateCommand, Store, TypedAgentInstallCas,
-    TypedAgentInstallItemCas,
+    ErrorCode, GraphPinCommand, GraphPinOutcome, GraphSwitchCommand, SessionCreateCommand, Store,
+    TypedAgentInstallCas, TypedAgentInstallItemCas,
 };
 
 fn agent_type(id: &str, in_type: &str, out_type: &str) -> LoomAgentType {
@@ -515,6 +515,281 @@ fn registered_workflow_is_pinnable_by_name() {
         panic!("fresh pin must commit");
     };
     assert_eq!(pinned.template, "clip-flow");
+}
+
+/// ITEM #3 MUTATION CHECK: overwrite the sole registry row without archiving
+/// it, or make pinned execution resolve current-by-name. The rev-1 lookup by
+/// the digest frozen in the pin disappears (the original strand bug).
+#[test]
+fn pinned_workflow_revision_survives_registry_edit_and_stale_fences_name_current() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("open");
+    store
+        .loom_register_workflow("retained: A -> A\nstep \"one\" :cmd")
+        .expect("register rev 1");
+    let first = store
+        .loom_workflow("retained")
+        .expect("read rev 1")
+        .expect("rev 1 exists");
+    let first_template_digest = haider_protocol::graph::graph_template_digest(&first.template);
+
+    let session_id = SessionId::new("retained-revision-session");
+    store
+        .create_session(&SessionCreateCommand {
+            command_id: "create-retained-revision".into(),
+            request_digest: "create-retained-revision-digest".into(),
+            request_json: r#"{"session":"retained-revision"}"#.into(),
+            session_id: session_id.clone(),
+            cwd: "/tmp".into(),
+            provider: "fake".into(),
+            model: "fake-v1".into(),
+            max_tokens: 4096,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: "loom-test-v1".into(),
+            event_id: EventId::new("created-retained-revision"),
+            device_id: DeviceId::new("loom-test"),
+        })
+        .expect("create session");
+    let pin = store
+        .pin_graph_matching_digest(
+            &GraphPinCommand {
+                command_id: "pin-retained-rev-1".into(),
+                request_digest: "pin-retained-rev-1-digest".into(),
+                request_json: r#"{"template":"retained","expected":"rev-1"}"#.into(),
+                session_id: session_id.clone(),
+                worker_generation: store.worker_generation(),
+                graph_id: GraphId::new("graph-retained-rev-1"),
+                template: "retained".into(),
+                device_id: DeviceId::new("loom-test"),
+            },
+            &first_template_digest,
+        )
+        .expect("pin rev 1");
+    let pinned = match pin {
+        GraphPinOutcome::Committed { pinned, .. }
+        | GraphPinOutcome::IdempotentReplay { pinned } => pinned,
+    };
+
+    let revised = store
+        .loom_register_workflow("retained: A -> A\nstep \"two\" :cmd")
+        .expect("register rev 2");
+    assert_eq!(revised.rev, 2);
+    let current = store
+        .loom_workflow("retained")
+        .expect("read current")
+        .expect("current exists");
+    let current_template_digest = haider_protocol::graph::graph_template_digest(&current.template);
+
+    drop(store);
+    let store = Store::open(root.path()).expect("reopen with retained revisions");
+
+    let retained = store
+        .loom_workflow_revision("retained", &pinned.digest)
+        .expect("read pinned revision")
+        .expect("pinned revision remains executable");
+    assert_eq!(retained.rev, 1);
+    assert_eq!(retained.source, "retained: A -> A\nstep \"one\" :cmd");
+    assert_ne!(pinned.digest, current_template_digest);
+
+    let stale_pin = store
+        .pin_graph_matching_digest(
+            &GraphPinCommand {
+                command_id: "pin-stale-retained".into(),
+                request_digest: "pin-stale-retained-digest".into(),
+                request_json: r#"{"template":"retained","expected":"stale"}"#.into(),
+                session_id: session_id.clone(),
+                worker_generation: store.worker_generation(),
+                graph_id: GraphId::new("graph-stale-retained"),
+                template: "retained".into(),
+                device_id: DeviceId::new("loom-test"),
+            },
+            &first_template_digest,
+        )
+        .expect_err("stale pin fence rejects");
+    assert_eq!(stale_pin.code, ErrorCode::RevisionConflict);
+    assert_eq!(
+        stale_pin
+            .details
+            .as_ref()
+            .and_then(|value| value["current_revision"].as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        stale_pin
+            .details
+            .as_ref()
+            .and_then(|value| value["current_digest"].as_str()),
+        Some(current_template_digest.as_str())
+    );
+
+    let stale_switch = store
+        .switch_graph_matching_digest(
+            &GraphSwitchCommand {
+                command_id: "switch-stale-retained".into(),
+                request_digest: "switch-stale-retained-digest".into(),
+                request_json: r#"{"template":"retained","expected":"stale"}"#.into(),
+                session_id,
+                worker_generation: store.worker_generation(),
+                old_graph_id: pinned.graph_id,
+                new_graph_id: GraphId::new("graph-replacement-retained"),
+                template: "retained".into(),
+                template_spec: None,
+                device_id: DeviceId::new("loom-test"),
+            },
+            &first_template_digest,
+        )
+        .expect_err("stale switch fence rejects");
+    assert_eq!(stale_switch.code, ErrorCode::RevisionConflict);
+    assert_eq!(
+        stale_switch
+            .details
+            .as_ref()
+            .and_then(|value| value["current_revision"].as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        stale_switch
+            .details
+            .as_ref()
+            .and_then(|value| value["current_digest"].as_str()),
+        Some(current_template_digest.as_str())
+    );
+
+    let reverted = store
+        .loom_register_workflow("retained: A -> A\nstep \"one\" :cmd")
+        .expect("register content reversion");
+    assert_eq!(reverted.rev, 3);
+    let retained_after_reversion = store
+        .loom_workflow_revision("retained", &pinned.digest)
+        .expect("read retained revision after reversion")
+        .expect("rev 1 remains distinct from reverted rev 3");
+    assert_eq!(retained_after_reversion.rev, 1);
+    assert_eq!(
+        retained_after_reversion.source,
+        "retained: A -> A\nstep \"one\" :cmd"
+    );
+}
+
+/// ITEM #3 upgrade mutation check: migration 21 backfills the single v20
+/// current row as an immutable revision. A later pre-stamp heal must append a
+/// new current instance instead of rewriting the digest already in a pin.
+#[test]
+fn migration_backfill_and_legacy_heal_preserve_the_pinned_digest() {
+    let root = tempfile::tempdir().expect("profile");
+    let (database_path, legacy_json) = {
+        let store = Store::open(root.path()).expect("open");
+        store
+            .loom_register_workflow("legacy-retained: A -> A\nstep \"one\" :cmd")
+            .expect("register rev 1");
+        let registration = store
+            .loom_register_workflow("legacy-retained: A -> A\nstep \"two\" :cmd")
+            .expect("register rev 2");
+        assert_eq!(registration.rev, 2);
+        let mut legacy = store
+            .loom_workflow("legacy-retained")
+            .expect("read rev 2")
+            .expect("rev 2 exists");
+        legacy.template.version = 1;
+        (
+            store.database_path().to_path_buf(),
+            serde_json::to_string(&legacy).expect("encode legacy workflow"),
+        )
+    };
+
+    // Plant the exact shape a v20 database could contain: one current rev-2
+    // row whose compiled template predates revision stamping, and no history
+    // table. Reopening must run migration 21 and archive those exact bytes.
+    let raw = rusqlite::Connection::open(&database_path).expect("open legacy database");
+    raw.execute(
+        "UPDATE loom_workflows SET record_json = ?2 WHERE id = ?1",
+        rusqlite::params!["legacy-retained", legacy_json],
+    )
+    .expect("plant pre-stamp row");
+    raw.execute_batch(
+        "DROP TABLE loom_workflow_revisions;
+         DELETE FROM schema_migrations WHERE version = 21;
+         PRAGMA user_version = 20;",
+    )
+    .expect("rewind migration 21 fixture");
+    drop(raw);
+
+    let store = Store::open(root.path()).expect("migrate legacy database");
+    assert_eq!(store.schema_version().expect("schema version"), 21);
+    let legacy = store
+        .loom_workflow("legacy-retained")
+        .expect("read migrated current")
+        .expect("migrated current exists");
+    assert_eq!(legacy.rev, 2);
+    assert_eq!(legacy.template.version, 1);
+    let legacy_digest = haider_protocol::graph::graph_template_digest(&legacy.template);
+
+    let session_id = SessionId::new("legacy-retained-session");
+    store
+        .create_session(&SessionCreateCommand {
+            command_id: "create-legacy-retained".into(),
+            request_digest: "create-legacy-retained-digest".into(),
+            request_json: r#"{"session":"legacy-retained"}"#.into(),
+            session_id: session_id.clone(),
+            cwd: "/tmp".into(),
+            provider: "fake".into(),
+            model: "fake-v1".into(),
+            max_tokens: 4096,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: "loom-test-v1".into(),
+            event_id: EventId::new("created-legacy-retained"),
+            device_id: DeviceId::new("loom-test"),
+        })
+        .expect("create legacy pin session");
+    let pinned = store
+        .pin_graph_matching_digest(
+            &GraphPinCommand {
+                command_id: "pin-legacy-retained".into(),
+                request_digest: "pin-legacy-retained-digest".into(),
+                request_json: r#"{"template":"legacy-retained"}"#.into(),
+                session_id,
+                worker_generation: store.worker_generation(),
+                graph_id: GraphId::new("graph-legacy-retained"),
+                template: "legacy-retained".into(),
+                device_id: DeviceId::new("loom-test"),
+            },
+            &legacy_digest,
+        )
+        .expect("pin migrated pre-stamp instance");
+    let pinned = match pinned {
+        GraphPinOutcome::Committed { pinned, .. }
+        | GraphPinOutcome::IdempotentReplay { pinned } => pinned,
+    };
+
+    let healed = store
+        .loom_register_workflow("legacy-retained: A -> A\nstep \"two\" :cmd")
+        .expect("append healed current revision");
+    assert_eq!((healed.rev, healed.updated), (3, true));
+    let retained = store
+        .loom_workflow_revision("legacy-retained", &pinned.digest)
+        .expect("read migrated pinned revision")
+        .expect("pre-heal pinned digest remains retained");
+    assert_eq!(retained.rev, 2);
+    assert_eq!(retained.template.version, 1);
+    assert_eq!(
+        haider_protocol::graph::graph_template_digest(&retained.template),
+        pinned.digest
+    );
+    let current = store
+        .loom_workflow("legacy-retained")
+        .expect("read healed current")
+        .expect("healed current exists");
+    assert_eq!(current.rev, 3);
+    assert_eq!(current.template.version, 3);
+    assert_ne!(
+        haider_protocol::graph::graph_template_digest(&current.template),
+        pinned.digest
+    );
 }
 
 /// Review round 2 MUTATION CHECK: stop stamping `template.version = rev`, or

@@ -150,7 +150,8 @@ use haider_rpc::{
     ProtocolError, RequestBody, RequestId, ResponseBody, SURFACE_INPUT_MAX_BYTES,
     SURFACE_STATUS_MAX_BYTES, SeqRange, SessionReadResult, SessionSummary, SubmitDisposition,
     SurfaceInjectOp, SurfaceInputPublishWire, SurfaceInputWire, SurfaceStatusPublishWire,
-    SurfaceStatusWire, TodoGraphOpenedWire, WireFrame,
+    SurfaceStatusWire, TodoGraphOpenedWire, WireFrame, WorkflowInstanceSourceV1,
+    WorkflowInstanceV1,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -1279,6 +1280,7 @@ enum ActorCommand {
     },
     SwitchGraph {
         command: GraphSwitchCommand,
+        expected_digest: Option<String>,
         completed: oneshot::Sender<Result<GraphSwitchOutcome, HaiderError>>,
     },
     AbandonGraph {
@@ -2072,6 +2074,41 @@ impl SessionHub {
         id: &str,
     ) -> Result<Option<haider_protocol::loom::LoomWorkflow>, HaiderError> {
         self.inner.store.loom_workflow(id.to_owned()).await
+    }
+
+    /// Resolves the immutable registry revision named by a pinned graph fact.
+    pub(crate) async fn loom_workflow_revision(
+        &self,
+        id: &str,
+        template_digest: &str,
+    ) -> Result<Option<haider_protocol::loom::LoomWorkflow>, HaiderError> {
+        self.inner
+            .store
+            .loom_workflow_revision(id.to_owned(), template_digest.to_owned())
+            .await
+    }
+
+    /// Runtime-only exact lookup. A current registry row without the pinned
+    /// historical revision is corruption, never permission to execute the
+    /// graph as an untyped built-in/one-off template.
+    pub(crate) async fn pinned_loom_workflow(
+        &self,
+        id: &str,
+        template_digest: &str,
+    ) -> Result<Option<haider_protocol::loom::LoomWorkflow>, HaiderError> {
+        if let Some(workflow) = self.loom_workflow_revision(id, template_digest).await? {
+            return Ok(Some(workflow));
+        }
+        if self.loom_workflow(id).await?.is_some() {
+            return Err(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                format!(
+                    "pinned Loom workflow `{id}` revision `{template_digest}` is missing from history"
+                ),
+                false,
+            ));
+        }
+        Ok(None)
     }
 
     /// C2 — one registered Loom agent type (typed spawns).
@@ -3009,7 +3046,33 @@ impl SessionHub {
         let (completed, result) = oneshot::channel();
         actor
             .commands
-            .send(ActorCommand::SwitchGraph { command, completed })
+            .send(ActorCommand::SwitchGraph {
+                command,
+                expected_digest: None,
+                completed,
+            })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn switch_graph_matching_digest(
+        &self,
+        command: GraphSwitchCommand,
+        expected_digest: String,
+    ) -> Result<GraphSwitchOutcome, SessionHubError> {
+        let actor = self.actor_for(command.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::SwitchGraph {
+                command,
+                expected_digest: Some(expected_digest),
+                completed,
+            })
             .await
             .map_err(|_| SessionHubError::Closed)?;
         result

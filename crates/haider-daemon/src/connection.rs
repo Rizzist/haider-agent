@@ -1804,6 +1804,7 @@ fn welcome_features() -> BTreeSet<String> {
         FEATURE_CONVERGENCE_GRAPH_V3.to_owned(),
         FEATURE_CONVERGENCE_GRAPH_V4.to_owned(),
         FEATURE_LOOM_V1.to_owned(),
+        haider_rpc::FEATURE_WORKFLOW_INSTANCE_V1.to_owned(),
         FEATURE_LOOM_CLI_PRESENCE_V1.to_owned(),
         FEATURE_TYPED_AGENT_INSTALL_V1.to_owned(),
         FEATURE_SESSION_WORKFLOW_STATE_V1.to_owned(),

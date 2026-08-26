@@ -2059,6 +2059,54 @@ impl Store {
             .transpose()
     }
 
+    /// Reads one immutable registered-workflow revision by the exact template
+    /// digest frozen in `GraphPinned`. Current-by-name selection and pinned
+    /// execution deliberately use different doors: editing a registry row
+    /// must never change the bytes an already-pinned graph executes.
+    pub fn loom_workflow_revision(
+        &self,
+        id: &str,
+        template_digest: &str,
+    ) -> StoreResult<Option<LoomWorkflow>> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT rev, digest, record_json FROM loom_workflow_revisions
+                 WHERE id = ?1 ORDER BY rev DESC",
+            )
+            .map_err(map_sqlite_error)?;
+        let rows = statement
+            .query_map([id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(map_sqlite_error)?;
+        for row in rows {
+            let (revision, digest, json) = row.map_err(map_sqlite_error)?;
+            let workflow: LoomWorkflow = serde_json::from_str(&json)
+                .map_err(|_| corrupt("loom workflow revision is not decodable"))?;
+            let revision = u32::try_from(revision)
+                .map_err(|_| corrupt("loom workflow revision is out of range"))?;
+            if workflow.rev != revision {
+                return Err(corrupt(
+                    "loom workflow revision row and record revisions differ",
+                ));
+            }
+            if workflow.id != id || workflow.digest != digest {
+                return Err(corrupt(
+                    "loom workflow revision row and record identities differ",
+                ));
+            }
+            if graph_template_digest(&workflow.template) == template_digest {
+                return Ok(Some(workflow));
+            }
+        }
+        Ok(None)
+    }
+
     /// C2 — one agent type by id (registry read used by typed spawns).
     pub fn loom_agent_type(&self, id: &str) -> StoreResult<Option<LoomAgentType>> {
         let connection = self.connection()?;
@@ -2487,34 +2535,63 @@ impl Store {
             Some((rev, ref current, ref stored_json)) if *current == workflow.digest => {
                 let rev =
                     u32::try_from(rev).map_err(|_| corrupt("loom workflow rev is out of range"))?;
-                // Round 3/4: a pre-stamp record (STORED template.version !=
-                // rev) is healed HERE — the no-op path is the only chance a
-                // legacy row gets, and an unstamped row breaks the tail/TUI
-                // join. The decision reads the STORED row, never the freshly
-                // compiled template (whose version is the compile-time
-                // constant).
-                workflow.rev = rev;
                 let stored_version = serde_json::from_str::<LoomWorkflow>(stored_json)
                     .map_err(|_| corrupt("loom workflow record is not decodable"))?
                     .template
                     .version;
                 if stored_version != rev {
-                    workflow.template.version = rev;
+                    // A pre-stamp record is already an immutable instance: a
+                    // run may have pinned its old template digest before this
+                    // registration. Heal the current registry by appending a
+                    // new revision, never by rewriting that archived row.
+                    let next = rev
+                        .checked_add(1)
+                        .ok_or_else(|| corrupt("loom workflow rev is out of range"))?;
+                    workflow.rev = next;
+                    workflow.template.version = next;
                     let json = serde_json::to_string(&workflow)
                         .map_err(|_| corrupt("loom workflow record is not encodable"))?;
                     transaction
                         .execute(
-                            "UPDATE loom_workflows SET record_json = ?2, updated_at_ms = ?3
+                            "UPDATE loom_workflows
+                             SET rev = ?2, record_json = ?3, updated_at_ms = ?4
                              WHERE id = ?1",
-                            params![workflow.id.as_str(), json.as_str(), to_sqlite_integer(now)?],
+                            params![
+                                workflow.id.as_str(),
+                                i64::from(next),
+                                json.as_str(),
+                                to_sqlite_integer(now)?
+                            ],
                         )
                         .map_err(map_sqlite_error)?;
-                }
-                LoomRegistration {
-                    id: workflow.id.clone(),
-                    rev,
-                    digest: workflow.digest.clone(),
-                    updated: false,
+                    transaction
+                        .execute(
+                            "INSERT INTO loom_workflow_revisions(
+                                 id, rev, digest, record_json, created_at_ms)
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                            params![
+                                workflow.id.as_str(),
+                                i64::from(next),
+                                workflow.digest.as_str(),
+                                json.as_str(),
+                                to_sqlite_integer(now)?
+                            ],
+                        )
+                        .map_err(map_sqlite_error)?;
+                    LoomRegistration {
+                        id: workflow.id.clone(),
+                        rev: next,
+                        digest: workflow.digest.clone(),
+                        updated: true,
+                    }
+                } else {
+                    workflow.rev = rev;
+                    LoomRegistration {
+                        id: workflow.id.clone(),
+                        rev,
+                        digest: workflow.digest.clone(),
+                        updated: false,
+                    }
                 }
             }
             Some((rev, _, _)) => {
@@ -2546,6 +2623,20 @@ impl Store {
                         ],
                     )
                     .map_err(map_sqlite_error)?;
+                transaction
+                    .execute(
+                        "INSERT INTO loom_workflow_revisions(
+                             id, rev, digest, record_json, created_at_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            workflow.id.as_str(),
+                            i64::from(next),
+                            workflow.digest.as_str(),
+                            json.as_str(),
+                            to_sqlite_integer(now)?
+                        ],
+                    )
+                    .map_err(map_sqlite_error)?;
                 LoomRegistration {
                     id: workflow.id.clone(),
                     rev: next,
@@ -2563,6 +2654,19 @@ impl Store {
                         "INSERT INTO loom_workflows(
                              id, rev, digest, record_json, created_at_ms, updated_at_ms)
                          VALUES (?1, 1, ?2, ?3, ?4, ?4)",
+                        params![
+                            workflow.id.as_str(),
+                            workflow.digest.as_str(),
+                            json.as_str(),
+                            to_sqlite_integer(now)?
+                        ],
+                    )
+                    .map_err(map_sqlite_error)?;
+                transaction
+                    .execute(
+                        "INSERT INTO loom_workflow_revisions(
+                             id, rev, digest, record_json, created_at_ms)
+                         VALUES (?1, 1, ?2, ?3, ?4)",
                         params![
                             workflow.id.as_str(),
                             workflow.digest.as_str(),
@@ -3831,7 +3935,7 @@ impl Store {
             ));
         }
         require_typed_session(&transaction, &command.session_id)?;
-        let template =
+        let resolved =
             resolve_graph_template_tx(&transaction, &command.template)?.ok_or_else(|| {
                 store_error(
                     ErrorCode::InvalidArgument,
@@ -3839,13 +3943,16 @@ impl Store {
                     false,
                 )
             })?;
+        let template = resolved.template;
         validate_pinned_graph_template(&template)?;
         let digest = graph_template_digest(&template);
-        if expected_digest.is_some_and(|expected| expected != digest) {
-            return Err(graph_evidence_error(
-                ErrorCode::RevisionConflict,
-                "child_workflow_registry_race",
-                "registered child workflow changed before its instance could be pinned",
+        if let Some(expected_digest) = expected_digest
+            && expected_digest != digest
+        {
+            return Err(workflow_revision_conflict(
+                expected_digest,
+                &digest,
+                resolved.revision,
             ));
         }
         let current = self
@@ -4404,6 +4511,26 @@ impl Store {
     /// pins an immutable replacement, and opens the replacement START.
     #[allow(clippy::result_large_err)]
     pub fn switch_graph(&self, command: &GraphSwitchCommand) -> StoreResult<GraphSwitchOutcome> {
+        self.switch_graph_with_expected_digest(command, None)
+    }
+
+    /// Switches only when the registry bytes resolved inside the transaction
+    /// still match the client-observed immutable template digest.
+    #[allow(clippy::result_large_err)]
+    pub fn switch_graph_matching_digest(
+        &self,
+        command: &GraphSwitchCommand,
+        expected_digest: &str,
+    ) -> StoreResult<GraphSwitchOutcome> {
+        self.switch_graph_with_expected_digest(command, Some(expected_digest))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn switch_graph_with_expected_digest(
+        &self,
+        command: &GraphSwitchCommand,
+        expected_digest: Option<&str>,
+    ) -> StoreResult<GraphSwitchOutcome> {
         validate_command_identity(
             &command.command_id,
             &command.request_digest,
@@ -4431,8 +4558,11 @@ impl Store {
             ));
         }
         require_typed_session(&transaction, &command.session_id)?;
-        let template = match command.template_spec.clone() {
-            Some(template) if template.name == command.template => template,
+        let resolved = match command.template_spec.clone() {
+            Some(template) if template.name == command.template => ResolvedGraphTemplate {
+                revision: template.version,
+                template,
+            },
             Some(_) => {
                 return Err(store_error(
                     ErrorCode::InvalidArgument,
@@ -4450,6 +4580,7 @@ impl Store {
                 })?
             }
         };
+        let template = resolved.template;
         validate_pinned_graph_template(&template)?;
         let reductions = self.graph_reductions(&transaction, &command.session_id)?;
         if reductions.active_root.as_ref() != Some(&command.old_graph_id) {
@@ -4494,6 +4625,15 @@ impl Store {
         });
         let template_name = template.name.clone();
         let digest = graph_template_digest(&template);
+        if let Some(expected_digest) = expected_digest
+            && expected_digest != digest
+        {
+            return Err(workflow_revision_conflict(
+                expected_digest,
+                &digest,
+                resolved.revision,
+            ));
+        }
         let now = now_ms()?;
         claim_pending_receipt(
             &transaction,
@@ -12215,6 +12355,25 @@ fn child_cache_error(kind: &'static str, message: impl Into<String>) -> HaiderEr
     error
 }
 
+fn workflow_revision_conflict(
+    expected_digest: &str,
+    current_digest: &str,
+    current_revision: u32,
+) -> HaiderError {
+    let mut error = store_error(
+        ErrorCode::RevisionConflict,
+        "workflow changed before its immutable instance could be selected",
+        true,
+    );
+    error.details = Some(serde_json::json!({
+        "kind": "workflow_revision_conflict",
+        "expected_digest": expected_digest,
+        "current_digest": current_digest,
+        "current_revision": current_revision,
+    }));
+    error
+}
+
 #[allow(clippy::result_large_err)]
 fn load_child_template_observations(
     connection: &Connection,
@@ -16237,26 +16396,42 @@ fn map_sqlite_error(error: SqliteError) -> HaiderError {
 /// C1 — template resolution: the built-in catalog first, then the Loom
 /// registry. A registered pipe workflow is pinnable BY NAME exactly like a
 /// catalog entry, everywhere templates resolve (pin, switch, child refs).
+struct ResolvedGraphTemplate {
+    template: haider_protocol::graph::GraphTemplateSpec,
+    revision: u32,
+}
+
 fn resolve_graph_template_tx(
     transaction: &rusqlite::Transaction<'_>,
     name: &str,
-) -> StoreResult<Option<haider_protocol::graph::GraphTemplateSpec>> {
+) -> StoreResult<Option<ResolvedGraphTemplate>> {
     if let Some(template) = graph_template(name) {
-        return Ok(Some(template));
+        return Ok(Some(ResolvedGraphTemplate {
+            revision: template.version,
+            template,
+        }));
     }
     let record = transaction
         .query_row(
-            "SELECT record_json FROM loom_workflows WHERE id = ?1",
+            "SELECT rev, record_json FROM loom_workflows WHERE id = ?1",
             [name],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()
         .map_err(map_sqlite_error)?;
     record
-        .map(|json| {
+        .map(|(revision, json)| {
             let workflow: LoomWorkflow = serde_json::from_str(&json)
                 .map_err(|_| corrupt("loom workflow record is not decodable"))?;
-            Ok(workflow.template)
+            let revision = u32::try_from(revision)
+                .map_err(|_| corrupt("loom workflow rev is out of range"))?;
+            if workflow.rev != revision {
+                return Err(corrupt("loom workflow row and record revisions differ"));
+            }
+            Ok(ResolvedGraphTemplate {
+                template: workflow.template,
+                revision,
+            })
         })
         .transpose()
 }

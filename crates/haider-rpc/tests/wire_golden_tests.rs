@@ -257,6 +257,7 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "usage.history_day",
         "usage.history_range",
         "vault.stage",
+        "workflow.instance",
     ];
 
     let expected_methods = EXPECTED_METHODS
