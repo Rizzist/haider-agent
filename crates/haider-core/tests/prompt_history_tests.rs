@@ -136,6 +136,7 @@ impl ArtifactReader for CountingArtifacts {
 struct RecordingStore<'a, S: ?Sized> {
     inner: &'a S,
     reads: Mutex<Vec<u64>>,
+    lineage_reads: Mutex<Vec<Option<BranchId>>>,
     loaded_checkpoints: Mutex<Vec<SessionProjectionCheckpoint>>,
     checkpoint_override: Option<SessionProjectionCheckpoint>,
 }
@@ -145,6 +146,7 @@ impl<'a, S: ?Sized> RecordingStore<'a, S> {
         Self {
             inner,
             reads: Mutex::new(Vec::new()),
+            lineage_reads: Mutex::new(Vec::new()),
             loaded_checkpoints: Mutex::new(Vec::new()),
             checkpoint_override: None,
         }
@@ -154,6 +156,7 @@ impl<'a, S: ?Sized> RecordingStore<'a, S> {
         Self {
             inner,
             reads: Mutex::new(Vec::new()),
+            lineage_reads: Mutex::new(Vec::new()),
             loaded_checkpoints: Mutex::new(Vec::new()),
             checkpoint_override: Some(checkpoint),
         }
@@ -168,6 +171,10 @@ impl<'a, S: ?Sized> RecordingStore<'a, S> {
             .lock()
             .expect("checkpoint ledger")
             .clone()
+    }
+
+    fn lineage_read_count(&self) -> usize {
+        self.lineage_reads.lock().expect("lineage ledger").len()
     }
 }
 
@@ -231,6 +238,10 @@ impl<S: StoreHandle + ?Sized> StoreHandle for RecordingStore<'_, S> {
         session_id: &SessionId,
         branch_id: Option<&BranchId>,
     ) -> Result<Vec<BranchDescriptor>, haider_protocol::error::HaiderError> {
+        self.lineage_reads
+            .lock()
+            .expect("lineage ledger")
+            .push(branch_id.cloned());
         StoreHandle::branch_lineage(self.inner, session_id, branch_id).await
     }
 }
@@ -851,8 +862,10 @@ async fn idle_compaction_input_includes_completed_user_command_after_the_tree_he
     assert!(text.contains("tail output"));
 }
 
-/// Cache law: advancing the durable head by an append must produce the exact
-/// same provider projection as a fresh journal read and compile.
+/// MUTATION CHECK: delete the same-run exact-prefix extension and fall back to
+/// a full tree compile. Expected runtime failure: the second cached compile
+/// performs another lineage read. Appending only the suffix must remain
+/// byte-identical to the full oracle without rebuilding ancestry.
 #[tokio::test]
 async fn prompt_cache_matches_fresh_compile_after_append() {
     let store = MemoryStore::new();
@@ -860,23 +873,36 @@ async fn prompt_cache_matches_fresh_compile_after_append() {
     let cache = PromptHistoryCompiler::cache();
     let session_id = SessionId::new("prompt-cache-append-session");
     let run_id = RunId::new("prompt-cache-append-run");
-    let mut initial = vec![envelope(
-        &session_id,
-        &run_id,
-        "prompt-cache-initial",
-        EventPayload::UserMessage {
-            text: "inspect the cache".into(),
-            attachments: Vec::new(),
-            mode: DeliveryMode::Queue,
-        },
-        PromptRender::Verbatim,
-    )];
+    let mut initial = vec![
+        envelope(
+            &session_id,
+            &run_id,
+            "prompt-cache-initial",
+            EventPayload::UserMessage {
+                text: "inspect the cache".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &run_id,
+            "prompt-cache-initial-node",
+            None,
+            NodeKind::UserTurn {
+                text: "inspect the cache".into(),
+                attachments: Vec::new(),
+            },
+        ),
+    ];
     StoreHandle::append(&store, &mut initial)
         .await
         .expect("append initial prompt");
+    let recording = RecordingStore::new(&store);
     PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
         &cache,
-        &store,
+        &recording,
         &artifacts,
         &session_id,
         None,
@@ -885,25 +911,41 @@ async fn prompt_cache_matches_fresh_compile_after_append() {
     )
     .await
     .expect("prime prompt cache");
+    let lineage_reads_before_append = recording.lineage_read_count();
+    let head_before_append = StoreHandle::latest_seq(&store, &session_id)
+        .await
+        .expect("sample pre-append head");
 
-    let mut suffix = vec![envelope(
-        &session_id,
-        &run_id,
-        "prompt-cache-steer",
-        EventPayload::UserMessage {
-            text: "include the invalidation law".into(),
-            attachments: Vec::new(),
-            mode: DeliveryMode::Steer,
-        },
-        PromptRender::Verbatim,
-    )];
+    let mut suffix = vec![
+        envelope(
+            &session_id,
+            &run_id,
+            "prompt-cache-steer",
+            EventPayload::UserMessage {
+                text: "include the invalidation law".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Steer,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &run_id,
+            "prompt-cache-steer-node",
+            Some("prompt-cache-initial-node"),
+            NodeKind::UserTurn {
+                text: "include the invalidation law".into(),
+                attachments: Vec::new(),
+            },
+        ),
+    ];
     StoreHandle::append(&store, &mut suffix)
         .await
         .expect("append cache-invalidating suffix");
 
     let cached = PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
         &cache,
-        &store,
+        &recording,
         &artifacts,
         &session_id,
         None,
@@ -923,6 +965,400 @@ async fn prompt_cache_matches_fresh_compile_after_append() {
     .await
     .expect("compile fresh projection after append");
     assert_eq!(cached, fresh);
+    assert_eq!(recording.lineage_read_count(), lineage_reads_before_append);
+    assert_eq!(recording.read_cursors().last(), Some(&head_before_append));
+
+    // A sibling replaces, rather than extends, the selected ancestry. The
+    // exact cache must fall back to the indexed full fold and drop the old
+    // steer fragment byte-for-byte like the oracle.
+    let mut sibling = vec![
+        envelope(
+            &session_id,
+            &run_id,
+            "prompt-cache-sibling-user",
+            EventPayload::UserMessage {
+                text: "replace the earlier steer".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Steer,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &run_id,
+            "prompt-cache-sibling-node",
+            Some("prompt-cache-initial-node"),
+            NodeKind::UserTurn {
+                text: "replace the earlier steer".into(),
+                attachments: Vec::new(),
+            },
+        ),
+    ];
+    StoreHandle::append(&store, &mut sibling)
+        .await
+        .expect("append same-run sibling ancestry");
+    let cached_sibling = PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &cache,
+        &recording,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &run_id,
+    )
+    .await
+    .expect("compile cached sibling ancestry");
+    let fresh_sibling = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &run_id,
+    )
+    .await
+    .expect("compile fresh sibling ancestry");
+    assert_eq!(cached_sibling, fresh_sibling);
+    assert!(cached_sibling.messages.iter().all(|message| {
+        message.blocks.iter().all(
+            |block| !matches!(block, Block::Text { text } if text == "include the invalidation law"),
+        )
+    }));
+
+    // Structural corruption discovered in an appended suffix must have the
+    // same typed error as rebuilding the complete tree.
+    let mut duplicate = vec![envelope(
+        &session_id,
+        &run_id,
+        "prompt-cache-duplicate-node-event",
+        EventPayload::NodeCommitted(TreeNode {
+            node: NodeId::new("prompt-cache-sibling-node"),
+            parent: Some(NodeId::new("prompt-cache-initial-node")),
+            kind: NodeKind::UserTurn {
+                text: "duplicate node".into(),
+                attachments: Vec::new(),
+            },
+        }),
+        PromptRender::Omit,
+    )];
+    StoreHandle::append(&store, &mut duplicate)
+        .await
+        .expect("append duplicate cached node");
+    let cached_error = PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &cache,
+        &recording,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &run_id,
+    )
+    .await
+    .expect_err("cached duplicate node is corruption");
+    let fresh_error = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &run_id,
+    )
+    .await
+    .expect_err("fresh duplicate node is corruption");
+    assert_eq!(cached_error.code, fresh_error.code);
+    assert_eq!(cached_error.message, fresh_error.message);
+}
+
+/// MUTATION CHECK: clear every exact projection when either agent advances,
+/// or omit `agent_id` from the cache identity. Expected runtime failure: a
+/// lineage reread or cached/fresh byte mismatch on one of the two timelines.
+#[tokio::test]
+async fn prompt_cache_extends_interleaved_agents_from_exact_heads() {
+    let store = MemoryStore::new();
+    let recording = RecordingStore::new(&store);
+    let artifacts = TestArtifacts(HashMap::new());
+    let cache = PromptHistoryCompiler::cache();
+    let session_id = SessionId::new("prompt-cache-agent-session");
+    let first_agent = AgentId::new("prompt-cache-agent-a");
+    let second_agent = AgentId::new("prompt-cache-agent-b");
+    let first_run = RunId::new("prompt-cache-agent-a-run");
+    let second_run = RunId::new("prompt-cache-agent-b-run");
+    let scoped = |mut event: haider_protocol::envelope::RawEnvelope, agent: &AgentId| {
+        event.agent_id = Some(agent.clone());
+        event
+    };
+    let mut initial = vec![
+        scoped(
+            envelope(
+                &session_id,
+                &first_run,
+                "prompt-cache-agent-a-user",
+                EventPayload::UserMessage {
+                    text: "agent a".into(),
+                    attachments: Vec::new(),
+                    mode: DeliveryMode::Queue,
+                },
+                PromptRender::Verbatim,
+            ),
+            &first_agent,
+        ),
+        scoped(
+            node(
+                &session_id,
+                &first_run,
+                "prompt-cache-agent-a-node",
+                None,
+                NodeKind::UserTurn {
+                    text: "agent a".into(),
+                    attachments: Vec::new(),
+                },
+            ),
+            &first_agent,
+        ),
+        scoped(
+            envelope(
+                &session_id,
+                &second_run,
+                "prompt-cache-agent-b-user",
+                EventPayload::UserMessage {
+                    text: "agent b".into(),
+                    attachments: Vec::new(),
+                    mode: DeliveryMode::Queue,
+                },
+                PromptRender::Verbatim,
+            ),
+            &second_agent,
+        ),
+        scoped(
+            node(
+                &session_id,
+                &second_run,
+                "prompt-cache-agent-b-node",
+                None,
+                NodeKind::UserTurn {
+                    text: "agent b".into(),
+                    attachments: Vec::new(),
+                },
+            ),
+            &second_agent,
+        ),
+    ];
+    StoreHandle::append(&store, &mut initial)
+        .await
+        .expect("append agent cache prefixes");
+    for (agent, run) in [(&first_agent, &first_run), (&second_agent, &second_run)] {
+        PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+            &cache,
+            &recording,
+            &artifacts,
+            &session_id,
+            None,
+            Some(agent),
+            run,
+        )
+        .await
+        .expect("prime agent prompt cache");
+    }
+    let lineage_reads_before_suffix = recording.lineage_read_count();
+    let mut suffix = vec![
+        scoped(
+            envelope(
+                &session_id,
+                &first_run,
+                "prompt-cache-agent-a-steer",
+                EventPayload::UserMessage {
+                    text: "agent a steer".into(),
+                    attachments: Vec::new(),
+                    mode: DeliveryMode::Steer,
+                },
+                PromptRender::Verbatim,
+            ),
+            &first_agent,
+        ),
+        scoped(
+            node(
+                &session_id,
+                &first_run,
+                "prompt-cache-agent-a-steer-node",
+                Some("prompt-cache-agent-a-node"),
+                NodeKind::UserTurn {
+                    text: "agent a steer".into(),
+                    attachments: Vec::new(),
+                },
+            ),
+            &first_agent,
+        ),
+        scoped(
+            envelope(
+                &session_id,
+                &second_run,
+                "prompt-cache-agent-b-steer",
+                EventPayload::UserMessage {
+                    text: "agent b steer".into(),
+                    attachments: Vec::new(),
+                    mode: DeliveryMode::Steer,
+                },
+                PromptRender::Verbatim,
+            ),
+            &second_agent,
+        ),
+        scoped(
+            node(
+                &session_id,
+                &second_run,
+                "prompt-cache-agent-b-steer-node",
+                Some("prompt-cache-agent-b-node"),
+                NodeKind::UserTurn {
+                    text: "agent b steer".into(),
+                    attachments: Vec::new(),
+                },
+            ),
+            &second_agent,
+        ),
+    ];
+    StoreHandle::append(&store, &mut suffix)
+        .await
+        .expect("append interleaved agent suffixes");
+
+    for (agent, run) in [(&first_agent, &first_run), (&second_agent, &second_run)] {
+        let cached = PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+            &cache,
+            &recording,
+            &artifacts,
+            &session_id,
+            None,
+            Some(agent),
+            run,
+        )
+        .await
+        .expect("extend exact agent projection");
+        let fresh = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+            &store,
+            &artifacts,
+            &session_id,
+            None,
+            Some(agent),
+            run,
+        )
+        .await
+        .expect("fully compile agent projection");
+        assert_eq!(cached, fresh);
+    }
+    assert_eq!(
+        recording.lineage_read_count(),
+        lineage_reads_before_suffix,
+        "interleaved agent suffixes must reuse both exact ancestry indexes"
+    );
+}
+
+/// MUTATION CHECK: apply suffix facts only to suffix envelopes. Expected
+/// runtime failure: the cached projection omits the newly terminal prior run
+/// while the full projection retroactively includes it.
+#[tokio::test]
+async fn prompt_cache_rebuilds_when_suffix_facts_revise_the_prefix() {
+    let store = MemoryStore::new();
+    let artifacts = TestArtifacts(HashMap::new());
+    let cache = PromptHistoryCompiler::cache();
+    let session_id = SessionId::new("prompt-cache-retroactive-session");
+    let prior = RunId::new("prompt-cache-retroactive-prior");
+    let current = RunId::new("prompt-cache-retroactive-current");
+    let mut events = vec![
+        envelope(
+            &session_id,
+            &prior,
+            "prompt-cache-retroactive-prior-user",
+            EventPayload::UserMessage {
+                text: "previously unfinished".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &prior,
+            "prompt-cache-retroactive-prior-node",
+            None,
+            NodeKind::UserTurn {
+                text: "previously unfinished".into(),
+                attachments: Vec::new(),
+            },
+        ),
+        envelope(
+            &session_id,
+            &current,
+            "prompt-cache-retroactive-current-user",
+            EventPayload::UserMessage {
+                text: "current request".into(),
+                attachments: Vec::new(),
+                mode: DeliveryMode::Queue,
+            },
+            PromptRender::Verbatim,
+        ),
+        node(
+            &session_id,
+            &current,
+            "prompt-cache-retroactive-current-node",
+            Some("prompt-cache-retroactive-prior-node"),
+            NodeKind::UserTurn {
+                text: "current request".into(),
+                attachments: Vec::new(),
+            },
+        ),
+    ];
+    StoreHandle::append(&store, &mut events)
+        .await
+        .expect("append retroactive cache history");
+    PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &cache,
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &current,
+    )
+    .await
+    .expect("prime retroactive prompt cache");
+
+    let mut terminal = vec![envelope(
+        &session_id,
+        &prior,
+        "prompt-cache-retroactive-prior-done",
+        EventPayload::RunState(RunState::Done),
+        PromptRender::Omit,
+    )];
+    StoreHandle::append(&store, &mut terminal)
+        .await
+        .expect("terminalize prior run after cached head");
+    let cached = PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+        &cache,
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &current,
+    )
+    .await
+    .expect("rebuild cached projection after retroactive fact");
+    let fresh = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        &store,
+        &artifacts,
+        &session_id,
+        None,
+        None,
+        &current,
+    )
+    .await
+    .expect("fully compile retroactive projection");
+    assert_eq!(cached, fresh);
+    assert!(cached.messages.iter().any(|message| {
+        message
+            .blocks
+            .iter()
+            .any(|block| matches!(block, Block::Text { text } if text == "previously unfinished"))
+    }));
 }
 
 #[tokio::test]
@@ -1188,6 +1624,8 @@ async fn tree_compilation_is_byte_identical_to_journal_rendering() {
 /// the compaction-node event also fails the terminal-boundary identity pin.
 /// Replacing `prefix.projection.messages.clone()` with `Vec::new()` in the
 /// resumed fold fails `restarted_projection == fresh_projection` at runtime.
+/// Reusing the pre-compaction exact key after the epoch changes fails
+/// `first_projection == fresh_projection` byte-for-byte.
 #[tokio::test]
 async fn compaction_substitutes_summary_and_keeps_only_the_suffix() {
     let root = tempfile::tempdir().expect("temp profile");
@@ -3165,7 +3603,7 @@ async fn branch_agent_and_nonterminal_history_are_excluded_structurally() {
                 fork_seq: 2,
                 created_seq,
                 created_at_ms: 1,
-                head_node_id: current_node,
+                head_node_id: current_node.clone(),
                 head_seq: 20,
             },
         }
@@ -3177,9 +3615,10 @@ async fn branch_agent_and_nonterminal_history_are_excluded_structurally() {
         .expect("append named lineage");
     let cache = PromptHistoryCompiler::cache();
     let artifacts = TestArtifacts(HashMap::new());
+    let recording = RecordingStore::new(&tree_store);
     let cached_main = PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
         &cache,
-        &tree_store,
+        &recording,
         &artifacts,
         &tree_session,
         None,
@@ -3210,7 +3649,7 @@ async fn branch_agent_and_nonterminal_history_are_excluded_structurally() {
     .expect("compile named lineage");
     let cached_named = PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
         &cache,
-        &tree_store,
+        &recording,
         &artifacts,
         &tree_session,
         Some(&branch),
@@ -3231,10 +3670,58 @@ async fn branch_agent_and_nonterminal_history_are_excluded_structurally() {
     .expect("compile fresh named-branch projection");
     assert_eq!(cached_named, fresh_named);
     assert_eq!(cached_named.messages, named_messages);
+
+    // MUTATION CHECK: drop branch/agent/current-run identity from the exact
+    // prefix match, or rebuild the tree after this append. Expected runtime
+    // failure: cached/fresh bytes diverge or the lineage-read count advances.
+    let lineage_reads_before_increment = recording.lineage_read_count();
+    let mut named_increment = vec![
+        tree_scoped(
+            tree_user(&current, "named-current-steer", "branch current steer"),
+            Some(&branch),
+            &agent,
+        ),
+        tree_scoped(
+            tree_node(&current, "named-current-steer-node", Some(&current_node)),
+            Some(&branch),
+            &agent,
+        ),
+    ];
+    StoreHandle::append(&tree_store, &mut named_increment)
+        .await
+        .expect("append named incremental suffix");
+    let incrementally_cached =
+        PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
+            &cache,
+            &recording,
+            &artifacts,
+            &tree_session,
+            Some(&branch),
+            Some(&agent),
+            &current,
+        )
+        .await
+        .expect("extend exact named-branch projection");
+    let incrementally_fresh = PromptHistoryCompiler::compile_provider_projection_with_artifacts(
+        &tree_store,
+        &artifacts,
+        &tree_session,
+        Some(&branch),
+        Some(&agent),
+        &current,
+    )
+    .await
+    .expect("fully rebuild named-branch projection");
+    assert_eq!(incrementally_cached, incrementally_fresh);
+    assert_eq!(
+        recording.lineage_read_count(),
+        lineage_reads_before_increment,
+        "an exact branch+agent+run suffix must reuse its indexed ancestry"
+    );
     let cached_other_agent_error =
         PromptHistoryCompiler::compile_cached_provider_projection_with_artifacts(
             &cache,
-            &tree_store,
+            &recording,
             &artifacts,
             &tree_session,
             Some(&branch),
