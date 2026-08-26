@@ -57,6 +57,9 @@ pub const STARTUP_DEADLINE: Duration = Duration::from_secs(30);
 /// The race loser's expected exit code (`EX_TEMPFAIL`).
 pub const RACE_LOSER_EXIT_CODE: i32 = 75;
 
+const RACE_LOSER_REAP_ATTEMPTS: u8 = 40;
+const RACE_LOSER_REAP_POLL: Duration = Duration::from_millis(25);
+
 /// Whether a caller keeps an auto-spawned daemon persistent or tears down
 /// only the exact authenticated child it launched.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -73,6 +76,64 @@ pub enum DaemonLifetime {
 #[must_use]
 pub fn authenticated_peer_is_candidate(peer_pid: Option<u32>, candidate_pid: u32) -> bool {
     peer_pid == Some(candidate_pid)
+}
+
+enum CandidatePoll {
+    Running,
+    Exited { code: Option<i32> },
+}
+
+trait CandidateProcess: Sized {
+    fn id(&self) -> u32;
+    fn try_wait(&mut self) -> std::io::Result<CandidatePoll>;
+}
+
+impl CandidateProcess for Child {
+    fn id(&self) -> u32 {
+        Child::id(self)
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<CandidatePoll> {
+        Child::try_wait(self).map(|status| match status {
+            Some(status) => CandidatePoll::Exited {
+                code: status.code(),
+            },
+            None => CandidatePoll::Running,
+        })
+    }
+}
+
+enum ReadyCandidate<C> {
+    OwnChild(C),
+    CompetingLauncher { exit_code: Option<i32> },
+}
+
+/// PID-qualify a retained candidate after an attachable daemon answers.
+///
+/// Our authenticated child is the daemon we came to launch, so returning its
+/// handle must be immediate. Only a child belonging to a launcher that
+/// attached to somebody else's winner receives the bounded zombie-reap
+/// grace.
+async fn qualify_ready_candidate<C>(peer_pid: Option<u32>, mut child: C) -> ReadyCandidate<C>
+where
+    C: CandidateProcess,
+{
+    if authenticated_peer_is_candidate(peer_pid, child.id()) {
+        return ReadyCandidate::OwnChild(child);
+    }
+
+    let mut exit_code = None;
+    for _ in 0..RACE_LOSER_REAP_ATTEMPTS {
+        match child.try_wait() {
+            Ok(CandidatePoll::Exited { code }) => {
+                exit_code = code;
+                break;
+            }
+            Ok(CandidatePoll::Running) => sleep(RACE_LOSER_REAP_POLL).await,
+            Err(_) => break,
+        }
+    }
+    ReadyCandidate::CompetingLauncher { exit_code }
 }
 
 /// Options for [`ensure_daemon`].
@@ -307,31 +368,23 @@ pub async fn ensure_daemon(
                 // would linger as a zombie for the parent's lifetime (W3c2
                 // review finding 6). One bounded grace poll, then release.
                 let mut ownership = None;
-                if let Some(mut active) = child.take() {
+                if let Some(active) = child.take() {
                     // The authenticated endpoint PID distinguishes our
                     // healthy winner from a candidate that lost to another
                     // launcher. Waiting for the healthy child to exit would
                     // add the entire one-second loser grace to every cold
                     // launch even though that daemon is meant to outlive us.
-                    if authenticated_peer_is_candidate(peer_credentials.pid, active.id()) {
-                        ownership = Some(DaemonOwnershipToken {
-                            authenticated_pid: active.id(),
-                            child: active,
-                            instance_id: welcome.instance_id.clone(),
-                            daemon_generation: welcome.daemon_generation,
-                        });
-                    } else {
-                        for _ in 0..40u8 {
-                            match active.try_wait() {
-                                Ok(Some(status)) => {
-                                    if status.code() == Some(RACE_LOSER_EXIT_CODE) {
-                                        race_lost = true;
-                                    }
-                                    break;
-                                }
-                                Ok(None) => sleep(Duration::from_millis(25)).await,
-                                Err(_) => break,
-                            }
+                    match qualify_ready_candidate(peer_credentials.pid, active).await {
+                        ReadyCandidate::OwnChild(active) => {
+                            ownership = Some(DaemonOwnershipToken {
+                                authenticated_pid: active.id(),
+                                child: active,
+                                instance_id: welcome.instance_id.clone(),
+                                daemon_generation: welcome.daemon_generation,
+                            });
+                        }
+                        ReadyCandidate::CompetingLauncher { exit_code } => {
+                            race_lost = exit_code == Some(RACE_LOSER_EXIT_CODE);
                         }
                     }
                 }
@@ -480,4 +533,77 @@ pub fn spawn_daemon_retained(
 /// caller so update cannot accidentally turn a timeout into a second signal.
 pub fn signal_authenticated_peer(pid: u32) -> std::io::Result<()> {
     haider_platform::signal_process(pid, haider_platform::ProcessSignal::Terminate)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::{
+        CandidatePoll, CandidateProcess, RACE_LOSER_EXIT_CODE, RACE_LOSER_REAP_POLL,
+        ReadyCandidate, qualify_ready_candidate,
+    };
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    struct FakeCandidate {
+        id: u32,
+        polls: Arc<AtomicUsize>,
+        outcomes: VecDeque<CandidatePoll>,
+    }
+
+    impl CandidateProcess for FakeCandidate {
+        fn id(&self) -> u32 {
+            self.id
+        }
+
+        fn try_wait(&mut self) -> std::io::Result<CandidatePoll> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.outcomes.pop_front().unwrap_or(CandidatePoll::Running))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn own_healthy_child_skips_the_one_second_loser_grace() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let child = FakeCandidate {
+            id: 41,
+            polls: Arc::clone(&polls),
+            outcomes: VecDeque::new(),
+        };
+        let started = tokio::time::Instant::now();
+        let decision = qualify_ready_candidate(Some(41), child).await;
+
+        let ReadyCandidate::OwnChild(_) = decision else {
+            panic!("authenticated child must remain owned");
+        };
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn genuine_lost_race_keeps_the_loser_reap_wait() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let child = FakeCandidate {
+            id: 41,
+            polls: Arc::clone(&polls),
+            outcomes: VecDeque::from([
+                CandidatePoll::Running,
+                CandidatePoll::Running,
+                CandidatePoll::Exited {
+                    code: Some(RACE_LOSER_EXIT_CODE),
+                },
+            ]),
+        };
+        let started = tokio::time::Instant::now();
+        let decision = qualify_ready_candidate(Some(42), child).await;
+
+        let ReadyCandidate::CompetingLauncher { exit_code } = decision else {
+            panic!("competing launcher must reap its losing child");
+        };
+        assert_eq!(exit_code, Some(RACE_LOSER_EXIT_CODE));
+        assert_eq!(started.elapsed(), RACE_LOSER_REAP_POLL * 2);
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
+    }
 }

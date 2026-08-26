@@ -24,11 +24,14 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    is_raw_mode_enabled,
 };
 use ratatui::crossterm::{event, execute};
-use std::io::{Stdout, Write, stdout};
-use std::time::Duration;
+use std::io::{IsTerminal, Stdout, Write, stderr, stdin, stdout};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+const SYSTEM_THEME_PROBE_TIMEOUT: Duration = Duration::from_millis(20);
 
 /// OSC 11 sequence setting the terminal's own background — the emulator's
 /// window padding around the cell grid then matches the theme ground, so the
@@ -110,13 +113,141 @@ fn sync_terminal_bg(theme: ThemeKey) {
 ///
 /// Known residual (review TUI1 P2): the probe owns the tty for its bounded
 /// window, so a keystroke typed in that pre-UI instant is consumed, not
-/// forwarded. The window is kept tiny (80ms) and runs before any UI invites
+/// forwarded. The window is kept tiny (20ms) and runs before any UI invites
 /// input. The loss-free design — parsing the OSC reply inside the sole input
 /// reader — lands with the daemon-era input stack (see OPTIMIZATIONS.md).
 #[must_use]
 pub fn detect_system_theme() -> ThemeKey {
-    let osc = termbg::theme(Duration::from_millis(80)).ok();
+    let osc = probe_terminal_theme(SYSTEM_THEME_PROBE_TIMEOUT);
     resolve_system_theme(osc, std::env::var("COLORFGBG").ok().as_deref())
+}
+
+trait ThemeEventReader {
+    fn poll(&mut self, timeout: Duration) -> std::io::Result<bool>;
+    fn read(&mut self) -> std::io::Result<Event>;
+}
+
+struct CrosstermThemeEventReader;
+
+impl ThemeEventReader for CrosstermThemeEventReader {
+    fn poll(&mut self, timeout: Duration) -> std::io::Result<bool> {
+        event::poll(timeout)
+    }
+
+    fn read(&mut self) -> std::io::Result<Event> {
+        event::read()
+    }
+}
+
+struct RawModeRestore {
+    disable_on_drop: bool,
+}
+
+impl Drop for RawModeRestore {
+    fn drop(&mut self) {
+        if self.disable_on_drop {
+            let _ = disable_raw_mode();
+        }
+    }
+}
+
+fn probe_terminal_theme(timeout: Duration) -> Option<termbg::Theme> {
+    if !stdin().is_terminal() || !stdout().is_terminal() || !stderr().is_terminal() {
+        return None;
+    }
+
+    let terminal = termbg::terminal();
+    if terminal == termbg::Terminal::Emacs {
+        return None;
+    }
+    if terminal == termbg::Terminal::Windows {
+        // Native Windows consoles have no OSC 11 answer. Retain termbg's
+        // synchronous WinAPI lookup; Duration::ZERO never enters its OSC
+        // path and therefore adds no timeout.
+        return termbg::theme(Duration::ZERO).ok();
+    }
+
+    let raw_before = is_raw_mode_enabled().ok()?;
+    if !raw_before && enable_raw_mode().is_err() {
+        return None;
+    }
+    let _restore = RawModeRestore {
+        disable_on_drop: !raw_before,
+    };
+    let mut events = CrosstermThemeEventReader;
+    query_terminal_theme(terminal, timeout, &mut events, &mut stderr())
+        .ok()
+        .flatten()
+}
+
+fn query_terminal_theme(
+    terminal: termbg::Terminal,
+    timeout: Duration,
+    events: &mut dyn ThemeEventReader,
+    output: &mut dyn Write,
+) -> std::io::Result<Option<termbg::Theme>> {
+    let query = match terminal {
+        termbg::Terminal::Tmux => "\x1bPtmux;\x1b\x1b]11;?\x07\x1b\\",
+        termbg::Terminal::Screen => "\x1bP\x1b]11;?\x07\x1b\\",
+        termbg::Terminal::XtermCompatible => "\x1b]11;?\x1b\\",
+        termbg::Terminal::Windows | termbg::Terminal::Emacs => return Ok(None),
+    };
+    output.write_all(query.as_bytes())?;
+    output.flush()?;
+
+    let deadline = Instant::now() + timeout;
+    let mut response = String::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || !events.poll(remaining)? {
+            return Ok(terminal_appearance_from_response(&response));
+        }
+        let Event::Key(key) = events.read()? else {
+            continue;
+        };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('\\'), KeyModifiers::ALT | KeyModifiers::NONE)
+            | (KeyCode::Char('g'), KeyModifiers::CONTROL)
+            | (KeyCode::Char('\u{0007}'), KeyModifiers::NONE) => {
+                return Ok(terminal_appearance_from_response(&response));
+            }
+            (KeyCode::Char(character), modifiers)
+                if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT =>
+            {
+                response.push(character);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn terminal_appearance_from_response(response: &str) -> Option<termbg::Theme> {
+    let rgb = response.split_once("rgb:")?.1;
+    let mut components = rgb.split('/');
+    let red = parse_x11_component(components.next()?)?;
+    let green = parse_x11_component(components.next()?)?;
+    let blue = parse_x11_component(components.next()?)?;
+    let luminance = u64::from(red) * 299 + u64::from(green) * 587 + u64::from(blue) * 114;
+    if luminance > 32_768 * 1_000 {
+        Some(termbg::Theme::Light)
+    } else {
+        Some(termbg::Theme::Dark)
+    }
+}
+
+fn parse_x11_component(component: &str) -> Option<u16> {
+    let digits = component
+        .char_indices()
+        .find_map(|(index, character)| (!character.is_ascii_hexdigit()).then_some(index))
+        .map_or(component, |end| &component[..end]);
+    if digits.is_empty() || digits.len() > 4 {
+        return None;
+    }
+    let value = u16::from_str_radix(digits, 16).ok()?;
+    Some(value << (4 * (4 - digits.len())))
 }
 
 /// The OSC probe's answer type, re-exported so tests can drive
@@ -133,6 +264,106 @@ pub fn resolve_system_theme(osc: Option<termbg::Theme>, colorfgbg: Option<&str>)
         None => colorfgbg
             .and_then(theme_from_colorfgbg)
             .unwrap_or(ThemeKey::Dark),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod theme_probe_tests {
+    use super::{
+        SYSTEM_THEME_PROBE_TIMEOUT, ThemeEventReader, query_terminal_theme,
+        terminal_appearance_from_response,
+    };
+    use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct SilentEvents {
+        polls: Vec<Duration>,
+    }
+
+    impl ThemeEventReader for SilentEvents {
+        fn poll(&mut self, timeout: Duration) -> std::io::Result<bool> {
+            self.polls.push(timeout);
+            Ok(false)
+        }
+
+        fn read(&mut self) -> std::io::Result<Event> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "silent fixture has no event",
+            ))
+        }
+    }
+
+    struct AnswerEvents {
+        events: VecDeque<Event>,
+    }
+
+    impl ThemeEventReader for AnswerEvents {
+        fn poll(&mut self, _timeout: Duration) -> std::io::Result<bool> {
+            Ok(!self.events.is_empty())
+        }
+
+        fn read(&mut self) -> std::io::Result<Event> {
+            self.events.pop_front().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "answer fixture exhausted",
+                )
+            })
+        }
+    }
+
+    #[test]
+    fn silent_osc_probe_uses_only_the_short_bounded_poll() {
+        let mut events = SilentEvents::default();
+        let mut output = Vec::new();
+        let appearance = query_terminal_theme(
+            termbg::Terminal::XtermCompatible,
+            SYSTEM_THEME_PROBE_TIMEOUT,
+            &mut events,
+            &mut output,
+        )
+        .expect("silent query");
+
+        assert_eq!(appearance, None);
+        assert_eq!(output, b"\x1b]11;?\x1b\\");
+        assert_eq!(events.polls.len(), 1);
+        assert!(events.polls[0] <= SYSTEM_THEME_PROBE_TIMEOUT);
+        assert!(SYSTEM_THEME_PROBE_TIMEOUT < Duration::from_millis(25));
+    }
+
+    #[test]
+    fn prompt_osc_answer_is_parsed_before_the_deadline() {
+        let mut input: VecDeque<_> = "]11;rgb:ffff/ffff/ffff"
+            .chars()
+            .map(|character| {
+                Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+            })
+            .collect();
+        input.push_back(Event::Key(KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+        )));
+        let mut events = AnswerEvents { events: input };
+        let mut output = Vec::new();
+
+        assert_eq!(
+            query_terminal_theme(
+                termbg::Terminal::XtermCompatible,
+                SYSTEM_THEME_PROBE_TIMEOUT,
+                &mut events,
+                &mut output,
+            )
+            .expect("answered query"),
+            Some(termbg::Theme::Light)
+        );
+        assert_eq!(
+            terminal_appearance_from_response("prefix rgb:0000/0000/0000 suffix"),
+            Some(termbg::Theme::Dark)
+        );
     }
 }
 
