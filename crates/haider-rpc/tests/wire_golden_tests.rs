@@ -741,6 +741,7 @@ fn legacy_session_create_defaults_permission_overrides_to_none() {
     let overrides = SessionPermissionOverridesV1 {
         allow_writes: true,
         allow_exec: false,
+        allow_mobile: false,
         auto_allow: false,
     };
     assert!(!overrides.is_empty());

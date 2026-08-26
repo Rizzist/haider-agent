@@ -7995,7 +7995,13 @@ pub(crate) fn effective_permission_defaults(
                     // would be security theater. The empty-host template is
                     // the policy's Network class-family rule.
                     || (overrides.allow_exec && matches!(class, EffectClass::Network { .. }))
-                {
+                    || (overrides.allow_mobile
+                        && matches!(
+                            class,
+                            EffectClass::ReadSms
+                                | EffectClass::MobileObserve
+                                | EffectClass::MobileControl
+                        )) {
                     ToolPermissionDefault::Allow
                 } else {
                     entry.default
