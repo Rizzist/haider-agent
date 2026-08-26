@@ -30,6 +30,16 @@ use std::time::Duration;
 
 const RECOVERY_PAGE_SIZE: usize = 1_024;
 const RECOVERY_EVIDENCE_DEADLINE: Duration = Duration::from_secs(1);
+const RECOVERY_REDUCER_PAYLOAD_KINDS: &[&str] =
+    &["effect", "menu_opened", "menu_answered", "menu_closed"];
+const RECOVERY_EVIDENCE_PAYLOAD_KINDS: &[&str] = &[
+    "effect",
+    "task_completed",
+    "item",
+    "item_tool_call",
+    "tool_result",
+    "process_signal_recorded",
+];
 
 #[derive(Default)]
 struct RecoveryEvidence {
@@ -97,7 +107,14 @@ async fn gather_effect_recovery_evidence<S: StoreHandle + ?Sized>(
     let mut current_revision = Some("workspace-revision:0".to_owned());
     let mut cursor = 0;
     loop {
-        let page = store.read(session_id, cursor, RECOVERY_PAGE_SIZE).await?;
+        let page = store
+            .read_reducer_page(
+                session_id,
+                cursor,
+                RECOVERY_PAGE_SIZE,
+                RECOVERY_EVIDENCE_PAYLOAD_KINDS,
+            )
+            .await?;
         if page.is_empty() {
             break;
         }
@@ -360,7 +377,7 @@ pub async fn reconcile_dispatched_effects(
         let mut outcomes = HashMap::<EffectId, bool>::new();
         let mut recovery_menus = HashMap::<MenuId, EffectId>::new();
         loop {
-            let page = store.read(&session_id, cursor, RECOVERY_PAGE_SIZE).await?;
+            let page = read_startup_recovery_page(store, &session_id, cursor).await?;
             if page.is_empty() {
                 break;
             }
@@ -489,6 +506,21 @@ pub async fn reconcile_dispatched_effects(
         store.append(&mut recovery).await?;
     }
     Ok(report)
+}
+
+async fn read_startup_recovery_page<S: StoreHandle + ?Sized>(
+    store: &S,
+    session_id: &SessionId,
+    cursor: u64,
+) -> Result<Vec<RawEnvelope>, HaiderError> {
+    store
+        .read_reducer_page(
+            session_id,
+            cursor,
+            RECOVERY_PAGE_SIZE,
+            RECOVERY_REDUCER_PAYLOAD_KINDS,
+        )
+        .await
 }
 
 fn reduce_page(
@@ -624,4 +656,473 @@ fn recovery_menu_id(session_id: &str, effect_id: &str) -> MenuId {
 
 fn hash_part(hasher: &mut blake3::Hasher, part: &[u8]) {
     hasher.update(blake3::hash(part).as_bytes());
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod reducer_filter_tests {
+    use super::*;
+    use crate::{CommittedRange, MemoryStore};
+    use haider_protocol::branch::BranchDescriptor;
+    use haider_protocol::effect::{EffectClass, EffectIntent, WorkspaceMutation};
+    use haider_protocol::graph::ProcessSignalRecorded;
+    use haider_protocol::ids::{ArtifactRef, TaskId, WorkspaceRevision};
+    use haider_protocol::item::{ItemEvent, ToolStatus};
+    use haider_protocol::menu::{AnswerVia, MenuCloseReason};
+    use haider_protocol::task::{TaskCompleted, TaskCompletionDelivery, TaskTerminalState};
+    use haider_protocol::tool::{BoundedResult, ToolResultStatus};
+
+    struct UnfilteredStore {
+        inner: MemoryStore,
+    }
+
+    impl UnfilteredStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStore::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StoreHandle for UnfilteredStore {
+        async fn append(
+            &self,
+            envelopes: &mut [RawEnvelope],
+        ) -> Result<CommittedRange, HaiderError> {
+            self.inner.append(envelopes).await
+        }
+
+        async fn read(
+            &self,
+            session_id: &SessionId,
+            since_seq: u64,
+            limit: usize,
+        ) -> Result<Vec<RawEnvelope>, HaiderError> {
+            self.inner.read(session_id, since_seq, limit).await
+        }
+
+        async fn read_reducer_page(
+            &self,
+            session_id: &SessionId,
+            since_seq: u64,
+            limit: usize,
+            _payload_kinds: &'static [&'static str],
+        ) -> Result<Vec<RawEnvelope>, HaiderError> {
+            self.read(session_id, since_seq, limit).await
+        }
+
+        async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError> {
+            self.inner.latest_seq(session_id).await
+        }
+
+        async fn branch_lineage(
+            &self,
+            session_id: &SessionId,
+            branch_id: Option<&BranchId>,
+        ) -> Result<Vec<BranchDescriptor>, HaiderError> {
+            self.inner.branch_lineage(session_id, branch_id).await
+        }
+    }
+
+    fn fact(
+        session_id: &SessionId,
+        run_id: Option<&RunId>,
+        event_id: &str,
+        payload: serde_json::Value,
+    ) -> RawEnvelope {
+        EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new(event_id),
+            seq: 0,
+            session_id: session_id.clone(),
+            branch_id: None,
+            run_id: run_id.cloned(),
+            agent_id: None,
+            device_id: DeviceId::new("recovery-filter-test"),
+            authority_epoch: 7,
+            worker_generation: 1,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: RenderTargets {
+                ui: false,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload,
+        }
+    }
+
+    fn typed(payload: EventPayload) -> serde_json::Value {
+        serde_json::to_value(payload).expect("serialize recovery reducer fixture")
+    }
+
+    async fn seed_pair(events: Vec<RawEnvelope>) -> (MemoryStore, UnfilteredStore) {
+        let filtered = MemoryStore::new();
+        let unfiltered = UnfilteredStore::new();
+        let mut filtered_events = events.clone();
+        filtered
+            .append(&mut filtered_events)
+            .await
+            .expect("seed filtered recovery store");
+        let mut unfiltered_events = events;
+        unfiltered
+            .append(&mut unfiltered_events)
+            .await
+            .expect("seed unfiltered recovery store");
+        (filtered, unfiltered)
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct StartupReduction {
+        dispatched: Vec<(String, String, Option<String>)>,
+        outcomes: Vec<(String, bool)>,
+        recovery_menus: Vec<(String, String)>,
+    }
+
+    fn startup_reduction(page: Vec<RawEnvelope>) -> StartupReduction {
+        let mut dispatched = HashMap::new();
+        let mut outcomes = HashMap::new();
+        let mut recovery_menus = HashMap::new();
+        reduce_page(page, &mut dispatched, &mut outcomes, &mut recovery_menus)
+            .expect("reduce recovery fixtures");
+        let mut dispatched = dispatched
+            .into_iter()
+            .map(|(effect, dispatch)| {
+                (
+                    effect.as_str().to_owned(),
+                    dispatch.event_id.as_str().to_owned(),
+                    dispatch.run_id.map(|run| run.as_str().to_owned()),
+                )
+            })
+            .collect::<Vec<_>>();
+        dispatched.sort();
+        let mut outcomes = outcomes
+            .into_iter()
+            .map(|(effect, unknown)| (effect.as_str().to_owned(), unknown))
+            .collect::<Vec<_>>();
+        outcomes.sort();
+        let mut recovery_menus = recovery_menus
+            .into_iter()
+            .map(|(menu, effect)| (menu.as_str().to_owned(), effect.as_str().to_owned()))
+            .collect::<Vec<_>>();
+        recovery_menus.sort();
+        StartupReduction {
+            dispatched,
+            outcomes,
+            recovery_menus,
+        }
+    }
+
+    /// MUTATION CHECK: removing any startup-recovery kind changes the actual
+    /// reducer output relative to the historical unfiltered StoreHandle path.
+    #[tokio::test]
+    async fn startup_recovery_reducer_matches_unfiltered_output() {
+        let session = SessionId::new("startup-recovery-filter-equivalence");
+        let run = RunId::new("startup-recovery-run");
+        let dispatched_effect = EffectId::new("startup-dispatched");
+        let kept_menu = effect_recovery_menu(
+            MenuId::new("startup-menu-kept"),
+            EffectId::new("startup-menu-kept-effect"),
+            "kept menu",
+        );
+        let answered_menu = effect_recovery_menu(
+            MenuId::new("startup-menu-answered"),
+            EffectId::new("startup-menu-answered-effect"),
+            "answered menu",
+        );
+        let closed_menu = effect_recovery_menu(
+            MenuId::new("startup-menu-closed"),
+            EffectId::new("startup-menu-closed-effect"),
+            "closed menu",
+        );
+        let events = vec![
+            fact(
+                &session,
+                Some(&run),
+                "startup-dispatched-event",
+                typed(EventPayload::Effect(EffectPhase::Dispatched {
+                    effect: dispatched_effect,
+                })),
+            ),
+            fact(
+                &session,
+                Some(&run),
+                "startup-menu-kept-open",
+                typed(EventPayload::MenuOpened(kept_menu)),
+            ),
+            fact(
+                &session,
+                Some(&run),
+                "startup-menu-answered-open",
+                typed(EventPayload::MenuOpened(answered_menu.clone())),
+            ),
+            fact(
+                &session,
+                Some(&run),
+                "startup-menu-answered",
+                typed(EventPayload::MenuAnswered(MenuAnswer {
+                    menu: answered_menu.id,
+                    option_key: Some("retry".into()),
+                    option_index: 2,
+                    value: None,
+                    via: AnswerVia::Rpc,
+                })),
+            ),
+            fact(
+                &session,
+                Some(&run),
+                "startup-menu-closed-open",
+                typed(EventPayload::MenuOpened(closed_menu.clone())),
+            ),
+            fact(
+                &session,
+                Some(&run),
+                "startup-menu-closed",
+                typed(EventPayload::MenuClosed {
+                    menu: closed_menu.id,
+                    reason: MenuCloseReason::Dismissed,
+                }),
+            ),
+            fact(
+                &session,
+                Some(&run),
+                "startup-irrelevant",
+                typed(EventPayload::RunState(RunState::Thinking)),
+            ),
+        ];
+        let (filtered, unfiltered) = seed_pair(events).await;
+        let filtered_page = read_startup_recovery_page(&filtered, &session, 0)
+            .await
+            .expect("read filtered startup recovery page");
+        let unfiltered_page = read_startup_recovery_page(&unfiltered, &session, 0)
+            .await
+            .expect("read unfiltered startup recovery page");
+        assert_eq!(
+            startup_reduction(filtered_page),
+            startup_reduction(unfiltered_page)
+        );
+    }
+
+    fn started_item(item_id: &str, item: TurnItem) -> EventPayload {
+        EventPayload::Item(ItemEvent::Started {
+            item_id: ItemId::new(item_id),
+            item,
+        })
+    }
+
+    fn completed_item(item_id: &str, item: TurnItem) -> EventPayload {
+        EventPayload::Item(ItemEvent::Completed {
+            item_id: ItemId::new(item_id),
+            item,
+        })
+    }
+
+    fn effect_intent(effect: EffectId) -> EventPayload {
+        EventPayload::Effect(EffectPhase::Intent(EffectIntent {
+            effect,
+            class: EffectClass::ProcessExec,
+            summary: "recovery filter fixture".into(),
+            args_digest: "args-digest".into(),
+            workspace_revision: Some(WorkspaceRevision::new("workspace-revision:0")),
+        }))
+    }
+
+    fn tool_result(call_id: &str) -> EventPayload {
+        EventPayload::ToolResult {
+            call_id: call_id.into(),
+            result: BoundedResult {
+                preview: "committed".into(),
+                truncated: false,
+                artifact: None,
+                images: Vec::new(),
+                cursor: None,
+                status: ToolResultStatus::Completed,
+                reason: None,
+                presentation: None,
+            },
+        }
+    }
+
+    /// MUTATION CHECK: removing any recovery-evidence kind changes the actual
+    /// rendered evidence relative to the historical unfiltered StoreHandle.
+    #[tokio::test]
+    async fn recovery_evidence_reducer_matches_unfiltered_output() {
+        let session = SessionId::new("recovery-evidence-filter-equivalence");
+        let run = RunId::new("recovery-evidence-run");
+        let command_effect = EffectId::new("command-effect");
+        let tool_effect = EffectId::new("tool-effect");
+        let signal_effect = EffectId::new("signal-effect");
+        let command_item = TurnItem::CommandExecution {
+            call_id: "command-call".into(),
+            command: "echo command".into(),
+            status: ToolStatus::Completed,
+            exit_code: Some(0),
+        };
+        let tool_item = TurnItem::ToolCall {
+            call_id: "tool-call".into(),
+            name: "fixture".into(),
+            args: serde_json::json!({}),
+            status: ToolStatus::Completed,
+        };
+        let task_completed = TaskCompleted {
+            task: TaskId::new("recovery-evidence-task"),
+            name: "fixture task".into(),
+            state: TaskTerminalState::Completed { exit_code: Some(0) },
+            elapsed_ms: 1,
+            output_bytes: 0,
+            tail: String::new(),
+            artifact: None,
+            full_output_unavailable: false,
+            truncated: false,
+            delivery: TaskCompletionDelivery::DeliveredQueued,
+            workspace_mutation: Some(WorkspaceMutation {
+                effect_id: command_effect.clone(),
+                mutation_digest: "mutation-digest".into(),
+                workspace_revision: Some(WorkspaceRevision::new("workspace-revision:11")),
+                subject_digest: Some("mutation-subject".into()),
+            }),
+        };
+        let signal_artifact = ArtifactRef::new(format!("blake3:{}", "a".repeat(64)));
+        let events = vec![
+            fact(
+                &session,
+                Some(&run),
+                "command-item-started",
+                typed(started_item("command-item", command_item.clone())),
+            ),
+            fact(
+                &session,
+                Some(&run),
+                "command-intent",
+                typed(effect_intent(command_effect.clone())),
+            ),
+            fact(
+                &session,
+                Some(&run),
+                "command-dispatched",
+                typed(EventPayload::Effect(EffectPhase::Dispatched {
+                    effect: command_effect.clone(),
+                })),
+            ),
+            fact(
+                &session,
+                Some(&run),
+                "command-item-completed",
+                typed(completed_item("command-item", command_item)),
+            ),
+            fact(
+                &session,
+                Some(&run),
+                "tool-item-started",
+                typed(started_item("tool-item", tool_item.clone())),
+            ),
+            fact(
+                &session,
+                Some(&run),
+                "tool-intent",
+                typed(effect_intent(tool_effect.clone())),
+            ),
+            fact(
+                &session,
+                Some(&run),
+                "tool-dispatched",
+                typed(EventPayload::Effect(EffectPhase::Dispatched {
+                    effect: tool_effect.clone(),
+                })),
+            ),
+            fact(
+                &session,
+                Some(&run),
+                "tool-item-completed",
+                typed(completed_item("tool-item", tool_item)),
+            ),
+            fact(
+                &session,
+                Some(&run),
+                "signal-dispatched",
+                typed(EventPayload::Effect(EffectPhase::Dispatched {
+                    effect: signal_effect.clone(),
+                })),
+            ),
+            fact(
+                &session,
+                Some(&run),
+                "command-result",
+                typed(tool_result("command-call")),
+            ),
+            fact(
+                &session,
+                Some(&run),
+                "tool-result",
+                typed(tool_result("tool-call")),
+            ),
+            fact(
+                &session,
+                Some(&run),
+                "signal-recorded",
+                typed(EventPayload::ProcessSignalRecorded(ProcessSignalRecorded {
+                    run_id: run.clone(),
+                    call_id: "signal-call".into(),
+                    effect_id: signal_effect.clone(),
+                    command_arg_digest: "signal-args".into(),
+                    exit_code: Some(0),
+                    transcript_digest: "signal-transcript".into(),
+                    workspace_revision: None,
+                    subject_digest: "signal-subject".into(),
+                    artifact: Some(signal_artifact),
+                })),
+            ),
+            fact(
+                &session,
+                Some(&run),
+                "task-completed",
+                task_completed
+                    .to_payload_value()
+                    .expect("serialize task completion fixture"),
+            ),
+            fact(
+                &session,
+                Some(&run),
+                "evidence-irrelevant",
+                typed(EventPayload::RunState(RunState::Thinking)),
+            ),
+        ];
+        let targets = [
+            command_effect.clone(),
+            tool_effect.clone(),
+            signal_effect.clone(),
+        ];
+        let (filtered, unfiltered) = seed_pair(events).await;
+        let filtered_output =
+            gather_effect_recovery_evidence(&filtered, &session, Some(&run), None, &targets)
+                .await
+                .expect("reduce filtered recovery evidence");
+        let unfiltered_output =
+            gather_effect_recovery_evidence(&unfiltered, &session, Some(&run), None, &targets)
+                .await
+                .expect("reduce unfiltered recovery evidence");
+        assert_eq!(filtered_output, unfiltered_output);
+        assert!(
+            filtered_output
+                .get(&command_effect)
+                .is_some_and(|line| line.contains("result committed"))
+        );
+        assert!(
+            filtered_output
+                .get(&tool_effect)
+                .is_some_and(|line| line.contains("result committed"))
+        );
+        assert!(
+            filtered_output
+                .get(&signal_effect)
+                .is_some_and(|line| line.contains("artifact present"))
+        );
+        assert!(
+            filtered_output
+                .values()
+                .all(|line| line.contains("workspace ADVANCED past dispatch"))
+        );
+    }
 }
