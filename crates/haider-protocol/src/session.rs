@@ -16,6 +16,12 @@ pub struct SessionPermissionOverridesV1 {
     /// Allow model-initiated process execution without a menu.
     #[serde(default)]
     pub allow_exec: bool,
+    /// Allow access to the explicitly activated Android transport without a
+    /// permission menu. This grants only SMS read, mobile observation, and
+    /// mobile control; it does not lift any desktop, filesystem, process, or
+    /// network permission.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_mobile: bool,
     /// Auto-allow mode (the Codex `--full-auto` analogue): resolve EVERY
     /// effect class the model can reach to `Allow` for the session, not just
     /// writes/exec — computer control, web fetch, task-kill, and any future
@@ -36,7 +42,7 @@ impl SessionPermissionOverridesV1 {
     /// Whether this value grants no permissions and is equivalent to absence.
     #[must_use]
     pub fn is_empty(self) -> bool {
-        !self.allow_writes && !self.allow_exec && !self.auto_allow
+        !self.allow_writes && !self.allow_exec && !self.allow_mobile && !self.auto_allow
     }
 }
 

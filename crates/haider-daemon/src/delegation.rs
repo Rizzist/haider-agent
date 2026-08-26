@@ -345,6 +345,7 @@ impl DelegationHandle {
         let child_overrides = Some(haider_protocol::session::SessionPermissionOverridesV1 {
             allow_writes: crate::worker::effect_within_grant(&grant, &EffectClass::FsWrite),
             allow_exec: crate::worker::effect_within_grant(&grant, &EffectClass::ProcessExec),
+            allow_mobile: false,
             // A child's pre-allow is bounded per-class by its grant ceiling, so
             // it never gets the blanket auto-allow flip: computer/screen access
             // for a subagent must flow deliberately through the grant, not ride

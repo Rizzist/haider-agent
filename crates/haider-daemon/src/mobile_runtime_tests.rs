@@ -258,6 +258,7 @@ async fn mobile_dispatcher_fixture_with_grant(
     let overrides = Some(SessionPermissionOverridesV1 {
         allow_writes: false,
         allow_exec: false,
+        allow_mobile: false,
         auto_allow: true,
     });
     hub.create_internal_session(SessionCreateCommand {

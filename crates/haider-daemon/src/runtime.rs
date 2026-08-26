@@ -558,9 +558,19 @@ async fn run_inner(
             return Err(error.into());
         }
     }
+    if let Some(server) = mobile_server.as_ref() {
+        server.install_chat_bridge(
+            hub.clone(),
+            config.default_model.clone(),
+            instance_id.clone(),
+        );
+    }
     let mut endpoint = match endpoint::bind(config).await {
         Ok(endpoint) => endpoint,
         Err(error) => {
+            if let Some(server) = mobile_server.as_mut() {
+                server.shutdown().await;
+            }
             let _ = worker_manager.shutdown().await;
             if let Some(broker) = &credential_broker {
                 broker.abort_and_join().await;

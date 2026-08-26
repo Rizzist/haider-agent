@@ -43,6 +43,7 @@ fn overrides() -> Option<SessionPermissionOverridesV1> {
     Some(SessionPermissionOverridesV1 {
         allow_writes: true,
         allow_exec: true,
+        allow_mobile: false,
         auto_allow: false,
     })
 }

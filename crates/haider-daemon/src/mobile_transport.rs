@@ -4,6 +4,9 @@
 //! each authenticated TCP connection, correlates daemon capability requests,
 //! and accepts the APK's push lane. The most recently authenticated APK wins.
 
+#[path = "mobile_transport/chat_bridge.rs"]
+mod chat_bridge;
+
 use crate::{DaemonConfig, DaemonError};
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -47,6 +50,10 @@ const MAX_SMS_PUSH_ADDRESS_BYTES: usize = 1024;
 const MAX_SMS_PUSH_BODY_BYTES: usize = 64 * 1024;
 const MAX_GRANTED_CAPABILITIES: usize = 64;
 const MAX_CAPABILITY_NAME_BYTES: usize = 128;
+const MAX_CHAT_TEXT_BYTES: usize = 256 * 1024;
+const MAX_SESSION_FIELD_BYTES: usize = 512;
+const CHAT_OUTPUT_CAPACITY: usize = 128;
+const CHAT_COMMAND_CAPACITY: usize = 4;
 const SERVER_CAPABILITIES: &[&str] = &[
     "a11y.snapshot",
     "a11y.tap",
@@ -62,6 +69,300 @@ const SERVER_CAPABILITIES: &[&str] = &[
 struct Envelope {
     id: i64,
     body: Value,
+}
+
+#[derive(Debug, Clone)]
+enum ChatCommand {
+    Send {
+        text: String,
+    },
+    SessionConfig,
+    SelectModel {
+        provider: String,
+        model: String,
+        confirm_new_epoch: bool,
+    },
+    SelectEffort {
+        effort: Option<String>,
+        confirm_new_epoch: bool,
+    },
+}
+
+impl ChatCommand {
+    fn parse(body: &Value) -> Result<Self, MobileChatError> {
+        let frame_type = body
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| MobileChatError::invalid("mobile request has no string type"))?;
+        match frame_type {
+            "chat.send" => {
+                let text = body
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| MobileChatError::invalid("chat.send needs text"))?;
+                if text.trim().is_empty() {
+                    return Err(MobileChatError::invalid("chat text must not be empty"));
+                }
+                if text.len() > MAX_CHAT_TEXT_BYTES {
+                    return Err(MobileChatError::invalid(
+                        "chat text exceeds the 256 KiB limit",
+                    ));
+                }
+                Ok(Self::Send { text: text.into() })
+            }
+            "session.config.get" => Ok(Self::SessionConfig),
+            "session.select_model" => {
+                let provider = bounded_session_field(body, "provider")?;
+                let model = bounded_session_field(body, "model")?;
+                Ok(Self::SelectModel {
+                    provider,
+                    model,
+                    confirm_new_epoch: body
+                        .get("confirmNewEpoch")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                })
+            }
+            "session.select_effort" => {
+                let effort = match body.get("effort") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(effort))
+                        if !effort.trim().is_empty() && effort.len() <= MAX_SESSION_FIELD_BYTES =>
+                    {
+                        Some(effort.clone())
+                    }
+                    Some(_) => {
+                        return Err(MobileChatError::invalid(
+                            "effort must be null or a non-empty bounded string",
+                        ));
+                    }
+                };
+                Ok(Self::SelectEffort {
+                    effort,
+                    confirm_new_epoch: body
+                        .get("confirmNewEpoch")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                })
+            }
+            _ => Err(MobileChatError::invalid(format!(
+                "unsupported mobile session request `{frame_type}`"
+            ))),
+        }
+    }
+
+    fn is_chat(&self) -> bool {
+        matches!(self, Self::Send { .. })
+    }
+}
+
+fn bounded_session_field(body: &Value, name: &str) -> Result<String, MobileChatError> {
+    let value = body
+        .get(name)
+        .and_then(Value::as_str)
+        .ok_or_else(|| MobileChatError::invalid(format!("{name} must be a string")))?;
+    if value.trim().is_empty() || value.len() > MAX_SESSION_FIELD_BYTES {
+        return Err(MobileChatError::invalid(format!(
+            "{name} must be non-empty and at most {MAX_SESSION_FIELD_BYTES} bytes"
+        )));
+    }
+    Ok(value.to_owned())
+}
+
+#[derive(Debug)]
+enum ChatEvent {
+    Delta {
+        text: String,
+        segment: &'static str,
+    },
+    Tool {
+        call_id: String,
+        name: String,
+        summary: String,
+        status: &'static str,
+        result: Option<String>,
+    },
+    Status {
+        text: String,
+    },
+    Done,
+    ChatError(MobileChatError),
+    SessionConfig(MobileSessionConfig),
+    SessionError(MobileChatError),
+}
+
+impl ChatEvent {
+    fn into_body(self) -> Result<Value, MobileChatError> {
+        match self {
+            Self::Delta { text, segment } => {
+                Ok(json!({"type": "chat.delta", "text": text, "segment": segment}))
+            }
+            Self::Tool {
+                call_id,
+                name,
+                summary,
+                status,
+                result,
+            } => Ok(json!({
+                "type": "chat.tool",
+                "callId": call_id,
+                "name": name,
+                "summary": summary,
+                "status": status,
+                "result": result,
+            })),
+            Self::Status { text } => Ok(json!({"type": "chat.status", "text": text})),
+            Self::Done => Ok(json!({"type": "chat.done"})),
+            Self::ChatError(error) => Ok(json!({
+                "type": "chat.error",
+                "code": error.code,
+                "message": error.message,
+                "retryable": error.retryable,
+            })),
+            Self::SessionConfig(config) => {
+                let mut body = serde_json::to_value(config).map_err(|error| {
+                    MobileChatError::internal(format!(
+                        "cannot encode mobile session config: {error}"
+                    ))
+                })?;
+                body.as_object_mut()
+                    .ok_or_else(|| {
+                        MobileChatError::internal("mobile session config was not an object")
+                    })?
+                    .insert("type".into(), Value::String("session.config".into()));
+                Ok(body)
+            }
+            Self::SessionError(error) => Ok(json!({
+                "type": "session.error",
+                "code": error.code,
+                "message": error.message,
+                "retryable": error.retryable,
+            })),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MobileSessionConfig {
+    catalog_revision: u64,
+    catalog_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unavailable_reason: Option<String>,
+    current: MobileSelection,
+    providers: Vec<MobileProvider>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MobileSelection {
+    session_id: String,
+    provider: String,
+    model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MobileProvider {
+    id: String,
+    enabled: bool,
+    availability: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    availability_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_model: Option<String>,
+    models: Vec<MobileModel>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MobileModel {
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_window: Option<u64>,
+    supported_efforts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_effort: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MobileChatError {
+    code: String,
+    message: String,
+    retryable: bool,
+}
+
+impl MobileChatError {
+    fn new(code: impl Into<String>, message: impl Into<String>, retryable: bool) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            retryable,
+        }
+    }
+
+    fn invalid(message: impl Into<String>) -> Self {
+        Self::new("invalid_argument", message, false)
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self::new("internal", message, true)
+    }
+
+    fn daemon(error: impl fmt::Display) -> Self {
+        Self::internal(error.to_string())
+    }
+
+    fn into_event(self, chat: bool) -> ChatEvent {
+        if chat {
+            ChatEvent::ChatError(self)
+        } else {
+            ChatEvent::SessionError(self)
+        }
+    }
+}
+
+impl fmt::Display for MobileChatError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for MobileChatError {}
+
+#[derive(Clone)]
+struct ChatResponder {
+    id: i64,
+    frames: mpsc::Sender<Envelope>,
+}
+
+impl ChatResponder {
+    fn is_closed(&self) -> bool {
+        self.frames.is_closed()
+    }
+
+    async fn wait_closed(&self) {
+        self.frames.closed().await;
+    }
+
+    async fn send(&self, event: ChatEvent) -> Result<(), MobileChatError> {
+        let body = event.into_body()?;
+        self.frames
+            .send(Envelope { id: self.id, body })
+            .await
+            .map_err(|_| MobileChatError::internal("mobile connection closed"))
+    }
+}
+
+#[async_trait]
+trait MobileChatBridge: Send + Sync {
+    async fn handle(
+        &self,
+        command: ChatCommand,
+        responder: ChatResponder,
+    ) -> Result<(), MobileChatError>;
 }
 
 #[derive(Debug)]
@@ -326,6 +627,7 @@ impl MobileTransportServer {
     }
 
     pub(crate) async fn shutdown(&mut self) {
+        self.state.clear_chat_bridge();
         if let Some(task) = self.task.take() {
             task.abort();
             let _ = task.await;
@@ -338,10 +640,25 @@ impl MobileTransportServer {
     fn address(&self) -> SocketAddr {
         self.address
     }
+
+    pub(crate) fn install_chat_bridge(
+        &self,
+        hub: crate::SessionHub,
+        default_model: String,
+        instance_id: String,
+    ) {
+        self.state
+            .install_chat_bridge(Arc::new(chat_bridge::DaemonMobileChatBridge::new(
+                hub,
+                default_model,
+                instance_id,
+            )));
+    }
 }
 
 impl Drop for MobileTransportServer {
     fn drop(&mut self) {
+        self.state.clear_chat_bridge();
         if let Some(task) = self.task.take() {
             task.abort();
         }
@@ -480,6 +797,13 @@ async fn connection_actor(
 ) -> Result<(), TransportError> {
     let (mut reader, mut writer) = stream.into_split();
     let mut pending = HashMap::<i64, oneshot::Sender<Result<Value, RequestFailure>>>::new();
+    let (chat_output, mut chat_output_receiver) = mpsc::channel(CHAT_OUTPUT_CAPACITY);
+    let (chat_commands, chat_command_receiver) = mpsc::channel(CHAT_COMMAND_CAPACITY);
+    let (chat_worker_stop, chat_worker_stop_receiver) = watch::channel(false);
+    let chat_worker = tokio::spawn(run_bridge_commands(
+        chat_command_receiver,
+        chat_worker_stop_receiver,
+    ));
     let result = loop {
         tokio::select! {
             frame = read_frame(&mut reader) => {
@@ -489,6 +813,17 @@ async fn connection_actor(
                 };
                 if !state.is_current(connection_id) {
                     break Ok(());
+                }
+                if is_bridge_request(&frame.body) {
+                    if let Err(error) = dispatch_bridge_frame(
+                        frame,
+                        state,
+                        &chat_output,
+                        &chat_commands,
+                    ).await {
+                        break Err(error);
+                    }
+                    continue;
                 }
                 if let Err(error) = handle_inbound_frame(
                     frame,
@@ -554,6 +889,27 @@ async fn connection_actor(
                     }
                 }
             }
+            output = chat_output_receiver.recv() => {
+                let Some(output) = output else {
+                    break Err(TransportError::protocol("mobile chat output channel closed"));
+                };
+                let write = tokio::select! {
+                    result = write_frame(&mut writer, &output) => Some(result),
+                    changed = close.changed() => {
+                        if changed.is_err() || *close.borrow() {
+                            None
+                        } else {
+                            continue;
+                        }
+                    }
+                };
+                let Some(write) = write else {
+                    break Ok(());
+                };
+                if let Err(error) = write {
+                    break Err(error);
+                }
+            }
             changed = close.changed() => {
                 if changed.is_err() || *close.borrow() {
                     break Ok(());
@@ -564,7 +920,130 @@ async fn connection_actor(
     for (_, reply) in pending.drain() {
         let _ = reply.send(Err(RequestFailure::Disconnected));
     }
+    chat_worker_stop.send_replace(true);
+    // Do not abort an accepted canonical turn. The detached FIFO worker keeps
+    // observing it until terminal or until its responder notices this actor's
+    // dropped output receiver, at which point the bridge issues TurnCancel.
+    drop(chat_worker);
     result
+}
+
+fn is_bridge_request(body: &Value) -> bool {
+    matches!(
+        body.get("type").and_then(Value::as_str),
+        Some("chat.send" | "session.config.get" | "session.select_model" | "session.select_effort")
+    )
+}
+
+async fn dispatch_bridge_frame(
+    frame: Envelope,
+    state: &TransportState,
+    output: &mpsc::Sender<Envelope>,
+    commands: &mpsc::Sender<BridgeWork>,
+) -> Result<(), TransportError> {
+    if frame.id == 0 {
+        return Err(TransportError::protocol(
+            "mobile chat/session request used the reserved push id",
+        ));
+    }
+    let request_is_chat = frame.body.get("type").and_then(Value::as_str) == Some("chat.send");
+    let command = match ChatCommand::parse(&frame.body) {
+        Ok(command) => command,
+        Err(error) => {
+            try_enqueue_bridge_event(output, frame.id, error.into_event(request_is_chat))?;
+            return Ok(());
+        }
+    };
+    let Some(bridge) = state.chat_bridge() else {
+        try_enqueue_bridge_event(
+            output,
+            frame.id,
+            MobileChatError::new(
+                "daemon_initializing",
+                "The daemon chat session is not ready yet",
+                true,
+            )
+            .into_event(command.is_chat()),
+        )?;
+        return Ok(());
+    };
+    let responder = ChatResponder {
+        id: frame.id,
+        frames: output.clone(),
+    };
+    let is_chat = command.is_chat();
+    match commands.try_send(BridgeWork {
+        bridge,
+        command,
+        responder,
+        is_chat,
+    }) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(work)) => {
+            try_enqueue_bridge_event(
+                output,
+                work.responder.id,
+                MobileChatError::new(
+                    "bridge_busy",
+                    "Too many mobile chat requests are already queued",
+                    true,
+                )
+                .into_event(work.is_chat),
+            )?;
+        }
+        Err(mpsc::error::TrySendError::Closed(work)) => {
+            try_enqueue_bridge_event(
+                output,
+                work.responder.id,
+                MobileChatError::internal("mobile chat worker is unavailable")
+                    .into_event(work.is_chat),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+struct BridgeWork {
+    bridge: Arc<dyn MobileChatBridge>,
+    command: ChatCommand,
+    responder: ChatResponder,
+    is_chat: bool,
+}
+
+async fn run_bridge_commands(
+    mut commands: mpsc::Receiver<BridgeWork>,
+    mut stop: watch::Receiver<bool>,
+) {
+    loop {
+        if *stop.borrow() {
+            return;
+        }
+        let work = tokio::select! {
+            work = commands.recv() => work,
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return;
+                }
+                continue;
+            }
+        };
+        let Some(work) = work else { return };
+        let error_responder = work.responder.clone();
+        if let Err(error) = work.bridge.handle(work.command, work.responder).await {
+            let _ = error_responder.send(error.into_event(work.is_chat)).await;
+        }
+    }
+}
+
+fn try_enqueue_bridge_event(
+    output: &mpsc::Sender<Envelope>,
+    id: i64,
+    event: ChatEvent,
+) -> Result<(), TransportError> {
+    let body = event.into_body().map_err(TransportError::protocol)?;
+    output
+        .try_send(Envelope { id, body })
+        .map_err(|_| TransportError::protocol("mobile chat output queue is full"))
 }
 
 async fn handle_inbound_frame<W>(
@@ -583,30 +1062,6 @@ where
         .and_then(Value::as_str)
         .ok_or_else(|| TransportError::protocol("mobile frame body has no string type"))?
         .to_owned();
-    if frame_type == "chat.send" {
-        if frame.id == 0 {
-            return Err(TransportError::protocol(
-                "chat.send used the reserved push id",
-            ));
-        }
-        let message = if frame.body.get("text").and_then(Value::as_str).is_some() {
-            // The daemon turn path starts only from a durably committed
-            // AcceptedTurn tied to a session/branch. chat.send carries none
-            // of those coordinates, so do not bypass SessionHub/WorkerManager
-            // with an invented default session.
-            "chat bridge pending"
-        } else {
-            "invalid chat.send request"
-        };
-        return write_frame(
-            writer,
-            &Envelope {
-                id: frame.id,
-                body: json!({"type": "chat.error", "message": message}),
-            },
-        )
-        .await;
-    }
     if frame.id == 0 {
         return route_push(state, connection_id, frame.body).await;
     }
@@ -718,6 +1173,7 @@ struct TransportState {
     incoming_sms: broadcast::Sender<IncomingSmsPush>,
     recent_sms: StdMutex<RecentSmsCache>,
     dispatch_gate: AsyncMutex<()>,
+    chat_bridge: StdRwLock<Option<Arc<dyn MobileChatBridge>>>,
 }
 
 #[derive(Default)]
@@ -760,6 +1216,7 @@ impl TransportState {
                 bytes: 0,
             }),
             dispatch_gate: AsyncMutex::new(()),
+            chat_bridge: StdRwLock::new(None),
         }
     }
 
@@ -866,6 +1323,18 @@ impl TransportState {
             .iter()
             .cloned()
             .collect()
+    }
+
+    fn install_chat_bridge(&self, bridge: Arc<dyn MobileChatBridge>) {
+        *write_lock(&self.chat_bridge) = Some(bridge);
+    }
+
+    fn chat_bridge(&self) -> Option<Arc<dyn MobileChatBridge>> {
+        read_lock(&self.chat_bridge).clone()
+    }
+
+    fn clear_chat_bridge(&self) {
+        write_lock(&self.chat_bridge).take();
     }
 }
 
@@ -1785,29 +2254,128 @@ mod tests {
         assert!(matches!(error, MobileError::Backend { message } if message.contains("timed out")));
     }
 
+    struct StreamingTestBridge;
+
+    #[async_trait]
+    impl MobileChatBridge for StreamingTestBridge {
+        async fn handle(
+            &self,
+            command: ChatCommand,
+            responder: ChatResponder,
+        ) -> Result<(), MobileChatError> {
+            assert!(matches!(command, ChatCommand::Send { text } if text == "hello"));
+            responder
+                .send(ChatEvent::Delta {
+                    text: "checking".into(),
+                    segment: "thinking",
+                })
+                .await?;
+            responder
+                .send(ChatEvent::Delta {
+                    text: "world".into(),
+                    segment: "answer",
+                })
+                .await?;
+            responder.send(ChatEvent::Done).await
+        }
+    }
+
     #[tokio::test]
-    async fn chat_stub_returns_same_id_typed_terminal_error() {
+    async fn chat_send_streams_same_id_delta_and_done_shapes() {
         let state = Arc::new(TransportState::new());
-        let (mut daemon_writer, mut apk_reader) = tokio::io::duplex(1024);
-        handle_inbound_frame(
+        state.install_chat_bridge(Arc::new(StreamingTestBridge));
+        let (output, mut frames) = mpsc::channel(CHAT_OUTPUT_CAPACITY);
+        let (commands, command_receiver) = mpsc::channel(CHAT_COMMAND_CAPACITY);
+        let (stop, stop_receiver) = watch::channel(false);
+        let worker = tokio::spawn(run_bridge_commands(command_receiver, stop_receiver));
+        dispatch_bridge_frame(
             Envelope {
                 id: 77,
                 body: json!({"type": "chat.send", "text": "hello"}),
             },
             &state,
-            1,
-            &mut HashMap::new(),
-            &mut daemon_writer,
+            &output,
+            &commands,
         )
         .await
-        .expect("chat stub response");
+        .expect("dispatch chat request");
         assert_eq!(
-            read_frame(&mut apk_reader).await.expect("chat error frame"),
+            frames.recv().await.expect("thinking delta"),
             Envelope {
                 id: 77,
-                body: json!({"type": "chat.error", "message": "chat bridge pending"}),
+                body: json!({
+                    "type": "chat.delta",
+                    "text": "checking",
+                    "segment": "thinking",
+                }),
             }
         );
+        assert_eq!(
+            frames.recv().await.expect("answer delta"),
+            Envelope {
+                id: 77,
+                body: json!({
+                    "type": "chat.delta",
+                    "text": "world",
+                    "segment": "answer",
+                }),
+            }
+        );
+        assert_eq!(
+            frames.recv().await.expect("done"),
+            Envelope {
+                id: 77,
+                body: json!({"type": "chat.done"}),
+            }
+        );
+        stop.send_replace(true);
+        worker.await.expect("stop chat worker");
+    }
+
+    struct OrderedTestBridge;
+
+    #[async_trait]
+    impl MobileChatBridge for OrderedTestBridge {
+        async fn handle(
+            &self,
+            command: ChatCommand,
+            responder: ChatResponder,
+        ) -> Result<(), MobileChatError> {
+            let ChatCommand::Send { text } = command else {
+                return Err(MobileChatError::invalid("expected chat.send"));
+            };
+            if text == "first" {
+                tokio::task::yield_now().await;
+            }
+            responder.send(ChatEvent::Done).await
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_worker_preserves_socket_request_order() {
+        let state = Arc::new(TransportState::new());
+        state.install_chat_bridge(Arc::new(OrderedTestBridge));
+        let (output, mut frames) = mpsc::channel(CHAT_OUTPUT_CAPACITY);
+        let (commands, command_receiver) = mpsc::channel(CHAT_COMMAND_CAPACITY);
+        let (stop, stop_receiver) = watch::channel(false);
+        let worker = tokio::spawn(run_bridge_commands(command_receiver, stop_receiver));
+        for (id, text) in [(41, "first"), (42, "second")] {
+            dispatch_bridge_frame(
+                Envelope {
+                    id,
+                    body: json!({"type": "chat.send", "text": text}),
+                },
+                &state,
+                &output,
+                &commands,
+            )
+            .await
+            .expect("enqueue ordered chat request");
+        }
+        assert_eq!(frames.recv().await.expect("first terminal").id, 41);
+        assert_eq!(frames.recv().await.expect("second terminal").id, 42);
+        stop.send_replace(true);
+        worker.await.expect("stop ordered chat worker");
     }
 
     #[tokio::test]

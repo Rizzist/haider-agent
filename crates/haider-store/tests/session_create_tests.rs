@@ -117,6 +117,7 @@ fn session_create_persists_permission_overrides_and_binds_them_to_the_receipt() 
     let expected = SessionPermissionOverridesV1 {
         allow_writes: true,
         allow_exec: false,
+        allow_mobile: false,
         auto_allow: false,
     };
     {

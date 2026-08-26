@@ -359,6 +359,7 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
         permission_overrides: SessionPermissionOverridesV1 {
             allow_writes: options.allow_writes,
             allow_exec: options.allow_exec,
+            allow_mobile: false,
             auto_allow: options.auto_allow,
         },
         trust_hooks: options.trust_hooks,
