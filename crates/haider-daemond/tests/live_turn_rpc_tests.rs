@@ -783,22 +783,35 @@ fn cancellable_exec_command() -> String {
 fn cancellable_exec_command() -> String {
     // Windows PowerShell 5.1 `Start-Process` defaults to shell activation.
     // This fixture needs a direct child so it inherits the daemon-owned Job
-    // Object; the ready marker proves that child ran in the workspace.
+    // Object; the ready marker proves that child ran in the workspace. Keep
+    // PowerShell's location and .NET's relative-path base aligned: they are
+    // distinct process state on Windows and can otherwise name different dirs.
     windows_powershell_command(concat!(
+        "$workspace=(Get-Location).Path;[Environment]::CurrentDirectory=$workspace;",
+        "$ready=Join-Path $workspace 'descendant-started.log';",
+        "$heartbeat=Join-Path $workspace 'heartbeat.log';",
         "$cmd=Join-Path ([Environment]::SystemDirectory) 'cmd.exe';",
         "$start=[Diagnostics.ProcessStartInfo]::new();$start.FileName=$cmd;",
         "$start.Arguments='/D /S /C \"echo ready>descendant-started.log & ",
         "ping -n 2 127.0.0.1 >nul & ",
         "echo survived>descendant-survived.log\"';",
-        "$start.WorkingDirectory=(Get-Location).Path;$start.UseShellExecute=$false;",
+        "$start.WorkingDirectory=$workspace;$start.UseShellExecute=$false;",
         "$start.CreateNoWindow=$true;$child=[Diagnostics.Process]::Start($start);",
         "if($null -eq $child){throw 'descendant process did not start'};",
-        "while(-not [IO.File]::Exists('descendant-started.log')){",
-        "if($child.HasExited){throw 'descendant exited before its ready marker'};",
-        "Start-Sleep -Milliseconds 10};$child.Dispose();",
-        "[IO.File]::AppendAllText('heartbeat.log','x',[Text.Encoding]::ASCII);",
+        "$readyWait=[Diagnostics.Stopwatch]::StartNew();",
+        "while(-not [IO.File]::Exists($ready)){",
+        "if($child.HasExited){$child.Dispose();",
+        "throw 'descendant exited before its ready marker'};",
+        "if($readyWait.ElapsedMilliseconds -ge 15000){",
+        "try{$child.Kill()}catch{};$child.Dispose();",
+        "throw 'descendant did not create its ready marker within 15 seconds'};",
+        "Start-Sleep -Milliseconds 10};$readyWait.Stop();",
+        "if($child.HasExited){$child.Dispose();",
+        "throw 'descendant exited immediately after its ready marker'};",
+        "$child.Dispose();",
+        "[IO.File]::AppendAllText($heartbeat,'x',[Text.Encoding]::ASCII);",
         "[Console]::Out.Write('started');[Console]::Out.Flush();",
-        "while($true){[IO.File]::AppendAllText('heartbeat.log','x',[Text.Encoding]::ASCII);",
+        "while($true){[IO.File]::AppendAllText($heartbeat,'x',[Text.Encoding]::ASCII);",
         "[Console]::Out.Write('y');[Console]::Out.Flush();Start-Sleep -Milliseconds 10}"
     ))
 }
