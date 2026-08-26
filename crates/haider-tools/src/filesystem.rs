@@ -73,7 +73,7 @@ use haider_protocol::tool::{BoundedResult, DispatchMode, ToolManifest};
 #[cfg(unix)]
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use serde_json::{Value, json};
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 #[cfg(unix)]
 use std::ffi::CStr;
 #[cfg(unix)]
@@ -90,6 +90,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 /// Port for storing the complete result when its prompt preview is truncated.
 #[async_trait]
@@ -122,6 +123,228 @@ impl Default for ResultBounds {
             max_preview_bytes: 8 * 1024,
         }
     }
+}
+
+/// Process-local storage is partitioned by the broker identity embedded in an
+/// effect id, making entries session/worker scoped even though the cache lives
+/// outside [`EffectBroker`] to keep the broker's durable state schema unchanged.
+/// Only the declared-pure filesystem readers participate. Process execution
+/// remains deliberately uncached; a future extension would need an explicit
+/// declared-pure process mode rather than inferring purity from a command.
+const READ_MEMO_CAP_BYTES: usize = 2 * 1024 * 1024;
+const READ_MEMO_MAX_ENTRIES: usize = 256;
+const READ_MEMO_ENTRY_OVERHEAD_BYTES: usize = 512;
+const READ_FOOTPRINT_CAP_BYTES: usize = READ_MEMO_CAP_BYTES / 2;
+const READ_FOOTPRINT_MAX_ENTRIES: usize = 8 * 1024;
+const READ_FOOTPRINT_RESERVE_CHUNK: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReadMemoCallKey {
+    scope: String,
+    workspace: PathBuf,
+    tool: &'static str,
+    args_digest: String,
+    max_preview_bytes: usize,
+}
+
+#[derive(Clone)]
+struct MemoizedRead {
+    result: BoundedResult,
+    freshness: Option<FileFreshness>,
+    footprint: ReadFootprint,
+}
+
+#[derive(Clone)]
+struct ReadMemoCandidate {
+    generation: u64,
+    footprint: ReadFootprint,
+}
+
+struct MemoizedReadHit {
+    result: BoundedResult,
+    freshness: Option<FileFreshness>,
+}
+
+struct ReadMemoEntry {
+    generation: u64,
+    value: MemoizedRead,
+    weight: usize,
+}
+
+struct ReadMemo {
+    cap_bytes: usize,
+    used_bytes: usize,
+    next_generation: u64,
+    entries: HashMap<ReadMemoCallKey, ReadMemoEntry>,
+    lru: VecDeque<ReadMemoCallKey>,
+}
+
+impl ReadMemo {
+    fn new(cap_bytes: usize) -> Self {
+        Self {
+            cap_bytes,
+            used_bytes: 0,
+            next_generation: 0,
+            entries: HashMap::new(),
+            lru: VecDeque::new(),
+        }
+    }
+
+    fn candidate(&self, key: &ReadMemoCallKey) -> Option<ReadMemoCandidate> {
+        self.entries.get(key).map(|entry| ReadMemoCandidate {
+            generation: entry.generation,
+            footprint: entry.value.footprint.clone(),
+        })
+    }
+
+    fn confirm(&mut self, key: &ReadMemoCallKey, generation: u64) -> Option<MemoizedReadHit> {
+        let entry = self
+            .entries
+            .get(key)
+            .filter(|entry| entry.generation == generation)?;
+        let value = MemoizedReadHit {
+            result: entry.value.result.clone(),
+            freshness: entry.value.freshness.clone(),
+        };
+        self.touch(key);
+        Some(value)
+    }
+
+    fn reject(&mut self, key: &ReadMemoCallKey, generation: u64) {
+        if self
+            .entries
+            .get(key)
+            .is_some_and(|entry| entry.generation == generation)
+        {
+            self.remove(key);
+        }
+    }
+
+    fn insert(&mut self, key: ReadMemoCallKey, value: MemoizedRead) {
+        self.remove(&key);
+        let weight = read_memo_weight(&key, &value);
+        if weight > self.cap_bytes {
+            return;
+        }
+        while self.used_bytes.saturating_add(weight) > self.cap_bytes
+            || self.entries.len() >= READ_MEMO_MAX_ENTRIES
+        {
+            let Some(oldest) = self.lru.pop_front() else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&oldest) {
+                self.used_bytes = self.used_bytes.saturating_sub(entry.weight);
+            }
+        }
+        self.next_generation = self.next_generation.wrapping_add(1);
+        let generation = self.next_generation;
+        self.used_bytes = self.used_bytes.saturating_add(weight);
+        self.lru.push_back(key.clone());
+        self.entries.insert(
+            key,
+            ReadMemoEntry {
+                generation,
+                value,
+                weight,
+            },
+        );
+    }
+
+    fn invalidate_workspace(&mut self, workspace: &Path) {
+        let keys = self
+            .entries
+            .keys()
+            .filter(|key| key.workspace == workspace)
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.remove(&key);
+        }
+    }
+
+    fn touch(&mut self, key: &ReadMemoCallKey) {
+        if let Some(position) = self.lru.iter().position(|candidate| candidate == key) {
+            self.lru.remove(position);
+        }
+        self.lru.push_back(key.clone());
+    }
+
+    fn remove(&mut self, key: &ReadMemoCallKey) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.used_bytes = self.used_bytes.saturating_sub(entry.weight);
+        }
+        if let Some(position) = self.lru.iter().position(|candidate| candidate == key) {
+            self.lru.remove(position);
+        }
+    }
+}
+
+fn read_memo() -> &'static Mutex<ReadMemo> {
+    static MEMO: OnceLock<Mutex<ReadMemo>> = OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(ReadMemo::new(READ_MEMO_CAP_BYTES)))
+}
+
+fn with_read_memo<T>(operation: impl FnOnce(&mut ReadMemo) -> T) -> T {
+    let mut memo = read_memo()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    operation(&mut memo)
+}
+
+fn read_memo_key(
+    intent: &haider_protocol::effect::EffectIntent,
+    workspace: &Path,
+    tool: &'static str,
+    bounds: ResultBounds,
+) -> ReadMemoCallKey {
+    let scope = intent
+        .effect
+        .as_str()
+        .rsplit_once('-')
+        .map_or_else(|| intent.effect.as_str(), |(scope, _)| scope)
+        .to_owned();
+    ReadMemoCallKey {
+        scope,
+        workspace: workspace.to_path_buf(),
+        tool,
+        args_digest: intent.args_digest.clone(),
+        max_preview_bytes: bounds.max_preview_bytes,
+    }
+}
+
+fn read_memo_weight(key: &ReadMemoCallKey, value: &MemoizedRead) -> usize {
+    let result = &value.result;
+    let result_bytes = result
+        .preview
+        .capacity()
+        .saturating_add(result.cursor.as_ref().map_or(0, String::capacity))
+        .saturating_add(result.reason.as_ref().map_or(0, String::capacity))
+        .saturating_add(
+            result
+                .artifact
+                .as_ref()
+                .map_or(0, |artifact| artifact.0.capacity()),
+        );
+    let freshness_bytes = value.freshness.as_ref().map_or(0, |freshness| {
+        freshness.path.capacity() + freshness.digest.capacity()
+    });
+    let footprint_bytes = value.footprint.retained_bytes();
+    // The call key is owned once by the map and once by the exact LRU queue.
+    let key_bytes = key
+        .scope
+        .capacity()
+        .saturating_add(key.workspace.capacity())
+        .saturating_add(key.args_digest.capacity())
+        .saturating_mul(2);
+    READ_MEMO_ENTRY_OVERHEAD_BYTES
+        .saturating_add(key_bytes)
+        .saturating_add(result_bytes)
+        .saturating_add(freshness_bytes)
+        .saturating_add(footprint_bytes)
+}
+
+fn invalidate_read_memo(workspace: &Path) {
+    with_read_memo(|memo| memo.invalidate_workspace(workspace));
 }
 
 pub fn fs_read_manifest() -> ToolManifest {
@@ -740,14 +963,23 @@ impl EffectBroker {
         let workspace_dir = self.duplicate_workspace_dir()?;
         let freshness_path = relative_path_argument(&relative)?.to_owned();
         let intent = self.begin(&operation, policy).await?;
+        let memo_key = read_memo_key(&intent, self.workspace_root(), "fs_read", bounds);
+        if let Ok(memo_dir) = self.duplicate_workspace_dir()
+            && let Some(cached) = lookup_memoized_read(&memo_key, memo_dir).await
+        {
+            return self
+                .finish_with_freshness(&intent, Ok(cached.result), cached.freshness)
+                .await;
+        }
         let offset = operation.offset;
         let limit = operation.limit;
         let read = run_blocking(move || {
             read_path_at(workspace_dir, &relative, &display_path, offset, limit)
         })
         .await;
-        let (result, freshness) = match read {
+        let (result, freshness, footprint) = match read {
             Ok(read) => {
+                let footprint = read.footprint;
                 let result = bounded(read.contents, bounds, cas).await;
                 let freshness = result.as_ref().ok().and_then(|_| {
                     read.digest.map(|digest| FileFreshness {
@@ -755,11 +987,27 @@ impl EffectBroker {
                         digest,
                     })
                 });
-                (result, freshness)
+                (result, freshness, Some(footprint))
             }
-            Err(error) => (Err(error), None),
+            Err(error) => (Err(error), None, None),
         };
-        self.finish_with_freshness(&intent, result, freshness).await
+        let cached = result
+            .as_ref()
+            .ok()
+            .zip(footprint)
+            .map(|(result, footprint)| MemoizedRead {
+                result: result.clone(),
+                freshness: freshness.clone(),
+                footprint,
+            });
+        let result = self.finish_with_freshness(&intent, result, freshness).await;
+        if result.is_ok()
+            && let Some(cached) = cached
+            && let Ok(memo_dir) = self.duplicate_workspace_dir()
+        {
+            insert_memoized_read_if_current(memo_key, cached, memo_dir).await;
+        }
+        result
     }
 
     pub async fn fs_search<C>(
@@ -790,15 +1038,40 @@ impl EffectBroker {
         let relative = anchored_relative_path(self.workspace_root(), &operation.root)?;
         let workspace_dir = self.duplicate_workspace_dir()?;
         let intent = self.begin(&operation, policy).await?;
+        let memo_key = read_memo_key(&intent, self.workspace_root(), "fs_search", bounds);
+        if let Ok(memo_dir) = self.duplicate_workspace_dir()
+            && let Some(cached) = lookup_memoized_read(&memo_key, memo_dir).await
+        {
+            return self.finish(&intent, Ok(cached.result)).await;
+        }
         let result = run_blocking(move || {
             search_files_at(workspace_dir, &relative, &owned, bounds.max_preview_bytes)
         })
         .await;
-        let result = match result {
-            Ok(matches) => bounded_search(matches, bounds, cas).await,
-            Err(error) => Err(error),
+        let (result, footprint) = match result {
+            Ok(mut matches) => {
+                let footprint = matches.footprint.take();
+                (bounded_search(matches, bounds, cas).await, footprint)
+            }
+            Err(error) => (Err(error), None),
         };
-        self.finish(&intent, result).await
+        let cached = result
+            .as_ref()
+            .ok()
+            .zip(footprint)
+            .map(|(result, footprint)| MemoizedRead {
+                result: result.clone(),
+                freshness: None,
+                footprint,
+            });
+        let result = self.finish(&intent, result).await;
+        if result.is_ok()
+            && let Some(cached) = cached
+            && let Ok(memo_dir) = self.duplicate_workspace_dir()
+        {
+            insert_memoized_read_if_current(memo_key, cached, memo_dir).await;
+        }
+        result
     }
 
     pub async fn fs_glob<C>(
@@ -823,14 +1096,40 @@ impl EffectBroker {
         let relative = anchored_relative_path(self.workspace_root(), &operation.root)?;
         let workspace_dir = self.duplicate_workspace_dir()?;
         let intent = self.begin(&operation, policy).await?;
+        let memo_key = read_memo_key(&intent, self.workspace_root(), "fs_glob", bounds);
+        if let Ok(memo_dir) = self.duplicate_workspace_dir()
+            && let Some(cached) = lookup_memoized_read(&memo_key, memo_dir).await
+        {
+            return self.finish(&intent, Ok(cached.result)).await;
+        }
         let result = run_blocking(move || glob_files_at(workspace_dir, &relative, &owned)).await;
-        let result = match result {
+        let (result, footprint) = match result {
             Ok(output) => {
-                bounded_with_truncation(output.contents, output.truncated, bounds, cas).await
+                let footprint = output.footprint;
+                (
+                    bounded_with_truncation(output.contents, output.truncated, bounds, cas).await,
+                    footprint,
+                )
             }
-            Err(error) => Err(error),
+            Err(error) => (Err(error), None),
         };
-        self.finish(&intent, result).await
+        let cached = result
+            .as_ref()
+            .ok()
+            .zip(footprint)
+            .map(|(result, footprint)| MemoizedRead {
+                result: result.clone(),
+                freshness: None,
+                footprint,
+            });
+        let result = self.finish(&intent, result).await;
+        if result.is_ok()
+            && let Some(cached) = cached
+            && let Ok(memo_dir) = self.duplicate_workspace_dir()
+        {
+            insert_memoized_read_if_current(memo_key, cached, memo_dir).await;
+        }
+        result
     }
 
     pub async fn fs_write<L>(
@@ -852,6 +1151,11 @@ impl EffectBroker {
             operation.content.clone(),
         );
         let intent = self.begin(&operation, policy).await?;
+        // A dispatched workspace mutation may land even when its terminal
+        // ledger/result path later fails. Evict before the mutation worker
+        // starts so no reader can reuse a pre-mutation entry through that
+        // uncertainty.
+        invalidate_read_memo(self.workspace_root());
         let relative = anchored_relative_path(self.workspace_root(), &operation.path);
         let workspace_dir = self.duplicate_workspace_dir();
         let owned_operation = operation.clone();
@@ -936,6 +1240,7 @@ impl EffectBroker {
             edits: operation.edits.clone(),
         };
         let intent = self.begin(&operation, policy).await?;
+        invalidate_read_memo(self.workspace_root());
         let relative = anchored_relative_path(self.workspace_root(), &operation.path);
         let workspace_dir = self.duplicate_workspace_dir();
         let owned_operation = operation.clone();
@@ -1031,6 +1336,7 @@ impl EffectBroker {
             overwrite: operation.overwrite,
         };
         let intent = self.begin(&operation, policy).await?;
+        invalidate_read_memo(self.workspace_root());
         let source_relative = anchored_relative_path(self.workspace_root(), &operation.source);
         let destination_relative = operation
             .destination
@@ -1131,9 +1437,271 @@ impl Drop for WorkerCancelGuard {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadFootprint {
+    entries: Vec<FreshnessStamp>,
+    digest: String,
+}
+
+impl ReadFootprint {
+    fn new(entries: Vec<FreshnessStamp>) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        for entry in &entries {
+            entry.update_digest(&mut hasher);
+        }
+        Self {
+            entries,
+            digest: format!("blake3:{}", hasher.finalize().to_hex()),
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        let entry_storage = self
+            .entries
+            .capacity()
+            .saturating_mul(std::mem::size_of::<FreshnessStamp>());
+        self.entries.iter().fold(
+            self.digest.capacity().saturating_add(entry_storage),
+            |bytes, entry| bytes.saturating_add(entry.path.capacity()),
+        )
+    }
+}
+
+struct ReadFootprintBuilder {
+    entries: Vec<FreshnessStamp>,
+    path_bytes: usize,
+    cacheable: bool,
+}
+
+impl ReadFootprintBuilder {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            path_bytes: 0,
+            cacheable: true,
+        }
+    }
+
+    fn push(&mut self, entry: FreshnessStamp) {
+        if !self.cacheable {
+            return;
+        }
+        let path_bytes = entry.path.capacity();
+        if self.entries.len() >= READ_FOOTPRINT_MAX_ENTRIES
+            || self
+                .path_bytes
+                .saturating_add(path_bytes)
+                .saturating_add(
+                    self.entries
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<FreshnessStamp>()),
+                )
+                .saturating_add(READ_MEMO_ENTRY_OVERHEAD_BYTES)
+                > READ_FOOTPRINT_CAP_BYTES
+        {
+            self.disable();
+            return;
+        }
+        if self.entries.len() == self.entries.capacity() {
+            let additional = READ_FOOTPRINT_RESERVE_CHUNK
+                .min(READ_FOOTPRINT_MAX_ENTRIES.saturating_sub(self.entries.len()));
+            let projected_capacity = self.entries.capacity().saturating_add(additional);
+            let projected = self
+                .path_bytes
+                .saturating_add(path_bytes)
+                .saturating_add(
+                    projected_capacity.saturating_mul(std::mem::size_of::<FreshnessStamp>()),
+                )
+                .saturating_add(READ_MEMO_ENTRY_OVERHEAD_BYTES);
+            if projected > READ_FOOTPRINT_CAP_BYTES
+                || self.entries.try_reserve_exact(additional).is_err()
+            {
+                self.disable();
+                return;
+            }
+        }
+        self.path_bytes = self.path_bytes.saturating_add(path_bytes);
+        self.entries.push(entry);
+    }
+
+    fn finish(self) -> Option<ReadFootprint> {
+        self.cacheable.then(|| ReadFootprint::new(self.entries))
+    }
+
+    fn disable(&mut self) {
+        self.entries = Vec::new();
+        self.path_bytes = 0;
+        self.cacheable = false;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FreshnessStamp {
+    path: PathBuf,
+    metadata: FreshnessMetadata,
+}
+
+impl FreshnessStamp {
+    fn update_digest(&self, hasher: &mut blake3::Hasher) {
+        let path = self.path.as_os_str().as_encoded_bytes();
+        hasher.update(&(path.len() as u64).to_le_bytes());
+        hasher.update(path);
+        self.metadata.update_digest(hasher);
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FreshnessMetadata {
+    device: u64,
+    inode: u64,
+    mode: u64,
+    size: i64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+#[cfg(unix)]
+impl FreshnessMetadata {
+    fn from_stat(metadata: &rustix::fs::Stat) -> Self {
+        Self {
+            device: metadata.st_dev as u64,
+            inode: metadata.st_ino as u64,
+            mode: metadata.st_mode as u64,
+            size: metadata.st_size as i64,
+            modified_seconds: metadata.st_mtime as i64,
+            modified_nanoseconds: metadata.st_mtime_nsec as i64,
+            changed_seconds: metadata.st_ctime as i64,
+            changed_nanoseconds: metadata.st_ctime_nsec as i64,
+        }
+    }
+
+    fn update_digest(self, hasher: &mut blake3::Hasher) {
+        for field in [
+            self.device,
+            self.inode,
+            self.mode,
+            self.size as u64,
+            self.modified_seconds as u64,
+            self.modified_nanoseconds as u64,
+            self.changed_seconds as u64,
+            self.changed_nanoseconds as u64,
+        ] {
+            hasher.update(&field.to_le_bytes());
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FreshnessMetadata(WindowsPathIdentity);
+
+#[cfg(windows)]
+impl FreshnessMetadata {
+    fn update_digest(self, hasher: &mut blake3::Hasher) {
+        hasher.update(format!("{:?}", self.0).as_bytes());
+    }
+}
+
+async fn lookup_memoized_read(
+    key: &ReadMemoCallKey,
+    workspace_dir: OwnedFd,
+) -> Option<MemoizedReadHit> {
+    let candidate = with_read_memo(|memo| memo.candidate(key))?;
+    let footprint = candidate.footprint;
+    let current = run_blocking(move || Ok(read_footprint_is_current(workspace_dir, &footprint)))
+        .await
+        .unwrap_or(false);
+    with_read_memo(|memo| {
+        if current {
+            memo.confirm(key, candidate.generation)
+        } else {
+            memo.reject(key, candidate.generation);
+            None
+        }
+    })
+}
+
+async fn insert_memoized_read_if_current(
+    key: ReadMemoCallKey,
+    value: MemoizedRead,
+    workspace_dir: OwnedFd,
+) {
+    let footprint = value.footprint.clone();
+    let current = run_blocking(move || Ok(read_footprint_is_current(workspace_dir, &footprint)))
+        .await
+        .unwrap_or(false);
+    if current {
+        with_read_memo(|memo| memo.insert(key, value));
+    }
+}
+
+#[cfg(unix)]
+fn read_footprint_is_current(workspace_dir: OwnedFd, footprint: &ReadFootprint) -> bool {
+    let mut hasher = blake3::Hasher::new();
+    for expected in &footprint.entries {
+        let Ok(root) = rustix::io::dup(&workspace_dir) else {
+            return false;
+        };
+        let Ok(metadata) = freshness_stat_at(root, &expected.path) else {
+            return false;
+        };
+        let current = FreshnessStamp {
+            path: expected.path.clone(),
+            metadata: FreshnessMetadata::from_stat(&metadata),
+        };
+        if current != *expected {
+            return false;
+        }
+        current.update_digest(&mut hasher);
+    }
+    format!("blake3:{}", hasher.finalize().to_hex()) == footprint.digest
+}
+
+#[cfg(unix)]
+fn freshness_stat_at(workspace_dir: OwnedFd, relative: &Path) -> ToolResult<rustix::fs::Stat> {
+    let mut components = normal_components(relative);
+    let Some(leaf) = components.pop() else {
+        return rustix::fs::fstat(&workspace_dir)
+            .map_err(|error| ToolError::io("validate cached read", relative, error));
+    };
+    let parent = walk_directories(
+        workspace_dir,
+        &components,
+        "validate cached read parent",
+        relative,
+    )?;
+    rustix::fs::statat(&parent, &leaf, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| anchored_io_error("validate cached read", relative, error))
+}
+
+#[cfg(windows)]
+fn read_footprint_is_current(workspace_dir: OwnedFd, footprint: &ReadFootprint) -> bool {
+    let mut hasher = blake3::Hasher::new();
+    for expected in &footprint.entries {
+        let Ok((_parent, _target, entry)) =
+            windows_anchored_entry(&workspace_dir, &expected.path, &expected.path)
+        else {
+            return false;
+        };
+        let current = FreshnessStamp {
+            path: expected.path.clone(),
+            metadata: FreshnessMetadata(entry.identity),
+        };
+        if current != *expected {
+            return false;
+        }
+        current.update_digest(&mut hasher);
+    }
+    format!("blake3:{}", hasher.finalize().to_hex()) == footprint.digest
+}
+
 struct ReadPathOutput {
     contents: String,
     digest: Option<String>,
+    footprint: ReadFootprint,
 }
 
 #[cfg(unix)]
@@ -1163,6 +1731,12 @@ fn read_path_at(
     )?;
     let metadata = rustix::fs::fstat(&target)
         .map_err(|error| ToolError::io("inspect read target", display_path, error))?;
+    let footprint = || {
+        ReadFootprint::new(vec![FreshnessStamp {
+            path: relative.to_path_buf(),
+            metadata: FreshnessMetadata::from_stat(&metadata),
+        }])
+    };
     match FileType::from_raw_mode(metadata.st_mode) {
         FileType::RegularFile => {
             let contents = read_utf8_file(fs::File::from(target), display_path)?;
@@ -1175,11 +1749,13 @@ fn read_path_at(
             Ok(ReadPathOutput {
                 contents,
                 digest: Some(digest),
+                footprint: footprint(),
             })
         }
         FileType::Directory => Ok(ReadPathOutput {
             contents: list_directory_fd(target, display_path)?,
             digest: None,
+            footprint: footprint(),
         }),
         _ => Err(ToolError::invalid_argument(format!(
             "{} is neither a regular file nor a directory",
@@ -1253,6 +1829,13 @@ fn search_files_at(
         ));
     }
     let directory = open_directory_at(workspace_dir, relative, "open for search", &operation.root)?;
+    let root_metadata = rustix::fs::fstat(&directory)
+        .map_err(|error| ToolError::io("inspect search root", &operation.root, error))?;
+    let mut footprint = ReadFootprintBuilder::new();
+    footprint.push(FreshnessStamp {
+        path: relative.to_path_buf(),
+        metadata: FreshnessMetadata::from_stat(&root_metadata),
+    });
     let mut matches = SearchCollector::new(max_preview_bytes)?;
     collect_search_matches_at(
         directory,
@@ -1261,8 +1844,9 @@ fn search_files_at(
         &operation.root,
         operation,
         &mut matches,
+        &mut footprint,
     )?;
-    Ok(matches.finish())
+    Ok(matches.finish(footprint.finish()))
 }
 
 #[cfg(unix)]
@@ -1273,6 +1857,7 @@ fn collect_search_matches_at(
     display_root: &Path,
     operation: &FsSearch,
     matches: &mut SearchCollector,
+    footprint: &mut ReadFootprintBuilder,
 ) -> ToolResult<()> {
     let mut entries = rustix::fs::Dir::read_from(&directory)
         .map_err(|error| ToolError::io("list", display_root.join(relative), error))?;
@@ -1292,6 +1877,10 @@ fn collect_search_matches_at(
         let entry_path = display_root.join(&display_path);
         let metadata = rustix::fs::statat(&directory, &name, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|error| anchored_io_error("inspect", &entry_path, error))?;
+        footprint.push(FreshnessStamp {
+            path: workspace_prefix.join(&display_path),
+            metadata: FreshnessMetadata::from_stat(&metadata),
+        });
         match FileType::from_raw_mode(metadata.st_mode) {
             FileType::Symlink => {}
             FileType::Directory => {
@@ -1309,6 +1898,7 @@ fn collect_search_matches_at(
                     display_root,
                     operation,
                     matches,
+                    footprint,
                 )?;
             }
             FileType::RegularFile => {
@@ -1376,6 +1966,7 @@ struct SearchOutput {
     match_count: usize,
     total_bytes: usize,
     complete: tempfile::NamedTempFile,
+    footprint: Option<ReadFootprint>,
 }
 
 struct SearchCollector {
@@ -1426,12 +2017,13 @@ impl SearchCollector {
         Ok(())
     }
 
-    fn finish(self) -> SearchOutput {
+    fn finish(self, footprint: Option<ReadFootprint>) -> SearchOutput {
         SearchOutput {
             preview: self.preview,
             match_count: self.match_count,
             total_bytes: self.total_bytes,
             complete: self.complete,
+            footprint,
         }
     }
 }
@@ -1439,6 +2031,7 @@ impl SearchCollector {
 struct CappedOutput {
     contents: String,
     truncated: bool,
+    footprint: Option<ReadFootprint>,
 }
 
 struct GlobCollector {
@@ -1483,6 +2076,13 @@ fn glob_files_at(
         ));
     }
     let directory = open_directory_at(workspace_dir, relative, "open for glob", &operation.root)?;
+    let root_metadata = rustix::fs::fstat(&directory)
+        .map_err(|error| ToolError::io("inspect glob root", &operation.root, error))?;
+    let mut footprint = ReadFootprintBuilder::new();
+    footprint.push(FreshnessStamp {
+        path: relative.to_path_buf(),
+        metadata: FreshnessMetadata::from_stat(&root_metadata),
+    });
     let mut paths = GlobCollector::new();
     collect_glob_paths_at(
         directory,
@@ -1491,11 +2091,13 @@ fn glob_files_at(
         &operation.root,
         &operation.pattern,
         &mut paths,
+        &mut footprint,
     )?;
     let truncated = paths.truncated;
     Ok(CappedOutput {
         contents: join_lines(paths.entries.into_sorted_vec()),
         truncated,
+        footprint: footprint.finish(),
     })
 }
 
@@ -1507,6 +2109,7 @@ fn collect_glob_paths_at(
     display_root: &Path,
     pattern: &str,
     paths: &mut GlobCollector,
+    footprint: &mut ReadFootprintBuilder,
 ) -> ToolResult<()> {
     let mut entries = rustix::fs::Dir::read_from(&directory)
         .map_err(|error| ToolError::io("list", display_root.join(relative), error))?;
@@ -1525,6 +2128,10 @@ fn collect_glob_paths_at(
         let entry_path = display_root.join(&child_relative);
         let metadata = rustix::fs::statat(&directory, &name, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|error| anchored_io_error("inspect", &entry_path, error))?;
+        footprint.push(FreshnessStamp {
+            path: workspace_prefix.join(&child_relative),
+            metadata: FreshnessMetadata::from_stat(&metadata),
+        });
         match FileType::from_raw_mode(metadata.st_mode) {
             FileType::Symlink => {}
             FileType::Directory => {
@@ -1542,6 +2149,7 @@ fn collect_glob_paths_at(
                     display_root,
                     pattern,
                     paths,
+                    footprint,
                 )?;
             }
             FileType::RegularFile => {
@@ -1635,6 +2243,189 @@ fn wildcard_matches(pattern: &str, text: &str, slash_sensitive: bool) -> bool {
     false
 }
 
+#[cfg(all(test, unix))]
+#[allow(clippy::expect_used)]
+mod read_memo_tests {
+    use super::*;
+    use crate::broker::JournalSink;
+    use crate::ledger::ChangeLedger;
+    use haider_protocol::EventPayload;
+    use haider_protocol::ids::{ArtifactRef, RunId};
+
+    struct RecordingJournal;
+
+    #[async_trait::async_trait]
+    impl JournalSink for RecordingJournal {
+        async fn append(&mut self, _payload: EventPayload) -> ToolResult<()> {
+            Ok(())
+        }
+    }
+
+    struct WorkingCas;
+
+    #[async_trait::async_trait]
+    impl CasSink for WorkingCas {
+        async fn put(&mut self, bytes: &[u8]) -> ToolResult<ArtifactRef> {
+            Ok(ArtifactRef::new(format!(
+                "blake3:{}",
+                blake3::hash(bytes).to_hex()
+            )))
+        }
+
+        async fn put_file(&mut self, path: &Path) -> ToolResult<ArtifactRef> {
+            let bytes = fs::read(path)
+                .map_err(|error| ToolError::cas(format!("read test CAS input: {error}")))?;
+            self.put(&bytes).await
+        }
+    }
+
+    struct RefusingCas;
+
+    #[async_trait::async_trait]
+    impl CasSink for RefusingCas {
+        async fn put(&mut self, _bytes: &[u8]) -> ToolResult<ArtifactRef> {
+            Err(ToolError::cas("memo miss reached the refusing CAS"))
+        }
+
+        async fn put_file(&mut self, _path: &Path) -> ToolResult<ArtifactRef> {
+            Err(ToolError::cas("memo miss reached the refusing CAS"))
+        }
+    }
+
+    fn broker(root: &Path, session: &str) -> EffectBroker {
+        EffectBroker::new_at(
+            Box::new(RecordingJournal),
+            root,
+            SessionId::new(session),
+            1,
+            1_900_000_000_000,
+        )
+        .expect("memo test broker")
+    }
+
+    fn allow(class: EffectClass) -> PermissionPolicy {
+        let mut policy = PermissionPolicy::default();
+        policy.allow(class);
+        policy
+    }
+
+    #[tokio::test]
+    async fn repeated_read_and_search_reuse_results_until_a_workspace_mutation() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let large_file = "read payload ".repeat(128);
+        fs::write(directory.path().join("read.txt"), &large_file).expect("seed read input");
+        let search_file = (0..64)
+            .map(|index| format!("needle result {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(directory.path().join("search.txt"), search_file).expect("seed search input");
+        let mut broker = broker(directory.path(), "memo-repeat");
+        let bounds = ResultBounds {
+            max_preview_bytes: 64,
+        };
+
+        let first_read = broker
+            .fs_read(
+                &FsRead::new("read.txt"),
+                &allow(EffectClass::FsRead),
+                &mut WorkingCas,
+                bounds,
+            )
+            .await
+            .expect("first read populates memo");
+        let repeated_read = broker
+            .fs_read(
+                &FsRead::new("read.txt"),
+                &allow(EffectClass::FsRead),
+                &mut RefusingCas,
+                bounds,
+            )
+            .await
+            .expect("unchanged read bypasses refusing CAS");
+        assert_eq!(repeated_read, first_read);
+
+        let search = FsSearch::new(".", "needle");
+        let first_search = broker
+            .fs_search(
+                &search,
+                &allow(EffectClass::FsRead),
+                &mut WorkingCas,
+                bounds,
+            )
+            .await
+            .expect("first search populates memo");
+        let repeated_search = broker
+            .fs_search(
+                &search,
+                &allow(EffectClass::FsRead),
+                &mut RefusingCas,
+                bounds,
+            )
+            .await
+            .expect("unchanged search bypasses refusing CAS");
+        assert_eq!(repeated_search, first_search);
+
+        broker
+            .fs_write(
+                &FsWrite::new("mutation.txt", "changed"),
+                &allow(EffectClass::FsWrite),
+                &TurnAttribution::new(SessionId::new("memo-repeat"), RunId::new("turn")),
+                &ChangeLedger::new(),
+            )
+            .await
+            .expect("workspace mutation");
+        let error = broker
+            .fs_read(
+                &FsRead::new("read.txt"),
+                &allow(EffectClass::FsRead),
+                &mut RefusingCas,
+                bounds,
+            )
+            .await
+            .expect_err("mutation invalidates the prior read result");
+        assert!(matches!(error, ToolError::Cas { .. }));
+    }
+
+    #[test]
+    fn read_memo_lru_never_exceeds_its_byte_cap() {
+        let cap = 2_048;
+        let mut memo = ReadMemo::new(cap);
+        let value = |byte: char| MemoizedRead {
+            result: BoundedResult {
+                preview: byte.to_string().repeat(900),
+                truncated: true,
+                artifact: Some(ArtifactRef::new(format!("blake3:{byte}"))),
+                images: Vec::new(),
+                cursor: None,
+                status: haider_protocol::tool::ToolResultStatus::Completed,
+                reason: None,
+                presentation: None,
+            },
+            freshness: None,
+            footprint: ReadFootprint::new(Vec::new()),
+        };
+        let key = |digest: &str| ReadMemoCallKey {
+            scope: "session-scope".into(),
+            workspace: PathBuf::from("workspace"),
+            tool: "fs_read",
+            args_digest: digest.into(),
+            max_preview_bytes: 900,
+        };
+        let first = key("first");
+        let second = key("second");
+
+        memo.insert(first.clone(), value('a'));
+        memo.insert(second.clone(), value('b'));
+
+        assert!(memo.used_bytes <= cap);
+        assert!(
+            !memo.entries.contains_key(&first),
+            "oldest entry is evicted"
+        );
+        assert!(memo.entries.contains_key(&second));
+    }
+}
+
 #[cfg(test)]
 mod wildcard_match_tests {
     use super::wildcard_matches;
@@ -1691,6 +2482,10 @@ fn read_path_at(
         .handle
         .metadata()
         .map_err(|error| ToolError::io("inspect", display_path, error))?;
+    let footprint = ReadFootprint::new(vec![FreshnessStamp {
+        path: relative.to_path_buf(),
+        metadata: FreshnessMetadata(entry.identity),
+    }]);
     if metadata.is_file() {
         let contents = read_utf8_file(entry.handle, display_path)?;
         let digest = format!("blake3:{}", blake3::hash(contents.as_bytes()).to_hex());
@@ -1702,6 +2497,7 @@ fn read_path_at(
         Ok(ReadPathOutput {
             contents,
             digest: Some(digest),
+            footprint,
         })
     } else if metadata.is_dir() {
         let mut entries = fs::read_dir(&target)
@@ -1722,6 +2518,7 @@ fn read_path_at(
         Ok(ReadPathOutput {
             contents: join_lines(contents),
             digest: None,
+            footprint,
         })
     } else {
         Err(ToolError::invalid_argument(format!(
@@ -1745,7 +2542,8 @@ fn search_files_at(
     }
     let (_parent, root, entry) = windows_anchored_entry(&workspace_dir, relative, &operation.root)?;
     let mut matches = SearchCollector::new(max_preview_bytes)?;
-    windows_walk_files(&root, entry, &mut |path, file| {
+    let mut footprint = ReadFootprintBuilder::new();
+    windows_walk_files(&root, entry, relative, &mut footprint, &mut |path, file| {
         let path_under_root = path.strip_prefix(&root).unwrap_or(path);
         let match_path = windows_relative_path(path_under_root)?;
         if operation
@@ -1770,7 +2568,7 @@ fn search_files_at(
         }
         Ok(())
     })?;
-    Ok(matches.finish())
+    Ok(matches.finish(footprint.finish()))
 }
 
 #[cfg(windows)]
@@ -1786,43 +2584,70 @@ fn glob_files_at(
     }
     let (_parent, root, entry) = windows_anchored_entry(&workspace_dir, relative, &operation.root)?;
     let mut matches = GlobCollector::new();
-    windows_walk_files(&root, entry, &mut |path, _file| {
-        let path_under_root = path.strip_prefix(&root).unwrap_or(path);
-        let candidate = windows_relative_path(path_under_root)?;
-        if glob_matches(&operation.pattern, &candidate) {
-            matches.push(windows_relative_path(&relative.join(path_under_root))?);
-        }
-        Ok(())
-    })?;
+    let mut footprint = ReadFootprintBuilder::new();
+    windows_walk_files(
+        &root,
+        entry,
+        relative,
+        &mut footprint,
+        &mut |path, _file| {
+            let path_under_root = path.strip_prefix(&root).unwrap_or(path);
+            let candidate = windows_relative_path(path_under_root)?;
+            if glob_matches(&operation.pattern, &candidate) {
+                matches.push(windows_relative_path(&relative.join(path_under_root))?);
+            }
+            Ok(())
+        },
+    )?;
     // Same collector → output conversion as the Unix glob path.
     let truncated = matches.truncated;
     Ok(CappedOutput {
         contents: join_lines(matches.entries.into_sorted_vec()),
         truncated,
+        footprint: footprint.finish(),
     })
 }
 
 #[cfg(windows)]
 fn windows_walk_files(
     root: &Path,
-    mut entry: WindowsPathEntry,
+    entry: WindowsPathEntry,
+    workspace_prefix: &Path,
+    footprint: &mut ReadFootprintBuilder,
     visit: &mut impl FnMut(&Path, &mut fs::File) -> ToolResult<()>,
 ) -> ToolResult<()> {
+    windows_walk_files_inner(root, root, entry, workspace_prefix, footprint, visit)
+}
+
+#[cfg(windows)]
+fn windows_walk_files_inner(
+    root: &Path,
+    path: &Path,
+    mut entry: WindowsPathEntry,
+    workspace_prefix: &Path,
+    footprint: &mut ReadFootprintBuilder,
+    visit: &mut impl FnMut(&Path, &mut fs::File) -> ToolResult<()>,
+) -> ToolResult<()> {
+    let path_under_root = path.strip_prefix(root).unwrap_or(path);
+    footprint.push(FreshnessStamp {
+        path: workspace_prefix.join(path_under_root),
+        metadata: FreshnessMetadata(entry.identity),
+    });
     if !entry.identity.directory {
-        return visit(root, &mut entry.handle);
+        return visit(path, &mut entry.handle);
     }
     // `entry.handle` omits FILE_SHARE_DELETE and remains live while read_dir
     // opens the pathname, so the enumerated directory cannot be swapped for a
     // junction after validation.
-    let mut entries = fs::read_dir(root)
-        .map_err(|error| ToolError::io("list", root, error))?
+    let mut entries = fs::read_dir(path)
+        .map_err(|error| ToolError::io("list", path, error))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| ToolError::io("list", root, error))?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
         let path = entry.path();
         let child = open_windows_path_entry(&path, &path, false)?;
-        windows_walk_files(&path, child, visit)?;
+        windows_walk_files_inner(root, &path, child, workspace_prefix, footprint, visit)?;
     }
     Ok(())
 }

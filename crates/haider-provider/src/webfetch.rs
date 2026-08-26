@@ -11,9 +11,10 @@
 //! reduced to readable text by a small in-crate reducer, and output is
 //! capped at [`WEB_FETCH_OUTPUT_CAP_BYTES`] with an honest truncation marker.
 
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::origin::{FixedDnsResolver, SystemFixedDnsResolver, blocked_public_web_target};
@@ -41,6 +42,10 @@ const CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// (slowloris) never trips it; this absolute deadline aborts the entire fetch
 /// no matter how the bytes are paced.
 const WEB_FETCH_TOTAL_DEADLINE: Duration = Duration::from_secs(120);
+const WEB_FETCH_CLIENT_ORIGIN_CAP: usize = 32;
+const WEB_FETCH_VALIDATOR_CAP_BYTES: usize = 2 * 1024 * 1024;
+const WEB_FETCH_VALIDATOR_ENTRY_CAP: usize = 64;
+const WEB_FETCH_VALIDATOR_ENTRY_OVERHEAD_BYTES: usize = 512;
 
 /// The bounded, reduced result of one guarded fetch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +66,241 @@ pub struct WebFetchOutcome {
 pub struct WebFetchExecution {
     pub outcome: Result<WebFetchOutcome, ProviderError>,
     pub attempts: u8,
+}
+
+/// The reusable transport key includes both the origin and the exact freshly
+/// validated DNS pin set. A DNS answer or policy classification change builds
+/// a different client; validation itself still runs before every hop.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FetchPolicyKey {
+    scheme: String,
+    host: String,
+    port: u16,
+    pinned: Option<Vec<SocketAddr>>,
+    is_public: bool,
+}
+
+impl FetchPolicyKey {
+    fn new(url: &reqwest::Url, target: &ValidatedFetchTarget) -> Result<Self, ProviderError> {
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| refused("web_fetch URL has no usable port"))?;
+        let mut pinned = target.pinned.clone();
+        if let Some(addresses) = &mut pinned {
+            addresses.sort_unstable();
+            addresses.dedup();
+        }
+        Ok(Self {
+            scheme: url.scheme().to_owned(),
+            host: target.host.clone(),
+            port,
+            pinned,
+            is_public: target.is_public,
+        })
+    }
+}
+
+struct ClientCache {
+    entries: HashMap<FetchPolicyKey, reqwest::Client>,
+    lru: VecDeque<FetchPolicyKey>,
+}
+
+impl ClientCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            lru: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, key: &FetchPolicyKey) -> Option<reqwest::Client> {
+        let client = self.entries.get(key)?.clone();
+        self.touch(key);
+        Some(client)
+    }
+
+    fn insert(&mut self, key: FetchPolicyKey, client: reqwest::Client) {
+        self.remove(&key);
+        while self.entries.len() >= WEB_FETCH_CLIENT_ORIGIN_CAP {
+            let Some(oldest) = self.lru.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+        self.lru.push_back(key.clone());
+        self.entries.insert(key, client);
+    }
+
+    fn touch(&mut self, key: &FetchPolicyKey) {
+        if let Some(position) = self.lru.iter().position(|candidate| candidate == key) {
+            self.lru.remove(position);
+        }
+        self.lru.push_back(key.clone());
+    }
+
+    fn remove(&mut self, key: &FetchPolicyKey) {
+        self.entries.remove(key);
+        if let Some(position) = self.lru.iter().position(|candidate| candidate == key) {
+            self.lru.remove(position);
+        }
+    }
+}
+
+fn client_cache() -> &'static Mutex<ClientCache> {
+    static CACHE: OnceLock<Mutex<ClientCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(ClientCache::new()))
+}
+
+fn with_client_cache<T>(operation: impl FnOnce(&mut ClientCache) -> T) -> T {
+    let mut cache = client_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    operation(&mut cache)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ValidatorCacheKey {
+    url: String,
+    output_cap: usize,
+    policy: FetchPolicyKey,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct CachedValidatedResponse {
+    etag: Option<reqwest::header::HeaderValue>,
+    last_modified: Option<reqwest::header::HeaderValue>,
+    outcome: WebFetchOutcome,
+}
+
+struct ValidatorCacheEntry {
+    response: CachedValidatedResponse,
+    weight: usize,
+}
+
+struct ValidatorCache {
+    cap_bytes: usize,
+    used_bytes: usize,
+    entries: HashMap<ValidatorCacheKey, ValidatorCacheEntry>,
+    lru: VecDeque<ValidatorCacheKey>,
+}
+
+impl ValidatorCache {
+    fn new(cap_bytes: usize) -> Self {
+        Self {
+            cap_bytes,
+            used_bytes: 0,
+            entries: HashMap::new(),
+            lru: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, key: &ValidatorCacheKey) -> Option<CachedValidatedResponse> {
+        let response = self.entries.get(key)?.response.clone();
+        self.touch(key);
+        Some(response)
+    }
+
+    fn insert(&mut self, key: ValidatorCacheKey, response: CachedValidatedResponse) {
+        self.remove(&key);
+        let weight = validator_cache_weight(&key, &response);
+        if weight > self.cap_bytes {
+            return;
+        }
+        while self.used_bytes.saturating_add(weight) > self.cap_bytes
+            || self.entries.len() >= WEB_FETCH_VALIDATOR_ENTRY_CAP
+        {
+            let Some(oldest) = self.lru.pop_front() else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&oldest) {
+                self.used_bytes = self.used_bytes.saturating_sub(entry.weight);
+            }
+        }
+        self.used_bytes = self.used_bytes.saturating_add(weight);
+        self.lru.push_back(key.clone());
+        self.entries
+            .insert(key, ValidatorCacheEntry { response, weight });
+    }
+
+    fn replace_if_matches(
+        &mut self,
+        key: ValidatorCacheKey,
+        expected: &CachedValidatedResponse,
+        response: CachedValidatedResponse,
+    ) {
+        if self
+            .entries
+            .get(&key)
+            .is_some_and(|entry| &entry.response == expected)
+        {
+            self.insert(key, response);
+        }
+    }
+
+    fn remove_if_matches(&mut self, key: &ValidatorCacheKey, expected: &CachedValidatedResponse) {
+        if self
+            .entries
+            .get(key)
+            .is_some_and(|entry| &entry.response == expected)
+        {
+            self.remove(key);
+        }
+    }
+
+    fn remove(&mut self, key: &ValidatorCacheKey) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.used_bytes = self.used_bytes.saturating_sub(entry.weight);
+        }
+        if let Some(position) = self.lru.iter().position(|candidate| candidate == key) {
+            self.lru.remove(position);
+        }
+    }
+
+    fn touch(&mut self, key: &ValidatorCacheKey) {
+        if let Some(position) = self.lru.iter().position(|candidate| candidate == key) {
+            self.lru.remove(position);
+        }
+        self.lru.push_back(key.clone());
+    }
+}
+
+fn validator_cache() -> &'static Mutex<ValidatorCache> {
+    static CACHE: OnceLock<Mutex<ValidatorCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(ValidatorCache::new(WEB_FETCH_VALIDATOR_CAP_BYTES)))
+}
+
+fn with_validator_cache<T>(operation: impl FnOnce(&mut ValidatorCache) -> T) -> T {
+    let mut cache = validator_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    operation(&mut cache)
+}
+
+fn validator_cache_weight(key: &ValidatorCacheKey, response: &CachedValidatedResponse) -> usize {
+    let validator_bytes = response
+        .etag
+        .as_ref()
+        .map_or(0, |value| value.as_bytes().len())
+        + response
+            .last_modified
+            .as_ref()
+            .map_or(0, |value| value.as_bytes().len());
+    // The validator key is owned once by the map and once by the exact LRU.
+    let key_bytes = key
+        .url
+        .capacity()
+        .saturating_add(key.policy.scheme.capacity())
+        .saturating_add(key.policy.host.capacity())
+        .saturating_add(key.policy.pinned.as_ref().map_or(0, |addresses| {
+            addresses.capacity() * std::mem::size_of::<SocketAddr>()
+        }))
+        .saturating_mul(2);
+    WEB_FETCH_VALIDATOR_ENTRY_OVERHEAD_BYTES
+        .saturating_add(key_bytes)
+        .saturating_add(response.outcome.final_url.capacity())
+        .saturating_add(response.outcome.content_type.capacity())
+        .saturating_add(response.outcome.text.capacity())
+        .saturating_add(validator_bytes)
 }
 
 /// Fetches one model-supplied URL through the strict-public origin policy.
@@ -199,7 +439,49 @@ async fn fetch_public_url_inner(
         let forbid_downgrade = chain_started_public == Some(true);
         let target = validate_fetch_target(&current, resolver.as_ref(), forbid_downgrade).await?;
         chain_started_public.get_or_insert(target.is_public);
-        let response = open_response(&current, &target, deadline).await?;
+        let policy_key = FetchPolicyKey::new(&current, &target)?;
+        let validator_key = ValidatorCacheKey {
+            url: current.to_string(),
+            output_cap,
+            policy: policy_key.clone(),
+        };
+        let cached = with_validator_cache(|cache| cache.get(&validator_key));
+        let response =
+            open_response(&current, &target, &policy_key, cached.as_ref(), deadline).await?;
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            let Some(cached) = cached else {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::Transport,
+                    format!(
+                        "web_fetch {current} returned HTTP 304 without a cached representation"
+                    ),
+                )
+                .with_http_metadata(304, None));
+            };
+            let mut refreshed = cached.clone();
+            refreshed.etag = response
+                .headers()
+                .get(reqwest::header::ETAG)
+                .cloned()
+                .or(refreshed.etag);
+            refreshed.last_modified =
+                valid_last_modified(response.headers()).or(refreshed.last_modified);
+            let outcome = refreshed.outcome.clone();
+            if response_allows_validator_storage(&response) {
+                with_validator_cache(|cache| {
+                    cache.replace_if_matches(validator_key, &cached, refreshed);
+                });
+            } else {
+                with_validator_cache(|cache| cache.remove_if_matches(&validator_key, &cached));
+            }
+            return Ok(outcome);
+        }
+        // Any full response supersedes the cached representation. Remove it
+        // before redirect/status/MIME/body handling so a failed replacement
+        // can never make a later 304 resurrect stale bytes.
+        if let Some(cached) = &cached {
+            with_validator_cache(|cache| cache.remove_if_matches(&validator_key, cached));
+        }
         if response.status().is_redirection() {
             let location = response
                 .headers()
@@ -231,6 +513,13 @@ async fn fetch_public_url_inner(
             )
             .with_http_metadata(code, None));
         }
+        let cacheable = response_allows_validator_storage(&response);
+        let etag = cacheable
+            .then(|| response.headers().get(reqwest::header::ETAG).cloned())
+            .flatten();
+        let last_modified = cacheable
+            .then(|| valid_last_modified(response.headers()))
+            .flatten();
         let content_type = declared_media_type(&response)?;
         let (bytes, source_truncated) = read_body_bounded(response, deadline).await?;
         let text = if content_type == "text/html" {
@@ -245,12 +534,25 @@ async fn fetch_public_url_inner(
         } else {
             text
         };
-        return Ok(WebFetchOutcome {
+        let outcome = WebFetchOutcome {
             final_url: current.to_string(),
             content_type,
             text,
             truncated,
-        });
+        };
+        if etag.is_some() || last_modified.is_some() {
+            with_validator_cache(|cache| {
+                cache.insert(
+                    validator_key,
+                    CachedValidatedResponse {
+                        etag,
+                        last_modified,
+                        outcome: outcome.clone(),
+                    },
+                );
+            });
+        }
+        return Ok(outcome);
     }
     Err(refused(format!(
         "web_fetch exceeded {WEB_FETCH_MAX_REDIRECTS} redirects"
@@ -358,31 +660,24 @@ pub(crate) async fn validate_fetch_target(
 async fn open_response(
     url: &reqwest::Url,
     target: &ValidatedFetchTarget,
+    policy_key: &FetchPolicyKey,
+    cached: Option<&CachedValidatedResponse>,
     deadline: tokio::time::Instant,
 ) -> Result<reqwest::Response, ProviderError> {
-    let mut builder = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .retry(reqwest::retry::never())
-        .connect_timeout(CONNECT_TIMEOUT);
-    if let Some(pinned) = &target.pinned {
-        // The validated answers are the ONLY addresses this client may dial
-        // for the host — a rebind between validation and connect dead-ends.
-        builder = builder.resolve_to_addrs(&target.host, pinned);
+    let client = client_for_target(target, policy_key)?;
+    let mut request = client.get(url.clone()).header(
+        reqwest::header::ACCEPT,
+        "text/html, application/json;q=0.9, text/*;q=0.8",
+    );
+    if let Some(cached) = cached {
+        if let Some(etag) = &cached.etag {
+            request = request.header(reqwest::header::IF_NONE_MATCH, etag.clone());
+        }
+        if let Some(last_modified) = &cached.last_modified {
+            request = request.header(reqwest::header::IF_MODIFIED_SINCE, last_modified.clone());
+        }
     }
-    let client = builder.build().map_err(|error| {
-        ProviderError::new(
-            ProviderErrorKind::Internal,
-            format!("web_fetch could not construct its HTTP client: {error}"),
-        )
-    })?;
-    let opening = client
-        .get(url.clone())
-        .header(
-            reqwest::header::ACCEPT,
-            "text/html, application/json;q=0.9, text/*;q=0.8",
-        )
-        .send();
+    let opening = request.send();
     // M6: bound the open by whichever comes first — the per-open timeout or
     // the whole-fetch deadline.
     within_fetch_deadline(opening, deadline, RESPONSE_OPEN_TIMEOUT, || {
@@ -401,6 +696,33 @@ async fn open_response(
             format!("web_fetch transport failed: {error}"),
         )
     })
+}
+
+fn client_for_target(
+    target: &ValidatedFetchTarget,
+    policy_key: &FetchPolicyKey,
+) -> Result<reqwest::Client, ProviderError> {
+    if let Some(client) = with_client_cache(|cache| cache.get(policy_key)) {
+        return Ok(client);
+    }
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .connect_timeout(CONNECT_TIMEOUT);
+    if let Some(pinned) = &target.pinned {
+        // The validated answers are the ONLY addresses this client may dial
+        // for the host — a rebind between validation and connect dead-ends.
+        builder = builder.resolve_to_addrs(&target.host, pinned);
+    }
+    let client = builder.build().map_err(|error| {
+        ProviderError::new(
+            ProviderErrorKind::Internal,
+            format!("web_fetch could not construct its HTTP client: {error}"),
+        )
+    })?;
+    with_client_cache(|cache| cache.insert(policy_key.clone(), client.clone()));
+    Ok(client)
 }
 
 /// The typed abort for the whole-fetch wall-clock deadline (M6). Phrased
@@ -433,6 +755,24 @@ fn declared_media_type(response: &reqwest::Response) -> Result<String, ProviderE
             "web_fetch refuses content type `{media_type}` (text/* and application/json only)"
         )))
     }
+}
+
+fn response_allows_validator_storage(response: &reqwest::Response) -> bool {
+    !response
+        .headers()
+        .get_all(reqwest::header::CACHE_CONTROL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|directive| directive.trim().eq_ignore_ascii_case("no-store"))
+}
+
+fn valid_last_modified(
+    headers: &reqwest::header::HeaderMap,
+) -> Option<reqwest::header::HeaderValue> {
+    let value = headers.get(reqwest::header::LAST_MODIFIED)?;
+    httpdate::parse_http_date(value.to_str().ok()?).ok()?;
+    Some(value.clone())
 }
 
 async fn read_body_bounded(
@@ -824,6 +1164,23 @@ fn refused(message: impl Into<String>) -> ProviderError {
 mod retry_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    struct CountingResolver {
+        calls: Arc<AtomicUsize>,
+        address: SocketAddr,
+    }
+
+    #[async_trait::async_trait]
+    impl FixedDnsResolver for CountingResolver {
+        async fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+            assert_eq!(host, "validator.test");
+            assert_eq!(port, self.address.port());
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![self.address])
+        }
+    }
 
     /// Loom B2 MUTATION CHECK: move the host-scope check out of the hop loop
     /// (back to hop 0 only) or drop it. Expected RUNTIME failure: a scoped
@@ -902,5 +1259,97 @@ mod retry_tests {
         .await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(execution.attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn unchanged_refetch_sends_both_validators_and_reuses_the_304_body() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind validator test server");
+        let address = listener.local_addr().expect("validator server address");
+        let server = tokio::spawn(async move {
+            for request_index in 0..2 {
+                let (mut socket, _) = listener.accept().await.expect("accept validator request");
+                let mut request = vec![0u8; 4096];
+                let mut used = 0usize;
+                loop {
+                    let read = socket
+                        .read(&mut request[used..])
+                        .await
+                        .expect("read validator request");
+                    assert!(read > 0, "request ends after complete headers");
+                    used += read;
+                    if request[..used]
+                        .windows(4)
+                        .any(|window| window == b"\r\n\r\n")
+                    {
+                        break;
+                    }
+                    assert!(used < request.len(), "request headers stay bounded");
+                }
+                let request = String::from_utf8_lossy(&request[..used]).to_ascii_lowercase();
+                let response = if request_index == 0 {
+                    assert!(!request.contains("if-none-match:"));
+                    assert!(!request.contains("if-modified-since:"));
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\netag: \"v1\"\r\nlast-modified: Wed, 21 Oct 2015 07:28:00 GMT\r\ncontent-length: 9\r\nconnection: close\r\n\r\nunchanged"
+                } else {
+                    assert!(request.contains("if-none-match: \"v1\""), "{request}");
+                    assert!(
+                        request.contains("if-modified-since: wed, 21 oct 2015 07:28:00 gmt"),
+                        "{request}"
+                    );
+                    "HTTP/1.1 304 Not Modified\r\netag: \"v1\"\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                };
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write validator response");
+                socket.shutdown().await.expect("close validator response");
+            }
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver: Arc<dyn FixedDnsResolver> = Arc::new(CountingResolver {
+            calls: Arc::clone(&calls),
+            address,
+        });
+        let url = format!("http://validator.test:{}/resource", address.port());
+
+        let first = fetch_public_url_with_resolver(&url, None, Arc::clone(&resolver))
+            .await
+            .expect("initial validator response");
+        let second = fetch_public_url_with_resolver(&url, None, resolver)
+            .await
+            .expect("304 reuses cached representation");
+
+        assert_eq!(first.text, "unchanged");
+        assert_eq!(second, first);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "every fetch revalidates DNS"
+        );
+        server.await.expect("validator server completes");
+    }
+
+    #[test]
+    fn client_reuse_key_changes_when_the_dns_pin_policy_changes() {
+        let url = reqwest::Url::parse("https://example.test/resource").expect("test URL");
+        let first_target = ValidatedFetchTarget {
+            host: "example.test".into(),
+            pinned: Some(vec!["192.0.2.10:443".parse().expect("first address")]),
+            is_public: true,
+        };
+        let second_target = ValidatedFetchTarget {
+            host: "example.test".into(),
+            pinned: Some(vec!["192.0.2.11:443".parse().expect("second address")]),
+            is_public: true,
+        };
+
+        let first = FetchPolicyKey::new(&url, &first_target).expect("first policy key");
+        let repeated = FetchPolicyKey::new(&url, &first_target).expect("repeated policy key");
+        let changed = FetchPolicyKey::new(&url, &second_target).expect("changed policy key");
+
+        assert_eq!(repeated, first);
+        assert_ne!(changed, first, "a changed pin set cannot reuse the client");
     }
 }
