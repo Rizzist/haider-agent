@@ -333,6 +333,18 @@ impl SessionState {
                 if matches!(note, crate::branch::AdmittedNote::Content) {
                     match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
                         Ok(payload) => {
+                            // Hidden direct-shell provenance annotates its
+                            // linked visible command without painting a row.
+                            if envelope.agent_id.is_none()
+                                && let Some(origin) =
+                                    crate::projection::user_command_origin(&payload)
+                            {
+                                self.branch_state.mark_user_command(
+                                    &mut self.projection,
+                                    envelope.branch_id.as_ref(),
+                                    &origin,
+                                );
+                            }
                             if envelope.agent_id.is_none()
                                 && let EventPayload::UserMessage { text, .. } = &payload
                             {

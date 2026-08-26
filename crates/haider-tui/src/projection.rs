@@ -75,6 +75,9 @@ pub enum TranscriptEntry {
 pub struct ItemBlock {
     pub item_id: ItemId,
     pub item: TurnItem,
+    /// The hidden durable origin marker linked this command item to a direct
+    /// user `!` submission. Model-origin command executions remain false.
+    pub user_command: bool,
     /// True between `Started` and `Completed`.
     pub streaming: bool,
     /// Accumulated `ToolArgs` fragments (display-only; `Completed` carries
@@ -98,6 +101,7 @@ impl ItemBlock {
         Self {
             item_id,
             item,
+            user_command: false,
             streaming,
             args_fragments: String::new(),
             output_tail: Vec::new(),
@@ -121,6 +125,18 @@ impl ItemBlock {
     pub fn output_text(&self) -> std::borrow::Cow<'_, str> {
         String::from_utf8_lossy(&self.output_tail)
     }
+}
+
+/// A hidden direct-user-shell provenance marker. Unknown, malformed, and
+/// non-item extensions are not display authority.
+#[must_use]
+pub(crate) fn user_command_origin(
+    payload: &EventPayload,
+) -> Option<haider_protocol::item::UserCommandOriginV1> {
+    let EventPayload::Item(ItemEvent::Completed { item, .. }) = payload else {
+        return None;
+    };
+    haider_protocol::item::UserCommandOriginV1::from_extension_item(item)
 }
 
 #[derive(Debug, Clone)]
@@ -283,6 +299,34 @@ pub struct SessionProjection {
 }
 
 impl SessionProjection {
+    /// Apply hidden provenance to an already-visible command block. The
+    /// marker is committed after the started item, so no pending side table
+    /// is needed; a missing target fails closed as model-origin display.
+    #[must_use]
+    pub fn mark_user_command(
+        &mut self,
+        origin: &haider_protocol::item::UserCommandOriginV1,
+    ) -> bool {
+        let Some(block) = self.entries.iter_mut().find_map(|entry| match entry {
+            TranscriptEntry::Item(block) if block.item_id == origin.command_item_id => Some(block),
+            _ => None,
+        }) else {
+            return false;
+        };
+        if !matches!(
+            &block.item,
+            TurnItem::CommandExecution { call_id, .. } if call_id == &origin.call_id
+        ) {
+            return false;
+        }
+        let changed = !block.user_command;
+        block.user_command = true;
+        if changed {
+            self.render_revision = self.render_revision.wrapping_add(1);
+        }
+        true
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self::default()

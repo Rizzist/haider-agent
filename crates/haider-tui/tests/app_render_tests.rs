@@ -324,7 +324,26 @@ fn command_decode_error_is_visible_in_the_session_view() {
         },
     ))));
     let (text, _) = draw(&model, 90, 30);
+    assert!(
+        text.contains("$ cat log.bin") && !text.contains("! cat log.bin"),
+        "an unmarked/model command keeps the $ sigil"
+    );
     assert!(text.contains("⚠ some output could not be decoded"));
+
+    assert!(
+        model
+            .projection
+            .mark_user_command(&haider_protocol::item::UserCommandOriginV1 {
+                origin: haider_protocol::item::CommandExecutionOrigin::UserCommand,
+                command_item_id: ItemId::new("cmd-err"),
+                call_id: "c".to_owned(),
+            })
+    );
+    let (text, _) = draw(&model, 90, 30);
+    assert!(
+        text.contains("! cat log.bin"),
+        "a provenance-linked user-shell row carries the ! sigil"
+    );
 }
 
 #[test]

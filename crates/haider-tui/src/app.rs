@@ -484,6 +484,14 @@ impl AppModel {
         self.mode.fabricates_locally() || self.daemon_features.contains(feature)
     }
 
+    /// Direct user commands require the same complete semantic surface as
+    /// the typed client: admission, provenance/context, and cancellation.
+    #[must_use]
+    fn daemon_serves_user_commands(&self) -> bool {
+        self.mode.fabricates_locally()
+            || haider_client::required_user_command_features().is_subset(&self.daemon_features)
+    }
+
     /// Whether the connected daemon can run the hidden device-credential
     /// auto-adoption refresh. The discovery report is no longer rendered;
     /// this feature gate only schedules the daemon policy pass.
@@ -2462,8 +2470,12 @@ pub enum AppRequest {
     RunUpdate,
     /// W8b: live `!` shell escape — one exact command for the SESSION
     /// daemon's workspace (receipt-backed `shell.exec`; zero provider
-    /// requests). Never demo vocabulary.
-    ShellExec { command: String },
+    /// requests). The branch is captured at issuance so a later switch
+    /// cannot retarget the durable command record. Never demo vocabulary.
+    ShellExec {
+        command: String,
+        branch: Option<haider_protocol::ids::BranchId>,
+    },
     /// W10b: durable account removal (receipt-backed `account.remove`).
     AccountRemove { alias: String },
     /// W10b: durable custom-provider removal (`provider.remove`) — the
@@ -6817,9 +6829,12 @@ impl AppModel {
                 );
             } else if stripped.trim().is_empty() {
                 self.flash = Some("· ! — type a command".to_owned());
+            } else if !self.daemon_serves_user_commands() {
+                self.flash = Some(self.stale_daemon_note("the ! shell escape"));
             } else {
                 self.requests.push(AppRequest::ShellExec {
                     command: stripped.to_owned(),
+                    branch: self.branch_state.active().cloned(),
                 });
             }
             self.dirty = true;
@@ -11617,6 +11632,19 @@ impl AppModel {
                 if matches!(note, crate::branch::AdmittedNote::Content) {
                     match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
                         Ok(payload) => {
+                            // The origin marker is intentionally `ui=false`:
+                            // consume it as display metadata for the linked
+                            // visible command, never as its own row.
+                            if envelope.agent_id.is_none()
+                                && let Some(origin) =
+                                    crate::projection::user_command_origin(&payload)
+                            {
+                                self.branch_state.mark_user_command(
+                                    &mut self.projection,
+                                    envelope.branch_id.as_ref(),
+                                    &origin,
+                                );
+                            }
                             if envelope.agent_id.is_none()
                                 && let EventPayload::UserMessage { text, .. } = &payload
                             {

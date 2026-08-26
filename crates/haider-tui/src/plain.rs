@@ -466,7 +466,8 @@ fn render_item(out: &mut String, block: &ItemBlock) {
             exit_code,
             ..
         } => {
-            out.push_str(&format!("$ {command} {}", status_glyph(*status)));
+            let sigil = if block.user_command { '!' } else { '$' };
+            out.push_str(&format!("{sigil} {command} {}", status_glyph(*status)));
             if let Some(code) = exit_code {
                 out.push_str(&format!(" · exit {code}"));
             }

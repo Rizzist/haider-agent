@@ -225,6 +225,8 @@ pub enum LiveCommand {
         command_id: CommandId,
         session: SessionId,
         worker_generation: u64,
+        /// Branch captured by the composer at issuance (B2b).
+        branch: Option<haider_protocol::ids::BranchId>,
         command: String,
     },
     /// `tools.inventory` — a READ of the daemon's canonical tool registry
@@ -4762,10 +4764,10 @@ impl LiveDriver {
                     branch,
                 })]
             }
-            AppRequest::ShellExec { command } => {
+            AppRequest::ShellExec { command, branch } => {
                 // W8b law 5/6: one durable daemon command, no UserMessage,
                 // no client-side spawn, no shell re-quoting — the exact
-                // bytes travel once.
+                // bytes and captured branch travel once.
                 let Some(session) = model.active_session.clone() else {
                     return Vec::new();
                 };
@@ -4775,6 +4777,7 @@ impl LiveDriver {
                     command_id,
                     session,
                     worker_generation,
+                    branch,
                     command,
                 })]
             }

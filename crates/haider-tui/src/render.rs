@@ -11354,8 +11354,9 @@ fn item_lines<'a>(
             exit_code,
             ..
         } => {
+            let sigil = if block.user_command { "  ! " } else { "  $ " };
             let mut spans = vec![
-                Span::styled("  $ ", theme.gold_style()),
+                Span::styled(sigil, theme.gold_style()),
                 Span::styled(command.as_str(), theme.text_style()),
                 Span::styled(format!(" {}", status_glyph(*status)), theme.dim_style()),
             ];

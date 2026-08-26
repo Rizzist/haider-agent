@@ -17,7 +17,7 @@ use haider_protocol::ids::{
 use haider_protocol::state::RunState;
 use haider_rpc::{AttachmentId, CommandId, RequestBody, ResponseBody, SubmitDisposition};
 use haider_tui::app::{AppModel, AppRequest, RuntimeMode};
-use haider_tui::link::{CommandContext, map_response, request_body};
+use haider_tui::link::{CommandContext, map_response, request_body, request_body_for_features};
 use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};
 use haider_tui::projection::RawOutcome;
 
@@ -685,6 +685,105 @@ fn a_submit_queued_before_a_later_switch_still_carries_its_captured_branch() {
     );
 }
 
+/// MUTATION CHECK: replace the `!` request's issuance-time branch with
+/// `None`, or re-read the active branch in the live driver. Expected runtime
+/// failure: the scoped wire request below targets main after the later switch.
+#[test]
+fn shell_exec_captures_the_named_branch_through_the_scoped_wire() {
+    let mut model = attached_model();
+    model.daemon_features = haider_client::required_user_command_features();
+    let mut driver = LiveDriver::new("test");
+    driver.apply(
+        &mut model,
+        LiveReply::Attached {
+            session: sid(0),
+            attachment: AttachmentId::new("att-shell"),
+            worker_generation: 7,
+            replay_through_seq: 0,
+        },
+    );
+    seed_branch(&mut model);
+    model.switch_branch(Some(&bid("b-exp")));
+
+    common::submit(&mut model, "!printf branch");
+    let request = model
+        .requests
+        .drain(..)
+        .find(|request| matches!(request, AppRequest::ShellExec { .. }))
+        .expect("a shell request");
+    let AppRequest::ShellExec { branch, .. } = &request else {
+        unreachable!()
+    };
+    assert_eq!(branch.as_ref().map(BranchId::as_str), Some("b-exp"));
+
+    model.switch_branch(None);
+    let commands = driver.handle_request(&mut model, request);
+    let Some(command @ LiveCommand::ShellExec { branch, .. }) = commands.first() else {
+        panic!("expected a ShellExec command, got {commands:?}");
+    };
+    assert_eq!(branch.as_ref().map(BranchId::as_str), Some("b-exp"));
+    assert!(matches!(
+        request_body(command.clone()),
+        RequestBody::ShellExecScoped {
+            branch_id: Some(branch),
+            ..
+        } if branch.as_str() == "b-exp"
+    ));
+
+    // The existing TUI branch router then keeps the daemon-stamped record
+    // out of main, and the next submit retains the same branch coordinate.
+    let record = EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
+        item_id: haider_protocol::ids::ItemId::new("branch-shell-item"),
+        item: haider_protocol::item::TurnItem::CommandExecution {
+            call_id: "branch-shell-call".to_owned(),
+            command: "printf branch".to_owned(),
+            status: haider_protocol::item::ToolStatus::Completed,
+            exit_code: Some(0),
+        },
+    });
+    assert_eq!(
+        model.route_raw(&stamped(&sid(0), 4, "b-exp", &record)),
+        RawOutcome::Applied
+    );
+    let origin = haider_protocol::item::UserCommandOriginV1 {
+        origin: haider_protocol::item::CommandExecutionOrigin::UserCommand,
+        command_item_id: haider_protocol::ids::ItemId::new("branch-shell-item"),
+        call_id: "branch-shell-call".to_owned(),
+    };
+    let marker = EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
+        item_id: haider_protocol::ids::ItemId::new("branch-shell-origin"),
+        item: origin.extension_item().expect("origin item"),
+    });
+    let mut marker = stamped(&sid(0), 5, "b-exp", &marker);
+    marker.render.ui = false;
+    assert_eq!(model.route_raw(&marker), RawOutcome::Applied);
+    assert!(
+        !model.projection.entries().iter().any(|entry| matches!(
+            entry,
+            haider_tui::projection::TranscriptEntry::Item(block)
+                if matches!(&block.item, haider_protocol::item::TurnItem::CommandExecution { .. })
+        )),
+        "the named-branch shell record must not leak into main"
+    );
+    model.switch_branch(Some(&bid("b-exp")));
+    assert!(model.projection.entries().iter().any(|entry| {
+        matches!(
+            entry,
+            haider_tui::projection::TranscriptEntry::Item(block)
+                if block.user_command
+                    && matches!(&block.item, haider_protocol::item::TurnItem::CommandExecution { .. })
+        )
+    }));
+    common::submit(&mut model, "explain that output");
+    assert!(model.requests.iter().any(|request| matches!(
+        request,
+        AppRequest::SubmitText {
+            branch: Some(branch),
+            ..
+        } if branch.as_str() == "b-exp"
+    )));
+}
+
 #[test]
 fn menu_answers_and_compact_capture_the_branch_at_issuance() {
     let mut model = attached_model();
@@ -842,6 +941,45 @@ fn main_branch_wire_bytes_stay_historical_and_branches_ride_the_decode_forms() {
         cancel.get("branch_id").is_none(),
         "cancel wire bytes are unchanged"
     );
+}
+
+#[test]
+fn shell_exec_on_main_stays_unbranched_and_old_daemons_keep_legacy_bytes() {
+    let shell = |branch: Option<BranchId>| LiveCommand::ShellExec {
+        command_id: CommandId::new("shell-1"),
+        session: sid(0),
+        worker_generation: 7,
+        branch,
+        command: "printf exact".to_owned(),
+    };
+
+    assert!(matches!(
+        request_body(shell(None)),
+        RequestBody::ShellExecScoped {
+            branch_id: None,
+            agent_id: None,
+            ..
+        }
+    ));
+    let main = serde_json::to_value(request_body(shell(None))).expect("main shell encodes");
+    assert!(
+        main.get("branch_id").is_none(),
+        "main shell bytes stay unbranched: {main}"
+    );
+
+    let mut legacy_features = haider_client::required_user_command_features();
+    legacy_features.remove(haider_rpc::FEATURE_USER_COMMAND_V1);
+    assert!(matches!(
+        request_body_for_features(shell(Some(bid("b-exp"))), &legacy_features),
+        RequestBody::ShellExec { .. }
+    ));
+
+    let mut scoped_without_turn_control = haider_client::required_user_command_features();
+    scoped_without_turn_control.remove(haider_rpc::FEATURE_TURN_CONTROL_V1);
+    assert!(matches!(
+        request_body_for_features(shell(Some(bid("b-exp"))), &scoped_without_turn_control),
+        RequestBody::ShellExecScoped { .. }
+    ));
 }
 
 #[test]

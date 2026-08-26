@@ -210,6 +210,28 @@ impl BranchState {
         }
     }
 
+    /// Attach hidden direct-user-shell provenance to the command block in
+    /// its exact branch view. This is command metadata, not a transcript row:
+    /// the marker itself remains invisible while its linked row gains `!`.
+    pub fn mark_user_command(
+        &mut self,
+        projection: &mut SessionProjection,
+        branch: Option<&BranchId>,
+        origin: &haider_protocol::item::UserCommandOriginV1,
+    ) -> bool {
+        match self.content_scope(branch) {
+            BranchScope::Active => projection.mark_user_command(origin),
+            BranchScope::ParkedMain => self
+                .parked_main
+                .as_mut()
+                .is_some_and(|view| view.projection.mark_user_command(origin)),
+            BranchScope::ParkedNamed(id) => self
+                .view_mut(&id)
+                .is_some_and(|view| view.projection.mark_user_command(origin)),
+            BranchScope::Aggregate | BranchScope::Orphan => false,
+        }
+    }
+
     /// Swap the displayed branch's surfaces with `target`'s — the ONE
     /// switch authority (risk 8). The session cursor is transplanted onto
     /// the incoming projection so admission continues through the
