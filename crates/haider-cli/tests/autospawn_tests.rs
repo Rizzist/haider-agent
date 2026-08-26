@@ -406,16 +406,23 @@ fn parent_exit_leaves_the_daemon_running() {
         store: store.path().to_path_buf(),
     };
 
+    let started = Instant::now();
     let output = output_with_timeout(
         &mut haider_command(store.path()),
         "haider launcher to spawn the persistent daemon and exit",
     );
+    let launch_elapsed = started.elapsed();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("daemon ready"));
     assert!(
         stdout.contains("spawned"),
         "first launch must spawn: {stdout}"
+    );
+    assert!(
+        launch_elapsed < Duration::from_millis(950),
+        "an authenticated own child must skip the 40 x 25 ms loser grace; launch took \
+         {launch_elapsed:?}"
     );
 
     // The launcher has fully exited; the daemon must still serve, and the
