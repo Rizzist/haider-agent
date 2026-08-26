@@ -2544,6 +2544,7 @@ impl SessionHub {
     /// Routes atomic session creation through the candidate session actor.
     /// A guessed concurrent attachment is therefore ordered with the
     /// `Created` commit/publication by the same INV-1/INV-2 actor step.
+    #[cfg(test)]
     async fn create_session(
         &self,
         command: SessionCreateCommand,

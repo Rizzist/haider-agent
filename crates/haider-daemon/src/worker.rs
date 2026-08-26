@@ -8564,6 +8564,7 @@ fn typed_workflow_coordinates_match(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod typed_workflow_boundary_tests {
     use super::{
         TypedWorkflowExecutionBinding, default_child_grant, loom_provider_grant,
