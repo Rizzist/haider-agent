@@ -177,7 +177,7 @@ pub struct CommittedSeqRange {
 /// observed under the same connection lock. The head carries only indexed
 /// coordinates, so a reducer can advance across an irrelevant suffix without
 /// fetching or decoding that suffix's envelopes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReducerPage {
     pub envelopes: Vec<RawEnvelope>,
     pub observed_head: Option<(u64, EventId)>,
@@ -810,7 +810,7 @@ pub struct SessionForkCommand {
 /// the authoritative ledger event in the copied source lineage, permits only
 /// append-only history after that exact prefix, and extracts the bounded,
 /// non-secret coordinates needed by the fork audit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ForkCacheInheritanceCandidate {
     pub provider_view: serde_json::Value,
 }
