@@ -361,11 +361,17 @@ pub(super) async fn run_session_actor(
                     }
                 }
             }
-            ActorCommand::CreateSession { command, completed } => {
+            ActorCommand::CreateSession {
+                command,
+                interaction_mode,
+                completed,
+            } => {
                 // Same INV-1 shape as ordinary append: the complete metadata +
                 // Created + receipt transaction returns before publication,
                 // and no await separates that return from `publish`.
-                let result = store.create_session(command).await;
+                let result = store
+                    .create_session_with_interaction_mode(command, interaction_mode)
+                    .await;
                 if let Ok(SessionCreateOutcome::Committed { envelope, .. }) = &result {
                     head = envelope.seq;
                     authority_epoch = envelope.authority_epoch;
@@ -716,7 +722,11 @@ pub(super) async fn run_session_actor(
                     | Ok(GraphFinalizationOutcome::ConfirmRequired { envelopes, .. }) => {
                         Some(envelopes.as_slice())
                     }
-                    Ok(GraphFinalizationOutcome::AllowDone) | Err(_) => None,
+                    Ok(
+                        GraphFinalizationOutcome::AllowDone
+                        | GraphFinalizationOutcome::WorkflowUnfinished { .. },
+                    )
+                    | Err(_) => None,
                 };
                 publish_graph_commit(
                     envelopes,

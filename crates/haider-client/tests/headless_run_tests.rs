@@ -23,7 +23,9 @@ use haider_rpc::haider_protocol::item::{ItemEvent, TurnItem};
 use haider_rpc::haider_protocol::menu::{
     AnswerVia, DecisionKind, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope,
 };
-use haider_rpc::haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
+use haider_rpc::haider_protocol::session::{
+    SessionInteractionModeV1, SessionMetadataV1, SessionPermissionOverridesV1,
+};
 use haider_rpc::haider_protocol::state::{RunState, WaitReason};
 use haider_rpc::{
     AttachMode, AttachState, AttachmentId, CancelStatus, Capability, CapabilitySet,
@@ -120,6 +122,8 @@ fn profile() -> (tempfile::TempDir, ResolvedProfile) {
 }
 
 fn welcome(profile: &ResolvedProfile) -> Welcome {
+    let mut features = haider_client::required_live_features();
+    features.insert(haider_rpc::FEATURE_AUTONOMOUS_INTERACTION_V1.to_owned());
     Welcome {
         protocol: WIRE_PROTOCOL_VERSION,
         instance_id: "headless-test-peer".into(),
@@ -129,7 +133,7 @@ fn welcome(profile: &ResolvedProfile) -> Welcome {
         daemon_version: "0.0.36-test".into(),
         lifecycle_phase: LifecyclePhase::Ready,
         capabilities_granted: CapabilitySet::from([Capability::View, Capability::Control]),
-        features: haider_client::required_live_features(),
+        features,
         user_command_withheld: false,
         encoding: None,
     }
@@ -168,12 +172,14 @@ async fn accept_create_and_attach(peer: &mut Peer) -> (SessionId, AttachmentId) 
     let (create_request, create) = peer.request().await;
     let RequestBody::SessionCreateWithPermissionOverrides {
         permission_overrides,
+        interaction_mode,
         ..
     } = create
     else {
         panic!("headless runner must use additive session.create shape");
     };
     assert_eq!(permission_overrides, None);
+    assert_eq!(interaction_mode, SessionInteractionModeV1::Autonomous);
     respond_create_and_attach(peer, create_request, "fake", "fake-model").await
 }
 
@@ -196,6 +202,7 @@ async fn respond_create_and_attach(
                 model: model.into(),
                 max_tokens: 4096,
                 permission_overrides: None,
+                interaction_mode: SessionInteractionModeV1::Autonomous,
                 system_prompt_version: Some("test".into()),
                 title: None,
                 effort: None,
@@ -2056,6 +2063,61 @@ async fn adjacent_store_failure_and_errored_terminal_return_without_hanging() {
     ));
 }
 
+#[tokio::test]
+async fn workflow_unfinished_survives_the_durable_headless_projection() {
+    let (_root, profile) = profile();
+    let peer = spawn_peer(&profile, |mut peer| async move {
+        let (session_id, attachment_id) = accept_create_and_attach(&mut peer).await;
+        let (submit_request, run_id) = accept_submit(&mut peer, &session_id).await;
+        peer.respond(
+            submit_request,
+            ResponseBody::TurnSubmit {
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                accepted_seq: 1,
+                worker_generation: 7,
+                disposition: SubmitDisposition::Started,
+            },
+        )
+        .await;
+        send_event(
+            &mut peer,
+            &attachment_id,
+            envelope(
+                &session_id,
+                &run_id,
+                1,
+                EventPayload::RunFailed {
+                    code: ErrorCode::WorkflowUnfinished,
+                    message: "workflow remains unfinished".into(),
+                    retryable: false,
+                    presentation: None,
+                },
+            ),
+        )
+        .await;
+        send_event(
+            &mut peer,
+            &attachment_id,
+            envelope(
+                &session_id,
+                &run_id,
+                2,
+                EventPayload::RunState(RunState::Errored),
+            ),
+        )
+        .await;
+    });
+
+    let (result, _) = run_with_events(profile, request(None), 4, Duration::ZERO).await;
+    peer.await.expect("peer");
+    assert_eq!(result.outcome, HeadlessOutcome::Errored);
+    assert!(matches!(
+        result.failure.map(|failure| failure.code),
+        Some(HeadlessFailureCode::Run(ErrorCode::WorkflowUnfinished))
+    ));
+}
+
 /// MUTATION CHECK: treat a parked Waiting state as terminal or coalesce the
 /// natural Cancelled terminal with Errored/Done. Expected RUNTIME failure:
 /// the runner returns before the delayed terminal or reports the wrong typed
@@ -2625,7 +2687,9 @@ fn override_feature_is_required_only_when_a_flag_is_present() {
         allow_exec: false,
         auto_allow: false,
     });
-    assert_eq!(no_flags, haider_client::required_live_features());
+    let mut expected = haider_client::required_live_features();
+    expected.insert(haider_rpc::FEATURE_AUTONOMOUS_INTERACTION_V1.to_owned());
+    assert_eq!(no_flags, expected);
     assert_eq!(
         flags
             .difference(&no_flags)

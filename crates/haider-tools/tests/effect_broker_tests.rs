@@ -136,6 +136,58 @@ async fn always_allow_is_bound_to_class_and_exact_argument_digest() {
 }
 
 #[tokio::test]
+async fn unresolved_ask_denial_is_lower_priority_than_grants_but_not_true_denies() {
+    let mut broker = broker_at(RecordingJournal::default(), source_root(), 1);
+    let mut policy = PermissionPolicy::default();
+    policy.ask(EffectClass::FsRead);
+    policy.deny_unresolved_asks("no_human_available");
+
+    let unresolved = broker
+        .normalize(&FsRead::new("src/lib.rs"))
+        .await
+        .expect("normalize unresolved read");
+    assert_eq!(
+        broker
+            .authorize(&unresolved, &policy)
+            .await
+            .expect("authorize unresolved read"),
+        AuthorizationVerdict::Deny {
+            reason: "no_human_available".into(),
+        }
+    );
+
+    policy
+        .allow_for_session(EffectClass::FsRead)
+        .expect("explicit read grant");
+    let granted = broker
+        .normalize(&FsRead::new("src/lib.rs"))
+        .await
+        .expect("normalize granted read");
+    assert_eq!(
+        broker
+            .authorize(&granted, &policy)
+            .await
+            .expect("authorize granted read"),
+        AuthorizationVerdict::Allow
+    );
+
+    policy.deny(EffectClass::FsRead, "explicit deny wins");
+    let denied = broker
+        .normalize(&FsRead::new("src/lib.rs"))
+        .await
+        .expect("normalize explicitly denied read");
+    assert_eq!(
+        broker
+            .authorize(&denied, &policy)
+            .await
+            .expect("authorize explicitly denied read"),
+        AuthorizationVerdict::Deny {
+            reason: "explicit deny wins".into(),
+        }
+    );
+}
+
+#[tokio::test]
 async fn authorization_rejects_any_substitute_for_the_journaled_intent() {
     let mut broker = broker_at(RecordingJournal::default(), source_root(), 1);
     let original = broker

@@ -241,6 +241,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_SESSION_FLEET_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_OBSERVE_V1.to_owned(),
             FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned(),
+            haider_rpc::FEATURE_AUTONOMOUS_INTERACTION_V1.to_owned(),
             haider_rpc::FEATURE_STATUS_SEGMENT_STRUCTURED_V1.to_owned(),
             haider_rpc::FEATURE_STATUS_SEGMENT_V1.to_owned(),
             haider_rpc::FEATURE_STORE_HEALTH_V1.to_owned(),

@@ -733,6 +733,7 @@ fn legacy_session_create_defaults_permission_overrides_to_none() {
                 max_tokens: 4096,
                 permission_overrides: None,
                 cache_policy: None,
+                interaction_mode: haider_protocol::session::SessionInteractionModeV1::Interactive,
             },
         }
     );

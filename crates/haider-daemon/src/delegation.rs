@@ -364,27 +364,31 @@ impl DelegationHandle {
             "effort": coordinates.metadata.effort,
             "fast": coordinates.metadata.fast,
             "cache_policy": coordinates.metadata.cache_policy,
+            "interaction_mode": coordinates.metadata.interaction_mode,
         }))
         .map_err(internal_serialization)?;
         let create_digest = digest_bytes(create_json.as_bytes());
         self.hub
-            .create_internal_session(SessionCreateCommand {
-                command_id: format!("delegation-session-{identity}"),
-                request_digest: create_digest,
-                request_json: create_json,
-                session_id: child_session_id.clone(),
-                cwd: coordinates.metadata.cwd.clone(),
-                provider: coordinates.metadata.provider.clone(),
-                model: coordinates.metadata.model.clone(),
-                max_tokens: coordinates.metadata.max_tokens,
-                permission_overrides: child_overrides,
-                effort: coordinates.metadata.effort.clone(),
-                fast: coordinates.metadata.fast,
-                cache_policy: coordinates.metadata.cache_policy,
-                system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
-                event_id: EventId::new(format!("delegation-created-{identity}")),
-                device_id: self.hub.device_id(),
-            })
+            .create_internal_session_with_interaction_mode(
+                SessionCreateCommand {
+                    command_id: format!("delegation-session-{identity}"),
+                    request_digest: create_digest,
+                    request_json: create_json,
+                    session_id: child_session_id.clone(),
+                    cwd: coordinates.metadata.cwd.clone(),
+                    provider: coordinates.metadata.provider.clone(),
+                    model: coordinates.metadata.model.clone(),
+                    max_tokens: coordinates.metadata.max_tokens,
+                    permission_overrides: child_overrides,
+                    effort: coordinates.metadata.effort.clone(),
+                    fast: coordinates.metadata.fast,
+                    cache_policy: coordinates.metadata.cache_policy,
+                    system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+                    event_id: EventId::new(format!("delegation-created-{identity}")),
+                    device_id: self.hub.device_id(),
+                },
+                coordinates.metadata.interaction_mode,
+            )
             .await?;
 
         if let Some(attached) = workflow.as_ref() {

@@ -398,6 +398,12 @@ pub enum GraphFinalizationOutcome {
         /// Empty when an already-open durable menu is replayed.
         envelopes: Vec<RawEnvelope>,
     },
+    /// Autonomous recurrence after the one durable continue-work deferral.
+    /// No abandon menu is opened and no graph authority is mutated.
+    WorkflowUnfinished {
+        graph_id: GraphId,
+        state_digest: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2915,7 +2921,60 @@ impl Store {
         let same_state_deferred = reduction.finalization_deferrals.iter().any(|deferred| {
             deferred.run_id == command.run_id && deferred.state_digest == state_digest
         });
+        let run_already_deferred = reduction
+            .finalization_deferrals
+            .iter()
+            .any(|deferred| deferred.run_id == command.run_id);
+        let metadata_json = transaction
+            .query_row(
+                "SELECT meta_json FROM sessions WHERE id = ?1",
+                [command.session_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(map_sqlite_error)?;
+        let metadata =
+            decode_session_metadata(&command.session_id, &metadata_json)?.ok_or_else(|| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    "legacy session has no interaction policy",
+                    false,
+                )
+            })?;
+        let policy = haider_protocol::interaction::InteractionResolutionPolicy::new(
+            metadata.interaction_mode,
+        );
+        if run_already_deferred
+            && matches!(
+                (
+                    policy.resolve(
+                        haider_protocol::interaction::InteractionGate::WorkflowUnfinishedRecurrence,
+                    ),
+                    policy
+                        .resolve(haider_protocol::interaction::InteractionGate::GraphHumanConfirm,),
+                ),
+                (
+                    haider_protocol::interaction::InteractionResolution::ReturnWorkflowUnfinished,
+                    haider_protocol::interaction::InteractionResolution::FailClosed,
+                )
+            )
+        {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(GraphFinalizationOutcome::WorkflowUnfinished {
+                graph_id: status.graph_id,
+                state_digest,
+            });
+        }
         if !same_state_deferred {
+            if policy
+                .resolve(haider_protocol::interaction::InteractionGate::WorkflowUnfinishedFirst)
+                != haider_protocol::interaction::InteractionResolution::ContinueWorkflow
+            {
+                return Err(store_error(
+                    ErrorCode::Internal,
+                    "unfinished-workflow policy refused its one safe continuation",
+                    false,
+                ));
+            }
             let emit_reminder = !reduction
                 .finalization_deferrals
                 .iter()
@@ -5356,6 +5415,20 @@ impl Store {
         &self,
         command: &SessionCreateCommand,
     ) -> StoreResult<SessionCreateOutcome> {
+        self.create_session_with_interaction_mode(
+            command,
+            haider_protocol::session::SessionInteractionModeV1::Interactive,
+        )
+    }
+
+    /// Same atomic session creation transaction with an explicit durable
+    /// human-availability contract. Legacy callers remain interactive through
+    /// [`Self::create_session`].
+    pub fn create_session_with_interaction_mode(
+        &self,
+        command: &SessionCreateCommand,
+        interaction_mode: haider_protocol::session::SessionInteractionModeV1,
+    ) -> StoreResult<SessionCreateOutcome> {
         validate_command_identity(
             &command.command_id,
             &command.request_digest,
@@ -5404,6 +5477,7 @@ impl Store {
             max_tokens: command.max_tokens,
             system_prompt_version: Some(command.system_prompt_version.clone()),
             permission_overrides: command.permission_overrides,
+            interaction_mode,
             // G2: sessions are born untitled; the daemon-side auto-title
             // (first accept) or an explicit `session.rename` fills this.
             title: None,
