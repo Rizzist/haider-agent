@@ -1980,7 +1980,7 @@ fn golden_convergence_graph_facts_and_old_decoder_tolerance() {
     let status = reduce_graph(&raw).status.expect("legacy status");
     assert_eq!(
         serde_json::to_string(&status).expect("legacy status JSON"),
-        r#"{"graph_id":"graph-ship-loop-1","template":"ship-loop","digest":"63cee264d2a430b21d32c5f8b71c390e0bb825e88073571d19e7dbf2084820eb","phase":"abandoned","current_node":"VERIFY","attempt":2,"nodes":[{"node":"BUILD","attempts_opened":1,"current_attempt":2,"evidence":{"green":0,"red":0,"effective_green":0,"standing_red":0},"satisfied":false},{"node":"VERIFY","attempts_opened":0,"current_attempt":null,"evidence":{"green":0,"red":0,"effective_green":0,"standing_red":0},"satisfied":true},{"node":"SHIP","attempts_opened":0,"current_attempt":null,"evidence":{"green":0,"red":0,"effective_green":0,"standing_red":0},"satisfied":false}],"blocked_reason":"no-progress"}"#
+        r#"{"graph_id":"graph-ship-loop-1","template":"ship-loop","digest":"63cee264d2a430b21d32c5f8b71c390e0bb825e88073571d19e7dbf2084820eb","phase":"abandoned","current_node":"VERIFY","attempt":2,"nodes":[{"node":"BUILD","attempts_opened":1,"current_attempt":2,"evidence":{"green":0,"red":0,"effective_green":0,"standing_red":0},"satisfied":false},{"node":"VERIFY","attempts_opened":0,"current_attempt":null,"evidence":{"green":0,"red":0,"effective_green":0,"standing_red":0},"satisfied":false},{"node":"SHIP","attempts_opened":0,"current_attempt":null,"evidence":{"green":0,"red":0,"effective_green":0,"standing_red":0},"satisfied":false}],"blocked_reason":"no-progress"}"#
     );
 
     #[derive(Debug, Deserialize)]

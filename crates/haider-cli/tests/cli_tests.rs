@@ -1323,28 +1323,54 @@ fn run_timeout_emits_timeout_json_and_exits_124() {
     assert_eq!(value["error"]["code"], "timeout");
 }
 
-/// MUTATION CHECK: invent an answer for a non-permission input menu or leave
-/// it parked forever. Expected RUNTIME failure: the bounded command does not
-/// return exit 77 with the typed input_required v1 object.
+/// §C MUTATION CHECK: invent an answer for a no-default request, park the
+/// autonomous run, or stop after the rejected tool result. Expected RUNTIME
+/// failure: an answer/menu wait appears, the typed rejection disappears, or
+/// the provider does not receive its continuation turn.
 #[test]
-fn run_nonpermission_input_cancels_and_exits_77() {
+fn run_nonpermission_input_rejects_without_guessing_and_continues() {
     let script = r#"[
         {"step":"emit_request_input","call_id":"ask","kind":"question","title":"Need input"},
-        {"step":"finish","reason":"tool_use"}
+        {"step":"finish","reason":"tool_use"},
+        {"step":"expect_tool_result","call_id":"ask"},
+        {"step":"emit_text","text":"continued without invented input"},
+        {"step":"finish","reason":"end_turn"}
     ]"#;
     let out = haider_with_boot_retry(
-        &["run", "--provider", "fake", "hello", "--output", "json"],
+        &["run", "--provider", "fake", "hello", "--jsonl"],
         &[("HAIDER_TEST_FAKE_PROVIDER", script)],
     );
-    assert_eq!(
-        out.status.code(),
-        Some(77),
+    assert!(
+        out.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let value: serde_json::Value = serde_json::from_slice(&out.stdout).expect("blocked JSON");
-    assert_eq!(value["outcome"], "input_required");
-    assert_eq!(value["error"]["code"], "input_required");
+    let envelopes = parse_jsonl(&out.stdout);
+    let rejection = envelopes
+        .iter()
+        .find_map(|envelope| match typed(envelope) {
+            Some(EventPayload::ToolResult { call_id, result }) if call_id == "ask" => Some(result),
+            _ => None,
+        })
+        .expect("request_input rejection");
+    assert_eq!(
+        rejection.status,
+        haider_protocol::tool::ToolResultStatus::Rejected
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&rejection.preview)
+            .expect("typed rejection JSON")["code"],
+        "no_human_available"
+    );
+    assert!(!envelopes.iter().any(|envelope| matches!(
+        typed(envelope),
+        Some(EventPayload::RunState(RunState::InputRequired { .. }))
+            | Some(EventPayload::MenuAnswered(_))
+    )));
+    assert_eq!(
+        envelopes.last().map(typed),
+        Some(Some(EventPayload::RunState(RunState::Done)))
+    );
 }
 
 /// MUTATION CHECK: silently approve the default Ask, fail to persist/apply

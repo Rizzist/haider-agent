@@ -3520,6 +3520,8 @@ async fn w8a_shell_busy_builtin_rejection_and_inventory_are_typed() {
             // CU-2: the computer-use tool — ScreenObserve/ScreenControl
             // effects, default-deny (allow_screen / allow_screen_control).
             "computer",
+            // §E: effect-free session monitor registry administration.
+            "monitor",
         ]
     );
     assert!(!names.contains(&"exec"));

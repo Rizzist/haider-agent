@@ -7982,7 +7982,7 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
             "mobile(action, element_id?, x?, y?, from?, to?, text?, key?, package?, name?, folder?, since?, limit?) — observe or control an explicitly activated mobile capability; screenshot returns an image, accessibility/apps/SMS return JSON"
         }
         "monitor" => {
-            "monitor(operation, source?, filter?, action?, occurrence?, lifetime?, monitor_id?) — register/list/remove durable session watches; register source={kind:sms}, optional filter={field:address|body,operator,value,case_sensitive?}, action={report,follow_up?}, occurrence=once|every, lifetime={kind:session|timeout,timeout_ms?}; process/file/poll/timer adapters currently fail closed"
+            "monitor(operation, source?, filter?, action?, occurrence?, lifetime?, monitor_id?) — durable watches; register needs source+action; timeout needs timeout_ms; non-SMS fails closed"
         }
         "fs_read" => {
             "fs_read(path, offset?, limit?) — read a bounded UTF-8 file slice; a directory path lists it"

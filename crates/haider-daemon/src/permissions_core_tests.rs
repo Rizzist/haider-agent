@@ -729,6 +729,7 @@ async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
             "web_fetch",
             "web_search",
             "computer",
+            "monitor",
         ]
     );
     // M2e: `workflow_author` is a GATED child capability, excluded from the
