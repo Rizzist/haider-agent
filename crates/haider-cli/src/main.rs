@@ -47,34 +47,51 @@ const CRATES: [&str; 10] = [
     haider_tui::CRATE_NAME,
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeProfile {
+    /// A one-shot client only multiplexes RPC and its stdout adapter. Tool
+    /// concurrency lives in `haiderd`, which retains its full runtime.
+    EphemeralHeadless,
+    /// TUI and long-lived/general CLI work retain Tokio's default worker pool.
+    Full,
+}
+
+impl RuntimeProfile {
+    fn for_args(args: &[String]) -> Self {
+        match args.first().map(String::as_str) {
+            Some("run") => Self::EphemeralHeadless,
+            _ => Self::Full,
+        }
+    }
+
+    fn build(self) -> io::Result<tokio::runtime::Runtime> {
+        let mut builder = match self {
+            Self::EphemeralHeadless => tokio::runtime::Builder::new_current_thread(),
+            Self::Full => tokio::runtime::Builder::new_multi_thread(),
+        };
+        builder.enable_all().build()
+    }
+}
+
 #[cfg(not(windows))]
-#[tokio::main]
-async fn main() -> ExitCode {
-    dispatch().await
+fn main() -> ExitCode {
+    run_cli(std::env::args().skip(1).collect())
 }
 
 // The CLI dispatcher composes several large async command futures. Windows
 // gives the executable's main thread a much smaller stack than Unix, so poll
-// that dispatcher on an explicitly sized thread while retaining Tokio's
-// normal multi-thread runtime for all spawned work.
+// it on an explicitly sized thread. Runtime selection inside that thread is
+// otherwise identical on every platform.
 #[cfg(windows)]
 fn main() -> ExitCode {
+    let args = std::env::args().skip(1).collect();
     let launched = std::thread::Builder::new()
         .name("haider-main".into())
         .stack_size(8 * 1024 * 1024)
-        .spawn(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .map(|runtime| runtime.block_on(dispatch()))
-        });
+        .spawn(|| run_cli(args));
     match launched {
         Ok(thread) => match thread.join() {
-            Ok(Ok(code)) => code,
-            Ok(Err(error)) => {
-                eprintln!("haider: could not start async runtime: {error}");
-                ExitCode::from(EX_SOFTWARE)
-            }
+            Ok(code) => code,
             Err(_) => {
                 eprintln!("haider: main runtime thread panicked");
                 ExitCode::from(EX_SOFTWARE)
@@ -87,9 +104,63 @@ fn main() -> ExitCode {
     }
 }
 
-async fn dispatch() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match parse_bare_tui_options(&args) {
+/// Select the runtime before constructing an async command future. In
+/// particular, `haider run` never constructs the omnibus dispatcher/TUI
+/// future and never initializes terminal, theme, settings, or render state.
+fn run_cli(args: Vec<String>) -> ExitCode {
+    let profile = RuntimeProfile::for_args(&args);
+    let runtime = match profile.build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("haider: could not start async runtime: {error}");
+            return ExitCode::from(EX_SOFTWARE);
+        }
+    };
+    match profile {
+        RuntimeProfile::EphemeralHeadless => {
+            let rest = args.get(1..).unwrap_or_default();
+            runtime.block_on(run::run_command(rest))
+        }
+        RuntimeProfile::Full => runtime.block_on(dispatch(&args)),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod runtime_tests {
+    use super::RuntimeProfile;
+    use tokio::runtime::RuntimeFlavor;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    fn runtime_flavor(profile: RuntimeProfile) -> RuntimeFlavor {
+        let runtime = profile.build().expect("runtime builds");
+        runtime.block_on(async { tokio::runtime::Handle::current().runtime_flavor() })
+    }
+
+    #[test]
+    fn run_uses_the_lean_current_thread_runtime() {
+        let profile = RuntimeProfile::for_args(&args(&["run", "hello"]));
+        assert_eq!(profile, RuntimeProfile::EphemeralHeadless);
+        assert_eq!(runtime_flavor(profile), RuntimeFlavor::CurrentThread);
+    }
+
+    #[test]
+    fn tui_paths_keep_the_full_runtime() {
+        for arguments in [args(&[]), args(&["tui"]), args(&["resume"])] {
+            assert_eq!(RuntimeProfile::for_args(&arguments), RuntimeProfile::Full);
+        }
+        assert_eq!(
+            runtime_flavor(RuntimeProfile::Full),
+            RuntimeFlavor::MultiThread
+        );
+    }
+}
+
+async fn dispatch(args: &[String]) -> ExitCode {
+    match parse_bare_tui_options(args) {
         Ok(Some(options)) => return front_door_with_options(FrontDoor::Tui, options).await,
         Ok(None) => {}
         Err(message) => {
@@ -97,7 +168,7 @@ async fn dispatch() -> ExitCode {
             return ExitCode::from(2);
         }
     }
-    match args.as_slice() {
+    match args {
         [version] if matches!(version.as_str(), "--version" | "-V" | "version") => {
             println!("haider {VERSION}");
             ExitCode::SUCCESS
