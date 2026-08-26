@@ -163,6 +163,7 @@ fn cache_assertion_request(
         attachments: Vec::new(),
         cache_metadata: Some(haider_provider::PromptCacheMetadata {
             stable_history_end,
+            cacheable_history_end: None,
             current_user_start,
             previous_stable_history_end: None,
             latest_compaction_summary_end: None,
@@ -175,6 +176,7 @@ fn cache_assertion_request(
                 reasoning_settings: "live-default-reasoning".into(),
             },
             cache_epoch: "live-cache-assertion-v1".into(),
+            header_epoch: String::new(),
             compaction_epoch: "live-root-compaction".into(),
             provider: "anthropic".into(),
             session_scope: "live-cache-assertion-session".into(),

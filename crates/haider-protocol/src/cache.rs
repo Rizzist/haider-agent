@@ -12,6 +12,90 @@ pub const CACHE_EPOCH_TRANSITION_EXTENSION_KIND: &str = "cache_epoch_transition_
 /// request fails before the provider can report usage.
 pub const CACHE_REQUEST_ATTEMPT_EXTENSION_KIND: &str = "cache_request_attempt_v1";
 
+/// Stable hidden extension kind for the exact, provider-rendered cacheable
+/// view written immediately before a physical provider request.
+///
+/// Unlike [`CACHE_REQUEST_ATTEMPT_EXTENSION_KIND`], this record deliberately
+/// contains exact serialized prompt bytes. It is conversation-store state,
+/// not telemetry: restart/resume validation must be able to byte-compare the
+/// old provider prefix instead of trusting a digest produced by new code.
+pub const PROVIDER_VIEW_ATTEMPT_EXTENSION_KIND: &str = "provider_view_attempt_v1";
+
+/// One explicit provider cache boundary selected by the placement planner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderViewBoundaryV1 {
+    /// Stable section name (`system`, `tools`, or `history`).
+    pub section: String,
+    /// Exclusive normalized-message boundary for history markers. System and
+    /// tool markers omit it because they are not conversation messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_end: Option<u64>,
+}
+
+/// Exact immutable provider view associated with one cacheable request.
+///
+/// The three byte sections are serialized by the selected adapter using its
+/// declared `serialization_version`. History is stored block-by-block so an
+/// append-only reconstruction can compare the exact old prefix without
+/// re-encoding durable data. The volatile newest tail is intentionally not
+/// included: it is never eligible for a cache marker or this invariant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderViewLedgerV1 {
+    pub provider: String,
+    pub model: String,
+    pub dialect: String,
+    pub serialization_version: String,
+    /// Content address of provider/model/system/tools/dialect/serialization.
+    pub header_epoch: String,
+    /// Full request cache domain, including auth/reasoning/compaction state.
+    pub cache_epoch: String,
+    pub compaction_epoch: String,
+    /// The retention rule that shaped provider-owned reasoning blocks.
+    pub reasoning_retention: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_scope: Option<String>,
+    pub stable_history_end: u64,
+    pub current_user_start: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_compaction_summary_end: Option<u64>,
+    /// Explicit epoch-changing trim sentinel. Root histories retain the root
+    /// compaction epoch here rather than inventing a rotating trim window.
+    pub trim_sentinel: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub boundaries: Vec<ProviderViewBoundaryV1>,
+    pub system_bytes: Vec<u8>,
+    pub tool_schema_bytes: Vec<u8>,
+    pub history_blocks: Vec<Vec<u8>>,
+}
+
+/// Dispatch-time wrapper which orders exact views alongside request usage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderViewAttemptV1 {
+    pub ordinal: u64,
+    pub view: ProviderViewLedgerV1,
+}
+
+impl ProviderViewAttemptV1 {
+    pub fn extension_item(&self) -> Result<TurnItem, serde_json::Error> {
+        Ok(TurnItem::Extension {
+            kind: PROVIDER_VIEW_ATTEMPT_EXTENSION_KIND.to_owned(),
+            data: serde_json::to_value(self)?,
+        })
+    }
+
+    /// Strict parser for the conversation store. A malformed known record is
+    /// corruption and must not silently downgrade exact-prefix validation.
+    pub fn try_from_extension_item(item: &TurnItem) -> Result<Option<Self>, serde_json::Error> {
+        let TurnItem::Extension { kind, data } = item else {
+            return Ok(None);
+        };
+        if kind != PROVIDER_VIEW_ATTEMPT_EXTENSION_KIND {
+            return Ok(None);
+        }
+        serde_json::from_value(data.clone()).map(Some)
+    }
+}
+
 /// Hashes-and-counts-only evidence captured at provider dispatch time.
 /// Response-local counters later join this record by `ordinal` through
 /// [`crate::provider::RequestUsage`].

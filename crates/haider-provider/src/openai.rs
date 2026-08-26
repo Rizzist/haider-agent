@@ -783,7 +783,7 @@ impl Provider for OpenAiProvider {
     }
 
     fn prepare_turn(&self, request: &TurnRequest) -> Option<crate::PreparedTurn> {
-        let boundary = request.cache_metadata.as_ref()?.stable_history_end;
+        let boundary = request.cache_metadata.as_ref()?.cacheable_history_end();
         self.http.validate_model(request).ok()?;
         let (full_payload, stable_wire_end, previous_wire_end) =
             responses_request_json_with_boundary(
@@ -819,11 +819,58 @@ impl Provider for OpenAiProvider {
             "instructions",
             "tools",
         )?;
+        let metadata = request.cache_metadata.as_ref()?;
+        let breakpoint_plan = crate::plan_inline_breakpoints(
+            &metadata.provider,
+            &request.model,
+            &request.messages,
+            metadata.cacheable_history_end(),
+            metadata.previous_stable_history_end,
+            metadata.latest_compaction_summary_end,
+            request.system_prompt.is_some(),
+            !request.tools.is_empty(),
+            metadata.stable_prefix_tokens,
+        );
+        let mut provider_view_payload = prompt_payload.clone();
+        let provider_view_system_key = if self.http.codex_responses_lite {
+            let rendered_system = prompt_payload
+                .get("input")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|input| input.first())
+                .filter(|item| {
+                    item.get("role").and_then(serde_json::Value::as_str) == Some("developer")
+                })
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            provider_view_payload
+                .as_object_mut()?
+                .insert("_haider_system_view".into(), rendered_system);
+            "_haider_system_view"
+        } else {
+            "instructions"
+        };
+        let provider_view = crate::cachemaxxing::prepared_array_provider_view(
+            request,
+            &provider_view_payload,
+            if self.http.codex_responses_lite {
+                "openai_responses_lite"
+            } else {
+                "openai_responses"
+            },
+            provider_view_system_key,
+            "tools",
+            "input",
+            usize::from(self.http.codex_responses_lite && request.system_prompt.is_some()),
+            stable_wire_end,
+            previous_wire_end,
+            breakpoint_plan.ledger_boundaries(),
+        );
         let cache_control = openai_cache_control_observation(request, &full_payload);
         Some(crate::PreparedTurn {
             prefix_digests,
             previous_immutable_history_digest,
             cache_control,
+            provider_view,
             wire: Some(crate::PreparedWire {
                 payload: full_payload,
                 history_boundary: None,
@@ -899,6 +946,19 @@ enum CompatibleDialect {
     HaiderCodeApi,
     XaiApi,
     GrokOAuth,
+}
+
+impl CompatibleDialect {
+    const fn provider_view_name(self) -> &'static str {
+        match self {
+            Self::Generic => "openai_chat_generic",
+            Self::KimiOAuth => "openai_chat_kimi_oauth",
+            Self::DeepSeekApi => "openai_chat_deepseek",
+            Self::HaiderCodeApi => "openai_chat_haider_code",
+            Self::XaiApi => "openai_chat_xai",
+            Self::GrokOAuth => "openai_chat_grok_oauth",
+        }
+    }
 }
 
 /// Kimi's opt-in `extra_body.thinking` request extension.
@@ -1594,7 +1654,7 @@ impl Provider for OpenAiCompatibleProvider {
     }
 
     fn prepare_turn(&self, request: &TurnRequest) -> Option<crate::PreparedTurn> {
-        let boundary = request.cache_metadata.as_ref()?.stable_history_end;
+        let boundary = request.cache_metadata.as_ref()?.cacheable_history_end();
         self.http.validate_model(request).ok()?;
         let (full_payload, stable_wire_end, previous_wire_end) = chat_request_json_with_boundary(
             request,
@@ -1626,12 +1686,38 @@ impl Provider for OpenAiCompatibleProvider {
             "system",
             "tools",
         )?;
+        let mut provider_view_payload = prompt_payload.clone();
+        let rendered_system = prompt_payload
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|messages| messages.first())
+            .filter(|message| {
+                message.get("role").and_then(serde_json::Value::as_str) == Some("system")
+            })
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        provider_view_payload
+            .as_object_mut()?
+            .insert("_haider_system_view".into(), rendered_system);
+        let provider_view = crate::cachemaxxing::prepared_array_provider_view(
+            request,
+            &provider_view_payload,
+            self.dialect.provider_view_name(),
+            "_haider_system_view",
+            "tools",
+            "messages",
+            usize::from(request.system_prompt.is_some()),
+            stable_wire_end,
+            previous_wire_end,
+            Vec::new(),
+        );
         let cache_control =
             compatible_cache_control_observation(request, &full_payload, self.dialect);
         Some(crate::PreparedTurn {
             prefix_digests,
             previous_immutable_history_digest,
             cache_control,
+            provider_view,
             wire: Some(crate::PreparedWire {
                 payload: full_payload,
                 history_boundary: None,
@@ -3739,6 +3825,19 @@ fn responses_request_json_with_boundary(
         }));
     }
     let stable_history_end = stable_history_end.min(request.messages.len());
+    let inline_cache_plan = request.cache_metadata.as_ref().map(|metadata| {
+        crate::plan_inline_breakpoints(
+            &metadata.provider,
+            &request.model,
+            &request.messages,
+            stable_history_end,
+            metadata.previous_stable_history_end,
+            metadata.latest_compaction_summary_end,
+            request.system_prompt.is_some(),
+            !request.tools.is_empty(),
+            metadata.stable_prefix_tokens,
+        )
+    });
     let mut stable_wire_end = (stable_history_end == 0).then_some(input.len());
     let previous_history_end = request
         .cache_metadata
@@ -3993,10 +4092,9 @@ fn responses_request_json_with_boundary(
         }
         flush_response_message(&mut input, message.role, &mut content);
         if openai_explicit_cache_enabled(request, codex_responses_lite)
-            && request.cache_metadata.as_ref().is_some_and(|metadata| {
-                metadata.latest_compaction_summary_end == Some(message_index.saturating_add(1))
-                    || metadata.stable_history_end == message_index.saturating_add(1)
-            })
+            && inline_cache_plan
+                .as_ref()
+                .is_some_and(|plan| plan.history_ends.contains(&message_index.saturating_add(1)))
         {
             mark_latest_openai_cacheable_block(&mut input);
         }
@@ -4295,7 +4393,9 @@ fn openai_explicit_cache_enabled(request: &TurnRequest, codex_responses_lite: bo
                 && metadata.provider == OPENAI_PROVIDER_NAME
                 && !metadata.session_scope.is_empty()
                 && metadata.account_scope.is_some()
-                && (request.model == "gpt-5.6" || request.model.starts_with("gpt-5.6-"))
+                && crate::cache_placement_capabilities(&metadata.provider, &request.model)
+                    .marker_mode
+                    == crate::CacheMarkerMode::OpenAiExplicit
         })
 }
 
@@ -4330,8 +4430,8 @@ fn openai_automatic_cache_key_supported(model: &str) -> bool {
 /// shard-routed, and fast agentic rounds always outran its async warm-up
 /// (observed 0%-cached rounds on live sessions, 2026-08-21). codex 0.145
 /// sends a stable per-thread key. Prefix bytes still decide whether a cached
-/// entry matches; the key only keeps one session on a consistent cache route,
-/// so prefix-version data must not rotate it between turns.
+/// entry matches; the key keeps one session/header ABI on a consistent cache
+/// route. Append-only history and compaction do not rotate the header epoch.
 fn openai_prompt_cache_key(request: &TurnRequest) -> Option<String> {
     if !openai_automatic_cache_key_supported(&request.model) {
         return None;
@@ -4456,11 +4556,12 @@ fn xai_prompt_cache_conversation_id(request: &TurnRequest) -> Option<String> {
         return None;
     }
     let domain = serde_json::json!({
-        "schema": "haider.xai-conversation-id.v1",
+        "schema": "haider.xai-conversation-id.v2",
         "provider": metadata.provider,
         "model": request.model,
         "session_scope": metadata.session_scope,
         "account_scope": metadata.account_scope,
+        "header_epoch": metadata.header_epoch,
     });
     serde_json::to_vec(&domain)
         .ok()
@@ -4469,11 +4570,12 @@ fn xai_prompt_cache_conversation_id(request: &TurnRequest) -> Option<String> {
 
 fn derive_prompt_cache_key(request: &TurnRequest, metadata: &crate::PromptCacheMetadata) -> String {
     let domain = serde_json::json!({
-        "schema": "haider.prompt-cache-key.v2",
+        "schema": "haider.prompt-cache-key.v3",
         "provider": metadata.provider,
         "model": request.model,
         "session_scope": metadata.session_scope,
         "account_scope": metadata.account_scope,
+        "header_epoch": metadata.header_epoch,
     });
     serde_json::to_vec(&domain).map_or_else(
         |_| {
@@ -4816,14 +4918,12 @@ fn derive_kimi_session_prompt_cache_key(
     metadata: &crate::PromptCacheMetadata,
 ) -> String {
     let domain = serde_json::json!({
-        "schema": "haider.kimi-prompt-cache-key.v1",
+        "schema": "haider.kimi-prompt-cache-key.v2",
         "provider": metadata.provider,
         "model": request.model,
         "session_scope": metadata.session_scope,
         "account_scope": metadata.account_scope,
-        "system_digest": metadata.prefix_digests.system,
-        "tool_digest": metadata.prefix_digests.tools,
-        "compaction_epoch": metadata.compaction_epoch,
+        "header_epoch": metadata.header_epoch,
     });
     serde_json::to_vec(&domain).map_or_else(
         |_| {

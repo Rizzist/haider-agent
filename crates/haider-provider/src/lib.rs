@@ -14,6 +14,7 @@ mod anthropic;
 #[cfg(test)]
 mod anthropic_tests;
 mod cache;
+mod cachemaxxing;
 mod catalog;
 #[cfg(test)]
 mod catalog_tests;
@@ -51,6 +52,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 
+pub use cachemaxxing::{
+    CacheEconomicSample, CacheMarkerMode, CachePlacementCapabilities, CacheScenario,
+    CacheWritePrice, InlineBreakpointPlan, PreparedProviderView, ProviderViewContinuity,
+    ProviderViewInvariantError, cache_placement_capabilities, economic_cache_hit_rate,
+    plan_inline_breakpoints, validate_provider_view_prefix,
+};
+
 const HTTP_ERROR_BODY_LIMIT: usize = 64 * 1024;
 /// Provider connections survive normal think/tool gaps and can be reused by
 /// concurrently-started child turns. Reqwest negotiates HTTP/2 through ALPN;
@@ -64,6 +72,21 @@ pub(crate) const PROVIDER_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(10 *
 /// provider-opaque/signed blocks from crossing this canonicalization seam.
 #[must_use]
 pub fn canonical_tool_definitions_digest(tools: &[ToolDefinition]) -> String {
+    serde_json::to_value(canonical_tool_definitions(tools))
+        .and_then(|value| serde_json::to_vec(&value))
+        .map_or_else(
+            |_| blake3::hash(b"haider-owned-json-serialization-error"),
+            |bytes| blake3::hash(&bytes),
+        )
+        .to_hex()
+        .to_string()
+}
+
+/// Freezes Haider-owned tool schemas as one cache ABI: definitions are sorted
+/// by stable identity and every schema object is recursively key-sorted.
+/// Provider-produced arguments and opaque blocks never cross this seam.
+#[must_use]
+pub fn canonical_tool_definitions(tools: &[ToolDefinition]) -> Vec<ToolDefinition> {
     fn canonicalize(value: serde_json::Value) -> serde_json::Value {
         match value {
             serde_json::Value::Array(values) => {
@@ -80,15 +103,25 @@ pub fn canonical_tool_definitions_digest(tools: &[ToolDefinition]) -> String {
         }
     }
 
-    serde_json::to_value(tools)
-        .map(canonicalize)
-        .and_then(|value| serde_json::to_vec(&value))
-        .map_or_else(
-            |_| blake3::hash(b"haider-owned-json-serialization-error"),
-            |bytes| blake3::hash(&bytes),
-        )
-        .to_hex()
-        .to_string()
+    let mut frozen = tools
+        .iter()
+        .cloned()
+        .map(|mut tool| {
+            tool.input_schema = canonicalize(tool.input_schema);
+            tool
+        })
+        .collect::<Vec<_>>();
+    frozen.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.description.cmp(&right.description))
+            .then_with(|| {
+                serde_json::to_vec(&left.input_schema)
+                    .unwrap_or_default()
+                    .cmp(&serde_json::to_vec(&right.input_schema).unwrap_or_default())
+            })
+    });
+    frozen
 }
 
 pub(crate) fn exact_optional_wire_digest<T>(value: Option<&T>) -> String
@@ -577,6 +610,11 @@ pub struct ResolvedAttachment {
 pub struct PromptCacheMetadata {
     /// End of immutable completed history and start of the volatile tail.
     pub stable_history_end: usize,
+    /// Newest immutable provider/tool-loop boundary eligible for a cache
+    /// marker. Absent equals `stable_history_end`; present may advance past
+    /// the accepted current-user start only after a completed provider round.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cacheable_history_end: Option<usize>,
     /// Start of the accepted current user turn.
     pub current_user_start: usize,
     /// The preceding request's moving immutable-history boundary. Adapters
@@ -591,6 +629,11 @@ pub struct PromptCacheMetadata {
     pub prefix_digests: PrefixDigests,
     /// Stable until system/tools/reasoning/provider/account/compaction change.
     pub cache_epoch: String,
+    /// Content address of provider/model/exact stable system/exact tool schema/
+    /// dialect/serialization version. Finalized by adapter preparation and
+    /// reused for routing plus resume validation.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub header_epoch: String,
     /// Stable identifier for the active compaction summary, or the root epoch.
     pub compaction_epoch: String,
     /// Provider name selected for this request.
@@ -618,9 +661,17 @@ impl PromptCacheMetadata {
     pub fn boundaries_valid(&self, message_count: usize) -> bool {
         self.stable_history_end <= self.current_user_start
             && self.current_user_start <= message_count
+            && self.cacheable_history_end() >= self.stable_history_end
+            && self.cacheable_history_end() <= message_count
             && self
                 .latest_compaction_summary_end
                 .is_none_or(|boundary| boundary > 0 && boundary <= self.stable_history_end)
+    }
+
+    #[must_use]
+    pub fn cacheable_history_end(&self) -> usize {
+        self.cacheable_history_end
+            .unwrap_or(self.stable_history_end)
     }
 }
 
@@ -648,6 +699,7 @@ pub struct PreparedTurn {
     pub(crate) prefix_digests: PrefixDigests,
     pub(crate) previous_immutable_history_digest: Option<String>,
     pub(crate) cache_control: haider_protocol::provider::CacheControlObservationV1,
+    pub(crate) provider_view: Option<PreparedProviderView>,
     pub(crate) wire: Option<PreparedWire>,
 }
 
@@ -676,6 +728,13 @@ impl PreparedTurn {
     #[must_use]
     pub fn cache_control(&self) -> &haider_protocol::provider::CacheControlObservationV1 {
         &self.cache_control
+    }
+
+    /// Exact adapter-rendered immutable view used by the conversation-store
+    /// prefix invariant and restart/resume ledger.
+    #[must_use]
+    pub fn provider_view(&self) -> Option<&PreparedProviderView> {
+        self.provider_view.as_ref()
     }
 }
 
@@ -1111,6 +1170,7 @@ pub trait Provider: Send + Sync {
                 prefix_digests,
                 previous_immutable_history_digest: None,
                 cache_control: haider_protocol::provider::CacheControlObservationV1::Unavailable,
+                provider_view: None,
                 wire: None,
             })
     }

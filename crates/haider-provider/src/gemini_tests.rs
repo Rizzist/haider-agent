@@ -337,6 +337,7 @@ fn gemini_cache_request(model: &str) -> TurnRequest {
         attachments: Vec::new(),
         cache_metadata: Some(PromptCacheMetadata {
             stable_history_end: 2,
+            cacheable_history_end: None,
             current_user_start: 2,
             previous_stable_history_end: None,
             latest_compaction_summary_end: None,
@@ -349,6 +350,7 @@ fn gemini_cache_request(model: &str) -> TurnRequest {
                 reasoning_settings: "reasoning-a".into(),
             },
             cache_epoch: "epoch-a".into(),
+            header_epoch: String::new(),
             compaction_epoch: "compaction-a".into(),
             provider: GEMINI_PROVIDER_NAME.into(),
             session_scope: "session-a".into(),

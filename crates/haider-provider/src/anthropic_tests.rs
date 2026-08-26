@@ -338,6 +338,7 @@ fn user_command_record_reaches_anthropic_as_labeled_user_text() {
 fn cache_metadata(provider: &str, stable_history_end: usize) -> PromptCacheMetadata {
     PromptCacheMetadata {
         stable_history_end,
+        cacheable_history_end: None,
         current_user_start: stable_history_end,
         previous_stable_history_end: None,
         latest_compaction_summary_end: Some(1),
@@ -350,6 +351,7 @@ fn cache_metadata(provider: &str, stable_history_end: usize) -> PromptCacheMetad
             reasoning_settings: "reasoning-digest".into(),
         },
         cache_epoch: "epoch-a".into(),
+        header_epoch: String::new(),
         compaction_epoch: "compaction-a".into(),
         provider: provider.into(),
         session_scope: "session-a".into(),

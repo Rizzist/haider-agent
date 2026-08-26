@@ -940,7 +940,7 @@ impl Provider for AnthropicProvider {
     }
 
     fn prepare_turn(&self, request: &TurnRequest) -> Option<crate::PreparedTurn> {
-        let boundary = request.cache_metadata.as_ref()?.stable_history_end;
+        let boundary = request.cache_metadata.as_ref()?.cacheable_history_end();
         let full_payload = self.request_payload(request).ok()?;
         // Cache-control objects select breakpoints but are not prompt
         // content. Re-render without them so a marker that moves as history
@@ -964,10 +964,43 @@ impl Provider for AnthropicProvider {
             "tools",
         )?;
         let cache_control = self.cache_control_observation(request, &full_payload, &prompt_payload);
+        let metadata = request.cache_metadata.as_ref()?;
+        let boundaries = matches!(
+            cache_control,
+            haider_protocol::provider::CacheControlObservationV1::Emitted { .. }
+        )
+        .then(|| {
+            crate::plan_inline_breakpoints(
+                &metadata.provider,
+                &request.model,
+                &request.messages,
+                metadata.cacheable_history_end(),
+                metadata.previous_stable_history_end,
+                metadata.latest_compaction_summary_end,
+                request.system_prompt.is_some(),
+                !request.tools.is_empty(),
+                metadata.stable_prefix_tokens,
+            )
+            .ledger_boundaries()
+        })
+        .unwrap_or_default();
+        let provider_view = crate::cachemaxxing::prepared_array_provider_view(
+            request,
+            &prompt_payload,
+            "anthropic_messages",
+            "system",
+            "tools",
+            "messages",
+            0,
+            boundary,
+            metadata.previous_stable_history_end,
+            boundaries,
+        );
         Some(crate::PreparedTurn {
             prefix_digests,
             previous_immutable_history_digest,
             cache_control,
+            provider_view,
             wire: Some(crate::PreparedWire {
                 payload: full_payload,
                 history_boundary: None,
