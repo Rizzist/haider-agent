@@ -9,12 +9,11 @@
 //! - durable `Cancelling` becomes `Cancelled` (items close `Cancelled`, an
 //!   open menu closes `Cancelled`, no `RunFailed` — cancellation is not an
 //!   error);
-//! - a run parked at a durable blocking tool-menu checkpoint (an open
-//!   `request_input` or broker-approved mutating tool without its
-//!   `ToolResult`, matching historical `InputRequired` or canonical
-//!   `PermissionRequired` state and open menu) is reconstructed as a waiter —
-//!   its menu stays PENDING, and neither the provider request that produced
-//!   it nor any dispatched effect is ever repeated;
+//! - a run parked at a durable tool-menu checkpoint (an open interactive or
+//!   autonomous `request_input`, or broker-approved mutating tool without its
+//!   `ToolResult`) is reconstructed with its exact session policy; blocking
+//!   menus remain waiters while autonomous nonblocking menus settle without
+//!   repeating the provider request or any dispatched effect;
 //! - an autonomous `plan` interrupted after its non-blocking `MenuOpened` is
 //!   reconstructed from `Streaming` (or legacy `InputRequired`) so the actor
 //!   immediately journals acceptance and continues without a waiter;
@@ -256,10 +255,7 @@ pub(crate) async fn recover_interrupted_turns_report(
                 continue;
             }
             if let Some(checkpoint) = pending_partial_stream_checkpoint(&reduction)
-                && matches!(
-                    &state,
-                    RunState::InputRequired { menu } if *menu == checkpoint.menu.id
-                )
+                && partial_stream_checkpoint_state_matches(&state, &checkpoint)
             {
                 let committed_answer = reduction.menu_answers.get(&checkpoint.menu.id).cloned();
                 let accepted_seq = reduction.user_seq.ok_or_else(|| {
@@ -381,9 +377,10 @@ fn checkpoint_state_matches(state: &RunState, checkpoint: &RequestInputCheckpoin
         // InputRequired, so the open non-blocking plan document plus its open
         // tool item is the durable checkpoint while the run remains Streaming.
         RunState::Streaming
-            if checkpoint.tool_name == "plan"
-                && checkpoint.menu.origin == haider_tools::PLAN_ORIGIN
-                && !checkpoint.menu.blocking =>
+            if !checkpoint.menu.blocking
+                && (checkpoint.tool_name == "request_input"
+                    || (checkpoint.tool_name == "plan"
+                        && checkpoint.menu.origin == haider_tools::PLAN_ORIGIN)) =>
         {
             true
         }
@@ -399,6 +396,16 @@ fn checkpoint_state_matches(state: &RunState, checkpoint: &RequestInputCheckpoin
         }
         _ => false,
     }
+}
+
+fn partial_stream_checkpoint_state_matches(
+    state: &RunState,
+    checkpoint: &PartialStreamCheckpoint,
+) -> bool {
+    matches!(
+        state,
+        RunState::InputRequired { menu } if *menu == checkpoint.menu.id
+    ) || matches!(state, RunState::Streaming if !checkpoint.menu.blocking)
 }
 
 async fn latest_run_state(
@@ -1082,6 +1089,18 @@ mod partial_stream_recovery_tests {
         assert_eq!(checkpoint.menu.id, menu_id);
         assert_eq!(checkpoint.request_seq, 3);
         assert_eq!(checkpoint.opening_generation, 7);
+        assert!(partial_stream_checkpoint_state_matches(
+            &RunState::InputRequired {
+                menu: menu_id.clone(),
+            },
+            &checkpoint,
+        ));
+        let mut autonomous_checkpoint = checkpoint.clone();
+        autonomous_checkpoint.menu.blocking = false;
+        assert!(partial_stream_checkpoint_state_matches(
+            &RunState::Streaming,
+            &autonomous_checkpoint,
+        ));
         assert_eq!(
             checkpoint.menu.kind,
             MenuKind::ErrorRecovery {
@@ -1186,5 +1205,63 @@ mod plan_recovery_tests {
             },
             MenuScope::Session,
         );
+    }
+
+    #[test]
+    fn restart_reconstructs_an_autonomous_request_input_checkpoint() {
+        let session_id = SessionId::new("request-input-restart");
+        let run_id = RunId::new("run-request-input-restart");
+        let item_id = ItemId::new("request-input-item");
+        let menu_id = MenuId::new("request-input-menu");
+        let args = serde_json::json!({
+            "kind": "choice",
+            "title": "Choose target",
+            "options": [{"key": "only", "label": "Only option"}]
+        });
+        let mut menu = haider_tools::RequestInput::from_tool_args(args.clone())
+            .expect("valid request")
+            .menu(menu_id.clone());
+        menu.blocking = false;
+        let payloads = vec![
+            EventPayload::UserMessage {
+                text: "continue headlessly".into(),
+                attachments: Vec::new(),
+                mode: haider_protocol::DeliveryMode::Steer,
+            },
+            EventPayload::Item(ItemEvent::Started {
+                item_id: item_id.clone(),
+                item: TurnItem::ToolCall {
+                    call_id: "request-input-call".into(),
+                    name: "request_input".into(),
+                    args: args.clone(),
+                    status: ToolStatus::InProgress,
+                },
+            }),
+            EventPayload::MenuOpened(menu),
+            EventPayload::RunState(RunState::Streaming),
+        ];
+        let mut envelopes = recovery_envelopes(
+            7,
+            &DeviceId::new("request-input-restart-device"),
+            &session_id,
+            &run_id,
+            None,
+            payloads,
+        )
+        .expect("recovery envelopes");
+        for (index, envelope) in envelopes.iter_mut().enumerate() {
+            envelope.seq = u64::try_from(index + 1).expect("small sequence");
+        }
+        let mut reductions = HashMap::new();
+        for envelope in envelopes {
+            reduce(&mut reductions, envelope);
+        }
+        let reduction = reductions.get(&run_id).expect("reduced run");
+        let checkpoint = pending_checkpoint(reduction).expect("request checkpoint reconstructs");
+        assert_eq!(checkpoint.tool_name, "request_input");
+        assert_eq!(checkpoint.call_id, "request-input-call");
+        assert_eq!(checkpoint.menu.id, menu_id);
+        assert!(!checkpoint.menu.blocking);
+        assert!(checkpoint_state_matches(&RunState::Streaming, &checkpoint));
     }
 }

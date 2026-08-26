@@ -366,6 +366,10 @@ fn session_metadata_tuning_fields_are_additive_and_skip_defaults() {
     assert_eq!(decoded.effort, None);
     assert!(!decoded.fast);
     assert_eq!(
+        decoded.interaction_mode,
+        haider_protocol::session::SessionInteractionModeV1::Interactive
+    );
+    assert_eq!(
         decoded.cache_policy,
         haider_protocol::cache::CachePolicySettingsV1::default()
     );
@@ -373,6 +377,7 @@ fn session_metadata_tuning_fields_are_additive_and_skip_defaults() {
     assert!(!encoded.contains("effort"));
     assert!(!encoded.contains("fast"));
     assert!(!encoded.contains("cache_policy"));
+    assert!(!encoded.contains("interaction_mode"));
 
     let tuned = SessionMetadataV1 {
         effort: Some("max".into()),

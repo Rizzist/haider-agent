@@ -746,6 +746,8 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
                 },
             ),
             cache_policy: None,
+            interaction_mode:
+                haider_rpc::haider_protocol::session::SessionInteractionModeV1::Interactive,
         },
         // B2b encode-selection law: a captured branch rides the
         // branch-capable decode form; `None` keeps the LEGACY variant so

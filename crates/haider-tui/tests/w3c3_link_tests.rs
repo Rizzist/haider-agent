@@ -983,9 +983,14 @@ fn tui_session_create_carries_automode_overrides() {
     match body {
         haider_rpc::RequestBody::SessionCreateWithPermissionOverrides {
             permission_overrides: Some(overrides),
+            interaction_mode,
             ..
         } => {
             assert!(overrides.allow_writes && overrides.allow_exec);
+            assert_eq!(
+                interaction_mode,
+                haider_protocol::session::SessionInteractionModeV1::Interactive
+            );
         }
         other => panic!("create must carry automode overrides, got {other:?}"),
     }

@@ -33,8 +33,10 @@
 //! - **Intent-bound authorization.** Lifecycle state retains the complete
 //!   journaled intent. Authorization and later transitions accept that intent,
 //!   and reject a reused effect id whose digest or other fields differ.
-//! - **Deny wins** over every form of approval, and `Dispatched`/`Outcome`
-//!   can only follow an `Allow` authorization (enforced by `require_state`).
+//! - **Explicit deny wins** over every form of approval. A non-interactive
+//!   residual-Ask fallback is deliberately lower priority than an explicit
+//!   grant, but still journals `Deny`; `Dispatched`/`Outcome` can only follow
+//!   an `Allow` authorization (enforced by `require_state`).
 //! - The journal sink never leaves the broker. Tests inspect a broker-owned,
 //!   read-only snapshot of successfully appended phases instead of recovering
 //!   or mutating the sink.
@@ -242,8 +244,10 @@ struct DenyRule {
 
 /// Permission policy keyed by normalized effect class.
 ///
-/// Classes absent from all three lists default to `Ask`. Overlaps are resolved
-/// conservatively: deny, exact always-allow, session/class allow, ask.
+/// Classes absent from all three lists default to `Ask`. An optional fallback
+/// can turn only that residual `Ask` into a typed denial for a non-interactive
+/// caller. Overlaps are resolved conservatively: explicit deny, exact
+/// always-allow, session/class allow, unresolved-ask fallback, ask.
 #[derive(Debug, Clone, Default)]
 pub struct PermissionPolicy {
     allowlist: Vec<EffectClass>,
@@ -251,6 +255,7 @@ pub struct PermissionPolicy {
     denylist: Vec<DenyRule>,
     always_allow: Vec<AlwaysAllowRule>,
     session_allow: Vec<SessionGrant>,
+    unresolved_ask_denial: Option<String>,
 }
 
 impl PermissionPolicy {
@@ -297,6 +302,13 @@ impl PermissionPolicy {
                 reason: reason.into(),
             },
         );
+    }
+
+    /// Denies only effects that would otherwise require a human answer.
+    /// Explicit deny rules retain highest priority, while exact and durable
+    /// session grants remain effective before this fallback is consulted.
+    pub fn deny_unresolved_asks(&mut self, reason: impl Into<String>) {
+        self.unresolved_ask_denial = Some(reason.into());
     }
 
     pub fn always_allow(&mut self, intent: &EffectIntent) {
@@ -392,6 +404,11 @@ impl PermissionPolicy {
                 .any(|listed| class_rule_matches(listed, &intent.class))
         {
             return PolicyDecision::Allow;
+        }
+        if let Some(reason) = &self.unresolved_ask_denial {
+            return PolicyDecision::Deny {
+                reason: reason.clone(),
+            };
         }
         PolicyDecision::Ask
     }

@@ -1964,6 +1964,7 @@ impl HubConnection {
                 max_tokens,
                 permission_overrides,
                 cache_policy,
+                interaction_mode,
             } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
                     return self.respond_error(
@@ -1983,6 +1984,7 @@ impl HubConnection {
                     max_tokens,
                     permission_overrides,
                     cache_policy.unwrap_or_default(),
+                    interaction_mode,
                 )
                 .await
             }
@@ -2011,6 +2013,7 @@ impl HubConnection {
                     max_tokens,
                     None,
                     Default::default(),
+                    haider_protocol::session::SessionInteractionModeV1::Interactive,
                 )
                 .await
             }
@@ -8833,6 +8836,7 @@ impl HubConnection {
         max_tokens: u64,
         permission_overrides: Option<haider_protocol::session::SessionPermissionOverridesV1>,
         cache_policy: haider_protocol::cache::CachePolicySettingsV1,
+        interaction_mode: haider_protocol::session::SessionInteractionModeV1,
     ) -> Result<(), SessionHubError> {
         if command_id.as_str().is_empty() {
             return self.respond_error(
@@ -8861,6 +8865,14 @@ impl HubConnection {
             request_coordinates["cache_policy"] =
                 serde_json::to_value(cache_policy).map_err(|error| {
                     SessionHubError::Task(format!("cannot encode session cache policy: {error}"))
+                })?;
+        }
+        if !interaction_mode.is_interactive() {
+            request_coordinates["interaction_mode"] = serde_json::to_value(interaction_mode)
+                .map_err(|error| {
+                    SessionHubError::Task(format!(
+                        "cannot encode session interaction mode: {error}"
+                    ))
                 })?;
         }
         let request_json = serde_json::to_string(&request_coordinates).map_err(|error| {
@@ -8966,7 +8978,11 @@ impl HubConnection {
         // Keep the opened directory descriptor alive until the transaction
         // returns. M3 transfers the same canonical identity into its broker.
         let _descriptor = workspace.descriptor;
-        match self.hub.create_session(command).await {
+        match self
+            .hub
+            .create_session_with_interaction_mode(command, interaction_mode)
+            .await
+        {
             Ok(SessionCreateOutcome::Committed { created, .. })
             | Ok(SessionCreateOutcome::IdempotentReplay { created }) => {
                 self.respond_created(request_id, created)

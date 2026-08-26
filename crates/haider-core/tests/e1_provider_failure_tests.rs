@@ -2,17 +2,21 @@
 
 use async_trait::async_trait;
 use haider_core::{
-    CancelToken, HarnessActor, HarnessConfig, MemoryStore, RetrySleeper, SubmitTurn,
-    ToolDispatchResult, ToolDispatcher, retry_jittered_backoff_ms,
+    CancelToken, HarnessActor, HarnessConfig, InteractionResolutionPolicy, MemoryStore,
+    PartialStreamCheckpoint, RetrySleeper, SubmitPartialStreamTurn, SubmitTurn, ToolDispatchResult,
+    ToolDispatcher, retry_jittered_backoff_ms,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
 use haider_protocol::history::NodeKind;
-use haider_protocol::ids::{CredentialAlias, DeviceId, ItemId, RunId, SessionId};
+use haider_protocol::ids::{CredentialAlias, DeviceId, ItemId, MenuId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
-use haider_protocol::menu::{AnswerVia, ErrorRecoveryCardKind, MenuAnswer, MenuKind};
+use haider_protocol::menu::{
+    AnswerVia, ErrorRecoveryCardKind, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope,
+};
 use haider_protocol::pipe::TranscriptProjector;
-use haider_protocol::provider::{Block, FinishReason};
+use haider_protocol::provider::{Block, FinishReason, Message};
+use haider_protocol::session::SessionInteractionModeV1;
 use haider_protocol::state::RunState;
 use haider_protocol::tool::{BoundedResult, ToolResultStatus};
 use haider_provider::{FakeProvider, FakeStep, MessageRole, ProviderErrorKind};
@@ -778,6 +782,199 @@ async fn e4b_continue_partial_primes_followup_exactly_once() {
     };
     assert_eq!(count(MessageRole::Assistant, PARTIAL), 1);
     assert_eq!(count(MessageRole::User, INSTRUCTION), 1);
+}
+
+#[tokio::test]
+async fn autonomous_partial_stream_preserves_output_without_human_wait() {
+    const PARTIAL: &str = "alpha beta";
+    const INSTRUCTION: &str = "The previous response was interrupted. Continue exactly where it stopped without repeating any completed text.";
+    let session = SessionId::new("e4-autonomous-continue");
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitText {
+            text: PARTIAL.into(),
+        },
+        FakeStep::Error {
+            kind: ProviderErrorKind::InvalidRequest,
+            message: "provider rejected the partial response".into(),
+            retry_after_ms: None,
+        },
+        FakeStep::EmitText {
+            text: " gamma".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let store = Arc::new(MemoryStore::new());
+    let mut config = HarnessConfig::for_session(session.clone(), DeviceId::new("e4-auto"), 1, 1);
+    config.interaction_policy =
+        InteractionResolutionPolicy::new(SessionInteractionModeV1::Autonomous);
+    let handle = HarnessActor::spawn(config, provider.clone(), store.clone());
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("continue autonomously"))
+        .await
+        .expect("accepted")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    let payloads = store
+        .events(&session)
+        .await
+        .into_iter()
+        .map(|event| serde_json::from_value::<EventPayload>(event.payload).expect("typed"))
+        .collect::<Vec<_>>();
+    assert!(!payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::RunState(RunState::InputRequired { .. })
+    )));
+    assert!(payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::MenuOpened(menu) if !menu.blocking
+    )));
+    assert!(payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::MenuAnswered(answer)
+            if answer.option_key.as_deref() == Some("continue_partial")
+    )));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let second = &requests[1].messages;
+    assert_eq!(
+        second
+            .iter()
+            .filter(|message| message
+                .blocks
+                .iter()
+                .any(|block| matches!(block, Block::Text { text } if text == PARTIAL)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        second
+            .iter()
+            .filter(|message| message
+                .blocks
+                .iter()
+                .any(|block| matches!(block, Block::Text { text } if text == INSTRUCTION)))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn recovered_autonomous_partial_stream_continues_without_waiting() {
+    const PARTIAL: &str = "durable prefix";
+    const INSTRUCTION: &str = "The previous response was interrupted. Continue exactly where it stopped without repeating any completed text.";
+    let session = SessionId::new("e4-autonomous-recovered-continue");
+    let run_id = RunId::new("e4-autonomous-recovered-run");
+    let item_id = ItemId::new("e4-autonomous-recovered-item");
+    let presentation = ErrorPresentation::new(
+        "stream-interrupted",
+        "Response interrupted",
+        "The provider stream ended before the response completed.",
+        ErrorScope::Turn,
+        [ErrorAction::ContinuePartial, ErrorAction::RetryFresh],
+    );
+    let menu = Menu {
+        id: MenuId::new("e4-autonomous-recovered-menu"),
+        kind: MenuKind::ErrorRecovery {
+            card: ErrorRecoveryCardKind::PartialStream,
+            presentation: presentation.clone(),
+            option_actions: vec![ErrorAction::ContinuePartial, ErrorAction::RetryFresh],
+            provider: Some("fake".into()),
+            account: None,
+            source_run: Some(run_id.clone()),
+            source_item: Some(item_id.clone()),
+        },
+        title: presentation.title.clone(),
+        body: vec![presentation.detail.clone()],
+        options: vec![
+            MenuOption {
+                key: "continue_partial".into(),
+                label: "Continue from partial".into(),
+                detail: None,
+                decision: None,
+            },
+            MenuOption {
+                key: "retry_fresh".into(),
+                label: "Retry from scratch".into(),
+                detail: None,
+                decision: None,
+            },
+        ],
+        blocking: false,
+        scope: MenuScope::Session,
+        origin: "provider".into(),
+        ttl_ms: None,
+        timeout_option: None,
+    };
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitText {
+            text: " continuation".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let store = Arc::new(MemoryStore::new());
+    let mut config = HarnessConfig::for_session(session.clone(), DeviceId::new("e4-auto"), 1, 2);
+    config.interaction_policy =
+        InteractionResolutionPolicy::new(SessionInteractionModeV1::Autonomous);
+    let handle = HarnessActor::spawn(config, provider.clone(), store.clone());
+    let outcome = handle
+        .submit_partial_stream_turn(SubmitPartialStreamTurn {
+            run_id,
+            messages: vec![Message::user_text("resume the interrupted response")],
+            checkpoint: PartialStreamCheckpoint {
+                menu,
+                request_seq: 4,
+                opening_generation: 1,
+                item_id,
+                text: PARTIAL.into(),
+            },
+        })
+        .await
+        .expect("recovered turn accepted")
+        .wait()
+        .await
+        .expect("recovered turn completed");
+    assert_eq!(outcome.state, RunState::Done);
+    assert!(
+        !store
+            .events(&session)
+            .await
+            .into_iter()
+            .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload).ok())
+            .any(|payload| matches!(
+                payload,
+                EventPayload::RunState(RunState::InputRequired { .. })
+            ))
+    );
+    let requests = provider.requests();
+    let request = &requests[0];
+    assert_eq!(
+        request
+            .messages
+            .iter()
+            .filter(|message| message
+                .blocks
+                .iter()
+                .any(|block| matches!(block, Block::Text { text } if text == PARTIAL)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        request
+            .messages
+            .iter()
+            .filter(|message| message
+                .blocks
+                .iter()
+                .any(|block| matches!(block, Block::Text { text } if text == INSTRUCTION)))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

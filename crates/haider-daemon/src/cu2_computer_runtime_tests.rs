@@ -33,7 +33,9 @@ use haider_protocol::permission::{
     PermissionEventPayload, PermissionGrantAction, PermissionGrantResolution, SystemPermission,
 };
 use haider_protocol::provider::{Block, FinishReason};
+use haider_protocol::session::SessionInteractionModeV1;
 use haider_protocol::state::RunState;
+use haider_protocol::tool::ToolResultStatus;
 use haider_provider::{FakeProvider, FakeStep, Provider, TurnRequest};
 use haider_store::{
     GraphPinCommand, MenuResolutionCommand, SessionCreateCommand, TurnAcceptCommand,
@@ -266,27 +268,45 @@ fn inspect_png_fixture() -> Vec<u8> {
 }
 
 async fn create_session(hub: &SessionHub, session_id: &SessionId, device_id: &DeviceId) {
+    create_session_with_interaction_mode(
+        hub,
+        session_id,
+        device_id,
+        SessionInteractionModeV1::Interactive,
+    )
+    .await;
+}
+
+async fn create_session_with_interaction_mode(
+    hub: &SessionHub,
+    session_id: &SessionId,
+    device_id: &DeviceId,
+    interaction_mode: SessionInteractionModeV1,
+) {
     let cwd = std::fs::canonicalize(std::env::current_dir().expect("cwd"))
         .expect("canonical cwd")
         .to_string_lossy()
         .into_owned();
-    hub.create_internal_session(SessionCreateCommand {
-        command_id: format!("create-{session_id}"),
-        request_digest: format!("create-{session_id}-digest"),
-        request_json: format!(r#"{{"session":"{session_id}"}}"#),
-        session_id: session_id.clone(),
-        cwd,
-        provider: "fake".into(),
-        model: "fake-model".into(),
-        max_tokens: 4096,
-        permission_overrides: None,
-        effort: None,
-        fast: false,
-        cache_policy: Default::default(),
-        system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
-        event_id: EventId::new(format!("{session_id}-created")),
-        device_id: device_id.clone(),
-    })
+    hub.create_internal_session_with_interaction_mode(
+        SessionCreateCommand {
+            command_id: format!("create-{session_id}"),
+            request_digest: format!("create-{session_id}-digest"),
+            request_json: format!(r#"{{"session":"{session_id}"}}"#),
+            session_id: session_id.clone(),
+            cwd,
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            max_tokens: 4096,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+            event_id: EventId::new(format!("{session_id}-created")),
+            device_id: device_id.clone(),
+        },
+        interaction_mode,
+    )
     .await
     .expect("create CU-2 session");
 }
@@ -672,6 +692,123 @@ async fn explicit_intent_auto_grants_and_tcc_flip_retries_the_parked_action() {
     assert!(
         observe_authorized,
         "explicit intent must authorize without Ask"
+    );
+
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
+#[tokio::test]
+async fn autonomous_os_permission_fails_typed_without_a_menu_or_dispatch() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let provider = Arc::new(
+        FakeProvider::new(vec![
+            FakeStep::EmitToolCall {
+                call_id: "autonomous-permission-screenshot".into(),
+                name: "computer".into(),
+                args: serde_json::json!({"action": "screenshot"}),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::ToolUse,
+            },
+            FakeStep::ExpectToolResult {
+                call_id: "autonomous-permission-screenshot".into(),
+            },
+            FakeStep::EmitText {
+                text: "permission was not granted".into(),
+            },
+            FakeStep::Finish {
+                reason: FinishReason::EndTurn,
+            },
+        ])
+        .with_vision_native(),
+    );
+    let backend = Arc::new(PermissionFlipBackend {
+        screenshot: inspect_png_fixture(),
+        permission: SystemPermission::Accessibility,
+        poll_result: ComputerPermissionPoll::Granted,
+        granted: AtomicBool::new(false),
+        prompts: AtomicUsize::new(0),
+        attempts: AtomicUsize::new(0),
+        polls: AtomicUsize::new(0),
+    });
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            diagnostics: None,
+            provider_factory: Arc::new(FixedProviderFactory { provider }),
+            tool_factory: Arc::new(BrokerToolFactory::with_computer_backend(
+                Arc::clone(&backend) as Arc<dyn ComputerBackend>,
+            )),
+            delegation: None,
+            web_search: None,
+        },
+        false,
+    );
+    hub.install_worker_manager(manager.handle())
+        .expect("install manager");
+    let session_id = SessionId::new("autonomous-permission-session");
+    let run_id = RunId::new("autonomous-permission-run");
+    let device_id = DeviceId::new("autonomous-permission-device");
+    create_session_with_interaction_mode(
+        &hub,
+        &session_id,
+        &device_id,
+        SessionInteractionModeV1::Autonomous,
+    )
+    .await;
+    // The explicit marker is enough to grant the broker effect, so this test
+    // reaches the independent OS permission gate.
+    submit_turn(
+        &hub,
+        &manager.handle(),
+        &store,
+        &session_id,
+        &run_id,
+        device_id,
+    )
+    .await;
+
+    let events = wait_for_run_state(&store, &session_id, &run_id, RunState::Done).await;
+    assert_eq!(backend.prompts.load(Ordering::Acquire), 1);
+    assert_eq!(backend.attempts.load(Ordering::Acquire), 0);
+    assert_eq!(backend.polls.load(Ordering::Acquire), 0);
+    assert!(!events.iter().any(|event| matches!(
+        serde_json::from_value::<EventPayload>(event.payload.clone()),
+        Ok(EventPayload::RunState(RunState::PermissionRequired { .. }))
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        serde_json::from_value::<EventPayload>(event.payload.clone()),
+        Ok(EventPayload::MenuOpened(ref menu))
+            if menu.origin == super::COMPUTER_PERMISSION_MENU_ORIGIN
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        serde_json::from_value::<EventPayload>(event.payload.clone()),
+        Ok(EventPayload::Effect(EffectPhase::Dispatched { .. }))
+    )));
+    let result = events
+        .iter()
+        .find_map(
+            |event| match serde_json::from_value::<EventPayload>(event.payload.clone()) {
+                Ok(EventPayload::ToolResult { call_id, result })
+                    if call_id == "autonomous-permission-screenshot" =>
+                {
+                    Some(result)
+                }
+                _ => None,
+            },
+        )
+        .expect("typed permission result");
+    assert_eq!(result.status, ToolResultStatus::Rejected);
+    assert!(result.preview.contains("permission_denied"));
+    assert!(
+        result
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("no_human_available"))
     );
 
     manager.shutdown().await.expect("manager shutdown");

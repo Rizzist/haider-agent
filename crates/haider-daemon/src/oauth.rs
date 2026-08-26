@@ -1217,15 +1217,54 @@ pub(crate) enum ClaudeNativeCredentialFailure {
     Unavailable,
 }
 
-/// Significant reads may retry a previously failed no-UI probe; ordinary
-/// provider read-throughs honor the boot-scoped cooldown and reuse the last
-/// typed failure. Auto-adopt discovery is distinguished only so its one
-/// successful read can be handed directly to the importer.
+/// Explicit-import reads may retry a previously failed no-UI probe and, on
+/// macOS, request protected data interactively. Ordinary provider read-throughs
+/// and auto-adopt discovery never permit credential UI; the latter remains a
+/// distinct event so one successful no-UI read can pass directly to import.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClaudeNativeReadEvent {
     Ordinary,
+    /// Explicit user-issued import. This is the only event permitted to ask
+    /// macOS Keychain for protected credential data.
     Significant,
     AutoAdoptDiscovery,
+}
+
+#[cfg(any(test, target_os = "macos"))]
+impl ClaudeNativeReadEvent {
+    #[must_use]
+    const fn credential_interaction_resolution(self) -> haider_core::InteractionResolution {
+        let mode = if matches!(self, Self::Significant) {
+            haider_protocol::session::SessionInteractionModeV1::Interactive
+        } else {
+            haider_protocol::session::SessionInteractionModeV1::Autonomous
+        };
+        haider_core::InteractionResolutionPolicy::new(mode)
+            .resolve(haider_core::InteractionGate::CredentialOrLogin)
+    }
+
+    #[must_use]
+    const fn macos_keychain_query_plan(self) -> MacosKeychainQueryPlan {
+        MacosKeychainQueryPlan {
+            skip_authenticated_attribute_items: true,
+            skip_authenticated_data_items: true,
+            allow_interactive_data_fallback: matches!(
+                self.credential_interaction_resolution(),
+                haider_core::InteractionResolution::AwaitHuman
+            ),
+        }
+    }
+}
+
+/// Mechanically testable Keychain query contract. Every discovery/preflight
+/// query skips protected items; only an explicit import may perform the later
+/// interactive data read.
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MacosKeychainQueryPlan {
+    skip_authenticated_attribute_items: bool,
+    skip_authenticated_data_items: bool,
+    allow_interactive_data_fallback: bool,
 }
 
 pub(crate) trait ClaudeNativeCredentialStore: Send + Sync {
@@ -1255,9 +1294,9 @@ pub(crate) struct PlatformClaudeNativeCredentialStore {
 impl ClaudeNativeCredentialStore for PlatformClaudeNativeCredentialStore {
     fn read(
         &self,
-        _event: ClaudeNativeReadEvent,
+        event: ClaudeNativeReadEvent,
     ) -> Result<ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
-        platform_claude_credential(self)
+        platform_claude_credential(self, event)
     }
 
     fn probe(&self) -> Result<(), ClaudeNativeCredentialFailure> {
@@ -1339,10 +1378,13 @@ fn platform_claude_credential_probe(
 ) -> Result<(), ClaudeNativeCredentialFailure> {
     use security_framework::item::{ItemClass, ItemSearchOptions, SearchResult};
 
+    let plan = ClaudeNativeReadEvent::Ordinary.macos_keychain_query_plan();
+
     ItemSearchOptions::new()
         .class(ItemClass::generic_password())
         .service(CLAUDE_CODE_CREDENTIAL_SERVICE)
         .load_attributes(true)
+        .skip_authenticated_items(plan.skip_authenticated_attribute_items)
         .search()
         .map_err(|error| classify_macos_keychain_status(error.code()))?;
 
@@ -1350,7 +1392,7 @@ fn platform_claude_credential_probe(
         .class(ItemClass::generic_password())
         .service(CLAUDE_CODE_CREDENTIAL_SERVICE)
         .load_data(true)
-        .skip_authenticated_items(true)
+        .skip_authenticated_items(plan.skip_authenticated_data_items)
         .search()
     {
         Ok(results) => {
@@ -1371,7 +1413,7 @@ fn platform_claude_credential_probe(
 fn platform_claude_credential_probe(
     store: &PlatformClaudeNativeCredentialStore,
 ) -> Result<(), ClaudeNativeCredentialFailure> {
-    platform_claude_credential(store).map(drop)
+    platform_claude_credential(store, ClaudeNativeReadEvent::Ordinary).map(drop)
 }
 
 #[cfg(any(test, not(any(target_os = "macos", target_os = "windows"))))]
@@ -1384,25 +1426,34 @@ fn platform_claude_credential_probe(
 #[cfg(all(target_os = "macos", not(test)))]
 fn platform_claude_credential(
     store: &PlatformClaudeNativeCredentialStore,
+    event: ClaudeNativeReadEvent,
 ) -> Result<ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
     use security_framework::item::{ItemClass, ItemSearchOptions, SearchResult};
 
-    // Attributes establish whether the service item exists without asking
-    // for secret data. This distinguishes a genuinely missing item from a
-    // protected item silently skipped by kSecUseAuthenticationUISkip.
-    ItemSearchOptions::new()
+    let plan = event.macos_keychain_query_plan();
+
+    // Every discovery query opts out of Keychain authentication UI. A
+    // protected item is therefore treated as unavailable unless this is the
+    // explicit-import path below.
+    let attribute_no_ui_failure = ItemSearchOptions::new()
         .class(ItemClass::generic_password())
         .service(CLAUDE_CODE_CREDENTIAL_SERVICE)
         .load_attributes(true)
+        .skip_authenticated_items(plan.skip_authenticated_attribute_items)
         .search()
-        .map_err(|error| classify_macos_keychain_status(error.code()))?;
+        .err()
+        .map(|error| classify_macos_keychain_status(error.code()));
 
     let no_ui = ItemSearchOptions::new()
         .class(ItemClass::generic_password())
         .service(CLAUDE_CODE_CREDENTIAL_SERVICE)
         .load_data(true)
-        .skip_authenticated_items(true)
+        .skip_authenticated_items(plan.skip_authenticated_data_items)
         .search();
+    let no_ui_failure = no_ui
+        .as_ref()
+        .err()
+        .map(|error| classify_macos_keychain_status(error.code()));
     if let Ok(results) = no_ui
         && let Some(bytes) = results.into_iter().find_map(|item| match item {
             SearchResult::Data(bytes) => Some(bytes),
@@ -1416,8 +1467,14 @@ fn platform_claude_credential(
         return native_claude_input("macOS Keychain", Zeroizing::new(bytes));
     }
 
-    // Protected data needs UI. Only the first attempt in this daemon boot is
-    // allowed to ask; later probes return the recorded typed outcome.
+    if !plan.allow_interactive_data_fallback {
+        return Err(no_ui_failure
+            .or(attribute_no_ui_failure)
+            .unwrap_or(ClaudeNativeCredentialFailure::Denied));
+    }
+
+    // Protected data needs UI. Only an explicit import may reach this branch,
+    // and only the first attempt in this daemon boot is allowed to ask.
     if store.interactive_attempted.swap(true, Ordering::AcqRel) {
         return Err(store
             .last_failure
@@ -1472,6 +1529,7 @@ fn classify_macos_keychain_status(status: i32) -> ClaudeNativeCredentialFailure 
 #[cfg(all(target_os = "windows", not(test)))]
 fn platform_claude_credential(
     _store: &PlatformClaudeNativeCredentialStore,
+    _event: ClaudeNativeReadEvent,
 ) -> Result<ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
     let bytes = windows_claude_store::read()?;
     native_claude_input(
@@ -1587,6 +1645,7 @@ mod windows_claude_store {
 #[cfg(any(test, not(any(target_os = "macos", target_os = "windows"))))]
 fn platform_claude_credential(
     _store: &PlatformClaudeNativeCredentialStore,
+    _event: ClaudeNativeReadEvent,
 ) -> Result<ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
     Err(ClaudeNativeCredentialFailure::Missing)
 }

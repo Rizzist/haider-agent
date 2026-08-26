@@ -260,6 +260,7 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
         model: model.into(),
         max_tokens: 64,
         permission_overrides: None,
+        interaction_mode: Default::default(),
         system_prompt_version: None,
         title: None,
         effort: None,
@@ -527,6 +528,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
             model: "llama-fixture".to_owned(),
             max_tokens: 64,
             permission_overrides: None,
+            interaction_mode: Default::default(),
             system_prompt_version: None,
             title: None,
             effort: None,
@@ -589,6 +591,7 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
         model: "model-small".to_owned(),
         max_tokens: 64,
         permission_overrides: None,
+        interaction_mode: Default::default(),
         system_prompt_version: None,
         title: None,
         effort: None,
@@ -724,6 +727,7 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
         model: "llama3.1:8b".to_owned(),
         max_tokens: 64,
         permission_overrides: None,
+        interaction_mode: Default::default(),
         system_prompt_version: None,
         title: None,
         effort: None,
@@ -819,6 +823,7 @@ async fn lk1_keyless_fallback_stays_scoped_to_enabled_auth_none_profiles() {
                 model: "llama3.1:8b".to_owned(),
                 max_tokens: 64,
                 permission_overrides: None,
+                interaction_mode: Default::default(),
                 system_prompt_version: None,
                 title: None,
                 effort: None,
@@ -1287,6 +1292,7 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
             model: "gpt-test".into(),
             max_tokens: 64,
             permission_overrides: None,
+            interaction_mode: Default::default(),
             system_prompt_version: None,
             title: None,
             effort: None,
@@ -1384,6 +1390,7 @@ fn fallback_chain_resolver_fixture() -> (AccountsAttemptResolver, CredentialAlia
         model: "claude-manual-selection".into(),
         max_tokens: 64,
         permission_overrides: None,
+        interaction_mode: Default::default(),
         system_prompt_version: None,
         title: None,
         effort: None,
@@ -1559,6 +1566,7 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
             model: "gpt-test".into(),
             max_tokens: 64,
             permission_overrides: None,
+            interaction_mode: Default::default(),
             system_prompt_version: None,
             title: None,
             effort: None,
@@ -1766,6 +1774,7 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         model: model.into(),
         max_tokens: 64,
         permission_overrides: None,
+        interaction_mode: Default::default(),
         system_prompt_version: None,
         title: None,
         effort: None,
@@ -2041,6 +2050,7 @@ const CLAUDE_READ_THROUGH_FIXTURE: &[u8] = br#"{
 struct StubAccountClaudeNative {
     state: StdMutex<Result<Vec<u8>, ClaudeNativeCredentialFailure>>,
     reads: std::sync::atomic::AtomicUsize,
+    events: StdMutex<Vec<ClaudeNativeReadEvent>>,
 }
 
 impl StubAccountClaudeNative {
@@ -2048,6 +2058,7 @@ impl StubAccountClaudeNative {
         Self {
             state: StdMutex::new(Ok(bytes.to_vec())),
             reads: std::sync::atomic::AtomicUsize::new(0),
+            events: StdMutex::new(Vec::new()),
         }
     }
 
@@ -2055,6 +2066,7 @@ impl StubAccountClaudeNative {
         Self {
             state: StdMutex::new(Err(ClaudeNativeCredentialFailure::Missing)),
             reads: std::sync::atomic::AtomicUsize::new(0),
+            events: StdMutex::new(Vec::new()),
         }
     }
 
@@ -2073,14 +2085,25 @@ impl StubAccountClaudeNative {
     fn reads(&self) -> usize {
         self.reads.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    fn events(&self) -> Vec<ClaudeNativeReadEvent> {
+        self.events
+            .lock()
+            .map(|events| events.clone())
+            .unwrap_or_default()
+    }
 }
 
 impl ClaudeNativeCredentialStore for StubAccountClaudeNative {
     fn read(
         &self,
-        _event: ClaudeNativeReadEvent,
+        event: ClaudeNativeReadEvent,
     ) -> Result<crate::oauth::ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
         self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.events
+            .lock()
+            .map_err(|_| ClaudeNativeCredentialFailure::Unavailable)?
+            .push(event);
         self.state
             .lock()
             .map_err(|_| ClaudeNativeCredentialFailure::Unavailable)?
@@ -6888,6 +6911,7 @@ async fn expired_claude_snapshot_reads_through_live_owner_without_refresh_grant(
             Some(exchange_service),
         );
     let descriptor = import_claude_for_heal(&actor).await;
+    assert_eq!(native.events(), [ClaudeNativeReadEvent::Significant]);
     assert!(descriptor.identity.ends_with("Linked to Claude Code"));
     native.replace(CLAUDE_READ_THROUGH_FIXTURE);
     age_import_bundle(vault.as_ref(), &descriptor);
@@ -8980,6 +9004,7 @@ async fn startup_auto_adopts_codex_once_and_refresh_is_idempotent() {
     let broker_vault = Arc::clone(&vault) as Arc<dyn Vault>;
     let broker_snapshot = Arc::clone(&snapshot);
     let broker_fences = refresh_fences.clone();
+    let native = Arc::new(StubAccountClaudeNative::unavailable());
     let (mut actor, broker) = start_account_actor_with_services(
         AccountActorConfig {
             store: store.clone(),
@@ -9006,7 +9031,7 @@ async fn startup_auto_adopts_codex_once_and_refresh_is_idempotent() {
         },
         Arc::new(ProductionProviderModelDiscoverer),
         Arc::new(UnreachableGcloud),
-        Arc::new(StubAccountClaudeNative::unavailable()),
+        native.clone(),
         Some(false),
     )
     .expect("auto-adopt actor");
@@ -9028,6 +9053,11 @@ async fn startup_auto_adopts_codex_once_and_refresh_is_idempotent() {
         OPENAI_OAUTH_PROVIDER_NAME
     );
     assert!(initial.descriptors[0].identity.ends_with(" · Codex"));
+    assert_eq!(
+        native.events(),
+        [ClaudeNativeReadEvent::AutoAdoptDiscovery],
+        "startup discovery must use the no-UI auto-adopt intent"
+    );
 
     for ordinal in 1..=2 {
         let (sink, mut frames) = channel_sink();
@@ -9059,6 +9089,15 @@ async fn startup_auto_adopts_codex_once_and_refresh_is_idempotent() {
     assert_eq!(
         store.account_add_receipts().await.expect("receipts").len(),
         1
+    );
+    assert_eq!(
+        native.events(),
+        [
+            ClaudeNativeReadEvent::AutoAdoptDiscovery,
+            ClaudeNativeReadEvent::AutoAdoptDiscovery,
+            ClaudeNativeReadEvent::AutoAdoptDiscovery,
+        ],
+        "startup and every DeviceCandidates refresh stay on the no-UI intent"
     );
 
     assert!(broker.shutdown().await);
@@ -9441,6 +9480,7 @@ fn provider_tuning_derives_from_metadata_and_fast_gate_filters_stale_pairs() {
         max_tokens: 4096,
         system_prompt_version: None,
         permission_overrides: None,
+        interaction_mode: Default::default(),
         title: None,
         effort: Some("xhigh".into()),
         fast: true,
@@ -9634,6 +9674,7 @@ fn enterprise_metadata(provider: &str, model: &str) -> haider_protocol::session:
         model: model.to_owned(),
         max_tokens: 64,
         permission_overrides: None,
+        interaction_mode: Default::default(),
         system_prompt_version: None,
         title: None,
         effort: None,
@@ -10353,6 +10394,7 @@ async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs
         model: "web-test".into(),
         max_tokens: 64,
         permission_overrides: None,
+        interaction_mode: Default::default(),
         system_prompt_version: None,
         title: None,
         effort: None,
@@ -10523,6 +10565,7 @@ async fn each_turn_resolves_the_currently_active_account() {
         model: "llama-fixture".to_owned(),
         max_tokens: 64,
         permission_overrides: None,
+        interaction_mode: Default::default(),
         system_prompt_version: None,
         title: None,
         effort: None,

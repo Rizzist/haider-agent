@@ -308,6 +308,8 @@ pub const FEATURE_USER_COMMAND_V1: &str = "user_command_v1";
 pub const FEATURE_TOOL_INVENTORY_V1: &str = "tool_inventory_v1";
 /// Daemon persists and applies typed per-session write/exec permission overrides.
 pub const FEATURE_SESSION_PERMISSION_OVERRIDES_V1: &str = "session_permission_overrides_v1";
+/// Daemon persists and applies the explicit interactive/autonomous session mode.
+pub const FEATURE_AUTONOMOUS_INTERACTION_V1: &str = "autonomous_interaction_v1";
 /// Daemon implements the read-only, journal-derived session observation digest.
 pub const FEATURE_SESSION_OBSERVE_V1: &str = "session_observe_v1";
 /// Daemon accepts up to 64 observation coordinates in one read-only RPC.
@@ -1697,6 +1699,11 @@ pub enum RequestBody {
         permission_overrides: Option<SessionPermissionOverridesV1>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_policy: Option<haider_protocol::cache::CachePolicySettingsV1>,
+        #[serde(
+            default,
+            skip_serializing_if = "haider_protocol::session::SessionInteractionModeV1::is_interactive"
+        )]
+        interaction_mode: haider_protocol::session::SessionInteractionModeV1,
     },
     /// Atomically creates typed session configuration, a `Created` event, and
     /// the durable command receipt that makes response-loss retries safe.

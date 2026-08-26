@@ -542,6 +542,21 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.create_session(&command))).await
     }
 
+    /// Atomically creates a session with an explicit durable interaction mode.
+    pub async fn create_session_with_interaction_mode(
+        &self,
+        command: SessionCreateCommand,
+        interaction_mode: haider_protocol::session::SessionInteractionModeV1,
+    ) -> Result<SessionCreateOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.create_session_with_interaction_mode(&command, interaction_mode)
+            })
+        })
+        .await
+    }
+
     pub async fn session_fork_receipt(
         &self,
         command_id: String,

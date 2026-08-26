@@ -10,6 +10,36 @@ use tokio::sync::Semaphore;
 use super::*;
 use crate::session_hub::{FrameSendError, FrameSink};
 
+#[test]
+fn macos_keychain_ui_is_reserved_for_explicit_import_intent() {
+    for event in [
+        ClaudeNativeReadEvent::Ordinary,
+        ClaudeNativeReadEvent::AutoAdoptDiscovery,
+        ClaudeNativeReadEvent::Significant,
+    ] {
+        let plan = event.macos_keychain_query_plan();
+        assert!(plan.skip_authenticated_attribute_items);
+        assert!(plan.skip_authenticated_data_items);
+        assert_eq!(
+            plan.allow_interactive_data_fallback,
+            matches!(event, ClaudeNativeReadEvent::Significant)
+        );
+    }
+
+    assert_eq!(
+        ClaudeNativeReadEvent::Ordinary.credential_interaction_resolution(),
+        haider_core::InteractionResolution::FailClosed
+    );
+    assert_eq!(
+        ClaudeNativeReadEvent::AutoAdoptDiscovery.credential_interaction_resolution(),
+        haider_core::InteractionResolution::FailClosed
+    );
+    assert_eq!(
+        ClaudeNativeReadEvent::Significant.credential_interaction_resolution(),
+        haider_core::InteractionResolution::AwaitHuman
+    );
+}
+
 const CODE_SENTINEL: &str = "AUTH_CODE_SENTINEL_51d2";
 const ACCESS_SENTINEL: &str = "ACCESS_TOKEN_SENTINEL_834a";
 const REFRESH_SENTINEL: &str = "REFRESH_TOKEN_SENTINEL_1c72";

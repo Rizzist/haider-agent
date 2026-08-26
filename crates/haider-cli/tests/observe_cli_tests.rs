@@ -92,6 +92,7 @@ fn digest(
             max_tokens: 4096,
             system_prompt_version: Some("v1".into()),
             permission_overrides: None,
+            interaction_mode: Default::default(),
             title: None,
             effort: None,
             fast: false,

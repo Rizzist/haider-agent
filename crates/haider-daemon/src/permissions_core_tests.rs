@@ -25,7 +25,9 @@ use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{
     AnswerVia, DecisionKind, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope,
 };
-use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
+use haider_protocol::session::{
+    SessionInteractionModeV1, SessionMetadataV1, SessionPermissionOverridesV1,
+};
 use haider_protocol::state::RunState;
 use haider_protocol::tool::{RememberedGrantScope, ToolPermissionDefault};
 use haider_store::{AcceptedShellExec, EventStore, SessionCreateCommand, Store};
@@ -259,6 +261,7 @@ fn session_permission_overrides_replace_only_write_and_exec_ask_defaults() {
         model: "fake-model".into(),
         max_tokens: 4096,
         permission_overrides,
+        interaction_mode: Default::default(),
         system_prompt_version: None,
         title: None,
         effort: None,
@@ -358,6 +361,65 @@ fn session_permission_overrides_replace_only_write_and_exec_ask_defaults() {
     );
 }
 
+/// Autonomous mode applies its no-human denial as the broker's residual-Ask
+/// fallback, not as a high-priority class deny. Registry defaults must stay
+/// `Ask` so durable and command-derived grants can still authorize first.
+#[test]
+fn autonomous_effect_defaults_preserve_explicit_grant_precedence() {
+    let metadata = |permission_overrides| SessionMetadataV1 {
+        cwd: "/tmp".into(),
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 4096,
+        permission_overrides,
+        interaction_mode: SessionInteractionModeV1::Autonomous,
+        system_prompt_version: None,
+        title: None,
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        created_at_ms: 1,
+        agent_type: None,
+    };
+    let decision = |metadata: &SessionMetadataV1, class: EffectClass| {
+        effective_permission_defaults(metadata)
+            .into_iter()
+            .find_map(|(candidate, default)| (candidate == class).then_some(default))
+            .expect("registered effect class")
+    };
+
+    let baseline = metadata(None);
+    for class in [
+        EffectClass::FsWrite,
+        EffectClass::ProcessExec,
+        EffectClass::ScreenObserve,
+        EffectClass::ScreenControl,
+        EffectClass::ReadSms,
+        EffectClass::MobileObserve,
+        EffectClass::MobileControl,
+    ] {
+        assert_eq!(decision(&baseline, class), ToolPermissionDefault::Ask);
+    }
+
+    let explicit = metadata(Some(SessionPermissionOverridesV1 {
+        allow_writes: true,
+        allow_exec: true,
+        auto_allow: false,
+    }));
+    assert_eq!(
+        decision(&explicit, EffectClass::FsWrite),
+        ToolPermissionDefault::Allow
+    );
+    assert_eq!(
+        decision(&explicit, EffectClass::ProcessExec),
+        ToolPermissionDefault::Allow
+    );
+    assert_eq!(
+        decision(&explicit, EffectClass::ScreenObserve),
+        ToolPermissionDefault::Ask
+    );
+}
+
 /// MUTATION CHECK: make `auto_allow` a no-op, scope it to only writes/exec, or
 /// let it promote a `NotApplicable` class into an effect. Expected RUNTIME
 /// failure: a class still on `Ask` under auto-allow (computer/screen/fetch), or
@@ -370,6 +432,7 @@ fn auto_allow_promotes_every_ask_class_including_computer_and_fetch() {
         model: "fake-model".into(),
         max_tokens: 4096,
         permission_overrides,
+        interaction_mode: Default::default(),
         system_prompt_version: None,
         title: None,
         effort: None,

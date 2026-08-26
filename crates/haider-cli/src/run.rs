@@ -788,7 +788,9 @@ pub(crate) fn exit_code_for_result(result: &HeadlessRunResult) -> u8 {
                 | ErrorCode::CredentialLimited,
             )) => EX_PROVIDER,
             Some(HeadlessFailureCode::Run(
-                ErrorCode::PermissionDenied | ErrorCode::EffectUnknownOutcome,
+                ErrorCode::PermissionDenied
+                | ErrorCode::EffectUnknownOutcome
+                | ErrorCode::WorkflowUnfinished,
             ))
             | Some(HeadlessFailureCode::Blocked(_)) => EX_BLOCKED,
             Some(HeadlessFailureCode::Run(ErrorCode::ProtocolMismatch)) => EX_PROTOCOL,

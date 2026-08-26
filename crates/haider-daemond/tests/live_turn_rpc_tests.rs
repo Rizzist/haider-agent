@@ -5091,6 +5091,7 @@ async fn session_create_permission_overrides_are_digest_bound_and_persisted() {
         max_tokens: 4096,
         permission_overrides: overrides,
         cache_policy: None,
+        interaction_mode: haider_protocol::session::SessionInteractionModeV1::Interactive,
     };
 
     send_request(

@@ -25,13 +25,15 @@ use haider_rpc::haider_protocol::ids::{ArtifactRef, MenuId, RunId, SessionId};
 use haider_rpc::haider_protocol::item::{ItemEvent, TurnItem};
 use haider_rpc::haider_protocol::menu::{DecisionKind, MenuKind};
 use haider_rpc::haider_protocol::provider::Usage;
-use haider_rpc::haider_protocol::session::SessionPermissionOverridesV1;
+use haider_rpc::haider_protocol::session::{
+    SessionInteractionModeV1, SessionPermissionOverridesV1,
+};
 use haider_rpc::haider_protocol::state::RunState;
 use haider_rpc::haider_protocol::tool::AttachmentBlock;
 use haider_rpc::{
     AttachMode, AttachmentId, Capability, CapabilitySet, ClientKind, CommandId,
-    ERROR_CODE_ALREADY_RESOLVED, FEATURE_ARTIFACT_PUT_V1, FEATURE_SESSION_PERMISSION_OVERRIDES_V1,
-    RequestBody, ResponseBody, WireFrame,
+    ERROR_CODE_ALREADY_RESOLVED, FEATURE_ARTIFACT_PUT_V1, FEATURE_AUTONOMOUS_INTERACTION_V1,
+    FEATURE_SESSION_PERMISSION_OVERRIDES_V1, RequestBody, ResponseBody, WireFrame,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -1347,6 +1349,7 @@ async fn run_headless_inner(
         permission_overrides: (!request.permission_overrides.is_empty())
             .then_some(request.permission_overrides),
         cache_policy: None,
+        interaction_mode: SessionInteractionModeV1::Autonomous,
     };
 
     let (session_id, created_generation, created_seq) =
@@ -1367,6 +1370,13 @@ async fn run_headless_inner(
                                 message:
                                     "daemon did not persist the requested permission overrides"
                                         .into(),
+                            });
+                        }
+                        if metadata.interaction_mode != SessionInteractionModeV1::Autonomous {
+                            return Err(HeadlessRunError::Protocol {
+                                stage: "session.create",
+                                message: "daemon did not persist autonomous interaction mode"
+                                    .into(),
                             });
                         }
                         break Ok((session_id, worker_generation, created_seq));
@@ -2209,6 +2219,9 @@ fn normalize_ensure_options(
     trust_hooks: bool,
 ) {
     options.required_features.extend(required_live_features());
+    options
+        .required_features
+        .insert(FEATURE_AUTONOMOUS_INTERACTION_V1.to_owned());
     if !permission_overrides.is_empty() {
         options
             .required_features
@@ -3325,6 +3338,7 @@ pub fn required_headless_features(
     permission_overrides: SessionPermissionOverridesV1,
 ) -> BTreeSet<String> {
     let mut features = required_live_features();
+    features.insert(FEATURE_AUTONOMOUS_INTERACTION_V1.to_owned());
     if !permission_overrides.is_empty() {
         features.insert(FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned());
     }

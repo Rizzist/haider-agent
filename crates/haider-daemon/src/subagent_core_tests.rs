@@ -307,6 +307,7 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
         max_tokens: 4096,
         system_prompt_version: Some(crate::worker::SystemPromptBuilder::VERSION.into()),
         permission_overrides: None,
+        interaction_mode: Default::default(),
         title: None,
         effort: None,
         fast: false,
@@ -601,6 +602,7 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
                     max_tokens: 4096,
                     system_prompt_version: Some(crate::worker::SystemPromptBuilder::VERSION.into()),
                     permission_overrides: None,
+                    interaction_mode: Default::default(),
                     title: None,
                     effort: None,
                     fast: false,
@@ -837,6 +839,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
                     max_tokens: 4096,
                     system_prompt_version: Some(crate::worker::SystemPromptBuilder::VERSION.into()),
                     permission_overrides: None,
+                    interaction_mode: Default::default(),
                     title: None,
                     effort: None,
                     fast: false,
@@ -882,6 +885,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
                 max_tokens: 4096,
                 system_prompt_version: Some(crate::worker::SystemPromptBuilder::VERSION.into()),
                 permission_overrides: None,
+                interaction_mode: Default::default(),
                 title: None,
                 effort: None,
                 fast: false,
@@ -1035,6 +1039,7 @@ async fn only_own_children_are_messageable_with_typed_error() {
                     max_tokens: 4096,
                     system_prompt_version: Some(crate::worker::SystemPromptBuilder::VERSION.into()),
                     permission_overrides: None,
+                    interaction_mode: Default::default(),
                     title: None,
                     effort: None,
                     fast: false,
@@ -1452,23 +1457,43 @@ async fn accept_parent(
     run_id: &RunId,
     label: &str,
 ) -> haider_core::AcceptedTurn {
-    hub.create_internal_session(SessionCreateCommand {
-        command_id: format!("create-{label}"),
-        request_digest: format!("create-{label}-digest"),
-        request_json: format!(r#"{{"session":"{label}"}}"#),
-        session_id: session_id.clone(),
-        cwd: test_cwd(),
-        provider: "fake".into(),
-        model: "fake-model".into(),
-        max_tokens: 4096,
-        permission_overrides: None,
-        effort: None,
-        fast: false,
-        cache_policy: Default::default(),
-        system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
-        event_id: EventId::new(format!("created-{label}")),
-        device_id: DeviceId::new("w6c-test-device"),
-    })
+    accept_parent_with_interaction_mode(
+        hub,
+        session_id,
+        run_id,
+        label,
+        haider_protocol::session::SessionInteractionModeV1::Interactive,
+    )
+    .await
+}
+
+async fn accept_parent_with_interaction_mode(
+    hub: &SessionHub,
+    session_id: &SessionId,
+    run_id: &RunId,
+    label: &str,
+    interaction_mode: haider_protocol::session::SessionInteractionModeV1,
+) -> haider_core::AcceptedTurn {
+    hub.create_internal_session_with_interaction_mode(
+        SessionCreateCommand {
+            command_id: format!("create-{label}"),
+            request_digest: format!("create-{label}-digest"),
+            request_json: format!(r#"{{"session":"{label}"}}"#),
+            session_id: session_id.clone(),
+            cwd: test_cwd(),
+            provider: "fake".into(),
+            model: "fake-model".into(),
+            max_tokens: 4096,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+            event_id: EventId::new(format!("created-{label}")),
+            device_id: DeviceId::new("w6c-test-device"),
+        },
+        interaction_mode,
+    )
     .await
     .expect("create parent");
     hub.accept_internal_turn(TurnAcceptCommand {
@@ -1564,6 +1589,126 @@ async fn wait_for_state(
     })
     .await
     .expect("expected run state");
+}
+
+/// Autonomous interaction mode is durable child-session policy, not a root
+/// headless reducer trick: a child request_input without a default returns a
+/// typed tool rejection and both child and parent terminate.
+#[cfg(unix)]
+#[tokio::test]
+async fn autonomous_child_request_input_cannot_hold_parent_forever() {
+    let root = tempfile::tempdir().expect("temp profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "autonomous-child-spawn".into(),
+            name: "spawn_subagent".into(),
+            args: serde_json::json!({"task":"ask","prompt":"ask, then continue"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::EmitRequestInput {
+            call_id: "autonomous-child-ask".into(),
+            kind: FakeInputKind::Question,
+            title: "which value?".into(),
+            body: Vec::new(),
+            options: Vec::new(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "autonomous-child-ask".into(),
+        },
+        FakeStep::EmitText {
+            text: "child continued without invented input".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "autonomous-child-spawn".into(),
+        },
+        FakeStep::EmitText {
+            text: "parent collected autonomous child".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            diagnostics: None,
+            provider_factory: Arc::new(FixedProviderFactory { provider }),
+            tool_factory: Arc::new(BrokerToolFactory),
+            delegation: Some(DelegationHandle::with_stall_deadline(
+                hub.clone(),
+                Duration::from_secs(3),
+            )),
+            web_search: None,
+        },
+        false,
+    );
+    let manager_handle = manager.handle();
+    hub.install_worker_manager(manager_handle.clone())
+        .expect("install manager");
+    let parent_session = SessionId::new("autonomous-child-parent");
+    let parent_run = RunId::new("autonomous-child-parent-run");
+    let accepted = accept_parent_with_interaction_mode(
+        &hub,
+        &parent_session,
+        &parent_run,
+        "autonomous-child",
+        haider_protocol::session::SessionInteractionModeV1::Autonomous,
+    )
+    .await;
+    manager_handle
+        .submit(accepted)
+        .await
+        .expect("submit parent");
+    wait_for_state(&store, &parent_session, |state| {
+        matches!(state, RunState::Done)
+    })
+    .await;
+
+    let child = hub
+        .delegations_for_parent_run(parent_session.clone(), parent_run)
+        .await
+        .expect("delegation")
+        .pop()
+        .expect("child");
+    let child_metadata = store
+        .session_metadata(&child.child_session_id)
+        .await
+        .expect("metadata read")
+        .expect("metadata");
+    assert_eq!(
+        child_metadata.interaction_mode,
+        haider_protocol::session::SessionInteractionModeV1::Autonomous
+    );
+    let payloads = typed_payloads(
+        &store
+            .read(&child.child_session_id, 0, 1024)
+            .await
+            .expect("child events"),
+    );
+    assert!(!payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::RunState(RunState::InputRequired { .. })
+    )));
+    assert!(payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::ToolResult { result, .. }
+            if serde_json::from_str::<serde_json::Value>(&result.preview)
+                .is_ok_and(|value| value["code"] == "no_human_available")
+    )));
+
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
 }
 
 // Every caller of this helper lives in a `cfg(unix)` test (the UDS/menu

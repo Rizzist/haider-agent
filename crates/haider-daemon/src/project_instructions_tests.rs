@@ -287,6 +287,7 @@ fn metadata(cwd: String) -> SessionMetadataV1 {
         max_tokens: 4096,
         system_prompt_version: Some(SystemPromptBuilder::VERSION.into()),
         permission_overrides: None,
+        interaction_mode: Default::default(),
         title: None,
         effort: None,
         fast: false,

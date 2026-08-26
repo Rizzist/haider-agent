@@ -112,6 +112,33 @@ fn create_session(store: &Store, name: &str) -> SessionId {
     session_id
 }
 
+fn create_autonomous_session(store: &Store, name: &str) -> SessionId {
+    let session_id = SessionId::new(name);
+    store
+        .create_session_with_interaction_mode(
+            &SessionCreateCommand {
+                command_id: format!("create-{name}"),
+                request_digest: format!("create-digest-{name}"),
+                request_json: format!(r#"{{"session":"{name}","interaction_mode":"autonomous"}}"#),
+                session_id: session_id.clone(),
+                cwd: "/tmp".into(),
+                provider: "fake".into(),
+                model: "fake-v1".into(),
+                max_tokens: 4096,
+                permission_overrides: None,
+                effort: None,
+                fast: false,
+                cache_policy: Default::default(),
+                system_prompt_version: "graph-test-v1".into(),
+                event_id: EventId::new(format!("created-{name}")),
+                device_id: DeviceId::new("graph-test"),
+            },
+            haider_protocol::session::SessionInteractionModeV1::Autonomous,
+        )
+        .expect("create autonomous typed session");
+    session_id
+}
+
 fn pin_command(store: &Store, session_id: &SessionId, suffix: &str) -> GraphPinCommand {
     GraphPinCommand {
         command_id: format!("pin-{suffix}"),
@@ -3295,6 +3322,69 @@ fn m2c_first_finalization_defers_and_second_requires_explicit_exit() {
             .guard_graph_finalization(&command)
             .expect("abandon permits finalization"),
         GraphFinalizationOutcome::AllowDone
+    );
+}
+
+#[test]
+fn autonomous_finalization_continues_once_then_fails_without_abandon_menu() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_autonomous_session(&store, "m2c-autonomous-finalization");
+    let graph_id = pin(&store, &session_id, "m2c-autonomous-finalization");
+    let run_id = RunId::new("run-m2c-autonomous-finalization");
+    let command = finalization_command(&store, &session_id, &run_id);
+
+    assert!(matches!(
+        store
+            .guard_graph_finalization(&command)
+            .expect("first guard"),
+        GraphFinalizationOutcome::Deferred {
+            emit_reminder: true,
+            ..
+        }
+    ));
+    // Make real workflow progress so the state digest changes. Autonomous
+    // mode still grants only one continuation for this run, not one per
+    // distinct unfinished digest.
+    let status = store
+        .graph_status(&session_id)
+        .expect("status after first guard")
+        .expect("active graph after first guard");
+    let next = status
+        .ready_nodes
+        .first()
+        .cloned()
+        .or(status.current_node)
+        .expect("unfinished graph has a ready node");
+    let mut serial = 77_000;
+    record_catalog_green(&store, &session_id, &next, &mut serial);
+    assert!(matches!(
+        store.guard_graph_finalization(&command).expect("recurrence"),
+        GraphFinalizationOutcome::WorkflowUnfinished {
+            graph_id: returned,
+            ..
+        } if returned == graph_id
+    ));
+    let payloads = store
+        .journal_replay(&session_id)
+        .expect("journal")
+        .into_iter()
+        .map(|event| serde_json::from_value::<EventPayload>(event.payload).expect("payload"))
+        .collect::<Vec<_>>();
+    assert!(!payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::MenuOpened(Menu {
+            kind: MenuKind::GraphAbandonConfirm { .. },
+            ..
+        }) | EventPayload::GraphAbandoned(_)
+    )));
+    assert_eq!(
+        store
+            .graph_status(&session_id)
+            .expect("status")
+            .expect("graph")
+            .phase,
+        GraphPhase::Active
     );
 }
 

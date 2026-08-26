@@ -35,7 +35,10 @@
 //! shared with the effect journal in the daemon, self-minted in standalone
 //! use.
 
-use crate::{ArtifactReader, PromptHistoryCompiler, StoreHandle, unix_time_ms};
+use crate::{
+    ArtifactReader, InteractionGate, InteractionResolution, InteractionResolutionPolicy,
+    PromptHistoryCompiler, StoreHandle, unix_time_ms,
+};
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -272,6 +275,8 @@ pub struct HarnessConfig {
     /// Daemon-owned provider EndTurn guard. Standalone actors have no graph
     /// authority and therefore leave this unset.
     pub finalization_guard: Option<Arc<dyn FinalizationGuard>>,
+    /// Typed human-availability policy derived from durable session metadata.
+    pub interaction_policy: InteractionResolutionPolicy,
     pub command_capacity: usize,
     pub broadcast_capacity: usize,
     /// Hard ceiling on provider requests made by one logical turn.
@@ -343,6 +348,7 @@ impl HarnessConfig {
             retry_sleeper: Arc::new(RealRetrySleeper),
             context_compactor: None,
             finalization_guard: None,
+            interaction_policy: InteractionResolutionPolicy::default(),
             command_capacity: 8,
             broadcast_capacity: 128,
             max_provider_requests_per_turn: DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN,
@@ -464,9 +470,10 @@ pub struct RequestInputCheckpoint {
     pub opening_generation: u64,
     pub tool_item_id: ItemId,
     pub call_id: String,
-    /// `request_input` for a blocking question, `plan` for an interrupted
-    /// automatic settlement, or the mutating tool whose broker approval is
-    /// waiting on the same durable menu CAS.
+    /// `request_input` for a blocking interactive question or nonblocking
+    /// autonomous resolution, `plan` for an interrupted automatic settlement,
+    /// or the mutating tool whose broker approval is waiting on the same
+    /// durable menu CAS.
     pub tool_name: String,
     pub args: String,
 }
@@ -1964,7 +1971,7 @@ impl HarnessActor {
         }
         if let Some(checkpoint) = partial_stream {
             match self
-                .wait_for_error_recovery_answer(&run_id, &cancel, &checkpoint.menu)
+                .resolve_partial_stream_recovery(&run_id, &cancel, &checkpoint.menu, true)
                 .await
             {
                 Ok(ErrorAction::ContinuePartial) => {
@@ -2739,6 +2746,11 @@ impl HarnessActor {
                                     )
                                     .await;
                             }
+                            let autonomous_partial = self
+                                .config
+                                .interaction_policy
+                                .resolve(InteractionGate::PartialProviderStream)
+                                == InteractionResolution::ContinuePartial;
                             let menu = recovery_menu(
                                 self.next_menu_id(),
                                 &run_id,
@@ -2747,7 +2759,7 @@ impl HarnessActor {
                                 presentation,
                                 Some(self.config.usage_scope.provider.clone()),
                                 usage_account.clone(),
-                                true,
+                                !autonomous_partial,
                             );
                             if let Err(error) = self
                                 .commit_payload(
@@ -2759,19 +2771,8 @@ impl HarnessActor {
                             {
                                 return self.errored_state_outcome(&run_id, error).await;
                             }
-                            if let Err(error) = self
-                                .commit_state(
-                                    &run_id,
-                                    RunState::InputRequired {
-                                        menu: menu.id.clone(),
-                                    },
-                                )
-                                .await
-                            {
-                                return self.errored_state_outcome(&run_id, error).await;
-                            }
                             let action = match self
-                                .wait_for_error_recovery_answer(&run_id, &cancel, &menu)
+                                .resolve_partial_stream_recovery(&run_id, &cancel, &menu, false)
                                 .await
                             {
                                 Ok(action) => action,
@@ -5289,7 +5290,16 @@ impl HarnessActor {
                 .await;
         }
         let request = RequestInput::from_tool_args(args).map_err(tool_error_to_drive)?;
-        let menu = request.menu(self.next_menu_id());
+        let mut menu = request.menu(self.next_menu_id());
+        let request_gate = if request.has_declared_default() {
+            InteractionGate::RequestInputWithDefault
+        } else {
+            InteractionGate::RequestInputWithoutDefault
+        };
+        if self.config.interaction_policy.resolve(request_gate) != InteractionResolution::AwaitHuman
+        {
+            menu.blocking = false;
+        }
         self.commit_payload(
             run_id,
             EventPayload::MenuOpened(menu.clone()),
@@ -5297,16 +5307,7 @@ impl HarnessActor {
         )
         .await
         .map_err(DriveError::Store)?;
-        self.commit_state(
-            run_id,
-            RunState::InputRequired {
-                menu: menu.id.clone(),
-            },
-        )
-        .await
-        .map_err(DriveError::Store)?;
-
-        self.wait_for_request_input(run_id, tools, index, cancel, request, menu)
+        self.resolve_or_wait_for_request_input(run_id, tools, index, cancel, request, menu, false)
             .await
     }
 
@@ -5389,8 +5390,171 @@ impl HarnessActor {
                 .await;
         }
         let request = RequestInput::from_tool_args(args).map_err(tool_error_to_drive)?;
-        self.wait_for_request_input(run_id, tools, index, cancel, request, menu)
+        self.resolve_or_wait_for_request_input(run_id, tools, index, cancel, request, menu, true)
             .await
+    }
+
+    async fn resolve_or_wait_for_request_input(
+        &mut self,
+        run_id: &RunId,
+        tools: &mut Vec<ToolAccumulator>,
+        index: usize,
+        cancel: &CancelToken,
+        request: RequestInput,
+        menu: Menu,
+        recovered_open_menu: bool,
+    ) -> Result<Message, DriveError> {
+        let gate = if request.has_declared_default() {
+            InteractionGate::RequestInputWithDefault
+        } else {
+            InteractionGate::RequestInputWithoutDefault
+        };
+        match self.config.interaction_policy.resolve(gate) {
+            InteractionResolution::AwaitHuman => {
+                if !recovered_open_menu {
+                    self.commit_state(
+                        run_id,
+                        RunState::InputRequired {
+                            menu: menu.id.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(DriveError::Store)?;
+                }
+                self.wait_for_request_input(run_id, tools, index, cancel, request, menu)
+                    .await
+            }
+            InteractionResolution::UseDeclaredDefault => {
+                let answer = request
+                    .declared_default_answer(&menu)
+                    .map_err(tool_error_to_drive)?;
+                let resolved = request
+                    .resolve(&menu, &answer)
+                    .map_err(tool_error_to_drive)?;
+                let answer_already_committed =
+                    recovered_open_menu && self.automatic_menu_answer_already_committed(&answer)?;
+                if !answer_already_committed {
+                    self.commit_payload(
+                        run_id,
+                        EventPayload::MenuAnswered(answer),
+                        prompt_omit_render(),
+                    )
+                    .await
+                    .map_err(DriveError::Store)?;
+                }
+                self.complete_resolved_request_input(run_id, tools, index, resolved)
+                    .await
+            }
+            InteractionResolution::ReturnNoHumanAvailable => {
+                self.complete_unanswered_autonomous_request_input(run_id, tools, index, &menu)
+                    .await
+            }
+            _ => Err(DriveError::Store(HaiderError::new(
+                ErrorCode::Internal,
+                "request_input interaction policy returned an incompatible resolution",
+                false,
+            ))),
+        }
+    }
+
+    async fn complete_resolved_request_input(
+        &mut self,
+        run_id: &RunId,
+        tools: &mut Vec<ToolAccumulator>,
+        index: usize,
+        resolved: haider_tools::RequestInputAnswer,
+    ) -> Result<Message, DriveError> {
+        let result = serde_json::json!({
+            "value": resolved.value,
+            "option_key": resolved.option_key,
+        })
+        .to_string();
+        let call_id = tools[index].call_id.clone();
+        self.commit_payload(
+            run_id,
+            EventPayload::ToolResult {
+                call_id: call_id.clone(),
+                result: BoundedResult {
+                    preview: result.clone(),
+                    truncated: false,
+                    artifact: None,
+                    images: Vec::new(),
+                    cursor: None,
+                    status: ToolResultStatus::Completed,
+                    reason: None,
+                    presentation: None,
+                },
+            },
+            prompt_verbatim_render(),
+        )
+        .await
+        .map_err(DriveError::Store)?;
+        self.commit_tool_completed(run_id, &tools[index], ToolStatus::Completed)
+            .await?;
+        tools.remove(index);
+        self.commit_state(run_id, RunState::Streaming)
+            .await
+            .map_err(DriveError::Store)?;
+        Ok(Message::tool_result(call_id, result, false))
+    }
+
+    async fn complete_unanswered_autonomous_request_input(
+        &mut self,
+        run_id: &RunId,
+        tools: &mut Vec<ToolAccumulator>,
+        index: usize,
+        menu: &Menu,
+    ) -> Result<Message, DriveError> {
+        let reason = "no human is available and request_input declared no default".to_owned();
+        let result = serde_json::json!({
+            "ok": false,
+            "code": "no_human_available",
+            "message": &reason,
+        })
+        .to_string();
+        let call_id = tools[index].call_id.clone();
+        self.commit_payload(
+            run_id,
+            EventPayload::ToolResult {
+                call_id: call_id.clone(),
+                result: BoundedResult {
+                    preview: result.clone(),
+                    truncated: false,
+                    artifact: None,
+                    images: Vec::new(),
+                    cursor: None,
+                    status: ToolResultStatus::Rejected,
+                    reason: Some(reason.clone()),
+                    presentation: Some(ErrorPresentation::new(
+                        "no_human_available",
+                        "No human available",
+                        &reason,
+                        ErrorScope::Tool,
+                        [ErrorAction::None],
+                    )),
+                },
+            },
+            prompt_verbatim_render(),
+        )
+        .await
+        .map_err(DriveError::Store)?;
+        self.commit_payload(
+            run_id,
+            EventPayload::MenuClosed {
+                menu: menu.id.clone(),
+                reason: MenuCloseReason::Dismissed,
+            },
+            prompt_omit_render(),
+        )
+        .await
+        .map_err(DriveError::Store)?;
+        self.commit_tool_completed(run_id, &tools[index], ToolStatus::Rejected)
+            .await?;
+        tools.remove(index);
+        self.commit_state(run_id, RunState::Streaming)
+            .await
+            .map_err(DriveError::Store)?;
+        Ok(Message::tool_result(call_id, result, false))
     }
 
     async fn resume_tool_approval(
@@ -5602,6 +5766,88 @@ impl HarnessActor {
             }
             return Ok(action);
         }
+    }
+
+    async fn resolve_partial_stream_recovery(
+        &mut self,
+        run_id: &RunId,
+        cancel: &CancelToken,
+        menu: &Menu,
+        recovered_open_menu: bool,
+    ) -> Result<ErrorAction, DriveError> {
+        match self
+            .config
+            .interaction_policy
+            .resolve(InteractionGate::PartialProviderStream)
+        {
+            InteractionResolution::ContinuePartial => {
+                let answer = automatic_error_action_answer(menu, ErrorAction::ContinuePartial)
+                    .map_err(DriveError::Store)?;
+                let answer_already_committed =
+                    recovered_open_menu && self.automatic_menu_answer_already_committed(&answer)?;
+                if !answer_already_committed {
+                    self.commit_payload(
+                        run_id,
+                        EventPayload::MenuAnswered(answer),
+                        prompt_omit_render(),
+                    )
+                    .await
+                    .map_err(DriveError::Store)?;
+                }
+                Ok(ErrorAction::ContinuePartial)
+            }
+            InteractionResolution::AwaitHuman => {
+                if !recovered_open_menu {
+                    self.commit_state(
+                        run_id,
+                        RunState::InputRequired {
+                            menu: menu.id.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(DriveError::Store)?;
+                }
+                self.wait_for_error_recovery_answer(run_id, cancel, menu)
+                    .await
+            }
+            _ => Err(DriveError::Store(HaiderError::new(
+                ErrorCode::Internal,
+                "partial-stream interaction policy returned an incompatible resolution",
+                false,
+            ))),
+        }
+    }
+
+    fn automatic_menu_answer_already_committed(
+        &mut self,
+        expected: &MenuAnswer,
+    ) -> Result<bool, DriveError> {
+        let Some(envelope) = self.committed_menus.borrow_and_update().clone() else {
+            return Ok(false);
+        };
+        let payload =
+            serde_json::from_value::<EventPayload>(envelope.payload).map_err(|error| {
+                DriveError::Store(HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    format!("recovered menu answer does not decode: {error}"),
+                    false,
+                ))
+            })?;
+        let EventPayload::MenuAnswered(committed) = payload else {
+            return Err(DriveError::Store(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "recovered menu wake is not a menu answer",
+                false,
+            )));
+        };
+        if &committed != expected {
+            return Err(DriveError::Store(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "recovered automatic menu answer differs from the declared policy resolution",
+                false,
+            )));
+        }
+        Ok(true)
     }
 
     async fn wait_for_request_input(
@@ -7275,6 +7521,51 @@ fn selected_error_action(menu: &Menu, answer: &MenuAnswer) -> Result<ErrorAction
         ));
     }
     Ok(action)
+}
+
+fn automatic_error_action_answer(
+    menu: &Menu,
+    requested: ErrorAction,
+) -> Result<MenuAnswer, HaiderError> {
+    let MenuKind::ErrorRecovery { option_actions, .. } = &menu.kind else {
+        return Err(HaiderError::new(
+            ErrorCode::InvalidArgument,
+            "automatic recovery targeted a non-recovery menu",
+            false,
+        ));
+    };
+    let (index, option) = option_actions
+        .iter()
+        .enumerate()
+        .find(|(_, action)| **action == requested)
+        .and_then(|(index, _)| menu.options.get(index).map(|option| (index, option)))
+        .ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "automatic recovery action is not enumerated by the menu",
+                false,
+            )
+        })?;
+    if option.key != error_action_key(requested) {
+        return Err(HaiderError::new(
+            ErrorCode::InvalidArgument,
+            "automatic recovery option key does not match its typed action",
+            false,
+        ));
+    }
+    Ok(MenuAnswer {
+        menu: menu.id.clone(),
+        option_key: Some(option.key.clone()),
+        option_index: u32::try_from(index).map_err(|_| {
+            HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "automatic recovery option index exceeds protocol bounds",
+                false,
+            )
+        })?,
+        value: None,
+        via: haider_protocol::menu::AnswerVia::Hook,
+    })
 }
 
 fn copy_provider_metadata(target: &mut ErrorPresentation, source: &ErrorPresentation) {
