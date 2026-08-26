@@ -203,10 +203,10 @@ An operation not listed here is part of the v1 base surface. “Field” means t
 client may use that field only when it is present; the named token permits an
 affordance before the response exists.
 
-The ordinary v0.0.962 `welcome_features()` set contains all 79 tokens below.
+The ordinary v0.0.962 `welcome_features()` set contains all 82 tokens below.
 The re-verification anchors are
-`crates/haider-daemon/src/connection.rs:1784-1864` for the assembled set and
-`crates/haider-rpc/src/frame.rs:246-483` for the exact string constants. The
+`crates/haider-daemon/src/connection.rs:1867-1951` for the assembled set and
+`crates/haider-rpc/src/frame.rs:248-496` for the exact string constants. The
 one peer-specific withholding exception is §4.1.
 
 | Feature token | Methods, frames, or fields it publishes |
@@ -226,6 +226,7 @@ one peer-specific withholding exception is §4.1.
 | `session_observe_v1` | `session.observe` |
 | `session_observe_batch_v1` | `session.observe_batch` |
 | `session_fleet_v1` | `session.fleet` |
+| `session_descendant_stream_v1` | `session.descendants.attach`, `SessionDescendantStream`, and `SessionDescendantRepairRequired` |
 | `resident_turn_submit_v1` | `turn.submit_from_cli` |
 | `hooks_v1` | `hooks.list`, `hooks.trust`, `hooks.revoke`, `turn.submit_with_hook_trust`, hook events |
 | `hooks_server_v1` | long-lived JSONL hook runtime facts; no new method |
@@ -234,6 +235,8 @@ one peer-specific withholding exception is §4.1.
 | `user_command_v1` | direct user shell-command provenance/output committed into later model context and the synthetic `shell.exec.run_id` cancellation coordinate; paired with `shell_exec_v1`, unrelated to catalog rows whose `kind` is `"custom"` |
 | `tool_inventory_v1` | `tools.inventory` |
 | `monitor_v1` | daemon-owned durable session `monitor` model tool and source/delivery runtime; no client RPC method and not the private APK transport |
+| `monitor_control_v1` | typed client `monitor.list`, `monitor.register`, and `monitor.remove` receipts |
+| `monitor_delivery_v1` | replayable `monitor.watch`, `MonitorDelivery`, and `MonitorDeliveryCaughtUp` |
 | `vault_stage_v1` | `vault.stage` |
 | `account_login_api_v1` | `account.login_api` |
 | `account_oauth_pkce_v1` | browser/loopback `account.oauth_start/status/cancel` |
@@ -296,7 +299,7 @@ one peer-specific withholding exception is §4.1.
 Normally a feature token means “this daemon implements the named surface,” so
 its absence reads as unimplemented. `FEATURE_USER_COMMAND_V1`
 (`"user_command_v1"`) is the sole exception. In
-`crates/haider-daemon/src/connection.rs:1876-1896`, `encode_welcome_for_peer`
+`crates/haider-daemon/src/connection.rs:1959-1979`, `encode_welcome_for_peer`
 removes only this token and retries the otherwise unchanged `Welcome` when
 advertising that token is exactly what pushes the frame past the peer's
 receive-frame limit. Every other encoding failure remains fatal. The reason
@@ -366,6 +369,8 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | Workflows and agent types | `loom.list` | `LoomList` | snapshot | persisted Loom registry; pipe source is workflow structure of record |
 | Exact workflow instance | `workflow.instance` | `WorkflowInstance` | snapshot | current registry/catalog instance by id, or an exact retained user revision by template digest |
 | Typed-agent install readiness | `loom.install.status` | `LoomInstallStatus` | reconnectable, bounded snapshot | durable install jobs and per-CLI items read from one store snapshot |
+| Monitor registry | `monitor.list` | `MonitorList` | typed snapshot receipt | durable session monitor facts |
+| Monitor deliveries | `monitor.watch` | `MonitorWatch`, then `MonitorDelivery` / `MonitorDeliveryCaughtUp` | required cursor replay/live stream | durable `MonitorReportPending` facts in the session journal |
 | Todos | raw `ItemEvent` envelopes (`TurnItem` with `item: "plan"`) | no independent snapshot response | attach replay/live lifecycle | durable item lifecycle; reducer in §12 |
 
 ### 5.2 Mutation and specialist doors
@@ -393,6 +398,10 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | `agent.message` | `AgentMessage` | durable receipt |
 | `shell.exec` | `ShellExec` | durable acceptance; terminal bytes/status are item events |
 | `tools.inventory` | `ToolsInventory` | snapshot |
+| `monitor.list` | `MonitorList` | typed snapshot receipt |
+| `monitor.register` | `MonitorRegister` | durable command receipt or structured rejection |
+| `monitor.remove` | `MonitorRemove` | durable command receipt or structured rejection |
+| `monitor.watch` | `MonitorWatch` | typed watch receipt; report frames are separate |
 | `hooks.list` | `HooksList` | snapshot |
 | `hooks.trust`, `hooks.revoke` | `HooksTrust`, `HooksRevoke` | durable receipts |
 | `graph.pin`, `graph.switch` | same-named response | durable receipts; optionally template-digest-fenced under `workflow_instance_v1` |
@@ -410,7 +419,7 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 The golden matrix at
 `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`, combined
 with the historical `wire_transcript.json`, pins a request and successful
-response for every one of the 79 v1 request methods. `menu.answer` and resident
+response for every one of the 84 v1 request methods. `menu.answer` and resident
 binding are top-level frames, not `RequestBody` methods.
 
 ### 5.3 Advertised runtime with no client method
@@ -419,24 +428,22 @@ binding are top-level frames, not `RequestBody` methods.
 **model tool** and the source/delivery runtime that can wake a session from a
 matching external event. Its source anchors are
 `haider_rpc::FEATURE_MONITOR_V1` at
-`crates/haider-rpc/src/frame.rs:309-311`, the model-facing `MonitorRequest` at
+`crates/haider-rpc/src/frame.rs:311-319`, the model-facing `MonitorRequest` at
 `crates/haider-tools/src/monitor.rs:22-72`, the daemon registration at
 `crates/haider-daemon/src/worker.rs:7382-7389`, and dispatch at
 `crates/haider-daemon/src/worker.rs:9569-9588`.
 
-There is no `monitor.*` variant in `haider_rpc::RequestBody` or
-`haider_rpc::ResponseBody`; therefore there is no client request or response
-shape to implement. `register`, `list`, and `remove` are tagged operations in
-model tool arguments, not RPC method names. A client may render their ordinary
-durable tool/item transcript, and may discover the model tool through the
-separately gated `tools.inventory` snapshot
-(`crates/haider-daemon/src/worker.rs:11421-11442`), but MUST NOT copy its
-manifest into a client catalog or manufacture a monitor-administration door.
+`monitor_v1` by itself still publishes no client method. Client control and
+delivery are separate contracts gated by `monitor_control_v1` and
+`monitor_delivery_v1` (§5.4-§5.5). A client may render the model tool's
+ordinary durable item transcript, but MUST NOT copy its manifest into a client
+catalog or treat the tool call as a client receipt.
 
-Without `monitor_v1`, monitor support is unavailable to that connection: a
-client disables any capability indicator and neither infers registrations
-from transcript prose nor sends an invented method. This absence is not an
-empty monitor list because the v1 client wire has no monitor-list snapshot.
+Without `monitor_control_v1`, `monitor.list/register/remove` are unavailable,
+even when `monitor_v1` is present. That absence is not an empty registry.
+Without `monitor_delivery_v1`, `monitor.watch` and both delivery frame kinds
+are unavailable, even when the model tool can wake a session. The two client
+bits do not grant their required View/Control capabilities.
 
 The APK monitor delivery path is intentionally **not** this client contract.
 `crates/haider-daemon/src/mobile_transport.rs:1299-1331` reserves private
@@ -447,13 +454,191 @@ with the APK's positive chat ids, and
 implementation detail, not v1 client frames, not a `monitor` RPC surface, and
 MUST NOT be implemented or consumed by an ADE client.
 
+### 5.4 Typed client monitor control (`monitor_control_v1`)
+
+The client control surface uses the real durable monitor registry and the
+canonical `haider-tools` parser. It does not define a second registry or relax
+the model tool's validation. The methods and authorization policy are:
+
+| Request | Required capability | Request fields |
+|---|---|---|
+| `monitor.list` | View (Control also satisfies View) | `session_id: SessionId` |
+| `monitor.register` | Control plus a live Control attachment to `session_id` | `command_id: CommandId`, `session_id: SessionId`, `worker_generation: u64`, `source: MonitorSourceWire`, optional `filter: MonitorFilterWire`, `action: MonitorActionWire`, `occurrence: MonitorOccurrenceWire`, `lifetime: MonitorLifetimeWire` |
+| `monitor.remove` | Control plus a live Control attachment to `session_id` | `command_id: CommandId`, `session_id: SessionId`, `worker_generation: u64`, `monitor_id: String` |
+
+Every successful RPC response has the same method name and one `receipt`
+field. `MonitorListReceiptWire`, `MonitorRegisterReceiptWire`, and
+`MonitorRemoveReceiptWire` all carry `session_id`, `policy`, `sources`, and a
+tagged `outcome`; mutation receipts additionally carry the `command_id` and
+authoritative `worker_generation`. `policy` is typed as
+`{list: view, register: control, register_requires_control_attachment: true,
+remove: control, remove_requires_control_attachment: true, watch: view}`. The
+daemon returns this policy as data, but it remains descriptive: negotiated
+`capabilities_granted` and the connection's live attachment ownership are the
+authorization authorities.
+
+The outcome tags are:
+
+- list: `listed { monitors: MonitorRegistrationWire[] }` or
+  `rejected { rejection }`;
+- register: `registered { monitor: MonitorRegistrationWire }` or
+  `rejected { rejection }`; and
+- remove: `removed { monitor_id: String }` or
+  `rejected { rejection }`.
+
+`MonitorRegistrationWire` contains `monitor_id`, `session_id`, optional
+`branch_id`, optional `agent_id`, the complete typed `source`, optional
+`filter`, `action`, `occurrence`, `created_at_ms`,
+`start_source_sequence: u64`, and optional `expires_at_ms`. The start source
+sequence is the source-hub registration fence. It is not a delivery cursor
+and MUST NOT be sent as `monitor.watch.after_cursor`.
+
+The client register request intentionally has no `branch_id` or `agent_id`.
+Those optional coordinates are registry/report facts retained when the
+trusted model-tool surface creates a scoped monitor; their absence on a
+client-created monitor is real. A client MUST NOT invent routing coordinates
+or infer them from an attachment.
+
+The source/filter/action/lifetime vocabulary is exactly:
+
+- source: `sms`; `process { command: String }`; `file { path: String }`;
+  `poll { command: String, interval_ms: u64 }`; or
+  `timer { interval_ms: u64 }`;
+- filter: `field` is `address | body | payload`, `operator` is
+  `equals | contains | starts_with | ends_with`, with `value: String` and
+  `case_sensitive: bool`;
+- action: `report: bool` plus optional `follow_up: String`; at least one action
+  must remain enabled;
+- occurrence: `once | every`; and
+- lifetime: `session` or `timeout { timeout_ms: u64 }`.
+
+Wire defaults match the canonical tool defaults: omitted
+`filter.case_sensitive` is `false`, omitted `action.report` is `true`, omitted
+`occurrence` is `every`, and omitted `lifetime` is `session`. These defaults
+do not make an inactive source available.
+
+Validation bounds and source/filter compatibility come from
+`crates/haider-tools/src/monitor.rs`; a client MUST NOT widen them. Unknown
+nested enum values fail closed as `invalid_request`, not as a best-effort
+substitute.
+
+Every receipt includes all five `MonitorSourceAvailabilityWire` rows. The
+current daemon truth is:
+
+| Source | Availability | Meaning |
+|---|---|---|
+| `sms` | `available` | the only active source subscription/adapter |
+| `process` | `unavailable { reason: adapter_inactive }` | typed extension point; registration is refused |
+| `file` | `unavailable { reason: adapter_inactive }` | typed extension point; registration is refused |
+| `poll` | `unavailable { reason: adapter_inactive }` | typed extension point; registration is refused |
+| `timer` | `unavailable { reason: adapter_inactive }` | typed extension point; registration is refused |
+
+Typed declaration is not availability. A client may render an inactive row,
+but MUST NOT enable its registration control or claim platform support.
+
+Rejection is `MonitorControlRejectionWire`, tagged by `reason`; it is never a
+bare error string. Defined reasons are `capability_denied { required }`,
+`control_attachment_required`,
+`source_unavailable { source }`, `limit_reached { count, limit }`,
+`not_found { monitor_id }`, `session_not_found`,
+`stale_generation { requested, current }`,
+`cursor_ahead { requested, head }`,
+`invalid_request { field?, detail }`, `command_conflict`, `service_stopped`,
+and `store_unavailable { retryable, detail }`. Clients branch on `reason` and
+use `detail` only for display. `store_unavailable.retryable` preserves the
+store's typed retry classification; daemon-local encoding, receipt-shape, and
+invariant failures are non-retryable rather than guessed transient.
+
+Register/remove command ids are durable retry identities. A same-command,
+same-arguments retry replays the stored typed receipt; the same command id
+with a different method or canonical body returns `command_conflict`. The
+command-id namespace is profile-global, matching the other durable client
+mutations; changing `session_id` does not create a new namespace. Unsupported
+source, monitor-limit, and remove-not-found outcomes are also durably
+receipted. Capability, missing-control-attachment, malformed-request,
+stale-generation, and stopped-service outcomes assert that no mutation
+committed. `store_unavailable` during receipt finalization is indeterminate:
+the session-local fact and recovery receipt may already be durable, so the
+client retries the exact same command id/body and MUST NOT issue a replacement
+command id.
+
+### 5.5 Replayable monitor delivery (`monitor_delivery_v1`)
+
+`monitor.watch { session_id, after_cursor }` requires View. Its typed receipt
+contains the same `policy` and `sources` tables plus either:
+
+- `watching { watch_id: String, requested_after_cursor: u64,
+  replay_through_cursor: u64 }`; or
+- `rejected { rejection: MonitorControlRejectionWire }`.
+
+The cursor is the owning session journal sequence, not a source-event
+sequence and not a mobile chat id. The daemon subscribes to commit notices
+before sealing `replay_through_cursor`, replays the complete interval
+`(after_cursor, replay_through_cursor]`, then continues from later sealed
+heads. A cursor beyond the current head is typed `cursor_ahead`; it is never
+clamped. If a live journal head regresses below an already emitted cursor, the
+daemon closes required delivery; it does not reinterpret deletion as idle.
+
+Only durable `MonitorReportPending` facts produce `MonitorDelivery` frames.
+Every frame carries `watch_id` and a `MonitorDeliveryReportWire`:
+
+| Field | Type and law |
+|---|---|
+| `report_id` | `String`; stable across revisions of one coalesced pending report |
+| `monitor_id` | `String`; owning registration |
+| `session_id` | `SessionId`; must equal the watched journal owner |
+| `branch_id`, `agent_id` | optional `BranchId` / `AgentId`; exact registration routing coordinates, absence is real |
+| `source` | `sms | process | file | poll | timer`; exact report source |
+| `status` | `matched | rate_limited | timed_out` |
+| `events` | bounded `MonitorEventWire[]`; each has source `sequence`, `observed_at_ms`, and typed payload |
+| `coalesced_count` | `u64`; total matches represented by this report revision |
+| `omitted_count` | `u64`; represented matches not present in `events` |
+| `action` | exact `MonitorActionWire` copied from the registration |
+| `cursor` | `u64`; session journal sequence of this pending-report revision |
+| `dedupe.delivery_key` | `String`; unique to `(session_id, cursor)` and safe for exact-redelivery suppression |
+| `dedupe.report_key` | `String`; the stable `report_id`, used to group/replace coalesced revisions |
+
+SMS payload is `{kind: "sms", address, body, received_at_ms}`. The other
+typed payloads are `process { line }`, `file { payload }`, `poll { payload }`,
+and `timer { fired_at_ms }`; current source availability still means only SMS
+can originate a new registration.
+
+Explicit truncation is mandatory. `events.len()` may be smaller than
+`coalesced_count` only with the exact positive difference represented by
+`omitted_count`; the current daemon retains at most 16 event previews. A
+client MUST show or otherwise preserve that omission fact and MUST NOT present
+the retained events as the complete burst. A later coalesced revision may
+repeat `report_id`; it is not a duplicate when its cursor/delivery key is new.
+
+After scanning every envelope through a seal, including a suffix containing
+no monitor report, the daemon emits
+`MonitorDeliveryCaughtUp { watch_id, session_id, high_water_cursor }`. The
+client advances its persisted resume cursor only after fully applying a
+delivery or caught-up frame. Exact redelivery is at least once: drop a delivery
+whose `delivery_key`/cursor was already applied, apply newer cursor revisions
+in order, and reconnect from the greatest fully applied cursor. A journal
+sequence discontinuity or required-frame delivery failure closes the affected
+stream; the daemon never skips the missing interval and continues live.
+The watch response, report records, and caught-up seals are admitted in that
+order; report/seal traffic uses one paced FIFO lane and cannot borrow the
+priority reply floor to overtake an earlier record. Replacing a watch first
+settles and purges the old watch lane.
+
+A monitor delivery is a dedicated report record, not a `WireFrame::Event`
+chat message. The private APK negative-integer `chat.delta/chat.done` mirror
+remains an implementation detail and MUST NOT be used for replay, dedupe, or
+feature fallback. If `monitor_delivery_v1` is absent, the complete client
+delivery surface is absent: do not start `monitor.watch`, attach a guessed
+stream, interpret ordinary chat as a report, or fabricate a transport from
+the APK convention.
+
 ## 6. Snapshot, watch, invalidation, push, and replay laws
 
 - `session.list`, `session.read`, `session.observe`, `session.observe_batch`,
   `session.fleet`, `command.list`, `account.list`, `account.oauth_import_sources`, `provider.list`,
   `usage.report`, `usage.history_day`, `usage.history_range`, `loom.list`,
   `loom.install.status`, `tools.inventory`, `hooks.list`, graph reads,
-  `queue.list`, and `session.pipe_path` are snapshots. Calling them does not
+  `queue.list`, `monitor.list`, and `session.pipe_path` are snapshots. Calling them does not
   subscribe.
 - `session.list_watch` subscribes before acknowledging. Its first
   `SessionRosterDelta` set is the current changed/new baseline, chunked at 64;
@@ -473,6 +658,10 @@ MUST NOT be implemented or consumed by an ADE client.
 - `HaiderCodePlanStatus`, store-health `ProtocolError` transitions, drain
   notices, and resident/surface frames are unsolicited pushes, not journal
   replay.
+- `monitor.watch` is the sole monitor-report subscription. It replays durable
+  pending-report revisions after `after_cursor`, seals every scanned suffix
+  with `MonitorDeliveryCaughtUp`, and then continues live. It is independent
+  of `session.attach`; neither stream substitutes for the other.
 - only `session.attach` begins raw event delivery. It replays strictly after
   `after_seq`, through the captured `replay_through_seq`, emits
   `AttachCaughtUp`, then continues live. `session.read` never subscribes.
@@ -648,6 +837,8 @@ generation, or surface owner/revision as if they were one observation.
 | Historical device-local usage | `usage.history_day` for a day or `usage.history_range` for heatmap totals | A missing day/slot is absence, not zero. Session summaries and `usage.report` are current projections and do not replace the ledger. Cross-device aggregation belongs to the client/cloud layer. |
 | Per-session cache health | `SessionSummary.cache_reread_hit_basis_points`; use `cache_lifetime_hit_basis_points` only for the separately labeled lifetime/all-input share | The same-summary nested `agent_metrics.usage.cache_reread_hit_basis_points` and `cache_hit_basis_points` are compatibility sources only when their promoted field is absent. Never calculate a substitute from token counts. |
 | Volatile composer/status | surface watch response/delta | Journal and terminal scraping are not fallback sources. Reconnect/watch again after owner loss. |
+| Monitor registry and source availability | typed `monitor.list` receipt | Model-tool prose, tool inventory, APK packets, and an absent feature are not empty registry/availability truth. |
+| Monitor report delivery | `MonitorDelivery` revisions plus `MonitorDeliveryCaughtUp` at the applied monitor cursor | Chat messages and ordinary raw attachment events do not become monitor reports. Group by `report_key`, dedupe exact redelivery by delivery key/cursor, and preserve omission counts. |
 | Resident profile binding and client-minted surface correlation | `ResidentSessionBinding` baseline/push and optional `binding_token` | OSC 7791 is compatibility output, not an authority or required per-pane source; see §11. |
 | Commands and ownership | `command.list` result | Never mirror `COMMANDS`. Ownership `"client_view"` is deliberately client-owned; `"unknown"` is non-executable. |
 | Workflow/agent-type registry | `loom.list` | Compiled graph material is derived; `LoomWorkflow.source` is the workflow structure of record. |
@@ -1174,8 +1365,8 @@ rechecks the OS. Clients must not treat a successful open action as a grant.
 `autonomous_interaction_v1` adds no new method. It gates one additive field on
 the existing `session.create` door and the same field in typed metadata. The
 wire/type anchors are `RequestBody::SessionCreateWithPermissionOverrides` at
-`crates/haider-rpc/src/frame.rs:1703-1722`, `ResponseBody::SessionCreate` at
-`crates/haider-rpc/src/frame.rs:2439-2444`, and
+`crates/haider-rpc/src/frame.rs:2114-2129`, `ResponseBody::SessionCreate` at
+`crates/haider-rpc/src/frame.rs:2882-2887`, and
 `SessionInteractionModeV1`/`SessionMetadataV1.interaction_mode` at
 `crates/haider-protocol/src/session.rs:5-22,98-104`.
 
@@ -1183,7 +1374,7 @@ The metadata member also rides `SessionSummary` from `session.list` and
 `SessionRosterDelta`, `SessionReadResult` from `session.read`,
 `SessionObserveDigest` from `session.observe`/`session.observe_batch`,
 `SessionFork`, and a committed `SessionMetafork`
-(`crates/haider-rpc/src/frame.rs:1149-1153,1330-1339,1489-1496,2637-2675`).
+(`crates/haider-rpc/src/frame.rs:1109-1153,1340-1350,1499-1550,3080-3121`).
 Those owning surfaces retain their own base/feature gates;
 `autonomous_interaction_v1` gates this metadata member wherever typed metadata
 is present.
@@ -1485,9 +1676,9 @@ transaction at
 `crates/haider-store/src/event_store.rs:2094-2247,16264-16326`. The
 request/response anchors are
 `RequestBody::LoomInstallStatus` at
-`crates/haider-rpc/src/frame.rs:1853-1861`,
+`crates/haider-rpc/src/frame.rs:2263-2268`,
 `ResponseBody::LoomInstallStatus` at
-`crates/haider-rpc/src/frame.rs:2588-2594`, and the producer at
+`crates/haider-rpc/src/frame.rs:3032-3037`, and the producer at
 `crates/haider-daemon/src/session_hub/rpc.rs:6934-6962`.
 
 | Direction | Method/type | Fields |
@@ -1595,9 +1786,9 @@ shapes are:
 | Success response | `SessionObserveBatch` (`method: "session.observe_batch"`) | `digests: Vec<SessionObserveDigest>` in request order; every digest has the same `workflow: Option<GraphStatus>` field |
 
 The wire anchors are `SessionObserveDigest.workflow` at
-`crates/haider-rpc/src/frame.rs:1535-1540`, the request variants at
-`crates/haider-rpc/src/frame.rs:1783-1807`, and the response variants at
-`crates/haider-rpc/src/frame.rs:2486-2491`. The batch bound and request-order
+`crates/haider-rpc/src/frame.rs:1548`, the request variants at
+`crates/haider-rpc/src/frame.rs:2193-2214`, and the response variants at
+`crates/haider-rpc/src/frame.rs:2932-2934`. The batch bound and request-order
 production are at
 `crates/haider-daemon/src/session_hub/rpc.rs:9724-9759`. The digest producer
 takes workflow from the same cached sealed-journal snapshot and explicitly
@@ -1715,15 +1906,23 @@ a raw additive event family. Others explicitly absorb unknown variants. The
 complete classification is normative in
 [Client contract v1 — wire enum audit](client-contract-v1-enum-audit.md).
 
-That sibling audit's dated snapshot predates the two direct v0.0.961 enum
-additions documented here. Until the appendix is refreshed in its own scoped
-change, `SessionInteractionModeV1` (`"interactive" | "autonomous"`) and
-`TypedAgentInstallState`
+That sibling audit's dated snapshot predates the direct enums documented by
+the v0.0.961 additions and this monitor surface. Until the appendix is
+refreshed in its own scoped change, `SessionInteractionModeV1`
+(`"interactive" | "autonomous"`) and `TypedAgentInstallState`
 (`"queued" | "installing" | "verifying" | "succeeded" | "failed"`) are
 normatively **Frozen**: neither has `#[serde(other)]` or a custom unknown
-carrier. A new state requires a replacement field/type, feature-gated method,
-or wire-version change; a client MUST NOT map an unfamiliar literal to one of
-the shipped values.
+carrier. The monitor direct enums `MonitorSourceKindWire`,
+`MonitorSourceWire`, `MonitorFilterFieldWire`, `MonitorFilterOperatorWire`,
+`MonitorOccurrenceWire`, `MonitorLifetimeWire`,
+`MonitorSourceUnavailableReasonWire`, `MonitorSourceAvailabilityStateWire`,
+`MonitorControlRejectionWire`, `MonitorListOutcomeWire`,
+`MonitorRegisterOutcomeWire`, `MonitorRemoveOutcomeWire`,
+`MonitorWatchOutcomeWire`, `MonitorReportStatusWire`, and
+`MonitorEventPayloadWire` are normatively **Extensible**: each has a
+`#[serde(other)]` `Unknown` arm. A frozen enum's new state requires a
+replacement field/type, feature-gated method, or wire-version change; a client
+MUST NOT map an unfamiliar literal to one of its shipped values.
 
 Never derive an enum's wire spelling from its Rust variant name. Read the
 variant's `#[serde(rename = "...")]` first, then its enum-level serde rule, and
@@ -1739,10 +1938,11 @@ The machine-checkable contract lives in these fixtures/tests:
 - `crates/haider-rpc/tests/fixtures/wire_transcript.json`: historical compact
   WebSocket bodies and four-byte length-prefixed UDS bytes, including
   Hello/Welcome, raw replay, menu CAS, accounts/providers/usage, and mutation
-  receipts.
+  receipts; the appended monitor delivery/caught-up entries pin the dedicated
+  non-chat stream and its explicit truncation/dedupe fields.
 - `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`: the
   methods added after the historical matrix, completing golden request and
-  successful response coverage for all 79 request methods and all five
+  successful response coverage for all 84 request methods and all five
   command dynamic slots.
 - `crates/haider-rpc/tests/fixtures/snapshot_availability_compat_v1.json`:
   old and new account/provider/usage response bytes.

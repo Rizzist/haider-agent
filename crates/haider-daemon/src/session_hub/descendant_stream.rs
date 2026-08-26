@@ -1044,6 +1044,7 @@ async fn send_stream_event(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::{is_next_sequence, known_omitted_children, negotiated_child_limit};
 

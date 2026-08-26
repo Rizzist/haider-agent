@@ -361,6 +361,55 @@ pub(super) async fn deliver_frame(
     deliver_prepared_frame(hub, sink, attachment_id, &frame, lagged, cancel).await
 }
 
+/// Delivers one record on a named required FIFO stream. Unlike replies this
+/// path cannot consume the priority floor, so a later cursor seal cannot
+/// overtake an earlier record. Cancelling the stream drops the ticket guard
+/// and releases any pending admission reservation.
+pub(super) async fn deliver_ordered_frame(
+    sink: &Arc<dyn FrameSink>,
+    stream_id: &str,
+    frame: &WireFrame,
+    cancel: &mut watch::Receiver<bool>,
+) -> FrameDelivery {
+    if *cancel.borrow() {
+        return FrameDelivery::Cancelled;
+    }
+    let Ok(frame) = sink.prepare(frame) else {
+        return FrameDelivery::Refused;
+    };
+    match sink.offer_ordered_prepared(stream_id, &frame) {
+        SendAdmission::Sent => return FrameDelivery::Delivered,
+        SendAdmission::Refused => return FrameDelivery::Refused,
+        SendAdmission::Busy => {}
+    }
+    let Some(ticket) = sink.drain_ticket() else {
+        return FrameDelivery::Refused;
+    };
+    let mut ticket = AdmissionTicketGuard::new(Arc::clone(sink), ticket);
+    loop {
+        match sink.offer_ordered_prepared_ticketed(stream_id, &frame, ticket.ticket()) {
+            SendAdmission::Sent => {
+                ticket.disarm();
+                return FrameDelivery::Delivered;
+            }
+            SendAdmission::Refused => {
+                ticket.cancel();
+                return FrameDelivery::Refused;
+            }
+            SendAdmission::Busy => {
+                tokio::select! {
+                    _ = ticket.ticket().notified() => {}
+                    changed = cancel.changed() => {
+                        if changed.is_err() || *cancel.borrow() {
+                            return FrameDelivery::Cancelled;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn deliver_prepared_frame(
     hub: &SessionHub,
     sink: &Arc<dyn FrameSink>,

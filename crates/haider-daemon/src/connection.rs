@@ -186,11 +186,13 @@ pub(crate) struct ConnectionGrant {
 }
 
 /// One fair scheduling lane (policy stated on [`OutboundLane`]). System
-/// replies share one lane; each attachment owns another.
+/// replies share one lane; each attachment and required ordered stream owns
+/// another.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum LaneKey {
     System,
     Attachment(AttachmentId),
+    Ordered(String),
 }
 
 #[derive(Debug)]
@@ -749,6 +751,28 @@ impl OutboundLane {
         pending
     }
 
+    fn purge_ordered(&self, stream_id: &str) {
+        let Ok(mut state) = self.inner.state.lock() else {
+            return;
+        };
+        let key = LaneKey::Ordered(stream_id.to_owned());
+        let Some(frames) = state.lanes.remove(&key) else {
+            return;
+        };
+        let count = frames.len();
+        let bytes = frames.iter().fold(0_usize, |total, frame| {
+            total.saturating_add(frame.bytes.len())
+        });
+        state.queued_frames = state.queued_frames.saturating_sub(count);
+        state.queued_bytes = state.queued_bytes.saturating_sub(bytes);
+        state.round_robin.retain(|candidate| candidate != &key);
+        if state.queued_frames < self.inner.frame_capacity
+            && state.queued_bytes < self.inner.byte_budget
+        {
+            state.fire_one_ticket();
+        }
+    }
+
     /// R9 write-progress marker: changes whenever any queued frame's write
     /// settles.
     fn progress_marker(&self) -> u64 {
@@ -887,6 +911,63 @@ impl FrameSink for ConnectionFrameSink {
         self.lane
             .try_push_droppable(key, QueuedFrame::ordinary(bytes))
             .map_err(|_| FrameSendError)
+    }
+
+    fn offer_ordered(&self, stream_id: &str, frame: &WireFrame) -> SendAdmission {
+        let Ok(bytes) = encode_outbound_parts(frame, self.outbound_limit, self.encoding) else {
+            return SendAdmission::Refused;
+        };
+        self.lane
+            .offer(LaneKey::Ordered(stream_id.to_owned()), bytes, None)
+    }
+
+    fn offer_ordered_prepared(&self, stream_id: &str, frame: &PreparedFrame) -> SendAdmission {
+        let Some(bytes) = frame.encoded_bytes() else {
+            return frame
+                .logical_frame()
+                .map_or(SendAdmission::Refused, |frame| {
+                    self.offer_ordered(stream_id, frame)
+                });
+        };
+        self.lane
+            .offer(LaneKey::Ordered(stream_id.to_owned()), bytes.clone(), None)
+    }
+
+    fn offer_ordered_ticketed(
+        &self,
+        stream_id: &str,
+        frame: &WireFrame,
+        ticket: &AdmissionTicket,
+    ) -> SendAdmission {
+        let Ok(bytes) = encode_outbound_parts(frame, self.outbound_limit, self.encoding) else {
+            return SendAdmission::Refused;
+        };
+        self.lane
+            .offer(LaneKey::Ordered(stream_id.to_owned()), bytes, Some(ticket))
+    }
+
+    fn offer_ordered_prepared_ticketed(
+        &self,
+        stream_id: &str,
+        frame: &PreparedFrame,
+        ticket: &AdmissionTicket,
+    ) -> SendAdmission {
+        let Some(bytes) = frame.encoded_bytes() else {
+            return frame
+                .logical_frame()
+                .map_or(SendAdmission::Refused, |frame| {
+                    self.offer_ordered_ticketed(stream_id, frame, ticket)
+                });
+        };
+        self.lane.offer(
+            LaneKey::Ordered(stream_id.to_owned()),
+            bytes.clone(),
+            Some(ticket),
+        )
+    }
+
+    fn purge_ordered(&self, stream_id: &str) {
+        self.lane.purge_ordered(stream_id);
     }
 
     fn try_send_for(
@@ -1857,6 +1938,8 @@ fn welcome_features() -> BTreeSet<String> {
         FEATURE_USER_COMMAND_V1.to_owned(),
         FEATURE_TOOL_INVENTORY_V1.to_owned(),
         FEATURE_MONITOR_V1.to_owned(),
+        haider_rpc::FEATURE_MONITOR_CONTROL_V1.to_owned(),
+        haider_rpc::FEATURE_MONITOR_DELIVERY_V1.to_owned(),
         haider_rpc::FEATURE_TRANSCRIPTION_V1.to_owned(),
         FEATURE_TURN_CONTROL_V1.to_owned(),
         FEATURE_RESIDENT_TURN_SUBMIT_V1.to_owned(),

@@ -5082,16 +5082,14 @@ async fn start_turn(
         .await
         .map_err(hub_error)?;
     let loom_workflow = match graph_status.as_ref() {
-        Some(status) => match lease
-            .hub()
-            .pinned_loom_workflow(&status.template, &status.digest)
-            .await?
-        {
-            Some(workflow) => Some(workflow),
-            // Built-ins and one-off authored GraphTemplateSpec pins have no
-            // Loom registry row and therefore no typed-node metadata.
-            None => None,
-        },
+        Some(status) => {
+            lease
+                .hub()
+                .pinned_loom_workflow(&status.template, &status.digest)
+                .await?
+        }
+        // Built-ins and one-off authored GraphTemplateSpec pins have no Loom
+        // registry row and therefore no typed-node metadata.
         None => None,
     };
     let loom_provider_fenced = loom_workflow.is_some()

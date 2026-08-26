@@ -3697,6 +3697,144 @@ impl HubConnection {
                 self.usage_history_range(request_id, through_date, days)
                     .await
             }
+            RequestBody::MonitorList { session_id } => {
+                if authorize(&self.capabilities, Operation::View).is_err() {
+                    return self.send(WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::MonitorList {
+                            receipt: crate::monitor::monitor_list_rejected(
+                                session_id,
+                                haider_rpc::MonitorControlRejectionWire::CapabilityDenied {
+                                    required: Capability::View,
+                                },
+                            ),
+                        },
+                    });
+                }
+                self.monitor_list(request_id, session_id).await
+            }
+            RequestBody::MonitorRegister {
+                command_id,
+                session_id,
+                worker_generation,
+                source,
+                filter,
+                action,
+                occurrence,
+                lifetime,
+            } => {
+                if authorize(&self.capabilities, Operation::Control).is_err() {
+                    return self.send(WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::MonitorRegister {
+                            receipt: crate::monitor::monitor_register_rejected(
+                                command_id,
+                                session_id,
+                                self.hub.worker_generation(),
+                                haider_rpc::MonitorControlRejectionWire::CapabilityDenied {
+                                    required: Capability::Control,
+                                },
+                            ),
+                        },
+                    });
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.send(WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::MonitorRegister {
+                            receipt: crate::monitor::monitor_register_rejected(
+                                command_id,
+                                session_id,
+                                self.hub.worker_generation(),
+                                haider_rpc::MonitorControlRejectionWire::ControlAttachmentRequired,
+                            ),
+                        },
+                    });
+                }
+                self.monitor_register(
+                    request_id,
+                    crate::monitor::MonitorClientRegistrationRequest {
+                        command_id,
+                        session_id,
+                        worker_generation,
+                        source,
+                        filter,
+                        action,
+                        occurrence,
+                        lifetime,
+                    },
+                )
+                .await
+            }
+            RequestBody::MonitorRemove {
+                command_id,
+                session_id,
+                worker_generation,
+                monitor_id,
+            } => {
+                if authorize(&self.capabilities, Operation::Control).is_err() {
+                    return self.send(WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::MonitorRemove {
+                            receipt: crate::monitor::monitor_remove_rejected(
+                                command_id,
+                                session_id,
+                                self.hub.worker_generation(),
+                                haider_rpc::MonitorControlRejectionWire::CapabilityDenied {
+                                    required: Capability::Control,
+                                },
+                            ),
+                        },
+                    });
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.send(WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::MonitorRemove {
+                            receipt: crate::monitor::monitor_remove_rejected(
+                                command_id,
+                                session_id,
+                                self.hub.worker_generation(),
+                                haider_rpc::MonitorControlRejectionWire::ControlAttachmentRequired,
+                            ),
+                        },
+                    });
+                }
+                self.monitor_remove(
+                    request_id,
+                    command_id,
+                    session_id,
+                    worker_generation,
+                    monitor_id,
+                )
+                .await
+            }
+            RequestBody::MonitorWatch {
+                session_id,
+                after_cursor,
+            } => {
+                if authorize(&self.capabilities, Operation::View).is_err() {
+                    return self.send(WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::MonitorWatch {
+                            receipt: crate::monitor::monitor_watch_rejected(
+                                session_id,
+                                haider_rpc::MonitorControlRejectionWire::CapabilityDenied {
+                                    required: Capability::View,
+                                },
+                            ),
+                        },
+                    });
+                }
+                self.monitor_watch(request_id, session_id, after_cursor)
+                    .await
+            }
             RequestBody::ComputerPermissionOpenSettings {
                 session_id,
                 request_id: permission_request_id,
@@ -4000,6 +4138,7 @@ impl HubConnection {
                 roster_watch: Mutex::new(None),
                 accounts_watch: Mutex::new(None),
                 surface_watch: Mutex::new(None),
+                monitor_watch: Mutex::new(None),
                 metafork_reviews: Arc::clone(&self.metafork_reviews),
                 identity_lease: Arc::clone(&self.identity_lease),
                 closed: AtomicBool::new(false),
@@ -7324,6 +7463,8 @@ impl HubConnection {
         })
     }
 
+    // The wire request's seven independent coordinates stay explicit here.
+    #[allow(clippy::too_many_arguments)]
     async fn graph_switch(
         &self,
         request_id: RequestId,
@@ -9316,6 +9457,175 @@ impl HubConnection {
         })
     }
 
+    async fn monitor_list(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+    ) -> Result<(), SessionHubError> {
+        let receipt = match self.hub.inner.store.latest_seq(&session_id).await {
+            Ok(0) => crate::monitor::monitor_list_rejected(
+                session_id,
+                haider_rpc::MonitorControlRejectionWire::SessionNotFound,
+            ),
+            Ok(_) => {
+                self.hub
+                    .inner_monitor()
+                    .client_list(&self.hub, session_id)
+                    .await
+            }
+            Err(error) => crate::monitor::monitor_list_rejected(
+                session_id,
+                haider_rpc::MonitorControlRejectionWire::StoreUnavailable {
+                    retryable: error.retryable,
+                    detail: error.message,
+                },
+            ),
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::MonitorList { receipt },
+        })
+    }
+
+    async fn monitor_register(
+        &self,
+        request_id: RequestId,
+        request: crate::monitor::MonitorClientRegistrationRequest,
+    ) -> Result<(), SessionHubError> {
+        let receipt = self
+            .hub
+            .inner_monitor()
+            .client_register(&self.hub, request)
+            .await;
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::MonitorRegister { receipt },
+        })
+    }
+
+    async fn monitor_remove(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        monitor_id: String,
+    ) -> Result<(), SessionHubError> {
+        let receipt = self
+            .hub
+            .inner_monitor()
+            .client_remove(
+                &self.hub,
+                command_id,
+                session_id,
+                worker_generation,
+                monitor_id,
+            )
+            .await;
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::MonitorRemove { receipt },
+        })
+    }
+
+    async fn monitor_watch(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+        after_cursor: u64,
+    ) -> Result<(), SessionHubError> {
+        // Subscribe before sealing the head: a racing append is either in the
+        // initial replay seal or retained as a wake for the next seal.
+        let publications = self.hub.inner.roster_publications.subscribe();
+        let head = match self.hub.inner.store.latest_seq(&session_id).await {
+            Ok(0) => {
+                return self.send(WireFrame::Response {
+                    request_id,
+                    body: ResponseBody::MonitorWatch {
+                        receipt: crate::monitor::monitor_watch_rejected(
+                            session_id,
+                            haider_rpc::MonitorControlRejectionWire::SessionNotFound,
+                        ),
+                    },
+                });
+            }
+            Ok(head) => head,
+            Err(error) => {
+                return self.send(WireFrame::Response {
+                    request_id,
+                    body: ResponseBody::MonitorWatch {
+                        receipt: crate::monitor::monitor_watch_rejected(
+                            session_id,
+                            haider_rpc::MonitorControlRejectionWire::StoreUnavailable {
+                                retryable: error.retryable,
+                                detail: error.message,
+                            },
+                        ),
+                    },
+                });
+            }
+        };
+        if after_cursor > head {
+            return self.send(WireFrame::Response {
+                request_id,
+                body: ResponseBody::MonitorWatch {
+                    receipt: crate::monitor::monitor_watch_rejected(
+                        session_id,
+                        haider_rpc::MonitorControlRejectionWire::CursorAhead {
+                            requested: after_cursor,
+                            head,
+                        },
+                    ),
+                },
+            });
+        }
+        let watch_id = random_id("monitor-watch")?;
+        let previous = {
+            let mut slot = lock(&self.monitor_watch)?;
+            slot.take()
+        };
+        if let Some(previous) = previous {
+            previous.cancel.send_replace(true);
+            let _ = previous.task.await;
+            self.sink.purge_ordered(&previous.stream_id);
+        }
+        let mut slot = lock(&self.monitor_watch)?;
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::MonitorWatch {
+                receipt: haider_rpc::MonitorWatchReceiptWire {
+                    session_id: session_id.clone(),
+                    policy: crate::monitor::monitor_control_policy(),
+                    sources: crate::monitor::monitor_source_availability(),
+                    outcome: haider_rpc::MonitorWatchOutcomeWire::Watching {
+                        watch_id: watch_id.clone(),
+                        requested_after_cursor: after_cursor,
+                        replay_through_cursor: head,
+                    },
+                },
+            },
+        })?;
+        let hub = self.hub.clone();
+        let sink = Arc::clone(&self.sink);
+        let stream_id = watch_id.clone();
+        let (cancel, cancel_receiver) = watch::channel(false);
+        *slot = Some(MonitorWatchState {
+            stream_id,
+            cancel,
+            task: tokio::spawn(run_monitor_watch(
+                hub,
+                sink,
+                watch_id,
+                session_id,
+                after_cursor,
+                head,
+                publications,
+                cancel_receiver,
+            )),
+        });
+        Ok(())
+    }
+
     /// `account.list_watch`: a change SIGNAL, not a delta stream. The
     /// management view is small and already revision-stamped, so a watcher
     /// re-reads `account.list` on notice — which also means this frame can
@@ -10916,6 +11226,12 @@ impl HubConnection {
         {
             watch.task.abort();
         }
+        if let Ok(mut watch) = self.monitor_watch.lock()
+            && let Some(watch) = watch.take()
+        {
+            watch.cancel.send_replace(true);
+            self.sink.purge_ordered(&watch.stream_id);
+        }
         if let Ok(Some(facade)) = self.hub.accounts()
             && let Some(oauth) = facade.oauth
         {
@@ -10973,6 +11289,160 @@ async fn run_surface_watch(
             }
         }
     }
+}
+
+// Watch identity, replay bounds, publication source, and cancellation stay explicit.
+#[allow(clippy::too_many_arguments)]
+async fn run_monitor_watch(
+    hub: SessionHub,
+    sink: Arc<dyn FrameSink>,
+    watch_id: String,
+    session_id: SessionId,
+    mut cursor: u64,
+    initial_head: u64,
+    mut publications: tokio::sync::broadcast::Receiver<SessionId>,
+    mut cancel: watch::Receiver<bool>,
+) {
+    if !replay_monitor_delivery_range(
+        &hub,
+        &sink,
+        &watch_id,
+        &session_id,
+        &mut cursor,
+        initial_head,
+        &mut cancel,
+    )
+    .await
+    {
+        return;
+    }
+
+    let period = std::time::Duration::from_secs(30);
+    let mut ticker = interval_at(tokio::time::Instant::now() + period, period);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        let reconcile = tokio::select! {
+            changed = cancel.changed() => {
+                if changed.is_err() || *cancel.borrow() {
+                    return;
+                }
+                false
+            },
+            received = publications.recv() => match received {
+                Ok(changed) => changed == session_id,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            },
+            _ = ticker.tick() => true,
+        };
+        if !reconcile {
+            continue;
+        }
+        let head = match hub.inner.store.latest_seq(&session_id).await {
+            Ok(head) => head,
+            Err(_) => {
+                sink.close_after_required_delivery_failure();
+                return;
+            }
+        };
+        if head < cursor {
+            sink.close_after_required_delivery_failure();
+            return;
+        }
+        if head == cursor {
+            continue;
+        }
+        if !replay_monitor_delivery_range(
+            &hub,
+            &sink,
+            &watch_id,
+            &session_id,
+            &mut cursor,
+            head,
+            &mut cancel,
+        )
+        .await
+        {
+            return;
+        }
+    }
+}
+
+/// Scans the complete durable interval, emitting only monitor pending facts.
+/// Advancing across non-report envelopes is made visible by the caught-up
+/// cursor, so reconnect never guesses whether an empty suffix was inspected.
+async fn replay_monitor_delivery_range(
+    hub: &SessionHub,
+    sink: &Arc<dyn FrameSink>,
+    watch_id: &str,
+    session_id: &SessionId,
+    cursor: &mut u64,
+    high_water: u64,
+    cancel: &mut watch::Receiver<bool>,
+) -> bool {
+    while *cursor < high_water {
+        if *cancel.borrow() {
+            return false;
+        }
+        let page = match hub
+            .read_internal_session(session_id, *cursor, REPLAY_PAGE_SIZE)
+            .await
+        {
+            Ok(page) => page,
+            Err(_) => {
+                sink.close_after_required_delivery_failure();
+                return false;
+            }
+        };
+        let mut advanced = false;
+        for envelope in page
+            .into_iter()
+            .take_while(|envelope| envelope.seq <= high_water)
+        {
+            if *cancel.borrow() {
+                return false;
+            }
+            let expected = (*cursor).saturating_add(1);
+            if envelope.seq != expected {
+                sink.close_after_required_delivery_failure();
+                return false;
+            }
+            if let Some(report) = crate::monitor::monitor_delivery_report(&envelope) {
+                let frame = WireFrame::MonitorDelivery {
+                    watch_id: watch_id.to_owned(),
+                    report,
+                };
+                match super::replay::deliver_ordered_frame(sink, watch_id, &frame, cancel).await {
+                    super::replay::FrameDelivery::Delivered => {}
+                    super::replay::FrameDelivery::Cancelled => return false,
+                    super::replay::FrameDelivery::Stuck | super::replay::FrameDelivery::Refused => {
+                        sink.close_after_required_delivery_failure();
+                        return false;
+                    }
+                }
+            }
+            *cursor = envelope.seq;
+            advanced = true;
+        }
+        if !advanced {
+            sink.close_after_required_delivery_failure();
+            return false;
+        }
+    }
+    let caught_up = WireFrame::MonitorDeliveryCaughtUp {
+        watch_id: watch_id.to_owned(),
+        session_id: session_id.clone(),
+        high_water_cursor: high_water,
+    };
+    match super::replay::deliver_ordered_frame(sink, watch_id, &caught_up, cancel).await {
+        super::replay::FrameDelivery::Delivered => {}
+        super::replay::FrameDelivery::Cancelled => return false,
+        super::replay::FrameDelivery::Stuck | super::replay::FrameDelivery::Refused => {
+            sink.close_after_required_delivery_failure();
+            return false;
+        }
+    }
+    true
 }
 
 pub(crate) async fn session_summaries(

@@ -1309,6 +1309,16 @@ pub enum ContextCompactionClaim {
     Committed(Box<ContextCompactionReceiptResponse>),
 }
 
+/// Global command-id claim for the typed client monitor mutations. The
+/// response stays as JSON here so the storage layer does not depend on the
+/// RPC crate; the daemon decodes it into the method-specific typed receipt.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MonitorControlClaim {
+    Fresh,
+    ResumePending,
+    Committed(serde_json::Value),
+}
+
 /// Secret-free coordinates for atomically accepting a direct user shell
 /// command. The command bytes themselves live in the ordinary started item
 /// and in the canonical receipt request JSON, never in this response.
@@ -5976,6 +5986,107 @@ impl Store {
         Ok(())
     }
 
+    /// Looks up a committed typed client-monitor mutation in the same global
+    /// command-id namespace used by every other durable client mutation.
+    pub fn monitor_control_receipt(
+        &self,
+        command_id: &str,
+        method: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<serde_json::Value>> {
+        validate_monitor_control_method(method)?;
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            method,
+            request_digest,
+            request_json,
+            "monitor-control",
+        )
+    }
+
+    /// Claims (or resumes) one typed client-monitor mutation. A pending row
+    /// is recoverable from the atomically appended session-local monitor fact
+    /// and receipt before this global response is finalized.
+    pub fn claim_monitor_control_receipt(
+        &self,
+        command_id: &str,
+        method: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<MonitorControlClaim> {
+        validate_monitor_control_method(method)?;
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(response) = lookup_command_response::<serde_json::Value>(
+            &transaction,
+            command_id,
+            method,
+            request_digest,
+            request_json,
+            "monitor-control",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(MonitorControlClaim::Committed(response));
+        }
+        let pending = transaction
+            .query_row(
+                "SELECT 1 FROM command_receipts WHERE command_id = ?1",
+                [command_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?
+            .is_some();
+        claim_pending_receipt(
+            &transaction,
+            command_id,
+            method,
+            request_digest,
+            request_json,
+            now_ms()?,
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(if pending {
+            MonitorControlClaim::ResumePending
+        } else {
+            MonitorControlClaim::Fresh
+        })
+    }
+
+    /// Finalizes a monitor mutation after its session-local fact and recovery
+    /// receipt have committed atomically through the session actor.
+    pub fn finalize_monitor_control_receipt(
+        &self,
+        command_id: &str,
+        session_id: &SessionId,
+        accepted_seq: u64,
+        response: &serde_json::Value,
+    ) -> StoreResult<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        finalize_command_receipt(
+            &transaction,
+            command_id,
+            session_id.as_str(),
+            None,
+            Some(accepted_seq),
+            response,
+            now_ms()?,
+            "monitor-control",
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(())
+    }
+
     /// Looks up a committed `session.create` response before filesystem
     /// validation. This ordering is intentional: after a successful create,
     /// a lost-response retry remains recoverable even if the workspace path
@@ -10147,6 +10258,18 @@ fn validate_command_identity(
         )
     })?;
     Ok(())
+}
+
+fn validate_monitor_control_method(method: &str) -> StoreResult<()> {
+    if matches!(method, "monitor.register" | "monitor.remove") {
+        Ok(())
+    } else {
+        Err(store_error(
+            ErrorCode::InvalidArgument,
+            "monitor control receipts accept only monitor.register or monitor.remove",
+            false,
+        ))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

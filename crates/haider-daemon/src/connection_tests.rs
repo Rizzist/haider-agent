@@ -184,8 +184,18 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// MUTATION CHECK: remove `FEATURE_PIPE_TOOL_STATUS_V1` from
 /// `welcome_features`. Expected runtime failure: cold-history clients cannot
 /// discover the typed tool outcome and fall back to parsing summary prose.
+///
+/// MUTATION CHECK: remove `FEATURE_MONITOR_CONTROL_V1` or
+/// `FEATURE_MONITOR_DELIVERY_V1`. Expected runtime failure: clients cannot
+/// distinguish the served typed control/replay surfaces from the private APK
+/// transport or from total client-surface absence.
 #[test]
 fn welcome_features_pin_served_management_families() {
+    assert_eq!(
+        welcome_features().len(),
+        82,
+        "the ordinary Welcome advertises all 78 base and four v0.0.962 feature tokens"
+    );
     assert_eq!(
         welcome_features(),
         BTreeSet::from([
@@ -262,6 +272,8 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_USER_COMMAND_V1.to_owned(),
             FEATURE_TOOL_INVENTORY_V1.to_owned(),
             haider_rpc::FEATURE_MONITOR_V1.to_owned(),
+            haider_rpc::FEATURE_MONITOR_CONTROL_V1.to_owned(),
+            haider_rpc::FEATURE_MONITOR_DELIVERY_V1.to_owned(),
             haider_rpc::FEATURE_TRANSCRIPTION_V1.to_owned(),
             FEATURE_TURN_CONTROL_V1.to_owned(),
             haider_rpc::FEATURE_USAGE_REPORT_V1.to_owned(),
@@ -572,6 +584,42 @@ async fn reply_floor_admits_and_pops_ahead_of_camped_event_traffic() {
     // A second floor push while the floor is in use is refused terminally.
     lane.try_push(LaneKey::System, ordinary(b"reply-3"))
         .expect_err("floor in use and ordinary camped");
+}
+
+/// Monitor replay records use one paced ordered lane, never the reply floor.
+/// MUTATION CHECK: route an ordered record through `try_push`/System or let it
+/// borrow the floor. Expected failure: caught-up may pop before the earlier
+/// report, allowing a client to persist a cursor that skipped it.
+#[tokio::test]
+async fn ordered_stream_preserves_response_report_and_caught_up_order() {
+    let lane = OutboundLane::new(2, 1_024, 64);
+    let ordered = LaneKey::Ordered("monitor-watch-order".into());
+    lane.try_push(LaneKey::System, ordinary(b"watch-response"))
+        .expect("watch response enters system lane");
+    assert_eq!(
+        lane.offer(ordered.clone(), b"monitor-report".to_vec(), None),
+        SendAdmission::Sent
+    );
+    assert_eq!(
+        lane.offer(ordered.clone(), b"monitor-caught-up".to_vec(), None),
+        SendAdmission::Busy,
+        "ordered traffic waits instead of overtaking through the reply floor"
+    );
+    assert_eq!(lane.inner.state.lock().expect("state lock").floor_in_use, 0);
+
+    let response = lane.recv().await.expect("response first");
+    assert_eq!(response.bytes, b"watch-response");
+    lane.credit(&response);
+    assert_eq!(
+        lane.offer(ordered, b"monitor-caught-up".to_vec(), None),
+        SendAdmission::Sent
+    );
+    let report = lane.recv().await.expect("report second");
+    assert_eq!(report.bytes, b"monitor-report");
+    lane.credit(&report);
+    let caught_up = lane.recv().await.expect("caught-up last");
+    assert_eq!(caught_up.bytes, b"monitor-caught-up");
+    lane.credit(&caught_up);
 }
 
 /// Roster deltas are best-effort observations, never replies. When ordinary

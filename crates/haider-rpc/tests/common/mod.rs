@@ -37,6 +37,8 @@ use haider_rpc::{
     FEATURE_TURN_CONTROL_V1, FEATURE_USAGE_REPORT_V1, FEATURE_VAULT_STAGE_V1, FleetAgentStateWire,
     FleetMetricsTotalsWire, FleetNodeWire, FleetRollupWire, FleetStateCountsWire, Hello,
     HookSummaryWire, HookTrustStateWire, LifecyclePhase, MenuInput, ModelDetailWire,
+    MonitorActionWire, MonitorDeliveryDedupeWire, MonitorDeliveryReportWire,
+    MonitorEventPayloadWire, MonitorEventWire, MonitorReportStatusWire, MonitorSourceKindWire,
     OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId, OAuthFlowStatusWire,
     OAuthReadyRefWire, ObserveRunStateWire, ProtocolError, ProviderActiveWire,
     ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
@@ -1829,6 +1831,45 @@ pub fn transcript() -> Vec<WireFrame> {
                     truncated: true,
                 },
             },
+        },
+        // monitor_delivery_v1 appends a dedicated report and caught-up seal;
+        // neither is a chat Event nor the private APK negative-id transport.
+        WireFrame::MonitorDelivery {
+            watch_id: "monitor-watch-1".into(),
+            report: MonitorDeliveryReportWire {
+                report_id: "monitor-report-1".into(),
+                monitor_id: "monitor-1".into(),
+                session_id: SessionId::new("session-1"),
+                branch_id: Some(BranchId::new("branch-1")),
+                agent_id: Some(AgentId::new("agent-1")),
+                source: MonitorSourceKindWire::Sms,
+                status: MonitorReportStatusWire::Matched,
+                events: vec![MonitorEventWire {
+                    sequence: 9,
+                    observed_at_ms: 1_753_500_070_000,
+                    payload: MonitorEventPayloadWire::Sms {
+                        address: "+15550001".into(),
+                        body: "ship it".into(),
+                        received_at_ms: 1_753_500_069_000,
+                    },
+                }],
+                coalesced_count: 3,
+                omitted_count: 2,
+                action: MonitorActionWire {
+                    report: true,
+                    follow_up: Some("summarize the alert".into()),
+                },
+                cursor: 71,
+                dedupe: MonitorDeliveryDedupeWire {
+                    delivery_key: "monitor-delivery-session-1-71".into(),
+                    report_key: "monitor-report-1".into(),
+                },
+            },
+        },
+        WireFrame::MonitorDeliveryCaughtUp {
+            watch_id: "monitor-watch-1".into(),
+            session_id: SessionId::new("session-1"),
+            high_water_cursor: 73,
         },
     ]
 }
