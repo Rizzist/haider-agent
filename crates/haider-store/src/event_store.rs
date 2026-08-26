@@ -16127,6 +16127,9 @@ fn inherited_fork_cache_segment(
     None
 }
 
+// Every argument is a fail-closed fork-inheritance validation input (C3); a
+// params struct would only relocate the same nine facts.
+#[allow(clippy::too_many_arguments)]
 fn effective_source_cache_route(
     source_cache_boundary: Option<&SourceForkCacheBoundary>,
     source_session_id: &SessionId,
