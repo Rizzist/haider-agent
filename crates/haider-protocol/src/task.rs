@@ -16,8 +16,9 @@ const fn is_false(value: &bool) -> bool {
 /// Rolling tail preview retained per task for cheap reads (bytes).
 pub const TASK_TAIL_BYTES: usize = 4 * 1024;
 
-/// Hard cap on retained task output (bytes). Output beyond the cap is
+/// Hard cap on live retained task output (bytes). Output beyond the cap is
 /// dropped and the truncation is marked honestly — the task keeps running.
+/// After completion is copied to the CAS, the live allocation is released.
 pub const TASK_OUTPUT_RETAIN_BYTES: usize = 512 * 1024;
 
 /// Hard cap on concurrent background tasks per session.
