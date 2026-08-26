@@ -2674,8 +2674,8 @@ fn model_selection_refusals_are_typed_and_golden() {
     );
 }
 
-/// LAW (G2 wire): the session-rename family appends exactly three frames at
-/// the END of the golden transcript (welcome advertising
+/// LAW (G2 wire): the session-rename family appended exactly three frames at
+/// its then-END in the golden transcript (welcome advertising
 /// `session_rename_v1`, the rename request, the committed response); a
 /// title-less request (a CLEAR) keeps `title` OFF the wire in both
 /// directions; and `SessionSummary.title` is additive — absent for older
@@ -2708,8 +2708,10 @@ fn session_rename_frames_are_additive_and_golden() {
         .expect("G2 welcome frame in the golden transcript");
     assert_eq!(
         frames.len() - g2_start,
-        3 + 4 + 3 + 4 + 1,
-        "G2's three frames, then G3's four tuning frames, F1's three fleet frames, WIRE-GAPS' four read frames, then Slice 2's folded response"
+        3 + 4 + 3 + 4 + 1 + 2,
+        "G2's three frames, then G3's four tuning frames, F1's three fleet frames, \
+         WIRE-GAPS' four read frames, Slice 2's folded response, then #6's two \
+         monitor-delivery frames"
     );
 
     // Exact golden bytes for the titled request/response pair.
@@ -2837,11 +2839,32 @@ fn transcription_secret_frames_are_additive_and_redacted() {
     assert_eq!(haider_rpc::FEATURE_TRANSCRIPTION_V1, "transcription_v1");
 
     // The seven T1 frames sit directly before U1's three usage frames,
-    // G2's three session-rename frames, G3's four session-tuning frames, and
-    // F1's three fleet frames at the transcript tail (each later wave's own
-    // law pins its append).
+    // G2's three session-rename frames, G3's four session-tuning frames, F1's
+    // three fleet frames, WIRE-GAPS' four reads, Slice 2's folded response,
+    // and #6's two monitor-delivery frames (each later wave's own law pins its
+    // append). Anchor the intended block by identity so a later tail append
+    // cannot silently slide this sequence window onto unrelated frames.
     let frames = transcript();
-    let tail = &frames[frames.len() - 25..frames.len() - 18];
+    let t1_start = frames
+        .iter()
+        .position(|frame| {
+            matches!(
+                frame,
+                WireFrame::Request {
+                    request_id,
+                    body: RequestBody::TranscriptionSecretSet { .. },
+                } if request_id.as_str() == "request-transcription-set"
+            )
+        })
+        .expect("T1 first set request in the golden transcript");
+    assert_eq!(
+        frames.len() - t1_start,
+        7 + 3 + 3 + 4 + 3 + 4 + 1 + 2,
+        "T1's seven frames, U1's three usage frames, G2's three rename frames, \
+         G3's four tuning frames, F1's three fleet frames, WIRE-GAPS' four read \
+         frames, Slice 2's folded response, then #6's two monitor-delivery frames"
+    );
+    let tail = &frames[t1_start..t1_start + 7];
     let methods: Vec<String> = tail
         .iter()
         .map(|frame| {
@@ -2935,7 +2958,7 @@ fn transcription_secret_frames_are_additive_and_redacted() {
 }
 
 /// LAW (usage_report_goldens_are_additive_normalized_and_secret_free): the U1
-/// wave appends exactly three frames at the END of the golden transcript
+/// wave appended exactly three frames at its then-END in the golden transcript
 /// (welcome advertising `usage_report_v1`, the parameterless request, the
 /// report response); utilization rides the wire as the normalized 0–1
 /// fraction, never a raw percentage; unknown future fields are tolerated in
@@ -2967,11 +2990,11 @@ fn usage_report_goldens_are_additive_normalized_and_secret_free() {
         .expect("U1 welcome frame in the golden transcript");
     assert_eq!(
         frames.len() - u1_start,
-        3 + 3 + 4 + 3 + 4 + 1,
+        3 + 3 + 4 + 3 + 4 + 1 + 2,
         "three U1 frames, then G2's three session-rename frames, then G3's \
          four session-tuning frames, F1's three fleet frames, then \
-         WIRE-GAPS' four read frames, then Slice 2's folded response (each later \
-         wave's own law pins its append)"
+         WIRE-GAPS' four read frames, Slice 2's folded response, then #6's two \
+         monitor-delivery frames (each later wave's own law pins its append)"
     );
     for frame in &frames[u1_start..u1_start + 3] {
         let encoded = ws_codec::encode(frame, TEST_FRAME_LIMIT).expect("encode U1 frame");

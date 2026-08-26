@@ -591,7 +591,14 @@ fn pinned_workflow_revision_survives_registry_edit_and_stale_fences_name_current
         .expect("read pinned revision")
         .expect("pinned revision remains executable");
     assert_eq!(retained.rev, 1);
-    assert_eq!(retained.source, "retained: A -> A\nstep \"one\" :cmd");
+    assert_eq!(retained, first, "the complete rev-1 record is immutable");
+    // `:cmd` is pipe/v1's implicit default and canonical source omits it; the
+    // compiled gate is the execution authority and must remain command-green.
+    assert_eq!(retained.source, "retained: A -> A\nstep \"one\"");
+    assert_eq!(
+        retained.template.nodes[0].gate,
+        haider_protocol::graph::GraphGateKind::CommandGreen
+    );
     assert_ne!(pinned.digest, current_template_digest);
 
     let stale_pin = store
@@ -667,9 +674,10 @@ fn pinned_workflow_revision_survives_registry_edit_and_stale_fences_name_current
         .expect("read retained revision after reversion")
         .expect("rev 1 remains distinct from reverted rev 3");
     assert_eq!(retained_after_reversion.rev, 1);
+    assert_eq!(retained_after_reversion, retained);
     assert_eq!(
         retained_after_reversion.source,
-        "retained: A -> A\nstep \"one\" :cmd"
+        "retained: A -> A\nstep \"one\""
     );
 }
 
