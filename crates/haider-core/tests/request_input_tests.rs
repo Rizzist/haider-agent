@@ -9,11 +9,11 @@ use haider_protocol::error::ErrorCode;
 use haider_protocol::ids::{BranchId, DeviceId, EventId, ItemId, MenuId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
-use haider_protocol::provider::{FinishReason, Message};
+use haider_protocol::provider::FinishReason;
 use haider_protocol::session::SessionInteractionModeV1;
 use haider_protocol::state::RunState;
 use haider_protocol::tool::ToolResultStatus;
-use haider_provider::{FakeInputKind, FakeInputOption, FakeProvider, FakeStep};
+use haider_provider::{FakeInputKind, FakeInputOption, FakeProvider, FakeStep, Message};
 use std::sync::Arc;
 
 const SESSION: &str = "request-input-session";

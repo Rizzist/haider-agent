@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::{Message, PromptCacheMetadata, ToolDefinition, UserCommandRecord};
+use crate::{CatalogSource, Message, PromptCacheMetadata, ToolDefinition, UserCommandRecord};
 use haider_accounts::{MemoryVault, Vault};
 use haider_protocol::ids::ArtifactRef;
 use haider_protocol::item::ToolStatus;

@@ -1015,7 +1015,8 @@ where
         let body = event
             .into_body()
             .map_err(|error| TransportError::protocol(error.to_string()))?;
-        write_frame(writer, &Envelope { id, body }).await?;
+        let envelope = Envelope { id, body };
+        write_frame(writer, &envelope).await?;
     }
     Ok(())
 }

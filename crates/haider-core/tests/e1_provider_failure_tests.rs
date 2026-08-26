@@ -15,11 +15,11 @@ use haider_protocol::menu::{
     AnswerVia, ErrorRecoveryCardKind, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope,
 };
 use haider_protocol::pipe::TranscriptProjector;
-use haider_protocol::provider::{Block, FinishReason, Message};
+use haider_protocol::provider::{Block, FinishReason};
 use haider_protocol::session::SessionInteractionModeV1;
 use haider_protocol::state::RunState;
 use haider_protocol::tool::{BoundedResult, ToolResultStatus};
-use haider_provider::{FakeProvider, FakeStep, MessageRole, ProviderErrorKind};
+use haider_provider::{FakeProvider, FakeStep, Message, MessageRole, ProviderErrorKind};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Default)]
