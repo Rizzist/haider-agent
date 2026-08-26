@@ -26,13 +26,19 @@ object DaemonConnection {
         replay = CHAT_REPLY_REPLAY,
         extraBufferCapacity = 64,
     )
+    private val _sessionConfig = MutableStateFlow<SessionConfig?>(null)
+    private val _sessionErrors = MutableSharedFlow<String>(extraBufferCapacity = 8)
 
     val state: StateFlow<TransportState> = _state.asStateFlow()
     val chatReplies: SharedFlow<ChatReply> = _chatReplies.asSharedFlow()
+    val sessionConfig: StateFlow<SessionConfig?> = _sessionConfig.asStateFlow()
+    val sessionErrors: SharedFlow<String> = _sessionErrors.asSharedFlow()
 
     private var client: TransportClient? = null
     private var stateForwarder: Job? = null
     private var chatForwarder: Job? = null
+    private var configForwarder: Job? = null
+    private var sessionErrorForwarder: Job? = null
     private var generation = 0L
 
     /** Loads the saved endpoint and starts one client. Calls while a client is active are no-ops. */
@@ -57,6 +63,7 @@ object DaemonConnection {
             generation += 1L
             val current = detachLocked()
             _state.value = TransportState.Disconnected
+            _sessionConfig.value = null
             current to generation
         }
 
@@ -78,6 +85,7 @@ object DaemonConnection {
             generation += 1L
             val detached = detachLocked()
             _state.value = TransportState.Disconnected
+            _sessionConfig.value = null
             detached
         }
         if (current != null) {
@@ -86,11 +94,27 @@ object DaemonConnection {
     }
 
     /** Sends a chat turn through the authenticated client and returns its streamed-reply ID. */
-    suspend fun sendChat(text: String): Long {
+    suspend fun sendChat(text: String, onReserved: (Long) -> Unit = {}): Long {
         val current = synchronized(lifecycleLock) { client }
             ?: throw IllegalStateException("Daemon connection has not been started")
-        return current.sendChat(text)
+        return current.sendChat(text, onReserved)
     }
+
+    suspend fun requestSessionConfig() {
+        currentClient().requestSessionConfig()
+    }
+
+    suspend fun selectModel(provider: String, model: String) {
+        currentClient().selectModel(provider, model)
+    }
+
+    suspend fun selectEffort(effort: String?) {
+        currentClient().selectEffort(effort)
+    }
+
+    private fun currentClient(): TransportClient =
+        synchronized(lifecycleLock) { client }
+            ?: throw IllegalStateException("Daemon connection has not been started")
 
     /** Must be called while holding [lifecycleLock]. */
     private fun attachLocked(context: Context, config: DaemonConfig, ownerGeneration: Long) {
@@ -118,6 +142,22 @@ object DaemonConnection {
                 if (isCurrent) _chatReplies.emit(reply)
             }
         }
+        configForwarder = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            newClient.sessionConfig.collect { config ->
+                val isCurrent = synchronized(lifecycleLock) {
+                    client === newClient && generation == ownerGeneration
+                }
+                if (isCurrent) _sessionConfig.value = config
+            }
+        }
+        sessionErrorForwarder = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            newClient.sessionErrors.collect { message ->
+                val isCurrent = synchronized(lifecycleLock) {
+                    client === newClient && generation == ownerGeneration
+                }
+                if (isCurrent) _sessionErrors.emit(message)
+            }
+        }
         newClient.start()
     }
 
@@ -127,8 +167,12 @@ object DaemonConnection {
         client = null
         stateForwarder?.cancel()
         chatForwarder?.cancel()
+        configForwarder?.cancel()
+        sessionErrorForwarder?.cancel()
         stateForwarder = null
         chatForwarder = null
+        configForwarder = null
+        sessionErrorForwarder = null
         return current
     }
 

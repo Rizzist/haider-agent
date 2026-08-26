@@ -5081,6 +5081,7 @@ async fn session_create_permission_overrides_are_digest_bound_and_persisted() {
     let expected = SessionPermissionOverridesV1 {
         allow_writes: true,
         allow_exec: false,
+        allow_mobile: false,
         auto_allow: false,
     };
     let body = |overrides| RequestBody::SessionCreateWithPermissionOverrides {

@@ -102,7 +102,9 @@ val ForgeLight = ForgeColors(
 data class ForgeType(
     val chatBody: TextStyle,
     val userBody: TextStyle,
+    val thinking: TextStyle,
     val toolRow: TextStyle,
+    val toolStrong: TextStyle,
     val chip: TextStyle,
     val label: TextStyle,
     val h1: TextStyle,
@@ -113,7 +115,9 @@ data class ForgeType(
 val ForgeTypography = ForgeType(
     chatBody = TextStyle(fontFamily = FontFamily.Default, fontSize = 15.5.sp, lineHeight = 26.sp, fontWeight = FontWeight.Normal),
     userBody = TextStyle(fontFamily = FontFamily.Default, fontSize = 15.sp, lineHeight = 24.sp, fontWeight = FontWeight.Medium),
+    thinking = TextStyle(fontFamily = FontFamily.Default, fontSize = 14.sp, lineHeight = 22.sp, fontWeight = FontWeight.Normal),
     toolRow = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp, lineHeight = 18.sp),
+    toolStrong = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp, lineHeight = 18.sp, fontWeight = FontWeight.SemiBold),
     chip = TextStyle(fontFamily = FontFamily.Default, fontSize = 11.sp, lineHeight = 14.sp, fontWeight = FontWeight.Medium),
     label = TextStyle(fontFamily = FontFamily.Default, fontSize = 10.sp, lineHeight = 13.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.6.sp),
     h1 = TextStyle(fontFamily = FontFamily.Default, fontSize = 19.sp, lineHeight = 24.sp, fontWeight = FontWeight.SemiBold),

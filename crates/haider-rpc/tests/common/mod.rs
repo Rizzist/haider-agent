@@ -965,6 +965,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 permission_overrides: Some(SessionPermissionOverridesV1 {
                     allow_writes: true,
                     allow_exec: true,
+                    allow_mobile: false,
                     auto_allow: false,
                 }),
                 cache_policy: None,

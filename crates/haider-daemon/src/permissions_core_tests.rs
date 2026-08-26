@@ -254,7 +254,7 @@ fn workflow_capabilities_are_sparse_and_grant_scoped() {
 /// RUNTIME failure: flagged classes are not ordinary policy `Allow`, or the
 /// unflagged W8a defaults stop being `Ask`.
 #[test]
-fn session_permission_overrides_replace_only_write_and_exec_ask_defaults() {
+fn session_permission_overrides_grant_only_their_named_effect_families() {
     let metadata = |permission_overrides| SessionMetadataV1 {
         cwd: "/tmp".into(),
         provider: "fake".into(),
@@ -310,6 +310,7 @@ fn session_permission_overrides_replace_only_write_and_exec_ask_defaults() {
     let writes = metadata(Some(SessionPermissionOverridesV1 {
         allow_writes: true,
         allow_exec: false,
+        allow_mobile: false,
         auto_allow: false,
     }));
     assert_eq!(
@@ -324,6 +325,7 @@ fn session_permission_overrides_replace_only_write_and_exec_ask_defaults() {
     let exec = metadata(Some(SessionPermissionOverridesV1 {
         allow_writes: false,
         allow_exec: true,
+        allow_mobile: false,
         auto_allow: false,
     }));
     assert_eq!(
@@ -359,6 +361,32 @@ fn session_permission_overrides_replace_only_write_and_exec_ask_defaults() {
         ToolPermissionDefault::Ask,
         "allow_exec must never imply mobile control"
     );
+
+    let mobile = metadata(Some(SessionPermissionOverridesV1 {
+        allow_writes: false,
+        allow_exec: false,
+        allow_mobile: true,
+        auto_allow: false,
+    }));
+    for class in [
+        EffectClass::ReadSms,
+        EffectClass::MobileObserve,
+        EffectClass::MobileControl,
+    ] {
+        assert_eq!(decision(&mobile, class), ToolPermissionDefault::Allow);
+    }
+    for class in [
+        EffectClass::FsWrite,
+        EffectClass::ProcessExec,
+        EffectClass::ScreenObserve,
+        EffectClass::ScreenControl,
+    ] {
+        assert_eq!(
+            decision(&mobile, class),
+            ToolPermissionDefault::Ask,
+            "allow_mobile must stay scoped to the Android transport"
+        );
+    }
 }
 
 /// Autonomous mode applies its no-human denial as the broker's residual-Ask
@@ -444,6 +472,7 @@ fn auto_allow_promotes_every_ask_class_including_computer_and_fetch() {
     let defaults = effective_permission_defaults(&metadata(Some(SessionPermissionOverridesV1 {
         allow_writes: false,
         allow_exec: false,
+        allow_mobile: false,
         auto_allow: true,
     })));
     let decision = |class: EffectClass| {

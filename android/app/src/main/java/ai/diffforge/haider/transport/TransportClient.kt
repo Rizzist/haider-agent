@@ -27,6 +27,7 @@ import java.io.IOException
 import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
 sealed interface TransportState {
@@ -71,12 +72,22 @@ class TransportClient(
         replay = CHAT_REPLY_REPLAY,
         extraBufferCapacity = 64,
     )
+    private val _sessionConfig = MutableStateFlow<SessionConfig?>(null)
+    private val _sessionErrors = MutableSharedFlow<String>(extraBufferCapacity = 8)
 
     val state: StateFlow<TransportState> = _state.asStateFlow()
     val chatReplies: SharedFlow<ChatReply> = _chatReplies.asSharedFlow()
+    val sessionConfig: StateFlow<SessionConfig?> = _sessionConfig.asStateFlow()
+    val sessionErrors: SharedFlow<String> = _sessionErrors.asSharedFlow()
 
     @Volatile
     private var runner: Job? = null
+
+    @Volatile
+    private var configRetry: Job? = null
+
+    private val pendingChats = ConcurrentHashMap<Long, String>()
+    private val chatRetries = ConcurrentHashMap<Long, Job>()
 
     private var stopping = false
 
@@ -135,17 +146,19 @@ class TransportClient(
     }
 
     /** Sends a body as an APK push envelope. Returns false while unauthenticated or after I/O error. */
-    suspend fun sendPush(json: JSONObject): Boolean = writeMutex.withLock {
-        val output = activeOutput
-        if (_state.value !is TransportState.Authenticated || output == null) {
-            return@withLock false
-        }
-        try {
-            Frames.write(output, Frames.envelope(id = 0L, body = json))
-            true
-        } catch (_: IOException) {
-            activeSocket?.closeQuietly()
-            false
+    suspend fun sendPush(json: JSONObject): Boolean = withContext(Dispatchers.IO) {
+        writeMutex.withLock {
+            val output = activeOutput
+            if (_state.value !is TransportState.Authenticated || output == null) {
+                return@withLock false
+            }
+            try {
+                Frames.write(output, Frames.envelope(id = 0L, body = json))
+                true
+            } catch (_: IOException) {
+                activeSocket?.closeQuietly()
+                false
+            }
         }
     }
 
@@ -154,18 +167,47 @@ class TransportClient(
      * The response is a stream of [ChatReply] values on [chatReplies], not a single correlated
      * response. Throws [IllegalStateException] while the transport is unauthenticated.
      */
-    suspend fun sendChat(text: String): Long = writeMutex.withLock {
-        val output = activeOutput
-        if (_state.value !is TransportState.Authenticated || output == null) {
-            throw IllegalStateException("Daemon transport is not authenticated")
-        }
+    suspend fun sendChat(text: String, onReserved: (Long) -> Unit = {}): Long {
         val id = allocateOutboundId()
+        // Correlation is installed before the first suspension, so an immediate
+        // daemon delta can never outrun the ViewModel's turn map.
+        onReserved(id)
+        pendingChats[id] = text
         try {
-            Frames.write(output, Frames.envelope(id, Frames.chatSend(text)))
-            id
-        } catch (error: IOException) {
-            activeSocket?.closeQuietly()
+            writeRequest(id, Frames.chatSend(text))
+        } catch (error: Exception) {
+            pendingChats.remove(id)
             throw error
+        }
+        return id
+    }
+
+    suspend fun requestSessionConfig(): Long = sendRequest(Frames.sessionConfigGet())
+
+    suspend fun selectModel(provider: String, model: String): Long =
+        sendRequest(Frames.sessionSelectModel(provider, model))
+
+    suspend fun selectEffort(effort: String?): Long =
+        sendRequest(Frames.sessionSelectEffort(effort))
+
+    private suspend fun sendRequest(body: JSONObject): Long {
+        val id = allocateOutboundId()
+        writeRequest(id, body)
+        return id
+    }
+
+    private suspend fun writeRequest(id: Long, body: JSONObject) = withContext(Dispatchers.IO) {
+        writeMutex.withLock {
+            val output = activeOutput
+            if (_state.value !is TransportState.Authenticated || output == null) {
+                throw IllegalStateException("Daemon transport is not authenticated")
+            }
+            try {
+                Frames.write(output, Frames.envelope(id, body))
+            } catch (error: IOException) {
+                activeSocket?.closeQuietly()
+                throw error
+            }
         }
     }
 
@@ -222,6 +264,7 @@ class TransportClient(
         _state.value = TransportState.Authenticated
         onAuthenticated()
         sendPush(CapabilityBus.toPush())
+        requestSessionConfig()
 
         while (currentCoroutineContext().isActive) {
             val requestJson = Frames.read(input) ?: return
@@ -229,8 +272,38 @@ class TransportClient(
             if (request.id == 0L) {
                 throw Frames.ProtocolException("Daemon request uses the reserved push ID")
             }
-            if (Frames.isChat(request.body)) {
-                _chatReplies.emit(Frames.parseChatReply(request))
+            if (Frames.isChatReply(request.body)) {
+                val reply = Frames.parseChatReply(request)
+                if (reply is ChatReply.Error &&
+                    reply.code == "daemon_initializing" &&
+                    reply.retryable &&
+                    pendingChats.containsKey(reply.id)
+                ) {
+                    scheduleChatRetry(reply.id)
+                    continue
+                }
+                if (reply is ChatReply.Done || reply is ChatReply.Error) {
+                    pendingChats.remove(reply.id)
+                    chatRetries.remove(reply.id)?.cancel()
+                }
+                _chatReplies.emit(reply)
+                continue
+            }
+            if (Frames.isSessionReply(request.body)) {
+                when (val reply = Frames.parseSessionReply(request)) {
+                    is SessionReply.Config -> {
+                        configRetry?.cancel()
+                        configRetry = null
+                        _sessionConfig.value = reply.value
+                    }
+                    is SessionReply.Error -> {
+                        if (reply.code == "daemon_initializing" && reply.retryable) {
+                            scheduleSessionConfigRetry()
+                        } else {
+                            _sessionErrors.emit(reply.message)
+                        }
+                    }
+                }
                 continue
             }
             val response = try {
@@ -249,9 +322,48 @@ class TransportClient(
     }
 
     private suspend fun clearConnection() {
+        configRetry?.cancel()
+        configRetry = null
+        chatRetries.values.forEach { it.cancel() }
+        chatRetries.clear()
+        pendingChats.clear()
         writeMutex.withLock {
             activeOutput = null
             activeSocket = null
+        }
+        _sessionConfig.value = null
+    }
+
+    private fun scheduleSessionConfigRetry() {
+        if (configRetry?.isActive == true) return
+        configRetry = scope.launch {
+            delay(SESSION_CONFIG_RETRY_MS)
+            if (_state.value is TransportState.Authenticated) {
+                try {
+                    requestSessionConfig()
+                } catch (_: IllegalStateException) {
+                    // A reconnect will request the snapshot after authentication.
+                } catch (_: IOException) {
+                    // The connection loop owns I/O recovery.
+                }
+            }
+        }
+    }
+
+    private fun scheduleChatRetry(id: Long) {
+        if (chatRetries[id]?.isActive == true) return
+        val text = pendingChats[id] ?: return
+        chatRetries[id] = scope.launch {
+            delay(CHAT_STARTUP_RETRY_MS)
+            if (_state.value is TransportState.Authenticated && pendingChats[id] == text) {
+                try {
+                    writeRequest(id, Frames.chatSend(text))
+                } catch (_: IllegalStateException) {
+                    // A disconnect seals the turn in the ViewModel.
+                } catch (_: IOException) {
+                    // The connection loop owns I/O recovery.
+                }
+            }
         }
     }
 
@@ -279,6 +391,8 @@ class TransportClient(
         const val MIN_BACKOFF_MS = 500L
         const val MAX_BACKOFF_MS = 8_000L
         const val CHAT_REPLY_REPLAY = 64
+        const val SESSION_CONFIG_RETRY_MS = 500L
+        const val CHAT_STARTUP_RETRY_MS = 500L
         val nextOutboundId = AtomicLong(2L)
     }
 }

@@ -742,6 +742,7 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
                 haider_rpc::haider_protocol::session::SessionPermissionOverridesV1 {
                     allow_writes: true,
                     allow_exec: true,
+                    allow_mobile: false,
                     auto_allow: true,
                 },
             ),
