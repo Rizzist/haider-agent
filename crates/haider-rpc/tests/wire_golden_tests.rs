@@ -211,7 +211,9 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "hooks.revoke",
         "hooks.trust",
         "loom.list",
+        "loom.install.retry",
         "loom.install.status",
+        "loom.install.watch",
         "loom.register_agent_type",
         "loom.register_workflow",
         "monitor.list",
@@ -271,8 +273,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         expected_methods.len(),
-        84,
-        "the v1 contract covers all 78 base and six v0.0.962 request methods"
+        86,
+        "the v1 contract covers all 78 base and eight v0.0.962 request methods"
     );
     assert_eq!(
         request_methods_declared_in_source(),
@@ -339,6 +341,83 @@ fn every_request_method_has_a_golden_request_and_success_response() {
     }
 
     assert_eq!(covered, expected_methods);
+}
+
+/// MUTATION CHECK: make `install_job_id` required, rename an existing
+/// `loom.registered` field, or insert the control methods anywhere except as
+/// unknown-tolerant additions. Expected runtime failure: one N-1 direction or
+/// the exact current-reader projection below stops decoding.
+#[test]
+fn typed_agent_install_control_is_additive_under_v1() {
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "method")]
+    enum PreControlRequest {
+        #[serde(rename = "loom.install.status")]
+        LoomInstallStatus {},
+        #[serde(other)]
+        Unknown,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "method")]
+    enum PreControlResponse {
+        #[serde(rename = "loom.registered")]
+        LoomRegistered { registration: Value },
+        #[serde(other)]
+        Unknown,
+    }
+
+    let old_registered = serde_json::json!({
+        "method": "loom.registered",
+        "registration": {
+            "id": "reviewer",
+            "rev": 1,
+            "digest": "digest-agent",
+            "updated": true
+        }
+    });
+    let current: ResponseBody =
+        serde_json::from_value(old_registered).expect("current client decodes old receipt");
+    assert!(matches!(
+        current,
+        ResponseBody::LoomRegistered {
+            install_job_id: None,
+            ..
+        }
+    ));
+
+    let new_registered = serde_json::json!({
+        "method": "loom.registered",
+        "registration": {
+            "id": "reviewer",
+            "rev": 1,
+            "digest": "digest-agent",
+            "updated": true
+        },
+        "install_job_id": "install:reviewer:1"
+    });
+    let legacy: PreControlResponse =
+        serde_json::from_value(new_registered).expect("old client ignores additive job id");
+    let PreControlResponse::LoomRegistered { registration } = legacy else {
+        panic!("old client keeps the registered receipt method");
+    };
+    assert_eq!(registration["id"], "reviewer");
+
+    for method in ["loom.install.retry", "loom.install.watch"] {
+        let request: PreControlRequest = serde_json::from_value(serde_json::json!({
+            "method": method,
+            "job_id": "install:reviewer:1",
+            "after_cursor": 0
+        }))
+        .expect("old client tolerates control request method");
+        assert!(matches!(request, PreControlRequest::Unknown));
+    }
+
+    let known: PreControlRequest = serde_json::from_value(serde_json::json!({
+        "method": "loom.install.status"
+    }))
+    .expect("pre-control method remains unchanged");
+    assert!(matches!(known, PreControlRequest::LoomInstallStatus {}));
 }
 
 /// v0.0.942-shaped readers ignore the additive availability field, while the

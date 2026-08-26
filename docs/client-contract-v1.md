@@ -203,9 +203,9 @@ An operation not listed here is part of the v1 base surface. “Field” means t
 client may use that field only when it is present; the named token permits an
 affordance before the response exists.
 
-The ordinary v0.0.962 `welcome_features()` set contains all 82 tokens below.
+The ordinary v0.0.962 `welcome_features()` set contains all 83 tokens below.
 The re-verification anchors are
-`crates/haider-daemon/src/connection.rs:1867-1951` for the assembled set and
+`crates/haider-daemon/src/connection.rs:1868-1953` for the assembled set and
 `crates/haider-rpc/src/frame.rs:248-496` for the exact string constants. The
 one peer-specific withholding exception is §4.1.
 
@@ -283,6 +283,7 @@ one peer-specific withholding exception is §4.1.
 | `workflow_instance_v1` | immutable `workflow.instance` descriptors and optional `expected_digest` fences on `graph.pin`/`graph.switch` |
 | `loom_cli_presence_v1` | `loom.list.cli_present` |
 | `typed_agent_install_v1` | `loom.install.status` and the durable required-CLI install lifecycle started by agent-type registration |
+| `typed_agent_install_control_v1` | additive `LoomRegistered.install_job_id`, `loom.install.retry`, and cursor-replayable `loom.install.watch` |
 | `session_workflow_state_v1` | `SessionObserveDigest.workflow` on `session.observe` and `session.observe_batch` |
 | `store_health_v1` | unsolicited latched/replayed store-health `ProtocolError` transitions |
 | `resident_session_binding_v1` | bidirectional `ResidentSessionBinding` baseline/push frame and its generation fence; it does not by itself guarantee publisher-token echo |
@@ -369,6 +370,7 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | Workflows and agent types | `loom.list` | `LoomList` | snapshot | persisted Loom registry; pipe source is workflow structure of record |
 | Exact workflow instance | `workflow.instance` | `WorkflowInstance` | snapshot | current registry/catalog instance by id, or an exact retained user revision by template digest |
 | Typed-agent install readiness | `loom.install.status` | `LoomInstallStatus` | reconnectable, bounded snapshot | durable install jobs and per-CLI items read from one store snapshot |
+| Typed-agent install progress | `loom.install.watch` | `LoomInstallWatch` | bounded cursor replay page | durable exact-job progress snapshots |
 | Monitor registry | `monitor.list` | `MonitorList` | typed snapshot receipt | durable session monitor facts |
 | Monitor deliveries | `monitor.watch` | `MonitorWatch`, then `MonitorDelivery` / `MonitorDeliveryCaughtUp` | required cursor replay/live stream | durable `MonitorReportPending` facts in the session journal |
 | Todos | raw `ItemEvent` envelopes (`TurnItem` with `item: "plan"`) | no independent snapshot response | attach replay/live lifecycle | durable item lifecycle; reducer in §12 |
@@ -408,6 +410,8 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | `graph.run_set.open`, `graph.abandon` | same-named response | durable receipts |
 | `graph.status`, `graph.inspect` | same-named response | snapshots |
 | `loom.register_agent_type`, `loom.register_workflow` | `LoomRegistered` (`method: "loom.registered"`) | registry mutation/no-op receipt |
+| `loom.install.retry` | `LoomInstallRetry` | typed requeue receipt or structured rejection |
+| `loom.install.watch` | `LoomInstallWatch` | typed bounded replay page or structured rejection |
 | `vault.stage` | `VaultStage` | connection-local ephemeral dedupe, deliberately not durable |
 | `account.login_api`, `account.oauth_import`, `account.import_device`, `account.add`, `account.set_active`, `account.remove`, `account.set_default_model` | same-named response | durable account mutation |
 | `account.oauth_start/status/cancel`, `account.oauth_import_sources`, `account.device_candidates` | same-named response | connection-bound flow/catalog reads/actions |
@@ -419,7 +423,7 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 The golden matrix at
 `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`, combined
 with the historical `wire_transcript.json`, pins a request and successful
-response for every one of the 84 v1 request methods. `menu.answer` and resident
+response for every one of the 86 v1 request methods. `menu.answer` and resident
 binding are top-level frames, not `RequestBody` methods.
 
 ### 5.3 Advertised runtime with no client method
@@ -1667,10 +1671,11 @@ accent. A client must not infer capabilities from the job prose.
 `typed_agent_install_v1` negotiates the reconnectable required-CLI install
 status surface. Registering or revising a `LoomAgentType` through
 `loom.register_agent_type` atomically creates a durable install job for the
-exact stored type revision/digest when its derived contract has required CLIs;
-the existing success response remains `LoomRegistered` and does not contain
-the job. A client observes the resulting work through the View-plane read
-below. Registration and installer adoption are anchored at
+exact stored type revision/digest when its derived contract has required CLIs.
+The success response remains `LoomRegistered`; without the separately
+negotiated `typed_agent_install_control_v1` addition it does not contain an
+install-job coordinate. A client observes the resulting work through the
+View-plane read below. Registration and installer adoption are anchored at
 `crates/haider-daemon/src/session_hub/mod.rs:2109-2140` and the atomic store
 transaction at
 `crates/haider-store/src/event_store.rs:2094-2247,16264-16326`. The
@@ -1771,6 +1776,86 @@ Without `typed_agent_install_v1`, a client MUST NOT call
 MUST NOT substitute `cli_present`, a terminal transcript, or a locally probed
 program. It may still use separately advertised Loom registry and inline
 agent-type selection surfaces, without claiming capability-scoped readiness.
+
+### 13.2.1 Typed-agent install control and progress replay
+
+`typed_agent_install_control_v1` is an additive control/replay surface over the
+durable install lifecycle in §13.2. It publishes one optional field on the
+existing registration receipt and two tail-added request/response methods:
+
+| Direction | Method/type | Fields |
+|---|---|---|
+| Success response | `LoomRegistered` (`method: "loom.registered"`) | existing `registration: LoomRegistration`; additive `install_job_id: Option<String>` |
+| Request | `loom.install.retry` | `job_id: String` |
+| Success response | `LoomInstallRetry` (`method: "loom.install.retry"`) | `receipt: TypedAgentInstallRetryReceiptWire` |
+| Request | `loom.install.watch` | `job_id: String`, `after_cursor: u64` |
+| Success response | `LoomInstallWatch` (`method: "loom.install.watch"`) | `receipt: TypedAgentInstallWatchReceiptWire` |
+
+For `loom.register_agent_type`, `install_job_id` is present exactly when the
+stored agent-type revision has a durable required-CLI job. A newly created job
+and an idempotently re-registered exact revision both return the store-issued
+id. A type with no required CLIs and every `loom.register_workflow` receipt
+omit the field. Omission means no job coordinate was published; it is never an
+empty string, a workflow/agent id, or permission to derive the store's private
+job-id format. The field is additive: a current client decodes an old receipt
+as `None`, while an old client ignores the new field without any existing field
+changing type.
+
+`TypedAgentInstallRetryReceiptWire` repeats the requested `job_id` and carries
+one tagged `outcome`:
+
+- `status: "requeued"` carries the exact reset `job: TypedAgentInstallJob`.
+  The store accepts this only from `state: "failed"`, only while that job's
+  agent-type revision/digest is still current, and atomically resets the job
+  and every CLI item to queued before the daemon adopts a new runner. This is
+  a real re-run; identical registry registration remains an idempotent registry
+  operation and is not the retry mechanism.
+- `status: "rejected"` carries a typed `rejection`. `reason:
+  "job_not_found"` means the opaque install id is unknown. `reason:
+  "state_not_retryable"` includes the observed `state`. `reason:
+  "contract_not_current"` means the failed job belongs to a superseded agent
+  type revision/digest. Clients MUST branch on these tags, not message prose.
+
+The ordinary installer CAS still treats success and failure as terminal. Only
+the negotiated retry transaction may reopen failure; success is never reset.
+The optional `loom.install.cancel` door is not published by this revision, so
+clients MUST NOT infer or call it from the word “control.”
+
+`loom.install.watch` is the additive status door form of a replayable progress
+watch. Its typed `outcome` is either:
+
+- `status: "watching"` with `requested_after_cursor`,
+  `replay_through_cursor`, `next_cursor`, and zero or more
+  `TypedAgentInstallEvent { cursor, job }` records; or
+- `status: "rejected"` with `reason: "job_not_found"` or `reason:
+  "cursor_ahead" { requested, head }`.
+
+For jobs created after this feature, each event is an immutable store snapshot
+recorded in the same transaction as the job creation, installer CAS, or retry
+reset. Migration gives each pre-feature job one exact current-state baseline;
+it does not invent transitions that were never recorded. The watch therefore
+replays the exact available wire states (`queued`, `installing`, `verifying`,
+and terminal `succeeded`/`failed`); `installing` is the wire's running phase
+and MUST NOT be renamed by a client. Cursors are positive, opaque,
+store-issued replay coordinates for this door—not timestamps or
+install/agent/workflow ids. A
+client sends its greatest fully applied event cursor, applies returned events
+in ascending cursor order, persists `next_cursor`, and pages until
+`next_cursor == replay_through_cursor`. Empty `events` is authoritative for
+that sealed interval. One page returns at most 128 events.
+
+The existing unfiltered `loom.install.status` registry window remains bounded
+to the newest 32 jobs; install control does not widen it. Watch and retry name
+one exact job id, so they neither scan nor synthesize a larger registry.
+
+**Absence law.** If Welcome omits `typed_agent_install_control_v1`, a client
+has only fire-and-forget `loom.register_agent_type` behavior for this control
+surface. It MUST treat `LoomRegistered.install_job_id` as unavailable, MUST NOT
+call retry, cancel, or watch, and MUST NOT fabricate a job id from the agent
+type, revision, digest, `cli_present`, PATH, or any other local fact. A
+separately present `typed_agent_install_v1` still permits its documented status
+read, but `cli_present: true` never proves install readiness and never creates
+a retry coordinate.
 
 ### 13.3 Session workflow projection
 
@@ -1942,7 +2027,7 @@ The machine-checkable contract lives in these fixtures/tests:
   non-chat stream and its explicit truncation/dedupe fields.
 - `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`: the
   methods added after the historical matrix, completing golden request and
-  successful response coverage for all 84 request methods and all five
+  successful response coverage for all 86 request methods and all five
   command dynamic slots.
 - `crates/haider-rpc/tests/fixtures/snapshot_availability_compat_v1.json`:
   old and new account/provider/usage response bytes.

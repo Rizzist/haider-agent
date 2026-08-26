@@ -14,7 +14,7 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 21;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 22;
 
 struct Migration {
     version: u32,
@@ -430,6 +430,50 @@ const MIGRATIONS: &[Migration] = &[
             )
             SELECT id, rev, digest, record_json, created_at_ms
             FROM loom_workflows;
+        ",
+    },
+    Migration {
+        version: 22,
+        sql: "
+            CREATE TABLE loom_cli_install_events (
+                cursor             INTEGER PRIMARY KEY AUTOINCREMENT
+                    CHECK (cursor > 0),
+                job_id             TEXT NOT NULL,
+                agent_type_id      TEXT NOT NULL,
+                agent_type_rev     INTEGER NOT NULL CHECK (agent_type_rev > 0),
+                agent_type_digest  TEXT NOT NULL
+                    CHECK (length(agent_type_digest) = 32),
+                state              TEXT NOT NULL
+                    CHECK (state IN (
+                        'queued', 'installing', 'verifying', 'succeeded', 'failed'
+                    )),
+                total              INTEGER NOT NULL CHECK (total BETWEEN 1 AND 32),
+                completed          INTEGER NOT NULL
+                    CHECK (completed >= 0 AND completed <= total),
+                current_cli        TEXT
+                    CHECK (current_cli IS NULL OR length(current_cli) BETWEEN 1 AND 128),
+                error              TEXT
+                    CHECK (error IS NULL OR length(error) BETWEEN 1 AND 512),
+                created_at_ms      INTEGER NOT NULL CHECK (created_at_ms >= 0),
+                updated_at_ms      INTEGER NOT NULL
+                    CHECK (updated_at_ms >= created_at_ms),
+                FOREIGN KEY (job_id) REFERENCES loom_cli_install_jobs(job_id)
+                    ON DELETE CASCADE
+            );
+
+            CREATE INDEX loom_cli_install_events_job_cursor
+            ON loom_cli_install_events(job_id, cursor);
+
+            INSERT INTO loom_cli_install_events(
+                job_id, agent_type_id, agent_type_rev, agent_type_digest,
+                state, total, completed, current_cli, error,
+                created_at_ms, updated_at_ms
+            )
+            SELECT job_id, agent_type_id, agent_type_rev, agent_type_digest,
+                   state, total, completed, current_cli, error,
+                   created_at_ms, updated_at_ms
+            FROM loom_cli_install_jobs
+            ORDER BY created_at_ms, job_id;
         ",
     },
 ];

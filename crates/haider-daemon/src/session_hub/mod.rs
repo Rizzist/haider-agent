@@ -2236,7 +2236,7 @@ impl SessionHub {
     pub(crate) async fn loom_register_agent_type(
         &self,
         record: haider_protocol::loom::LoomAgentType,
-    ) -> Result<haider_protocol::loom::LoomRegistration, HaiderError> {
+    ) -> Result<haider_core::LoomAgentTypeRegistration, HaiderError> {
         if self.inner.draining.load(Ordering::Acquire) {
             return Err(HaiderError::new(
                 ErrorCode::Busy,
@@ -2261,10 +2261,10 @@ impl SessionHub {
             .loom_register_agent_type_with_install(record)
             .await?;
         drop(install_serial);
-        if let Some(job) = outcome.install_job {
-            self.spawn_typed_install_job(job.job_id)?;
+        if let Some(job) = &outcome.install_job {
+            self.spawn_typed_install_job(job.job_id.clone())?;
         }
-        Ok(outcome.registration)
+        Ok(outcome)
     }
 
     pub(crate) async fn typed_agent_install_jobs(
@@ -2286,6 +2286,48 @@ impl SessionHub {
         self.inner
             .store
             .typed_agent_install_status(job_id, agent_type_id)
+            .await
+    }
+
+    pub(crate) async fn typed_agent_install_retry(
+        &self,
+        job_id: String,
+    ) -> Result<haider_core::TypedAgentInstallRetryResult, HaiderError> {
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(HaiderError::new(
+                ErrorCode::Busy,
+                "daemon is draining; typed-agent install retry is closed",
+                true,
+            ));
+        }
+        let install_serial = self.inner.typed_install_serial.lock().await;
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(HaiderError::new(
+                ErrorCode::Busy,
+                "daemon is draining; typed-agent install retry is closed",
+                true,
+            ));
+        }
+        let outcome = self.inner.store.typed_agent_install_retry(job_id).await?;
+        let requeued_job_id = match &outcome {
+            haider_core::TypedAgentInstallRetryResult::Requeued(job) => Some(job.job_id.clone()),
+            _ => None,
+        };
+        drop(install_serial);
+        if let Some(job_id) = requeued_job_id {
+            self.spawn_typed_install_job(job_id)?;
+        }
+        Ok(outcome)
+    }
+
+    pub(crate) async fn typed_agent_install_watch(
+        &self,
+        job_id: String,
+        after_cursor: u64,
+    ) -> Result<haider_core::TypedAgentInstallWatchResult, HaiderError> {
+        self.inner
+            .store
+            .typed_agent_install_watch(job_id, after_cursor)
             .await
     }
 

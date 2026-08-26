@@ -1432,6 +1432,27 @@ impl SqliteStoreHandle {
         .await
     }
 
+    pub async fn typed_agent_install_retry(
+        &self,
+        job_id: String,
+    ) -> Result<haider_store::TypedAgentInstallRetryResult, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.typed_agent_install_retry(&job_id)))
+            .await
+    }
+
+    pub async fn typed_agent_install_watch(
+        &self,
+        job_id: String,
+        after_cursor: u64,
+    ) -> Result<haider_store::TypedAgentInstallWatchResult, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.typed_agent_install_watch(&job_id, after_cursor))
+        })
+        .await
+    }
+
     pub async fn typed_agent_install_compare_and_swap(
         &self,
         update: TypedAgentInstallCas,

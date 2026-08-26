@@ -193,8 +193,8 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
         welcome_features().len(),
-        82,
-        "the ordinary Welcome advertises all 78 base and four v0.0.962 feature tokens"
+        83,
+        "the ordinary Welcome advertises all 78 base and five v0.0.962 feature tokens"
     );
     assert_eq!(
         welcome_features(),
@@ -226,6 +226,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_HAIDER_CODE_PLAN_STATUS_V1.to_owned(),
             haider_rpc::FEATURE_LOOM_CLI_PRESENCE_V1.to_owned(),
             haider_rpc::FEATURE_TYPED_AGENT_INSTALL_V1.to_owned(),
+            haider_rpc::FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_RUN_ID_V1.to_owned(),
             haider_rpc::FEATURE_LOOM_V1.to_owned(),
             haider_rpc::FEATURE_WORKFLOW_INSTANCE_V1.to_owned(),

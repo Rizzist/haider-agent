@@ -71,7 +71,8 @@ pub use haider_store::{
     SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SwitchedGraph,
     TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand,
     TurnCancelOutcome, TurnCancellationStatus, TypedAgentInstallCas, TypedAgentInstallItemCas,
-    TypedAgentInstallSnapshot,
+    TypedAgentInstallRetryResult, TypedAgentInstallSnapshot, TypedAgentInstallWatchPage,
+    TypedAgentInstallWatchResult,
 };
 pub use prompt_history::{
     ArtifactReader, CompiledPromptProjection, PromptHistoryCache, PromptHistoryCompiler,
