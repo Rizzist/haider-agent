@@ -1,9 +1,9 @@
 # Haider client contract — revision 1
 
 Status: authoritative for wire protocol `v = 1`  
-Source snapshot: package `0.0.943` plus the additive snapshot-availability field in this tree  
-N-1 compatibility baseline: `0.0.942`  
-Contract revision date: 2026-08-25
+Source snapshot: package `0.0.961`  
+N-1 compatibility baseline: `0.0.960`  
+Contract revision date: 2026-08-26
 
 This document is the client-facing contract of `haider-rpc`,
 `haider-client`, and the daemon producers behind them. Rust types and golden
@@ -203,10 +203,17 @@ An operation not listed here is part of the v1 base surface. “Field” means t
 client may use that field only when it is present; the named token permits an
 affordance before the response exists.
 
+The ordinary v0.0.961 `welcome_features()` set contains all 78 tokens below.
+The re-verification anchors are
+`crates/haider-daemon/src/connection.rs:1784-1864` for the assembled set and
+`crates/haider-rpc/src/frame.rs:246-480` for the exact string constants. The
+one peer-specific withholding exception is §4.1.
+
 | Feature token | Methods, frames, or fields it publishes |
 |---|---|
 | `session_mutation_v1` | `session.create` and typed create metadata |
 | `session_permission_overrides_v1` | `session.create.permission_overrides` and metadata permission overrides |
+| `autonomous_interaction_v1` | `session.create.interaction_mode` and `SessionMetadataV1.interaction_mode` |
 | `turn_control_v1` | `turn.submit`, `turn.cancel` |
 | `queue_control_v1` | `queue.list`, `queue.remove`, `queue.promote_steer`, and durable `QueueChanged` events on an attached session |
 | `run_retry_v1` | `run.retry` |
@@ -226,6 +233,7 @@ affordance before the response exists.
 | `shell_exec_v1` | receipt-backed direct user `shell.exec` |
 | `user_command_v1` | direct user shell-command provenance/output committed into later model context and the synthetic `shell.exec.run_id` cancellation coordinate; paired with `shell_exec_v1`, unrelated to catalog rows whose `kind` is `"custom"` |
 | `tool_inventory_v1` | `tools.inventory` |
+| `monitor_v1` | daemon-owned durable session `monitor` model tool and source/delivery runtime; no client RPC method and not the private APK transport |
 | `vault_stage_v1` | `vault.stage` |
 | `account_login_api_v1` | `account.login_api` |
 | `account_oauth_pkce_v1` | browser/loopback `account.oauth_start/status/cancel` |
@@ -270,6 +278,8 @@ affordance before the response exists.
 | `convergence_graph_v4` | `graph.run_set.open` and todo child-graph telemetry |
 | `loom_v1` | `loom.list/register_agent_type/register_workflow` |
 | `loom_cli_presence_v1` | `loom.list.cli_present` |
+| `typed_agent_install_v1` | `loom.install.status` and the durable required-CLI install lifecycle started by agent-type registration |
+| `session_workflow_state_v1` | `SessionObserveDigest.workflow` on `session.observe` and `session.observe_batch` |
 | `store_health_v1` | unsolicited latched/replayed store-health `ProtocolError` transitions |
 | `resident_session_binding_v1` | bidirectional `ResidentSessionBinding` baseline/push frame and its generation fence; it does not by itself guarantee publisher-token echo |
 | `resident_session_binding_token_v1` | for every accepted publication carrying a valid client-originated `binding_token`, the daemon stores it with that publisher and echoes it verbatim on `ResidentSessionBinding` baselines/pushes; a publisher that supplies no token produces no field, never an empty string |
@@ -285,16 +295,18 @@ affordance before the response exists.
 Normally a feature token means “this daemon implements the named surface,” so
 its absence reads as unimplemented. `FEATURE_USER_COMMAND_V1`
 (`"user_command_v1"`) is the sole exception. In
-`crates/haider-daemon/src/connection.rs:1829`, `encode_welcome_for_peer`
+`crates/haider-daemon/src/connection.rs:1876-1896`, `encode_welcome_for_peer`
 removes only this token and retries the otherwise unchanged `Welcome` when
 advertising that token is exactly what pushes the frame past the peer's
 receive-frame limit. Every other encoding failure remains fatal. The reason
 is that one additive feature must not make the whole pre-existing connection
 surface unavailable to a tightly bounded peer.
 
-The additive Welcome field `uw` disambiguates that cause. It is absent by
-default and when false; it is serialized only as `"uw":true` after this one
-token was actually withheld. Therefore the three observable states are:
+The additive Welcome field `uw` disambiguates that cause
+(`haider_rpc::Welcome.user_command_withheld` at
+`crates/haider-rpc/src/frame.rs:614-621`). It is absent by default and when
+false; it is serialized only as `"uw":true` after this one token was actually
+withheld. Therefore the three observable states are:
 
 - absent `user_command_v1`, absent `uw`: an old or non-implementing daemon;
 - present `user_command_v1`, absent `uw`: implemented and not withheld;
@@ -332,6 +344,7 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | Exact event range | `session.read` | `SessionRead` / `SessionReadResult` | non-subscribing snapshot | raw committed envelopes |
 | Current session state | `session.observe` | `SessionObserve` / `SessionObserveDigest` | bounded snapshot at one head | daemon journal reducer |
 | Several current states | `session.observe_batch` | `SessionObserveBatch` | ordered bounded snapshots | same reducer, request order preserved |
+| Active session workflow | digest `workflow` from either observe door | `Option<GraphStatus>` inside each `SessionObserveDigest` | same bounded snapshot, including the metadata-only fast path | active retained Convergence Graph projection at the digest head |
 | Descendant fleet | `session.fleet` | `SessionFleet` | bounded snapshot | durable delegation records plus child journals |
 | Transcript replay/live tail | `session.attach` | `SessionAttach`, `Event*`, `AttachCaughtUp` | replay then live stream | raw journal envelopes |
 | End replay/live tail | `session.detach` | `SessionDetach` | connection-local command | attachment registry |
@@ -349,7 +362,8 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | Resident binding | top-level `ResidentSessionBinding` | same top-level frame fanned out; no response | required unsolicited baseline and pushes | profile-global most-recent live publisher |
 | Volatile input/status | `session.surface_watch` | `SessionSurfaceWatching`, then `SessionSurfaceDelta` | complete baseline then complete latest snapshots | live publisher registry; not journaled |
 | Volatile input action | `session.input_inject` | `SessionInputInjectAck`, then owner receives `SessionInputInjected` | routed action | current live input owner |
-| Workflows | `loom.list` | `LoomList` | snapshot | persisted Loom registry; pipe source is workflow structure of record |
+| Workflows and agent types | `loom.list` | `LoomList` | snapshot | persisted Loom registry; pipe source is workflow structure of record |
+| Typed-agent install readiness | `loom.install.status` | `LoomInstallStatus` | reconnectable, bounded snapshot | durable install jobs and per-CLI items read from one store snapshot |
 | Todos | raw `ItemEvent` envelopes (`TurnItem` with `item: "plan"`) | no independent snapshot response | attach replay/live lifecycle | durable item lifecycle; reducer in §12 |
 
 ### 5.2 Mutation and specialist doors
@@ -393,14 +407,49 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 The golden matrix at
 `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`, combined
 with the historical `wire_transcript.json`, pins a request and successful
-response for every one of the 76 v1 request methods. `menu.answer` and resident
+response for every one of the 78 v1 request methods. `menu.answer` and resident
 binding are top-level frames, not `RequestBody` methods.
+
+### 5.3 Advertised runtime with no client method
+
+`monitor_v1` negotiates the daemon-owned, durable, session-scoped `monitor`
+**model tool** and the source/delivery runtime that can wake a session from a
+matching external event. Its source anchors are
+`haider_rpc::FEATURE_MONITOR_V1` at
+`crates/haider-rpc/src/frame.rs:309-311`, the model-facing `MonitorRequest` at
+`crates/haider-tools/src/monitor.rs:22-72`, the daemon registration at
+`crates/haider-daemon/src/worker.rs:7382-7389`, and dispatch at
+`crates/haider-daemon/src/worker.rs:9569-9588`.
+
+There is no `monitor.*` variant in `haider_rpc::RequestBody` or
+`haider_rpc::ResponseBody`; therefore there is no client request or response
+shape to implement. `register`, `list`, and `remove` are tagged operations in
+model tool arguments, not RPC method names. A client may render their ordinary
+durable tool/item transcript, and may discover the model tool through the
+separately gated `tools.inventory` snapshot
+(`crates/haider-daemon/src/worker.rs:11421-11442`), but MUST NOT copy its
+manifest into a client catalog or manufacture a monitor-administration door.
+
+Without `monitor_v1`, monitor support is unavailable to that connection: a
+client disables any capability indicator and neither infers registrations
+from transcript prose nor sends an invented method. This absence is not an
+empty monitor list because the v1 client wire has no monitor-list snapshot.
+
+The APK monitor delivery path is intentionally **not** this client contract.
+`crates/haider-daemon/src/mobile_transport.rs:1299-1331` reserves private
+negative integer ids so daemon-originated APK chat delivery cannot collide
+with the APK's positive chat ids, and
+`crates/haider-daemon/src/mobile_transport.rs:999-1020` writes private
+`chat.delta`/`chat.done` envelopes. Those frames are mobile-transport
+implementation detail, not v1 client frames, not a `monitor` RPC surface, and
+MUST NOT be implemented or consumed by an ADE client.
 
 ## 6. Snapshot, watch, invalidation, push, and replay laws
 
 - `session.list`, `session.read`, `session.observe`, `session.observe_batch`,
   `session.fleet`, `command.list`, `account.list`, `account.oauth_import_sources`, `provider.list`,
-  `usage.report`, `usage.history_day`, `usage.history_range`, `loom.list`, `tools.inventory`, `hooks.list`, graph reads,
+  `usage.report`, `usage.history_day`, `usage.history_range`, `loom.list`,
+  `loom.install.status`, `tools.inventory`, `hooks.list`, graph reads,
   `queue.list`, and `session.pipe_path` are snapshots. Calling them does not
   subscribe.
 - `session.list_watch` subscribes before acknowledging. Its first
@@ -583,8 +632,9 @@ generation, or surface owner/revision as if they were one observation.
 
 | Fact being rendered | Winning client door | Lower projections and rule |
 |---|---|---|
-| Roster row, provider, last model, title, workspace, turn count, footprint, lineage, run badge/id, cache headline | `SessionSummary` from `session.list` or `SessionRosterDelta` at that head | A digest or raw-event fold is fallback only. An absent top-level field stays unknown unless this contract names an exact compatibility source, as it does for the promoted cache fields in §1.1; it must never be overwritten by a guessed/default value. |
-| Detailed current run/menu/branch/subagent state | `SessionObserveDigest` at its `head_seq` | Raw events are durable facts but a client need not rebuild the daemon reducer. `metadata_only=true` authorizes only metadata/title/head/generation; projected defaults are not state. |
+| Roster row, provider, last model, title, workspace, turn count, footprint, lineage, run badge/id, cache headline | `SessionSummary` from `session.list` or `SessionRosterDelta` at that head | A digest or raw-event fold is fallback only. Session lineage is the delegation ancestry formed by `kind` and `parent_session_id`; it is not the session's workflow DAG. An absent top-level field stays unknown unless this contract names an exact compatibility source, as it does for the promoted cache fields in §1.1; it must never be overwritten by a guessed/default value. |
+| Detailed current run/menu/branch/subagent state | `SessionObserveDigest` at its `head_seq` | Raw events are durable facts but a client need not rebuild the daemon reducer. `metadata_only=true` authorizes metadata/title/head/generation and, when `session_workflow_state_v1` is advertised, `workflow`; every other projected default is not state. |
+| Active workflow state | `SessionObserveDigest.workflow` at the digest `head_seq` when `session_workflow_state_v1` is advertised | If that bit is absent, separately gated `graph.status` is the read fallback. Neither `SessionSummary.kind`/`parent_session_id`, `session.select_agent_type`, nor a `LoomWorkflow` registry record is a substitute for current workflow state. |
 | Durable event fact and replay cursor | `RawEnvelope` from read/attach | Summary/digest are projections and cannot invent or reorder the event. Preserve raw payload. |
 | Transcript display rows | a current-generation native pipe followed to full coverage | Raw item/node events are the durable fallback. At equal coverage, do not show both pipe and fallback rows. Pipe is not authority for run, account, roster, or permission state. |
 | Current todo panel | latest open `TurnItem` lifecycle whose `item` is `"plan"`, at the applied raw-event cursor | There is no summary/digest todo projection. Use the exact reducer in §12; do not infer a plan from tool text. |
@@ -597,7 +647,9 @@ generation, or surface owner/revision as if they were one observation.
 | Volatile composer/status | surface watch response/delta | Journal and terminal scraping are not fallback sources. Reconnect/watch again after owner loss. |
 | Resident profile binding and client-minted surface correlation | `ResidentSessionBinding` baseline/push and optional `binding_token` | OSC 7791 is compatibility output, not an authority or required per-pane source; see §11. |
 | Commands and ownership | `command.list` result | Never mirror `COMMANDS`. Ownership `"client_view"` is deliberately client-owned; `"unknown"` is non-executable. |
-| Workflows/agent types | `loom.list` | Compiled graph material is derived; `LoomWorkflow.source` is the workflow structure of record. |
+| Workflow/agent-type registry | `loom.list` | Compiled graph material is derived; `LoomWorkflow.source` is the workflow structure of record. |
+| Typed-agent required-CLI readiness | `loom.install.status` for the exact agent-type/job coordinates | `loom.list.cli_present` is point-in-time advisory PATH inventory only. It never proves install-ready, and a client must not turn it into a synthetic install job or state. |
+| Session interaction mode | `SessionMetadataV1.interaction_mode` from the winning create, summary/roster-delta, read, observe/batch, fork, or committed-metafork metadata projection | A missing `interaction_mode` inside present typed metadata is the source-defined legacy `interactive` value. Missing metadata makes the mode unknown; permission overrides and observed menu state do not reconstruct it. |
 
 If two winning snapshots have different heads/revisions, select the newer
 complete snapshot as a unit. Do not take a model from one and a cache rate from
@@ -721,12 +773,16 @@ a general absence sentinel; generation comparisons use the supplied integer.
 | subagent `callsign` | daemon never persisted one; a UI fallback is display-only |
 | digest `turn_count`, `agent_metrics` | old daemon or `metadata_only` response; not zero |
 | digest `needs_input` | no current human park or old daemon without the field |
+| digest `workflow` | with `session_workflow_state_v1`, no active pinned workflow. Without that bit, the projection is unavailable and a client may use only the separately gated `graph.status` fallback |
 | attach `sealed_replay` omitted/false | replay ordinary durable deltas; true may omit superseded item deltas only during initial store replay |
 
 `last_event_limit = 0` requests no trailing kind names; it does not make the
 rest of the digest metadata-only. An empty branch list means only the implicit
 main branch is known. An empty pending-menu/subagent list is genuine for a full
-digest, but is merely a skipped projection when `metadata_only=true`.
+digest, but is merely a skipped projection when `metadata_only=true`. The
+advertised `workflow` field is the deliberate exception: the daemon copies it
+from the same cached sealed-journal snapshot after constructing either the full
+or metadata-only digest.
 
 ### 9.4 Request optionals with semantic meaning
 
@@ -735,6 +791,7 @@ digest, but is merely a skipped projection when `metadata_only=true`.
 | `session.list.cursor` | first page; a returned cursor is opaque and passed verbatim |
 | create `permission_overrides` | daemon defaults |
 | create `cache_policy` | daemon/default policy |
+| create `interaction_mode` | the source-defined `interactive` enum value. A client may send `"autonomous"` only when `autonomous_interaction_v1` is advertised |
 | surface publish `input` or `status` | leave that surface unchanged; empty text/line is a value |
 | branch-scoped `branch_id` | implicit main branch |
 | branch/fork `source_branch_id` | source main branch |
@@ -947,8 +1004,13 @@ contract defect.
   their typed graph records; unknown graph payload additions remain raw in
   journal replay.
 - `LoomList.cli_present[name]` absent means not probed. `false` means probed
-  and missing. Empty `agent_types`/`workflows` in a successful snapshot means
-  none registered.
+  and missing. `true` means only present on PATH at list time; neither boolean
+  is typed install readiness. Empty `agent_types`/`workflows` in a successful
+  snapshot means none registered.
+- `LoomInstallStatus.jobs=[]` and `items=[]` in a successful, advertised
+  snapshot mean no retained install job matched the supplied filters. They do
+  not mean an installation succeeded. An absent install-status feature or a
+  failed request is typed unavailability, not an empty result.
 - `OAuthStart` optionals are present only when that flow form supplies them.
   `availability.available=false` must carry the public reason; absence of a
   URL/flow id is not permission to synthesize one. `user_code` exists only for
@@ -971,6 +1033,7 @@ surface tables above.
 | `Welcome.encoding` | JSON, as defined at the switch boundary in §3.2 |
 | session metadata `system_prompt_version` | legacy or unspecified daemon policy version; do not name one client-side |
 | session metadata `permission_overrides` | daemon registry defaults; the nested false booleans grant nothing |
+| session metadata `interaction_mode` | omitted inside present `SessionMetadataV1` is the serialized legacy/default value `"interactive"`; absence of the outer metadata still means the session mode is unknown |
 | session metadata `title`, `effort`, `agent_type` | untitled, provider default, and plain session respectively; metadata `fast=false` and default cache policy are real defaults, not missing values |
 | `command.invoke.session_id` | launcher/global command context; an operation that needs a session must refuse, not choose one |
 | `command.list.items=[]` | no catalog rows match the supplied query/context; the advertised command-door feature establishes that the subsystem answered |
@@ -1100,6 +1163,68 @@ The durable permission event enumerates allowed actions such as open settings,
 retry, or restart. Opening settings does not resolve the menu. Retry/decision
 still uses the separately fenced menu answer coordinates, and the daemon
 rechecks the OS. Clients must not treat a successful open action as a grant.
+
+### 10.4 Autonomous session interaction policy
+
+`autonomous_interaction_v1` adds no new method. It gates one additive field on
+the existing `session.create` door and the same field in typed metadata. The
+wire/type anchors are `RequestBody::SessionCreateWithPermissionOverrides` at
+`crates/haider-rpc/src/frame.rs:1703-1722`, `ResponseBody::SessionCreate` at
+`crates/haider-rpc/src/frame.rs:2439-2444`, and
+`SessionInteractionModeV1`/`SessionMetadataV1.interaction_mode` at
+`crates/haider-protocol/src/session.rs:5-22,98-104`.
+
+The metadata member also rides `SessionSummary` from `session.list` and
+`SessionRosterDelta`, `SessionReadResult` from `session.read`,
+`SessionObserveDigest` from `session.observe`/`session.observe_batch`,
+`SessionFork`, and a committed `SessionMetafork`
+(`crates/haider-rpc/src/frame.rs:1149-1153,1330-1339,1489-1496,2637-2675`).
+Those owning surfaces retain their own base/feature gates;
+`autonomous_interaction_v1` gates this metadata member wherever typed metadata
+is present.
+
+The create dispatcher passes the decoded value to the producer, which stores
+it in durable `SessionMetadataV1` and returns that metadata in the success
+response (`crates/haider-daemon/src/session_hub/rpc.rs:1975-2005,8925-8977,9077-9110`
+and `crates/haider-store/src/event_store.rs:5876-5946`).
+
+| Direction | Method/type | Fields |
+|---|---|---|
+| Request | `session.create` | `command_id: CommandId`, `cwd: String`, `provider: String`, `model: String`, `max_tokens: u64`, `permission_overrides: Option<SessionPermissionOverridesV1>`, `cache_policy: Option<CachePolicySettingsV1>`, `interaction_mode: SessionInteractionModeV1` |
+| Success response | `SessionCreate` (`method: "session.create"`) | `session_id: SessionId`, `created_seq: u64`, `worker_generation: u64`, `metadata: SessionMetadataV1`; the metadata carries the same `interaction_mode: SessionInteractionModeV1` |
+
+The exact enum strings are `"interactive"` and `"autonomous"`.
+`interactive` is the serde default and is omitted on the wire; that is a
+source-defined compatibility value, not a client-invented default. When the
+feature is advertised, an omitted request field creates an interactive
+session and an omitted `interaction_mode` inside present `SessionMetadataV1`
+means interactive. If the outer metadata is absent, the mode is unknown.
+
+The mode is a human-availability contract, not a permission grant. The exact
+autonomous resolutions in
+`crates/haider-protocol/src/interaction.rs:5-94` are:
+
+| Gate | Autonomous resolution |
+|---|---|
+| `InteractionGate::RequestInputWithDefault` | `InteractionResolution::UseDeclaredDefault` |
+| `InteractionGate::RequestInputWithoutDefault` | `InteractionResolution::ReturnNoHumanAvailable` |
+| `InteractionGate::PartialProviderStream` | `InteractionResolution::ContinuePartial` |
+| `InteractionGate::WorkflowUnfinishedFirst` | `InteractionResolution::ContinueWorkflow` |
+| `InteractionGate::WorkflowUnfinishedRecurrence` | `InteractionResolution::ReturnWorkflowUnfinished` |
+| `InteractionGate::EffectBrokerAsk`, `InteractionGate::OsOrDesktopPermission`, `InteractionGate::CredentialOrLogin`, `InteractionGate::MobileOrDeviceGrant`, `InteractionGate::GraphHumanConfirm`, `InteractionGate::UnknownEffectAfterCrash`, `InteractionGate::DestructiveOrClobber`, or `InteractionGate::CacheEpochOrConfiguration` | `InteractionResolution::FailClosed` |
+
+`ReturnNoHumanAvailable` commits the typed tool code
+`"no_human_available"` (`crates/haider-core/src/actor.rs:5544-5577`), and
+`ReturnWorkflowUnfinished` publishes the turn error code
+`"workflow_unfinished"` (`crates/haider-daemon/src/worker.rs:509-528`).
+
+In particular, autonomous mode MUST NOT be rendered as auto-approval. Durable
+permission overrides remain a separate field and authority. Without
+`autonomous_interaction_v1`, a client MUST omit `interaction_mode`, MUST NOT
+offer autonomous creation, and may use only the base interactive create
+behavior. Sending `"autonomous"` to a daemon that did not advertise the bit is
+unsafe because an older object decoder may ignore the additive field and
+create an interactive session instead.
 
 ## 11. Resident binding and volatile surfaces
 
@@ -1325,7 +1450,9 @@ through normal attach replay.
   `dep: None` means no dependency. A listed item whose referenced dependency
   is not completed is blocked. Do not derive dependency from ordering or text.
 
-## 13. Workflows
+## 13. Workflows and typed-agent execution
+
+### 13.1 Registry and advisory CLI presence
 
 `loom.list` returns registered `LoomAgentType` and compiled `LoomWorkflow`
 records. An available empty list is genuinely empty. `LoomWorkflow.source` in
@@ -1338,6 +1465,169 @@ not probed; `false` means probed and unavailable; `true` means present at list
 time, not a permanent execution guarantee. Agent-type optional/empty
 capability lists mean none declared, and empty color/glyph means no declared
 accent. A client must not infer capabilities from the job prose.
+
+### 13.2 Durable typed-agent installation
+
+`typed_agent_install_v1` negotiates the reconnectable required-CLI install
+status surface. Registering or revising a `LoomAgentType` through
+`loom.register_agent_type` atomically creates a durable install job for the
+exact stored type revision/digest when its derived contract has required CLIs;
+the existing success response remains `LoomRegistered` and does not contain
+the job. A client observes the resulting work through the View-plane read
+below. Registration and installer adoption are anchored at
+`crates/haider-daemon/src/session_hub/mod.rs:2109-2140` and the atomic store
+transaction at
+`crates/haider-store/src/event_store.rs:2094-2247,16264-16326`. The
+request/response anchors are
+`RequestBody::LoomInstallStatus` at
+`crates/haider-rpc/src/frame.rs:1853-1861`,
+`ResponseBody::LoomInstallStatus` at
+`crates/haider-rpc/src/frame.rs:2588-2594`, and the producer at
+`crates/haider-daemon/src/session_hub/rpc.rs:6934-6962`.
+
+| Direction | Method/type | Fields |
+|---|---|---|
+| Request | `loom.install.status` | `job_id: Option<String>`, `agent_type_id: Option<String>` |
+| Success response | `LoomInstallStatus` (`method: "loom.install.status"`) | `jobs: Vec<TypedAgentInstallJob>`, `items: Vec<TypedAgentInstallItem>` |
+
+On the wire, an empty `jobs` or `items` vector is omitted and decodes to empty
+inside this successful advertised response. That field omission is not feature
+absence or request failure.
+
+Omitting both request filters selects the bounded newest retained jobs. Either
+filter narrows the result and supplying both applies both. The bound is 32
+jobs (`crates/haider-protocol/src/typed_agent.rs:30-33`). The store selects
+that newest window, then returns jobs in stable
+`(agent_type_id, agent_type_rev, job_id)` order and items in stable
+`(agent_type_id, agent_type_rev, ordinal)` order. Jobs and their items come
+from one SQLite snapshot, so a response never pairs a pre-transition job with
+post-transition item rows. These producer laws are pinned at
+`crates/haider-store/src/event_store.rs:2273-2285,16355-16467`.
+
+The direct response records are exactly:
+
+| Type | Fields |
+|---|---|
+| `TypedAgentInstallJob` | `job_id: String`, `agent_type_id: String`, `agent_type_rev: u32`, `agent_type_digest: String`, `state: TypedAgentInstallState`, `progress: TypedAgentInstallProgress`, `error: Option<String>`, `created_at_ms: u64`, `updated_at_ms: u64` |
+| `TypedAgentInstallProgress` | `total: u16`, `completed: u16`, `current_cli: Option<String>` |
+| `TypedAgentInstallItem` | `job_id: String`, `ordinal: u16`, `required_cli: TypedAgentRequiredCli`, `state: TypedAgentInstallState`, `error: Option<String>`, `created_at_ms: u64`, `updated_at_ms: u64` |
+| `TypedAgentRequiredCli` | `program: String` |
+
+`TypedAgentInstallState` has the exact frozen wire strings `"queued"`,
+`"installing"`, `"verifying"`, `"succeeded"`, and `"failed"`; the record
+definitions and transition/absence invariants are at
+`crates/haider-protocol/src/typed_agent.rs:115-457`. `error` is present for a
+failed job/item and absent otherwise. `current_cli` names current progress only
+when supplied; its absence MUST NOT be rendered as completion. A present
+`completed: 0`, item `ordinal: 0`, or required timestamp value of zero is data,
+not absence; `total` is validated as `1..=32`, never zero.
+
+A successful empty result means no retained job matched. For a registered type
+whose `clis` list is empty, CLI installation is not applicable and the daemon
+deliberately creates no job; this is not a `TypedAgentInstallState` literal and
+MUST NOT be labeled `succeeded`, `failed`, or unavailable. For a type with
+required CLIs, typed dispatch admits only a valid `succeeded` job whose
+`agent_type_id`, `agent_type_rev`, and `agent_type_digest` match that exact
+contract
+(`crates/haider-daemon/src/typed_agent_executor.rs:56-109`). The daemon's
+executor, not the client, remains the execution admission authority.
+
+`job_id` is a daemon-issued opaque filter coordinate and MUST be echoed
+verbatim, never rebuilt from the private store format at
+`crates/haider-store/src/event_store.rs:16272-16276`. Likewise,
+`agent_type_digest` is daemon-published in registration/install-job records;
+`LoomAgentType` has no digest field on the list wire
+(`crates/haider-protocol/src/loom.rs:33-60`). A client MUST NOT hash registry
+JSON or manufacture either coordinate.
+
+PATH presence is not install-ready. `LoomList.cli_present` is an advisory
+point-in-time device probe; even `true` cannot replace a missing, pending,
+failed, invalid, or stale durable install job. This hard fence is source law at
+`crates/haider-daemon/src/typed_agent_executor.rs:40-112`.
+
+`session.select_agent_type` is also not capability-scoped execution. That
+separately gated method updates only `SessionMetadataV1.agent_type` and returns
+a durable selection receipt. The selected type's `LoomAgentType.job` prose
+rides the same session's volatile prompt tail, and accent surfaces may join its
+color by id; selection does not assess install readiness or mint a `Grant` or
+`cli_scope`
+(`crates/haider-protocol/src/session.rs:129-135`,
+`crates/haider-store/src/event_store.rs:7264-7335`,
+`crates/haider-daemon/src/worker.rs:5324-5337`, and
+`crates/haider-rpc/src/frame.rs:1232-1236`).
+
+Capability-scoped typed execution uses different daemon doors. A model
+`spawn_subagent.agent_type` request resolves the current registry record and a
+matching install job before child creation, then freezes the task/prompt,
+effective grant, and manifest `cli_scope` at spawn
+(`crates/haider-daemon/src/typed_agent_executor.rs:39-132`,
+`crates/haider-daemon/src/worker.rs:9847-9921`, and
+`crates/haider-daemon/src/delegation.rs:212-254,314-338`). A ready typed Loom
+workflow node instead validates its pinned `agent_type_rev`/`agent_type_digest`
+against the exact record/job and creates a request-bound grant and CLI scope
+(`crates/haider-daemon/src/typed_agent_executor.rs:135-225` and
+`crates/haider-daemon/src/worker.rs:7510-7549`). A client MUST NOT treat a
+successful `session.select_agent_type` as either path, install success, or a
+grant to execute the type's CLIs/APIs.
+
+Without `typed_agent_install_v1`, a client MUST NOT call
+`loom.install.status`, MUST report typed install readiness unavailable, and
+MUST NOT substitute `cli_present`, a terminal transcript, or a locally probed
+program. It may still use separately advertised Loom registry and inline
+agent-type selection surfaces, without claiming capability-scoped readiness.
+
+### 13.3 Session workflow projection
+
+`session_workflow_state_v1` adds `workflow: Option<GraphStatus>` to each
+`SessionObserveDigest`. It does not add a method. The complete owning method
+shapes are:
+
+| Direction | Method/type | Fields |
+|---|---|---|
+| Request | `session.observe` | `session_id: SessionId`, `last_event_limit: u32`, `metadata_only: bool` |
+| Success response | `SessionObserve` (`method: "session.observe"`) | `digest: SessionObserveDigest`; the advertised addition is `digest.workflow: Option<GraphStatus>` |
+| Request | `session.observe_batch` | `session_ids: Vec<SessionId>` (1–64), `last_event_limit: u32`, `metadata_only: bool` |
+| Success response | `SessionObserveBatch` (`method: "session.observe_batch"`) | `digests: Vec<SessionObserveDigest>` in request order; every digest has the same `workflow: Option<GraphStatus>` field |
+
+The wire anchors are `SessionObserveDigest.workflow` at
+`crates/haider-rpc/src/frame.rs:1535-1540`, the request variants at
+`crates/haider-rpc/src/frame.rs:1783-1807`, and the response variants at
+`crates/haider-rpc/src/frame.rs:2486-2491`. The batch bound and request-order
+production are at
+`crates/haider-daemon/src/session_hub/rpc.rs:9724-9759`. The digest producer
+takes workflow from the same cached sealed-journal snapshot and explicitly
+assigns it after constructing either the full or metadata-only shape
+(`crates/haider-daemon/src/session_hub/rpc.rs:1119-1158`). Therefore the
+advertised workflow field remains authoritative at `digest.head_seq` even
+when `metadata_only=true`; the other skipped projections do not become state.
+
+The direct `GraphStatus` fields are `graph_id: GraphId`, `template: String`,
+`digest: String`, `template_version: u32`,
+`start_node: Option<GraphNodeName>`, `phase: GraphPhase`,
+`current_node: Option<GraphNodeName>`, `ready_nodes: Vec<GraphNodeName>`,
+`attempt: u32`, `nodes: Vec<GraphNodeStatus>`,
+`blocked_reason: Option<GraphBlockReason>`,
+`pending_menu: Option<MenuId>`, `pending_menus: Vec<MenuId>`, and
+`run_set: Option<GraphRunSetStatus>`
+(`crates/haider-protocol/src/graph.rs:898-924`). Their nested enum and optional
+laws remain the graph laws already referenced by §§9.7, 9.8, and 14.
+
+With the feature advertised, `workflow=None` means no active pinned workflow
+at that digest head. Without it, the digest projection is typed unavailable;
+if `convergence_graph_v1` is separately advertised, a client may issue
+`graph.status` as the explicit fallback. It MUST NOT derive workflow state
+from `loom.list`, from a selected `agent_type`, or from session lineage.
+
+The concepts are intentionally disjoint:
+
+- the workflow DAG is the active retained Convergence Graph projection in
+  `SessionObserveDigest.workflow` (or the separately gated `graph.status`
+  fallback);
+- the Loom registry's `LoomWorkflow.source` is workflow structure of record,
+  not proof that a session has pinned or advanced that workflow; and
+- the agent-lineage graph is delegation ancestry from `SessionSummary.kind`
+  plus `parent_session_id`. It is not the workflow DAG and MUST NOT be folded
+  into one client graph.
 
 ## 14. Forward compatibility and raw preservation
 
@@ -1352,6 +1642,16 @@ a variant would break an old decoder, so expansion requires a new field/type or
 a raw additive event family. Others explicitly absorb unknown variants. The
 complete classification is normative in
 [Client contract v1 — wire enum audit](client-contract-v1-enum-audit.md).
+
+That sibling audit's dated snapshot predates the two direct v0.0.961 enum
+additions documented here. Until the appendix is refreshed in its own scoped
+change, `SessionInteractionModeV1` (`"interactive" | "autonomous"`) and
+`TypedAgentInstallState`
+(`"queued" | "installing" | "verifying" | "succeeded" | "failed"`) are
+normatively **Frozen**: neither has `#[serde(other)]` or a custom unknown
+carrier. A new state requires a replacement field/type, feature-gated method,
+or wire-version change; a client MUST NOT map an unfamiliar literal to one of
+the shipped values.
 
 Never derive an enum's wire spelling from its Rust variant name. Read the
 variant's `#[serde(rename = "...")]` first, then its enum-level serde rule, and
@@ -1370,7 +1670,7 @@ The machine-checkable contract lives in these fixtures/tests:
   receipts.
 - `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`: the
   methods added after the historical matrix, completing golden request and
-  successful response coverage for all 76 request methods and all five
+  successful response coverage for all 78 request methods and all five
   command dynamic slots.
 - `crates/haider-rpc/tests/fixtures/snapshot_availability_compat_v1.json`:
   old and new account/provider/usage response bytes.
