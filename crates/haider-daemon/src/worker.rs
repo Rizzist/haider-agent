@@ -493,8 +493,35 @@ impl FinalizationGuard for DaemonGraphFinalizationGuard {
             GraphFinalizationOutcome::ConfirmRequired { menu, .. } => {
                 FinalizationGuardDecision::ConfirmRequired(menu)
             }
+            GraphFinalizationOutcome::WorkflowUnfinished {
+                graph_id,
+                state_digest,
+            } => return Err(workflow_unfinished_error(&graph_id, &state_digest)),
         })
     }
+}
+
+fn workflow_unfinished_error(graph_id: &GraphId, state_digest: &str) -> HaiderError {
+    let mut error = HaiderError::new(
+        ErrorCode::WorkflowUnfinished,
+        format!(
+            "workflow_unfinished: graph {graph_id} remains unfinished after its one autonomous continuation (state {state_digest})"
+        ),
+        false,
+    )
+    .with_presentation(ErrorPresentation::new(
+        "workflow_unfinished",
+        "Workflow remains unfinished",
+        "The workflow still has unmet obligations after one autonomous continuation. It was not abandoned.",
+        ErrorScope::Turn,
+        [ErrorAction::None],
+    ));
+    error.details = Some(serde_json::json!({
+        "code": "workflow_unfinished",
+        "graph_id": graph_id,
+        "state_digest": state_digest,
+    }));
+    error
 }
 
 #[async_trait]
@@ -5236,6 +5263,8 @@ async fn start_turn(
     config.agent_id = agent_id;
     config.branch_id = accepted.branch_id.clone();
     config.max_tokens = metadata.max_tokens;
+    config.interaction_policy =
+        haider_core::InteractionResolutionPolicy::new(metadata.interaction_mode);
     config.reserved_output_tokens = metadata.max_tokens;
     if let Some(window) = config.context_window
         && config.reserved_output_tokens >= window
@@ -6889,6 +6918,26 @@ mod manager_law_tests {
         assert!(cancellation_fences_start(Some(RunState::Cancelled)));
         assert!(!cancellation_fences_start(Some(RunState::Queued)));
     }
+
+    #[test]
+    fn recurring_autonomous_workflow_maps_to_a_top_level_typed_error() {
+        let error = workflow_unfinished_error(&GraphId::new("graph-typed"), "digest-typed");
+        assert_eq!(error.code, ErrorCode::WorkflowUnfinished);
+        assert!(!error.retryable);
+        assert_eq!(
+            error
+                .presentation
+                .as_ref()
+                .expect("typed presentation")
+                .subcode
+                .as_str(),
+            "workflow-unfinished"
+        );
+        assert_eq!(
+            error.details.as_ref().expect("typed details")["code"],
+            "workflow_unfinished"
+        );
+    }
 }
 
 // ───────────────── production broker-backed general tools ─────────────────
@@ -7866,12 +7915,31 @@ async fn create_broker_tool_dispatcher(
         match default {
             ToolPermissionDefault::Allow => policy.allow(class),
             ToolPermissionDefault::Ask => policy.ask(class),
-            ToolPermissionDefault::Deny => policy.deny(class, "denied by daemon default policy"),
+            ToolPermissionDefault::Deny => policy.deny(
+                class,
+                if context.metadata.interaction_mode
+                    == haider_protocol::session::SessionInteractionModeV1::Autonomous
+                {
+                    "no_human_available: autonomous mode does not approve effects"
+                } else {
+                    "denied by daemon default policy"
+                },
+            ),
             ToolPermissionDefault::NotApplicable => {}
         }
     }
     for grant in durable_permissions.grants {
         policy.allow_session_grant(grant).map_err(tool_error)?;
+    }
+    let interaction_policy =
+        haider_core::InteractionResolutionPolicy::new(context.metadata.interaction_mode);
+    if interaction_policy.resolve(haider_core::InteractionGate::EffectBrokerAsk)
+        == haider_core::InteractionResolution::FailClosed
+        && interaction_policy.resolve(haider_core::InteractionGate::MobileOrDeviceGrant)
+            == haider_core::InteractionResolution::FailClosed
+    {
+        policy
+            .deny_unresolved_asks("no_human_available: autonomous mode cannot approve this effect");
     }
     let output = HubCommandOutputContext {
         store: context.store.clone(),
@@ -7939,8 +8007,9 @@ pub(crate) fn effective_permission_defaults(
                 // lifted, and `NotApplicable` stays a non-effect — auto-allow
                 // only ever promotes `Ask` to `Allow`. Deny RULES still win at
                 // the broker (denylist is checked before any allow), the OS
-                // TCC gate for computer actions is untouched, and every effect
-                // is still journaled.
+                // TCC gate for computer actions remains independent, and every
+                // effect is still journaled. Autonomous sessions fail that OS
+                // gate closed instead of opening a blocking grant card.
                 let default = if overrides.auto_allow && base == ToolPermissionDefault::Ask {
                     ToolPermissionDefault::Allow
                 } else {
@@ -9744,8 +9813,24 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 .await?;
                         }
                         Err(error @ ComputerError::PermissionRequired { .. }) => {
-                            let pending = Self::pending_permission(&intent, &error)
-                                .expect("permission error has a grant descriptor");
+                            if haider_core::InteractionResolutionPolicy::new(
+                                self.metadata.interaction_mode,
+                            )
+                            .resolve(haider_core::InteractionGate::OsOrDesktopPermission)
+                                == haider_core::InteractionResolution::FailClosed
+                            {
+                                return Err(ToolError::PermissionDenied {
+                                    reason: format!(
+                                        "no_human_available: OS permission requires explicit user action: {error}"
+                                    ),
+                                });
+                            }
+                            let pending = Self::pending_permission(&intent, &error).ok_or_else(|| {
+                                ToolError::Runtime {
+                                    message: "OS permission error omitted its grant descriptor"
+                                        .into(),
+                                }
+                            })?;
                             let menu = Self::permission_menu(
                                 &intent,
                                 pending.permission,
@@ -10893,6 +10978,11 @@ fn request_input_definition() -> ToolDefinition {
                         "required": ["key", "label"],
                         "additionalProperties": false
                     }
+                },
+                "default": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Optional deterministic fallback: literal answer for question, option key for choice"
                 }
             },
             "required": ["kind", "title"],

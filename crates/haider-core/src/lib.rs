@@ -39,6 +39,9 @@ pub use actor::{
     retry_jittered_backoff_ms, sanitized_failure_message,
 };
 pub use fake_store::MemoryStore;
+pub use haider_protocol::interaction::{
+    InteractionGate, InteractionResolution, InteractionResolutionPolicy,
+};
 pub use haider_store::{
     ACCOUNT_REMOVE_METHOD, ACCOUNT_SET_ACTIVE_METHOD, ACCOUNT_SET_DEFAULT_MODEL_METHOD,
     AbandonedGraph, AcceptedRunRetry, AcceptedShellExec, AcceptedTurn, AccountAddClaim,

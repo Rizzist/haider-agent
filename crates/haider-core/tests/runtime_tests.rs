@@ -171,6 +171,70 @@ impl FinalizationGuard for ScriptedFinalizationGuard {
     }
 }
 
+#[derive(Debug)]
+struct FailingFinalizationGuard {
+    error: HaiderError,
+}
+
+#[async_trait]
+impl FinalizationGuard for FailingFinalizationGuard {
+    async fn before_done(&self, _run_id: &RunId) -> Result<FinalizationGuardDecision, HaiderError> {
+        Err(self.error.clone())
+    }
+}
+
+#[tokio::test]
+async fn finalization_failure_journals_top_level_workflow_unfinished_without_parking() {
+    let provider = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]));
+    let store = Arc::new(MemoryStore::new());
+    let mut runtime_config = config();
+    runtime_config.finalization_guard = Some(Arc::new(FailingFinalizationGuard {
+        error: HaiderError::new(
+            ErrorCode::WorkflowUnfinished,
+            "workflow remains unfinished",
+            false,
+        ),
+    }));
+    let handle = HarnessActor::spawn(runtime_config, provider, store.clone());
+
+    let outcome = timeout(
+        Duration::from_secs(2),
+        handle
+            .submit_turn(SubmitTurn::new("finish"))
+            .await
+            .expect("turn accepted")
+            .wait(),
+    )
+    .await
+    .expect("finalization failure is bounded")
+    .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+    assert_eq!(
+        outcome.error.expect("typed failure").code,
+        ErrorCode::WorkflowUnfinished
+    );
+
+    let events = store.events(&SessionId::new(SESSION)).await;
+    assert!(events.iter().any(|event| matches!(
+        typed(event),
+        EventPayload::RunFailed {
+            code: ErrorCode::WorkflowUnfinished,
+            ..
+        }
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        typed(event),
+        EventPayload::RunState(RunState::InputRequired { .. })
+            | EventPayload::RunState(RunState::PermissionRequired { .. })
+    )));
+    assert!(matches!(
+        events.last().map(typed),
+        Some(EventPayload::RunState(RunState::Errored))
+    ));
+}
+
 /// Expected failure under mutation: moving the guard after `Done`, dropping
 /// the reminder continuation, or treating the blocking card as advisory lets
 /// this turn terminalize before durable abandonment authority is observed.

@@ -92,6 +92,7 @@ pub fn transcript() -> Vec<WireFrame> {
         max_tokens: 4096,
         system_prompt_version: Some("fork-policy-v1".into()),
         permission_overrides: None,
+        interaction_mode: Default::default(),
         title: Some("Chocolate-free child".into()),
         effort: None,
         fast: false,
@@ -375,6 +376,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 max_tokens: 4096,
                 permission_overrides: None,
                 cache_policy: None,
+                interaction_mode: haider_protocol::session::SessionInteractionModeV1::Interactive,
             },
         },
         WireFrame::Response {
@@ -389,6 +391,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     model: "claude-test".into(),
                     max_tokens: 4096,
                     permission_overrides: None,
+                    interaction_mode: Default::default(),
                     system_prompt_version: None,
                     title: None,
                     effort: None,
@@ -965,6 +968,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     auto_allow: false,
                 }),
                 cache_policy: None,
+                interaction_mode: haider_protocol::session::SessionInteractionModeV1::Interactive,
             },
         },
         // B2a append-only branch shapes. Every earlier frame stays byte-for-

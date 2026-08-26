@@ -16,6 +16,7 @@ fn metadata(mode: CachePolicyMode, threshold: u64) -> SessionMetadataV1 {
         max_tokens: 4096,
         system_prompt_version: Some("haider-system-v2".into()),
         permission_overrides: None,
+        interaction_mode: Default::default(),
         title: None,
         effort: None,
         fast: false,

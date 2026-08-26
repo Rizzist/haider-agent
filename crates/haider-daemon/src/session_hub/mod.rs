@@ -1209,6 +1209,7 @@ enum ActorCommand {
     },
     CreateSession {
         command: SessionCreateCommand,
+        interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         completed: oneshot::Sender<Result<SessionCreateOutcome, HaiderError>>,
     },
     ForkSession {
@@ -2014,6 +2015,18 @@ impl SessionHub {
         &self,
         command: SessionCreateCommand,
     ) -> Result<CreatedSession, HaiderError> {
+        self.create_internal_session_with_interaction_mode(
+            command,
+            haider_protocol::session::SessionInteractionModeV1::Interactive,
+        )
+        .await
+    }
+
+    pub(crate) async fn create_internal_session_with_interaction_mode(
+        &self,
+        command: SessionCreateCommand,
+        interaction_mode: haider_protocol::session::SessionInteractionModeV1,
+    ) -> Result<CreatedSession, HaiderError> {
         if let Some(created) = self
             .inner
             .store
@@ -2027,7 +2040,7 @@ impl SessionHub {
             return Ok(created);
         }
         match self
-            .create_session(command)
+            .create_session_with_interaction_mode(command, interaction_mode)
             .await
             .map_err(hub_error_as_store)?
         {
@@ -2380,11 +2393,27 @@ impl SessionHub {
         &self,
         command: SessionCreateCommand,
     ) -> Result<SessionCreateOutcome, SessionHubError> {
+        self.create_session_with_interaction_mode(
+            command,
+            haider_protocol::session::SessionInteractionModeV1::Interactive,
+        )
+        .await
+    }
+
+    async fn create_session_with_interaction_mode(
+        &self,
+        command: SessionCreateCommand,
+        interaction_mode: haider_protocol::session::SessionInteractionModeV1,
+    ) -> Result<SessionCreateOutcome, SessionHubError> {
         let actor = self.actor_for(command.session_id.clone()).await?;
         let (completed, result) = oneshot::channel();
         actor
             .commands
-            .send(ActorCommand::CreateSession { command, completed })
+            .send(ActorCommand::CreateSession {
+                command,
+                interaction_mode,
+                completed,
+            })
             .await
             .map_err(|_| SessionHubError::Closed)?;
         result

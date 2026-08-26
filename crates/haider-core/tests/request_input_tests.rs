@@ -1,13 +1,18 @@
 #![allow(clippy::expect_used)]
 
-use haider_core::{HarnessActor, HarnessConfig, MemoryStore, StoreHandle, SubmitTurn};
+use haider_core::{
+    HarnessActor, HarnessConfig, InteractionResolutionPolicy, MemoryStore, RequestInputCheckpoint,
+    StoreHandle, SubmitCheckpointTurn, SubmitTurn,
+};
 use haider_protocol::EventPayload;
 use haider_protocol::error::ErrorCode;
-use haider_protocol::ids::{BranchId, DeviceId, EventId, SessionId};
+use haider_protocol::ids::{BranchId, DeviceId, EventId, ItemId, MenuId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
-use haider_protocol::menu::{AnswerVia, MenuAnswer, MenuKind};
-use haider_protocol::provider::FinishReason;
+use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
+use haider_protocol::provider::{FinishReason, Message};
+use haider_protocol::session::SessionInteractionModeV1;
 use haider_protocol::state::RunState;
+use haider_protocol::tool::ToolResultStatus;
 use haider_provider::{FakeInputKind, FakeInputOption, FakeProvider, FakeStep};
 use std::sync::Arc;
 
@@ -31,6 +36,239 @@ fn actor(
     let provider = Arc::new(FakeProvider::new(script));
     let handle = HarnessActor::spawn(config, provider.clone(), store.clone());
     (handle, store, provider)
+}
+
+fn autonomous_actor(
+    script: Vec<FakeStep>,
+) -> (
+    haider_core::HarnessHandle,
+    Arc<MemoryStore>,
+    Arc<FakeProvider>,
+) {
+    let mut config = HarnessConfig::for_session(
+        SessionId::new(SESSION),
+        DeviceId::new("request-input-autonomous-device"),
+        7,
+        11,
+    );
+    config.interaction_policy =
+        InteractionResolutionPolicy::new(SessionInteractionModeV1::Autonomous);
+    let store = Arc::new(MemoryStore::new());
+    let provider = Arc::new(FakeProvider::new(script));
+    let handle = HarnessActor::spawn(config, provider.clone(), store.clone());
+    (handle, store, provider)
+}
+
+#[tokio::test]
+async fn autonomous_request_input_uses_only_its_declared_default() {
+    let (handle, store, provider) = autonomous_actor(vec![
+        FakeStep::EmitToolCall {
+            call_id: "autonomous-default".into(),
+            name: "request_input".into(),
+            args: serde_json::json!({
+                "kind": "choice",
+                "title": "Choose target",
+                "options": [
+                    {"key": "library", "label": "Library"},
+                    {"key": "binary", "label": "Binary"}
+                ],
+                "default": "binary"
+            }),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "autonomous-default".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("use the declared fallback"))
+        .await
+        .expect("accepted")
+        .wait()
+        .await
+        .expect("completed");
+    assert_eq!(outcome.state, RunState::Done);
+    let payloads = store
+        .events(&SessionId::new(SESSION))
+        .await
+        .into_iter()
+        .map(|event| serde_json::from_value::<EventPayload>(event.payload).expect("typed"))
+        .collect::<Vec<_>>();
+    assert!(!payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::RunState(RunState::InputRequired { .. })
+    )));
+    assert!(payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::MenuOpened(menu) if !menu.blocking
+    )));
+    assert!(payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::MenuAnswered(answer) if answer.option_key.as_deref() == Some("binary")
+    )));
+    let requests = provider.requests();
+    let result = requests[1]
+        .messages
+        .iter()
+        .find_map(|message| message.tool_result_for("autonomous-default"))
+        .expect("provider receives default result");
+    assert!(matches!(
+        result,
+        haider_protocol::provider::Block::ToolResult { preview, .. }
+            if serde_json::from_str::<serde_json::Value>(preview).expect("json")
+                == serde_json::json!({"value":"Binary","option_key":"binary"})
+    ));
+}
+
+#[tokio::test]
+async fn autonomous_request_input_without_default_returns_typed_tool_result() {
+    let (handle, store, provider) = autonomous_actor(vec![
+        FakeStep::EmitRequestInput {
+            call_id: "autonomous-no-human".into(),
+            kind: FakeInputKind::Choice,
+            title: "Choose target".into(),
+            body: Vec::new(),
+            options: vec![FakeInputOption {
+                key: "only".into(),
+                label: "Only option".into(),
+                detail: None,
+            }],
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "autonomous-no-human".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("do not invent an answer"))
+        .await
+        .expect("accepted")
+        .wait()
+        .await
+        .expect("completed");
+    assert_eq!(outcome.state, RunState::Done);
+    let payloads = store
+        .events(&SessionId::new(SESSION))
+        .await
+        .into_iter()
+        .map(|event| serde_json::from_value::<EventPayload>(event.payload).expect("typed"))
+        .collect::<Vec<_>>();
+    assert!(!payloads.iter().any(|payload| matches!(
+        payload,
+        EventPayload::RunState(RunState::InputRequired { .. })
+    )));
+    assert!(
+        !payloads
+            .iter()
+            .any(|payload| matches!(payload, EventPayload::MenuAnswered(_)))
+    );
+    let tool_result = payloads
+        .iter()
+        .find_map(|payload| match payload {
+            EventPayload::ToolResult { call_id, result } if call_id == "autonomous-no-human" => {
+                Some(result)
+            }
+            _ => None,
+        })
+        .expect("typed failure result");
+    assert_eq!(tool_result.status, ToolResultStatus::Rejected);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&tool_result.preview).expect("json")["code"],
+        "no_human_available"
+    );
+    assert_eq!(
+        provider.requests().len(),
+        2,
+        "model continues after tool rejection"
+    );
+}
+
+#[tokio::test]
+async fn autonomous_request_input_checkpoint_resumes_after_restart_without_waiting() {
+    let call_id = "autonomous-recovered-no-human";
+    let menu = Menu {
+        id: MenuId::new("autonomous-recovered-menu"),
+        kind: MenuKind::Choice,
+        title: "Choose target".into(),
+        body: Vec::new(),
+        options: vec![MenuOption {
+            key: "only".into(),
+            label: "Only option".into(),
+            detail: None,
+            decision: None,
+        }],
+        blocking: false,
+        scope: MenuScope::Session,
+        origin: "request_input".into(),
+        ttl_ms: None,
+        timeout_option: None,
+    };
+    let (handle, store, provider) = autonomous_actor(vec![
+        FakeStep::ExpectToolResult {
+            call_id: call_id.into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let outcome = handle
+        .submit_checkpoint_turn(SubmitCheckpointTurn {
+            run_id: RunId::new("autonomous-recovered-run"),
+            messages: vec![Message::user_text("resume without a human")],
+            checkpoint: RequestInputCheckpoint {
+                menu,
+                request_seq: 4,
+                opening_generation: 6,
+                tool_item_id: ItemId::new("autonomous-recovered-item"),
+                call_id: call_id.into(),
+                tool_name: "request_input".into(),
+                args: serde_json::json!({
+                    "kind": "choice",
+                    "title": "Choose target",
+                    "options": [{"key": "only", "label": "Only option"}]
+                })
+                .to_string(),
+            },
+        })
+        .await
+        .expect("recovered turn accepted")
+        .wait()
+        .await
+        .expect("recovered turn completed");
+    assert_eq!(outcome.state, RunState::Done);
+    assert!(
+        !store
+            .events(&SessionId::new(SESSION))
+            .await
+            .into_iter()
+            .filter_map(|event| serde_json::from_value::<EventPayload>(event.payload).ok())
+            .any(|payload| matches!(
+                payload,
+                EventPayload::RunState(RunState::InputRequired { .. })
+            ))
+    );
+    let requests = provider.requests();
+    let result = requests[0]
+        .messages
+        .iter()
+        .find_map(|message| message.tool_result_for(call_id))
+        .expect("provider receives recovered typed result");
+    assert!(matches!(
+        result,
+        haider_protocol::provider::Block::ToolResult { preview, .. }
+            if serde_json::from_str::<serde_json::Value>(preview).expect("json")["code"]
+                == "no_human_available"
+    ));
 }
 
 /// MUTATION CHECK: omit `HarnessConfig::branch_id` from menu/tool/item/run

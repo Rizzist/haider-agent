@@ -2,6 +2,26 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Whether a session may stop for a human interaction.
+///
+/// The default is deliberately interactive so legacy metadata and every UI
+/// session preserve their existing behavior. Non-interactive callers must
+/// opt into `Autonomous` explicitly at durable session creation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionInteractionModeV1 {
+    #[default]
+    Interactive,
+    Autonomous,
+}
+
+impl SessionInteractionModeV1 {
+    #[must_use]
+    pub const fn is_interactive(&self) -> bool {
+        matches!(self, Self::Interactive)
+    }
+}
+
 /// Optional, durable permissions granted when a session is created by a
 /// non-interactive client.
 ///
@@ -22,9 +42,10 @@ pub struct SessionPermissionOverridesV1 {
     /// class included. It is a policy default flip, never a `PreAuthorized`
     /// credential and never a suppression of the deny path: an explicit deny
     /// rule still wins (the broker checks the denylist first), every effect is
-    /// still journaled, the macOS TCC gate still applies to computer actions
-    /// (auto-allow only lifts Haider's own menu — the OS grant flow is
-    /// unchanged), and the "controlling your screen" banner still shows.
+    /// still journaled, and the macOS TCC gate still applies to computer
+    /// actions (auto-allow only lifts Haider's own menu; autonomous sessions
+    /// fail a missing OS grant closed), and the "controlling your screen"
+    /// banner still shows.
     ///
     /// Omitted from the wire while `false` so a pre-auto-allow overrides value
     /// keeps its exact historical bytes; the field only appears when enabled.
@@ -68,6 +89,13 @@ pub struct SessionMetadataV1 {
     /// receipt bytes and means the daemon registry defaults remain authoritative.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_overrides: Option<SessionPermissionOverridesV1>,
+    /// Durable human-availability contract for root runs, restart recovery,
+    /// and any session fork. Omitted legacy metadata remains interactive.
+    #[serde(
+        default,
+        skip_serializing_if = "SessionInteractionModeV1::is_interactive"
+    )]
+    pub interaction_mode: SessionInteractionModeV1,
     /// Optional user-facing session title (G2). `None` for legacy rows and
     /// untitled sessions — absence stays OFF the wire so pre-G2 metadata
     /// bytes are unchanged. Normalized by the daemon: trimmed, control

@@ -24,6 +24,7 @@ pub mod history;
 pub mod hook;
 pub mod ids;
 pub mod image;
+pub mod interaction;
 pub mod item;
 pub mod loom;
 pub mod menu;

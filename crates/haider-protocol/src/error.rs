@@ -317,6 +317,7 @@ pub enum ErrorCode {
     Busy,
     RevisionConflict,
     LoopLimit,
+    WorkflowUnfinished,
     GraphAlreadyActive,
     GraphNotActive,
     GraphWrongNode,
@@ -359,6 +360,7 @@ impl ErrorCode {
             Self::Busy => "busy",
             Self::RevisionConflict => "revision_conflict",
             Self::LoopLimit => "loop_limit",
+            Self::WorkflowUnfinished => "workflow_unfinished",
             Self::GraphAlreadyActive => "graph_already_active",
             Self::GraphNotActive => "graph_not_active",
             Self::GraphWrongNode => "graph_wrong_node",
@@ -395,6 +397,7 @@ impl ErrorCode {
             Self::Busy => "busy",
             Self::RevisionConflict => "revision-conflict",
             Self::LoopLimit => "loop-limit",
+            Self::WorkflowUnfinished => "workflow-unfinished",
             Self::GraphAlreadyActive => "graph-already-active",
             Self::GraphNotActive => "graph-not-active",
             Self::GraphWrongNode => "graph-wrong-node",
@@ -469,5 +472,21 @@ mod tests {
         assert!(!presentation.title.trim().is_empty());
         assert!(!presentation.detail.trim().is_empty());
         assert_eq!(presentation.allowed_actions, vec![ErrorAction::None]);
+    }
+
+    #[test]
+    fn workflow_unfinished_has_stable_typed_wire_names() {
+        assert_eq!(
+            ErrorCode::WorkflowUnfinished.as_str(),
+            "workflow_unfinished"
+        );
+        assert_eq!(
+            ErrorCode::WorkflowUnfinished.as_subcode(),
+            "workflow-unfinished"
+        );
+        assert_eq!(
+            serde_json::to_value(ErrorCode::WorkflowUnfinished).expect("serialize code"),
+            serde_json::json!("workflow_unfinished")
+        );
     }
 }

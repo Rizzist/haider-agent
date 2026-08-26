@@ -318,6 +318,7 @@ async fn mobile_dispatcher_fixture_with_grant(
                 max_tokens: 4096,
                 system_prompt_version: Some(SystemPromptBuilder::VERSION.into()),
                 permission_overrides: overrides,
+                interaction_mode: Default::default(),
                 title: None,
                 effort: None,
                 fast: false,

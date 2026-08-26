@@ -55,6 +55,7 @@ fn task_metadata(cwd: &str) -> SessionMetadataV1 {
         max_tokens: 4096,
         system_prompt_version: Some(crate::worker::SystemPromptBuilder::VERSION.into()),
         permission_overrides: overrides(),
+        interaction_mode: Default::default(),
         title: None,
         effort: None,
         fast: false,

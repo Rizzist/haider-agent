@@ -1776,6 +1776,18 @@ fn run_exit_codes_are_table_driven() {
             result(
                 HeadlessOutcome::Errored,
                 Some(HeadlessRunFailure {
+                    code: HeadlessFailureCode::Run(ErrorCode::WorkflowUnfinished),
+                    message: "workflow remains unfinished".into(),
+                    retryable: false,
+                    presentation: None,
+                }),
+            ),
+            EX_BLOCKED,
+        ),
+        (
+            result(
+                HeadlessOutcome::Errored,
+                Some(HeadlessRunFailure {
                     code: HeadlessFailureCode::Internal,
                     message: "internal".into(),
                     retryable: false,
