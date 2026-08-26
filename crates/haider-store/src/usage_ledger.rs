@@ -9,12 +9,13 @@ use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::ErrorCode;
 use haider_protocol::provider::{NormalizedUsage, UsageRequestKind, UsageScope};
-use haider_protocol::session_fork::SessionForked;
+use haider_protocol::session_fork::SessionForkEventPayload;
 use haider_protocol::usage::{
     USAGE_HISTORY_MAX_RANGE_DAYS, USAGE_HISTORY_SLOTS_PER_DAY, UsageHistoryDailyTotalV1,
     UsageHistoryDayV1, UsageHistoryKeyV1, UsageHistoryMeterSampleV1, UsageHistoryRangeDayV1,
     UsageHistoryRoleV1, UsageHistoryRowV1, UsageHistorySlotV1, UsageHistoryVersionChangeV1,
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
@@ -684,10 +685,17 @@ pub fn reduce_journal_usage(
 ) -> BTreeMap<UsageSlotAddress, UsageLedgerSlot> {
     let fork_boundaries = envelopes
         .iter()
-        .filter_map(|envelope| {
-            SessionForked::from_payload_value(&envelope.payload)
-                .map(|_| (envelope.session_id.clone(), envelope.seq))
+        .filter(|envelope| {
+            envelope.payload.get("type").and_then(Value::as_str) == Some("session_forked")
         })
+        .filter_map(
+            |envelope| match SessionForkEventPayload::deserialize(&envelope.payload) {
+                Ok(SessionForkEventPayload::SessionForked(_)) => {
+                    Some((envelope.session_id.clone(), envelope.seq))
+                }
+                Ok(SessionForkEventPayload::Unknown) | Err(_) => None,
+            },
+        )
         .collect::<HashMap<_, _>>();
     let mut chunks = BTreeMap::<ChunkKey, ObservedChunk>::new();
     let mut spawns = BTreeMap::<UsageSlotAddress, u64>::new();
@@ -703,7 +711,10 @@ pub fn reduce_journal_usage(
             // would duplicate the source device's usage.
             continue;
         }
-        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+        if envelope.payload.get("type").and_then(Value::as_str) == Some("session_forked") {
+            continue;
+        }
+        let Ok(payload) = EventPayload::deserialize(&envelope.payload) else {
             continue;
         };
         match payload {

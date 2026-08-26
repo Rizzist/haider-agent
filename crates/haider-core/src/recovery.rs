@@ -30,6 +30,16 @@ use std::time::Duration;
 
 const RECOVERY_PAGE_SIZE: usize = 1_024;
 const RECOVERY_EVIDENCE_DEADLINE: Duration = Duration::from_secs(1);
+const RECOVERY_REDUCER_PAYLOAD_KINDS: &[&str] =
+    &["effect", "menu_opened", "menu_answered", "menu_closed"];
+const RECOVERY_EVIDENCE_PAYLOAD_KINDS: &[&str] = &[
+    "effect",
+    "task_completed",
+    "item",
+    "item_tool_call",
+    "tool_result",
+    "process_signal_recorded",
+];
 
 #[derive(Default)]
 struct RecoveryEvidence {
@@ -97,7 +107,14 @@ async fn gather_effect_recovery_evidence<S: StoreHandle + ?Sized>(
     let mut current_revision = Some("workspace-revision:0".to_owned());
     let mut cursor = 0;
     loop {
-        let page = store.read(session_id, cursor, RECOVERY_PAGE_SIZE).await?;
+        let page = store
+            .read_reducer_page(
+                session_id,
+                cursor,
+                RECOVERY_PAGE_SIZE,
+                RECOVERY_EVIDENCE_PAYLOAD_KINDS,
+            )
+            .await?;
         if page.is_empty() {
             break;
         }
@@ -360,7 +377,14 @@ pub async fn reconcile_dispatched_effects(
         let mut outcomes = HashMap::<EffectId, bool>::new();
         let mut recovery_menus = HashMap::<MenuId, EffectId>::new();
         loop {
-            let page = store.read(&session_id, cursor, RECOVERY_PAGE_SIZE).await?;
+            let page = store
+                .read_reducer_page(
+                    &session_id,
+                    cursor,
+                    RECOVERY_PAGE_SIZE,
+                    RECOVERY_REDUCER_PAYLOAD_KINDS,
+                )
+                .await?;
             if page.is_empty() {
                 break;
             }

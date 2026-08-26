@@ -85,8 +85,10 @@ use haider_protocol::typed_agent::{
 use haider_protocol::{DeliveryMode, EventPayload};
 use rusqlite::{
     Connection, Error as SqliteError, ErrorCode as SqliteErrorCode, OptionalExtension, Transaction,
-    TransactionBehavior, params, types::ValueRef,
+    TransactionBehavior, params,
+    types::{Value as SqlValue, ValueRef},
 };
+use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -95,6 +97,13 @@ use std::time::Duration;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const REPLAY_PAGE_SIZE: usize = 1_024;
+const USAGE_REDUCER_PAYLOAD_KINDS: &[&str] =
+    &["usage", "agent_spawned", "run_failed", "session_forked"];
+const RUN_STATE_REDUCER_PAYLOAD_KINDS: &[&str] = &["run_state"];
+const QUEUE_REDUCER_PAYLOAD_KINDS: &[&str] = &["user_message", "queue_changed"];
+const RUN_PROMPT_SOURCE_PAYLOAD_KINDS: &[&str] = &["user_message", "run_retried"];
+const FAILED_TURN_REDUCER_PAYLOAD_KINDS: &[&str] = &["user_message", "run_failed", "run_retried"];
+const TREE_HEAD_REDUCER_PAYLOAD_KINDS: &[&str] = &["node_committed"];
 
 /// Deployment escape hatch for the journal connection's SQLite `synchronous`
 /// pragma. Accepted values are the lower-case strings `normal` and `full`.
@@ -1838,7 +1847,7 @@ impl Store {
     pub fn initialize_usage_history(&self) -> StoreResult<()> {
         let installation_id = self.profile_installation_id()?;
         let backfill_version = self.usage_backfill_version()?;
-        let envelopes = self.all_journal_envelopes()?;
+        let envelopes = self.all_usage_reducer_envelopes()?;
         let slots = reduce_journal_usage(&envelopes);
         let now = now_ms()?;
         if backfill_version < 1 {
@@ -1861,7 +1870,7 @@ impl Store {
         let installation_id = self.profile_installation_id()?;
         let writer = UsageLedgerWriter::new(&self.root, installation_id, env!("CARGO_PKG_VERSION"));
         let now = now_ms()?;
-        for (address, slot) in reduce_journal_usage(&self.all_journal_envelopes()?) {
+        for (address, slot) in reduce_journal_usage(&self.all_usage_reducer_envelopes()?) {
             let address_start = usage_slot_start_ms(&address.date, address.slot)?;
             if address_start.saturating_add(15 * 60 * 1_000) <= now {
                 writer.append_slot(&address, &slot, false)?;
@@ -1940,10 +1949,23 @@ impl Store {
         Ok(())
     }
 
-    fn all_journal_envelopes(&self) -> StoreResult<Vec<RawEnvelope>> {
+    fn all_usage_reducer_envelopes(&self) -> StoreResult<Vec<RawEnvelope>> {
         let mut envelopes = Vec::new();
         for session_id in self.session_ids()? {
-            envelopes.extend(self.journal_replay(&session_id)?);
+            let mut cursor = 0;
+            loop {
+                let page = self.read_reducer_page(
+                    &session_id,
+                    cursor,
+                    REPLAY_PAGE_SIZE,
+                    USAGE_REDUCER_PAYLOAD_KINDS,
+                )?;
+                if page.is_empty() {
+                    break;
+                }
+                cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+                envelopes.extend(page);
+            }
         }
         Ok(envelopes)
     }
@@ -10288,6 +10310,42 @@ impl Store {
         Ok(envelopes)
     }
 
+    /// Reads one sequence-ordered page for a reducer that declares the outer
+    /// payload kinds it consumes.
+    ///
+    /// The denormalized `payload_kind` predicate is evaluated before SQLite
+    /// materializes `envelope_json`, so unrelated envelopes are not decoded.
+    /// A `NULL` kind remains eligible for journals written before the kind
+    /// backfill. If an eligible envelope itself cannot be decoded, the read is
+    /// retried through [`EventStore::read`], preserving the historical full
+    /// scan's corruption behavior instead of turning an optimization into a
+    /// new failure surface.
+    pub fn read_reducer_page(
+        &self,
+        session: &SessionId,
+        since_seq: u64,
+        limit: usize,
+        payload_kinds: &[&str],
+    ) -> StoreResult<Vec<RawEnvelope>> {
+        if limit == 0 || payload_kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        let filtered = read_reducer_page_with_connection(
+            &connection,
+            session,
+            since_seq,
+            limit,
+            payload_kinds,
+        );
+        drop(connection);
+        match filtered {
+            Ok(envelopes) => Ok(envelopes),
+            Err(FilteredReadError::Decode) => self.read(session, since_seq, limit),
+            Err(FilteredReadError::Store(error)) => Err(error),
+        }
+    }
+
     /// Replays a session's complete journal in committed sequence order.
     pub fn journal_replay(&self, session: &SessionId) -> StoreResult<Vec<RawEnvelope>> {
         let mut replay = Vec::new();
@@ -10871,7 +10929,7 @@ fn graph_evidence_provenance(
                 "invalid graph provenance envelope in session {session_id}: {error}"
             ))
         })?;
-        match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
+        match decode_payload::<EventPayload>(&envelope.payload) {
             Ok(EventPayload::EvidenceRecorded(evidence)) if evidence.graph_id == *graph_id => {
                 recorded.push((envelope, evidence));
                 if recorded.len() == limit {
@@ -11503,14 +11561,13 @@ fn plan_items_from_event(
     envelope: &RawEnvelope,
     expected_item_id: &ItemId,
 ) -> StoreResult<Vec<TodoItem>> {
-    let payload =
-        serde_json::from_value::<EventPayload>(envelope.payload.clone()).map_err(|_| {
-            store_error(
-                ErrorCode::InvalidArgument,
-                "requested Plan coordinate is not a typed event",
-                false,
-            )
-        })?;
+    let payload = decode_payload::<EventPayload>(&envelope.payload).map_err(|_| {
+        store_error(
+            ErrorCode::InvalidArgument,
+            "requested Plan coordinate is not a typed event",
+            false,
+        )
+    })?;
     match payload {
         EventPayload::Item(
             ItemEvent::Started {
@@ -13183,19 +13240,26 @@ fn workspace_revision_at_or_before(
                 "invalid workspace-mutation envelope in session {session_id}: {error}"
             ))
         })?;
-        let mutation =
-            match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
+        let mutation = match envelope
+            .payload
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("effect") => match decode_payload::<EventPayload>(&envelope.payload) {
                 Ok(EventPayload::Effect(EffectPhase::Outcome {
                     workspace_mutation: Some(mutation),
                     ..
                 })) => Some(mutation),
-                _ => TaskEventPayload::from_payload_value(&envelope.payload).and_then(|event| {
-                    match event {
-                        TaskEventPayload::TaskCompleted(completed) => completed.workspace_mutation,
-                        TaskEventPayload::TaskStarted(_) => None,
-                    }
+                _ => None,
+            },
+            Some("task_completed") => decode_payload::<TaskEventPayload>(&envelope.payload)
+                .ok()
+                .and_then(|event| match event {
+                    TaskEventPayload::TaskCompleted(completed) => completed.workspace_mutation,
+                    TaskEventPayload::TaskStarted(_) => None,
                 }),
-            };
+            _ => None,
+        };
         let Some(mutation) = mutation else {
             continue;
         };
@@ -13535,12 +13599,18 @@ fn latest_run_states(
 ) -> StoreResult<HashMap<RunId, DurableRunHead>> {
     let mut statement = connection
         .prepare_cached(
-            "SELECT seq, envelope_json FROM events
-             WHERE session_id = ?1 ORDER BY seq ASC",
+            "SELECT seq, envelope_json
+             FROM events INDEXED BY events_payload_kind_session_seq
+             WHERE session_id = ?1
+               AND (payload_kind = ?2 OR payload_kind IS NULL)
+             ORDER BY seq ASC",
         )
         .map_err(map_sqlite_error)?;
     let mut rows = statement
-        .query([session_id.as_str()])
+        .query(params![
+            session_id.as_str(),
+            RUN_STATE_REDUCER_PAYLOAD_KINDS[0]
+        ])
         .map_err(map_sqlite_error)?;
     let mut states = HashMap::new();
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
@@ -13585,14 +13655,22 @@ fn queue_entries(
     let states = latest_run_states(connection, session_id)?;
     let mut statement = connection
         .prepare_cached(
-            "SELECT seq, envelope_json FROM events
+            "SELECT seq, envelope_json
+             FROM events INDEXED BY events_payload_kind_session_seq
              WHERE session_id = ?1
-               AND payload_kind IN ('user_message', 'queue_changed')
+               AND (
+                   payload_kind IN (?2, ?3)
+                   OR payload_kind IS NULL
+               )
              ORDER BY seq ASC",
         )
         .map_err(map_sqlite_error)?;
     let mut rows = statement
-        .query([session_id.as_str()])
+        .query(params![
+            session_id.as_str(),
+            QUEUE_REDUCER_PAYLOAD_KINDS[0],
+            QUEUE_REDUCER_PAYLOAD_KINDS[1]
+        ])
         .map_err(map_sqlite_error)?;
     let mut revision = 0_u64;
     let mut messages = HashMap::<RunId, QueuedEntry>::new();
@@ -13604,7 +13682,7 @@ fn queue_entries(
                 "invalid queue envelope for session {session_id}, seq {seq}: {error}"
             ))
         })?;
-        match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
+        match decode_payload::<EventPayload>(&envelope.payload) {
             Ok(EventPayload::UserMessage { text, mode, .. }) => {
                 let Some(run_id) = envelope.run_id.clone() else {
                     continue;
@@ -13779,12 +13857,19 @@ fn main_timeline_run_prompt_source(
 ) -> StoreResult<Option<(RunId, u64)>> {
     let mut statement = connection
         .prepare_cached(
-            "SELECT seq, envelope_json FROM events
-             WHERE session_id = ?1 ORDER BY seq ASC",
+            "SELECT seq, envelope_json
+             FROM events INDEXED BY events_payload_kind_session_seq
+             WHERE session_id = ?1
+               AND (payload_kind IN (?2, ?3) OR payload_kind IS NULL)
+             ORDER BY seq ASC",
         )
         .map_err(map_sqlite_error)?;
     let mut rows = statement
-        .query([session_id.as_str()])
+        .query(params![
+            session_id.as_str(),
+            RUN_PROMPT_SOURCE_PAYLOAD_KINDS[0],
+            RUN_PROMPT_SOURCE_PAYLOAD_KINDS[1]
+        ])
         .map_err(map_sqlite_error)?;
     let mut source = None;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
@@ -13800,28 +13885,33 @@ fn main_timeline_run_prompt_source(
         {
             continue;
         }
-        let payload = envelope.payload;
-        // Type-tag peek: only `user_message` and `run_retried` can change the
-        // prompt source; skip the payload deep-clone + full decode for every
-        // other envelope. Serde's internal tag makes the peek exact — a
-        // payload that decodes to either relevant variant carries that tag.
+        let payload = &envelope.payload;
+        // `NULL` legacy rows are deliberately over-selected. Keep the exact
+        // type fence before decoding them into either supported union.
         if !matches!(
             payload.get("type").and_then(serde_json::Value::as_str),
             Some("user_message" | "run_retried")
         ) {
             continue;
         }
-        if serde_json::from_value::<EventPayload>(payload.clone())
-            .is_ok_and(|payload| matches!(payload, EventPayload::UserMessage { .. }))
-        {
-            source = Some((target_run_id.clone(), seq));
-        } else if let Ok(RunRetryEventPayload::RunRetried {
-            prompt_run_id,
-            user_seq,
-            ..
-        }) = RunRetryEventPayload::from_payload_value(payload)
-        {
-            source = Some((prompt_run_id, user_seq));
+        match payload.get("type").and_then(serde_json::Value::as_str) {
+            Some("user_message")
+                if decode_payload::<EventPayload>(payload)
+                    .is_ok_and(|payload| matches!(payload, EventPayload::UserMessage { .. })) =>
+            {
+                source = Some((target_run_id.clone(), seq));
+            }
+            Some("run_retried") => {
+                if let Ok(RunRetryEventPayload::RunRetried {
+                    prompt_run_id,
+                    user_seq,
+                    ..
+                }) = decode_payload::<RunRetryEventPayload>(payload)
+                {
+                    source = Some((prompt_run_id, user_seq));
+                }
+            }
+            _ => {}
         }
     }
     Ok(source)
@@ -13838,12 +13928,20 @@ fn latest_main_timeline_failed_turn(
     let states = latest_run_states(connection, session_id)?;
     let mut statement = connection
         .prepare_cached(
-            "SELECT seq, envelope_json FROM events
-             WHERE session_id = ?1 ORDER BY seq ASC",
+            "SELECT seq, envelope_json
+             FROM events INDEXED BY events_payload_kind_session_seq
+             WHERE session_id = ?1
+               AND (payload_kind IN (?2, ?3, ?4) OR payload_kind IS NULL)
+             ORDER BY seq ASC",
         )
         .map_err(map_sqlite_error)?;
     let mut rows = statement
-        .query([session_id.as_str()])
+        .query(params![
+            session_id.as_str(),
+            FAILED_TURN_REDUCER_PAYLOAD_KINDS[0],
+            FAILED_TURN_REDUCER_PAYLOAD_KINDS[1],
+            FAILED_TURN_REDUCER_PAYLOAD_KINDS[2]
+        ])
         .map_err(map_sqlite_error)?;
     let mut latest_user = None::<(RunId, u64)>;
     let mut retries = Vec::<(RunId, RunId, u64)>::new();
@@ -13859,28 +13957,37 @@ fn latest_main_timeline_failed_turn(
             continue;
         };
         let main_timeline = envelope.branch_id.is_none() && envelope.agent_id.is_none();
-        let payload = envelope.payload;
-        // Type-tag peek: only these three tags can mutate the scan state
-        // below; skip the payload deep-clone + full decode for the rest.
+        let payload = &envelope.payload;
+        // `NULL` legacy rows are deliberately over-selected. Keep the exact
+        // type fence before decoding them into either supported union.
         if !matches!(
             payload.get("type").and_then(serde_json::Value::as_str),
             Some("user_message" | "run_failed" | "run_retried")
         ) {
             continue;
         }
-        match serde_json::from_value::<EventPayload>(payload.clone()) {
-            Ok(EventPayload::UserMessage { .. }) if main_timeline => {
+        match payload.get("type").and_then(serde_json::Value::as_str) {
+            Some("user_message")
+                if main_timeline
+                    && decode_payload::<EventPayload>(payload).is_ok_and(|payload| {
+                        matches!(payload, EventPayload::UserMessage { .. })
+                    }) =>
+            {
                 latest_user = Some((run_id, seq));
             }
-            Ok(EventPayload::RunFailed { .. }) if main_timeline => {
+            Some("run_failed")
+                if main_timeline
+                    && decode_payload::<EventPayload>(payload)
+                        .is_ok_and(|payload| matches!(payload, EventPayload::RunFailed { .. })) =>
+            {
                 failed.insert(run_id);
             }
-            _ if main_timeline => {
+            Some("run_retried") if main_timeline => {
                 if let Ok(RunRetryEventPayload::RunRetried {
                     prompt_run_id,
                     user_seq,
                     ..
-                }) = RunRetryEventPayload::from_payload_value(payload)
+                }) = decode_payload::<RunRetryEventPayload>(payload)
                 {
                     retries.push((run_id, prompt_run_id, user_seq));
                 }
@@ -13912,12 +14019,18 @@ fn latest_tree_head(
 ) -> StoreResult<Option<NodeId>> {
     let mut statement = connection
         .prepare_cached(
-            "SELECT seq, envelope_json FROM events
-             WHERE session_id = ?1 ORDER BY seq DESC",
+            "SELECT seq, envelope_json
+             FROM events INDEXED BY events_payload_kind_session_seq
+             WHERE session_id = ?1
+               AND (payload_kind = ?2 OR payload_kind IS NULL)
+             ORDER BY seq DESC",
         )
         .map_err(map_sqlite_error)?;
     let mut rows = statement
-        .query([session_id.as_str()])
+        .query(params![
+            session_id.as_str(),
+            TREE_HEAD_REDUCER_PAYLOAD_KINDS[0]
+        ])
         .map_err(map_sqlite_error)?;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
         let seq: i64 = row.get(0).map_err(map_sqlite_error)?;
@@ -14796,14 +14909,13 @@ fn load_envelope_by_event_id(
 }
 
 fn opened_menu(opening: &RawEnvelope, menu_id: &MenuId) -> StoreResult<Menu> {
-    let payload =
-        serde_json::from_value::<EventPayload>(opening.payload.clone()).map_err(|_| {
-            store_error(
-                ErrorCode::MenuNotFound,
-                format!("event {} is not a recognized menu request", opening.seq),
-                false,
-            )
-        })?;
+    let payload = decode_payload::<EventPayload>(&opening.payload).map_err(|_| {
+        store_error(
+            ErrorCode::MenuNotFound,
+            format!("event {} is not a recognized menu request", opening.seq),
+            false,
+        )
+    })?;
     match payload {
         EventPayload::MenuOpened(menu) if menu.id == *menu_id => Ok(menu),
         _ => Err(store_error(
@@ -16582,6 +16694,103 @@ fn payload_kind(envelope: &RawEnvelope) -> &str {
     }
 }
 
+#[derive(Debug)]
+enum FilteredReadError {
+    Decode,
+    Store(HaiderError),
+}
+
+fn read_reducer_page_with_connection(
+    connection: &Connection,
+    session: &SessionId,
+    since_seq: u64,
+    limit: usize,
+    payload_kinds: &[&str],
+) -> Result<Vec<RawEnvelope>, FilteredReadError> {
+    let (sql, parameter_capacity) = reducer_page_sql(payload_kinds.len())?;
+    let mut parameters = Vec::with_capacity(parameter_capacity);
+    parameters.push(SqlValue::Text(session.as_str().to_owned()));
+    parameters.push(SqlValue::Integer(
+        to_sqlite_integer(since_seq).map_err(FilteredReadError::Store)?,
+    ));
+    parameters.extend(
+        payload_kinds
+            .iter()
+            .map(|kind| SqlValue::Text((*kind).to_owned())),
+    );
+    parameters.push(SqlValue::Integer(i64::try_from(limit).unwrap_or(i64::MAX)));
+
+    let mut statement = connection
+        .prepare_cached(&sql)
+        .map_err(map_sqlite_error)
+        .map_err(FilteredReadError::Store)?;
+    let mut rows = statement
+        .query(rusqlite::params_from_iter(parameters.iter()))
+        .map_err(map_sqlite_error)
+        .map_err(FilteredReadError::Store)?;
+    let mut envelopes = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(map_sqlite_error)
+        .map_err(FilteredReadError::Store)?
+    {
+        let stored_seq: i64 = row
+            .get(0)
+            .map_err(map_sqlite_error)
+            .map_err(FilteredReadError::Store)?;
+        let stored_event_id: String = row
+            .get(2)
+            .map_err(map_sqlite_error)
+            .map_err(FilteredReadError::Store)?;
+        let stored_committed_at_ms: i64 = row
+            .get(3)
+            .map_err(map_sqlite_error)
+            .map_err(FilteredReadError::Store)?;
+        let envelope = decode_envelope_column(row, 1).map_err(|_| FilteredReadError::Decode)?;
+        validate_stored_envelope(
+            session,
+            stored_seq,
+            &stored_event_id,
+            stored_committed_at_ms,
+            &envelope,
+        )
+        .map_err(FilteredReadError::Store)?;
+        envelopes.push(envelope);
+    }
+    Ok(envelopes)
+}
+
+fn reducer_page_sql(payload_kind_count: usize) -> Result<(String, usize), FilteredReadError> {
+    let parameter_capacity = payload_kind_count.checked_add(3).ok_or_else(|| {
+        FilteredReadError::Store(store_error(
+            ErrorCode::InvalidArgument,
+            "reducer payload-kind filter is too large",
+            false,
+        ))
+    })?;
+    let kind_parameters = (0..payload_kind_count)
+        .map(|index| format!("?{}", index + 3))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let limit_parameter = parameter_capacity;
+    let sql = format!(
+        "SELECT seq, envelope_json, event_id, committed_at_ms
+         FROM events INDEXED BY events_payload_kind_session_seq
+         WHERE (payload_kind IN ({kind_parameters}) OR payload_kind IS NULL)
+           AND session_id = ?1 AND seq > ?2
+         ORDER BY seq ASC
+         LIMIT ?{limit_parameter}"
+    );
+    Ok((sql, parameter_capacity))
+}
+
+fn decode_payload<'de, T>(payload: &'de serde_json::Value) -> Result<T, serde_json::Error>
+where
+    T: Deserialize<'de>,
+{
+    T::deserialize(payload)
+}
+
 /// Decodes the authoritative event record according to its SQLite storage
 /// class. Version-13-and-earlier rows are JSON `TEXT`; current rows are
 /// MessagePack `BLOB`s.
@@ -17461,6 +17670,379 @@ fn store_io_error(operation: &str, error: std::io::Error) -> HaiderError {
         format!("cannot {operation}: {error}"),
         error.kind() == std::io::ErrorKind::Interrupted,
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod reducer_filter_tests {
+    use super::*;
+
+    #[derive(Debug, PartialEq)]
+    struct ReducerOutputs {
+        run_states: HashMap<RunId, DurableRunHead>,
+        queue_revision: u64,
+        queue: Vec<(QueueRow, RunId, Option<BranchId>, u64)>,
+        ordinary_prompt_source: Option<(RunId, u64)>,
+        prompt_source: Option<(RunId, u64)>,
+        failed_turn: Option<(RunId, RunId, u64)>,
+        tree_head: Option<NodeId>,
+    }
+
+    fn seed_session(store: &Store, session_id: &SessionId) {
+        let connection = Connection::open(store.database_path()).expect("open test journal");
+        connection
+            .execute(
+                "INSERT INTO sessions(id, created_at_ms, meta_json) VALUES (?1, 1, '{}')",
+                [session_id.as_str()],
+            )
+            .expect("seed test session");
+    }
+
+    fn fact(
+        store: &Store,
+        session_id: &SessionId,
+        event_id: impl Into<String>,
+        run_id: Option<RunId>,
+        payload: serde_json::Value,
+    ) -> RawEnvelope {
+        EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new(event_id),
+            seq: 0,
+            session_id: session_id.clone(),
+            branch_id: None,
+            run_id,
+            agent_id: None,
+            device_id: DeviceId::new("reducer-filter-test"),
+            authority_epoch: 0,
+            worker_generation: store.worker_generation(),
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: RenderTargets {
+                ui: false,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload,
+        }
+    }
+
+    fn typed_payload(payload: EventPayload) -> serde_json::Value {
+        serde_json::to_value(payload).expect("serialize reducer fixture")
+    }
+
+    fn reducer_outputs(
+        store: &Store,
+        session_id: &SessionId,
+        queued_run: &RunId,
+        retry_run: &RunId,
+    ) -> StoreResult<ReducerOutputs> {
+        let connection = store.connection()?;
+        let (queue_revision, queue) = queue_entries(&connection, session_id)?;
+        Ok(ReducerOutputs {
+            run_states: latest_run_states(&connection, session_id)?,
+            queue_revision,
+            queue: queue
+                .into_iter()
+                .map(|entry| (entry.row, entry.run_id, entry.branch_id, entry.accepted_seq))
+                .collect(),
+            ordinary_prompt_source: main_timeline_run_prompt_source(
+                &connection,
+                session_id,
+                queued_run,
+            )?,
+            prompt_source: main_timeline_run_prompt_source(&connection, session_id, retry_run)?,
+            failed_turn: latest_main_timeline_failed_turn(&connection, session_id)?,
+            tree_head: latest_tree_head(&connection, session_id, None, None)?,
+        })
+    }
+
+    /// MUTATION CHECK: remove any production reducer kind or its `NULL`
+    /// fallback. The indexed result then differs from the same production
+    /// reducer forced through an all-legacy (therefore full-scan) journal.
+    #[test]
+    fn store_reducers_match_unfiltered_outputs() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(root.path()).expect("open store");
+        let session_id = SessionId::new("store-reducer-filter-equivalence");
+        seed_session(&store, &session_id);
+        let queued_run = RunId::new("queued-run");
+        let retry_run = RunId::new("retry-run");
+        let user_event_id = EventId::new("queued-user");
+        let node_id = NodeId::new("latest-node");
+        let mut events = vec![
+            fact(
+                &store,
+                &session_id,
+                "queued-state",
+                Some(queued_run.clone()),
+                typed_payload(EventPayload::RunState(RunState::Queued)),
+            ),
+            fact(
+                &store,
+                &session_id,
+                user_event_id.as_str(),
+                Some(queued_run.clone()),
+                typed_payload(EventPayload::UserMessage {
+                    text: "queued prompt".into(),
+                    attachments: Vec::new(),
+                    mode: DeliveryMode::Queue,
+                }),
+            ),
+            fact(
+                &store,
+                &session_id,
+                "queue-enqueued",
+                None,
+                typed_payload(EventPayload::QueueChanged(
+                    haider_protocol::queue::QueueDelta {
+                        revision: 0,
+                        change: QueueChange::Enqueued {
+                            row: QueueRow {
+                                id: user_event_id,
+                                text: "queued prompt".into(),
+                                mode: DeliveryMode::Queue,
+                                ordinal: 1,
+                                created_at_ms: 0,
+                            },
+                        },
+                    },
+                )),
+            ),
+            fact(
+                &store,
+                &session_id,
+                "manual-retry",
+                Some(retry_run.clone()),
+                RunRetryEventPayload::RunRetried {
+                    failed_run_id: queued_run.clone(),
+                    prompt_run_id: queued_run.clone(),
+                    user_seq: 2,
+                }
+                .to_payload_value()
+                .expect("serialize retry fact"),
+            ),
+            fact(
+                &store,
+                &session_id,
+                "retry-failed",
+                Some(retry_run.clone()),
+                typed_payload(EventPayload::RunFailed {
+                    code: ErrorCode::ProviderError,
+                    message: "provider failed".into(),
+                    retryable: false,
+                    presentation: None,
+                }),
+            ),
+            fact(
+                &store,
+                &session_id,
+                "retry-errored",
+                Some(retry_run.clone()),
+                typed_payload(EventPayload::RunState(RunState::Errored)),
+            ),
+            fact(
+                &store,
+                &session_id,
+                "latest-node-event",
+                Some(retry_run.clone()),
+                typed_payload(EventPayload::NodeCommitted(TreeNode {
+                    node: node_id,
+                    parent: None,
+                    kind: NodeKind::UserTurn {
+                        text: "node".into(),
+                        attachments: Vec::new(),
+                    },
+                })),
+            ),
+            fact(
+                &store,
+                &session_id,
+                "irrelevant-event",
+                None,
+                serde_json::json!({"type": "irrelevant"}),
+            ),
+        ];
+        store.append(&mut events).expect("append reducer fixtures");
+
+        let filtered = reducer_outputs(&store, &session_id, &queued_run, &retry_run)
+            .expect("reduce indexed journal");
+        let connection = Connection::open(store.database_path()).expect("open raw journal");
+        connection
+            .execute(
+                "UPDATE events SET payload_kind = NULL WHERE session_id = ?1",
+                [session_id.as_str()],
+            )
+            .expect("force unfiltered legacy scan");
+        drop(connection);
+        let unfiltered = reducer_outputs(&store, &session_id, &queued_run, &retry_run)
+            .expect("reduce unfiltered journal");
+        assert_eq!(filtered, unfiltered);
+    }
+
+    fn usage_payload(input: u64) -> serde_json::Value {
+        serde_json::json!({
+            "type": "usage",
+            "input": input,
+            "output": 1,
+            "reasoning": 0,
+            "cached": 0,
+            "source": "provider_reported",
+            "account": "usage-test-account"
+        })
+    }
+
+    /// MUTATION CHECK: remove any usage reducer kind. Each kind independently
+    /// changes the rollup, so the indexed result diverges from an all-legacy
+    /// production reduction.
+    #[test]
+    fn usage_reducer_matches_unfiltered_output() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(root.path()).expect("open store");
+        let session_id = SessionId::new("usage-reducer-filter-equivalence");
+        seed_session(&store, &session_id);
+        let fork = SessionForked {
+            source_session_id: SessionId::new("usage-source"),
+            source_branch_id: None,
+            fork_node_id: NodeId::new("fork-node"),
+            fork_seq: 1,
+            mode: haider_protocol::session_fork::SessionForkMode::Fork,
+            description: None,
+            accepted_proposal_digest: None,
+            omissions: Vec::new(),
+            context_epoch: ForkContextEpoch::Fresh,
+        };
+        let manifest = AgentManifest {
+            agent: AgentId::new("usage-child"),
+            role: haider_protocol::agent::AgentRole::Subagent,
+            task: "usage child".into(),
+            callsign: None,
+            model_profile: "test".into(),
+            grant: haider_protocol::agent::Grant {
+                tools: Vec::new(),
+                effect_ceiling: Vec::new(),
+            },
+            budget_tokens: None,
+            placement: haider_protocol::agent::Placement::Local,
+            lease: haider_protocol::ids::LeaseId::new("usage-lease"),
+            fencing_epoch: 1,
+            attempt: 0,
+            parent: None,
+            coordinates: None,
+            cli_scope: None,
+        };
+        let mut events = vec![
+            fact(
+                &store,
+                &session_id,
+                "inherited-usage",
+                None,
+                usage_payload(100),
+            ),
+            fact(
+                &store,
+                &session_id,
+                "inherited-spawn",
+                None,
+                typed_payload(EventPayload::AgentSpawned(manifest.clone())),
+            ),
+            fact(
+                &store,
+                &session_id,
+                "fork-boundary",
+                None,
+                fork.to_payload_value().expect("serialize fork fact"),
+            ),
+            fact(&store, &session_id, "child-usage", None, usage_payload(10)),
+            fact(
+                &store,
+                &session_id,
+                "child-spawned",
+                None,
+                typed_payload(EventPayload::AgentSpawned(manifest)),
+            ),
+            fact(
+                &store,
+                &session_id,
+                "child-failed",
+                None,
+                typed_payload(EventPayload::RunFailed {
+                    code: ErrorCode::ProviderError,
+                    message: "failed".into(),
+                    retryable: false,
+                    presentation: None,
+                }),
+            ),
+            fact(
+                &store,
+                &session_id,
+                "usage-irrelevant",
+                None,
+                serde_json::json!({"type": "irrelevant"}),
+            ),
+        ];
+        store.append(&mut events).expect("append usage fixtures");
+
+        let filtered = reduce_journal_usage(
+            &store
+                .all_usage_reducer_envelopes()
+                .expect("read indexed usage facts"),
+        );
+        let connection = Connection::open(store.database_path()).expect("open raw journal");
+        connection
+            .execute(
+                "UPDATE events SET payload_kind = NULL WHERE session_id = ?1",
+                [session_id.as_str()],
+            )
+            .expect("force unfiltered legacy scan");
+        drop(connection);
+        let unfiltered = reduce_journal_usage(
+            &store
+                .all_usage_reducer_envelopes()
+                .expect("read unfiltered usage facts"),
+        );
+        assert_eq!(filtered, unfiltered);
+    }
+
+    /// MUTATION CHECK: drop the explicit payload-kind index selection. The
+    /// real schema's `(session_id, seq)` primary key then wins and every row is
+    /// visited despite the SQL predicate.
+    #[test]
+    fn reducer_page_query_is_pinned_to_payload_kind_index() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(root.path()).expect("open store");
+        let (sql, _) = reducer_page_sql(4).expect("build reducer SQL");
+        let explain = format!("EXPLAIN QUERY PLAN {sql}");
+        let parameters = [
+            SqlValue::Text("session".into()),
+            SqlValue::Integer(0),
+            SqlValue::Text("effect".into()),
+            SqlValue::Text("menu_opened".into()),
+            SqlValue::Text("menu_answered".into()),
+            SqlValue::Text("menu_closed".into()),
+            SqlValue::Integer(1_024),
+        ];
+        let connection = Connection::open(store.database_path()).expect("open raw journal");
+        let mut statement = connection.prepare(&explain).expect("prepare query plan");
+        let details = statement
+            .query_map(rusqlite::params_from_iter(parameters.iter()), |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("query plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect query plan");
+        assert!(details.iter().any(|detail| {
+            detail.contains("SEARCH events USING INDEX events_payload_kind_session_seq")
+                && detail.contains("payload_kind=?")
+                && detail.contains("session_id=?")
+        }));
+        assert!(
+            details
+                .iter()
+                .all(|detail| !detail.contains("sqlite_autoindex_events_1"))
+        );
+    }
 }
 
 #[cfg(test)]

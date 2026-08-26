@@ -17,6 +17,13 @@ fn must<T, E: Debug>(result: Result<T, E>) -> T {
     }
 }
 
+fn must_err<T: Debug, E>(result: Result<T, E>) -> E {
+    match result {
+        Ok(value) => panic!("operation unexpectedly succeeded: {value:?}"),
+        Err(error) => error,
+    }
+}
+
 fn test_root() -> tempfile::TempDir {
     must(tempfile::tempdir())
 }
@@ -796,6 +803,201 @@ fn read_page_ends_early_on_byte_budget_and_always_makes_progress() {
         [1],
         "a single envelope larger than the budget is still returned"
     );
+}
+
+fn test_payload_kind(envelope: &RawEnvelope) -> &str {
+    let kind = envelope
+        .payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if kind == "item"
+        && envelope
+            .payload
+            .get("item")
+            .and_then(|item| item.get("item"))
+            .and_then(Value::as_str)
+            == Some("tool_call")
+    {
+        "item_tool_call"
+    } else {
+        kind
+    }
+}
+
+/// MUTATION CHECK: remove any reducer kind, omit the SQL predicate, or stop
+/// paging across an over-selected legacy row. Expected failure: at least one
+/// filtered reduction differs from the historical full-scan reduction, or an
+/// irrelevant current row escapes the indexed reader.
+#[test]
+fn reducer_payload_filters_match_full_scan_for_every_declared_kind_set() {
+    let root = test_root();
+    let store = must(Store::open(root.path()));
+    let session = SessionId::new("reducer-payload-filter-equivalence");
+    let payloads = [
+        json!({"type": "unrelated_before"}),
+        json!({"type": "run_state", "state": "queued"}),
+        json!({"type": "user_message", "text": "hello", "mode": "start"}),
+        json!({"type": "queue_changed", "revision": 4, "change": {"change": "unknown"}}),
+        json!({"type": "run_retried", "failed_run_id": "failed", "prompt_run_id": "prompt", "user_seq": 3}),
+        json!({"type": "run_failed", "message": "failed"}),
+        json!({"type": "usage"}),
+        json!({"type": "agent_spawned"}),
+        json!({"type": "session_forked"}),
+        json!({"type": "node_committed", "node": {"node": "node"}}),
+        json!({"type": "effect", "phase": "dispatched", "effect": "effect"}),
+        json!({"type": "menu_opened", "id": "menu"}),
+        json!({"type": "menu_answered", "menu": "menu"}),
+        json!({"type": "menu_closed", "menu": "menu"}),
+        json!({"type": "task_completed"}),
+        json!({"type": "item", "item": {"item": "command_execution"}}),
+        json!({"type": "item", "item": {"item": "tool_call"}}),
+        json!({"type": "tool_result", "call_id": "call"}),
+        json!({"type": "process_signal_recorded", "effect_id": "effect"}),
+        json!({"type": "unrelated_legacy"}),
+        json!({"type": "unrelated_after"}),
+    ];
+    let mut batch = payloads
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            envelope(
+                &session,
+                &format!("reducer-filter-{index}"),
+                json!({"type": "filter_fixture"}),
+            )
+        })
+        .collect::<Vec<_>>();
+    must(store.append(&mut batch));
+    let connection = must(Connection::open(store.database_path()));
+    for (envelope, payload) in batch.iter_mut().zip(payloads) {
+        envelope.payload = payload;
+        let kind = test_payload_kind(envelope).to_owned();
+        let encoded = must(rmp_serde::to_vec_named(envelope));
+        must(connection.execute(
+            "UPDATE events
+             SET envelope_json = ?2, payload_kind = ?3
+             WHERE event_id = ?1",
+            params![envelope.event_id.as_str(), encoded, kind],
+        ));
+    }
+    let legacy_kinds = [
+        "usage",
+        "run_state",
+        "queue_changed",
+        "run_retried",
+        "node_committed",
+        "menu_closed",
+        "tool_result",
+        "unrelated_legacy",
+    ];
+    let legacy_event_ids = batch
+        .iter()
+        .filter(|envelope| legacy_kinds.contains(&test_payload_kind(envelope)))
+        .map(|envelope| envelope.event_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(legacy_event_ids.len(), legacy_kinds.len());
+    for event_id in &legacy_event_ids {
+        must(connection.execute(
+            "UPDATE events SET payload_kind = NULL WHERE event_id = ?1",
+            [event_id.as_str()],
+        ));
+    }
+    drop(connection);
+
+    let full_scan = must(store.read(&session, 0, usize::MAX));
+    let reducer_kind_sets: &[(&str, &[&str])] = &[
+        (
+            "usage",
+            &["usage", "agent_spawned", "run_failed", "session_forked"],
+        ),
+        ("run-state", &["run_state"]),
+        ("queue", &["user_message", "queue_changed"]),
+        ("run-prompt-source", &["user_message", "run_retried"]),
+        (
+            "failed-turn",
+            &["user_message", "run_failed", "run_retried"],
+        ),
+        ("tree-head", &["node_committed"]),
+        (
+            "startup-recovery",
+            &["effect", "menu_opened", "menu_answered", "menu_closed"],
+        ),
+        (
+            "recovery-evidence",
+            &[
+                "effect",
+                "task_completed",
+                "item",
+                "item_tool_call",
+                "tool_result",
+                "process_signal_recorded",
+            ],
+        ),
+    ];
+    for (name, payload_kinds) in reducer_kind_sets {
+        let mut cursor = 0;
+        let mut filtered_scan = Vec::new();
+        loop {
+            let page = must(store.read_reducer_page(&session, cursor, 2, payload_kinds));
+            if page.is_empty() {
+                break;
+            }
+            assert!(page.iter().all(|envelope| {
+                legacy_event_ids.contains(&envelope.event_id)
+                    || payload_kinds.contains(&test_payload_kind(envelope))
+            }));
+            cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+            filtered_scan.extend(page);
+        }
+        let filtered_output = filtered_scan
+            .into_iter()
+            .filter(|envelope| payload_kinds.contains(&test_payload_kind(envelope)))
+            .collect::<Vec<_>>();
+        let full_output = full_scan
+            .iter()
+            .filter(|envelope| payload_kinds.contains(&test_payload_kind(envelope)))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(filtered_output, full_output, "{name} reducer output");
+    }
+}
+
+/// MUTATION CHECK: return the indexed decode error directly instead of
+/// falling back through the historical reader. Expected failure: the first
+/// page reports corruption rather than returning the preceding full-scan row.
+#[test]
+fn reducer_page_decode_failure_falls_back_to_full_scan() {
+    let root = test_root();
+    let store = must(Store::open(root.path()));
+    let session = SessionId::new("reducer-corrupt-fallback");
+    let mut batch = vec![
+        envelope(
+            &session,
+            "reducer-corrupt-prefix",
+            json!({"type": "irrelevant"}),
+        ),
+        envelope(
+            &session,
+            "reducer-corrupt-target",
+            json!({"type": "run_state", "state": "queued"}),
+        ),
+    ];
+    must(store.append(&mut batch));
+    let connection = must(Connection::open(store.database_path()));
+    must(connection.execute(
+        "UPDATE events SET envelope_json = X'C1' WHERE event_id = ?1",
+        [batch[1].event_id.as_str()],
+    ));
+    drop(connection);
+
+    let fallback = must(store.read_reducer_page(&session, 0, 1, &["run_state"]));
+    assert_eq!(fallback, vec![batch[0].clone()]);
+    let filtered_error =
+        must_err(store.read_reducer_page(&session, fallback[0].seq, 1, &["run_state"]));
+    let full_scan_error = must_err(store.read(&session, fallback[0].seq, 1));
+    assert_eq!(filtered_error.code, ErrorCode::StoreCorrupt);
+    assert_eq!(filtered_error, full_scan_error);
 }
 
 /// v0.0.936 attention state: `seen_at_ms` is monotone under ANY candidate —

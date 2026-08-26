@@ -84,7 +84,7 @@ pub use sqlite_store::{AppendGroupBatch, ProfileStoreFault, SqliteStoreHandle};
 use async_trait::async_trait;
 use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::envelope::RawEnvelope;
-use haider_protocol::error::HaiderError;
+use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{BranchId, SessionId};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -96,6 +96,26 @@ pub const CRATE_NAME: &str = "haider-core";
 pub struct CommittedRange {
     pub first_seq: u64,
     pub last_seq: u64,
+}
+
+fn envelope_payload_kind(envelope: &RawEnvelope) -> &str {
+    let kind = envelope
+        .payload
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if kind == "item"
+        && envelope
+            .payload
+            .get("item")
+            .and_then(|item| item.get("item"))
+            .and_then(serde_json::Value::as_str)
+            == Some("tool_call")
+    {
+        "item_tool_call"
+    } else {
+        kind
+    }
 }
 
 /// Durability port consumed by the runtime.
@@ -112,6 +132,52 @@ pub trait StoreHandle: Send + Sync {
         since_seq: u64,
         limit: usize,
     ) -> Result<Vec<RawEnvelope>, HaiderError>;
+
+    /// Reads a reducer page containing only its declared outer payload kinds.
+    ///
+    /// Journal-only stores retain correct behavior through this default full
+    /// scan. Indexed stores override it so irrelevant encoded envelopes never
+    /// leave the database.
+    async fn read_reducer_page(
+        &self,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+        payload_kinds: &'static [&'static str],
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        if limit == 0 || payload_kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut cursor = since_seq;
+        let mut selected = Vec::new();
+        loop {
+            let page = self.read(session_id, cursor, limit).await?;
+            if page.is_empty() {
+                return Ok(selected);
+            }
+            let scan_complete = page.len() < limit;
+            let next_cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+            if next_cursor <= cursor {
+                return Err(HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    "journal reducer page did not advance its sequence cursor",
+                    false,
+                ));
+            }
+            cursor = next_cursor;
+            selected.extend(
+                page.into_iter()
+                    .filter(|envelope| payload_kinds.contains(&envelope_payload_kind(envelope))),
+            );
+            if selected.len() >= limit {
+                selected.truncate(limit);
+                return Ok(selected);
+            }
+            if scan_complete {
+                return Ok(selected);
+            }
+        }
+    }
 
     async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError>;
 

@@ -1912,6 +1912,23 @@ impl StoreHandle for SqliteStoreHandle {
             .await
     }
 
+    async fn read_reducer_page(
+        &self,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+        payload_kinds: &'static [&'static str],
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.read_reducer_page(&session_id, since_seq, limit, payload_kinds)
+            })
+        })
+        .await
+    }
+
     async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError> {
         let owner = Arc::clone(&self.owner);
         let session_id = session_id.clone();
