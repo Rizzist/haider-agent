@@ -71,7 +71,7 @@ use haider_protocol::session::{
     SessionPermissionOverridesV1,
 };
 use haider_protocol::session_fork::{
-    ForkContextEpoch, SessionForkMode, SessionForked, SessionHistoryOmission,
+    ForkCacheSegmentV1, ForkContextEpoch, SessionForkMode, SessionForked, SessionHistoryOmission,
     SessionMetaforkProposal, SessionMetaforkReviewManifest,
 };
 use haider_protocol::state::{RunState, SessionState};
@@ -763,6 +763,18 @@ pub struct SessionForkCommand {
     pub device_id: DeviceId,
 }
 
+/// Provider-rendered child view proposed for exact-prefix cache inheritance.
+///
+/// The store deliberately accepts an opaque JSON value here instead of
+/// duplicating the provider-view ledger schema. It compares this value with
+/// the authoritative ledger event in the copied source lineage, permits only
+/// append-only history after that exact prefix, and extracts the bounded,
+/// non-secret coordinates needed by the fork audit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkCacheInheritanceCandidate {
+    pub provider_view: serde_json::Value,
+}
+
 /// Stable response stored in the committed fork/metafork command receipt.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CreatedSessionFork {
@@ -783,6 +795,8 @@ pub struct CreatedSessionFork {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposal_digest: Option<String>,
     pub omission_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_cache_segment: Option<ForkCacheSegmentV1>,
 }
 
 /// Result of the atomic child metadata/history/audit/receipt transaction.
@@ -6572,6 +6586,17 @@ impl Store {
     /// admitted source lineage through the requested node, appends an audit
     /// fact, and finalizes the command receipt. Source rows are read-only.
     pub fn fork_session(&self, command: &SessionForkCommand) -> StoreResult<SessionForkOutcome> {
+        self.fork_session_with_cache_candidate(command, None)
+    }
+
+    /// Same atomic fork with a provider-rendered child view eligible for
+    /// fail-closed exact-prefix cache inheritance. Missing, malformed, stale,
+    /// or byte-divergent candidates retain the ordinary fresh epoch.
+    pub fn fork_session_with_cache_candidate(
+        &self,
+        command: &SessionForkCommand,
+        cache_candidate: Option<&ForkCacheInheritanceCandidate>,
+    ) -> StoreResult<SessionForkOutcome> {
         validate_command_identity(
             &command.command_id,
             &command.request_digest,
@@ -6719,6 +6744,26 @@ impl Store {
                 "fork source lineage does not contain its created envelope",
             ));
         }
+        let inherited_cache_segment = if model_proposal.is_none() {
+            if let Some(candidate) = cache_candidate {
+                let source_cache_boundary =
+                    source_fork_cache_boundary(&transaction, &command.source_session_id)?;
+                inherited_fork_cache_segment(
+                    &source_envelopes,
+                    source_owner_agent.as_ref(),
+                    &metadata,
+                    &command.source_session_id,
+                    source_cache_boundary.as_ref(),
+                    candidate,
+                )
+            } else {
+                None
+            }
+        } else {
+            // A valid metafork changes at least one prompt-visible source
+            // envelope, so its copied history cannot equal the parent view.
+            None
+        };
 
         let event_ids = source_envelopes
             .iter()
@@ -6837,9 +6882,12 @@ impl Store {
                 description: description.clone(),
                 accepted_proposal_digest: proposal_digest.clone(),
                 omissions: omissions.clone(),
-                // A distinct session id gives both prompt cache and native
-                // pipe sidecar a fresh root; parent segments are never copied.
-                context_epoch: ForkContextEpoch::Fresh,
+                context_epoch: if inherited_cache_segment.is_some() {
+                    ForkContextEpoch::Inherited
+                } else {
+                    ForkContextEpoch::Fresh
+                },
+                inherited_cache_segment: inherited_cache_segment.clone(),
             }
             .to_payload_value()
             .map_err(|error| {
@@ -6868,6 +6916,7 @@ impl Store {
             model_proposal,
             proposal_digest,
             omission_count: u64::try_from(omissions.len()).unwrap_or(u64::MAX),
+            inherited_cache_segment,
         };
         finalize_command_receipt(
             &transaction,
@@ -15799,6 +15848,321 @@ fn validate_metafork_commit(
         ));
     }
     Ok(())
+}
+
+/// Content address for the complete exact provider view used to justify a
+/// fork cache-prefix inheritance decision.
+pub fn fork_provider_view_prefix_digest(provider_view: &serde_json::Value) -> StoreResult<String> {
+    let bytes = serde_json::to_vec(provider_view).map_err(|error| {
+        store_error(
+            ErrorCode::InvalidArgument,
+            format!("cannot serialize fork provider view: {error}"),
+            false,
+        )
+    })?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"haider.session-fork.provider-prefix.v1\0");
+    hasher.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(&bytes);
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+struct SourceForkCacheBoundary {
+    seq: u64,
+    inherited_segment: Option<ForkCacheSegmentV1>,
+}
+
+fn source_fork_cache_boundary(
+    connection: &Connection,
+    source_session_id: &SessionId,
+) -> StoreResult<Option<SourceForkCacheBoundary>> {
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT seq, envelope_json, event_id, committed_at_ms
+             FROM events
+             WHERE session_id = ?1 AND payload_kind = 'session_forked'
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query([source_session_id.as_str()])
+        .map_err(map_sqlite_error)?;
+    let Some(row) = rows.next().map_err(map_sqlite_error)? else {
+        return Ok(None);
+    };
+    let stored_seq: i64 = row.get(0).map_err(map_sqlite_error)?;
+    let stored_event_id: String = row.get(2).map_err(map_sqlite_error)?;
+    let stored_committed_at_ms: i64 = row.get(3).map_err(map_sqlite_error)?;
+    let envelope = decode_envelope_column(row, 1).map_err(|error| {
+        corrupt(format!(
+            "invalid session-fork boundary for session {source_session_id}, seq {stored_seq}: {error}"
+        ))
+    })?;
+    validate_stored_envelope(
+        source_session_id,
+        stored_seq,
+        &stored_event_id,
+        stored_committed_at_ms,
+        &envelope,
+    )?;
+    let seq = u64::try_from(stored_seq)
+        .map_err(|_| corrupt("session-fork boundary sequence is negative"))?;
+    let inherited_segment =
+        SessionForked::from_payload_value(&envelope.payload).and_then(|record| {
+            (record.context_epoch == ForkContextEpoch::Inherited)
+                .then_some(record.inherited_cache_segment)
+                .flatten()
+        });
+    Ok(Some(SourceForkCacheBoundary {
+        seq,
+        inherited_segment,
+    }))
+}
+
+fn inherited_fork_cache_segment(
+    source_envelopes: &[RawEnvelope],
+    source_owner_agent: Option<&AgentId>,
+    source_metadata: &SessionMetadataV1,
+    source_session_id: &SessionId,
+    source_cache_boundary: Option<&SourceForkCacheBoundary>,
+    candidate: &ForkCacheInheritanceCandidate,
+) -> Option<ForkCacheSegmentV1> {
+    const PROVIDER_VIEW_ATTEMPT_KIND: &str = "provider_view_attempt_v1";
+    const PROVIDER_VIEW_ATTEMPT_PREFIX: &str = "provider_view_attempt_";
+
+    for envelope in source_envelopes.iter().rev() {
+        if envelope.agent_id.as_ref() != source_owner_agent {
+            continue;
+        }
+        let payload = match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
+            Ok(payload) => payload,
+            Err(_)
+                if raw_provider_view_kind(&envelope.payload)
+                    .is_some_and(|kind| kind.starts_with(PROVIDER_VIEW_ATTEMPT_PREFIX)) =>
+            {
+                return None;
+            }
+            Err(_) => continue,
+        };
+        let EventPayload::Item(item_event) = payload else {
+            continue;
+        };
+        let item = match item_event {
+            ItemEvent::Completed { item, .. } => item,
+            ItemEvent::Started {
+                item: TurnItem::Extension { kind, .. },
+                ..
+            } if kind.starts_with(PROVIDER_VIEW_ATTEMPT_PREFIX) => return None,
+            ItemEvent::Started { .. } | ItemEvent::Delta { .. } => continue,
+        };
+        let TurnItem::Extension { kind, data } = item else {
+            continue;
+        };
+        if kind != PROVIDER_VIEW_ATTEMPT_KIND {
+            if kind.starts_with(PROVIDER_VIEW_ATTEMPT_PREFIX) {
+                return None;
+            }
+            continue;
+        }
+
+        // The newest known ledger is authoritative. A malformed newest
+        // record must not fall back to an older, apparently compatible view.
+        data.get("ordinal")?.as_u64()?;
+        let source_view = data.get("view")?;
+        if !provider_views_share_cache_prefix(source_view, &candidate.provider_view) {
+            return None;
+        }
+        let provider = source_view.get("provider")?.as_str()?;
+        let model = source_view.get("model")?.as_str()?;
+        let account_scope = source_view.get("account_scope")?.as_str()?;
+        let cache_epoch = source_view.get("cache_epoch")?.as_str()?;
+        let stable_history_end = source_view.get("stable_history_end")?.as_u64()?;
+        if provider != source_metadata.provider
+            || model != source_metadata.model
+            || account_scope.is_empty()
+            || cache_epoch.is_empty()
+        {
+            return None;
+        }
+        let prefix_digest = fork_provider_view_prefix_digest(source_view).ok()?;
+        let cache_route = effective_source_cache_route(
+            source_cache_boundary,
+            source_session_id,
+            envelope.seq,
+            provider,
+            model,
+            account_scope,
+            cache_epoch,
+            stable_history_end,
+            &prefix_digest,
+        )?;
+        return Some(ForkCacheSegmentV1 {
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+            account_scope: account_scope.to_owned(),
+            cache_route,
+            cache_epoch: cache_epoch.to_owned(),
+            prefix_digest,
+            stable_history_end,
+            source_provider_view_seq: envelope.seq,
+            source_provider_view_event_id: envelope.event_id.clone(),
+        });
+    }
+    None
+}
+
+fn effective_source_cache_route(
+    source_cache_boundary: Option<&SourceForkCacheBoundary>,
+    source_session_id: &SessionId,
+    source_provider_view_seq: u64,
+    provider: &str,
+    model: &str,
+    account_scope: &str,
+    cache_epoch: &str,
+    stable_history_end: u64,
+    prefix_digest: &str,
+) -> Option<String> {
+    let Some(boundary) = source_cache_boundary else {
+        return Some(source_session_id.as_str().to_owned());
+    };
+    if let Some(segment) = boundary.inherited_segment.as_ref() {
+        let inherited_prefix = segment.provider == provider
+            && segment.model == model
+            && segment.account_scope == account_scope
+            && segment.cache_epoch == cache_epoch
+            && segment.stable_history_end == stable_history_end
+            && segment.prefix_digest == prefix_digest
+            && !segment.cache_route.is_empty();
+        if inherited_prefix {
+            return Some(segment.cache_route.clone());
+        }
+    }
+    (source_provider_view_seq >= boundary.seq).then(|| source_session_id.as_str().to_owned())
+}
+
+fn raw_provider_view_kind(payload: &serde_json::Value) -> Option<&str> {
+    payload.get("item")?.get("kind")?.as_str()
+}
+
+fn provider_views_share_cache_prefix(
+    source: &serde_json::Value,
+    child: &serde_json::Value,
+) -> bool {
+    if !provider_view_is_complete(source) || !provider_view_is_complete(child) {
+        return false;
+    }
+    let same_domain = [
+        "provider",
+        "model",
+        "dialect",
+        "serialization_version",
+        "header_epoch",
+        "cache_epoch",
+        "compaction_epoch",
+        "reasoning_retention",
+        "account_scope",
+        "trim_sentinel",
+        "system_bytes",
+        "tool_schema_bytes",
+    ]
+    .into_iter()
+    .all(|field| source.get(field) == child.get(field));
+    if !same_domain {
+        return false;
+    }
+    let Some(source_history) = source
+        .get("history_blocks")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    let Some(child_history) = child
+        .get("history_blocks")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    let stable_boundary_grew = source
+        .get("stable_history_end")
+        .and_then(serde_json::Value::as_u64)
+        .zip(
+            child
+                .get("stable_history_end")
+                .and_then(serde_json::Value::as_u64),
+        )
+        .is_some_and(|(source_end, child_end)| source_end <= child_end);
+    stable_boundary_grew
+        && source_history.len() <= child_history.len()
+        && source_history
+            .iter()
+            .zip(child_history)
+            .all(|(source_block, child_block)| source_block == child_block)
+}
+
+fn provider_view_is_complete(view: &serde_json::Value) -> bool {
+    let nonempty_string = |field| {
+        view.get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    };
+    let byte_array = |value: &serde_json::Value| {
+        value.as_array().is_some_and(|bytes| {
+            bytes
+                .iter()
+                .all(|byte| byte.as_u64().is_some_and(|byte| u8::try_from(byte).is_ok()))
+        })
+    };
+    let history_blocks = view
+        .get("history_blocks")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|blocks| blocks.iter().all(byte_array));
+    let latest_compaction_boundary_valid = view
+        .get("latest_compaction_summary_end")
+        .is_none_or(|boundary| boundary.is_null() || boundary.as_u64().is_some());
+    let boundaries_valid = view.get("boundaries").is_none_or(|boundaries| {
+        boundaries.as_array().is_some_and(|boundaries| {
+            boundaries.iter().all(|boundary| {
+                boundary
+                    .get("section")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+                    && boundary.get("message_end").is_none_or(|message_end| {
+                        message_end.is_null() || message_end.as_u64().is_some()
+                    })
+            })
+        })
+    });
+
+    [
+        "provider",
+        "model",
+        "dialect",
+        "serialization_version",
+        "header_epoch",
+        "cache_epoch",
+        "compaction_epoch",
+        "reasoning_retention",
+        "trim_sentinel",
+    ]
+    .into_iter()
+    .all(nonempty_string)
+        && view
+            .get("account_scope")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|scope| !scope.is_empty())
+        && view
+            .get("stable_history_end")
+            .and_then(serde_json::Value::as_u64)
+            .is_some()
+        && view
+            .get("current_user_start")
+            .and_then(serde_json::Value::as_u64)
+            .is_some()
+        && view.get("system_bytes").is_some_and(byte_array)
+        && view.get("tool_schema_bytes").is_some_and(byte_array)
+        && history_blocks
+        && latest_compaction_boundary_valid
+        && boundaries_valid
 }
 
 fn load_fork_source_envelopes(
