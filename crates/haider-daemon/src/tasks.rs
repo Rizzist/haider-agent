@@ -69,10 +69,14 @@ pub(crate) struct TaskEntry {
     run_id: RunId,
     branch_id: Option<BranchId>,
     agent_id: Option<AgentId>,
-    output: SharedTaskOutput,
+    /// Present while output has no durable backing. Successful CAS storage
+    /// atomically replaces this allocation with `terminal_fact.artifact`.
+    output: Option<SharedTaskOutput>,
     /// `None` for entries re-adopted from a prior daemon life (their
     /// supervision — and live output — died with that daemon).
     kill: Option<TaskKillHandle>,
+    /// Staged as soon as CAS succeeds so reads can cross the live-to-durable
+    /// swap; its delivery field is finalized when the state becomes terminal.
     terminal_fact: Option<TaskCompleted>,
 }
 
@@ -154,6 +158,25 @@ impl TaskRegistry {
         {
             entry.state = TaskLiveState::Terminal(state);
             entry.terminal_fact = Some(fact);
+            entry.kill = None;
+        }
+    }
+
+    /// Switches completed output to its durable backing in one registry
+    /// step. Readers see either the intact live buffer or the CAS reference,
+    /// never an evicted buffer without a source for cursor pages.
+    fn stage_durable_output(&self, session_id: &SessionId, task: &TaskId, fact: &TaskCompleted) {
+        if fact.artifact.is_none() {
+            return;
+        }
+        if let Some(entry) = self
+            .lock()
+            .get_mut(session_id)
+            .and_then(|session| session.tasks.get_mut(task))
+            .filter(|entry| entry.state == TaskLiveState::Running)
+        {
+            entry.terminal_fact = Some(fact.clone());
+            entry.output = None;
         }
     }
 
@@ -302,7 +325,10 @@ impl TaskFacade {
                         run_id: started.run_id.clone(),
                         branch_id: started.branch_id.clone(),
                         agent_id: started.agent_id.clone(),
-                        output: shared_task_output(0, 0),
+                        output: completed
+                            .artifact
+                            .is_none()
+                            .then(|| shared_task_output(0, 0)),
                         kill: None,
                         terminal_fact: Some(completed.clone()),
                     },
@@ -361,7 +387,7 @@ impl TaskFacade {
                     run_id: started.run_id,
                     branch_id: started.branch_id,
                     agent_id: started.agent_id,
-                    output: shared_task_output(0, 0),
+                    output: Some(shared_task_output(0, 0)),
                     kill: None,
                     terminal_fact: Some(completed),
                 },
@@ -468,7 +494,7 @@ impl TaskFacade {
                 run_id: context.run_id.clone(),
                 branch_id: context.branch_id.clone(),
                 agent_id: context.agent_id.clone(),
-                output: Arc::clone(&output),
+                output: Some(Arc::clone(&output)),
                 kill: Some(kill),
                 terminal_fact: None,
             },
@@ -511,7 +537,7 @@ impl TaskFacade {
         status: BackgroundExitStatus,
     ) {
         let registry = self.hub.task_registry();
-        let Some(entry) = registry.get(session_id, task) else {
+        let Some(mut entry) = registry.get(session_id, task) else {
             // The delete fence removed the session projection: the session
             // (and its journal) is gone — nothing to record.
             return;
@@ -542,8 +568,12 @@ impl TaskFacade {
                 reason: "process ended without an exit status".into(),
             }
         };
+        let Some(output) = entry.output.as_ref() else {
+            tracing::warn!(%session_id, task = %task, "running task lost its live output buffer");
+            return;
+        };
         let (output_bytes, truncated, tail, retained) = {
-            let buffer = lock_task_output(&entry.output);
+            let buffer = lock_task_output(output);
             (
                 buffer.total_bytes(),
                 buffer.truncated(),
@@ -575,6 +605,16 @@ impl TaskFacade {
             delivery: TaskCompletionDelivery::DeliveredQueued,
             workspace_mutation: status.workspace_mutation.clone(),
         };
+        if completed.artifact.is_some() {
+            // Publish the CAS reference and discard the registry and
+            // completion-local live buffer handles immediately after the
+            // durable write succeeds.
+            // The provisional fact also preserves summary metadata while
+            // delivery and journaling finish; `set_terminal` replaces it
+            // with the final delivery disposition below.
+            registry.stage_durable_output(session_id, task, &completed);
+            entry.output = None;
+        }
         let notice =
             haider_core::task_event_notice(&TaskEventPayload::TaskCompleted(completed.clone()));
         let delivery = match self.active_run(session_id).await {
@@ -641,45 +681,96 @@ impl TaskFacade {
         let Some(entry) = self.hub.task_registry().get(session_id, &task) else {
             return Ok(unknown_task_result(task_id));
         };
-        let artifact = entry
-            .terminal_fact
-            .as_ref()
-            .and_then(|fact| fact.artifact.clone());
+        let terminal_fact = entry.terminal_fact.clone();
+        let artifact = match &entry.state {
+            TaskLiveState::Running => None,
+            TaskLiveState::Terminal(_) => terminal_fact
+                .as_ref()
+                .and_then(|fact| fact.artifact.clone()),
+        };
         let state = task_state_value(&entry.state);
-        let buffer = lock_task_output(&entry.output);
-        let (preview, result_cursor) = match cursor {
-            None => (
-                json!({
-                    "task_id": task,
-                    "name": entry.name,
-                    "state": state,
-                    "output_bytes": buffer.total_bytes(),
-                    "truncated": buffer.truncated(),
-                    "tail": buffer.tail_lossy(),
-                }),
-                None,
-            ),
-            Some(cursor) => {
-                let (bytes, next_cursor) = buffer.read_from(cursor, TASK_OUTPUT_READ_BYTES);
-                let exhausted = next_cursor >= buffer.retained().len() as u64;
+        let (preview, result_cursor, truncated) = match cursor {
+            None => {
+                let (output_bytes, truncated, tail) = if let Some(fact) = terminal_fact.as_ref() {
+                    (fact.output_bytes, fact.truncated, fact.tail.clone())
+                } else {
+                    let Some(output) = entry.output.as_ref() else {
+                        return Err(missing_task_output_backing(&task));
+                    };
+                    let buffer = lock_task_output(output);
+                    (
+                        buffer.total_bytes(),
+                        buffer.truncated(),
+                        buffer.tail_lossy(),
+                    )
+                };
                 (
                     json!({
                         "task_id": task,
                         "name": entry.name,
                         "state": state,
-                        "output_bytes": buffer.total_bytes(),
-                        "truncated": buffer.truncated(),
+                        "output_bytes": output_bytes,
+                        "truncated": truncated,
+                        "tail": tail,
+                    }),
+                    None,
+                    truncated,
+                )
+            }
+            Some(cursor) => {
+                let (bytes, next_cursor, exhausted, output_bytes, truncated) =
+                    if let Some((artifact, output_bytes, truncated)) =
+                        terminal_fact.as_ref().and_then(|fact| {
+                            fact.artifact
+                                .as_ref()
+                                .map(|artifact| (artifact, fact.output_bytes, fact.truncated))
+                        })
+                    {
+                        let retained = self
+                            .hub
+                            .get_internal_artifact(artifact)
+                            .await
+                            .map_err(|error| ToolError::cas(error.message))?;
+                        let (bytes, next_cursor, exhausted) =
+                            read_task_output_page(&retained, cursor, TASK_OUTPUT_READ_BYTES);
+                        (bytes, next_cursor, exhausted, output_bytes, truncated)
+                    } else {
+                        let Some(output) = entry.output.as_ref() else {
+                            return Err(missing_task_output_backing(&task));
+                        };
+                        let buffer = lock_task_output(output);
+                        let (bytes, next_cursor, exhausted) = read_task_output_page(
+                            buffer.retained(),
+                            cursor,
+                            TASK_OUTPUT_READ_BYTES,
+                        );
+                        (
+                            bytes,
+                            next_cursor,
+                            exhausted,
+                            buffer.total_bytes(),
+                            buffer.truncated(),
+                        )
+                    };
+                (
+                    json!({
+                        "task_id": task,
+                        "name": entry.name,
+                        "state": state,
+                        "output_bytes": output_bytes,
+                        "truncated": truncated,
                         "chunk": String::from_utf8_lossy(&bytes).into_owned(),
                         "next_cursor": next_cursor,
                         "exhausted": exhausted,
                     }),
                     Some(next_cursor.to_string()),
+                    truncated,
                 )
             }
         };
         Ok(BoundedResult {
             preview: preview.to_string(),
-            truncated: buffer.truncated(),
+            truncated,
             artifact,
             images: Vec::new(),
             cursor: result_cursor,
@@ -1122,6 +1213,24 @@ fn bounded_chars(text: &str, cap: usize) -> String {
     text.chars().take(cap).collect()
 }
 
+fn missing_task_output_backing(task: &TaskId) -> ToolError {
+    ToolError::Lifecycle {
+        message: format!("background task `{task}` has no readable output backing"),
+    }
+}
+
+fn read_task_output_page(retained: &[u8], cursor: u64, max: usize) -> (Vec<u8>, u64, bool) {
+    let retained_len = u64::try_from(retained.len()).unwrap_or(u64::MAX);
+    let start = usize::try_from(cursor.min(retained_len)).unwrap_or(usize::MAX);
+    let start = start.min(retained.len());
+    let end = start.saturating_add(max).min(retained.len());
+    (
+        retained[start..end].to_vec(),
+        u64::try_from(end).unwrap_or(u64::MAX),
+        end >= retained.len(),
+    )
+}
+
 fn now_ms() -> u64 {
     u64::try_from(
         SystemTime::now()
@@ -1144,4 +1253,163 @@ fn internal_serialization(error: serde_json::Error) -> HaiderError {
         format!("cannot encode background task fact: {error}"),
         false,
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod eviction_tests {
+    use super::*;
+    use crate::session_hub::SessionHubConfig;
+    use haider_core::SqliteStoreHandle;
+
+    fn running_entry(task: &TaskId, output: SharedTaskOutput) -> TaskEntry {
+        TaskEntry {
+            task: task.clone(),
+            name: "buffer-test".into(),
+            pid: 1,
+            started_at_ms: 1,
+            state: TaskLiveState::Running,
+            run_id: RunId::new("buffer-test-run"),
+            branch_id: None,
+            agent_id: None,
+            output: Some(output),
+            kill: None,
+            terminal_fact: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_cas_output_is_evicted_and_paged_through_the_facade() {
+        let profile = tempfile::tempdir().expect("profile");
+        let store = SqliteStoreHandle::open(profile.path())
+            .await
+            .expect("store");
+        let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+        let facade = TaskFacade::new(hub.clone());
+        let registry = hub.task_registry();
+        let session = SessionId::new("buffer-test-session");
+        let task = TaskId::new("buffer-test-task");
+        assert!(registry.begin_adoption(&session));
+        let output = shared_task_output(TASK_OUTPUT_RETAIN_BYTES, TASK_TAIL_BYTES);
+        lock_task_output(&output).append(b"abcdef");
+        let live_buffer = Arc::downgrade(&output);
+        registry.insert(&session, running_entry(&task, Arc::clone(&output)));
+        drop(output);
+        let live_page = facade
+            .task_output(&session, task.as_str(), Some(2))
+            .await
+            .expect("live task output page");
+        let live_preview: serde_json::Value =
+            serde_json::from_str(&live_page.preview).expect("live task output preview");
+
+        facade
+            .complete_task(
+                &session,
+                &task,
+                BackgroundExitStatus {
+                    exit_code: Some(0),
+                    signal: None,
+                    killed: false,
+                    fault: None,
+                    workspace_mutation: None,
+                },
+            )
+            .await;
+
+        assert!(live_buffer.upgrade().is_none());
+        let entry = registry
+            .get(&session, &task)
+            .expect("completed task remains projected");
+        assert!(entry.output.is_none());
+        assert!(matches!(entry.state, TaskLiveState::Terminal(_)));
+        assert!(
+            entry
+                .terminal_fact
+                .as_ref()
+                .and_then(|fact| fact.artifact.as_ref())
+                .is_some()
+        );
+
+        let page = facade
+            .task_output(&session, task.as_str(), Some(2))
+            .await
+            .expect("CAS-backed task output page");
+        let preview: serde_json::Value =
+            serde_json::from_str(&page.preview).expect("task output preview");
+        assert_eq!(preview["chunk"], live_preview["chunk"]);
+        assert_eq!(preview["next_cursor"], live_preview["next_cursor"]);
+        assert_eq!(preview["exhausted"], live_preview["exhausted"]);
+        assert_eq!(preview["chunk"], "cdef");
+        assert_eq!(preview["next_cursor"], 6);
+        assert_eq!(preview["exhausted"], true);
+        assert!(page.artifact.is_some());
+
+        hub.shutdown().await.expect("hub shutdown");
+        store.close().await.expect("store close");
+    }
+
+    #[test]
+    fn cas_pages_preserve_live_buffer_bytes_and_offsets() {
+        let output = shared_task_output(TASK_OUTPUT_RETAIN_BYTES, TASK_TAIL_BYTES);
+        lock_task_output(&output).append(b"abcdef");
+        for cursor in [0, 2, 5, 6, 20] {
+            let (live_bytes, live_next) = lock_task_output(&output).read_from(cursor, 2);
+            let (cas_bytes, cas_next, exhausted) = read_task_output_page(b"abcdef", cursor, 2);
+            assert_eq!(cas_bytes, live_bytes);
+            assert_eq!(cas_next, live_next);
+            assert_eq!(exhausted, live_next >= 6);
+        }
+    }
+
+    #[test]
+    fn running_output_is_untouched_before_cas_staging() {
+        let registry = TaskRegistry::default();
+        let session = SessionId::new("live-buffer-test-session");
+        let task = TaskId::new("live-buffer-test-task");
+        let output = shared_task_output(TASK_OUTPUT_RETAIN_BYTES, TASK_TAIL_BYTES);
+        lock_task_output(&output).append(b"in-flight");
+        registry.insert(&session, running_entry(&task, Arc::clone(&output)));
+
+        let entry = registry
+            .get(&session, &task)
+            .expect("running task remains projected");
+        let output = entry.output.as_ref().expect("running output remains live");
+        assert_eq!(lock_task_output(output).retained(), b"in-flight");
+        assert_eq!(entry.state, TaskLiveState::Running);
+        assert!(entry.terminal_fact.is_none());
+    }
+
+    #[test]
+    fn durable_staging_keeps_running_tasks_killable() {
+        let registry = TaskRegistry::default();
+        let session = SessionId::new("killable-stage-session");
+        let task = TaskId::new("killable-stage-task");
+        let output = shared_task_output(TASK_OUTPUT_RETAIN_BYTES, TASK_TAIL_BYTES);
+        let (kill, _kill_signal) = task_kill_channel();
+        let mut entry = running_entry(&task, output);
+        entry.kill = Some(kill);
+        registry.insert(&session, entry);
+        let fact = TaskCompleted {
+            task: task.clone(),
+            name: "buffer-test".into(),
+            state: TaskTerminalState::Completed { exit_code: Some(0) },
+            elapsed_ms: 1,
+            output_bytes: 6,
+            tail: "abcdef".into(),
+            artifact: Some(haider_protocol::ids::ArtifactRef::new("blake3:buffer-test")),
+            full_output_unavailable: false,
+            truncated: false,
+            delivery: TaskCompletionDelivery::DeliveredQueued,
+            workspace_mutation: None,
+        };
+
+        registry.stage_durable_output(&session, &task, &fact);
+
+        let entry = registry
+            .get(&session, &task)
+            .expect("staged task remains projected");
+        assert_eq!(entry.state, TaskLiveState::Running);
+        assert!(entry.output.is_none());
+        assert!(entry.kill.is_some());
+    }
 }

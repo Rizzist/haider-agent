@@ -1961,6 +1961,14 @@ impl SessionHub {
         self.inner.store.put(bytes).await
     }
 
+    /// Reads one background-task output payload from the profile CAS.
+    pub(crate) async fn get_internal_artifact(
+        &self,
+        artifact: &haider_protocol::ids::ArtifactRef,
+    ) -> Result<Vec<u8>, HaiderError> {
+        self.inner.store.get(artifact).await
+    }
+
     /// Direct durable read used only by the delete fence, where the session
     /// actor is already stopped and `read_internal_session` cannot route.
     pub(crate) async fn store_read(
