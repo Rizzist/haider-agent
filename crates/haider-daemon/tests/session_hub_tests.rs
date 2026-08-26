@@ -5029,8 +5029,8 @@ async fn descendant_stream_reconnects_per_child_without_gaps_or_duplicates() {
         .append(&mut [spawn, spawn_item])
         .await
         .expect("parent anchors commit");
-    let spawn_seq = committed[0].seq;
-    let spawn_item_seq = committed[1].seq;
+    let spawn_seq = committed.first_seq;
+    let spawn_item_seq = committed.last_seq;
 
     let mut thinking = envelope(&child_session, "descendant-child-thinking", generation);
     thinking.run_id = Some(record.child_run_id.clone());
@@ -5104,7 +5104,7 @@ async fn descendant_stream_reconnects_per_child_without_gaps_or_duplicates() {
             haider_rpc::SessionDescendantStreamEventWire::Envelope {
                 session_id,
                 agent_id,
-                envelope,
+                envelope: replayed_envelope,
             },
     } = sink.next().await
     else {
@@ -5113,8 +5113,8 @@ async fn descendant_stream_reconnects_per_child_without_gaps_or_duplicates() {
     assert_eq!(attachment_id, first_attachment);
     assert_eq!(session_id, child_session);
     assert_eq!(agent_id, record.agent_id);
-    assert_eq!(envelope.session_id, child_session);
-    assert_eq!(envelope.seq, 2);
+    assert_eq!(replayed_envelope.session_id, child_session);
+    assert_eq!(replayed_envelope.seq, 2);
     assert!(matches!(
         sink.next().await,
         WireFrame::SessionDescendantStream {
@@ -5180,13 +5180,20 @@ async fn descendant_stream_reconnects_per_child_without_gaps_or_duplicates() {
     assert_eq!(baseline.roots[0].requested_after_seq, 2);
     assert_eq!(baseline.roots[0].replay_through_seq, 3);
     let WireFrame::SessionDescendantStream {
-        event: haider_rpc::SessionDescendantStreamEventWire::Envelope { envelope, .. },
+        event:
+            haider_rpc::SessionDescendantStreamEventWire::Envelope {
+                envelope: replayed_envelope,
+                ..
+            },
         ..
     } = sink.next().await
     else {
         panic!("expected detached suffix replay");
     };
-    assert_eq!(envelope.seq, 3, "resume is strict and duplicate-free");
+    assert_eq!(
+        replayed_envelope.seq, 3,
+        "resume is strict and duplicate-free"
+    );
     assert!(matches!(
         sink.next().await,
         WireFrame::SessionDescendantStream {
@@ -5273,8 +5280,11 @@ async fn descendant_stream_reconnects_per_child_without_gaps_or_duplicates() {
         } = sink.next().await
             && child.parent_anchors.result_seq.is_some()
         {
-            assert_eq!(child.parent_anchors.result_seq, Some(committed[0].seq));
-            assert_eq!(child.parent_anchors.result_item_seq, Some(committed[1].seq));
+            assert_eq!(child.parent_anchors.result_seq, Some(committed.first_seq));
+            assert_eq!(
+                child.parent_anchors.result_item_seq,
+                Some(committed.last_seq)
+            );
             break;
         }
     }
