@@ -429,6 +429,57 @@ fn cm2b_anthropic_four_breakpoints_oauth_identity_first_golden() {
     );
 }
 
+#[test]
+fn prepared_anthropic_wire_bytes_match_legacy_final_render() {
+    let provider = payload_provider(true).with_prompt_caching_verified(true);
+    let request = cache_control_request();
+    let legacy = provider
+        .request_payload(&request)
+        .expect("legacy cache-controlled Anthropic payload");
+    let prepared = provider.prepare_turn(&request).expect("prepared turn");
+    assert_eq!(
+        serde_json::to_vec(&prepared.wire.as_ref().expect("prepared wire").payload)
+            .expect("prepared bytes"),
+        serde_json::to_vec(&legacy).expect("legacy bytes")
+    );
+}
+
+#[test]
+fn api_key_system_only_marker_preserves_legacy_diagnostic_shape_semantics() {
+    let provider = payload_provider(false).with_prompt_caching_verified(true);
+    let mut request = cache_control_request();
+    request.tools.clear();
+    request.messages.clear();
+    let metadata = request.cache_metadata.as_mut().expect("cache metadata");
+    metadata.provider = crate::ANTHROPIC_PROVIDER_NAME.into();
+    metadata.stable_history_end = 0;
+    metadata.current_user_start = 0;
+    metadata.latest_compaction_summary_end = None;
+    let prepared = provider.prepare_turn(&request).expect("prepared turn");
+    assert!(
+        prepared.wire.as_ref().expect("prepared wire").payload["system"]
+            .to_string()
+            .contains("cache_control"),
+        "fixture must exercise the legacy string-to-array system marker case"
+    );
+    assert!(
+        !matches!(
+            prepared.cache_control(),
+            haider_protocol::provider::CacheControlObservationV1::Emitted { .. }
+        ),
+        "legacy structural comparison did not observe a key through the string-to-array system shape change"
+    );
+    assert!(
+        prepared
+            .provider_view()
+            .expect("provider view")
+            .ledger()
+            .boundaries
+            .is_empty(),
+        "system-only API-key observation historically recorded no ledger breakpoint"
+    );
+}
+
 /// CM2c — the longer TTL requires both a gap beyond five minutes and at
 /// least two later reads; every uncertain/short/single-read case stays 5m.
 ///
@@ -654,6 +705,64 @@ fn cache_diagnostic_provider_prepare_added_cpu_cost_is_measured() {
         "cache diagnostic provider prepare: added_mean_ns={} added_p95_ns={} baseline_mean_ns={baseline_mean} prepared_mean_ns={prepared_mean} samples={samples}",
         prepared_mean.saturating_sub(baseline_mean),
         prepared_p95.saturating_sub(baseline_p95),
+    );
+}
+
+/// v0.0.962 M5 allocation proof: the thread-local counting allocator samples
+/// every live allocation made during preparation, including transient DOMs
+/// and serializer buffers. The 1 MiB text makes fixed overhead negligible;
+/// the bound permits one final DOM plus one exact CAS view.
+#[test]
+fn single_render_prepare_peaks_at_two_prompt_sized_views() {
+    let provider = payload_provider(true).with_prompt_caching_verified(true);
+    let mut request = cache_control_request();
+    request.messages[0] = Message::user_text("x".repeat(1024 * 1024));
+    let (prepared, peak_bytes) = crate::measure_peak_test_allocation(|| {
+        provider.prepare_turn(&request).expect("prepared turn")
+    });
+    let wire_size = crate::exact_wire_size(&prepared.wire.as_ref().expect("prepared wire").payload)
+        .expect("wire size");
+    let allowed = usize::try_from(wire_size)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(2)
+        .saturating_add(128 * 1024);
+    assert!(
+        peak_bytes <= allowed,
+        "prepare peak {peak_bytes} exceeded two prompt views plus fixed overhead {allowed}"
+    );
+}
+
+#[test]
+fn single_render_cas_digests_match_legacy_whole_fragment_serialization() {
+    let provider = payload_provider(true).with_prompt_caching_verified(true);
+    let request = cache_control_request();
+    let prepared = provider.prepare_turn(&request).expect("prepared turn");
+    let mut neutral_request = request;
+    neutral_request.cache_metadata = None;
+    let neutral = provider
+        .request_payload(&neutral_request)
+        .expect("neutral payload");
+    let legacy_digest = |value: Option<&serde_json::Value>| {
+        blake3::hash(&serde_json::to_vec(&value).expect("legacy fragment serialization"))
+            .to_hex()
+            .to_string()
+    };
+    let messages = neutral["messages"].as_array().expect("messages array");
+    assert_eq!(
+        prepared.prefix_digests().system,
+        legacy_digest(neutral.get("system"))
+    );
+    assert_eq!(
+        prepared.prefix_digests().tools,
+        legacy_digest(neutral.get("tools"))
+    );
+    assert_eq!(
+        prepared.prefix_digests().immutable_history,
+        blake3::hash(
+            &serde_json::to_vec(&Some(&messages[..3])).expect("legacy history serialization")
+        )
+        .to_hex()
+        .to_string()
     );
 }
 

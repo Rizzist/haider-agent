@@ -466,16 +466,26 @@ impl OpenAiHttp {
         })
     }
 
-    async fn post_json(
+    async fn post_json_body(
         &self,
         url: &str,
-        payload: &serde_json::Value,
+        body: Vec<u8>,
     ) -> Result<reqwest::Response, ProviderError> {
         let opening = async {
-            let request = self.post_json_request(url, payload).await?;
+            let request = self.post_json_body_request(url, body).await?;
             self.client.execute(request).await.map_err(transport_error)
         };
         response_before_deadline(TRANSPORT_CONFIG.response_open_timeout, opening).await
+    }
+
+    async fn post_json_body_request(
+        &self,
+        url: &str,
+        body: Vec<u8>,
+    ) -> Result<reqwest::Request, ProviderError> {
+        self.validate_origin(url).await?;
+        let request = self.json_request_builder(url)?.body(body);
+        request.build().map_err(transport_error)
     }
 
     async fn post_json_request(
@@ -484,6 +494,13 @@ impl OpenAiHttp {
         payload: &serde_json::Value,
     ) -> Result<reqwest::Request, ProviderError> {
         self.validate_origin(url).await?;
+        self.json_request_builder(url)?
+            .json(payload)
+            .build()
+            .map_err(transport_error)
+    }
+
+    fn json_request_builder(&self, url: &str) -> Result<reqwest::RequestBuilder, ProviderError> {
         let mut request = self.with_auth_header(
             self.client
                 .post(url)
@@ -499,7 +516,7 @@ impl OpenAiHttp {
         if self.grok_subscription_headers {
             request = apply_grok_subscription_headers(request, Some(&self.model));
         }
-        request.json(payload).build().map_err(transport_error)
+        Ok(request)
     }
 
     async fn get(&self, url: &str) -> Result<reqwest::Response, ProviderError> {
@@ -703,8 +720,24 @@ impl OpenAiProvider {
             Some(prepared) => prepared.payload,
             None => self.request_payload(request)?,
         };
-        refresh_openai_cache_routing(request, self.http.codex_responses_lite, &mut payload);
-        self.http.post_json(&self.api_url, &payload).await
+        refresh_openai_cache_routing(request, self.http.codex_responses_lite, &mut payload, None);
+        let body = crate::serialize_json_body(payload)?;
+        self.http.post_json_body(&self.api_url, body).await
+    }
+
+    async fn stream_turn_ref(
+        &self,
+        request: &TurnRequest,
+    ) -> Result<ProviderStream, ProviderError> {
+        let computer_kind =
+            openai_computer_tool_kind(&request.model, self.http.codex_responses_lite);
+        let response = self.send_request(request).await?;
+        checked_stream(
+            response,
+            self.http.account.clone(),
+            DecoderKind::Responses(computer_kind),
+        )
+        .await
     }
 }
 
@@ -737,49 +770,28 @@ impl Provider for OpenAiProvider {
     fn prepare_turn(&self, request: &TurnRequest) -> Option<crate::PreparedTurn> {
         let boundary = request.cache_metadata.as_ref()?.cacheable_history_end();
         self.http.validate_model(request).ok()?;
-        let (mut full_payload, stable_wire_end, previous_wire_end) =
-            responses_request_json_with_boundary(
-                request,
-                self.http.codex_responses_lite,
-                self.effort.as_deref(),
-                self.web_search,
-                boundary,
-            )
-            .ok()?;
-        // Explicit breakpoint fields and routing keys are cache controls,
-        // not prompt content. Re-render the identical request without cache
-        // metadata so a moving marker does not masquerade as prefix drift.
-        let mut prompt_request = request.clone();
-        prompt_request.cache_metadata = None;
-        let (prompt_payload, _, _) = responses_request_json_with_boundary(
-            &prompt_request,
+        let rendered = responses_request_json_neutral_with_boundary(
+            request,
             self.http.codex_responses_lite,
             self.effort.as_deref(),
             self.web_search,
             boundary,
         )
         .ok()?;
-        let immutable_history =
-            crate::rendered_array_prefix_digest(&prompt_payload, "input", stable_wire_end)?;
-        let previous_immutable_history_digest = previous_wire_end.and_then(|previous| {
-            crate::rendered_array_prefix_digest(&prompt_payload, "input", previous)
-        });
+        let stable_wire_end = rendered.stable_wire_end;
+        let previous_wire_end = rendered.previous_wire_end;
+        let message_wire_ends = rendered.message_wire_ends;
+        let mut full_payload = rendered.payload;
         let rendered_system = if self.http.codex_responses_lite {
             request.system_prompt.as_ref().and_then(|_| {
-                prompt_payload
+                full_payload
                     .get("input")
                     .and_then(serde_json::Value::as_array)
                     .and_then(|input| input.first())
             })
         } else {
-            prompt_payload.get("instructions")
+            full_payload.get("instructions")
         };
-        let prefix_digests = crate::rendered_prefix_digests_from_components(
-            request,
-            rendered_system,
-            prompt_payload.get("tools"),
-            immutable_history,
-        )?;
         let metadata = request.cache_metadata.as_ref()?;
         let breakpoint_plan = crate::plan_inline_breakpoints(
             &metadata.provider,
@@ -792,53 +804,57 @@ impl Provider for OpenAiProvider {
             !request.tools.is_empty(),
             metadata.stable_prefix_tokens,
         );
-        let mut provider_view_payload = prompt_payload.clone();
-        let provider_view_system_key = if self.http.codex_responses_lite {
-            let rendered_system = prompt_payload
-                .get("input")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|input| input.first())
-                .filter(|item| {
-                    item.get("role").and_then(serde_json::Value::as_str) == Some("developer")
-                })
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            provider_view_payload
-                .as_object_mut()?
-                .insert("_haider_system_view".into(), rendered_system);
-            "_haider_system_view"
-        } else {
-            "instructions"
-        };
-        let provider_view = crate::cachemaxxing::prepared_array_provider_view(
+        let history_wire_start =
+            usize::from(self.http.codex_responses_lite && request.system_prompt.is_some());
+        let history = full_payload.get("input")?.as_array()?;
+        let (history_blocks, previous_history_blocks, previous_history_block_len) =
+            crate::serialized_provider_view_history(
+                history,
+                history_wire_start,
+                stable_wire_end,
+                previous_wire_end,
+            )?;
+        let mut provider_view = crate::cachemaxxing::prepared_serialized_provider_view(
             request,
-            &provider_view_payload,
             if self.http.codex_responses_lite {
                 "openai_responses_lite"
             } else {
                 "openai_responses"
             },
-            provider_view_system_key,
-            "tools",
-            "input",
-            usize::from(self.http.codex_responses_lite && request.system_prompt.is_some()),
-            stable_wire_end,
-            previous_wire_end,
+            rendered_system,
+            full_payload.get("tools"),
+            history_blocks,
+            previous_history_blocks,
             breakpoint_plan.ledger_boundaries(),
-        );
-        let finalized_request =
-            request_with_finalized_provider_view(request, provider_view.as_ref());
-        refresh_openai_cache_routing(
-            &finalized_request,
+        )?;
+        let (prefix_digests, mut previous_immutable_history_digest, provider_view_storage_blobs) =
+            crate::rendered_prefix_digests_from_provider_view(
+                request,
+                &mut provider_view,
+                self.http.codex_responses_lite && request.system_prompt.is_some(),
+                previous_history_block_len,
+            )?;
+        if previous_immutable_history_digest.is_none() {
+            previous_immutable_history_digest = previous_wire_end.map(|end| {
+                crate::exact_optional_wire_digest(Some(&history[..end.min(history.len())]))
+            });
+        }
+        let header_epoch = provider_view.ledger().header_epoch.as_str();
+        apply_openai_cache_controls(
+            request,
             self.http.codex_responses_lite,
             &mut full_payload,
+            &message_wire_ends,
+            boundary,
+            Some(header_epoch),
         );
-        let cache_control = openai_cache_control_observation(&finalized_request, &full_payload);
+        let cache_control = openai_cache_control_observation(request, &full_payload);
         Some(crate::PreparedTurn {
             prefix_digests,
             previous_immutable_history_digest,
             cache_control,
-            provider_view,
+            provider_view: Some(provider_view),
+            provider_view_storage_blobs,
             wire: Some(crate::PreparedWire {
                 payload: full_payload,
                 history_boundary: None,
@@ -855,15 +871,15 @@ impl Provider for OpenAiProvider {
     }
 
     async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError> {
-        let computer_kind =
-            openai_computer_tool_kind(&request.model, self.http.codex_responses_lite);
-        let response = self.send_request(&request).await?;
-        checked_stream(
-            response,
-            self.http.account.clone(),
-            DecoderKind::Responses(computer_kind),
-        )
-        .await
+        self.stream_turn_ref(&request).await
+    }
+
+    async fn stream_prepared_turn_ref(
+        &self,
+        request: &TurnRequest,
+        prepared: Option<crate::PreparedTurn>,
+    ) -> Result<ProviderStream, ProviderError> {
+        crate::scope_prepared_wire(prepared, self.stream_turn_ref(request)).await
     }
 }
 
@@ -1568,12 +1584,13 @@ impl OpenAiCompatibleProvider {
                 object.remove("prompt_cache_key");
             }
         }
+        let body = crate::serialize_json_body(payload)?;
         let mut outbound = self
             .http
-            .post_json_request(&self.chat_url, &payload)
+            .post_json_body_request(&self.chat_url, body)
             .await?;
         if self.dialect == CompatibleDialect::XaiApi
-            && let Some(conversation_id) = xai_prompt_cache_conversation_id(request)
+            && let Some(conversation_id) = xai_prompt_cache_conversation_id(request, None)
         {
             outbound.headers_mut().insert(
                 XAI_CONVERSATION_ID_HEADER,
@@ -1583,6 +1600,19 @@ impl OpenAiCompatibleProvider {
             );
         }
         Ok(outbound)
+    }
+
+    async fn stream_turn_ref(
+        &self,
+        request: &TurnRequest,
+    ) -> Result<ProviderStream, ProviderError> {
+        let response = self.send_request(request).await?;
+        checked_stream(
+            response,
+            self.http.account.clone(),
+            DecoderKind::Chat(self.dialect),
+        )
+        .await
     }
 }
 
@@ -1632,95 +1662,86 @@ impl Provider for OpenAiCompatibleProvider {
                 boundary,
             )
             .ok()?;
-        let mut prompt_request = request.clone();
-        prompt_request.cache_metadata = None;
-        let (prompt_payload, _, _) = chat_request_json_with_boundary(
-            &prompt_request,
-            self.dialect,
-            self.kimi_thinking.as_ref(),
-            self.kimi_reasoning_effort.as_deref(),
-            boundary,
-        )
-        .ok()?;
-        let immutable_history =
-            crate::rendered_array_prefix_digest(&prompt_payload, "messages", stable_wire_end)?;
-        let previous_immutable_history_digest = previous_wire_end.and_then(|previous| {
-            crate::rendered_array_prefix_digest(&prompt_payload, "messages", previous)
-        });
-        let prefix_digests = if matches!(
-            self.dialect,
-            CompatibleDialect::KimiOAuth | CompatibleDialect::XaiApi
-        ) {
-            let rendered_system = request.system_prompt.as_ref().and_then(|_| {
-                prompt_payload
-                    .get("messages")
-                    .and_then(serde_json::Value::as_array)
-                    .and_then(|messages| messages.first())
-            });
-            crate::rendered_prefix_digests_from_components(
-                request,
-                rendered_system,
-                prompt_payload.get("tools"),
-                immutable_history,
-            )?
-        } else {
-            // DeepSeek and the unrelated compatible dialects retain their
-            // established automatic-cache diagnostics unchanged.
-            crate::rendered_prefix_digests(
-                request,
-                &prompt_payload,
-                immutable_history,
-                "system",
-                "tools",
-            )?
-        };
-        let mut provider_view_payload = prompt_payload.clone();
-        let rendered_system = prompt_payload
+        // Kimi's cohort key is a routing overlay, not prompt content. Remove
+        // it from the only render until M4's exact provider view is frozen.
+        if self.dialect == CompatibleDialect::KimiOAuth
+            && let Some(object) = full_payload.as_object_mut()
+        {
+            object.remove("prompt_cache_key");
+        }
+        let rendered_system = full_payload
             .get("messages")
             .and_then(serde_json::Value::as_array)
             .and_then(|messages| messages.first())
             .filter(|message| {
                 message.get("role").and_then(serde_json::Value::as_str) == Some("system")
-            })
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        provider_view_payload
-            .as_object_mut()?
-            .insert("_haider_system_view".into(), rendered_system);
-        let provider_view = crate::cachemaxxing::prepared_array_provider_view(
+            });
+        let history_wire_start = usize::from(request.system_prompt.is_some());
+        let history = full_payload.get("messages")?.as_array()?;
+        let (history_blocks, previous_history_blocks, previous_history_block_len) =
+            crate::serialized_provider_view_history(
+                history,
+                history_wire_start,
+                stable_wire_end,
+                previous_wire_end,
+            )?;
+        let mut provider_view = crate::cachemaxxing::prepared_serialized_provider_view(
             request,
-            &provider_view_payload,
             self.dialect.provider_view_name(),
-            "_haider_system_view",
-            "tools",
-            "messages",
-            usize::from(request.system_prompt.is_some()),
-            stable_wire_end,
-            previous_wire_end,
+            rendered_system,
+            full_payload.get("tools"),
+            history_blocks,
+            previous_history_blocks,
             Vec::new(),
-        );
-        let finalized_request =
-            request_with_finalized_provider_view(request, provider_view.as_ref());
+        )?;
+        let (
+            mut prefix_digests,
+            mut previous_immutable_history_digest,
+            provider_view_storage_blobs,
+        ) = crate::rendered_prefix_digests_from_provider_view(
+            request,
+            &mut provider_view,
+            request.system_prompt.is_some(),
+            previous_history_block_len,
+        )?;
+        if previous_immutable_history_digest.is_none() {
+            previous_immutable_history_digest = previous_wire_end.map(|end| {
+                crate::exact_optional_wire_digest(Some(&history[..end.min(history.len())]))
+            });
+        }
+        if !matches!(
+            self.dialect,
+            CompatibleDialect::KimiOAuth | CompatibleDialect::XaiApi
+        ) {
+            // Preserve the established diagnostic ABI for unrelated
+            // compatible dialects: their top-level `system` field is absent
+            // even though the provider view correctly records message[0].
+            prefix_digests.system = crate::exact_optional_wire_digest::<serde_json::Value>(None);
+        }
+        let header_epoch = provider_view.ledger().header_epoch.as_str();
         if self.dialect == CompatibleDialect::KimiOAuth
             && let Some(object) = full_payload.as_object_mut()
         {
-            if let Some(key) = finalized_request
-                .cache_metadata
-                .as_ref()
-                .and_then(|metadata| prompt_cache_cohort_key(&finalized_request, metadata))
-            {
+            if let Some(key) = request.cache_metadata.as_ref().and_then(|metadata| {
+                prompt_cache_cohort_key_with_header(request, metadata, Some(header_epoch))
+            }) {
                 object.insert("prompt_cache_key".into(), serde_json::Value::String(key));
             } else {
                 object.remove("prompt_cache_key");
             }
         }
-        let cache_control =
-            compatible_cache_control_observation(&finalized_request, &full_payload, self.dialect);
+        let cache_control = compatible_cache_control_observation(
+            request,
+            &full_payload,
+            self.dialect,
+            Some(header_epoch),
+        );
         Some(crate::PreparedTurn {
             prefix_digests,
             previous_immutable_history_digest,
             cache_control,
-            provider_view,
+            provider_view: Some(provider_view),
+            provider_view_storage_blobs,
             wire: Some(crate::PreparedWire {
                 payload: full_payload,
                 history_boundary: None,
@@ -1769,13 +1790,15 @@ impl Provider for OpenAiCompatibleProvider {
     }
 
     async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError> {
-        let response = self.send_request(&request).await?;
-        checked_stream(
-            response,
-            self.http.account.clone(),
-            DecoderKind::Chat(self.dialect),
-        )
-        .await
+        self.stream_turn_ref(&request).await
+    }
+
+    async fn stream_prepared_turn_ref(
+        &self,
+        request: &TurnRequest,
+        prepared: Option<crate::PreparedTurn>,
+    ) -> Result<ProviderStream, ProviderError> {
+        crate::scope_prepared_wire(prepared, self.stream_turn_ref(request)).await
     }
 }
 
@@ -3780,6 +3803,13 @@ fn responses_request_json(
     .map(|(payload, _, _)| payload)
 }
 
+struct ResponsesNeutralRender {
+    payload: serde_json::Value,
+    stable_wire_end: usize,
+    previous_wire_end: Option<usize>,
+    message_wire_ends: Vec<usize>,
+}
+
 fn responses_request_json_with_boundary(
     request: &TurnRequest,
     codex_responses_lite: bool,
@@ -3787,6 +3817,35 @@ fn responses_request_json_with_boundary(
     hosted_web_search: bool,
     stable_history_end: usize,
 ) -> Result<(serde_json::Value, usize, Option<usize>), ProviderError> {
+    let mut rendered = responses_request_json_neutral_with_boundary(
+        request,
+        codex_responses_lite,
+        effort,
+        hosted_web_search,
+        stable_history_end,
+    )?;
+    apply_openai_cache_controls(
+        request,
+        codex_responses_lite,
+        &mut rendered.payload,
+        &rendered.message_wire_ends,
+        stable_history_end,
+        None,
+    );
+    Ok((
+        rendered.payload,
+        rendered.stable_wire_end,
+        rendered.previous_wire_end,
+    ))
+}
+
+fn responses_request_json_neutral_with_boundary(
+    request: &TurnRequest,
+    codex_responses_lite: bool,
+    effort: Option<&str>,
+    hosted_web_search: bool,
+    stable_history_end: usize,
+) -> Result<ResponsesNeutralRender, ProviderError> {
     let computer_kind = openai_computer_tool_kind(&request.model, codex_responses_lite);
     let computer_display = latest_computer_display_dimensions(request).unwrap_or((
         OPENAI_COMPUTER_BOOTSTRAP_WIDTH,
@@ -3794,9 +3853,6 @@ fn responses_request_json_with_boundary(
     ));
     let attachments = attachment_index(request)?;
     let native_computer_results = native_computer_result_index(request)?;
-    let lite_cache_breakpoint = codex_responses_lite
-        && request.cache_metadata.is_some()
-        && openai_lite_cache_breakpoint_enabled();
     let computer_result_call_ids = request
         .messages
         .iter()
@@ -3811,16 +3867,7 @@ fn responses_request_json_with_boundary(
     // input item and leaves the top-level `instructions` parameter null. Keep
     // the API-key Responses shape unchanged.
     if codex_responses_lite && let Some(instructions) = &request.system_prompt {
-        let mut instruction_block = serde_json::json!({"type": "input_text", "text": instructions});
-        if lite_cache_breakpoint {
-            instruction_block
-                .as_object_mut()
-                .ok_or_else(|| internal("OpenAI instruction block was not a JSON object"))?
-                .insert(
-                    "prompt_cache_breakpoint".into(),
-                    serde_json::json!({"mode": "explicit"}),
-                );
-        }
+        let instruction_block = serde_json::json!({"type": "input_text", "text": instructions});
         input.push(serde_json::json!({
             "type": "message",
             "role": "developer",
@@ -3828,19 +3875,6 @@ fn responses_request_json_with_boundary(
         }));
     }
     let stable_history_end = stable_history_end.min(request.messages.len());
-    let inline_cache_plan = request.cache_metadata.as_ref().map(|metadata| {
-        crate::plan_inline_breakpoints(
-            &metadata.provider,
-            &request.model,
-            &request.messages,
-            stable_history_end,
-            metadata.previous_stable_history_end,
-            metadata.latest_compaction_summary_end,
-            request.system_prompt.is_some(),
-            !request.tools.is_empty(),
-            metadata.stable_prefix_tokens,
-        )
-    });
     let mut stable_wire_end = (stable_history_end == 0).then_some(input.len());
     let previous_history_end = request
         .cache_metadata
@@ -3848,6 +3882,7 @@ fn responses_request_json_with_boundary(
         .and_then(|metadata| metadata.previous_stable_history_end)
         .filter(|previous| *previous <= request.messages.len());
     let mut previous_wire_end = (previous_history_end == Some(0)).then_some(input.len());
+    let mut message_wire_ends = Vec::with_capacity(request.messages.len());
     for (message_index, message) in request.messages.iter().enumerate() {
         let mut content = Vec::new();
         for block in &message.blocks {
@@ -4094,13 +4129,7 @@ fn responses_request_json_with_boundary(
             }
         }
         flush_response_message(&mut input, message.role, &mut content);
-        if openai_explicit_cache_enabled(request, codex_responses_lite)
-            && inline_cache_plan
-                .as_ref()
-                .is_some_and(|plan| plan.history_ends.contains(&message_index.saturating_add(1)))
-        {
-            mark_latest_openai_cacheable_block(&mut input);
-        }
+        message_wire_ends.push(input.len());
         if message_index.saturating_add(1) == stable_history_end {
             stable_wire_end = Some(input.len());
         }
@@ -4184,15 +4213,6 @@ fn responses_request_json_with_boundary(
     if !tools.is_empty() {
         object.insert("tools".into(), serde_json::Value::Array(tools));
     }
-    if let Some(key) = openai_prompt_cache_key(request) {
-        object.insert("prompt_cache_key".into(), serde_json::Value::String(key));
-        if openai_explicit_cache_enabled(request, codex_responses_lite) {
-            object.insert(
-                "prompt_cache_options".into(),
-                serde_json::json!({"mode": "explicit", "ttl": "30m"}),
-            );
-        }
-    }
     // Reasoning object: `summary: auto` + encrypted-content include for
     // reasoning models; lite ADDS the required `context: all_turns` and
     // ensures the object exists even for a non-reasoning model.
@@ -4219,7 +4239,12 @@ fn responses_request_json_with_boundary(
             );
         }
     }
-    Ok((payload, stable_wire_end, previous_wire_end))
+    Ok(ResponsesNeutralRender {
+        payload,
+        stable_wire_end,
+        previous_wire_end,
+        message_wire_ends,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -4430,19 +4455,6 @@ fn openai_automatic_cache_key_supported(model: &str) -> bool {
         || model_or_variant("o4")
 }
 
-fn request_with_finalized_provider_view(
-    request: &TurnRequest,
-    provider_view: Option<&crate::PreparedProviderView>,
-) -> TurnRequest {
-    let mut finalized = request.clone();
-    if let Some(header_epoch) = provider_view.map(|view| &view.ledger().header_epoch)
-        && let Some(metadata) = finalized.cache_metadata.as_mut()
-    {
-        metadata.header_epoch.clone_from(header_epoch);
-    }
-    finalized
-}
-
 /// On the subscription lite dialect the key is REQUIRED for reliable cache
 /// hits: without it OpenAI's implicit prefix cache is best-effort and
 /// shard-routed, and fast agentic rounds always outran its async warm-up
@@ -4453,6 +4465,13 @@ fn request_with_finalized_provider_view(
 /// the exact provider-view header epoch, so there is no second competing
 /// system/tool digest path.
 fn openai_prompt_cache_key(request: &TurnRequest) -> Option<String> {
+    openai_prompt_cache_key_with_header(request, None)
+}
+
+fn openai_prompt_cache_key_with_header(
+    request: &TurnRequest,
+    header_epoch: Option<&str>,
+) -> Option<String> {
     if !openai_automatic_cache_key_supported(&request.model) {
         return None;
     }
@@ -4465,7 +4484,7 @@ fn openai_prompt_cache_key(request: &TurnRequest) -> Option<String> {
     {
         return None;
     }
-    prompt_cache_cohort_key(request, metadata)
+    prompt_cache_cohort_key_with_header(request, metadata, header_epoch)
 }
 
 /// Refreshes the coupled OpenAI routing fields after the provider-view header
@@ -4475,11 +4494,16 @@ fn refresh_openai_cache_routing(
     request: &TurnRequest,
     codex_responses_lite: bool,
     payload: &mut serde_json::Value,
+    header_epoch: Option<&str>,
 ) {
     let Some(object) = payload.as_object_mut() else {
         return;
     };
-    let Some(key) = openai_prompt_cache_key(request) else {
+    let key = header_epoch.map_or_else(
+        || openai_prompt_cache_key(request),
+        |header_epoch| openai_prompt_cache_key_with_header(request, Some(header_epoch)),
+    );
+    let Some(key) = key else {
         object.remove("prompt_cache_key");
         object.remove("prompt_cache_options");
         return;
@@ -4493,6 +4517,68 @@ fn refresh_openai_cache_routing(
     } else {
         object.remove("prompt_cache_options");
     }
+}
+
+/// Applies the thin cache-control overlay to a cache-neutral Responses DOM.
+/// Normalized-message boundaries were captured during the only render, so
+/// provider-opaque/signed objects are never traversed or reconstructed.
+fn apply_openai_cache_controls(
+    request: &TurnRequest,
+    codex_responses_lite: bool,
+    payload: &mut serde_json::Value,
+    message_wire_ends: &[usize],
+    stable_history_end: usize,
+    header_epoch: Option<&str>,
+) {
+    let Some(input) = payload
+        .get_mut("input")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        refresh_openai_cache_routing(request, codex_responses_lite, payload, header_epoch);
+        return;
+    };
+    if codex_responses_lite
+        && request.cache_metadata.is_some()
+        && request.system_prompt.is_some()
+        && openai_lite_cache_breakpoint_enabled()
+        && let Some(object) = input
+            .first_mut()
+            .and_then(|item| item.get_mut("content"))
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|content| content.first_mut())
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        object.insert(
+            "prompt_cache_breakpoint".into(),
+            serde_json::json!({"mode": "explicit"}),
+        );
+    }
+    if openai_explicit_cache_enabled(request, codex_responses_lite)
+        && let Some(metadata) = request.cache_metadata.as_ref()
+    {
+        let plan = crate::plan_inline_breakpoints(
+            &metadata.provider,
+            &request.model,
+            &request.messages,
+            stable_history_end,
+            metadata.previous_stable_history_end,
+            metadata.latest_compaction_summary_end,
+            request.system_prompt.is_some(),
+            !request.tools.is_empty(),
+            metadata.stable_prefix_tokens,
+        );
+        for boundary in plan.history_ends {
+            if let Some(wire_end) = boundary
+                .checked_sub(1)
+                .and_then(|index| message_wire_ends.get(index))
+                .copied()
+            {
+                let wire_end = wire_end.min(input.len());
+                mark_latest_openai_cacheable_block(&mut input[..wire_end]);
+            }
+        }
+    }
+    refresh_openai_cache_routing(request, codex_responses_lite, payload, header_epoch);
 }
 
 fn openai_cache_control_observation(
@@ -4538,6 +4624,7 @@ fn compatible_cache_control_observation(
     request: &TurnRequest,
     payload: &serde_json::Value,
     dialect: CompatibleDialect,
+    header_epoch: Option<&str>,
 ) -> haider_protocol::provider::CacheControlObservationV1 {
     use haider_protocol::provider::{CacheControlObservationV1, CacheControlOmissionReasonV1};
 
@@ -4563,7 +4650,9 @@ fn compatible_cache_control_observation(
             };
             CacheControlObservationV1::NotEmitted { reason }
         }
-        CompatibleDialect::XaiApi if xai_prompt_cache_conversation_id(request).is_some() => {
+        CompatibleDialect::XaiApi
+            if xai_prompt_cache_conversation_id(request, header_epoch).is_some() =>
+        {
             CacheControlObservationV1::Emitted { ttl_ms: None }
         }
         CompatibleDialect::XaiApi => {
@@ -4591,13 +4680,16 @@ fn compatible_cache_control_observation(
 
 /// xAI Chat Completions caches matching message prefixes automatically, while
 /// `x-grok-conv-id` provides the sticky route needed for reliable reuse.
-fn xai_prompt_cache_conversation_id(request: &TurnRequest) -> Option<String> {
+fn xai_prompt_cache_conversation_id(
+    request: &TurnRequest,
+    header_epoch: Option<&str>,
+) -> Option<String> {
     let metadata = request.cache_metadata.as_ref()?;
     if !metadata.boundaries_valid(request.messages.len()) || metadata.provider != XAI_PROVIDER_NAME
     {
         return None;
     }
-    prompt_cache_cohort_key(request, metadata)
+    prompt_cache_cohort_key_with_header(request, metadata, header_epoch)
 }
 
 /// Cache-cohort isolation law: a route exists only for a daemon-resolved
@@ -4613,11 +4705,23 @@ fn prompt_cache_cohort_key(
     request: &TurnRequest,
     metadata: &crate::PromptCacheMetadata,
 ) -> Option<String> {
+    prompt_cache_cohort_key_with_header(request, metadata, None)
+}
+
+fn prompt_cache_cohort_key_with_header(
+    request: &TurnRequest,
+    metadata: &crate::PromptCacheMetadata,
+    header_epoch: Option<&str>,
+) -> Option<String> {
     let account_scope = metadata
         .account_scope
         .as_deref()
         .filter(|scope| !scope.is_empty())?;
-    let header_epoch = (!metadata.header_epoch.is_empty()).then_some(&metadata.header_epoch)?;
+    let header_epoch = header_epoch
+        .filter(|header_epoch| !header_epoch.is_empty())
+        .or_else(|| {
+            (!metadata.header_epoch.is_empty()).then_some(metadata.header_epoch.as_str())
+        })?;
     let domain = serde_json::json!({
         "schema": "haider.prompt-cache-cohort.v2",
         "provider": metadata.provider,

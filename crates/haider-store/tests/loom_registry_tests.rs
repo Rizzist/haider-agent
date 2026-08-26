@@ -717,7 +717,11 @@ fn migration_backfill_and_legacy_heal_preserve_the_pinned_digest() {
     )
     .expect("plant pre-stamp row");
     raw.execute_batch(
-        "DROP TABLE run_heads;
+        "DROP TABLE provider_view_gc;
+         DROP TABLE provider_view_blocks;
+         DROP TABLE provider_view_requests;
+         DROP TABLE provider_view_session_cursors;
+         DROP TABLE run_heads;
          DROP TABLE run_head_sessions;
          DROP TABLE loom_cli_install_events;
          DROP TABLE loom_workflow_revisions;
@@ -728,7 +732,7 @@ fn migration_backfill_and_legacy_heal_preserve_the_pinned_digest() {
     drop(raw);
 
     let store = Store::open(root.path()).expect("migrate legacy database");
-    assert_eq!(store.schema_version().expect("schema version"), 23);
+    assert_eq!(store.schema_version().expect("schema version"), 24);
     let legacy = store
         .loom_workflow("legacy-retained")
         .expect("read migrated current")

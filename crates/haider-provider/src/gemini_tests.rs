@@ -393,6 +393,21 @@ fn cache_diagnostic_gemini_hashes_current_wire_through_previous_history_length()
 }
 
 #[test]
+fn prepared_gemini_wire_bytes_match_legacy_final_render() {
+    let provider = provider_with_resolver(SocketAddr::from(([127, 0, 0, 1], 443)));
+    let request = gemini_cache_request("gemini-2.5-flash");
+    let legacy = provider
+        .request_payload(&request)
+        .expect("legacy Gemini payload");
+    let prepared = crate::Provider::prepare_turn(&provider, &request).expect("prepared Gemini");
+    assert_eq!(
+        serde_json::to_vec(&prepared.wire.as_ref().expect("prepared wire").payload)
+            .expect("prepared Gemini bytes"),
+        serde_json::to_vec(&legacy).expect("legacy Gemini bytes")
+    );
+}
+
+#[test]
 fn user_command_record_reaches_gemini_as_labeled_user_text() {
     let mut request = gemini_cache_request("gemini-2.5-flash");
     request.cache_metadata = None;

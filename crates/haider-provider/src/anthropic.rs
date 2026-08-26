@@ -496,6 +496,25 @@ impl AnthropicProvider {
         }
     }
 
+    fn request_cache_ttl(&self, request: &TurnRequest) -> Option<AnthropicCacheTtl> {
+        self.prompt_caching_enabled(&request.model)
+            .then_some(request.cache_metadata.as_ref())
+            .flatten()
+            .filter(|metadata| {
+                metadata.boundaries_valid(request.messages.len())
+                    && metadata.account_scope.is_some()
+                    && match self.auth_mode {
+                        AnthropicAuthMode::ApiKey => metadata.provider == ANTHROPIC_PROVIDER_NAME,
+                        AnthropicAuthMode::OAuthBearer => {
+                            metadata.provider == ANTHROPIC_OAUTH_PROVIDER_NAME
+                        }
+                        AnthropicAuthMode::CloudBearer => false,
+                    }
+                    && known_anthropic_cache_model(&request.model)
+            })
+            .map(|metadata| self.cache_ttl(metadata))
+    }
+
     #[cfg(test)]
     pub(crate) fn client_debug(&self) -> String {
         format!("{:?}", self.client)
@@ -542,8 +561,17 @@ impl AnthropicProvider {
             self.effort.as_deref(),
             self.fast,
             self.web_tools,
-            cache_ttl,
+            None,
         )?;
+        if let Some(cache_ttl) = cache_ttl {
+            apply_anthropic_cache_controls(
+                request,
+                &mut payload,
+                system_shape,
+                self.web_tools,
+                cache_ttl,
+            );
+        }
         // G4b Vertex wire deltas (LV1): the model is URL-addressed, so the
         // body DROPS `model` and carries `anthropic_version` in its place.
         if self.endpoint_shape == AnthropicEndpointShape::Vertex {
@@ -574,24 +602,17 @@ impl AnthropicProvider {
         request: &TurnRequest,
     ) -> Result<serde_json::Value, ProviderError> {
         self.validate_model(request)?;
-        let cache_ttl = self
-            .prompt_caching_enabled(&request.model)
-            .then_some(request.cache_metadata.as_ref())
-            .flatten()
-            .filter(|metadata| {
-                metadata.boundaries_valid(request.messages.len())
-                    && metadata.account_scope.is_some()
-                    && match self.auth_mode {
-                        AnthropicAuthMode::ApiKey => metadata.provider == ANTHROPIC_PROVIDER_NAME,
-                        AnthropicAuthMode::OAuthBearer => {
-                            metadata.provider == ANTHROPIC_OAUTH_PROVIDER_NAME
-                        }
-                        AnthropicAuthMode::CloudBearer => false,
-                    }
-                    && known_anthropic_cache_model(&request.model)
-            })
-            .map(|metadata| self.cache_ttl(metadata));
+        let cache_ttl = self.request_cache_ttl(request);
         let payload = self.render_payload(request, cache_ttl)?;
+        self.validate_pdf_request_size(request, &payload)?;
+        Ok(payload)
+    }
+
+    fn validate_pdf_request_size(
+        &self,
+        request: &TurnRequest,
+        payload: &serde_json::Value,
+    ) -> Result<(), ProviderError> {
         let has_pdf = request.messages.iter().any(|message| {
             message.blocks.iter().any(|block| {
                 matches!(
@@ -603,13 +624,13 @@ impl AnthropicProvider {
             })
         });
         if has_pdf {
-            let payload_bytes = serde_json::to_vec(&payload).map_err(|error| {
+            let payload_bytes = crate::exact_wire_size(payload).ok_or_else(|| {
                 ProviderError::new(
                     ProviderErrorKind::Internal,
-                    format!("could not measure Anthropic PDF request: {error}"),
+                    "could not measure Anthropic PDF request",
                 )
             })?;
-            if payload_bytes.len() > ANTHROPIC_PDF_REQUEST_MAX_BYTES {
+            if payload_bytes > u64::try_from(ANTHROPIC_PDF_REQUEST_MAX_BYTES).unwrap_or(u64::MAX) {
                 return Err(ProviderError::new(
                     ProviderErrorKind::InvalidRequest,
                     "Anthropic PDF request exceeds the provider's 32 MiB request limit",
@@ -623,18 +644,17 @@ impl AnthropicProvider {
                 )));
             }
         }
-        Ok(payload)
+        Ok(())
     }
 
     fn cache_control_observation(
         &self,
         request: &TurnRequest,
-        payload: &serde_json::Value,
-        prompt_payload: &serde_json::Value,
+        emitted: bool,
     ) -> haider_protocol::provider::CacheControlObservationV1 {
         use haider_protocol::provider::{CacheControlObservationV1, CacheControlOmissionReasonV1};
 
-        if crate::payload_has_added_key(payload, prompt_payload, "cache_control") {
+        if emitted {
             let ttl = request
                 .cache_metadata
                 .as_ref()
@@ -744,6 +764,26 @@ impl AnthropicProvider {
         &self,
         payload: &serde_json::Value,
     ) -> Result<reqwest::Request, ProviderError> {
+        self.request_builder(payload)
+            .await?
+            .json(payload)
+            .build()
+            .map_err(transport_error)
+    }
+
+    async fn request_body(
+        &self,
+        payload: serde_json::Value,
+    ) -> Result<reqwest::Request, ProviderError> {
+        let request = self.request_builder(&payload).await?;
+        let body = crate::serialize_json_body(payload)?;
+        request.body(body).build().map_err(transport_error)
+    }
+
+    async fn request_builder(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<reqwest::RequestBuilder, ProviderError> {
         if let Some(guard) = &self.fixed_origin_guard {
             guard.validate_endpoint(&self.api_url).await?;
         }
@@ -807,7 +847,7 @@ impl AnthropicProvider {
                 }
             }
         };
-        request.json(payload).build().map_err(transport_error)
+        Ok(request)
     }
 
     async fn send_request(
@@ -818,7 +858,7 @@ impl AnthropicProvider {
             Some(prepared) => prepared.payload,
             None => self.request_payload(request)?,
         };
-        let request = self.request(&payload).await?;
+        let request = self.request_body(payload).await?;
         let opening = self.client.execute(request);
         tokio::time::timeout(Self::transport_config().response_open_timeout, opening)
             .await
@@ -827,6 +867,252 @@ impl AnthropicProvider {
             })?
             .map_err(transport_error)
     }
+
+    async fn stream_turn_ref(
+        &self,
+        request: &TurnRequest,
+    ) -> Result<ProviderStream, ProviderError> {
+        let native_computer = anthropic_computer_tool_version(&request.model).is_some()
+            && request.tools.iter().any(|tool| tool.name == "computer");
+        let response = self.send_request(request).await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let request_id = response
+                .headers()
+                .get("request-id")
+                .or_else(|| response.headers().get("x-request-id"))
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let retry_after = response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let body = read_error_body_bounded(response).await?;
+            return Err(
+                replay_anthropic_http_error(status, retry_after.as_deref(), &body)
+                    .with_http_metadata(status, request_id.as_deref()),
+            );
+        }
+
+        let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
+        let account = self.account.clone();
+        let chunk_idle_timeout = Self::transport_config().chunk_idle_timeout;
+        let producer = tokio::spawn(async move {
+            stream_response(
+                response,
+                account,
+                sender,
+                chunk_idle_timeout,
+                native_computer,
+            )
+            .await;
+        });
+        Ok(ProviderStream::owned(receiver, producer))
+    }
+}
+
+fn anthropic_cache_control(ttl: AnthropicCacheTtl) -> serde_json::Value {
+    serde_json::json!({"type": "ephemeral", "ttl": ttl.wire()})
+}
+
+fn anthropic_cache_controls_would_emit(
+    request: &TurnRequest,
+    payload: &serde_json::Value,
+    plan: &crate::InlineBreakpointPlan,
+) -> bool {
+    if plan.mark_system && request.system_prompt.is_some() {
+        return true;
+    }
+    if plan.mark_final_tool
+        && payload
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|tools| tools.last())
+            .is_some_and(serde_json::Value::is_object)
+    {
+        return true;
+    }
+    let Some(messages) = payload
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    plan.history_ends.iter().any(|boundary| {
+        *boundary > 0
+            && *boundary <= messages.len()
+            && *boundary <= request.messages.len()
+            && request.messages[*boundary - 1]
+                .blocks
+                .last()
+                .is_some_and(|block| {
+                    !matches!(
+                        block,
+                        haider_protocol::provider::Block::ProviderOpaque { .. }
+                    )
+                })
+            && messages[*boundary - 1]
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|content| content.last())
+                .is_some_and(serde_json::Value::is_object)
+    })
+}
+
+/// Preserves the prior diagnostic comparer exactly without retaining a
+/// second neutral DOM. The legacy recursive comparison could see inserted
+/// keys only when the surrounding JSON shape stayed the same; notably, an
+/// API-key system marker changes `system` from a string to an array and was
+/// therefore intentionally invisible to that observation path.
+fn anthropic_cache_controls_legacy_observable(
+    request: &TurnRequest,
+    payload: &serde_json::Value,
+    plan: &crate::InlineBreakpointPlan,
+) -> bool {
+    if plan.mark_system
+        && request.system_prompt.is_some()
+        && payload
+            .get("system")
+            .is_some_and(serde_json::Value::is_array)
+    {
+        return true;
+    }
+    if plan.mark_final_tool
+        && payload
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|tools| tools.last())
+            .is_some_and(serde_json::Value::is_object)
+    {
+        return true;
+    }
+    let Some(messages) = payload
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    plan.history_ends.iter().any(|boundary| {
+        *boundary > 0
+            && *boundary <= messages.len()
+            && *boundary <= request.messages.len()
+            && request.messages[*boundary - 1]
+                .blocks
+                .last()
+                .is_some_and(|block| {
+                    !matches!(
+                        block,
+                        haider_protocol::provider::Block::ProviderOpaque { .. }
+                    )
+                })
+            && messages[*boundary - 1]
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|content| content.last())
+                .is_some_and(serde_json::Value::is_object)
+    })
+}
+
+/// Adds Anthropic's cache markers as a thin overlay on the one cache-neutral
+/// render. Every target is Haider-shaped; a provider-opaque block at a
+/// boundary remains untouched exactly as in the original renderer.
+fn apply_anthropic_cache_controls(
+    request: &TurnRequest,
+    payload: &mut serde_json::Value,
+    system_shape: AnthropicSystemShape,
+    web_tools: bool,
+    ttl: AnthropicCacheTtl,
+) -> bool {
+    let Some(metadata) = request.cache_metadata.as_ref() else {
+        return false;
+    };
+    let plan = crate::plan_inline_breakpoints(
+        &metadata.provider,
+        &request.model,
+        &request.messages,
+        metadata.cacheable_history_end(),
+        metadata.previous_stable_history_end,
+        metadata.latest_compaction_summary_end,
+        request.system_prompt.is_some(),
+        !request.tools.is_empty() || web_tools,
+        metadata.stable_prefix_tokens,
+    );
+    let Some(object) = payload.as_object_mut() else {
+        return false;
+    };
+    let mut emitted = false;
+    if plan.mark_system
+        && let Some(system) = request.system_prompt.as_ref()
+    {
+        match system_shape {
+            AnthropicSystemShape::ApiKey => {
+                object.insert(
+                    "system".into(),
+                    serde_json::json!([{
+                        "type": "text",
+                        "text": system,
+                        "cache_control": anthropic_cache_control(ttl),
+                    }]),
+                );
+                emitted = true;
+            }
+            AnthropicSystemShape::OAuthClaudeCode => {
+                if let Some(system) = object
+                    .get_mut("system")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .and_then(|blocks| blocks.last_mut())
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    system.insert("cache_control".into(), anthropic_cache_control(ttl));
+                    emitted = true;
+                }
+            }
+        }
+    }
+    if plan.mark_final_tool
+        && let Some(tool) = object
+            .get_mut("tools")
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|tools| tools.last_mut())
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        tool.insert("cache_control".into(), anthropic_cache_control(ttl));
+        emitted = true;
+    }
+    if let Some(messages) = object
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for boundary in plan.history_ends {
+            if boundary == 0 || boundary > messages.len() || boundary > request.messages.len() {
+                continue;
+            }
+            if request.messages[boundary - 1]
+                .blocks
+                .last()
+                .is_none_or(|block| {
+                    matches!(
+                        block,
+                        haider_protocol::provider::Block::ProviderOpaque { .. }
+                    )
+                })
+            {
+                continue;
+            }
+            if let Some(content) = messages[boundary - 1]
+                .get_mut("content")
+                .and_then(serde_json::Value::as_array_mut)
+                .and_then(|content| content.last_mut())
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                content.insert("cache_control".into(), anthropic_cache_control(ttl));
+                emitted = true;
+            }
+        }
+    }
+    emitted
 }
 
 fn verified_anthropic_cache_model(model: &str) -> bool {
@@ -905,66 +1191,93 @@ impl Provider for AnthropicProvider {
 
     fn prepare_turn(&self, request: &TurnRequest) -> Option<crate::PreparedTurn> {
         let boundary = request.cache_metadata.as_ref()?.cacheable_history_end();
-        let full_payload = self.request_payload(request).ok()?;
-        // Cache-control objects select breakpoints but are not prompt
-        // content. Re-render without them so a marker that moves as history
-        // grows cannot falsely report that the old token prefix changed.
-        let prompt_payload = self.render_payload(request, None).ok()?;
-        let immutable_history =
-            crate::rendered_array_prefix_digest(&prompt_payload, "messages", boundary)?;
-        let previous_immutable_history_digest = request
-            .cache_metadata
-            .as_ref()?
-            .previous_stable_history_end
-            .filter(|previous| *previous <= request.messages.len())
-            .and_then(|previous| {
-                crate::rendered_array_prefix_digest(&prompt_payload, "messages", previous)
-            });
-        let prefix_digests = crate::rendered_prefix_digests(
-            request,
-            &prompt_payload,
-            immutable_history,
-            "system",
-            "tools",
-        )?;
-        let cache_control = self.cache_control_observation(request, &full_payload, &prompt_payload);
+        self.validate_model(request).ok()?;
+        let mut full_payload = self.render_payload(request, None).ok()?;
         let metadata = request.cache_metadata.as_ref()?;
-        let boundaries = matches!(
-            cache_control,
-            haider_protocol::provider::CacheControlObservationV1::Emitted { .. }
-        )
-        .then(|| {
-            crate::plan_inline_breakpoints(
-                &metadata.provider,
-                &request.model,
-                &request.messages,
-                metadata.cacheable_history_end(),
-                metadata.previous_stable_history_end,
-                metadata.latest_compaction_summary_end,
-                request.system_prompt.is_some(),
-                !request.tools.is_empty(),
-                metadata.stable_prefix_tokens,
-            )
-            .ledger_boundaries()
-        })
-        .unwrap_or_default();
-        let provider_view = crate::cachemaxxing::prepared_array_provider_view(
-            request,
-            &prompt_payload,
-            "anthropic_messages",
-            "system",
-            "tools",
-            "messages",
-            0,
-            boundary,
+        let ledger_plan = crate::plan_inline_breakpoints(
+            &metadata.provider,
+            &request.model,
+            &request.messages,
+            metadata.cacheable_history_end(),
             metadata.previous_stable_history_end,
-            boundaries,
+            metadata.latest_compaction_summary_end,
+            request.system_prompt.is_some(),
+            !request.tools.is_empty(),
+            metadata.stable_prefix_tokens,
         );
+        let wire_plan = crate::plan_inline_breakpoints(
+            &metadata.provider,
+            &request.model,
+            &request.messages,
+            metadata.cacheable_history_end(),
+            metadata.previous_stable_history_end,
+            metadata.latest_compaction_summary_end,
+            request.system_prompt.is_some(),
+            !request.tools.is_empty() || self.web_tools,
+            metadata.stable_prefix_tokens,
+        );
+        let cache_ttl = self.request_cache_ttl(request);
+        let will_emit = cache_ttl.is_some()
+            && anthropic_cache_controls_would_emit(request, &full_payload, &wire_plan);
+        let legacy_observable = cache_ttl.is_some()
+            && anthropic_cache_controls_legacy_observable(request, &full_payload, &wire_plan);
+        let boundaries = legacy_observable
+            .then(|| ledger_plan.ledger_boundaries())
+            .unwrap_or_default();
+        let messages = full_payload.get("messages")?.as_array()?;
+        let (history_blocks, previous_history_blocks, previous_history_block_len) =
+            crate::serialized_provider_view_history(
+                messages,
+                0,
+                boundary,
+                metadata.previous_stable_history_end,
+            )?;
+        let mut provider_view = crate::cachemaxxing::prepared_serialized_provider_view(
+            request,
+            "anthropic_messages",
+            full_payload.get("system"),
+            full_payload.get("tools"),
+            history_blocks,
+            previous_history_blocks,
+            boundaries,
+        )?;
+        let (prefix_digests, mut previous_immutable_history_digest, provider_view_storage_blobs) =
+            crate::rendered_prefix_digests_from_provider_view(
+                request,
+                &mut provider_view,
+                false,
+                previous_history_block_len,
+            )?;
+        if previous_immutable_history_digest.is_none() {
+            previous_immutable_history_digest = metadata
+                .previous_stable_history_end
+                .filter(|previous| *previous <= messages.len())
+                .map(|previous| crate::exact_optional_wire_digest(Some(&messages[..previous])));
+        }
+        let emitted = cache_ttl.is_some_and(|ttl| {
+            apply_anthropic_cache_controls(
+                request,
+                &mut full_payload,
+                match self.auth_mode {
+                    AnthropicAuthMode::ApiKey | AnthropicAuthMode::CloudBearer => {
+                        AnthropicSystemShape::ApiKey
+                    }
+                    AnthropicAuthMode::OAuthBearer => AnthropicSystemShape::OAuthClaudeCode,
+                },
+                self.web_tools,
+                ttl,
+            )
+        });
+        debug_assert_eq!(emitted, will_emit);
+        self.validate_pdf_request_size(request, &full_payload)
+            .ok()?;
+        let cache_control = self.cache_control_observation(request, legacy_observable);
         Some(crate::PreparedTurn {
             prefix_digests,
             previous_immutable_history_digest,
             cache_control,
-            provider_view,
+            provider_view: Some(provider_view),
+            provider_view_storage_blobs,
             wire: Some(crate::PreparedWire {
                 payload: full_payload,
                 history_boundary: None,
@@ -990,44 +1303,15 @@ impl Provider for AnthropicProvider {
     }
 
     async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError> {
-        let native_computer = anthropic_computer_tool_version(&request.model).is_some()
-            && request.tools.iter().any(|tool| tool.name == "computer");
-        let response = self.send_request(&request).await?;
+        self.stream_turn_ref(&request).await
+    }
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let request_id = response
-                .headers()
-                .get("request-id")
-                .or_else(|| response.headers().get("x-request-id"))
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            let retry_after = response
-                .headers()
-                .get(RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            let body = read_error_body_bounded(response).await?;
-            return Err(
-                replay_anthropic_http_error(status, retry_after.as_deref(), &body)
-                    .with_http_metadata(status, request_id.as_deref()),
-            );
-        }
-
-        let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
-        let account = self.account.clone();
-        let chunk_idle_timeout = Self::transport_config().chunk_idle_timeout;
-        let producer = tokio::spawn(async move {
-            stream_response(
-                response,
-                account,
-                sender,
-                chunk_idle_timeout,
-                native_computer,
-            )
-            .await;
-        });
-        Ok(ProviderStream::owned(receiver, producer))
+    async fn stream_prepared_turn_ref(
+        &self,
+        request: &TurnRequest,
+        prepared: Option<crate::PreparedTurn>,
+    ) -> Result<ProviderStream, ProviderError> {
+        crate::scope_prepared_wire(prepared, self.stream_turn_ref(request)).await
     }
 }
 

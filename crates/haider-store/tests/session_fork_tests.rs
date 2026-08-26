@@ -310,6 +310,12 @@ fn accept_metafork_review(command: &mut SessionForkCommand) -> String {
 }
 
 fn provider_view(account_scope: &str, history: &str) -> serde_json::Value {
+    let block = |bytes: &[u8]| {
+        serde_json::json!({
+            "content_hash": format!("blake3:{}", blake3::hash(bytes).to_hex()),
+            "byte_len": bytes.len(),
+        })
+    };
     serde_json::json!({
         "provider": "fake",
         "model": "fake-model",
@@ -324,9 +330,9 @@ fn provider_view(account_scope: &str, history: &str) -> serde_json::Value {
         "current_user_start": 1,
         "trim_sentinel": "root-compaction",
         "boundaries": [],
-        "system_bytes": b"stable system".to_vec(),
-        "tool_schema_bytes": b"stable tools".to_vec(),
-        "history_blocks": [history.as_bytes().to_vec()],
+        "system_block": block(b"stable system"),
+        "tool_schema_block": block(b"stable tools"),
+        "history_blocks": [block(history.as_bytes())],
     })
 }
 
@@ -640,7 +646,12 @@ fn byte_identical_fork_inherits_parent_cache_segment() {
     child_view["history_blocks"]
         .as_array_mut()
         .expect("child history blocks")
-        .push(serde_json::json!(b"first child-only suffix".to_vec()));
+        .push(
+            serde_json::to_value(haider_protocol::cache::ProviderViewBlockRefV1::for_bytes(
+                b"first child-only suffix",
+            ))
+            .expect("child block ref"),
+        );
     let command = fork_command(
         &store,
         "cache-inherit-command",
@@ -948,7 +959,12 @@ fn nested_forks_recover_route_then_fork_it_after_first_new_view() {
     post_fork_view["history_blocks"]
         .as_array_mut()
         .expect("post-fork history blocks")
-        .push(serde_json::json!(b"first divergent child block".to_vec()));
+        .push(
+            serde_json::to_value(haider_protocol::cache::ProviderViewBlockRefV1::for_bytes(
+                b"first divergent child block",
+            ))
+            .expect("post-fork block ref"),
+        );
     let (post_fork_node, post_fork_seq, _, _) = append_provider_view_head_data(
         &store,
         &first_child,

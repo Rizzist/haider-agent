@@ -83,6 +83,9 @@ pub use sqlite_store::{AppendGroupBatch, ProfileStoreFault, SqliteStoreHandle};
 
 use async_trait::async_trait;
 use haider_protocol::branch::BranchDescriptor;
+use haider_protocol::cache::{
+    ProviderViewBlobV1, ProviderViewBlockRefV1, ProviderViewLedgerV1, ProviderViewStorageV1,
+};
 use haider_protocol::envelope::{RawEnvelope, envelope_weight_bytes};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{BranchId, SessionId};
@@ -227,6 +230,73 @@ pub trait StoreHandle: Send + Sync {
         _checkpoint: SessionProjectionCheckpoint,
     ) -> Result<(), HaiderError> {
         Ok(())
+    }
+
+    /// Persists exact provider-rendered blocks before the hashes-only ledger
+    /// enters the journal. Journal-only test stores validate and discard the
+    /// transient bytes; the SQLite implementation owns durable CAS storage.
+    async fn persist_provider_view(
+        &self,
+        session_id: &SessionId,
+        mut ledger: ProviderViewLedgerV1,
+        blobs: Vec<ProviderViewBlobV1>,
+    ) -> Result<ProviderViewLedgerV1, HaiderError> {
+        use std::collections::HashSet;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static EPHEMERAL_REQUEST_ORDINAL: AtomicU64 = AtomicU64::new(1);
+        let expected = std::iter::once(&ledger.system_block)
+            .chain(std::iter::once(&ledger.tool_schema_block))
+            .chain(ledger.history_blocks.iter())
+            .cloned()
+            .collect::<HashSet<_>>();
+        let actual = blobs
+            .into_iter()
+            .map(|blob| {
+                let computed = ProviderViewBlockRefV1::for_bytes(&blob.bytes);
+                (computed == blob.block).then_some(computed).ok_or_else(|| {
+                    HaiderError::new(
+                        haider_protocol::error::ErrorCode::InvalidArgument,
+                        "provider-view blob does not match its content address",
+                        false,
+                    )
+                })
+            })
+            .collect::<Result<HashSet<_>, _>>()?;
+        if actual != expected {
+            return Err(HaiderError::new(
+                haider_protocol::error::ErrorCode::InvalidArgument,
+                "provider-view write does not exactly cover its ledger blocks",
+                false,
+            ));
+        }
+        ledger.storage = Some(ProviderViewStorageV1 {
+            session_id: session_id.clone(),
+            request_ordinal: EPHEMERAL_REQUEST_ORDINAL.fetch_add(1, Ordering::Relaxed),
+            expires_at_ms: u64::MAX,
+        });
+        Ok(ledger)
+    }
+
+    /// Verifies the on-disk content addresses for one prior request view.
+    async fn verify_provider_view(
+        &self,
+        _ledger: &ProviderViewLedgerV1,
+    ) -> Result<(), HaiderError> {
+        Ok(())
+    }
+
+    /// Lazily reads one prior request block for replay/keepalive work.
+    async fn read_provider_view_block(
+        &self,
+        _ledger: &ProviderViewLedgerV1,
+        _block: &ProviderViewBlockRefV1,
+    ) -> Result<Vec<u8>, HaiderError> {
+        Err(HaiderError::new(
+            haider_protocol::error::ErrorCode::InvalidArgument,
+            "this journal-only store has no provider-view blob reader",
+            false,
+        ))
     }
 
     /// Resolves the durable named-ref registry from root to requested leaf.

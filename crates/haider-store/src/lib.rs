@@ -19,6 +19,7 @@ mod cas;
 mod event_store;
 mod migrations;
 mod profile_lock;
+mod provider_view_store;
 mod usage_ledger;
 
 pub use cas::{FileCas, validate_image_block};

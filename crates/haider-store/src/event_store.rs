@@ -17,13 +17,14 @@
 use crate::cas::FileCas;
 use crate::migrations;
 use crate::profile_lock::ProfileLock;
+use crate::provider_view_store::{ProviderViewStore, default_expiry_ms};
 use crate::usage_ledger::{
     UsageJournalReducer, UsageLedgerWriter, read_usage_day, slot_start_ms as usage_slot_start_ms,
 };
 use crate::{Cas, StoreResult, now_ms, store_error, to_sqlite_integer, validate_image_block};
 use haider_protocol::agent::{AgentManifest, ChildReport, ReportVerification};
 use haider_protocol::branch::{BranchCreated, BranchDescriptor};
-use haider_protocol::cache::ProviderViewLedgerV1;
+use haider_protocol::cache::{ProviderViewBlobV1, ProviderViewBlockRefV1, ProviderViewLedgerV1};
 use haider_protocol::credential::CredentialDescriptor;
 use haider_protocol::effect::{
     AuthorizationVerdict, EffectClass, EffectOutcome, EffectPhase, WorkspaceMutation,
@@ -1708,6 +1709,7 @@ pub struct Store {
     graph_reductions: Mutex<HashMap<SessionId, CachedGraphReduction>>,
     graph_telemetry: Mutex<GraphTelemetryCache>,
     cas: FileCas,
+    provider_views: ProviderViewStore,
     _lock: ProfileLock,
 }
 
@@ -1766,6 +1768,8 @@ impl Store {
         backfill_run_head_projections(&mut connection)?;
         connection.set_prepared_statement_cache_capacity(16);
         let cas = FileCas::open(&root)?;
+        let provider_views = ProviderViewStore::open(&root)?;
+        provider_views.sweep_expired(&mut connection, now_ms()?)?;
         let worker_generation = next_worker_generation(&mut connection)?;
         let graph_telemetry = rebuild_graph_telemetry_cache(&connection)?;
 
@@ -1777,6 +1781,7 @@ impl Store {
             graph_reductions: Mutex::new(HashMap::new()),
             graph_telemetry: Mutex::new(graph_telemetry),
             cas,
+            provider_views,
             _lock: profile_lock,
         })
     }
@@ -1800,6 +1805,70 @@ impl Store {
     /// Durable fencing generation allocated by this successful profile open.
     pub fn worker_generation(&self) -> u64 {
         self.worker_generation
+    }
+
+    /// Persists one provider-rendered request view into the dedicated CAS and
+    /// returns the hashes-only ledger with its durable request cursor.
+    pub fn persist_provider_view(
+        &self,
+        session_id: &SessionId,
+        ledger: ProviderViewLedgerV1,
+        blobs: Vec<ProviderViewBlobV1>,
+    ) -> StoreResult<ProviderViewLedgerV1> {
+        let mut connection = self.connection()?;
+        self.provider_views
+            .sweep_expired(&mut connection, now_ms()?)?;
+        self.provider_views.persist(
+            &mut connection,
+            session_id,
+            ledger,
+            blobs,
+            default_expiry_ms()?,
+        )
+    }
+
+    /// Testable storage seam with an explicit expiry; production callers use
+    /// [`Self::persist_provider_view`].
+    pub fn persist_provider_view_until(
+        &self,
+        session_id: &SessionId,
+        ledger: ProviderViewLedgerV1,
+        blobs: Vec<ProviderViewBlobV1>,
+        expires_at_ms: u64,
+    ) -> StoreResult<ProviderViewLedgerV1> {
+        let mut connection = self.connection()?;
+        self.provider_views
+            .persist(&mut connection, session_id, ledger, blobs, expires_at_ms)
+    }
+
+    /// Verifies every referenced block directly from disk without retaining
+    /// a complete request view.
+    pub fn verify_provider_view(&self, ledger: &ProviderViewLedgerV1) -> StoreResult<()> {
+        let connection = self.connection()?;
+        self.provider_views.verify(&connection, ledger)
+    }
+
+    /// Re-reads one exact block for request replay/keepalive work. Callers
+    /// release the returned block before advancing to the next cursor.
+    pub fn read_provider_view_block(
+        &self,
+        ledger: &ProviderViewLedgerV1,
+        block: &ProviderViewBlockRefV1,
+    ) -> StoreResult<Vec<u8>> {
+        let connection = self.connection()?;
+        self.provider_views.read_block(&connection, ledger, block)
+    }
+
+    /// Deletes expired request indexes and unreferenced provider-view blobs.
+    pub fn sweep_expired_provider_views(&self, through_ms: u64) -> StoreResult<usize> {
+        let mut connection = self.connection()?;
+        self.provider_views
+            .sweep_expired(&mut connection, through_ms)
+    }
+
+    /// Resident bytes used by the byte-capped provider-view hot-block LRU.
+    pub fn provider_view_resident_bytes(&self) -> StoreResult<usize> {
+        self.provider_views.resident_bytes()
     }
 
     /// Durably advances the daemon-process generation for one guarded start.
@@ -17238,8 +17307,8 @@ fn provider_views_share_cache_prefix(
         "reasoning_retention",
         "account_scope",
         "trim_sentinel",
-        "system_bytes",
-        "tool_schema_bytes",
+        "system_block",
+        "tool_schema_block",
     ]
     .into_iter()
     .all(|field| source.get(field) == child.get(field));
@@ -17281,17 +17350,26 @@ fn provider_view_is_complete(view: &serde_json::Value) -> bool {
             .and_then(serde_json::Value::as_str)
             .is_some_and(|value| !value.is_empty())
     };
-    let byte_array = |value: &serde_json::Value| {
-        value.as_array().is_some_and(|bytes| {
-            bytes
-                .iter()
-                .all(|byte| byte.as_u64().is_some_and(|byte| u8::try_from(byte).is_ok()))
-        })
+    let block_ref = |value: &serde_json::Value| {
+        value
+            .get("content_hash")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|hash| {
+                hash.len() == 71
+                    && hash.starts_with("blake3:")
+                    && hash[7..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            && value
+                .get("byte_len")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
     };
     let history_blocks = view
         .get("history_blocks")
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|blocks| blocks.iter().all(byte_array));
+        .is_some_and(|blocks| blocks.iter().all(block_ref));
     let latest_compaction_boundary_valid = view
         .get("latest_compaction_summary_end")
         .is_none_or(|boundary| boundary.is_null() || boundary.as_u64().is_some());
@@ -17334,8 +17412,8 @@ fn provider_view_is_complete(view: &serde_json::Value) -> bool {
             .get("current_user_start")
             .and_then(serde_json::Value::as_u64)
             .is_some()
-        && view.get("system_bytes").is_some_and(byte_array)
-        && view.get("tool_schema_bytes").is_some_and(byte_array)
+        && view.get("system_block").is_some_and(block_ref)
+        && view.get("tool_schema_block").is_some_and(block_ref)
         && history_blocks
         && latest_compaction_boundary_valid
         && boundaries_valid
@@ -18311,7 +18389,7 @@ fn validate_stored_envelope(
 /// retryable `StoreLocked`, constraint violations become `InvalidArgument`
 /// (the caller sent conflicting data, e.g. a duplicate event ID), and
 /// corrupt-database classes become `StoreCorrupt`.
-fn map_sqlite_error(error: SqliteError) -> HaiderError {
+pub(crate) fn map_sqlite_error(error: SqliteError) -> HaiderError {
     match &error {
         SqliteError::SqliteFailure(inner, _)
             if matches!(
@@ -20041,9 +20119,13 @@ mod run_head_projection_tests {
         }
         let raw = Connection::open(&database_path).expect("open raw v22 fixture");
         raw.execute_batch(
-            "DROP TABLE run_heads;
+            "DROP TABLE provider_view_gc;
+             DROP TABLE provider_view_blocks;
+             DROP TABLE provider_view_requests;
+             DROP TABLE provider_view_session_cursors;
+             DROP TABLE run_heads;
              DROP TABLE run_head_sessions;
-             DELETE FROM schema_migrations WHERE version = 23;
+             DELETE FROM schema_migrations WHERE version >= 23;
              PRAGMA user_version = 22;",
         )
         .expect("rewind fixture to v22");
@@ -20051,7 +20133,7 @@ mod run_head_projection_tests {
 
         for pass in 0..2 {
             let store = Store::open(root.path()).expect("migrate v22 store");
-            assert_eq!(store.schema_version().expect("schema version"), 23);
+            assert_eq!(store.schema_version().expect("schema version"), 24);
             let connection = store.connection().expect("migrated journal connection");
             assert_eq!(
                 load_projected_run_heads(&connection, &SessionId::new("run-head-session"))

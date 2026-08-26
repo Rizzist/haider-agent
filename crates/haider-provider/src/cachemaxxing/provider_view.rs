@@ -1,24 +1,31 @@
 use std::fmt;
 
-use haider_protocol::cache::{ProviderViewBoundaryV1, ProviderViewLedgerV1};
+use haider_protocol::cache::{ProviderViewBlobV1, ProviderViewBoundaryV1, ProviderViewLedgerV1};
 
 use crate::TurnRequest;
 
 pub const PROVIDER_VIEW_SERIALIZATION_VERSION: &str = "haider.provider-view.json.v1";
 
-/// Adapter-prepared exact view. `previous_history_blocks` is reconstructed
-/// from the current request through the preceding request's durable boundary;
-/// it is validation scratch and is never persisted as a second copy.
-#[derive(Debug, Clone)]
+/// Adapter-prepared exact view. Only the content-addressed ledger survives
+/// request preparation. `storage_blobs` and `previous_history_blocks` are
+/// transient validation/write scratch and are drained before provider I/O.
 pub struct PreparedProviderView {
     ledger: ProviderViewLedgerV1,
-    previous_history_blocks: Option<Vec<Vec<u8>>>,
+    storage_blobs: Vec<ProviderViewBlobV1>,
+    previous_history_blocks: Option<Vec<haider_protocol::cache::ProviderViewBlockRefV1>>,
 }
 
 impl PreparedProviderView {
     #[must_use]
     pub fn ledger(&self) -> &ProviderViewLedgerV1 {
         &self.ledger
+    }
+
+    /// Drains the only resident copy of the serialized blocks for immediate
+    /// durable storage. A prepared request cannot accidentally retain the
+    /// complete ledger after this call.
+    pub fn take_storage_blobs(&mut self) -> Vec<ProviderViewBlobV1> {
+        std::mem::take(&mut self.storage_blobs)
     }
 }
 
@@ -58,7 +65,10 @@ impl fmt::Display for ProviderViewInvariantError {
 
 impl std::error::Error for ProviderViewInvariantError {}
 
-/// Byte-compares the exact old provider prefix before a same-epoch send.
+/// Compares content addresses of the exact old provider prefix before a
+/// same-epoch send. Addresses are minted only from bytes written to the
+/// provider-view CAS, so equality is the disk-backed byte invariant without
+/// retaining or re-reading the whole prior view.
 /// Header, serialization, auth/reasoning, and compaction changes are already
 /// content-addressed in the two epochs, so they are explicit cold boundaries
 /// rather than accidental middle mutations.
@@ -77,13 +87,13 @@ pub fn validate_provider_view_prefix(
     {
         return Ok(ProviderViewContinuity::DeclaredEpochChange);
     }
-    if previous.system_bytes != current_ledger.system_bytes {
+    if previous.system_block != current_ledger.system_block {
         return Err(ProviderViewInvariantError::MiddleMutation {
             section: "system",
             block: None,
         });
     }
-    if previous.tool_schema_bytes != current_ledger.tool_schema_bytes {
+    if previous.tool_schema_block != current_ledger.tool_schema_block {
         return Err(ProviderViewInvariantError::MiddleMutation {
             section: "tools",
             block: None,
@@ -113,6 +123,8 @@ pub fn validate_provider_view_prefix(
 }
 
 // These arguments map ten independent adapter wire facts directly at each call site.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepared_array_provider_view(
     request: &TurnRequest,
@@ -126,22 +138,50 @@ pub(crate) fn prepared_array_provider_view(
     previous_wire_end: Option<usize>,
     boundaries: Vec<ProviderViewBoundaryV1>,
 ) -> Option<PreparedProviderView> {
+    crate::cachemaxxing::prepared_array_provider_view_with_system(
+        request,
+        prompt_payload,
+        dialect,
+        prompt_payload.get(system_key),
+        tools_key,
+        history_key,
+        history_wire_start,
+        stable_wire_end,
+        previous_wire_end,
+        boundaries,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepared_array_provider_view_with_system(
+    request: &TurnRequest,
+    prompt_payload: &serde_json::Value,
+    dialect: &str,
+    system: Option<&serde_json::Value>,
+    tools_key: &str,
+    history_key: &str,
+    history_wire_start: usize,
+    stable_wire_end: usize,
+    previous_wire_end: Option<usize>,
+    boundaries: Vec<ProviderViewBoundaryV1>,
+) -> Option<PreparedProviderView> {
     let history = prompt_payload.get(history_key)?.as_array()?;
     let history_wire_start = history_wire_start.min(history.len());
     let stable_wire_end = stable_wire_end.max(history_wire_start).min(history.len());
     let history_blocks = serialize_values(&history[history_wire_start..stable_wire_end])?;
     let previous_history_blocks = match previous_wire_end {
-        Some(end) => Some(serialize_values(
+        Some(end) => Some(serialize_value_refs(
             &history[history_wire_start..end.max(history_wire_start).min(history.len())],
         )?),
         None => None,
     };
     prepared_serialized_provider_view(
         request,
-        prompt_payload,
         dialect,
-        system_key,
-        tools_key,
+        system,
+        prompt_payload.get(tools_key),
         history_blocks,
         previous_history_blocks,
         boundaries,
@@ -151,17 +191,16 @@ pub(crate) fn prepared_array_provider_view(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepared_serialized_provider_view(
     request: &TurnRequest,
-    prompt_payload: &serde_json::Value,
     dialect: &str,
-    system_key: &str,
-    tools_key: &str,
+    system: Option<&serde_json::Value>,
+    tools: Option<&serde_json::Value>,
     history_blocks: Vec<Vec<u8>>,
-    previous_history_blocks: Option<Vec<Vec<u8>>>,
+    previous_history_blocks: Option<Vec<haider_protocol::cache::ProviderViewBlockRefV1>>,
     boundaries: Vec<ProviderViewBoundaryV1>,
 ) -> Option<PreparedProviderView> {
     let metadata = request.cache_metadata.as_ref()?;
-    let system_bytes = serde_json::to_vec(&prompt_payload.get(system_key)).ok()?;
-    let tool_schema_bytes = serde_json::to_vec(&prompt_payload.get(tools_key)).ok()?;
+    let system_bytes = serde_json::to_vec(&system).ok()?;
+    let tool_schema_bytes = serde_json::to_vec(&tools).ok()?;
     let header_epoch = header_epoch(
         &metadata.provider,
         &request.model,
@@ -169,6 +208,22 @@ pub(crate) fn prepared_serialized_provider_view(
         &system_bytes,
         &tool_schema_bytes,
     );
+    let system_blob = ProviderViewBlobV1::new(system_bytes);
+    let tool_schema_blob = ProviderViewBlobV1::new(tool_schema_bytes);
+    let history_blobs = history_blocks
+        .into_iter()
+        .map(ProviderViewBlobV1::new)
+        .collect::<Vec<_>>();
+    let system_block = system_blob.block.clone();
+    let tool_schema_block = tool_schema_blob.block.clone();
+    let history_blocks = history_blobs
+        .iter()
+        .map(|blob| blob.block.clone())
+        .collect();
+    let mut storage_blobs = Vec::with_capacity(history_blobs.len().saturating_add(2));
+    storage_blobs.push(system_blob);
+    storage_blobs.push(tool_schema_blob);
+    storage_blobs.extend(history_blobs);
     Some(PreparedProviderView {
         ledger: ProviderViewLedgerV1 {
             provider: metadata.provider.clone(),
@@ -190,18 +245,37 @@ pub(crate) fn prepared_serialized_provider_view(
                 .map(|boundary| u64::try_from(boundary).unwrap_or(u64::MAX)),
             trim_sentinel: metadata.compaction_epoch.clone(),
             boundaries,
-            system_bytes,
-            tool_schema_bytes,
+            system_block,
+            tool_schema_block,
             history_blocks,
+            storage: None,
         },
+        storage_blobs,
         previous_history_blocks,
     })
 }
 
+#[cfg(test)]
+#[allow(clippy::expect_used)]
 fn serialize_values(values: &[serde_json::Value]) -> Option<Vec<Vec<u8>>> {
     values
         .iter()
         .map(|value| serde_json::to_vec(value).ok())
+        .collect()
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+fn serialize_value_refs(
+    values: &[serde_json::Value],
+) -> Option<Vec<haider_protocol::cache::ProviderViewBlockRefV1>> {
+    values
+        .iter()
+        .map(|value| {
+            serde_json::to_vec(value)
+                .ok()
+                .map(|bytes| haider_protocol::cache::ProviderViewBlockRefV1::for_bytes(&bytes))
+        })
         .collect()
 }
 
@@ -275,7 +349,7 @@ mod tests {
             "tools": [],
             "input": [{"role": "user", "content": "old"}],
         });
-        let first = prepared_array_provider_view(
+        let first = crate::cachemaxxing::prepared_array_provider_view(
             &first_request,
             &first_payload,
             "openai_responses",
@@ -301,7 +375,7 @@ mod tests {
                 {"role": "user", "content": "new"},
             ],
         });
-        let current = prepared_array_provider_view(
+        let current = crate::cachemaxxing::prepared_array_provider_view(
             &grown_request,
             &mutated_payload,
             "openai_responses",
@@ -331,7 +405,7 @@ mod tests {
             "tools": [],
             "input": [{"role": "user", "content": "old"}],
         });
-        let first = prepared_array_provider_view(
+        let first = crate::cachemaxxing::prepared_array_provider_view(
             &first_request,
             &first_payload,
             "openai_responses",
@@ -356,7 +430,7 @@ mod tests {
                 {"role": "user", "content": "new"},
             ],
         });
-        let grown = prepared_array_provider_view(
+        let grown = crate::cachemaxxing::prepared_array_provider_view(
             &grown_request,
             &grown_payload,
             "openai_responses",
@@ -382,7 +456,7 @@ mod tests {
                 {"role": "user", "content": "new"},
             ],
         });
-        let changed = prepared_array_provider_view(
+        let changed = crate::cachemaxxing::prepared_array_provider_view(
             &grown_request,
             &changed_payload,
             "openai_responses",

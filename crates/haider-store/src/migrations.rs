@@ -14,7 +14,7 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 23;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 24;
 
 struct Migration {
     version: u32,
@@ -509,6 +509,67 @@ const MIGRATIONS: &[Migration] = &[
                 session_id, through_seq, run_count, nonterminal_count
             )
             SELECT id, 0, 0, 0 FROM sessions;
+        ",
+    },
+    Migration {
+        version: 24,
+        sql: "
+            CREATE TABLE provider_view_session_cursors (
+                session_id              TEXT PRIMARY KEY,
+                next_request_ordinal    INTEGER NOT NULL
+                    CHECK (next_request_ordinal > 0),
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE provider_view_requests (
+                -- No sessions FK: copied fork ledgers retain this source CAS
+                -- cursor after the source session itself is deleted. Expiry
+                -- owns reclamation.
+                session_id       TEXT NOT NULL,
+                request_ordinal  INTEGER NOT NULL CHECK (request_ordinal > 0),
+                provider         TEXT NOT NULL,
+                model            TEXT NOT NULL,
+                cache_epoch      TEXT NOT NULL,
+                expires_at_ms    INTEGER NOT NULL CHECK (expires_at_ms >= 0),
+                PRIMARY KEY (session_id, request_ordinal)
+            );
+
+            CREATE TABLE provider_view_blocks (
+                provider         TEXT NOT NULL,
+                model            TEXT NOT NULL,
+                cache_epoch      TEXT NOT NULL,
+                session_id       TEXT NOT NULL,
+                request_ordinal  INTEGER NOT NULL CHECK (request_ordinal > 0),
+                section          TEXT NOT NULL
+                    CHECK (section IN ('system', 'tools', 'history')),
+                block_ordinal    INTEGER NOT NULL CHECK (block_ordinal >= 0),
+                content_hash     TEXT NOT NULL
+                    CHECK (length(content_hash) = 71),
+                byte_len         INTEGER NOT NULL CHECK (byte_len >= 0),
+                expires_at_ms    INTEGER NOT NULL CHECK (expires_at_ms >= 0),
+                PRIMARY KEY (
+                    provider, model, cache_epoch, session_id,
+                    request_ordinal, section, block_ordinal, content_hash
+                ),
+                FOREIGN KEY (session_id, request_ordinal)
+                    REFERENCES provider_view_requests(session_id, request_ordinal)
+                    ON DELETE CASCADE
+            );
+
+            CREATE INDEX provider_view_requests_expiry
+            ON provider_view_requests(expires_at_ms);
+
+            CREATE INDEX provider_view_blocks_hash
+            ON provider_view_blocks(content_hash);
+
+            CREATE INDEX provider_view_blocks_request
+            ON provider_view_blocks(session_id, request_ordinal);
+
+            CREATE TABLE provider_view_gc (
+                content_hash  TEXT PRIMARY KEY
+                    CHECK (length(content_hash) = 71),
+                queued_at_ms  INTEGER NOT NULL CHECK (queued_at_ms >= 0)
+            );
         ",
     },
 ];

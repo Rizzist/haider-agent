@@ -18,4 +18,9 @@ pub use provider_view::{
 };
 pub use telemetry::{CacheEconomicSample, CacheScenario, economic_cache_hit_rate};
 
-pub(crate) use provider_view::{prepared_array_provider_view, prepared_serialized_provider_view};
+pub(crate) use provider_view::prepared_serialized_provider_view;
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) use provider_view::{
+    prepared_array_provider_view, prepared_array_provider_view_with_system,
+};

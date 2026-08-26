@@ -5135,6 +5135,43 @@ impl StoreHandle for HubStoreHandle {
             .await
     }
 
+    async fn persist_provider_view(
+        &self,
+        session_id: &SessionId,
+        ledger: haider_protocol::cache::ProviderViewLedgerV1,
+        blobs: Vec<haider_protocol::cache::ProviderViewBlobV1>,
+    ) -> Result<haider_protocol::cache::ProviderViewLedgerV1, HaiderError> {
+        self.ensure_session(session_id)?;
+        self.hub
+            .inner
+            .store
+            .persist_provider_view(session_id.clone(), ledger, blobs)
+            .await
+    }
+
+    async fn verify_provider_view(
+        &self,
+        ledger: &haider_protocol::cache::ProviderViewLedgerV1,
+    ) -> Result<(), HaiderError> {
+        self.hub
+            .inner
+            .store
+            .verify_provider_view(ledger.clone())
+            .await
+    }
+
+    async fn read_provider_view_block(
+        &self,
+        ledger: &haider_protocol::cache::ProviderViewLedgerV1,
+        block: &haider_protocol::cache::ProviderViewBlockRefV1,
+    ) -> Result<Vec<u8>, HaiderError> {
+        self.hub
+            .inner
+            .store
+            .read_provider_view_block(ledger.clone(), block.clone())
+            .await
+    }
+
     async fn branch_lineage(
         &self,
         session_id: &SessionId,

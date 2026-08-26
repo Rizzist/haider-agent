@@ -77,8 +77,9 @@ use haider_protocol::provider::{
 };
 use haider_protocol::state::{RunState, WaitReason};
 use haider_protocol::tool::{
-    BoundedResult, ImageBlockRef, TOOL_RESULT_IMAGE_MAX_BYTES, TOOL_RESULT_IMAGE_MAX_DIMENSION,
-    ToolResultStatus,
+    BoundedResult, ImageBlockRef, TOOL_RESULT_IMAGE_MAX_BYTES,
+    TOOL_RESULT_IMAGE_MAX_BYTES_PER_TURN, TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN,
+    TOOL_RESULT_IMAGE_MAX_DIMENSION, ToolResultStatus,
 };
 use haider_protocol::verify::VerifyVerdict;
 use haider_provider::{
@@ -2320,7 +2321,52 @@ impl HarnessActor {
                         .as_ref()
                         .map(|previous| previous.history_message_count)
                 });
-            let mut request_messages = messages.clone();
+            // Move the canonical history into the provider request and take
+            // it back immediately after the HTTP stream opens. Built-in
+            // adapters borrow this request; only compatibility providers use
+            // the trait's owned-clone fallback. Preserve the few tool-result
+            // fields that request-only image budgeting may rewrite.
+            let mut request_messages = std::mem::take(&mut messages);
+            let (request_image_count, request_image_bytes) = request_messages
+                .iter()
+                .flat_map(|message| &message.blocks)
+                .filter_map(|block| match block {
+                    Block::ToolResult { images, .. } => Some(images),
+                    _ => None,
+                })
+                .flatten()
+                .fold((0_usize, 0_u64), |(count, bytes), image| {
+                    (
+                        count.saturating_add(1),
+                        bytes.saturating_add(image.byte_len),
+                    )
+                });
+            let request_images_will_mutate = !self.config.tool_result_images_supported
+                || request_image_count > TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN
+                || request_image_bytes > TOOL_RESULT_IMAGE_MAX_BYTES_PER_TURN;
+            let mut request_only_tool_results = request_images_will_mutate
+                .then(|| {
+                    request_messages
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(message_index, message)| {
+                            message.blocks.iter().enumerate().filter_map(
+                                move |(block_index, block)| match block {
+                                    Block::ToolResult {
+                                        preview, images, ..
+                                    } if !images.is_empty() => Some((
+                                        message_index,
+                                        block_index,
+                                        preview.clone(),
+                                        images.clone(),
+                                    )),
+                                    _ => None,
+                                },
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             let snapshot_insert_at = current_turn_start.min(request_messages.len());
             let mut request_stable_history_end = stable_history_end.min(request_messages.len());
             let mut request_cacheable_history_end =
@@ -2341,13 +2387,13 @@ impl HarnessActor {
                     };
                 request_current_user_start = snapshot_end;
             }
-            let mut prefix_digests = usage_prefix_digests(
-                &self.config,
-                &request_messages[..request_cacheable_history_end.min(request_messages.len())],
-            );
-            let mut previous_prefix_digests = previous_stable_history_end
-                .filter(|previous| *previous <= request_messages.len())
-                .map(|previous| usage_prefix_digests(&self.config, &request_messages[..previous]));
+            // Cache-epoch construction needs the stable header components,
+            // but built-in adapters replace the history digest from M4's
+            // exact provider-view CAS. Defer normalized history hashing to
+            // the compatibility fallback instead of serializing P twice.
+            let mut prefix_digests = usage_prefix_digests(&self.config, &[]);
+            prefix_digests.immutable_history.clear();
+            let mut previous_prefix_digests = None;
             let request_attachments =
                 match self.resolve_tool_result_images(&mut request_messages).await {
                     Ok(attachments) => attachments,
@@ -2399,12 +2445,35 @@ impl HarnessActor {
                 messages: request_messages,
                 model: self.config.model.clone(),
                 max_tokens: self.config.max_tokens,
-                system_prompt: self.config.system_prompt.clone(),
-                tools: self.config.tools.clone(),
+                system_prompt: self.config.system_prompt.take(),
+                tools: std::mem::take(&mut self.config.tools),
                 attachments: request_attachments,
                 cache_metadata: Some(cache_metadata.clone()),
             };
-            let prepared = provider.prepare_turn(&provider_request);
+            let mut prepared = provider.prepare_turn(&provider_request);
+            let retained_wire = prepared
+                .as_ref()
+                .is_some_and(haider_provider::PreparedTurn::has_rendered_wire);
+            self.config.system_prompt = provider_request.system_prompt.take();
+            self.config.tools = std::mem::take(&mut provider_request.tools);
+            if retained_wire {
+                // Anthropic's stream decoder needs only this capability bit;
+                // the complete schemas already live in the retained wire.
+                provider_request.tools.extend(
+                    self.config
+                        .tools
+                        .iter()
+                        .filter(|tool| tool.name == "computer")
+                        .cloned(),
+                );
+            } else {
+                // Unknown/injected providers own their TurnRequest and retain
+                // the compatibility clone behavior.
+                provider_request
+                    .system_prompt
+                    .clone_from(&self.config.system_prompt);
+                provider_request.tools.clone_from(&self.config.tools);
+            }
             if let Some(rendered) = prepared.as_ref().map(|prepared| prepared.prefix_digests()) {
                 prefix_digests = rendered.clone();
                 previous_prefix_digests = prepared
@@ -2415,46 +2484,114 @@ impl HarnessActor {
                         previous.immutable_history = history.to_owned();
                         previous
                     });
-                cache_metadata = prompt_cache_metadata(
-                    &self.config,
-                    &provider_request.messages,
-                    PromptCacheBoundaries {
-                        stable_history_end: request_stable_history_end,
-                        cacheable_history_end: request_cacheable_history_end,
-                        current_user_start: request_current_user_start,
-                        previous_stable_history_end,
-                        latest_compaction_summary_end,
-                    },
-                    prefix_digests.clone(),
-                    usage_account.as_ref(),
-                    volatile_context_epoch.as_deref(),
-                );
-                provider_request.cache_metadata = Some(cache_metadata.clone());
+            } else {
+                // Legacy/injected providers report normalized diagnostics
+                // over the canonical pre-projection history. Temporarily
+                // swap back only fields changed by request image budgeting;
+                // the outbound projection remains degraded afterward.
+                for (message_index, block_index, preview, images) in &mut request_only_tool_results
+                {
+                    let request_message_index = message_index.saturating_add(usize::from(
+                        volatile_user_tail.is_some() && *message_index >= snapshot_insert_at,
+                    ));
+                    if let Some(Block::ToolResult {
+                        preview: request_preview,
+                        images: request_images,
+                        ..
+                    }) = provider_request
+                        .messages
+                        .get_mut(request_message_index)
+                        .and_then(|message| message.blocks.get_mut(*block_index))
+                    {
+                        std::mem::swap(request_preview, preview);
+                        std::mem::swap(request_images, images);
+                    }
+                }
+                let current_end =
+                    request_cacheable_history_end.min(provider_request.messages.len());
+                prefix_digests =
+                    usage_prefix_digests(&self.config, &provider_request.messages[..current_end]);
+                previous_prefix_digests = previous_stable_history_end
+                    .filter(|previous| *previous <= provider_request.messages.len())
+                    .map(|previous| {
+                        usage_prefix_digests(&self.config, &provider_request.messages[..previous])
+                    });
+                for (message_index, block_index, preview, images) in &mut request_only_tool_results
+                {
+                    let request_message_index = message_index.saturating_add(usize::from(
+                        volatile_user_tail.is_some() && *message_index >= snapshot_insert_at,
+                    ));
+                    if let Some(Block::ToolResult {
+                        preview: request_preview,
+                        images: request_images,
+                        ..
+                    }) = provider_request
+                        .messages
+                        .get_mut(request_message_index)
+                        .and_then(|message| message.blocks.get_mut(*block_index))
+                    {
+                        std::mem::swap(request_preview, preview);
+                        std::mem::swap(request_images, images);
+                    }
+                }
             }
+            cache_metadata = prompt_cache_metadata(
+                &self.config,
+                &provider_request.messages,
+                PromptCacheBoundaries {
+                    stable_history_end: request_stable_history_end,
+                    cacheable_history_end: request_cacheable_history_end,
+                    current_user_start: request_current_user_start,
+                    previous_stable_history_end,
+                    latest_compaction_summary_end,
+                },
+                prefix_digests.clone(),
+                usage_account.as_ref(),
+                volatile_context_epoch.as_deref(),
+            );
+            provider_request.cache_metadata = Some(cache_metadata.clone());
             if let Some(provider_view) = prepared
                 .as_ref()
                 .and_then(|prepared| prepared.provider_view())
             {
-                if let Some(previous) = previous_provider_view.as_ref()
-                    && let Err(error) = validate_provider_view_prefix(previous, provider_view)
-                {
-                    return self
-                        .errored_outcome_with_items(
-                            &run_id,
-                            &mut message,
-                            &mut reasoning,
-                            &mut tools,
-                            provider_view_invariant_error(error),
-                        )
-                        .await;
+                if let Some(previous) = previous_provider_view.as_ref() {
+                    if let Err(error) = validate_provider_view_prefix(previous, provider_view) {
+                        return self
+                            .errored_outcome_with_items(
+                                &run_id,
+                                &mut message,
+                                &mut reasoning,
+                                &mut tools,
+                                provider_view_invariant_error(error),
+                            )
+                            .await;
+                    }
                 }
+            }
+            if let Some(provider_view_ledger) = prepared
+                .as_ref()
+                .and_then(|prepared| prepared.provider_view())
+                .map(|provider_view| provider_view.ledger().clone())
+            {
+                let blobs = prepared
+                    .as_mut()
+                    .map(haider_provider::PreparedTurn::take_provider_view_storage_blobs)
+                    .unwrap_or_default();
+                let stored_provider_view = match self
+                    .store
+                    .persist_provider_view(&self.config.session_id, provider_view_ledger, blobs)
+                    .await
+                {
+                    Ok(stored) => stored,
+                    Err(error) => return self.errored_state_outcome(&run_id, error).await,
+                };
                 cache_metadata
                     .header_epoch
-                    .clone_from(&provider_view.ledger().header_epoch);
+                    .clone_from(&stored_provider_view.header_epoch);
                 provider_request.cache_metadata = Some(cache_metadata.clone());
                 let provider_view_attempt = ProviderViewAttemptV1 {
                     ordinal: provider_request_ordinal,
-                    view: provider_view.ledger().clone(),
+                    view: stored_provider_view.clone(),
                 };
                 let provider_view_data = match serde_json::to_value(provider_view_attempt) {
                     Ok(data) => data,
@@ -2484,7 +2621,7 @@ impl HarnessActor {
                 {
                     return self.errored_state_outcome(&run_id, error).await;
                 }
-                previous_provider_view = Some(provider_view.ledger().clone());
+                previous_provider_view = Some(stored_provider_view);
             }
             let cache_control = prepared
                 .as_ref()
@@ -2547,7 +2684,7 @@ impl HarnessActor {
             let mut request_usage: Option<Usage> = None;
             let attempt_provider = Arc::clone(&provider);
             let mut opening =
-                Box::pin(attempt_provider.stream_prepared_turn(provider_request, prepared));
+                Box::pin(attempt_provider.stream_prepared_turn_ref(&provider_request, prepared));
             let mut stream = loop {
                 let opened = tokio::select! {
                     biased;
@@ -2604,6 +2741,27 @@ impl HarnessActor {
                         )
                         .await;
                 }
+                drop(opening);
+                let mut restored_messages = std::mem::take(&mut provider_request.messages);
+                if volatile_user_tail.is_some() && snapshot_insert_at < restored_messages.len() {
+                    restored_messages.remove(snapshot_insert_at);
+                }
+                for (message_index, block_index, preview, images) in
+                    std::mem::take(&mut request_only_tool_results)
+                {
+                    if let Some(Block::ToolResult {
+                        preview: restored_preview,
+                        images: restored_images,
+                        ..
+                    }) = restored_messages
+                        .get_mut(message_index)
+                        .and_then(|message| message.blocks.get_mut(block_index))
+                    {
+                        *restored_preview = preview;
+                        *restored_images = images;
+                    }
+                }
+                messages = restored_messages;
                 match opened {
                     Ok(stream) => break stream,
                     Err(error) if error.kind == ProviderErrorKind::ContextExceeded => {

@@ -1,5 +1,6 @@
 //! Cache-epoch policy and visible transition facts (CM3).
 
+use crate::ids::SessionId;
 use crate::item::TurnItem;
 use crate::provider::CacheRequestDiagnosticV1;
 use serde::{Deserialize, Serialize};
@@ -15,10 +16,10 @@ pub const CACHE_REQUEST_ATTEMPT_EXTENSION_KIND: &str = "cache_request_attempt_v1
 /// Stable hidden extension kind for the exact, provider-rendered cacheable
 /// view written immediately before a physical provider request.
 ///
-/// Unlike [`CACHE_REQUEST_ATTEMPT_EXTENSION_KIND`], this record deliberately
-/// contains exact serialized prompt bytes. It is conversation-store state,
-/// not telemetry: restart/resume validation must be able to byte-compare the
-/// old provider prefix instead of trusting a digest produced by new code.
+/// Unlike [`CACHE_REQUEST_ATTEMPT_EXTENSION_KIND`], this record names exact
+/// serialized prompt blocks in the profile's content-addressed provider-view
+/// store. It never embeds those bytes in the journal or resident session
+/// state.
 pub const PROVIDER_VIEW_ATTEMPT_EXTENSION_KIND: &str = "provider_view_attempt_v1";
 
 /// One explicit provider cache boundary selected by the placement planner.
@@ -32,13 +33,64 @@ pub struct ProviderViewBoundaryV1 {
     pub message_end: Option<u64>,
 }
 
+/// Content-addressed identity of one exact provider-rendered block.
+///
+/// The address is the ordinary `blake3:<hex>` CAS address. Keeping the exact
+/// byte length beside it detects truncated/colliding index metadata without
+/// loading the block into session state.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ProviderViewBlockRefV1 {
+    pub content_hash: String,
+    pub byte_len: u64,
+}
+
+impl ProviderViewBlockRefV1 {
+    #[must_use]
+    pub fn for_bytes(bytes: &[u8]) -> Self {
+        Self {
+            content_hash: format!("blake3:{}", blake3::hash(bytes).to_hex()),
+            byte_len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        }
+    }
+}
+
+/// Transient write payload handed from an adapter to the durable store.
+///
+/// This type is intentionally not serializable: bytes may exist while one
+/// request is being prepared and persisted, but cannot enter an event or a
+/// long-lived projection by accident.
+#[derive(Debug)]
+pub struct ProviderViewBlobV1 {
+    pub block: ProviderViewBlockRefV1,
+    pub bytes: Vec<u8>,
+}
+
+impl ProviderViewBlobV1 {
+    #[must_use]
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            block: ProviderViewBlockRefV1::for_bytes(&bytes),
+            bytes,
+        }
+    }
+}
+
+/// Durable lookup cursor for the SQLite/CAS request view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderViewStorageV1 {
+    pub session_id: SessionId,
+    pub request_ordinal: u64,
+    pub expires_at_ms: u64,
+}
+
 /// Exact immutable provider view associated with one cacheable request.
 ///
-/// The three byte sections are serialized by the selected adapter using its
-/// declared `serialization_version`. History is stored block-by-block so an
-/// append-only reconstruction can compare the exact old prefix without
-/// re-encoding durable data. The volatile newest tail is intentionally not
-/// included: it is never eligible for a cache marker or this invariant.
+/// The three sections are serialized by the selected adapter using its
+/// declared `serialization_version`, then stored in a disk-only CAS. History
+/// is addressed block-by-block so an append-only reconstruction can compare
+/// the exact old prefix by content address without retaining or re-encoding
+/// durable data. The volatile newest tail is intentionally not included: it
+/// is never eligible for a cache marker or this invariant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderViewLedgerV1 {
     pub provider: String,
@@ -63,17 +115,60 @@ pub struct ProviderViewLedgerV1 {
     pub trim_sentinel: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub boundaries: Vec<ProviderViewBoundaryV1>,
-    pub system_bytes: Vec<u8>,
-    pub tool_schema_bytes: Vec<u8>,
-    pub history_blocks: Vec<Vec<u8>>,
+    pub system_block: ProviderViewBlockRefV1,
+    pub tool_schema_block: ProviderViewBlockRefV1,
+    pub history_blocks: Vec<ProviderViewBlockRefV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<ProviderViewStorageV1>,
 }
 
 impl ProviderViewLedgerV1 {
     /// Domain-separated content address of this complete exact provider view.
     /// Fork inheritance persists this digest so the ledger remains the one
     /// authority for both byte comparison and inherited-segment identity.
+    /// The physical storage cursor and expiry are excluded: moving the same
+    /// immutable view to another request slot cannot change its prefix.
     pub fn prefix_digest(&self) -> Result<String, serde_json::Error> {
-        let bytes = serde_json::to_vec(self)?;
+        #[derive(Serialize)]
+        struct Prefix<'a> {
+            provider: &'a str,
+            model: &'a str,
+            dialect: &'a str,
+            serialization_version: &'a str,
+            header_epoch: &'a str,
+            cache_epoch: &'a str,
+            compaction_epoch: &'a str,
+            reasoning_retention: &'a str,
+            account_scope: &'a Option<String>,
+            stable_history_end: u64,
+            current_user_start: u64,
+            latest_compaction_summary_end: Option<u64>,
+            trim_sentinel: &'a str,
+            boundaries: &'a [ProviderViewBoundaryV1],
+            system_block: &'a ProviderViewBlockRefV1,
+            tool_schema_block: &'a ProviderViewBlockRefV1,
+            history_blocks: &'a [ProviderViewBlockRefV1],
+        }
+
+        let bytes = serde_json::to_vec(&Prefix {
+            provider: &self.provider,
+            model: &self.model,
+            dialect: &self.dialect,
+            serialization_version: &self.serialization_version,
+            header_epoch: &self.header_epoch,
+            cache_epoch: &self.cache_epoch,
+            compaction_epoch: &self.compaction_epoch,
+            reasoning_retention: &self.reasoning_retention,
+            account_scope: &self.account_scope,
+            stable_history_end: self.stable_history_end,
+            current_user_start: self.current_user_start,
+            latest_compaction_summary_end: self.latest_compaction_summary_end,
+            trim_sentinel: &self.trim_sentinel,
+            boundaries: &self.boundaries,
+            system_block: &self.system_block,
+            tool_schema_block: &self.tool_schema_block,
+            history_blocks: &self.history_blocks,
+        })?;
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"haider.session-fork.provider-prefix.v1\0");
         hasher.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());

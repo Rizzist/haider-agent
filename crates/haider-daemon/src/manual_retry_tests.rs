@@ -16,8 +16,11 @@ use haider_protocol::ids::{DeviceId, EventId, RunId, SessionId};
 use haider_protocol::retry::RunRetryEventPayload;
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState, WaitReason};
-use haider_protocol::{EventPayload, provider::FinishReason};
-use haider_provider::{Block, FakeProvider, FakeStep, Message, ProviderErrorKind};
+use haider_protocol::{
+    EventPayload,
+    provider::{Block, FinishReason},
+};
+use haider_provider::{FakeProvider, FakeStep, Message, ProviderErrorKind};
 use haider_rpc::{
     AttachMode, Capability, CommandId, RequestBody, RequestId, ResponseBody, SubmitDisposition,
     WireFrame,

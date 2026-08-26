@@ -8,6 +8,7 @@ use crate::{ArtifactReader, CommittedRange, ReducerPage, StoreHandle};
 use async_trait::async_trait;
 use haider_protocol::agent::ChildReport;
 use haider_protocol::branch::BranchDescriptor;
+use haider_protocol::cache::{ProviderViewBlobV1, ProviderViewBlockRefV1, ProviderViewLedgerV1};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
 use haider_protocol::ids::{AgentId, ArtifactRef, BranchId, RunId, SessionId};
@@ -1858,6 +1859,50 @@ impl SqliteStoreHandle {
         let artifact = artifact.clone();
         run_blocking(move || owner.with_store(|store| Ok(store.verify(&artifact)))).await
     }
+
+    pub async fn persist_provider_view(
+        &self,
+        session_id: SessionId,
+        ledger: ProviderViewLedgerV1,
+        blobs: Vec<ProviderViewBlobV1>,
+    ) -> Result<ProviderViewLedgerV1, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.persist_provider_view(&session_id, ledger, blobs))
+        })
+        .await
+    }
+
+    pub async fn verify_provider_view(
+        &self,
+        ledger: ProviderViewLedgerV1,
+    ) -> Result<(), HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.verify_provider_view(&ledger))).await
+    }
+
+    pub async fn read_provider_view_block(
+        &self,
+        ledger: ProviderViewLedgerV1,
+        block: ProviderViewBlockRefV1,
+    ) -> Result<Vec<u8>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.read_provider_view_block(&ledger, &block))
+        })
+        .await
+    }
+
+    pub async fn sweep_expired_provider_views(
+        &self,
+        through_ms: u64,
+    ) -> Result<usize, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.sweep_expired_provider_views(through_ms))
+        })
+        .await
+    }
 }
 
 #[async_trait]
@@ -1980,6 +2025,27 @@ impl StoreHandle for SqliteStoreHandle {
         checkpoint: SessionProjectionCheckpoint,
     ) -> Result<(), HaiderError> {
         SqliteStoreHandle::put_projection_checkpoint(self, checkpoint).await
+    }
+
+    async fn persist_provider_view(
+        &self,
+        session_id: &SessionId,
+        ledger: ProviderViewLedgerV1,
+        blobs: Vec<ProviderViewBlobV1>,
+    ) -> Result<ProviderViewLedgerV1, HaiderError> {
+        SqliteStoreHandle::persist_provider_view(self, session_id.clone(), ledger, blobs).await
+    }
+
+    async fn verify_provider_view(&self, ledger: &ProviderViewLedgerV1) -> Result<(), HaiderError> {
+        SqliteStoreHandle::verify_provider_view(self, ledger.clone()).await
+    }
+
+    async fn read_provider_view_block(
+        &self,
+        ledger: &ProviderViewLedgerV1,
+        block: &ProviderViewBlockRefV1,
+    ) -> Result<Vec<u8>, HaiderError> {
+        SqliteStoreHandle::read_provider_view_block(self, ledger.clone(), block.clone()).await
     }
 
     async fn branch_lineage(

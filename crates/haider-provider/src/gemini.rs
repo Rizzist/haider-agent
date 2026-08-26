@@ -193,7 +193,7 @@ pub struct GeminiCacheRegistry {
 struct GeminiCachedResource {
     epoch: String,
     name: String,
-    contents: Vec<serde_json::Value>,
+    content_blocks: Vec<haider_protocol::cache::ProviderViewBlockRefV1>,
     stable_prefix_tokens: u64,
     expires_at: tokio::time::Instant,
     backend: Arc<dyn GeminiCacheBackend>,
@@ -370,6 +370,23 @@ impl GeminiProvider {
         &self,
         payload: &serde_json::Value,
     ) -> Result<reqwest::Request, ProviderError> {
+        self.request_builder()
+            .await?
+            .json(payload)
+            .build()
+            .map_err(transport_error)
+    }
+
+    async fn request_body(
+        &self,
+        payload: serde_json::Value,
+    ) -> Result<reqwest::Request, ProviderError> {
+        let request = self.request_builder().await?;
+        let body = crate::serialize_json_body(payload)?;
+        request.body(body).build().map_err(transport_error)
+    }
+
+    async fn request_builder(&self) -> Result<reqwest::RequestBuilder, ProviderError> {
         // The guard validates and resolves before credential material is
         // placed on a request. `alt=sse` is a fixed non-routing query added
         // only after the exact HTTPS path has passed the gate.
@@ -377,14 +394,12 @@ impl GeminiProvider {
             .validate_endpoint(&self.api_url)
             .await?;
         let request_url = format!("{}?alt=sse", self.api_url);
-        self.client
+        Ok(self
+            .client
             .post(request_url)
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "text/event-stream")
-            .header("x-goog-api-key", self.api_key_header()?)
-            .json(payload)
-            .build()
-            .map_err(transport_error)
+            .header("x-goog-api-key", self.api_key_header()?))
     }
 
     async fn send_request(
@@ -424,7 +439,7 @@ impl GeminiProvider {
         } else {
             full_payload
         };
-        let request = self.request(&payload).await?;
+        let request = self.request_body(payload).await?;
         tokio::time::timeout(
             Self::transport_config().response_open_timeout,
             self.client.execute(request),
@@ -432,6 +447,48 @@ impl GeminiProvider {
         .await
         .map_err(|_| response_open_timeout_error(Self::transport_config().response_open_timeout))?
         .map_err(transport_error)
+    }
+
+    async fn stream_turn_ref(
+        &self,
+        request: &TurnRequest,
+    ) -> Result<ProviderStream, ProviderError> {
+        let next_call_index = next_synthesized_call_index(request)?;
+        let response = self.send_request(request).await?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let request_id = response
+                .headers()
+                .get("x-request-id")
+                .or_else(|| response.headers().get("x-goog-request-id"))
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let retry_after = response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let body = read_error_body_bounded(response).await?;
+            return Err(
+                replay_gemini_http_error(status, retry_after.as_deref(), &body)
+                    .with_http_metadata(status, request_id.as_deref()),
+            );
+        }
+
+        let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
+        let account = self.account.clone();
+        let chunk_idle_timeout = Self::transport_config().chunk_idle_timeout;
+        let producer = tokio::spawn(async move {
+            stream_sse_source(
+                response,
+                account,
+                next_call_index,
+                sender,
+                chunk_idle_timeout,
+            )
+            .await;
+        });
+        Ok(ProviderStream::owned(receiver, producer))
     }
 }
 
@@ -468,21 +525,20 @@ impl Provider for GeminiProvider {
                 boundary,
             )
             .ok()?;
-        let immutable_history = gemini_history_digest(&full_payload, history_boundary)?;
-        let previous_immutable_history_digest = previous_history_boundary
-            .and_then(|previous| gemini_history_digest(&full_payload, previous));
-        let prefix_digests = crate::rendered_prefix_digests(
-            request,
-            &full_payload,
-            immutable_history,
-            "system_instruction",
-            "tools",
-        )?;
         let contents = payload_contents(&full_payload)?;
         let history_blocks = gemini_provider_view_blocks(contents, history_boundary)?;
-        let previous_history_blocks = match previous_history_boundary {
-            Some(boundary) => Some(gemini_provider_view_blocks(contents, boundary)?),
-            None => None,
+        let (previous_history_blocks, previous_history_block_len) = match previous_history_boundary
+        {
+            Some(boundary) => {
+                let (blocks, reusable_len) = gemini_previous_provider_view_block_refs(
+                    contents,
+                    history_boundary,
+                    &history_blocks,
+                    boundary,
+                )?;
+                (Some(blocks), reusable_len)
+            }
+            None => (None, None),
         };
         let metadata = request.cache_metadata.as_ref()?;
         let boundaries = (metadata.cacheable_history_end() > 0)
@@ -494,21 +550,34 @@ impl Provider for GeminiProvider {
             })
             .into_iter()
             .collect();
-        let provider_view = crate::cachemaxxing::prepared_serialized_provider_view(
+        let mut provider_view = crate::cachemaxxing::prepared_serialized_provider_view(
             request,
-            &full_payload,
             "gemini_generate_content",
-            "system_instruction",
-            "tools",
+            full_payload.get("system_instruction"),
+            full_payload.get("tools"),
             history_blocks,
             previous_history_blocks,
             boundaries,
-        );
+        )?;
+        let (prefix_digests, block_previous_digest, provider_view_storage_blobs) =
+            crate::rendered_prefix_digests_from_provider_view(
+                request,
+                &mut provider_view,
+                false,
+                previous_history_block_len,
+            )?;
+        let previous_immutable_history_digest = match previous_history_boundary {
+            Some(previous) => {
+                block_previous_digest.or_else(|| gemini_history_digest(&full_payload, previous))
+            }
+            None => None,
+        };
         Some(crate::PreparedTurn {
             prefix_digests,
             previous_immutable_history_digest,
             cache_control: haider_protocol::provider::CacheControlObservationV1::Unavailable,
-            provider_view,
+            provider_view: Some(provider_view),
+            provider_view_storage_blobs,
             wire: Some(crate::PreparedWire {
                 payload: full_payload,
                 history_boundary: Some(history_boundary),
@@ -542,42 +611,15 @@ impl Provider for GeminiProvider {
     }
 
     async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError> {
-        let next_call_index = next_synthesized_call_index(&request)?;
-        let response = self.send_request(&request).await?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let request_id = response
-                .headers()
-                .get("x-request-id")
-                .or_else(|| response.headers().get("x-goog-request-id"))
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            let retry_after = response
-                .headers()
-                .get(RETRY_AFTER)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            let body = read_error_body_bounded(response).await?;
-            return Err(
-                replay_gemini_http_error(status, retry_after.as_deref(), &body)
-                    .with_http_metadata(status, request_id.as_deref()),
-            );
-        }
+        self.stream_turn_ref(&request).await
+    }
 
-        let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
-        let account = self.account.clone();
-        let chunk_idle_timeout = Self::transport_config().chunk_idle_timeout;
-        let producer = tokio::spawn(async move {
-            stream_sse_source(
-                response,
-                account,
-                next_call_index,
-                sender,
-                chunk_idle_timeout,
-            )
-            .await;
-        });
-        Ok(ProviderStream::owned(receiver, producer))
+    async fn stream_prepared_turn_ref(
+        &self,
+        request: &TurnRequest,
+        prepared: Option<crate::PreparedTurn>,
+    ) -> Result<ProviderStream, ProviderError> {
+        crate::scope_prepared_wire(prepared, self.stream_turn_ref(request)).await
     }
 }
 
@@ -767,7 +809,12 @@ impl GeminiCacheRegistry {
             if existing.epoch == metadata.cache_epoch
                 && !expired
                 && payload_contents(&full_payload)
-                    .is_some_and(|contents| contents.starts_with(&existing.contents))
+                    .and_then(|contents| {
+                        contents
+                            .get(..existing.content_blocks.len())
+                            .and_then(gemini_content_block_refs)
+                    })
+                    .is_some_and(|blocks| blocks == existing.content_blocks)
                 && !gemini_cached_coverage_needs_refresh(
                     existing.stable_prefix_tokens,
                     metadata.stable_prefix_tokens,
@@ -776,7 +823,7 @@ impl GeminiCacheRegistry {
                 let payload = gemini_cached_generate_payload(
                     full_payload,
                     &existing.name,
-                    existing.contents.len(),
+                    existing.content_blocks.len(),
                 );
                 self.resources.lock().await.insert(scope, existing);
                 return payload;
@@ -825,18 +872,22 @@ impl GeminiCacheRegistry {
             // boundary is not byte-stable and stays on implicit caching.
             return full_payload;
         }
+        let Some(content_blocks) = gemini_content_block_refs(stable_contents) else {
+            return full_payload;
+        };
         let create_payload =
-            gemini_cached_content_create_payload(request, &full_payload, &stable_contents);
+            gemini_cached_content_create_payload(request, &full_payload, stable_contents);
         let Ok(name) = backend.create_cached_content(&create_payload).await else {
             return full_payload;
         };
-        let payload = gemini_cached_generate_payload(full_payload, &name, stable_contents.len());
+        drop(create_payload);
+        let payload = gemini_cached_generate_payload(full_payload, &name, content_blocks.len());
         self.resources.lock().await.insert(
             scope,
             GeminiCachedResource {
                 epoch: metadata.cache_epoch.clone(),
                 name,
-                contents: stable_contents,
+                content_blocks,
                 stable_prefix_tokens: metadata.stable_prefix_tokens,
                 expires_at: tokio::time::Instant::now() + Duration::from_secs(3_600),
                 backend,
@@ -1346,28 +1397,90 @@ fn gemini_provider_view_blocks(
     contents: &[serde_json::Value],
     boundary: crate::PreparedHistoryBoundary,
 ) -> Option<Vec<Vec<u8>>> {
-    serde_json::to_value(GeminiContentsPrefix { contents, boundary })
-        .ok()?
-        .as_array()?
+    let end = boundary.items.min(contents.len());
+    contents[..end]
         .iter()
-        .map(|content| serde_json::to_vec(content).ok())
+        .enumerate()
+        .map(|(index, content)| {
+            crate::serialize_json_fragment(&GeminiContentPrefix {
+                content,
+                parts_end: if index + 1 == end {
+                    boundary.last_parts
+                } else {
+                    usize::MAX
+                },
+            })
+        })
         .collect()
+}
+
+fn gemini_previous_provider_view_block_refs(
+    contents: &[serde_json::Value],
+    current_boundary: crate::PreparedHistoryBoundary,
+    current_blocks: &[Vec<u8>],
+    previous_boundary: crate::PreparedHistoryBoundary,
+) -> Option<(
+    Vec<haider_protocol::cache::ProviderViewBlockRefV1>,
+    Option<usize>,
+)> {
+    let previous_end = previous_boundary.items.min(contents.len());
+    let current_end = current_boundary.items.min(contents.len());
+    let mut all_reused = previous_end <= current_blocks.len();
+    let mut refs = Vec::with_capacity(previous_end);
+    for (index, content) in contents[..previous_end].iter().enumerate() {
+        let previous_parts_end = if index + 1 == previous_end {
+            previous_boundary.last_parts
+        } else {
+            usize::MAX
+        };
+        let current_parts_end = if index + 1 == current_end {
+            current_boundary.last_parts
+        } else {
+            usize::MAX
+        };
+        let parts_len = content
+            .get("parts")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len);
+        let same_projection = index < current_blocks.len()
+            && parts_len.is_none_or(|parts_len| {
+                previous_parts_end.min(parts_len) == current_parts_end.min(parts_len)
+            });
+        if same_projection {
+            refs.push(haider_protocol::cache::ProviderViewBlockRefV1::for_bytes(
+                &current_blocks[index],
+            ));
+        } else {
+            all_reused = false;
+            refs.push(crate::exact_wire_block_ref(&GeminiContentPrefix {
+                content,
+                parts_end: previous_parts_end,
+            })?);
+        }
+    }
+    Some((refs, all_reused.then_some(previous_end)))
 }
 
 fn gemini_cacheable_contents(
     full_payload: &serde_json::Value,
     boundary: crate::PreparedHistoryBoundary,
-) -> Option<Vec<serde_json::Value>> {
+) -> Option<&[serde_json::Value]> {
     let contents = payload_contents(full_payload)?;
     let end = boundary.items.min(contents.len());
     if end == 0 {
-        return Some(Vec::new());
+        return Some(&[]);
     }
     let final_parts = contents[end - 1].get("parts")?.as_array()?.len();
     if final_parts != boundary.last_parts {
         return None;
     }
-    Some(contents[..end].to_vec())
+    Some(&contents[..end])
+}
+
+fn gemini_content_block_refs(
+    contents: &[serde_json::Value],
+) -> Option<Vec<haider_protocol::cache::ProviderViewBlockRefV1>> {
+    contents.iter().map(crate::exact_wire_block_ref).collect()
 }
 
 fn append_content(

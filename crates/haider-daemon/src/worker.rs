@@ -674,7 +674,7 @@ impl ContextCompactor for DaemonContextCompactor {
             attachments,
             cache_metadata: Some(cache_metadata.clone()),
         };
-        let prepared = self.provider.prepare_turn(&request);
+        let mut prepared = self.provider.prepare_turn(&request);
         if let Some(rendered) = prepared.as_ref().map(|prepared| prepared.prefix_digests()) {
             prefix_digests = rendered.clone();
             previous_prefix_digests = prepared
@@ -716,11 +716,28 @@ impl ContextCompactor for DaemonContextCompactor {
                     },
                 )?;
             }
+        }
+        if let Some(provider_view_ledger) = prepared
+            .as_ref()
+            .and_then(|prepared| prepared.provider_view())
+            .map(|provider_view| provider_view.ledger().clone())
+        {
+            let blobs = prepared
+                .as_mut()
+                .map(haider_provider::PreparedTurn::take_provider_view_storage_blobs)
+                .unwrap_or_default();
+            let stored_provider_view = StoreHandle::persist_provider_view(
+                &self.store,
+                self.store.session_id(),
+                provider_view_ledger,
+                blobs,
+            )
+            .await?;
             cache_metadata
                 .header_epoch
-                .clone_from(&provider_view.ledger().header_epoch);
+                .clone_from(&stored_provider_view.header_epoch);
             request.cache_metadata = Some(cache_metadata.clone());
-            self.record_provider_view_attempt(run_id, 1, provider_view.ledger())
+            self.record_provider_view_attempt(run_id, 1, &stored_provider_view)
                 .await?;
         }
         let cache_control = prepared

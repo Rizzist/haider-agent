@@ -1904,6 +1904,69 @@ fn prepared_openai_cache_control_uses_the_provider_view_header_epoch() {
     );
 }
 
+#[test]
+fn prepared_openai_and_compatible_wire_bytes_match_legacy_final_render() {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("openai-single-render-wire");
+    vault
+        .put(&alias, b"openai-single-render-wire-key")
+        .expect("store test credential");
+    let openai = OpenAiProvider::new(
+        vault.resolve(&alias).expect("resolve test credential"),
+        "gpt-5.6",
+    )
+    .expect("construct OpenAI provider");
+    let mut request = probe_request("gpt-5.6");
+    request.tools = vec![computer_tool_definition()];
+    request.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
+    let prepared = crate::Provider::prepare_turn(&openai, &request).expect("prepared OpenAI turn");
+    let mut finalized = request.clone();
+    finalized
+        .cache_metadata
+        .as_mut()
+        .expect("cache metadata")
+        .header_epoch = prepared
+        .provider_view()
+        .expect("provider view")
+        .ledger()
+        .header_epoch
+        .clone();
+    let legacy = openai
+        .request_payload(&finalized)
+        .expect("legacy OpenAI payload");
+    assert_eq!(
+        serde_json::to_vec(&prepared.wire.as_ref().expect("prepared wire").payload)
+            .expect("prepared OpenAI bytes"),
+        serde_json::to_vec(&legacy).expect("legacy OpenAI bytes")
+    );
+
+    let compatible = compatible_provider_with_resolver(
+        b"compatible-single-render-wire-key",
+        "https://compatible-wire.example",
+        Arc::new(StubDnsResolver::new(std::iter::empty::<Vec<SocketAddr>>())),
+    );
+    let mut compatible_request = probe_request("audit-model");
+    compatible_request.tools = vec![computer_tool_definition()];
+    compatible_request.cache_metadata =
+        Some(cm2_cache_metadata(OPENAI_COMPATIBLE_PROVIDER_NAME, 1));
+    let compatible_prepared = crate::Provider::prepare_turn(&compatible, &compatible_request)
+        .expect("prepared compatible turn");
+    let compatible_legacy = compatible
+        .request_payload(&compatible_request)
+        .expect("legacy compatible payload");
+    assert_eq!(
+        serde_json::to_vec(
+            &compatible_prepared
+                .wire
+                .as_ref()
+                .expect("prepared compatible wire")
+                .payload
+        )
+        .expect("prepared compatible bytes"),
+        serde_json::to_vec(&compatible_legacy).expect("legacy compatible bytes")
+    );
+}
+
 /// CM2d — the routing key identifies an account/model/base cohort. Rendered
 /// prefix diagnostics do not rotate it; the provider-view header epoch is the
 /// one authoritative address of the actual shared base.

@@ -45,8 +45,13 @@ pub struct FileCas {
 impl FileCas {
     /// Opens a CAS in a profile root, creating its directory if needed.
     pub fn open(profile_root: impl AsRef<Path>) -> StoreResult<Self> {
-        let profile_root = profile_root.as_ref();
-        let root = profile_root.join("cas");
+        Self::open_namespace(profile_root.as_ref(), "cas")
+    }
+
+    /// Opens one store-owned CAS namespace. Namespace names are compile-time
+    /// constants supplied by this crate, never user-controlled paths.
+    pub(crate) fn open_namespace(profile_root: &Path, namespace: &str) -> StoreResult<Self> {
+        let root = profile_root.join(namespace);
         let created = !root.exists();
         fs::create_dir_all(&root).map_err(|error| io_error("create CAS root", &root, error))?;
         if created {
@@ -54,6 +59,27 @@ impl FileCas {
             sync_directory(profile_root)?;
         }
         Ok(Self { root })
+    }
+
+    /// Removes one verified namespace object during reference-index GC.
+    /// Missing objects are already swept. The shard directory is fsynced so
+    /// Windows and Unix both durably observe the unlink.
+    pub(crate) fn remove(&self, artifact: &ArtifactRef) -> StoreResult<()> {
+        let path = self.path_for(artifact)?;
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                let parent = path.parent().ok_or_else(|| {
+                    store_error(
+                        ErrorCode::Internal,
+                        format!("CAS object has no parent directory: {}", path.display()),
+                        false,
+                    )
+                })?;
+                sync_directory(parent)
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io_error("remove CAS object", &path, error)),
+        }
     }
 
     /// Resolves a validated artifact reference to its on-disk path.
@@ -70,6 +96,11 @@ impl FileCas {
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
             Err(error) => Err(io_error("read CAS object", path, error)),
         }
+    }
+
+    pub(crate) fn verify_artifact(&self, artifact: &ArtifactRef) -> StoreResult<bool> {
+        let path = self.path_for(artifact)?;
+        self.verify_existing(artifact, &path)
     }
 
     /// Copies and hashes one reader in the same pass. The temporary lives in
@@ -362,18 +393,17 @@ impl Cas for FileCas {
 
     fn get(&self, artifact: &ArtifactRef) -> StoreResult<Vec<u8>> {
         let path = self.path_for(artifact)?;
-        let bytes = fs::read(&path).map_err(|error| {
-            let code = if error.kind() == ErrorKind::NotFound {
-                ErrorCode::InvalidArgument
-            } else {
-                ErrorCode::Internal
-            };
-            store_error(
-                code,
-                format!("cannot read CAS object {}: {error}", path.display()),
-                false,
-            )
-        })?;
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Err(store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("cannot read CAS object {}: {error}", path.display()),
+                    false,
+                ));
+            }
+            Err(error) => return Err(io_error("read CAS object", &path, error)),
+        };
         if artifact_for(&bytes) != *artifact {
             return Err(corrupt_object(&path));
         }

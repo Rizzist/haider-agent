@@ -1828,7 +1828,7 @@ fn suffix_revises_prior_facts(
             }
             EventPayload::Item(ItemEvent::Completed { item, .. }) => {
                 if let Some(origin) =
-                    UserCommandOriginV1::try_from_extension_item(&item).map_err(|error| {
+                    UserCommandOriginV1::try_from_extension_item(item).map_err(|error| {
                         corrupt(format!("malformed user-command origin marker: {error}"))
                     })?
                     && (checkpoint_prefix_runs.is_some()
@@ -3019,7 +3019,7 @@ impl JournalFacts {
             }
             EventPayload::Item(ItemEvent::Completed { item, .. }) => {
                 let origin =
-                    UserCommandOriginV1::try_from_extension_item(&item).map_err(|error| {
+                    UserCommandOriginV1::try_from_extension_item(item).map_err(|error| {
                         corrupt(format!("malformed user-command origin marker: {error}"))
                     })?;
                 if let Some(origin) = origin

@@ -52,6 +52,104 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+#[allow(unsafe_code)]
+mod allocation_probe {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static ACTIVE: Cell<bool> = const { Cell::new(false) };
+        static LIVE: Cell<usize> = const { Cell::new(0) };
+        static PEAK: Cell<usize> = const { Cell::new(0) };
+    }
+
+    struct CountingAllocator;
+
+    #[global_allocator]
+    static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    fn allocated(bytes: usize) {
+        ACTIVE.with(|active| {
+            if !active.get() {
+                return;
+            }
+            LIVE.with(|live| {
+                let current = live.get().saturating_add(bytes);
+                live.set(current);
+                PEAK.with(|peak| peak.set(peak.get().max(current)));
+            });
+        });
+    }
+
+    fn deallocated(bytes: usize) {
+        ACTIVE.with(|active| {
+            if active.get() {
+                LIVE.with(|live| live.set(live.get().saturating_sub(bytes)));
+            }
+        });
+    }
+
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc(layout) };
+            if !pointer.is_null() {
+                allocated(layout.size());
+            }
+            pointer
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc_zeroed(layout) };
+            if !pointer.is_null() {
+                allocated(layout.size());
+            }
+            pointer
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            deallocated(layout.size());
+            unsafe { System.dealloc(pointer, layout) };
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let resized = unsafe { System.realloc(pointer, layout, new_size) };
+            if !resized.is_null() {
+                if new_size >= layout.size() {
+                    allocated(new_size - layout.size());
+                } else {
+                    deallocated(layout.size() - new_size);
+                }
+            }
+            resized
+        }
+    }
+
+    struct ProbeGuard;
+
+    impl Drop for ProbeGuard {
+        fn drop(&mut self) {
+            ACTIVE.with(|active| active.set(false));
+        }
+    }
+
+    pub(crate) fn measure_peak<T>(operation: impl FnOnce() -> T) -> (T, usize) {
+        LIVE.with(|live| live.set(0));
+        PEAK.with(|peak| peak.set(0));
+        ACTIVE.with(|active| active.set(true));
+        let guard = ProbeGuard;
+        let result = operation();
+        let peak = PEAK.with(Cell::get);
+        drop(guard);
+        (result, peak)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) use allocation_probe::measure_peak as measure_peak_test_allocation;
+
 pub use cachemaxxing::{
     CacheEconomicSample, CacheMarkerMode, CachePlacementCapabilities, CacheScenario,
     CacheWritePrice, InlineBreakpointPlan, PreparedProviderView, ProviderViewContinuity,
@@ -72,14 +170,76 @@ pub(crate) const PROVIDER_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(10 *
 /// provider-opaque/signed blocks from crossing this canonicalization seam.
 #[must_use]
 pub fn canonical_tool_definitions_digest(tools: &[ToolDefinition]) -> String {
-    serde_json::to_value(canonical_tool_definitions(tools))
-        .and_then(|value| serde_json::to_vec(&value))
-        .map_or_else(
-            |_| blake3::hash(b"haider-owned-json-serialization-error"),
-            |bytes| blake3::hash(&bytes),
-        )
-        .to_hex()
-        .to_string()
+    canonical_tool_definitions_digest_inner(tools).unwrap_or_else(|| {
+        blake3::hash(b"haider-owned-json-serialization-error")
+            .to_hex()
+            .to_string()
+    })
+}
+
+fn canonical_tool_definitions_digest_inner(tools: &[ToolDefinition]) -> Option<String> {
+    let mut ordered = tools
+        .iter()
+        .map(|tool| {
+            let mut schema = Vec::new();
+            write_canonical_json(&tool.input_schema, &mut schema).ok()?;
+            Some((tool, schema))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    ordered.sort_by(|(left, left_schema), (right, right_schema)| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.description.cmp(&right.description))
+            .then_with(|| left_schema.cmp(right_schema))
+    });
+    let mut writer = Blake3Writer::default();
+    writer.hasher.update(b"[");
+    for (index, (tool, schema)) in ordered.iter().enumerate() {
+        if index > 0 {
+            writer.hasher.update(b",");
+        }
+        writer.hasher.update(b"{\"description\":");
+        serde_json::to_writer(&mut writer, &tool.description).ok()?;
+        writer.hasher.update(b",\"input_schema\":");
+        writer.hasher.update(schema);
+        writer.hasher.update(b",\"name\":");
+        serde_json::to_writer(&mut writer, &tool.name).ok()?;
+        writer.hasher.update(b"}");
+    }
+    writer.hasher.update(b"]");
+    Some(writer.finish())
+}
+
+fn write_canonical_json(value: &serde_json::Value, output: &mut Vec<u8>) -> serde_json::Result<()> {
+    match value {
+        serde_json::Value::Array(values) => {
+            output.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push(b',');
+                }
+                write_canonical_json(value, output)?;
+            }
+            output.push(b']');
+            Ok(())
+        }
+        serde_json::Value::Object(values) => {
+            output.push(b'{');
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    output.push(b',');
+                }
+                serde_json::to_writer(&mut *output, key)?;
+                output.push(b':');
+                write_canonical_json(&values[key], output)?;
+            }
+            output.push(b'}');
+            Ok(())
+        }
+        scalar => serde_json::to_writer(output, scalar),
+    }
 }
 
 /// Freezes Haider-owned tool schemas as one cache ABI: definitions are sorted
@@ -128,87 +288,225 @@ pub(crate) fn exact_optional_wire_digest<T>(value: Option<&T>) -> String
 where
     T: Serialize + ?Sized,
 {
-    serde_json::to_vec(&value)
-        .map_or_else(
-            |_| blake3::hash(b"haider-final-wire-serialization-error"),
-            |bytes| blake3::hash(&bytes),
-        )
-        .to_hex()
-        .to_string()
-}
-
-/// Replaces the normalized component hashes with exact rendered-wire hashes.
-/// Adapters call this only on Haider-rendered top-level system/tools/history
-/// values; provider-opaque children remain byte-for-byte in the value and are
-/// never canonicalized.
-pub(crate) fn rendered_prefix_digests(
-    request: &TurnRequest,
-    full_payload: &serde_json::Value,
-    immutable_history: String,
-    system_key: &str,
-    tools_key: &str,
-) -> Option<PrefixDigests> {
-    rendered_prefix_digests_from_components(
-        request,
-        full_payload.get(system_key),
-        full_payload.get(tools_key),
-        immutable_history,
-    )
-}
-
-/// Replaces normalized hashes with exact adapter-rendered components when
-/// those components are nested rather than top-level provider fields.
-pub(crate) fn rendered_prefix_digests_from_components(
-    request: &TurnRequest,
-    system: Option<&serde_json::Value>,
-    tools: Option<&serde_json::Value>,
-    immutable_history: String,
-) -> Option<PrefixDigests> {
-    let mut digests = request.cache_metadata.as_ref()?.prefix_digests.clone();
-    digests.system = exact_optional_wire_digest(system);
-    digests.tools = exact_optional_wire_digest(tools);
-    digests.immutable_history = immutable_history;
-    Some(digests)
-}
-
-pub(crate) fn rendered_array_prefix_digest(
-    full_payload: &serde_json::Value,
-    history_key: &str,
-    end: usize,
-) -> Option<String> {
-    let history = full_payload.get(history_key)?.as_array()?;
-    Some(exact_optional_wire_digest(Some(
-        &history[..end.min(history.len())],
-    )))
-}
-
-/// Finds a metadata key introduced by the adapter by comparing the final
-/// payload with the same rendered prompt before cache controls are applied.
-/// A provider-opaque or user-authored key present in both values is ignored.
-pub(crate) fn payload_has_added_key(
-    final_value: &serde_json::Value,
-    prompt_value: &serde_json::Value,
-    needle: &str,
-) -> bool {
-    match (final_value, prompt_value) {
-        (serde_json::Value::Array(final_values), serde_json::Value::Array(prompt_values)) => {
-            final_values
-                .iter()
-                .zip(prompt_values)
-                .any(|(final_value, prompt_value)| {
-                    payload_has_added_key(final_value, prompt_value, needle)
-                })
-        }
-        (serde_json::Value::Object(final_values), serde_json::Value::Object(prompt_values)) => {
-            (final_values.contains_key(needle) && !prompt_values.contains_key(needle))
-                || final_values.iter().any(|(key, final_value)| {
-                    prompt_values.get(key).is_some_and(|prompt_value| {
-                        payload_has_added_key(final_value, prompt_value, needle)
-                    })
-                })
-        }
-        _ => false,
+    let mut writer = Blake3Writer::default();
+    if serde_json::to_writer(&mut writer, &value).is_err() {
+        return blake3::hash(b"haider-final-wire-serialization-error")
+            .to_hex()
+            .to_string();
     }
+    writer.finish()
+}
+
+#[derive(Default)]
+struct Blake3Writer {
+    hasher: blake3::Hasher,
+    byte_len: u64,
+}
+
+impl std::io::Write for Blake3Writer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.hasher.update(bytes);
+        self.byte_len = self
+            .byte_len
+            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Blake3Writer {
+    fn finish(self) -> String {
+        self.hasher.finalize().to_hex().to_string()
+    }
+}
+
+struct CompactJsonVecWriter {
+    bytes: Vec<u8>,
+}
+
+impl CompactJsonVecWriter {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::with_capacity(256),
+        }
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl std::io::Write for CompactJsonVecWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let required = self.bytes.len().saturating_add(bytes.len());
+        if required > self.bytes.capacity() {
+            let capacity = self.bytes.capacity();
+            let growth = if bytes.len() >= 64 * 1024 {
+                bytes.len().saturating_add(64 * 1024)
+            } else {
+                capacity.saturating_div(4).max(256)
+            };
+            let target = required.max(capacity.saturating_add(growth));
+            self.bytes
+                .reserve_exact(target.saturating_sub(self.bytes.len()));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn serialize_json_fragment<T>(value: &T) -> Option<Vec<u8>>
+where
+    T: Serialize + ?Sized,
+{
+    let mut writer = CompactJsonVecWriter::new();
+    serde_json::to_writer(&mut writer, value).ok()?;
+    Some(writer.finish())
+}
+
+pub(crate) fn exact_wire_block_ref<T>(
+    value: &T,
+) -> Option<haider_protocol::cache::ProviderViewBlockRefV1>
+where
+    T: Serialize + ?Sized,
+{
+    let mut writer = Blake3Writer::default();
+    serde_json::to_writer(&mut writer, value).ok()?;
+    Some(haider_protocol::cache::ProviderViewBlockRefV1 {
+        content_hash: format!("blake3:{}", writer.hasher.finalize().to_hex()),
+        byte_len: writer.byte_len,
+    })
+}
+
+pub(crate) fn exact_wire_size<T>(value: &T) -> Option<u64>
+where
+    T: Serialize + ?Sized,
+{
+    let mut writer = Blake3Writer::default();
+    serde_json::to_writer(&mut writer, value).ok()?;
+    Some(writer.byte_len)
+}
+
+/// Serializes the current stable history once for M4's CAS. When the prior
+/// boundary is a true prefix, its ledger refs are derived from those same
+/// bytes instead of serializing the old history again.
+pub(crate) fn serialized_provider_view_history(
+    history: &[serde_json::Value],
+    history_wire_start: usize,
+    stable_wire_end: usize,
+    previous_wire_end: Option<usize>,
+) -> Option<(
+    Vec<Vec<u8>>,
+    Option<Vec<haider_protocol::cache::ProviderViewBlockRefV1>>,
+    Option<usize>,
+)> {
+    let start = history_wire_start.min(history.len());
+    let stable_end = stable_wire_end.max(start).min(history.len());
+    let blocks = history[start..stable_end]
+        .iter()
+        .map(serialize_json_fragment)
+        .collect::<Option<Vec<_>>>()?;
+    let Some(previous_end) = previous_wire_end else {
+        return Some((blocks, None, None));
+    };
+    let previous_end = previous_end.max(start).min(history.len());
+    let previous_len = previous_end.saturating_sub(start);
+    if previous_len <= blocks.len() {
+        let refs = blocks[..previous_len]
+            .iter()
+            .map(|bytes| haider_protocol::cache::ProviderViewBlockRefV1::for_bytes(bytes))
+            .collect();
+        return Some((blocks, Some(refs), Some(previous_len)));
+    }
+    let refs = history[start..previous_end]
+        .iter()
+        .map(exact_wire_block_ref)
+        .collect::<Option<Vec<_>>>()?;
+    Some((blocks, Some(refs), None))
+}
+
+/// Reuses the exact CAS fragments produced by M4 for the stable rendered
+/// system/tools/history digests. History is hashed as JSON punctuation plus
+/// the already serialized blocks, so no prompt-sized digest buffer exists.
+/// The blobs move into [`PreparedTurn`] and are drained by the ledger writer;
+/// they are never copied back into a second provider view.
+pub(crate) fn rendered_prefix_digests_from_provider_view(
+    request: &TurnRequest,
+    provider_view: &mut PreparedProviderView,
+    history_includes_system: bool,
+    previous_history_block_len: Option<usize>,
+) -> Option<(
+    PrefixDigests,
+    Option<String>,
+    Vec<haider_protocol::cache::ProviderViewBlobV1>,
+)> {
+    let system = cas_block_digest(&provider_view.ledger().system_block)?;
+    let tools = cas_block_digest(&provider_view.ledger().tool_schema_block)?;
+    let history_block_len = provider_view.ledger().history_blocks.len();
+    let storage_blobs = provider_view.take_storage_blobs();
+    let history = storage_blobs.get(2..)?;
+    let history = history.get(..history_block_len)?;
+    let mut digests = request.cache_metadata.as_ref()?.prefix_digests.clone();
+    digests.system = system;
+    digests.tools = tools;
+    digests.immutable_history =
+        cas_history_digest(&storage_blobs, history, history_includes_system)?;
+    let previous = previous_history_block_len
+        .and_then(|len| history.get(..len))
+        .and_then(|history| cas_history_digest(&storage_blobs, history, history_includes_system));
+    Some((digests, previous, storage_blobs))
+}
+
+fn cas_block_digest(block: &haider_protocol::cache::ProviderViewBlockRefV1) -> Option<String> {
+    block
+        .content_hash
+        .strip_prefix("blake3:")
+        .filter(|digest| digest.len() == 64)
+        .map(str::to_owned)
+}
+
+fn cas_history_digest(
+    storage_blobs: &[haider_protocol::cache::ProviderViewBlobV1],
+    history: &[haider_protocol::cache::ProviderViewBlobV1],
+    include_system: bool,
+) -> Option<String> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"[");
+    let mut wrote_value = false;
+    if include_system {
+        hasher.update(&storage_blobs.first()?.bytes);
+        wrote_value = true;
+    }
+    for blob in history {
+        if wrote_value {
+            hasher.update(b",");
+        }
+        hasher.update(&blob.bytes);
+        wrote_value = true;
+    }
+    hasher.update(b"]");
+    Some(hasher.finalize().to_hex().to_string())
+}
+
+/// Encodes a completed provider wire tree exactly once. The DOM and growing
+/// body necessarily overlap during encoding; consuming the DOM releases it
+/// before the request is opened and prevents any later re-encoding.
+pub(crate) fn serialize_json_body(payload: serde_json::Value) -> Result<Vec<u8>, ProviderError> {
+    let mut writer = CompactJsonVecWriter::new();
+    serde_json::to_writer(&mut writer, &payload).map_err(|error| {
+        ProviderError::new(
+            ProviderErrorKind::Internal,
+            format!("provider request body could not serialize: {error}"),
+        )
+    })?;
+    Ok(writer.finish())
 }
 
 pub use anthropic::{
@@ -716,6 +1014,7 @@ pub struct PreparedTurn {
     pub(crate) previous_immutable_history_digest: Option<String>,
     pub(crate) cache_control: haider_protocol::provider::CacheControlObservationV1,
     pub(crate) provider_view: Option<PreparedProviderView>,
+    pub(crate) provider_view_storage_blobs: Vec<haider_protocol::cache::ProviderViewBlobV1>,
     pub(crate) wire: Option<PreparedWire>,
 }
 
@@ -752,6 +1051,29 @@ impl PreparedTurn {
     pub fn provider_view(&self) -> Option<&PreparedProviderView> {
         self.provider_view.as_ref()
     }
+
+    /// Whether a built-in adapter retained the complete provider wire. Core
+    /// can then return shared system/tool configuration to its canonical
+    /// owner before the HTTP open without forcing another prompt clone.
+    #[must_use]
+    pub fn has_rendered_wire(&self) -> bool {
+        self.wire.is_some()
+    }
+
+    /// Moves exact serialized provider-view blocks to the disk-backed ledger
+    /// writer, leaving only hashes and boundaries in the prepared request.
+    pub fn take_provider_view_storage_blobs(
+        &mut self,
+    ) -> Vec<haider_protocol::cache::ProviderViewBlobV1> {
+        if self.provider_view_storage_blobs.is_empty() {
+            self.provider_view
+                .as_mut()
+                .map(PreparedProviderView::take_storage_blobs)
+                .unwrap_or_default()
+        } else {
+            std::mem::take(&mut self.provider_view_storage_blobs)
+        }
+    }
 }
 
 tokio::task_local! {
@@ -763,6 +1085,16 @@ pub(crate) fn take_prepared_wire_payload() -> Option<PreparedWire> {
         .try_with(|payload| payload.borrow_mut().take())
         .ok()
         .flatten()
+}
+
+pub(crate) async fn scope_prepared_wire<T>(
+    prepared: Option<PreparedTurn>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    let payload = prepared.and_then(|prepared| prepared.wire);
+    PREPARED_WIRE_PAYLOAD
+        .scope(RefCell::new(payload), future)
+        .await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1187,6 +1519,7 @@ pub trait Provider: Send + Sync {
                 previous_immutable_history_digest: None,
                 cache_control: haider_protocol::provider::CacheControlObservationV1::Unavailable,
                 provider_view: None,
+                provider_view_storage_blobs: Vec::new(),
                 wire: None,
             })
     }
@@ -1205,10 +1538,18 @@ pub trait Provider: Send + Sync {
         request: TurnRequest,
         prepared: Option<PreparedTurn>,
     ) -> Result<ProviderStream, ProviderError> {
-        let payload = prepared.and_then(|prepared| prepared.wire);
-        PREPARED_WIRE_PAYLOAD
-            .scope(RefCell::new(payload), self.stream_turn(request))
-            .await
+        scope_prepared_wire(prepared, self.stream_turn(request)).await
+    }
+
+    /// Opens a request while the caller retains its canonical message tree.
+    /// Built-in adapters override this borrow path; injected providers keep
+    /// the compatibility default and receive one owned clone.
+    async fn stream_prepared_turn_ref(
+        &self,
+        request: &TurnRequest,
+        prepared: Option<PreparedTurn>,
+    ) -> Result<ProviderStream, ProviderError> {
+        self.stream_prepared_turn(request.clone(), prepared).await
     }
 }
 
@@ -1837,6 +2178,35 @@ mod e2_contract_tests {
         assert!(BUILTIN_PROVIDER_NAMES.contains(&XAI_PROVIDER_NAME));
         assert!(BUILTIN_PROVIDER_NAMES.contains(&GROK_OAUTH_PROVIDER_NAME));
         assert!(BUILTIN_PROVIDER_NAMES.contains(&HAIDER_CODE_PROVIDER_NAME));
+    }
+
+    #[test]
+    fn streaming_tool_digest_matches_legacy_canonical_dom_bytes() {
+        let tools = vec![
+            ToolDefinition {
+                name: "z-tool".into(),
+                description: "same".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "z": {"enum": [3, 2, 1]},
+                        "a": {"type": "string"}
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "a-tool".into(),
+                description: "first".into(),
+                input_schema: serde_json::json!({"required": ["x"], "type": "object"}),
+            },
+        ];
+        let legacy = serde_json::to_value(canonical_tool_definitions(&tools))
+            .and_then(|value| serde_json::to_vec(&value))
+            .expect("legacy canonical tool bytes");
+        assert_eq!(
+            canonical_tool_definitions_digest(&tools),
+            blake3::hash(&legacy).to_hex().to_string()
+        );
     }
 
     /// MUTATION CHECK: record the monthly plans as token rates or change the
