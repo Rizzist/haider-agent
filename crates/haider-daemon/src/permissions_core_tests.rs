@@ -29,7 +29,7 @@ use haider_protocol::session::{
     SessionInteractionModeV1, SessionMetadataV1, SessionPermissionOverridesV1,
 };
 use haider_protocol::state::RunState;
-use haider_protocol::tool::{RememberedGrantScope, ToolPermissionDefault};
+use haider_protocol::tool::{DispatchMode, RememberedGrantScope, ToolPermissionDefault};
 use haider_store::{AcceptedShellExec, EventStore, SessionCreateCommand, Store};
 use haider_tools::{FsEditAnchorMismatch, ToolError};
 use std::collections::VecDeque;
@@ -118,6 +118,7 @@ fn canonical_inventory_equals_advertised_dispatchable_set() {
     assert!(advertised.contains(&"message_subagent"));
     assert!(advertised.contains(&"computer"));
     assert!(advertised.contains(&"mobile"));
+    assert!(advertised.contains(&"monitor"));
     assert!(!advertised.contains(&"exec"));
     assert!(
         advertised
@@ -157,6 +158,25 @@ fn canonical_inventory_equals_advertised_dispatchable_set() {
         registered_tool_route("mobile"),
         Some(RegisteredToolRoute::Mobile)
     );
+    assert_eq!(
+        registered_tool_route("monitor"),
+        Some(RegisteredToolRoute::Monitor)
+    );
+}
+
+/// §E: monitor registry administration is effect-free and canonical. Grant
+/// policy remains owned by the existing delegation layer.
+#[test]
+fn monitor_is_advertised_dispatchable_and_effect_free() {
+    let registry = registered_tools();
+    let entry = registry
+        .iter()
+        .find(|entry| entry.manifest.name == "monitor")
+        .expect("monitor manifest");
+    assert_eq!(entry.route, RegisteredToolRoute::Monitor);
+    assert_eq!(entry.manifest.dispatch, DispatchMode::Await);
+    assert!(entry.manifest.effects.is_empty());
+    assert_eq!(entry.default, ToolPermissionDefault::NotApplicable);
 }
 
 /// MUTATION CHECK: drop any C1 registry entry or change its typed route.
@@ -1135,7 +1155,13 @@ fn every_advertised_tool_is_manual_described_and_wire_is_description_free() {
         );
     }
     let manual = tool_manual(&root);
-    for signature in ["fs_read(", "process_exec(", "computer(", "todo_write("] {
+    for signature in [
+        "fs_read(",
+        "process_exec(",
+        "computer(",
+        "todo_write(",
+        "monitor(",
+    ] {
         assert!(manual.contains(signature), "manual missing `{signature}`");
     }
     // The whole-list-replace teaching that used to live on the todo_write wire
@@ -1188,8 +1214,8 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
 }
 
 /// C1 MUTATION CHECK: drop the node walk or the agent-type/task rendering.
-/// Expected RUNTIME failure: the volatile Loom tail stops teaching the model
-/// which specialist runs which node.
+/// Expected RUNTIME failure: the volatile Loom tail stops describing the
+/// daemon-owned specialist binding for each node.
 #[test]
 fn loom_run_tail_teaches_typed_nodes() {
     use haider_protocol::loom::{LoomTypeSig, compile_pipe, parse_pipe};
@@ -1209,7 +1235,7 @@ fn loom_run_tail_teaches_typed_nodes() {
         "{tail}"
     );
     assert!(tail.contains("→ publish \"approve\""), "{tail}");
-    assert!(tail.contains("spawn_subagent(agent_type"), "{tail}");
+    assert!(tail.contains("daemon-scoped typed nodes"), "{tail}");
 }
 
 /// Review round 2 MUTATION CHECK: put the ellipsis OUTSIDE the cap again.

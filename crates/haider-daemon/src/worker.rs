@@ -80,8 +80,8 @@ use haider_protocol::effect::{
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
 use haider_protocol::graph::{
-    ComputerObservationKind, GraphNodeName, GraphPhase, ProcessSignalRecorded, ProcessSignalRef,
-    WorkspaceMutationRef, process_signal_subject_digest,
+    ComputerObservationKind, GraphGateKind, GraphNodeName, GraphPhase, ProcessSignalRecorded,
+    ProcessSignalRef, WorkspaceMutationRef, process_signal_subject_digest,
 };
 use haider_protocol::history::{
     COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume, NodeKind, TreeNode,
@@ -129,9 +129,9 @@ use haider_tools::{
     ComputerOperation, ComputerOutput, ComputerPermissionPoll, EffectBroker, FsCaseMode, FsEdit,
     FsEditChange, FsGlob, FsPath, FsPathOperation, FsRead, FsSearch, FsSearchMode, FsWrite,
     GraphEvidence, JournalSink, MessageSubagent, MobileBackend, MobileCancelToken, MobileError,
-    MobileOperation, MobileOutput, PermissionPolicy, ProcessBounds, ProcessExec, ProcessResult,
-    ResultBounds, ScreenshotRedactionPolicy, SessionGrant, SessionGrantScope, ShellSession,
-    SpawnSubagent, ToolError, ToolResult, TurnAttribution, WebFetch, WorkflowAuthor,
+    MobileOperation, MobileOutput, MonitorRequest, PermissionPolicy, ProcessBounds, ProcessExec,
+    ProcessResult, ResultBounds, ScreenshotRedactionPolicy, SessionGrant, SessionGrantScope,
+    ShellSession, SpawnSubagent, ToolError, ToolResult, TurnAttribution, WebFetch, WorkflowAuthor,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -223,6 +223,11 @@ pub struct WebCapabilityDegrade {
     /// The codex alpha/search endpoint returned 404/410 this session: stop
     /// advertising the client `web_search` tool (no retry storm).
     pub openai_alpha_search: bool,
+    /// This turn is executing a daemon-owned Loom workflow. Provider-hosted
+    /// web tools bypass the local dispatcher, so all provider families must
+    /// construct without them; scoped specialists use the brokered local
+    /// `web_fetch` path instead.
+    pub disable_hosted_web_tools: bool,
 }
 
 /// W-B (decision 3): daemon-side executor for the CLIENT `web_search` tool —
@@ -995,6 +1000,22 @@ fn approximate_len_tokens(bytes: usize) -> u64 {
 }
 
 /// Inputs available to a turn-scoped tool dispatcher factory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TypedWorkflowExecutionBinding {
+    graph_id: GraphId,
+    node: GraphNodeName,
+    attempt: u32,
+    agent_type_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TypedWorkflowExecutionState {
+    binding: TypedWorkflowExecutionBinding,
+    grant: Grant,
+    cli_scope: Vec<String>,
+    context_tail: String,
+}
+
 #[derive(Clone)]
 pub struct WorkerToolContext {
     pub metadata: SessionMetadataV1,
@@ -1014,6 +1035,13 @@ pub struct WorkerToolContext {
     /// B3 — the typed child's declared-CLI exec scope. `None` = unfenced
     /// (untyped); `Some(vec![])` = deny-all (typed record unresolvable).
     pub cli_scope: Option<Vec<String>>,
+    /// Daemon-owned typed node state for the first provider request. The
+    /// dispatcher rebinds this state at every later provider-request boundary
+    /// when graph traversal selects a different node or attempt.
+    pub(crate) typed_workflow_execution: Option<TypedWorkflowExecutionState>,
+    /// The provider and static actor-owned tool pack were constructed with
+    /// Loom's fail-closed restrictions before this turn started.
+    pub(crate) loom_provider_fenced: bool,
     /// W-B: the client web_search executor for this turn (None = typed
     /// unavailable result).
     pub(crate) web_search: Option<Arc<dyn WebSearchExecutor>>,
@@ -4233,6 +4261,21 @@ async fn perform_manual_compaction(
             false,
         ));
     }
+    // A fresh compaction becomes a nonterminal session at the Compacting
+    // append below. Share the native graph-selection lane from the idle check
+    // through that append so graph.pin/switch cannot commit from a stale idle
+    // observation. Receipt recovery already owns a durable run and therefore
+    // needs no new admission fence.
+    let workflow_selection = if existing.is_none() {
+        Some(
+            lease
+                .hub()
+                .lock_workflow_selection(lease.session_id())
+                .await,
+        )
+    } else {
+        None
+    };
     if existing.is_none()
         && durable_runs(lease)
             .await?
@@ -4408,6 +4451,7 @@ async fn perform_manual_compaction(
         let range = StoreHandle::append(lease, &mut envelopes).await?;
         (run_id, range.first_seq.saturating_add(1), intent)
     };
+    drop(workflow_selection);
     let cache_expected_later_reads = u32::from(!post_compaction_tools.is_empty()) * 2;
     let compactor = DaemonContextCompactor {
         store: lease.clone(),
@@ -5021,10 +5065,117 @@ async fn start_turn(
     let agent_id = delegation_record
         .as_ref()
         .map(|record| record.agent_id.clone());
-    let grant = delegation_record
+    let delegation_grant = delegation_record
         .as_ref()
         .map(|record| record.manifest.grant.clone());
-    if let Some(grant) = grant.as_ref() {
+    if let Some(grant) = delegation_grant.as_ref() {
+        validate_grant(grant)?;
+    }
+    // Graph state selects a typed Loom executor before provider/tool setup.
+    // A model never chooses, omits, or substitutes the specialist for an OPEN
+    // typed node: the pinned digest and current ready node are daemon truth.
+    // Native graph.pin/switch applies to delegated sessions too, so graph
+    // discovery cannot depend on the child's pre-existing spawn grant.
+    let graph_status = lease
+        .hub()
+        .graph_status(lease.session_id())
+        .await
+        .map_err(hub_error)?;
+    let loom_workflow = match graph_status.as_ref() {
+        Some(status) => match lease.hub().loom_workflow(&status.template).await? {
+            Some(workflow)
+                if haider_protocol::graph::graph_template_digest(&workflow.template)
+                    == status.digest =>
+            {
+                Some(workflow)
+            }
+            Some(_) => {
+                return Err(HaiderError::new(
+                    ErrorCode::RevisionConflict,
+                    format!(
+                        "pinned Loom workflow `{}` no longer matches its registry revision; switch or re-pin it",
+                        status.template
+                    ),
+                    true,
+                ));
+            }
+            // Built-ins and one-off authored GraphTemplateSpec pins have no
+            // Loom registry row and therefore no typed-node metadata.
+            None => None,
+        },
+        None => None,
+    };
+    let loom_provider_fenced = loom_workflow.is_some()
+        && graph_status
+            .as_ref()
+            .is_some_and(haider_protocol::graph::GraphStatus::is_unfinished);
+    if loom_provider_fenced {
+        // Hosted/server tools execute inside the provider adapter and cannot
+        // be checked by the node-local dispatcher. Loom turns therefore use
+        // only local brokered web tools for every provider family.
+        web_degrade.anthropic_web_tools = true;
+        web_degrade.openai_alpha_search = true;
+        web_degrade.disable_hosted_web_tools = true;
+    }
+    let typed_node_dispatch = match (graph_status.as_ref(), loom_workflow.as_ref()) {
+        (Some(status), Some(workflow)) => {
+            let expected_type = (status.phase == GraphPhase::Active)
+                .then_some(())
+                .and_then(|()| status.current_node.as_ref())
+                .filter(|node| status.node_is_ready(node))
+                .and_then(|node| workflow.meta.iter().find(|meta| &meta.node == node))
+                .and_then(|meta| meta.agent_type.as_deref());
+            match expected_type {
+                Some(type_id) => {
+                    let record = lease.hub().loom_agent_type(type_id).await?.ok_or_else(|| {
+                        HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            format!("pinned Loom node references missing agent type `{type_id}`"),
+                            false,
+                        )
+                    })?;
+                    let install_job = lease
+                        .hub()
+                        .typed_agent_install_jobs(None, Some(type_id.to_owned()))
+                        .await?
+                        .into_iter()
+                        .find(|job| {
+                            job.agent_type_rev == record.rev
+                                && job.agent_type_digest == record.digest()
+                        });
+                    crate::typed_agent_executor::prepare_typed_workflow_node_dispatch(
+                        workflow,
+                        status,
+                        record,
+                        install_job,
+                    )
+                    .map_err(typed_dispatch_refusal_error)?
+                }
+                None => None,
+            }
+        }
+        _ => None,
+    };
+    let typed_workflow_execution = match (typed_node_dispatch.as_ref(), graph_status.as_ref()) {
+        (Some(plan), Some(status)) => Some(typed_workflow_execution_state(
+            plan,
+            status,
+            delegation_grant.as_ref(),
+        )?),
+        (None, Some(status)) => loom_workflow
+            .as_ref()
+            .map(|workflow| {
+                loom_control_execution_state(workflow, status, delegation_grant.as_ref())
+            })
+            .transpose()?
+            .flatten(),
+        _ => None,
+    };
+    let current_grant = typed_workflow_execution
+        .as_ref()
+        .map(|execution| &execution.grant)
+        .or(delegation_grant.as_ref());
+    if let Some(grant) = current_grant {
         validate_grant(grant)?;
         if !effect_within_grant(
             grant,
@@ -5157,45 +5308,16 @@ async fn start_turn(
         provider_capabilities.pdf_documents,
     )
     .await?;
-    // Dynamic graph state is deliberately outside durable prompt history and
-    // the stable system/tool prefix. Root sessions receive one bounded,
-    // turn-scoped user-role tail; delegated children receive no parent graph.
-    let workflow_child = grant
-        .as_ref()
-        .is_some_and(|grant| grant.tools.iter().any(|tool| tool == "graph_evidence"));
-    let graph_status = if agent_id.is_none() || workflow_child {
-        lease
-            .hub()
-            .graph_status(lease.session_id())
-            .await
-            .map_err(hub_error)?
-    } else {
-        None
-    };
+    // Dynamic graph state is deliberately outside durable prompt history.
     let graph_brief = graph_status
         .as_ref()
         .and_then(|status| status.graph_brief());
-    // C1: when the pinned template is a REGISTERED LOOM WORKFLOW, ride its
-    // typed-node manual beside the graph brief so the model runs each node
-    // through the node's agent type (C2's typed spawn).
-    let loom_tail = match graph_status.as_ref() {
-        Some(status) => lease
-            .hub()
-            .loom_workflow(&status.template)
-            .await?
-            // Verify-fix C1 / review round 2: the PINNED instance is
-            // immutable; the registry is not. The pin persisted
-            // `graph_template_digest(template)`, so the tail joins on that
-            // SAME key — the registry stamps `template.version = rev`, which
-            // makes the template digest a faithful proxy for the whole
-            // workflow identity. A re-registered rev mismatches and the tail
-            // stays silent rather than teach nodes the pin does not enforce.
-            .filter(|workflow| {
-                haider_protocol::graph::graph_template_digest(&workflow.template) == status.digest
-            })
-            .map(|workflow| loom_run_tail(&workflow)),
-        None => None,
-    };
+    // The Loom tail is now descriptive only. Actual typed-node selection and
+    // scoping happened above at the daemon boundary.
+    let loom_tail = loom_workflow.as_ref().map(loom_run_tail);
+    let typed_node_tail = typed_workflow_execution
+        .as_ref()
+        .map(|execution| execution.context_tail.clone());
     // E1: the registry inventory rides the SAME volatile tail — the model
     // learns what specialists/workflows exist without a cache-epoch cost
     // (registrations move tail bytes only, never history).
@@ -5215,10 +5337,16 @@ async fn start_turn(
         (loom_inventory_line(&types, &workflows), identity)
     };
     let graph_brief = {
-        let parts: Vec<String> = [graph_brief, loom_tail, agent_type_identity, loom_inventory]
-            .into_iter()
-            .flatten()
-            .collect();
+        let parts: Vec<String> = [
+            graph_brief,
+            loom_tail,
+            typed_node_tail,
+            agent_type_identity,
+            loom_inventory,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         (!parts.is_empty()).then(|| parts.join("\n"))
     };
     let mobile_use_active = durable_session_tool_state(lease, lease.session_id())
@@ -5236,9 +5364,11 @@ async fn start_turn(
             delegation,
             tasks: crate::tasks::TaskFacade::new(lease.hub().clone()),
             agent_id: agent_id.clone(),
-            grant: grant.clone(),
+            grant: delegation_grant.clone(),
             mobile_use_active,
             cli_scope,
+            typed_workflow_execution,
+            loom_provider_fenced,
             web_search: dependencies.web_search.clone(),
             diagnostics: dependencies.diagnostics.clone(),
         })
@@ -5261,6 +5391,7 @@ async fn start_turn(
     config.model = resolved.model;
     config.context_window = resolved.context_window;
     config.agent_id = agent_id;
+    config.enforce_advertised_tool_ceiling = loom_provider_fenced;
     config.branch_id = accepted.branch_id.clone();
     config.max_tokens = metadata.max_tokens;
     config.interaction_policy =
@@ -5286,10 +5417,24 @@ async fn start_turn(
         &instruction_entries,
         handoff_dir.as_deref(),
     ));
+    if let (Some(system_prompt), Some(workflow)) =
+        (config.system_prompt.as_mut(), loom_workflow.as_ref())
+        && workflow.meta.iter().any(|meta| meta.agent_type.is_some())
+    {
+        system_prompt.push_str("\n\n[DAEMON-BOUND TYPED WORKFLOW EXECUTOR]\n");
+        system_prompt.push_str(
+            "The daemon selects and capability-scopes each typed node. The current volatile typed-executor binding is authoritative; stop using a prior specialist role whenever that binding changes.",
+        );
+    }
     config.volatile_user_tail = graph_brief;
+    let loom_turn_grant =
+        loom_provider_fenced.then(|| loom_provider_grant(delegation_grant.as_ref()));
+    if let Some(grant) = loom_turn_grant.as_ref() {
+        validate_grant(grant)?;
+    }
     let provider_tool_base = authorized_tool_definitions(
         &dependencies.tool_factory,
-        grant.as_ref(),
+        loom_turn_grant.as_ref().or(delegation_grant.as_ref()),
         mobile_use_active,
     );
     config.provider_local_web_tools = provider_tool_base
@@ -7013,6 +7158,7 @@ pub(crate) enum RegisteredToolRoute {
     WebSearch,
     Computer,
     Mobile,
+    Monitor,
 }
 
 #[derive(Debug, Clone)]
@@ -7232,6 +7378,16 @@ pub(crate) fn registered_tools() -> Vec<RegisteredTool> {
                 route: RegisteredToolRoute::Mobile,
             }
         },
+        {
+            // §E: actor/service-owned registry administration. Publishing an
+            // SMS source event is transport authority, not a model effect.
+            let manifest = haider_tools::monitor_manifest();
+            RegisteredTool {
+                manifest,
+                default: ToolPermissionDefault::NotApplicable,
+                route: RegisteredToolRoute::Monitor,
+            }
+        },
     ]
 }
 
@@ -7336,6 +7492,242 @@ pub(crate) fn typed_child_grant(record: &haider_protocol::loom::LoomAgentType) -
     }
 }
 
+fn typed_dispatch_refusal_error(
+    refusal: crate::typed_agent_executor::TypedAgentDispatchRefusal,
+) -> HaiderError {
+    let pending = refusal.code == "typed_agent_install_pending";
+    HaiderError::new(
+        if pending {
+            ErrorCode::Busy
+        } else {
+            ErrorCode::InvalidArgument
+        },
+        format!("{}: {}", refusal.code, refusal.message),
+        pending,
+    )
+}
+
+fn typed_workflow_execution_state(
+    plan: &crate::typed_agent_executor::TypedWorkflowNodeDispatchPlan,
+    status: &haider_protocol::graph::GraphStatus,
+    inherited_grant: Option<&Grant>,
+) -> Result<TypedWorkflowExecutionState, HaiderError> {
+    let attempt = status
+        .nodes
+        .iter()
+        .find(|node| node.node == plan.node)
+        .and_then(|node| node.current_attempt)
+        .ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                format!("typed Loom node {} has no open attempt", plan.node),
+                false,
+            )
+        })?;
+    let grant = typed_workflow_node_grant(&plan.dispatch.record, &plan.node, inherited_grant)?;
+    let cli_scope = plan
+        .dispatch
+        .contract
+        .required_clis
+        .iter()
+        .map(|required| required.program.clone())
+        .collect();
+    let context_tail = format!(
+        "typed executor: daemon bound workflow {} node {} to @{} for this request boundary\n{}",
+        plan.workflow_id, plan.node, plan.dispatch.record.id, plan.dispatch.prompt
+    );
+    Ok(TypedWorkflowExecutionState {
+        binding: TypedWorkflowExecutionBinding {
+            graph_id: status.graph_id.clone(),
+            node: plan.node.clone(),
+            attempt,
+            agent_type_id: plan.dispatch.record.id.clone(),
+        },
+        grant,
+        cli_scope,
+        context_tail,
+    })
+}
+
+fn loom_control_execution_state(
+    workflow: &haider_protocol::loom::LoomWorkflow,
+    status: &haider_protocol::graph::GraphStatus,
+    inherited_grant: Option<&Grant>,
+) -> Result<Option<TypedWorkflowExecutionState>, HaiderError> {
+    if status.phase == GraphPhase::Blocked {
+        let node = status
+            .current_node
+            .clone()
+            .or_else(|| status.start_node.clone())
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    "blocked Loom workflow has no node coordinate",
+                    false,
+                )
+            })?;
+        let attempt = status
+            .nodes
+            .iter()
+            .find(|candidate| candidate.node == node)
+            .and_then(|candidate| candidate.current_attempt)
+            .unwrap_or(status.attempt);
+        return Ok(Some(TypedWorkflowExecutionState {
+            binding: TypedWorkflowExecutionBinding {
+                graph_id: status.graph_id.clone(),
+                node,
+                attempt,
+                agent_type_id: "loom-blocked".into(),
+            },
+            grant: Grant {
+                tools: Vec::new(),
+                effect_ceiling: Vec::new(),
+            },
+            cli_scope: Vec::new(),
+            context_tail: format!(
+                "workflow executor: workflow {} is blocked; no model tool effect is authorized until it is switched or re-pinned",
+                workflow.id
+            ),
+        }));
+    }
+    if status.phase != GraphPhase::Active {
+        return Ok(None);
+    }
+    let Some(node) = status
+        .current_node
+        .as_ref()
+        .filter(|node| status.node_is_ready(node))
+    else {
+        return Ok(None);
+    };
+    let Some(meta) = workflow.meta.iter().find(|meta| &meta.node == node) else {
+        return Err(HaiderError::new(
+            ErrorCode::StoreCorrupt,
+            format!("pinned Loom workflow has no metadata for control node {node}"),
+            false,
+        ));
+    };
+    if meta.agent_type.is_some() {
+        return Ok(None);
+    }
+    let attempt = status
+        .nodes
+        .iter()
+        .find(|candidate| &candidate.node == node)
+        .and_then(|candidate| candidate.current_attempt)
+        .ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                format!("Loom control node {node} has no open attempt"),
+                false,
+            )
+        })?;
+    let human = workflow
+        .template
+        .nodes
+        .iter()
+        .any(|spec| &spec.name == node && matches!(spec.gate, GraphGateKind::HumanConfirm));
+    let requested = Grant {
+        tools: if human {
+            Vec::new()
+        } else {
+            vec!["graph_evidence".into()]
+        },
+        effect_ceiling: Vec::new(),
+    };
+    let grant = inherited_grant.map_or(requested.clone(), |parent| {
+        intersect_grant(requested, parent)
+    });
+    if !human && !grant.tools.iter().any(|tool| tool == "graph_evidence") {
+        return Err(HaiderError::new(
+            ErrorCode::PermissionDenied,
+            format!(
+                "daemon-owned Loom control node {node} cannot execute because the inherited child grant excludes graph_evidence"
+            ),
+            false,
+        ));
+    }
+    validate_grant(&grant)?;
+    let instruction = if human {
+        "await the durable human decision; no model tool effect is authorized"
+    } else {
+        "record only this control gate's outcome through graph_evidence"
+    };
+    Ok(Some(TypedWorkflowExecutionState {
+        binding: TypedWorkflowExecutionBinding {
+            graph_id: status.graph_id.clone(),
+            node: node.clone(),
+            attempt,
+            agent_type_id: "loom-control".into(),
+        },
+        grant,
+        cli_scope: Vec::new(),
+        context_tail: format!(
+            "workflow executor: daemon bound workflow {} control node {} for this request boundary; {instruction}",
+            workflow.id, node
+        ),
+    }))
+}
+
+/// Static provider/actor advertisement ceiling for a Loom turn. The dynamic
+/// dispatcher applies the exact node role beneath this union. Keeping the
+/// actor-owned request/plan/todo and delegation tools out is essential
+/// because those routes do not pass through the general dispatcher.
+fn loom_provider_grant(inherited_grant: Option<&Grant>) -> Grant {
+    let requested = Grant {
+        tools: [
+            "fs_read",
+            "fs_glob",
+            "fs_search",
+            "fs_write",
+            "fs_edit",
+            "fs_path",
+            "process_exec",
+            "task_output",
+            "task_kill",
+            "web_fetch",
+            "graph_evidence",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        effect_ceiling: vec![
+            EffectClass::FsRead,
+            EffectClass::FsWrite,
+            EffectClass::ProcessExec,
+            EffectClass::Network {
+                host: String::new(),
+            },
+        ],
+    };
+    inherited_grant.map_or(requested.clone(), |parent| {
+        intersect_grant(requested, parent)
+    })
+}
+
+fn typed_workflow_node_grant(
+    record: &haider_protocol::loom::LoomAgentType,
+    node: &GraphNodeName,
+    inherited_grant: Option<&Grant>,
+) -> Result<Grant, HaiderError> {
+    let mut node_grant = typed_child_grant(record);
+    node_grant.tools.push("graph_evidence".into());
+    let grant = inherited_grant.map_or(node_grant.clone(), |parent| {
+        intersect_grant(node_grant, parent)
+    });
+    if !grant.tools.iter().any(|tool| tool == "graph_evidence") {
+        return Err(HaiderError::new(
+            ErrorCode::PermissionDenied,
+            format!(
+                "daemon-owned typed workflow node {node} cannot execute because the inherited child grant excludes graph_evidence"
+            ),
+            false,
+        ));
+    }
+    validate_grant(&grant)?;
+    Ok(grant)
+}
+
 /// B3 (review round 2) — a typed child's exec authority is its DECLARED
 /// CLIs, not "any shell". One declared program per call: chaining
 /// metacharacters would smuggle a second program (`curl`!) past both this
@@ -7437,6 +7829,30 @@ pub(crate) fn web_fetch_host_allowed(grant: &Grant, host: &str) -> bool {
 
 pub(crate) fn intersect_grant(requested: Grant, ceiling: &Grant) -> Grant {
     let registry = registered_tools();
+    let mut effect_ceiling = Vec::new();
+    for effect in requested.effect_ceiling {
+        match effect {
+            // The semantic intersection of a family-wide network request and
+            // a host-scoped parent is the parent's host set, not the empty
+            // set. This keeps the manifest/tool declaration coherent while
+            // preserving the stricter per-call URL fence.
+            EffectClass::Network { host } if host.is_empty() => {
+                for inherited in &ceiling.effect_ceiling {
+                    if matches!(inherited, EffectClass::Network { .. })
+                        && !effect_ceiling.contains(inherited)
+                    {
+                        effect_ceiling.push(inherited.clone());
+                    }
+                }
+            }
+            effect if effect_within_grant(ceiling, &effect) => {
+                if !effect_ceiling.contains(&effect) {
+                    effect_ceiling.push(effect);
+                }
+            }
+            _ => {}
+        }
+    }
     Grant {
         tools: requested
             .tools
@@ -7455,11 +7871,7 @@ pub(crate) fn intersect_grant(requested: Grant, ceiling: &Grant) -> Grant {
                     })
             })
             .collect(),
-        effect_ceiling: requested
-            .effect_ceiling
-            .into_iter()
-            .filter(|effect| effect_within_grant(ceiling, effect))
-            .collect(),
+        effect_ceiling,
     }
 }
 
@@ -7569,6 +7981,9 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
         "mobile" => {
             "mobile(action, element_id?, x?, y?, from?, to?, text?, key?, package?, name?, folder?, since?, limit?) — observe or control an explicitly activated mobile capability; screenshot returns an image, accessibility/apps/SMS return JSON"
         }
+        "monitor" => {
+            "monitor(operation, source?, filter?, action?, occurrence?, lifetime?, monitor_id?) — register/list/remove durable session watches; register source={kind:sms}, optional filter={field:address|body,operator,value,case_sensitive?}, action={report,follow_up?}, occurrence=once|every, lifetime={kind:session|timeout,timeout_ms?}; process/file/poll/timer adapters currently fail closed"
+        }
         "fs_read" => {
             "fs_read(path, offset?, limit?) — read a bounded UTF-8 file slice; a directory path lists it"
         }
@@ -7627,13 +8042,12 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
 /// a tool never sees a signature for one it cannot call. Returns `""` when no
 /// advertised tool is manual-described (e.g. a computer-only child), leaving
 /// the base prompt byte-identical.
-/// C1 — the compact typed-node manual for a pinned Loom workflow. Rides the
-/// volatile user tail (never durable history) beside the graph brief; each
-/// work node names its agent type and task so the model dispatches it with
-/// `spawn_subagent(agent_type=..)`. Bounded: task text is already ≤200B/node.
+/// C1 — compact metadata for a pinned Loom workflow. Typed-node selection is
+/// performed by the daemon before provider dispatch; this volatile tail is
+/// only an honest description of the frozen node/type map.
 pub(crate) fn loom_run_tail(workflow: &haider_protocol::loom::LoomWorkflow) -> String {
     let mut tail = format!(
-        "loom {} rev {} · {} -> {} — run each OPEN node with spawn_subagent(agent_type, task): ",
+        "loom {} rev {} · {} -> {} — daemon-scoped typed nodes: ",
         workflow.id, workflow.rev, workflow.in_type, workflow.out_type
     );
     let mut first = true;
@@ -7786,12 +8200,16 @@ fn provider_web_tool_names(
     let native_anthropic_web = matches!(
         provider_name,
         ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME
-    ) && !web_degrade.anthropic_web_tools;
+    ) && !web_degrade.anthropic_web_tools
+        && !web_degrade.disable_hosted_web_tools;
     let mut local = Vec::new();
     if !native_anthropic_web {
         local.push("web_fetch".to_owned());
     }
-    if provider_name == OPENAI_OAUTH_PROVIDER_NAME && !web_degrade.openai_alpha_search {
+    if provider_name == OPENAI_OAUTH_PROVIDER_NAME
+        && !web_degrade.openai_alpha_search
+        && !web_degrade.disable_hosted_web_tools
+    {
         local.push("web_search".to_owned());
     }
     let fallback = if native_anthropic_web {
@@ -7974,6 +8392,8 @@ async fn create_broker_tool_dispatcher(
         grant: context.grant,
         mobile_use_active: context.mobile_use_active,
         cli_scope: context.cli_scope,
+        typed_workflow_execution: Mutex::new(context.typed_workflow_execution),
+        loom_provider_fenced: context.loom_provider_fenced,
         deferred: Mutex::new(HashMap::new()),
         active_tool_name,
     })))
@@ -8055,6 +8475,8 @@ struct BrokerToolDispatcher {
     grant: Option<Grant>,
     mobile_use_active: bool,
     cli_scope: Option<Vec<String>>,
+    typed_workflow_execution: Mutex<Option<TypedWorkflowExecutionState>>,
+    loom_provider_fenced: bool,
     deferred: Mutex<HashMap<AgentId, DeferredTicket>>,
     /// The journal sink reads this only while `broker` is held. Setting it
     /// after acquiring that mutex keeps concurrent tool calls correctly named.
@@ -8120,7 +8542,340 @@ struct CreatedImageScan<'a> {
     started: SystemTime,
 }
 
+fn typed_workflow_coordinates_match(
+    binding: &TypedWorkflowExecutionBinding,
+    graph_id: &GraphId,
+    phase: GraphPhase,
+    current_node: Option<&GraphNodeName>,
+    node_ready: bool,
+    current_attempt: Option<u32>,
+    allow_completed: bool,
+) -> bool {
+    if graph_id != &binding.graph_id {
+        return false;
+    }
+    if allow_completed && phase == GraphPhase::Completed {
+        return true;
+    }
+    phase == GraphPhase::Active
+        && current_node == Some(&binding.node)
+        && node_ready
+        && current_attempt == Some(binding.attempt)
+}
+
+#[cfg(test)]
+mod typed_workflow_boundary_tests {
+    use super::{
+        TypedWorkflowExecutionBinding, default_child_grant, loom_provider_grant,
+        typed_workflow_coordinates_match, typed_workflow_node_grant, validate_grant,
+    };
+    use haider_protocol::agent::Grant;
+    use haider_protocol::effect::EffectClass;
+    use haider_protocol::graph::{GraphNodeName, GraphPhase};
+    use haider_protocol::ids::GraphId;
+    use haider_protocol::loom::LoomAgentType;
+
+    #[test]
+    fn typed_executor_binding_ends_when_node_or_attempt_advances() {
+        let graph_id = GraphId::new("typed-graph");
+        let node = GraphNodeName::new("RESEARCH").expect("node");
+        let binding = TypedWorkflowExecutionBinding {
+            graph_id: graph_id.clone(),
+            node: node.clone(),
+            attempt: 2,
+            agent_type_id: "researcher".into(),
+        };
+        assert!(typed_workflow_coordinates_match(
+            &binding,
+            &graph_id,
+            GraphPhase::Active,
+            Some(&node),
+            true,
+            Some(2),
+            false,
+        ));
+
+        let next_node = GraphNodeName::new("VERIFY").expect("next node");
+        assert!(!typed_workflow_coordinates_match(
+            &binding,
+            &graph_id,
+            GraphPhase::Active,
+            Some(&next_node),
+            true,
+            Some(2),
+            false,
+        ));
+        assert!(!typed_workflow_coordinates_match(
+            &binding,
+            &graph_id,
+            GraphPhase::Active,
+            Some(&node),
+            true,
+            Some(3),
+            false,
+        ));
+        assert!(!typed_workflow_coordinates_match(
+            &binding,
+            &GraphId::new("replacement-graph"),
+            GraphPhase::Active,
+            Some(&node),
+            true,
+            Some(2),
+            false,
+        ));
+
+        // Completion may clear the volatile graph brief, but no subsequent
+        // tool execution is allowed under the finished specialist binding.
+        assert!(typed_workflow_coordinates_match(
+            &binding,
+            &graph_id,
+            GraphPhase::Completed,
+            None,
+            false,
+            None,
+            true,
+        ));
+        assert!(!typed_workflow_coordinates_match(
+            &binding,
+            &graph_id,
+            GraphPhase::Completed,
+            None,
+            false,
+            None,
+            false,
+        ));
+    }
+
+    #[test]
+    fn native_typed_workflow_on_generic_child_fails_closed_without_graph_evidence() {
+        let record = LoomAgentType {
+            id: "researcher".into(),
+            name: "Researcher".into(),
+            job: "Research only the scoped node.".into(),
+            in_type: "Question".into(),
+            out_type: "Sources".into(),
+            clis: Vec::new(),
+            apis: Vec::new(),
+            skills: Vec::new(),
+            scripts: Vec::new(),
+            color: String::new(),
+            glyph: String::new(),
+            rev: 1,
+        };
+        let node = GraphNodeName::new("RESEARCH").expect("node");
+        let inherited = default_child_grant();
+        let error = typed_workflow_node_grant(&record, &node, Some(&inherited))
+            .expect_err("native pin must not widen a generic child's grant");
+        assert_eq!(
+            error.code,
+            haider_protocol::error::ErrorCode::PermissionDenied
+        );
+
+        let mut workflow_child = inherited;
+        workflow_child.tools.push("graph_evidence".into());
+        assert!(typed_workflow_node_grant(&record, &node, Some(&workflow_child)).is_ok());
+    }
+
+    #[test]
+    fn loom_static_provider_ceiling_excludes_actor_owned_and_delegation_tools() {
+        let grant = loom_provider_grant(None);
+        for denied in [
+            "request_input",
+            "plan",
+            "todo_write",
+            "spawn_subagent",
+            "message_subagent",
+            "workflow_author",
+        ] {
+            assert!(!grant.tools.iter().any(|tool| tool == denied), "{denied}");
+        }
+        for brokered in ["graph_evidence", "fs_read", "process_exec", "web_fetch"] {
+            assert!(
+                grant.tools.iter().any(|tool| tool == brokered),
+                "{brokered}"
+            );
+        }
+    }
+
+    #[test]
+    fn loom_provider_ceiling_preserves_inherited_network_host_scopes() {
+        let inherited = Grant {
+            tools: vec!["web_fetch".into(), "graph_evidence".into()],
+            effect_ceiling: vec![EffectClass::Network {
+                host: "api.example.test".into(),
+            }],
+        };
+        let grant = loom_provider_grant(Some(&inherited));
+        assert!(grant.tools.iter().any(|tool| tool == "web_fetch"));
+        assert_eq!(
+            grant.effect_ceiling,
+            vec![EffectClass::Network {
+                host: "api.example.test".into(),
+            }]
+        );
+        validate_grant(&grant).expect("host-scoped Loom provider grant remains coherent");
+    }
+}
+
 impl BrokerToolDispatcher {
+    async fn typed_workflow_binding_is_current(
+        &self,
+        binding: &TypedWorkflowExecutionBinding,
+    ) -> Result<bool, HaiderError> {
+        let Some(status) = self
+            .output
+            .store
+            .hub()
+            .graph_status(&self.session_id)
+            .await
+            .map_err(hub_error)?
+        else {
+            return Ok(false);
+        };
+        let current_attempt = status
+            .nodes
+            .iter()
+            .find(|node| node.node == binding.node)
+            .and_then(|node| node.current_attempt);
+        Ok(typed_workflow_coordinates_match(
+            binding,
+            &status.graph_id,
+            status.phase,
+            status.current_node.as_ref(),
+            status.node_is_ready(&binding.node),
+            current_attempt,
+            false,
+        ))
+    }
+
+    async fn typed_workflow_execution_snapshot(&self) -> Option<TypedWorkflowExecutionState> {
+        self.typed_workflow_execution.lock().await.clone()
+    }
+
+    /// Re-resolve the current graph node at the provider-request boundary.
+    /// Tool calls within one provider response retain the exact snapshot
+    /// installed here; graph advancement therefore cannot lend an old role to
+    /// a second call, while the next request automatically owns the next
+    /// typed node/self-loop/back-hop attempt.
+    async fn rebind_typed_workflow_execution(&self) -> Result<String, HaiderError> {
+        let status = self
+            .output
+            .store
+            .hub()
+            .graph_status(&self.session_id)
+            .await
+            .map_err(hub_error)?;
+        let Some(status) = status else {
+            // A graph removed/completed during this logical turn must not
+            // restore the broader session grant before the model's final
+            // response. Retaining the old coordinate makes every later tool
+            // call hit the boundary rejection. A new external turn creates a
+            // fresh dispatcher with no retained execution.
+            return Ok(String::new());
+        };
+        let graph_brief = status.graph_brief();
+        let workflow = match self
+            .output
+            .store
+            .hub()
+            .loom_workflow(&status.template)
+            .await?
+        {
+            Some(workflow)
+                if haider_protocol::graph::graph_template_digest(&workflow.template)
+                    == status.digest =>
+            {
+                if status.is_unfinished() && !self.loom_provider_fenced {
+                    return Err(HaiderError::new(
+                        ErrorCode::RevisionConflict,
+                        "a Loom workflow was pinned after this provider turn started; retry so hosted tools and actor-owned tools are rebuilt under the workflow fence",
+                        true,
+                    ));
+                }
+                workflow
+            }
+            Some(_) => {
+                return Err(HaiderError::new(
+                    ErrorCode::RevisionConflict,
+                    format!(
+                        "pinned Loom workflow `{}` no longer matches its registry revision; switch or re-pin it",
+                        status.template
+                    ),
+                    true,
+                ));
+            }
+            None => {
+                return Ok(graph_brief.unwrap_or_default());
+            }
+        };
+        let loom_tail = Some(loom_run_tail(&workflow));
+        let expected_type = (status.phase == GraphPhase::Active)
+            .then_some(())
+            .and_then(|()| status.current_node.as_ref())
+            .filter(|node| status.node_is_ready(node))
+            .and_then(|node| workflow.meta.iter().find(|meta| &meta.node == node))
+            .and_then(|meta| meta.agent_type.as_deref());
+        let Some(type_id) = expected_type else {
+            let control = loom_control_execution_state(&workflow, &status, self.grant.as_ref())?;
+            let control_tail = control
+                .as_ref()
+                .map(|execution| execution.context_tail.clone());
+            if let Some(control) = control {
+                *self.typed_workflow_execution.lock().await = Some(control);
+            }
+            return Ok([graph_brief, loom_tail, control_tail]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("\n"));
+        };
+        let record = self
+            .output
+            .store
+            .hub()
+            .loom_agent_type(type_id)
+            .await?
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    format!("pinned Loom node references missing agent type `{type_id}`"),
+                    false,
+                )
+            })?;
+        let install_job = self
+            .output
+            .store
+            .hub()
+            .typed_agent_install_jobs(None, Some(type_id.to_owned()))
+            .await?
+            .into_iter()
+            .find(|job| {
+                job.agent_type_rev == record.rev && job.agent_type_digest == record.digest()
+            });
+        let plan = crate::typed_agent_executor::prepare_typed_workflow_node_dispatch(
+            &workflow,
+            &status,
+            record,
+            install_job,
+        )
+        .map_err(typed_dispatch_refusal_error)?
+        .ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "active typed Loom node lost its daemon dispatch plan",
+                false,
+            )
+        })?;
+        let execution = typed_workflow_execution_state(&plan, &status, self.grant.as_ref())?;
+        let typed_tail = execution.context_tail.clone();
+        *self.typed_workflow_execution.lock().await = Some(execution);
+        Ok([graph_brief, loom_tail, Some(typed_tail)]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
     async fn emit_created_images(&self, scan: CreatedImageScan<'_>) -> ToolResult<()> {
         // Verify round 2: relative tokens resolve against the EXEC cwd, but
         // the publication fence is the SESSION workspace root — an exec in
@@ -8493,11 +9248,16 @@ impl BrokerToolDispatcher {
             })?;
         Ok(status.and_then(|status| {
             let node = status.current_node.clone()?;
+            let attempt = status
+                .nodes
+                .iter()
+                .find(|candidate| candidate.node == node)?
+                .current_attempt?;
             (status.phase == GraphPhase::Active && status.node_is_ready(&node)).then_some(
                 ComputerGraphTarget {
                     graph_id: status.graph_id,
                     node,
-                    attempt: status.attempt,
+                    attempt,
                 },
             )
         }))
@@ -8685,27 +9445,51 @@ impl BrokerToolDispatcher {
 
 #[async_trait]
 impl ToolDispatcher for BrokerToolDispatcher {
-    async fn refresh_volatile_context_tail(&self) -> Result<Option<String>, HaiderError> {
-        if self.parent_agent_id.is_some()
-            && self
-                .grant
-                .as_ref()
-                .is_none_or(|grant| !grant.tools.iter().any(|tool| tool == "graph_evidence"))
-        {
-            return Ok(None);
+    async fn preflight_tool_call(&self, _name: &str) -> Result<(), HaiderError> {
+        if self.loom_provider_fenced {
+            return Ok(());
         }
-        let brief = self
+        let Some(status) = self
             .output
             .store
             .hub()
             .graph_status(&self.session_id)
             .await
             .map_err(hub_error)?
-            .and_then(|status| status.graph_brief())
-            .unwrap_or_default();
-        // An empty managed tail explicitly clears a brief after completion or
-        // abandonment in the middle of the same provider tool loop.
-        Ok(Some(brief))
+        else {
+            return Ok(());
+        };
+        if !status.is_unfinished() {
+            return Ok(());
+        }
+        let Some(workflow) = self
+            .output
+            .store
+            .hub()
+            .loom_workflow(&status.template)
+            .await?
+        else {
+            return Ok(());
+        };
+        if haider_protocol::graph::graph_template_digest(&workflow.template) == status.digest {
+            return Err(HaiderError::new(
+                ErrorCode::RevisionConflict,
+                "a Loom workflow was pinned after this provider turn started; retry so every tool route is rebuilt under the workflow fence",
+                true,
+            ));
+        }
+        Err(HaiderError::new(
+            ErrorCode::RevisionConflict,
+            format!(
+                "pinned Loom workflow `{}` no longer matches its registry revision; switch or re-pin it",
+                status.template
+            ),
+            true,
+        ))
+    }
+
+    async fn refresh_volatile_context_tail(&self) -> Result<Option<String>, HaiderError> {
+        Ok(Some(self.rebind_typed_workflow_execution().await?))
     }
 
     #[allow(clippy::expect_used)]
@@ -8725,12 +9509,40 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 false,
             ));
         }
+        let typed_execution = self.typed_workflow_execution_snapshot().await;
+        // Multiple calls from one provider response are fenced to the exact
+        // request-bound snapshot. A call after evidence advanced the graph is
+        // a typed rejection, not a terminal turn error; the actor reaches its
+        // next provider boundary and the daemon rebinds automatically.
+        if let Some(execution) = typed_execution.as_ref()
+            && !self
+                .typed_workflow_binding_is_current(&execution.binding)
+                .await?
+        {
+            return Ok(ToolDispatchResult::Completed(
+                typed_workflow_boundary_result(&format!(
+                    "typed executor @{} completed graph attempt {}:{}@{}; the next provider request will bind the next ready node",
+                    execution.binding.agent_type_id,
+                    execution.binding.graph_id,
+                    execution.binding.node,
+                    execution.binding.attempt,
+                )),
+            ));
+        }
+        let effective_grant = typed_execution
+            .as_ref()
+            .map(|execution| &execution.grant)
+            .or(self.grant.as_ref());
+        let effective_cli_scope = typed_execution
+            .as_ref()
+            .map(|execution| &execution.cli_scope)
+            .or(self.cli_scope.as_ref());
         if name == "mobile" && !self.mobile_use_active {
             return Ok(ToolDispatchResult::Completed(
                 mobile_capability_denied_result(),
             ));
         }
-        if let Some(grant) = &self.grant {
+        if let Some(grant) = effective_grant {
             let allowed = grant.tools.iter().any(|allowed| allowed == name)
                 && registered_tools()
                     .into_iter()
@@ -8753,6 +9565,27 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 false,
             )
         })?;
+        if route == RegisteredToolRoute::Monitor {
+            let request = MonitorRequest::from_tool_args(args).map_err(tool_error)?;
+            let result = self
+                .output
+                .store
+                .hub()
+                .execute_monitor_tool(
+                    &self.output.store,
+                    crate::monitor::MonitorToolCoordinates {
+                        run_id: run_id.clone(),
+                        branch_id: self.branch_id.clone(),
+                        agent_id: self.parent_agent_id.clone(),
+                        call_id: call_id.to_owned(),
+                        device_id: self.output.device_id.clone(),
+                    },
+                    request,
+                )
+                .await
+                .map_err(tool_error)?;
+            return Ok(ToolDispatchResult::Completed(result));
+        }
         if route == RegisteredToolRoute::GraphEvidence {
             let mut request = match GraphEvidence::from_tool_args(args) {
                 Ok(request) => request,
@@ -8764,6 +9597,22 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     )));
                 }
             };
+            if let Some(binding) = typed_execution.as_ref().map(|execution| &execution.binding)
+                && (request.node != binding.node
+                    || request
+                        .graph_id
+                        .as_ref()
+                        .is_some_and(|graph_id| graph_id != &binding.graph_id))
+            {
+                return Ok(ToolDispatchResult::Completed(graph_evidence_rejection(
+                    ErrorCode::GraphWrongNode,
+                    &format!(
+                        "typed executor @{} owns only {}:{}@{}",
+                        binding.agent_type_id, binding.graph_id, binding.node, binding.attempt
+                    ),
+                    Some("typed_executor_wrong_node"),
+                )));
+            }
             if request.graph_id.is_none() {
                 let status = match self.output.store.hub().graph_status(&self.session_id).await {
                     Ok(Some(status)) => status,
@@ -8798,6 +9647,13 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 identity.update(&(part.len() as u64).to_be_bytes());
                 identity.update(part.as_bytes());
             }
+            let graph_id = request.graph_id.clone().ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::GraphNotActive,
+                    "graph evidence target disappeared before dispatch",
+                    true,
+                )
+            })?;
             let command = GraphEvidenceCommand {
                 command_id: format!("graph-evidence-{}", identity.finalize().to_hex()),
                 request_digest,
@@ -8806,10 +9662,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 worker_generation: self.output.store.worker_generation(),
                 run_id: run_id.clone(),
                 call_id: call_id.to_owned(),
-                graph_id: request
-                    .graph_id
-                    .clone()
-                    .expect("graph evidence target is resolved above"),
+                graph_id,
                 node: request.node,
                 verdict: request.verdict,
                 detail: request.detail,
@@ -9017,24 +9870,54 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         presentation: None,
                     }));
                 };
-                typed_record = Some(record.clone());
-                // Verify-fix C5: registry strings frame a SINGLE-LINE role
-                // header — newlines must not fake a second header.
-                let line = |value: &str| value.replace(['\n', '\r'], " ");
-                request.prompt = format!(
-                    "[agent type @{} — {} · {} -> {}]\n{}\n\n{}",
-                    record.id,
-                    line(&record.name),
-                    line(&record.in_type),
-                    line(&record.out_type),
-                    record.job,
-                    request.prompt
-                );
-                // Verify-fix C3: the `@type ·` chip convention is DAEMON
-                // truth, never model input — a task that already leads with
-                // `@` is stripped before the honest prefix goes on.
-                let clean = request.task.trim_start_matches('@').trim_start().to_owned();
-                request.task = format!("@{} · {}", record.id, clean);
+                let install_job = self
+                    .output
+                    .store
+                    .hub()
+                    .typed_agent_install_jobs(None, Some(type_id.clone()))
+                    .await?
+                    .into_iter()
+                    .find(|job| {
+                        job.agent_type_rev == record.rev && job.agent_type_digest == record.digest()
+                    });
+                let plan = match crate::typed_agent_executor::prepare_typed_dispatch(
+                    record,
+                    install_job,
+                    &request.task,
+                    &request.prompt,
+                ) {
+                    Ok(plan) => plan,
+                    Err(refusal) => {
+                        return Ok(ToolDispatchResult::Completed(BoundedResult {
+                            preview: serde_json::json!({
+                                "ok": false,
+                                "error": refusal.message,
+                                "code": refusal.code,
+                                "install_job": refusal.install_job,
+                            })
+                            .to_string(),
+                            truncated: false,
+                            artifact: None,
+                            images: Vec::new(),
+                            cursor: None,
+                            status: ToolResultStatus::Completed,
+                            reason: None,
+                            presentation: None,
+                        }));
+                    }
+                };
+                // Role framing, the honest chip label, and install readiness
+                // are all frozen by the daemon-owned executor above.
+                request.task = plan.task;
+                request.prompt = plan.prompt;
+                let mut record = plan.record;
+                record.clis = plan
+                    .contract
+                    .required_clis
+                    .into_iter()
+                    .map(|required| required.program)
+                    .collect();
+                typed_record = Some(record);
             } else if request.task.starts_with('@') {
                 // An UNTYPED spawn must not cosplay as a specialist.
                 request.task = request.task.trim_start_matches('@').trim_start().to_owned();
@@ -9299,7 +10182,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 // specialist runs its DECLARED CLIs, one program per call
                 // (foreground AND background). A refusal is a completed
                 // typed result the model can react to.
-                if let Some(scope) = &self.cli_scope
+                if let Some(scope) = effective_cli_scope
                     && let Err(reason) = cli_scope_admits(scope, &command)
                 {
                     return Ok(ToolDispatchResult::Completed(BoundedResult {
@@ -9526,7 +10409,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 // B2 — the use-site host fence: a typed child's grant scopes
                 // the network to its DECLARED APIs; a fetch outside them is a
                 // completed refusal the model can react to.
-                if let Some(grant) = &self.grant
+                if let Some(grant) = effective_grant
                     && !web_fetch_host_allowed(grant, operation.host())
                 {
                     return Ok(ToolDispatchResult::Completed(BoundedResult {
@@ -9566,7 +10449,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 // checked hop 0; a typed grant's scope must
                                 // also hold across every REDIRECT hop, so the
                                 // scoped engine re-checks per hop.
-                                match self.grant.as_ref().and_then(scoped_network_hosts) {
+                                match effective_grant.and_then(scoped_network_hosts) {
                                     Some(hosts) => {
                                         haider_provider::fetch_public_url_scoped_with_one_retry(
                                             operation.url(),
@@ -10088,7 +10971,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
             RegisteredToolRoute::Mobile => {
                 async {
                     let operation = MobileOperation::from_tool_args(args)?;
-                    if self.grant.as_ref().is_some_and(|grant| {
+                    if effective_grant.is_some_and(|grant| {
                         !effect_within_grant(grant, &operation.action().effect_class())
                     }) {
                         return Ok(grant_ceiling_result("mobile"));
@@ -10207,7 +11090,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
             | RegisteredToolRoute::GraphEvidence
             | RegisteredToolRoute::WorkflowAuthor
             | RegisteredToolRoute::SpawnSubagent
-            | RegisteredToolRoute::MessageSubagent => {
+            | RegisteredToolRoute::MessageSubagent
+            | RegisteredToolRoute::Monitor => {
                 return Err(HaiderError::new(
                     ErrorCode::InvalidArgument,
                     format!("tool `{name}` is not dispatched by the general-tool match"),
@@ -10874,6 +11758,28 @@ fn subagent_limit_result(error: &HaiderError) -> BoundedResult {
         status: ToolResultStatus::Rejected,
         reason: Some(bounded_failure_reason(&error.message)),
         presentation,
+    }
+}
+
+fn typed_workflow_boundary_result(message: &str) -> BoundedResult {
+    let reason = bounded_failure_reason(message);
+    BoundedResult {
+        preview: serde_json::json!({
+            "status": "rejected",
+            "error": {
+                "kind": "typed_executor_request_boundary",
+                "message": reason,
+                "retryable": true,
+            }
+        })
+        .to_string(),
+        truncated: false,
+        artifact: None,
+        images: Vec::new(),
+        cursor: None,
+        status: ToolResultStatus::Rejected,
+        reason: Some(reason),
+        presentation: None,
     }
 }
 

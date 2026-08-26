@@ -4,11 +4,20 @@
 mod common;
 
 use common::{TEST_FRAME_LIMIT, golden_descriptor, raw_envelope, transcript};
-use haider_rpc::{
-    AttachmentId, CodecError, CommandId, FEATURE_ACCOUNT_OAUTH_IMPORT_V1, RequestBody, RequestId,
-    ResponseBody, WireEncoding, WireFrame, decode_msgpack, encode_msgpack,
-    haider_protocol::ids::SessionId, uds_codec, ws_codec,
+use haider_rpc::haider_protocol::typed_agent::{
+    TypedAgentInstallItem, TypedAgentInstallJob, TypedAgentInstallProgress, TypedAgentInstallState,
+    TypedAgentRequiredCli,
 };
+use haider_rpc::{
+    AttachmentId, CodecError, CommandId, FEATURE_ACCOUNT_OAUTH_IMPORT_V1, FEATURE_MONITOR_V1,
+    FEATURE_TYPED_AGENT_INSTALL_V1, RequestBody, RequestId, ResponseBody, WireEncoding, WireFrame,
+    decode_msgpack, encode_msgpack, haider_protocol::ids::SessionId, uds_codec, ws_codec,
+};
+
+#[test]
+fn monitor_feature_is_pinned() {
+    assert_eq!(FEATURE_MONITOR_V1, "monitor_v1");
+}
 
 struct CodecCase {
     name: &'static str,
@@ -105,6 +114,84 @@ fn oauth_import_bodies_round_trip_and_feature_is_pinned() {
     for frame in frames {
         let ws = ws_codec::encode(&frame, TEST_FRAME_LIMIT).expect("WS encode");
         assert!(ws.contains(r#""method":"account.oauth_import""#));
+        assert_eq!(
+            ws_codec::decode(&ws, TEST_FRAME_LIMIT).expect("WS decode"),
+            frame
+        );
+        let uds = uds_codec::encode(&frame, TEST_FRAME_LIMIT).expect("UDS encode");
+        assert_eq!(uds_decode(&uds), frame);
+    }
+}
+
+/// The reconnectable install status is a View-plane read carrying durable,
+/// bounded protocol records. Pin both method discriminants and the advertised
+/// feature literal so clients never infer progress from live PATH presence.
+#[test]
+fn typed_agent_install_status_round_trips_and_feature_is_pinned() {
+    assert_eq!(FEATURE_TYPED_AGENT_INSTALL_V1, "typed_agent_install_v1");
+    let job = TypedAgentInstallJob {
+        job_id: "install:reviewer:1".into(),
+        agent_type_id: "reviewer".into(),
+        agent_type_rev: 1,
+        agent_type_digest: "0123456789abcdef0123456789abcdef".into(),
+        state: TypedAgentInstallState::Queued,
+        progress: TypedAgentInstallProgress {
+            total: 1,
+            completed: 0,
+            current_cli: None,
+        },
+        error: None,
+        created_at_ms: 1_753_500_000_000,
+        updated_at_ms: 1_753_500_000_000,
+    };
+    let item = TypedAgentInstallItem {
+        job_id: job.job_id.clone(),
+        ordinal: 0,
+        required_cli: TypedAgentRequiredCli {
+            program: "rg".into(),
+        },
+        state: TypedAgentInstallState::Queued,
+        error: None,
+        created_at_ms: job.created_at_ms,
+        updated_at_ms: job.updated_at_ms,
+    };
+    job.validate().expect("bounded install job");
+    item.validate().expect("bounded install item");
+
+    let request = RequestBody::LoomInstallStatus {
+        job_id: Some(job.job_id.clone()),
+        agent_type_id: Some(job.agent_type_id.clone()),
+    };
+    let response = ResponseBody::LoomInstallStatus {
+        jobs: vec![job],
+        items: vec![item],
+    };
+    assert_eq!(
+        serde_json::to_value(&request).expect("request JSON"),
+        serde_json::json!({
+            "method": "loom.install.status",
+            "job_id": "install:reviewer:1",
+            "agent_type_id": "reviewer",
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(&response).expect("response JSON")["method"],
+        "loom.install.status"
+    );
+
+    let frames = [
+        WireFrame::Request {
+            request_id: RequestId::new("request-loom-install-status"),
+            body: request,
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-loom-install-status"),
+            body: response,
+        },
+    ];
+    for frame in frames {
+        let ws = ws_codec::encode(&frame, TEST_FRAME_LIMIT).expect("WS encode");
+        assert!(ws.contains(r#""method":"loom.install.status""#));
         assert_eq!(
             ws_codec::decode(&ws, TEST_FRAME_LIMIT).expect("WS decode"),
             frame

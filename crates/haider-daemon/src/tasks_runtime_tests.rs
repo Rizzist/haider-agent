@@ -189,6 +189,8 @@ async fn task_dispatcher_with_grant(
             grant,
             mobile_use_active: false,
             cli_scope: None,
+            typed_workflow_execution: None,
+            loom_provider_fenced: false,
             web_search: None,
         },
     )

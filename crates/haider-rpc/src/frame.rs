@@ -306,6 +306,9 @@ pub const FEATURE_SHELL_EXEC_V1: &str = "shell_exec_v1";
 pub const FEATURE_USER_COMMAND_V1: &str = "user_command_v1";
 /// Daemon implements the canonical read-only tool inventory snapshot.
 pub const FEATURE_TOOL_INVENTORY_V1: &str = "tool_inventory_v1";
+/// Daemon exposes the durable session-scoped monitor tool and source/delivery
+/// runtime needed to wake a session from matching external events.
+pub const FEATURE_MONITOR_V1: &str = "monitor_v1";
 /// Daemon persists and applies typed per-session write/exec permission overrides.
 pub const FEATURE_SESSION_PERMISSION_OVERRIDES_V1: &str = "session_permission_overrides_v1";
 /// Daemon persists and applies the explicit interactive/autonomous session mode.
@@ -403,6 +406,13 @@ pub const FEATURE_CONVERGENCE_GRAPH_V4: &str = "convergence_graph_v4";
 pub const FEATURE_LOOM_V1: &str = "loom_v1";
 /// W-flow — `loom.list` carries the declared-CLI device presence map.
 pub const FEATURE_LOOM_CLI_PRESENCE_V1: &str = "loom_cli_presence_v1";
+/// Typed-agent registrations create durable required-CLI install jobs whose
+/// progress can be queried after disconnect or daemon restart.
+pub const FEATURE_TYPED_AGENT_INSTALL_V1: &str = "typed_agent_install_v1";
+/// Session observe projections carry the active pinned workflow so a
+/// client can render workflow state without issuing a separate graph.status
+/// read (the workflow remains distinct from a child spawn's selector).
+pub const FEATURE_SESSION_WORKFLOW_STATE_V1: &str = "session_workflow_state_v1";
 /// W-flow — observation surfaces report the active run id (cancel coordinate).
 pub const FEATURE_SESSION_RUN_ID_V1: &str = "session_run_id_v1";
 /// Daemon can push changed/new session summaries after a read-only roster
@@ -1523,6 +1533,11 @@ pub struct SessionObserveDigest {
     /// listing's field): present whenever this session is parked on a human.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub needs_input: Option<NeedsInputWire>,
+    /// Active per-session workflow for composer/status-strip consumers.
+    /// This is native selection state for this session, not the
+    /// `spawn_subagent.workflow` child-creation argument.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<ConvergenceGraphStatus>,
 }
 
 /// Stable display state for one descendant in a fleet snapshot.
@@ -1834,6 +1849,15 @@ pub enum RequestBody {
     #[serde(rename = "loom.register_agent_type")]
     LoomRegisterAgentType {
         record: haider_protocol::loom::LoomAgentType,
+    },
+    /// Durable required-CLI installation status. Both filters omitted lists
+    /// the bounded newest retained jobs; either filter narrows that view.
+    #[serde(rename = "loom.install.status")]
+    LoomInstallStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_type_id: Option<String>,
     },
     /// B1 — register/revise one workflow FROM PIPE SOURCE; the daemon
     /// compiles it against the current agent-type registry and rejects a bad
@@ -2544,11 +2568,10 @@ pub enum ResponseBody {
         agent_types: Vec<haider_protocol::loom::LoomAgentType>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         workflows: Vec<haider_protocol::loom::LoomWorkflow>,
-        /// W-flow (owner 2026-08-22) — device PATH presence for every CLI
-        /// any registered type DECLARES, probed at list time. A type may
-        /// register naming `yt-dlp` and only discover at spawn that the
-        /// device has never had it; this makes the gap visible before the
-        /// bind rather than at the first failing turn.
+        /// Device PATH presence for every CLI any registered type declares,
+        /// probed at list time. This is advisory inventory; the durable
+        /// install job remains the authoritative typed-executor readiness
+        /// gate and is observed through `loom.install.status`.
         ///
         /// Keyed by the declared name verbatim. Absent from the map means
         /// NOT PROBED (an older daemon, or a name that reached the client
@@ -2561,6 +2584,13 @@ pub enum ResponseBody {
     #[serde(rename = "loom.registered")]
     LoomRegistered {
         registration: haider_protocol::loom::LoomRegistration,
+    },
+    #[serde(rename = "loom.install.status")]
+    LoomInstallStatus {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        jobs: Vec<haider_protocol::typed_agent::TypedAgentInstallJob>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        items: Vec<haider_protocol::typed_agent::TypedAgentInstallItem>,
     },
     #[serde(rename = "graph.inspect")]
     GraphInspect {

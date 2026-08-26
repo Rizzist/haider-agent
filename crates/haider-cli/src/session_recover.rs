@@ -568,6 +568,7 @@ mod tests {
             turn_count: None,
             agent_metrics: None,
             needs_input: None,
+            workflow: None,
         }
     }
 

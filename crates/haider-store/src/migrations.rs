@@ -14,7 +14,7 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 19;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 20;
 
 struct Migration {
     version: u32,
@@ -360,6 +360,57 @@ const MIGRATIONS: &[Migration] = &[
             ALTER TABLE profile_meta ADD COLUMN installation_id TEXT;
             ALTER TABLE profile_meta ADD COLUMN usage_backfill_version INTEGER
                 NOT NULL DEFAULT 0 CHECK (usage_backfill_version >= 0);
+        ",
+    },
+    Migration {
+        version: 20,
+        sql: "
+            CREATE TABLE loom_cli_install_jobs (
+                job_id             TEXT PRIMARY KEY
+                    CHECK (length(job_id) BETWEEN 1 AND 128),
+                agent_type_id      TEXT NOT NULL,
+                agent_type_rev     INTEGER NOT NULL CHECK (agent_type_rev > 0),
+                agent_type_digest  TEXT NOT NULL
+                    CHECK (length(agent_type_digest) = 32),
+                state              TEXT NOT NULL
+                    CHECK (state IN (
+                        'queued', 'installing', 'verifying', 'succeeded', 'failed'
+                    )),
+                total              INTEGER NOT NULL CHECK (total BETWEEN 1 AND 32),
+                completed          INTEGER NOT NULL
+                    CHECK (completed >= 0 AND completed <= total),
+                current_cli        TEXT
+                    CHECK (current_cli IS NULL OR length(current_cli) BETWEEN 1 AND 128),
+                error              TEXT
+                    CHECK (error IS NULL OR length(error) BETWEEN 1 AND 512),
+                created_at_ms      INTEGER NOT NULL CHECK (created_at_ms >= 0),
+                updated_at_ms      INTEGER NOT NULL
+                    CHECK (updated_at_ms >= created_at_ms),
+                UNIQUE (agent_type_id, agent_type_rev),
+                FOREIGN KEY (agent_type_id) REFERENCES loom_agent_types(id)
+            );
+
+            CREATE INDEX loom_cli_install_jobs_state_updated
+            ON loom_cli_install_jobs(state, updated_at_ms);
+
+            CREATE TABLE loom_cli_install_items (
+                job_id          TEXT NOT NULL,
+                ordinal         INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 31),
+                cli_program     TEXT NOT NULL
+                    CHECK (length(cli_program) BETWEEN 1 AND 128),
+                state           TEXT NOT NULL
+                    CHECK (state IN (
+                        'queued', 'installing', 'verifying', 'succeeded', 'failed'
+                    )),
+                error           TEXT
+                    CHECK (error IS NULL OR length(error) BETWEEN 1 AND 512),
+                created_at_ms   INTEGER NOT NULL CHECK (created_at_ms >= 0),
+                updated_at_ms   INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+                PRIMARY KEY (job_id, ordinal),
+                UNIQUE (job_id, cli_program),
+                FOREIGN KEY (job_id) REFERENCES loom_cli_install_jobs(job_id)
+                    ON DELETE CASCADE
+            );
         ",
     },
 ];

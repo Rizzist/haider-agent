@@ -35,7 +35,7 @@ use haider_protocol::graph::{
     ChildContractRef, ChildGraphAttached, ChildTemplateCacheKey, ChildTemplateObserved,
     ChildTemplatePromoted, ComputerObservationKind, EvidenceAuthority, EvidenceRecorded,
     EvidenceSlotSpec, EvidenceVerdict, GRAPH_INSPECT_MAX_RUNS,
-    GRAPH_INSPECT_MAX_TOOL_SELECTION_ROWS, GRAPH_MAX_TODO_CHILDREN,
+    GRAPH_INSPECT_MAX_TOOL_SELECTION_ROWS, GRAPH_MAX_CONDITIONAL_HOPS, GRAPH_MAX_TODO_CHILDREN,
     GRAPH_TELEMETRY_MAX_ATTEMPT_ROWS, GRAPH_TELEMETRY_MAX_RUN_ROWS,
     GRAPH_TELEMETRY_MAX_TEMPLATE_ROWS, GraphAbandoned, GraphAdvanced, GraphAttemptOpened,
     GraphBlockReason, GraphBlocked, GraphCompleted, GraphEvidenceProvenanceRow,
@@ -77,6 +77,11 @@ use haider_protocol::session_fork::{
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::task::TaskEventPayload;
 use haider_protocol::tool::{AttachmentBlock, ImageBlockRef};
+use haider_protocol::typed_agent::{
+    TYPED_AGENT_INSTALL_STATUS_MAX_JOBS, TypedAgentContract, TypedAgentContractError,
+    TypedAgentInstallItem, TypedAgentInstallJob, TypedAgentInstallProgress, TypedAgentInstallState,
+    TypedAgentRequiredCli,
+};
 use haider_protocol::{DeliveryMode, EventPayload};
 use rusqlite::{
     Connection, Error as SqliteError, ErrorCode as SqliteErrorCode, OptionalExtension, Transaction,
@@ -1384,6 +1389,40 @@ pub struct CachedModels {
     pub fetched_at_ms: u64,
 }
 
+/// Atomic result of registering one typed Loom specialist. A changed or new
+/// type with required CLIs carries the durable install job created in the same
+/// transaction as its frozen registry revision. Idempotent registrations and
+/// types without required CLIs carry no job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoomAgentTypeRegistration {
+    pub registration: LoomRegistration,
+    pub install_job: Option<TypedAgentInstallJob>,
+}
+
+/// Compare-and-swap coordinates for one optional per-program transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedAgentInstallItemCas {
+    pub expected: TypedAgentInstallItem,
+    pub next: TypedAgentInstallItem,
+}
+
+/// One atomic install lifecycle update. The expected snapshots are the CAS
+/// fence; the store validates all identity, progress, timestamp, and state
+/// transitions before replacing the job and optional item together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedAgentInstallCas {
+    pub expected_job: TypedAgentInstallJob,
+    pub next_job: TypedAgentInstallJob,
+    pub item: Option<TypedAgentInstallItemCas>,
+}
+
+/// One transactionally coherent status view for reconnecting callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedAgentInstallSnapshot {
+    pub jobs: Vec<TypedAgentInstallJob>,
+    pub items: Vec<TypedAgentInstallItem>,
+}
+
 /// Definitive login failure persisted in a failed receipt (401/403 class):
 /// stable code + human message, never provider body or key text.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -2048,6 +2087,19 @@ impl Store {
         &self,
         record: &LoomAgentType,
     ) -> StoreResult<LoomRegistration> {
+        Ok(self
+            .loom_register_agent_type_with_install(record)?
+            .registration)
+    }
+
+    /// Register or revise one typed specialist and atomically enqueue the
+    /// required CLI installation for the exact stored rev/digest. The legacy
+    /// registration method delegates here and discards only the richer job
+    /// projection, preserving its public result and rev law.
+    pub fn loom_register_agent_type_with_install(
+        &self,
+        record: &LoomAgentType,
+    ) -> StoreResult<LoomAgentTypeRegistration> {
         let record = &normalize_agent_type(record);
         validate_agent_type(record)?;
         let mut connection = self.connection()?;
@@ -2064,50 +2116,65 @@ impl Store {
             .map_err(map_sqlite_error)?;
         let digest = record.digest();
         let now = now_ms()?;
-        let outcome = match existing {
-            Some((rev, ref current)) if *current == digest => LoomRegistration {
-                id: record.id.clone(),
-                rev: u32::try_from(rev)
-                    .map_err(|_| corrupt("loom agent type rev is out of range"))?,
-                digest,
-                updated: false,
-            },
+        let is_new = existing.is_none();
+        let (outcome, changed_record) = match &existing {
+            Some((rev, current)) if *current == digest => (
+                LoomRegistration {
+                    id: record.id.clone(),
+                    rev: u32::try_from(*rev)
+                        .map_err(|_| corrupt("loom agent type rev is out of range"))?,
+                    digest: digest.clone(),
+                    updated: false,
+                },
+                None,
+            ),
             Some((rev, _)) => {
-                let next = u32::try_from(rev)
+                let next = u32::try_from(*rev)
                     .ok()
                     .and_then(|rev| rev.checked_add(1))
                     .ok_or_else(|| corrupt("loom agent type rev is out of range"))?;
                 let mut stored = record.clone();
                 stored.rev = next;
-                let json = serde_json::to_string(&stored)
-                    .map_err(|_| corrupt("loom agent type record is not encodable"))?;
-                transaction
-                    .execute(
-                        "UPDATE loom_agent_types
-                         SET rev = ?2, digest = ?3, record_json = ?4, updated_at_ms = ?5
-                         WHERE id = ?1",
-                        params![
-                            record.id.as_str(),
-                            i64::from(next),
-                            digest.as_str(),
-                            json.as_str(),
-                            to_sqlite_integer(now)?
-                        ],
-                    )
-                    .map_err(map_sqlite_error)?;
-                LoomRegistration {
-                    id: record.id.clone(),
-                    rev: next,
-                    digest,
-                    updated: true,
-                }
+                (
+                    LoomRegistration {
+                        id: record.id.clone(),
+                        rev: next,
+                        digest: digest.clone(),
+                        updated: true,
+                    },
+                    Some(stored),
+                )
             }
             None => {
                 let mut stored = record.clone();
                 stored.rev = 1;
-                let json = serde_json::to_string(&stored)
-                    .map_err(|_| corrupt("loom agent type record is not encodable"))?;
-                transaction
+                (
+                    LoomRegistration {
+                        id: record.id.clone(),
+                        rev: 1,
+                        digest: digest.clone(),
+                        updated: true,
+                    },
+                    Some(stored),
+                )
+            }
+        };
+        let install_job = if let Some(stored) = changed_record {
+            // Derive from the normalized, store-owned revision before either
+            // registry or install rows are inserted. This is deliberately
+            // stricter than the display/capability registry validation: a CLI
+            // grant must also be a valid required-program install contract.
+            let contract = TypedAgentContract::from_loom_agent_type(&stored).map_err(|error| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("invalid typed-agent execution contract: {error}"),
+                    false,
+                )
+            })?;
+            let json = serde_json::to_string(&stored)
+                .map_err(|_| corrupt("loom agent type record is not encodable"))?;
+            if is_new {
+                let inserted = transaction
                     .execute(
                         "INSERT INTO loom_agent_types(
                              id, rev, digest, record_json, created_at_ms, updated_at_ms)
@@ -2120,16 +2187,224 @@ impl Store {
                         ],
                     )
                     .map_err(map_sqlite_error)?;
-                LoomRegistration {
-                    id: record.id.clone(),
-                    rev: 1,
-                    digest,
-                    updated: true,
+                if inserted != 1 {
+                    return Err(corrupt("typed-agent registry insert affected no row"));
                 }
+            } else {
+                let updated = transaction
+                    .execute(
+                        "UPDATE loom_agent_types
+                         SET rev = ?2, digest = ?3, record_json = ?4, updated_at_ms = ?5
+                         WHERE id = ?1",
+                        params![
+                            record.id.as_str(),
+                            i64::from(stored.rev),
+                            digest.as_str(),
+                            json.as_str(),
+                            to_sqlite_integer(now)?
+                        ],
+                    )
+                    .map_err(map_sqlite_error)?;
+                if updated != 1 {
+                    return Err(corrupt("typed-agent registry update affected no row"));
+                }
+            }
+            enqueue_typed_agent_install(&transaction, &contract, now)?
+        } else {
+            // Upgrade/backfill seam: a type created by an older daemon can be
+            // content-identical yet have no install job. Re-registration at
+            // startup creates the missing work exactly once without minting a
+            // registry revision; ordinary no-ops with an existing job remain
+            // no-ops on both tables.
+            let mut stored = record.clone();
+            stored.rev = outcome.rev;
+            let contract = TypedAgentContract::from_loom_agent_type(&stored).map_err(|error| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("invalid typed-agent execution contract: {error}"),
+                    false,
+                )
+            })?;
+            let already_enqueued = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM loom_cli_install_jobs
+                         WHERE agent_type_id = ?1 AND agent_type_rev = ?2
+                     )",
+                    params![stored.id.as_str(), i64::from(stored.rev)],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(map_sqlite_error)?;
+            if already_enqueued {
+                None
+            } else {
+                enqueue_typed_agent_install(&transaction, &contract, now)?
             }
         };
         transaction.commit().map_err(map_sqlite_error)?;
-        Ok(outcome)
+        Ok(LoomAgentTypeRegistration {
+            registration: outcome,
+            install_job,
+        })
+    }
+
+    /// Durable install jobs, optionally narrowed by exact job and/or agent
+    /// type. Results are stable by type revision so reconnecting callers can
+    /// resume polling without depending on row insertion order.
+    pub fn typed_agent_install_jobs(
+        &self,
+        job_id: Option<&str>,
+        agent_type_id: Option<&str>,
+    ) -> StoreResult<Vec<TypedAgentInstallJob>> {
+        let connection = self.connection()?;
+        typed_agent_install_jobs_tx(&connection, job_id, agent_type_id)
+    }
+
+    /// Durable per-CLI items, with the same optional job/type filters as the
+    /// job query. The type filter is resolved through the owning job.
+    pub fn typed_agent_install_items(
+        &self,
+        job_id: Option<&str>,
+        agent_type_id: Option<&str>,
+    ) -> StoreResult<Vec<TypedAgentInstallItem>> {
+        let connection = self.connection()?;
+        typed_agent_install_items_tx(&connection, job_id, agent_type_id)
+    }
+
+    /// Read jobs and their item progress from one SQLite snapshot so an RPC
+    /// never pairs a pre-transition job with post-transition item rows.
+    pub fn typed_agent_install_status(
+        &self,
+        job_id: Option<&str>,
+        agent_type_id: Option<&str>,
+    ) -> StoreResult<TypedAgentInstallSnapshot> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(map_sqlite_error)?;
+        let jobs = typed_agent_install_status_jobs_tx(&transaction, job_id, agent_type_id)?;
+        let items = typed_agent_install_status_items_tx(&transaction, job_id, agent_type_id)?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(TypedAgentInstallSnapshot { jobs, items })
+    }
+
+    /// Atomically compare and replace one durable install job plus an
+    /// optional item. A stale expected snapshot is a revision conflict; an
+    /// illegal or non-monotonic proposed transition is an invalid argument.
+    pub fn typed_agent_install_compare_and_swap(
+        &self,
+        update: &TypedAgentInstallCas,
+    ) -> StoreResult<TypedAgentInstallJob> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let actual_job = typed_agent_install_job_tx(&transaction, &update.expected_job.job_id)?
+            .ok_or_else(|| {
+                typed_agent_install_conflict(format!(
+                    "typed-agent install job `{}` no longer exists",
+                    update.expected_job.job_id
+                ))
+            })?;
+        if actual_job != update.expected_job {
+            return Err(typed_agent_install_conflict(format!(
+                "typed-agent install job `{}` changed before update",
+                update.expected_job.job_id
+            )));
+        }
+        actual_job
+            .validate_update(&update.next_job)
+            .map_err(typed_agent_install_validation_error)?;
+
+        let actual_item = if let Some(item_update) = &update.item {
+            if item_update.next.job_id != update.next_job.job_id {
+                return Err(store_error(
+                    ErrorCode::InvalidArgument,
+                    "typed-agent install item must belong to the updated job",
+                    false,
+                ));
+            }
+            let actual = typed_agent_install_item_tx(
+                &transaction,
+                &item_update.expected.job_id,
+                item_update.expected.ordinal,
+            )?
+            .ok_or_else(|| {
+                typed_agent_install_conflict(format!(
+                    "typed-agent install item `{}:{}` no longer exists",
+                    item_update.expected.job_id, item_update.expected.ordinal
+                ))
+            })?;
+            if actual != item_update.expected {
+                return Err(typed_agent_install_conflict(format!(
+                    "typed-agent install item `{}:{}` changed before update",
+                    item_update.expected.job_id, item_update.expected.ordinal
+                )));
+            }
+            actual
+                .validate_update(&item_update.next)
+                .map_err(typed_agent_install_validation_error)?;
+            Some(actual)
+        } else {
+            None
+        };
+        validate_typed_agent_install_aggregate(
+            &transaction,
+            &actual_job,
+            &update.next_job,
+            update.item.as_ref(),
+        )?;
+
+        let updated_job = transaction
+            .execute(
+                "UPDATE loom_cli_install_jobs
+                 SET state = ?2, completed = ?3, current_cli = ?4, error = ?5,
+                     updated_at_ms = ?6
+                 WHERE job_id = ?1 AND state = ?7 AND updated_at_ms = ?8",
+                params![
+                    update.next_job.job_id.as_str(),
+                    typed_agent_install_state_str(update.next_job.state),
+                    i64::from(update.next_job.progress.completed),
+                    update.next_job.progress.current_cli.as_deref(),
+                    update.next_job.error.as_deref(),
+                    to_sqlite_integer(update.next_job.updated_at_ms)?,
+                    typed_agent_install_state_str(actual_job.state),
+                    to_sqlite_integer(actual_job.updated_at_ms)?,
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+        if updated_job != 1 {
+            return Err(typed_agent_install_conflict(format!(
+                "typed-agent install job `{}` lost its update race",
+                update.next_job.job_id
+            )));
+        }
+
+        if let (Some(item_update), Some(actual_item)) = (&update.item, actual_item) {
+            let updated_item = transaction
+                .execute(
+                    "UPDATE loom_cli_install_items
+                     SET state = ?3, error = ?4, updated_at_ms = ?5
+                     WHERE job_id = ?1 AND ordinal = ?2
+                       AND state = ?6 AND updated_at_ms = ?7",
+                    params![
+                        item_update.next.job_id.as_str(),
+                        i64::from(item_update.next.ordinal),
+                        typed_agent_install_state_str(item_update.next.state),
+                        item_update.next.error.as_deref(),
+                        to_sqlite_integer(item_update.next.updated_at_ms)?,
+                        typed_agent_install_state_str(actual_item.state),
+                        to_sqlite_integer(actual_item.updated_at_ms)?,
+                    ],
+                )
+                .map_err(map_sqlite_error)?;
+            if updated_item != 1 {
+                return Err(typed_agent_install_conflict(format!(
+                    "typed-agent install item `{}:{}` lost its update race",
+                    item_update.next.job_id, item_update.next.ordinal
+                )));
+            }
+        }
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(update.next_job.clone())
     }
 
     /// B1 — register (or revise) one workflow FROM PIPE SOURCE. The store is
@@ -2143,7 +2418,7 @@ impl Store {
             .map_err(map_sqlite_error)?;
         // Resolve @agent-type references against the registry AS OF this
         // transaction.
-        let mut signatures = std::collections::HashMap::new();
+        let mut agent_types = std::collections::HashMap::new();
         {
             let mut statement = transaction
                 .prepare("SELECT record_json FROM loom_agent_types")
@@ -2155,7 +2430,7 @@ impl Store {
                 let json = row.map_err(map_sqlite_error)?;
                 let record: LoomAgentType = serde_json::from_str(&json)
                     .map_err(|_| corrupt("loom agent type record is not decodable"))?;
-                signatures.insert(record.id.clone(), record.signature());
+                agent_types.insert(record.id.clone(), record);
             }
         }
         let ast = parse_pipe(source);
@@ -2172,13 +2447,28 @@ impl Store {
             ));
         }
         let mut workflow =
-            compile_pipe(&ast, |id| signatures.get(id).cloned()).map_err(|errors| {
-                HaiderError::new(
-                    ErrorCode::InvalidArgument,
-                    format!("pipe rejected: {}", errors.join("; ")),
-                    false,
-                )
+            compile_pipe(&ast, |id| agent_types.get(id).map(LoomAgentType::signature)).map_err(
+                |errors| {
+                    HaiderError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("pipe rejected: {}", errors.join("; ")),
+                        false,
+                    )
+                },
+            )?;
+        for meta in &mut workflow.meta {
+            let Some(type_id) = meta.agent_type.as_deref() else {
+                continue;
+            };
+            let record = agent_types.get(type_id).ok_or_else(|| {
+                corrupt(format!(
+                    "compiled Loom node references absent agent type `{type_id}`"
+                ))
             })?;
+            meta.agent_type_rev = Some(record.rev);
+            meta.agent_type_digest = Some(record.digest());
+        }
+        workflow.refresh_digest();
         let existing = transaction
             .query_row(
                 "SELECT rev, digest, record_json FROM loom_workflows WHERE id = ?1",
@@ -3345,6 +3635,19 @@ impl Store {
             now,
         )?;
         let mut payloads = Vec::new();
+        // The root becomes an aggregate and any previous run-set children are
+        // retired in this transaction. Their graph menus must be retired too:
+        // leaving one journal-open would keep ObserveProjection in
+        // `needs_input` even though the graph reducer correctly hides it.
+        let mut closed_menus = HashSet::new();
+        for menu in graph_pending_menus(&root_status) {
+            if closed_menus.insert(menu.clone()) {
+                payloads.push(EventPayload::MenuClosed {
+                    menu,
+                    reason: MenuCloseReason::Dismissed,
+                });
+            }
+        }
         if let Some(previous_id) = reductions.active_run_set.as_ref()
             && let Some(previous) = reductions.run_sets.get(previous_id)
         {
@@ -3353,6 +3656,19 @@ impl Store {
                     child.phase,
                     GraphPhase::Completed | GraphPhase::Abandoned | GraphPhase::Superseded
                 ) {
+                    if let Some(status) = reductions
+                        .graph(&child.graph_id)
+                        .and_then(|graph| graph.status.as_ref())
+                    {
+                        for menu in graph_pending_menus(status) {
+                            if closed_menus.insert(menu.clone()) {
+                                payloads.push(EventPayload::MenuClosed {
+                                    menu,
+                                    reason: MenuCloseReason::Dismissed,
+                                });
+                            }
+                        }
+                    }
                     let replacement = items
                         .iter()
                         .position(|todo| todo.id == child.todo_id)
@@ -3405,6 +3721,16 @@ impl Store {
                     node: start_node.clone(),
                     attempt: 1,
                 }));
+                if template.nodes.iter().any(|spec| {
+                    spec.name == start_node && matches!(spec.gate, GraphGateKind::HumanConfirm)
+                }) {
+                    payloads.push(EventPayload::MenuOpened(graph_confirm_menu_for(
+                        child_graph_id,
+                        &template.name,
+                        &start_node,
+                        1,
+                    )));
+                }
                 Some(index)
             } else {
                 None
@@ -3562,6 +3888,10 @@ impl Store {
                 false,
             )
         })?;
+        let human_start = template.nodes.iter().any(|spec| {
+            spec.name == start_node && matches!(spec.gate, GraphGateKind::HumanConfirm)
+        });
+        let template_name = template.name.clone();
         payloads.push(EventPayload::GraphPinned(GraphPinned {
             graph_id: command.graph_id.clone(),
             template: template.name,
@@ -3572,9 +3902,17 @@ impl Store {
         }));
         payloads.push(EventPayload::GraphAttemptOpened(GraphAttemptOpened {
             graph_id: command.graph_id.clone(),
-            node: start_node,
+            node: start_node.clone(),
             attempt: 1,
         }));
+        if human_start {
+            payloads.push(EventPayload::MenuOpened(graph_confirm_menu_for(
+                &command.graph_id,
+                &template_name,
+                &start_node,
+                1,
+            )));
+        }
         let mut envelopes = graph_command_envelopes(command, payloads)?;
         append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
         let pinned = PinnedGraph {
@@ -3656,8 +3994,12 @@ impl Store {
             )
         })?;
         if parent.graph_id != attachment.parent_attempt.graph_id
-            || parent.attempt != attachment.parent_attempt.attempt
             || !parent.node_is_ready(&attachment.parent_attempt.node)
+            || parent
+                .nodes
+                .iter()
+                .find(|node| node.node == attachment.parent_attempt.node)
+                .is_none_or(|node| node.current_attempt != Some(attachment.parent_attempt.attempt))
         {
             return Err(graph_evidence_error(
                 ErrorCode::RevisionConflict,
@@ -4140,6 +4482,7 @@ impl Store {
                     false,
                 )
             })?;
+        let unfinished_children = active_unfinished_run_set_children(&reductions);
         let start_node = template.start_node.clone().ok_or_else(|| {
             store_error(
                 ErrorCode::StoreCorrupt,
@@ -4147,6 +4490,10 @@ impl Store {
                 false,
             )
         })?;
+        let human_start = template.nodes.iter().any(|spec| {
+            spec.name == start_node && matches!(spec.gate, GraphGateKind::HumanConfirm)
+        });
+        let template_name = template.name.clone();
         let digest = graph_template_digest(&template);
         let now = now_ms()?;
         claim_pending_receipt(
@@ -4161,11 +4508,32 @@ impl Store {
             old: command.old_graph_id.clone(),
             new: command.new_graph_id.clone(),
         })];
+        let mut closed_menus = HashSet::new();
         for menu in graph_pending_menus(&old_status) {
-            payloads.push(EventPayload::MenuClosed {
-                menu,
-                reason: MenuCloseReason::Dismissed,
-            });
+            if closed_menus.insert(menu.clone()) {
+                payloads.push(EventPayload::MenuClosed {
+                    menu,
+                    reason: MenuCloseReason::Dismissed,
+                });
+            }
+        }
+        // A run-set root is only an aggregate projection: every unfinished
+        // child is an independently pinned graph with its own menus and
+        // effect coordinates. Switching the session must terminalize that
+        // complete owned forest in the same journal transaction.
+        for (child_graph_id, child_menus) in unfinished_children {
+            for menu in child_menus {
+                if closed_menus.insert(menu.clone()) {
+                    payloads.push(EventPayload::MenuClosed {
+                        menu,
+                        reason: MenuCloseReason::Dismissed,
+                    });
+                }
+            }
+            payloads.push(EventPayload::GraphSuperseded(GraphSuperseded {
+                old: child_graph_id,
+                new: command.new_graph_id.clone(),
+            }));
         }
         let pinned_index = payloads.len();
         payloads.push(EventPayload::GraphPinned(GraphPinned {
@@ -4178,9 +4546,17 @@ impl Store {
         }));
         payloads.push(EventPayload::GraphAttemptOpened(GraphAttemptOpened {
             graph_id: command.new_graph_id.clone(),
-            node: start_node,
+            node: start_node.clone(),
             attempt: 1,
         }));
+        if human_start {
+            payloads.push(EventPayload::MenuOpened(graph_confirm_menu_for(
+                &command.new_graph_id,
+                &template_name,
+                &start_node,
+                1,
+            )));
+        }
         let mut envelopes = graph_command_envelopes(command, payloads)?;
         append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
         let switched = SwitchedGraph {
@@ -4258,8 +4634,8 @@ impl Store {
             ));
         }
         require_typed_session(&transaction, &command.session_id)?;
-        let status = self
-            .graph_reductions(&transaction, &command.session_id)?
+        let reductions = self.graph_reductions(&transaction, &command.session_id)?;
+        let status = reductions
             .active()
             .and_then(|reduction| reduction.status.clone())
             .filter(GraphStatus::is_unfinished)
@@ -4270,6 +4646,7 @@ impl Store {
                     false,
                 )
             })?;
+        let unfinished_children = active_unfinished_run_set_children(&reductions);
         let why = normalize_graph_why(&command.why)?;
         let now = now_ms()?;
         claim_pending_receipt(
@@ -4282,17 +4659,33 @@ impl Store {
         )?;
         let mut payloads = vec![EventPayload::GraphAbandoned(GraphAbandoned {
             graph_id: status.graph_id.clone(),
-            why,
+            why: why.clone(),
         })];
-        let pending_menus = graph_pending_menus(&status);
-        for menu in pending_menus {
+        let mut closed_menus = HashSet::new();
+        for menu in graph_pending_menus(&status) {
             // Leaving an active SHIP obligation retires its durable menu too;
             // otherwise the answered-menu fallback scan would keep exposing
             // a permanently stale, unanswerable card after abandonment.
-            payloads.push(EventPayload::MenuClosed {
-                menu,
-                reason: MenuCloseReason::Dismissed,
-            });
+            if closed_menus.insert(menu.clone()) {
+                payloads.push(EventPayload::MenuClosed {
+                    menu,
+                    reason: MenuCloseReason::Dismissed,
+                });
+            }
+        }
+        for (child_graph_id, child_menus) in unfinished_children {
+            for menu in child_menus {
+                if closed_menus.insert(menu.clone()) {
+                    payloads.push(EventPayload::MenuClosed {
+                        menu,
+                        reason: MenuCloseReason::Dismissed,
+                    });
+                }
+            }
+            payloads.push(EventPayload::GraphAbandoned(GraphAbandoned {
+                graph_id: child_graph_id,
+                why: why.clone(),
+            }));
         }
         let mut envelopes = graph_command_envelopes(command, payloads)?;
         append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
@@ -4391,9 +4784,13 @@ impl Store {
             return Ok(ComputerEvidenceOutcome::StaleGraph);
         };
         if status.graph_id != command.graph_id
-            || status.attempt != command.attempt
             || status.current_node.as_ref() != Some(&command.node)
             || !status.node_is_ready(&command.node)
+            || status
+                .nodes
+                .iter()
+                .find(|node| node.node == command.node)
+                .is_none_or(|node| node.current_attempt != Some(command.attempt))
         {
             transaction.commit().map_err(map_sqlite_error)?;
             return Ok(ComputerEvidenceOutcome::StaleGraph);
@@ -4527,16 +4924,16 @@ impl Store {
         }
         require_typed_session(&transaction, &command.session_id)?;
         let reductions = self.graph_reductions(&transaction, &command.session_id)?;
-        let active_child = reductions
+        let active_run_set = reductions
             .active_run_set
             .as_ref()
-            .and_then(|run_set_id| reductions.run_sets.get(run_set_id))
-            .is_some_and(|run_set| {
-                run_set
-                    .children
-                    .iter()
-                    .any(|child| child.graph_id == command.graph_id)
-            });
+            .and_then(|run_set_id| reductions.run_sets.get(run_set_id));
+        let active_child = active_run_set.is_some_and(|run_set| {
+            run_set
+                .children
+                .iter()
+                .any(|child| child.graph_id == command.graph_id)
+        });
         if reductions.active_root.as_ref() != Some(&command.graph_id) && !active_child {
             let superseded = reductions
                 .graph(&command.graph_id)
@@ -4556,7 +4953,7 @@ impl Store {
             ));
         }
         if reductions.active_root.as_ref() == Some(&command.graph_id)
-            && reductions.active_run_set.is_some()
+            && active_run_set.is_some_and(|run_set| run_set.root_graph_id == command.graph_id)
         {
             return Err(store_error(
                 ErrorCode::GraphWrongNode,
@@ -4603,8 +5000,20 @@ impl Store {
                     false,
                 )
             })?;
+        let node_status = status
+            .nodes
+            .iter()
+            .find(|node| node.node == current_node)
+            .ok_or_else(|| {
+                store_error(
+                    ErrorCode::StoreCorrupt,
+                    "open graph node is absent from its pinned template",
+                    false,
+                )
+            })?;
         if !status.node_is_ready(&current_node)
             || matches!(node_spec.gate, GraphGateKind::HumanConfirm)
+            || node_status.current_attempt.is_none()
         {
             return Err(store_error(
                 ErrorCode::GraphWrongNode,
@@ -4628,7 +5037,13 @@ impl Store {
             ));
         }
         let fingerprint = evidence_fingerprint(&detail);
-        let attempt = status.attempt;
+        let attempt = node_status.current_attempt.ok_or_else(|| {
+            store_error(
+                ErrorCode::GraphWrongNode,
+                "graph evidence target has no open node-local attempt",
+                false,
+            )
+        })?;
         let graph_id = status.graph_id.clone();
         let slot_spec = if node_spec.verify_slots.is_empty() {
             if command.slot.is_some() {
@@ -4777,17 +5192,6 @@ impl Store {
                 reason: GraphBlockReason::NoProgress,
             }));
         } else {
-            let node_status = status
-                .nodes
-                .iter()
-                .find(|node| node.node == current_node)
-                .ok_or_else(|| {
-                    store_error(
-                        ErrorCode::StoreCorrupt,
-                        "open graph node is absent from its pinned template",
-                        false,
-                    )
-                })?;
             let evidence_count = node_status
                 .evidence
                 .green
@@ -4830,16 +5234,54 @@ impl Store {
                     payloads.extend(todo_child_completed_followups(&reductions, &graph_id)?);
                 }
             } else if evidence_count >= graph_evidence_limit(node_spec)? {
-                if attempt >= node_spec.max_attempts {
+                let declared_target = node_spec.red_target.as_ref();
+                let target = declared_target
+                    .cloned()
+                    .unwrap_or_else(|| status.start_node.clone().unwrap_or_else(build_node));
+                let target_spec = reduction
+                    .template_nodes
+                    .iter()
+                    .find(|spec| spec.name == target)
+                    .ok_or_else(|| {
+                        store_error(
+                            ErrorCode::StoreCorrupt,
+                            format!("graph red target {target} is absent from its pinned template"),
+                            false,
+                        )
+                    })?;
+                let target_status = status
+                    .nodes
+                    .iter()
+                    .find(|node| node.node == target)
+                    .ok_or_else(|| {
+                        store_error(
+                            ErrorCode::StoreCorrupt,
+                            format!("graph red target {target} has no reduced state"),
+                            false,
+                        )
+                    })?;
+                let source_attempts_exhausted =
+                    node_status.attempts_opened >= node_spec.max_attempts;
+                let target_attempts_exhausted = declared_target.is_some()
+                    && target_status.attempts_opened >= target_spec.max_attempts;
+                let conditional_hops_exhausted = declared_target.is_some()
+                    && status.attempt.saturating_sub(1) >= GRAPH_MAX_CONDITIONAL_HOPS;
+                if source_attempts_exhausted
+                    || target_attempts_exhausted
+                    || conditional_hops_exhausted
+                {
                     payloads.push(EventPayload::GraphBlocked(GraphBlocked {
                         graph_id: graph_id.clone(),
                         node: current_node.clone(),
                         reason: GraphBlockReason::RoundsExhausted,
                     }));
                 } else {
-                    // No back-edge: the new START epoch is an immutable
-                    // attempt opening, never GraphAdvanced traversal.
-                    for menu in graph_pending_menus(&status)
+                    let menus = if declared_target.is_some() {
+                        graph_retry_menus(&status, &reduction.template_nodes, &target)
+                    } else {
+                        graph_pending_menus(&status)
+                    };
+                    for menu in menus
                         .into_iter()
                         .filter(|menu| !pending_finalization_menus.contains(menu))
                     {
@@ -4848,12 +5290,23 @@ impl Store {
                             reason: MenuCloseReason::Dismissed,
                         });
                     }
-                    let start_node = status.start_node.clone().unwrap_or_else(build_node);
+                    let next_epoch = status.attempt.checked_add(1).ok_or_else(|| {
+                        store_error(
+                            ErrorCode::StoreCorrupt,
+                            "graph traversal epoch space is exhausted",
+                            false,
+                        )
+                    })?;
                     payloads.push(EventPayload::GraphAttemptOpened(GraphAttemptOpened {
                         graph_id: graph_id.clone(),
-                        node: start_node,
-                        attempt: attempt + 1,
+                        node: target.clone(),
+                        attempt: next_epoch,
                     }));
+                    if matches!(target_spec.gate, GraphGateKind::HumanConfirm) {
+                        payloads.push(EventPayload::MenuOpened(graph_confirm_menu(
+                            &status, &target, next_epoch,
+                        )));
+                    }
                 }
             }
         }
@@ -10712,6 +11165,81 @@ fn graph_pending_menus(status: &GraphStatus) -> Vec<MenuId> {
     }
 }
 
+/// Snapshot the unfinished child graph identities and menu ownership for the
+/// active aggregate. Callers can then append a forest-wide terminal batch
+/// without holding borrows into the reduction while constructing payloads.
+fn active_unfinished_run_set_children(reductions: &GraphReductions) -> Vec<(GraphId, Vec<MenuId>)> {
+    reductions
+        .active_run_set
+        .as_ref()
+        .and_then(|run_set_id| reductions.run_sets.get(run_set_id))
+        .into_iter()
+        .flat_map(|run_set| run_set.children.iter())
+        .filter(|child| {
+            !matches!(
+                child.phase,
+                GraphPhase::Completed | GraphPhase::Abandoned | GraphPhase::Superseded
+            )
+        })
+        .map(|child| {
+            let menus = reductions
+                .graph(&child.graph_id)
+                .and_then(|reduction| reduction.status.as_ref())
+                .map(graph_pending_menus)
+                .unwrap_or_default();
+            (child.graph_id.clone(), menus)
+        })
+        .collect()
+}
+
+fn graph_retry_menus(
+    status: &GraphStatus,
+    specs: &[haider_protocol::graph::GraphNodeSpec],
+    target: &GraphNodeName,
+) -> Vec<MenuId> {
+    let invalidated = graph_descendants_inclusive(specs, target);
+    let invalidated_menu_ids = specs
+        .iter()
+        .filter(|spec| {
+            invalidated.contains(&spec.name) && matches!(spec.gate, GraphGateKind::HumanConfirm)
+        })
+        .filter_map(|spec| {
+            status
+                .nodes
+                .iter()
+                .find(|node| node.node == spec.name)
+                .and_then(|node| node.current_attempt)
+                .map(|attempt| graph_confirm_menu(status, &spec.name, attempt).id)
+        })
+        .collect::<HashSet<_>>();
+    graph_pending_menus(status)
+        .into_iter()
+        .filter(|menu| invalidated_menu_ids.contains(menu))
+        .collect()
+}
+
+fn graph_descendants_inclusive(
+    specs: &[haider_protocol::graph::GraphNodeSpec],
+    target: &GraphNodeName,
+) -> HashSet<GraphNodeName> {
+    let mut descendants = HashSet::from([target.clone()]);
+    loop {
+        let before = descendants.len();
+        for spec in specs {
+            if spec
+                .depends_on
+                .iter()
+                .any(|dependency| descendants.contains(dependency))
+            {
+                descendants.insert(spec.name.clone());
+            }
+        }
+        if descendants.len() == before {
+            return descendants;
+        }
+    }
+}
+
 fn linear_template(reduction: &GraphReduction, status: &GraphStatus) -> bool {
     let Some(first) = reduction.template_nodes.first() else {
         return false;
@@ -10732,6 +11260,10 @@ fn dependency_followups(
     satisfied_node: &GraphNodeName,
     attempt: u32,
 ) -> StoreResult<Vec<EventPayload>> {
+    // A targeted hop can leave an independent ready sibling on an older
+    // node-local epoch. Newly unlocked nodes join the latest graph traversal
+    // epoch; already-ready siblings must not be reopened or lose evidence.
+    let opening_attempt = status.attempt.max(attempt);
     let satisfied = |name: &GraphNodeName| {
         name == satisfied_node
             || status
@@ -10753,13 +11285,7 @@ fn dependency_followups(
     let ready = unsatisfied
         .into_iter()
         .filter(|spec| spec.depends_on.iter().all(&satisfied))
-        .filter(|spec| {
-            status
-                .nodes
-                .iter()
-                .find(|node| node.node == spec.name)
-                .is_none_or(|node| node.current_attempt != Some(attempt))
-        })
+        .filter(|spec| !status.node_is_ready(&spec.name))
         .collect::<Vec<_>>();
     let linear = linear_template(reduction, status);
     let mut payloads = Vec::new();
@@ -10774,17 +11300,19 @@ fn dependency_followups(
             payloads.push(EventPayload::GraphNodeReadied(GraphNodeReadied {
                 graph_id: status.graph_id.clone(),
                 node: spec.name.clone(),
-                attempt,
+                attempt: opening_attempt,
             }));
         }
         payloads.push(EventPayload::GraphAttemptOpened(GraphAttemptOpened {
             graph_id: status.graph_id.clone(),
             node: spec.name.clone(),
-            attempt,
+            attempt: opening_attempt,
         }));
         if matches!(spec.gate, GraphGateKind::HumanConfirm) {
             payloads.push(EventPayload::MenuOpened(graph_confirm_menu(
-                status, &spec.name, attempt,
+                status,
+                &spec.name,
+                opening_attempt,
             )));
         }
     }
@@ -12366,21 +12894,26 @@ fn validate_process_signal_provenance(
 }
 
 fn graph_confirm_menu(status: &GraphStatus, node: &GraphNodeName, attempt: u32) -> Menu {
+    graph_confirm_menu_for(&status.graph_id, &status.template, node, attempt)
+}
+
+fn graph_confirm_menu_for(
+    graph_id: &GraphId,
+    template: &str,
+    node: &GraphNodeName,
+    attempt: u32,
+) -> Menu {
     let legacy_ship_loop_id =
-        status.template == haider_protocol::graph::SHIP_LOOP_TEMPLATE && node.as_str() == "SHIP";
+        template == haider_protocol::graph::SHIP_LOOP_TEMPLATE && node.as_str() == "SHIP";
     let id = if legacy_ship_loop_id {
-        format!("graph-confirm-{}-{attempt}", status.graph_id)
+        format!("graph-confirm-{graph_id}-{attempt}")
     } else {
-        format!(
-            "graph-confirm-{}-{}-{attempt}",
-            status.graph_id,
-            node.as_str()
-        )
+        format!("graph-confirm-{graph_id}-{}-{attempt}", node.as_str())
     };
     Menu {
         id: MenuId::new(id),
         kind: MenuKind::GraphHumanConfirm {
-            graph_id: status.graph_id.clone(),
+            graph_id: graph_id.clone(),
             node: node.clone(),
             attempt,
         },
@@ -13471,7 +14004,11 @@ fn resolve_menu_transaction(
         if status.graph_id != *graph_id
             || status.phase != GraphPhase::Active
             || !status.node_is_ready(node)
-            || status.attempt != *attempt
+            || status
+                .nodes
+                .iter()
+                .find(|candidate| candidate.node == *node)
+                .is_none_or(|candidate| candidate.current_attempt != Some(*attempt))
             || !graph_pending_menus(&status).iter().any(|id| id == &menu.id)
             || !reduction
                 .template_nodes
@@ -15698,6 +16235,435 @@ fn resolve_graph_template_tx(
         .transpose()
 }
 
+fn enqueue_typed_agent_install(
+    transaction: &Transaction<'_>,
+    contract: &TypedAgentContract,
+    now: u64,
+) -> StoreResult<Option<TypedAgentInstallJob>> {
+    if contract.required_clis.is_empty() {
+        return Ok(None);
+    }
+    let job_id = format!(
+        "install:{}:{}:{}",
+        contract.agent_type_id, contract.agent_type_rev, contract.agent_type_digest
+    );
+    let job = TypedAgentInstallJob::queued(job_id, contract, now)
+        .map_err(typed_agent_install_validation_error)?;
+    transaction
+        .execute(
+            "INSERT INTO loom_cli_install_jobs(
+                 job_id, agent_type_id, agent_type_rev, agent_type_digest, state,
+                 total, completed, current_cli, error, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?8)",
+            params![
+                job.job_id.as_str(),
+                job.agent_type_id.as_str(),
+                i64::from(job.agent_type_rev),
+                job.agent_type_digest.as_str(),
+                typed_agent_install_state_str(job.state),
+                i64::from(job.progress.total),
+                i64::from(job.progress.completed),
+                to_sqlite_integer(now)?,
+            ],
+        )
+        .map_err(map_sqlite_error)?;
+    for (ordinal, required_cli) in contract.required_clis.iter().enumerate() {
+        let ordinal = u16::try_from(ordinal).map_err(|_| {
+            corrupt("typed-agent required CLI ordinal exceeds the validated contract bound")
+        })?;
+        let item = TypedAgentInstallItem {
+            job_id: job.job_id.clone(),
+            ordinal,
+            required_cli: required_cli.clone(),
+            state: TypedAgentInstallState::Queued,
+            error: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        item.validate()
+            .map_err(typed_agent_install_validation_error)?;
+        transaction
+            .execute(
+                "INSERT INTO loom_cli_install_items(
+                     job_id, ordinal, cli_program, state, error, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?5)",
+                params![
+                    item.job_id.as_str(),
+                    i64::from(item.ordinal),
+                    item.required_cli.program.as_str(),
+                    typed_agent_install_state_str(item.state),
+                    to_sqlite_integer(now)?,
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+    }
+    Ok(Some(job))
+}
+
+fn typed_agent_install_jobs_tx(
+    connection: &Connection,
+    job_id: Option<&str>,
+    agent_type_id: Option<&str>,
+) -> StoreResult<Vec<TypedAgentInstallJob>> {
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT job_id, agent_type_id, agent_type_rev, agent_type_digest,
+                    state, total, completed, current_cli, error,
+                    created_at_ms, updated_at_ms
+             FROM loom_cli_install_jobs
+             WHERE (?1 IS NULL OR job_id = ?1)
+               AND (?2 IS NULL OR agent_type_id = ?2)
+             ORDER BY agent_type_id, agent_type_rev, job_id",
+        )
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query(params![job_id, agent_type_id])
+        .map_err(map_sqlite_error)?;
+    let mut jobs = Vec::new();
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        jobs.push(typed_agent_install_job_row(row)?);
+    }
+    Ok(jobs)
+}
+
+/// Status is a reconnect surface, so its unfiltered history bound belongs in
+/// SQL rather than after row hydration. Select the newest jobs first, then
+/// restore the public stable type/revision order within that bounded window.
+fn typed_agent_install_status_jobs_tx(
+    connection: &Connection,
+    job_id: Option<&str>,
+    agent_type_id: Option<&str>,
+) -> StoreResult<Vec<TypedAgentInstallJob>> {
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT job_id, agent_type_id, agent_type_rev, agent_type_digest,
+                    state, total, completed, current_cli, error,
+                    created_at_ms, updated_at_ms
+             FROM loom_cli_install_jobs
+             WHERE (?1 IS NULL OR job_id = ?1)
+               AND (?2 IS NULL OR agent_type_id = ?2)
+             ORDER BY updated_at_ms DESC, agent_type_rev DESC, job_id DESC
+             LIMIT ?3",
+        )
+        .map_err(map_sqlite_error)?;
+    let limit = i64::try_from(TYPED_AGENT_INSTALL_STATUS_MAX_JOBS)
+        .map_err(|_| corrupt("typed-agent install status job bound exceeds SQLite INTEGER"))?;
+    let mut rows = statement
+        .query(params![job_id, agent_type_id, limit])
+        .map_err(map_sqlite_error)?;
+    let mut jobs = Vec::new();
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        jobs.push(typed_agent_install_job_row(row)?);
+    }
+    jobs.sort_by(|left, right| {
+        (&left.agent_type_id, left.agent_type_rev, &left.job_id).cmp(&(
+            &right.agent_type_id,
+            right.agent_type_rev,
+            &right.job_id,
+        ))
+    });
+    Ok(jobs)
+}
+
+fn typed_agent_install_job_tx(
+    connection: &Connection,
+    job_id: &str,
+) -> StoreResult<Option<TypedAgentInstallJob>> {
+    let mut jobs = typed_agent_install_jobs_tx(connection, Some(job_id), None)?;
+    if jobs.len() > 1 {
+        return Err(corrupt(format!(
+            "typed-agent install job id `{job_id}` is not unique"
+        )));
+    }
+    Ok(jobs.pop())
+}
+
+fn typed_agent_install_items_tx(
+    connection: &Connection,
+    job_id: Option<&str>,
+    agent_type_id: Option<&str>,
+) -> StoreResult<Vec<TypedAgentInstallItem>> {
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT item.job_id, item.ordinal, item.cli_program, item.state,
+                    item.error, item.created_at_ms, item.updated_at_ms
+             FROM loom_cli_install_items AS item
+             JOIN loom_cli_install_jobs AS job ON job.job_id = item.job_id
+             WHERE (?1 IS NULL OR item.job_id = ?1)
+               AND (?2 IS NULL OR job.agent_type_id = ?2)
+             ORDER BY job.agent_type_id, job.agent_type_rev, item.ordinal",
+        )
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query(params![job_id, agent_type_id])
+        .map_err(map_sqlite_error)?;
+    let mut items = Vec::new();
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        items.push(typed_agent_install_item_row(row)?);
+    }
+    Ok(items)
+}
+
+/// One bounded item query matching the status job window. Keeping the bound
+/// in the subquery avoids both historical over-read and one query per job.
+fn typed_agent_install_status_items_tx(
+    connection: &Connection,
+    job_id: Option<&str>,
+    agent_type_id: Option<&str>,
+) -> StoreResult<Vec<TypedAgentInstallItem>> {
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT item.job_id, item.ordinal, item.cli_program, item.state,
+                    item.error, item.created_at_ms, item.updated_at_ms
+             FROM loom_cli_install_items AS item
+             JOIN loom_cli_install_jobs AS job ON job.job_id = item.job_id
+             WHERE item.job_id IN (
+                 SELECT retained.job_id
+                 FROM loom_cli_install_jobs AS retained
+                 WHERE (?1 IS NULL OR retained.job_id = ?1)
+                   AND (?2 IS NULL OR retained.agent_type_id = ?2)
+                 ORDER BY retained.updated_at_ms DESC,
+                          retained.agent_type_rev DESC, retained.job_id DESC
+                 LIMIT ?3
+             )
+             ORDER BY job.agent_type_id, job.agent_type_rev, item.ordinal",
+        )
+        .map_err(map_sqlite_error)?;
+    let limit = i64::try_from(TYPED_AGENT_INSTALL_STATUS_MAX_JOBS)
+        .map_err(|_| corrupt("typed-agent install status job bound exceeds SQLite INTEGER"))?;
+    let mut rows = statement
+        .query(params![job_id, agent_type_id, limit])
+        .map_err(map_sqlite_error)?;
+    let mut items = Vec::new();
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        items.push(typed_agent_install_item_row(row)?);
+    }
+    Ok(items)
+}
+
+fn typed_agent_install_item_tx(
+    connection: &Connection,
+    job_id: &str,
+    ordinal: u16,
+) -> StoreResult<Option<TypedAgentInstallItem>> {
+    let items = typed_agent_install_items_tx(connection, Some(job_id), None)?;
+    Ok(items.into_iter().find(|item| item.ordinal == ordinal))
+}
+
+/// Cross-row invariant for the durable installer state machine. Job and item
+/// validators intentionally remain reusable value validators; this store
+/// boundary additionally proves that aggregate progress describes the exact
+/// item snapshot committed in the same transaction.
+fn validate_typed_agent_install_aggregate(
+    connection: &Connection,
+    actual_job: &TypedAgentInstallJob,
+    next_job: &TypedAgentInstallJob,
+    item_update: Option<&TypedAgentInstallItemCas>,
+) -> StoreResult<()> {
+    let actual_items = typed_agent_install_items_tx(connection, Some(&actual_job.job_id), None)?;
+    validate_typed_agent_install_snapshot(actual_job, &actual_items).map_err(|message| {
+        corrupt(format!(
+            "typed-agent install job `{}` has inconsistent durable rows: {message}",
+            actual_job.job_id
+        ))
+    })?;
+
+    let mut next_items = actual_items;
+    if let Some(update) = item_update {
+        let item = next_items
+            .iter_mut()
+            .find(|item| item.ordinal == update.expected.ordinal)
+            .ok_or_else(|| {
+                corrupt(format!(
+                    "typed-agent install item `{}:{}` disappeared during aggregate validation",
+                    update.expected.job_id, update.expected.ordinal
+                ))
+            })?;
+        *item = update.next.clone();
+    }
+    validate_typed_agent_install_snapshot(next_job, &next_items).map_err(|message| {
+        store_error(
+            ErrorCode::InvalidArgument,
+            format!(
+                "typed-agent install update for `{}` is inconsistent: {message}",
+                next_job.job_id
+            ),
+            false,
+        )
+    })?;
+
+    if let Some(update) = item_update
+        && update.next.state == TypedAgentInstallState::Failed
+        && (next_job.state != TypedAgentInstallState::Failed || next_job.error != update.next.error)
+    {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            "a failed typed-agent install item and its job must fail atomically with the same error",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_typed_agent_install_snapshot(
+    job: &TypedAgentInstallJob,
+    items: &[TypedAgentInstallItem],
+) -> Result<(), &'static str> {
+    if items.len() != usize::from(job.progress.total) {
+        return Err("item count does not match job total");
+    }
+    if items
+        .iter()
+        .enumerate()
+        .any(|(ordinal, item)| usize::from(item.ordinal) != ordinal || item.job_id != job.job_id)
+    {
+        return Err("item identity or ordinal does not match its job");
+    }
+    let succeeded = items
+        .iter()
+        .filter(|item| item.state == TypedAgentInstallState::Succeeded)
+        .count();
+    if succeeded != usize::from(job.progress.completed) {
+        return Err("completed count does not equal succeeded item count");
+    }
+    match job.state {
+        TypedAgentInstallState::Queued => {
+            if items
+                .iter()
+                .any(|item| item.state != TypedAgentInstallState::Queued)
+            {
+                return Err("queued job contains a non-queued item");
+            }
+        }
+        TypedAgentInstallState::Installing => {
+            let Some(current) = job.progress.current_cli.as_deref() else {
+                return Err("installing job has no current CLI");
+            };
+            let Some(item) = items
+                .iter()
+                .find(|item| item.required_cli.program == current)
+            else {
+                return Err("current CLI has no durable item");
+            };
+            if matches!(
+                item.state,
+                TypedAgentInstallState::Succeeded | TypedAgentInstallState::Failed
+            ) {
+                return Err("installing job points at a terminal item");
+            }
+        }
+        TypedAgentInstallState::Verifying | TypedAgentInstallState::Succeeded => {
+            if items
+                .iter()
+                .any(|item| item.state != TypedAgentInstallState::Succeeded)
+            {
+                return Err("verifying/succeeded job contains an incomplete item");
+            }
+        }
+        TypedAgentInstallState::Failed => {}
+    }
+    Ok(())
+}
+
+fn typed_agent_install_job_row(row: &rusqlite::Row<'_>) -> StoreResult<TypedAgentInstallJob> {
+    let agent_type_rev = u32::try_from(row.get::<_, i64>(2).map_err(map_sqlite_error)?)
+        .map_err(|_| corrupt("typed-agent install job revision is out of range"))?;
+    let total = u16::try_from(row.get::<_, i64>(5).map_err(map_sqlite_error)?)
+        .map_err(|_| corrupt("typed-agent install job total is out of range"))?;
+    let completed = u16::try_from(row.get::<_, i64>(6).map_err(map_sqlite_error)?)
+        .map_err(|_| corrupt("typed-agent install job completion count is out of range"))?;
+    let created_at_ms = u64::try_from(row.get::<_, i64>(9).map_err(map_sqlite_error)?)
+        .map_err(|_| corrupt("typed-agent install job creation timestamp is negative"))?;
+    let updated_at_ms = u64::try_from(row.get::<_, i64>(10).map_err(map_sqlite_error)?)
+        .map_err(|_| corrupt("typed-agent install job update timestamp is negative"))?;
+    let state: String = row.get(4).map_err(map_sqlite_error)?;
+    let job = TypedAgentInstallJob {
+        job_id: row.get(0).map_err(map_sqlite_error)?,
+        agent_type_id: row.get(1).map_err(map_sqlite_error)?,
+        agent_type_rev,
+        agent_type_digest: row.get(3).map_err(map_sqlite_error)?,
+        state: typed_agent_install_state(&state)?,
+        progress: TypedAgentInstallProgress {
+            total,
+            completed,
+            current_cli: row.get(7).map_err(map_sqlite_error)?,
+        },
+        error: row.get(8).map_err(map_sqlite_error)?,
+        created_at_ms,
+        updated_at_ms,
+    };
+    job.validate().map_err(|error| {
+        corrupt(format!(
+            "typed-agent install job `{}` is invalid: {error}",
+            job.job_id
+        ))
+    })?;
+    Ok(job)
+}
+
+fn typed_agent_install_item_row(row: &rusqlite::Row<'_>) -> StoreResult<TypedAgentInstallItem> {
+    let ordinal = u16::try_from(row.get::<_, i64>(1).map_err(map_sqlite_error)?)
+        .map_err(|_| corrupt("typed-agent install item ordinal is out of range"))?;
+    let created_at_ms = u64::try_from(row.get::<_, i64>(5).map_err(map_sqlite_error)?)
+        .map_err(|_| corrupt("typed-agent install item creation timestamp is negative"))?;
+    let updated_at_ms = u64::try_from(row.get::<_, i64>(6).map_err(map_sqlite_error)?)
+        .map_err(|_| corrupt("typed-agent install item update timestamp is negative"))?;
+    let state: String = row.get(3).map_err(map_sqlite_error)?;
+    let item = TypedAgentInstallItem {
+        job_id: row.get(0).map_err(map_sqlite_error)?,
+        ordinal,
+        required_cli: TypedAgentRequiredCli {
+            program: row.get(2).map_err(map_sqlite_error)?,
+        },
+        state: typed_agent_install_state(&state)?,
+        error: row.get(4).map_err(map_sqlite_error)?,
+        created_at_ms,
+        updated_at_ms,
+    };
+    item.validate().map_err(|error| {
+        corrupt(format!(
+            "typed-agent install item `{}:{}` is invalid: {error}",
+            item.job_id, item.ordinal
+        ))
+    })?;
+    Ok(item)
+}
+
+fn typed_agent_install_state(value: &str) -> StoreResult<TypedAgentInstallState> {
+    match value {
+        "queued" => Ok(TypedAgentInstallState::Queued),
+        "installing" => Ok(TypedAgentInstallState::Installing),
+        "verifying" => Ok(TypedAgentInstallState::Verifying),
+        "succeeded" => Ok(TypedAgentInstallState::Succeeded),
+        "failed" => Ok(TypedAgentInstallState::Failed),
+        _ => Err(corrupt(format!(
+            "typed-agent install state `{value}` is unknown"
+        ))),
+    }
+}
+
+const fn typed_agent_install_state_str(state: TypedAgentInstallState) -> &'static str {
+    match state {
+        TypedAgentInstallState::Queued => "queued",
+        TypedAgentInstallState::Installing => "installing",
+        TypedAgentInstallState::Verifying => "verifying",
+        TypedAgentInstallState::Succeeded => "succeeded",
+        TypedAgentInstallState::Failed => "failed",
+    }
+}
+
+fn typed_agent_install_validation_error(error: TypedAgentContractError) -> HaiderError {
+    store_error(
+        ErrorCode::InvalidArgument,
+        format!("invalid typed-agent install state: {error}"),
+        false,
+    )
+}
+
+fn typed_agent_install_conflict(message: impl Into<String>) -> HaiderError {
+    store_error(ErrorCode::RevisionConflict, message, false)
+}
+
 /// Round 3 — canonical form BEFORE validation and digesting: typed I/O is
 /// trimmed, API hosts are lowercased. Comparisons downstream (grant hosts,
 /// tail joins) then never fight case or stray whitespace.
@@ -15929,6 +16895,7 @@ mod m2d_law_tests {
                 max_attempts: 2,
                 max_evidence_per_attempt: Some(2),
                 depends_on: Vec::new(),
+                red_target: None,
                 verify_slots: Vec::new(),
             }],
         })

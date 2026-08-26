@@ -655,6 +655,7 @@ struct ObserveProjection {
     main_head_seq: u64,
     branches: HashMap<haider_protocol::ids::BranchId, haider_protocol::branch::BranchDescriptor>,
     updated_at_ms: u64,
+    graphs: haider_protocol::graph::GraphReductions,
 }
 
 /// Daemon-lifetime observe/roster fold. Missing sessions rebuild from the
@@ -710,6 +711,7 @@ struct ObserveFoldSnapshot {
     turns: u64,
     agent_metrics: Option<haider_protocol::agent::AgentMetricsSnapshot>,
     last_model: Option<String>,
+    workflow: Option<haider_protocol::graph::GraphStatus>,
 }
 
 enum CacheStart {
@@ -812,6 +814,11 @@ impl ObserveFold {
                 .metrics
                 .primary_agent_snapshot(session_id, self.head_seq),
             last_model: self.metrics.active_model().map(str::to_owned),
+            workflow: self
+                .projection
+                .graphs
+                .active()
+                .and_then(|reduction| reduction.status.clone()),
         }
     }
 }
@@ -879,6 +886,7 @@ impl ObserveFoldSnapshot {
                 .then(|| self.agent_metrics.clone())
                 .flatten(),
             needs_input: needs_input(self.run_state, &self.pending_menus),
+            workflow: self.workflow.clone(),
         }
     }
 }
@@ -1125,7 +1133,8 @@ async fn session_observe_digest(
     let event_limit = usize::try_from(last_event_limit)
         .unwrap_or(usize::MAX)
         .min(MAX_OBSERVE_EVENT_KINDS);
-    let digest = if metadata_only {
+    let workflow = snapshot.workflow.clone();
+    let mut digest = if metadata_only {
         let mut projection = ObserveProjection::new(event_limit);
         projection.title = snapshot.title;
         projection.finish(
@@ -1143,6 +1152,7 @@ async fn session_observe_digest(
             true,
         )
     };
+    digest.workflow = workflow;
     Ok(Some(digest))
 }
 
@@ -1160,10 +1170,12 @@ impl ObserveProjection {
             main_head_seq: 0,
             branches: HashMap::new(),
             updated_at_ms: 0,
+            graphs: haider_protocol::graph::GraphReductions::default(),
         }
     }
 
     fn apply(&mut self, envelope: haider_protocol::envelope::RawEnvelope) {
+        self.graphs.apply_envelope(&envelope);
         self.updated_at_ms = self.updated_at_ms.max(envelope.committed_at_ms);
         if let Some(kind) = envelope
             .payload
@@ -1385,6 +1397,10 @@ impl ObserveProjection {
             turn_count: None,
             agent_metrics: None,
             needs_input,
+            workflow: self
+                .graphs
+                .active()
+                .and_then(|reduction| reduction.status.clone()),
         }
     }
 }
@@ -2199,6 +2215,22 @@ impl HubConnection {
                     );
                 }
                 self.loom_register_agent_type(request_id, record).await
+            }
+            RequestBody::LoomInstallStatus {
+                job_id,
+                agent_type_id,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.loom_install_status(request_id, job_id, agent_type_id)
+                    .await
             }
             RequestBody::LoomRegisterWorkflow { source } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
@@ -6884,7 +6916,7 @@ impl HubConnection {
         request_id: RequestId,
         record: haider_protocol::loom::LoomAgentType,
     ) -> Result<(), SessionHubError> {
-        match self.hub.inner.store.loom_register_agent_type(record).await {
+        match self.hub.loom_register_agent_type(record).await {
             Ok(registration) => self.send(WireFrame::Response {
                 request_id,
                 body: ResponseBody::LoomRegistered { registration },
@@ -6897,6 +6929,37 @@ impl HubConnection {
                 None,
             ),
         }
+    }
+
+    async fn loom_install_status(
+        &self,
+        request_id: RequestId,
+        job_id: Option<String>,
+        agent_type_id: Option<String>,
+    ) -> Result<(), SessionHubError> {
+        let snapshot = match self
+            .hub
+            .typed_agent_install_status(job_id, agent_type_id)
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return self.respond_error(
+                    request_id,
+                    error.code.as_str(),
+                    &error.message,
+                    error.retryable,
+                    None,
+                );
+            }
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::LoomInstallStatus {
+                jobs: snapshot.jobs,
+                items: snapshot.items,
+            },
+        })
     }
 
     /// B1 — workflow registration from pipe source; the daemon compiles.
@@ -6992,6 +7055,25 @@ impl HubConnection {
                 false,
                 None,
             );
+        }
+        // Serialize the idle check and durable selection against turn
+        // admission. Once a turn is accepted its nonterminal RunState is
+        // visible before this lock can be acquired, so a provider request can
+        // never gain authority under one workflow and be switched to another
+        // by the native RPC while its response is in flight.
+        let _workflow_selection = self.hub.lock_workflow_selection(&session_id).await;
+        match self.hub.session_has_nonterminal_runs(&session_id).await {
+            Ok(false) => {}
+            Ok(true) => {
+                return self.respond_error(
+                    request_id,
+                    haider_rpc::ERROR_CODE_BUSY,
+                    "graph pin requires an idle session; retry after the active turn completes",
+                    true,
+                    None,
+                );
+            }
+            Err(error) => return self.respond_graph_error(request_id, error),
         }
         let command = GraphPinCommand {
             command_id: command_id.0,
@@ -7189,6 +7271,20 @@ impl HubConnection {
                 false,
                 None,
             );
+        }
+        let _workflow_selection = self.hub.lock_workflow_selection(&session_id).await;
+        match self.hub.session_has_nonterminal_runs(&session_id).await {
+            Ok(false) => {}
+            Ok(true) => {
+                return self.respond_error(
+                    request_id,
+                    haider_rpc::ERROR_CODE_BUSY,
+                    "graph switch requires an idle session; retry after the active turn completes",
+                    true,
+                    None,
+                );
+            }
+            Err(error) => return self.respond_graph_error(request_id, error),
         }
         let command = GraphSwitchCommand {
             command_id: command_id.0,
@@ -11459,7 +11555,11 @@ mod run_identity_tests {
     use super::*;
     use haider_protocol::EventPayload;
     use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
-    use haider_protocol::ids::{DeviceId, EventId};
+    use haider_protocol::graph::{
+        GraphAttemptOpened, GraphPhase, GraphPinned, GraphSuperseded, SHIP_LOOP_TEMPLATE,
+        STAGGERED_TEMPLATE, graph_template, graph_template_digest,
+    };
+    use haider_protocol::ids::{DeviceId, EventId, GraphId};
 
     fn state_envelope(run: &str, seq: u64, state: RunState) -> RawEnvelope {
         EventEnvelope {
@@ -11492,6 +11592,122 @@ mod run_identity_tests {
             projection.apply(envelope);
         }
         projection.finish(SessionId::new("session-run-identity"), head, 1, None)
+    }
+
+    fn graph_envelope(seq: u64, payload: EventPayload) -> RawEnvelope {
+        EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new(format!("workflow-projection-{seq}")),
+            seq,
+            session_id: SessionId::new("session-run-identity"),
+            branch_id: None,
+            run_id: None,
+            agent_id: None,
+            device_id: DeviceId::new("workflow-projection-test"),
+            authority_epoch: 0,
+            worker_generation: 1,
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: seq,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: serde_json::to_value(payload).expect("graph fact serializes"),
+        }
+    }
+
+    fn pinned_graph_events(
+        graph_id: &GraphId,
+        template_name: &str,
+        pin_seq: u64,
+    ) -> Vec<RawEnvelope> {
+        let template = graph_template(template_name).expect("built-in graph template exists");
+        let start_node = template
+            .start_node
+            .clone()
+            .expect("built-in graph template has a start node");
+        let digest = graph_template_digest(&template);
+        vec![
+            graph_envelope(
+                pin_seq,
+                EventPayload::GraphPinned(GraphPinned {
+                    graph_id: graph_id.clone(),
+                    template: template.name,
+                    digest,
+                    template_version: template.version,
+                    start_node: template.start_node,
+                    nodes: template.nodes,
+                }),
+            ),
+            graph_envelope(
+                pin_seq + 1,
+                EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+                    graph_id: graph_id.clone(),
+                    node: start_node,
+                    attempt: 1,
+                }),
+            ),
+        ]
+    }
+
+    #[test]
+    fn observe_digest_projects_the_session_pinned_workflow() {
+        let graph_id = GraphId::new("graph-observe-pin");
+        let expected_template = graph_template(SHIP_LOOP_TEMPLATE).expect("template exists");
+        let expected_digest = graph_template_digest(&expected_template);
+
+        let digest = digest_of(pinned_graph_events(&graph_id, SHIP_LOOP_TEMPLATE, 1));
+        let workflow = digest
+            .workflow
+            .expect("the observer projects the session's pinned workflow");
+
+        assert_eq!(workflow.graph_id, graph_id);
+        assert_eq!(workflow.template, SHIP_LOOP_TEMPLATE);
+        assert_eq!(workflow.digest, expected_digest);
+        assert_eq!(workflow.phase, GraphPhase::Active);
+        assert_eq!(workflow.current_node, expected_template.start_node);
+        assert_eq!(workflow.attempt, 1);
+    }
+
+    #[test]
+    fn observe_digest_selects_the_replacement_workflow_from_one_switch_fold() {
+        let old_graph_id = GraphId::new("graph-observe-old");
+        let new_graph_id = GraphId::new("graph-observe-new");
+        let mut envelopes = pinned_graph_events(&old_graph_id, SHIP_LOOP_TEMPLATE, 1);
+        envelopes.push(graph_envelope(
+            3,
+            EventPayload::GraphSuperseded(GraphSuperseded {
+                old: old_graph_id.clone(),
+                new: new_graph_id.clone(),
+            }),
+        ));
+        envelopes.extend(pinned_graph_events(&new_graph_id, STAGGERED_TEMPLATE, 4));
+
+        let mut projection = ObserveProjection::new(8);
+        for envelope in envelopes {
+            projection.apply(envelope);
+        }
+        let old_status = projection
+            .graphs
+            .graph(&old_graph_id)
+            .and_then(|reduction| reduction.status.as_ref())
+            .expect("the superseded workflow remains queryable in the same fold");
+        assert_eq!(old_status.phase, GraphPhase::Superseded);
+
+        let digest = projection.finish(SessionId::new("session-run-identity"), 5, 1, None);
+        let workflow = digest
+            .workflow
+            .expect("the observer selects the replacement pinned workflow");
+        let expected_template = graph_template(STAGGERED_TEMPLATE).expect("template exists");
+
+        assert_eq!(workflow.graph_id, new_graph_id);
+        assert_eq!(workflow.template, STAGGERED_TEMPLATE);
+        assert_eq!(workflow.digest, graph_template_digest(&expected_template));
+        assert_eq!(workflow.phase, GraphPhase::Active);
+        assert_eq!(workflow.current_node, expected_template.start_node);
+        assert_eq!(workflow.attempt, 1);
     }
 
     /// The id and the state are ONE observation. A client told "running" must

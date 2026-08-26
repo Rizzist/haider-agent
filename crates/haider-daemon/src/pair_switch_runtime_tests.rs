@@ -5,7 +5,10 @@
 
 #![allow(clippy::expect_used)]
 
-use crate::session_hub::{SessionHub, SessionHubConfig, SessionHubError};
+use crate::accounts::ConnectionTransport;
+use crate::session_hub::{
+    FrameSendError, FrameSink, SessionHub, SessionHubConfig, SessionHubError,
+};
 use crate::worker::{
     BrokerToolFactory, ProviderFactory, ResolvedTurnProvider, WorkerDependencies, WorkerManager,
 };
@@ -29,9 +32,36 @@ use haider_protocol::session::{
 };
 use haider_protocol::state::RunState;
 use haider_provider::{FakeProvider, FakeStep, ProviderError};
+use haider_rpc::{
+    AttachMode, Capability, CommandId, RequestBody, RequestId, ResponseBody, WireFrame,
+};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use tokio::time::{Duration, timeout};
+
+#[derive(Default)]
+struct GraphSelectionSink(Mutex<Vec<WireFrame>>);
+
+impl FrameSink for GraphSelectionSink {
+    fn try_send(&self, frame: WireFrame) -> Result<(), FrameSendError> {
+        self.0.lock().expect("graph sink lock").push(frame);
+        Ok(())
+    }
+}
+
+fn graph_response(sink: &GraphSelectionSink, request_id: &str) -> Option<haider_rpc::ResponseBody> {
+    sink.0
+        .lock()
+        .expect("graph sink frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id: found,
+                body,
+            } if found.as_str() == request_id => Some(body.clone()),
+            _ => None,
+        })
+}
 
 /// Routes each turn to the fake registered for `metadata.provider` — the
 /// injected analog of per-provider adapters, echoing the R6 contract
@@ -1036,6 +1066,123 @@ async fn manual_compaction_follows_the_current_selection() {
     assert_eq!(b_requests[0].model, "model-b");
     assert_eq!(fake_a.requests().len(), 1, "provider A saw only turn 1");
 
+    world.shutdown().await;
+}
+
+/// A fresh manual compaction and native workflow selection have one durable
+/// order. Compaction-first makes the session nonterminal and the switch is
+/// Busy; switch-first commits its new pin before the compaction run appears.
+#[tokio::test]
+async fn manual_compaction_and_graph_switch_cannot_cross_the_idle_boundary() {
+    let fake_a = Arc::new(FakeProvider::new(
+        [
+            text_turn("history for graph race"),
+            vec![
+                FakeStep::Delay { ms: 50 },
+                FakeStep::EmitText {
+                    text: "summary after ordered graph selection".into(),
+                },
+                FakeStep::Finish {
+                    reason: FinishReason::EndTurn,
+                },
+            ],
+        ]
+        .concat(),
+    ));
+    let world = PairSwitchWorld::boot(
+        "compact-graph-switch",
+        fake_a,
+        Arc::new(FakeProvider::new(Vec::new())),
+    )
+    .await;
+    world
+        .run_turn("compact-graph-history", "build history")
+        .await;
+
+    let sink = Arc::new(GraphSelectionSink::default());
+    let connection = world
+        .hub
+        .open_connection(
+            BTreeSet::from([Capability::View, Capability::Control]),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("graph control connection");
+    connection
+        .request(
+            RequestId::new("compact-graph-attach"),
+            RequestBody::SessionAttach {
+                session_id: world.session_id.clone(),
+                after_seq: 0,
+                mode: AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("attach graph control");
+    connection
+        .request(
+            RequestId::new("compact-graph-pin"),
+            RequestBody::GraphPin {
+                command_id: CommandId::new("compact-graph-pin-command"),
+                session_id: world.session_id.clone(),
+                worker_generation: world.store.worker_generation(),
+                template: haider_protocol::graph::SHIP_LOOP_TEMPLATE.into(),
+            },
+        )
+        .await
+        .expect("initial graph pin routes");
+    let Some(ResponseBody::GraphPin {
+        graph_id: old_graph_id,
+        ..
+    }) = graph_response(&sink, "compact-graph-pin")
+    else {
+        panic!("initial graph pin succeeds while the session is idle")
+    };
+
+    let manager = world.manager.handle();
+    let compact = manager.compact(
+        world.session_id.clone(),
+        "compact-graph-command".into(),
+        world.store.worker_generation(),
+        None,
+    );
+    let switch = async {
+        connection
+            .request(
+                RequestId::new("compact-graph-switch"),
+                RequestBody::GraphSwitch {
+                    command_id: CommandId::new("compact-graph-switch-command"),
+                    session_id: world.session_id.clone(),
+                    worker_generation: world.store.worker_generation(),
+                    old_graph_id,
+                    template: haider_protocol::graph::STAGGERED_TEMPLATE.into(),
+                },
+            )
+            .await
+            .expect("graph switch routes");
+        graph_response(&sink, "compact-graph-switch").expect("graph switch response")
+    };
+    let (accepted, switched) = tokio::join!(compact, switch);
+    let accepted = accepted.expect("manual compaction remains admissible");
+    match switched {
+        ResponseBody::Error { code, .. } => {
+            assert_eq!(
+                code,
+                haider_rpc::ERROR_CODE_BUSY,
+                "compaction-first makes graph selection nonterminal"
+            );
+        }
+        ResponseBody::GraphSwitch { pinned_seq, .. } => {
+            assert!(
+                pinned_seq < accepted.accepted_seq,
+                "switch-first must commit before compaction admission"
+            );
+        }
+        other => panic!("unexpected compact/switch race response: {other:?}"),
+    }
+
+    connection.close().await.expect("graph connection closes");
     world.shutdown().await;
 }
 

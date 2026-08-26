@@ -156,7 +156,7 @@ class ChatViewModel : ViewModel() {
     }
 
     private fun applyReply(reply: ChatReply) {
-        val agentId = turnAgents[reply.id] ?: return
+        val agentId = turnAgents[reply.id] ?: beginUnsolicitedStream(reply) ?: return
         when (reply) {
             is ChatReply.Delta -> mutateAgent(agentId) { message ->
                 when (reply.segment) {
@@ -189,6 +189,28 @@ class ChatViewModel : ViewModel() {
                 }
             }
         }
+    }
+
+    /**
+     * Daemon-owned negative IDs carry authenticated background chat streams,
+     * including monitor reports. Positive IDs remain strictly correlated to
+     * requests reserved by [send].
+     */
+    private fun beginUnsolicitedStream(reply: ChatReply): Long? {
+        if (reply.id >= 0L || reply is ChatReply.Done || reply is ChatReply.Error) return null
+        val agentId = nextId++
+        _messages.add(
+            Message(
+                id = agentId,
+                role = Role.Agent,
+                text = "",
+                streaming = true,
+                status = "monitor update…",
+                provider = sessionConfig?.current?.provider,
+            ),
+        )
+        turnAgents[reply.id] = agentId
+        return agentId
     }
 
     private fun mutateAgent(id: Long, transform: (Message) -> Message) {

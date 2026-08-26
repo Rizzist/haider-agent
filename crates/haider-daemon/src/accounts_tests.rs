@@ -10407,6 +10407,11 @@ async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs
     let latched = crate::worker::WebCapabilityDegrade {
         anthropic_web_tools: true,
         openai_alpha_search: false,
+        disable_hosted_web_tools: false,
+    };
+    let loom_fenced = crate::worker::WebCapabilityDegrade {
+        disable_hosted_web_tools: true,
+        ..crate::worker::WebCapabilityDegrade::default()
     };
 
     factory
@@ -10425,9 +10430,13 @@ async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs
         .resolve_for_turn_with_web(&metadata(OPENAI_PROVIDER_NAME), latched)
         .await
         .expect("the SAME latch on a different pair");
+    factory
+        .resolve_for_turn_with_web(&metadata(OPENAI_PROVIDER_NAME), loom_fenced)
+        .await
+        .expect("Loom fence disables hosted search on every pair");
 
     let recorded = builder.recorded();
-    assert_eq!(recorded.len(), 4);
+    assert_eq!(recorded.len(), 5);
     assert!(
         recorded[0].1.web_tools,
         "an undegraded anthropic turn declares its server web tools"
@@ -10443,6 +10452,10 @@ async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs
     assert!(
         recorded[3].1.web_tools,
         "the latch is anthropic-scoped: another pair keeps its own native search"
+    );
+    assert!(
+        !recorded[4].1.web_tools,
+        "the Loom fence disables provider-hosted web outside the local dispatcher"
     );
 }
 

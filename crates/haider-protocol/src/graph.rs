@@ -29,6 +29,9 @@ pub const GRAPH_MAX_NODES: usize = 512;
 pub const GRAPH_MAX_EDGES: usize = 4_096;
 pub const GRAPH_MAX_SLOTS: usize = 4_096;
 pub const GRAPH_MAX_ATTEMPTS: u32 = 8;
+/// Maximum conditional self/back hops in one immutable graph instance.
+/// Forward DAG traversal does not consume this budget.
+pub const GRAPH_MAX_CONDITIONAL_HOPS: u32 = 24;
 pub const GRAPH_MAX_EVIDENCE_PER_ATTEMPT: u32 = 8;
 pub const GRAPH_EVIDENCE_DETAIL_MAX_BYTES: usize = 1_024;
 pub const GRAPH_BRIEF_MAX_BYTES: usize = 400;
@@ -172,13 +175,19 @@ pub struct GraphNodeSpec {
     pub executor: GraphExecutorShape,
     pub max_attempts: u32,
     /// Maximum evidence items accepted before an unsatisfied attempt settles
-    /// red and opens the next BUILD epoch. Human gates have no such round.
+    /// red and follows its declared retry target (or legacy START fallback).
+    /// Human gates have no such round.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_evidence_per_attempt: Option<u32>,
     /// Immutable incoming dependencies. M1's built-in template is a simple
     /// linear DAG, but the dependency shape is stamped rather than inferred.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<GraphNodeName>,
+    /// Target reopened when this node remains red after its bounded evidence
+    /// round. Self is a ↻ retry; a transitive dependency ancestor is a ↺
+    /// back-edge. Absence preserves the legacy whole-graph START retry law.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub red_target: Option<GraphNodeName>,
     /// Declared evidence frontiers for slot-aware `AllOfN` gates. Empty is
     /// the durable M1 discriminator and retains the legacy flat-counter law.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -241,8 +250,9 @@ pub struct GraphPinned {
 pub struct GraphAttemptOpened {
     pub graph_id: GraphId,
     pub node: GraphNodeName,
-    /// M1's graph-wide attempt epoch. Reopening BUILD increments it and every
-    /// later node in that lineage carries the same value.
+    /// Monotonic traversal epoch. A conditional hop increments it; nodes
+    /// reached afterward carry the new epoch while unaffected fork siblings
+    /// may retain an older node-local attempt.
     pub attempt: u32,
 }
 
@@ -420,7 +430,7 @@ pub struct ProcessSignalRecorded {
 pub struct EvidenceRecorded {
     pub graph_id: GraphId,
     pub node: GraphNodeName,
-    /// The graph-wide BUILD lineage epoch, implied by the open obligation at
+    /// The target node's open traversal epoch, implied by its obligation at
     /// tool-call time and stamped by the daemon.
     pub attempt: u32,
     pub verdict: EvidenceVerdict,
@@ -991,7 +1001,7 @@ impl GraphStatus {
         let mut line = format!(
             "GraphBrief: {} attempt {}/{}; graph_id={}; ready={}; gate {}; evidence {} green/{} red ({} effective); next: {}.",
             node.label(),
-            self.attempt,
+            node_status.current_attempt.unwrap_or(self.attempt),
             GRAPH_MAX_ATTEMPTS,
             self.graph_id,
             ready,
@@ -1332,17 +1342,35 @@ pub fn reduce_graph(envelopes: &[RawEnvelope]) -> GraphReduction {
 pub fn reduce_graphs(envelopes: &[RawEnvelope]) -> GraphReductions {
     let mut reductions = GraphReductions::default();
     for envelope in envelopes {
-        reductions.apply_envelope(envelope);
+        reductions.apply_envelope_unprojected(envelope);
     }
     refresh_run_set_projections(&mut reductions);
     reductions
 }
 
 impl GraphReductions {
-    fn apply_envelope(&mut self, envelope: &RawEnvelope) {
+    /// Incrementally folds one journal envelope into this session projection.
+    /// Run-set children and their aggregate root are coherent on return. This
+    /// is exposed so same-head observers do not need to replay an unchanged
+    /// prefix; batch reducers use the unprojected fold and reconcile once.
+    pub fn apply_envelope(&mut self, envelope: &RawEnvelope) {
+        if self.apply_envelope_unprojected(envelope) {
+            refresh_run_set_projections(self);
+        }
+    }
+
+    /// Applies graph facts without rebuilding derived run-set aggregates.
+    /// Callers folding a batch must invoke `refresh_run_set_projections` once
+    /// after its final envelope.
+    fn apply_envelope_unprojected(&mut self, envelope: &RawEnvelope) -> bool {
         let Some(payload) = graph_reduction_payload(&envelope.payload) else {
-            return;
+            return false;
         };
+        self.apply_payload(payload);
+        true
+    }
+
+    fn apply_payload(&mut self, payload: EventPayload) {
         match payload {
             EventPayload::GraphPinned(pinned) => {
                 let GraphPinned {
@@ -1479,18 +1507,41 @@ impl GraphReductions {
                 if status.phase != GraphPhase::Active {
                     return;
                 }
-                status.attempt = opened.attempt;
+                let reopening = status
+                    .nodes
+                    .iter()
+                    .find(|node| node.node == opened.node)
+                    .is_some_and(|node| node.attempts_opened > 0);
+                status.attempt = status.attempt.max(opened.attempt);
                 let start_node = status.start_node.clone().unwrap_or_else(build_node);
                 if opened.node == start_node {
-                    // A new START opening is a new graph-wide revision epoch:
-                    // every prior gate/evidence projection is stale, while
-                    // immutable attempt counts remain historical truth.
+                    // START dominates every valid modern DAG, so its targeted
+                    // forward slice is the whole graph. Keep the explicit
+                    // whole-graph branch for legacy pins whose unstamped
+                    // dependency lists cannot reconstruct that same slice.
                     for node in &mut status.nodes {
                         node.current_attempt = None;
                         node.clear_evidence_frontier();
                         node.satisfied = false;
                     }
                     status.ready_nodes.clear();
+                } else if reopening {
+                    // A targeted retry invalidates exactly the reopened node
+                    // and its dependency descendants. Independent fork
+                    // siblings keep their green/partial frontiers and may
+                    // legitimately retain an older node-local epoch.
+                    let invalidated = graph_descendants_inclusive(&template_nodes, &opened.node);
+                    for node in &mut status.nodes {
+                        if invalidated.contains(&node.node) {
+                            node.current_attempt = None;
+                            node.clear_evidence_frontier();
+                            node.satisfied = false;
+                        }
+                    }
+                    status
+                        .ready_nodes
+                        .retain(|node| !invalidated.contains(node));
+                    refresh_current_node(status, &template_nodes);
                 }
                 if let Some(node) = status.node_mut(&opened.node) {
                     node.attempts_opened = node.attempts_opened.saturating_add(1);
@@ -1513,7 +1564,11 @@ impl GraphReductions {
                 };
                 if status.phase != GraphPhase::Active
                     || !status.node_is_ready(&recorded.node)
-                    || status.attempt != recorded.attempt
+                    || status
+                        .nodes
+                        .iter()
+                        .find(|node| node.node == recorded.node)
+                        .is_none_or(|node| node.current_attempt != Some(recorded.attempt))
                 {
                     return;
                 }
@@ -1585,6 +1640,16 @@ impl GraphReductions {
                 let Some(status) = reduction.status_for_graph_mut(&satisfied.graph_id) else {
                     return;
                 };
+                if status.phase != GraphPhase::Active
+                    || !status.node_is_ready(&satisfied.node)
+                    || status
+                        .nodes
+                        .iter()
+                        .find(|node| node.node == satisfied.node)
+                        .is_none_or(|node| node.current_attempt != Some(satisfied.attempt))
+                {
+                    return;
+                }
                 if let Some(node) = status.node_mut(&satisfied.node) {
                     node.satisfied = true;
                 }
@@ -1823,6 +1888,27 @@ fn refresh_current_node(status: &mut GraphStatus, template_nodes: &[GraphNodeSpe
     status.current_node = status.ready_nodes.first().cloned();
 }
 
+fn graph_descendants_inclusive(
+    specs: &[GraphNodeSpec],
+    target: &GraphNodeName,
+) -> HashSet<GraphNodeName> {
+    let mut descendants = HashSet::from([target.clone()]);
+    let mut queue = VecDeque::from([target.clone()]);
+    while let Some(node) = queue.pop_front() {
+        for dependent in specs.iter().filter(|candidate| {
+            candidate
+                .depends_on
+                .iter()
+                .any(|dependency| dependency == &node)
+        }) {
+            if descendants.insert(dependent.name.clone()) {
+                queue.push_back(dependent.name.clone());
+            }
+        }
+    }
+    descendants
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TelemetryAttempt {
     node: GraphNodeName,
@@ -1886,6 +1972,16 @@ impl TelemetryRun {
         }
         self.last_observed_at_ms = self.last_observed_at_ms.max(at_ms);
     }
+
+    fn close_invalidated_attempts(&mut self, invalidated: &HashSet<GraphNodeName>, at_ms: u64) {
+        for attempt in &mut self.attempts {
+            if attempt.closed_at_ms.is_none() && invalidated.contains(&attempt.node) {
+                attempt.closed_at_ms = Some(at_ms);
+                attempt.outcome = GraphNodeAttemptOutcome::Retried;
+            }
+        }
+        self.last_observed_at_ms = self.last_observed_at_ms.max(at_ms);
+    }
 }
 
 /// Durable continuation of the exact from-scratch telemetry fold. Persisted
@@ -1907,7 +2003,7 @@ impl GraphTelemetryAccumulator {
         self.reductions_by_session
             .entry(envelope.session_id.clone())
             .or_default()
-            .apply_envelope(envelope);
+            .apply_envelope_unprojected(envelope);
         self.tool_selection.apply(envelope);
         let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
             return;
@@ -1953,17 +2049,21 @@ impl GraphTelemetryAccumulator {
             }
             EventPayload::GraphAttemptOpened(opened) => {
                 if let Some(run) = self.runs.get_mut(&(session_id, opened.graph_id.clone())) {
-                    let is_new_epoch = run
-                        .start_node
-                        .as_ref()
-                        .or_else(|| run.specs.first().map(|spec| &spec.name))
-                        .is_some_and(|start| start == &opened.node)
-                        && run
-                            .attempts
-                            .iter()
-                            .any(|prior| prior.attempt < opened.attempt);
-                    if is_new_epoch {
-                        run.close_open_attempts(at_ms, GraphNodeAttemptOutcome::Retried);
+                    let reopening = run
+                        .attempts
+                        .iter()
+                        .any(|prior| prior.node == opened.node && prior.attempt < opened.attempt);
+                    if reopening {
+                        let start_node = run
+                            .start_node
+                            .as_ref()
+                            .or_else(|| run.specs.first().map(|spec| &spec.name));
+                        let invalidated = if start_node == Some(&opened.node) {
+                            run.specs.iter().map(|spec| spec.name.clone()).collect()
+                        } else {
+                            graph_descendants_inclusive(&run.specs, &opened.node)
+                        };
+                        run.close_invalidated_attempts(&invalidated, at_ms);
                     }
                     run.last_observed_at_ms = run.last_observed_at_ms.max(at_ms);
                     run.attempts.push(TelemetryAttempt {
@@ -2740,6 +2840,7 @@ pub fn ship_loop_nodes() -> Vec<GraphNodeSpec> {
             max_attempts: GRAPH_MAX_ATTEMPTS,
             max_evidence_per_attempt: Some(GRAPH_MAX_EVIDENCE_PER_ATTEMPT),
             depends_on: Vec::new(),
+            red_target: None,
             verify_slots: Vec::new(),
         },
         GraphNodeSpec {
@@ -2749,6 +2850,7 @@ pub fn ship_loop_nodes() -> Vec<GraphNodeSpec> {
             max_attempts: GRAPH_MAX_ATTEMPTS,
             max_evidence_per_attempt: Some(GRAPH_MAX_EVIDENCE_PER_ATTEMPT),
             depends_on: vec![build_node()],
+            red_target: None,
             verify_slots: ["tests", "lint", "typecheck"]
                 .into_iter()
                 .map(|id| EvidenceSlotSpec {
@@ -2765,6 +2867,7 @@ pub fn ship_loop_nodes() -> Vec<GraphNodeSpec> {
             max_attempts: GRAPH_MAX_ATTEMPTS,
             max_evidence_per_attempt: None,
             depends_on: vec![verify_node()],
+            red_target: None,
             verify_slots: Vec::new(),
         },
     ]
@@ -3011,6 +3114,34 @@ pub fn validate_graph_template(template: &GraphTemplateSpec) -> Result<(), Graph
                 ));
             }
         }
+        if let Some(target) = &node.red_target {
+            if !names.contains(target) {
+                return Err(reject(
+                    GraphTemplateRejection::UnknownDependency,
+                    format!(
+                        "graph node {} has an unknown red target {target}",
+                        node.name
+                    ),
+                ));
+            }
+            if matches!(node.gate, GraphGateKind::HumanConfirm) {
+                return Err(reject(
+                    GraphTemplateRejection::InvalidGate,
+                    format!("human graph node {} cannot declare a red target", node.name),
+                ));
+            }
+            if target != &node.name
+                && !graph_dependency_ancestors(&template.nodes, &node.name).contains(target)
+            {
+                return Err(reject(
+                    GraphTemplateRejection::InvalidGate,
+                    format!(
+                        "graph node {} red target {target} is not a dependency ancestor",
+                        node.name
+                    ),
+                ));
+            }
+        }
         let mut slots = HashSet::new();
         for slot in &node.verify_slots {
             if slot.id.is_empty()
@@ -3116,6 +3247,28 @@ pub fn validate_graph_template(template: &GraphTemplateSpec) -> Result<(), Graph
     Ok(())
 }
 
+fn graph_dependency_ancestors(
+    specs: &[GraphNodeSpec],
+    node: &GraphNodeName,
+) -> HashSet<GraphNodeName> {
+    let mut ancestors = HashSet::new();
+    let mut queue = specs
+        .iter()
+        .find(|spec| &spec.name == node)
+        .map_or_else(VecDeque::new, |spec| {
+            VecDeque::from(spec.depends_on.clone())
+        });
+    while let Some(dependency) = queue.pop_front() {
+        if !ancestors.insert(dependency.clone()) {
+            continue;
+        }
+        if let Some(spec) = specs.iter().find(|spec| spec.name == dependency) {
+            queue.extend(spec.depends_on.iter().cloned());
+        }
+    }
+    ancestors
+}
+
 fn node_spec(
     name: &str,
     gate: GraphGateKind,
@@ -3134,6 +3287,7 @@ fn node_spec(
             .iter()
             .filter_map(|name| GraphNodeName::new(*name).ok())
             .collect(),
+        red_target: None,
         verify_slots: slots,
     }
 }
@@ -3508,6 +3662,7 @@ mod tests {
                 max_attempts: 2,
                 max_evidence_per_attempt: Some(2),
                 depends_on: Vec::new(),
+                red_target: None,
                 verify_slots: Vec::new(),
             }],
         }
@@ -3687,6 +3842,130 @@ mod tests {
     }
 
     #[test]
+    fn incremental_reduction_keeps_run_set_and_root_projection_coherent() {
+        // The observer retains this projection across calls. Every public
+        // incremental fold must therefore equal a from-scratch reduction of
+        // the same prefix, including the derived child and aggregate state.
+        let (mut facts, root, run_set, plan) = run_set_prefix(1);
+        let child = GraphId::new("incremental-child");
+        attach_and_pin(&mut facts, &run_set, &plan, 1, None, &child);
+        facts.push(graph_fact(
+            6,
+            EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+                graph_id: child.clone(),
+                node: build_node(),
+                attempt: 1,
+            }),
+        ));
+        facts.push(graph_fact(
+            7,
+            EventPayload::GraphCompleted(GraphCompleted { graph_id: child }),
+        ));
+
+        let mut incremental = GraphReductions::default();
+        for (index, fact) in facts.iter().enumerate() {
+            incremental.apply_envelope(fact);
+            assert_eq!(incremental, reduce_graphs(&facts[..=index]));
+        }
+        assert_eq!(incremental.run_sets[&run_set].terminal_children, 1);
+        let root = incremental
+            .graph(&root)
+            .and_then(|reduction| reduction.status.as_ref())
+            .expect("aggregate root");
+        assert_eq!(root.phase, GraphPhase::Completed);
+        assert_eq!(root.run_set.as_ref(), incremental.run_sets.get(&run_set));
+    }
+
+    #[test]
+    fn legacy_start_retry_still_invalidates_nodes_without_stamped_dependencies() {
+        // Pre-M2b pins did not carry dependency edges. START must therefore
+        // retain its historical whole-graph invalidation semantics instead
+        // of deriving an incomplete forward slice from empty legacy fields.
+        let graph_id = GraphId::new("legacy-start-retry");
+        let build = build_node();
+        let verify = verify_node();
+        let nodes = vec![
+            node_spec(
+                "BUILD",
+                GraphGateKind::CommandGreen,
+                GraphExecutorShape::Inline,
+                &[],
+                vec![],
+            ),
+            node_spec(
+                "VERIFY",
+                GraphGateKind::CommandGreen,
+                GraphExecutorShape::Inline,
+                &[],
+                vec![],
+            ),
+        ];
+        let mut verify_green = model_green(&graph_id, 1, "legacy verify");
+        verify_green.node = verify.clone();
+        let facts = vec![
+            graph_fact(
+                1,
+                EventPayload::GraphPinned(GraphPinned {
+                    graph_id: graph_id.clone(),
+                    template: "legacy-start-retry".into(),
+                    digest: "legacy-start-retry-digest".into(),
+                    template_version: 0,
+                    start_node: None,
+                    nodes,
+                }),
+            ),
+            graph_fact(
+                2,
+                EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+                    graph_id: graph_id.clone(),
+                    node: build.clone(),
+                    attempt: 1,
+                }),
+            ),
+            graph_fact(
+                3,
+                EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+                    graph_id: graph_id.clone(),
+                    node: verify.clone(),
+                    attempt: 1,
+                }),
+            ),
+            graph_fact(4, EventPayload::EvidenceRecorded(verify_green)),
+            graph_fact(
+                5,
+                EventPayload::GraphGateSatisfied(GraphGateSatisfied {
+                    graph_id: graph_id.clone(),
+                    node: verify.clone(),
+                    attempt: 1,
+                }),
+            ),
+            graph_fact(
+                6,
+                EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+                    graph_id: graph_id.clone(),
+                    node: build.clone(),
+                    attempt: 2,
+                }),
+            ),
+        ];
+
+        let reduced = reduce_graphs(&facts);
+        let status = reduced
+            .graph(&graph_id)
+            .and_then(|reduction| reduction.status.as_ref())
+            .expect("legacy status");
+        assert_eq!(status.current_node, Some(build));
+        let verify = status
+            .nodes
+            .iter()
+            .find(|node| node.node == verify)
+            .expect("verify state");
+        assert_eq!(verify.current_attempt, None);
+        assert!(!verify.satisfied);
+        assert_eq!(verify.evidence.effective_green, 0);
+    }
+
+    #[test]
     fn m2d_retrying_one_child_preserves_its_siblings_green_state() {
         // Expected failure under mutation: share one epoch/frontier across all
         // todos, causing child A's retry to clear child B's satisfied green.
@@ -3820,6 +4099,7 @@ mod tests {
                 max_attempts: 2,
                 max_evidence_per_attempt: Some(1),
                 depends_on: vec![GraphNodeName::new("A").unwrap()],
+                red_target: None,
                 verify_slots: Vec::new(),
             }],
         };
@@ -4048,6 +4328,20 @@ mod tests {
         );
         assert_rejection(unknown, GraphTemplateRejection::UnknownDependency);
 
+        // A conditional back-edge may only reopen the same node or one of
+        // its dependency ancestors; otherwise it could jump across forks or
+        // forward through the DAG without a well-defined invalidation slice.
+        let mut non_ancestor_back_edge = ship_loop_template();
+        non_ancestor_back_edge.nodes[0].red_target = Some(verify_node());
+        assert_rejection(non_ancestor_back_edge, GraphTemplateRejection::InvalidGate);
+
+        // Humans decide explicitly through a menu and never autonomously
+        // consume a red condition, so a retry target on a human gate is
+        // structurally invalid even when it points to an ancestor.
+        let mut human_back_edge = ship_loop_template();
+        human_back_edge.nodes[2].red_target = Some(build_node());
+        assert_rejection(human_back_edge, GraphTemplateRejection::InvalidGate);
+
         // Mutation guard: raising or forgetting the 512-node bound permits
         // unbounded reducer state from one pin.
         let over = template(
@@ -4072,6 +4366,7 @@ mod tests {
                                 GraphNodeName::new(dependency.clone()).expect("bounded dependency")
                             })
                             .collect(),
+                        red_target: None,
                         verify_slots: Vec::new(),
                     }
                 })

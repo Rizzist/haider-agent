@@ -1889,6 +1889,7 @@ fn golden_convergence_graph_facts_and_old_decoder_tolerance() {
             max_attempts: 8,
             max_evidence_per_attempt: Some(8),
             depends_on: Vec::new(),
+            red_target: None,
             verify_slots: Vec::new(),
         },
         GraphNodeSpec {
@@ -1898,6 +1899,7 @@ fn golden_convergence_graph_facts_and_old_decoder_tolerance() {
             max_attempts: 8,
             max_evidence_per_attempt: Some(8),
             depends_on: vec![haider_protocol::graph::build_node()],
+            red_target: None,
             verify_slots: Vec::new(),
         },
         GraphNodeSpec {
@@ -1907,6 +1909,7 @@ fn golden_convergence_graph_facts_and_old_decoder_tolerance() {
             max_attempts: 8,
             max_evidence_per_attempt: None,
             depends_on: vec![haider_protocol::graph::verify_node()],
+            red_target: None,
             verify_slots: Vec::new(),
         },
     ];
@@ -2104,6 +2107,7 @@ fn ship_loop_template_and_graph_brief_are_bounded_contracts() {
                 max_attempts: 8,
                 max_evidence_per_attempt: Some(8),
                 depends_on: Vec::new(),
+                red_target: None,
                 verify_slots: Vec::new(),
             },
             GraphNodeSpec {
@@ -2113,6 +2117,7 @@ fn ship_loop_template_and_graph_brief_are_bounded_contracts() {
                 max_attempts: 8,
                 max_evidence_per_attempt: Some(8),
                 depends_on: vec![haider_protocol::graph::build_node()],
+                red_target: None,
                 verify_slots: ["tests", "lint", "typecheck"]
                     .into_iter()
                     .map(|id| EvidenceSlotSpec {
@@ -2129,6 +2134,7 @@ fn ship_loop_template_and_graph_brief_are_bounded_contracts() {
                 max_attempts: 8,
                 max_evidence_per_attempt: None,
                 depends_on: vec![haider_protocol::graph::verify_node()],
+                red_target: None,
                 verify_slots: Vec::new(),
             },
         ]

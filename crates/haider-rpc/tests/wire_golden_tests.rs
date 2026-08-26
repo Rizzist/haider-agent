@@ -211,6 +211,7 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "hooks.revoke",
         "hooks.trust",
         "loom.list",
+        "loom.install.status",
         "loom.register_agent_type",
         "loom.register_workflow",
         "provider.configure",

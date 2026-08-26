@@ -36,10 +36,10 @@ pub use event_store::{
     GraphFinalizationCommand, GraphFinalizationOutcome, GraphInspectResult, GraphPinCommand,
     GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome, GraphSwitchCommand,
     GraphSwitchOutcome, HookTrustChange, HookTrustCommand, JournalAppendBatch, LoginClaim,
-    LoginReceiptFailure, LoginReceiptResponse, LoginReceiptRow, ManagementClaim,
-    ManagementReceiptRow, MenuResolutionCommand, MenuResolutionOutcome, OpenedGraphRunSet,
-    OpenedTodoGraph, PROVIDER_CONFIGURE_METHOD, PROVIDER_REMOVE_METHOD, PinnedGraph,
-    ProcessSignalCommand, ProcessSignalOutcome, ProfileLease, QueueConsumeCommand,
+    LoginReceiptFailure, LoginReceiptResponse, LoginReceiptRow, LoomAgentTypeRegistration,
+    ManagementClaim, ManagementReceiptRow, MenuResolutionCommand, MenuResolutionOutcome,
+    OpenedGraphRunSet, OpenedTodoGraph, PROVIDER_CONFIGURE_METHOD, PROVIDER_REMOVE_METHOD,
+    PinnedGraph, ProcessSignalCommand, ProcessSignalOutcome, ProfileLease, QueueConsumeCommand,
     QueueConsumeOutcome, QueuePromoteCommand, QueuePromoteOutcome, QueuePromotePreview,
     QueueRemoveCommand, QueueRemoveOutcome, QueueSnapshot, RecordedGraphEvidence,
     RecordedProcessSignal, RenamedSession, RunRetryCommand, RunRetryOutcome, SUBAGENT_LIVE_LIMIT,
@@ -51,7 +51,8 @@ pub use event_store::{
     SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
     SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, Store,
     SwitchedGraph, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
-    TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
+    TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus, TypedAgentInstallCas,
+    TypedAgentInstallItemCas, TypedAgentInstallSnapshot,
 };
 pub use haider_protocol::error::{ErrorCode, HaiderError};
 pub use usage_ledger::{

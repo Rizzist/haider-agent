@@ -801,6 +801,81 @@ async fn run_retry_duplicate_while_live_is_refused_without_a_second_run() {
     world.shutdown().await;
 }
 
+/// Workflow selection and fresh retry admission have one total order. If the
+/// retry wins, the now-live run rejects the switch; if the switch wins, its
+/// pin is durable before the retry is accepted and handed to the provider.
+#[tokio::test]
+async fn run_retry_and_graph_switch_cannot_cross_the_provider_authority_boundary() {
+    let fake = Arc::new(FakeProvider::new(vec![FakeStep::Hang]));
+    let world = RetryWorld::terminal_failed("retry-graph-switch", Arc::clone(&fake)).await;
+    let (retry_connection, retry_sink) = world.control().await;
+    let (switch_connection, switch_sink) = world.control().await;
+
+    let initial = request(
+        &switch_connection,
+        &switch_sink,
+        "retry-graph-initial-pin",
+        RequestBody::GraphPin {
+            command_id: CommandId::new("retry-graph-initial-pin-command"),
+            session_id: world.session_id.clone(),
+            worker_generation: world.store.worker_generation(),
+            template: haider_protocol::graph::SHIP_LOOP_TEMPLATE.into(),
+        },
+    )
+    .await;
+    let ResponseBody::GraphPin {
+        graph_id: old_graph_id,
+        ..
+    } = initial
+    else {
+        panic!("initial graph pin succeeds while the failed session is idle")
+    };
+
+    let (retry, switch) = tokio::join!(
+        request(
+            &retry_connection,
+            &retry_sink,
+            "retry-graph-retry",
+            retry_request(&world, "retry-graph-retry-command"),
+        ),
+        request(
+            &switch_connection,
+            &switch_sink,
+            "retry-graph-switch",
+            RequestBody::GraphSwitch {
+                command_id: CommandId::new("retry-graph-switch-command"),
+                session_id: world.session_id.clone(),
+                worker_generation: world.store.worker_generation(),
+                old_graph_id,
+                template: haider_protocol::graph::STAGGERED_TEMPLATE.into(),
+            },
+        ),
+    );
+    let ResponseBody::RunRetry { accepted_seq, .. } = retry else {
+        panic!("the terminal-failure retry remains admissible")
+    };
+    match switch {
+        ResponseBody::Error { code, .. } => {
+            assert_eq!(
+                code,
+                haider_rpc::ERROR_CODE_BUSY,
+                "a retry-first ordering makes the session nonterminal"
+            );
+        }
+        ResponseBody::GraphSwitch { pinned_seq, .. } => {
+            assert!(
+                pinned_seq < accepted_seq,
+                "a switch-first ordering must commit the new workflow before retry admission"
+            );
+        }
+        other => panic!("unexpected graph-switch race response: {other:?}"),
+    }
+
+    drop(retry_connection);
+    drop(switch_connection);
+    world.shutdown().await;
+}
+
 /// MUTATION CHECK: accept an idle session merely because all runs are
 /// terminal (or because there are no runs). Expected runtime failure: this
 /// request returns `run.retry` success instead of typed `invalid_argument`.
