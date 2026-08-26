@@ -205,6 +205,14 @@ pub struct GraphTemplateSpec {
     pub nodes: Vec<GraphNodeSpec>,
 }
 
+/// One release-owned workflow and its selection class. Eligibility describes
+/// where the workflow may be offered; it is not graph execution authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltInWorkflowCatalogEntry {
+    pub template: GraphTemplateSpec,
+    pub main_session_eligible: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GraphTemplateRejection {
@@ -2885,13 +2893,40 @@ pub fn ship_loop_template() -> GraphTemplateSpec {
 
 #[must_use]
 pub fn graph_template_catalog() -> Vec<GraphTemplateSpec> {
-    vec![
+    built_in_workflow_catalog()
+        .into_iter()
+        .filter(|entry| entry.main_session_eligible)
+        .map(|entry| entry.template)
+        .collect()
+}
+
+/// Complete release-owned workflow catalog. The main-session catalog remains
+/// the five historical templates returned by [`graph_template_catalog`]; the
+/// adjacent sparse/deeper templates are selectable only for delegated work.
+#[must_use]
+pub fn built_in_workflow_catalog() -> Vec<BuiltInWorkflowCatalogEntry> {
+    let mut catalog = [
         ship_loop_template(),
         super_ship_loop_template(),
         staggered_template(),
         sec_audit_template(),
         docs_sweep_template(),
     ]
+    .into_iter()
+    .map(|template| BuiltInWorkflowCatalogEntry {
+        template,
+        main_session_eligible: true,
+    })
+    .collect::<Vec<_>>();
+    catalog.extend(
+        [implement_verify_child_template(), deeper_child_template()]
+            .into_iter()
+            .map(|template| BuiltInWorkflowCatalogEntry {
+                template,
+                main_session_eligible: false,
+            }),
+    );
+    catalog
 }
 
 #[must_use]
@@ -4386,6 +4421,20 @@ mod tests {
             validate_graph_template(&template).expect("catalog template validates");
             assert!(digests.insert(graph_template_digest(&template)));
         }
+        let complete = built_in_workflow_catalog();
+        assert_eq!(complete.len(), 7);
+        assert!(
+            complete[..5]
+                .iter()
+                .all(|entry| entry.main_session_eligible)
+        );
+        assert!(
+            complete[5..]
+                .iter()
+                .all(|entry| !entry.main_session_eligible)
+        );
+        assert_eq!(complete[5].template.name, IMPLEMENT_VERIFY_CHILD_TEMPLATE);
+        assert_eq!(complete[6].template.name, DEEPER_CHILD_TEMPLATE);
     }
 
     #[test]

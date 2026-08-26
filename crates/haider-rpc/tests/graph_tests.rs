@@ -6,8 +6,9 @@ use haider_protocol::graph::{
 use haider_protocol::ids::{GraphId, GraphRunSetId, ItemId, MenuId, SessionId};
 use haider_rpc::{
     CommandId, ErrorData, FEATURE_CONVERGENCE_GRAPH_V1, FEATURE_CONVERGENCE_GRAPH_V2,
-    FEATURE_CONVERGENCE_GRAPH_V3, FEATURE_CONVERGENCE_GRAPH_V4, FEATURE_WORKFLOW_INSTANCE_V1,
-    RequestBody, ResponseBody, TodoGraphOpenedWire, WorkflowInstanceSourceV1, WorkflowInstanceV1,
+    FEATURE_CONVERGENCE_GRAPH_V3, FEATURE_CONVERGENCE_GRAPH_V4, FEATURE_LOOM_PIPE_DAG_V1,
+    FEATURE_WORKFLOW_CATALOG_V1, FEATURE_WORKFLOW_INSTANCE_V1, RequestBody, ResponseBody,
+    TodoGraphOpenedWire, WorkflowCatalogEntryV1, WorkflowInstanceSourceV1, WorkflowInstanceV1,
 };
 
 #[test]
@@ -16,6 +17,8 @@ fn graph_request_and_response_family_has_exact_additive_wire_shapes() {
     assert_eq!(FEATURE_CONVERGENCE_GRAPH_V2, "convergence_graph_v2");
     assert_eq!(FEATURE_CONVERGENCE_GRAPH_V3, "convergence_graph_v3");
     assert_eq!(FEATURE_CONVERGENCE_GRAPH_V4, "convergence_graph_v4");
+    assert_eq!(FEATURE_WORKFLOW_CATALOG_V1, "workflow_catalog_v1");
+    assert_eq!(FEATURE_LOOM_PIPE_DAG_V1, "loom_pipe_dag_v1");
     assert_eq!(FEATURE_WORKFLOW_INSTANCE_V1, "workflow_instance_v1");
     let session_id = SessionId::new("session-graph");
     let graph_id = GraphId::new("graph-1");
@@ -483,4 +486,92 @@ fn workflow_revision_conflict_is_typed_and_carries_current_authority() {
             }
         })
     );
+}
+
+/// MUTATION CHECK: remove the catalog field's serde default/skip-empty,
+/// flatten or retype either nested authority record, or make an old reader
+/// reject the additive field. Expected runtime failure: one of the three
+/// compatibility directions below changes.
+#[test]
+fn workflow_catalog_is_additive_verbatim_and_unknown_origin_tolerant() {
+    let template =
+        haider_protocol::graph::graph_template(haider_protocol::graph::SHIP_LOOP_TEMPLATE)
+            .expect("built-in template");
+    let new = ResponseBody::LoomList {
+        agent_types: Vec::new(),
+        workflows: Vec::new(),
+        cli_present: std::collections::BTreeMap::new(),
+        workflow_catalog: vec![WorkflowCatalogEntryV1::BuiltIn {
+            id: template.name.clone(),
+            main_session_eligible: true,
+            template: template.clone(),
+        }],
+    };
+    let new_value = serde_json::to_value(&new).expect("new loom.list encodes");
+    assert_eq!(new_value["workflow_catalog"][0]["origin"], "built_in");
+    assert_eq!(new_value["workflow_catalog"][0]["id"], template.name);
+    assert_eq!(
+        new_value["workflow_catalog"][0]["main_session_eligible"],
+        true
+    );
+    assert_eq!(
+        new_value["workflow_catalog"][0]["template"],
+        serde_json::to_value(template).expect("authoritative template encodes")
+    );
+
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "method")]
+    enum PreCatalogResponse {
+        #[serde(rename = "loom.list")]
+        LoomList {
+            #[serde(default)]
+            workflows: Vec<serde_json::Value>,
+        },
+        #[serde(other)]
+        Unknown,
+    }
+    let PreCatalogResponse::LoomList { workflows } =
+        serde_json::from_value(new_value).expect("old client ignores additive catalog")
+    else {
+        panic!("old client must retain the loom.list method");
+    };
+    assert!(workflows.is_empty());
+
+    let old: ResponseBody = serde_json::from_value(serde_json::json!({"method": "loom.list"}))
+        .expect("new client decodes old loom.list");
+    let ResponseBody::LoomList {
+        workflow_catalog, ..
+    } = old
+    else {
+        panic!("old loom.list keeps its method");
+    };
+    assert!(workflow_catalog.is_empty());
+    assert_eq!(
+        serde_json::to_value(ResponseBody::LoomList {
+            agent_types: Vec::new(),
+            workflows: Vec::new(),
+            cli_present: std::collections::BTreeMap::new(),
+            workflow_catalog,
+        })
+        .expect("empty catalog re-encodes"),
+        serde_json::json!({"method": "loom.list"})
+    );
+
+    let future: ResponseBody = serde_json::from_value(serde_json::json!({
+        "method": "loom.list",
+        "workflow_catalog": [{
+            "origin": "remote_marketplace",
+            "id": "future",
+            "main_session_eligible": true,
+            "future": {"ignored": true}
+        }]
+    }))
+    .expect("future catalog origin is tolerated");
+    assert!(matches!(
+        future,
+        ResponseBody::LoomList {
+            workflow_catalog,
+            ..
+        } if workflow_catalog == vec![WorkflowCatalogEntryV1::Unknown]
+    ));
 }

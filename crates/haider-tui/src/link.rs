@@ -1416,9 +1416,11 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             agent_types,
             workflows,
             cli_present,
+            workflow_catalog,
         } => vec![LiveReply::LoomRegistry {
             agent_types,
             workflows,
+            workflow_catalog,
             cli_present,
             epoch: context.loom_epoch.unwrap_or(0),
         }],

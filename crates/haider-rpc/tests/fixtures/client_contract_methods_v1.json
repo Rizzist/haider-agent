@@ -101,7 +101,7 @@
       "request_method": "loom.list",
       "response_method": "loom.list",
       "request": {"method":"loom.list"},
-      "response": {"method":"loom.list"}
+      "response": {"method":"loom.list","workflow_catalog":[{"origin":"built_in","id":"catalog-one","main_session_eligible":true,"template":{"name":"catalog-one","version":1,"nodes":[]}}]}
     },
     {
       "request_method": "loom.install.retry",

@@ -9,6 +9,7 @@ use haider_protocol::graph::{
 };
 use haider_protocol::ids::{AgentId, GraphId, LeaseId};
 use haider_protocol::loom::{LoomAgentType, LoomTypeSig, compile_pipe, parse_pipe};
+use haider_rpc::WorkflowCatalogEntryV1;
 use haider_tui::app::{AppModel, Screen};
 use haider_tui::render::render;
 use ratatui::Terminal;
@@ -180,20 +181,32 @@ fn loom_screen_lists_registry() {
     let mut model = launcher_model();
     submit(&mut model, "open the loom");
     model.loom_types = vec![researcher()];
-    model.loom_workflows = vec![
-        compile_pipe(
-            &parse_pipe(
-                "clip: SourceURL -> Transcript\nresearch @researcher \"pull and transcribe\" :cmd",
-            ),
-            |id| {
-                (id == "researcher").then(|| LoomTypeSig {
-                    in_type: "SourceURL".into(),
-                    out_type: "Transcript".into(),
-                })
-            },
-        )
-        .expect("compiles"),
-    ];
+    let workflow = compile_pipe(
+        &parse_pipe(
+            "clip: SourceURL -> Transcript\nresearch @researcher \"pull and transcribe\" :cmd",
+        ),
+        |id| {
+            (id == "researcher").then(|| LoomTypeSig {
+                in_type: "SourceURL".into(),
+                out_type: "Transcript".into(),
+            })
+        },
+    )
+    .expect("compiles");
+    model.workflow_catalog = haider_protocol::graph::built_in_workflow_catalog()
+        .into_iter()
+        .map(|entry| WorkflowCatalogEntryV1::BuiltIn {
+            id: entry.template.name.clone(),
+            main_session_eligible: entry.main_session_eligible,
+            template: entry.template,
+        })
+        .chain(std::iter::once(WorkflowCatalogEntryV1::User {
+            id: workflow.id.clone(),
+            main_session_eligible: true,
+            workflow: workflow.clone(),
+        }))
+        .collect();
+    model.loom_workflows = vec![workflow];
     model.screen = Screen::Loom;
 
     let (rows, colors) = draw(&model);
@@ -223,9 +236,9 @@ fn loom_screen_lists_registry() {
     );
 
     // ⏎ detail: the workflow pane shows the typed signature + pipe source.
-    // W-flow: registered rows sit AFTER the fixed head (`∅ none` + the two
-    // built-ins), so the first registered workflow is row 3.
-    model.loom_selection = 3;
+    // Registered rows sit after `∅ none` and every main-eligible built-in
+    // published by the catalog; derive the offset from that authority.
+    model.loom_selection = 1 + model.builtin_workflow_templates().len();
     model.loom_detail = true;
     let (rows, _) = draw(&model);
     let all = rows.join("\n");

@@ -40,7 +40,7 @@ pub const HELP_TEXT: &[&str] = &[
     "  /tools             core + custom tools · register with a dispatch mode (menu card) — demo only",
     "  /queue <steer|subturn|turn> mid-turn input — safe boundary, next tool call, or turn end",
     "  /graph [pin]       Convergence Graph — where the pinned run stands (nodes · gates · evidence)",
-    "  /workflows         Workflows — registered typed pipe DAGs (tab ⇄ loom) — live only",
+    "  /workflows         Workflows — registered typed pipe workflows (tab ⇄ loom) — live only",
     "  /loom              Loom — agent types: job, typed I/O, capability grants (tab ⇄ workflows) — live only",
     "  /update            check for and install production updates",
     "  /rename <name>     rename this session",
