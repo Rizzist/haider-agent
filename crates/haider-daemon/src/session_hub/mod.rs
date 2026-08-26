@@ -5087,6 +5087,21 @@ impl StoreHandle for HubStoreHandle {
             .await
     }
 
+    async fn read_reducer_page(
+        &self,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+        payload_kinds: &'static [&'static str],
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        self.ensure_session(session_id)?;
+        self.hub
+            .inner
+            .store
+            .read_reducer_page(session_id, since_seq, limit, payload_kinds)
+            .await
+    }
+
     async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError> {
         self.ensure_session(session_id)?;
         self.hub.inner.store.latest_seq(session_id).await
