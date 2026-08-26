@@ -1113,6 +1113,7 @@ fn live_tools_reads_the_daemon_inventory_and_opens_no_card() {
 #[test]
 fn live_bang_routes_one_exact_command_to_shell_exec_and_never_a_turn() {
     let mut model = live_model();
+    model.daemon_features = haider_client::required_user_command_features();
     let mut driver = LiveDriver::new("test");
     pass(
         &mut driver,
@@ -1135,9 +1136,13 @@ fn live_bang_routes_one_exact_command_to_shell_exec_and_never_a_turn() {
     assert!(
         issued.iter().any(|command| matches!(
             command,
-            LiveCommand::ShellExec { command, .. } if command == "!echo hi"
+            LiveCommand::ShellExec {
+                command,
+                branch: None,
+                ..
+            } if command == "!echo hi"
         )),
-        "one ! stripped, the literal rest sent once: {issued:?}"
+        "one ! stripped and main stays unbranched: {issued:?}"
     );
     assert!(
         !issued
@@ -1163,6 +1168,46 @@ fn live_bang_routes_one_exact_command_to_shell_exec_and_never_a_turn() {
         pass(&mut driver, &mut model, None).is_empty(),
         "bare ! promises nothing"
     );
+}
+
+/// MUTATION CHECK: drop any one of the typed client's three user-command
+/// feature requirements from the TUI gate. Expected runtime failure: that
+/// deficient daemon receives a mutating shell request below.
+#[test]
+fn live_bang_requires_the_typed_clients_complete_feature_set() {
+    let required = haider_client::required_user_command_features();
+    assert_eq!(
+        required.len(),
+        3,
+        "the shared gate stays explicit and complete"
+    );
+
+    for missing in &required {
+        let mut model = live_model();
+        model.daemon_features = required.clone();
+        model.daemon_features.remove(missing);
+        model.daemon_version = Some("0.0.961".to_owned());
+        model.upsert_live_session(&sid(0));
+        model.open_session(&sid(0));
+        model.screen = Screen::Session;
+
+        common::submit(&mut model, "!echo gated");
+        assert!(
+            !model
+                .requests
+                .iter()
+                .any(|request| matches!(request, AppRequest::ShellExec { .. })),
+            "missing {missing} must send no shell request"
+        );
+        assert!(
+            model
+                .flash
+                .as_deref()
+                .is_some_and(|flash| flash.contains("needs a newer daemon")),
+            "missing {missing} gets the typed compatibility refusal: {:?}",
+            model.flash
+        );
+    }
 }
 
 #[test]

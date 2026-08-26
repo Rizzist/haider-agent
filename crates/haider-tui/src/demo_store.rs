@@ -822,6 +822,7 @@ fn entry_from_dto(dto: EntryDto) -> TranscriptEntry {
             TranscriptEntry::Item(ItemBlock {
                 item_id,
                 item,
+                user_command: false,
                 streaming: false,
                 args_fragments: String::new(),
                 output_tail,

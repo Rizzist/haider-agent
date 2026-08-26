@@ -495,7 +495,7 @@ async fn issue(
     }
     let context = CommandContext::of(&command);
     let is_attach = context.attach.is_some();
-    let body = request_body(command);
+    let body = request_body_for_features(command, &client.welcome().features);
     let pending = match client.begin_request(body).await {
         Ok(pending) => pending,
         // Nothing reached the wire, so nothing is outstanding. The outbox
@@ -693,6 +693,17 @@ impl CommandContext {
 /// The wire request one driver command becomes.
 #[must_use]
 pub fn request_body(command: LiveCommand) -> RequestBody {
+    request_body_for_features(command, &haider_client::required_user_command_features())
+}
+
+/// The wire request one driver command becomes under one negotiated daemon
+/// feature set. Public for compatibility-law tests; production passes the
+/// active connection's `Welcome.features` at the last responsible moment.
+#[must_use]
+pub fn request_body_for_features(
+    command: LiveCommand,
+    daemon_features: &std::collections::BTreeSet<String>,
+) -> RequestBody {
     match command {
         LiveCommand::List { cursor } => RequestBody::SessionList {
             cursor,
@@ -887,14 +898,29 @@ pub fn request_body(command: LiveCommand) -> RequestBody {
             command_id,
             session,
             worker_generation,
+            branch,
             command,
-        } => RequestBody::ShellExec {
-            command_id,
-            session_id: session,
-            worker_generation,
-            command,
-            cwd: None,
-        },
+        } => {
+            if daemon_features.contains(haider_rpc::FEATURE_USER_COMMAND_V1) {
+                RequestBody::ShellExecScoped {
+                    command_id,
+                    session_id: session,
+                    worker_generation,
+                    branch_id: branch,
+                    agent_id: None,
+                    command,
+                    cwd: None,
+                }
+            } else {
+                RequestBody::ShellExec {
+                    command_id,
+                    session_id: session,
+                    worker_generation,
+                    command,
+                    cwd: None,
+                }
+            }
+        }
         LiveCommand::ToolsInventory { session } => RequestBody::ToolsInventory {
             session_id: session,
         },

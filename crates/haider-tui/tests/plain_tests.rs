@@ -79,6 +79,24 @@ fn command_blocks_render_output_tail_and_truncation_notice() {
     }));
     let text = render_plain(&projection, 0, None);
     assert!(text.contains("$ cargo test ✗ · exit 101"));
+    assert!(!text.contains("! cargo test ✗ · exit 101"));
+    assert!(
+        !projection.mark_user_command(&haider_protocol::item::UserCommandOriginV1 {
+            origin: haider_protocol::item::CommandExecutionOrigin::UserCommand,
+            command_item_id: ItemId::new("c1"),
+            call_id: "wrong-call".to_owned(),
+        }),
+        "a mismatched provenance coordinate fails closed"
+    );
+    assert!(
+        projection.mark_user_command(&haider_protocol::item::UserCommandOriginV1 {
+            origin: haider_protocol::item::CommandExecutionOrigin::UserCommand,
+            command_item_id: ItemId::new("c1"),
+            call_id: "call".to_owned(),
+        })
+    );
+    let text = render_plain(&projection, 0, None);
+    assert!(text.contains("! cargo test ✗ · exit 101"));
     assert!(text.contains("⋯ earlier output truncated"));
 }
 
