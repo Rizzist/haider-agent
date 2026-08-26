@@ -536,26 +536,26 @@ pub fn compile_pipe(
         // or-one-composite-operand widening. A real JOIN is strict: its entire
         // merged input expression must equal the specialist's input expression
         // modulo operand order. Missing and extra branch artifacts both reject.
-        if let Some(signature) = &signature {
-            if !carried.is_empty() {
-                let accepted = if carries_merge {
-                    same_type_operands(&signature.in_type, &carried)
+        if let Some(signature) = &signature
+            && !carried.is_empty()
+        {
+            let accepted = if carries_merge {
+                same_type_operands(&signature.in_type, &carried)
+            } else {
+                accepts(&signature.in_type, &carried)
+            };
+            if !accepted {
+                let input = if carries_merge {
+                    "merged inputs"
                 } else {
-                    accepts(&signature.in_type, &carried)
+                    "carries"
                 };
-                if !accepted {
-                    let input = if carries_merge {
-                        "merged inputs"
-                    } else {
-                        "carries"
-                    };
-                    errors.push(format!(
-                        "type mismatch at {}: {input} `{carried}` but @{} accepts `{}`",
-                        node.name,
-                        node.agent_type.as_deref().unwrap_or("?"),
-                        signature.in_type
-                    ));
-                }
+                errors.push(format!(
+                    "type mismatch at {}: {input} `{carried}` but @{} accepts `{}`",
+                    node.name,
+                    node.agent_type.as_deref().unwrap_or("?"),
+                    signature.in_type
+                ));
             }
         }
         // A target like `2nd` passes ident parsing but is no legal CG name.

@@ -17,7 +17,7 @@ use crate::{
 use async_trait::async_trait;
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
-use haider_protocol::session::SessionPermissionOverridesV1;
+use haider_protocol::session::{SessionInteractionModeV1, SessionPermissionOverridesV1};
 use haider_protocol::state::RunState;
 use haider_protocol::tool::ToolResultStatus;
 use haider_protocol::{DeliveryMode, EventPayload};
@@ -157,6 +157,7 @@ impl DaemonMobileChatBridge {
                     ..SessionPermissionOverridesV1::default()
                 }),
                 cache_policy: None,
+                interaction_mode: SessionInteractionModeV1::Interactive,
             })
             .await?;
         let (session_id, created_seq, worker_generation) = match created.body {
@@ -661,7 +662,7 @@ impl MobileHubRuntime {
             .hub
             .session_metadata(&session_id)
             .await
-            .map_err(MobileChatError::daemon)?
+            .map_err(|error| MobileChatError::internal(error.message))?
             .ok_or_else(|| MobileChatError::internal("mobile session metadata is missing"))?;
         Ok(MobileSessionConfig {
             catalog_revision: catalog.revision,

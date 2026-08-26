@@ -1307,7 +1307,7 @@ impl MonitorService {
             let page = hub
                 .read_internal_session(session, cursor, 256)
                 .await
-                .map_err(|error| MonitorError::Store(error.to_string()))?;
+                .map_err(|error| MonitorError::Store(error.message))?;
             if page.is_empty() {
                 break;
             }
@@ -1411,7 +1411,7 @@ impl MonitorService {
         store
             .append(&mut envelopes)
             .await
-            .map_err(|error| monitor_tool_error(MonitorError::Store(error.to_string())))?;
+            .map_err(|error| monitor_tool_error(MonitorError::Store(error.message)))?;
         Ok(())
     }
 
@@ -1427,7 +1427,7 @@ impl MonitorService {
             let page = hub
                 .read_internal_session(session, cursor, 256)
                 .await
-                .map_err(|error| monitor_tool_error(MonitorError::Store(error.to_string())))?;
+                .map_err(|error| monitor_tool_error(MonitorError::Store(error.message)))?;
             if page.is_empty() {
                 return Ok(None);
             }
@@ -1606,7 +1606,7 @@ impl MonitorService {
                 store
                     .append(&mut envelopes)
                     .await
-                    .map_err(|error| monitor_tool_error(MonitorError::Store(error.to_string())))?;
+                    .map_err(|error| monitor_tool_error(MonitorError::Store(error.message)))?;
                 self.inner
                     .registry
                     .insert(store.session_id(), registration.clone());
@@ -1701,7 +1701,7 @@ impl MonitorService {
                 store
                     .append(&mut envelopes)
                     .await
-                    .map_err(|error| monitor_tool_error(MonitorError::Store(error.to_string())))?;
+                    .map_err(|error| monitor_tool_error(MonitorError::Store(error.message)))?;
                 self.inner.registry.remove(store.session_id(), &monitor_id);
                 self.clear_rate(store.session_id(), &monitor_id);
                 self.cancel_timeout(store.session_id(), &monitor_id);
@@ -1954,7 +1954,7 @@ impl MonitorService {
         )];
         hub.append(&mut envelopes)
             .await
-            .map_err(|error| MonitorError::Store(error.to_string()))?;
+            .map_err(|error| MonitorError::Store(error.message))?;
         self.inner.registry.insert_pending(session, pending.clone());
         drop(mutation);
         if start_delivery {
@@ -2325,7 +2325,7 @@ impl MonitorService {
         }
         hub.append(&mut envelopes)
             .await
-            .map_err(|error| MonitorError::Store(error.to_string()))?;
+            .map_err(|error| MonitorError::Store(error.message))?;
         self.inner
             .registry
             .remove_pending(session, &pending.report.report_id);
@@ -2602,7 +2602,7 @@ impl SessionHub {
                 device_id: self.device_id(),
             })
             .await
-            .map_err(|error| MonitorError::Delivery(error.to_string()))?;
+            .map_err(|error| MonitorError::Delivery(error.message))?;
         let accepted_disposition = accepted.disposition;
         let disposition = match accepted_disposition {
             TurnAdmissionDisposition::Started => "started",
@@ -2632,7 +2632,8 @@ impl SessionHub {
             Some(Ok(())) => true,
             Some(Err(error)) => {
                 return Err(MonitorError::Delivery(format!(
-                    "durable monitor event could not reach the worker manager: {error}"
+                    "durable monitor event could not reach the worker manager: {}",
+                    error.message
                 )));
             }
         };
