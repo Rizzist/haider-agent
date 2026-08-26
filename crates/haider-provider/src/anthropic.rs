@@ -1,7 +1,7 @@
 //! Anthropic Messages API adapter.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -93,9 +93,6 @@ const TRANSPORT_CONFIG: AnthropicTransportConfig = AnthropicTransportConfig {
     chunk_idle_timeout: Duration::from_secs(90),
 };
 
-static SHARED_ANTHROPIC_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
-static SHARED_ANTHROPIC_OAUTH_CLIENT: OnceLock<Result<SharedAnthropicFixedTransport, String>> =
-    OnceLock::new();
 static ANTHROPIC_CLIENT_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Anthropic's model-keyed native computer tool dialect.
@@ -155,15 +152,10 @@ fn anthropic_computer_beta_from_payload(payload: &serde_json::Value) -> Option<&
         )
 }
 
-#[derive(Clone)]
-struct SharedAnthropicFixedTransport {
-    client: reqwest::Client,
-    guard: Arc<FixedOriginGuard>,
-}
-
 fn build_anthropic_client(
     fixed_origin_guard: Option<Arc<FixedOriginGuard>>,
 ) -> Result<reqwest::Client, ProviderError> {
+    ANTHROPIC_CLIENT_BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
     let transport = AnthropicProvider::transport_config();
     let mut client = reqwest::Client::builder()
         .no_proxy()
@@ -185,38 +177,9 @@ fn build_anthropic_client(
     })
 }
 
-fn shared_anthropic_client() -> Result<reqwest::Client, ProviderError> {
-    SHARED_ANTHROPIC_CLIENT
-        .get_or_init(|| {
-            ANTHROPIC_CLIENT_BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
-            build_anthropic_client(None).map_err(|error| error.to_string())
-        })
-        .clone()
-        .map_err(|message| ProviderError::new(ProviderErrorKind::Internal, message))
-}
-
-fn shared_anthropic_oauth_transport() -> Result<SharedAnthropicFixedTransport, ProviderError> {
-    SHARED_ANTHROPIC_OAUTH_CLIENT
-        .get_or_init(|| {
-            let guard = Arc::new(
-                FixedOriginGuard::new(
-                    ANTHROPIC_API_URL,
-                    ANTHROPIC_API_HOST,
-                    Arc::new(SystemFixedDnsResolver),
-                )
-                .map_err(|error| error.to_string())?,
-            );
-            let client = build_anthropic_client(Some(Arc::clone(&guard)))
-                .map_err(|error| error.to_string())?;
-            Ok(SharedAnthropicFixedTransport { client, guard })
-        })
-        .clone()
-        .map_err(|message| ProviderError::new(ProviderErrorKind::Internal, message))
-}
-
 /// Process-lifetime construction counter used by performance regression
-/// harnesses. API-key and enterprise adapters share one policy-identical
-/// reqwest pool; fixed-origin OAuth transports retain their guarded client.
+/// harnesses. Production account resolution reuses the complete adapter;
+/// standalone constructors deliberately own a configuration-local client.
 #[doc(hidden)]
 #[must_use]
 pub fn anthropic_http_client_build_count() -> usize {
@@ -357,7 +320,12 @@ impl AnthropicProvider {
                 "Anthropic subscription inference base URL is not sanctioned",
             ));
         }
-        let SharedAnthropicFixedTransport { client, guard } = shared_anthropic_oauth_transport()?;
+        let guard = Arc::new(FixedOriginGuard::new(
+            ANTHROPIC_API_URL,
+            ANTHROPIC_API_HOST,
+            Arc::new(SystemFixedDnsResolver),
+        )?);
+        let client = build_anthropic_client(Some(Arc::clone(&guard)))?;
         Ok(Self {
             client,
             credential,
@@ -439,11 +407,7 @@ impl AnthropicProvider {
         auth_mode: AnthropicAuthMode,
         fixed_origin_guard: Option<Arc<FixedOriginGuard>>,
     ) -> Result<Self, ProviderError> {
-        let client = if fixed_origin_guard.is_none() {
-            shared_anthropic_client()?
-        } else {
-            build_anthropic_client(fixed_origin_guard.clone())?
-        };
+        let client = build_anthropic_client(fixed_origin_guard.clone())?;
         Ok(Self {
             client,
             credential,

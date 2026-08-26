@@ -408,7 +408,7 @@ async fn run_inner(
                     std::sync::Arc::clone(&accounts_runtime.facade.snapshot),
                     accounts_runtime.facade.management.clone(),
                     accounts_runtime.vault.clone(),
-                    std::sync::Arc::new(crate::accounts::ProductionAccountBuilder),
+                    std::sync::Arc::new(crate::accounts::ProductionAccountBuilder::default()),
                     broker,
                 )
                 .with_model_source(std::sync::Arc::clone(&accounts_runtime.model_source))
@@ -419,7 +419,7 @@ async fn run_inner(
                     std::sync::Arc::clone(&accounts_runtime.facade.snapshot),
                     accounts_runtime.facade.management.clone(),
                     accounts_runtime.vault.clone(),
-                    std::sync::Arc::new(crate::accounts::ProductionAccountBuilder),
+                    std::sync::Arc::new(crate::accounts::ProductionAccountBuilder::default()),
                 )
                 .with_model_source(std::sync::Arc::clone(&accounts_runtime.model_source))
                 .with_resilience(account_resilience.clone()),

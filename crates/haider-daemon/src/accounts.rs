@@ -5959,7 +5959,7 @@ async fn finalize_and_respond(
 /// Per-turn provider tuning derived from session metadata (G3): the
 /// session's explicit effort selection and fast-mode flag, threaded from
 /// `ProviderFactory::resolve_for_turn` into the provider constructors.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct ProviderTuning {
     pub effort: Option<String>,
     pub fast: bool,
@@ -6058,8 +6058,252 @@ pub trait AccountProviderBuilder: Send + Sync {
     }
 }
 
+/// Maximum number of credential-bearing provider adapters retained by one
+/// production builder. Custom endpoints and model/tuning combinations are
+/// user-controlled, so this bound is also the bound on their live reqwest
+/// clients and connection pools.
+const ACCOUNT_PROVIDER_ADAPTER_CACHE_CAPACITY: usize = 64;
+
+/// Adapter-effective provider profile fields. Other profile fields control
+/// whether resolution is allowed or how it is displayed, but do not reach an
+/// adapter constructor.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct AccountProviderProfileCacheKey {
+    endpoint: Option<String>,
+    openai_chat_completions: bool,
+    auth_methods: Vec<AuthMethod>,
+    selected_model: Option<AccountProviderModelCacheKey>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct AccountProviderModelCacheKey {
+    supported_efforts: Vec<String>,
+    supports_thinking_type: Option<bool>,
+}
+
+impl AccountProviderProfileCacheKey {
+    fn new(profile: &ProviderSummaryWire, model: &str) -> Self {
+        let selected_model = profile
+            .model_details
+            .iter()
+            .find(|detail| detail.name == model)
+            .map(|detail| AccountProviderModelCacheKey {
+                supported_efforts: detail.supported_efforts.clone(),
+                supports_thinking_type: detail.supports_thinking_type,
+            });
+        Self {
+            endpoint: profile.endpoint.clone(),
+            openai_chat_completions: matches!(
+                profile.api_family,
+                ProviderApiFamilyWire::OpenAiChatCompletions
+            ),
+            auth_methods: profile.auth_methods.clone(),
+            selected_model,
+        }
+    }
+}
+
+/// Provider-declared fields retained by the Kimi/Grok adapter. Keeping these
+/// typed avoids serializing a catalog row merely to identify it.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct AccountProviderCatalogModelCacheKey {
+    slug: String,
+    display_name: String,
+    context_window: Option<u64>,
+    description: Option<String>,
+    default_effort: Option<String>,
+    supported_efforts: Vec<String>,
+    visible: bool,
+    priority: Option<i64>,
+    extensions: Option<AccountProviderCatalogExtensionsCacheKey>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct AccountProviderCatalogExtensionsCacheKey {
+    protocol: String,
+    supports_reasoning: bool,
+    supports_vision: bool,
+    supports_tool_use: bool,
+    supports_thinking_type: bool,
+    supports_reasoning_effort: bool,
+}
+
+impl From<&DiscoveredModel> for AccountProviderCatalogModelCacheKey {
+    fn from(model: &DiscoveredModel) -> Self {
+        Self {
+            slug: model.slug.clone(),
+            display_name: model.display_name.clone(),
+            context_window: model.context_window,
+            description: model.description.clone(),
+            default_effort: model.default_effort.clone(),
+            supported_efforts: model.supported_efforts.clone(),
+            visible: model.visible,
+            priority: model.priority,
+            extensions: model.extensions.as_ref().map(|extensions| {
+                AccountProviderCatalogExtensionsCacheKey {
+                    protocol: extensions.protocol.clone(),
+                    supports_reasoning: extensions.supports_reasoning,
+                    supports_vision: extensions.supports_vision,
+                    supports_tool_use: extensions.supports_tool_use,
+                    supports_thinking_type: extensions.supports_thinking_type,
+                    supports_reasoning_effort: extensions.supports_reasoning_effort,
+                }
+            }),
+        }
+    }
+}
+
+/// Every non-secret input that can change adapter construction. Account,
+/// endpoint, auth/header mode, origin policy, tuning, and catalog facts are
+/// explicit; the credential fingerprint separates rotations without
+/// retaining another copy of the secret. Proxy, timeout, TLS, redirect, and
+/// DNS-resolver implementations are constructor constants in one process, so
+/// the provider/profile route selects their exact policy.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct AccountProviderAdapterCacheKey {
+    provider: String,
+    alias: CredentialAlias,
+    account_identity: String,
+    base_url: Option<String>,
+    auth_method: AuthMethod,
+    credential_fingerprint: [u8; 32],
+    model: String,
+    tuning: ProviderTuning,
+    profile: Option<AccountProviderProfileCacheKey>,
+    catalog_model: Option<AccountProviderCatalogModelCacheKey>,
+    gemini_cache_registry_identity: usize,
+}
+
+impl AccountProviderAdapterCacheKey {
+    fn new(
+        profile: Option<&ProviderSummaryWire>,
+        descriptor: &CredentialDescriptor,
+        credential: &haider_accounts::SecretHandle,
+        model: &str,
+        tuning: &ProviderTuning,
+        catalog_model: Option<&DiscoveredModel>,
+        gemini_cache_registry: &Arc<haider_provider::GeminiCacheRegistry>,
+    ) -> Self {
+        Self {
+            provider: descriptor.provider.clone(),
+            alias: descriptor.alias.clone(),
+            account_identity: descriptor.identity.clone(),
+            base_url: descriptor.base_url.clone(),
+            auth_method: descriptor.auth_method,
+            credential_fingerprint: *blake3::hash(credential.expose_secret()).as_bytes(),
+            model: model.to_owned(),
+            tuning: tuning.clone(),
+            profile: profile.map(|profile| AccountProviderProfileCacheKey::new(profile, model)),
+            catalog_model: if matches!(
+                descriptor.provider.as_str(),
+                KIMI_OAUTH_PROVIDER_NAME | GROK_OAUTH_PROVIDER_NAME
+            ) {
+                catalog_model
+                    .filter(|catalog_model| catalog_model.slug == model)
+                    .map(AccountProviderCatalogModelCacheKey::from)
+            } else {
+                None
+            },
+            gemini_cache_registry_identity: if descriptor.provider == GEMINI_PROVIDER_NAME {
+                Arc::as_ptr(gemini_cache_registry) as usize
+            } else {
+                0
+            },
+        }
+    }
+}
+
+struct AccountProviderAdapterCache {
+    capacity: usize,
+    recency: u64,
+    entries: HashMap<AccountProviderAdapterCacheKey, AccountProviderAdapterCacheEntry>,
+}
+
+struct AccountProviderAdapterCacheEntry {
+    adapter: Arc<dyn Provider>,
+    last_used: u64,
+}
+
+impl AccountProviderAdapterCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            recency: 0,
+            entries: HashMap::new(),
+        }
+    }
+
+    fn get(&mut self, key: &AccountProviderAdapterCacheKey) -> Option<Arc<dyn Provider>> {
+        let last_used = self.next_recency();
+        let entry = self.entries.get_mut(key)?;
+        entry.last_used = last_used;
+        Some(Arc::clone(&entry.adapter))
+    }
+
+    fn insert(&mut self, key: AccountProviderAdapterCacheKey, adapter: Arc<dyn Provider>) {
+        if self.capacity == 0 {
+            return;
+        }
+        if self.entries.len() >= self.capacity
+            && let Some(evicted) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key)
+                .cloned()
+        {
+            self.entries.remove(&evicted);
+        }
+        let last_used = self.next_recency();
+        self.entries
+            .insert(key, AccountProviderAdapterCacheEntry { adapter, last_used });
+    }
+
+    fn next_recency(&mut self) -> u64 {
+        self.recency = self.recency.saturating_add(1);
+        self.recency
+    }
+}
+
 /// Production builder for every account-backed adapter shipped in this lane.
-pub(crate) struct ProductionAccountBuilder;
+pub(crate) struct ProductionAccountBuilder {
+    adapters: StdMutex<AccountProviderAdapterCache>,
+}
+
+impl Default for ProductionAccountBuilder {
+    fn default() -> Self {
+        Self {
+            adapters: StdMutex::new(AccountProviderAdapterCache::new(
+                ACCOUNT_PROVIDER_ADAPTER_CACHE_CAPACITY,
+            )),
+        }
+    }
+}
+
+impl ProductionAccountBuilder {
+    #[cfg(test)]
+    fn with_cache_capacity(capacity: usize) -> Self {
+        Self {
+            adapters: StdMutex::new(AccountProviderAdapterCache::new(capacity)),
+        }
+    }
+
+    #[cfg(test)]
+    fn cached_adapter_count(&self) -> Result<usize, HaiderError> {
+        self.adapters
+            .lock()
+            .map(|adapters| adapters.entries.len())
+            .map_err(|_| adapter_cache_unavailable())
+    }
+}
+
+fn adapter_cache_unavailable() -> HaiderError {
+    HaiderError::new(
+        ErrorCode::ProviderError,
+        "account provider adapter cache is unavailable",
+        true,
+    )
+}
 
 impl AccountProviderBuilder for ProductionAccountBuilder {
     fn providers(&self) -> std::collections::BTreeSet<String> {
@@ -6164,7 +6408,23 @@ impl AccountProviderBuilder for ProductionAccountBuilder {
         catalog_model: Option<&DiscoveredModel>,
         gemini_cache_registry: Arc<haider_provider::GeminiCacheRegistry>,
     ) -> Result<Arc<dyn Provider>, HaiderError> {
-        build_account_provider(
+        let key = AccountProviderAdapterCacheKey::new(
+            profile,
+            descriptor,
+            &credential,
+            model,
+            tuning,
+            catalog_model,
+            &gemini_cache_registry,
+        );
+        let mut adapters = self
+            .adapters
+            .lock()
+            .map_err(|_| adapter_cache_unavailable())?;
+        if let Some(adapter) = adapters.get(&key) {
+            return Ok(adapter);
+        }
+        let adapter = build_account_provider(
             &descriptor.provider,
             profile,
             descriptor.base_url.as_deref(),
@@ -6175,7 +6435,9 @@ impl AccountProviderBuilder for ProductionAccountBuilder {
             tuning,
             catalog_model,
             Some(gemini_cache_registry),
-        )
+        )?;
+        adapters.insert(key, Arc::clone(&adapter));
+        Ok(adapter)
     }
 }
 
