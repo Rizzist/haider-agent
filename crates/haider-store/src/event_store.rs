@@ -14936,13 +14936,41 @@ fn validate_worker_run_transitions(
     session_id: &SessionId,
     envelopes: &[RawEnvelope],
 ) -> StoreResult<()> {
-    let commits_done = envelopes.iter().any(|envelope| {
+    let mut states = latest_run_states(transaction, session_id)?;
+    // Manual idle compaction is an internal maintenance run. Its atomic final
+    // batch carries the projection-switch node and `Done`, but that `Done`
+    // does not finalize provider work or discharge graph obligations.
+    let manual_compaction_runs = envelopes
+        .iter()
+        .filter_map(|envelope| {
+            let manual_node = matches!(
+                serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                Ok(EventPayload::NodeCommitted(TreeNode {
+                    kind: NodeKind::Compaction {
+                        resume_cause: haider_protocol::history::CompactionResume::ManualIdle,
+                        ..
+                    },
+                    ..
+                }))
+            );
+            let run_id = envelope.run_id.as_ref()?;
+            (manual_node
+                && states
+                    .get(run_id)
+                    .is_some_and(|(state, _, _)| state == &RunState::Compacting))
+            .then_some(run_id.clone())
+        })
+        .collect::<HashSet<_>>();
+    let commits_graph_guarded_done = envelopes.iter().any(|envelope| {
         matches!(
             serde_json::from_value::<EventPayload>(envelope.payload.clone()),
             Ok(EventPayload::RunState(RunState::Done))
-        )
+        ) && envelope
+            .run_id
+            .as_ref()
+            .is_none_or(|run_id| !manual_compaction_runs.contains(run_id))
     });
-    if commits_done
+    if commits_graph_guarded_done
         && load_graph_reduction(transaction, session_id)?
             .status
             .is_some_and(|status| {
@@ -14955,15 +14983,14 @@ fn validate_worker_run_transitions(
             })
     {
         // Final guard against a pin/switch racing the provider's earlier
-        // guard decision. MUTATION: removing this check permits Done to land
-        // beside newly unmet obligations.
+        // guard decision. MUTATION: removing this check permits a provider
+        // Done to land beside newly unmet obligations.
         return Err(store_error(
             ErrorCode::GraphNotActive,
             "cannot commit Done while the active Convergence Graph has unmet obligations",
             false,
         ));
     }
-    let mut states = latest_run_states(transaction, session_id)?;
     for envelope in envelopes {
         let supplemental_project_instructions =
             ProjectInstructionsLoaded::from_payload_value(&envelope.payload).is_some();

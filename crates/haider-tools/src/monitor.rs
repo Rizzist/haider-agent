@@ -6,7 +6,7 @@
 
 use crate::{ToolError, ToolResult};
 use haider_protocol::tool::{DispatchMode, ToolManifest};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 pub const MAX_MONITOR_ID_CHARS: usize = 96;
@@ -21,8 +21,8 @@ const MAX_MONITOR_TIMEOUT_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
 /// One strict `monitor` tool call. A single tool keeps registry operations
 /// discoverable without multiplying provider declarations.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
 pub enum MonitorRequest {
     Register {
         source: MonitorSource,
@@ -38,6 +38,58 @@ pub enum MonitorRequest {
     Remove {
         monitor_id: String,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+enum MonitorRequestWire {
+    Register(MonitorRegisterRequest),
+    List(MonitorNoFields),
+    Remove(MonitorRemoveRequest),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MonitorRegisterRequest {
+    source: MonitorSource,
+    #[serde(default)]
+    filter: Option<MonitorFilter>,
+    action: MonitorAction,
+    #[serde(default)]
+    occurrence: MonitorOccurrence,
+    #[serde(default)]
+    lifetime: MonitorLifetime,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MonitorRemoveRequest {
+    monitor_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MonitorNoFields {}
+
+impl<'de> Deserialize<'de> for MonitorRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match MonitorRequestWire::deserialize(deserializer)? {
+            MonitorRequestWire::Register(request) => Self::Register {
+                source: request.source,
+                filter: request.filter,
+                action: request.action,
+                occurrence: request.occurrence,
+                lifetime: request.lifetime,
+            },
+            MonitorRequestWire::List(MonitorNoFields {}) => Self::List,
+            MonitorRequestWire::Remove(request) => Self::Remove {
+                monitor_id: request.monitor_id,
+            },
+        })
+    }
 }
 
 impl MonitorRequest {
@@ -81,14 +133,71 @@ impl MonitorRequest {
 
 /// Extensible source declaration. The daemon initially activates SMS; the
 /// remaining variants reserve typed, fail-closed adapter contracts.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MonitorSource {
     Sms,
     Process { command: String },
     File { path: String },
     Poll { command: String, interval_ms: u64 },
     Timer { interval_ms: u64 },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum MonitorSourceWire {
+    Sms(MonitorNoFields),
+    Process(MonitorCommandSource),
+    File(MonitorFileSource),
+    Poll(MonitorPollSource),
+    Timer(MonitorTimerSource),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MonitorCommandSource {
+    command: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MonitorFileSource {
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MonitorPollSource {
+    command: String,
+    interval_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MonitorTimerSource {
+    interval_ms: u64,
+}
+
+impl<'de> Deserialize<'de> for MonitorSource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match MonitorSourceWire::deserialize(deserializer)? {
+            MonitorSourceWire::Sms(MonitorNoFields {}) => Self::Sms,
+            MonitorSourceWire::Process(source) => Self::Process {
+                command: source.command,
+            },
+            MonitorSourceWire::File(source) => Self::File { path: source.path },
+            MonitorSourceWire::Poll(source) => Self::Poll {
+                command: source.command,
+                interval_ms: source.interval_ms,
+            },
+            MonitorSourceWire::Timer(source) => Self::Timer {
+                interval_ms: source.interval_ms,
+            },
+        })
+    }
 }
 
 impl MonitorSource {
@@ -222,14 +331,41 @@ pub enum MonitorOccurrence {
     Every,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MonitorLifetime {
     #[default]
     Session,
     Timeout {
         timeout_ms: u64,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum MonitorLifetimeWire {
+    Session(MonitorNoFields),
+    Timeout(MonitorTimeoutLifetime),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MonitorTimeoutLifetime {
+    timeout_ms: u64,
+}
+
+impl<'de> Deserialize<'de> for MonitorLifetime {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match MonitorLifetimeWire::deserialize(deserializer)? {
+            MonitorLifetimeWire::Session(MonitorNoFields {}) => Self::Session,
+            MonitorLifetimeWire::Timeout(lifetime) => Self::Timeout {
+                timeout_ms: lifetime.timeout_ms,
+            },
+        })
+    }
 }
 
 impl MonitorLifetime {
@@ -359,10 +495,55 @@ mod tests {
         assert!(
             MonitorRequest::from_tool_args(serde_json::json!({
                 "operation": "register",
-                "source": {"kind": "sms", "surprise": true},
+                "source": {"kind": "process", "command": "printf ok", "surprise": true},
                 "action": {"report": true}
             }))
             .is_err()
+        );
+        assert!(
+            MonitorRequest::from_tool_args(serde_json::json!({
+                "operation": "register",
+                "source": {"kind": "sms"},
+                "action": {"report": true},
+                "lifetime": {"kind": "session", "surprise": true}
+            }))
+            .is_err()
+        );
+        assert!(
+            MonitorRequest::from_tool_args(serde_json::json!({
+                "operation": "remove", "monitor_id": "monitor-1", "surprise": true
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn every_tagged_monitor_variant_still_parses() {
+        for source in [
+            serde_json::json!({"kind": "sms"}),
+            serde_json::json!({"kind": "process", "command": "printf ok"}),
+            serde_json::json!({"kind": "file", "path": "status.txt"}),
+            serde_json::json!({"kind": "poll", "command": "printf ok", "interval_ms": 250}),
+            serde_json::json!({"kind": "timer", "interval_ms": 250}),
+        ] {
+            assert!(
+                MonitorRequest::from_tool_args(serde_json::json!({
+                    "operation": "register",
+                    "source": source,
+                    "action": {"report": true},
+                    "lifetime": {"kind": "session"}
+                }))
+                .is_ok()
+            );
+        }
+        assert!(
+            MonitorRequest::from_tool_args(serde_json::json!({
+                "operation": "register",
+                "source": {"kind": "sms"},
+                "action": {"report": true},
+                "lifetime": {"kind": "timeout", "timeout_ms": 100}
+            }))
+            .is_ok()
         );
     }
 

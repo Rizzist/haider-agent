@@ -24,10 +24,13 @@ use haider_protocol::graph::{
     process_signal_subject_digest, reduce_graph_telemetry, ship_loop_nodes,
     validate_graph_template,
 };
-use haider_protocol::history::{TodoItem, TodoState};
+use haider_protocol::history::{
+    COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume, NodeKind, TodoItem,
+    TodoState, TreeNode,
+};
 use haider_protocol::ids::{
-    DeviceId, EffectId, EventId, GraphId, GraphRunSetId, ItemId, MenuId, RunId, SessionId, TaskId,
-    WorkspaceRevision,
+    DeviceId, EffectId, EventId, GraphId, GraphRunSetId, ItemId, MenuId, NodeId, RunId, SessionId,
+    TaskId, WorkspaceRevision,
 };
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
@@ -4465,6 +4468,92 @@ fn m2c_worker_done_rechecks_graph_authority_in_append_transaction() {
                 serde_json::from_value::<EventPayload>(envelope.payload.clone())
                     .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Done))
             })
+    );
+}
+
+#[test]
+fn m2c_manual_idle_compaction_done_does_not_finalize_graph_work() {
+    // Expected failure under mutation: treating every internal `Done` as a
+    // provider finalization blocks idle maintenance whenever a graph is open.
+    // The sibling above still proves that an ordinary turn cannot bypass the
+    // graph guard by merely committing `Done`.
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "m2c-manual-compaction-done");
+    pin(&store, &session_id, "m2c-manual-compaction-done");
+    let run_id = RunId::new("run-m2c-manual-compaction-done");
+    let covers_from = NodeId::new("m2c-covered-from");
+    let covers_to = NodeId::new("m2c-covered-to");
+    let intent_item = TurnItem::Extension {
+        kind: COMPACTION_INTENT_EXTENSION_KIND.into(),
+        data: serde_json::to_value(CompactionIntent {
+            operation_id: "manual-test".into(),
+            covers_from: covers_from.clone(),
+            covers_to: covers_to.clone(),
+            resume_cause: CompactionResume::ManualIdle,
+        })
+        .expect("serialize compaction intent"),
+    };
+    let mut started = vec![
+        raw_envelope(
+            &store,
+            &session_id,
+            &run_id,
+            "m2c-manual-compaction-intent",
+            EventPayload::Item(ItemEvent::Started {
+                item_id: ItemId::new("m2c-manual-compaction-intent-item"),
+                item: intent_item,
+            }),
+        ),
+        raw_envelope(
+            &store,
+            &session_id,
+            &run_id,
+            "m2c-manual-compaction-running",
+            EventPayload::RunState(RunState::Compacting),
+        ),
+    ];
+    store
+        .append_worker(&mut started)
+        .expect("manual compaction starts beside the active graph");
+
+    let mut completed = vec![
+        raw_envelope(
+            &store,
+            &session_id,
+            &run_id,
+            "m2c-manual-compaction-node",
+            EventPayload::NodeCommitted(TreeNode {
+                node: NodeId::new("m2c-manual-compaction-node"),
+                parent: None,
+                kind: NodeKind::Compaction {
+                    covers_from,
+                    covers_to,
+                    summary_artifact: ArtifactRef::new("blake3:m2c-manual-summary"),
+                    tokens_before: 100,
+                    tokens_after: 10,
+                    resume_cause: CompactionResume::ManualIdle,
+                },
+            }),
+        ),
+        raw_envelope(
+            &store,
+            &session_id,
+            &run_id,
+            "m2c-manual-compaction-done",
+            EventPayload::RunState(RunState::Done),
+        ),
+    ];
+    store
+        .append_worker(&mut completed)
+        .expect("manual compaction Done is not graph finalization");
+    assert_eq!(
+        store
+            .graph_status(&session_id)
+            .expect("graph status")
+            .expect("active graph")
+            .phase,
+        GraphPhase::Active
     );
 }
 

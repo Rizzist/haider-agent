@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use haider_rpc::haider_protocol::EventPayload;
+use haider_rpc::haider_protocol::effect::{AuthorizationVerdict, EffectPhase};
 use haider_rpc::haider_protocol::envelope::RawEnvelope;
 use haider_rpc::haider_protocol::error::{ErrorCode, ErrorPresentation};
 use haider_rpc::haider_protocol::ids::{ArtifactRef, MenuId, RunId, SessionId};
@@ -417,13 +418,15 @@ pub enum HeadlessEvent {
     /// One fully applied durable envelope. Duplicates and gap-crossing frames
     /// are never emitted.
     Envelope(Box<RawEnvelope>),
-    /// Observable fail-closed decision made for a permission menu.
+    /// Observable fail-closed decision for a permission-gated effect.
     PermissionDenied(HeadlessPermissionDenial),
 }
 
 /// Machine-readable permission denial made by the headless default policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeadlessPermissionDenial {
+    /// Permission-menu id for the interactive fallback, or the effect id when
+    /// autonomous policy denied the effect before opening a menu.
     pub menu_id: String,
     pub effect_summary: String,
     pub notice: String,
@@ -757,6 +760,7 @@ struct HeadlessReducer {
     response: Option<String>,
     usage: Option<Usage>,
     permission_denials: Vec<HeadlessPermissionDenial>,
+    effect_summaries: BTreeMap<String, String>,
     pending_run_failure: Option<(u64, HeadlessRunFailure)>,
     blocking_presentation: Option<ErrorPresentation>,
     terminal: Option<NaturalTerminal>,
@@ -779,6 +783,7 @@ impl HeadlessReducer {
             response: None,
             usage: None,
             permission_denials: Vec::new(),
+            effect_summaries: BTreeMap::new(),
             pending_run_failure: None,
             blocking_presentation: None,
             terminal: None,
@@ -854,6 +859,28 @@ impl HeadlessReducer {
                 ..
             }) => self.response = Some(text),
             EventPayload::Usage(usage) => self.usage = Some(usage),
+            EventPayload::Effect(EffectPhase::Intent(intent)) => {
+                self.effect_summaries
+                    .insert(intent.effect.as_str().to_owned(), intent.summary);
+            }
+            EventPayload::Effect(EffectPhase::Authorized {
+                effect,
+                verdict: AuthorizationVerdict::Deny { .. },
+            }) => {
+                let denial = HeadlessPermissionDenial {
+                    menu_id: effect.as_str().to_owned(),
+                    effect_summary: self
+                        .effect_summaries
+                        .remove(effect.as_str())
+                        .unwrap_or_else(|| effect.as_str().to_owned()),
+                    notice: "permission_denied_by_headless_default".into(),
+                };
+                self.permission_denials.push(denial.clone());
+                self.emit(HeadlessEvent::PermissionDenied(denial)).await;
+            }
+            EventPayload::Effect(EffectPhase::Authorized { effect, .. }) => {
+                self.effect_summaries.remove(effect.as_str());
+            }
             EventPayload::RunFailed {
                 code,
                 message,
