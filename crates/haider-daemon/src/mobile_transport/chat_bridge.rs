@@ -1406,6 +1406,7 @@ fn connection_closed_error() -> MobileChatError {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::mobile_transport::Envelope;

@@ -2863,9 +2863,7 @@ fn report_status_name(status: MonitorReportStatus) -> &'static str {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use haider_core::{
-        BranchCreateCommand, SessionCreateCommand, SqliteStoreHandle, StoreHandle as _,
-    };
+    use haider_core::{BranchCreateCommand, SessionCreateCommand, SqliteStoreHandle};
     use haider_protocol::EventPayload;
     use haider_protocol::ids::DeviceId;
     use haider_protocol::state::{RunState, WaitReason};

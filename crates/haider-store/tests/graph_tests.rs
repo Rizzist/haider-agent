@@ -2591,7 +2591,10 @@ fn human_start_opens_a_menu_on_pin_switch_and_run_set_child_creation() {
         graph_human_menu_graphs(&envelopes),
         [opened.children[0].child_graph_id.clone()]
     );
-    assert_eq!(closed_menu_ids(&envelopes), [root_menu.clone()]);
+    assert_eq!(
+        closed_menu_ids(&envelopes),
+        std::slice::from_ref(&root_menu)
+    );
     let status = store
         .graph_status(&run_set_session)
         .expect("child graph status")
