@@ -1271,7 +1271,12 @@ fn render_launcher(
             LauncherRow::Workflows,
             "⌘",
             "Workflows",
-            "typed pipe DAGs — nodes, gates, conditional edges · /workflows".to_owned(),
+            if model.daemon_serves(haider_rpc::FEATURE_LOOM_PIPE_DAG_V1) {
+                "typed pipe DAGs — nodes, gates, conditional edges · /workflows"
+            } else {
+                "typed sequential workflows · /workflows"
+            }
+            .to_owned(),
         ),
         (
             LauncherRow::Loom,
@@ -6317,7 +6322,7 @@ fn wrap_plain(text: &str, width: usize) -> Vec<String> {
 /// know-how; workflow: typed signature + node chain + pipe source; built-in:
 /// nodes + gates from the catalog spec; `none`: the honest default line).
 /// W-flow: the workflows pane leads with the synthetic `∅ none` row and the
-/// built-in catalog pair — `p` pins the selected row to the bound session,
+/// daemon-published built-in catalog — `p` pins the selected row to the bound session,
 /// `n` opens the describe-it authoring input on both panes.
 /// The Loom/Workflows tab keeps the session COMPOSER live at its foot
 /// (owner 2026-08-22): authoring is a conversation, not a one-shot prompt,
@@ -6350,6 +6355,8 @@ fn render_loom(
     let area = list_area;
     let mut lines: Vec<Line<'static>> = Vec::new();
     let on_types = model.loom_pane == LoomPane::Types;
+    let catalog_available =
+        on_types || model.daemon_serves(haider_rpc::FEATURE_WORKFLOW_CATALOG_V1);
     let (title, own, own_noun, sibling) = if on_types {
         ("loom", model.loom_types.len(), "agent type", "workflows")
     } else {
@@ -6358,10 +6365,14 @@ fn render_loom(
     lines.push(Line::from(vec![
         Span::styled(title, theme.bright_style().add_modifier(Modifier::BOLD)),
         Span::styled(
-            format!(
-                " — {own} {own_noun}{} registered · tab ⇄ {sibling}",
-                if own == 1 { "" } else { "s" },
-            ),
+            if catalog_available {
+                format!(
+                    " — {own} {own_noun}{} registered · tab ⇄ {sibling}",
+                    if own == 1 { "" } else { "s" },
+                )
+            } else {
+                format!(" — catalog unavailable · tab ⇄ {sibling}")
+            },
             theme.dim_style(),
         ),
     ]));
@@ -6392,6 +6403,19 @@ fn render_loom(
         lines.push(new_row);
         lines.push(Line::raw(""));
     }
+    // A fresh Welcome is already authoritative about feature absence even
+    // while the registry snapshot remains unhydrated. Do not turn that typed
+    // absence into an endless loading state on the Workflows pane.
+    if !catalog_available {
+        lines.push(Line::styled(
+            "workflow catalog needs workflow_catalog_v1; no local list is substituted",
+            theme.dim_style(),
+        ));
+        lines.push(Line::raw(""));
+        lines.push(Line::styled("tab ⇄ loom · esc back", theme.dim_style()));
+        frame.render_widget(Paragraph::new(Text::from(lines)), area);
+        return;
+    }
     // Round 3: an unhydrated live connection is LOADING, not empty — the
     // once-per-connection loom.list may still be in flight (or the socket
     // just died and the next connection re-hydrates).
@@ -6405,9 +6429,9 @@ fn render_loom(
         frame.render_widget(Paragraph::new(Text::from(lines)), area);
         return;
     }
-    // W-flow: NEITHER pane can be empty — both row spaces lead with the
-    // synthetic `∅ none` default, so registry emptiness renders inside the
-    // REGISTERED section of each pane instead of a whole-pane state.
+    // Once its feature is available, neither pane can be empty: both row
+    // spaces lead with the synthetic `∅ none` default, so registry emptiness
+    // renders inside the REGISTERED section instead of a whole-pane state.
     let total_rows = if on_types {
         model.type_row_count()
     } else {
@@ -6737,7 +6761,8 @@ fn render_loom(
         ));
         // W-flow fixed head: the synthetic `∅ none` row is ALWAYS first —
         // not a registry record, which is exactly what makes it undeletable
-        // — then the built-in catalog pair, then the REGISTERED section.
+        // — then every main-eligible built-in published by the daemon, then
+        // the REGISTERED section.
         if selection == 0 {
             selected_line = lines.len();
         }
@@ -6747,7 +6772,7 @@ fn render_loom(
             Span::styled("none", theme.bright_style().add_modifier(Modifier::BOLD)),
             Span::styled(" — no flow · default", theme.dim_style()),
         ]));
-        let builtins = crate::app::AppModel::builtin_workflow_templates();
+        let builtins = model.builtin_workflow_templates();
         for (offset, template) in builtins.iter().enumerate() {
             let index = 1 + offset;
             if index == selection {
@@ -6777,7 +6802,11 @@ fn render_loom(
         lines.push(Line::styled("REGISTERED", theme.gold_style()));
         if model.loom_workflows.is_empty() {
             lines.push(Line::styled(
-                "  none registered — press n: the model proposes a pipe DAG; a plan you accept registers",
+                if model.daemon_serves(haider_rpc::FEATURE_LOOM_PIPE_DAG_V1) {
+                    "  none registered — press n: the model proposes a pipe DAG; a plan you accept registers"
+                } else {
+                    "  none registered — press n: the model proposes a sequential workflow; a plan you accept registers"
+                },
                 theme.dim_style(),
             ));
         }

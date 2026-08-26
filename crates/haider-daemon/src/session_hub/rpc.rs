@@ -7128,12 +7128,14 @@ impl HubConnection {
                 (cli, present)
             })
             .collect();
+        let workflow_catalog = published_workflow_catalog(&workflows);
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::LoomList {
                 agent_types,
                 workflows,
                 cli_present,
+                workflow_catalog,
             },
         })
     }
@@ -11239,6 +11241,71 @@ impl HubConnection {
         }
         self.clear_resident_binding();
         self.hub.detach_connection(&self.connection_id).await
+    }
+}
+
+/// One publication projection over the existing authorities. Built-in
+/// templates remain byte-for-byte graph records; registered workflows remain
+/// byte-for-byte Loom records. Eligibility classifies where a workflow may be
+/// selected and does not bypass any graph or typed-agent execution gate.
+fn published_workflow_catalog(
+    workflows: &[haider_protocol::loom::LoomWorkflow],
+) -> Vec<WorkflowCatalogEntryV1> {
+    let mut catalog = haider_protocol::graph::built_in_workflow_catalog()
+        .into_iter()
+        .map(|entry| WorkflowCatalogEntryV1::BuiltIn {
+            id: entry.template.name.clone(),
+            main_session_eligible: entry.main_session_eligible,
+            template: entry.template,
+        })
+        .collect::<Vec<_>>();
+    catalog.extend(
+        workflows
+            .iter()
+            .cloned()
+            .map(|workflow| WorkflowCatalogEntryV1::User {
+                id: workflow.id.clone(),
+                main_session_eligible: true,
+                workflow,
+            }),
+    );
+    catalog
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod workflow_catalog_tests {
+    use super::*;
+
+    #[test]
+    fn publication_preserves_authority_records_and_eligibility_classes() {
+        let user = haider_protocol::loom::compile_pipe(
+            &haider_protocol::loom::parse_pipe("review: Patch -> Patch\ncheck \"review\""),
+            |_| None,
+        )
+        .expect("control-only user workflow compiles");
+        let authoritative_builtins = haider_protocol::graph::built_in_workflow_catalog();
+        let catalog = published_workflow_catalog(std::slice::from_ref(&user));
+
+        assert_eq!(catalog.len(), authoritative_builtins.len() + 1);
+        for (entry, authoritative) in catalog.iter().zip(&authoritative_builtins) {
+            assert_eq!(
+                entry,
+                &WorkflowCatalogEntryV1::BuiltIn {
+                    id: authoritative.template.name.clone(),
+                    main_session_eligible: authoritative.main_session_eligible,
+                    template: authoritative.template.clone(),
+                }
+            );
+        }
+        assert_eq!(
+            catalog.last(),
+            Some(&WorkflowCatalogEntryV1::User {
+                id: user.id.clone(),
+                main_session_eligible: true,
+                workflow: user,
+            })
+        );
     }
 }
 

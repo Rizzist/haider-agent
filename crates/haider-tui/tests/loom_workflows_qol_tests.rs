@@ -1,6 +1,6 @@
 //! W-flow — the Loom/Workflows QOL wave: the /workflows pane's fixed-head
 //! row space (`∅ none` first and undeletable, then the built-in catalog
-//! pair, then the REGISTERED section), ⌃P pin-by-name to the bound
+//! entries, then the REGISTERED section), ⌃P pin-by-name to the bound
 //! session, the ⌃N composer seed (authoring is a conversation held IN the
 //! tab, ⌥m picks the drafting model), the fleet's typed-agent accent, and
 //! the pane-entry snapshot re-request.
@@ -17,6 +17,7 @@ use haider_protocol::loom::{LoomAgentType, LoomTypeSig, compile_pipe, parse_pipe
 use haider_rpc::{
     FLEET_MAX_DEPTH, FLEET_MAX_NODES, FleetAgentStateWire, FleetMetricsTotalsWire, FleetNodeWire,
     FleetRollupWire, FleetStateCountsWire, RequestBody, SessionFleetSnapshot,
+    WorkflowCatalogEntryV1,
 };
 use haider_tui::app::{AppModel, AppRequest, LoomPane, RuntimeMode, Screen, WorkflowRow};
 use haider_tui::fleet;
@@ -41,6 +42,8 @@ fn live_bound_model() -> AppModel {
     model.mode = RuntimeMode::Live;
     model.daemon_features = [
         haider_rpc::FEATURE_LOOM_V1.to_owned(),
+        haider_rpc::FEATURE_WORKFLOW_CATALOG_V1.to_owned(),
+        haider_rpc::FEATURE_LOOM_PIPE_DAG_V1.to_owned(),
         haider_rpc::FEATURE_CONVERGENCE_GRAPH_V1.to_owned(),
     ]
     .into_iter()
@@ -50,7 +53,31 @@ fn live_bound_model() -> AppModel {
     model.upsert_live_session(&sid());
     model.open_session(&sid());
     model.loom_loaded = true;
+    install_catalog(&mut model, Vec::new());
     model
+}
+
+fn install_catalog(model: &mut AppModel, workflows: Vec<haider_protocol::loom::LoomWorkflow>) {
+    let mut catalog = haider_protocol::graph::built_in_workflow_catalog()
+        .into_iter()
+        .map(|entry| WorkflowCatalogEntryV1::BuiltIn {
+            id: entry.template.name.clone(),
+            main_session_eligible: entry.main_session_eligible,
+            template: entry.template,
+        })
+        .collect::<Vec<_>>();
+    catalog.extend(
+        workflows
+            .iter()
+            .cloned()
+            .map(|workflow| WorkflowCatalogEntryV1::User {
+                id: workflow.id.clone(),
+                main_session_eligible: true,
+                workflow,
+            }),
+    );
+    model.workflow_catalog = catalog;
+    model.loom_workflows = workflows;
 }
 
 fn researcher() -> LoomAgentType {
@@ -150,7 +177,7 @@ fn workflows_pane_leads_with_none_then_builtins_then_registered() {
     let mut model = launcher_model();
     submit(&mut model, "open the workflows");
     model.loom_types = vec![researcher()];
-    model.loom_workflows = vec![clip_workflow()];
+    install_catalog(&mut model, vec![clip_workflow()]);
     model.screen = Screen::Loom;
     model.loom_pane = LoomPane::Workflows;
 
@@ -163,18 +190,29 @@ fn workflows_pane_leads_with_none_then_builtins_then_registered() {
     let none = position("∅ none — no flow · default");
     let ship = position("⛩ ship-loop");
     let super_ship = position("⛩ super-ship-loop");
+    let staggered = position("⛩ staggered");
+    let sec_audit = position("⛩ sec-audit");
+    let docs_sweep = position("⛩ docs-sweep");
     let registered = position("REGISTERED");
     let clip = position("@clip");
     assert!(
-        none < ship && ship < super_ship && super_ship < registered && registered < clip,
+        none < ship
+            && ship < super_ship
+            && super_ship < staggered
+            && staggered < sec_audit
+            && sec_audit < docs_sweep
+            && docs_sweep < registered
+            && registered < clip,
         "fixed-head order broken:\n{}",
         rows.join("\n")
     );
-    assert!(
-        rows[ship].contains("built-in") && rows[super_ship].contains("built-in"),
-        "built-ins must be marked:\n{}",
-        rows.join("\n")
-    );
+    for row in [ship, super_ship, staggered, sec_audit, docs_sweep] {
+        assert!(
+            rows[row].contains("built-in"),
+            "built-ins must be marked:\n{}",
+            rows.join("\n")
+        );
+    }
     // The footer carries the new verbs — on ⌃, because the composer below
     // owns every bare letter.
     assert!(
@@ -184,9 +222,9 @@ fn workflows_pane_leads_with_none_then_builtins_then_registered() {
         rows.join("\n")
     );
 
-    // The row-space authority agrees with the paint: none, 2 built-ins,
+    // The row-space authority agrees with the paint: none, all 5 built-ins,
     // then the registered record.
-    assert_eq!(model.workflow_row_count(), 4);
+    assert_eq!(model.workflow_row_count(), 7);
     assert_eq!(model.workflow_row(0), Some(WorkflowRow::None));
     assert!(matches!(
         model.workflow_row(1),
@@ -196,11 +234,23 @@ fn workflows_pane_leads_with_none_then_builtins_then_registered() {
         model.workflow_row(2),
         Some(WorkflowRow::BuiltIn(template)) if template.name == "super-ship-loop"
     ));
-    assert_eq!(model.workflow_row(3), Some(WorkflowRow::Registered(0)));
+    assert!(matches!(
+        model.workflow_row(3),
+        Some(WorkflowRow::BuiltIn(template)) if template.name == "staggered"
+    ));
+    assert!(matches!(
+        model.workflow_row(4),
+        Some(WorkflowRow::BuiltIn(template)) if template.name == "sec-audit"
+    ));
+    assert!(matches!(
+        model.workflow_row(5),
+        Some(WorkflowRow::BuiltIn(template)) if template.name == "docs-sweep"
+    ));
+    assert_eq!(model.workflow_row(6), Some(WorkflowRow::Registered(0)));
 
     // An EMPTY registry never empties the pane — the head stays, and the
     // registry emptiness moves inside the REGISTERED section (reworded).
-    model.loom_workflows.clear();
+    install_catalog(&mut model, Vec::new());
     let (rows, _) = draw(&model);
     assert!(
         rows.iter().any(|row| row.contains("∅ none")),
@@ -222,6 +272,143 @@ fn workflows_pane_leads_with_none_then_builtins_then_registered() {
     );
 }
 
+#[test]
+fn loom_reply_installs_workflow_rows_from_the_published_catalog() {
+    let mut model = launcher_model();
+    model.mode = RuntimeMode::Live;
+    model.daemon_features = [
+        haider_rpc::FEATURE_LOOM_V1.to_owned(),
+        haider_rpc::FEATURE_WORKFLOW_CATALOG_V1.to_owned(),
+    ]
+    .into_iter()
+    .collect();
+    let published_builtin =
+        haider_protocol::graph::graph_template(haider_protocol::graph::DOCS_SWEEP_TEMPLATE)
+            .expect("published built-in");
+    let child_only = haider_protocol::graph::implement_verify_child_template();
+    let published_user = clip_workflow();
+    let mut driver = LiveDriver::new("test");
+    driver.apply(&mut model, LiveReply::Reconnected);
+    driver.apply(
+        &mut model,
+        LiveReply::LoomRegistry {
+            agent_types: vec![researcher()],
+            // Deliberately empty: workflow rows must come from the new field.
+            workflows: Vec::new(),
+            workflow_catalog: vec![
+                WorkflowCatalogEntryV1::BuiltIn {
+                    id: published_builtin.name.clone(),
+                    main_session_eligible: true,
+                    template: published_builtin.clone(),
+                },
+                WorkflowCatalogEntryV1::BuiltIn {
+                    id: child_only.name.clone(),
+                    main_session_eligible: false,
+                    template: child_only,
+                },
+                WorkflowCatalogEntryV1::User {
+                    id: published_user.id.clone(),
+                    main_session_eligible: true,
+                    workflow: published_user.clone(),
+                },
+            ],
+            cli_present: std::collections::BTreeMap::new(),
+            epoch: 0,
+        },
+    );
+
+    assert_eq!(model.builtin_workflow_templates(), vec![published_builtin]);
+    assert_eq!(model.loom_workflows, vec![published_user]);
+    assert_eq!(model.workflow_row_count(), 3);
+}
+
+/// MUTATION CHECK: restore the linked-in built-in fallback, retain legacy
+/// loom.list workflows when the catalog feature is absent, or let Tab enter
+/// the unsupported pane. Expected runtime failure: rows or navigation appear.
+#[test]
+fn absent_catalog_feature_never_becomes_a_hardcoded_or_legacy_list() {
+    let mut model = launcher_model();
+    model.mode = RuntimeMode::Live;
+    model.daemon_features = [haider_rpc::FEATURE_LOOM_V1.to_owned()]
+        .into_iter()
+        .collect();
+    model.loom_loaded = true;
+    install_catalog(&mut model, vec![clip_workflow()]);
+
+    let mut driver = LiveDriver::new("test");
+    driver.apply(&mut model, LiveReply::Reconnected);
+    let unadvertised_catalog = model.workflow_catalog.clone();
+    driver.apply(
+        &mut model,
+        LiveReply::LoomRegistry {
+            agent_types: Vec::new(),
+            workflows: vec![clip_workflow()],
+            workflow_catalog: unadvertised_catalog,
+            cli_present: std::collections::BTreeMap::new(),
+            epoch: 0,
+        },
+    );
+
+    assert!(model.builtin_workflow_templates().is_empty());
+    assert!(model.workflow_catalog.is_empty());
+    assert!(model.loom_workflows.is_empty());
+    assert_eq!(model.workflow_row_count(), 0);
+    assert_eq!(model.workflow_row(0), None);
+
+    model.screen = Screen::Loom;
+    model.loom_pane = LoomPane::Types;
+    model.handle(key(KeyCode::Tab));
+    assert_eq!(model.loom_pane, LoomPane::Types);
+    assert!(
+        model
+            .flash
+            .as_deref()
+            .is_some_and(|flash| flash.contains("workflow catalog"))
+    );
+}
+
+/// After a redial, Welcome settles feature absence before `loom.list` can
+/// settle registry hydration. The open Workflows pane must render that known
+/// absence instead of claiming the catalog is still loading.
+///
+/// MUTATION CHECK: put the loading branch ahead of the catalog feature gate.
+/// Expected RUNTIME failure: the unavailable/loading assertions below.
+#[test]
+fn reconnect_to_pre_catalog_daemon_renders_typed_absence_immediately() {
+    let mut model = live_bound_model();
+    model.screen = Screen::Loom;
+    model.loom_pane = LoomPane::Workflows;
+    let mut driver = LiveDriver::new("test");
+
+    driver.apply(
+        &mut model,
+        LiveReply::Disconnected {
+            reason: "test redial".to_owned(),
+        },
+    );
+    driver.apply(
+        &mut model,
+        LiveReply::Handshake {
+            features: [haider_rpc::FEATURE_LOOM_V1.to_owned()]
+                .into_iter()
+                .collect(),
+            version: "0.0.961".to_owned(),
+        },
+    );
+    driver.apply(&mut model, LiveReply::Reconnected);
+
+    let (rows, _) = draw(&model);
+    let all = rows.join("\n");
+    assert!(
+        all.contains("workflow catalog needs workflow_catalog_v1"),
+        "the fresh Welcome establishes typed absence:\n{all}"
+    );
+    assert!(
+        !all.contains("loading registry from the daemon"),
+        "known feature absence is not an in-flight catalog:\n{all}"
+    );
+}
+
 /// MUTATION CHECK: drop the built-in detail derivation (nodes/gates from
 /// the GraphTemplateSpec) or the `none` detail one-liner. Expected RUNTIME
 /// failure: the node/gate assertions or the default-line assertion below.
@@ -229,6 +416,7 @@ fn workflows_pane_leads_with_none_then_builtins_then_registered() {
 fn builtin_and_none_details_render_from_the_catalog() {
     let mut model = launcher_model();
     submit(&mut model, "inspect the built-ins");
+    install_catalog(&mut model, Vec::new());
     model.screen = Screen::Loom;
     model.loom_pane = LoomPane::Workflows;
 
@@ -305,8 +493,8 @@ fn p_pin_carries_the_selected_template_name_on_the_wire() {
     }
 
     // A registered workflow row pins by ITS name too.
-    model.loom_workflows = vec![clip_workflow()];
-    model.loom_selection = 3;
+    install_catalog(&mut model, vec![clip_workflow()]);
+    model.loom_selection = 6;
     model.requests.clear();
     model.handle(ctrl(KeyCode::Char('p')));
     assert!(
@@ -383,6 +571,7 @@ fn p_without_a_bound_session_flashes_honestly() {
     model.mode = RuntimeMode::Live;
     model.daemon_features = [
         haider_rpc::FEATURE_LOOM_V1.to_owned(),
+        haider_rpc::FEATURE_WORKFLOW_CATALOG_V1.to_owned(),
         haider_rpc::FEATURE_CONVERGENCE_GRAPH_V1.to_owned(),
     ]
     .into_iter()
@@ -569,6 +758,39 @@ fn ctrl_n_seeds_the_composer_per_pane_and_stays_in_the_tab() {
         model.composer.text(),
         "half a thought",
         "⌃N must not overwrite work in progress"
+    );
+}
+
+/// `workflow_catalog_v1` and `loom_pipe_dag_v1` are independent. A client
+/// may browse a published catalog while talking to a daemon that only knows
+/// the legacy sequential grammar; its authoring turn must preserve that
+/// typed absence instead of prompting the model to invent DAG syntax.
+///
+/// MUTATION CHECK: remove the grammar feature branch from `submit_loom_turn`.
+/// Expected RUNTIME failure: the legacy-law assertion below.
+#[test]
+fn authoring_without_pipe_dag_feature_requests_only_legacy_grammar() {
+    let mut model = live_bound_model();
+    model
+        .daemon_features
+        .remove(haider_rpc::FEATURE_LOOM_PIPE_DAG_V1);
+    model.screen = Screen::Loom;
+    model.loom_pane = LoomPane::Workflows;
+    model.composer.set_text("New workflow: sequential review");
+    model.requests.clear();
+
+    model.handle(key(KeyCode::Enter));
+
+    let AppRequest::SubmitText { text, .. } = model.requests.pop().expect("submit request") else {
+        panic!("workflow authoring should submit an ordinary text turn");
+    };
+    assert!(
+        text.contains("Use only the legacy loom_v1 sequential pipe grammar"),
+        "the absent feature is carried into the authoring request: {text}"
+    );
+    assert!(
+        !text.contains("supports the v0.0.961 explicit fork"),
+        "the absent DAG grammar must not be fabricated: {text}"
     );
 }
 

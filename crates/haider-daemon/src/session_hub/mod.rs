@@ -152,8 +152,8 @@ use haider_rpc::{
     ProtocolError, RequestBody, RequestId, ResponseBody, SURFACE_INPUT_MAX_BYTES,
     SURFACE_STATUS_MAX_BYTES, SeqRange, SessionReadResult, SessionSummary, SubmitDisposition,
     SurfaceInjectOp, SurfaceInputPublishWire, SurfaceInputWire, SurfaceStatusPublishWire,
-    SurfaceStatusWire, TodoGraphOpenedWire, WireFrame, WorkflowInstanceSourceV1,
-    WorkflowInstanceV1,
+    SurfaceStatusWire, TodoGraphOpenedWire, WireFrame, WorkflowCatalogEntryV1,
+    WorkflowInstanceSourceV1, WorkflowInstanceV1,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;

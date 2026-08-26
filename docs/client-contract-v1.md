@@ -203,10 +203,10 @@ An operation not listed here is part of the v1 base surface. “Field” means t
 client may use that field only when it is present; the named token permits an
 affordance before the response exists.
 
-The ordinary v0.0.962 `welcome_features()` set contains all 82 tokens below.
+The ordinary v0.0.962 `welcome_features()` set contains all 84 tokens below.
 The re-verification anchors are
-`crates/haider-daemon/src/connection.rs:1867-1951` for the assembled set and
-`crates/haider-rpc/src/frame.rs:248-496` for the exact string constants. The
+`crates/haider-daemon/src/connection.rs:1868-1955` for the assembled set and
+`crates/haider-rpc/src/frame.rs:248-502` for the exact string constants. The
 one peer-specific withholding exception is §4.1.
 
 | Feature token | Methods, frames, or fields it publishes |
@@ -280,6 +280,8 @@ one peer-specific withholding exception is §4.1.
 | `convergence_graph_v3` | `graph.inspect` |
 | `convergence_graph_v4` | `graph.run_set.open` and todo child-graph telemetry |
 | `loom_v1` | `loom.list/register_agent_type/register_workflow` |
+| `loom_pipe_dag_v1` | v0.0.961 Loom pipe fork/join/back-edge DAG grammar |
+| `workflow_catalog_v1` | additive authoritative `workflow_catalog` section on `loom.list` |
 | `workflow_instance_v1` | immutable `workflow.instance` descriptors and optional `expected_digest` fences on `graph.pin`/`graph.switch` |
 | `loom_cli_presence_v1` | `loom.list.cli_present` |
 | `typed_agent_install_v1` | `loom.install.status` and the durable required-CLI install lifecycle started by agent-type registration |
@@ -299,7 +301,7 @@ one peer-specific withholding exception is §4.1.
 Normally a feature token means “this daemon implements the named surface,” so
 its absence reads as unimplemented. `FEATURE_USER_COMMAND_V1`
 (`"user_command_v1"`) is the sole exception. In
-`crates/haider-daemon/src/connection.rs:1959-1979`, `encode_welcome_for_peer`
+`crates/haider-daemon/src/connection.rs:1966-1986`, `encode_welcome_for_peer`
 removes only this token and retries the otherwise unchanged `Welcome` when
 advertising that token is exactly what pushes the frame past the peer's
 receive-frame limit. Every other encoding failure remains fatal. The reason
@@ -366,7 +368,7 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | Resident binding | top-level `ResidentSessionBinding` | same top-level frame fanned out; no response | required unsolicited baseline and pushes | profile-global most-recent live publisher |
 | Volatile input/status | `session.surface_watch` | `SessionSurfaceWatching`, then `SessionSurfaceDelta` | complete baseline then complete latest snapshots | live publisher registry; not journaled |
 | Volatile input action | `session.input_inject` | `SessionInputInjectAck`, then owner receives `SessionInputInjected` | routed action | current live input owner |
-| Workflows and agent types | `loom.list` | `LoomList` | snapshot | persisted Loom registry; pipe source is workflow structure of record |
+| Workflows and agent types | `loom.list` | `LoomList` | snapshot | persisted Loom registry and, with `workflow_catalog_v1`, the authoritative built-in + user workflow catalog; pipe source is user-workflow structure of record |
 | Exact workflow instance | `workflow.instance` | `WorkflowInstance` | snapshot | current registry/catalog instance by id, or an exact retained user revision by template digest |
 | Typed-agent install readiness | `loom.install.status` | `LoomInstallStatus` | reconnectable, bounded snapshot | durable install jobs and per-CLI items read from one store snapshot |
 | Monitor registry | `monitor.list` | `MonitorList` | typed snapshot receipt | durable session monitor facts |
@@ -1891,6 +1893,67 @@ agent type, CLI, API, graph node, or model tool. Execution still requires the
 durable `GraphPinned` fact, the current graph reduction, and the daemon's
 typed-agent contract/install/grant checks. The workflow instance is also not
 the delegation/agent-lineage graph described above.
+
+### 13.5 Workflow catalog and pipe-DAG grammar negotiation
+
+`workflow_catalog_v1` adds one optional section to the existing `loom.list`
+success response; it does not add a second registry method. The request remains
+`LoomList` (`method: "loom.list"`) with no fields. The response retains
+`agent_types`, `workflows`, and `cli_present` unchanged and additively carries
+`workflow_catalog: Vec<WorkflowCatalogEntryV1>`. The field has a serde default
+and is omitted when empty, so a pre-feature v1 response retains its exact wire
+shape and an older v1 client ignores the new object field.
+
+Each known catalog entry has exactly one of these origin-tagged forms:
+
+| `origin` | Uniform fields | Verbatim authority record |
+|---|---|---|
+| `"built_in"` | `id: String`, `main_session_eligible: bool` | `template: GraphTemplateSpec` |
+| `"user"` | `id: String`, `main_session_eligible: bool` | `workflow: LoomWorkflow` |
+
+The nested record is complete and unchanged. A client MUST NOT flatten it into
+invented optional summaries, synthesize a user pipe record for a built-in, or
+compile a user `source` locally and substitute that output. `id` is the exact
+`template.name` or `workflow.id`; `origin` distinguishes release-owned graph
+templates from persisted user registry rows. An unknown future `origin`
+decodes to `WorkflowCatalogEntryV1::Unknown` and supplies no v1 identity,
+eligibility, template, source, or execution fact.
+
+The built-in projection copies `built_in_workflow_catalog()` from the graph
+authority. That catalog preserves all five historical
+`graph_template_catalog()` records as main-session eligible, followed by the
+two adjacent child workflow templates as `main_session_eligible=false`.
+Persisted user `LoomWorkflow` rows are main-session eligible and are copied
+whole from the same store snapshot as `loom.list.workflows`. Eligibility means
+only that the workflow class may be selected for a main session. It is not
+execution authority, a graph pin, typed-agent install readiness, a grant, or
+proof that any session is currently running that workflow. A main-session
+picker filters on the published boolean; it MUST NOT infer eligibility from an
+id prefix, template shape, origin, or the presence of a human gate.
+
+`loom_pipe_dag_v1` separately negotiates the v0.0.961 extension of the
+`pipe/v1` source grammar. When present, a client may author explicit green
+dependencies with `<-node` or `<-left,right` (including forks and strict
+multi-input joins), self retry with `↻`, and conditional back edges with
+`↺node` or `^node`, subject to the daemon parser/compiler's existing bounds
+and earlier-node rules. `loom_v1` alone establishes only the Loom registry and
+legacy pipe workflow surface; it does not assert support for these DAG forms.
+The catalog bit and grammar bit are independent: catalog enumeration does not
+authorize registration, and grammar support does not publish a catalog.
+
+The workflow DAG remains the compiled Convergence Graph described by a
+catalog/instance record and, for an active session, the separately negotiated
+projection in §13.3. It is not the delegation lineage graph formed by
+`SessionSummary.kind` and `parent_session_id`; clients MUST NOT merge or use
+one as a fallback for the other.
+
+**Absence laws.** When `workflow_catalog_v1` is absent, the catalog is typed
+unavailable: a client MUST NOT treat a defaulted empty field as an empty
+catalog, hardcode release built-ins, scrape a terminal, or reinterpret the
+legacy `loom.list.workflows` vector as the catalog/eligibility authority. When
+`loom_pipe_dag_v1` is absent, a client MUST assume only the older `loom_v1`
+grammar and MUST NOT submit fork, join, or back-edge syntax. Neither absence
+licenses probing by speculative registration.
 
 ## 14. Forward compatibility and raw preservation
 

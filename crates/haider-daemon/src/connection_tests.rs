@@ -189,12 +189,17 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// `FEATURE_MONITOR_DELIVERY_V1`. Expected runtime failure: clients cannot
 /// distinguish the served typed control/replay surfaces from the private APK
 /// transport or from total client-surface absence.
+///
+/// MUTATION CHECK: remove `FEATURE_WORKFLOW_CATALOG_V1` or
+/// `FEATURE_LOOM_PIPE_DAG_V1`. Expected runtime failure: clients cannot
+/// discover the catalog snapshot or distinguish v0.0.961 fork/join/back-edge
+/// grammar from legacy `loom_v1`.
 #[test]
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
         welcome_features().len(),
-        82,
-        "the ordinary Welcome advertises all 78 base and four v0.0.962 feature tokens"
+        84,
+        "the ordinary Welcome advertises all 78 base and six v0.0.962 feature tokens"
     );
     assert_eq!(
         welcome_features(),
@@ -228,6 +233,8 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_TYPED_AGENT_INSTALL_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_RUN_ID_V1.to_owned(),
             haider_rpc::FEATURE_LOOM_V1.to_owned(),
+            haider_rpc::FEATURE_LOOM_PIPE_DAG_V1.to_owned(),
+            haider_rpc::FEATURE_WORKFLOW_CATALOG_V1.to_owned(),
             haider_rpc::FEATURE_WORKFLOW_INSTANCE_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_WORKFLOW_STATE_V1.to_owned(),
             haider_rpc::FEATURE_MODELS_LIST_V1.to_owned(),
@@ -290,6 +297,27 @@ fn welcome_advertises_typed_pipe_tool_status() {
     assert!(
         welcome_features().contains(haider_rpc::FEATURE_PIPE_TOOL_STATUS_V1),
         "the daemon publishes typed native-pipe tool status"
+    );
+}
+
+#[test]
+fn welcome_advertises_the_961_loom_pipe_dag_grammar() {
+    assert!(
+        welcome_features().contains(haider_rpc::FEATURE_LOOM_PIPE_DAG_V1),
+        "fork/join/back-edge parsing requires its distinct negotiation bit"
+    );
+    let workflow = haider_protocol::loom::compile_pipe(
+        &haider_protocol::loom::parse_pipe(
+            "dag: A -> A\nroot\nleft <-root\nright <-root\njoin <-left,right ↺root",
+        ),
+        |_| None,
+    )
+    .expect("the advertised v0.0.961 DAG grammar compiles");
+    let join = workflow.template.nodes.last().expect("join node");
+    assert_eq!(join.depends_on.len(), 2);
+    assert_eq!(
+        join.red_target.as_ref().map(|node| node.as_str()),
+        Some("ROOT")
     );
 }
 

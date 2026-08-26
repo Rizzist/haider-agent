@@ -376,35 +376,48 @@ impl AppModel {
             })
     }
 
-    /// W-flow — the MAIN-session built-ins the /workflows pane lists
-    /// (`ship-loop`, `super-ship-loop`). The other catalog entries
-    /// (staggered/sec-audit/docs-sweep) stay pinnable by name but keep the
-    /// pane focused; child templates never belong on a MAIN pane.
+    /// The MAIN-session built-ins published by this connection's daemon.
+    /// Unknown origins and child-only entries carry no row authority here.
+    /// Feature absence leaves the list empty; the TUI never substitutes its
+    /// linked protocol crate's local catalog.
     #[must_use]
-    pub fn builtin_workflow_templates() -> Vec<haider_protocol::graph::GraphTemplateSpec> {
-        use haider_protocol::graph::{SHIP_LOOP_TEMPLATE, SUPER_SHIP_LOOP_TEMPLATE};
-        haider_protocol::graph::graph_template_catalog()
-            .into_iter()
-            .filter(|template| {
-                template.name == SHIP_LOOP_TEMPLATE || template.name == SUPER_SHIP_LOOP_TEMPLATE
+    pub fn builtin_workflow_templates(&self) -> Vec<haider_protocol::graph::GraphTemplateSpec> {
+        if !self.daemon_serves(haider_rpc::FEATURE_WORKFLOW_CATALOG_V1) {
+            return Vec::new();
+        }
+        self.workflow_catalog
+            .iter()
+            .filter_map(|entry| match entry {
+                haider_rpc::WorkflowCatalogEntryV1::BuiltIn {
+                    main_session_eligible: true,
+                    template,
+                    ..
+                } => Some(template.clone()),
+                _ => None,
             })
             .collect()
     }
 
-    /// W-flow — total /workflows rows: `none` + built-ins + registered.
-    /// Never zero, which is why the workflows pane has no empty state.
+    /// Total /workflows rows: `none` + built-ins + registered while the
+    /// catalog feature is present; zero is typed catalog unavailability.
     #[must_use]
     pub fn workflow_row_count(&self) -> usize {
-        1 + Self::builtin_workflow_templates().len() + self.loom_workflows.len()
+        if !self.daemon_serves(haider_rpc::FEATURE_WORKFLOW_CATALOG_V1) {
+            return 0;
+        }
+        1 + self.builtin_workflow_templates().len() + self.loom_workflows.len()
     }
 
     /// W-flow — resolve one /workflows selection index into its row.
     #[must_use]
     pub fn workflow_row(&self, index: usize) -> Option<WorkflowRow> {
+        if !self.daemon_serves(haider_rpc::FEATURE_WORKFLOW_CATALOG_V1) {
+            return None;
+        }
         if index == 0 {
             return Some(WorkflowRow::None);
         }
-        let builtins = Self::builtin_workflow_templates();
+        let builtins = self.builtin_workflow_templates();
         if let Some(template) = builtins.get(index - 1) {
             return Some(WorkflowRow::BuiltIn(template.clone()));
         }
@@ -3145,7 +3158,7 @@ impl std::ops::Deref for OutboundAnswer {
 }
 
 /// Which half of the Loom registry the browser shows. The sim splits the
-/// two surfaces (`/loom` = Agent Types, `/workflows` = pipe DAG templates);
+/// two surfaces (`/loom` = Agent Types, `/workflows` = pipe workflows);
 /// one Screen::Loom carries both as panes so every `match Screen` stays put.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LoomPane {
@@ -3192,7 +3205,7 @@ pub enum LauncherRow {
     Peers,
     /// The all-sessions browser (`/resume`).
     Sessions,
-    /// The Workflows registry browser (`/workflows`) — typed pipe DAGs.
+    /// The Workflows registry browser (`/workflows`) — typed pipe templates.
     Workflows,
     /// The Loom agent-type browser (`/loom`) — capability-scoped specialists.
     Loom,
@@ -3712,6 +3725,9 @@ pub struct AppModel {
     /// D1 — the Loom registry snapshot (types color the `@type ·` chips; the
     /// workflows annotate the graph screen with tasks + typed I/O).
     pub loom_types: Vec<haider_protocol::loom::LoomAgentType>,
+    /// `workflow_catalog_v1` snapshot. This is connection truth and is empty
+    /// when the feature is absent; no local built-in fallback is permitted.
+    pub workflow_catalog: Vec<haider_rpc::WorkflowCatalogEntryV1>,
     pub loom_workflows: Vec<haider_protocol::loom::LoomWorkflow>,
     /// ADE seam: a session id handed to the CLI (`haider --session <id>`)
     /// that the TUI opens as soon as the live list proves it exists. Cleared
@@ -4100,6 +4116,7 @@ impl Default for AppModel {
             fleet: crate::fleet::FleetView::default(),
             graph: None,
             loom_types: Vec::new(),
+            workflow_catalog: Vec::new(),
             loom_workflows: Vec::new(),
             initial_session: None,
             loom_cli_present: std::collections::BTreeMap::new(),
@@ -6073,9 +6090,9 @@ impl AppModel {
                 self.dirty = true;
                 return;
             }
-            // W-flow: BOTH row spaces are fixed-head (synthetic `none`
-            // first) — never empty, so the emptied-registry detail fold
-            // below is vestigial but harmless.
+            // Both supported row spaces are fixed-head (synthetic `none`
+            // first). A zero workflow total means the catalog feature is
+            // unavailable, never an empty catalog.
             let total = match self.loom_pane {
                 LoomPane::Types => self.type_row_count(),
                 LoomPane::Workflows => self.workflow_row_count(),
@@ -6135,6 +6152,12 @@ impl AppModel {
                 KeyCode::Tab => {
                     // ⇄ the sibling registry pane, selection reset — the
                     // sim's two surfaces, one keystroke apart.
+                    if self.loom_pane == LoomPane::Types
+                        && !self.daemon_serves(haider_rpc::FEATURE_WORKFLOW_CATALOG_V1)
+                    {
+                        self.flash = Some(self.stale_daemon_note("workflow catalog"));
+                        return;
+                    }
                     self.loom_pane = match self.loom_pane {
                         LoomPane::Types => LoomPane::Workflows,
                         LoomPane::Workflows => LoomPane::Types,
@@ -10043,6 +10066,12 @@ impl AppModel {
             self.flash = Some(self.stale_daemon_note(surface));
             return;
         }
+        if pane == LoomPane::Workflows
+            && !self.daemon_serves(haider_rpc::FEATURE_WORKFLOW_CATALOG_V1)
+        {
+            self.flash = Some(self.stale_daemon_note("workflow catalog"));
+            return;
+        }
         self.loom_pane = pane;
         self.loom_selection = 0;
         self.loom_detail = false;
@@ -10071,6 +10100,10 @@ impl AppModel {
         self.dirty = true;
         if self.mode.fabricates_locally() {
             self.flash = Some("· pin — live only; graphs are daemon truth".to_owned());
+            return;
+        }
+        if !self.daemon_serves(haider_rpc::FEATURE_WORKFLOW_CATALOG_V1) {
+            self.flash = Some(self.stale_daemon_note("workflow catalog"));
             return;
         }
         if !self.daemon_serves(haider_rpc::FEATURE_CONVERGENCE_GRAPH_V1) {
@@ -10235,13 +10268,22 @@ impl AppModel {
                  command-line tools it expects to have installed). After I accept \
                  the plan, register it with loom_register."
             ),
-            LoomPane::Workflows => format!(
-                "{described}\n\nDraft this as a Loom WORKFLOW. Propose it as a plan \
-                 carrying the pipe DSL source (header `name: In -> Out`, one node per \
-                 line, using the registered agent types in your loom inventory) and \
-                 name the model each node should run on. After I accept the plan, \
-                 register it with loom_register."
-            ),
+            LoomPane::Workflows => {
+                let grammar = if self.daemon_serves(haider_rpc::FEATURE_LOOM_PIPE_DAG_V1) {
+                    "The daemon supports the v0.0.961 explicit fork, join, and back-edge \
+                     pipe-DAG grammar when the workflow needs it."
+                } else {
+                    "Use only the legacy loom_v1 sequential pipe grammar; do not use \
+                     explicit dependencies, forks, joins, or back edges."
+                };
+                format!(
+                    "{described}\n\nDraft this as a Loom WORKFLOW. Propose it as a plan \
+                     carrying the pipe DSL source (header `name: In -> Out`, one node per \
+                     line, using the registered agent types in your loom inventory) and \
+                     name the model each node should run on. {grammar} After I accept the \
+                     plan, register it with loom_register."
+                )
+            }
         };
         let attachments = self.composer.take_ready_attachments();
         self.turn_active = true;

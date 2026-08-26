@@ -28,6 +28,12 @@ fn live_loom_model() -> AppModel {
     model
         .daemon_features
         .insert(haider_rpc::FEATURE_LOOM_V1.to_owned());
+    model
+        .daemon_features
+        .insert(haider_rpc::FEATURE_WORKFLOW_CATALOG_V1.to_owned());
+    model
+        .daemon_features
+        .insert(haider_rpc::FEATURE_LOOM_PIPE_DAG_V1.to_owned());
     model.loom_loaded = true;
     model
 }
@@ -198,7 +204,13 @@ fn launcher_rows_open_their_registry_panes() {
 fn workflows_pane_lists_only_workflows_and_tab_hops_to_types() {
     let mut model = live_loom_model();
     model.loom_types = vec![researcher_type()];
-    model.loom_workflows = vec![clip_workflow()];
+    let workflow = clip_workflow();
+    model.workflow_catalog = vec![haider_rpc::WorkflowCatalogEntryV1::User {
+        id: workflow.id.clone(),
+        main_session_eligible: true,
+        workflow: workflow.clone(),
+    }];
+    model.loom_workflows = vec![workflow];
     run_slash(&mut model, "/workflows");
     assert_eq!(model.screen, Screen::Loom);
     assert_eq!(model.loom_pane, LoomPane::Workflows);

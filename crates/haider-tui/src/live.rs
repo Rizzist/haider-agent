@@ -895,6 +895,7 @@ pub enum LiveReply {
     LoomRegistry {
         agent_types: Vec<haider_protocol::loom::LoomAgentType>,
         workflows: Vec<haider_protocol::loom::LoomWorkflow>,
+        workflow_catalog: Vec<haider_rpc::WorkflowCatalogEntryV1>,
         /// W-flow — device PATH presence per DECLARED cli name. Absent key
         /// means NOT PROBED (older daemon), never "missing".
         cli_present: std::collections::BTreeMap<String, bool>,
@@ -2068,6 +2069,7 @@ impl LiveDriver {
             LiveReply::LoomRegistry {
                 agent_types,
                 workflows,
+                workflow_catalog,
                 cli_present,
                 epoch,
             } => {
@@ -2075,12 +2077,36 @@ impl LiveDriver {
                 // connection epoch is the fence — `connected` alone races a
                 // reply that slept across a full disconnect/reconnect cycle.
                 if self.connected && epoch == self.connection_epoch {
+                    let workflow_catalog =
+                        if model.daemon_serves(haider_rpc::FEATURE_WORKFLOW_CATALOG_V1) {
+                            workflow_catalog
+                        } else {
+                            Vec::new()
+                        };
+                    // `workflows` remains on loom.list for pre-catalog
+                    // clients. This TUI derives its rows from the advertised
+                    // catalog and never treats that legacy vector as
+                    // main-session eligibility authority.
+                    let _legacy_workflows = workflows;
+                    let workflows = workflow_catalog
+                        .iter()
+                        .filter_map(|entry| match entry {
+                            haider_rpc::WorkflowCatalogEntryV1::User {
+                                main_session_eligible: true,
+                                workflow,
+                                ..
+                            } => Some(workflow.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
                     // Round 4: a CHANGED registry under an open detail pane
                     // may silently swap the pane's subject even when the
                     // index still clamps — close it on any content change.
-                    let changed =
-                        model.loom_types != agent_types || model.loom_workflows != workflows;
+                    let changed = model.loom_types != agent_types
+                        || model.workflow_catalog != workflow_catalog
+                        || model.loom_workflows != workflows;
                     model.loom_types = agent_types;
+                    model.workflow_catalog = workflow_catalog;
                     model.loom_workflows = workflows;
                     model.loom_cli_present = cli_present;
                     model.loom_loaded = true;
@@ -3644,6 +3670,7 @@ impl LiveDriver {
                 model.loom_loaded = false;
                 model.loom_requested = false;
                 model.loom_types.clear();
+                model.workflow_catalog.clear();
                 model.loom_workflows.clear();
                 self.connection_epoch = self.connection_epoch.wrapping_add(1);
                 // Round 3: capability facts die with the socket as well; the

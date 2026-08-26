@@ -417,6 +417,12 @@ pub const FEATURE_CONVERGENCE_GRAPH_V4: &str = "convergence_graph_v4";
 /// Daemon implements the Loom registry: agent types + pipe-source workflows
 /// (`loom.list`, `loom.register_agent_type`, `loom.register_workflow`).
 pub const FEATURE_LOOM_V1: &str = "loom_v1";
+/// `loom.list` publishes the daemon-owned built-in + user workflow catalog,
+/// including origin and whether each entry may be selected by a main session.
+pub const FEATURE_WORKFLOW_CATALOG_V1: &str = "workflow_catalog_v1";
+/// The Loom pipe compiler accepts the v0.0.961 dependency-DAG grammar:
+/// explicit forks, multi-input joins, and conditional self/back edges.
+pub const FEATURE_LOOM_PIPE_DAG_V1: &str = "loom_pipe_dag_v1";
 /// Daemon exposes immutable built-in/user workflow-instance descriptors and
 /// accepts template-digest fences on `graph.pin` and `graph.switch`.
 pub const FEATURE_WORKFLOW_INSTANCE_V1: &str = "workflow_instance_v1";
@@ -543,6 +549,58 @@ pub struct WorkflowInstanceV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_metadata: Option<Vec<haider_protocol::loom::LoomNodeMeta>>,
     pub compiled_template: haider_protocol::graph::GraphTemplateSpec,
+}
+
+/// One daemon-owned workflow-catalog entry.
+///
+/// The `origin` tag is a registry classification, not execution authority.
+/// Each known variant nests the complete record from its owning authority so
+/// clients never have to reconstruct catalog facts from a summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "origin", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WorkflowCatalogEntryV1 {
+    BuiltIn {
+        id: String,
+        main_session_eligible: bool,
+        template: haider_protocol::graph::GraphTemplateSpec,
+    },
+    User {
+        id: String,
+        main_session_eligible: bool,
+        workflow: haider_protocol::loom::LoomWorkflow,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+impl WorkflowCatalogEntryV1 {
+    /// Uniform catalog identity. An unknown future origin has no v1 identity
+    /// authority even if its raw object happened to contain an `id` field.
+    #[must_use]
+    pub fn id(&self) -> Option<&str> {
+        match self {
+            Self::BuiltIn { id, .. } | Self::User { id, .. } => Some(id),
+            Self::Unknown => None,
+        }
+    }
+
+    /// Whether the catalog authority permits this workflow class on a main
+    /// session. This is eligibility only; it never grants execution.
+    #[must_use]
+    pub fn main_session_eligible(&self) -> Option<bool> {
+        match self {
+            Self::BuiltIn {
+                main_session_eligible,
+                ..
+            }
+            | Self::User {
+                main_session_eligible,
+                ..
+            } => Some(*main_session_eligible),
+            Self::Unknown => None,
+        }
+    }
 }
 
 /// Kind of client taking part in the handshake.
@@ -3245,6 +3303,11 @@ pub enum ResponseBody {
         /// device, and clients must not render it as missing.
         #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
         cli_present: std::collections::BTreeMap<String, bool>,
+        /// Built-in and user workflow records from their daemon authorities.
+        /// The field is meaningful only when `workflow_catalog_v1` was
+        /// advertised; default + skip-empty preserves pre-feature v1 bytes.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        workflow_catalog: Vec<WorkflowCatalogEntryV1>,
     },
     /// B1 — a committed (or no-op) registration.
     #[serde(rename = "loom.registered")]
