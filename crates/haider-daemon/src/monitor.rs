@@ -999,8 +999,9 @@ impl MonitorService {
                 let (Some(inner), Some(hub)) = (weak_service.upgrade(), boot_hub.upgrade()) else {
                     return;
                 };
+                let service = MonitorService { inner };
                 let result = tokio::select! {
-                    result = (MonitorService { inner }).adopt_all(&hub) => Some(result),
+                    result = service.adopt_all(&hub) => Some(result),
                     changed = boot_shutdown.changed() => {
                         let _ = changed;
                         None
@@ -2193,8 +2194,9 @@ impl MonitorService {
                 let (Some(inner), Some(hub)) = (weak_service.upgrade(), hub.upgrade()) else {
                     break;
                 };
+                let service = MonitorService { inner };
                 let result = tokio::select! {
-                    result = (MonitorService { inner }).deliver_pending(&hub, &session, &pending) => Some(result),
+                    result = service.deliver_pending(&hub, &session, &pending) => Some(result),
                     _ = &mut cancelled => None,
                     changed = shutdown.changed() => {
                         let _ = changed;
@@ -2387,6 +2389,7 @@ impl MonitorService {
             .saturating_add(1);
         let (cancel, cancelled) = oneshot::channel();
         let (start, started) = oneshot::channel();
+        let task_session = session.clone();
         let task = tokio::spawn(async move {
             if started.await.is_err() {
                 return;
@@ -2395,8 +2398,9 @@ impl MonitorService {
                 () = async {
                     tokio::time::sleep(delay).await;
                     if let (Some(inner), Some(hub)) = (weak_service.upgrade(), hub.upgrade()) {
-                        MonitorService { inner }
-                            .expire_monitor(&hub, &session, &registration)
+                        let service = MonitorService { inner };
+                        service
+                            .expire_monitor(&hub, &task_session, &registration)
                             .await;
                     }
                 } => {}
