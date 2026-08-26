@@ -2180,6 +2180,23 @@ impl HubConnection {
                 }
                 self.session_fleet(request_id, session_id).await
             }
+            RequestBody::SessionDescendantsAttach {
+                session_id,
+                cursors,
+                max_children,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.session_descendants_attach(request_id, session_id, cursors, max_children)
+                    .await
+            }
             RequestBody::GraphStatus { session_id } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::View) {
                     return self.respond_error(
@@ -9947,6 +9964,128 @@ impl HubConnection {
         })
     }
 
+    async fn session_descendants_attach(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+        cursors: Vec<haider_rpc::DescendantReplayCursorWire>,
+        max_children: u32,
+    ) -> Result<(), SessionHubError> {
+        if self.hub.inner.store.latest_seq(&session_id).await? == 0 {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "session was not found",
+                false,
+                None,
+            );
+        }
+        let prepared = match super::descendant_stream::prepare_descendant_stream(
+            &self.hub,
+            session_id.clone(),
+            cursors,
+            max_children,
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(super::descendant_stream::PrepareDescendantStreamError::Invalid(message)) => {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    &message,
+                    false,
+                    None,
+                );
+            }
+            Err(super::descendant_stream::PrepareDescendantStreamError::CursorAhead {
+                cursor,
+                head,
+            }) => {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_CURSOR_AHEAD,
+                    &format!(
+                        "descendant cursor for session {} and agent {} is beyond its committed head",
+                        cursor.session_id, cursor.agent_id
+                    ),
+                    false,
+                    Some(ErrorData::CursorAhead {
+                        requested: cursor.after_seq,
+                        head,
+                    }),
+                );
+            }
+            Err(super::descendant_stream::PrepareDescendantStreamError::Hub(error)) => {
+                return Err(error);
+            }
+        };
+        let baseline = prepared.baseline.clone();
+        let streamed_session_ids = prepared.streamed_session_ids();
+        let repair_identities = prepared.repair_identities();
+        let (attachment_id, cancel) = match self.hub.register_descendant_attachment(
+            &self.connection_id,
+            session_id,
+            streamed_session_ids,
+        ) {
+            Ok(DescendantRegisterResult::Registered {
+                attachment_id,
+                cancel,
+            }) => (attachment_id, cancel),
+            Ok(DescendantRegisterResult::Overloaded { message }) => {
+                return self.respond_error(request_id, ERROR_CODE_OVERLOADED, &message, true, None);
+            }
+            Ok(DescendantRegisterResult::SessionUnavailable) => {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_NOT_FOUND,
+                    "session was not found",
+                    false,
+                    None,
+                );
+            }
+            Err(error) => return Err(error),
+        };
+        if self.closed.load(Ordering::Acquire) {
+            let _ = self.hub.detach_descendant(&attachment_id);
+            return Err(SessionHubError::Closed);
+        }
+        if self
+            .sink
+            .try_send_for(
+                &attachment_id,
+                WireFrame::Response {
+                    request_id,
+                    body: ResponseBody::SessionDescendantsAttach {
+                        attachment_id: attachment_id.clone(),
+                        baseline,
+                    },
+                },
+            )
+            .is_err()
+        {
+            let _ = self.hub.detach_descendant(&attachment_id);
+            return Err(SessionHubError::Delivery);
+        }
+        if self
+            .hub
+            .spawn_descendant_stream(
+                attachment_id.clone(),
+                prepared,
+                Arc::clone(&self.sink),
+                cancel,
+            )
+            .is_err()
+        {
+            // The success may still be staged behind the attachment lane.
+            // Atomically purge/replace it, or send an identity-only repair if
+            // it already reached the peer; never leave a ghost attachment.
+            self.hub
+                .repair_and_detach_descendant(&self.sink, &attachment_id, repair_identities);
+        }
+        Ok(())
+    }
+
     async fn session_diagnostic(
         &self,
         request_id: RequestId,
@@ -10217,6 +10356,18 @@ impl HubConnection {
         let owner = self
             .hub
             .take_attachment(&attachment_id, Some(&self.connection_id))?;
+        if owner.is_none()
+            && self
+                .hub
+                .take_descendant_attachment(&attachment_id, Some(&self.connection_id))?
+                .is_some()
+        {
+            let _ = self.sink.purge_attachment(&attachment_id);
+            return self.send(WireFrame::Response {
+                request_id,
+                body: ResponseBody::SessionDetach { attachment_id },
+            });
+        }
         let Some(owner) = owner else {
             return self.respond_error(
                 request_id,

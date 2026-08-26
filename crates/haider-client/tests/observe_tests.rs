@@ -6,8 +6,8 @@ use std::collections::{BTreeSet, VecDeque};
 use std::time::Duration;
 
 use haider_client::{
-    ObserveClient, ObserveError, ProfileEnv, ResolvedProfile, observe_stream_session,
-    resolve_profile,
+    DescendantView, ObserveClient, ObserveError, ProfileEnv, ResolvedProfile,
+    observe_stream_session, resolve_profile,
 };
 use haider_rpc::haider_protocol::envelope::{
     PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
@@ -15,8 +15,10 @@ use haider_rpc::haider_protocol::envelope::{
 use haider_rpc::haider_protocol::ids::{DeviceId, EventId, SessionId};
 use haider_rpc::{
     AttachMode, AttachState, AttachmentId, Capability, CapabilitySet, DEFAULT_FRAME_LIMIT,
-    ERROR_CODE_NOT_FOUND, FEATURE_SESSION_FLEET_V1, LifecyclePhase, RequestBody, RequestId,
-    ResponseBody, WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec,
+    ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_NOT_FOUND, FEATURE_SESSION_DESCENDANT_STREAM_V1,
+    FEATURE_SESSION_FLEET_V1, FleetMetricsTotalsWire, FleetRollupWire, FleetStateCountsWire,
+    LifecyclePhase, RequestBody, RequestId, ResponseBody, SessionDescendantBaselineWire,
+    SessionFleetSnapshot, WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -302,6 +304,152 @@ async fn fleet_reads_return_typed_feature_and_unknown_session_errors() {
     ));
     new_client.close();
     new_server.await.expect("fleet daemon peer");
+}
+
+/// ABSENCE LAW: an older daemon is queried only through `session.fleet` and
+/// the result remains a typed snapshot. Advertising the live bit switches to
+/// the real attach method and yields an event-bearing live variant.
+#[tokio::test]
+async fn descendant_view_feature_negotiation_never_fabricates_live_lineage() {
+    let (_snapshot_root, snapshot_profile) = profile();
+    let snapshot_listener = match UnixListener::bind(&snapshot_profile.endpoint_path) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("bind snapshot fallback peer: {error}"),
+    };
+    let snapshot_session = SessionId::new("descendant-fallback-root");
+    let snapshot = SessionFleetSnapshot {
+        session_id: snapshot_session.clone(),
+        generated_at_ms: 77,
+        node_limit: 512,
+        depth_limit: 32,
+        roots: Vec::new(),
+        rollup: FleetRollupWire {
+            node_count: 0,
+            states: FleetStateCountsWire::default(),
+            max_depth: 0,
+            metrics: FleetMetricsTotalsWire::default(),
+            metrics_complete: true,
+            complete: true,
+        },
+        truncated: false,
+    };
+    let snapshot_server_profile = snapshot_profile.clone();
+    let expected_snapshot = snapshot.clone();
+    let snapshot_server = tokio::spawn(async move {
+        let mut advertised = welcome(&snapshot_server_profile, "descendant-snapshot-daemon");
+        advertised.features.insert(FEATURE_SESSION_FLEET_V1.into());
+        let mut peer = accept_peer(&snapshot_listener, advertised).await;
+        let (request_id, body) = peer.request().await;
+        assert!(matches!(
+            body,
+            RequestBody::SessionFleet { session_id }
+                if session_id.as_str() == "descendant-fallback-root"
+        ));
+        peer.respond(
+            request_id,
+            ResponseBody::SessionFleet {
+                snapshot: expected_snapshot,
+            },
+        )
+        .await;
+    });
+    let snapshot_client = ObserveClient::connect(&snapshot_profile, false)
+        .await
+        .expect("connect snapshot fallback daemon");
+    match snapshot_client
+        .descendants_attach(snapshot_session, Vec::new(), 8)
+        .await
+        .expect("snapshot fallback")
+    {
+        DescendantView::Snapshot(actual) => assert_eq!(actual, snapshot),
+        DescendantView::Live(_) => panic!("absence must not fabricate a live descendant view"),
+    }
+    snapshot_client.close();
+    snapshot_server.await.expect("snapshot fallback peer");
+
+    let (_live_root, live_profile) = profile();
+    let live_listener = UnixListener::bind(&live_profile.endpoint_path).expect("bind live peer");
+    let live_session = SessionId::new("descendant-live-root");
+    let live_server_profile = live_profile.clone();
+    let live_session_for_server = live_session.clone();
+    let live_server = tokio::spawn(async move {
+        let mut advertised = welcome(&live_server_profile, "descendant-live-daemon");
+        advertised
+            .features
+            .insert(FEATURE_SESSION_DESCENDANT_STREAM_V1.into());
+        let mut peer = accept_peer(&live_listener, advertised).await;
+        let (rejected_request_id, rejected_body) = peer.request().await;
+        assert!(matches!(
+            rejected_body,
+            RequestBody::SessionDescendantsAttach { .. }
+        ));
+        peer.respond(
+            rejected_request_id,
+            ResponseBody::Error {
+                code: ERROR_CODE_INVALID_ARGUMENT.into(),
+                message: "bad reconnect cursor".into(),
+                retryable: false,
+                data: None,
+            },
+        )
+        .await;
+        let (request_id, body) = peer.request().await;
+        assert!(matches!(
+            body,
+            RequestBody::SessionDescendantsAttach {
+                session_id,
+                max_children: 8,
+                ..
+            } if session_id.as_str() == "descendant-live-root"
+        ));
+        peer.respond(
+            request_id,
+            ResponseBody::SessionDescendantsAttach {
+                attachment_id: AttachmentId::new("descendant-live-attachment"),
+                baseline: SessionDescendantBaselineWire {
+                    session_id: live_session_for_server,
+                    generated_at_ms: 88,
+                    fanout: haider_rpc::DescendantFanoutWire {
+                        requested_children: 8,
+                        accepted_children: 8,
+                        hard_limit: 64,
+                    },
+                    truncation: haider_rpc::DescendantTruncationWire {
+                        truncated: false,
+                        streamed_children: 0,
+                        omitted_children: 0,
+                        count_complete: true,
+                    },
+                    roots: Vec::new(),
+                },
+            },
+        )
+        .await;
+    });
+    let live_client = ObserveClient::connect(&live_profile, false)
+        .await
+        .expect("connect live descendant daemon");
+    assert!(matches!(
+        live_client
+            .descendants_attach(live_session.clone(), Vec::new(), 8)
+            .await,
+        Err(ObserveError::Rpc { code, .. }) if code == ERROR_CODE_INVALID_ARGUMENT
+    ));
+    match live_client
+        .descendants_attach(live_session, Vec::new(), 8)
+        .await
+        .expect("live descendant attach")
+    {
+        DescendantView::Live(live) => {
+            assert_eq!(live.attachment_id.as_str(), "descendant-live-attachment");
+            assert_eq!(live.baseline.generated_at_ms, 88);
+            assert_eq!(live.lost_events_at_attach, 0);
+        }
+        DescendantView::Snapshot(_) => panic!("advertised live method must not fall back"),
+    }
+    live_client.close();
+    live_server.await.expect("live descendant peer");
 }
 
 /// MUTATION CHECK: advance the cursor across a gap, narrow raw payloads to

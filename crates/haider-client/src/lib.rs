@@ -54,8 +54,8 @@ pub use headless::{
     run_headless, run_headless_with_session_config,
 };
 pub use observe::{
-    ObserveClient, ObserveError, observe_stream_all, observe_stream_session,
-    observe_stream_session_after,
+    DescendantLiveAttachment, DescendantView, ObserveClient, ObserveError, observe_stream_all,
+    observe_stream_session, observe_stream_session_after,
 };
 pub use permission::{
     ComputerPermissionClientError, open_permission_settings, open_permission_settings_request,

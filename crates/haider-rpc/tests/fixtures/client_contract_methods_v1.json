@@ -56,6 +56,12 @@
       "response": {"method":"session.observe_batch","digests":[{"session_id":"session-1","head_seq":7,"worker_generation":3,"title":"Batch","run_state":"idle","branches":[],"main_head_seq":7,"pending_menus":[],"subagents":[],"updated_at_ms":1753500000000,"last_event_kinds":[]}]}
     },
     {
+      "request_method": "session.descendants.attach",
+      "response_method": "session.descendants.attach",
+      "request": {"method":"session.descendants.attach","session_id":"session-root","cursors":[{"session_id":"session-child","agent_id":"agent-child","after_seq":2}],"max_children":8},
+      "response": {"method":"session.descendants.attach","attachment_id":"descendants-1","baseline":{"session_id":"session-root","generated_at_ms":1753500000000,"fanout":{"requested_children":8,"accepted_children":8,"hard_limit":64},"truncation":{"truncated":false,"streamed_children":1,"omitted_children":0,"count_complete":true},"roots":[{"session_id":"session-child","agent_id":"agent-child","child_run_id":"run-child","parent_session_id":"session-root","parent_run_id":"run-parent","depth":1,"task":"inspect reconnectability","state":"live","requested_after_seq":2,"replay_through_seq":4,"parent_anchors":{"spawn_seq":9,"spawn_item_seq":11}}]}}
+    },
+    {
       "request_method": "graph.pin",
       "response_method": "graph.pin",
       "request": {"method":"graph.pin","command_id":"command-graph-pin","session_id":"session-1","worker_generation":3,"template":"review-v1"},

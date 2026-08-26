@@ -514,6 +514,23 @@ impl RpcClient {
         self.events.lock().ok().and_then(|mut slot| slot.take())
     }
 
+    /// Returns an event receiver taken speculatively by a higher-level attach
+    /// helper when the correlated attach request was rejected. A successful
+    /// attachment keeps ownership of the receiver instead.
+    pub(crate) fn restore_events(
+        &self,
+        receiver: mpsc::Receiver<WireFrame>,
+    ) -> Result<(), mpsc::Receiver<WireFrame>> {
+        let Ok(mut slot) = self.events.lock() else {
+            return Err(receiver);
+        };
+        if slot.is_some() {
+            return Err(receiver);
+        }
+        *slot = Some(receiver);
+        Ok(())
+    }
+
     /// Sends one correlated request and awaits its response body.
     ///
     /// Exactly [`Self::begin_request`] followed by [`PendingResponse::wait`]:

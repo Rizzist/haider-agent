@@ -58,8 +58,8 @@ use haider_rpc::{
     FEATURE_PROVIDER_MODELS_V1, FEATURE_PROVIDER_REMOVE_V1,
     FEATURE_RESIDENT_SESSION_BINDING_TOKEN_V1, FEATURE_RESIDENT_SESSION_BINDING_V1,
     FEATURE_RESIDENT_TURN_SUBMIT_V1, FEATURE_RUN_RETRY_V1, FEATURE_SESSION_CONFIG_V1,
-    FEATURE_SESSION_FLEET_V1, FEATURE_SESSION_FORK_V1, FEATURE_SESSION_MUTATION_V1,
-    FEATURE_SESSION_OBSERVE_BATCH_V1, FEATURE_SESSION_OBSERVE_V1,
+    FEATURE_SESSION_DESCENDANT_STREAM_V1, FEATURE_SESSION_FLEET_V1, FEATURE_SESSION_FORK_V1,
+    FEATURE_SESSION_MUTATION_V1, FEATURE_SESSION_OBSERVE_BATCH_V1, FEATURE_SESSION_OBSERVE_V1,
     FEATURE_SESSION_PERMISSION_OVERRIDES_V1, FEATURE_SESSION_RUN_ID_V1,
     FEATURE_SESSION_WORKFLOW_STATE_V1, FEATURE_SHELL_EXEC_V1, FEATURE_TOOL_INVENTORY_V1,
     FEATURE_TURN_CONTROL_V1, FEATURE_TYPED_AGENT_INSTALL_V1, FEATURE_USER_COMMAND_V1,
@@ -1014,7 +1014,8 @@ impl FrameSink for ConnectionFrameSink {
     }
 }
 
-/// Lane routing: EVENT traffic (events and caught-up markers) is
+/// Lane routing: EVENT traffic (events, caught-up markers, and descendant
+/// stream frames) is
 /// attachment-keyed; everything else — including `Lagged`, which is a
 /// CONTROL notice about an attachment that no longer exists — rides the
 /// shared System reply lane. After a detach nothing attachment-keyed is ever
@@ -1022,7 +1023,8 @@ impl FrameSink for ConnectionFrameSink {
 fn attachment_lane(frame: &WireFrame) -> LaneKey {
     match frame {
         WireFrame::Event { attachment_id, .. }
-        | WireFrame::AttachCaughtUp { attachment_id, .. } => {
+        | WireFrame::AttachCaughtUp { attachment_id, .. }
+        | WireFrame::SessionDescendantStream { attachment_id, .. } => {
             LaneKey::Attachment(attachment_id.clone())
         }
         _ => LaneKey::System,
@@ -1840,6 +1842,7 @@ fn welcome_features() -> BTreeSet<String> {
         haider_rpc::FEATURE_ACCOUNT_LIST_WATCH_V1.to_owned(),
         haider_rpc::FEATURE_ACCOUNT_LABEL_V1.to_owned(),
         FEATURE_SESSION_FLEET_V1.to_owned(),
+        FEATURE_SESSION_DESCENDANT_STREAM_V1.to_owned(),
         FEATURE_SESSION_OBSERVE_V1.to_owned(),
         FEATURE_SESSION_OBSERVE_BATCH_V1.to_owned(),
         FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned(),
