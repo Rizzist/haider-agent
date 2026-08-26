@@ -10255,15 +10255,20 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     completed(serde_json::json!({ "ok": false, "error": error }))
                 };
                 let receipt = |kind: &str,
-                               registration: haider_protocol::loom::LoomRegistration| {
-                    completed(serde_json::json!({
+                               registration: haider_protocol::loom::LoomRegistration,
+                               install_job_id: Option<String>| {
+                    let mut receipt = serde_json::json!({
                         "ok": true,
                         "kind": kind,
                         "id": registration.id,
                         "rev": registration.rev,
                         "digest": registration.digest,
                         "updated": registration.updated,
-                    }))
+                    });
+                    if let Some(install_job_id) = install_job_id {
+                        receipt["install_job_id"] = install_job_id.into();
+                    }
+                    completed(receipt)
                 };
                 let bodies =
                     accepted_plan_bodies(&self.output.store, self.branch_id.as_ref()).await?;
@@ -10272,7 +10277,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         let source = required_string(&args, "source")?;
                         if plan_gate_admits(&bodies, &[source.trim()]) {
                             match self.output.store.hub().loom_register_workflow(source).await {
-                                Ok(registration) => Ok(receipt("workflow", registration)),
+                                Ok(registration) => Ok(receipt("workflow", registration, None)),
                                 Err(error) if error.code == ErrorCode::InvalidArgument => {
                                     Ok(refusal(format!(
                                         "registration rejected: {}",
@@ -10322,7 +10327,11 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 .loom_register_agent_type(record)
                                 .await
                             {
-                                Ok(registration) => Ok(receipt("agent_type", registration)),
+                                Ok(outcome) => Ok(receipt(
+                                    "agent_type",
+                                    outcome.registration,
+                                    outcome.install_job_id,
+                                )),
                                 Err(error) if error.code == ErrorCode::InvalidArgument => {
                                     Ok(refusal(format!(
                                         "registration rejected: {}",
