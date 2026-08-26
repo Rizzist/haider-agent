@@ -88,7 +88,7 @@ use rusqlite::{
     TransactionBehavior, params, types::ValueRef,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -1978,8 +1978,7 @@ impl Store {
                 fs::rename(entry.path(), destination)
                     .map_err(|error| store_io_error("publish usage backfill day", error))?;
             }
-            File::open(&destination_dir)
-                .and_then(|directory| directory.sync_all())
+            haider_platform::sync_directory(&destination_dir)
                 .map_err(|error| store_io_error("sync usage history directory", error))?;
         }
         fs::remove_dir_all(&staging_root)
