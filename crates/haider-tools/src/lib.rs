@@ -13,6 +13,7 @@ mod graph_evidence;
 mod ledger;
 mod message_subagent;
 mod mobile;
+mod monitor;
 mod plan;
 mod process;
 mod request_input;
@@ -55,6 +56,11 @@ pub use message_subagent::{MessageSubagent, message_subagent_manifest};
 pub use mobile::{
     FakeMobileBackend, MobileBackend, MobileCancelToken, MobileError, MobileOperation,
     MobileResult, UnavailableMobileBackend, mobile_manifest, platform_mobile_backend,
+};
+pub use monitor::{
+    MAX_MONITOR_FILTER_CHARS, MAX_MONITOR_FOLLOW_UP_CHARS, MAX_MONITOR_ID_CHARS, MonitorAction,
+    MonitorFilter, MonitorFilterField, MonitorFilterOperator, MonitorLifetime, MonitorOccurrence,
+    MonitorRequest, MonitorSource, MonitorSourceKind, monitor_manifest,
 };
 pub use plan::{
     PLAN_BODY_MAX_BYTES, PLAN_DECISION_ACCEPT, PLAN_ORIGIN, PLAN_TITLE_MAX_BYTES, Plan, PlanResult,

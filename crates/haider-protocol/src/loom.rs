@@ -8,14 +8,16 @@
 //! pinning, reduction, advancement and the TUI status surfaces execute Loom
 //! workflows without new graph machinery. What is genuinely new — the
 //! per-node agent type, task, and derived typed I/O — rides beside the
-//! template as [`LoomNodeMeta`], and the pipe source stays the structure of
-//! record: the template is a derived artifact.
+//! template as [`LoomNodeMeta`]. Red traversal is duplicated into the frozen
+//! graph spec for runtime authority; the pipe source stays the structure of
+//! record and the template remains a derived artifact.
 
 use crate::graph::{
     GRAPH_MAX_ATTEMPTS, GRAPH_MAX_EVIDENCE_PER_ATTEMPT, GRAPH_TEMPLATE_VERSION, GraphExecutorShape,
     GraphGateKind, GraphNodeName, GraphNodeSpec, GraphTemplateSpec, validate_graph_template,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 /// The DSL revision carried by every compiled workflow record.
 pub const LOOM_PIPE_VERSION: &str = "pipe/v1";
@@ -130,7 +132,13 @@ pub struct LoomNodeAst {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub task: String,
     pub gate: LoomGate,
-    /// Conditional red back-edge target (must name an earlier node).
+    /// Explicit incoming green dependencies. `None` preserves pipe/v1's
+    /// implicit dependency on the previous source line; `Some` is authored as
+    /// one compact `<-first,second` clause.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depends_on: Option<Vec<String>>,
+    /// Conditional red target. The node's own name represents an authored
+    /// self-loop (`↻`); any other value is an earlier ancestor (`↺`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub back: Option<String>,
 }
@@ -152,7 +160,7 @@ pub struct LoomAst {
 }
 
 /// Loom-specific compiled facts for one node, carried beside the CG template
-/// (which has no vocabulary for agent types, tasks, typed I/O or back-edges).
+/// (which has no vocabulary for agent types, tasks, or typed I/O).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoomNodeMeta {
     /// The source-level (lowercase) name.
@@ -161,6 +169,13 @@ pub struct LoomNodeMeta {
     pub node: GraphNodeName,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_type: Option<String>,
+    /// Exact registry contract resolved when this workflow revision compiled.
+    /// Store-backed compilation fills both fields for typed nodes; absence is
+    /// a legacy/unbound contract and runtime dispatch fails closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type_rev: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type_digest: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub task: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -184,6 +199,15 @@ pub struct LoomWorkflow {
     pub meta: Vec<LoomNodeMeta>,
     pub rev: u32,
     pub digest: String,
+}
+
+impl LoomWorkflow {
+    /// Recompute content identity after the store binds exact agent contracts
+    /// to compiler metadata. Pure compiler callers leave those optional facts
+    /// empty and retain their deterministic source/signature digest.
+    pub fn refresh_digest(&mut self) {
+        self.digest = workflow_digest(self);
+    }
 }
 
 /// Registry outcome for one register call (agent type or workflow).
@@ -257,8 +281,25 @@ pub fn parse_pipe(source: &str) -> LoomAst {
     if ast.nodes.is_empty() {
         ast.errors.push("pipe declares no nodes".into());
     }
-    // Back-edges must target an EARLIER node — the DAG never time-travels.
+    // Green dependencies and red back-edges must target EARLIER nodes. Keeping
+    // pipe source topologically ordered makes local parsing/compilation total
+    // and gives the dependency engine one deterministic declaration order.
     for (index, node) in ast.nodes.iter().enumerate() {
+        if let Some(dependencies) = &node.depends_on {
+            for dependency in dependencies {
+                match ast.nodes.iter().position(|other| other.name == *dependency) {
+                    None => ast.errors.push(format!(
+                        "dependency {dependency} on {} targets no node",
+                        node.name
+                    )),
+                    Some(target) if target >= index => ast.errors.push(format!(
+                        "dependency {dependency} on {} must target an earlier node",
+                        node.name
+                    )),
+                    Some(_) => {}
+                }
+            }
+        }
         let Some(back) = node.back.as_deref() else {
             continue;
         };
@@ -266,7 +307,7 @@ pub fn parse_pipe(source: &str) -> LoomAst {
             None => ast
                 .errors
                 .push(format!("↺{back} on {} targets no node", node.name)),
-            Some(target) if target >= index => ast.errors.push(format!(
+            Some(target) if target > index => ast.errors.push(format!(
                 "↺{back} on {} must target an earlier node",
                 node.name
             )),
@@ -330,6 +371,7 @@ fn parse_node_line(line: &str) -> Result<LoomNodeAst, String> {
         agent_type: None,
         task,
         gate: LoomGate::Cmd,
+        depends_on: None,
         back: None,
     };
     let mut saw_gate = false;
@@ -374,12 +416,32 @@ fn parse_node_line(line: &str) -> Result<LoomNodeAst, String> {
                     _ => return Err(format!("unknown gate :{other} on {name}")),
                 },
             };
+        } else if let Some(dependencies) = token.strip_prefix("<-") {
+            if node.depends_on.is_some() {
+                return Err(format!("duplicate dependency clause on {name}"));
+            }
+            let mut parsed = Vec::new();
+            for dependency in dependencies.split(',') {
+                if !is_ident(dependency) {
+                    return Err(format!("bad dependency target `{dependency}` on {name}"));
+                }
+                if parsed.iter().any(|prior| prior == dependency) {
+                    return Err(format!("duplicate dependency {dependency} on {name}"));
+                }
+                parsed.push(dependency.to_owned());
+            }
+            node.depends_on = Some(parsed);
+        } else if token == "↻" {
+            if node.back.is_some() {
+                return Err(format!("duplicate red traversal on {name}"));
+            }
+            node.back = Some(name.to_string());
         } else if let Some(back) = token.strip_prefix('↺').or_else(|| token.strip_prefix('^')) {
             if !is_ident(back) {
                 return Err(format!("bad back-edge target `{back}` on {name}"));
             }
             if node.back.is_some() {
-                return Err(format!("duplicate back-edge on {name}"));
+                return Err(format!("duplicate red traversal on {name}"));
             }
             node.back = Some(back.to_string());
         } else {
@@ -400,11 +462,14 @@ pub fn compile_pipe(
     let mut errors = ast.errors.clone();
     let name = ast.name.clone().unwrap_or_default();
 
-    // Node identities: uppercase the source names onto GraphNodeName.
+    // Node identities: uppercase the source names onto GraphNodeName. Artifact
+    // types travel along the same immutable dependency edges as readiness.
     let mut meta = Vec::new();
     let mut specs = Vec::new();
     let mut previous: Option<GraphNodeName> = None;
-    let mut carried = ast.in_type.clone();
+    let mut source_nodes = HashMap::<String, GraphNodeName>::new();
+    let mut node_outputs = HashMap::<GraphNodeName, String>::new();
+    let mut merged_outputs = HashSet::<GraphNodeName>::new();
     for node in &ast.nodes {
         let upper = node.name.to_ascii_uppercase();
         let cg_name = match GraphNodeName::new(upper) {
@@ -414,6 +479,46 @@ pub fn compile_pipe(
                 continue;
             }
         };
+        let dependencies = match &node.depends_on {
+            Some(authored) => {
+                let mut resolved = Vec::new();
+                for dependency in authored {
+                    let Some(cg_dependency) = source_nodes.get(dependency) else {
+                        // `parse_pipe` reports the more specific unknown/forward
+                        // distinction. Keep compile total for callers that build
+                        // a LoomAst directly instead of using the parser.
+                        errors.push(format!(
+                            "dependency {dependency} on {} must target an earlier node",
+                            node.name
+                        ));
+                        continue;
+                    };
+                    if resolved.iter().any(|prior| prior == cg_dependency) {
+                        errors.push(format!(
+                            "duplicate dependency {dependency} on {}",
+                            node.name
+                        ));
+                        continue;
+                    }
+                    resolved.push(cg_dependency.clone());
+                }
+                resolved
+            }
+            None => previous.clone().into_iter().collect(),
+        };
+        let incoming = if dependencies.is_empty() {
+            vec![ast.in_type.clone()]
+        } else {
+            dependencies
+                .iter()
+                .filter_map(|dependency| node_outputs.get(dependency).cloned())
+                .collect::<Vec<_>>()
+        };
+        let carried = merge_type_exprs(&incoming);
+        let carries_merge = dependencies.len() > 1
+            || dependencies
+                .iter()
+                .any(|dependency| merged_outputs.contains(dependency));
         let signature = match node.agent_type.as_deref() {
             Some(atype) => match lookup(atype) {
                 Some(signature) => Some(signature),
@@ -427,18 +532,31 @@ pub fn compile_pipe(
             },
             None => None,
         };
-        // A4 — the typed-edge law: a work node must accept what the pipe has
-        // carried to it. `A + B` composite inputs accept any one operand.
+        // A4 — the typed-edge law. One incoming edge retains pipe/v1's exact-
+        // or-one-composite-operand widening. A real JOIN is strict: its entire
+        // merged input expression must equal the specialist's input expression
+        // modulo operand order. Missing and extra branch artifacts both reject.
         if let Some(signature) = &signature {
-            if !carried.is_empty() && !accepts(&signature.in_type, &carried) {
-                errors.push(format!(
-                    "type mismatch at {}: carries `{carried}` but @{} accepts `{}`",
-                    node.name,
-                    node.agent_type.as_deref().unwrap_or("?"),
-                    signature.in_type
-                ));
+            if !carried.is_empty() {
+                let accepted = if carries_merge {
+                    same_type_operands(&signature.in_type, &carried)
+                } else {
+                    accepts(&signature.in_type, &carried)
+                };
+                if !accepted {
+                    let input = if carries_merge {
+                        "merged inputs"
+                    } else {
+                        "carries"
+                    };
+                    errors.push(format!(
+                        "type mismatch at {}: {input} `{carried}` but @{} accepts `{}`",
+                        node.name,
+                        node.agent_type.as_deref().unwrap_or("?"),
+                        signature.in_type
+                    ));
+                }
             }
-            carried = signature.out_type.clone();
         }
         // A target like `2nd` passes ident parsing but is no legal CG name.
         let back = match node.back.as_deref() {
@@ -479,26 +597,63 @@ pub fn compile_pipe(
             executor,
             max_attempts,
             max_evidence_per_attempt,
-            depends_on: previous.clone().into_iter().collect(),
+            depends_on: dependencies,
+            red_target: back.clone(),
             verify_slots: Vec::new(),
         });
         meta.push(LoomNodeMeta {
             source_name: node.name.clone(),
             node: cg_name.clone(),
             agent_type: node.agent_type.clone(),
+            agent_type_rev: None,
+            agent_type_digest: None,
             task: node.task.clone(),
             in_type: signature.as_ref().map(|s| s.in_type.clone()),
             out_type: signature.as_ref().map(|s| s.out_type.clone()),
             back,
         });
+        // A control node is identity on its complete input, including a merged
+        // join input. Work nodes replace that input with their declared output.
+        let control_node = signature.is_none();
+        let output = signature
+            .as_ref()
+            .map_or(carried, |signature| signature.out_type.clone());
+        if control_node && carries_merge {
+            merged_outputs.insert(cg_name.clone());
+        }
+        node_outputs.insert(cg_name.clone(), output);
+        source_nodes.insert(node.name.clone(), cg_name.clone());
         previous = Some(cg_name);
     }
-    // The pipe's declared output must be what the last work node produces.
-    if errors.is_empty() && !ast.out_type.is_empty() && !accepts(&ast.out_type, &carried) {
-        errors.push(format!(
-            "pipe declares output `{}` but its nodes produce `{carried}`",
-            ast.out_type
-        ));
+    // A DAG may have multiple terminal branches. Its effective output is the
+    // strict merge of every terminal artifact; a linear graph still has the
+    // exact byte-for-byte behavior of its single last carried artifact.
+    if errors.is_empty() && !ast.out_type.is_empty() {
+        let depended_on = specs
+            .iter()
+            .flat_map(|spec| spec.depends_on.iter().cloned())
+            .collect::<HashSet<_>>();
+        let terminal_outputs = specs
+            .iter()
+            .filter(|spec| !depended_on.contains(&spec.name))
+            .filter_map(|spec| node_outputs.get(&spec.name).cloned())
+            .collect::<Vec<_>>();
+        let produced = merge_type_exprs(&terminal_outputs);
+        let output_is_merged = terminal_outputs.len() > 1
+            || specs.iter().any(|spec| {
+                !depended_on.contains(&spec.name) && merged_outputs.contains(&spec.name)
+            });
+        let output_matches = if output_is_merged {
+            same_type_operands(&ast.out_type, &produced)
+        } else {
+            accepts(&ast.out_type, &produced)
+        };
+        if !output_matches {
+            errors.push(format!(
+                "pipe declares output `{}` but its nodes produce `{produced}`",
+                ast.out_type
+            ));
+        }
     }
     let template = GraphTemplateSpec {
         name: name.clone(),
@@ -541,6 +696,43 @@ fn accepts(expected: &str, carried: &str) -> bool {
         .any(|operand| operand == carried)
 }
 
+/// Merge artifact expressions as a stable union. The first dependency's
+/// operand order wins for rendering/error text; duplicate type names collapse
+/// because pipe/v1's type vocabulary has no labels or multiplicity.
+fn merge_type_exprs(inputs: &[String]) -> String {
+    if let [only] = inputs {
+        return only.clone();
+    }
+    let mut operands = Vec::<&str>::new();
+    for operand in inputs
+        .iter()
+        .flat_map(|input| input.split('+').map(str::trim))
+        .filter(|operand| !operand.is_empty())
+    {
+        if !operands.contains(&operand) {
+            operands.push(operand);
+        }
+    }
+    operands.join(" + ")
+}
+
+/// Composite equality at a JOIN is deliberately order-insensitive but strict
+/// about membership: `A + B` accepts `B + A`, not `A` or `A + B + C`.
+fn same_type_operands(expected: &str, carried: &str) -> bool {
+    normalized_type_operands(expected) == normalized_type_operands(carried)
+}
+
+fn normalized_type_operands(value: &str) -> Vec<&str> {
+    let mut operands = value
+        .split('+')
+        .map(str::trim)
+        .filter(|operand| !operand.is_empty())
+        .collect::<Vec<_>>();
+    operands.sort_unstable();
+    operands.dedup();
+    operands
+}
+
 /// Canonical source: the AST printed back in one normal form, so the digest
 /// is insensitive to author whitespace.
 fn rebuild_source(ast: &LoomAst) -> String {
@@ -571,9 +763,17 @@ fn rebuild_source(ast: &LoomAst) -> String {
             }
             LoomGate::Human => out.push_str(" :human"),
         }
+        if let Some(dependencies) = &node.depends_on {
+            out.push_str(" <-");
+            out.push_str(&dependencies.join(","));
+        }
         if let Some(back) = &node.back {
-            out.push_str(" ↺");
-            out.push_str(back);
+            if back == &node.name {
+                out.push_str(" ↻");
+            } else {
+                out.push_str(" ↺");
+                out.push_str(back);
+            }
         }
     }
     out
@@ -593,6 +793,12 @@ fn workflow_digest(workflow: &LoomWorkflow) -> String {
         part(meta.node.as_str().as_bytes());
         part(meta.in_type.as_deref().unwrap_or("").as_bytes());
         part(meta.out_type.as_deref().unwrap_or("").as_bytes());
+        if let Some(rev) = meta.agent_type_rev {
+            part(&rev.to_le_bytes());
+        }
+        if let Some(digest) = meta.agent_type_digest.as_deref() {
+            part(digest.as_bytes());
+        }
     }
     hasher.finalize().to_hex()[..32].to_string()
 }
@@ -601,7 +807,6 @@ fn workflow_digest(workflow: &LoomWorkflow) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     fn registry() -> HashMap<&'static str, LoomTypeSig> {
         let sig = |i: &str, o: &str| LoomTypeSig {
@@ -623,13 +828,13 @@ make-video: SourceURL -> VideoFile
 research @researcher "pull the source and transcribe it" :cmd
 propose  @proposer   "shape a hook and a 6-beat arc"     :ship
 capture  @capturer   "gather b-roll for every beat"      :all-of-6 ↺propose
-edit     @editor     "cut to the arc, trim dead air"     :ship ^capture
+edit     @editor     "cut to the arc, trim dead air"     :ship <-propose,capture ^capture
 render   @renderer   "encode 1080p H.264"                :cmd
 publish              "you approve the cut"               :human
 "#;
 
-    /// MUTATION CHECK: drop a gate mapping, stop uppercasing names, or skip
-    /// the linear dependency chain. Expected RUNTIME failure below.
+    /// MUTATION CHECK: drop a gate mapping, stop uppercasing names, or skip a
+    /// declared dependency. Expected RUNTIME failure below.
     #[test]
     fn make_video_parses_and_compiles_onto_cg_vocabulary() {
         let ast = parse_pipe(MAKE_VIDEO);
@@ -641,6 +846,10 @@ publish              "you approve the cut"               :human
         assert_eq!(ast.nodes[2].back.as_deref(), Some("propose"));
         // ASCII ^ alias reads identically to ↺.
         assert_eq!(ast.nodes[3].back.as_deref(), Some("capture"));
+        assert_eq!(
+            ast.nodes[3].depends_on.as_deref(),
+            Some(["propose".to_owned(), "capture".to_owned()].as_slice())
+        );
 
         let registry = registry();
         let workflow = compile_pipe(&ast, |id| registry.get(id).cloned()).expect("compiles");
@@ -651,9 +860,16 @@ publish              "you approve the cut"               :human
             workflow.template.start_node.as_ref().map(|n| n.as_str()),
             Some("RESEARCH")
         );
-        // Linear chain: each node depends on exactly the previous one.
+        // The start is dependency-free; EDIT is the explicit typed join.
         assert!(workflow.template.nodes[0].depends_on.is_empty());
-        assert_eq!(workflow.template.nodes[3].depends_on[0].as_str(), "CAPTURE");
+        assert_eq!(
+            workflow.template.nodes[3]
+                .depends_on
+                .iter()
+                .map(|node| node.as_str())
+                .collect::<Vec<_>>(),
+            ["PROPOSE", "CAPTURE"]
+        );
         // Gate lowering.
         assert_eq!(
             workflow.template.nodes[2].gate,
@@ -690,6 +906,187 @@ publish              "you approve the cut"               :human
         // The compiled template passes the CG validator (redundant with
         // compile, pinned here so a validator change surfaces loudly).
         assert!(validate_graph_template(&workflow.template).is_ok());
+    }
+
+    /// Explicit dependencies lower a real diamond onto CG `depends_on`. A JOIN
+    /// consumes every predecessor artifact, and composite operand order is not
+    /// semantically significant.
+    #[test]
+    fn explicit_fork_join_compiles_and_type_checks_merged_inputs() {
+        let source = r#"fork-join: Seed -> Result
+start "seed"
+left @left "make left" <-start
+right @right "make right" <-start
+join @join "merge both" <-left,right"#;
+        let ast = parse_pipe(source);
+        assert!(ast.errors.is_empty(), "{:?}", ast.errors);
+        assert_eq!(
+            ast.nodes[3].depends_on.as_deref(),
+            Some(["left".to_owned(), "right".to_owned()].as_slice())
+        );
+
+        let workflow = compile_pipe(&ast, |id| match id {
+            "left" => Some(LoomTypeSig {
+                in_type: "Seed".into(),
+                out_type: "Left".into(),
+            }),
+            "right" => Some(LoomTypeSig {
+                in_type: "Seed".into(),
+                out_type: "Right".into(),
+            }),
+            "join" => Some(LoomTypeSig {
+                // Reverse order proves JOIN comparison is order-insensitive.
+                in_type: "Right + Left".into(),
+                out_type: "Result".into(),
+            }),
+            _ => None,
+        })
+        .expect("fork/join compiles");
+        let dependency_names = |index: usize| {
+            workflow.template.nodes[index]
+                .depends_on
+                .iter()
+                .map(|node| node.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(dependency_names(1), ["START"]);
+        assert_eq!(dependency_names(2), ["START"]);
+        assert_eq!(dependency_names(3), ["LEFT", "RIGHT"]);
+        assert_eq!(
+            workflow.source,
+            "fork-join: Seed -> Result\nstart \"seed\"\nleft @left \"make left\" <-start\nright @right \"make right\" <-start\njoin @join \"merge both\" <-left,right"
+        );
+        assert!(validate_graph_template(&workflow.template).is_ok());
+    }
+
+    /// JOIN inputs are exact as a set: the old single-edge composite widening
+    /// must not hide a missing branch or accept an artifact no branch produced.
+    #[test]
+    fn explicit_join_rejects_missing_and_extra_input_operands() {
+        let ast = parse_pipe(
+            "strict: Seed -> Result\nstart\nleft @left <-start\nright @right <-start\njoin @join <-left,right",
+        );
+        let compile_with_join_input = |join_input: &str| {
+            compile_pipe(&ast, |id| match id {
+                "left" => Some(LoomTypeSig {
+                    in_type: "Seed".into(),
+                    out_type: "Left".into(),
+                }),
+                "right" => Some(LoomTypeSig {
+                    in_type: "Seed".into(),
+                    out_type: "Right".into(),
+                }),
+                "join" => Some(LoomTypeSig {
+                    in_type: join_input.into(),
+                    out_type: "Result".into(),
+                }),
+                _ => None,
+            })
+            .expect_err("incoherent join input must reject")
+        };
+        for expected in ["Left", "Left + Right + Extra"] {
+            let errors = compile_with_join_input(expected);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error
+                        .contains("type mismatch at join: merged inputs `Left + Right`")),
+                "{errors:?}"
+            );
+        }
+    }
+
+    /// An untyped JOIN is identity on the complete merged artifact. A following
+    /// typed node receives that composite through its ordinary single edge.
+    #[test]
+    fn control_join_is_identity_on_merged_input() {
+        let ast = parse_pipe(
+            "control-join: Seed -> Result\nstart\nleft @left <-start\nright @right <-start\nmerge <-left,right\nfinish @finish",
+        );
+        let workflow = compile_pipe(&ast, |id| match id {
+            "left" => Some(LoomTypeSig {
+                in_type: "Seed".into(),
+                out_type: "Left".into(),
+            }),
+            "right" => Some(LoomTypeSig {
+                in_type: "Seed".into(),
+                out_type: "Right".into(),
+            }),
+            "finish" => Some(LoomTypeSig {
+                // A control JOIN preserves merge provenance as well as value;
+                // the downstream strict comparison is order-insensitive.
+                in_type: "Right + Left".into(),
+                out_type: "Result".into(),
+            }),
+            _ => None,
+        })
+        .expect("control join carries the merged artifact");
+        assert!(workflow.meta[3].agent_type.is_none());
+        assert_eq!(workflow.template.nodes[4].depends_on[0].as_str(), "MERGE");
+    }
+
+    /// With no explicit final join, the header describes the strict merge of
+    /// all terminal branch outputs instead of whichever line was declared last.
+    #[test]
+    fn workflow_output_merges_all_terminal_branches() {
+        let ast = parse_pipe(
+            "terminals: Seed -> Right + Left\nstart\nleft @left <-start\nright @right <-start",
+        );
+        let lookup = |id: &str| match id {
+            "left" => Some(LoomTypeSig {
+                in_type: "Seed".into(),
+                out_type: "Left".into(),
+            }),
+            "right" => Some(LoomTypeSig {
+                in_type: "Seed".into(),
+                out_type: "Right".into(),
+            }),
+            _ => None,
+        };
+        compile_pipe(&ast, lookup).expect("terminal outputs merge order-insensitively");
+
+        let bad = parse_pipe(
+            "terminals-bad: Seed -> Left\nstart\nleft @left <-start\nright @right <-start",
+        );
+        let errors = compile_pipe(&bad, lookup).expect_err("missing terminal type rejects");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("nodes produce `Left + Right`")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn dependencies_must_be_unique_earlier_nodes() {
+        let forward = parse_pipe("f: A -> A\na <-later\nlater");
+        assert!(
+            forward
+                .errors
+                .iter()
+                .any(|error| error.contains("must target an earlier node"))
+        );
+        let unknown = parse_pipe("f: A -> A\na\nb <-ghost");
+        assert!(
+            unknown
+                .errors
+                .iter()
+                .any(|error| error.contains("targets no node"))
+        );
+        let duplicate = parse_pipe("f: A -> A\na\nb <-a,a");
+        assert!(
+            duplicate
+                .errors
+                .iter()
+                .any(|error| error.contains("duplicate dependency a on b"))
+        );
+        let duplicate_clause = parse_pipe("f: A -> A\na\nb <-a <-a");
+        assert!(
+            duplicate_clause
+                .errors
+                .iter()
+                .any(|error| error.contains("duplicate dependency clause on b"))
+        );
     }
 
     /// MUTATION CHECK: stop collecting errors (first-failure or panic), or
@@ -761,6 +1158,10 @@ publish              "you approve the cut"               :human
         let a = compile("f: SourceURL -> Transcript\nn   @researcher    \"t\"").expect("a");
         let b = compile("f: SourceURL -> Transcript\nn @researcher \"t\"").expect("b");
         assert_eq!(a.digest, b.digest);
+        assert_eq!(
+            a.source, "f: SourceURL -> Transcript\nn @researcher \"t\"",
+            "an implicit previous edge stays implicit in canonical source"
+        );
         let c = compile("f: SourceURL -> Transcript\nn @researcher \"different task\"").expect("c");
         assert_ne!(a.digest, c.digest);
     }
@@ -775,6 +1176,22 @@ publish              "you approve the cut"               :human
         let workflow = compile_pipe(&ast, |_| None).expect("control-only compiles");
         assert_eq!(workflow.template.nodes.len(), 3);
         assert!(workflow.meta.iter().all(|m| m.agent_type.is_none()));
+    }
+
+    #[test]
+    fn conditional_self_loop_lowers_to_the_immutable_graph_target() {
+        let ast = parse_pipe("loop: Task -> Task\nbuild \"retry this node\" ↻");
+        assert!(ast.errors.is_empty(), "{:?}", ast.errors);
+        assert_eq!(ast.nodes[0].back.as_deref(), Some("build"));
+
+        let workflow = compile_pipe(&ast, |_| None).expect("self-loop compiles");
+        let build = GraphNodeName::new("BUILD").expect("valid name");
+        assert_eq!(workflow.meta[0].back.as_ref(), Some(&build));
+        assert_eq!(workflow.template.nodes[0].red_target.as_ref(), Some(&build));
+        assert_eq!(
+            workflow.source,
+            "loop: Task -> Task\nbuild \"retry this node\" ↻"
+        );
     }
 
     /// Agent-type digests: rev-sensitive, list-order-sensitive.
@@ -822,7 +1239,7 @@ publish              "you approve the cut"               :human
             dup_back
                 .errors
                 .iter()
-                .any(|e| e.contains("duplicate back-edge"))
+                .any(|e| e.contains("duplicate red traversal"))
         );
 
         let wide = parse_pipe("f: A -> A\nn :all-of-4294967295 \"x\"");

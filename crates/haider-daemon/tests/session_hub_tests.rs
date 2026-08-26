@@ -49,10 +49,11 @@ use haider_rpc::{
     ARTIFACT_PUT_MAX_BYTES, AttachMode, AttachmentId, Capability, CapabilitySet, CommandId,
     ERROR_CODE_ARTIFACT_TOO_LARGE, ERROR_CODE_ATTACHMENT_MIME_UNSUPPORTED,
     ERROR_CODE_ATTACHMENT_NOT_FOUND, ERROR_CODE_ATTACHMENT_TOO_LARGE,
-    ERROR_CODE_ATTACHMENTS_TOO_LARGE, ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_PDF_MALFORMED,
-    ERROR_CODE_PDF_TOO_LARGE, ERROR_CODE_PDF_TOO_MANY_PAGES, ERROR_CODE_TOO_MANY_ATTACHMENTS,
-    ErrorData, FleetAgentStateWire, MenuInput, ObserveRunStateWire, RequestBody, RequestId,
-    ResponseBody, SeqRange, SessionSummary, SurfaceInputPublishWire, WireFrame,
+    ERROR_CODE_ATTACHMENTS_TOO_LARGE, ERROR_CODE_BUSY, ERROR_CODE_CAPABILITY_DENIED,
+    ERROR_CODE_PDF_MALFORMED, ERROR_CODE_PDF_TOO_LARGE, ERROR_CODE_PDF_TOO_MANY_PAGES,
+    ERROR_CODE_TOO_MANY_ATTACHMENTS, ErrorData, FleetAgentStateWire, MenuInput,
+    ObserveRunStateWire, RequestBody, RequestId, ResponseBody, SeqRange, SessionSummary,
+    SurfaceInputPublishWire, WireFrame,
 };
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
@@ -1924,6 +1925,120 @@ async fn graph_pin_rpc_replays_its_receipt_before_control_attachment_validation(
     assert_eq!(store.latest_seq(&session_id).await.expect("head"), head);
 
     replay.close().await.expect("replay connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// Native workflow selection and turn admission share one serialization
+/// boundary: once the accepted run is nonterminal, neither pin nor switch can
+/// alter the authority of an already assembled provider request.
+#[tokio::test]
+async fn graph_pin_and_switch_refuse_nonterminal_sessions() {
+    let (_root, store, hub) = open_hub(None, 16).await;
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            capabilities(),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+
+    let pin_session = SessionId::new("graph-pin-during-turn");
+    create_and_attach_typed_session(&store, &connection, &sink, &pin_session, "fake").await;
+    hub.append(&mut [run_state_pipe_event(
+        &pin_session,
+        "graph-pin-active-run",
+        store.worker_generation(),
+        "graph-pin-active-run",
+        RunState::Thinking,
+    )])
+    .await
+    .expect("active pin run");
+    let pin_request_id = RequestId::new("graph-pin-during-turn-request");
+    connection
+        .request(
+            pin_request_id.clone(),
+            RequestBody::GraphPin {
+                command_id: CommandId::new("graph-pin-during-turn-command"),
+                session_id: pin_session.clone(),
+                worker_generation: store.worker_generation(),
+                template: haider_protocol::graph::SHIP_LOOP_TEMPLATE.into(),
+            },
+        )
+        .await
+        .expect("pin request routes");
+    let pin_error = loop {
+        if let WireFrame::Response { request_id, body } = sink.next().await
+            && request_id == pin_request_id
+        {
+            break body;
+        }
+    };
+    assert!(matches!(
+        pin_error,
+        ResponseBody::Error { ref code, .. } if code == ERROR_CODE_BUSY
+    ));
+
+    let switch_session = SessionId::new("graph-switch-during-turn");
+    create_and_attach_typed_session(&store, &connection, &sink, &switch_session, "fake").await;
+    let initial_request_id = RequestId::new("graph-switch-initial-pin");
+    connection
+        .request(
+            initial_request_id.clone(),
+            RequestBody::GraphPin {
+                command_id: CommandId::new("graph-switch-initial-pin-command"),
+                session_id: switch_session.clone(),
+                worker_generation: store.worker_generation(),
+                template: haider_protocol::graph::SHIP_LOOP_TEMPLATE.into(),
+            },
+        )
+        .await
+        .expect("initial pin routes");
+    let old_graph_id = loop {
+        if let WireFrame::Response { request_id, body } = sink.next().await
+            && request_id == initial_request_id
+            && let ResponseBody::GraphPin { graph_id, .. } = body
+        {
+            break graph_id;
+        }
+    };
+    hub.append(&mut [run_state_pipe_event(
+        &switch_session,
+        "graph-switch-active-run",
+        store.worker_generation(),
+        "graph-switch-active-run",
+        RunState::Thinking,
+    )])
+    .await
+    .expect("active switch run");
+    let switch_request_id = RequestId::new("graph-switch-during-turn-request");
+    connection
+        .request(
+            switch_request_id.clone(),
+            RequestBody::GraphSwitch {
+                command_id: CommandId::new("graph-switch-during-turn-command"),
+                session_id: switch_session,
+                worker_generation: store.worker_generation(),
+                old_graph_id,
+                template: haider_protocol::graph::SHIP_LOOP_TEMPLATE.into(),
+            },
+        )
+        .await
+        .expect("switch request routes");
+    let switch_error = loop {
+        if let WireFrame::Response { request_id, body } = sink.next().await
+            && request_id == switch_request_id
+        {
+            break body;
+        }
+    };
+    assert!(matches!(
+        switch_error,
+        ResponseBody::Error { ref code, .. } if code == ERROR_CODE_BUSY
+    ));
+
+    connection.close().await.expect("connection closes");
     hub.shutdown().await.expect("hub stops");
     store.close().await.expect("store closes");
 }

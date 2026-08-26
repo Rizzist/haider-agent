@@ -5966,8 +5966,10 @@ pub struct ProviderTuning {
     /// W-B: whether the resolved pair may declare its PROVIDER-NATIVE web
     /// tools (Anthropic server tools, OpenAI hosted search, Gemini
     /// built-ins). True on real turns; the factory clears it when the
-    /// session's anthropic server tools degraded (local-fallback latch),
-    /// and probe/validation constructions leave it false via `default()`.
+    /// session's anthropic server tools degraded (local-fallback latch) or a
+    /// daemon-owned Loom workflow requires every network effect to cross the
+    /// scoped local dispatcher. Probe/validation constructions leave it false
+    /// via `default()`.
     pub web_tools: bool,
 }
 
@@ -6661,11 +6663,12 @@ fn provider_tuning_with_web_degrade(
     web_degrade: crate::worker::WebCapabilityDegrade,
 ) -> ProviderTuning {
     let mut tuning = ProviderTuning::from_metadata(metadata);
-    if web_degrade.anthropic_web_tools
-        && matches!(
-            metadata.provider.as_str(),
-            ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME
-        )
+    if web_degrade.disable_hosted_web_tools
+        || (web_degrade.anthropic_web_tools
+            && matches!(
+                metadata.provider.as_str(),
+                ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME
+            ))
     {
         tuning.web_tools = false;
     }

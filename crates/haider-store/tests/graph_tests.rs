@@ -22,6 +22,7 @@ use haider_protocol::graph::{
     child_contract_subject_digest, child_gate_structure, evidence_fingerprint, graph_template,
     graph_template_catalog, graph_template_digest, implement_verify_child_template,
     process_signal_subject_digest, reduce_graph_telemetry, ship_loop_nodes,
+    validate_graph_template,
 };
 use haider_protocol::history::{TodoItem, TodoState};
 use haider_protocol::ids::{
@@ -237,6 +238,96 @@ fn raw_envelope(
         },
         payload: serde_json::to_value(payload).expect("serialize test payload"),
     }
+}
+
+fn graph_human_menu_graphs(envelopes: &[haider_protocol::envelope::RawEnvelope]) -> Vec<GraphId> {
+    envelopes
+        .iter()
+        .filter_map(|envelope| serde_json::from_value(envelope.payload.clone()).ok())
+        .filter_map(|payload| match payload {
+            EventPayload::MenuOpened(Menu {
+                kind: MenuKind::GraphHumanConfirm { graph_id, .. },
+                ..
+            }) => Some(graph_id),
+            _ => None,
+        })
+        .collect()
+}
+
+fn closed_menu_ids(envelopes: &[haider_protocol::envelope::RawEnvelope]) -> Vec<MenuId> {
+    envelopes
+        .iter()
+        .filter_map(|envelope| serde_json::from_value(envelope.payload.clone()).ok())
+        .filter_map(|payload| match payload {
+            EventPayload::MenuClosed { menu, .. } => Some(menu),
+            _ => None,
+        })
+        .collect()
+}
+
+fn runtime_node(name: &str, dependencies: &[&str], red_target: &str) -> GraphNodeSpec {
+    GraphNodeSpec {
+        name: GraphNodeName::new(name).expect("runtime node"),
+        gate: GraphGateKind::CommandGreen,
+        executor: GraphExecutorShape::Inline,
+        max_attempts: 8,
+        max_evidence_per_attempt: Some(1),
+        depends_on: dependencies
+            .iter()
+            .map(|dependency| GraphNodeName::new(*dependency).expect("runtime dependency"))
+            .collect(),
+        red_target: Some(GraphNodeName::new(red_target).expect("runtime red target")),
+        verify_slots: Vec::new(),
+    }
+}
+
+fn pin_runtime_graph(
+    store: &Store,
+    session_id: &SessionId,
+    suffix: &str,
+    start: &str,
+    nodes: Vec<GraphNodeSpec>,
+) -> GraphId {
+    let template = GraphTemplateSpec {
+        name: format!("runtime-{suffix}"),
+        version: 1,
+        start_node: Some(GraphNodeName::new(start).expect("runtime start")),
+        nodes,
+    };
+    validate_graph_template(&template).expect("runtime graph validates");
+    let graph_id = GraphId::new(format!("runtime-graph-{suffix}"));
+    let run_id = RunId::new(format!("runtime-run-{suffix}"));
+    let start_node = template.start_node.clone().expect("validated start");
+    let digest = graph_template_digest(&template);
+    let mut facts = vec![
+        raw_envelope(
+            store,
+            session_id,
+            &run_id,
+            format!("runtime-pin-{suffix}"),
+            EventPayload::GraphPinned(GraphPinned {
+                graph_id: graph_id.clone(),
+                template: template.name,
+                digest,
+                template_version: template.version,
+                start_node: Some(start_node.clone()),
+                nodes: template.nodes,
+            }),
+        ),
+        raw_envelope(
+            store,
+            session_id,
+            &run_id,
+            format!("runtime-open-{suffix}"),
+            EventPayload::GraphAttemptOpened(GraphAttemptOpened {
+                graph_id: graph_id.clone(),
+                node: start_node,
+                attempt: 1,
+            }),
+        ),
+    ];
+    store.append(&mut facts).expect("append runtime graph");
+    graph_id
 }
 
 fn computer_png_fixture() -> Vec<u8> {
@@ -2424,6 +2515,229 @@ fn human_confirm_commits_completion_atomically_and_replays_after_restart() {
 }
 
 #[test]
+fn human_start_opens_a_menu_on_pin_switch_and_run_set_child_creation() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    store
+        .loom_register_workflow("human-start: Task -> Task\napprove :human")
+        .expect("register human-start workflow");
+
+    let pin_session = create_session(&store, "human-start-pin");
+    let mut pin_command = pin_command(&store, &pin_session, "human-start-pin");
+    pin_command.template = "human-start".into();
+    let GraphPinOutcome::Committed { pinned, envelopes } = store
+        .pin_graph(&pin_command)
+        .expect("pin human-start workflow")
+    else {
+        panic!("fresh human-start pin must commit");
+    };
+    assert_eq!(graph_human_menu_graphs(&envelopes), [pinned.graph_id]);
+
+    let switch_session = create_session(&store, "human-start-switch");
+    let old_graph = pin(&store, &switch_session, "human-start-switch-old");
+    let new_graph = GraphId::new("graph-human-start-switch-new");
+    let command = switch_command(
+        &store,
+        &switch_session,
+        old_graph,
+        new_graph.clone(),
+        "human-start",
+        "human-start-switch",
+    );
+    let GraphSwitchOutcome::Committed { envelopes, .. } =
+        store.switch_graph(&command).expect("switch to human start")
+    else {
+        panic!("fresh human-start switch must commit");
+    };
+    assert_eq!(graph_human_menu_graphs(&envelopes), [new_graph]);
+
+    let run_set_session = create_session(&store, "human-start-run-set");
+    pin_named_template(
+        &store,
+        &run_set_session,
+        "human-start-run-set-root",
+        "human-start",
+    );
+    let root_menu = store
+        .graph_status(&run_set_session)
+        .expect("root graph status")
+        .and_then(|status| status.pending_menu)
+        .expect("human root menu");
+    let plan_item = ItemId::new("human-start-plan");
+    let plan_seq = append_plan(
+        &store,
+        &run_set_session,
+        &plan_item,
+        "human-start-plan-event",
+        vec![todo(1, None)],
+    );
+    let command = GraphRunSetOpenCommand {
+        command_id: "open-human-start-run-set".into(),
+        request_digest: "open-human-start-run-set-digest".into(),
+        request_json: format!(r#"{{"plan_event_seq":{plan_seq}}}"#),
+        session_id: run_set_session.clone(),
+        worker_generation: store.worker_generation(),
+        plan_item_id: plan_item,
+        plan_event_seq: plan_seq,
+        device_id: DeviceId::new("graph-test"),
+    };
+    let GraphRunSetOpenOutcome::Committed { opened, envelopes } = store
+        .open_graph_run_set(&command)
+        .expect("open human-start run-set")
+    else {
+        panic!("fresh human-start run-set must commit");
+    };
+    assert_eq!(
+        graph_human_menu_graphs(&envelopes),
+        [opened.children[0].child_graph_id.clone()]
+    );
+    assert_eq!(closed_menu_ids(&envelopes), [root_menu.clone()]);
+    let status = store
+        .graph_status(&run_set_session)
+        .expect("child graph status")
+        .expect("selected child graph");
+    assert_ne!(status.pending_menu, Some(root_menu));
+}
+
+#[test]
+fn switch_and_abandon_terminalize_unfinished_run_set_children_and_their_menus() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    store
+        .loom_register_workflow("human-start: Task -> Task\napprove :human")
+        .expect("register human-start workflow");
+
+    let switch_session = create_session(&store, "run-set-switch-forest");
+    let switch_root = pin_named_template(
+        &store,
+        &switch_session,
+        "run-set-switch-root",
+        "human-start",
+    );
+    let switch_plan = ItemId::new("run-set-switch-plan");
+    let switch_plan_seq = append_plan(
+        &store,
+        &switch_session,
+        &switch_plan,
+        "run-set-switch-plan-event",
+        vec![todo(1, None)],
+    );
+    let switch_set = open_run_set(
+        &store,
+        &switch_session,
+        &switch_plan,
+        switch_plan_seq,
+        "switch-forest",
+    );
+    let switch_child = switch_set.children[0].child_graph_id.clone();
+    let switch_child_menu = store
+        .graph_status_by_id(&switch_session, &switch_child)
+        .expect("switch child status")
+        .and_then(|status| status.pending_menu)
+        .expect("switch child human menu");
+    let replacement = GraphId::new("graph-run-set-switch-replacement");
+    let GraphSwitchOutcome::Committed { envelopes, .. } = store
+        .switch_graph(&switch_command(
+            &store,
+            &switch_session,
+            switch_root,
+            replacement.clone(),
+            STAGGERED_TEMPLATE,
+            "run-set-forest",
+        ))
+        .expect("switch aggregate forest")
+    else {
+        panic!("fresh run-set switch must commit");
+    };
+    assert!(closed_menu_ids(&envelopes).contains(&switch_child_menu));
+    assert!(envelopes.iter().any(|envelope| {
+        matches!(
+            serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+            Ok(EventPayload::GraphSuperseded(GraphSuperseded { old, new }))
+                if old == switch_child && new == replacement
+        )
+    }));
+    assert_eq!(
+        store
+            .graph_status_by_id(&switch_session, &switch_child)
+            .expect("retained switch child")
+            .expect("switch child graph")
+            .phase,
+        GraphPhase::Superseded
+    );
+    assert!(matches!(
+        record(
+            &store,
+            &switch_session,
+            8_800,
+            GraphNodeName::new("START").expect("replacement start node"),
+            EvidenceVerdict::Green,
+            "replacement root accepts evidence after run-set switch",
+        ),
+        GraphEvidenceOutcome::Committed { .. }
+    ));
+
+    let abandon_session = create_session(&store, "run-set-abandon-forest");
+    pin_named_template(
+        &store,
+        &abandon_session,
+        "run-set-abandon-root",
+        "human-start",
+    );
+    let abandon_plan = ItemId::new("run-set-abandon-plan");
+    let abandon_plan_seq = append_plan(
+        &store,
+        &abandon_session,
+        &abandon_plan,
+        "run-set-abandon-plan-event",
+        vec![todo(1, None)],
+    );
+    let abandon_set = open_run_set(
+        &store,
+        &abandon_session,
+        &abandon_plan,
+        abandon_plan_seq,
+        "abandon-forest",
+    );
+    let abandon_child = abandon_set.children[0].child_graph_id.clone();
+    let abandon_child_menu = store
+        .graph_status_by_id(&abandon_session, &abandon_child)
+        .expect("abandon child status")
+        .and_then(|status| status.pending_menu)
+        .expect("abandon child human menu");
+    let GraphAbandonOutcome::Committed { envelopes, .. } = store
+        .abandon_graph(&GraphAbandonCommand {
+            command_id: "abandon-run-set-forest".into(),
+            request_digest: "abandon-run-set-forest-digest".into(),
+            request_json: r#"{"why":"operator stopped run set"}"#.into(),
+            session_id: abandon_session.clone(),
+            worker_generation: store.worker_generation(),
+            why: "operator stopped run set".into(),
+            device_id: DeviceId::new("graph-test"),
+        })
+        .expect("abandon aggregate forest")
+    else {
+        panic!("fresh run-set abandon must commit");
+    };
+    assert!(closed_menu_ids(&envelopes).contains(&abandon_child_menu));
+    assert!(envelopes.iter().any(|envelope| {
+        matches!(
+            serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+            Ok(EventPayload::GraphAbandoned(ref abandoned))
+                if abandoned.graph_id == abandon_child
+        )
+    }));
+    assert_eq!(
+        store
+            .graph_status_by_id(&abandon_session, &abandon_child)
+            .expect("retained abandon child")
+            .expect("abandon child graph")
+            .phase,
+        GraphPhase::Abandoned
+    );
+}
+
+#[test]
 fn human_hold_parks_graph_without_completing_it() {
     let root = tempfile::tempdir().expect("tempdir");
     let store = Store::open(root.path()).expect("open store");
@@ -2783,6 +3097,555 @@ fn m2b_retry_reopens_declared_start_and_clears_parallel_greens() {
         Some(GraphNodeName::new("START").expect("node"))
     );
     assert!(status.nodes.iter().all(|node| !node.satisfied));
+}
+
+#[test]
+fn compiled_loom_red_targets_survive_registry_pin_and_converge_at_runtime() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "compiled-loom-red-runtime");
+    store
+        .loom_register_workflow(
+            "compiled-red: Task -> Task\nprepare \"prepare\" ↻\ncheck \"check\" ↺prepare",
+        )
+        .expect("register compiled red traversal");
+    let workflow = store
+        .loom_workflow("compiled-red")
+        .expect("read workflow")
+        .expect("compiled workflow exists");
+    let prepare = GraphNodeName::new("PREPARE").expect("prepare node");
+    let check = GraphNodeName::new("CHECK").expect("check node");
+    assert_eq!(
+        workflow.template.nodes[0].red_target.as_ref(),
+        Some(&prepare)
+    );
+    assert_eq!(
+        workflow.template.nodes[1].red_target.as_ref(),
+        Some(&prepare)
+    );
+    assert!(workflow.template.nodes.iter().all(|node| {
+        node.max_evidence_per_attempt
+            == Some(haider_protocol::graph::GRAPH_MAX_EVIDENCE_PER_ATTEMPT)
+    }));
+
+    let mut command = pin_command(&store, &session_id, "compiled-loom-red-runtime");
+    command.template = "compiled-red".into();
+    let GraphPinOutcome::Committed { pinned, .. } =
+        store.pin_graph(&command).expect("pin compiled workflow")
+    else {
+        panic!("fresh compiled workflow pin must commit");
+    };
+    let frozen_nodes = store
+        .read(&session_id, 0, 64)
+        .expect("read frozen pin")
+        .into_iter()
+        .filter_map(|envelope| serde_json::from_value(envelope.payload).ok())
+        .find_map(|payload| match payload {
+            EventPayload::GraphPinned(pin) if pin.graph_id == pinned.graph_id => Some(pin.nodes),
+            _ => None,
+        })
+        .expect("pinned graph carries immutable nodes");
+    assert_eq!(frozen_nodes[0].red_target.as_ref(), Some(&prepare));
+    assert_eq!(frozen_nodes[1].red_target.as_ref(), Some(&prepare));
+
+    for serial in 30_000..30_008 {
+        record(
+            &store,
+            &session_id,
+            serial,
+            prepare.clone(),
+            EvidenceVerdict::Red,
+            &format!("prepare red {serial}"),
+        );
+    }
+    let after_self = store
+        .graph_status(&session_id)
+        .expect("status")
+        .expect("graph");
+    assert_eq!(after_self.attempt, 2);
+    assert_eq!(after_self.current_node, Some(prepare.clone()));
+
+    record(
+        &store,
+        &session_id,
+        30_008,
+        prepare.clone(),
+        EvidenceVerdict::Green,
+        "prepare converged after self-loop",
+    );
+    for serial in 30_009..30_017 {
+        record(
+            &store,
+            &session_id,
+            serial,
+            check.clone(),
+            EvidenceVerdict::Red,
+            &format!("check red {serial}"),
+        );
+    }
+    let after_back = store
+        .graph_status(&session_id)
+        .expect("status")
+        .expect("graph");
+    assert_eq!(after_back.attempt, 3);
+    assert_eq!(after_back.current_node, Some(prepare.clone()));
+    assert!(after_back.nodes.iter().all(|node| !node.satisfied));
+
+    record(
+        &store,
+        &session_id,
+        30_017,
+        prepare,
+        EvidenceVerdict::Green,
+        "prepare converged after back-hop",
+    );
+    record(
+        &store,
+        &session_id,
+        30_018,
+        check,
+        EvidenceVerdict::Green,
+        "check converged",
+    );
+    assert_eq!(
+        store
+            .graph_status(&session_id)
+            .expect("status")
+            .expect("graph")
+            .phase,
+        GraphPhase::Completed
+    );
+}
+
+#[test]
+fn conditional_self_loop_reopens_only_its_target_then_completes() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "targeted-self-loop");
+    let node = GraphNodeName::new("WORK").expect("node");
+    pin_runtime_graph(
+        &store,
+        &session_id,
+        "targeted-self-loop",
+        "WORK",
+        vec![runtime_node("WORK", &[], "WORK")],
+    );
+
+    record(
+        &store,
+        &session_id,
+        20_000,
+        node.clone(),
+        EvidenceVerdict::Red,
+        "first bounded failure",
+    );
+    let reopened = store
+        .graph_status(&session_id)
+        .expect("status")
+        .expect("graph");
+    let work = reopened
+        .nodes
+        .iter()
+        .find(|candidate| candidate.node == node)
+        .expect("work state");
+    assert_eq!(reopened.attempt, 2);
+    assert_eq!(reopened.current_node, Some(node.clone()));
+    assert_eq!(work.current_attempt, Some(2));
+    assert_eq!(work.attempts_opened, 2);
+    assert_eq!(work.evidence.red, 0, "the new attempt has a fresh frontier");
+
+    record(
+        &store,
+        &session_id,
+        20_001,
+        node,
+        EvidenceVerdict::Green,
+        "second attempt converged",
+    );
+    assert_eq!(
+        store
+            .graph_status(&session_id)
+            .expect("status")
+            .expect("graph")
+            .phase,
+        GraphPhase::Completed
+    );
+}
+
+#[test]
+fn conditional_back_edge_invalidates_target_forward_slice_then_completes() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "targeted-back-edge");
+    let prepare = GraphNodeName::new("PREPARE").expect("node");
+    let check = GraphNodeName::new("CHECK").expect("node");
+    pin_runtime_graph(
+        &store,
+        &session_id,
+        "targeted-back-edge",
+        "PREPARE",
+        vec![
+            runtime_node("PREPARE", &[], "PREPARE"),
+            runtime_node("CHECK", &["PREPARE"], "PREPARE"),
+        ],
+    );
+
+    record(
+        &store,
+        &session_id,
+        20_010,
+        prepare.clone(),
+        EvidenceVerdict::Green,
+        "prepared",
+    );
+    record(
+        &store,
+        &session_id,
+        20_011,
+        check.clone(),
+        EvidenceVerdict::Red,
+        "check remained red",
+    );
+    let reopened = store
+        .graph_status(&session_id)
+        .expect("status")
+        .expect("graph");
+    assert_eq!(reopened.current_node, Some(prepare.clone()));
+    assert!(reopened.nodes.iter().all(|node| !node.satisfied));
+
+    record(
+        &store,
+        &session_id,
+        20_012,
+        prepare,
+        EvidenceVerdict::Green,
+        "prepared again",
+    );
+    record(
+        &store,
+        &session_id,
+        20_013,
+        check,
+        EvidenceVerdict::Green,
+        "check converged",
+    );
+    assert_eq!(
+        store
+            .graph_status(&session_id)
+            .expect("status")
+            .expect("graph")
+            .phase,
+        GraphPhase::Completed
+    );
+}
+
+#[test]
+fn back_edge_preserves_unrelated_fork_green_for_join_reentry() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "targeted-fork-join");
+    let start = GraphNodeName::new("START").expect("node");
+    let left = GraphNodeName::new("LEFT").expect("node");
+    let right = GraphNodeName::new("RIGHT").expect("node");
+    let join = GraphNodeName::new("JOIN").expect("node");
+    pin_runtime_graph(
+        &store,
+        &session_id,
+        "targeted-fork-join",
+        "START",
+        vec![
+            runtime_node("START", &[], "START"),
+            runtime_node("LEFT", &["START"], "LEFT"),
+            runtime_node("RIGHT", &["START"], "RIGHT"),
+            runtime_node("JOIN", &["LEFT", "RIGHT"], "LEFT"),
+        ],
+    );
+
+    record(
+        &store,
+        &session_id,
+        20_020,
+        start,
+        EvidenceVerdict::Green,
+        "fork opened",
+    );
+    record(
+        &store,
+        &session_id,
+        20_021,
+        right.clone(),
+        EvidenceVerdict::Green,
+        "right green",
+    );
+    record(
+        &store,
+        &session_id,
+        20_022,
+        left.clone(),
+        EvidenceVerdict::Green,
+        "left green",
+    );
+    record(
+        &store,
+        &session_id,
+        20_023,
+        join.clone(),
+        EvidenceVerdict::Red,
+        "join requested left rework",
+    );
+
+    let reopened = store
+        .graph_status(&session_id)
+        .expect("status")
+        .expect("graph");
+    let state = |name: &GraphNodeName| {
+        reopened
+            .nodes
+            .iter()
+            .find(|node| &node.node == name)
+            .expect("node state")
+    };
+    assert!(state(&right).satisfied, "unrelated fork green survives");
+    assert_eq!(state(&right).current_attempt, Some(1));
+    assert!(!state(&left).satisfied);
+    assert!(!state(&join).satisfied);
+    assert_eq!(reopened.ready_nodes, vec![left.clone()]);
+
+    record(
+        &store,
+        &session_id,
+        20_024,
+        left,
+        EvidenceVerdict::Green,
+        "left converged",
+    );
+    let join_ready = store
+        .graph_status(&session_id)
+        .expect("status")
+        .expect("graph");
+    assert_eq!(join_ready.ready_nodes, vec![join.clone()]);
+    assert_eq!(
+        join_ready
+            .nodes
+            .iter()
+            .find(|node| node.node == join)
+            .and_then(|node| node.current_attempt),
+        Some(2)
+    );
+    record(
+        &store,
+        &session_id,
+        20_025,
+        join,
+        EvidenceVerdict::Green,
+        "join converged",
+    );
+    assert_eq!(
+        store
+            .graph_status(&session_id)
+            .expect("status")
+            .expect("graph")
+            .phase,
+        GraphPhase::Completed
+    );
+}
+
+#[test]
+fn back_edge_preserves_unrelated_ready_sibling_evidence_and_epoch() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "targeted-partial-fork");
+    let start = GraphNodeName::new("START").expect("node");
+    let left = GraphNodeName::new("LEFT").expect("node");
+    let right = GraphNodeName::new("RIGHT").expect("node");
+    let check = GraphNodeName::new("CHECK").expect("node");
+    let mut right_spec = runtime_node("RIGHT", &["START"], "RIGHT");
+    right_spec.max_evidence_per_attempt = Some(2);
+    pin_runtime_graph(
+        &store,
+        &session_id,
+        "targeted-partial-fork",
+        "START",
+        vec![
+            runtime_node("START", &[], "START"),
+            runtime_node("LEFT", &["START"], "LEFT"),
+            right_spec,
+            runtime_node("CHECK", &["LEFT"], "LEFT"),
+        ],
+    );
+
+    record(
+        &store,
+        &session_id,
+        20_030,
+        start,
+        EvidenceVerdict::Green,
+        "fork opened",
+    );
+    record(
+        &store,
+        &session_id,
+        20_031,
+        right.clone(),
+        EvidenceVerdict::Red,
+        "right partial evidence",
+    );
+    record(
+        &store,
+        &session_id,
+        20_032,
+        left.clone(),
+        EvidenceVerdict::Green,
+        "left green",
+    );
+    record(
+        &store,
+        &session_id,
+        20_033,
+        check.clone(),
+        EvidenceVerdict::Red,
+        "check requested left rework",
+    );
+    record(
+        &store,
+        &session_id,
+        20_034,
+        left,
+        EvidenceVerdict::Green,
+        "left converged",
+    );
+
+    let reentered = store
+        .graph_status(&session_id)
+        .expect("status")
+        .expect("graph");
+    let right_state = reentered
+        .nodes
+        .iter()
+        .find(|node| node.node == right)
+        .expect("right state");
+    assert_eq!(right_state.current_attempt, Some(1));
+    assert_eq!(right_state.evidence.red, 1);
+    assert!(!right_state.satisfied);
+    assert!(reentered.node_is_ready(&right));
+    assert_eq!(
+        reentered
+            .nodes
+            .iter()
+            .find(|node| node.node == check)
+            .and_then(|node| node.current_attempt),
+        Some(2)
+    );
+
+    record(
+        &store,
+        &session_id,
+        20_035,
+        right,
+        EvidenceVerdict::Green,
+        "right converged without reopening",
+    );
+    record(
+        &store,
+        &session_id,
+        20_036,
+        check,
+        EvidenceVerdict::Green,
+        "check converged",
+    );
+    assert_eq!(
+        store
+            .graph_status(&session_id)
+            .expect("status")
+            .expect("graph")
+            .phase,
+        GraphPhase::Completed
+    );
+}
+
+#[test]
+fn twenty_four_conditional_hops_is_a_hard_runtime_bound() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "conditional-hop-bound");
+    let nodes = ["ONE", "TWO", "THREE", "FOUR"];
+    pin_runtime_graph(
+        &store,
+        &session_id,
+        "conditional-hop-bound",
+        "ONE",
+        vec![
+            runtime_node("ONE", &[], "ONE"),
+            runtime_node("TWO", &["ONE"], "TWO"),
+            runtime_node("THREE", &["TWO"], "THREE"),
+            runtime_node("FOUR", &["THREE"], "FOUR"),
+        ],
+    );
+
+    let mut serial = 20_100;
+    for name in nodes.iter().take(3) {
+        let node = GraphNodeName::new(*name).expect("node");
+        for round in 0..7 {
+            record(
+                &store,
+                &session_id,
+                serial,
+                node.clone(),
+                EvidenceVerdict::Red,
+                &format!("{name} distinct bounded failure {round}"),
+            );
+            serial += 1;
+        }
+        record(
+            &store,
+            &session_id,
+            serial,
+            node,
+            EvidenceVerdict::Green,
+            &format!("{name} converged"),
+        );
+        serial += 1;
+    }
+    let fourth = GraphNodeName::new("FOUR").expect("node");
+    for round in 0..3 {
+        record(
+            &store,
+            &session_id,
+            serial,
+            fourth.clone(),
+            EvidenceVerdict::Red,
+            &format!("FOUR distinct bounded failure {round}"),
+        );
+        serial += 1;
+    }
+    let at_bound = store
+        .graph_status(&session_id)
+        .expect("status")
+        .expect("graph");
+    assert_eq!(
+        at_bound.attempt, 25,
+        "initial epoch plus 24 conditional hops"
+    );
+    assert_eq!(at_bound.phase, GraphPhase::Active);
+
+    record(
+        &store,
+        &session_id,
+        serial,
+        fourth,
+        EvidenceVerdict::Red,
+        "FOUR hop 25 is refused",
+    );
+    let blocked = store
+        .graph_status(&session_id)
+        .expect("status")
+        .expect("graph");
+    assert_eq!(blocked.attempt, 25);
+    assert_eq!(blocked.phase, GraphPhase::Blocked);
+    assert_eq!(
+        blocked.blocked_reason,
+        Some(GraphBlockReason::RoundsExhausted)
+    );
 }
 
 #[test]
@@ -3927,6 +4790,7 @@ fn telemetry_node(name: &str, dependencies: &[&str]) -> GraphNodeSpec {
             .iter()
             .map(|dependency| GraphNodeName::new(*dependency).expect("dependency"))
             .collect(),
+        red_target: None,
         verify_slots: Vec::new(),
     }
 }
@@ -4499,6 +5363,7 @@ fn m2d_run_set_open_revalidates_the_selected_template_before_child_creation() {
             max_attempts: 2,
             max_evidence_per_attempt: Some(2),
             depends_on: vec![node],
+            red_target: None,
             verify_slots: Vec::new(),
         }],
     };

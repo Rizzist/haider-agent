@@ -564,12 +564,12 @@ fn migrations_apply_fresh_and_are_idempotent_on_reopen() {
     let root = test_root();
     let database_path = {
         let store = must(Store::open(root.path()));
-        assert_eq!(must(store.schema_version()), 19);
+        assert_eq!(must(store.schema_version()), 20);
         store.database_path().to_path_buf()
     };
 
     let reopened = must(Store::open(root.path()));
-    assert_eq!(must(reopened.schema_version()), 19);
+    assert_eq!(must(reopened.schema_version()), 20);
     let connection = must(Connection::open(database_path));
     let registered: u32 = must(connection.query_row(
         "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 1 AND 14",
@@ -590,6 +590,8 @@ fn migrations_apply_fresh_and_are_idempotent_on_reopen() {
         "branches",
         "hook_dispatch_outbox",
         "session_projection_checkpoints",
+        "loom_cli_install_jobs",
+        "loom_cli_install_items",
     ] {
         let count: u32 = must(connection.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -598,6 +600,62 @@ fn migrations_apply_fresh_and_are_idempotent_on_reopen() {
         ));
         assert_eq!(count, 1, "missing table {table}");
     }
+}
+
+#[test]
+fn typed_agent_install_job_schema_is_durable_and_bounded() {
+    let root = test_root();
+    let database_path = {
+        let store = must(Store::open(root.path()));
+        store.database_path().to_path_buf()
+    };
+    let connection = must(Connection::open(&database_path));
+    must(connection.pragma_update(None, "foreign_keys", true));
+    must(connection.execute(
+        "INSERT INTO loom_agent_types(
+             id, rev, digest, record_json, created_at_ms, updated_at_ms
+         ) VALUES (?1, 1, ?2, '{}', 10, 10)",
+        params!["researcher", "0123456789abcdef0123456789abcdef"],
+    ));
+    must(connection.execute(
+        "INSERT INTO loom_cli_install_jobs(
+             job_id, agent_type_id, agent_type_rev, agent_type_digest, state,
+             total, completed, current_cli, error, created_at_ms, updated_at_ms
+         ) VALUES (?1, ?2, 1, ?3, 'queued', 2, 0, NULL, NULL, 10, 10)",
+        params![
+            "install:researcher:1",
+            "researcher",
+            "0123456789abcdef0123456789abcdef"
+        ],
+    ));
+    must(connection.execute(
+        "INSERT INTO loom_cli_install_items(
+             job_id, ordinal, cli_program, state, error, created_at_ms, updated_at_ms
+         ) VALUES (?1, 0, 'rg', 'queued', NULL, 10, 10)",
+        ["install:researcher:1"],
+    ));
+    assert!(
+        connection
+            .execute(
+                "INSERT INTO loom_cli_install_items(
+                     job_id, ordinal, cli_program, state, error, created_at_ms, updated_at_ms
+                 ) VALUES (?1, 32, 'jq', 'unknown', NULL, 10, 10)",
+                ["install:researcher:1"],
+            )
+            .is_err(),
+        "migration must reject out-of-bounds ordinals and unknown states"
+    );
+    drop(connection);
+
+    let reopened = must(Store::open(root.path()));
+    assert_eq!(must(reopened.schema_version()), 20);
+    let connection = must(Connection::open(reopened.database_path()));
+    let retained: (String, u32, u32) = must(connection.query_row(
+        "SELECT state, completed, total FROM loom_cli_install_jobs WHERE job_id = ?1",
+        ["install:researcher:1"],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ));
+    assert_eq!(retained, ("queued".into(), 0, 2));
 }
 
 #[test]

@@ -338,6 +338,8 @@ async fn mobile_dispatcher_fixture_with_grant(
             grant,
             mobile_use_active,
             cli_scope: None,
+            typed_workflow_execution: None,
+            loom_provider_fenced: false,
             web_search: None,
         },
     )

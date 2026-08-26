@@ -29,7 +29,7 @@ use haider_store::{
     SessionForkOutcome, SessionProjectionCheckpoint, SessionRenameCommand, SessionRenameOutcome,
     SessionSeenCommand, SessionSeenOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
     ShellExecAcceptCommand, ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome,
-    TurnCancelCommand, TurnCancelOutcome,
+    TurnCancelCommand, TurnCancelOutcome, TypedAgentInstallCas,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::{Path, PathBuf};
@@ -1352,6 +1352,70 @@ impl SqliteStoreHandle {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.loom_register_agent_type(&record)))
             .await
+    }
+
+    pub async fn loom_register_agent_type_with_install(
+        &self,
+        record: haider_protocol::loom::LoomAgentType,
+    ) -> Result<haider_store::LoomAgentTypeRegistration, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.loom_register_agent_type_with_install(&record))
+        })
+        .await
+    }
+
+    pub async fn typed_agent_install_jobs(
+        &self,
+        job_id: Option<String>,
+        agent_type_id: Option<String>,
+    ) -> Result<Vec<haider_protocol::typed_agent::TypedAgentInstallJob>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.typed_agent_install_jobs(job_id.as_deref(), agent_type_id.as_deref())
+            })
+        })
+        .await
+    }
+
+    pub async fn typed_agent_install_items(
+        &self,
+        job_id: Option<String>,
+        agent_type_id: Option<String>,
+    ) -> Result<Vec<haider_protocol::typed_agent::TypedAgentInstallItem>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.typed_agent_install_items(job_id.as_deref(), agent_type_id.as_deref())
+            })
+        })
+        .await
+    }
+
+    pub async fn typed_agent_install_status(
+        &self,
+        job_id: Option<String>,
+        agent_type_id: Option<String>,
+    ) -> Result<haider_store::TypedAgentInstallSnapshot, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.typed_agent_install_status(job_id.as_deref(), agent_type_id.as_deref())
+            })
+        })
+        .await
+    }
+
+    pub async fn typed_agent_install_compare_and_swap(
+        &self,
+        update: TypedAgentInstallCas,
+    ) -> Result<haider_protocol::typed_agent::TypedAgentInstallJob, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.typed_agent_install_compare_and_swap(&update))
+        })
+        .await
     }
 
     pub async fn loom_register_workflow(

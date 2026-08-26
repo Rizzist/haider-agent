@@ -21,6 +21,7 @@ fn node(name: &str, depends_on: &[&str]) -> GraphNodeSpec {
             .iter()
             .map(|dep| GraphNodeName::new(*dep).expect("valid dep"))
             .collect(),
+        red_target: None,
         verify_slots: Vec::new(),
     }
 }

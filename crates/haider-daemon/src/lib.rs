@@ -77,6 +77,7 @@ mod loom_seed_tests;
 mod manual_retry_tests;
 mod mobile_transport;
 mod model_select;
+mod monitor;
 mod oauth;
 #[cfg(test)]
 mod permissions_core_tests;
@@ -92,6 +93,9 @@ mod tasks;
 #[cfg(all(test, unix))]
 mod tasks_runtime_tests;
 mod turn_recovery;
+mod typed_agent_executor;
+mod typed_agent_installer;
+mod typed_agent_runtime;
 mod usage_report;
 #[cfg(test)]
 mod wb_web_runtime_tests;
@@ -110,7 +114,15 @@ pub use config::DaemonConfig;
 pub use diagnostics::{BUILD_UUID, BUILD_VERSION, process_started_unix_ms};
 pub use error::{DaemonError, IncumbentDiagnostics};
 pub use gcloud::{GcloudAccessTokenSource, GcloudCli};
+pub use haider_tools::MonitorSourceKind;
 pub use lifecycle::{DaemonState, Readiness, ShutdownDisposition, ShutdownHandle, ShutdownOutcome};
+pub use monitor::{
+    MAX_MONITORS_PER_SESSION, MAX_PENDING_MONITOR_REPORTS_PER_SESSION, MONITOR_COALESCE_WINDOW,
+    MONITOR_RATE_LIMIT_MATCHES, MONITOR_RATE_LIMIT_WINDOW, MonitorDeliveryReceipt,
+    MonitorDeliverySink, MonitorError, MonitorEvent, MonitorEventPayload, MonitorPublishReceipt,
+    MonitorReport, MonitorReportStatus, MonitorSourceHub, MonitorSubscription,
+    SessionMonitorDeliverySink, SmsIncomingEvent, publish_sms_incoming,
+};
 pub use oauth::{
     OAuthAuthorizeParameter, OAuthCoordinatorConfig, OAuthIdentityExpectation, OAuthIdentityMode,
     OAuthIdentityVerifier, OAuthInferenceAuthMode, OAuthInferenceHeaderSet,

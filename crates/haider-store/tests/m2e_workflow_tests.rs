@@ -147,6 +147,7 @@ fn m2e_authored_replacement_cannot_launder_model_testimony_into_daemon_authority
             max_attempts: 1,
             max_evidence_per_attempt: Some(1),
             depends_on: Vec::new(),
+            red_target: None,
             verify_slots: vec![EvidenceSlotSpec {
                 id: "model".into(),
                 authority: EvidenceAuthority::ModelAttested,

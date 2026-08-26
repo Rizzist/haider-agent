@@ -904,6 +904,8 @@ async fn message_subagent_starts_an_idle_child_immediately() {
             grant: None,
             mobile_use_active: false,
             cli_scope: None,
+            typed_workflow_execution: None,
+            loom_provider_fenced: false,
             web_search: None,
         },
     )

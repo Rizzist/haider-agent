@@ -212,6 +212,11 @@ pub struct HarnessConfig {
     pub volatile_user_tail: Option<String>,
     /// General tools the paired dispatcher can execute.
     pub tools: Vec<ToolDefinition>,
+    /// Enforce `tools` as an authorization ceiling even for root sessions.
+    /// Delegated children always enforce it through `agent_id`; daemon-owned
+    /// workflows enable this bit so actor-owned tools cannot bypass a dynamic
+    /// dispatcher grant merely by naming an unadvertised tool.
+    pub enforce_advertised_tool_ceiling: bool,
     /// Local equivalents advertised after one exact provider-hosted-tool
     /// rejection. Empty means this provider has no safe fallback pack.
     pub provider_tool_fallback_tools: Vec<ToolDefinition>,
@@ -324,6 +329,7 @@ impl HarnessConfig {
             system_prompt: None,
             volatile_user_tail: None,
             tools: Vec::new(),
+            enforce_advertised_tool_ceiling: false,
             provider_tool_fallback_tools: Vec::new(),
             provider_tool_base: None,
             provider_local_web_tools: Vec::new(),
@@ -786,6 +792,14 @@ pub trait ContextCompactor: Send + Sync + std::fmt::Debug {
 
 #[async_trait]
 pub trait ToolDispatcher: Send + Sync {
+    /// Re-checks daemon-owned authority immediately before any tool route,
+    /// including actor-owned request/plan/todo handling. Implementations use
+    /// this narrow hook to fail closed when external session state changed
+    /// after the current provider request was assembled.
+    async fn preflight_tool_call(&self, _name: &str) -> Result<(), HaiderError> {
+        Ok(())
+    }
+
     async fn execute(
         &self,
         run_id: &RunId,
@@ -4660,18 +4674,24 @@ impl HarnessActor {
                 "provider ended unknown tool call `{call_id}`",
             ))));
         };
-        // A delegated child may only invoke declarations present in its
-        // resolved grant-filtered pack. This actor-side fence covers the two
-        // actor-owned tools before the daemon dispatcher is reached.
-        if self.config.agent_id.is_some()
-            && !self
-                .config
-                .tools
-                .iter()
-                .any(|definition| definition.name == tools[index].name)
-        {
+        if let Some(dispatcher) = self.dispatcher.as_ref() {
+            dispatcher
+                .preflight_tool_call(&tools[index].name)
+                .await
+                .map_err(DriveError::Store)?;
+        }
+        // A delegated child or daemon-owned workflow may only invoke
+        // declarations present in its resolved grant-filtered pack. This
+        // actor-side fence covers request/plan/todo before the general
+        // dispatcher is reached.
+        if !tool_call_within_advertised_ceiling(&self.config, &tools[index].name) {
+            let authority = if self.config.agent_id.is_some() {
+                "child"
+            } else {
+                "workflow"
+            };
             let reason = format!(
-                "grant ceiling violation: child is not allowed to use `{}`",
+                "grant ceiling violation: {authority} is not allowed to use `{}`",
                 tools[index].name
             );
             let result = BoundedResult {
@@ -4692,7 +4712,7 @@ impl HarnessActor {
                 presentation: Some(tool_error_presentation(
                     "grant-ceiling-violation",
                     "Tool grant denied",
-                    "This child is not allowed to use the requested tool.",
+                    &format!("This {authority} is not allowed to use the requested tool."),
                 )),
             };
             let call_id = tools[index].call_id.clone();
@@ -7306,6 +7326,16 @@ fn tool_args_or_raw(tool: &ToolAccumulator) -> serde_json::Value {
         .unwrap_or_else(|_| serde_json::Value::String(tool.args.clone()))
 }
 
+fn tool_call_within_advertised_ceiling(config: &HarnessConfig, name: &str) -> bool {
+    if config.agent_id.is_none() && !config.enforce_advertised_tool_ceiling {
+        return true;
+    }
+    config
+        .tools
+        .iter()
+        .any(|definition| definition.name == name)
+}
+
 fn provider_protocol_error(message: impl Into<String>) -> ProviderError {
     ProviderError::new(ProviderErrorKind::MalformedFrame, message)
 }
@@ -9078,6 +9108,32 @@ mod cu1_actor_tests {
         );
         config.tool_result_images_supported = images_supported;
         config
+    }
+
+    #[test]
+    fn root_workflow_rejects_a_forged_unadvertised_actor_tool() {
+        let mut config = actor_config(false);
+        assert!(
+            tool_call_within_advertised_ceiling(&config, "todo_write"),
+            "ordinary root compatibility remains unchanged"
+        );
+
+        config.enforce_advertised_tool_ceiling = true;
+        config.tools.push(ToolDefinition {
+            name: "graph_evidence".into(),
+            description: String::new(),
+            input_schema: serde_json::json!({"type": "object"}),
+        });
+        assert!(tool_call_within_advertised_ceiling(
+            &config,
+            "graph_evidence"
+        ));
+        for forged in ["request_input", "plan", "todo_write"] {
+            assert!(
+                !tool_call_within_advertised_ceiling(&config, forged),
+                "root Loom turn admitted forged {forged}"
+            );
+        }
     }
 
     #[test]

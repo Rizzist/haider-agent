@@ -155,7 +155,7 @@ use haider_rpc::{
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
@@ -726,6 +726,19 @@ pub struct SessionHub {
     inner: Arc<HubInner>,
 }
 
+/// Non-owning hub reference used by daemon-lifetime services. Keeping source
+/// listeners weak prevents their tasks from extending the hub lifetime.
+#[derive(Clone)]
+pub(crate) struct WeakSessionHub {
+    inner: Weak<HubInner>,
+}
+
+impl WeakSessionHub {
+    pub(crate) fn upgrade(&self) -> Option<SessionHub> {
+        self.inner.upgrade().map(|inner| SessionHub { inner })
+    }
+}
+
 struct HubInner {
     store: SqliteStoreHandle,
     append_committer: AppendCommitter,
@@ -759,6 +772,18 @@ struct HubInner {
     /// race actor recreation or fresh admission.
     deleting_sessions: Mutex<HashSet<SessionId>>,
     actor_tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Serializes every package-manager side effect in this daemon. Durable
+    /// CAS protects state, while this process-local mutex prevents a startup
+    /// resume and a concurrent registration from both executing the same
+    /// already-Installing item before either reaches its post-effect CAS.
+    typed_install_serial: Arc<tokio::sync::Mutex<()>>,
+    /// Orders native workflow selection against every run admission. RPC pin
+    /// and switch hold this through their idle check and commit; turn, retry,
+    /// shell, and manual-compaction admission hold it until the nonterminal
+    /// run fact is committed. This closes the request TOCTOU window without
+    /// blocking daemon-internal workflow_author transitions inside an already
+    /// fenced tool call.
+    workflow_selection_serials: tokio::sync::Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>,
     replay_tasks: Mutex<Vec<JoinHandle<ReplayCompletion>>>,
     attachments: Mutex<HashMap<AttachmentId, AttachmentOwner>>,
     /// Admission ledger for the per-connection and global attachment caps.
@@ -797,6 +822,9 @@ struct HubInner {
     /// tasks. Hub-owned so every facade clone shares it; the journal's
     /// task facts remain the durable truth.
     tasks: crate::tasks::TaskRegistry,
+    /// §E: source subscriptions and the in-memory projection of durable
+    /// monitor journal facts. The projection is rebuilt at startup.
+    monitors: crate::monitor::MonitorService,
     /// W-B: session-scoped web-capability degrades (anthropic server tools
     /// 400ed → local fallback; codex alpha/search 404/410 → stop advertising
     /// the client search). Deliberately IN-MEMORY: "for the session" is a
@@ -1615,6 +1643,8 @@ impl SessionHub {
             surface_publications,
             deleting_sessions: Mutex::new(HashSet::new()),
             actor_tasks: Mutex::new(Vec::new()),
+            typed_install_serial: Arc::new(tokio::sync::Mutex::new(())),
+            workflow_selection_serials: tokio::sync::Mutex::new(HashMap::new()),
             replay_tasks: Mutex::new(Vec::new()),
             attachments: Mutex::new(HashMap::new()),
             attachment_slots: Mutex::new(AttachmentSlots::default()),
@@ -1632,13 +1662,53 @@ impl SessionHub {
             haider_code_plan_changes,
             usage_report: Mutex::new(None),
             tasks: crate::tasks::TaskRegistry::default(),
+            monitors: crate::monitor::MonitorService::default(),
             web_degrade: Mutex::new(HashMap::new()),
             prompt_history: PromptHistoryCache::default(),
         });
         let hub = Self { inner };
         hub.spawn_profile_fault_watcher();
         hub.spawn_usage_history_reconciler()?;
+        hub.spawn_typed_install_resume()?;
         Ok(hub)
+    }
+
+    fn spawn_typed_install_resume(&self) -> Result<(), SessionHubError> {
+        let store = self.inner.store.clone();
+        let serial = Arc::clone(&self.inner.typed_install_serial);
+        lock(&self.inner.actor_tasks)?.push(tokio::spawn(async move {
+            let _exclusive = serial.lock().await;
+            crate::typed_agent_runtime::resume_pending_installs(store).await;
+        }));
+        Ok(())
+    }
+
+    fn spawn_typed_install_job(&self, job_id: String) -> Result<(), HaiderError> {
+        let store = self.inner.store.clone();
+        let mut tasks = self.inner.actor_tasks.lock().map_err(|_| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                "typed-agent installer task registry is unavailable",
+                true,
+            )
+        })?;
+        // Keep this check under the same task-registry lock that shutdown
+        // takes after publishing the drain flag. A committed job may remain
+        // queued for next-start adoption, but no installer task can detach
+        // behind the shutdown barrier.
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let serial = Arc::clone(&self.inner.typed_install_serial);
+        tasks.push(tokio::spawn(async move {
+            let _exclusive = serial.lock().await;
+            if let Err(error) =
+                crate::typed_agent_runtime::run_install_job(store, job_id.clone()).await
+            {
+                tracing::warn!(job_id = %job_id, %error, "typed-agent install job stopped");
+            }
+        }));
+        Ok(())
     }
 
     fn spawn_usage_history_reconciler(&self) -> Result<(), SessionHubError> {
@@ -1721,6 +1791,36 @@ impl SessionHub {
         &self.inner.tasks
     }
 
+    pub(crate) fn inner_monitor(&self) -> &crate::monitor::MonitorService {
+        &self.inner.monitors
+    }
+
+    pub(crate) fn downgrade(&self) -> WeakSessionHub {
+        WeakSessionHub {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
+    /// Source-subscription seam for transport wiring. The returned hub is
+    /// instance-scoped and contains no session-selection authority.
+    pub fn monitor_source_hub(&self) -> crate::monitor::MonitorSourceHub {
+        self.inner.monitors.source_hub()
+    }
+
+    pub(crate) async fn wait_for_monitor_ready(&self) {
+        self.inner.monitors.wait_ready().await;
+    }
+
+    /// Installs a transport-specific report mirror. The default sink remains
+    /// authoritative and routes every report through an ordinary durable
+    /// turn, so transport wiring cannot accidentally suppress agent wake.
+    pub fn install_monitor_delivery_sink(
+        &self,
+        sink: Arc<dyn crate::monitor::MonitorDeliverySink>,
+    ) {
+        self.inner.monitors.install_delivery_sink(sink);
+    }
+
     /// W-B: this session's web-capability degrade snapshot (Default = no
     /// degrade). Poison-tolerant like the task registry.
     pub(crate) fn web_degrade(
@@ -1791,6 +1891,11 @@ impl SessionHub {
             ));
         }
         *installed = Some(manager);
+        drop(installed);
+        // MONITOR intake starts only after the canonical turn engine exists.
+        // Boot adoption can wake an already-expired durable watch; starting
+        // earlier would allow acceptance to outrun the manager handoff.
+        self.inner.monitors.activate(self.downgrade());
         Ok(())
     }
 
@@ -2005,7 +2110,56 @@ impl SessionHub {
         &self,
         record: haider_protocol::loom::LoomAgentType,
     ) -> Result<haider_protocol::loom::LoomRegistration, HaiderError> {
-        self.inner.store.loom_register_agent_type(record).await
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(HaiderError::new(
+                ErrorCode::Busy,
+                "daemon is draining; typed-agent registration is closed",
+                true,
+            ));
+        }
+        // Registry revision changes and installer adoption share one daemon
+        // ownership lane. This prevents startup from deciding an old
+        // revision is current while a concurrent registration supersedes it.
+        let install_serial = self.inner.typed_install_serial.lock().await;
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(HaiderError::new(
+                ErrorCode::Busy,
+                "daemon is draining; typed-agent registration is closed",
+                true,
+            ));
+        }
+        let outcome = self
+            .inner
+            .store
+            .loom_register_agent_type_with_install(record)
+            .await?;
+        drop(install_serial);
+        if let Some(job) = outcome.install_job {
+            self.spawn_typed_install_job(job.job_id)?;
+        }
+        Ok(outcome.registration)
+    }
+
+    pub(crate) async fn typed_agent_install_jobs(
+        &self,
+        job_id: Option<String>,
+        agent_type_id: Option<String>,
+    ) -> Result<Vec<haider_protocol::typed_agent::TypedAgentInstallJob>, HaiderError> {
+        self.inner
+            .store
+            .typed_agent_install_jobs(job_id, agent_type_id)
+            .await
+    }
+
+    pub(crate) async fn typed_agent_install_status(
+        &self,
+        job_id: Option<String>,
+        agent_type_id: Option<String>,
+    ) -> Result<haider_core::TypedAgentInstallSnapshot, HaiderError> {
+        self.inner
+            .store
+            .typed_agent_install_status(job_id, agent_type_id)
+            .await
     }
 
     /// Narrow daemon-internal session creation used by local delegation.
@@ -3077,6 +3231,7 @@ impl SessionHub {
         command: TurnAcceptCommand,
     ) -> Result<TurnAcceptOutcome, SessionHubError> {
         let actor = self.actor_for(command.session_id.clone()).await?;
+        let _workflow_selection = self.lock_workflow_selection(&command.session_id).await;
         let (completed, result) = oneshot::channel();
         actor
             .commands
@@ -3162,6 +3317,7 @@ impl SessionHub {
         command: RunRetryCommand,
     ) -> Result<RunRetryOutcome, SessionHubError> {
         let actor = self.actor_for(command.session_id.clone()).await?;
+        let _workflow_selection = self.lock_workflow_selection(&command.session_id).await;
         let (completed, result) = oneshot::channel();
         actor
             .commands
@@ -3196,6 +3352,7 @@ impl SessionHub {
         command: ShellExecAcceptCommand,
     ) -> Result<ShellExecAcceptOutcome, SessionHubError> {
         let actor = self.actor_for(command.session_id.clone()).await?;
+        let _workflow_selection = self.lock_workflow_selection(&command.session_id).await;
         let (completed, result) = oneshot::channel();
         actor
             .commands
@@ -3438,7 +3595,36 @@ impl SessionHub {
         // W-A fence law: session close kills every pgid the session owns,
         // after the actor is provably stopped and before the durable delete.
         self.fence_background_tasks(session_id).await;
-        self.inner.store.delete_session(session_id.clone()).await?;
+        self.inner
+            .monitors
+            .forget_session(self, session_id)
+            .await
+            .map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("monitor deletion fence failed: {error}"),
+                    true,
+                )
+            })?;
+        match self.inner.store.delete_session(session_id.clone()).await {
+            Ok(()) => self.inner.monitors.release_session_tombstone(session_id),
+            Err(error) => {
+                self.inner
+                    .monitors
+                    .restore_session(self, session_id)
+                    .await
+                    .map_err(|restore| {
+                        HaiderError::new(
+                            ErrorCode::Internal,
+                            format!(
+                                "session delete failed ({error}); monitor rollback failed: {restore}"
+                            ),
+                            true,
+                        )
+                    })?;
+                return Err(error);
+            }
+        }
         self.inner.observe_digests.remove(session_id);
         if let Ok(Some(hooks)) = self.hooks() {
             hooks.session_deleted(session_id.clone());
@@ -3474,6 +3660,23 @@ impl SessionHub {
                 }
             }
         }
+    }
+
+    /// One per-session total order for native workflow selection and the
+    /// durable admission of work that makes an idle session nonterminal.
+    pub(crate) async fn lock_workflow_selection(
+        &self,
+        session_id: &SessionId,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let serial = {
+            let mut serials = self.inner.workflow_selection_serials.lock().await;
+            Arc::clone(
+                serials
+                    .entry(session_id.clone())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        serial.lock_owned().await
     }
 
     async fn acquire_worker_lease_inner(
@@ -4238,6 +4441,11 @@ impl SessionHub {
     /// final marker is recorded and returns [`SessionHubShutdownOutcome::Forced`];
     /// it can never be mistaken for a graceful join.
     pub async fn shutdown(&self) -> Result<SessionHubShutdownOutcome, SessionHubError> {
+        self.inner
+            .monitors
+            .shutdown()
+            .await
+            .map_err(|error| SessionHubError::Task(error.to_string()))?;
         // W-A fence law: background tasks die with the daemon. The kill
         // ladders run BEFORE the drain flag so completion facts can still
         // journal; anything unsettled is reaped by next-start adoption.

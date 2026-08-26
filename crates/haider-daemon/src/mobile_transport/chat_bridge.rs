@@ -8,9 +8,12 @@
 
 use super::{
     ChatCommand, ChatEvent, ChatResponder, MobileChatBridge, MobileChatError, MobileModel,
-    MobileProvider, MobileSelection, MobileSessionConfig,
+    MobileProvider, MobileSelection, MobileSessionConfig, TransportState,
 };
-use crate::AdmissionTicket;
+use crate::{
+    AdmissionTicket, MonitorDeliveryReceipt, MonitorDeliverySink, MonitorError,
+    MonitorEventPayload, MonitorReport, MonitorReportStatus,
+};
 use async_trait::async_trait;
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
@@ -24,7 +27,7 @@ use haider_rpc::{
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -42,17 +45,50 @@ pub(super) struct DaemonMobileChatBridge {
     instance_id: String,
     next_id: AtomicU64,
     runtime: Mutex<Option<MobileHubRuntime>>,
+    attached_session: StdRwLock<Option<haider_protocol::ids::SessionId>>,
+    transport: Weak<TransportState>,
+}
+
+pub(super) struct MobileMonitorDeliverySink {
+    bridge: Weak<DaemonMobileChatBridge>,
+}
+
+impl MobileMonitorDeliverySink {
+    pub(super) fn new(bridge: Weak<DaemonMobileChatBridge>) -> Self {
+        Self { bridge }
+    }
 }
 
 impl DaemonMobileChatBridge {
-    pub(super) fn new(hub: crate::SessionHub, default_model: String, instance_id: String) -> Self {
+    pub(super) fn new(
+        hub: crate::SessionHub,
+        default_model: String,
+        instance_id: String,
+        transport: Weak<TransportState>,
+    ) -> Self {
         Self {
             hub,
             default_model,
             instance_id,
             next_id: AtomicU64::new(1),
             runtime: Mutex::new(None),
+            attached_session: StdRwLock::new(None),
+            transport,
         }
+    }
+
+    fn attached_session(&self) -> Option<haider_protocol::ids::SessionId> {
+        self.attached_session
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn set_attached_session(&self, session: Option<haider_protocol::ids::SessionId>) {
+        *self
+            .attached_session
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = session;
     }
 
     fn next_coordinate(&self, kind: &str) -> String {
@@ -249,7 +285,14 @@ impl MobileChatBridge for DaemonMobileChatBridge {
             return Err(connection_closed_error());
         }
         if runtime.is_none() {
-            *runtime = Some(self.initialize_runtime().await?);
+            let initialized = self.initialize_runtime().await?;
+            self.set_attached_session(
+                initialized
+                    .session
+                    .as_ref()
+                    .map(|session| session.session_id.clone()),
+            );
+            *runtime = Some(initialized);
         }
         if responder.is_closed() {
             return Err(connection_closed_error());
@@ -262,9 +305,101 @@ impl MobileChatBridge for DaemonMobileChatBridge {
         };
         if matches!(&result, Err(error) if runtime_reset_required(error)) {
             runtime.take();
+            self.set_attached_session(None);
         }
         result
     }
+}
+
+#[async_trait]
+impl MonitorDeliverySink for MobileMonitorDeliverySink {
+    async fn deliver(
+        &self,
+        session: &haider_protocol::ids::SessionId,
+        report: MonitorReport,
+    ) -> Result<MonitorDeliveryReceipt, MonitorError> {
+        let bridge = self.bridge.upgrade().ok_or_else(|| {
+            MonitorError::Delivery("mobile chat bridge is no longer attached".into())
+        })?;
+        if &report.session_id != session {
+            return Err(MonitorError::Delivery(
+                "mobile monitor delivery session does not match report owner".into(),
+            ));
+        }
+        if bridge.attached_session().as_ref() != Some(session) {
+            return Err(MonitorError::Delivery(
+                "monitor owner is not attached to the mobile chat bridge".into(),
+            ));
+        }
+        let transport = bridge.transport.upgrade().ok_or_else(|| {
+            MonitorError::Delivery("mobile chat transport is no longer available".into())
+        })?;
+        transport
+            .send_monitor_chat(monitor_report_chat_text(&report))
+            .await
+            .map_err(|error| MonitorError::Delivery(error.to_string()))?;
+        Ok(MonitorDeliveryReceipt {
+            durable: false,
+            handed_off: true,
+            disposition: "mobile_chat_delta",
+        })
+    }
+}
+
+fn monitor_report_chat_text(report: &MonitorReport) -> String {
+    let mut text = match report.status {
+        MonitorReportStatus::Matched => format!("Monitor `{}` matched", report.monitor_id),
+        MonitorReportStatus::RateLimited => {
+            format!(
+                "Monitor `{}` stopped after too many matches",
+                report.monitor_id
+            )
+        }
+        MonitorReportStatus::TimedOut => format!("Monitor `{}` timed out", report.monitor_id),
+    };
+    if report.coalesced_count > 1 {
+        text.push_str(&format!(" ({} events)", report.coalesced_count));
+    }
+    text.push_str(".\n");
+    for event in &report.events {
+        match &event.payload {
+            MonitorEventPayload::Sms(sms) => {
+                text.push_str(&format!(
+                    "\nSMS from {}:\n{}\n",
+                    sms.address,
+                    truncate_chars(&sms.body, TOOL_PREVIEW_CHARS),
+                ));
+            }
+            MonitorEventPayload::Process { line } => {
+                text.push_str(&format!(
+                    "\nProcess event:\n{}\n",
+                    truncate_chars(line, TOOL_PREVIEW_CHARS),
+                ));
+            }
+            MonitorEventPayload::File { payload } => {
+                text.push_str(&format!(
+                    "\nFile event:\n{}\n",
+                    truncate_chars(payload, TOOL_PREVIEW_CHARS),
+                ));
+            }
+            MonitorEventPayload::Poll { payload } => {
+                text.push_str(&format!(
+                    "\nPoll event:\n{}\n",
+                    truncate_chars(payload, TOOL_PREVIEW_CHARS),
+                ));
+            }
+            MonitorEventPayload::Timer { fired_at_ms } => {
+                text.push_str(&format!("\nTimer fired at {fired_at_ms} ms.\n"));
+            }
+        }
+    }
+    if report.omitted_count > 0 {
+        text.push_str(&format!(
+            "\n{} additional matching events were omitted.",
+            report.omitted_count
+        ));
+    }
+    text
 }
 
 struct MobileHubSink {

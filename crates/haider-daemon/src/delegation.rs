@@ -568,16 +568,26 @@ impl DelegationHandle {
                 "a workflow child must name its single parent evidence slot",
             )
         })?;
-        let slot = parent
+        let parent_node = parent
             .nodes
             .iter()
             .find(|candidate| candidate.node == node)
-            .and_then(|candidate| {
-                candidate
-                    .evidence_slots
-                    .iter()
-                    .find(|slot| slot.id == parent_slot)
-            })
+            .ok_or_else(|| {
+                workflow_rejection(
+                    "missing_parent_attempt",
+                    "parent graph node has no reduced attempt state",
+                )
+            })?;
+        let parent_attempt_epoch = parent_node.current_attempt.ok_or_else(|| {
+            workflow_rejection(
+                "missing_parent_attempt",
+                "parent graph node has no open node-local attempt",
+            )
+        })?;
+        let slot = parent_node
+            .evidence_slots
+            .iter()
+            .find(|slot| slot.id == parent_slot)
             .ok_or_else(|| {
                 workflow_rejection(
                     "unknown_parent_slot",
@@ -630,7 +640,7 @@ impl DelegationHandle {
         let parent_attempt = ParentGraphAttempt {
             graph_id: parent.graph_id,
             node,
-            attempt: parent.attempt,
+            attempt: parent_attempt_epoch,
         };
         Ok(Some(ChildGraphAttached {
             parent_run_id: coordinates.parent_run_id.clone(),

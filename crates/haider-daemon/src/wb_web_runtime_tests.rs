@@ -552,6 +552,7 @@ fn web_fetch_advertises_on_every_pair_except_first_party_anthropic() {
             WebCapabilityDegrade {
                 anthropic_web_tools: true,
                 openai_alpha_search: false,
+                disable_hosted_web_tools: false,
             },
         );
         assert!(
@@ -615,6 +616,7 @@ fn client_web_search_advertises_on_lite_only_and_a_gone_endpoint_unadvertises_it
         WebCapabilityDegrade {
             anthropic_web_tools: false,
             openai_alpha_search: true,
+            disable_hosted_web_tools: false,
         },
     );
     assert!(

@@ -7,7 +7,7 @@
 #[path = "mobile_transport/chat_bridge.rs"]
 mod chat_bridge;
 
-use crate::{DaemonConfig, DaemonError};
+use crate::{DaemonConfig, DaemonError, MonitorSourceHub, publish_sms_incoming};
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -54,6 +54,7 @@ const MAX_CHAT_TEXT_BYTES: usize = 256 * 1024;
 const MAX_SESSION_FIELD_BYTES: usize = 512;
 const CHAT_OUTPUT_CAPACITY: usize = 128;
 const CHAT_COMMAND_CAPACITY: usize = 4;
+const MONITOR_CHAT_STREAM_CAPACITY: usize = 16;
 const SERVER_CAPABILITIES: &[&str] = &[
     "a11y.snapshot",
     "a11y.tap",
@@ -69,6 +70,12 @@ const SERVER_CAPABILITIES: &[&str] = &[
 struct Envelope {
     id: i64,
     body: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MonitorChatStream {
+    id: i64,
+    text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -565,16 +572,26 @@ fn mobile_home(config: &DaemonConfig) -> PathBuf {
 
 pub(crate) async fn start_if_enabled(
     config: &DaemonConfig,
+    hub: crate::SessionHub,
+    default_model: String,
+    instance_id: String,
 ) -> Result<Option<MobileTransportServer>, DaemonError> {
     if !mobile_apk_enabled() {
         return Ok(None);
     }
-    MobileTransportServer::start(&mobile_home(config))
-        .await
-        .map(Some)
-        .map_err(|error| DaemonError::Task {
-            message: format!("cannot start mobile APK transport: {error}"),
-        })
+    MobileTransportServer::start(
+        &mobile_home(config),
+        Some(MobileChatIntegration {
+            hub,
+            default_model,
+            instance_id,
+        }),
+    )
+    .await
+    .map(Some)
+    .map_err(|error| DaemonError::Task {
+        message: format!("cannot start mobile APK transport: {error}"),
+    })
 }
 
 pub(crate) struct MobileTransportServer {
@@ -584,8 +601,17 @@ pub(crate) struct MobileTransportServer {
     task: Option<JoinHandle<()>>,
 }
 
+struct MobileChatIntegration {
+    hub: crate::SessionHub,
+    default_model: String,
+    instance_id: String,
+}
+
 impl MobileTransportServer {
-    async fn start(home: &Path) -> Result<Self, TransportError> {
+    async fn start(
+        home: &Path,
+        integration: Option<MobileChatIntegration>,
+    ) -> Result<Self, TransportError> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .map_err(|error| TransportError::io("bind numeric mobile loopback listener", error))?;
@@ -606,7 +632,20 @@ impl MobileTransportServer {
         let token = Arc::new(generate_token()?);
         let token_path = write_mobile_token(home, token.as_str())?;
         let state = Arc::new(TransportState::new());
-        register_transport(&state);
+        let mut server = Self {
+            state,
+            #[cfg(test)]
+            address: SocketAddr::V4(address),
+            task: None,
+        };
+        if let Some(integration) = integration {
+            server.install_chat_bridge(
+                integration.hub,
+                integration.default_model,
+                integration.instance_id,
+            );
+        }
+        register_transport(&server.state);
         writeln!(
             std::io::stderr().lock(),
             "haiderd: mobile APK transport listening on {address}; token={} (written to {})",
@@ -614,16 +653,11 @@ impl MobileTransportServer {
             token_path.display(),
         )
         .map_err(|error| TransportError::io("print mobile APK bootstrap", error))?;
-        let accept_state = Arc::clone(&state);
-        let task = tokio::spawn(async move {
+        let accept_state = Arc::clone(&server.state);
+        server.task = Some(tokio::spawn(async move {
             accept_connections(listener, accept_state, token).await;
-        });
-        Ok(Self {
-            state,
-            #[cfg(test)]
-            address: SocketAddr::V4(address),
-            task: Some(task),
-        })
+        }));
+        Ok(server)
     }
 
     pub(crate) async fn shutdown(&mut self) {
@@ -648,11 +682,18 @@ impl MobileTransportServer {
         instance_id: String,
     ) {
         self.state
-            .install_chat_bridge(Arc::new(chat_bridge::DaemonMobileChatBridge::new(
-                hub,
-                default_model,
-                instance_id,
-            )));
+            .install_monitor_source_hub(hub.monitor_source_hub());
+        let bridge = Arc::new(chat_bridge::DaemonMobileChatBridge::new(
+            hub.clone(),
+            default_model,
+            instance_id,
+            Arc::downgrade(&self.state),
+        ));
+        let monitor_sink = Arc::new(chat_bridge::MobileMonitorDeliverySink::new(Arc::downgrade(
+            &bridge,
+        )));
+        self.state.install_chat_bridge(bridge.clone());
+        hub.install_monitor_delivery_sink(monitor_sink);
     }
 }
 
@@ -740,11 +781,13 @@ async fn serve_connection(
 
     let connection_id = state.allocate_connection_id();
     let (commands, command_receiver) = mpsc::channel(CONNECTION_COMMAND_CAPACITY);
+    let (monitor_streams, monitor_stream_receiver) = mpsc::channel(MONITOR_CHAT_STREAM_CAPACITY);
     let (close, close_receiver) = watch::channel(false);
     state
         .install_connection(Arc::new(ConnectionHandle {
             id: connection_id,
             commands,
+            monitor_streams,
             close,
         }))
         .await;
@@ -753,6 +796,7 @@ async fn serve_connection(
         &state,
         connection_id,
         command_receiver,
+        monitor_stream_receiver,
         close_receiver,
     )
     .await;
@@ -793,6 +837,7 @@ async fn connection_actor(
     state: &Arc<TransportState>,
     connection_id: u64,
     mut commands: mpsc::Receiver<ActorCommand>,
+    mut monitor_streams: mpsc::Receiver<MonitorChatStream>,
     mut close: watch::Receiver<bool>,
 ) -> Result<(), TransportError> {
     let (mut reader, mut writer) = stream.into_split();
@@ -910,6 +955,30 @@ async fn connection_actor(
                     break Err(error);
                 }
             }
+            stream = monitor_streams.recv() => {
+                let Some(stream) = stream else {
+                    break Err(TransportError::protocol("mobile monitor chat stream channel closed"));
+                };
+                if !state.is_current(connection_id) {
+                    break Ok(());
+                }
+                let write = tokio::select! {
+                    result = write_monitor_chat_stream(&mut writer, stream) => Some(result),
+                    changed = close.changed() => {
+                        if changed.is_err() || *close.borrow() {
+                            None
+                        } else {
+                            continue;
+                        }
+                    }
+                };
+                let Some(write) = write else {
+                    break Ok(());
+                };
+                if let Err(error) = write {
+                    break Err(error);
+                }
+            }
             changed = close.changed() => {
                 if changed.is_err() || *close.borrow() {
                     break Ok(());
@@ -926,6 +995,29 @@ async fn connection_actor(
     // dropped output receiver, at which point the bridge issues TurnCancel.
     drop(chat_worker);
     result
+}
+
+async fn write_monitor_chat_stream<W>(
+    writer: &mut W,
+    stream: MonitorChatStream,
+) -> Result<(), TransportError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let MonitorChatStream { id, text } = stream;
+    for event in [
+        ChatEvent::Delta {
+            text,
+            segment: "answer",
+        },
+        ChatEvent::Done,
+    ] {
+        let body = event
+            .into_body()
+            .map_err(|error| TransportError::protocol(error.to_string()))?;
+        write_frame(writer, &Envelope { id, body }).await?;
+    }
+    Ok(())
 }
 
 fn is_bridge_request(body: &Value) -> bool {
@@ -1040,7 +1132,9 @@ fn try_enqueue_bridge_event(
     id: i64,
     event: ChatEvent,
 ) -> Result<(), TransportError> {
-    let body = event.into_body().map_err(TransportError::protocol)?;
+    let body = event
+        .into_body()
+        .map_err(|error| TransportError::protocol(error.to_string()))?;
     output
         .try_send(Envelope { id, body })
         .map_err(|_| TransportError::protocol("mobile chat output queue is full"))
@@ -1090,11 +1184,16 @@ async fn route_push(
             })?;
             if push.address.len() > MAX_SMS_PUSH_ADDRESS_BYTES
                 || push.body.len() > MAX_SMS_PUSH_BODY_BYTES
+                || push.ts < 0
             {
                 return Err(TransportError::protocol(
-                    "sms.incoming push exceeds the field-size limit",
+                    "sms.incoming push exceeds a field limit or has a negative timestamp",
                 ));
             }
+            let monitor_source = state.monitor_source_hub().ok_or_else(|| {
+                TransportError::protocol("mobile monitor source is not installed")
+            })?;
+            publish_monitor_sms(&monitor_source, &push);
             state.record_incoming_sms(push.clone());
             let _ = state.incoming_sms.send(push);
             Ok(())
@@ -1160,6 +1259,7 @@ enum RequestFailure {
 struct ConnectionHandle {
     id: u64,
     commands: mpsc::Sender<ActorCommand>,
+    monitor_streams: mpsc::Sender<MonitorChatStream>,
     close: watch::Sender<bool>,
 }
 
@@ -1174,6 +1274,7 @@ struct TransportState {
     recent_sms: StdMutex<RecentSmsCache>,
     dispatch_gate: AsyncMutex<()>,
     chat_bridge: StdRwLock<Option<Arc<dyn MobileChatBridge>>>,
+    monitor_source_hub: StdRwLock<Option<MonitorSourceHub>>,
 }
 
 #[derive(Default)]
@@ -1217,6 +1318,7 @@ impl TransportState {
             }),
             dispatch_gate: AsyncMutex::new(()),
             chat_bridge: StdRwLock::new(None),
+            monitor_source_hub: StdRwLock::new(None),
         }
     }
 
@@ -1329,12 +1431,66 @@ impl TransportState {
         *write_lock(&self.chat_bridge) = Some(bridge);
     }
 
+    fn install_monitor_source_hub(&self, hub: MonitorSourceHub) {
+        *write_lock(&self.monitor_source_hub) = Some(hub);
+    }
+
+    fn monitor_source_hub(&self) -> Option<MonitorSourceHub> {
+        read_lock(&self.monitor_source_hub).clone()
+    }
+
+    async fn send_monitor_chat(&self, text: String) -> Result<i64, MobileChatError> {
+        let connection = self.current_connection().ok_or_else(|| {
+            MobileChatError::new(
+                "mobile_chat_unavailable",
+                "the mobile chat transport is not connected",
+                true,
+            )
+        })?;
+        if !self.is_current(connection.id) {
+            return Err(MobileChatError::new(
+                "mobile_chat_unavailable",
+                "the mobile chat transport changed before monitor delivery",
+                true,
+            ));
+        }
+        let id = self.allocate_request_id();
+        connection
+            .monitor_streams
+            .send(MonitorChatStream { id, text })
+            .await
+            .map_err(|_| {
+                MobileChatError::new(
+                    "mobile_chat_unavailable",
+                    "the mobile monitor chat stream is closed",
+                    true,
+                )
+            })?;
+        Ok(id)
+    }
+
     fn chat_bridge(&self) -> Option<Arc<dyn MobileChatBridge>> {
         read_lock(&self.chat_bridge).clone()
     }
 
     fn clear_chat_bridge(&self) {
         write_lock(&self.chat_bridge).take();
+    }
+}
+
+fn publish_monitor_sms(hub: &MonitorSourceHub, push: &IncomingSmsPush) {
+    match publish_sms_incoming(hub, &push.address, &push.body, push.ts) {
+        Ok(receipt) if receipt.saturated_subscribers > 0 => {
+            tracing::warn!(
+                sequence = receipt.sequence,
+                saturated = receipt.saturated_subscribers,
+                "monitor SMS source queue is saturated"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%error, "validated SMS push could not reach monitor source hub");
+        }
     }
 }
 
@@ -1941,14 +2097,20 @@ mod tests {
     async fn apk_pushes_reach_their_typed_routes() {
         let state = TransportState::new();
         let (commands, _receiver) = mpsc::channel(CONNECTION_COMMAND_CAPACITY);
+        let (monitor_streams, mut monitor_stream_receiver) =
+            mpsc::channel(MONITOR_CHAT_STREAM_CAPACITY);
         let (close, _close_receiver) = watch::channel(false);
         state
             .install_connection(Arc::new(ConnectionHandle {
                 id: 9,
                 commands,
+                monitor_streams,
                 close,
             }))
             .await;
+        let monitor_sources = MonitorSourceHub::new();
+        let mut monitor_sms = monitor_sources.subscribe(haider_tools::MonitorSourceKind::Sms);
+        state.install_monitor_source_hub(monitor_sources);
         let mut incoming_sms = state.incoming_sms.subscribe();
         route_push(
             &state,
@@ -1971,6 +2133,30 @@ mod tests {
                 ts: 456,
             }
         );
+        let monitor_event = monitor_sms.recv().await.expect("monitor SMS source event");
+        assert!(matches!(
+            monitor_event.payload,
+            crate::MonitorEventPayload::Sms(crate::SmsIncomingEvent {
+                address,
+                body,
+                received_at_ms: 456,
+            }) if address == "+1555" && body == "new message"
+        ));
+        let monitor_chat_id = state
+            .send_monitor_chat("monitor report".into())
+            .await
+            .expect("queue monitor chat stream");
+        assert!(monitor_chat_id < 0);
+        assert_eq!(
+            monitor_stream_receiver
+                .recv()
+                .await
+                .expect("monitor chat stream"),
+            MonitorChatStream {
+                id: monitor_chat_id,
+                text: "monitor report".into(),
+            }
+        );
         route_push(
             &state,
             9,
@@ -1990,11 +2176,14 @@ mod tests {
     async fn last_authenticated_connection_closes_prior_and_resets_push_state() {
         let state = TransportState::new();
         let (first_commands, _first_receiver) = mpsc::channel(CONNECTION_COMMAND_CAPACITY);
+        let (first_monitor_streams, _first_monitor_stream_receiver) =
+            mpsc::channel(MONITOR_CHAT_STREAM_CAPACITY);
         let (first_close, first_close_receiver) = watch::channel(false);
         state
             .install_connection(Arc::new(ConnectionHandle {
                 id: 1,
                 commands: first_commands,
+                monitor_streams: first_monitor_streams,
                 close: first_close,
             }))
             .await;
@@ -2007,11 +2196,14 @@ mod tests {
         });
 
         let (second_commands, _second_receiver) = mpsc::channel(CONNECTION_COMMAND_CAPACITY);
+        let (second_monitor_streams, _second_monitor_stream_receiver) =
+            mpsc::channel(MONITOR_CHAT_STREAM_CAPACITY);
         let (second_close, _second_close_receiver) = watch::channel(false);
         state
             .install_connection(Arc::new(ConnectionHandle {
                 id: 2,
                 commands: second_commands,
+                monitor_streams: second_monitor_streams,
                 close: second_close,
             }))
             .await;
@@ -2029,11 +2221,14 @@ mod tests {
     ) {
         let state = Arc::new(TransportState::new());
         let (commands, receiver) = mpsc::channel(CONNECTION_COMMAND_CAPACITY);
+        let (monitor_streams, _monitor_stream_receiver) =
+            mpsc::channel(MONITOR_CHAT_STREAM_CAPACITY);
         let (close, close_receiver) = watch::channel(false);
         state
             .install_connection(Arc::new(ConnectionHandle {
                 id: 7,
                 commands,
+                monitor_streams,
                 close,
             }))
             .await;
@@ -2332,6 +2527,38 @@ mod tests {
         worker.await.expect("stop chat worker");
     }
 
+    #[tokio::test]
+    async fn monitor_chat_stream_uses_negative_id_delta_then_done() {
+        let (mut daemon, mut apk) = tokio::io::duplex(8 * 1024);
+        write_monitor_chat_stream(
+            &mut daemon,
+            MonitorChatStream {
+                id: -9,
+                text: "SMS from +1555:\nship it".into(),
+            },
+        )
+        .await
+        .expect("write monitor chat stream");
+        assert_eq!(
+            read_frame(&mut apk).await.expect("monitor delta"),
+            Envelope {
+                id: -9,
+                body: json!({
+                    "type": "chat.delta",
+                    "text": "SMS from +1555:\nship it",
+                    "segment": "answer",
+                }),
+            }
+        );
+        assert_eq!(
+            read_frame(&mut apk).await.expect("monitor done"),
+            Envelope {
+                id: -9,
+                body: json!({"type": "chat.done"}),
+            }
+        );
+    }
+
     struct OrderedTestBridge;
 
     #[async_trait]
@@ -2382,7 +2609,7 @@ mod tests {
     #[ignore = "requires a host that permits numeric loopback socket binds"]
     async fn host_loopback_gate_authenticates_and_advertises_capabilities() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let mut server = MobileTransportServer::start(directory.path())
+        let mut server = MobileTransportServer::start(directory.path(), None)
             .await
             .expect("start loopback server");
         let token = std::fs::read_to_string(directory.path().join(TOKEN_FILE_NAME))

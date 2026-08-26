@@ -41,6 +41,7 @@ pub mod session_fork;
 pub mod state;
 pub mod task;
 pub mod tool;
+pub mod typed_agent;
 pub mod usage;
 pub mod verify;
 

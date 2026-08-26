@@ -6,7 +6,11 @@
 
 use haider_protocol::ids::{DeviceId, EventId, GraphId, SessionId};
 use haider_protocol::loom::LoomAgentType;
-use haider_store::{GraphPinCommand, GraphPinOutcome, SessionCreateCommand, Store};
+use haider_protocol::typed_agent::{TYPED_AGENT_INSTALL_STATUS_MAX_JOBS, TypedAgentInstallState};
+use haider_store::{
+    ErrorCode, GraphPinCommand, GraphPinOutcome, SessionCreateCommand, Store, TypedAgentInstallCas,
+    TypedAgentInstallItemCas,
+};
 
 fn agent_type(id: &str, in_type: &str, out_type: &str) -> LoomAgentType {
     LoomAgentType {
@@ -67,6 +71,312 @@ fn agent_type_registration_owns_the_rev_law() {
     assert!(store.loom_register_agent_type(&bad).is_err());
 }
 
+#[test]
+fn typed_agent_registration_atomically_enqueues_frozen_install_work() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("open");
+    let mut first = agent_type("researcher", "SourceURL", "Transcript");
+    first.rev = 99;
+
+    let created = store
+        .loom_register_agent_type_with_install(&first)
+        .expect("typed registration");
+    let job = created.install_job.expect("required CLI creates a job");
+    assert_eq!(
+        (created.registration.rev, created.registration.updated),
+        (1, true)
+    );
+    assert_eq!(job.agent_type_id, "researcher");
+    assert_eq!(job.agent_type_rev, 1);
+    assert_eq!(job.agent_type_digest, created.registration.digest);
+    assert_eq!(
+        job.job_id,
+        format!("install:researcher:1:{}", created.registration.digest),
+        "job identity is deterministic and bound to the frozen revision"
+    );
+    let items = store
+        .typed_agent_install_items(Some(&job.job_id), Some("researcher"))
+        .expect("job items");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].required_cli.program, "yt-dlp");
+    assert_eq!(items[0].state, TypedAgentInstallState::Queued);
+    let snapshot = store
+        .typed_agent_install_status(Some(&job.job_id), Some("researcher"))
+        .expect("coherent install status");
+    assert_eq!(snapshot.jobs, vec![job.clone()]);
+    assert_eq!(snapshot.items, items);
+    assert!(
+        store
+            .typed_agent_install_items(Some(&job.job_id), Some("other-type"))
+            .expect("combined item filters")
+            .is_empty(),
+        "item job and type filters are conjunctive"
+    );
+
+    let noop = store
+        .loom_register_agent_type_with_install(&first)
+        .expect("idempotent typed registration");
+    assert!(!noop.registration.updated);
+    assert!(noop.install_job.is_none());
+    assert_eq!(
+        store
+            .typed_agent_install_jobs(None, Some("researcher"))
+            .expect("researcher jobs")
+            .len(),
+        1,
+        "same content must not enqueue duplicate work"
+    );
+
+    // Upgrade seam: a pre-feature registry row has no job. Simulate that
+    // state and prove startup's idempotent re-registration backfills work
+    // without changing the agent-type revision.
+    let raw = rusqlite::Connection::open(store.database_path()).expect("raw registry database");
+    raw.pragma_update(None, "foreign_keys", true)
+        .expect("foreign keys");
+    raw.execute(
+        "DELETE FROM loom_cli_install_jobs WHERE job_id = ?1",
+        [job.job_id.as_str()],
+    )
+    .expect("remove pre-feature missing job fixture");
+    drop(raw);
+    let backfilled = store
+        .loom_register_agent_type_with_install(&first)
+        .expect("backfill missing install work");
+    assert_eq!(backfilled.registration.rev, 1);
+    assert!(!backfilled.registration.updated);
+    assert_eq!(
+        backfilled
+            .install_job
+            .as_ref()
+            .map(|created| created.job_id.as_str()),
+        Some(job.job_id.as_str())
+    );
+
+    let mut revised = first.clone();
+    revised.clis.push("jq".into());
+    let revised = store
+        .loom_register_agent_type_with_install(&revised)
+        .expect("changed typed registration");
+    let revised_job = revised.install_job.expect("changed type creates a job");
+    assert_eq!(revised.registration.rev, 2);
+    assert_eq!(revised_job.agent_type_rev, 2);
+    assert_eq!(revised_job.progress.total, 2);
+    assert_eq!(
+        store
+            .typed_agent_install_jobs(None, Some("researcher"))
+            .expect("all researcher jobs")
+            .len(),
+        2
+    );
+    assert!(
+        store
+            .typed_agent_install_jobs(Some(&revised_job.job_id), Some("other-type"))
+            .expect("combined filters")
+            .is_empty(),
+        "job and type filters are conjunctive"
+    );
+
+    let mut no_cli = agent_type("writer", "Notes", "Draft");
+    no_cli.clis.clear();
+    let no_cli = store
+        .loom_register_agent_type_with_install(&no_cli)
+        .expect("CLI-free typed registration");
+    assert!(no_cli.install_job.is_none());
+    assert!(
+        store
+            .typed_agent_install_jobs(None, Some("writer"))
+            .expect("writer jobs")
+            .is_empty()
+    );
+
+    let mut unsafe_cli = agent_type("unsafe", "A", "B");
+    unsafe_cli.clis = vec!["relative/tool".into()];
+    let error = store
+        .loom_register_agent_type_with_install(&unsafe_cli)
+        .expect_err("required CLI contract rejects relative programs");
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert!(
+        store
+            .loom_agent_type("unsafe")
+            .expect("unsafe type lookup")
+            .is_none(),
+        "contract rejection rolls back the registry row too"
+    );
+    assert!(
+        store
+            .typed_agent_install_jobs(None, Some("unsafe"))
+            .expect("unsafe type jobs")
+            .is_empty(),
+        "contract rejection leaves no partial install job"
+    );
+}
+
+#[test]
+fn typed_agent_status_bounds_history_before_loading_items() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("open");
+    let mut record = agent_type("bounded-installer", "Input", "Output");
+    for revision in 1..=40 {
+        record.job = format!("Scoped installer contract revision {revision}.");
+        store
+            .loom_register_agent_type_with_install(&record)
+            .expect("register revision");
+    }
+
+    let snapshot = store
+        .typed_agent_install_status(None, Some("bounded-installer"))
+        .expect("bounded reconnect status");
+    assert_eq!(snapshot.jobs.len(), TYPED_AGENT_INSTALL_STATUS_MAX_JOBS);
+    assert_eq!(snapshot.items.len(), snapshot.jobs.len());
+    assert!(snapshot.jobs.iter().any(|job| job.agent_type_rev == 40));
+    assert!(snapshot.jobs.iter().all(|job| job.agent_type_rev >= 9));
+}
+
+#[test]
+fn typed_agent_install_lifecycle_is_validated_cas_and_restart_visible() {
+    let root = tempfile::tempdir().expect("profile");
+    let (terminal_job, terminal_item) = {
+        let store = Store::open(root.path()).expect("open");
+        let registration = store
+            .loom_register_agent_type_with_install(&agent_type(
+                "installer",
+                "SourceURL",
+                "Transcript",
+            ))
+            .expect("typed registration");
+        let queued_job = registration.install_job.expect("queued job");
+        let queued_item = store
+            .typed_agent_install_items(Some(&queued_job.job_id), None)
+            .expect("queued items")
+            .into_iter()
+            .next()
+            .expect("queued item");
+
+        let mut installing_job = queued_job.clone();
+        installing_job.state = TypedAgentInstallState::Installing;
+        installing_job.progress.current_cli = Some(queued_item.required_cli.program.clone());
+        installing_job.updated_at_ms += 1;
+        let mut installing_item = queued_item.clone();
+        installing_item.state = TypedAgentInstallState::Installing;
+        installing_item.updated_at_ms += 1;
+        store
+            .typed_agent_install_compare_and_swap(&TypedAgentInstallCas {
+                expected_job: queued_job.clone(),
+                next_job: installing_job.clone(),
+                item: Some(TypedAgentInstallItemCas {
+                    expected: queued_item.clone(),
+                    next: installing_item.clone(),
+                }),
+            })
+            .expect("start install");
+
+        let stale = store
+            .typed_agent_install_compare_and_swap(&TypedAgentInstallCas {
+                expected_job: queued_job,
+                next_job: installing_job.clone(),
+                item: None,
+            })
+            .expect_err("stale job snapshot is rejected");
+        assert_eq!(stale.code, ErrorCode::RevisionConflict);
+
+        let mut illegal_job = installing_job.clone();
+        illegal_job.state = TypedAgentInstallState::Succeeded;
+        illegal_job.progress.completed = illegal_job.progress.total;
+        illegal_job.progress.current_cli = None;
+        illegal_job.updated_at_ms += 1;
+        let illegal = store
+            .typed_agent_install_compare_and_swap(&TypedAgentInstallCas {
+                expected_job: installing_job.clone(),
+                next_job: illegal_job,
+                item: None,
+            })
+            .expect_err("installing cannot skip verification");
+        assert_eq!(illegal.code, ErrorCode::InvalidArgument);
+
+        let mut item_verifying_job = installing_job.clone();
+        item_verifying_job.updated_at_ms += 1;
+        let mut verifying_item = installing_item.clone();
+        verifying_item.state = TypedAgentInstallState::Verifying;
+        verifying_item.updated_at_ms += 1;
+        store
+            .typed_agent_install_compare_and_swap(&TypedAgentInstallCas {
+                expected_job: installing_job,
+                next_job: item_verifying_job.clone(),
+                item: Some(TypedAgentInstallItemCas {
+                    expected: installing_item,
+                    next: verifying_item.clone(),
+                }),
+            })
+            .expect("verify installed CLI");
+
+        let mut aggregate_lie = item_verifying_job.clone();
+        aggregate_lie.state = TypedAgentInstallState::Verifying;
+        aggregate_lie.progress.completed = aggregate_lie.progress.total;
+        aggregate_lie.progress.current_cli = None;
+        aggregate_lie.updated_at_ms += 1;
+        let invalid_aggregate = store
+            .typed_agent_install_compare_and_swap(&TypedAgentInstallCas {
+                expected_job: item_verifying_job.clone(),
+                next_job: aggregate_lie,
+                item: None,
+            })
+            .expect_err("job cannot claim verifying while its item is incomplete");
+        assert_eq!(invalid_aggregate.code, ErrorCode::InvalidArgument);
+
+        let mut verifying_job = item_verifying_job.clone();
+        verifying_job.state = TypedAgentInstallState::Verifying;
+        verifying_job.progress.completed = verifying_job.progress.total;
+        verifying_job.progress.current_cli = None;
+        verifying_job.updated_at_ms += 1;
+        let mut succeeded_item = verifying_item.clone();
+        succeeded_item.state = TypedAgentInstallState::Succeeded;
+        succeeded_item.updated_at_ms += 1;
+        store
+            .typed_agent_install_compare_and_swap(&TypedAgentInstallCas {
+                expected_job: item_verifying_job,
+                next_job: verifying_job.clone(),
+                item: Some(TypedAgentInstallItemCas {
+                    expected: verifying_item,
+                    next: succeeded_item.clone(),
+                }),
+            })
+            .expect("finish CLI verification");
+
+        let mut succeeded_job = verifying_job.clone();
+        succeeded_job.state = TypedAgentInstallState::Succeeded;
+        succeeded_job.updated_at_ms += 1;
+        store
+            .typed_agent_install_compare_and_swap(&TypedAgentInstallCas {
+                expected_job: verifying_job,
+                next_job: succeeded_job.clone(),
+                item: None,
+            })
+            .expect("finish install job");
+        (succeeded_job, succeeded_item)
+    };
+
+    let reopened = Store::open(root.path()).expect("reopen");
+    let stored_job = reopened
+        .typed_agent_install_jobs(Some(&terminal_job.job_id), None)
+        .expect("reopened job")
+        .into_iter()
+        .next()
+        .expect("durable terminal job");
+    let stored_item = reopened
+        .typed_agent_install_items(Some(&terminal_job.job_id), None)
+        .expect("reopened item")
+        .into_iter()
+        .next()
+        .expect("durable terminal item");
+    assert_eq!(stored_job, terminal_job);
+    assert_eq!(stored_item, terminal_item);
+    let snapshot = reopened
+        .typed_agent_install_status(Some(&stored_job.job_id), Some("installer"))
+        .expect("reopened coherent status");
+    assert_eq!(snapshot.jobs, vec![stored_job]);
+    assert_eq!(snapshot.items, vec![stored_item]);
+}
+
 /// MUTATION CHECK: compile outside the transaction's registry view, accept a
 /// pipe with unresolved @types, or lose the compiled template. Expected
 /// RUNTIME failure.
@@ -103,6 +413,16 @@ fn workflow_registration_compiles_source_against_the_live_registry() {
     assert_eq!(workflow.template.nodes.len(), 1);
     assert_eq!(workflow.template.nodes[0].name.as_str(), "RESEARCH");
     assert_eq!(workflow.meta[0].out_type.as_deref(), Some("Transcript"));
+    assert_eq!(workflow.meta[0].agent_type_rev, Some(1));
+    let researcher = store
+        .loom_agent_type("researcher")
+        .expect("researcher lookup")
+        .expect("researcher record");
+    let researcher_digest = researcher.digest();
+    assert_eq!(
+        workflow.meta[0].agent_type_digest.as_deref(),
+        Some(researcher_digest.as_str())
+    );
 
     // A registry change that alters the RESOLVED signature is a new content
     // digest: the same source re-registers as rev 2 (the digest binds the

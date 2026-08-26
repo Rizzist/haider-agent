@@ -331,14 +331,6 @@ async fn run_inner(
         operation_micros = turn_recovery_started.elapsed().as_micros(),
         "pre-ready recovery phase completed"
     );
-    let mut mobile_server = match crate::mobile_transport::start_if_enabled(config).await {
-        Ok(server) => server,
-        Err(error) => {
-            let _ = store.close().await;
-            return Err(error);
-        }
-    };
-
     // W3c2 R10 startup phase: load the descriptor store and reconcile
     // pending/committed LOGIN receipts against vault + descriptor truth
     // before anything can observe Ready (run_inner's receipt-reconciliation
@@ -502,6 +494,10 @@ async fn run_inner(
     let worker_handle = worker_manager.handle();
     hub.install_worker_manager(worker_handle.clone())
         .map_err(DaemonError::from)?;
+    // The monitor registry must finish durable boot adoption before any
+    // external source can publish. Otherwise an authenticated startup event
+    // could outrun an existing watch or its timeout fence.
+    hub.wait_for_monitor_ready().await;
     let crate::accounts::AccountsRuntime {
         facade: accounts_facade,
         actor: mut account_actor,
@@ -561,13 +557,37 @@ async fn run_inner(
             return Err(error.into());
         }
     }
-    if let Some(server) = mobile_server.as_ref() {
-        server.install_chat_bridge(
-            hub.clone(),
-            config.default_model.clone(),
-            instance_id.clone(),
-        );
-    }
+    // Install both monitor seams before the accept task exists. From the
+    // first authenticated APK frame onward, every valid SMS therefore has an
+    // active source subscriber and every report has the canonical chat sink.
+    let mut mobile_server = match crate::mobile_transport::start_if_enabled(
+        config,
+        hub.clone(),
+        config.default_model.clone(),
+        instance_id.clone(),
+    )
+    .await
+    {
+        Ok(server) => server,
+        Err(error) => {
+            let _ = worker_manager.shutdown().await;
+            if let Some(broker) = &credential_broker {
+                broker.abort_and_join().await;
+            }
+            if let Some(oauth) = &oauth_coordinator {
+                oauth.abort_and_join().await;
+            }
+            if let Some(actor) = account_actor.as_mut() {
+                actor.force_and_join().await;
+            }
+            if let Some(engine) = hook_engine.take() {
+                engine.shutdown().await;
+            }
+            let _ = hub.shutdown().await;
+            let _ = store.close().await;
+            return Err(error);
+        }
+    };
     let mut endpoint = match endpoint::bind(config).await {
         Ok(endpoint) => endpoint,
         Err(error) => {
