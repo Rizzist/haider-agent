@@ -14,40 +14,15 @@ use haider_provider::{
     Message, MessageRole, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_SUBSCRIPTION_BASE_URL,
     OpenAiCompatibleProvider, OpenAiProvider, OpenAiRetryPolicy, PromptCacheMetadata, Provider,
     ProviderError, ProviderErrorKind, ProviderStreamItem, ResolvedAttachment, ToolDefinition,
-    TurnRequest, degrade_tool_result_images_to_placeholders, openai_http_client_build_count,
-    replay_deepseek_chat_sse, replay_openai_chat_sse, replay_openai_http_error,
-    replay_openai_models_response, replay_openai_responses_sse,
+    TurnRequest, degrade_tool_result_images_to_placeholders, replay_deepseek_chat_sse,
+    replay_openai_chat_sse, replay_openai_http_error, replay_openai_models_response,
+    replay_openai_responses_sse,
 };
 use serde::Deserialize;
 
 use support::{ExpectedItem, read_json, reanchor_events};
 
 const FIXTURE_DIR: &str = "tests/fixtures/openai";
-
-#[test]
-fn native_adapters_reuse_one_process_http_client() {
-    let vault = MemoryVault::new();
-    let first = CredentialAlias::new("shared-openai-first");
-    let second = CredentialAlias::new("shared-openai-second");
-    vault.put(&first, b"sk-first").expect("store first key");
-    vault.put(&second, b"sk-second").expect("store second key");
-
-    let before = openai_http_client_build_count();
-    let _first = OpenAiProvider::new(
-        vault.resolve(&first).expect("resolve first key"),
-        "gpt-shared",
-    )
-    .expect("construct first adapter");
-    let after_first = openai_http_client_build_count();
-    let _second = OpenAiProvider::new(
-        vault.resolve(&second).expect("resolve second key"),
-        "gpt-shared",
-    )
-    .expect("construct second adapter");
-
-    assert!(after_first <= before + 1);
-    assert_eq!(openai_http_client_build_count(), after_first);
-}
 
 #[derive(Debug, Deserialize)]
 struct Manifest {

@@ -11,8 +11,8 @@ use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -144,22 +144,14 @@ const TRANSPORT_CONFIG: OpenAiTransportConfig = OpenAiTransportConfig {
     chunk_idle_timeout: Duration::from_secs(5),
 };
 
-static SHARED_OPENAI_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
-static SHARED_OPENAI_FIXED_CLIENTS: OnceLock<Mutex<HashMap<String, SharedOpenAiFixedTransport>>> =
-    OnceLock::new();
-static SHARED_COMPATIBLE_CLIENTS: OnceLock<
-    Mutex<HashMap<String, SharedOpenAiCompatibleTransport>>,
-> = OnceLock::new();
 static OPENAI_CLIENT_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Clone)]
-struct SharedOpenAiFixedTransport {
+struct OpenAiFixedTransport {
     client: reqwest::Client,
     guard: Arc<FixedOriginGuard>,
 }
 
-#[derive(Clone)]
-struct SharedOpenAiCompatibleTransport {
+struct OpenAiCompatibleTransport {
     client: reqwest::Client,
     guard: Option<Arc<CompatibleOriginGuard>>,
 }
@@ -168,6 +160,7 @@ fn build_openai_client(
     origin_guard: Option<Arc<CompatibleOriginGuard>>,
     fixed_origin_guard: Option<Arc<FixedOriginGuard>>,
 ) -> Result<reqwest::Client, ProviderError> {
+    OPENAI_CLIENT_BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
     let transport = TRANSPORT_CONFIG;
     let mut client = reqwest::Client::builder()
         .no_proxy()
@@ -192,57 +185,23 @@ fn build_openai_client(
     })
 }
 
-fn shared_openai_client() -> Result<reqwest::Client, ProviderError> {
-    SHARED_OPENAI_CLIENT
-        .get_or_init(|| {
-            OPENAI_CLIENT_BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
-            build_openai_client(None, None).map_err(|error| error.to_string())
-        })
-        .clone()
-        .map_err(|message| ProviderError::new(ProviderErrorKind::Internal, message))
-}
-
-fn shared_openai_fixed_transport(
+fn openai_fixed_transport(
     endpoints: &[&str],
     trusted_host: &str,
-) -> Result<SharedOpenAiFixedTransport, ProviderError> {
-    let key = format!("{trusted_host}\0{}", endpoints.join("\0"));
-    let transports = SHARED_OPENAI_FIXED_CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut transports = transports.lock().map_err(|_| {
-        ProviderError::new(
-            ProviderErrorKind::Internal,
-            "OpenAI fixed-origin HTTP client pool is unavailable",
-        )
-    })?;
-    if let Some(transport) = transports.get(&key) {
-        return Ok(transport.clone());
-    }
+) -> Result<OpenAiFixedTransport, ProviderError> {
     let guard = Arc::new(FixedOriginGuard::new_allowing(
         endpoints,
         trusted_host,
         Arc::new(SystemFixedDnsResolver),
     )?);
     let client = build_openai_client(None, Some(Arc::clone(&guard)))?;
-    let transport = SharedOpenAiFixedTransport { client, guard };
-    transports.insert(key, transport.clone());
-    Ok(transport)
+    Ok(OpenAiFixedTransport { client, guard })
 }
 
-fn shared_compatible_transport(
+fn compatible_transport(
     endpoints: &CompatibleEndpoints,
     policy: CompatibleOriginPolicy,
-) -> Result<SharedOpenAiCompatibleTransport, ProviderError> {
-    let key = format!("{policy:?}\0{}", endpoints.base_url);
-    let transports = SHARED_COMPATIBLE_CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut transports = transports.lock().map_err(|_| {
-        ProviderError::new(
-            ProviderErrorKind::Internal,
-            "OpenAI-compatible HTTP client pool is unavailable",
-        )
-    })?;
-    if let Some(transport) = transports.get(&key) {
-        return Ok(transport.clone());
-    }
+) -> Result<OpenAiCompatibleTransport, ProviderError> {
     let guard = endpoints.origin.as_ref().map(|origin| {
         Arc::new(CompatibleOriginGuard::new(
             origin.host.clone(),
@@ -253,13 +212,12 @@ fn shared_compatible_transport(
         ))
     });
     let client = build_openai_client(guard.clone(), None)?;
-    let transport = SharedOpenAiCompatibleTransport { client, guard };
-    transports.insert(key, transport.clone());
-    Ok(transport)
+    Ok(OpenAiCompatibleTransport { client, guard })
 }
 
 /// Process-lifetime construction counter used by performance regression
-/// harnesses. Ordinary first-party adapters share the one initialized client.
+/// harnesses. Production account resolution reuses the complete adapter;
+/// standalone constructors deliberately own a configuration-local client.
 #[doc(hidden)]
 #[must_use]
 pub fn openai_http_client_build_count() -> usize {
@@ -330,7 +288,7 @@ impl OpenAiHttp {
     fn new_with_shared_origin_transport(
         credential: SecretHandle,
         model: impl Into<String>,
-        transport: SharedOpenAiCompatibleTransport,
+        transport: OpenAiCompatibleTransport,
     ) -> Self {
         Self {
             client: transport.client,
@@ -411,8 +369,8 @@ impl OpenAiHttp {
         trusted_host: &str,
         codex_responses_lite: bool,
     ) -> Result<Self, ProviderError> {
-        let SharedOpenAiFixedTransport { client, guard } =
-            shared_openai_fixed_transport(endpoints, trusted_host)?;
+        let OpenAiFixedTransport { client, guard } =
+            openai_fixed_transport(endpoints, trusted_host)?;
         Ok(Self {
             client,
             credential,
@@ -434,7 +392,7 @@ impl OpenAiHttp {
         codex_responses_lite: bool,
     ) -> Result<Self, ProviderError> {
         let client = if origin_guard.is_none() && fixed_origin_guard.is_none() {
-            shared_openai_client()?
+            build_openai_client(None, None)?
         } else {
             build_openai_client(origin_guard.clone(), fixed_origin_guard.clone())?
         };
@@ -1003,7 +961,7 @@ impl OpenAiCompatibleProvider {
         policy: CompatibleOriginPolicy,
     ) -> Result<Self, ProviderError> {
         let endpoints = compatible_endpoints(base_url.as_ref(), policy)?;
-        let transport = shared_compatible_transport(&endpoints, policy)?;
+        let transport = compatible_transport(&endpoints, policy)?;
         Ok(Self {
             http: OpenAiHttp::new_with_shared_origin_transport(credential, model, transport),
             base_url: endpoints.base_url,

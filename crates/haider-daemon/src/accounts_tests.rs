@@ -252,7 +252,7 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
     let factory = AccountsProviderFactory::new(
         snapshot,
         VaultProvision::Available(vault as Arc<dyn Vault>),
-        Arc::new(ProductionAccountBuilder),
+        Arc::new(ProductionAccountBuilder::default()),
     );
     let metadata = |provider: &str, model: &str| haider_protocol::session::SessionMetadataV1 {
         cwd: "/tmp/haider-provider-dispatch".into(),
@@ -274,6 +274,14 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
         .resolve_for_turn(&metadata(OPENAI_PROVIDER_NAME, "gpt-5-test"))
         .await
         .unwrap_or_else(|error| panic!("openai dispatch: {error:?}"));
+    let same_openai = factory
+        .resolve_for_turn(&metadata(OPENAI_PROVIDER_NAME, "gpt-5-test"))
+        .await
+        .unwrap_or_else(|error| panic!("second openai dispatch: {error:?}"));
+    let other_openai_model = factory
+        .resolve_for_turn(&metadata(OPENAI_PROVIDER_NAME, "gpt-5-other"))
+        .await
+        .unwrap_or_else(|error| panic!("other-model openai dispatch: {error:?}"));
     let anthropic = factory
         .resolve_for_turn(&metadata(ANTHROPIC_PROVIDER_NAME, "claude-test"))
         .await
@@ -292,6 +300,14 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
         OPENAI_PROVIDER_NAME
     );
     assert_eq!(openai.account_alias.as_deref(), Some(openai_alias.as_str()));
+    assert!(
+        Arc::ptr_eq(&openai.provider, &same_openai.provider),
+        "an exact account adapter configuration reuses the adapter and its reqwest pool"
+    );
+    assert!(
+        !Arc::ptr_eq(&openai.provider, &other_openai_model.provider),
+        "a different model is a different adapter configuration"
+    );
     assert_eq!(
         anthropic.provider.capabilities().await.provider,
         ANTHROPIC_PROVIDER_NAME
@@ -313,6 +329,153 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
         compatible.account_alias.as_deref(),
         Some(compatible_alias.as_str())
     );
+}
+
+fn adapter_cache_profile(provider: &str, endpoint: &str) -> ProviderSummaryWire {
+    ProviderSummaryWire {
+        provider: provider.to_owned(),
+        api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
+        endpoint: Some(endpoint.to_owned()),
+        models: vec!["adapter-cache-model".to_owned()],
+        model_details: Vec::new(),
+        auth_methods: vec![AuthMethod::ApiKey],
+        availability: haider_rpc::ProviderAvailabilityWire::Available,
+        availability_reason: None,
+        default_model: Some("adapter-cache-model".to_owned()),
+        enabled: true,
+    }
+}
+
+fn adapter_cache_descriptor(provider: &str, alias: &str) -> CredentialDescriptor {
+    CredentialDescriptor {
+        alias: CredentialAlias::new(alias),
+        provider: provider.to_owned(),
+        base_url: None,
+        auth_method: AuthMethod::ApiKey,
+        identity: format!("{provider} adapter cache fixture"),
+        status: CredentialStatus::Ok,
+        active: true,
+        label: None,
+    }
+}
+
+fn build_cached_adapter(
+    builder: &ProductionAccountBuilder,
+    vault: &MemoryVault,
+    profile: &ProviderSummaryWire,
+    descriptor: &CredentialDescriptor,
+    registry: &Arc<haider_provider::GeminiCacheRegistry>,
+) -> Arc<dyn Provider> {
+    builder
+        .build_tuned_with_cache(
+            Some(profile),
+            descriptor,
+            vault
+                .resolve(&descriptor.alias)
+                .expect("resolve adapter cache credential"),
+            "adapter-cache-model",
+            &ProviderTuning::default(),
+            None,
+            Arc::clone(registry),
+        )
+        .expect("build cached custom adapter")
+}
+
+#[test]
+fn production_adapter_cache_separates_policy_and_credential_configurations() {
+    let builder = ProductionAccountBuilder::default();
+    let vault = MemoryVault::default();
+    let descriptor = adapter_cache_descriptor("adapter-policy", "adapter-policy-key");
+    vault
+        .put(&descriptor.alias, b"adapter-policy-secret")
+        .expect("seed adapter policy key");
+    let registry = Arc::new(haider_provider::GeminiCacheRegistry::default());
+    let trusted_lan = adapter_cache_profile("adapter-policy", "http://127.0.0.1:11434/v1");
+    let azure = adapter_cache_profile(
+        "adapter-policy",
+        "https://adapterpolicy.openai.azure.com/openai/v1",
+    );
+
+    let first = build_cached_adapter(&builder, &vault, &trusted_lan, &descriptor, &registry);
+    let same = build_cached_adapter(&builder, &vault, &trusted_lan, &descriptor, &registry);
+    let different_policy = build_cached_adapter(&builder, &vault, &azure, &descriptor, &registry);
+
+    assert!(Arc::ptr_eq(&first, &same));
+    assert!(
+        !Arc::ptr_eq(&first, &different_policy),
+        "TrustedLan/Bearer and strict Azure/api-key configurations need distinct guarded clients"
+    );
+    vault
+        .put(&descriptor.alias, b"rotated-adapter-policy-secret")
+        .expect("rotate adapter policy key");
+    let rotated_credential =
+        build_cached_adapter(&builder, &vault, &trusted_lan, &descriptor, &registry);
+    assert!(
+        !Arc::ptr_eq(&first, &rotated_credential),
+        "the same alias with new credential material needs a distinct adapter"
+    );
+}
+
+#[test]
+fn production_adapter_cache_is_lru_bounded_for_custom_endpoints() {
+    let builder = ProductionAccountBuilder::with_cache_capacity(2);
+    let vault = MemoryVault::default();
+    let registry = Arc::new(haider_provider::GeminiCacheRegistry::default());
+    let first_descriptor = adapter_cache_descriptor("adapter-cap-a", "adapter-cap-a-key");
+    let second_descriptor = adapter_cache_descriptor("adapter-cap-b", "adapter-cap-b-key");
+    let third_descriptor = adapter_cache_descriptor("adapter-cap-c", "adapter-cap-c-key");
+    for descriptor in [&first_descriptor, &second_descriptor, &third_descriptor] {
+        vault
+            .put(&descriptor.alias, b"adapter-cap-secret")
+            .expect("seed adapter cap key");
+    }
+    let first_profile = adapter_cache_profile("adapter-cap-a", "http://127.0.0.1:11431/v1");
+    let second_profile = adapter_cache_profile("adapter-cap-b", "http://127.0.0.1:11432/v1");
+    let third_profile = adapter_cache_profile("adapter-cap-c", "http://127.0.0.1:11433/v1");
+
+    let first = build_cached_adapter(
+        &builder,
+        &vault,
+        &first_profile,
+        &first_descriptor,
+        &registry,
+    );
+    let second = build_cached_adapter(
+        &builder,
+        &vault,
+        &second_profile,
+        &second_descriptor,
+        &registry,
+    );
+    let first_again = build_cached_adapter(
+        &builder,
+        &vault,
+        &first_profile,
+        &first_descriptor,
+        &registry,
+    );
+    assert!(Arc::ptr_eq(&first, &first_again), "cache hit refreshes LRU");
+
+    let _third = build_cached_adapter(
+        &builder,
+        &vault,
+        &third_profile,
+        &third_descriptor,
+        &registry,
+    );
+    assert_eq!(builder.cached_adapter_count().expect("cache size"), 2);
+    let rebuilt_second = build_cached_adapter(
+        &builder,
+        &vault,
+        &second_profile,
+        &second_descriptor,
+        &registry,
+    );
+    assert!(
+        !Arc::ptr_eq(&second, &rebuilt_second),
+        "the least-recent custom endpoint was evicted at the count cap"
+    );
+    assert_eq!(builder.cached_adapter_count().expect("cache size"), 2);
 }
 
 /// WH1 factory half — the named DeepSeek API-key pair constructs through
@@ -519,7 +682,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
         snapshot,
         management,
         VaultProvision::Available(vault as Arc<dyn Vault>),
-        Arc::new(ProductionAccountBuilder),
+        Arc::new(ProductionAccountBuilder::default()),
     );
     let resolved = factory
         .resolve_for_turn(&haider_protocol::session::SessionMetadataV1 {
@@ -615,7 +778,7 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
         Arc::new(StdMutex::new(Vec::new())),
         ManagementSnapshot::new(0, Vec::new(), vec![summary.clone()]),
         VaultProvision::Available(Arc::new(MemoryVault::default()) as Arc<dyn Vault>),
-        Arc::new(ProductionAccountBuilder),
+        Arc::new(ProductionAccountBuilder::default()),
     )
     .with_resilience(resilience("model-large"));
     assert!(
@@ -641,7 +804,7 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
         Arc::new(StdMutex::new(vec![descriptor.clone()])),
         ManagementSnapshot::new(0, vec![descriptor], vec![summary]),
         VaultProvision::Available(vault as Arc<dyn Vault>),
-        Arc::new(ProductionAccountBuilder),
+        Arc::new(ProductionAccountBuilder::default()),
     );
     let promoted = signed
         .clone()
@@ -752,7 +915,7 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
         snapshot,
         management,
         VaultProvision::Available(vault as Arc<dyn Vault>),
-        Arc::new(ProductionAccountBuilder),
+        Arc::new(ProductionAccountBuilder::default()),
     );
     let resolved = factory
         .resolve_for_turn(&metadata)
@@ -785,7 +948,7 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
         snapshot,
         management,
         VaultProvision::Available(vault as Arc<dyn Vault>),
-        Arc::new(ProductionAccountBuilder),
+        Arc::new(ProductionAccountBuilder::default()),
     );
     let resolved = factory
         .resolve_for_turn(&metadata)
@@ -814,7 +977,7 @@ async fn lk1_keyless_fallback_stays_scoped_to_enabled_auth_none_profiles() {
             Arc::new(StdMutex::new(Vec::new())),
             ManagementSnapshot::new(0, Vec::new(), vec![summary]),
             VaultProvision::Available(Arc::new(MemoryVault::default()) as Arc<dyn Vault>),
-            Arc::new(ProductionAccountBuilder),
+            Arc::new(ProductionAccountBuilder::default()),
         );
         let Err(error) = factory
             .resolve_for_turn(&haider_protocol::session::SessionMetadataV1 {
@@ -1281,7 +1444,7 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
     let factory = AccountsProviderFactory::with_broker(
         Arc::clone(&snapshot),
         VaultProvision::Available(vault as Arc<dyn Vault>),
-        Arc::new(ProductionAccountBuilder),
+        Arc::new(ProductionAccountBuilder::default()),
         broker.clone(),
     );
     let resolver = AccountsAttemptResolver::new(
@@ -1362,7 +1525,7 @@ fn fallback_chain_resolver_fixture() -> (AccountsAttemptResolver, CredentialAlia
     let factory = AccountsProviderFactory::new(
         snapshot,
         VaultProvision::Available(vault as Arc<dyn Vault>),
-        Arc::new(ProductionAccountBuilder),
+        Arc::new(ProductionAccountBuilder::default()),
     )
     .with_resilience(AccountsResilienceConfig {
         fallback_chain: vec![
@@ -1556,7 +1719,7 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
     let factory = AccountsProviderFactory::with_broker(
         Arc::clone(&snapshot),
         VaultProvision::Available(vault as Arc<dyn Vault>),
-        Arc::new(ProductionAccountBuilder),
+        Arc::new(ProductionAccountBuilder::default()),
         broker.clone(),
     );
     let resolved = factory
@@ -1765,7 +1928,7 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
     let factory = AccountsProviderFactory::with_broker(
         snapshot,
         VaultProvision::Available(vault.clone() as Arc<dyn Vault>),
-        Arc::new(ProductionAccountBuilder),
+        Arc::new(ProductionAccountBuilder::default()),
         broker,
     );
     let metadata = |provider: &str, model: &str| haider_protocol::session::SessionMetadataV1 {
@@ -9719,7 +9882,7 @@ async fn g4b_factory_builds_bedrock_and_vertex_adapters_with_their_surfaces() {
             snapshot,
             management,
             VaultProvision::Available(vault as Arc<dyn Vault>),
-            Arc::new(ProductionAccountBuilder),
+            Arc::new(ProductionAccountBuilder::default()),
         );
         let metadata = enterprise_metadata(provider, model);
         async move { factory.resolve_for_turn(&metadata).await }
@@ -10570,7 +10733,7 @@ async fn each_turn_resolves_the_currently_active_account() {
         Arc::clone(&snapshot),
         management,
         VaultProvision::Available(vault as Arc<dyn Vault>),
-        Arc::new(ProductionAccountBuilder),
+        Arc::new(ProductionAccountBuilder::default()),
     );
     let metadata = haider_protocol::session::SessionMetadataV1 {
         cwd: "/tmp/switch-fixture".to_owned(),

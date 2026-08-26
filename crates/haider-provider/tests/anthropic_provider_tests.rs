@@ -15,39 +15,14 @@ use haider_protocol::tool::{AttachmentBlock, ImageBlockRef, PdfDeliveryMode};
 use haider_provider::{
     AnthropicProvider, AnthropicRetryPolicy, BUILTIN_PROVIDER_NAMES, Message, MessageRole,
     Provider, ProviderError, ProviderErrorKind, ResolvedAttachment, ToolDefinition, TurnRequest,
-    anthropic_http_client_build_count, degrade_tool_result_images_to_placeholders,
-    pdf_document_capability, replay_anthropic_http_error, replay_anthropic_sse,
+    degrade_tool_result_images_to_placeholders, pdf_document_capability,
+    replay_anthropic_http_error, replay_anthropic_sse,
 };
 
 use provider_manifest::Manifest;
 use support::{ExpectedItem, read_json, reanchor_events};
 
 const FIXTURE_DIR: &str = "tests/fixtures/anthropic";
-
-#[test]
-fn api_key_adapters_reuse_one_process_http_client() {
-    let vault = MemoryVault::new();
-    let first = CredentialAlias::new("shared-anthropic-first");
-    let second = CredentialAlias::new("shared-anthropic-second");
-    vault.put(&first, b"sk-first").expect("store first key");
-    vault.put(&second, b"sk-second").expect("store second key");
-
-    let before = anthropic_http_client_build_count();
-    let _first = AnthropicProvider::new(
-        vault.resolve(&first).expect("resolve first key"),
-        "claude-shared",
-    )
-    .expect("construct first adapter");
-    let after_first = anthropic_http_client_build_count();
-    let _second = AnthropicProvider::new(
-        vault.resolve(&second).expect("resolve second key"),
-        "claude-shared",
-    )
-    .expect("construct second adapter");
-
-    assert!(after_first <= before + 1);
-    assert_eq!(anthropic_http_client_build_count(), after_first);
-}
 
 #[test]
 fn manifest_replays_every_declared_wire_fixture_in_either_promotion_state() {

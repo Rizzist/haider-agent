@@ -33,6 +33,7 @@ const GEMINI_API_HOST: &str = "generativelanguage.googleapis.com";
 const STREAM_CAPACITY: usize = 32;
 const OPAQUE_KIND: &str = "signed_part";
 const CALL_ID_PREFIX: &str = "gemini-call-";
+const CLIENT_BUILD_METRIC_CAPACITY: usize = 64;
 const TRANSPORT_CONFIG: GeminiTransportConfig = GeminiTransportConfig {
     retry_policy: GeminiRetryPolicy::Never,
     connect_timeout: Duration::from_secs(10),
@@ -40,22 +41,20 @@ const TRANSPORT_CONFIG: GeminiTransportConfig = GeminiTransportConfig {
     chunk_idle_timeout: Duration::from_secs(90),
 };
 
-#[derive(Clone)]
-struct SharedGeminiTransport {
+struct GeminiTransport {
     client: reqwest::Client,
     fixed_origin_guard: Arc<FixedOriginGuard>,
 }
 
-static SHARED_GEMINI_CLIENTS: OnceLock<StdMutex<HashMap<String, SharedGeminiTransport>>> =
-    OnceLock::new();
-static GEMINI_CLIENT_BUILDS_BY_ENDPOINT: OnceLock<StdMutex<HashMap<String, usize>>> =
-    OnceLock::new();
 static GEMINI_CLIENT_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
+static GEMINI_CLIENT_BUILDS_BY_ENDPOINT: OnceLock<StdMutex<VecDeque<(String, usize)>>> =
+    OnceLock::new();
 
 fn build_gemini_transport(
     api_url: &str,
     resolver: Arc<dyn FixedDnsResolver>,
-) -> Result<SharedGeminiTransport, ProviderError> {
+) -> Result<GeminiTransport, ProviderError> {
+    GEMINI_CLIENT_BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
     let fixed_origin_guard = Arc::new(FixedOriginGuard::new_allowing(
         &[api_url, GEMINI_CACHED_CONTENTS_URL],
         GEMINI_API_HOST,
@@ -79,44 +78,42 @@ fn build_gemini_transport(
                 format!("could not construct Gemini HTTP client: {error}"),
             )
         })?;
-    Ok(SharedGeminiTransport {
+    record_gemini_client_build(api_url);
+    Ok(GeminiTransport {
         client,
         fixed_origin_guard,
     })
 }
 
-fn shared_gemini_transport(api_url: &str) -> Result<SharedGeminiTransport, ProviderError> {
-    let transports = SHARED_GEMINI_CLIENTS.get_or_init(|| StdMutex::new(HashMap::new()));
-    let mut transports = transports.lock().map_err(|_| {
-        ProviderError::new(
-            ProviderErrorKind::Internal,
-            "Gemini HTTP client pool is unavailable",
-        )
-    })?;
-    if let Some(transport) = transports.get(api_url) {
-        return Ok(transport.clone());
-    }
-    GEMINI_CLIENT_BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
-    let transport = build_gemini_transport(api_url, Arc::new(SystemFixedDnsResolver))?;
-    if let Ok(mut builds) = GEMINI_CLIENT_BUILDS_BY_ENDPOINT
-        .get_or_init(|| StdMutex::new(HashMap::new()))
-        .lock()
+fn record_gemini_client_build(api_url: &str) {
+    let builds = GEMINI_CLIENT_BUILDS_BY_ENDPOINT
+        .get_or_init(|| StdMutex::new(VecDeque::with_capacity(CLIENT_BUILD_METRIC_CAPACITY)));
+    let Ok(mut builds) = builds.lock() else {
+        return;
+    };
+    if let Some(index) = builds.iter().position(|(endpoint, _)| endpoint == api_url)
+        && let Some((endpoint, count)) = builds.remove(index)
     {
-        *builds.entry(api_url.to_owned()).or_default() += 1;
+        builds.push_back((endpoint, count.saturating_add(1)));
+        return;
     }
-    transports.insert(api_url.to_owned(), transport.clone());
-    Ok(transport)
+    if builds.len() >= CLIENT_BUILD_METRIC_CAPACITY {
+        builds.pop_front();
+    }
+    builds.push_back((api_url.to_owned(), 1));
 }
 
 /// Process-lifetime construction counter used by performance regression
-/// harnesses. A model endpoint has one client and exact fixed-origin guard.
+/// harnesses. Production account resolution reuses the complete adapter;
+/// standalone constructors deliberately own a configuration-local client.
 #[doc(hidden)]
 #[must_use]
 pub fn gemini_http_client_build_count() -> usize {
     GEMINI_CLIENT_BUILD_COUNT.load(Ordering::Relaxed)
 }
 
-/// Exact-endpoint construction count for the pooling law.
+/// Exact-endpoint construction count for performance harnesses. Metric
+/// retention is LRU-bounded independently from adapter/client retention.
 #[doc(hidden)]
 #[must_use]
 pub fn gemini_model_http_client_build_count(model: &str) -> usize {
@@ -124,10 +121,14 @@ pub fn gemini_model_http_client_build_count(model: &str) -> usize {
         return 0;
     };
     GEMINI_CLIENT_BUILDS_BY_ENDPOINT
-        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .get_or_init(|| StdMutex::new(VecDeque::with_capacity(CLIENT_BUILD_METRIC_CAPACITY)))
         .lock()
         .ok()
-        .and_then(|builds| builds.get(&api_url).copied())
+        .and_then(|builds| {
+            builds
+                .iter()
+                .find_map(|(endpoint, count)| (endpoint == &api_url).then_some(*count))
+        })
         .unwrap_or(0)
 }
 
@@ -209,7 +210,7 @@ impl GeminiProvider {
     pub fn new(credential: SecretHandle, model: impl Into<String>) -> Result<Self, ProviderError> {
         let model = model.into();
         let api_url = gemini_stream_endpoint(&model)?;
-        let transport = shared_gemini_transport(&api_url)?;
+        let transport = build_gemini_transport(&api_url, Arc::new(SystemFixedDnsResolver))?;
         Ok(Self::with_transport(credential, model, api_url, transport))
     }
 
@@ -229,9 +230,9 @@ impl GeminiProvider {
         credential: SecretHandle,
         model: String,
         api_url: String,
-        transport: SharedGeminiTransport,
+        transport: GeminiTransport,
     ) -> Self {
-        let SharedGeminiTransport {
+        let GeminiTransport {
             client,
             fixed_origin_guard,
         } = transport;
