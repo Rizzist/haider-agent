@@ -436,6 +436,50 @@ pub trait FrameSink: Send + Sync {
         self.try_send(frame)
     }
 
+    /// Admits one frame on a named required FIFO stream. Production sinks
+    /// keep this lane outside the priority reply floor so a later cursor seal
+    /// cannot overtake an earlier stream record. Sinks without keyed lanes
+    /// retain their single-queue behavior.
+    fn offer_ordered(&self, _stream_id: &str, frame: &WireFrame) -> SendAdmission {
+        match self.try_send(frame.clone()) {
+            Ok(()) => SendAdmission::Sent,
+            Err(FrameSendError) => SendAdmission::Refused,
+        }
+    }
+
+    fn offer_ordered_prepared(&self, stream_id: &str, frame: &PreparedFrame) -> SendAdmission {
+        frame
+            .logical_frame()
+            .map_or(SendAdmission::Refused, |frame| {
+                self.offer_ordered(stream_id, frame)
+            })
+    }
+
+    fn offer_ordered_ticketed(
+        &self,
+        stream_id: &str,
+        frame: &WireFrame,
+        _ticket: &AdmissionTicket,
+    ) -> SendAdmission {
+        self.offer_ordered(stream_id, frame)
+    }
+
+    fn offer_ordered_prepared_ticketed(
+        &self,
+        stream_id: &str,
+        frame: &PreparedFrame,
+        ticket: &AdmissionTicket,
+    ) -> SendAdmission {
+        frame
+            .logical_frame()
+            .map_or(SendAdmission::Refused, |frame| {
+                self.offer_ordered_ticketed(stream_id, frame, ticket)
+            })
+    }
+
+    /// Removes not-yet-written frames for a replaced ordered stream.
+    fn purge_ordered(&self, _stream_id: &str) {}
+
     /// Stages a `SessionAttach` RESPONSE with response-before-event
     /// ordering: a sink with keyed event lanes must not admit this
     /// attachment's event offers until the response has left the queue, and
@@ -1422,6 +1466,9 @@ pub struct HubConnection {
     accounts_watch: Mutex<Option<JoinHandle<()>>>,
     /// One ticker serves a bounded set of per-session volatile watches.
     surface_watch: Mutex<Option<SurfaceWatchState>>,
+    /// One required-delivery, cursor-replayable monitor stream. A new
+    /// `monitor.watch` replaces the prior registration on this connection.
+    monitor_watch: Mutex<Option<MonitorWatchState>>,
     /// Write-free metafork reviews awaiting an explicit acceptance on this
     /// connection. Shared with command-capture facades; dropped on disconnect.
     metafork_reviews: Arc<Mutex<HashMap<String, String>>>,
@@ -1430,6 +1477,12 @@ pub struct HubConnection {
     /// independently tear down) the caller's live identity.
     identity_lease: Arc<ConnectionIdentityLease>,
     closed: AtomicBool,
+}
+
+struct MonitorWatchState {
+    stream_id: String,
+    cancel: watch::Sender<bool>,
+    task: JoinHandle<()>,
 }
 
 /// RAII ownership of an identity registered by `open_connection`.
@@ -1485,6 +1538,12 @@ impl Drop for HubConnection {
             && let Some(watch) = watch.take()
         {
             watch.task.abort();
+        }
+        if let Ok(watch) = self.monitor_watch.get_mut()
+            && let Some(watch) = watch.take()
+        {
+            watch.cancel.send_replace(true);
+            self.sink.purge_ordered(&watch.stream_id);
         }
     }
 }
@@ -2411,6 +2470,67 @@ impl SessionHub {
         self.inner.store.read(session_id, since_seq, limit).await
     }
 
+    pub(crate) async fn latest_internal_session_seq(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<u64, HaiderError> {
+        self.inner.store.latest_seq(session_id).await
+    }
+
+    pub(crate) async fn monitor_control_receipt(
+        &self,
+        command_id: &haider_rpc::CommandId,
+        method: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> Result<Option<serde_json::Value>, HaiderError> {
+        self.inner
+            .store
+            .monitor_control_receipt(
+                command_id.as_str().to_owned(),
+                method.to_owned(),
+                request_digest.to_owned(),
+                request_json.to_owned(),
+            )
+            .await
+    }
+
+    pub(crate) async fn claim_monitor_control_receipt(
+        &self,
+        command_id: &haider_rpc::CommandId,
+        method: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> Result<haider_core::MonitorControlClaim, HaiderError> {
+        self.inner
+            .store
+            .claim_monitor_control_receipt(
+                command_id.as_str().to_owned(),
+                method.to_owned(),
+                request_digest.to_owned(),
+                request_json.to_owned(),
+            )
+            .await
+    }
+
+    pub(crate) async fn finalize_monitor_control_receipt(
+        &self,
+        command_id: &haider_rpc::CommandId,
+        session_id: &SessionId,
+        accepted_seq: u64,
+        response: serde_json::Value,
+    ) -> Result<(), HaiderError> {
+        self.inner
+            .store
+            .finalize_monitor_control_receipt(
+                command_id.as_str().to_owned(),
+                session_id.clone(),
+                accepted_seq,
+                response,
+            )
+            .await
+    }
+
     /// Opens one logical connection after handshake negotiation.
     ///
     /// W3c/W3d seam: every real client — CLI attach, TUI live-attach, web —
@@ -2484,6 +2604,7 @@ impl SessionHub {
             roster_watch: Mutex::new(None),
             accounts_watch: Mutex::new(None),
             surface_watch: Mutex::new(None),
+            monitor_watch: Mutex::new(None),
             metafork_reviews: Arc::new(Mutex::new(HashMap::new())),
             identity_lease,
             closed: AtomicBool::new(false),

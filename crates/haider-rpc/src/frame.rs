@@ -309,6 +309,14 @@ pub const FEATURE_TOOL_INVENTORY_V1: &str = "tool_inventory_v1";
 /// Daemon exposes the durable session-scoped monitor tool and source/delivery
 /// runtime needed to wake a session from matching external events.
 pub const FEATURE_MONITOR_V1: &str = "monitor_v1";
+/// Daemon exposes typed client `monitor.list`, `monitor.register`, and
+/// `monitor.remove` receipts. This is separate from the model-facing monitor
+/// tool and from every private mobile transport convention.
+pub const FEATURE_MONITOR_CONTROL_V1: &str = "monitor_control_v1";
+/// Daemon exposes the cursor-replayable `monitor.watch` report stream.
+/// Absence means there is no client delivery surface; clients must not infer
+/// one from a private transport.
+pub const FEATURE_MONITOR_DELIVERY_V1: &str = "monitor_delivery_v1";
 /// Daemon persists and applies typed per-session write/exec permission overrides.
 pub const FEATURE_SESSION_PERMISSION_OVERRIDES_V1: &str = "session_permission_overrides_v1";
 /// Daemon persists and applies the explicit interactive/autonomous session mode.
@@ -1661,6 +1669,407 @@ pub enum HookTrustStateWire {
     RevokedByEdit,
 }
 
+/// Source families understood by the monitor registry. Availability is
+/// reported separately because a typed source is not necessarily active on
+/// this daemon/platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MonitorSourceKindWire {
+    Sms,
+    Process,
+    File,
+    Poll,
+    Timer,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Complete typed monitor source declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MonitorSourceWire {
+    Sms,
+    Process {
+        command: String,
+    },
+    File {
+        path: String,
+    },
+    Poll {
+        command: String,
+        interval_ms: u64,
+    },
+    Timer {
+        interval_ms: u64,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// Field selected by one monitor predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MonitorFilterFieldWire {
+    Address,
+    Body,
+    Payload,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Comparison performed by one monitor predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MonitorFilterOperatorWire {
+    Equals,
+    Contains,
+    StartsWith,
+    EndsWith,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Optional source-local predicate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorFilterWire {
+    pub field: MonitorFilterFieldWire,
+    pub operator: MonitorFilterOperatorWire,
+    pub value: String,
+    #[serde(default)]
+    pub case_sensitive: bool,
+}
+
+fn monitor_default_report() -> bool {
+    true
+}
+
+/// Action retained with a registration and copied verbatim to deliveries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorActionWire {
+    #[serde(default = "monitor_default_report")]
+    pub report: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_up: Option<String>,
+}
+
+/// Whether a matching registration stops after its first occurrence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MonitorOccurrenceWire {
+    Once,
+    #[default]
+    Every,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Registration lifetime. Timeout bounds are validated by the canonical
+/// monitor parser in `haider-tools`, not duplicated in this wire crate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MonitorLifetimeWire {
+    #[default]
+    Session,
+    Timeout {
+        timeout_ms: u64,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// Why a known source declaration cannot currently be registered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MonitorSourceUnavailableReasonWire {
+    AdapterInactive,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Honest source-adapter state for this daemon/platform.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MonitorSourceAvailabilityStateWire {
+    Available,
+    Unavailable {
+        reason: MonitorSourceUnavailableReasonWire,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// One row of the exhaustive sms/process/file/poll/timer availability table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorSourceAvailabilityWire {
+    pub source: MonitorSourceKindWire,
+    pub availability: MonitorSourceAvailabilityStateWire,
+}
+
+/// Capability policy returned with every monitor receipt. Control implies
+/// View under daemon authorization, as on the rest of the client surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorControlPolicyWire {
+    pub list: Capability,
+    pub register: Capability,
+    pub register_requires_control_attachment: bool,
+    pub remove: Capability,
+    pub remove_requires_control_attachment: bool,
+    pub watch: Capability,
+}
+
+/// Client-visible durable registry row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorRegistrationWire {
+    pub monitor_id: String,
+    pub session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_id: Option<BranchId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<AgentId>,
+    pub source: MonitorSourceWire,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<MonitorFilterWire>,
+    pub action: MonitorActionWire,
+    pub occurrence: MonitorOccurrenceWire,
+    pub created_at_ms: u64,
+    /// Source-hub watermark captured by registration. This is not a delivery
+    /// replay cursor and clients must not use it as one.
+    pub start_source_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
+}
+
+/// Structured refusal shared by the typed monitor control receipts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MonitorControlRejectionWire {
+    CapabilityDenied {
+        required: Capability,
+    },
+    ControlAttachmentRequired,
+    SourceUnavailable {
+        source: MonitorSourceKindWire,
+    },
+    LimitReached {
+        count: u32,
+        limit: u32,
+    },
+    NotFound {
+        monitor_id: String,
+    },
+    SessionNotFound,
+    StaleGeneration {
+        requested: u64,
+        current: u64,
+    },
+    CursorAhead {
+        requested: u64,
+        head: u64,
+    },
+    InvalidRequest {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        field: Option<String>,
+        detail: String,
+    },
+    CommandConflict,
+    ServiceStopped,
+    StoreUnavailable {
+        retryable: bool,
+        detail: String,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// `monitor.list` result. Empty `monitors` is authoritative only in `Listed`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MonitorListOutcomeWire {
+    Listed {
+        #[serde(default)]
+        monitors: Vec<MonitorRegistrationWire>,
+    },
+    Rejected {
+        rejection: MonitorControlRejectionWire,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// Typed `monitor.list` receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorListReceiptWire {
+    pub session_id: SessionId,
+    pub policy: MonitorControlPolicyWire,
+    pub sources: Vec<MonitorSourceAvailabilityWire>,
+    pub outcome: MonitorListOutcomeWire,
+}
+
+/// `monitor.register` result. Rejections are data, never an untyped string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MonitorRegisterOutcomeWire {
+    Registered {
+        monitor: MonitorRegistrationWire,
+    },
+    Rejected {
+        rejection: MonitorControlRejectionWire,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// Typed, command-correlated `monitor.register` receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorRegisterReceiptWire {
+    pub command_id: CommandId,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub policy: MonitorControlPolicyWire,
+    pub sources: Vec<MonitorSourceAvailabilityWire>,
+    pub outcome: MonitorRegisterOutcomeWire,
+}
+
+/// `monitor.remove` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MonitorRemoveOutcomeWire {
+    Removed {
+        monitor_id: String,
+    },
+    Rejected {
+        rejection: MonitorControlRejectionWire,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// Typed, command-correlated `monitor.remove` receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorRemoveReceiptWire {
+    pub command_id: CommandId,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub policy: MonitorControlPolicyWire,
+    pub sources: Vec<MonitorSourceAvailabilityWire>,
+    pub outcome: MonitorRemoveOutcomeWire,
+}
+
+/// `monitor.watch` registration result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MonitorWatchOutcomeWire {
+    Watching {
+        watch_id: String,
+        requested_after_cursor: u64,
+        replay_through_cursor: u64,
+    },
+    Rejected {
+        rejection: MonitorControlRejectionWire,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// Typed `monitor.watch` receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorWatchReceiptWire {
+    pub session_id: SessionId,
+    pub policy: MonitorControlPolicyWire,
+    pub sources: Vec<MonitorSourceAvailabilityWire>,
+    pub outcome: MonitorWatchOutcomeWire,
+}
+
+/// Report terminal/match status from the durable monitor subsystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MonitorReportStatusWire {
+    Matched,
+    RateLimited,
+    TimedOut,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Source event payload retained by one bounded report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MonitorEventPayloadWire {
+    Sms {
+        address: String,
+        body: String,
+        received_at_ms: i64,
+    },
+    Process {
+        line: String,
+    },
+    File {
+        payload: String,
+    },
+    Poll {
+        payload: String,
+    },
+    Timer {
+        fired_at_ms: u64,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// One source observation in a delivery report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorEventWire {
+    pub sequence: u64,
+    pub observed_at_ms: u64,
+    pub payload: MonitorEventPayloadWire,
+}
+
+/// Stable identities for exact-redelivery suppression and revision grouping.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorDeliveryDedupeWire {
+    /// Unique to one durable journal revision (`session_id` + `cursor`).
+    pub delivery_key: String,
+    /// Stable across coalesced revisions of the same report.
+    pub report_key: String,
+}
+
+/// One bounded, durable monitor delivery revision. `cursor` is the owning
+/// session journal sequence of `MonitorReportPending`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorDeliveryReportWire {
+    pub report_id: String,
+    pub monitor_id: String,
+    pub session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_id: Option<BranchId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<AgentId>,
+    pub source: MonitorSourceKindWire,
+    pub status: MonitorReportStatusWire,
+    #[serde(default)]
+    pub events: Vec<MonitorEventWire>,
+    pub coalesced_count: u64,
+    pub omitted_count: u64,
+    pub action: MonitorActionWire,
+    pub cursor: u64,
+    pub dedupe: MonitorDeliveryDedupeWire,
+}
+
 /// v0.1 request method bodies.
 ///
 /// The internally tagged method object keeps each operation visibly named and
@@ -2408,6 +2817,42 @@ pub enum RequestBody {
         request_id: String,
         permission: haider_protocol::permission::SystemPermission,
     },
+    /// Read the durable monitor registry for one session. View is sufficient.
+    #[serde(rename = "monitor.list")]
+    MonitorList { session_id: SessionId },
+    /// Register one monitor through the same source/filter/action vocabulary
+    /// as the model tool. Control is required and `command_id` is the durable
+    /// retry identity.
+    #[serde(rename = "monitor.register")]
+    MonitorRegister {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        source: MonitorSourceWire,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<MonitorFilterWire>,
+        action: MonitorActionWire,
+        #[serde(default)]
+        occurrence: MonitorOccurrenceWire,
+        #[serde(default)]
+        lifetime: MonitorLifetimeWire,
+    },
+    /// Remove one monitor from its owning session. Control is required and
+    /// retries use the durable command receipt.
+    #[serde(rename = "monitor.remove")]
+    MonitorRemove {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        monitor_id: String,
+    },
+    /// Start a session-scoped delivery replay strictly after the greatest
+    /// journal cursor the client has fully applied.
+    #[serde(rename = "monitor.watch")]
+    MonitorWatch {
+        session_id: SessionId,
+        after_cursor: u64,
+    },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline). W3b answers it with a protocol error, not a panic.
     #[serde(other)]
@@ -3035,6 +3480,14 @@ pub enum ResponseBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         data: Option<ErrorData>,
     },
+    #[serde(rename = "monitor.list")]
+    MonitorList { receipt: MonitorListReceiptWire },
+    #[serde(rename = "monitor.register")]
+    MonitorRegister { receipt: MonitorRegisterReceiptWire },
+    #[serde(rename = "monitor.remove")]
+    MonitorRemove { receipt: MonitorRemoveReceiptWire },
+    #[serde(rename = "monitor.watch")]
+    MonitorWatch { receipt: MonitorWatchReceiptWire },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline).
     #[serde(other)]
@@ -3427,6 +3880,20 @@ pub enum WireFrame {
     /// Request-specific failures use [`ResponseBody::Error`] so they retain
     /// their `request_id` correlation.
     ProtocolError(ProtocolError),
+    /// One replayable monitor-report revision. This is a dedicated delivery
+    /// record, not a chat message and not a private mobile transport packet.
+    MonitorDelivery {
+        watch_id: String,
+        report: MonitorDeliveryReportWire,
+    },
+    /// The monitor watch has scanned every session journal envelope through
+    /// `high_water_cursor`, including non-report facts. Persisting this cursor
+    /// avoids rescanning a report-free suffix on reconnect.
+    MonitorDeliveryCaughtUp {
+        watch_id: String,
+        session_id: SessionId,
+        high_water_cursor: u64,
+    },
     /// Decode artifact for a frame kind this crate does not know (tolerance
     /// discipline). Never constructed for sending.
     Unknown,
@@ -3511,6 +3978,15 @@ enum WireFrameRef<'a> {
         nonce: u64,
     },
     ProtocolError(&'a ProtocolError),
+    MonitorDelivery {
+        watch_id: &'a str,
+        report: &'a MonitorDeliveryReportWire,
+    },
+    MonitorDeliveryCaughtUp {
+        watch_id: &'a str,
+        session_id: &'a SessionId,
+        high_water_cursor: u64,
+    },
     Unknown,
 }
 
@@ -3596,6 +4072,15 @@ enum WireFrameOwned {
         nonce: u64,
     },
     ProtocolError(ProtocolError),
+    MonitorDelivery {
+        watch_id: String,
+        report: MonitorDeliveryReportWire,
+    },
+    MonitorDeliveryCaughtUp {
+        watch_id: String,
+        session_id: SessionId,
+        high_water_cursor: u64,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -3670,6 +4155,18 @@ impl Serialize for WireFrame {
             }
             Self::AccountsChanged { revision } => WireFrameRef::AccountsChanged {
                 revision: *revision,
+            },
+            Self::MonitorDelivery { watch_id, report } => {
+                WireFrameRef::MonitorDelivery { watch_id, report }
+            }
+            Self::MonitorDeliveryCaughtUp {
+                watch_id,
+                session_id,
+                high_water_cursor,
+            } => WireFrameRef::MonitorDeliveryCaughtUp {
+                watch_id,
+                session_id,
+                high_water_cursor: *high_water_cursor,
             },
             Self::HaiderCodePlanStatus {
                 provider,
@@ -3790,6 +4287,18 @@ impl<'de> Deserialize<'de> for WireFrame {
                 Self::SessionRosterDelta { summaries }
             }
             WireFrameOwned::AccountsChanged { revision } => Self::AccountsChanged { revision },
+            WireFrameOwned::MonitorDelivery { watch_id, report } => {
+                Self::MonitorDelivery { watch_id, report }
+            }
+            WireFrameOwned::MonitorDeliveryCaughtUp {
+                watch_id,
+                session_id,
+                high_water_cursor,
+            } => Self::MonitorDeliveryCaughtUp {
+                watch_id,
+                session_id,
+                high_water_cursor,
+            },
             WireFrameOwned::HaiderCodePlanStatus {
                 provider,
                 account_alias,

@@ -228,6 +228,30 @@
       "response_method": "usage.history_range",
       "request": {"method":"usage.history_range","through_date":"2026-08-24","days":2},
       "response": {"method":"usage.history_range","through_date":"2026-08-24","device_id":"dev-0123456789abcdef0123456789abcdef","days":[{"date":"2026-08-23"},{"date":"2026-08-24","total":{"sampled_slots":1,"requests":0,"errors":0,"input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0,"reasoning_tokens":0,"subagents_spawned":0}}],"availability":{"state":"available"}}
+    },
+    {
+      "request_method": "monitor.list",
+      "response_method": "monitor.list",
+      "request": {"method":"monitor.list","session_id":"session-1"},
+      "response": {"method":"monitor.list","receipt":{"session_id":"session-1","policy":{"list":"view","register":"control","register_requires_control_attachment":true,"remove":"control","remove_requires_control_attachment":true,"watch":"view"},"sources":[{"source":"sms","availability":{"state":"available"}},{"source":"process","availability":{"state":"unavailable","reason":"adapter_inactive"}},{"source":"file","availability":{"state":"unavailable","reason":"adapter_inactive"}},{"source":"poll","availability":{"state":"unavailable","reason":"adapter_inactive"}},{"source":"timer","availability":{"state":"unavailable","reason":"adapter_inactive"}}],"outcome":{"status":"listed","monitors":[]}}}
+    },
+    {
+      "request_method": "monitor.register",
+      "response_method": "monitor.register",
+      "request": {"method":"monitor.register","command_id":"command-monitor-register","session_id":"session-1","worker_generation":7,"source":{"kind":"sms"},"action":{"report":true},"occurrence":"every","lifetime":{"kind":"session"}},
+      "response": {"method":"monitor.register","receipt":{"command_id":"command-monitor-register","session_id":"session-1","worker_generation":7,"policy":{"list":"view","register":"control","register_requires_control_attachment":true,"remove":"control","remove_requires_control_attachment":true,"watch":"view"},"sources":[{"source":"sms","availability":{"state":"available"}},{"source":"process","availability":{"state":"unavailable","reason":"adapter_inactive"}},{"source":"file","availability":{"state":"unavailable","reason":"adapter_inactive"}},{"source":"poll","availability":{"state":"unavailable","reason":"adapter_inactive"}},{"source":"timer","availability":{"state":"unavailable","reason":"adapter_inactive"}}],"outcome":{"status":"registered","monitor":{"monitor_id":"monitor-command-register","session_id":"session-1","source":{"kind":"sms"},"action":{"report":true},"occurrence":"every","created_at_ms":1753500000000,"start_source_sequence":9}}}}
+    },
+    {
+      "request_method": "monitor.remove",
+      "response_method": "monitor.remove",
+      "request": {"method":"monitor.remove","command_id":"command-monitor-remove","session_id":"session-1","worker_generation":7,"monitor_id":"monitor-command-register"},
+      "response": {"method":"monitor.remove","receipt":{"command_id":"command-monitor-remove","session_id":"session-1","worker_generation":7,"policy":{"list":"view","register":"control","register_requires_control_attachment":true,"remove":"control","remove_requires_control_attachment":true,"watch":"view"},"sources":[{"source":"sms","availability":{"state":"available"}},{"source":"process","availability":{"state":"unavailable","reason":"adapter_inactive"}},{"source":"file","availability":{"state":"unavailable","reason":"adapter_inactive"}},{"source":"poll","availability":{"state":"unavailable","reason":"adapter_inactive"}},{"source":"timer","availability":{"state":"unavailable","reason":"adapter_inactive"}}],"outcome":{"status":"removed","monitor_id":"monitor-command-register"}}}
+    },
+    {
+      "request_method": "monitor.watch",
+      "response_method": "monitor.watch",
+      "request": {"method":"monitor.watch","session_id":"session-1","after_cursor":40},
+      "response": {"method":"monitor.watch","receipt":{"session_id":"session-1","policy":{"list":"view","register":"control","register_requires_control_attachment":true,"remove":"control","remove_requires_control_attachment":true,"watch":"view"},"sources":[{"source":"sms","availability":{"state":"available"}},{"source":"process","availability":{"state":"unavailable","reason":"adapter_inactive"}},{"source":"file","availability":{"state":"unavailable","reason":"adapter_inactive"}},{"source":"poll","availability":{"state":"unavailable","reason":"adapter_inactive"}},{"source":"timer","availability":{"state":"unavailable","reason":"adapter_inactive"}}],"outcome":{"status":"watching","watch_id":"monitor-watch-1","requested_after_cursor":40,"replay_through_cursor":44}}}
     }
   ]
 }

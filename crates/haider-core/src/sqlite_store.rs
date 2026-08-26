@@ -22,14 +22,15 @@ use haider_store::{
     GraphFinalizationOutcome, GraphInspectResult, GraphPinCommand, GraphPinOutcome,
     GraphRunSetOpenCommand, GraphRunSetOpenOutcome, GraphSwitchCommand, GraphSwitchOutcome,
     HookTrustChange, HookTrustCommand, JournalAppendBatch, MenuResolutionCommand,
-    MenuResolutionOutcome, ProcessSignalCommand, ProcessSignalOutcome, ProfileLease,
-    QueueConsumeCommand, QueueConsumeOutcome, QueuePromoteCommand, QueuePromoteOutcome,
-    QueuePromotePreview, QueueRemoveCommand, QueueRemoveOutcome, QueueSnapshot, RunRetryCommand,
-    RunRetryOutcome, SessionCreateCommand, SessionCreateOutcome, SessionForkCommand,
-    SessionForkOutcome, SessionProjectionCheckpoint, SessionRenameCommand, SessionRenameOutcome,
-    SessionSeenCommand, SessionSeenOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
-    ShellExecAcceptCommand, ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome,
-    TurnCancelCommand, TurnCancelOutcome, TypedAgentInstallCas,
+    MenuResolutionOutcome, MonitorControlClaim, ProcessSignalCommand, ProcessSignalOutcome,
+    ProfileLease, QueueConsumeCommand, QueueConsumeOutcome, QueuePromoteCommand,
+    QueuePromoteOutcome, QueuePromotePreview, QueueRemoveCommand, QueueRemoveOutcome,
+    QueueSnapshot, RunRetryCommand, RunRetryOutcome, SessionCreateCommand, SessionCreateOutcome,
+    SessionForkCommand, SessionForkOutcome, SessionProjectionCheckpoint, SessionRenameCommand,
+    SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome, SessionSelectModelCommand,
+    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, Store,
+    TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand, TurnCancelOutcome,
+    TypedAgentInstallCas,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::{Path, PathBuf};
@@ -1603,6 +1604,64 @@ impl SqliteStoreHandle {
         run_blocking(move || {
             owner.with_store(|store| {
                 store.finalize_context_compaction_receipt(&command_id, &response)
+            })
+        })
+        .await
+    }
+
+    pub async fn monitor_control_receipt(
+        &self,
+        command_id: String,
+        method: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<serde_json::Value>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.monitor_control_receipt(&command_id, &method, &request_digest, &request_json)
+            })
+        })
+        .await
+    }
+
+    pub async fn claim_monitor_control_receipt(
+        &self,
+        command_id: String,
+        method: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<MonitorControlClaim, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.claim_monitor_control_receipt(
+                    &command_id,
+                    &method,
+                    &request_digest,
+                    &request_json,
+                )
+            })
+        })
+        .await
+    }
+
+    pub async fn finalize_monitor_control_receipt(
+        &self,
+        command_id: String,
+        session_id: SessionId,
+        accepted_seq: u64,
+        response: serde_json::Value,
+    ) -> Result<(), HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.finalize_monitor_control_receipt(
+                    &command_id,
+                    &session_id,
+                    accepted_seq,
+                    &response,
+                )
             })
         })
         .await

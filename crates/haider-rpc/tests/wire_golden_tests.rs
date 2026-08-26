@@ -214,6 +214,10 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "loom.install.status",
         "loom.register_agent_type",
         "loom.register_workflow",
+        "monitor.list",
+        "monitor.register",
+        "monitor.remove",
+        "monitor.watch",
         "provider.configure",
         "provider.list",
         "provider.models_refresh",
@@ -537,7 +541,10 @@ fn compact_ws_bodies_and_length_prefixed_uds_streams_are_golden() {
             }
         })
         .collect();
-    let serialized = serde_json::to_string_pretty(&expected_bytes).expect("serialize transcript");
+    let mut serialized =
+        serde_json::to_string_pretty(&expected_bytes).expect("serialize transcript");
+    // Keep the checked-in JSON text convention explicit and platform-neutral.
+    serialized.push('\n');
     let path = fixture_path();
     if std::env::var("UPDATE_FIXTURES").is_ok() {
         std::fs::create_dir_all(path.parent().expect("fixture parent")).expect("mkdir fixtures");
@@ -569,6 +576,79 @@ fn compact_ws_bodies_and_length_prefixed_uds_streams_are_golden() {
         );
         assert_eq!(batch.frames, vec![expected_frame]);
     }
+}
+
+/// `monitor_delivery_v1` is append-only at the end of the historical
+/// transcript and pins the dedicated report/caught-up shapes.
+///
+/// MUTATION CHECK: remove `cursor`, either dedupe key, `coalesced_count`, or
+/// `omitted_count`, or serialize the report as an ordinary `event`. Expected
+/// runtime failure: the exact appended goldens or the typed assertions below
+/// change. Retype any pre-existing v1 field and the earlier 129 byte goldens
+/// fail before these appended entries are reached.
+#[test]
+fn monitor_delivery_stream_is_additive_replayable_and_explicitly_bounded() {
+    let frames = transcript();
+    assert_eq!(frames.len(), 131);
+    let WireFrame::MonitorDelivery { watch_id, report } = &frames[129] else {
+        panic!("monitor delivery must be the first appended stream frame");
+    };
+    assert_eq!(watch_id, "monitor-watch-1");
+    assert_eq!(report.cursor, 71);
+    assert_eq!(report.coalesced_count, 3);
+    assert_eq!(report.omitted_count, 2);
+    assert_eq!(report.events.len(), 1);
+    assert_eq!(report.dedupe.report_key, report.report_id);
+    assert_ne!(report.dedupe.delivery_key, report.dedupe.report_key);
+
+    let encoded = serde_json::to_value(&frames[129]).expect("encode monitor delivery");
+    assert_eq!(encoded["kind"], "monitor_delivery");
+    assert!(encoded.get("attachment_id").is_none());
+    assert!(encoded.get("body").is_none());
+
+    assert!(matches!(
+        &frames[130],
+        WireFrame::MonitorDeliveryCaughtUp {
+            watch_id,
+            session_id,
+            high_water_cursor: 73,
+        } if watch_id == "monitor-watch-1" && session_id.as_str() == "session-1"
+    ));
+}
+
+/// MUTATION CHECK: remove one monitor default or change its v1 meaning.
+/// Expected runtime failure: the legacy-minimal register request no longer
+/// normalizes to the canonical tool defaults.
+#[test]
+fn monitor_register_additive_defaults_are_stable() {
+    let request = serde_json::from_value::<RequestBody>(serde_json::json!({
+        "method": "monitor.register",
+        "command_id": "monitor-default-command",
+        "session_id": "monitor-default-session",
+        "worker_generation": 3,
+        "source": {"kind": "sms"},
+        "filter": {
+            "field": "body",
+            "operator": "contains",
+            "value": "ready"
+        },
+        "action": {}
+    }))
+    .expect("decode monitor defaults");
+    let RequestBody::MonitorRegister {
+        filter: Some(filter),
+        action,
+        occurrence,
+        lifetime,
+        ..
+    } = request
+    else {
+        panic!("typed monitor register request");
+    };
+    assert!(!filter.case_sensitive);
+    assert!(action.report);
+    assert_eq!(occurrence, haider_rpc::MonitorOccurrenceWire::Every);
+    assert_eq!(lifetime, haider_rpc::MonitorLifetimeWire::Session);
 }
 
 /// ST1 submit-wire law. MUTATION CHECK: omit the mode, map Subturn to Steer,

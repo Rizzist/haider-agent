@@ -134,6 +134,7 @@ pub enum MonitorError {
     InvalidEvent(String),
     SubscriptionClosed,
     Store(String),
+    StoreUnavailable { message: String, retryable: bool },
     Delivery(String),
 }
 
@@ -143,12 +144,22 @@ impl fmt::Display for MonitorError {
             Self::InvalidEvent(message) => write!(formatter, "invalid monitor event: {message}"),
             Self::SubscriptionClosed => formatter.write_str("monitor source subscription closed"),
             Self::Store(message) => write!(formatter, "monitor store failure: {message}"),
+            Self::StoreUnavailable { message, .. } => {
+                write!(formatter, "monitor store failure: {message}")
+            }
             Self::Delivery(message) => write!(formatter, "monitor delivery failure: {message}"),
         }
     }
 }
 
 impl std::error::Error for MonitorError {}
+
+fn monitor_store_error(error: haider_protocol::error::HaiderError) -> MonitorError {
+    MonitorError::StoreUnavailable {
+        message: error.message,
+        retryable: error.retryable,
+    }
+}
 
 /// One bounded per-source subscription.
 pub struct MonitorSubscription {
@@ -536,6 +547,44 @@ struct StoredMonitorToolReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+enum StoredMonitorClientReceiptBody {
+    Register {
+        receipt: haider_rpc::MonitorRegisterReceiptWire,
+    },
+    Remove {
+        receipt: haider_rpc::MonitorRemoveReceiptWire,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct StoredMonitorClientReceipt {
+    request_digest: String,
+    body: StoredMonitorClientReceiptBody,
+}
+
+enum MonitorClientReceiptReplay {
+    Missing,
+    Found {
+        body: StoredMonitorClientReceiptBody,
+        accepted_seq: u64,
+    },
+    Conflict,
+}
+
+#[derive(Clone)]
+pub(crate) struct MonitorClientRegistrationRequest {
+    pub command_id: haider_rpc::CommandId,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub source: haider_rpc::MonitorSourceWire,
+    pub filter: Option<haider_rpc::MonitorFilterWire>,
+    pub action: haider_rpc::MonitorActionWire,
+    pub occurrence: haider_rpc::MonitorOccurrenceWire,
+    pub lifetime: haider_rpc::MonitorLifetimeWire,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 // The `Monitor` prefix is part of each durable on-wire journal event tag.
 #[allow(clippy::enum_variant_names)]
@@ -551,6 +600,10 @@ enum MonitorJournalEvent {
     MonitorToolReceipt {
         operation_id: String,
         receipt: StoredMonitorToolReceipt,
+    },
+    MonitorClientReceipt {
+        operation_id: String,
+        receipt: StoredMonitorClientReceipt,
     },
     MonitorReportPending {
         pending: PendingMonitorReport,
@@ -1310,7 +1363,7 @@ impl MonitorService {
             let page = hub
                 .read_internal_session(session, cursor, 256)
                 .await
-                .map_err(|error| MonitorError::Store(error.message))?;
+                .map_err(monitor_store_error)?;
             if page.is_empty() {
                 break;
             }
@@ -1334,7 +1387,10 @@ impl MonitorService {
                     Some(MonitorJournalEvent::MonitorRemoved { monitor_id, .. }) => {
                         monitors.remove(&monitor_id);
                     }
-                    Some(MonitorJournalEvent::MonitorToolReceipt { .. }) => {}
+                    Some(
+                        MonitorJournalEvent::MonitorToolReceipt { .. }
+                        | MonitorJournalEvent::MonitorClientReceipt { .. },
+                    ) => {}
                     Some(MonitorJournalEvent::MonitorReportPending { pending })
                         if pending.report.session_id == *session =>
                     {
@@ -1414,7 +1470,7 @@ impl MonitorService {
         store
             .append(&mut envelopes)
             .await
-            .map_err(|error| monitor_tool_error(MonitorError::Store(error.message)))?;
+            .map_err(|error| monitor_tool_error(monitor_store_error(error)))?;
         Ok(())
     }
 
@@ -1430,7 +1486,7 @@ impl MonitorService {
             let page = hub
                 .read_internal_session(session, cursor, 256)
                 .await
-                .map_err(|error| monitor_tool_error(MonitorError::Store(error.message)))?;
+                .map_err(|error| monitor_tool_error(monitor_store_error(error)))?;
             if page.is_empty() {
                 return Ok(None);
             }
@@ -1453,6 +1509,1099 @@ impl MonitorService {
                 }
                 return Ok(Some(receipt.result));
             }
+        }
+    }
+
+    async fn replay_client_receipt(
+        &self,
+        hub: &SessionHub,
+        session: &SessionId,
+        operation_id: &str,
+        request_digest: &str,
+    ) -> Result<MonitorClientReceiptReplay, MonitorError> {
+        let mut cursor = 0_u64;
+        loop {
+            let page = hub
+                .read_internal_session(session, cursor, 256)
+                .await
+                .map_err(monitor_store_error)?;
+            if page.is_empty() {
+                return Ok(MonitorClientReceiptReplay::Missing);
+            }
+            cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+            for envelope in page {
+                let Some(MonitorJournalEvent::MonitorClientReceipt {
+                    operation_id: stored_operation,
+                    receipt,
+                }) = MonitorJournalEvent::from_value(&envelope.payload)
+                else {
+                    continue;
+                };
+                if stored_operation != operation_id {
+                    continue;
+                }
+                if receipt.request_digest != request_digest {
+                    return Ok(MonitorClientReceiptReplay::Conflict);
+                }
+                return Ok(MonitorClientReceiptReplay::Found {
+                    body: receipt.body,
+                    accepted_seq: envelope.seq,
+                });
+            }
+        }
+    }
+
+    async fn persist_client_receipt_locked(
+        &self,
+        hub: &SessionHub,
+        session: &SessionId,
+        branch_id: Option<&BranchId>,
+        agent_id: Option<&AgentId>,
+        operation_id: &str,
+        receipt: StoredMonitorClientReceipt,
+    ) -> Result<u64, MonitorError> {
+        let fact = MonitorJournalEvent::MonitorClientReceipt {
+            operation_id: operation_id.to_owned(),
+            receipt,
+        };
+        let mut envelopes = [monitor_envelope(
+            session,
+            None,
+            branch_id,
+            agent_id,
+            &format!("monitor-client-receipt-{}", &operation_id[..24]),
+            hub.device_id(),
+            hub.worker_generation(),
+            fact.to_value()?,
+        )];
+        hub.append(&mut envelopes)
+            .await
+            .map_err(monitor_store_error)?;
+        Ok(envelopes[0].seq)
+    }
+
+    async fn finalize_client_receipt(
+        &self,
+        hub: &SessionHub,
+        command_id: &haider_rpc::CommandId,
+        session_id: &SessionId,
+        accepted_seq: u64,
+        body: &StoredMonitorClientReceiptBody,
+    ) -> Result<(), MonitorError> {
+        let response = serde_json::to_value(body).map_err(|error| {
+            MonitorError::Store(format!("cannot encode global monitor receipt: {error}"))
+        })?;
+        hub.finalize_monitor_control_receipt(command_id, session_id, accepted_seq, response)
+            .await
+            .map_err(monitor_store_error)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_and_finalize_client_receipt_locked(
+        &self,
+        hub: &SessionHub,
+        command_id: &haider_rpc::CommandId,
+        session_id: &SessionId,
+        operation_id: &str,
+        request_digest: String,
+        body: StoredMonitorClientReceiptBody,
+    ) -> Result<(), MonitorError> {
+        let accepted_seq = self
+            .persist_client_receipt_locked(
+                hub,
+                session_id,
+                None,
+                None,
+                operation_id,
+                StoredMonitorClientReceipt {
+                    request_digest,
+                    body: body.clone(),
+                },
+            )
+            .await?;
+        self.finalize_client_receipt(hub, command_id, session_id, accepted_seq, &body)
+            .await
+    }
+
+    pub(crate) async fn client_list(
+        &self,
+        hub: &SessionHub,
+        session: SessionId,
+    ) -> haider_rpc::MonitorListReceiptWire {
+        if *self.inner.shutdown.borrow() || self.is_retired(&session) {
+            return monitor_list_rejected(
+                session,
+                haider_rpc::MonitorControlRejectionWire::ServiceStopped,
+            );
+        }
+        let _mutation = self.inner.mutations.lock().await;
+        if *self.inner.shutdown.borrow() || self.is_retired(&session) {
+            return monitor_list_rejected(
+                session,
+                haider_rpc::MonitorControlRejectionWire::ServiceStopped,
+            );
+        }
+        match hub.latest_internal_session_seq(&session).await {
+            Ok(0) => {
+                return monitor_list_rejected(
+                    session,
+                    haider_rpc::MonitorControlRejectionWire::SessionNotFound,
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return monitor_list_rejected(session, monitor_store_haider_rejection(error));
+            }
+        }
+        if let Err(error) = self.adopt_session_locked(hub, &session).await {
+            return monitor_list_rejected(session, monitor_store_rejection(error));
+        }
+        let monitors = self
+            .inner
+            .registry
+            .snapshot(&session)
+            .iter()
+            .map(monitor_registration_wire)
+            .collect();
+        haider_rpc::MonitorListReceiptWire {
+            session_id: session,
+            policy: monitor_control_policy(),
+            sources: monitor_source_availability(),
+            outcome: haider_rpc::MonitorListOutcomeWire::Listed { monitors },
+        }
+    }
+
+    pub(crate) async fn client_register(
+        &self,
+        hub: &SessionHub,
+        request: MonitorClientRegistrationRequest,
+    ) -> haider_rpc::MonitorRegisterReceiptWire {
+        let current_generation = hub.worker_generation();
+        let MonitorClientRegistrationRequest {
+            command_id,
+            session_id,
+            worker_generation,
+            source,
+            filter,
+            action,
+            occurrence,
+            lifetime,
+        } = request;
+        let parsed = match monitor_register_request_from_wire(
+            source, filter, action, occurrence, lifetime,
+        ) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return monitor_register_rejected(
+                    command_id,
+                    session_id,
+                    current_generation,
+                    invalid_monitor_request(error),
+                );
+            }
+        };
+        if command_id.as_str().trim().is_empty() {
+            return monitor_register_rejected(
+                command_id,
+                session_id,
+                current_generation,
+                haider_rpc::MonitorControlRejectionWire::InvalidRequest {
+                    field: Some("command_id".into()),
+                    detail: "command_id must not be empty".into(),
+                },
+            );
+        }
+        let request_value = json!({
+            "session_id": session_id,
+            "worker_generation": worker_generation,
+            "request": parsed,
+        });
+        let request_json = match serde_json::to_string(&request_value) {
+            Ok(json) => json,
+            Err(error) => {
+                return monitor_register_rejected(
+                    command_id,
+                    session_id,
+                    current_generation,
+                    haider_rpc::MonitorControlRejectionWire::InvalidRequest {
+                        field: None,
+                        detail: format!("cannot encode canonical monitor request: {error}"),
+                    },
+                );
+            }
+        };
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        let operation_id = stable_digest(&[
+            session_id.as_str(),
+            command_id.as_str(),
+            "monitor-client-register",
+        ]);
+
+        match hub
+            .monitor_control_receipt(
+                &command_id,
+                "monitor.register",
+                &request_digest,
+                &request_json,
+            )
+            .await
+        {
+            Ok(Some(response)) => {
+                return match decode_client_receipt(response) {
+                    Ok(StoredMonitorClientReceiptBody::Register { receipt }) => receipt,
+                    Ok(StoredMonitorClientReceiptBody::Remove { .. }) => monitor_register_rejected(
+                        command_id,
+                        session_id,
+                        current_generation,
+                        haider_rpc::MonitorControlRejectionWire::CommandConflict,
+                    ),
+                    Err(error) => monitor_register_rejected(
+                        command_id,
+                        session_id,
+                        current_generation,
+                        monitor_store_rejection(error),
+                    ),
+                };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return monitor_register_rejected(
+                    command_id,
+                    session_id,
+                    current_generation,
+                    monitor_receipt_rejection(error),
+                );
+            }
+        }
+        match hub.latest_internal_session_seq(&session_id).await {
+            Ok(0) => {
+                return monitor_register_rejected(
+                    command_id,
+                    session_id,
+                    current_generation,
+                    haider_rpc::MonitorControlRejectionWire::SessionNotFound,
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return monitor_register_rejected(
+                    command_id,
+                    session_id,
+                    current_generation,
+                    monitor_store_haider_rejection(error),
+                );
+            }
+        }
+
+        if *self.inner.shutdown.borrow() || self.is_retired(&session_id) {
+            return monitor_register_rejected(
+                command_id,
+                session_id,
+                current_generation,
+                haider_rpc::MonitorControlRejectionWire::ServiceStopped,
+            );
+        }
+        let _mutation = self.inner.mutations.lock().await;
+        if *self.inner.shutdown.borrow() || self.is_retired(&session_id) {
+            return monitor_register_rejected(
+                command_id,
+                session_id,
+                current_generation,
+                haider_rpc::MonitorControlRejectionWire::ServiceStopped,
+            );
+        }
+        match hub.latest_internal_session_seq(&session_id).await {
+            Ok(0) => {
+                return monitor_register_rejected(
+                    command_id,
+                    session_id,
+                    current_generation,
+                    haider_rpc::MonitorControlRejectionWire::SessionNotFound,
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return monitor_register_rejected(
+                    command_id,
+                    session_id,
+                    current_generation,
+                    monitor_store_haider_rejection(error),
+                );
+            }
+        }
+        if let Err(error) = self.adopt_session_locked(hub, &session_id).await {
+            return monitor_register_rejected(
+                command_id,
+                session_id,
+                current_generation,
+                monitor_store_rejection(error),
+            );
+        }
+        match self
+            .replay_client_receipt(hub, &session_id, &operation_id, &request_digest)
+            .await
+        {
+            Ok(MonitorClientReceiptReplay::Found {
+                body: StoredMonitorClientReceiptBody::Register { receipt },
+                accepted_seq,
+            }) => {
+                let body = StoredMonitorClientReceiptBody::Register {
+                    receipt: receipt.clone(),
+                };
+                match hub
+                    .claim_monitor_control_receipt(
+                        &command_id,
+                        "monitor.register",
+                        &request_digest,
+                        &request_json,
+                    )
+                    .await
+                {
+                    Ok(haider_core::MonitorControlClaim::Committed(response)) => {
+                        return match decode_client_receipt(response) {
+                            Ok(StoredMonitorClientReceiptBody::Register { receipt }) => receipt,
+                            Ok(StoredMonitorClientReceiptBody::Remove { .. }) => {
+                                monitor_register_rejected(
+                                    command_id,
+                                    session_id,
+                                    current_generation,
+                                    haider_rpc::MonitorControlRejectionWire::CommandConflict,
+                                )
+                            }
+                            Err(error) => monitor_register_rejected(
+                                command_id,
+                                session_id,
+                                current_generation,
+                                monitor_store_rejection(error),
+                            ),
+                        };
+                    }
+                    Ok(
+                        haider_core::MonitorControlClaim::Fresh
+                        | haider_core::MonitorControlClaim::ResumePending,
+                    ) => {}
+                    Err(error) => {
+                        return monitor_register_rejected(
+                            command_id,
+                            session_id,
+                            current_generation,
+                            monitor_receipt_rejection(error),
+                        );
+                    }
+                }
+                return match self
+                    .finalize_client_receipt(hub, &command_id, &session_id, accepted_seq, &body)
+                    .await
+                {
+                    Ok(()) => receipt,
+                    Err(error) => monitor_register_rejected(
+                        command_id,
+                        session_id,
+                        current_generation,
+                        monitor_store_rejection(error),
+                    ),
+                };
+            }
+            Ok(MonitorClientReceiptReplay::Found { .. } | MonitorClientReceiptReplay::Conflict) => {
+                return monitor_register_rejected(
+                    command_id,
+                    session_id,
+                    current_generation,
+                    haider_rpc::MonitorControlRejectionWire::CommandConflict,
+                );
+            }
+            Ok(MonitorClientReceiptReplay::Missing) => {}
+            Err(error) => {
+                return monitor_register_rejected(
+                    command_id,
+                    session_id,
+                    current_generation,
+                    monitor_store_rejection(error),
+                );
+            }
+        }
+        if worker_generation != current_generation {
+            return monitor_register_rejected(
+                command_id,
+                session_id,
+                current_generation,
+                haider_rpc::MonitorControlRejectionWire::StaleGeneration {
+                    requested: worker_generation,
+                    current: current_generation,
+                },
+            );
+        }
+        match hub
+            .claim_monitor_control_receipt(
+                &command_id,
+                "monitor.register",
+                &request_digest,
+                &request_json,
+            )
+            .await
+        {
+            Ok(haider_core::MonitorControlClaim::Committed(response)) => {
+                return match decode_client_receipt(response) {
+                    Ok(StoredMonitorClientReceiptBody::Register { receipt }) => receipt,
+                    Ok(StoredMonitorClientReceiptBody::Remove { .. }) => monitor_register_rejected(
+                        command_id,
+                        session_id,
+                        current_generation,
+                        haider_rpc::MonitorControlRejectionWire::CommandConflict,
+                    ),
+                    Err(error) => monitor_register_rejected(
+                        command_id,
+                        session_id,
+                        current_generation,
+                        monitor_store_rejection(error),
+                    ),
+                };
+            }
+            Ok(
+                haider_core::MonitorControlClaim::Fresh
+                | haider_core::MonitorControlClaim::ResumePending,
+            ) => {}
+            Err(error) => {
+                return monitor_register_rejected(
+                    command_id,
+                    session_id,
+                    current_generation,
+                    monitor_receipt_rejection(error),
+                );
+            }
+        }
+        let MonitorRequest::Register {
+            source,
+            filter,
+            action,
+            occurrence,
+            lifetime,
+        } = parsed
+        else {
+            return monitor_register_rejected(
+                command_id,
+                session_id,
+                current_generation,
+                haider_rpc::MonitorControlRejectionWire::InvalidRequest {
+                    field: None,
+                    detail: "canonical monitor request was not register".into(),
+                },
+            );
+        };
+
+        if source.kind() != MonitorSourceKind::Sms {
+            let receipt = monitor_register_rejected(
+                command_id,
+                session_id,
+                current_generation,
+                haider_rpc::MonitorControlRejectionWire::SourceUnavailable {
+                    source: monitor_source_kind_wire(source.kind()),
+                },
+            );
+            let body = StoredMonitorClientReceiptBody::Register {
+                receipt: receipt.clone(),
+            };
+            return match self
+                .persist_and_finalize_client_receipt_locked(
+                    hub,
+                    &receipt.command_id,
+                    &receipt.session_id,
+                    &operation_id,
+                    request_digest,
+                    body,
+                )
+                .await
+            {
+                Ok(()) => receipt,
+                Err(error) => monitor_register_rejected(
+                    receipt.command_id,
+                    receipt.session_id,
+                    current_generation,
+                    monitor_store_rejection(error),
+                ),
+            };
+        }
+        let current = self.inner.registry.snapshot(&session_id);
+        if current.len() >= MAX_MONITORS_PER_SESSION {
+            let receipt = monitor_register_rejected(
+                command_id,
+                session_id,
+                current_generation,
+                haider_rpc::MonitorControlRejectionWire::LimitReached {
+                    count: u32::try_from(current.len()).unwrap_or(u32::MAX),
+                    limit: u32::try_from(MAX_MONITORS_PER_SESSION).unwrap_or(u32::MAX),
+                },
+            );
+            let body = StoredMonitorClientReceiptBody::Register {
+                receipt: receipt.clone(),
+            };
+            return match self
+                .persist_and_finalize_client_receipt_locked(
+                    hub,
+                    &receipt.command_id,
+                    &receipt.session_id,
+                    &operation_id,
+                    request_digest,
+                    body,
+                )
+                .await
+            {
+                Ok(()) => receipt,
+                Err(error) => monitor_register_rejected(
+                    receipt.command_id,
+                    receipt.session_id,
+                    current_generation,
+                    monitor_store_rejection(error),
+                ),
+            };
+        }
+
+        let created_at_ms = now_ms();
+        let expires_at_ms = match lifetime {
+            MonitorLifetime::Session => None,
+            MonitorLifetime::Timeout { timeout_ms } => {
+                Some(created_at_ms.saturating_add(timeout_ms))
+            }
+        };
+        let registration = MonitorRegistration {
+            monitor_id: format!("monitor-{}", &operation_id[..20]),
+            owner_session_id: session_id.clone(),
+            source,
+            filter,
+            action,
+            occurrence,
+            created_at_ms,
+            start_sequence: self.inner.sources.current_sequence(),
+            expires_at_ms,
+            branch_id: None,
+            agent_id: None,
+        };
+        let receipt = haider_rpc::MonitorRegisterReceiptWire {
+            command_id,
+            session_id: session_id.clone(),
+            worker_generation: current_generation,
+            policy: monitor_control_policy(),
+            sources: monitor_source_availability(),
+            outcome: haider_rpc::MonitorRegisterOutcomeWire::Registered {
+                monitor: monitor_registration_wire(&registration),
+            },
+        };
+        let registered = MonitorJournalEvent::MonitorRegistered {
+            registration: registration.clone(),
+        };
+        let receipt_body = StoredMonitorClientReceiptBody::Register {
+            receipt: receipt.clone(),
+        };
+        let stored = MonitorJournalEvent::MonitorClientReceipt {
+            operation_id: operation_id.clone(),
+            receipt: StoredMonitorClientReceipt {
+                request_digest,
+                body: receipt_body.clone(),
+            },
+        };
+        let mut envelopes = [
+            monitor_envelope(
+                &session_id,
+                None,
+                registration.branch_id.as_ref(),
+                registration.agent_id.as_ref(),
+                &format!("monitor-client-registered-{}", &operation_id[..24]),
+                hub.device_id(),
+                current_generation,
+                match registered.to_value() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return monitor_register_rejected(
+                            receipt.command_id,
+                            receipt.session_id,
+                            current_generation,
+                            monitor_store_rejection(error),
+                        );
+                    }
+                },
+            ),
+            monitor_envelope(
+                &session_id,
+                None,
+                registration.branch_id.as_ref(),
+                registration.agent_id.as_ref(),
+                &format!("monitor-client-receipt-{}", &operation_id[..24]),
+                hub.device_id(),
+                current_generation,
+                match stored.to_value() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return monitor_register_rejected(
+                            receipt.command_id,
+                            receipt.session_id,
+                            current_generation,
+                            monitor_store_rejection(error),
+                        );
+                    }
+                },
+            ),
+        ];
+        if let Err(error) = hub.append(&mut envelopes).await {
+            return monitor_register_rejected(
+                receipt.command_id,
+                receipt.session_id,
+                current_generation,
+                monitor_store_rejection(monitor_store_error(error)),
+            );
+        }
+        self.inner
+            .registry
+            .insert(&session_id, registration.clone());
+        let accepted_seq = envelopes[1].seq;
+        self.schedule_timeout(hub.downgrade(), session_id, registration);
+        match self
+            .finalize_client_receipt(
+                hub,
+                &receipt.command_id,
+                &receipt.session_id,
+                accepted_seq,
+                &receipt_body,
+            )
+            .await
+        {
+            Ok(()) => receipt,
+            Err(error) => monitor_register_rejected(
+                receipt.command_id,
+                receipt.session_id,
+                current_generation,
+                monitor_store_rejection(error),
+            ),
+        }
+    }
+
+    pub(crate) async fn client_remove(
+        &self,
+        hub: &SessionHub,
+        command_id: haider_rpc::CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        monitor_id: String,
+    ) -> haider_rpc::MonitorRemoveReceiptWire {
+        let current_generation = hub.worker_generation();
+        let parsed = match MonitorRequest::from_tool_args(json!({
+            "operation": "remove",
+            "monitor_id": monitor_id,
+        })) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return monitor_remove_rejected(
+                    command_id,
+                    session_id,
+                    current_generation,
+                    invalid_monitor_request(error),
+                );
+            }
+        };
+        if command_id.as_str().trim().is_empty() {
+            return monitor_remove_rejected(
+                command_id,
+                session_id,
+                current_generation,
+                haider_rpc::MonitorControlRejectionWire::InvalidRequest {
+                    field: Some("command_id".into()),
+                    detail: "command_id must not be empty".into(),
+                },
+            );
+        }
+        let request_value = json!({
+            "session_id": session_id,
+            "worker_generation": worker_generation,
+            "request": parsed,
+        });
+        let request_json = match serde_json::to_string(&request_value) {
+            Ok(json) => json,
+            Err(error) => {
+                return monitor_remove_rejected(
+                    command_id,
+                    session_id,
+                    current_generation,
+                    haider_rpc::MonitorControlRejectionWire::InvalidRequest {
+                        field: None,
+                        detail: format!("cannot encode canonical monitor request: {error}"),
+                    },
+                );
+            }
+        };
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        let operation_id = stable_digest(&[
+            session_id.as_str(),
+            command_id.as_str(),
+            "monitor-client-remove",
+        ]);
+        match hub
+            .monitor_control_receipt(
+                &command_id,
+                "monitor.remove",
+                &request_digest,
+                &request_json,
+            )
+            .await
+        {
+            Ok(Some(response)) => {
+                return match decode_client_receipt(response) {
+                    Ok(StoredMonitorClientReceiptBody::Remove { receipt }) => receipt,
+                    Ok(StoredMonitorClientReceiptBody::Register { .. }) => monitor_remove_rejected(
+                        command_id,
+                        session_id,
+                        current_generation,
+                        haider_rpc::MonitorControlRejectionWire::CommandConflict,
+                    ),
+                    Err(error) => monitor_remove_rejected(
+                        command_id,
+                        session_id,
+                        current_generation,
+                        monitor_store_rejection(error),
+                    ),
+                };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return monitor_remove_rejected(
+                    command_id,
+                    session_id,
+                    current_generation,
+                    monitor_receipt_rejection(error),
+                );
+            }
+        }
+        match hub.latest_internal_session_seq(&session_id).await {
+            Ok(0) => {
+                return monitor_remove_rejected(
+                    command_id,
+                    session_id,
+                    current_generation,
+                    haider_rpc::MonitorControlRejectionWire::SessionNotFound,
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return monitor_remove_rejected(
+                    command_id,
+                    session_id,
+                    current_generation,
+                    monitor_store_haider_rejection(error),
+                );
+            }
+        }
+        if *self.inner.shutdown.borrow() || self.is_retired(&session_id) {
+            return monitor_remove_rejected(
+                command_id,
+                session_id,
+                current_generation,
+                haider_rpc::MonitorControlRejectionWire::ServiceStopped,
+            );
+        }
+        let _mutation = self.inner.mutations.lock().await;
+        if *self.inner.shutdown.borrow() || self.is_retired(&session_id) {
+            return monitor_remove_rejected(
+                command_id,
+                session_id,
+                current_generation,
+                haider_rpc::MonitorControlRejectionWire::ServiceStopped,
+            );
+        }
+        match hub.latest_internal_session_seq(&session_id).await {
+            Ok(0) => {
+                return monitor_remove_rejected(
+                    command_id,
+                    session_id,
+                    current_generation,
+                    haider_rpc::MonitorControlRejectionWire::SessionNotFound,
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return monitor_remove_rejected(
+                    command_id,
+                    session_id,
+                    current_generation,
+                    monitor_store_haider_rejection(error),
+                );
+            }
+        }
+        if let Err(error) = self.adopt_session_locked(hub, &session_id).await {
+            return monitor_remove_rejected(
+                command_id,
+                session_id,
+                current_generation,
+                monitor_store_rejection(error),
+            );
+        }
+        match self
+            .replay_client_receipt(hub, &session_id, &operation_id, &request_digest)
+            .await
+        {
+            Ok(MonitorClientReceiptReplay::Found {
+                body: StoredMonitorClientReceiptBody::Remove { receipt },
+                accepted_seq,
+            }) => {
+                let body = StoredMonitorClientReceiptBody::Remove {
+                    receipt: receipt.clone(),
+                };
+                match hub
+                    .claim_monitor_control_receipt(
+                        &command_id,
+                        "monitor.remove",
+                        &request_digest,
+                        &request_json,
+                    )
+                    .await
+                {
+                    Ok(haider_core::MonitorControlClaim::Committed(response)) => {
+                        return match decode_client_receipt(response) {
+                            Ok(StoredMonitorClientReceiptBody::Remove { receipt }) => receipt,
+                            Ok(StoredMonitorClientReceiptBody::Register { .. }) => {
+                                monitor_remove_rejected(
+                                    command_id,
+                                    session_id,
+                                    current_generation,
+                                    haider_rpc::MonitorControlRejectionWire::CommandConflict,
+                                )
+                            }
+                            Err(error) => monitor_remove_rejected(
+                                command_id,
+                                session_id,
+                                current_generation,
+                                monitor_store_rejection(error),
+                            ),
+                        };
+                    }
+                    Ok(
+                        haider_core::MonitorControlClaim::Fresh
+                        | haider_core::MonitorControlClaim::ResumePending,
+                    ) => {}
+                    Err(error) => {
+                        return monitor_remove_rejected(
+                            command_id,
+                            session_id,
+                            current_generation,
+                            monitor_receipt_rejection(error),
+                        );
+                    }
+                }
+                return match self
+                    .finalize_client_receipt(hub, &command_id, &session_id, accepted_seq, &body)
+                    .await
+                {
+                    Ok(()) => receipt,
+                    Err(error) => monitor_remove_rejected(
+                        command_id,
+                        session_id,
+                        current_generation,
+                        monitor_store_rejection(error),
+                    ),
+                };
+            }
+            Ok(MonitorClientReceiptReplay::Found { .. } | MonitorClientReceiptReplay::Conflict) => {
+                return monitor_remove_rejected(
+                    command_id,
+                    session_id,
+                    current_generation,
+                    haider_rpc::MonitorControlRejectionWire::CommandConflict,
+                );
+            }
+            Ok(MonitorClientReceiptReplay::Missing) => {}
+            Err(error) => {
+                return monitor_remove_rejected(
+                    command_id,
+                    session_id,
+                    current_generation,
+                    monitor_store_rejection(error),
+                );
+            }
+        }
+        if worker_generation != current_generation {
+            return monitor_remove_rejected(
+                command_id,
+                session_id,
+                current_generation,
+                haider_rpc::MonitorControlRejectionWire::StaleGeneration {
+                    requested: worker_generation,
+                    current: current_generation,
+                },
+            );
+        }
+        match hub
+            .claim_monitor_control_receipt(
+                &command_id,
+                "monitor.remove",
+                &request_digest,
+                &request_json,
+            )
+            .await
+        {
+            Ok(haider_core::MonitorControlClaim::Committed(response)) => {
+                return match decode_client_receipt(response) {
+                    Ok(StoredMonitorClientReceiptBody::Remove { receipt }) => receipt,
+                    Ok(StoredMonitorClientReceiptBody::Register { .. }) => monitor_remove_rejected(
+                        command_id,
+                        session_id,
+                        current_generation,
+                        haider_rpc::MonitorControlRejectionWire::CommandConflict,
+                    ),
+                    Err(error) => monitor_remove_rejected(
+                        command_id,
+                        session_id,
+                        current_generation,
+                        monitor_store_rejection(error),
+                    ),
+                };
+            }
+            Ok(
+                haider_core::MonitorControlClaim::Fresh
+                | haider_core::MonitorControlClaim::ResumePending,
+            ) => {}
+            Err(error) => {
+                return monitor_remove_rejected(
+                    command_id,
+                    session_id,
+                    current_generation,
+                    monitor_receipt_rejection(error),
+                );
+            }
+        }
+        let MonitorRequest::Remove { monitor_id } = parsed else {
+            return monitor_remove_rejected(
+                command_id,
+                session_id,
+                current_generation,
+                haider_rpc::MonitorControlRejectionWire::InvalidRequest {
+                    field: None,
+                    detail: "canonical monitor request was not remove".into(),
+                },
+            );
+        };
+        let Some(registration) = self.inner.registry.get(&session_id, &monitor_id) else {
+            let receipt = monitor_remove_rejected(
+                command_id,
+                session_id,
+                current_generation,
+                haider_rpc::MonitorControlRejectionWire::NotFound { monitor_id },
+            );
+            let body = StoredMonitorClientReceiptBody::Remove {
+                receipt: receipt.clone(),
+            };
+            return match self
+                .persist_and_finalize_client_receipt_locked(
+                    hub,
+                    &receipt.command_id,
+                    &receipt.session_id,
+                    &operation_id,
+                    request_digest,
+                    body,
+                )
+                .await
+            {
+                Ok(()) => receipt,
+                Err(error) => monitor_remove_rejected(
+                    receipt.command_id,
+                    receipt.session_id,
+                    current_generation,
+                    monitor_store_rejection(error),
+                ),
+            };
+        };
+        let receipt = haider_rpc::MonitorRemoveReceiptWire {
+            command_id,
+            session_id: session_id.clone(),
+            worker_generation: current_generation,
+            policy: monitor_control_policy(),
+            sources: monitor_source_availability(),
+            outcome: haider_rpc::MonitorRemoveOutcomeWire::Removed {
+                monitor_id: monitor_id.clone(),
+            },
+        };
+        let removed = MonitorJournalEvent::MonitorRemoved {
+            monitor_id: monitor_id.clone(),
+            reason: MonitorRemovalReason::Removed,
+            removed_at_ms: now_ms(),
+        };
+        let receipt_body = StoredMonitorClientReceiptBody::Remove {
+            receipt: receipt.clone(),
+        };
+        let stored = MonitorJournalEvent::MonitorClientReceipt {
+            operation_id: operation_id.clone(),
+            receipt: StoredMonitorClientReceipt {
+                request_digest,
+                body: receipt_body.clone(),
+            },
+        };
+        let mut envelopes = [
+            monitor_envelope(
+                &session_id,
+                None,
+                registration.branch_id.as_ref(),
+                registration.agent_id.as_ref(),
+                &format!("monitor-client-removed-{}", &operation_id[..24]),
+                hub.device_id(),
+                current_generation,
+                match removed.to_value() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return monitor_remove_rejected(
+                            receipt.command_id,
+                            receipt.session_id,
+                            current_generation,
+                            monitor_store_rejection(error),
+                        );
+                    }
+                },
+            ),
+            monitor_envelope(
+                &session_id,
+                None,
+                registration.branch_id.as_ref(),
+                registration.agent_id.as_ref(),
+                &format!("monitor-client-receipt-{}", &operation_id[..24]),
+                hub.device_id(),
+                current_generation,
+                match stored.to_value() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return monitor_remove_rejected(
+                            receipt.command_id,
+                            receipt.session_id,
+                            current_generation,
+                            monitor_store_rejection(error),
+                        );
+                    }
+                },
+            ),
+        ];
+        if let Err(error) = hub.append(&mut envelopes).await {
+            return monitor_remove_rejected(
+                receipt.command_id,
+                receipt.session_id,
+                current_generation,
+                monitor_store_rejection(monitor_store_error(error)),
+            );
+        }
+        self.inner.registry.remove(&session_id, &monitor_id);
+        self.clear_rate(&session_id, &monitor_id);
+        self.cancel_timeout(&session_id, &monitor_id);
+        self.cancel_enqueue(&session_id, &monitor_id);
+        match self
+            .finalize_client_receipt(
+                hub,
+                &receipt.command_id,
+                &receipt.session_id,
+                envelopes[1].seq,
+                &receipt_body,
+            )
+            .await
+        {
+            Ok(()) => receipt,
+            Err(error) => monitor_remove_rejected(
+                receipt.command_id,
+                receipt.session_id,
+                current_generation,
+                monitor_store_rejection(error),
+            ),
         }
     }
 
@@ -1609,7 +2758,7 @@ impl MonitorService {
                 store
                     .append(&mut envelopes)
                     .await
-                    .map_err(|error| monitor_tool_error(MonitorError::Store(error.message)))?;
+                    .map_err(|error| monitor_tool_error(monitor_store_error(error)))?;
                 self.inner
                     .registry
                     .insert(store.session_id(), registration.clone());
@@ -1708,7 +2857,7 @@ impl MonitorService {
                 store
                     .append(&mut envelopes)
                     .await
-                    .map_err(|error| monitor_tool_error(MonitorError::Store(error.message)))?;
+                    .map_err(|error| monitor_tool_error(monitor_store_error(error)))?;
                 self.inner.registry.remove(store.session_id(), &monitor_id);
                 self.clear_rate(store.session_id(), &monitor_id);
                 self.cancel_timeout(store.session_id(), &monitor_id);
@@ -1961,7 +3110,7 @@ impl MonitorService {
         )];
         hub.append(&mut envelopes)
             .await
-            .map_err(|error| MonitorError::Store(error.message))?;
+            .map_err(monitor_store_error)?;
         self.inner.registry.insert_pending(session, pending.clone());
         drop(mutation);
         if start_delivery {
@@ -2333,7 +3482,7 @@ impl MonitorService {
         }
         hub.append(&mut envelopes)
             .await
-            .map_err(|error| MonitorError::Store(error.message))?;
+            .map_err(monitor_store_error)?;
         self.inner
             .registry
             .remove_pending(session, &pending.report.report_id);
@@ -2653,6 +3802,329 @@ impl SessionHub {
             disposition,
         })
     }
+}
+
+pub(crate) fn monitor_control_policy() -> haider_rpc::MonitorControlPolicyWire {
+    haider_rpc::MonitorControlPolicyWire {
+        list: haider_rpc::Capability::View,
+        register: haider_rpc::Capability::Control,
+        register_requires_control_attachment: true,
+        remove: haider_rpc::Capability::Control,
+        remove_requires_control_attachment: true,
+        watch: haider_rpc::Capability::View,
+    }
+}
+
+pub(crate) fn monitor_source_availability() -> Vec<haider_rpc::MonitorSourceAvailabilityWire> {
+    use haider_rpc::{
+        MonitorSourceAvailabilityStateWire as Availability, MonitorSourceAvailabilityWire as Row,
+        MonitorSourceKindWire as Source, MonitorSourceUnavailableReasonWire as Reason,
+    };
+
+    vec![
+        Row {
+            source: Source::Sms,
+            availability: Availability::Available,
+        },
+        Row {
+            source: Source::Process,
+            availability: Availability::Unavailable {
+                reason: Reason::AdapterInactive,
+            },
+        },
+        Row {
+            source: Source::File,
+            availability: Availability::Unavailable {
+                reason: Reason::AdapterInactive,
+            },
+        },
+        Row {
+            source: Source::Poll,
+            availability: Availability::Unavailable {
+                reason: Reason::AdapterInactive,
+            },
+        },
+        Row {
+            source: Source::Timer,
+            availability: Availability::Unavailable {
+                reason: Reason::AdapterInactive,
+            },
+        },
+    ]
+}
+
+pub(crate) fn monitor_list_rejected(
+    session_id: SessionId,
+    rejection: haider_rpc::MonitorControlRejectionWire,
+) -> haider_rpc::MonitorListReceiptWire {
+    haider_rpc::MonitorListReceiptWire {
+        session_id,
+        policy: monitor_control_policy(),
+        sources: monitor_source_availability(),
+        outcome: haider_rpc::MonitorListOutcomeWire::Rejected { rejection },
+    }
+}
+
+pub(crate) fn monitor_register_rejected(
+    command_id: haider_rpc::CommandId,
+    session_id: SessionId,
+    worker_generation: u64,
+    rejection: haider_rpc::MonitorControlRejectionWire,
+) -> haider_rpc::MonitorRegisterReceiptWire {
+    haider_rpc::MonitorRegisterReceiptWire {
+        command_id,
+        session_id,
+        worker_generation,
+        policy: monitor_control_policy(),
+        sources: monitor_source_availability(),
+        outcome: haider_rpc::MonitorRegisterOutcomeWire::Rejected { rejection },
+    }
+}
+
+pub(crate) fn monitor_remove_rejected(
+    command_id: haider_rpc::CommandId,
+    session_id: SessionId,
+    worker_generation: u64,
+    rejection: haider_rpc::MonitorControlRejectionWire,
+) -> haider_rpc::MonitorRemoveReceiptWire {
+    haider_rpc::MonitorRemoveReceiptWire {
+        command_id,
+        session_id,
+        worker_generation,
+        policy: monitor_control_policy(),
+        sources: monitor_source_availability(),
+        outcome: haider_rpc::MonitorRemoveOutcomeWire::Rejected { rejection },
+    }
+}
+
+pub(crate) fn monitor_watch_rejected(
+    session_id: SessionId,
+    rejection: haider_rpc::MonitorControlRejectionWire,
+) -> haider_rpc::MonitorWatchReceiptWire {
+    haider_rpc::MonitorWatchReceiptWire {
+        session_id,
+        policy: monitor_control_policy(),
+        sources: monitor_source_availability(),
+        outcome: haider_rpc::MonitorWatchOutcomeWire::Rejected { rejection },
+    }
+}
+
+fn monitor_store_rejection(error: MonitorError) -> haider_rpc::MonitorControlRejectionWire {
+    match error {
+        MonitorError::StoreUnavailable { message, retryable } => {
+            haider_rpc::MonitorControlRejectionWire::StoreUnavailable {
+                retryable,
+                detail: message,
+            }
+        }
+        other => haider_rpc::MonitorControlRejectionWire::StoreUnavailable {
+            retryable: false,
+            detail: other.to_string(),
+        },
+    }
+}
+
+fn monitor_store_haider_rejection(
+    error: haider_protocol::error::HaiderError,
+) -> haider_rpc::MonitorControlRejectionWire {
+    haider_rpc::MonitorControlRejectionWire::StoreUnavailable {
+        retryable: error.retryable,
+        detail: error.message,
+    }
+}
+
+fn monitor_receipt_rejection(
+    error: haider_protocol::error::HaiderError,
+) -> haider_rpc::MonitorControlRejectionWire {
+    if error.code == haider_protocol::error::ErrorCode::InvalidArgument {
+        haider_rpc::MonitorControlRejectionWire::CommandConflict
+    } else {
+        monitor_store_haider_rejection(error)
+    }
+}
+
+fn decode_client_receipt(
+    value: serde_json::Value,
+) -> Result<StoredMonitorClientReceiptBody, MonitorError> {
+    serde_json::from_value(value)
+        .map_err(|error| MonitorError::Store(format!("invalid global monitor receipt: {error}")))
+}
+
+fn invalid_monitor_request(error: ToolError) -> haider_rpc::MonitorControlRejectionWire {
+    let detail = match error {
+        ToolError::InvalidArgument { message } => message,
+        other => other.to_string(),
+    };
+    haider_rpc::MonitorControlRejectionWire::InvalidRequest {
+        field: None,
+        detail,
+    }
+}
+
+fn monitor_register_request_from_wire(
+    source: haider_rpc::MonitorSourceWire,
+    filter: Option<haider_rpc::MonitorFilterWire>,
+    action: haider_rpc::MonitorActionWire,
+    occurrence: haider_rpc::MonitorOccurrenceWire,
+    lifetime: haider_rpc::MonitorLifetimeWire,
+) -> ToolResult<MonitorRequest> {
+    MonitorRequest::from_tool_args(json!({
+        "operation": "register",
+        "source": source,
+        "filter": filter,
+        "action": action,
+        "occurrence": occurrence,
+        "lifetime": lifetime,
+    }))
+}
+
+fn monitor_registration_wire(
+    registration: &MonitorRegistration,
+) -> haider_rpc::MonitorRegistrationWire {
+    haider_rpc::MonitorRegistrationWire {
+        monitor_id: registration.monitor_id.clone(),
+        session_id: registration.owner_session_id.clone(),
+        branch_id: registration.branch_id.clone(),
+        agent_id: registration.agent_id.clone(),
+        source: monitor_source_wire(&registration.source),
+        filter: registration.filter.as_ref().map(monitor_filter_wire),
+        action: monitor_action_wire(&registration.action),
+        occurrence: monitor_occurrence_wire(registration.occurrence),
+        created_at_ms: registration.created_at_ms,
+        start_source_sequence: registration.start_sequence,
+        expires_at_ms: registration.expires_at_ms,
+    }
+}
+
+fn monitor_source_wire(source: &MonitorSource) -> haider_rpc::MonitorSourceWire {
+    match source {
+        MonitorSource::Sms => haider_rpc::MonitorSourceWire::Sms,
+        MonitorSource::Process { command } => haider_rpc::MonitorSourceWire::Process {
+            command: command.clone(),
+        },
+        MonitorSource::File { path } => haider_rpc::MonitorSourceWire::File { path: path.clone() },
+        MonitorSource::Poll {
+            command,
+            interval_ms,
+        } => haider_rpc::MonitorSourceWire::Poll {
+            command: command.clone(),
+            interval_ms: *interval_ms,
+        },
+        MonitorSource::Timer { interval_ms } => haider_rpc::MonitorSourceWire::Timer {
+            interval_ms: *interval_ms,
+        },
+    }
+}
+
+fn monitor_source_kind_wire(source: MonitorSourceKind) -> haider_rpc::MonitorSourceKindWire {
+    match source {
+        MonitorSourceKind::Sms => haider_rpc::MonitorSourceKindWire::Sms,
+        MonitorSourceKind::Process => haider_rpc::MonitorSourceKindWire::Process,
+        MonitorSourceKind::File => haider_rpc::MonitorSourceKindWire::File,
+        MonitorSourceKind::Poll => haider_rpc::MonitorSourceKindWire::Poll,
+        MonitorSourceKind::Timer => haider_rpc::MonitorSourceKindWire::Timer,
+    }
+}
+
+fn monitor_filter_wire(filter: &MonitorFilter) -> haider_rpc::MonitorFilterWire {
+    haider_rpc::MonitorFilterWire {
+        field: match filter.field {
+            MonitorFilterField::Address => haider_rpc::MonitorFilterFieldWire::Address,
+            MonitorFilterField::Body => haider_rpc::MonitorFilterFieldWire::Body,
+            MonitorFilterField::Payload => haider_rpc::MonitorFilterFieldWire::Payload,
+        },
+        operator: match filter.operator {
+            MonitorFilterOperator::Equals => haider_rpc::MonitorFilterOperatorWire::Equals,
+            MonitorFilterOperator::Contains => haider_rpc::MonitorFilterOperatorWire::Contains,
+            MonitorFilterOperator::StartsWith => haider_rpc::MonitorFilterOperatorWire::StartsWith,
+            MonitorFilterOperator::EndsWith => haider_rpc::MonitorFilterOperatorWire::EndsWith,
+        },
+        value: filter.value.clone(),
+        case_sensitive: filter.case_sensitive,
+    }
+}
+
+fn monitor_action_wire(action: &MonitorAction) -> haider_rpc::MonitorActionWire {
+    haider_rpc::MonitorActionWire {
+        report: action.report,
+        follow_up: action.follow_up.clone(),
+    }
+}
+
+fn monitor_occurrence_wire(occurrence: MonitorOccurrence) -> haider_rpc::MonitorOccurrenceWire {
+    match occurrence {
+        MonitorOccurrence::Once => haider_rpc::MonitorOccurrenceWire::Once,
+        MonitorOccurrence::Every => haider_rpc::MonitorOccurrenceWire::Every,
+    }
+}
+
+/// Decode one durable pending-report fact into the dedicated client delivery
+/// shape. Fork-copied facts fail the embedded owner fence and stay silent.
+pub(crate) fn monitor_delivery_report(
+    envelope: &RawEnvelope,
+) -> Option<haider_rpc::MonitorDeliveryReportWire> {
+    let MonitorJournalEvent::MonitorReportPending { pending } =
+        MonitorJournalEvent::from_value(&envelope.payload)?
+    else {
+        return None;
+    };
+    let report = pending.report;
+    if report.session_id != envelope.session_id {
+        return None;
+    }
+    let delivery_identity = stable_digest(&[
+        report.session_id.as_str(),
+        &envelope.seq.to_string(),
+        "monitor-delivery-v1",
+    ]);
+    Some(haider_rpc::MonitorDeliveryReportWire {
+        report_id: report.report_id.clone(),
+        monitor_id: report.monitor_id,
+        session_id: report.session_id,
+        branch_id: report.branch_id,
+        agent_id: report.agent_id,
+        source: monitor_source_kind_wire(report.source),
+        status: match report.status {
+            MonitorReportStatus::Matched => haider_rpc::MonitorReportStatusWire::Matched,
+            MonitorReportStatus::RateLimited => haider_rpc::MonitorReportStatusWire::RateLimited,
+            MonitorReportStatus::TimedOut => haider_rpc::MonitorReportStatusWire::TimedOut,
+        },
+        events: report
+            .events
+            .into_iter()
+            .map(|event| haider_rpc::MonitorEventWire {
+                sequence: event.sequence,
+                observed_at_ms: event.observed_at_ms,
+                payload: match event.payload {
+                    MonitorEventPayload::Sms(sms) => haider_rpc::MonitorEventPayloadWire::Sms {
+                        address: sms.address,
+                        body: sms.body,
+                        received_at_ms: sms.received_at_ms,
+                    },
+                    MonitorEventPayload::Process { line } => {
+                        haider_rpc::MonitorEventPayloadWire::Process { line }
+                    }
+                    MonitorEventPayload::File { payload } => {
+                        haider_rpc::MonitorEventPayloadWire::File { payload }
+                    }
+                    MonitorEventPayload::Poll { payload } => {
+                        haider_rpc::MonitorEventPayloadWire::Poll { payload }
+                    }
+                    MonitorEventPayload::Timer { fired_at_ms } => {
+                        haider_rpc::MonitorEventPayloadWire::Timer { fired_at_ms }
+                    }
+                },
+            })
+            .collect(),
+        coalesced_count: u64::try_from(report.coalesced_count).unwrap_or(u64::MAX),
+        omitted_count: u64::try_from(report.omitted_count).unwrap_or(u64::MAX),
+        action: monitor_action_wire(&report.action),
+        cursor: envelope.seq,
+        dedupe: haider_rpc::MonitorDeliveryDedupeWire {
+            delivery_key: format!("monitor-delivery-{}", &delivery_identity[..24]),
+            report_key: report.report_id,
+        },
+    })
 }
 
 fn monitor_matches(registration: &MonitorRegistration, event: &MonitorEvent) -> bool {
@@ -3111,6 +4583,128 @@ mod tests {
         assert!(report.prompt_text().contains("monitor_event"));
     }
 
+    #[test]
+    fn client_availability_is_exhaustive_and_does_not_invent_adapters() {
+        use haider_rpc::{
+            MonitorSourceAvailabilityStateWire as Availability, MonitorSourceKindWire as Source,
+            MonitorSourceUnavailableReasonWire as Reason,
+        };
+
+        assert_eq!(
+            monitor_source_availability(),
+            vec![
+                haider_rpc::MonitorSourceAvailabilityWire {
+                    source: Source::Sms,
+                    availability: Availability::Available,
+                },
+                haider_rpc::MonitorSourceAvailabilityWire {
+                    source: Source::Process,
+                    availability: Availability::Unavailable {
+                        reason: Reason::AdapterInactive,
+                    },
+                },
+                haider_rpc::MonitorSourceAvailabilityWire {
+                    source: Source::File,
+                    availability: Availability::Unavailable {
+                        reason: Reason::AdapterInactive,
+                    },
+                },
+                haider_rpc::MonitorSourceAvailabilityWire {
+                    source: Source::Poll,
+                    availability: Availability::Unavailable {
+                        reason: Reason::AdapterInactive,
+                    },
+                },
+                haider_rpc::MonitorSourceAvailabilityWire {
+                    source: Source::Timer,
+                    availability: Availability::Unavailable {
+                        reason: Reason::AdapterInactive,
+                    },
+                },
+            ]
+        );
+        assert_eq!(monitor_control_policy().list, haider_rpc::Capability::View);
+        assert_eq!(monitor_control_policy().watch, haider_rpc::Capability::View);
+        assert_eq!(
+            monitor_control_policy().register,
+            haider_rpc::Capability::Control
+        );
+        assert!(monitor_control_policy().register_requires_control_attachment);
+        assert_eq!(
+            monitor_control_policy().remove,
+            haider_rpc::Capability::Control
+        );
+        assert!(monitor_control_policy().remove_requires_control_attachment);
+
+        assert!(matches!(
+            monitor_store_rejection(MonitorError::StoreUnavailable {
+                message: "transient".into(),
+                retryable: true,
+            }),
+            haider_rpc::MonitorControlRejectionWire::StoreUnavailable {
+                retryable: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            monitor_store_rejection(MonitorError::Store("invalid receipt shape".into())),
+            haider_rpc::MonitorControlRejectionWire::StoreUnavailable {
+                retryable: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn client_delivery_projects_durable_report_with_cursor_and_dedupe() {
+        let session = SessionId::new("session-delivery-projection");
+        let mut report = test_report(
+            "report-projection",
+            "bounded body",
+            MonitorReportStatus::Matched,
+        );
+        report.session_id = session.clone();
+        report.coalesced_count = 5;
+        report.omitted_count = 4;
+        let pending = PendingMonitorReport {
+            report,
+            terminal_reason: None,
+            queue_order: 11,
+            queued_at_ms: 17,
+        };
+        let mut envelope = monitor_envelope(
+            &session,
+            None,
+            None,
+            None,
+            "monitor-report-projection",
+            DeviceId::new("monitor-report-device"),
+            9,
+            MonitorJournalEvent::MonitorReportPending { pending }
+                .to_value()
+                .expect("encode monitor report"),
+        );
+        envelope.seq = 41;
+
+        let delivery = monitor_delivery_report(&envelope).expect("monitor delivery projection");
+        assert_eq!(delivery.report_id, "report-projection");
+        assert_eq!(delivery.session_id, session);
+        assert_eq!(delivery.cursor, 41);
+        assert_eq!(delivery.coalesced_count, 5);
+        assert_eq!(delivery.omitted_count, 4);
+        assert_eq!(delivery.events.len(), 1);
+        assert_eq!(delivery.dedupe.report_key, "report-projection");
+        assert!(
+            delivery
+                .dedupe
+                .delivery_key
+                .starts_with("monitor-delivery-")
+        );
+
+        envelope.session_id = SessionId::new("fork-copy");
+        assert!(monitor_delivery_report(&envelope).is_none());
+    }
+
     struct MonitorWorld {
         store: SqliteStoreHandle,
         hub: SessionHub,
@@ -3431,6 +5025,120 @@ mod tests {
         assert_eq!(replayed_remove, removed);
         let empty = world.execute("empty", MonitorRequest::List).await;
         assert!(empty.preview.contains(r#""count":0"#));
+    }
+
+    /// MUTATION CHECK: scope a command receipt to one session/method or skip
+    /// the session-local recovery receipt. Expected runtime failure: replay
+    /// diverges or the cross-method reuse stops returning CommandConflict.
+    #[tokio::test]
+    async fn client_control_reuses_registry_and_replays_typed_receipts() {
+        let world = MonitorWorld::new("client-control").await;
+        let generation = world.hub.worker_generation();
+        let request = MonitorClientRegistrationRequest {
+            command_id: haider_rpc::CommandId::new("monitor-client-register"),
+            session_id: world.session.clone(),
+            worker_generation: generation,
+            source: haider_rpc::MonitorSourceWire::Sms,
+            filter: None,
+            action: haider_rpc::MonitorActionWire {
+                report: true,
+                follow_up: Some("react to this SMS".into()),
+            },
+            occurrence: haider_rpc::MonitorOccurrenceWire::Every,
+            lifetime: haider_rpc::MonitorLifetimeWire::Session,
+        };
+        let receipt = world
+            .hub
+            .inner_monitor()
+            .client_register(&world.hub, request.clone())
+            .await;
+        let monitor_id = match &receipt.outcome {
+            haider_rpc::MonitorRegisterOutcomeWire::Registered { monitor } => {
+                monitor.monitor_id.clone()
+            }
+            other => panic!("expected registered receipt, got {other:?}"),
+        };
+        let replay = world
+            .hub
+            .inner_monitor()
+            .client_register(&world.hub, request.clone())
+            .await;
+        assert_eq!(replay, receipt);
+
+        let mut cross_session_request = request;
+        cross_session_request.session_id = SessionId::new("monitor-session-other");
+        let cross_session = world
+            .hub
+            .inner_monitor()
+            .client_register(&world.hub, cross_session_request)
+            .await;
+        assert!(matches!(
+            cross_session.outcome,
+            haider_rpc::MonitorRegisterOutcomeWire::Rejected {
+                rejection: haider_rpc::MonitorControlRejectionWire::CommandConflict
+            }
+        ));
+
+        let cross_method = world
+            .hub
+            .inner_monitor()
+            .client_remove(
+                &world.hub,
+                haider_rpc::CommandId::new("monitor-client-register"),
+                world.session.clone(),
+                generation,
+                monitor_id.clone(),
+            )
+            .await;
+        assert!(matches!(
+            cross_method.outcome,
+            haider_rpc::MonitorRemoveOutcomeWire::Rejected {
+                rejection: haider_rpc::MonitorControlRejectionWire::CommandConflict
+            }
+        ));
+
+        let listed = world
+            .hub
+            .inner_monitor()
+            .client_list(&world.hub, world.session.clone())
+            .await;
+        match listed.outcome {
+            haider_rpc::MonitorListOutcomeWire::Listed { monitors } => {
+                assert_eq!(monitors.len(), 1);
+                assert_eq!(monitors[0].monitor_id, monitor_id);
+            }
+            other => panic!("expected monitor list, got {other:?}"),
+        }
+
+        let removed = world
+            .hub
+            .inner_monitor()
+            .client_remove(
+                &world.hub,
+                haider_rpc::CommandId::new("monitor-client-remove"),
+                world.session.clone(),
+                generation,
+                monitor_id.clone(),
+            )
+            .await;
+        assert_eq!(
+            removed.outcome,
+            haider_rpc::MonitorRemoveOutcomeWire::Removed {
+                monitor_id: monitor_id.clone(),
+            }
+        );
+        let replayed_remove = world
+            .hub
+            .inner_monitor()
+            .client_remove(
+                &world.hub,
+                haider_rpc::CommandId::new("monitor-client-remove"),
+                world.session.clone(),
+                generation,
+                monitor_id,
+            )
+            .await;
+        assert_eq!(replayed_remove, removed);
     }
 
     #[tokio::test]
