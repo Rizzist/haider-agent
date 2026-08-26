@@ -501,6 +501,8 @@ async fn daemon_compactor_replays_exact_lane_prefix_with_cache_boundary() {
         context_window: None,
         reserved_output_tokens: 4096,
         post_compaction_system_prompt: lane_system_prompt.clone(),
+        post_compaction_volatile_tail: None,
+        post_compaction_grant_scope: "cu1-image-grant".into(),
         post_compaction_tools: lane_tools.clone(),
         reasoning_settings: "lane-reasoning".into(),
         cache_expected_later_reads: 2,
@@ -626,6 +628,8 @@ async fn daemon_compactor_falls_back_once_to_text_only_after_replay_rejection() 
         context_window: None,
         reserved_output_tokens: 4096,
         post_compaction_system_prompt: lane_system_prompt.clone(),
+        post_compaction_volatile_tail: None,
+        post_compaction_grant_scope: "cu1-fallback-grant".into(),
         post_compaction_tools: lane_tools.clone(),
         reasoning_settings: "lane-reasoning".into(),
         cache_expected_later_reads: 2,
@@ -678,7 +682,13 @@ async fn daemon_compactor_falls_back_once_to_text_only_after_replay_rejection() 
 
     // Mutation pin: deleting this one-shot fallback turns a provider's
     // multimodal replay rejection into a failed compaction.
-    assert_eq!(requests[1].system_prompt, None);
+    assert_eq!(
+        requests[1].system_prompt,
+        Some(super::SystemPromptBuilder::shared_immutable_base(
+            &[],
+            "cu1-fallback-grant"
+        ))
+    );
     assert!(requests[1].tools.is_empty());
     assert!(requests[1].cache_metadata.is_none());
     assert_eq!(requests[1].messages.len(), covered_messages.len() + 1);

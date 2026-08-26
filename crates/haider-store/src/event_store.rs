@@ -23,6 +23,7 @@ use crate::usage_ledger::{
 use crate::{Cas, StoreResult, now_ms, store_error, to_sqlite_integer, validate_image_block};
 use haider_protocol::agent::{AgentManifest, ChildReport, ReportVerification};
 use haider_protocol::branch::{BranchCreated, BranchDescriptor};
+use haider_protocol::cache::ProviderViewLedgerV1;
 use haider_protocol::credential::CredentialDescriptor;
 use haider_protocol::effect::{
     AuthorizationVerdict, EffectClass, EffectOutcome, EffectPhase, WorkspaceMutation,
@@ -15853,18 +15854,21 @@ fn validate_metafork_commit(
 /// Content address for the complete exact provider view used to justify a
 /// fork cache-prefix inheritance decision.
 pub fn fork_provider_view_prefix_digest(provider_view: &serde_json::Value) -> StoreResult<String> {
-    let bytes = serde_json::to_vec(provider_view).map_err(|error| {
+    let ledger =
+        serde_json::from_value::<ProviderViewLedgerV1>(provider_view.clone()).map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot decode fork provider-view ledger: {error}"),
+                false,
+            )
+        })?;
+    ledger.prefix_digest().map_err(|error| {
         store_error(
             ErrorCode::InvalidArgument,
-            format!("cannot serialize fork provider view: {error}"),
+            format!("cannot digest fork provider-view ledger: {error}"),
             false,
         )
-    })?;
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"haider.session-fork.provider-prefix.v1\0");
-    hasher.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
-    hasher.update(&bytes);
-    Ok(hasher.finalize().to_hex().to_string())
+    })
 }
 
 struct SourceForkCacheBoundary {

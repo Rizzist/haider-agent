@@ -68,6 +68,20 @@ pub struct ProviderViewLedgerV1 {
     pub history_blocks: Vec<Vec<u8>>,
 }
 
+impl ProviderViewLedgerV1 {
+    /// Domain-separated content address of this complete exact provider view.
+    /// Fork inheritance persists this digest so the ledger remains the one
+    /// authority for both byte comparison and inherited-segment identity.
+    pub fn prefix_digest(&self) -> Result<String, serde_json::Error> {
+        let bytes = serde_json::to_vec(self)?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"haider.session-fork.provider-prefix.v1\0");
+        hasher.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(&bytes);
+        Ok(hasher.finalize().to_hex().to_string())
+    }
+}
+
 /// Dispatch-time wrapper which orders exact views alongside request usage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderViewAttemptV1 {

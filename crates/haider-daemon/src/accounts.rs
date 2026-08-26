@@ -6282,6 +6282,7 @@ impl Default for ProductionAccountBuilder {
 
 impl ProductionAccountBuilder {
     #[cfg(test)]
+    #[allow(clippy::expect_used)]
     fn with_cache_capacity(capacity: usize) -> Self {
         Self {
             adapters: StdMutex::new(AccountProviderAdapterCache::new(capacity)),
@@ -6289,6 +6290,7 @@ impl ProductionAccountBuilder {
     }
 
     #[cfg(test)]
+    #[allow(clippy::expect_used)]
     fn cached_adapter_count(&self) -> Result<usize, HaiderError> {
         self.adapters
             .lock()

@@ -17,7 +17,7 @@ use haider_protocol::retry::RunRetryEventPayload;
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState, WaitReason};
 use haider_protocol::{EventPayload, provider::FinishReason};
-use haider_provider::{FakeProvider, FakeStep, Message, ProviderErrorKind};
+use haider_provider::{Block, FakeProvider, FakeStep, Message, ProviderErrorKind};
 use haider_rpc::{
     AttachMode, Capability, CommandId, RequestBody, RequestId, ResponseBody, SubmitDisposition,
     WireFrame,
@@ -68,6 +68,22 @@ struct RetryWorld {
     session_id: SessionId,
     failed_run_id: RunId,
     user_seq: u64,
+}
+
+fn assert_retry_provider_messages(messages: &[Message]) {
+    assert_eq!(
+        messages.first(),
+        Some(&Message::user_text("retry this exact user turn")),
+        "the fresh run compiles the failed run's committed user ancestry"
+    );
+    assert_eq!(
+        messages.len(),
+        2,
+        "the immutable user ancestry is followed only by daemon session context"
+    );
+    assert!(messages[1].blocks.iter().any(|block| {
+        matches!(block, Block::Text { text } if text.starts_with("[DAEMON-BOUND SESSION CONTEXT]"))
+    }));
 }
 
 impl RetryWorld {
@@ -463,11 +479,7 @@ async fn run_retry_terminal_failure_starts_one_fresh_run_on_the_same_user_turn()
     );
     let requests = fake.requests();
     assert_eq!(requests.len(), 1, "exactly one fresh provider run starts");
-    assert_eq!(
-        requests[0].messages,
-        vec![Message::user_text("retry this exact user turn")],
-        "the fresh run compiles the failed run's committed user ancestry"
-    );
+    assert_retry_provider_messages(&requests[0].messages);
     let stale_failure_retry = request(
         &connection,
         &sink,
@@ -576,9 +588,9 @@ async fn run_retry_of_failed_retry_reuses_the_original_user_turn() {
     );
     let requests = fake.requests();
     assert_eq!(requests.len(), 2, "each manual retry starts once");
-    assert!(requests.iter().all(|request| {
-        request.messages == vec![Message::user_text("retry this exact user turn")]
-    }));
+    requests
+        .iter()
+        .for_each(|request| assert_retry_provider_messages(&request.messages));
     drop(connection);
     world.shutdown().await;
 }
@@ -688,10 +700,7 @@ async fn run_retry_lost_handoff_recovers_once_after_restart() {
     wait_for_store_state(&restarted_store, &session_id, &accepted_run, RunState::Done).await;
     let requests = fake.requests();
     assert_eq!(requests.len(), 1, "recovery starts the retry exactly once");
-    assert_eq!(
-        requests[0].messages,
-        vec![Message::user_text("retry this exact user turn")]
-    );
+    assert_retry_provider_messages(&requests[0].messages);
     restarted_manager
         .shutdown()
         .await

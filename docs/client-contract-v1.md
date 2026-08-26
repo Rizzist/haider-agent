@@ -2115,6 +2115,32 @@ Existing fields do not change meaning. A frozen enum does not grow. A required
 field or incompatible meaning requires a new type/field or a wire-version
 change. Months-old session payloads remain raw-decodable.
 
+### 15.2 v0.0.962 internal integration lanes
+
+The twelve integration lanes below do not add a client request method or a
+Welcome feature token. The exact totals therefore remain 86 request methods
+and 85 feature tokens, and the existing wire frames remain byte-identical.
+Clients MUST NOT infer new callable surfaces from these implementation facts:
+
+| Lane | Client-contract effect |
+|---|---|
+| cachemaxxing | Provider-view ledgers, breakpoint placement, cache lifecycle, header epochs, and economic cache accounting refine the existing published cache metrics. They add no RPC method; clients still read the authorities in §1.1 and §9.1. |
+| C1 | A provider-only graph/Loom/inventory snapshot is frozen once per turn and placed in that turn's immutable provider prefix. It is not journaled or exposed as a client field. |
+| C2 | Prompt-cache routing uses an account/model/provider-view-header cohort shared by trusted sibling sessions. The opaque provider key is not a session identity or client surface. |
+| C3 | A byte-identical fork may inherit the parent provider-view segment. Its durable internal fork record binds the decision to the exact ledger digest; no new `session.fork` request or response field is promised here. |
+| C4 | Pure filesystem reads and validated web responses may be served from bounded, freshness-checked process-local memos. Tool results retain their existing wire and journal shapes. |
+| S1 | Launch-race and terminal-theme probe latency changed; discovery, framing, and launcher ownership rules in §§2–3 did not. |
+| S2 | Exact-config provider adapters retain bounded shared HTTP connection pools. Cache warm/keepalive work uses the same retained adapter/client. |
+| S4 + S6 | Adjacent actor facts form one logical append and already-queued logical appends may share one outer journal transaction. Envelope order, per-session sequence allocation, persist-before-publish, and method-specific receipt atomicity are unchanged. |
+| M1 | Headless commands select a lean Tokio runtime without changing their request, response, or exit semantics. |
+| M3 | Completed background-task live buffers are released after CAS publication; cursor pages read the same bytes and offsets through the durable artifact. |
+| T1 | Daemon tests moved to sibling test modules. Production symbols and wire bytes did not change. |
+
+These lanes are deliberately absent from the feature-token table: performance,
+storage, cache-routing, and test-layout changes are not negotiable client
+capabilities. Any future client-visible field or method requires its own
+additive contract entry and golden frame.
+
 ## 16. Known absences and limits of this revision
 
 These are not guesses; they are explicit gaps in the current source contract.

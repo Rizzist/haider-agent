@@ -703,6 +703,7 @@ async fn repeated_max_tokens_is_bounded_independently() {
 #[derive(Debug, Default)]
 struct FakeContextCompactor {
     calls: AtomicUsize,
+    expected_covered: Option<Vec<Message>>,
 }
 
 #[async_trait]
@@ -729,7 +730,13 @@ impl ContextCompactor for FakeContextCompactor {
         _latest_compaction_summary_end: Option<usize>,
     ) -> Result<Message, HaiderError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(covered_messages, [Message::user_text("old history")]);
+        let default_expected = [Message::user_text("old history")];
+        assert_eq!(
+            covered_messages.as_slice(),
+            self.expected_covered
+                .as_deref()
+                .unwrap_or(&default_expected)
+        );
         Ok(Message::user_text("compacted history"))
     }
 }
@@ -1459,7 +1466,13 @@ async fn footprint_is_exact_only_for_request_local_provider_usage() {
 /// the retry lacks the summary, or the double-overflow case makes >2 calls.
 #[tokio::test]
 async fn context_overflow_forces_one_compaction_and_only_one_retry() {
-    let compactor = Arc::new(FakeContextCompactor::default());
+    let compactor = Arc::new(FakeContextCompactor {
+        expected_covered: Some(vec![
+            Message::user_text("old history one"),
+            Message::user_text("old history two"),
+        ]),
+        ..FakeContextCompactor::default()
+    });
     let success_provider = Arc::new(FakeProvider::new(vec![
         FakeStep::Error {
             kind: ProviderErrorKind::ContextExceeded,
@@ -1473,6 +1486,7 @@ async fn context_overflow_forces_one_compaction_and_only_one_retry() {
     let success_store = Arc::new(MemoryStore::new());
     let mut success_config = config();
     success_config.context_compactor = Some(compactor.clone());
+    success_config.volatile_user_tail = Some("volatile snapshot".into());
     let success = HarnessActor::spawn(
         success_config,
         success_provider.clone(),
@@ -1482,7 +1496,8 @@ async fn context_overflow_forces_one_compaction_and_only_one_retry() {
         .submit_committed_turn(SubmitCommittedTurn {
             run_id: RunId::new("forced-success"),
             messages: vec![
-                Message::user_text("old history"),
+                Message::user_text("old history one"),
+                Message::user_text("old history two"),
                 Message::user_text("current"),
             ],
         })
@@ -1492,12 +1507,30 @@ async fn context_overflow_forces_one_compaction_and_only_one_retry() {
         .await
         .expect("forced-compaction outcome");
     assert_eq!(outcome.state, RunState::Done);
-    assert_eq!(success_provider.requests().len(), 2);
+    let success_requests = success_provider.requests();
+    assert_eq!(success_requests.len(), 2);
     assert_eq!(compactor.calls.load(Ordering::Relaxed), 1);
-    assert!(
-        success_provider.requests()[1]
-            .messages
-            .contains(&Message::user_text("compacted history"))
+    assert_eq!(
+        success_requests[1].messages,
+        vec![
+            Message::user_text("compacted history"),
+            Message::user_text("volatile snapshot"),
+            Message::user_text("current"),
+        ],
+        "reactive compaction rebases the frozen snapshot before the current user"
+    );
+    let compacted_metadata = success_requests[1]
+        .cache_metadata
+        .as_ref()
+        .expect("compacted request metadata");
+    assert_eq!(
+        (
+            compacted_metadata.stable_history_end,
+            compacted_metadata.current_user_start,
+            compacted_metadata.latest_compaction_summary_end,
+        ),
+        (2, 2, Some(1)),
+        "reactive compaction rebases every request-local cache boundary"
     );
     assert!(
         success_store

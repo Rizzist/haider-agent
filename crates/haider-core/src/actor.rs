@@ -208,9 +208,11 @@ pub struct HarnessConfig {
     pub compaction_guard_v1: bool,
     /// Deterministic daemon-owned policy bound to every request in this actor.
     pub system_prompt: Option<String>,
-    /// Ephemeral daemon-authored user-role context appended after compiler
-    /// cache boundaries are frozen. It is never journaled or hashed into the
-    /// stable prefix. Convergence Graph M1 uses this for `GraphBrief`.
+    /// Ephemeral daemon-authored user-role context snapshotted once per turn
+    /// and inserted immediately before the accepted current-user message. It
+    /// is never journaled or hashed into the durable stable prefix. The
+    /// snapshot is intentionally byte-stable through every same-turn tool
+    /// continuation; Convergence Graph M1 uses this for `GraphBrief`.
     pub volatile_user_tail: Option<String>,
     /// General tools the paired dispatcher can execute.
     pub tools: Vec<ToolDefinition>,
@@ -817,10 +819,12 @@ pub trait ToolDispatcher: Send + Sync {
         cancel: &CancelToken,
     ) -> Result<ToolDispatchResult, HaiderError>;
 
-    /// Returns a freshly reduced provider-only context tail. `None` means
-    /// this dispatcher does not manage volatile context; `Some("")` clears a
-    /// previously supplied tail. Daemon dispatchers use this to refresh a
-    /// GraphBrief before every provider continuation after gate evidence.
+    /// Returns the provider-only context snapshot for a new turn. `None`
+    /// means this dispatcher does not manage volatile context; `Some("")`
+    /// clears a previously supplied snapshot. The actor calls this exactly
+    /// once at turn start and freezes the result through all provider/tool
+    /// continuations. State changed during the turn is therefore visible no
+    /// later than the next turn boundary.
     async fn refresh_volatile_context_tail(&self) -> Result<Option<String>, HaiderError> {
         Ok(None)
     }
@@ -1931,9 +1935,10 @@ impl HarnessActor {
             .cache_compaction_summary_end
             .filter(|boundary| *boundary <= stable_history_end);
         // Provider-only context remains separate from the reconstructed
-        // conversation. It is appended to each request only after cache
-        // boundaries and context policy have been computed, then refreshed
-        // through the dispatcher before a same-turn continuation.
+        // conversation. It is frozen once for this turn, then inserted before
+        // the accepted current-user message in every request projection. This
+        // makes same-turn tool continuations append-only at the provider while
+        // keeping the snapshot out of durable prompt history.
         let mut volatile_user_tail = self.config.volatile_user_tail.take();
 
         let mut message: Option<TextAccumulator> = None;
@@ -2173,6 +2178,36 @@ impl HarnessActor {
         let mut pending_previous_cache_request: Option<PreviousCacheRequest> = None;
         let mut previous_cache_request_sent_at: Option<tokio::time::Instant> = None;
         let mut cache_rewarm_pending = self.config.cache_initial_rewarm;
+        if let Some(dispatcher) = self.dispatcher.as_ref() {
+            match dispatcher.refresh_volatile_context_tail().await {
+                Ok(Some(tail)) => volatile_user_tail = (!tail.is_empty()).then_some(tail),
+                Ok(None) => {}
+                Err(error) => {
+                    if let Err(state_error) = self
+                        .commit_pending_thinking(&run_id, &mut thinking_pending)
+                        .await
+                    {
+                        return self.errored_state_outcome(&run_id, state_error).await;
+                    }
+                    return self
+                        .errored_outcome_with_items(
+                            &run_id,
+                            &mut message,
+                            &mut reasoning,
+                            &mut tools,
+                            error,
+                        )
+                        .await;
+                }
+            }
+        }
+        // A snapshot is an immutable provider-prefix block for this turn, but
+        // it is refreshed at the next accepted-turn boundary. Include the run
+        // identity so even byte-identical refreshes declare a new exact-view
+        // epoch instead of pretending to continue the preceding turn.
+        let volatile_context_epoch = volatile_user_tail
+            .as_ref()
+            .map(|tail| digest_json(&(run_id.clone(), tail)));
         // W-B: provider-executed tool rows and cited web sources are
         // TURN-scoped — a pause_turn boundary can split a server call from
         // its result across requests, and the bounded sources list journals
@@ -2185,29 +2220,6 @@ impl HarnessActor {
             let previous_cache_request_completed = pending_previous_cache_request.is_some();
             if let Some(completed) = pending_previous_cache_request.take() {
                 previous_cache_request = Some(completed);
-            }
-            if let Some(dispatcher) = self.dispatcher.as_ref() {
-                match dispatcher.refresh_volatile_context_tail().await {
-                    Ok(Some(tail)) => volatile_user_tail = (!tail.is_empty()).then_some(tail),
-                    Ok(None) => {}
-                    Err(error) => {
-                        if let Err(state_error) = self
-                            .commit_pending_thinking(&run_id, &mut thinking_pending)
-                            .await
-                        {
-                            return self.errored_state_outcome(&run_id, state_error).await;
-                        }
-                        return self
-                            .errored_outcome_with_items(
-                                &run_id,
-                                &mut message,
-                                &mut reasoning,
-                                &mut tools,
-                                error,
-                            )
-                            .await;
-                    }
-                }
             }
             let newest_volatile_history_start = messages.len();
             messages.extend(
@@ -2254,9 +2266,12 @@ impl HarnessActor {
                 // Compaction replaces the covered prefix with exactly one
                 // immutable summary message; the current-turn suffix stays
                 // verbatim after it.
-                stable_history_end = usize::from(!messages.is_empty());
-                current_turn_start = stable_history_end;
-                latest_compaction_summary_end = Some(stable_history_end);
+                Self::reset_cache_boundaries_after_compaction(
+                    &messages,
+                    &mut stable_history_end,
+                    &mut current_turn_start,
+                    &mut latest_compaction_summary_end,
+                );
                 cache_rewarm_pending = Some(CacheRewarmReasonV1::PlannedCompaction);
             }
             if provider_attempt == 0 {
@@ -2305,17 +2320,34 @@ impl HarnessActor {
                         .as_ref()
                         .map(|previous| previous.history_message_count)
                 });
+            let mut request_messages = messages.clone();
+            let snapshot_insert_at = current_turn_start.min(request_messages.len());
+            let mut request_stable_history_end = stable_history_end.min(request_messages.len());
+            let mut request_cacheable_history_end =
+                cacheable_history_end.min(request_messages.len());
+            let mut request_current_user_start = snapshot_insert_at;
+            if let Some(tail) = &volatile_user_tail {
+                request_messages.insert(snapshot_insert_at, Message::user_text(tail.clone()));
+                let snapshot_end = snapshot_insert_at.saturating_add(1);
+                // The frozen snapshot is stable inside this turn. A later
+                // provider/tool-loop boundary is expressed in durable-message
+                // coordinates, so shift it past the inserted request block.
+                request_stable_history_end = request_stable_history_end.max(snapshot_end);
+                request_cacheable_history_end =
+                    if request_cacheable_history_end > snapshot_insert_at {
+                        request_cacheable_history_end.saturating_add(1)
+                    } else {
+                        snapshot_end
+                    };
+                request_current_user_start = snapshot_end;
+            }
             let mut prefix_digests = usage_prefix_digests(
                 &self.config,
-                &messages[..cacheable_history_end.min(messages.len())],
+                &request_messages[..request_cacheable_history_end.min(request_messages.len())],
             );
             let mut previous_prefix_digests = previous_stable_history_end
-                .filter(|previous| *previous <= messages.len())
-                .map(|previous| usage_prefix_digests(&self.config, &messages[..previous]));
-            let mut request_messages = messages.clone();
-            if let Some(tail) = &volatile_user_tail {
-                request_messages.push(Message::user_text(tail.clone()));
-            }
+                .filter(|previous| *previous <= request_messages.len())
+                .map(|previous| usage_prefix_digests(&self.config, &request_messages[..previous]));
             let request_attachments =
                 match self.resolve_tool_result_images(&mut request_messages).await {
                     Ok(attachments) => attachments,
@@ -2351,16 +2383,17 @@ impl HarnessActor {
             }
             let mut cache_metadata = prompt_cache_metadata(
                 &self.config,
-                &messages,
+                &request_messages,
                 PromptCacheBoundaries {
-                    stable_history_end,
-                    cacheable_history_end,
-                    current_user_start: current_turn_start,
+                    stable_history_end: request_stable_history_end,
+                    cacheable_history_end: request_cacheable_history_end,
+                    current_user_start: request_current_user_start,
                     previous_stable_history_end,
                     latest_compaction_summary_end,
                 },
                 prefix_digests.clone(),
                 usage_account.as_ref(),
+                volatile_context_epoch.as_deref(),
             );
             let mut provider_request = TurnRequest {
                 messages: request_messages,
@@ -2384,16 +2417,17 @@ impl HarnessActor {
                     });
                 cache_metadata = prompt_cache_metadata(
                     &self.config,
-                    &messages,
+                    &provider_request.messages,
                     PromptCacheBoundaries {
-                        stable_history_end,
-                        cacheable_history_end,
-                        current_user_start: current_turn_start,
+                        stable_history_end: request_stable_history_end,
+                        cacheable_history_end: request_cacheable_history_end,
+                        current_user_start: request_current_user_start,
                         previous_stable_history_end,
                         latest_compaction_summary_end,
                     },
                     prefix_digests.clone(),
                     usage_account.as_ref(),
+                    volatile_context_epoch.as_deref(),
                 );
                 provider_request.cache_metadata = Some(cache_metadata.clone());
             }
@@ -2465,7 +2499,7 @@ impl HarnessActor {
                 &prefix_digests,
                 previous_prefix_digests.as_ref(),
                 previous_cache_request.as_ref(),
-                cacheable_history_end,
+                request_cacheable_history_end,
                 cache_metadata.stable_prefix_tokens,
                 cache_metadata.reuse_gap_ms,
                 cache_control,
@@ -2580,8 +2614,9 @@ impl HarnessActor {
                             self.force_context_compaction(
                                 &run_id,
                                 &mut messages,
-                                current_turn_start,
-                                latest_compaction_summary_end,
+                                &mut stable_history_end,
+                                &mut current_turn_start,
+                                &mut latest_compaction_summary_end,
                                 &mut forced_compaction_used,
                             )
                             .await
@@ -2755,8 +2790,9 @@ impl HarnessActor {
                             self.force_context_compaction(
                                 &run_id,
                                 &mut messages,
-                                current_turn_start,
-                                latest_compaction_summary_end,
+                                &mut stable_history_end,
+                                &mut current_turn_start,
+                                &mut latest_compaction_summary_end,
                                 &mut forced_compaction_used,
                             )
                             .await
@@ -3284,7 +3320,7 @@ impl HarnessActor {
                             cache: Some(cache_diagnostic.clone()),
                         });
                         pending_previous_cache_request = Some(PreviousCacheRequest {
-                            history_message_count: cacheable_history_end,
+                            history_message_count: request_cacheable_history_end,
                             breakpoint_hashes: cache_diagnostic.breakpoint_hashes,
                             cache_domain_hash: cache_diagnostic.cache_domain_hash,
                         });
@@ -4189,12 +4225,25 @@ impl HarnessActor {
         .map_err(DriveError::Store)
     }
 
+    fn reset_cache_boundaries_after_compaction(
+        messages: &[Message],
+        stable_history_end: &mut usize,
+        current_turn_start: &mut usize,
+        latest_compaction_summary_end: &mut Option<usize>,
+    ) {
+        let summary_end = usize::from(!messages.is_empty());
+        *stable_history_end = summary_end;
+        *current_turn_start = summary_end;
+        *latest_compaction_summary_end = Some(summary_end);
+    }
+
     async fn force_context_compaction(
         &mut self,
         run_id: &RunId,
         messages: &mut Vec<Message>,
-        current_turn_start: usize,
-        latest_compaction_summary_end: Option<usize>,
+        stable_history_end: &mut usize,
+        current_turn_start: &mut usize,
+        latest_compaction_summary_end: &mut Option<usize>,
         forced_compaction_used: &mut bool,
     ) -> Result<(), DriveError> {
         if *forced_compaction_used {
@@ -4203,10 +4252,16 @@ impl HarnessActor {
         self.perform_context_compaction(
             run_id,
             messages,
-            current_turn_start,
-            latest_compaction_summary_end,
+            *current_turn_start,
+            *latest_compaction_summary_end,
         )
         .await?;
+        Self::reset_cache_boundaries_after_compaction(
+            messages,
+            stable_history_end,
+            current_turn_start,
+            latest_compaction_summary_end,
+        );
         *forced_compaction_used = true;
         Ok(())
     }
@@ -8358,6 +8413,7 @@ fn prompt_cache_metadata(
     boundaries: PromptCacheBoundaries,
     prefix_digests: PrefixDigests,
     account_scope: Option<&CredentialAlias>,
+    volatile_context_epoch: Option<&str>,
 ) -> PromptCacheMetadata {
     let PromptCacheBoundaries {
         stable_history_end,
@@ -8386,6 +8442,7 @@ fn prompt_cache_metadata(
         "auth_digest": prefix_digests.auth_mode,
         "reasoning_digest": prefix_digests.reasoning_settings,
         "compaction_epoch": compaction_epoch,
+        "volatile_context_epoch": volatile_context_epoch,
     }));
     let stable_prefix_tokens =
         estimated_request_input_tokens(config, &messages[..cacheable_history_end]);

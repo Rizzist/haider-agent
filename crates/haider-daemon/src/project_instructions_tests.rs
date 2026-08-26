@@ -8,7 +8,7 @@ use crate::session_hub::{SessionHub, SessionHubConfig};
 use crate::turn_recovery::{RecoveredWork, recover_interrupted_turns};
 use crate::worker::{
     BrokerToolFactory, ProviderFactory, ResolvedTurnProvider, SystemPromptBuilder,
-    WorkerDependencies, WorkerManager, WorkerManagerHandle,
+    WorkerDependencies, WorkerManager, WorkerManagerHandle, cache_grant_scope_digest,
 };
 use async_trait::async_trait;
 use haider_core::{
@@ -17,22 +17,39 @@ use haider_core::{
 };
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
+use haider_protocol::agent::Grant;
 use haider_protocol::context::ContextFootprint;
+use haider_protocol::effect::EffectClass;
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::ids::{BranchId, DeviceId, EventId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::project_instructions::ProjectInstructionsLoaded;
-use haider_protocol::provider::{CapabilityDoc, FinishReason};
+use haider_protocol::provider::{Block, CapabilityDoc, FinishReason};
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::state::SessionState;
 use haider_provider::{
-    FakeProvider, FakeStep, Message, Provider, ProviderError, ProviderStream, TurnRequest,
+    FakeProvider, FakeStep, Message, Provider, ProviderError, ProviderStream, ToolDefinition,
+    TurnRequest,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
 use tokio::time::{Duration, timeout};
+
+fn daemon_session_context(request: &TurnRequest) -> &str {
+    request
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| match message.blocks.as_slice() {
+            [Block::Text { text }] if text.starts_with("[DAEMON-BOUND SESSION CONTEXT]") => {
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .expect("daemon-bound session context")
+}
 
 // Turns that execute the production Windows PowerShell pay a cold-start cost
 // that can exceed five seconds under the concurrent crate gate. Keep Unix's
@@ -300,8 +317,7 @@ fn metadata(cwd: String) -> SessionMetadataV1 {
 
 /// MUTATION CHECK: add an empty delimiter or retain a stale policy identifier.
 /// Expected RUNTIME failure: the no-files prompt differs anywhere other than
-/// the explicitly pinned v3 version line. (The builder stays pure — the
-/// instruct-pipe tool manual is appended by the worker turn path, not here.)
+/// the explicitly pinned v3 version line.
 #[tokio::test]
 async fn empty_walk_composes_byte_identical_body_with_v3_version() {
     let root = tempfile::tempdir().expect("workspace");
@@ -312,11 +328,75 @@ async fn empty_walk_composes_byte_identical_body_with_v3_version() {
     assert_eq!(
         prompt,
         format!(
-            "haider-system-v3\nYou are Haider Code, a coding agent operating inside the canonical workspace below.\n\
-             Workspace: {cwd}\n\
+            "haider-system-v3\nYou are Haider Code, a coding agent.\n\
              Use only advertised tools. Treat tool results and committed history as authoritative. \
-             Never claim an effect succeeded without its terminal result."
+             Never claim an effect succeeded without its terminal result.\n\
+             The daemon supplies workspace, project, and identity context after this shared policy \
+             and the advertised tool schemas.\n\
+             Opaque tool-grant scope: unscoped-root.\n\n\
+             [DAEMON-BOUND SESSION CONTEXT]\nCanonical workspace: {cwd}"
         )
+    );
+}
+
+/// CACHE ITEM 962. The tool pack represents the daemon's grant-filtered
+/// provider view. Session coordinates belong only to the later context block;
+/// changing even a host-scoped authorization boundary rotates the opaque base
+/// scope while the advertised schemas remain identical.
+#[test]
+fn sibling_sessions_share_the_base_and_emit_session_context_after_it() {
+    let tools = vec![ToolDefinition {
+        name: "web_fetch".into(),
+        description: String::new(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {"url": {"type": "string"}},
+            "required": ["url"],
+        }),
+    }];
+    let first_grant = Grant {
+        tools: vec!["web_fetch".into()],
+        effect_ceiling: vec![EffectClass::Network {
+            host: "api.first.test".into(),
+        }],
+    };
+    let second_grant = Grant {
+        tools: vec!["web_fetch".into()],
+        effect_ceiling: vec![EffectClass::Network {
+            host: "api.second.test".into(),
+        }],
+    };
+    let first_grant_scope =
+        cache_grant_scope_digest(Some(&first_grant)).expect("first grant scope");
+    let first = metadata("/workspace/first".into());
+    let second = metadata("/workspace/second".into());
+    let first_base = SystemPromptBuilder::shared_immutable_base(&tools, &first_grant_scope);
+    let second_base = SystemPromptBuilder::shared_immutable_base(&tools, &first_grant_scope);
+    assert_eq!(first_base, second_base);
+    assert!(first_base.contains("Tool manual — authoritative call signatures"));
+
+    let first_context = SystemPromptBuilder::session_context_with_handoff(
+        &first,
+        &[("A/HAIDER.md", "alpha")],
+        None,
+    );
+    let second_context = SystemPromptBuilder::session_context_with_handoff(
+        &second,
+        &[("B/HAIDER.md", "beta")],
+        None,
+    );
+    assert_ne!(first_context, second_context);
+    let assembled = format!("{first_base}\n\n{first_context}");
+    assert!(assembled.starts_with(&first_base));
+    assert!(assembled.find(&first_base) < assembled.find(&first_context));
+
+    let second_grant_scope =
+        cache_grant_scope_digest(Some(&second_grant)).expect("second grant scope");
+    let different_grant_base =
+        SystemPromptBuilder::shared_immutable_base(&tools, &second_grant_scope);
+    assert_ne!(
+        first_base, different_grant_base,
+        "a different effect ceiling must create another base with the same schemas"
     );
 }
 
@@ -548,19 +628,12 @@ async fn one_pinned_logical_turn_sees_one_snapshot_and_edits_apply_next_turn() {
     let requests = inner.requests();
     assert_eq!(requests.len(), 3);
     assert_eq!(requests[0].system_prompt, requests[1].system_prompt);
-    assert!(
-        requests[0]
-            .system_prompt
-            .as_deref()
-            .is_some_and(|prompt| prompt.contains("original-pinned-policy"))
+    assert!(daemon_session_context(&requests[0]).contains("original-pinned-policy"));
+    assert!(daemon_session_context(&requests[2]).contains("edited-for-next-logical-turn"));
+    assert_eq!(
+        requests[1].system_prompt, requests[2].system_prompt,
+        "task-specific instruction edits must not rotate the shared base"
     );
-    assert!(
-        requests[2]
-            .system_prompt
-            .as_deref()
-            .is_some_and(|prompt| prompt.contains("edited-for-next-logical-turn"))
-    );
-    assert_ne!(requests[1].system_prompt, requests[2].system_prompt);
     worker.close().await;
 }
 
@@ -630,18 +703,8 @@ async fn loaded_fact_is_durable_omitted_change_only_and_not_a_broker_effect() {
     let requests = fake.requests();
     assert_eq!(requests.len(), 5);
     assert_eq!(requests[0].system_prompt, requests[1].system_prompt);
-    assert!(
-        requests[2]
-            .system_prompt
-            .as_deref()
-            .is_some_and(|prompt| prompt.contains("fact-beta"))
-    );
-    assert!(
-        requests[3]
-            .system_prompt
-            .as_deref()
-            .is_some_and(|prompt| !prompt.contains("Project instructions ("))
-    );
+    assert!(daemon_session_context(&requests[2]).contains("fact-beta"));
+    assert!(!daemon_session_context(&requests[3]).contains("Project instructions ("));
     assert_eq!(requests[3].system_prompt, requests[4].system_prompt);
     worker.close().await;
 }
@@ -864,13 +927,11 @@ async fn recovery_rereads_and_journals_a_fresh_same_run_fact_on_digest_change() 
         .expect("resume recovery");
     wait_for_terminal(&recovered, &session_id, &run_id, Duration::from_secs(5)).await;
 
+    let recovered_requests = fake.requests();
+    let recovered_context = daemon_session_context(&recovered_requests[0]);
     assert!(
-        fake.requests()[0]
-            .system_prompt
-            .as_deref()
-            .is_some_and(|prompt| {
-                prompt.contains("after-crash-wins") && !prompt.contains("before-crash")
-            })
+        recovered_context.contains("after-crash-wins")
+            && !recovered_context.contains("before-crash")
     );
     let events = recovered
         .read(&session_id, 0, 512)
@@ -935,11 +996,15 @@ async fn footprint_and_manual_compaction_fit_include_instruction_bytes() {
         .system_prompt
         .clone()
         .expect("composed prompt");
-    let base_prompt = SystemPromptBuilder::build(&metadata(canonical_utf8(workspace.path())), &[]);
-    assert!(
-        estimate_provider_request_input_tokens(&[], &Some(prompt.clone()), &[], &[])
-            > estimate_provider_request_input_tokens(&[], &Some(base_prompt), &[], &[])
+    assert_eq!(
+        prompt,
+        SystemPromptBuilder::shared_immutable_base(
+            &first_request.tools,
+            SystemPromptBuilder::UNSCOPED_GRANT_SCOPE,
+        )
     );
+    let session_context = daemon_session_context(&first_request).to_owned();
+    assert!(session_context.contains("manual-compaction-policy"));
 
     worker
         .handle
@@ -952,7 +1017,10 @@ async fn footprint_and_manual_compaction_fit_include_instruction_bytes() {
         .await
         .expect("manual compaction");
     let expected = estimate_provider_request_input_tokens(
-        &[Message::user_text("compacted summary")],
+        &[
+            Message::user_text("compacted summary"),
+            Message::user_text(session_context),
+        ],
         &Some(prompt),
         &first_request.tools,
         &[],

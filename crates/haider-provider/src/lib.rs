@@ -148,9 +148,25 @@ pub(crate) fn rendered_prefix_digests(
     system_key: &str,
     tools_key: &str,
 ) -> Option<PrefixDigests> {
+    rendered_prefix_digests_from_components(
+        request,
+        full_payload.get(system_key),
+        full_payload.get(tools_key),
+        immutable_history,
+    )
+}
+
+/// Replaces normalized hashes with exact adapter-rendered components when
+/// those components are nested rather than top-level provider fields.
+pub(crate) fn rendered_prefix_digests_from_components(
+    request: &TurnRequest,
+    system: Option<&serde_json::Value>,
+    tools: Option<&serde_json::Value>,
+    immutable_history: String,
+) -> Option<PrefixDigests> {
     let mut digests = request.cache_metadata.as_ref()?.prefix_digests.clone();
-    digests.system = exact_optional_wire_digest(full_payload.get(system_key));
-    digests.tools = exact_optional_wire_digest(full_payload.get(tools_key));
+    digests.system = exact_optional_wire_digest(system);
+    digests.tools = exact_optional_wire_digest(tools);
     digests.immutable_history = immutable_history;
     Some(digests)
 }
@@ -693,8 +709,8 @@ pub struct TurnRequest {
 }
 
 /// Adapter-rendered request retained across cache-digest finalization. The
-/// full wire object is built once; only a provider cache-key scalar may be
-/// refreshed from finalized metadata before transmission.
+/// full wire object is built once; only provider cache-routing controls may
+/// be refreshed from finalized metadata before transmission.
 pub struct PreparedTurn {
     pub(crate) prefix_digests: PrefixDigests,
     pub(crate) previous_immutable_history_digest: Option<String>,

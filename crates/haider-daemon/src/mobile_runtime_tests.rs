@@ -335,6 +335,7 @@ async fn mobile_dispatcher_fixture_with_grant(
             delegation: crate::delegation::DelegationHandle::new(hub.clone()),
             tasks: crate::tasks::TaskFacade::new(hub.clone()),
             agent_id: None,
+            session_context_tail: String::new(),
             grant,
             mobile_use_active,
             cli_scope: None,

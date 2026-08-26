@@ -1765,7 +1765,7 @@ fn cm2_cache_metadata(provider: &str, stable_history_end: usize) -> PromptCacheM
             reasoning_settings: "reasoning-a".into(),
         },
         cache_epoch: "epoch-a".into(),
-        header_epoch: String::new(),
+        header_epoch: "provider-header-a".into(),
         compaction_epoch: "compaction-a".into(),
         provider: provider.into(),
         session_scope: "session-a".into(),
@@ -1774,6 +1774,33 @@ fn cm2_cache_metadata(provider: &str, stable_history_end: usize) -> PromptCacheM
         expected_later_reads: 2,
         reuse_gap_ms: Some(10_000),
     }
+}
+
+fn prepared_cohort_key(provider: &dyn crate::Provider, request: &TurnRequest) -> String {
+    let prepared = provider
+        .prepare_turn(request)
+        .expect("prepared provider turn");
+    let mut finalized = request.clone();
+    finalized
+        .cache_metadata
+        .as_mut()
+        .expect("cache metadata")
+        .prefix_digests = prepared.prefix_digests().clone();
+    finalized
+        .cache_metadata
+        .as_mut()
+        .expect("cache metadata")
+        .header_epoch = prepared
+        .provider_view()
+        .expect("prepared provider view")
+        .ledger()
+        .header_epoch
+        .clone();
+    prompt_cache_cohort_key(
+        &finalized,
+        finalized.cache_metadata.as_ref().expect("cache metadata"),
+    )
+    .expect("prepared cohort key")
 }
 
 fn remove_openai_cache_metadata(value: &mut serde_json::Value) {
@@ -1829,12 +1856,60 @@ fn cache_diagnostic_openai_hashes_current_wire_through_previous_history_length()
     );
 }
 
-/// CM2d — the routing key identifies a stable provider/header lane within one
-/// session. Append-only history and compaction do not rotate it; an explicit
-/// stable-header ABI change does.
+/// The actor learns `header_epoch` from the prepared provider view. Preparation
+/// must nevertheless classify the exact wire it built with that finalized
+/// header, rather than reporting a missing key until the later send refresh.
+#[test]
+fn prepared_openai_cache_control_uses_the_provider_view_header_epoch() {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("openai-finalized-header");
+    vault
+        .put(&alias, b"openai-finalized-header-key")
+        .expect("store test credential");
+    let provider = OpenAiProvider::new(
+        vault.resolve(&alias).expect("resolve test credential"),
+        "gpt-5.6",
+    )
+    .expect("construct OpenAI provider");
+    let mut request = probe_request("gpt-5.6");
+    request.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
+    request
+        .cache_metadata
+        .as_mut()
+        .expect("cache metadata")
+        .header_epoch
+        .clear();
+
+    let prepared = crate::Provider::prepare_turn(&provider, &request).expect("prepared turn");
+    assert!(
+        !prepared
+            .provider_view()
+            .expect("provider view")
+            .ledger()
+            .header_epoch
+            .is_empty()
+    );
+    let payload = &prepared.wire.as_ref().expect("prepared wire").payload;
+    assert!(payload.get("prompt_cache_key").is_some());
+    assert_eq!(
+        payload.get("prompt_cache_options"),
+        Some(&serde_json::json!({"mode": "explicit", "ttl": "30m"})),
+        "the finalized cohort key and explicit TTL must enter the same prepared wire"
+    );
+    assert_eq!(
+        *prepared.cache_control(),
+        haider_protocol::provider::CacheControlObservationV1::Emitted {
+            ttl_ms: Some(30 * 60 * 1_000),
+        }
+    );
+}
+
+/// CM2d — the routing key identifies an account/model/base cohort. Rendered
+/// prefix diagnostics do not rotate it; the provider-view header epoch is the
+/// one authoritative address of the actual shared base.
 ///
-/// MUTATION CHECK: put a moving history/compaction digest back into the key,
-/// or remove the header epoch; one of the assertions fails.
+/// MUTATION CHECK: put history/compaction/session into the key or replace the
+/// header epoch with a second system/tool digest path; an assertion fails.
 #[test]
 fn cm2d_openai_prompt_cache_key_is_stable_and_domain_sensitive() {
     let mut request = probe_request("gpt-5.6");
@@ -1845,13 +1920,11 @@ fn cm2d_openai_prompt_cache_key_is_stable_and_domain_sensitive() {
         .expect("metadata")
         .header_epoch = "provider-header-a".into();
     let metadata = request.cache_metadata.as_ref().expect("metadata");
-    let first = derive_prompt_cache_key(&request, metadata);
+    let first = prompt_cache_cohort_key(&request, metadata).expect("cohort key");
 
-    for mutate in ["system", "tools", "history", "compaction"] {
+    for mutate in ["history", "compaction"] {
         let mut changed = request.cache_metadata.clone().expect("metadata");
         match mutate {
-            "system" => changed.prefix_digests.system.push_str("-changed"),
-            "tools" => changed.prefix_digests.tools.push_str("-changed"),
             "history" => changed
                 .prefix_digests
                 .immutable_history
@@ -1861,29 +1934,135 @@ fn cm2d_openai_prompt_cache_key_is_stable_and_domain_sensitive() {
         }
         assert_eq!(
             first,
-            derive_prompt_cache_key(&request, &changed),
+            prompt_cache_cohort_key(&request, &changed).expect("unchanged cohort key"),
             "{mutate} is prefix-match state, not routing identity"
+        );
+    }
+
+    for mutate in ["system-diagnostic", "tools-diagnostic"] {
+        let mut changed = request.cache_metadata.clone().expect("metadata");
+        match mutate {
+            "system-diagnostic" => changed.prefix_digests.system.push_str("-changed"),
+            "tools-diagnostic" => changed.prefix_digests.tools.push_str("-changed"),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            first,
+            prompt_cache_cohort_key(&request, &changed).expect("same finalized header key"),
+            "{mutate} cannot compete with the finalized provider-view header"
         );
     }
 
     let mut other_account = request.cache_metadata.clone().expect("metadata");
     other_account.account_scope = Some("account-b".into());
-    assert_ne!(first, derive_prompt_cache_key(&request, &other_account));
+    assert_ne!(
+        first,
+        prompt_cache_cohort_key(&request, &other_account).expect("other account key")
+    );
 
     let mut other_header = request.cache_metadata.clone().expect("metadata");
     other_header.header_epoch = "provider-header-b".into();
     assert_ne!(
         first,
-        derive_prompt_cache_key(&request, &other_header),
+        prompt_cache_cohort_key(&request, &other_header).expect("other header key"),
         "stable-header ABI changes must select a new cache route"
     );
 }
 
-/// HAIDER949(a). MUTATION CHECK: drop `session_scope` from
-/// `derive_prompt_cache_key`; the equality assertion below reports that two
-/// otherwise identical sessions collided.
+/// CACHE ITEM 962. Provider adapters place the shared system base in three
+/// different wire locations. Every routed path must hash its rendered value,
+/// including the opaque grant-scope marker, plus its finalized hosted schemas.
+///
+/// MUTATION CHECK: hash absent top-level `instructions`/`system` keys on the
+/// Responses-lite or Chat paths, or ignore hosted tools; an assertion fails.
 #[test]
-fn openai_prompt_cache_key_differs_across_session_scopes() {
+fn routed_adapters_finalize_their_rendered_system_base_into_the_cohort() {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("rendered-system-cohort");
+    vault
+        .put(&alias, b"rendered-system-cohort-secret")
+        .expect("store test credential");
+    let providers: Vec<(&str, Box<dyn crate::Provider>, &str, &str)> = vec![
+        (
+            "OpenAI Responses-lite",
+            Box::new(
+                OpenAiProvider::new_subscription(
+                    vault.resolve(&alias).expect("resolve OpenAI credential"),
+                    "gpt-5.6",
+                    OPENAI_SUBSCRIPTION_BASE_URL,
+                )
+                .expect("construct OpenAI subscription adapter"),
+            ),
+            OPENAI_OAUTH_PROVIDER_NAME,
+            "gpt-5.6",
+        ),
+        (
+            "Kimi Chat Completions",
+            Box::new(
+                OpenAiCompatibleProvider::new_kimi_subscription(
+                    vault.resolve(&alias).expect("resolve Kimi credential"),
+                    "kimi-coding-a",
+                    KIMI_OAUTH_BASE_URL,
+                )
+                .expect("construct Kimi adapter"),
+            ),
+            KIMI_OAUTH_PROVIDER_NAME,
+            "kimi-coding-a",
+        ),
+        (
+            "xAI Chat Completions",
+            Box::new(
+                OpenAiCompatibleProvider::new_xai_api(
+                    vault.resolve(&alias).expect("resolve xAI credential"),
+                    "grok-4.6",
+                    XAI_BASE_URL,
+                )
+                .expect("construct xAI adapter"),
+            ),
+            XAI_PROVIDER_NAME,
+            "grok-4.6",
+        ),
+    ];
+
+    for (label, provider, provider_name, model) in providers {
+        let mut first = probe_request(model);
+        first.system_prompt = Some("shared base; grant-scope=a".into());
+        first.cache_metadata = Some(cm2_cache_metadata(provider_name, 1));
+        let first_key = prepared_cohort_key(provider.as_ref(), &first);
+
+        let mut other_grant = first;
+        other_grant.system_prompt = Some("shared base; grant-scope=b".into());
+        let other_key = prepared_cohort_key(provider.as_ref(), &other_grant);
+        assert_ne!(
+            first_key, other_key,
+            "{label} must isolate different rendered system/grant bases"
+        );
+    }
+
+    let plain = OpenAiProvider::new(
+        vault.resolve(&alias).expect("resolve plain credential"),
+        "gpt-5.6",
+    )
+    .expect("construct plain OpenAI adapter");
+    let hosted = OpenAiProvider::new(
+        vault.resolve(&alias).expect("resolve hosted credential"),
+        "gpt-5.6",
+    )
+    .expect("construct hosted OpenAI adapter")
+    .with_web_search(true);
+    let mut request = probe_request("gpt-5.6");
+    request.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
+    assert_ne!(
+        prepared_cohort_key(&plain, &request),
+        prepared_cohort_key(&hosted, &request),
+        "provider-added hosted schemas must participate in the finalized base"
+    );
+}
+
+/// CACHE ITEM 962. MUTATION CHECK: add `session_scope` back to the cohort;
+/// identical sibling sessions stop sharing their cold-start route.
+#[test]
+fn openai_prompt_cache_key_matches_across_session_scopes_for_identical_base() {
     let mut request = probe_request("gpt-5.6");
     request.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
     let first = openai_prompt_cache_key(&request).expect("first session key");
@@ -1895,9 +2074,9 @@ fn openai_prompt_cache_key_differs_across_session_scopes() {
         .session_scope = "session-b".into();
     let second = openai_prompt_cache_key(&request).expect("second session key");
 
-    assert_ne!(
+    assert_eq!(
         first, second,
-        "session_scope must isolate otherwise identical OpenAI cache domains"
+        "trusted same-account/model/base siblings must share one cache cohort"
     );
 }
 
@@ -1927,8 +2106,6 @@ fn openai_prompt_cache_key_is_stable_across_turns_in_one_session() {
     metadata.previous_stable_history_end = Some(metadata.stable_history_end);
     metadata.stable_history_end = second_stable_history_end;
     metadata.current_user_start = second_stable_history_end;
-    metadata.prefix_digests.system = "rendered-system-b".into();
-    metadata.prefix_digests.tools = "rendered-tools-b".into();
     metadata.prefix_digests.immutable_history = "history-b".into();
     metadata.compaction_epoch = "compaction-b".into();
     let second = openai_prompt_cache_key(&second_turn).expect("second turn key");
@@ -2032,37 +2209,37 @@ fn openai_rendered_prefix_bytes_are_stable_across_turns() {
             .as_mut()
             .expect("metadata")
             .session_scope = "session-b".into();
-        assert_ne!(
+        assert_eq!(
             openai_prompt_cache_key(&first_turn),
             openai_prompt_cache_key(&second_turn),
-            "a different session must use a different cache route"
+            "a different session with the same base must use the cohort route"
         );
     }
 }
 
-/// HAIDER949(c). `PromptCacheMetadata` uses the default empty string for an
-/// absent session scope. Without stable routing identity the adapter must
-/// omit the key rather than inventing a request-varying anonymous value.
+/// Account scope is the hard tenant boundary. Without it the adapter must
+/// fail closed instead of placing unrelated anonymous callers in one cohort.
 #[test]
-fn openai_prompt_cache_key_is_omitted_without_session_scope() {
+fn openai_prompt_cache_key_is_omitted_without_account_scope() {
     let mut request = probe_request("gpt-5.6");
     request.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
-    request
-        .cache_metadata
-        .as_mut()
-        .expect("metadata")
-        .session_scope
-        .clear();
-    assert_eq!(
-        openai_prompt_cache_key(&request),
-        None,
-        "anonymous requests cannot provide stable cache routing"
-    );
-    let payload = responses_request_json(&request, false, None, false).expect("OpenAI wire");
-    assert!(
-        !payload.to_string().contains("prompt_cache"),
-        "no cache control may be emitted without stable session identity: {payload}"
-    );
+    for missing in [None, Some(String::new())] {
+        request
+            .cache_metadata
+            .as_mut()
+            .expect("metadata")
+            .account_scope = missing;
+        assert_eq!(
+            openai_prompt_cache_key(&request),
+            None,
+            "requests without a trusted account cannot provide cache routing"
+        );
+        let payload = responses_request_json(&request, false, None, false).expect("OpenAI wire");
+        assert!(
+            !payload.to_string().contains("prompt_cache"),
+            "no cache control may be emitted without account isolation: {payload}"
+        );
+    }
 }
 
 /// GPT-5.6 gets explicit breakpoints plus the stable cache key. The volatile
@@ -2599,10 +2776,13 @@ fn kimi_requests_use_bearer_and_max_completion_tokens() {
         attachments: Vec::new(),
         cache_metadata: Some(cm2_cache_metadata(KIMI_OAUTH_PROVIDER_NAME, 1)),
     };
-    let expected: serde_json::Value =
+    let mut expected: serde_json::Value =
         serde_json::from_str(include_str!("../tests/fixtures/openai/kimi_request.json"))
             .expect("Kimi request fixture");
     let payload = provider.request_payload(&request).expect("Kimi payload");
+    // Routing metadata is content-addressed below; keep the sanctioned model-
+    // visible fixture byte-identical and compare its non-routing shape.
+    expected["prompt_cache_key"] = payload["prompt_cache_key"].clone();
     assert_eq!(payload, expected);
     assert!(payload.get("max_tokens").is_none());
     assert!(payload.get("thinking").is_none());
@@ -2633,7 +2813,7 @@ fn kimi_requests_use_bearer_and_max_completion_tokens() {
         .to_owned();
     assert_eq!(
         first_key, next_key,
-        "append-only turns share the session key"
+        "append-only turns share the cohort key"
     );
     next_turn
         .cache_metadata
@@ -2646,7 +2826,25 @@ fn kimi_requests_use_bearer_and_max_completion_tokens() {
         .as_str()
         .expect("other Kimi cache key")
         .to_owned();
-    assert_ne!(first_key, other_session_key, "Kimi keys are session-scoped");
+    assert_eq!(
+        first_key, other_session_key,
+        "same-account Kimi siblings share the cohort key"
+    );
+    next_turn
+        .cache_metadata
+        .as_mut()
+        .expect("cache metadata")
+        .account_scope = Some("account-b".into());
+    let other_account_key = provider
+        .request_payload(&next_turn)
+        .expect("other Kimi account")["prompt_cache_key"]
+        .as_str()
+        .expect("other Kimi account key")
+        .to_owned();
+    assert_ne!(
+        first_key, other_account_key,
+        "Kimi cohorts must not cross accounts"
+    );
 
     let thinking = provider
         .with_kimi_thinking(KimiThinkingConfig {
@@ -2860,12 +3058,11 @@ async fn grok_oauth_proxy_request_pins_complete_header_contract() {
     assert!(!discovery.headers().contains_key("x-grok-model-override"));
 }
 
-/// HAIDER952XAI(a). MUTATION CHECK: remove the xAI inference header, derive it
-/// from a turn-varying prefix component, expose the raw session scope, or
-/// apply it to model discovery. The exact header, stability, isolation,
-/// opacity, and discovery assertions below fail independently.
+/// HAIDER952XAI(a) + CACHE ITEM 962. MUTATION CHECK: remove the xAI inference
+/// header, derive it from a turn-varying component, restore per-session
+/// routing, cross an account boundary, or apply it to model discovery.
 #[tokio::test]
-async fn xai_inference_uses_stable_opaque_session_cache_route() {
+async fn xai_inference_uses_stable_opaque_cohort_cache_route() {
     use haider_protocol::provider::CacheControlObservationV1;
 
     let vault = MemoryVault::new();
@@ -2929,7 +3126,7 @@ async fn xai_inference_uses_stable_opaque_session_cache_route() {
     assert_eq!(
         next.headers()[XAI_CONVERSATION_ID_HEADER],
         first_id,
-        "one session keeps its route across append-only turns and cache epochs"
+        "one cohort keeps its route across append-only turns and cache epochs"
     );
 
     request
@@ -2941,10 +3138,25 @@ async fn xai_inference_uses_stable_opaque_session_cache_route() {
         .inference_request(&request)
         .await
         .expect("other xAI session request");
-    assert_ne!(
+    assert_eq!(
         other.headers()[XAI_CONVERSATION_ID_HEADER],
         first_id,
-        "concurrent sessions must not share xAI routing"
+        "same-account/model/base siblings share xAI routing"
+    );
+
+    request
+        .cache_metadata
+        .as_mut()
+        .expect("cache metadata")
+        .account_scope = Some("account-b".into());
+    let other_account = provider
+        .inference_request(&request)
+        .await
+        .expect("other xAI account request");
+    assert_ne!(
+        other_account.headers()[XAI_CONVERSATION_ID_HEADER],
+        first_id,
+        "xAI cohorts must not cross accounts"
     );
 
     let discovery = provider

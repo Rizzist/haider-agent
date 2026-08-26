@@ -1,10 +1,17 @@
 #![allow(clippy::expect_used)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use haider_core::{HarnessActor, HarnessConfig, MemoryStore, SubmitTurn};
-use haider_protocol::ids::{DeviceId, SessionId};
+use async_trait::async_trait;
+use haider_core::{
+    CancelToken, HarnessActor, HarnessConfig, MemoryStore, SubmitTurn, ToolDispatchResult,
+    ToolDispatcher,
+};
+use haider_protocol::error::HaiderError;
+use haider_protocol::ids::{DeviceId, ItemId, RunId, SessionId};
 use haider_protocol::provider::{Block, FinishReason};
+use haider_protocol::tool::{BoundedResult, ToolResultStatus};
 use haider_provider::{FakeProvider, FakeStep};
 
 async fn one_request(brief: Option<&str>) -> (haider_provider::TurnRequest, Arc<MemoryStore>) {
@@ -34,26 +41,52 @@ async fn one_request(brief: Option<&str>) -> (haider_provider::TurnRequest, Arc<
     )
 }
 
-/// CG-M1 LAW: GraphBrief is provider-visible but lies strictly after both
-/// cache boundaries, so activating a graph cannot change the durable-head
-/// cache identity or stable-prefix token estimate.
+/// CG-M1 LAW: GraphBrief is provider-visible immediately before the accepted
+/// current user. It stays outside durable history while becoming an immutable
+/// provider-prefix block for this turn, with its own exact-view epoch.
 #[tokio::test]
-async fn graph_brief_is_volatile_and_cache_equivalent_to_no_active_graph() {
+async fn graph_brief_is_volatile_but_stable_inside_its_turn_epoch() {
     let brief = "GraphBrief: VERIFY attempt 2/8; gate all-of-3; evidence 1 green/0 red (1 effective); next: record 3 green VERIFY results.";
     let (baseline, _) = one_request(None).await;
     let (active, store) = one_request(Some(brief)).await;
 
     assert_eq!(active.messages.len(), baseline.messages.len() + 1);
     assert_eq!(
-        &active.messages[..baseline.messages.len()],
-        baseline.messages
+        &active.messages[1..],
+        baseline.messages,
+        "the frozen snapshot precedes the accepted current user"
     );
-    assert!(active.messages.last().is_some_and(|message| {
+    assert!(active.messages.first().is_some_and(|message| {
         matches!(message.blocks.as_slice(), [Block::Text { text }] if text == brief)
     }));
+    let active_metadata = active.cache_metadata.clone().expect("active metadata");
+    let baseline_metadata = baseline.cache_metadata.expect("baseline metadata");
     assert_eq!(
-        active.cache_metadata, baseline.cache_metadata,
-        "volatile tail must not move boundaries, change prefix digests/cache epoch, or add stable tokens"
+        active_metadata.current_user_start,
+        baseline_metadata.current_user_start + 1,
+        "the request-local current-user boundary accounts for the inserted snapshot"
+    );
+    assert_eq!(
+        active_metadata.stable_history_end,
+        baseline_metadata.stable_history_end + 1,
+        "the frozen snapshot is part of this turn's exact provider prefix"
+    );
+    assert_eq!(
+        active_metadata.prefix_digests.system,
+        baseline_metadata.prefix_digests.system
+    );
+    assert_eq!(
+        active_metadata.prefix_digests.tools,
+        baseline_metadata.prefix_digests.tools
+    );
+    assert_ne!(
+        active_metadata.prefix_digests.immutable_history,
+        baseline_metadata.prefix_digests.immutable_history
+    );
+    assert_ne!(active_metadata.cache_epoch, baseline_metadata.cache_epoch);
+    assert!(
+        active_metadata.stable_prefix_tokens > baseline_metadata.stable_prefix_tokens,
+        "stable-prefix accounting includes the request-local snapshot bytes"
     );
 
     let durable = store.events(&SessionId::new("graph-brief-cache-law")).await;
@@ -63,4 +96,206 @@ async fn graph_brief_is_volatile_and_cache_equivalent_to_no_active_graph() {
             .all(|envelope| !envelope.payload.to_string().contains("GraphBrief:")),
         "GraphBrief never enters the durable prompt history"
     );
+}
+
+struct CountingSnapshotDispatcher {
+    refreshes: AtomicUsize,
+}
+
+impl CountingSnapshotDispatcher {
+    fn refresh_count(&self) -> usize {
+        self.refreshes.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ToolDispatcher for CountingSnapshotDispatcher {
+    async fn refresh_volatile_context_tail(&self) -> Result<Option<String>, HaiderError> {
+        let ordinal = self.refreshes.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(Some(format!("GraphBrief snapshot {ordinal}")))
+    }
+
+    async fn execute(
+        &self,
+        _run_id: &RunId,
+        _item_id: &ItemId,
+        _call_id: &str,
+        _name: &str,
+        _args: serde_json::Value,
+        _cancel: &CancelToken,
+    ) -> Result<ToolDispatchResult, HaiderError> {
+        Ok(ToolDispatchResult::Completed(BoundedResult {
+            preview: "done".into(),
+            truncated: false,
+            artifact: None,
+            images: Vec::new(),
+            cursor: None,
+            status: ToolResultStatus::Completed,
+            reason: None,
+            presentation: None,
+        }))
+    }
+}
+
+fn message_contains_text(message: &haider_provider::Message, expected: &str) -> bool {
+    message
+        .blocks
+        .iter()
+        .any(|block| matches!(block, Block::Text { text } if text == expected))
+}
+
+/// HAIDER962 LAW. MUTATION CHECKS: move the snapshot back to the request tail
+/// or refresh it inside the provider loop. Either mutation rewrites request
+/// two/three's serialized prefix or increments the first-turn refresh count.
+#[tokio::test]
+async fn volatile_snapshot_is_append_only_across_tool_rounds_and_refreshes_once_per_turn() {
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "round-1".into(),
+            name: "inspect".into(),
+            args: serde_json::json!({"round": 1}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "round-1".into(),
+        },
+        FakeStep::EmitToolCall {
+            call_id: "round-2".into(),
+            name: "inspect".into(),
+            args: serde_json::json!({"round": 2}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "round-2".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let dispatcher = Arc::new(CountingSnapshotDispatcher {
+        refreshes: AtomicUsize::new(0),
+    });
+    let store = Arc::new(MemoryStore::new());
+    let mut config = HarnessConfig::for_session(
+        SessionId::new("graph-brief-monotonic-prefix"),
+        DeviceId::new("graph-brief-test"),
+        1,
+        1,
+    );
+    config.volatile_user_tail = Some("stale construction snapshot".into());
+    let (actor, handle) = HarnessActor::new_with_dispatcher(
+        config,
+        provider.clone(),
+        store,
+        Some(dispatcher.clone()),
+    );
+    let actor_task = tokio::spawn(actor.run());
+
+    handle
+        .submit_turn(SubmitTurn::new("run two tool rounds"))
+        .await
+        .expect("first turn accepted")
+        .wait()
+        .await
+        .expect("first turn completes");
+    assert_eq!(
+        dispatcher.refresh_count(),
+        1,
+        "all same-turn provider rounds share one snapshot"
+    );
+
+    let first_turn_requests = provider.requests();
+    assert_eq!(first_turn_requests.len(), 3);
+    let first_turn_epoch = first_turn_requests[0]
+        .cache_metadata
+        .as_ref()
+        .expect("first-round cache metadata")
+        .cache_epoch
+        .clone();
+    for (round, requests) in first_turn_requests.windows(2).enumerate() {
+        let previous = serde_json::to_vec(&requests[0].messages)
+            .expect("previous provider message prefix serializes");
+        let current = serde_json::to_vec(&requests[1].messages[..requests[0].messages.len()])
+            .expect("current provider message prefix serializes");
+        assert_eq!(
+            current,
+            previous,
+            "provider message prefix changed before tool round {}",
+            round + 2
+        );
+    }
+    for request in &first_turn_requests {
+        let metadata = request.cache_metadata.as_ref().expect("cache metadata");
+        assert_eq!(
+            metadata.cache_epoch, first_turn_epoch,
+            "every same-turn continuation retains the frozen snapshot epoch"
+        );
+        let snapshot = request
+            .messages
+            .iter()
+            .position(|message| message_contains_text(message, "GraphBrief snapshot 1"))
+            .expect("first-turn snapshot is provider-visible");
+        let current_user = request
+            .messages
+            .iter()
+            .position(|message| message_contains_text(message, "run two tool rounds"))
+            .expect("accepted current user is provider-visible");
+        assert!(snapshot < current_user);
+        assert_eq!(
+            request
+                .messages
+                .iter()
+                .filter(|message| message_contains_text(message, "GraphBrief snapshot 1"))
+                .count(),
+            1,
+            "the frozen snapshot is inserted exactly once per request"
+        );
+    }
+
+    handle
+        .submit_turn(SubmitTurn::new("start the next turn"))
+        .await
+        .expect("second turn accepted")
+        .wait()
+        .await
+        .expect("second turn completes");
+    assert_eq!(
+        dispatcher.refresh_count(),
+        2,
+        "the next turn boundary refreshes exactly once"
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 4);
+    let second_turn = &requests[3];
+    assert_ne!(
+        second_turn
+            .cache_metadata
+            .as_ref()
+            .expect("second-turn cache metadata")
+            .cache_epoch,
+        first_turn_epoch,
+        "the accepted turn boundary declares a new snapshot epoch"
+    );
+    assert!(
+        second_turn
+            .messages
+            .iter()
+            .any(|message| message_contains_text(message, "GraphBrief snapshot 2"))
+    );
+    assert!(
+        second_turn
+            .messages
+            .iter()
+            .all(|message| !message_contains_text(message, "GraphBrief snapshot 1"))
+    );
+
+    handle.stop().await.expect("actor stops");
+    actor_task.await.expect("actor joins");
 }

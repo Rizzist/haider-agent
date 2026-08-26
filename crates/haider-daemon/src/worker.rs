@@ -322,6 +322,8 @@ struct DaemonContextCompactor {
     context_window: Option<u64>,
     reserved_output_tokens: u64,
     post_compaction_system_prompt: Option<String>,
+    post_compaction_volatile_tail: Option<String>,
+    post_compaction_grant_scope: String,
     post_compaction_tools: Vec<ToolDefinition>,
     reasoning_settings: String,
     cache_expected_later_reads: u32,
@@ -629,6 +631,9 @@ impl ContextCompactor for DaemonContextCompactor {
         let immutable_history_digest = digest_json(&covered_messages);
         let covered_history_end = covered_messages.len();
         let mut replay_messages = covered_messages.clone();
+        if let Some(tail) = &self.post_compaction_volatile_tail {
+            replay_messages.push(Message::user_text(tail.clone()));
+        }
         replay_messages.push(Message::user_text(COMPACTION_SUMMARY_INSTRUCTION));
         let mut prefix_digests = PrefixDigests {
             system: digest_json(&self.post_compaction_system_prompt),
@@ -784,21 +789,28 @@ impl ContextCompactor for DaemonContextCompactor {
                 let artifact_store = self.store.clone();
                 prepare_tool_images_for_text_only_request(&artifact_store, &mut degraded_messages)
                     .await?;
+                if let Some(tail) = &self.post_compaction_volatile_tail {
+                    degraded_messages.push(Message::user_text(tail.clone()));
+                }
                 degraded_messages.push(Message::user_text(COMPACTION_SUMMARY_INSTRUCTION));
                 let request_messages = degraded_messages.clone();
+                let fallback_system_prompt = Some(SystemPromptBuilder::shared_immutable_base(
+                    &[],
+                    &self.post_compaction_grant_scope,
+                ));
                 let fallback = TurnRequest {
                     messages: degraded_messages,
                     model: self.model.clone(),
                     // Round 6: the degraded path needs the SAME output room
                     // as the replay — truncation is truncation either way.
                     max_tokens: self.max_tokens.min(8_192),
-                    system_prompt: None,
+                    system_prompt: fallback_system_prompt.clone(),
                     tools: Vec::new(),
                     attachments: Vec::new(),
                     cache_metadata: None,
                 };
                 let fallback_prefix_digests = PrefixDigests {
-                    system: digest_json(&Option::<String>::None),
+                    system: digest_json(&fallback_system_prompt),
                     tools: canonical_tool_definitions_digest(&[]),
                     immutable_history: immutable_history_digest.clone(),
                     model: digest_json(&self.model),
@@ -809,7 +821,7 @@ impl ContextCompactor for DaemonContextCompactor {
                 };
                 let fallback_stable_prefix_tokens = estimate_provider_request_input_tokens(
                     &request_messages[..covered_history_end.min(request_messages.len())],
-                    &None,
+                    &fallback_system_prompt,
                     &[],
                     &[],
                 );
@@ -1013,7 +1025,10 @@ impl ContextCompactor for DaemonContextCompactor {
             payloads.push(EventPayload::Usage(usage));
         }
         if intent.resume_cause == CompactionResume::ManualIdle {
-            let post_compaction_messages = [Message::user_text(summary.clone())];
+            let mut post_compaction_messages = vec![Message::user_text(summary.clone())];
+            if let Some(tail) = &self.post_compaction_volatile_tail {
+                post_compaction_messages.push(Message::user_text(tail.clone()));
+            }
             let post_compaction_input = estimate_provider_request_input_tokens(
                 &post_compaction_messages,
                 &self.post_compaction_system_prompt,
@@ -1121,6 +1136,9 @@ pub struct WorkerToolContext {
     pub(crate) delegation: DelegationHandle,
     pub(crate) tasks: crate::tasks::TaskFacade,
     pub agent_id: Option<AgentId>,
+    /// Immutable daemon-authored session/task suffix appended after every
+    /// dynamically refreshed graph/typed context at provider boundaries.
+    pub(crate) session_context_tail: String,
     /// Durable child capability ceiling; root sessions have no ceiling here.
     pub grant: Option<Grant>,
     /// One turn-start snapshot shared by provider advertisement and runtime
@@ -1287,6 +1305,7 @@ pub struct SystemPromptBuilder;
 
 impl SystemPromptBuilder {
     pub const VERSION: &'static str = "haider-system-v3";
+    pub(crate) const UNSCOPED_GRANT_SCOPE: &'static str = "unscoped-root";
 
     pub fn build(metadata: &SessionMetadataV1, instructions: &[(&str, &str)]) -> String {
         Self::build_with_handoff(metadata, instructions, None)
@@ -1297,27 +1316,68 @@ impl SystemPromptBuilder {
         instructions: &[(&str, &str)],
         handoff_dir: Option<&Path>,
     ) -> String {
+        let mut prompt = Self::shared_immutable_base(&[], Self::UNSCOPED_GRANT_SCOPE);
+        prompt.push_str("\n\n");
+        prompt.push_str(&Self::session_context_with_handoff(
+            metadata,
+            instructions,
+            handoff_dir,
+        ));
+        prompt
+    }
+
+    /// Account-local cache base: deterministic policy followed by the manual
+    /// for the exact grant-filtered tool schemas sent beside it. Provider
+    /// routing hashes these bytes together with those schemas; session/task
+    /// context must never be appended here.
+    pub(crate) fn shared_immutable_base(tools: &[ToolDefinition], grant_scope: &str) -> String {
         let mut prompt = format!(
-            "{}\nYou are Haider Code, a coding agent operating inside the canonical workspace below.\n\
-             Workspace: {}\n\
+            "{}\nYou are Haider Code, a coding agent.\n\
              Use only advertised tools. Treat tool results and committed history as authoritative. \
-             Never claim an effect succeeded without its terminal result.",
+             Never claim an effect succeeded without its terminal result.\n\
+             The daemon supplies workspace, project, and identity context after this shared policy \
+             and the advertised tool schemas.\n\
+             Opaque tool-grant scope: {}.",
             Self::VERSION,
+            grant_scope,
+        );
+        prompt.push_str(&tool_manual(tools));
+        prompt
+    }
+
+    /// Daemon-authored per-session context. The worker emits this after the
+    /// shared system/tool base as a volatile message, so different sessions
+    /// cannot perturb the provider-cache prefix shared by trusted siblings.
+    pub(crate) fn session_context_with_handoff(
+        metadata: &SessionMetadataV1,
+        instructions: &[(&str, &str)],
+        handoff_dir: Option<&Path>,
+    ) -> String {
+        let mut context = format!(
+            "[DAEMON-BOUND SESSION CONTEXT]\nCanonical workspace: {}",
             metadata.cwd
         );
         if let Some(handoff_dir) = handoff_dir {
-            prompt.push_str("\nEphemeral parent handoff directory: ");
-            prompt.push_str(&handoff_dir.to_string_lossy());
-            prompt.push_str(" (EPHEMERAL; use it for shared specs, never durable storage).");
+            context.push_str("\nEphemeral parent handoff directory: ");
+            context.push_str(&handoff_dir.to_string_lossy());
+            context.push_str(" (EPHEMERAL; use it for shared specs, never durable storage).");
         }
         for (path, text) in instructions {
-            prompt.push_str("\n\nProject instructions (");
-            prompt.push_str(path);
-            prompt.push_str("):\n<project-instructions>\n");
-            prompt.push_str(text);
-            prompt.push_str("\n</project-instructions>");
+            context.push_str("\n\nProject instructions (");
+            context.push_str(path);
+            context.push_str("):\n<project-instructions>\n");
+            context.push_str(text);
+            context.push_str("\n</project-instructions>");
         }
-        prompt
+        context
+    }
+}
+
+fn join_volatile_context_tail(dynamic: &str, session_context: &str) -> String {
+    match (dynamic.is_empty(), session_context.is_empty()) {
+        (true, _) => session_context.to_owned(),
+        (_, true) => dynamic.to_owned(),
+        (false, false) => format!("{dynamic}\n\n{session_context}"),
     }
 }
 
@@ -4443,17 +4503,16 @@ async fn perform_manual_compaction(
         web_degrade,
         mobile_use_active,
     );
-    let post_compaction_system_prompt = {
-        let mut prompt = SystemPromptBuilder::build_with_handoff(
-            metadata,
-            &instruction_entries,
-            handoff_dir.as_deref(),
-        );
-        // Same instruct-pipe manual as the live turn, so the cached system
-        // prefix is identical across normal and post-compaction requests.
-        prompt.push_str(&tool_manual(&post_compaction_tools));
-        prompt
-    };
+    let post_compaction_grant_scope = cache_grant_scope_digest(grant)?;
+    let post_compaction_system_prompt = SystemPromptBuilder::shared_immutable_base(
+        &post_compaction_tools,
+        &post_compaction_grant_scope,
+    );
+    let post_compaction_volatile_tail = SystemPromptBuilder::session_context_with_handoff(
+        metadata,
+        &instruction_entries,
+        handoff_dir.as_deref(),
+    );
     let auth_scope = credential_surface_name(resolved.provider.credential_surface()).to_owned();
     let usage_account = resolved
         .account_alias
@@ -4555,6 +4614,8 @@ async fn perform_manual_compaction(
         context_window: resolved.context_window,
         reserved_output_tokens: metadata.max_tokens,
         post_compaction_system_prompt: Some(post_compaction_system_prompt),
+        post_compaction_volatile_tail: Some(post_compaction_volatile_tail),
+        post_compaction_grant_scope,
         post_compaction_tools,
         reasoning_settings,
         cache_expected_later_reads,
@@ -5430,6 +5491,23 @@ async fn start_turn(
         .collect();
         (!parts.is_empty()).then(|| parts.join("\n"))
     };
+    let instruction_entries = instructions
+        .as_ref()
+        .map_or_else(Vec::new, LoadedProjectInstructions::prompt_entries);
+    let mut session_context = SystemPromptBuilder::session_context_with_handoff(
+        metadata,
+        &instruction_entries,
+        handoff_dir.as_deref(),
+    );
+    if loom_workflow
+        .as_ref()
+        .is_some_and(|workflow| workflow.meta.iter().any(|meta| meta.agent_type.is_some()))
+    {
+        session_context.push_str("\n\n[DAEMON-BOUND TYPED WORKFLOW EXECUTOR]\n");
+        session_context.push_str(
+            "The daemon selects and capability-scopes each typed node. The current volatile typed-executor binding is authoritative; stop using a prior specialist role whenever that binding changes.",
+        );
+    }
     let mobile_use_active = durable_session_tool_state(lease, lease.session_id())
         .await?
         .mobile_use_active;
@@ -5445,6 +5523,7 @@ async fn start_turn(
             delegation,
             tasks: crate::tasks::TaskFacade::new(lease.hub().clone()),
             agent_id: agent_id.clone(),
+            session_context_tail: session_context.clone(),
             grant: delegation_grant.clone(),
             mobile_use_active,
             cli_scope,
@@ -5490,32 +5569,16 @@ async fn start_turn(
             false,
         ));
     }
-    let instruction_entries = instructions
-        .as_ref()
-        .map_or_else(Vec::new, LoadedProjectInstructions::prompt_entries);
-    config.system_prompt = Some(SystemPromptBuilder::build_with_handoff(
-        metadata,
-        &instruction_entries,
-        handoff_dir.as_deref(),
-    ));
-    if let (Some(system_prompt), Some(workflow)) =
-        (config.system_prompt.as_mut(), loom_workflow.as_ref())
-        && workflow.meta.iter().any(|meta| meta.agent_type.is_some())
-    {
-        system_prompt.push_str("\n\n[DAEMON-BOUND TYPED WORKFLOW EXECUTOR]\n");
-        system_prompt.push_str(
-            "The daemon selects and capability-scopes each typed node. The current volatile typed-executor binding is authoritative; stop using a prior specialist role whenever that binding changes.",
-        );
-    }
-    config.volatile_user_tail = graph_brief;
     let loom_turn_grant =
         loom_provider_fenced.then(|| loom_provider_grant(delegation_grant.as_ref()));
     if let Some(grant) = loom_turn_grant.as_ref() {
         validate_grant(grant)?;
     }
+    let provider_grant = loom_turn_grant.as_ref().or(delegation_grant.as_ref());
+    let provider_grant_scope = cache_grant_scope_digest(provider_grant)?;
     let provider_tool_base = authorized_tool_definitions(
         &dependencies.tool_factory,
-        loom_turn_grant.as_ref().or(delegation_grant.as_ref()),
+        provider_grant,
         mobile_use_active,
     );
     config.provider_local_web_tools = provider_tool_base
@@ -5525,12 +5588,18 @@ async fn start_turn(
         .collect();
     config.provider_tool_base = Some(provider_tool_base);
     config.install_provider_derived_request_state(&provider_request_state);
-    // Instruct pipe: the tools ride the wire as minimal stubs; their signatures
-    // and semantics ride the cached system prompt as one compact manual for the
-    // exact advertised set.
-    if let Some(system_prompt) = config.system_prompt.as_mut() {
-        system_prompt.push_str(&tool_manual(&config.tools));
-    }
+    // Cache prefix law: common policy + the manual for the exact advertised
+    // schema pack are the complete system prompt. Session/task/identity state
+    // follows as a volatile user message, after providers have rendered the
+    // tool schemas, so trusted sibling sessions share a byte-identical base.
+    config.system_prompt = Some(SystemPromptBuilder::shared_immutable_base(
+        &config.tools,
+        &provider_grant_scope,
+    ));
+    config.volatile_user_tail = Some(join_volatile_context_tail(
+        graph_brief.as_deref().unwrap_or_default(),
+        &session_context,
+    ));
     let auth_scope = credential_surface_name(resolved.provider.credential_surface()).to_owned();
     let account_scope = resolved
         .account_alias
@@ -5620,6 +5689,11 @@ async fn start_turn(
         context_window: config.context_window,
         reserved_output_tokens: config.reserved_output_tokens,
         post_compaction_system_prompt: config.system_prompt.clone(),
+        // Graph/typed state refreshes at live provider boundaries. Compaction
+        // retains only the immutable per-turn session suffix so it cannot
+        // replay a stale dynamic binding after graph advancement.
+        post_compaction_volatile_tail: Some(session_context),
+        post_compaction_grant_scope: provider_grant_scope,
         post_compaction_tools: config.tools.clone(),
         reasoning_settings: config.reasoning_settings.clone(),
         cache_expected_later_reads: config.cache_expected_later_reads,
@@ -5798,6 +5872,41 @@ fn digest_json(value: &(impl serde::Serialize + ?Sized)) -> String {
         |_| blake3::hash(b"serialization-error").to_hex().to_string(),
         |bytes| blake3::hash(&bytes).to_hex().to_string(),
     )
+}
+
+/// Canonical non-secret identity for the effective authorization boundary
+/// behind an advertised tool pack. Tool names alone are insufficient: two
+/// host-scoped network grants can expose the same schema while authorizing
+/// different destinations, and must therefore occupy different cache bases.
+pub(crate) fn cache_grant_scope_digest(grant: Option<&Grant>) -> Result<String, HaiderError> {
+    let Some(grant) = grant else {
+        return Ok(SystemPromptBuilder::UNSCOPED_GRANT_SCOPE.to_owned());
+    };
+    let mut tools = grant.tools.clone();
+    tools.sort();
+    tools.dedup();
+    let mut effects = grant
+        .effect_ceiling
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                format!("cache grant scope could not serialize an effect: {error}"),
+                false,
+            )
+        })?;
+    effects.sort();
+    effects.dedup();
+    let bytes = serde_json::to_vec(&(tools, effects)).map_err(|error| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            format!("cache grant scope could not serialize: {error}"),
+            false,
+        )
+    })?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
 fn usage_scope_for(
@@ -8511,6 +8620,7 @@ async fn create_broker_tool_dispatcher(
         output,
         durable_permission_bindings: durable_permissions.bindings,
         metadata: context.metadata,
+        session_context_tail: context.session_context_tail,
         parent_agent_id: context.agent_id,
         delegation: context.delegation,
         tasks: context.tasks,
@@ -8594,6 +8704,7 @@ struct BrokerToolDispatcher {
     output: HubCommandOutputContext,
     durable_permission_bindings: HashMap<MenuId, (EffectClass, String)>,
     metadata: SessionMetadataV1,
+    session_context_tail: String,
     parent_agent_id: Option<AgentId>,
     delegation: DelegationHandle,
     tasks: crate::tasks::TaskFacade,
@@ -9592,7 +9703,11 @@ impl ToolDispatcher for BrokerToolDispatcher {
     }
 
     async fn refresh_volatile_context_tail(&self) -> Result<Option<String>, HaiderError> {
-        Ok(Some(self.rebind_typed_workflow_execution().await?))
+        let dynamic = self.rebind_typed_workflow_execution().await?;
+        Ok(Some(join_volatile_context_tail(
+            &dynamic,
+            &self.session_context_tail,
+        )))
     }
 
     #[allow(clippy::expect_used)]

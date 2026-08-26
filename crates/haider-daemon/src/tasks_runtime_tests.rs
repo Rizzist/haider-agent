@@ -186,6 +186,7 @@ async fn task_dispatcher_with_grant(
             delegation: crate::delegation::DelegationHandle::new(hub.clone()),
             tasks: TaskFacade::with_kill_grace(hub.clone(), Duration::from_millis(300)),
             agent_id: None,
+            session_context_tail: String::new(),
             grant,
             mobile_use_active: false,
             cli_scope: None,

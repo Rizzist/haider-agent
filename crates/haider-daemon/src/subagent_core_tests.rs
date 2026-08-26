@@ -648,10 +648,19 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
         .await
         .expect("first child request");
     let first_request = provider.requests().remove(0);
-    let system = first_request.system_prompt.expect("child system prompt");
-    assert!(system.contains(&format!(
+    let handoff_line = format!(
         "Ephemeral parent handoff directory: {manifest_handoff} (EPHEMERAL; use it for shared specs, never durable storage)."
-    )));
+    );
+    assert!(
+        first_request
+            .system_prompt
+            .as_deref()
+            .is_some_and(|system| !system.contains(&handoff_line)),
+        "session-specific handoff coordinates must stay out of the shared base"
+    );
+    assert!(first_request.messages.iter().any(|message| {
+        matches!(message.blocks.as_slice(), [Block::Text { text }] if text.contains(&handoff_line))
+    }));
 
     let mut control = UdsControlClient::connect(hub.clone()).await;
     control.attach_control(parent_session.clone()).await;
@@ -901,6 +910,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
             delegation: delegation.clone(),
             tasks: crate::tasks::TaskFacade::new(hub.clone()),
             agent_id: None,
+            session_context_tail: String::new(),
             grant: None,
             mobile_use_active: false,
             cli_scope: None,
