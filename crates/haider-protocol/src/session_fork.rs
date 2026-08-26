@@ -99,8 +99,35 @@ pub enum ForkContextEpoch {
     /// sidecar root. A first rebuild starts a fresh physical generation at
     /// segment zero and may segment immediately; no parent bytes are inherited.
     Fresh,
+    /// The child continues the exact provider-visible cache prefix recorded
+    /// by [`SessionForked::inherited_cache_segment`]. The first appended byte
+    /// after that prefix begins the child's independent lineage.
+    Inherited,
     #[serde(other)]
     Unknown,
+}
+
+/// Exact durable cache coordinates inherited by a byte-identical fork.
+///
+/// The source provider-view event remains the authority for the exact system,
+/// tool-schema, and history bytes. This compact descriptor binds the child to
+/// that event and lets restart/resume restore the parent's route and epoch
+/// without copying provider-view bytes into a second audit field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkCacheSegmentV1 {
+    pub provider: String,
+    pub model: String,
+    pub account_scope: String,
+    /// Parent routing scope; adapters derive their opaque provider route from
+    /// this value exactly as they did for the source session.
+    pub cache_route: String,
+    pub cache_epoch: String,
+    /// Domain-separated digest of the complete exact provider-view ledger
+    /// whose equality justified inheritance.
+    pub prefix_digest: String,
+    pub stable_history_end: u64,
+    pub source_provider_view_seq: u64,
+    pub source_provider_view_event_id: EventId,
 }
 
 /// One copied envelope whose child prompt rendering was changed to `omit`.
@@ -131,6 +158,8 @@ pub struct SessionForked {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub omissions: Vec<SessionHistoryOmission>,
     pub context_epoch: ForkContextEpoch,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_cache_segment: Option<ForkCacheSegmentV1>,
 }
 
 /// Additive fork-event union kept separate from the exhaustive core event

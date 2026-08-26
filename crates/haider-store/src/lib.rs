@@ -55,6 +55,7 @@ pub use event_store::{
     TypedAgentInstallItemCas, TypedAgentInstallRetryResult, TypedAgentInstallSnapshot,
     TypedAgentInstallWatchPage, TypedAgentInstallWatchResult,
 };
+pub use event_store::{ForkCacheInheritanceCandidate, fork_provider_view_prefix_digest};
 pub use haider_protocol::error::{ErrorCode, HaiderError};
 pub use usage_ledger::{
     UsageLedgerCounters, UsageLedgerLane, UsageLedgerSlot, UsageLedgerWriter, UsageSlotAddress,

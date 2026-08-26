@@ -4,19 +4,22 @@ use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::agent::{AgentManifest, AgentRole, Grant, Placement};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
-use haider_protocol::history::TreeNode;
+use haider_protocol::history::{NodeKind, TreeNode};
 use haider_protocol::ids::{
     AgentId, BranchId, DeviceId, EventId, ItemId, LeaseId, NodeId, RunId, SessionId,
 };
+use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::session_fork::{
     ForkContextEpoch, SessionForkMode, SessionForked, SessionMetaforkProposal,
     SessionMetaforkRemoval, SessionMetaforkReviewManifest,
 };
 use haider_protocol::state::RunState;
+use haider_protocol::verify::VerifyVerdict;
 use haider_store::{
-    BranchCreateCommand, DelegationRecord, DelegationState, EventStore, SessionCreateCommand,
-    SessionForkCommand, SessionForkOutcome, SessionMetaforkCommit, Store, TurnAcceptCommand,
-    TurnAcceptOutcome,
+    BranchCreateCommand, DelegationRecord, DelegationState, EventStore,
+    ForkCacheInheritanceCandidate, SessionCreateCommand, SessionForkCommand, SessionForkOutcome,
+    SessionMetaforkCommit, Store, TurnAcceptCommand, TurnAcceptOutcome,
+    fork_provider_view_prefix_digest,
 };
 use rusqlite::types::ValueRef;
 use std::collections::HashSet;
@@ -306,6 +309,131 @@ fn accept_metafork_review(command: &mut SessionForkCommand) -> String {
     digest
 }
 
+fn provider_view(account_scope: &str, history: &str) -> serde_json::Value {
+    serde_json::json!({
+        "provider": "fake",
+        "model": "fake-model",
+        "dialect": "fake-provider-v1",
+        "serialization_version": "haider.provider-view.json.v1",
+        "header_epoch": "header-epoch",
+        "cache_epoch": "cache-epoch",
+        "compaction_epoch": "root-compaction",
+        "reasoning_retention": "append-only",
+        "account_scope": account_scope,
+        "stable_history_end": 1,
+        "current_user_start": 1,
+        "trim_sentinel": "root-compaction",
+        "boundaries": [],
+        "system_bytes": b"stable system".to_vec(),
+        "tool_schema_bytes": b"stable tools".to_vec(),
+        "history_blocks": [history.as_bytes().to_vec()],
+    })
+}
+
+fn append_provider_view_head(
+    store: &Store,
+    session_id: &SessionId,
+    run_id: &RunId,
+    parent: NodeId,
+    view: &serde_json::Value,
+) -> (NodeId, u64, EventId, u64) {
+    append_provider_view_head_data(
+        store,
+        session_id,
+        run_id,
+        parent,
+        serde_json::json!({"ordinal": 1, "view": view}),
+    )
+}
+
+fn append_provider_view_head_data(
+    store: &Store,
+    session_id: &SessionId,
+    run_id: &RunId,
+    parent: NodeId,
+    data: serde_json::Value,
+) -> (NodeId, u64, EventId, u64) {
+    let attempt = data
+        .get("ordinal")
+        .and_then(serde_json::Value::as_u64)
+        .map_or_else(|| "malformed".to_owned(), |ordinal| ordinal.to_string());
+    let provider_view_event_id = EventId::new(format!("provider-view-{session_id}-{attempt}"));
+    let node_id = NodeId::new(format!("provider-view-head-{session_id}-{attempt}"));
+    let item = TurnItem::Extension {
+        kind: "provider_view_attempt_v1".into(),
+        data,
+    };
+    let hidden = RenderTargets {
+        ui: false,
+        durable: true,
+        prompt: PromptRender::Omit,
+    };
+    let mut envelopes = [
+        EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: provider_view_event_id.clone(),
+            seq: 0,
+            session_id: session_id.clone(),
+            branch_id: None,
+            run_id: Some(run_id.clone()),
+            agent_id: None,
+            device_id: DeviceId::new("session-fork-test-device"),
+            authority_epoch: 0,
+            worker_generation: store.worker_generation(),
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: hidden,
+            payload: serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new(format!("provider-view-item-{session_id}-{attempt}")),
+                item,
+            }))
+            .expect("provider view payload"),
+        },
+        EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new(format!("provider-view-node-{session_id}-{attempt}")),
+            seq: 0,
+            session_id: session_id.clone(),
+            branch_id: None,
+            run_id: Some(run_id.clone()),
+            agent_id: None,
+            device_id: DeviceId::new("session-fork-test-device"),
+            authority_epoch: 0,
+            worker_generation: store.worker_generation(),
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: hidden,
+            payload: serde_json::to_value(EventPayload::NodeCommitted(TreeNode {
+                node: node_id.clone(),
+                parent: Some(parent),
+                kind: NodeKind::AssistantCommit {
+                    text: "provider response".into(),
+                    verdict: VerifyVerdict::NotApplicable,
+                },
+            }))
+            .expect("provider view head payload"),
+        },
+    ];
+    store
+        .append(&mut envelopes)
+        .expect("append provider view head");
+    (
+        node_id,
+        envelopes[1].seq,
+        provider_view_event_id,
+        envelopes[0].seq,
+    )
+}
+
+fn fork_audit(envelopes: &[EventEnvelope<serde_json::Value>]) -> SessionForked {
+    envelopes
+        .last()
+        .and_then(|envelope| SessionForked::from_payload_value(&envelope.payload))
+        .expect("fork audit fact")
+}
+
 /// MUTATION CHECK: change the clone loop's child `session_id` predicate to the
 /// source id. Expected RUNTIME failure: this byte snapshot changes, proving a
 /// fork corrupted the only authoritative parent transcript.
@@ -493,6 +621,478 @@ fn session_fork_keeps_parent_byte_identical_and_replays_idempotently() {
     );
 }
 
+/// MUTATION CHECK: force every fork to `Fresh`, change the inherited route to
+/// the child id, rotate the epoch, or digest anything except the exact source
+/// provider view. Expected RUNTIME failure: the inherited segment assertions
+/// no longer match the parent cacheable prefix.
+#[test]
+fn byte_identical_fork_inherits_parent_cache_segment() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let source = SessionId::new("cache-inherit-parent");
+    create_session(&store, &source);
+    let (run_id, parent, _, _) = source_turn(&store, &source, "copied history");
+    let view = provider_view("account-a", "copied history");
+    let (node, seq, source_view_event_id, source_view_seq) =
+        append_provider_view_head(&store, &source, &run_id, parent, &view);
+    let mut child_view = view.clone();
+    child_view["stable_history_end"] = serde_json::json!(2);
+    child_view["history_blocks"]
+        .as_array_mut()
+        .expect("child history blocks")
+        .push(serde_json::json!(b"first child-only suffix".to_vec()));
+    let command = fork_command(
+        &store,
+        "cache-inherit-command",
+        &source,
+        "cache-inherit-child",
+        node,
+        seq,
+        None,
+    );
+
+    let SessionForkOutcome::Committed { created, envelopes } = store
+        .fork_session_with_cache_candidate(
+            &command,
+            Some(&ForkCacheInheritanceCandidate {
+                provider_view: child_view,
+            }),
+        )
+        .expect("cache-inheriting fork")
+    else {
+        panic!("fresh cache-inheriting fork commits");
+    };
+    let record = fork_audit(&envelopes);
+    let segment = record
+        .inherited_cache_segment
+        .as_ref()
+        .expect("inherited cache segment");
+    assert_eq!(record.context_epoch, ForkContextEpoch::Inherited);
+    assert_eq!(segment.cache_route, source.as_str());
+    assert_eq!(segment.cache_epoch, "cache-epoch");
+    assert_eq!(segment.provider, "fake");
+    assert_eq!(segment.model, "fake-model");
+    assert_eq!(segment.account_scope, "account-a");
+    assert_eq!(segment.stable_history_end, 1);
+    assert_eq!(segment.source_provider_view_seq, source_view_seq);
+    assert_eq!(segment.source_provider_view_event_id, source_view_event_id);
+    assert_eq!(
+        segment.prefix_digest,
+        fork_provider_view_prefix_digest(&view).expect("parent prefix digest")
+    );
+    assert_eq!(
+        created.inherited_cache_segment.as_ref(),
+        Some(segment),
+        "receipt and audit carry one inheritance decision"
+    );
+}
+
+/// MUTATION CHECK: compare history block counts but not exact bytes. Expected
+/// RUNTIME failure: one changed history byte incorrectly inherits the route.
+#[test]
+fn one_differing_provider_history_byte_forces_fresh_epoch() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let source = SessionId::new("cache-byte-mismatch-parent");
+    create_session(&store, &source);
+    let (run_id, parent, _, _) = source_turn(&store, &source, "copied history");
+    let source_view = provider_view("account-a", "copied history");
+    let (node, seq, _, _) =
+        append_provider_view_head(&store, &source, &run_id, parent, &source_view);
+    let command = fork_command(
+        &store,
+        "cache-byte-mismatch-command",
+        &source,
+        "cache-byte-mismatch-child",
+        node,
+        seq,
+        None,
+    );
+    let candidate = ForkCacheInheritanceCandidate {
+        // Same byte length and every other cache coordinate; only the final
+        // provider-visible history byte differs.
+        provider_view: provider_view("account-a", "copied historx"),
+    };
+
+    let SessionForkOutcome::Committed { created, envelopes } = store
+        .fork_session_with_cache_candidate(&command, Some(&candidate))
+        .expect("fresh byte-mismatch fork")
+    else {
+        panic!("fresh byte-mismatch fork commits");
+    };
+    let record = fork_audit(&envelopes);
+    assert_eq!(record.context_epoch, ForkContextEpoch::Fresh);
+    assert!(record.inherited_cache_segment.is_none());
+    assert!(created.inherited_cache_segment.is_none());
+}
+
+/// MUTATION CHECK: omit account scope from exact provider-view comparison.
+/// Expected RUNTIME failure: a child resolved to another tenant inherits the
+/// parent's cache route and epoch.
+#[test]
+fn cross_account_fork_forces_fresh_epoch() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let source = SessionId::new("cache-account-mismatch-parent");
+    create_session(&store, &source);
+    let (run_id, parent, _, _) = source_turn(&store, &source, "copied history");
+    let source_view = provider_view("account-a", "copied history");
+    let (node, seq, _, _) =
+        append_provider_view_head(&store, &source, &run_id, parent, &source_view);
+    let command = fork_command(
+        &store,
+        "cache-account-mismatch-command",
+        &source,
+        "cache-account-mismatch-child",
+        node,
+        seq,
+        None,
+    );
+    let candidate = ForkCacheInheritanceCandidate {
+        provider_view: provider_view("account-b", "copied history"),
+    };
+
+    let SessionForkOutcome::Committed { created, envelopes } = store
+        .fork_session_with_cache_candidate(&command, Some(&candidate))
+        .expect("fresh cross-account fork")
+    else {
+        panic!("fresh cross-account fork commits");
+    };
+    let record = fork_audit(&envelopes);
+    assert_eq!(record.context_epoch, ForkContextEpoch::Fresh);
+    assert!(record.inherited_cache_segment.is_none());
+    assert!(created.inherited_cache_segment.is_none());
+}
+
+/// MUTATION CHECK: keep the decision only in process memory or omit its exact
+/// digest from the audit/receipt. Expected RUNTIME failure: replay after open
+/// loses or changes the inherited segment.
+#[test]
+fn inherited_cache_decision_and_digest_survive_restart_replay() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let source = SessionId::new("cache-replay-parent");
+    create_session(&store, &source);
+    let (run_id, parent, _, _) = source_turn(&store, &source, "durable copied history");
+    let view = provider_view("account-a", "durable copied history");
+    let (node, seq, _, _) = append_provider_view_head(&store, &source, &run_id, parent, &view);
+    let command = fork_command(
+        &store,
+        "cache-replay-command",
+        &source,
+        "cache-replay-child",
+        node,
+        seq,
+        None,
+    );
+    let SessionForkOutcome::Committed { created, envelopes } = store
+        .fork_session_with_cache_candidate(
+            &command,
+            Some(&ForkCacheInheritanceCandidate {
+                provider_view: view,
+            }),
+        )
+        .expect("cache-inheriting fork")
+    else {
+        panic!("fresh cache-inheriting fork commits");
+    };
+    let committed_record = fork_audit(&envelopes);
+    let committed_segment = committed_record
+        .inherited_cache_segment
+        .clone()
+        .expect("committed inherited segment");
+    let child = created.session_id.clone();
+    drop(store);
+
+    let reopened = Store::open(root.path()).expect("store reopens");
+    let replayed_record = reopened
+        .journal_replay(&child)
+        .expect("child replay after restart")
+        .iter()
+        .filter_map(|envelope| SessionForked::from_payload_value(&envelope.payload))
+        .next_back()
+        .expect("replayed fork audit");
+    assert_eq!(replayed_record.context_epoch, ForkContextEpoch::Inherited);
+    assert_eq!(
+        replayed_record.inherited_cache_segment,
+        Some(committed_segment.clone())
+    );
+    assert_eq!(
+        reopened
+            .session_fork_receipt(
+                &command.command_id,
+                &command.request_digest,
+                &command.request_json,
+            )
+            .expect("fork receipt after restart")
+            .and_then(|created| created.inherited_cache_segment),
+        Some(committed_segment)
+    );
+}
+
+/// MUTATION CHECK: derive nested routes only from the copied slice, or keep
+/// reusing the ancestor route after a child emits its first divergent view,
+/// or forking the route on an identical post-fork retry.
+/// Expected RUNTIME failure: the immediate fork-of-fork loses the inherited
+/// root route, the identical retry switches early, or the post-divergence
+/// fork fails to switch to its parent.
+#[test]
+fn nested_forks_recover_route_then_fork_it_after_first_new_view() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let source = SessionId::new("cache-lineage-root");
+    create_session(&store, &source);
+    let (run_id, parent, _, _) = source_turn(&store, &source, "root cached history");
+    let view = provider_view("account-a", "root cached history");
+    let (node, seq, _, _) = append_provider_view_head(&store, &source, &run_id, parent, &view);
+    let first_command = fork_command(
+        &store,
+        "cache-lineage-first-command",
+        &source,
+        "cache-lineage-first-child",
+        node.clone(),
+        seq,
+        None,
+    );
+    let SessionForkOutcome::Committed {
+        created: first_created,
+        ..
+    } = store
+        .fork_session_with_cache_candidate(
+            &first_command,
+            Some(&ForkCacheInheritanceCandidate {
+                provider_view: view.clone(),
+            }),
+        )
+        .expect("first cache-lineage fork")
+    else {
+        panic!("first cache-lineage fork commits");
+    };
+    let first_child = first_created.session_id;
+
+    let immediate_command = fork_command(
+        &store,
+        "cache-lineage-immediate-command",
+        &first_child,
+        "cache-lineage-immediate-child",
+        node.clone(),
+        seq,
+        None,
+    );
+    let SessionForkOutcome::Committed {
+        created: immediate_created,
+        ..
+    } = store
+        .fork_session_with_cache_candidate(
+            &immediate_command,
+            Some(&ForkCacheInheritanceCandidate {
+                provider_view: view.clone(),
+            }),
+        )
+        .expect("immediate nested fork")
+    else {
+        panic!("immediate nested fork commits");
+    };
+    assert_eq!(
+        immediate_created
+            .inherited_cache_segment
+            .as_ref()
+            .expect("immediate nested cache segment")
+            .cache_route,
+        source.as_str(),
+        "the source fork audit lies after fork_seq but remains route authority"
+    );
+
+    let (retry_node, retry_seq, _, _) = append_provider_view_head_data(
+        &store,
+        &first_child,
+        &run_id,
+        node,
+        serde_json::json!({"ordinal": 2, "view": &view}),
+    );
+    let retry_command = fork_command(
+        &store,
+        "cache-lineage-retry-command",
+        &first_child,
+        "cache-lineage-retry-child",
+        retry_node.clone(),
+        retry_seq,
+        None,
+    );
+    let SessionForkOutcome::Committed {
+        created: retry_created,
+        ..
+    } = store
+        .fork_session_with_cache_candidate(
+            &retry_command,
+            Some(&ForkCacheInheritanceCandidate {
+                provider_view: view.clone(),
+            }),
+        )
+        .expect("identical-retry nested fork")
+    else {
+        panic!("identical-retry nested fork commits");
+    };
+    assert_eq!(
+        retry_created
+            .inherited_cache_segment
+            .as_ref()
+            .expect("identical-retry cache segment")
+            .cache_route,
+        source.as_str(),
+        "an exact post-fork retry remains on the inherited ancestor route"
+    );
+
+    let mut post_fork_view = view;
+    post_fork_view["stable_history_end"] = serde_json::json!(2);
+    post_fork_view["history_blocks"]
+        .as_array_mut()
+        .expect("post-fork history blocks")
+        .push(serde_json::json!(b"first divergent child block".to_vec()));
+    let (post_fork_node, post_fork_seq, _, _) = append_provider_view_head_data(
+        &store,
+        &first_child,
+        &run_id,
+        retry_node,
+        serde_json::json!({"ordinal": 3, "view": &post_fork_view}),
+    );
+    let divergent_command = fork_command(
+        &store,
+        "cache-lineage-divergent-command",
+        &first_child,
+        "cache-lineage-divergent-child",
+        post_fork_node,
+        post_fork_seq,
+        None,
+    );
+    let SessionForkOutcome::Committed {
+        created: divergent_created,
+        ..
+    } = store
+        .fork_session_with_cache_candidate(
+            &divergent_command,
+            Some(&ForkCacheInheritanceCandidate {
+                provider_view: post_fork_view,
+            }),
+        )
+        .expect("post-divergence nested fork")
+    else {
+        panic!("post-divergence nested fork commits");
+    };
+    assert_eq!(
+        divergent_created
+            .inherited_cache_segment
+            .as_ref()
+            .expect("post-divergence cache segment")
+            .cache_route,
+        first_child.as_str(),
+        "the first post-fork provider view starts the child's own route"
+    );
+}
+
+/// MUTATION CHECK: treat a copied provider ledger as if it were warm on a
+/// source child whose own creation audit declared `Fresh`. Expected RUNTIME
+/// failure: an immediate nested child reports inheritance from no cache.
+#[test]
+fn nested_fork_cannot_resurrect_cache_before_a_fresh_parent_sends() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let source = SessionId::new("cache-fresh-boundary-root");
+    create_session(&store, &source);
+    let (run_id, parent, _, _) = source_turn(&store, &source, "root cached history");
+    let view = provider_view("account-a", "root cached history");
+    let (node, seq, _, _) = append_provider_view_head(&store, &source, &run_id, parent, &view);
+    let fresh_parent_command = fork_command(
+        &store,
+        "cache-fresh-boundary-parent-command",
+        &source,
+        "cache-fresh-boundary-parent",
+        node.clone(),
+        seq,
+        None,
+    );
+    let SessionForkOutcome::Committed {
+        created: fresh_parent,
+        ..
+    } = store
+        .fork_session(&fresh_parent_command)
+        .expect("fresh parent fork")
+    else {
+        panic!("fresh parent fork commits");
+    };
+    let nested_command = fork_command(
+        &store,
+        "cache-fresh-boundary-nested-command",
+        &fresh_parent.session_id,
+        "cache-fresh-boundary-nested-child",
+        node,
+        seq,
+        None,
+    );
+
+    let SessionForkOutcome::Committed { created, envelopes } = store
+        .fork_session_with_cache_candidate(
+            &nested_command,
+            Some(&ForkCacheInheritanceCandidate {
+                provider_view: view,
+            }),
+        )
+        .expect("nested fork after fresh boundary")
+    else {
+        panic!("nested fork after fresh boundary commits");
+    };
+    let record = fork_audit(&envelopes);
+    assert_eq!(record.context_epoch, ForkContextEpoch::Fresh);
+    assert!(record.inherited_cache_segment.is_none());
+    assert!(created.inherited_cache_segment.is_none());
+}
+
+/// MUTATION CHECK: accept `data.view` without validating the complete
+/// `ProviderViewAttemptV1` wrapper. Expected RUNTIME failure: the newest
+/// missing-ordinal record falls through as an inheritable ledger.
+#[test]
+fn malformed_newest_provider_view_wrapper_forces_fresh_epoch() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let source = SessionId::new("cache-malformed-wrapper-parent");
+    create_session(&store, &source);
+    let (run_id, parent, _, _) = source_turn(&store, &source, "cached history");
+    let view = provider_view("account-a", "cached history");
+    let (valid_node, _, _, _) = append_provider_view_head(&store, &source, &run_id, parent, &view);
+    let (malformed_node, malformed_seq, _, _) = append_provider_view_head_data(
+        &store,
+        &source,
+        &run_id,
+        valid_node,
+        serde_json::json!({"view": &view}),
+    );
+    let command = fork_command(
+        &store,
+        "cache-malformed-wrapper-command",
+        &source,
+        "cache-malformed-wrapper-child",
+        malformed_node,
+        malformed_seq,
+        None,
+    );
+
+    let SessionForkOutcome::Committed { created, envelopes } = store
+        .fork_session_with_cache_candidate(
+            &command,
+            Some(&ForkCacheInheritanceCandidate {
+                provider_view: view,
+            }),
+        )
+        .expect("fresh malformed-wrapper fork")
+    else {
+        panic!("fresh malformed-wrapper fork commits");
+    };
+    let record = fork_audit(&envelopes);
+    assert_eq!(record.context_epoch, ForkContextEpoch::Fresh);
+    assert!(record.inherited_cache_segment.is_none());
+    assert!(created.inherited_cache_segment.is_none());
+}
+
 /// MUTATION CHECK: persist `PromptRender::Omit` back into the matching source
 /// event row instead of limiting it to the child clone. Expected RUNTIME
 /// failure: the decoded and raw parent byte snapshots change after metafork,
@@ -588,6 +1188,7 @@ fn metafork_omits_only_child_prompt_and_records_exact_removal() {
         "remove the chocolate discussion"
     );
     assert_eq!(record.context_epoch, ForkContextEpoch::Fresh);
+    assert!(record.inherited_cache_segment.is_none());
 }
 
 /// MUTATION CHECK: remove the accepted-proposal digest comparison. Expected
