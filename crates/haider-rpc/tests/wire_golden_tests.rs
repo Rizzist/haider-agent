@@ -227,6 +227,7 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "session.create",
         "session.detach",
         "session.diagnostic",
+        "session.descendants.attach",
         "session.fleet",
         "session.fork",
         "session.input_inject",
@@ -3346,6 +3347,108 @@ fn session_fleet_frames_are_additive_and_unknown_tolerant() {
         serde_json::from_str(&folded_json).expect("old decoder ignores additive witness");
     assert_eq!(old_decoder.agent_id.as_str(), "legacy-agent");
     assert!(old_decoder.children.is_empty());
+}
+
+/// DESCENDANT STREAM WIRE LAW: the method and top-level stream frame stay on
+/// protocol v1, carry distinct session/agent identities around the untouched
+/// raw envelope, and make the fan-out omission count explicit.
+///
+/// MUTATION CHECK: remove either identity tag, make truncation implicit,
+/// change an existing fleet field, or rename the v1 method/frame. Expected
+/// failure: the exact goldens or the historical transcript pin turns red.
+#[test]
+fn session_descendant_stream_is_additive_tagged_and_golden() {
+    assert_eq!(
+        haider_rpc::FEATURE_SESSION_DESCENDANT_STREAM_V1,
+        "session_descendant_stream_v1"
+    );
+    assert_eq!(haider_rpc::DESCENDANT_STREAM_MAX_CHILDREN, 64);
+
+    let request = WireFrame::Request {
+        request_id: haider_rpc::RequestId::new("descendants-attach"),
+        body: RequestBody::SessionDescendantsAttach {
+            session_id: haider_protocol::ids::SessionId::new("session-root"),
+            cursors: vec![haider_rpc::DescendantReplayCursorWire {
+                session_id: haider_protocol::ids::SessionId::new("session-child"),
+                agent_id: haider_protocol::ids::AgentId::new("agent-child"),
+                after_seq: 4,
+            }],
+            max_children: 8,
+        },
+    };
+    assert_eq!(
+        serde_json::to_string(&request).expect("encode descendant request"),
+        r#"{"v":1,"kind":"request","request_id":"descendants-attach","body":{"method":"session.descendants.attach","session_id":"session-root","cursors":[{"session_id":"session-child","agent_id":"agent-child","after_seq":4}],"max_children":8}}"#
+    );
+
+    let mut raw = common::raw_envelope(5);
+    raw.session_id = haider_protocol::ids::SessionId::new("session-child");
+    let frame = WireFrame::SessionDescendantStream {
+        attachment_id: haider_rpc::AttachmentId::new("descendants-1"),
+        event: haider_rpc::SessionDescendantStreamEventWire::Envelope {
+            session_id: haider_protocol::ids::SessionId::new("session-child"),
+            agent_id: haider_protocol::ids::AgentId::new("agent-child"),
+            envelope: raw,
+        },
+    };
+    let value = serde_json::to_value(&frame).expect("encode descendant event");
+    assert_eq!(value["v"], 1);
+    assert_eq!(value["kind"], "session_descendant_stream");
+    assert_eq!(value["event"]["event"], "envelope");
+    assert_eq!(value["event"]["session_id"], "session-child");
+    assert_eq!(value["event"]["agent_id"], "agent-child");
+    assert_eq!(value["event"]["envelope"]["session_id"], "session-child");
+    assert_eq!(value["event"]["envelope"]["seq"], 5);
+    let decoded: WireFrame = serde_json::from_value(value).expect("decode descendant event");
+    assert_eq!(decoded, frame);
+
+    let future: WireFrame = serde_json::from_value(serde_json::json!({
+        "v": 1,
+        "kind": "session_descendant_stream",
+        "attachment_id": "descendants-future",
+        "event": {"event": "future_additive_event", "future": 1}
+    }))
+    .expect("decode additive descendant event");
+    assert!(matches!(
+        future,
+        WireFrame::SessionDescendantStream {
+            event: haider_rpc::SessionDescendantStreamEventWire::Unknown,
+            ..
+        }
+    ));
+
+    let repair = WireFrame::SessionDescendantRepairRequired {
+        attachment_id: haider_rpc::AttachmentId::new("descendants-repair"),
+        children: vec![haider_rpc::DescendantIdentityWire {
+            session_id: haider_protocol::ids::SessionId::new("session-child"),
+            agent_id: haider_protocol::ids::AgentId::new("agent-child"),
+        }],
+    };
+    let repair_value = serde_json::to_value(&repair).expect("encode descendant repair");
+    assert_eq!(repair_value["kind"], "session_descendant_repair_required");
+    assert_eq!(repair_value["children"][0]["session_id"], "session-child");
+    assert_eq!(repair_value["children"][0]["agent_id"], "agent-child");
+    assert!(repair_value["children"][0].get("after_seq").is_none());
+    assert_eq!(
+        serde_json::from_value::<WireFrame>(repair_value).expect("decode descendant repair"),
+        repair
+    );
+
+    let truncation = haider_rpc::DescendantTruncationWire {
+        truncated: true,
+        streamed_children: 64,
+        omitted_children: 1,
+        count_complete: false,
+    };
+    assert_eq!(
+        serde_json::to_value(truncation).expect("encode explicit truncation"),
+        serde_json::json!({
+            "truncated": true,
+            "streamed_children": 64,
+            "omitted_children": 1,
+            "count_complete": false
+        })
+    );
 }
 
 /// Lineage truth (`session_lineage_v1`) is additive in both directions: an

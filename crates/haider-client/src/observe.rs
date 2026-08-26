@@ -12,9 +12,10 @@ use haider_rpc::haider_protocol::credential::CredentialDescriptor;
 use haider_rpc::haider_protocol::envelope::RawEnvelope;
 use haider_rpc::haider_protocol::ids::SessionId;
 use haider_rpc::{
-    AttachMode, AttachmentId, Capability, CapabilitySet, ClientKind, ERROR_CODE_NOT_FOUND,
-    FEATURE_EFFECT_RECOVERY_V1, FEATURE_SESSION_FLEET_V1, FEATURE_SESSION_OBSERVE_BATCH_V1,
-    FEATURE_SESSION_OBSERVE_V1, LifecyclePhase, RequestBody, ResponseBody, SessionFleetSnapshot,
+    AttachMode, AttachmentId, Capability, CapabilitySet, ClientKind, DescendantReplayCursorWire,
+    ERROR_CODE_NOT_FOUND, FEATURE_EFFECT_RECOVERY_V1, FEATURE_SESSION_DESCENDANT_STREAM_V1,
+    FEATURE_SESSION_FLEET_V1, FEATURE_SESSION_OBSERVE_BATCH_V1, FEATURE_SESSION_OBSERVE_V1,
+    LifecyclePhase, RequestBody, ResponseBody, SessionDescendantBaselineWire, SessionFleetSnapshot,
     SessionObserveDigest, SessionSummary, Welcome, WireFrame,
 };
 use tokio::sync::mpsc;
@@ -100,6 +101,26 @@ pub struct ObserveClient {
     welcome: Welcome,
 }
 
+/// Feature-negotiated descendant view. `Snapshot` is deliberately a separate
+/// variant: it carries no event receiver and cannot be mistaken for live
+/// lineage when an older daemon omits `session_descendant_stream_v1`.
+pub enum DescendantView {
+    Live(DescendantLiveAttachment),
+    Snapshot(SessionFleetSnapshot),
+}
+
+/// One real `session.descendants.attach` result. The receiver carries
+/// `SessionDescendantStream` and system-lane repair/drain frames for this
+/// connection; callers advance child cursors only after applying envelopes.
+pub struct DescendantLiveAttachment {
+    pub attachment_id: AttachmentId,
+    pub baseline: SessionDescendantBaselineWire,
+    pub events: mpsc::Receiver<WireFrame>,
+    /// Loss counter sampled before the request. A later value from
+    /// [`ObserveClient::lost_events`] requires reconnect from applied cursors.
+    pub lost_events_at_attach: u64,
+}
+
 impl ObserveClient {
     /// Connects to the resolved profile, optionally using the standard safe
     /// connect-or-spawn path. `spawn == false` never unlinks or starts anything.
@@ -144,6 +165,13 @@ impl ObserveClient {
 
     pub fn close(&self) {
         self.client.close();
+    }
+
+    /// Number of uncorrelated frames this connection could not spool. Any
+    /// increase invalidates a live descendant view until cursor-based repair.
+    #[must_use]
+    pub fn lost_events(&self) -> u64 {
+        self.client.lost_events()
     }
 
     /// Lists every durable session in the daemon's stable byte order.
@@ -285,6 +313,91 @@ impl ObserveClient {
                 "session.fleet response method mismatch",
             )),
         }
+    }
+
+    /// Opens the reconnectable descendant view when advertised. If and only
+    /// if that feature is absent, falls back to the separately feature-gated
+    /// point-in-time fleet snapshot and returns the `Snapshot` variant.
+    pub async fn descendants_attach(
+        &self,
+        session_id: SessionId,
+        cursors: Vec<DescendantReplayCursorWire>,
+        max_children: u32,
+    ) -> Result<DescendantView, ObserveError> {
+        if !self
+            .welcome
+            .features
+            .contains(FEATURE_SESSION_DESCENDANT_STREAM_V1)
+        {
+            return self.fleet(session_id).await.map(DescendantView::Snapshot);
+        }
+        let Some(events) = self.client.take_events() else {
+            return Err(ObserveError::Protocol(
+                "descendant attachment event stream was already taken",
+            ));
+        };
+        let requested_session = session_id.clone();
+        let lost_events_at_attach = self.client.lost_events();
+        let response = match self
+            .client
+            .request(RequestBody::SessionDescendantsAttach {
+                session_id,
+                cursors,
+                max_children,
+            })
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.restore_descendant_events(events)?;
+                return Err(error.into());
+            }
+        };
+        match response {
+            ResponseBody::SessionDescendantsAttach {
+                attachment_id,
+                baseline,
+            } if baseline.session_id == requested_session => {
+                Ok(DescendantView::Live(DescendantLiveAttachment {
+                    attachment_id,
+                    baseline,
+                    events,
+                    lost_events_at_attach,
+                }))
+            }
+            ResponseBody::Error { code, .. } if code == ERROR_CODE_NOT_FOUND => {
+                self.restore_descendant_events(events)?;
+                Err(ObserveError::UnknownSession(requested_session))
+            }
+            ResponseBody::Error {
+                code,
+                message,
+                retryable,
+                ..
+            } => {
+                self.restore_descendant_events(events)?;
+                Err(ObserveError::Rpc {
+                    code,
+                    message,
+                    retryable,
+                })
+            }
+            _ => {
+                self.restore_descendant_events(events)?;
+                Err(ObserveError::Protocol(
+                    "session.descendants.attach response method mismatch",
+                ))
+            }
+        }
+    }
+
+    fn restore_descendant_events(
+        &self,
+        events: mpsc::Receiver<WireFrame>,
+    ) -> Result<(), ObserveError> {
+        self.client.restore_events(events).map_err(|_| {
+            ObserveError::Protocol("descendant attachment event stream could not be restored")
+        })
     }
 
     /// Fails with the same typed feature error as [`Self::fleet`] before a

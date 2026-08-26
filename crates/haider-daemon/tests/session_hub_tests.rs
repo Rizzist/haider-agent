@@ -290,6 +290,10 @@ impl FrameSink for CollectSink {
                     attachment_id: queued,
                     ..
                 }
+                | WireFrame::SessionDescendantStream {
+                    attachment_id: queued,
+                    ..
+                }
                 | WireFrame::Lagged {
                     attachment_id: queued,
                     ..
@@ -298,6 +302,10 @@ impl FrameSink for CollectSink {
                     request_id,
                     body:
                         ResponseBody::SessionAttach {
+                            attachment_id: queued,
+                            ..
+                        }
+                        | ResponseBody::SessionDescendantsAttach {
                             attachment_id: queued,
                             ..
                         },
@@ -311,6 +319,55 @@ impl FrameSink for CollectSink {
             });
         }
         purged_response
+    }
+}
+
+/// Holds an attach response off-wire, then permanently refuses the first
+/// descendant event. This deterministically exercises the unknown-id repair
+/// path: purge must replace the staged success with a correlated error.
+#[derive(Default)]
+struct RefuseDescendantStartSink {
+    inner: CollectSink,
+    staged: Mutex<Option<(AttachmentId, RequestId)>>,
+}
+
+impl RefuseDescendantStartSink {
+    async fn next(&self) -> WireFrame {
+        self.inner.next().await
+    }
+}
+
+impl FrameSink for RefuseDescendantStartSink {
+    fn try_send(&self, frame: WireFrame) -> Result<(), FrameSendError> {
+        if matches!(frame, WireFrame::SessionDescendantStream { .. }) {
+            return Err(FrameSendError);
+        }
+        self.inner.try_send(frame)
+    }
+
+    fn try_send_for(
+        &self,
+        attachment_id: &AttachmentId,
+        frame: WireFrame,
+    ) -> Result<(), FrameSendError> {
+        let WireFrame::Response { request_id, .. } = frame else {
+            return Err(FrameSendError);
+        };
+        *self.staged.lock().map_err(|_| FrameSendError)? =
+            Some((attachment_id.clone(), request_id));
+        Ok(())
+    }
+
+    fn purge_attachment(&self, attachment_id: &AttachmentId) -> Option<RequestId> {
+        let mut staged = self.staged.lock().ok()?;
+        let matches = staged
+            .as_ref()
+            .is_some_and(|(queued, _)| queued == attachment_id);
+        if matches {
+            staged.take().map(|(_, request_id)| request_id)
+        } else {
+            None
+        }
     }
 }
 
@@ -4752,6 +4809,580 @@ async fn surface_watch_delivers_on_change_and_stays_silent_when_idle() {
         extra.is_empty(),
         "idle ticks must stay silent, got {extra:?}"
     );
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// DESCENDANT STREAM LAW: the baseline seals one head per child, replay is
+/// strictly after that child's supplied cursor, reconnect neither duplicates
+/// nor skips the detached suffix, and live terminal/parent-result deltas keep
+/// the child session and lineage agent identities distinct.
+///
+/// MUTATION CHECK: use one tree-global cursor, omit either outer identity,
+/// replay inclusively, or derive anchors from delegation coordinates.
+/// Expected RUNTIME failure: the exact sequence/identity/anchor assertions
+/// below turn red.
+#[tokio::test]
+async fn descendant_stream_reconnects_per_child_without_gaps_or_duplicates() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let generation = store.worker_generation();
+    let root = SessionId::new("descendant-stream-root");
+    let child_session = SessionId::new("descendant-stream-child-session");
+    create_typed_session(&store, &root, "openai").await;
+    create_typed_session(&store, &child_session, "openai").await;
+    let record = fleet_delegation(&root, &root, &child_session, "stream-child", None, 1);
+    store
+        .create_delegation(record.clone())
+        .await
+        .expect("stream relation");
+
+    let mut spawn = envelope(&root, "descendant-parent-spawn", generation);
+    spawn.run_id = Some(record.parent_run_id.clone());
+    spawn.payload = serde_json::to_value(EventPayload::AgentSpawned(record.manifest.clone()))
+        .expect("spawn fact");
+    let mut spawn_item = envelope(&root, "descendant-parent-spawn-item", generation);
+    spawn_item.run_id = Some(record.parent_run_id.clone());
+    spawn_item.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
+        item_id: record.tool_item_id.clone(),
+        item: TurnItem::ChildSpawn {
+            agent: record.agent_id.clone(),
+        },
+    }))
+    .expect("spawn item");
+    let committed = hub
+        .append(&mut [spawn, spawn_item])
+        .await
+        .expect("parent anchors commit");
+    let spawn_seq = committed[0].seq;
+    let spawn_item_seq = committed[1].seq;
+
+    let mut thinking = envelope(&child_session, "descendant-child-thinking", generation);
+    thinking.run_id = Some(record.child_run_id.clone());
+    thinking.agent_id = Some(record.agent_id.clone());
+    thinking.payload =
+        serde_json::to_value(EventPayload::RunState(RunState::Thinking)).expect("thinking state");
+    hub.append(&mut [thinking])
+        .await
+        .expect("child thinking commits");
+    assert_eq!(
+        store.latest_seq(&child_session).await.expect("child head"),
+        2
+    );
+
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            CapabilitySet::from([Capability::View]),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("descendant stream connection");
+    connection
+        .request(
+            RequestId::new("descendant-first-attach"),
+            RequestBody::SessionDescendantsAttach {
+                session_id: root.clone(),
+                cursors: vec![haider_rpc::DescendantReplayCursorWire {
+                    session_id: child_session.clone(),
+                    agent_id: record.agent_id.clone(),
+                    after_seq: 1,
+                }],
+                max_children: 4,
+            },
+        )
+        .await
+        .expect("first descendant attach routes");
+    let WireFrame::Response {
+        body:
+            ResponseBody::SessionDescendantsAttach {
+                attachment_id: first_attachment,
+                baseline,
+            },
+        ..
+    } = sink.next().await
+    else {
+        panic!("expected descendant baseline");
+    };
+    assert_eq!(baseline.roots.len(), 1);
+    let baseline_child = &baseline.roots[0];
+    assert_eq!(baseline_child.session_id, child_session);
+    assert_eq!(baseline_child.agent_id, record.agent_id);
+    assert_ne!(
+        baseline_child.session_id.as_str(),
+        baseline_child.agent_id.as_str(),
+        "session identity is not lineage identity"
+    );
+    assert_eq!(baseline_child.child_run_id, record.child_run_id);
+    assert_eq!(baseline_child.requested_after_seq, 1);
+    assert_eq!(baseline_child.replay_through_seq, 2);
+    assert_eq!(baseline_child.parent_anchors.spawn_seq, Some(spawn_seq));
+    assert_eq!(
+        baseline_child.parent_anchors.spawn_item_seq,
+        Some(spawn_item_seq)
+    );
+    assert_eq!(baseline_child.parent_anchors.result_seq, None);
+
+    let WireFrame::SessionDescendantStream {
+        attachment_id,
+        event:
+            haider_rpc::SessionDescendantStreamEventWire::Envelope {
+                session_id,
+                agent_id,
+                envelope,
+            },
+    } = sink.next().await
+    else {
+        panic!("expected first child replay envelope");
+    };
+    assert_eq!(attachment_id, first_attachment);
+    assert_eq!(session_id, child_session);
+    assert_eq!(agent_id, record.agent_id);
+    assert_eq!(envelope.session_id, child_session);
+    assert_eq!(envelope.seq, 2);
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::SessionDescendantStream {
+            attachment_id,
+            event: haider_rpc::SessionDescendantStreamEventWire::ChildCaughtUp {
+                high_water_seq: 2,
+                ..
+            },
+        } if attachment_id == first_attachment
+    ));
+
+    connection
+        .request(
+            RequestId::new("descendant-first-detach"),
+            RequestBody::SessionDetach {
+                attachment_id: first_attachment,
+            },
+        )
+        .await
+        .expect("first descendant detach routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            body: ResponseBody::SessionDetach { .. },
+            ..
+        }
+    ));
+
+    let child_suffix_seq = append_one(
+        &hub,
+        &child_session,
+        generation,
+        "descendant-detached-suffix",
+    )
+    .await;
+    assert_eq!(child_suffix_seq, 3);
+    connection
+        .request(
+            RequestId::new("descendant-reconnect"),
+            RequestBody::SessionDescendantsAttach {
+                session_id: root.clone(),
+                cursors: vec![haider_rpc::DescendantReplayCursorWire {
+                    session_id: child_session.clone(),
+                    agent_id: record.agent_id.clone(),
+                    after_seq: 2,
+                }],
+                max_children: 4,
+            },
+        )
+        .await
+        .expect("descendant reconnect routes");
+    let WireFrame::Response {
+        body:
+            ResponseBody::SessionDescendantsAttach {
+                attachment_id: reconnect_attachment,
+                baseline,
+            },
+        ..
+    } = sink.next().await
+    else {
+        panic!("expected reconnect baseline");
+    };
+    assert_eq!(baseline.roots[0].requested_after_seq, 2);
+    assert_eq!(baseline.roots[0].replay_through_seq, 3);
+    let WireFrame::SessionDescendantStream {
+        event: haider_rpc::SessionDescendantStreamEventWire::Envelope { envelope, .. },
+        ..
+    } = sink.next().await
+    else {
+        panic!("expected detached suffix replay");
+    };
+    assert_eq!(envelope.seq, 3, "resume is strict and duplicate-free");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::SessionDescendantStream {
+            event: haider_rpc::SessionDescendantStreamEventWire::ChildCaughtUp {
+                high_water_seq: 3,
+                ..
+            },
+            ..
+        }
+    ));
+
+    let mut done = envelope(&child_session, "descendant-child-done", generation);
+    done.run_id = Some(record.child_run_id.clone());
+    done.agent_id = Some(record.agent_id.clone());
+    done.payload =
+        serde_json::to_value(EventPayload::RunState(RunState::Done)).expect("done state");
+    hub.append(&mut [done])
+        .await
+        .expect("terminal child commits");
+    let mut saw_live_seq = false;
+    let mut saw_terminal = false;
+    while !saw_live_seq || !saw_terminal {
+        match sink.next().await {
+            WireFrame::SessionDescendantStream {
+                attachment_id,
+                event:
+                    haider_rpc::SessionDescendantStreamEventWire::Envelope {
+                        session_id,
+                        agent_id,
+                        envelope,
+                    },
+            } if attachment_id == reconnect_attachment && envelope.seq == 4 => {
+                assert_eq!(session_id, child_session);
+                assert_eq!(agent_id, record.agent_id);
+                saw_live_seq = true;
+            }
+            WireFrame::SessionDescendantStream {
+                attachment_id,
+                event:
+                    haider_rpc::SessionDescendantStreamEventWire::Delta {
+                        change: haider_rpc::DescendantChangeKindWire::Terminated,
+                        child,
+                    },
+            } if attachment_id == reconnect_attachment => {
+                assert_eq!(child.session_id, child_session);
+                assert_eq!(child.agent_id, record.agent_id);
+                assert_eq!(child.state, FleetAgentStateWire::Done);
+                saw_terminal = true;
+            }
+            WireFrame::SessionDescendantStream { .. } => {}
+            frame => panic!("unexpected descendant live frame: {frame:?}"),
+        }
+    }
+
+    let report = ChildReport {
+        agent: record.agent_id.clone(),
+        summary: "complete".into(),
+        verified: ReportVerification::Unverified,
+        workspace_revision: None,
+    };
+    let mut report_fact = envelope(&root, "descendant-parent-result", generation);
+    report_fact.run_id = Some(record.parent_run_id.clone());
+    report_fact.payload =
+        serde_json::to_value(EventPayload::AgentReport(report.clone())).expect("report fact");
+    let mut result_item = envelope(&root, "descendant-parent-result-item", generation);
+    result_item.run_id = Some(record.parent_run_id.clone());
+    result_item.payload = serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
+        item_id: ItemId::new("descendant-result-item"),
+        item: TurnItem::ChildResult { report },
+    }))
+    .expect("result item");
+    let committed = hub
+        .append(&mut [report_fact, result_item])
+        .await
+        .expect("parent result anchors commit");
+    loop {
+        if let WireFrame::SessionDescendantStream {
+            event:
+                haider_rpc::SessionDescendantStreamEventWire::Delta {
+                    change: haider_rpc::DescendantChangeKindWire::Updated,
+                    child,
+                },
+            ..
+        } = sink.next().await
+            && child.parent_anchors.result_seq.is_some()
+        {
+            assert_eq!(child.parent_anchors.result_seq, Some(committed[0].seq));
+            assert_eq!(child.parent_anchors.result_item_seq, Some(committed[1].seq));
+            break;
+        }
+    }
+
+    let late_session = SessionId::new("descendant-stream-late-session");
+    create_typed_session(&store, &late_session, "openai").await;
+    let late = fleet_delegation(&root, &root, &late_session, "late", None, 1);
+    store
+        .create_delegation(late.clone())
+        .await
+        .expect("late lineage relation");
+    loop {
+        if let WireFrame::SessionDescendantStream {
+            event:
+                haider_rpc::SessionDescendantStreamEventWire::Delta {
+                    change: haider_rpc::DescendantChangeKindWire::Appeared,
+                    child,
+                },
+            ..
+        } = sink.next().await
+            && child.agent_id == late.agent_id
+        {
+            assert_eq!(child.session_id, late_session);
+            assert_ne!(child.session_id.as_str(), child.agent_id.as_str());
+            break;
+        }
+    }
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// FAN-OUT LAW: the daemon clamps the requested live fan-out to a typed cap
+/// and reports every known omission. A bounded baseline never presents an
+/// empty child list as complete.
+#[tokio::test]
+async fn descendant_stream_fanout_truncation_is_explicit() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let root = SessionId::new("descendant-truncated-root");
+    create_typed_session(&store, &root, "openai").await;
+    for suffix in ["first", "second"] {
+        let child = SessionId::new(format!("descendant-truncated-{suffix}"));
+        create_typed_session(&store, &child, "openai").await;
+        store
+            .create_delegation(fleet_delegation(&root, &root, &child, suffix, None, 1))
+            .await
+            .expect("truncation relation");
+    }
+
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            CapabilitySet::from([Capability::View]),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("truncation connection");
+    connection
+        .request(
+            RequestId::new("descendant-truncated-attach"),
+            RequestBody::SessionDescendantsAttach {
+                session_id: root,
+                cursors: Vec::new(),
+                max_children: 1,
+            },
+        )
+        .await
+        .expect("bounded descendant attach routes");
+    let WireFrame::Response {
+        body: ResponseBody::SessionDescendantsAttach { baseline, .. },
+        ..
+    } = sink.next().await
+    else {
+        panic!("expected bounded descendant baseline");
+    };
+    assert_eq!(baseline.fanout.requested_children, 1);
+    assert_eq!(baseline.fanout.accepted_children, 1);
+    assert_eq!(baseline.fanout.hard_limit, 64);
+    assert_eq!(baseline.roots.len(), 1);
+    assert!(baseline.truncation.truncated);
+    assert_eq!(baseline.truncation.streamed_children, 1);
+    assert_eq!(baseline.truncation.omitted_children, 1);
+    assert!(baseline.truncation.count_complete);
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// COHORT RECONNECT LAW: cursors from the prior negotiated cohort seed the
+/// next baseline before a newly created shallower child can displace a nested
+/// child from the fresh BFS prefix.
+#[tokio::test]
+async fn descendant_reconnect_preserves_cursor_seeded_ancestry() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let root = SessionId::new("descendant-cohort-root");
+    let parent_session = SessionId::new("descendant-cohort-parent");
+    let nested_session = SessionId::new("descendant-cohort-nested");
+    create_typed_session(&store, &root, "openai").await;
+    create_typed_session(&store, &parent_session, "openai").await;
+    create_typed_session(&store, &nested_session, "openai").await;
+    let parent = fleet_delegation(&root, &root, &parent_session, "parent", None, 1);
+    let nested = fleet_delegation(
+        &root,
+        &parent_session,
+        &nested_session,
+        "nested",
+        Some(parent.agent_id.clone()),
+        2,
+    );
+    store
+        .create_delegation(parent.clone())
+        .await
+        .expect("parent lineage");
+    store
+        .create_delegation(nested.clone())
+        .await
+        .expect("nested lineage");
+
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            CapabilitySet::from([Capability::View]),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("cohort connection");
+    connection
+        .request(
+            RequestId::new("cohort-first"),
+            RequestBody::SessionDescendantsAttach {
+                session_id: root.clone(),
+                cursors: Vec::new(),
+                max_children: 2,
+            },
+        )
+        .await
+        .expect("first cohort attach");
+    let WireFrame::Response {
+        body:
+            ResponseBody::SessionDescendantsAttach {
+                attachment_id,
+                baseline,
+            },
+        ..
+    } = sink.next().await
+    else {
+        panic!("expected first cohort baseline");
+    };
+    assert_eq!(baseline.roots.len(), 1);
+    assert_eq!(baseline.roots[0].session_id, parent_session);
+    assert_eq!(baseline.roots[0].children[0].session_id, nested_session);
+    let mut caught_up = 0;
+    while caught_up < 2 {
+        if matches!(
+            sink.next().await,
+            WireFrame::SessionDescendantStream {
+                event: haider_rpc::SessionDescendantStreamEventWire::ChildCaughtUp {
+                    high_water_seq: 1,
+                    ..
+                },
+                ..
+            }
+        ) {
+            caught_up += 1;
+        }
+    }
+    connection
+        .request(
+            RequestId::new("cohort-detach"),
+            RequestBody::SessionDetach { attachment_id },
+        )
+        .await
+        .expect("detach first cohort");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            body: ResponseBody::SessionDetach { .. },
+            ..
+        }
+    ));
+
+    let shallower_session = SessionId::new("descendant-cohort-shallower");
+    create_typed_session(&store, &shallower_session, "openai").await;
+    store
+        .create_delegation(fleet_delegation(
+            &root,
+            &root,
+            &shallower_session,
+            "shallower",
+            None,
+            1,
+        ))
+        .await
+        .expect("shallower lineage");
+    connection
+        .request(
+            RequestId::new("cohort-reconnect"),
+            RequestBody::SessionDescendantsAttach {
+                session_id: root,
+                cursors: vec![
+                    haider_rpc::DescendantReplayCursorWire {
+                        session_id: parent_session.clone(),
+                        agent_id: parent.agent_id,
+                        after_seq: 1,
+                    },
+                    haider_rpc::DescendantReplayCursorWire {
+                        session_id: nested_session.clone(),
+                        agent_id: nested.agent_id,
+                        after_seq: 1,
+                    },
+                ],
+                max_children: 2,
+            },
+        )
+        .await
+        .expect("cursor-seeded reconnect");
+    let WireFrame::Response {
+        body: ResponseBody::SessionDescendantsAttach { baseline, .. },
+        ..
+    } = sink.next().await
+    else {
+        panic!("expected cursor-seeded baseline");
+    };
+    assert_eq!(baseline.roots.len(), 1);
+    assert_eq!(baseline.roots[0].session_id, parent_session);
+    assert_eq!(baseline.roots[0].children[0].session_id, nested_session);
+    assert!(baseline.truncation.truncated);
+    assert_eq!(baseline.truncation.streamed_children, 2);
+    assert_eq!(baseline.truncation.omitted_children, 1);
+
+    connection.close().await.expect("connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// REPAIR/UNKNOWN-ID LAW: a permanently refused first descendant frame
+/// purges the still-staged success and returns one correlated retryable error.
+#[tokio::test]
+async fn descendant_start_refusal_replaces_staged_success_with_typed_error() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let root = SessionId::new("descendant-refusal-root");
+    let child = SessionId::new("descendant-refusal-child");
+    create_typed_session(&store, &root, "openai").await;
+    create_typed_session(&store, &child, "openai").await;
+    store
+        .create_delegation(fleet_delegation(&root, &root, &child, "refused", None, 1))
+        .await
+        .expect("refusal lineage");
+
+    let sink = Arc::new(RefuseDescendantStartSink::default());
+    let connection = hub
+        .open_connection(
+            CapabilitySet::from([Capability::View]),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("refusal connection");
+    connection
+        .request(
+            RequestId::new("descendant-refused-attach"),
+            RequestBody::SessionDescendantsAttach {
+                session_id: root,
+                cursors: Vec::new(),
+                max_children: 1,
+            },
+        )
+        .await
+        .expect("refused attach routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            request_id,
+            body: ResponseBody::Error {
+                ref code,
+                retryable: true,
+                ..
+            },
+        } if request_id.as_str() == "descendant-refused-attach"
+            && code == haider_rpc::ERROR_CODE_OVERLOADED
+    ));
 
     connection.close().await.expect("connection closes");
     hub.shutdown().await.expect("hub stops");

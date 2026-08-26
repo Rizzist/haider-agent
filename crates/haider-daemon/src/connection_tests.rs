@@ -109,6 +109,10 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// MUTATION CHECK: remove `FEATURE_SESSION_FLEET_V1`. Expected RUNTIME
 /// failure: fleet clients cannot discover the served descendant snapshot.
 ///
+/// MUTATION CHECK: remove `FEATURE_SESSION_DESCENDANT_STREAM_V1`. Expected
+/// RUNTIME failure: clients cannot discover the reconnectable nested stream
+/// and may incorrectly treat the point-in-time fleet snapshot as live.
+///
 /// MUTATION CHECK: remove `FEATURE_HOOKS_V1`. Expected RUNTIME failure:
 /// hook-aware clients cannot discover the served list/trust/run grant seam.
 ///
@@ -241,6 +245,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_ACCOUNT_LIST_WATCH_V1.to_owned(),
             haider_rpc::FEATURE_ACCOUNT_LABEL_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_FLEET_V1.to_owned(),
+            haider_rpc::FEATURE_SESSION_DESCENDANT_STREAM_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_OBSERVE_V1.to_owned(),
             FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned(),
             haider_rpc::FEATURE_AUTONOMOUS_INTERACTION_V1.to_owned(),

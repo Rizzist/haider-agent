@@ -72,6 +72,9 @@ pub const FLEET_MAX_NODES: u32 = 512;
 /// Defensive response-depth ceiling. Execution currently admits only three
 /// delegation levels, but the read contract remains independently bounded.
 pub const FLEET_MAX_DEPTH: u32 = 32;
+/// Maximum number of descendant journals one live descendant attachment may
+/// fan out at once. The request may negotiate any smaller positive bound.
+pub const DESCENDANT_STREAM_MAX_CHILDREN: u32 = 64;
 
 const fn default_frame_limit_u32() -> u32 {
     DEFAULT_FRAME_LIMIT as u32
@@ -324,6 +327,8 @@ pub const FEATURE_RESIDENT_TURN_SUBMIT_V1: &str = "resident_turn_submit_v1";
 pub const FEATURE_EFFECT_RECOVERY_V1: &str = "effect_recovery_v1";
 /// Daemon implements the bounded, durable descendant-tree fleet snapshot.
 pub const FEATURE_SESSION_FLEET_V1: &str = "session_fleet_v1";
+/// Daemon implements the reconnectable, per-child-cursor descendant stream.
+pub const FEATURE_SESSION_DESCENDANT_STREAM_V1: &str = "session_descendant_stream_v1";
 /// The daemon serves receipt-backed named branch creation and branch-scoped turns.
 pub const FEATURE_BRANCH_CREATE_V1: &str = "branch_create_v1";
 /// Daemon serves receipt-backed session-level fork and review-gated metafork.
@@ -1635,6 +1640,166 @@ pub struct SessionFleetSnapshot {
     pub truncated: bool,
 }
 
+/// One reconnect cursor for a descendant journal. Both lineage identities
+/// are required so a client cannot accidentally apply one child's sequence
+/// coordinate to another child session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DescendantReplayCursorWire {
+    pub session_id: SessionId,
+    pub agent_id: AgentId,
+    /// Greatest child-journal sequence the client has fully applied.
+    pub after_seq: u64,
+}
+
+/// One descendant identity without any sequence claim. Used when the daemon
+/// must request reconnect after purging frames it had admitted but cannot
+/// know the client applied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DescendantIdentityWire {
+    pub session_id: SessionId,
+    pub agent_id: AgentId,
+}
+
+/// Negotiated bound for one descendant stream attachment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DescendantFanoutWire {
+    pub requested_children: u32,
+    pub accepted_children: u32,
+    pub hard_limit: u32,
+}
+
+/// Explicit accounting for descendants omitted by the negotiated fan-out or
+/// the defensive lineage scan. `omitted_children` is exact only when
+/// `count_complete` is true; otherwise it is a lower bound, never a claim
+/// that the omitted set is empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DescendantTruncationWire {
+    pub truncated: bool,
+    pub streamed_children: u32,
+    pub omitted_children: u32,
+    pub count_complete: bool,
+}
+
+/// Durable parent-turn anchors for one child. Every optional field preserves
+/// absence from the parent journal; no sequence is inferred from neighboring
+/// events or from the delegation row.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DescendantParentAnchorsWire {
+    /// Parent `AgentSpawned` fact for this exact `agent_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_seq: Option<u64>,
+    /// Parent completed `ChildSpawn` item for this exact `agent_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_item_seq: Option<u64>,
+    /// Parent `AgentReport` fact for this exact `agent_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_seq: Option<u64>,
+    /// Parent completed `ChildResult` item for this exact `agent_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_item_seq: Option<u64>,
+}
+
+/// One child in a descendant attachment baseline or lineage delta. The
+/// session, agent, child-run, and parent-run identities remain independent
+/// coordinates; none is derived from another's string shape. `children` is
+/// populated only while nesting the baseline; delta consumers upsert the
+/// named node and preserve its independently delivered child edges.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DescendantStreamNodeWire {
+    pub session_id: SessionId,
+    pub agent_id: AgentId,
+    pub child_run_id: RunId,
+    pub parent_session_id: SessionId,
+    pub parent_run_id: RunId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_branch_id: Option<BranchId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_agent_id: Option<AgentId>,
+    pub depth: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callsign: Option<String>,
+    pub task: String,
+    pub state: FleetAgentStateWire,
+    /// Echo of the reconnect cursor accepted for this child.
+    pub requested_after_seq: u64,
+    /// Sealed child-journal head for this baseline/delta. Replay covers
+    /// `(requested_after_seq, replay_through_seq]` before `ChildCaughtUp`.
+    pub replay_through_seq: u64,
+    pub parent_anchors: DescendantParentAnchorsWire,
+    /// Nested descendants in a baseline. Delta events leave this empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<DescendantStreamNodeWire>,
+}
+
+/// Reconnectable baseline returned before any descendant stream frame.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionDescendantBaselineWire {
+    pub session_id: SessionId,
+    pub generated_at_ms: u64,
+    pub fanout: DescendantFanoutWire,
+    pub truncation: DescendantTruncationWire,
+    #[serde(default)]
+    pub roots: Vec<DescendantStreamNodeWire>,
+}
+
+/// Typed lineage/state transition after the baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum DescendantChangeKindWire {
+    Appeared,
+    Updated,
+    Terminated,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Frames carried by a live descendant attachment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SessionDescendantStreamEventWire {
+    /// A child appeared or its durable lineage/state/anchor projection
+    /// changed. `Terminated` is emitted for the first transition into a
+    /// terminal fleet state. This is a node upsert, not subtree replacement.
+    Delta {
+        change: DescendantChangeKindWire,
+        child: DescendantStreamNodeWire,
+    },
+    /// One raw child-journal envelope. The outer tags are mandatory even
+    /// though the raw envelope itself also carries its session coordinate.
+    Envelope {
+        session_id: SessionId,
+        agent_id: AgentId,
+        envelope: RawEnvelope,
+    },
+    /// Replay for one child is complete through this sealed high-water mark.
+    ChildCaughtUp {
+        session_id: SessionId,
+        agent_id: AgentId,
+        high_water_seq: u64,
+    },
+    /// A non-contiguous store page was observed. The stream never advances
+    /// past this hole; `resume_after_seq` is diagnostic delivery position,
+    /// while the client reconnects from its own applied cursor.
+    RepairRequired {
+        session_id: SessionId,
+        agent_id: AgentId,
+        resume_after_seq: u64,
+        expected_seq: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_seq: Option<u64>,
+    },
+    /// Updated explicit omission accounting after live lineage growth.
+    Truncation {
+        truncation: DescendantTruncationWire,
+    },
+    /// A future additive event subtype. It conveys no cursor or lineage
+    /// authority to this decoder.
+    #[serde(other)]
+    Unknown,
+}
+
 /// Secret-free projection of one effective hook definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookSummaryWire {
@@ -1809,6 +1974,15 @@ pub enum RequestBody {
     /// durable delegation and child-journal truth. Read-only and receipt-free.
     #[serde(rename = "session.fleet")]
     SessionFleet { session_id: SessionId },
+    /// Attaches a reconnectable live view of the durable descendant tree.
+    /// Each cursor is scoped by both child session and agent identity.
+    #[serde(rename = "session.descendants.attach")]
+    SessionDescendantsAttach {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cursors: Vec<DescendantReplayCursorWire>,
+        max_children: u32,
+    },
     #[serde(rename = "graph.pin")]
     GraphPin {
         command_id: CommandId,
@@ -2491,6 +2665,13 @@ pub enum ResponseBody {
     SessionObserveBatch { digests: Vec<SessionObserveDigest> },
     #[serde(rename = "session.fleet")]
     SessionFleet { snapshot: SessionFleetSnapshot },
+    /// Establishes the connection-scoped descendant attachment. The complete
+    /// baseline is enqueued before any frame naming `attachment_id`.
+    #[serde(rename = "session.descendants.attach")]
+    SessionDescendantsAttach {
+        attachment_id: AttachmentId,
+        baseline: SessionDescendantBaselineWire,
+    },
     /// One atomic snapshot cut. `rows` are complete display values and ordered
     /// by their one-based ordinal.
     #[serde(rename = "queue.list")]
@@ -3318,6 +3499,20 @@ pub enum WireFrame {
         attachment_id: AttachmentId,
         high_water_seq: u64,
     },
+    /// One typed event on a reconnectable descendant attachment. Raw child
+    /// envelopes remain tagged with distinct session and agent identities in
+    /// [`SessionDescendantStreamEventWire::Envelope`].
+    SessionDescendantStream {
+        attachment_id: AttachmentId,
+        event: SessionDescendantStreamEventWire,
+    },
+    /// System-lane terminal repair after a descendant attachment can no
+    /// longer deliver authoritatively. It identifies affected children but
+    /// makes no sequence claim; the client reuses its own applied cursors.
+    SessionDescendantRepairRequired {
+        attachment_id: AttachmentId,
+        children: Vec<DescendantIdentityWire>,
+    },
     /// Changed or newly discovered session summaries for a roster watcher.
     ///
     /// Each frame carries at most 64 summaries. Larger baselines and change
@@ -3454,6 +3649,14 @@ enum WireFrameRef<'a> {
         attachment_id: &'a AttachmentId,
         high_water_seq: u64,
     },
+    SessionDescendantStream {
+        attachment_id: &'a AttachmentId,
+        event: &'a SessionDescendantStreamEventWire,
+    },
+    SessionDescendantRepairRequired {
+        attachment_id: &'a AttachmentId,
+        children: &'a [DescendantIdentityWire],
+    },
     SessionRosterDelta {
         summaries: &'a [SessionSummary],
     },
@@ -3535,6 +3738,15 @@ enum WireFrameOwned {
     AttachCaughtUp {
         attachment_id: AttachmentId,
         high_water_seq: u64,
+    },
+    SessionDescendantStream {
+        attachment_id: AttachmentId,
+        event: SessionDescendantStreamEventWire,
+    },
+    SessionDescendantRepairRequired {
+        attachment_id: AttachmentId,
+        #[serde(default)]
+        children: Vec<DescendantIdentityWire>,
     },
     SessionRosterDelta {
         #[serde(default)]
@@ -3665,6 +3877,20 @@ impl Serialize for WireFrame {
                 attachment_id,
                 high_water_seq: *high_water_seq,
             },
+            Self::SessionDescendantStream {
+                attachment_id,
+                event,
+            } => WireFrameRef::SessionDescendantStream {
+                attachment_id,
+                event,
+            },
+            Self::SessionDescendantRepairRequired {
+                attachment_id,
+                children,
+            } => WireFrameRef::SessionDescendantRepairRequired {
+                attachment_id,
+                children,
+            },
             Self::SessionRosterDelta { summaries } => {
                 WireFrameRef::SessionRosterDelta { summaries }
             }
@@ -3785,6 +4011,20 @@ impl<'de> Deserialize<'de> for WireFrame {
             } => Self::AttachCaughtUp {
                 attachment_id,
                 high_water_seq,
+            },
+            WireFrameOwned::SessionDescendantStream {
+                attachment_id,
+                event,
+            } => Self::SessionDescendantStream {
+                attachment_id,
+                event,
+            },
+            WireFrameOwned::SessionDescendantRepairRequired {
+                attachment_id,
+                children,
+            } => Self::SessionDescendantRepairRequired {
+                attachment_id,
+                children,
             },
             WireFrameOwned::SessionRosterDelta { summaries } => {
                 Self::SessionRosterDelta { summaries }

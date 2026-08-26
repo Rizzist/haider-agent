@@ -90,6 +90,7 @@
 mod session_hub_private_tests;
 
 mod actor;
+mod descendant_stream;
 mod replay;
 pub(crate) mod rpc;
 #[cfg(test)]
@@ -99,6 +100,7 @@ use crate::DaemonError;
 use crate::worker::WorkerManagerHandle;
 use actor::run_session_actor;
 use async_trait::async_trait;
+use descendant_stream::run_descendant_stream;
 use haider_core::{
     AbandonedGraph, AcceptedRunRetry, AcceptedShellExec, AcceptedTurn, AppendGroupBatch,
     BranchCreateCommand, BranchCreateOutcome, CacheDiagnosticKey, CancelledTurn,
@@ -436,12 +438,13 @@ pub trait FrameSink: Send + Sync {
         self.try_send(frame)
     }
 
-    /// Stages a `SessionAttach` RESPONSE with response-before-event
-    /// ordering: a sink with keyed event lanes must not admit this
-    /// attachment's event offers until the response has left the queue, and
-    /// [`Self::purge_attachment`] must report the response's request id if
-    /// it is still staged when the attachment dies. The default is correct
-    /// for sinks with one totally-ordered queue and no admission pressure.
+    /// Stages a `SessionAttach` or `SessionDescendantsAttach` RESPONSE with
+    /// response-before-event ordering: a sink with keyed event lanes must not
+    /// admit this attachment's event offers until the response has left the
+    /// queue, and [`Self::purge_attachment`] must report the response's
+    /// request id if it is still staged when the attachment dies. The default
+    /// is correct for sinks with one totally-ordered queue and no admission
+    /// pressure.
     fn try_send_for(
         &self,
         _attachment_id: &AttachmentId,
@@ -786,6 +789,14 @@ struct HubInner {
     workflow_selection_serials: tokio::sync::Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>,
     replay_tasks: Mutex<Vec<JoinHandle<ReplayCompletion>>>,
     attachments: Mutex<HashMap<AttachmentId, AttachmentOwner>>,
+    /// Connection-scoped nested-subagent streams. They share the ordinary
+    /// attachment admission ledger and outbox lanes but have no single
+    /// session actor because every child journal owns an independent cursor.
+    descendant_attachments: Mutex<HashMap<AttachmentId, DescendantAttachmentOwner>>,
+    /// Wakes descendant streams after durable lineage-row mutations. Child
+    /// journal commits use `roster_publications`; a periodic audit remains
+    /// the lag/restart repair backstop for both channels.
+    descendant_lineage_publications: watch::Sender<u64>,
     /// Admission ledger for the per-connection and global attachment caps.
     /// A slot is reserved BEFORE any actor or channel work and released when
     /// registration fails or `take_attachment` removes the owner, so every
@@ -1183,6 +1194,13 @@ struct AttachmentOwner {
     cancel: watch::Sender<bool>,
 }
 
+/// Ownership for one `session.descendants.attach` stream.
+struct DescendantAttachmentOwner {
+    connection_id: String,
+    session_ids: HashSet<SessionId>,
+    cancel: watch::Sender<bool>,
+}
+
 /// One committed envelope in flight on a catch-up channel, carrying the
 /// weight it was charged so receive-side credit is exactly symmetric.
 struct QueuedEnvelope {
@@ -1223,6 +1241,17 @@ enum RegisterResult {
     Overloaded {
         message: String,
     },
+}
+
+enum DescendantRegisterResult {
+    Registered {
+        attachment_id: AttachmentId,
+        cancel: watch::Receiver<bool>,
+    },
+    Overloaded {
+        message: String,
+    },
+    SessionUnavailable,
 }
 
 enum ActorRegisterResult {
@@ -1618,6 +1647,7 @@ impl SessionHub {
         let append_commit_task = tokio::spawn(run_append_committer(store.clone(), append_receiver));
         let (surface_publications, _) = watch::channel(0_u64);
         let (roster_publications, _) = broadcast::channel(1_024);
+        let (descendant_lineage_publications, _) = watch::channel(0_u64);
         let (haider_code_plan_changes, _) = watch::channel(0_u64);
         let hooks = Arc::new(Mutex::new(None));
         let observe_digests = Arc::new(rpc::ObserveDigestCache::default());
@@ -1647,6 +1677,8 @@ impl SessionHub {
             workflow_selection_serials: tokio::sync::Mutex::new(HashMap::new()),
             replay_tasks: Mutex::new(Vec::new()),
             attachments: Mutex::new(HashMap::new()),
+            descendant_attachments: Mutex::new(HashMap::new()),
+            descendant_lineage_publications,
             attachment_slots: Mutex::new(AttachmentSlots::default()),
             draining: AtomicBool::new(false),
             force_stop: Arc::new(AtomicBool::new(false)),
@@ -2330,7 +2362,9 @@ impl SessionHub {
         &self,
         record: haider_core::DelegationRecord,
     ) -> Result<haider_core::DelegationCreateOutcome, HaiderError> {
-        self.inner.store.create_delegation(record).await
+        let outcome = self.inner.store.create_delegation(record).await?;
+        self.notify_descendant_lineage_change();
+        Ok(outcome)
     }
 
     pub(crate) fn notify_roster_session(&self, session_id: SessionId) {
@@ -2381,7 +2415,9 @@ impl SessionHub {
         &self,
         agent: haider_protocol::ids::AgentId,
     ) -> Result<haider_core::DelegationRecord, HaiderError> {
-        self.inner.store.mark_delegation_running(agent).await
+        let record = self.inner.store.mark_delegation_running(agent).await?;
+        self.notify_descendant_lineage_change();
+        Ok(record)
     }
 
     pub(crate) async fn record_delegation_report(
@@ -2389,17 +2425,28 @@ impl SessionHub {
         agent: haider_protocol::ids::AgentId,
         report: haider_protocol::agent::ChildReport,
     ) -> Result<haider_core::DelegationRecord, HaiderError> {
-        self.inner
+        let record = self
+            .inner
             .store
             .record_delegation_report(agent, report)
-            .await
+            .await?;
+        self.notify_descendant_lineage_change();
+        Ok(record)
     }
 
     pub(crate) async fn mark_delegation_collected(
         &self,
         agent: haider_protocol::ids::AgentId,
     ) -> Result<haider_core::DelegationRecord, HaiderError> {
-        self.inner.store.mark_delegation_collected(agent).await
+        let record = self.inner.store.mark_delegation_collected(agent).await?;
+        self.notify_descendant_lineage_change();
+        Ok(record)
+    }
+
+    fn notify_descendant_lineage_change(&self) {
+        self.inner
+            .descendant_lineage_publications
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
     pub(crate) async fn read_internal_session(
@@ -3543,6 +3590,10 @@ impl SessionHub {
             .map_err(hub_error_as_store)?
             .values()
             .any(|owner| owner.session_id == *session_id)
+            || lock(&self.inner.descendant_attachments)
+                .map_err(hub_error_as_store)?
+                .values()
+                .any(|owner| owner.session_ids.contains(session_id))
         {
             return Err(HaiderError::new(
                 ErrorCode::Busy,
@@ -3871,6 +3922,96 @@ impl SessionHub {
         }
     }
 
+    fn register_descendant_attachment(
+        &self,
+        connection_id: &str,
+        root_session_id: SessionId,
+        mut session_ids: HashSet<SessionId>,
+    ) -> Result<DescendantRegisterResult, SessionHubError> {
+        // Serialize final publication with the same permanent deletion fence
+        // used by ordinary session attachments. If registration wins, the
+        // deleter observes this owner; if deletion wins, no stream is minted.
+        let deleting = lock(&self.inner.deleting_sessions)?;
+        session_ids.insert(root_session_id);
+        if session_ids
+            .iter()
+            .any(|session_id| deleting.contains(session_id))
+        {
+            return Ok(DescendantRegisterResult::SessionUnavailable);
+        }
+        if let Some(message) = self.reserve_attachment_slot(connection_id)? {
+            return Ok(DescendantRegisterResult::Overloaded { message });
+        }
+        let slot = AttachmentSlotGuard {
+            hub: self.clone(),
+            connection_id: connection_id.to_owned(),
+            armed: true,
+        };
+        let attachment_id = AttachmentId::new(random_id("descendants")?);
+        let (cancel, cancel_receiver) = watch::channel(false);
+        lock(&self.inner.descendant_attachments)?.insert(
+            attachment_id.clone(),
+            DescendantAttachmentOwner {
+                connection_id: connection_id.to_owned(),
+                session_ids,
+                cancel,
+            },
+        );
+        drop(deleting);
+        slot.transfer();
+        Ok(DescendantRegisterResult::Registered {
+            attachment_id,
+            cancel: cancel_receiver,
+        })
+    }
+
+    fn track_descendant_attachment_session(
+        &self,
+        attachment_id: &AttachmentId,
+        session_id: SessionId,
+    ) -> Result<bool, SessionHubError> {
+        // Keep live cohort growth on the same side of the deletion fence as
+        // initial registration. A successful insert makes deletion observe
+        // this attachment; a pre-existing deletion tombstone refuses it.
+        let deleting = lock(&self.inner.deleting_sessions)?;
+        if deleting.contains(&session_id) {
+            return Ok(false);
+        }
+        let mut attachments = lock(&self.inner.descendant_attachments)?;
+        let Some(owner) = attachments.get_mut(attachment_id) else {
+            return Ok(false);
+        };
+        owner.session_ids.insert(session_id);
+        drop(attachments);
+        drop(deleting);
+        Ok(true)
+    }
+
+    fn spawn_descendant_stream(
+        &self,
+        attachment_id: AttachmentId,
+        prepared: descendant_stream::PreparedDescendantStream,
+        sink: Arc<dyn FrameSink>,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<(), SessionHubError> {
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(SessionHubError::Closed);
+        }
+        let mut replay_tasks = lock(&self.inner.replay_tasks)?;
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(SessionHubError::Closed);
+        }
+        replay_tasks.retain(|handle| !handle.is_finished());
+        replay_tasks.push(tokio::spawn(run_descendant_stream(
+            self.clone(),
+            attachment_id,
+            prepared,
+            sink,
+            cancel,
+        )));
+        Ok(())
+    }
+
     async fn register_reserved(
         &self,
         connection_id: &str,
@@ -4000,6 +4141,26 @@ impl SessionHub {
         Ok(owner)
     }
 
+    fn take_descendant_attachment(
+        &self,
+        attachment_id: &AttachmentId,
+        connection_id: Option<&str>,
+    ) -> Result<Option<DescendantAttachmentOwner>, SessionHubError> {
+        let mut attachments = lock(&self.inner.descendant_attachments)?;
+        let owned = attachments
+            .get(attachment_id)
+            .is_some_and(|owner| connection_id.is_none_or(|id| owner.connection_id == id));
+        if !owned {
+            return Ok(None);
+        }
+        let owner = attachments.remove(attachment_id);
+        if let Some(owner) = owner.as_ref() {
+            let _ = owner.cancel.send(true);
+            self.release_attachment_slot(&owner.connection_id);
+        }
+        Ok(owner)
+    }
+
     /// Actor-side cleanup after `take_attachment` removed ownership — which
     /// is the authoritative detach. Best effort: a dead actor (forced
     /// teardown) has already dropped its whole attachment map.
@@ -4020,6 +4181,56 @@ impl SessionHub {
         };
         Self::finish_detach(attachment_id, owner).await;
         Ok(true)
+    }
+
+    fn detach_descendant(&self, attachment_id: &AttachmentId) -> Result<bool, SessionHubError> {
+        Ok(self
+            .take_descendant_attachment(attachment_id, None)?
+            .is_some())
+    }
+
+    fn repair_and_detach_descendant(
+        &self,
+        sink: &Arc<dyn FrameSink>,
+        attachment_id: &AttachmentId,
+        children: Vec<haider_rpc::DescendantIdentityWire>,
+    ) {
+        let Ok(Some(_owner)) = self.take_descendant_attachment(attachment_id, None) else {
+            return;
+        };
+        self.inner
+            .metrics
+            .outbox_detaches
+            .fetch_add(1, Ordering::Relaxed);
+        match sink.purge_attachment(attachment_id) {
+            Some(request_id) => {
+                if sink
+                    .try_send(WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::Error {
+                            code: haider_rpc::ERROR_CODE_OVERLOADED.into(),
+                            message: "descendant attachment could not start authoritatively; re-attach from your applied per-child cursors".into(),
+                            retryable: true,
+                            data: None,
+                        },
+                    })
+                    .is_err()
+                {
+                    sink.close_after_required_delivery_failure();
+                }
+            }
+            None => {
+                if sink
+                    .try_send(WireFrame::SessionDescendantRepairRequired {
+                        attachment_id: attachment_id.clone(),
+                        children,
+                    })
+                    .is_err()
+                {
+                    sink.close_after_required_delivery_failure();
+                }
+            }
+        }
     }
 
     fn live_surface_snapshot(
@@ -4346,6 +4557,17 @@ impl SessionHub {
                 attachments.push((attachment_id, owner));
             }
         }
+        let descendant_ids = {
+            let owners = lock(&self.inner.descendant_attachments)?;
+            owners
+                .iter()
+                .filter(|(_, owner)| owner.connection_id == connection_id)
+                .map(|(attachment_id, _)| attachment_id.clone())
+                .collect::<Vec<_>>()
+        };
+        for attachment_id in descendant_ids {
+            let _ = self.take_descendant_attachment(&attachment_id, Some(connection_id))?;
+        }
         Ok(attachments)
     }
 
@@ -4387,7 +4609,14 @@ impl SessionHub {
         let Ok(attachments) = lock(&self.inner.attachments) else {
             return SendAdmission::Refused;
         };
-        if !attachments.contains_key(attachment_id) {
+        if attachments.contains_key(attachment_id) {
+            return sink.offer_prepared(attachment_id, frame);
+        }
+        drop(attachments);
+        let Ok(descendants) = lock(&self.inner.descendant_attachments) else {
+            return SendAdmission::Refused;
+        };
+        if !descendants.contains_key(attachment_id) {
             return SendAdmission::Refused;
         }
         // The ownership lock makes admit-vs-detach atomic: detach removes the
@@ -4405,7 +4634,14 @@ impl SessionHub {
         let Ok(attachments) = lock(&self.inner.attachments) else {
             return SendAdmission::Refused;
         };
-        if !attachments.contains_key(attachment_id) {
+        if attachments.contains_key(attachment_id) {
+            return sink.offer_prepared_ticketed(attachment_id, frame, ticket);
+        }
+        drop(attachments);
+        let Ok(descendants) = lock(&self.inner.descendant_attachments) else {
+            return SendAdmission::Refused;
+        };
+        if !descendants.contains_key(attachment_id) {
             return SendAdmission::Refused;
         }
         // Keep the same admit-vs-detach ownership barrier as the fresh offer.
@@ -4533,10 +4769,17 @@ impl SessionHub {
             let mut owners = lock(&self.inner.attachments)?;
             owners.drain().collect::<Vec<_>>()
         };
+        let descendant_owners = {
+            let mut owners = lock(&self.inner.descendant_attachments)?;
+            owners.drain().collect::<Vec<_>>()
+        };
         // The drained owners bypass `take_attachment`; clear their admission
         // ledger wholesale (no new reservation is admitted while draining).
         *lock(&self.inner.attachment_slots)? = AttachmentSlots::default();
         for (_, owner) in &owners {
+            let _ = owner.cancel.send(true);
+        }
+        for (_, owner) in &descendant_owners {
             let _ = owner.cancel.send(true);
         }
         // Every task joined in order, so the abort fence stays down even when

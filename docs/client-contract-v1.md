@@ -1747,3 +1747,122 @@ most dangerous thing in the room precisely because it resembles the missing one.
 No additional precedence, latency guarantee, provider default, daemon-minted
 pane identity, or per-session account binding could be established from
 source, so none is claimed here.
+
+## 17. `session_descendant_stream_v1`
+
+`session_descendant_stream_v1` gates the read-only
+`session.descendants.attach` method and top-level `SessionDescendantStream`
+frames. This is the reconnectable live nested-subagent door. It is not a
+workflow projection: its tree comes exclusively from durable delegation
+lineage, while workflow state remains the separately gated Convergence Graph
+projection described in §13.3.
+
+The request fields are:
+
+- `session_id`: the root session whose durable descendants are requested;
+- `cursors[]`: zero or more `{ session_id, agent_id, after_seq }` entries.
+  `after_seq` is the greatest consecutive sequence from that exact child
+  journal that the client has fully applied. Both identities are mandatory;
+  a session id and an agent id are distinct coordinates and MUST NOT be
+  equated by string shape; and
+- `max_children`: a positive requested fan-out bound. The daemon clamps it to
+  the advertised v1 hard limit and reports the result rather than silently
+  exceeding or dropping it. Valid requested cursors and their ancestor chains
+  seed the stable negotiated cohort before unused slots are filled from
+  lineage order; a bound too small to preserve that ancestry is rejected
+  rather than silently dropping a resumable child.
+
+Success returns `attachment_id` plus one complete
+`SessionDescendantBaselineWire`. `session.detach` ends this attachment just as
+it ends an ordinary session attachment. The response is enqueued before any
+stream frame naming the new attachment id.
+
+The baseline contains `session_id`, `generated_at_ms`, `fanout`,
+`truncation`, and nested `roots`. `fanout` carries `requested_children`,
+`accepted_children`, and `hard_limit`. Every
+`DescendantStreamNodeWire` carries all of these as independent facts:
+
+- `session_id`, `agent_id`, `child_run_id`, `parent_session_id`, and
+  `parent_run_id`, plus optional `parent_branch_id` and `parent_agent_id`;
+- durable lineage presentation (`depth`, optional persisted `callsign`, and
+  `task`) and the journal/delegation-derived typed `state`;
+- `requested_after_seq` and that child's sealed `replay_through_seq`; and
+- `parent_anchors`, whose optional `spawn_seq`/`result_seq` are the exact
+  parent `AgentSpawned`/`AgentReport` envelope sequences for this agent.
+  Optional `spawn_item_seq`/`result_item_seq` separately anchor the completed
+  visible `ChildSpawn`/`ChildResult` items. Absence stays `None`; a client MUST
+  NOT substitute the tool item id, call id, neighboring sequence, or child
+  head.
+
+There is deliberately no tree-global journal head. Delegation rows establish
+one coherent baseline membership/tree, and every included child has its own
+sealed head. Initial replay for a child is exactly
+`(requested_after_seq, replay_through_seq]`; a `ChildCaughtUp` event confirms
+delivery through that child's `high_water_seq`. A reattaching client supplies
+the greatest sequence it actually applied for each child. It drops a repeated
+envelope at or below that cursor, accepts only the next consecutive sequence,
+and advances only after applying the complete raw envelope. This is the same
+at-least-once law as §7, applied independently per child.
+
+`SessionDescendantStreamEventWire` is typed as follows:
+
+- `delta` carries `change: appeared | updated | terminated` and a complete
+  current node upsert. Its `children` is empty: the client preserves existing
+  child edges and keys/reparents this node from its own lineage coordinates;
+  it MUST NOT replace an existing subtree with that empty vector. `appeared`
+  precedes that newly admitted child's raw replay; `terminated` is the first
+  transition into done, failed, or cancelled; later anchor/lineage changes
+  remain `updated`;
+- `envelope` carries the untouched `RawEnvelope` plus mandatory outer
+  `session_id` and `agent_id`. The outer agent tag is lineage identity; the
+  raw envelope's `run_id`/`agent_id` remain raw journal facts and MUST NOT be
+  overwritten or collapsed into it;
+- `child_caught_up` carries that child's two identities and high-water
+  sequence;
+- `repair_required` carries the child identities, `resume_after_seq`, the
+  expected next sequence, and an optional actually observed sequence. The
+  daemon does not advance past the hole. `resume_after_seq` reports the
+  daemon's delivery position; it never advances client authority. The client
+  reconnects from its own greatest applied sequence (which may be lower); it
+  never accepts the later sequence or fills the range synthetically;
+- `truncation` replaces the current explicit omission accounting after live
+  lineage growth; and
+- an unknown future event subtype carries no cursor, state, lineage, or
+  truncation authority to a v1 client. The client tolerates it but advances
+  no per-child cursor and infers no fact from its unknown fields.
+
+If delivery becomes permanently impossible, the attachment is purged before
+the daemon emits the system-lane `SessionDescendantRepairRequired` control
+frame. Its `children[]` carry both identities but deliberately no sequence:
+the daemon may have purged admitted-but-unwritten frames and cannot know what
+the client applied. The client reconnects the whole view from its own saved
+per-child cursors. If the success response itself was still staged, it is
+replaced by a correlated retryable error instead, so the client never receives
+a repair naming an attachment id it has not learned.
+
+`DescendantTruncationWire` always carries `truncated`, `streamed_children`,
+`omitted_children`, and `count_complete`. When `count_complete=true`,
+`omitted_children` is exact. When false, the defensive lineage scan itself
+hit a bound and the count is a nonzero lower bound; it MUST NOT be displayed
+as the total and MUST NOT be interpreted as an otherwise complete tree. An
+empty returned child list proves a real empty tree only when `truncated=false`
+and `omitted_children=0`.
+
+Gap repair is store-backed. The daemon reads strictly after the last delivered
+per-child delivery cursor, checks every next sequence for contiguity, and never
+advances that delivery cursor before the corresponding
+`SessionDescendantStream` frame is admitted. A missed wake is recovered from
+the store; after connection loss the client reattaches from its own applied
+cursor. Neither path omits facts; duplicates remain possible and are removed
+by the per-child applied cursor. A cursor beyond its child's committed head is
+a typed `cursor_ahead` error and is never clamped.
+
+**Absence law.** If Welcome omits `session_descendant_stream_v1`, the client
+MUST NOT call `session.descendants.attach` and MUST NOT manufacture deltas,
+raw child tails, anchors, or a “live” badge from roster polling. Its only
+sanctioned fallback is the point-in-time `session.fleet` snapshot when
+`session_fleet_v1` is present. That fallback remains a snapshot and must be
+labelled/refreshed as such; absence of both feature bits is unavailable
+lineage truth, not an empty tree. The non-UI `ObserveClient::descendants_attach`
+surface enforces this choice as `DescendantView::Live` versus
+`DescendantView::Snapshot`; the snapshot variant has no event receiver.
