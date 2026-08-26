@@ -19385,6 +19385,7 @@ mod reducer_filter_tests {
             accepted_proposal_digest: None,
             omissions: Vec::new(),
             context_epoch: ForkContextEpoch::Fresh,
+            inherited_cache_segment: None,
         };
         let manifest = AgentManifest {
             agent: AgentId::new("usage-child"),

@@ -1,6 +1,6 @@
 use super::*;
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets};
-use rusqlite::hooks::{AuthAction, Authorization};
+use rusqlite::hooks::{Action, AuthAction, AuthContext, Authorization};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
@@ -179,11 +179,14 @@ fn crash_mid_group_loses_the_whole_group_atomically() {
         store
             .connection()
             .expect("crash-child journal connection")
-            .update_hook(Some(move |_, _, table, _| {
-                if table == "events" && observed_inserts.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
-                    std::process::exit(CRASH_AFTER_SECOND_INSERT);
-                }
-            }))
+            .update_hook(Some(
+                move |_action: Action, _database: &str, table: &str, _row_id: i64| {
+                    if table == "events" && observed_inserts.fetch_add(1, Ordering::SeqCst) + 1 == 2
+                    {
+                        std::process::exit(CRASH_AFTER_SECOND_INSERT);
+                    }
+                },
+            ))
             .expect("install crash hook");
 
         let session = SessionId::new("group-commit-crashed");
@@ -273,7 +276,7 @@ fn lone_append_group_commits_immediately_without_a_batching_wait() {
     store
         .connection()
         .expect("journal connection")
-        .authorizer(Some(move |context| {
+        .authorizer(Some(move |context: AuthContext<'_>| {
             if matches!(context.action, AuthAction::Savepoint { .. }) {
                 observed_savepoints.fetch_add(1, Ordering::SeqCst);
             }
