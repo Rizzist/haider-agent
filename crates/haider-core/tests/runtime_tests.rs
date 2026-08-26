@@ -11,6 +11,7 @@ use haider_core::{
 };
 use haider_protocol::EventPayload;
 use haider_protocol::branch::BranchDescriptor;
+use haider_protocol::cache::CACHE_REQUEST_ATTEMPT_EXTENSION_KIND;
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::credential::{RotationCause, RotationEvent};
 use haider_protocol::envelope::{PromptRender, RawEnvelope};
@@ -3821,6 +3822,8 @@ fn completed_tool_call_is_pending_execution() {
 struct BatchRecordingStore {
     inner: MemoryStore,
     batches: Mutex<Vec<Vec<EventPayload>>>,
+    reject_tool_settlement: bool,
+    rejected_tool_settlement: AtomicBool,
 }
 
 impl BatchRecordingStore {
@@ -3828,6 +3831,15 @@ impl BatchRecordingStore {
         Self {
             inner: MemoryStore::new(),
             batches: Mutex::new(Vec::new()),
+            reject_tool_settlement: false,
+            rejected_tool_settlement: AtomicBool::new(false),
+        }
+    }
+
+    fn rejecting_tool_settlement() -> Self {
+        Self {
+            reject_tool_settlement: true,
+            ..Self::new()
         }
     }
 
@@ -3836,6 +3848,10 @@ impl BatchRecordingStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    fn rejected_tool_settlement(&self) -> bool {
+        self.rejected_tool_settlement.load(Ordering::Relaxed)
     }
 }
 
@@ -3854,10 +3870,31 @@ impl StoreHandle for BatchRecordingStore {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let reject_tool_settlement = self.reject_tool_settlement
+            && matches!(
+                batch.as_slice(),
+                [
+                    EventPayload::ToolResult { .. },
+                    EventPayload::Item(ItemEvent::Completed {
+                        item: TurnItem::ToolCall { .. },
+                        ..
+                    }),
+                    EventPayload::NodeCommitted(_),
+                    EventPayload::RunState(RunState::Streaming)
+                ]
+            );
         self.batches
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(batch);
+        if reject_tool_settlement {
+            self.rejected_tool_settlement.store(true, Ordering::Relaxed);
+            return Err(HaiderError::new(
+                ErrorCode::Internal,
+                "injected atomic tool-settlement rejection",
+                false,
+            ));
+        }
         self.inner.append(envelopes).await
     }
 
@@ -3881,6 +3918,301 @@ impl StoreHandle for BatchRecordingStore {
     ) -> Result<Vec<BranchDescriptor>, HaiderError> {
         self.inner.branch_lineage(session_id, branch_id).await
     }
+}
+
+struct DurableRunningToolDispatcher {
+    store: Arc<BatchRecordingStore>,
+    observed: AtomicBool,
+}
+
+#[async_trait]
+impl ToolDispatcher for DurableRunningToolDispatcher {
+    async fn execute(
+        &self,
+        _run_id: &RunId,
+        _item_id: &ItemId,
+        _call_id: &str,
+        _name: &str,
+        _args: serde_json::Value,
+        _cancel: &haider_core::CancelToken,
+    ) -> Result<ToolDispatchResult, HaiderError> {
+        let running_tool_is_durable = self
+            .store
+            .inner
+            .events(&SessionId::new(SESSION))
+            .await
+            .iter()
+            .any(|event| matches!(typed(event), EventPayload::RunState(RunState::RunningTool)));
+        self.observed
+            .store(running_tool_is_durable, Ordering::Relaxed);
+        Ok(ToolDispatchResult::Completed(BoundedResult {
+            preview: "atomic result".into(),
+            truncated: false,
+            artifact: None,
+            images: Vec::new(),
+            cursor: None,
+            status: haider_protocol::tool::ToolResultStatus::Completed,
+            reason: None,
+            presentation: None,
+        }))
+    }
+}
+
+/// MUTATION CHECK: restore the separate `Thinking` and cache-attempt appends.
+/// Expected failure: no batch contains the exact three-event request boundary.
+#[tokio::test]
+async fn request_start_batches_thinking_with_cache_attempt_in_event_order() {
+    let provider = Arc::new(FakeProvider::new(vec![FakeStep::Finish {
+        reason: FinishReason::EndTurn,
+    }]));
+    let store = Arc::new(BatchRecordingStore::new());
+    let handle = HarnessActor::spawn(config(), provider, store.clone());
+
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("batch request start"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Done);
+
+    let request_batch = store
+        .batches()
+        .into_iter()
+        .find(|batch| {
+            batch.iter().any(|payload| {
+                matches!(
+                    payload,
+                    EventPayload::Item(ItemEvent::Completed {
+                        item: TurnItem::Extension { kind, .. },
+                        ..
+                    }) if kind == CACHE_REQUEST_ATTEMPT_EXTENSION_KIND
+                )
+            })
+        })
+        .expect("cache-attempt batch");
+    assert!(matches!(
+        request_batch.as_slice(),
+        [
+            EventPayload::RunState(RunState::Thinking),
+            EventPayload::Item(ItemEvent::Started {
+                item: TurnItem::Extension { kind: started, .. },
+                ..
+            }),
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::Extension { kind: completed, .. },
+                ..
+            })
+        ] if started == CACHE_REQUEST_ATTEMPT_EXTENSION_KIND
+            && completed == CACHE_REQUEST_ATTEMPT_EXTENSION_KIND
+    ));
+}
+
+/// MUTATION CHECK: split exact footprint publication from usage again.
+/// Expected failure: the usage batch becomes a singleton.
+#[tokio::test]
+async fn usage_batches_context_footprint_before_usage() {
+    let usage = Usage {
+        input: 13,
+        output: 5,
+        reasoning: 2,
+        cached: 3,
+        source: UsageSource::ProviderReported,
+        account: None,
+        accounts: Vec::new(),
+        normalized: None,
+        scope: None,
+        cache_cost: None,
+        request: None,
+    };
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitUsage { usage },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let store = Arc::new(BatchRecordingStore::new());
+    let mut runtime_config = config();
+    runtime_config.context_compaction_v1 = true;
+    let handle = HarnessActor::spawn(runtime_config, provider, store.clone());
+
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("batch exact usage"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Done);
+
+    let usage_batch = store
+        .batches()
+        .into_iter()
+        .find(|batch| {
+            batch
+                .iter()
+                .any(|payload| matches!(payload, EventPayload::Usage(_)))
+        })
+        .expect("usage batch");
+    assert!(matches!(
+        usage_batch.as_slice(),
+        [
+            EventPayload::Item(ItemEvent::Started {
+                item_id: started_id,
+                item: started_item @ TurnItem::Extension { .. },
+                ..
+            }),
+            EventPayload::Item(ItemEvent::Completed {
+                item_id: completed_id,
+                item: completed_item @ TurnItem::Extension { .. },
+                ..
+            }),
+            EventPayload::Usage(_)
+        ] if started_id == completed_id
+            && ContextFootprint::from_extension_item(started_item).is_some()
+            && ContextFootprint::from_extension_item(completed_item).is_some()
+    ));
+}
+
+/// MUTATION CHECK: move `RunningTool` after dispatcher execution, or split the
+/// result/completion/node/Streaming group. Expected failure: the dispatcher
+/// cannot read the durable state or the settlement batch shape changes.
+#[tokio::test]
+async fn completed_tool_settlement_is_atomic_after_durable_running_tool() {
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "atomic-tool".into(),
+            name: "inspect".into(),
+            args: serde_json::json!({"path":"src/lib.rs"}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::ExpectToolResult {
+            call_id: "atomic-tool".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let store = Arc::new(BatchRecordingStore::new());
+    let dispatcher = Arc::new(DurableRunningToolDispatcher {
+        store: store.clone(),
+        observed: AtomicBool::new(false),
+    });
+    let (actor, handle) = HarnessActor::new_with_dispatcher(
+        config(),
+        provider,
+        store.clone(),
+        Some(dispatcher.clone()),
+    );
+    let actor_task = tokio::spawn(actor.run());
+
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("run atomically"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert!(dispatcher.observed.load(Ordering::Relaxed));
+
+    let settlement = store
+        .batches()
+        .into_iter()
+        .find(|batch| {
+            batch.iter().any(|payload| {
+                matches!(
+                    payload,
+                    EventPayload::ToolResult { call_id, .. } if call_id == "atomic-tool"
+                )
+            })
+        })
+        .expect("tool settlement batch");
+    assert!(matches!(
+        settlement.as_slice(),
+        [
+            EventPayload::ToolResult { call_id: result, .. },
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::ToolCall {
+                    call_id: completed,
+                    status: ToolStatus::Completed,
+                    ..
+                },
+                ..
+            }),
+            EventPayload::NodeCommitted(_),
+            EventPayload::RunState(RunState::Streaming)
+        ] if result == "atomic-tool" && completed == "atomic-tool"
+    ));
+
+    handle.stop().await.expect("actor stops");
+    actor_task.await.expect("actor joins");
+}
+
+/// MUTATION CHECK: replace the four-envelope settlement append with sequential
+/// commits. Expected failure: the injected batch rejection is bypassed and the
+/// turn succeeds, or one of the rejected facts leaks into the journal.
+#[tokio::test]
+async fn rejected_tool_settlement_batch_publishes_none_of_its_facts() {
+    let provider = Arc::new(FakeProvider::new(vec![FakeStep::EmitToolCall {
+        call_id: "reject-atomic-tool".into(),
+        name: "inspect".into(),
+        args: serde_json::json!({"path":"src/lib.rs"}),
+    }]));
+    let store = Arc::new(BatchRecordingStore::rejecting_tool_settlement());
+    let (actor, handle) = HarnessActor::new_with_dispatcher(
+        config(),
+        provider,
+        store.clone(),
+        Some(Arc::new(CompletingDispatcher)),
+    );
+    let actor_task = tokio::spawn(actor.run());
+
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("reject atomic settlement"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Errored);
+    assert!(store.rejected_tool_settlement());
+
+    let events = store.inner.events(&SessionId::new(SESSION)).await;
+    assert!(!events.iter().any(|event| {
+        matches!(
+            typed(event),
+            EventPayload::ToolResult { ref call_id, .. } if call_id == "reject-atomic-tool"
+        )
+    }));
+    assert!(!events.iter().any(|event| {
+        matches!(
+            typed(event),
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::ToolCall {
+                    ref call_id,
+                    status: ToolStatus::Completed,
+                    ..
+                },
+                ..
+            }) if call_id == "reject-atomic-tool"
+        )
+    }));
+    let running_tool = events
+        .iter()
+        .rposition(|event| matches!(typed(event), EventPayload::RunState(RunState::RunningTool)))
+        .expect("RunningTool committed before dispatch");
+    assert!(
+        !events[running_tool + 1..]
+            .iter()
+            .any(|event| { matches!(typed(event), EventPayload::RunState(RunState::Streaming)) })
+    );
+
+    handle.stop().await.expect("actor stops");
+    actor_task.await.expect("actor joins");
 }
 
 struct BlockingCompletedStore {

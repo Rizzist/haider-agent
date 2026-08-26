@@ -2123,14 +2123,22 @@ impl HarnessActor {
             messages.push(Message::assistant(assistant_blocks));
             messages.extend(results);
         }
-        if let Err(error) = self.commit_state(&run_id, RunState::Thinking).await {
-            return self.errored_state_outcome(&run_id, error).await;
-        }
+        // `Thinking` and the request-attempt marker describe one provider
+        // dispatch boundary. Keep the state pending until the marker is ready
+        // so the common path can journal both atomically. Any intervening
+        // durable context/rotation boundary flushes the state first.
+        let mut thinking_pending = true;
         let mut provider = Arc::clone(&self.provider);
         let mut usage_account = self.config.usage_account.clone();
         let mut rotation_budget_consumed = self.config.rotation_budget_consumed;
         let mut capability_fallback_consumed = false;
         if let Some(initial_rotation) = self.config.initial_rotation.take() {
+            if let Err(error) = self
+                .commit_pending_thinking(&run_id, &mut thinking_pending)
+                .await
+            {
+                return self.errored_state_outcome(&run_id, error).await;
+            }
             if let Err(error) = self
                 .commit_payload(
                     &run_id,
@@ -2183,6 +2191,12 @@ impl HarnessActor {
                     Ok(Some(tail)) => volatile_user_tail = (!tail.is_empty()).then_some(tail),
                     Ok(None) => {}
                     Err(error) => {
+                        if let Err(state_error) = self
+                            .commit_pending_thinking(&run_id, &mut thinking_pending)
+                            .await
+                        {
+                            return self.errored_state_outcome(&run_id, state_error).await;
+                        }
                         return self
                             .errored_outcome_with_items(
                                 &run_id,
@@ -2213,11 +2227,18 @@ impl HarnessActor {
                     &mut stable_history_end,
                     &mut compaction_guard_consumed,
                     &mut provider_pair_switch_ordinal,
+                    &mut thinking_pending,
                 )
                 .await
             {
                 Ok(compacted) => compacted,
                 Err(error) => {
+                    if let Err(state_error) = self
+                        .commit_pending_thinking(&run_id, &mut thinking_pending)
+                        .await
+                    {
+                        return self.errored_state_outcome(&run_id, state_error).await;
+                    }
                     return self
                         .drive_error_outcome_with_items(
                             &run_id,
@@ -2255,6 +2276,12 @@ impl HarnessActor {
                 provider_request_count = provider_request_count.saturating_add(1);
             }
             if provider_request_count > self.config.max_provider_requests_per_turn {
+                if let Err(error) = self
+                    .commit_pending_thinking(&run_id, &mut thinking_pending)
+                    .await
+                {
+                    return self.errored_state_outcome(&run_id, error).await;
+                }
                 return self
                     .errored_outcome_with_items(
                         &run_id,
@@ -2293,6 +2320,12 @@ impl HarnessActor {
                 match self.resolve_tool_result_images(&mut request_messages).await {
                     Ok(attachments) => attachments,
                     Err(error) => {
+                        if let Err(state_error) = self
+                            .commit_pending_thinking(&run_id, &mut thinking_pending)
+                            .await
+                        {
+                            return self.errored_state_outcome(&run_id, state_error).await;
+                        }
                         return self
                             .errored_outcome_with_items(
                                 &run_id,
@@ -2445,6 +2478,12 @@ impl HarnessActor {
             let request_attempt_data = match serde_json::to_value(request_attempt) {
                 Ok(data) => data,
                 Err(error) => {
+                    if let Err(state_error) = self
+                        .commit_pending_thinking(&run_id, &mut thinking_pending)
+                        .await
+                    {
+                        return self.errored_state_outcome(&run_id, state_error).await;
+                    }
                     return self
                         .errored_outcome_with_items(
                             &run_id,
@@ -2461,11 +2500,7 @@ impl HarnessActor {
                 }
             };
             if let Err(error) = self
-                .commit_hidden_extension_marker(
-                    &run_id,
-                    CACHE_REQUEST_ATTEMPT_EXTENSION_KIND,
-                    request_attempt_data,
-                )
+                .commit_request_attempt(&run_id, request_attempt_data, &mut thinking_pending)
                 .await
             {
                 return self.errored_state_outcome(&run_id, error).await;
@@ -2583,6 +2618,7 @@ impl HarnessActor {
                                 &mut rotation_budget_consumed,
                                 &mut capability_fallback_consumed,
                                 &mut provider_pair_switch_ordinal,
+                                &mut thinking_pending,
                                 error,
                             )
                             .await
@@ -2757,6 +2793,7 @@ impl HarnessActor {
                                 &mut rotation_budget_consumed,
                                 &mut capability_fallback_consumed,
                                 &mut provider_pair_switch_ordinal,
+                                &mut thinking_pending,
                                 error,
                             )
                             .await
@@ -2934,10 +2971,7 @@ impl HarnessActor {
                                 }
                             }
                             provider_attempt = 0;
-                            if let Err(error) = self.commit_state(&run_id, RunState::Thinking).await
-                            {
-                                return self.errored_state_outcome(&run_id, error).await;
-                            }
+                            thinking_pending = true;
                             continue 'requests;
                         }
                         return self
@@ -3080,11 +3114,7 @@ impl HarnessActor {
                                             .await;
                                     }
                                     provider_attempt = 0;
-                                    if let Err(error) =
-                                        self.commit_state(&run_id, RunState::Thinking).await
-                                    {
-                                        return self.errored_state_outcome(&run_id, error).await;
-                                    }
+                                    thinking_pending = true;
                                     continue 'requests;
                                 }
                                 self.complete_tool(
@@ -3167,38 +3197,30 @@ impl HarnessActor {
                             } else {
                                 ToolStatus::Completed
                             };
-                            self.commit_server_tool_row(&run_id, &call_id, name, args, status)
-                                .await?;
-                            self.commit_payload(
-                                &run_id,
-                                EventPayload::ToolResult {
-                                    call_id,
-                                    result: BoundedResult {
-                                        preview,
-                                        truncated: false,
-                                        artifact: None,
-                                        images: Vec::new(),
-                                        cursor: None,
-                                        status: if is_error {
-                                            ToolResultStatus::Failed
-                                        } else {
-                                            ToolResultStatus::Completed
-                                        },
-                                        reason: is_error
-                                            .then(|| "server tool reported an error".into()),
-                                        presentation: is_error.then(|| {
-                                            tool_error_presentation(
-                                                "server-tool-failed",
-                                                "Provider tool failed",
-                                                "The provider-hosted tool reported an error.",
-                                            )
-                                        }),
-                                    },
+                            let result = BoundedResult {
+                                preview,
+                                truncated: false,
+                                artifact: None,
+                                images: Vec::new(),
+                                cursor: None,
+                                status: if is_error {
+                                    ToolResultStatus::Failed
+                                } else {
+                                    ToolResultStatus::Completed
                                 },
-                                prompt_omit_render(),
+                                reason: is_error.then(|| "server tool reported an error".into()),
+                                presentation: is_error.then(|| {
+                                    tool_error_presentation(
+                                        "server-tool-failed",
+                                        "Provider tool failed",
+                                        "The provider-hosted tool reported an error.",
+                                    )
+                                }),
+                            };
+                            self.commit_server_tool_row(
+                                &run_id, &call_id, name, args, status, &result,
                             )
-                            .await
-                            .map_err(DriveError::Store)?;
+                            .await?;
                             Ok(None)
                         }
                         .await
@@ -3271,24 +3293,15 @@ impl HarnessActor {
                             context_footprint_from_usage(&self.config, &usage, &messages);
                         request_usage = Some(usage.clone());
                         match cumulative_usage(completed_usage.as_ref(), &usage) {
-                            Ok(usage) => {
-                                async {
-                                    if self.config.context_compaction_v1 {
-                                        self.commit_context_footprint(&run_id, &footprint)
-                                            .await
-                                            .map_err(DriveError::Store)?;
-                                    }
-                                    self.commit_payload(
-                                        &run_id,
-                                        EventPayload::Usage(usage),
-                                        prompt_omit_render(),
-                                    )
-                                    .await
-                                    .map_err(DriveError::Store)?;
-                                    Ok(None)
-                                }
+                            Ok(usage) => self
+                                .commit_usage_with_footprint(
+                                    &run_id,
+                                    self.config.context_compaction_v1.then_some(&footprint),
+                                    usage,
+                                )
                                 .await
-                            }
+                                .map(|()| None)
+                                .map_err(DriveError::Store),
                             Err(error) => Err(error),
                         }
                     }
@@ -3448,10 +3461,7 @@ impl HarnessActor {
                             }
                             provider_attempt = 0;
                             messages.append(&mut tool_results);
-                            if let Err(error) = self.commit_state(&run_id, RunState::Thinking).await
-                            {
-                                return self.errored_state_outcome(&run_id, error).await;
-                            }
+                            thinking_pending = true;
                             continue 'requests;
                         }
                         // W-B (LW2): `pause_turn` shares the MaxTokens
@@ -3528,10 +3538,7 @@ impl HarnessActor {
                                 ));
                             }
                             provider_attempt = 0;
-                            if let Err(error) = self.commit_state(&run_id, RunState::Thinking).await
-                            {
-                                return self.errored_state_outcome(&run_id, error).await;
-                            }
+                            thinking_pending = true;
                             continue 'requests;
                         }
                         // No tool-call boundary appeared in this response.
@@ -3558,10 +3565,7 @@ impl HarnessActor {
                                     .map(Message::user_text),
                             );
                             provider_attempt = 0;
-                            if let Err(error) = self.commit_state(&run_id, RunState::Thinking).await
-                            {
-                                return self.errored_state_outcome(&run_id, error).await;
-                            }
+                            thinking_pending = true;
                             continue 'requests;
                         }
                         if !self.pending_nudges.is_empty() {
@@ -3579,10 +3583,7 @@ impl HarnessActor {
                                     .await;
                             }
                             provider_attempt = 0;
-                            if let Err(error) = self.commit_state(&run_id, RunState::Thinking).await
-                            {
-                                return self.errored_state_outcome(&run_id, error).await;
-                            }
+                            thinking_pending = true;
                             continue 'requests;
                         }
                         // W-B (decision 6): the bounded sources list journals
@@ -3640,13 +3641,7 @@ impl HarnessActor {
                                             messages.push(Message::user_text(reminder));
                                         }
                                         provider_attempt = 0;
-                                        if let Err(error) =
-                                            self.commit_state(&run_id, RunState::Thinking).await
-                                        {
-                                            return self
-                                                .errored_state_outcome(&run_id, error)
-                                                .await;
-                                        }
+                                        thinking_pending = true;
                                         continue 'requests;
                                     }
                                     FinalizationGuardDecision::ConfirmRequired(menu) => {
@@ -3674,14 +3669,7 @@ impl HarnessActor {
                                                     "Continue working on the current workflow obligations. Do not finalize until they are satisfied, or ask for explicit abandonment again.",
                                                 ));
                                                 provider_attempt = 0;
-                                                if let Err(error) = self
-                                                    .commit_state(&run_id, RunState::Thinking)
-                                                    .await
-                                                {
-                                                    return self
-                                                        .errored_state_outcome(&run_id, error)
-                                                        .await;
-                                                }
+                                                thinking_pending = true;
                                                 continue 'requests;
                                             }
                                             Ok(GraphFinalizationAnswer::AbandonAndFinish) => {
@@ -3740,10 +3728,7 @@ impl HarnessActor {
                             }
                             messages.extend(promoted.into_iter().map(Message::user_text));
                             provider_attempt = 0;
-                            if let Err(error) = self.commit_state(&run_id, RunState::Thinking).await
-                            {
-                                return self.errored_state_outcome(&run_id, error).await;
-                            }
+                            thinking_pending = true;
                             continue 'requests;
                         }
                         return self.finish_outcome(&run_id, reason).await;
@@ -3859,6 +3844,7 @@ impl HarnessActor {
         rotation_budget_consumed: &mut bool,
         capability_fallback_consumed: &mut bool,
         provider_pair_switch_ordinal: &mut u32,
+        thinking_pending: &mut bool,
         error: ProviderError,
     ) -> Result<(), DriveError> {
         let hosted_fallback = error.presentation.subcode.as_str() == "provider-web-tool-rejected"
@@ -4008,7 +3994,9 @@ impl HarnessActor {
                 *provider_attempt,
                 &error,
             )
-            .await
+            .await?;
+            *thinking_pending = true;
+            Ok(())
         } else if provider_error_allows_pair_fallback(&error)
             && let (Some(resolver), Some(current_account)) = (
                 self.config.provider_attempt_resolver.clone(),
@@ -4312,6 +4300,7 @@ impl HarnessActor {
         stable_history_end: &mut usize,
         compaction_guard_consumed: &mut bool,
         provider_pair_switch_ordinal: &mut u32,
+        thinking_pending: &mut bool,
     ) -> Result<bool, DriveError> {
         // Volatile context is excluded from durable cache boundaries, but it
         // still consumes real provider input capacity. Measure a request-only
@@ -4320,6 +4309,9 @@ impl HarnessActor {
         let before =
             estimated_request_shaped_context_footprint(&self.config, messages, volatile_user_tail);
         if self.config.context_compaction_v1 {
+            self.commit_pending_thinking(run_id, thinking_pending)
+                .await
+                .map_err(DriveError::Store)?;
             self.commit_context_footprint(run_id, &before)
                 .await
                 .map_err(DriveError::Store)?;
@@ -4363,6 +4355,9 @@ impl HarnessActor {
         if !should_compact {
             return Ok(false);
         }
+        self.commit_pending_thinking(run_id, thinking_pending)
+            .await
+            .map_err(DriveError::Store)?;
         self.perform_context_compaction(
             run_id,
             messages,
@@ -4454,8 +4449,9 @@ impl HarnessActor {
 
     /// Commits adapter-visible `Waiting { reason }` telemetry immediately
     /// before `Retrying { attempt, max, delay_ms, reason }` (W-C M4: the
-    /// visible `attempt K/max` counter), waits through the injected sleeper,
-    /// then commits `Thinking` — the R6 backoff between provider attempts.
+    /// visible `attempt K/max` counter), then waits through the injected
+    /// sleeper. The next request batches its `Thinking` transition with the
+    /// durable cache-attempt marker.
     ///
     /// The delay is the run-scoped [`retry_jittered_backoff_ms`] schedule UNLESS the provider
     /// sent a `retry_after_ms`, which OVERRIDES it exactly through the
@@ -4578,9 +4574,7 @@ impl HarnessActor {
         if cancel.is_cancelled() {
             return Err(DriveError::Cancelled);
         }
-        self.commit_state(run_id, RunState::Thinking)
-            .await
-            .map_err(DriveError::Store)
+        Ok(())
     }
 
     /// Commits `Completed` with the accumulated text; no-op when nothing streamed.
@@ -4740,17 +4734,7 @@ impl HarnessActor {
             reason: Some("malformed JSON tool arguments".into()),
             presentation: Some(error.presentation.clone()),
         };
-        self.commit_payload(
-            run_id,
-            EventPayload::ToolResult {
-                call_id: tool.call_id.clone(),
-                result,
-            },
-            prompt_verbatim_render(),
-        )
-        .await
-        .map_err(DriveError::Store)?;
-        self.commit_tool_completed(run_id, tool, ToolStatus::Failed)
+        self.commit_tool_result_and_completion(run_id, tool, &result)
             .await?;
         tools.remove(index);
         Ok(())
@@ -4812,17 +4796,7 @@ impl HarnessActor {
                 )),
             };
             let call_id = tools[index].call_id.clone();
-            self.commit_payload(
-                run_id,
-                EventPayload::ToolResult {
-                    call_id: call_id.clone(),
-                    result: result.clone(),
-                },
-                prompt_verbatim_render(),
-            )
-            .await
-            .map_err(DriveError::Store)?;
-            self.commit_tool_completed(run_id, &tools[index], ToolStatus::Rejected)
+            self.commit_tool_result_and_completion(run_id, &tools[index], &result)
                 .await?;
             tools.remove(index);
             return Ok(Some(Message::tool_result(call_id, result.preview, false)));
@@ -4890,22 +4864,9 @@ impl HarnessActor {
             };
             self.admit_tool_result_images(&result.images).await?;
             let call_id = tools[index].call_id.clone();
-            self.commit_payload(
-                run_id,
-                EventPayload::ToolResult {
-                    call_id: call_id.clone(),
-                    result: result.clone(),
-                },
-                prompt_verbatim_render(),
-            )
-            .await
-            .map_err(DriveError::Store)?;
-            self.commit_tool_completed(run_id, &tools[index], result.status.item_status())
+            self.commit_tool_settlement_and_streaming(run_id, &tools[index], &result)
                 .await?;
             tools.remove(index);
-            self.commit_state(run_id, RunState::Streaming)
-                .await
-                .map_err(DriveError::Store)?;
             return Ok(Some(Message::tool_result_with_images(
                 call_id,
                 result.preview,
@@ -5295,17 +5256,7 @@ impl HarnessActor {
             Err(error) => return Err(tool_error_to_drive(error)),
         };
         let call_id = tools[index].call_id.clone();
-        self.commit_payload(
-            run_id,
-            EventPayload::ToolResult {
-                call_id: call_id.clone(),
-                result: result.clone(),
-            },
-            prompt_verbatim_render(),
-        )
-        .await
-        .map_err(DriveError::Store)?;
-        self.commit_tool_completed(run_id, &tools[index], result.status.item_status())
+        self.commit_tool_result_and_completion(run_id, &tools[index], &result)
             .await?;
         tools.remove(index);
         Ok(Message::tool_result_with_images(
@@ -5460,31 +5411,19 @@ impl HarnessActor {
         }
         let result = serde_json::json!(plan.accepted_result()).to_string();
         let call_id = tools[index].call_id.clone();
-        self.commit_payload(
-            run_id,
-            EventPayload::ToolResult {
-                call_id: call_id.clone(),
-                result: BoundedResult {
-                    preview: result.clone(),
-                    truncated: false,
-                    artifact: None,
-                    images: Vec::new(),
-                    cursor: None,
-                    status: ToolResultStatus::Completed,
-                    reason: None,
-                    presentation: None,
-                },
-            },
-            prompt_verbatim_render(),
-        )
-        .await
-        .map_err(DriveError::Store)?;
-        self.commit_tool_completed(run_id, &tools[index], ToolStatus::Completed)
+        let bounded = BoundedResult {
+            preview: result.clone(),
+            truncated: false,
+            artifact: None,
+            images: Vec::new(),
+            cursor: None,
+            status: ToolResultStatus::Completed,
+            reason: None,
+            presentation: None,
+        };
+        self.commit_tool_settlement_and_streaming(run_id, &tools[index], &bounded)
             .await?;
         tools.remove(index);
-        self.commit_state(run_id, RunState::Streaming)
-            .await
-            .map_err(DriveError::Store)?;
         Ok(Message::tool_result(call_id, result, false))
     }
 
@@ -5609,31 +5548,19 @@ impl HarnessActor {
         })
         .to_string();
         let call_id = tools[index].call_id.clone();
-        self.commit_payload(
-            run_id,
-            EventPayload::ToolResult {
-                call_id: call_id.clone(),
-                result: BoundedResult {
-                    preview: result.clone(),
-                    truncated: false,
-                    artifact: None,
-                    images: Vec::new(),
-                    cursor: None,
-                    status: ToolResultStatus::Completed,
-                    reason: None,
-                    presentation: None,
-                },
-            },
-            prompt_verbatim_render(),
-        )
-        .await
-        .map_err(DriveError::Store)?;
-        self.commit_tool_completed(run_id, &tools[index], ToolStatus::Completed)
+        let bounded = BoundedResult {
+            preview: result.clone(),
+            truncated: false,
+            artifact: None,
+            images: Vec::new(),
+            cursor: None,
+            status: ToolResultStatus::Completed,
+            reason: None,
+            presentation: None,
+        };
+        self.commit_tool_settlement_and_streaming(run_id, &tools[index], &bounded)
             .await?;
         tools.remove(index);
-        self.commit_state(run_id, RunState::Streaming)
-            .await
-            .map_err(DriveError::Store)?;
         Ok(Message::tool_result(call_id, result, false))
     }
 
@@ -5687,12 +5614,12 @@ impl HarnessActor {
         )
         .await
         .map_err(DriveError::Store)?;
-        self.commit_tool_completed(run_id, &tools[index], ToolStatus::Rejected)
+        // `MenuClosed` is an externally consumed lifecycle boundary: the
+        // rejected result must remain durable before it, while item closure and
+        // resumed streaming can share the following append.
+        self.commit_tool_completion_and_streaming(run_id, &tools[index], ToolStatus::Rejected)
             .await?;
         tools.remove(index);
-        self.commit_state(run_id, RunState::Streaming)
-            .await
-            .map_err(DriveError::Store)?;
         Ok(Message::tool_result(call_id, result, false))
     }
 
@@ -5738,22 +5665,9 @@ impl HarnessActor {
         };
         self.admit_tool_result_images(&result.images).await?;
         let call_id = tools[index].call_id.clone();
-        self.commit_payload(
-            run_id,
-            EventPayload::ToolResult {
-                call_id: call_id.clone(),
-                result: result.clone(),
-            },
-            prompt_verbatim_render(),
-        )
-        .await
-        .map_err(DriveError::Store)?;
-        self.commit_tool_completed(run_id, &tools[index], result.status.item_status())
+        self.commit_tool_settlement_and_streaming(run_id, &tools[index], &result)
             .await?;
         tools.remove(index);
-        self.commit_state(run_id, RunState::Streaming)
-            .await
-            .map_err(DriveError::Store)?;
         Ok(Message::tool_result_with_images(
             call_id,
             result.preview,
@@ -6152,37 +6066,28 @@ impl HarnessActor {
             })
             .to_string();
             let call_id = tools[index].call_id.clone();
+            let bounded = BoundedResult {
+                preview: result.clone(),
+                truncated: false,
+                artifact: None,
+                images: Vec::new(),
+                cursor: None,
+                status: ToolResultStatus::Completed,
+                reason: None,
+                presentation: None,
+            };
             if let Err(error) = self
-                .commit_payload(
-                    run_id,
-                    EventPayload::ToolResult {
-                        call_id: call_id.clone(),
-                        result: BoundedResult {
-                            preview: result.clone(),
-                            truncated: false,
-                            artifact: None,
-                            images: Vec::new(),
-                            cursor: None,
-                            status: ToolResultStatus::Completed,
-                            reason: None,
-                            presentation: None,
-                        },
-                    },
-                    prompt_verbatim_render(),
-                )
+                .commit_tool_settlement_and_streaming(run_id, &tools[index], &bounded)
                 .await
             {
-                if let Some(completed) = completed {
-                    let _ = completed.send(Err(error.clone()));
+                if let Some(completed) = completed
+                    && let DriveError::Store(store_error) = &error
+                {
+                    let _ = completed.send(Err(store_error.clone()));
                 }
-                return Err(DriveError::Store(error));
+                return Err(error);
             }
-            self.commit_tool_completed(run_id, &tools[index], ToolStatus::Completed)
-                .await?;
             tools.remove(index);
-            self.commit_state(run_id, RunState::Streaming)
-                .await
-                .map_err(DriveError::Store)?;
             if let Some(completed) = completed {
                 let _ = completed.send(Ok(()));
             }
@@ -6520,6 +6425,146 @@ impl HarnessActor {
         Ok(())
     }
 
+    async fn commit_tool_result_and_completion(
+        &mut self,
+        run_id: &RunId,
+        tool: &ToolAccumulator,
+        result: &BoundedResult,
+    ) -> Result<(), DriveError> {
+        self.commit_tool_settlement(
+            run_id,
+            tool,
+            Some(result),
+            result.status.item_status(),
+            false,
+        )
+        .await
+    }
+
+    /// Atomically publishes a finished tool's result, completed item/tree
+    /// fragment, and resumed `Streaming` state. Any effectful caller retains a
+    /// prior, independent `RunningTool` append before dispatch.
+    async fn commit_tool_settlement_and_streaming(
+        &mut self,
+        run_id: &RunId,
+        tool: &ToolAccumulator,
+        result: &BoundedResult,
+    ) -> Result<(), DriveError> {
+        self.commit_tool_settlement(
+            run_id,
+            tool,
+            Some(result),
+            result.status.item_status(),
+            true,
+        )
+        .await
+    }
+
+    async fn commit_tool_completion_and_streaming(
+        &mut self,
+        run_id: &RunId,
+        tool: &ToolAccumulator,
+        status: ToolStatus,
+    ) -> Result<(), DriveError> {
+        self.commit_tool_settlement(run_id, tool, None, status, true)
+            .await
+    }
+
+    async fn commit_tool_settlement(
+        &mut self,
+        run_id: &RunId,
+        tool: &ToolAccumulator,
+        result: Option<&BoundedResult>,
+        status: ToolStatus,
+        resume_streaming: bool,
+    ) -> Result<(), DriveError> {
+        let args = if matches!(status, ToolStatus::Failed | ToolStatus::Cancelled) {
+            tool_args_or_raw(tool)
+        } else {
+            parse_tool_args(tool)?
+        };
+
+        self.flush_pending_item_delta()
+            .await
+            .map_err(DriveError::Store)?;
+        let result_envelope = result
+            .map(|result| {
+                self.uncommitted_envelope(
+                    run_id,
+                    EventPayload::ToolResult {
+                        call_id: tool.call_id.clone(),
+                        result: result.clone(),
+                    },
+                    prompt_verbatim_render(),
+                )
+            })
+            .transpose()
+            .map_err(DriveError::Store)?;
+        let node = TreeNode {
+            node: self.next_node_id(),
+            parent: self.tree_parent().await.map_err(DriveError::Store)?,
+            kind: NodeKind::ToolExchange {
+                tool: tool.name.clone(),
+                summary: format!("tool call settled as {status:?}"),
+                artifact: None,
+            },
+        };
+        let mut envelopes =
+            Vec::with_capacity(2 + usize::from(result.is_some()) + usize::from(resume_streaming));
+        if let Some(result) = result_envelope {
+            envelopes.push(result);
+        }
+        envelopes.push(
+            self.uncommitted_envelope(
+                run_id,
+                EventPayload::Item(ItemEvent::Completed {
+                    item_id: tool.item_id.clone(),
+                    item: TurnItem::ToolCall {
+                        call_id: tool.call_id.clone(),
+                        name: tool.name.clone(),
+                        args,
+                        status,
+                    },
+                }),
+                prompt_verbatim_render(),
+            )
+            .map_err(DriveError::Store)?,
+        );
+        let node_committed_index = envelopes.len();
+        envelopes.push(
+            self.uncommitted_envelope(
+                run_id,
+                EventPayload::NodeCommitted(node.clone()),
+                prompt_omit_render(),
+            )
+            .map_err(DriveError::Store)?,
+        );
+        if resume_streaming {
+            envelopes.push(
+                self.uncommitted_envelope(
+                    run_id,
+                    EventPayload::RunState(RunState::Streaming),
+                    prompt_omit_render(),
+                )
+                .map_err(DriveError::Store)?,
+            );
+        }
+        self.store
+            .append(&mut envelopes)
+            .await
+            .map_err(DriveError::Store)?;
+        for (index, committed) in envelopes.into_iter().enumerate() {
+            let _ = self.events.send(committed);
+            if index == node_committed_index {
+                self.tree_head = Some(node.node.clone());
+            }
+        }
+        if resume_streaming {
+            self.state.send_replace(Some(RunState::Streaming));
+        }
+        Ok(())
+    }
+
     /// Maps the provider's finish reason onto the terminal run state.
     async fn finish_outcome(&mut self, run_id: &RunId, reason: FinishReason) -> TurnOutcome {
         match self.commit_state(run_id, RunState::Done).await {
@@ -6743,6 +6788,18 @@ impl HarnessActor {
         Ok(())
     }
 
+    async fn commit_pending_thinking(
+        &mut self,
+        run_id: &RunId,
+        pending: &mut bool,
+    ) -> Result<(), HaiderError> {
+        if !*pending {
+            return Ok(());
+        }
+        *pending = false;
+        self.commit_state(run_id, RunState::Thinking).await
+    }
+
     async fn commit_item(&mut self, run_id: &RunId, item: ItemEvent) -> Result<(), HaiderError> {
         let item = match item {
             ItemEvent::Delta { item_id, delta } => {
@@ -6868,7 +6925,7 @@ impl HarnessActor {
     }
 
     /// Atomically journals one PROVIDER-executed tool call as a closed,
-    /// UI-visible row (W-B decision 6).
+    /// UI-visible row followed by its bounded result (W-B decision 6).
     ///
     /// The render is prompt-OMIT on purpose: server tool state replays
     /// through the provider-opaque channel, and rendering this row into a
@@ -6881,6 +6938,7 @@ impl HarnessActor {
         name: String,
         args: serde_json::Value,
         status: ToolStatus,
+        result: &BoundedResult,
     ) -> Result<(), DriveError> {
         let item_id = self.next_item_id();
         let started = TurnItem::ToolCall {
@@ -6896,8 +6954,8 @@ impl HarnessActor {
             status,
         };
         let render = prompt_omit_render();
-        let mut envelopes = [
-            self.uncommitted_envelope(
+        let started = self
+            .uncommitted_envelope(
                 run_id,
                 EventPayload::Item(ItemEvent::Started {
                     item_id: item_id.clone(),
@@ -6905,8 +6963,9 @@ impl HarnessActor {
                 }),
                 render,
             )
-            .map_err(DriveError::Store)?,
-            self.uncommitted_envelope(
+            .map_err(DriveError::Store)?;
+        let completed = self
+            .uncommitted_envelope(
                 run_id,
                 EventPayload::Item(ItemEvent::Completed {
                     item_id,
@@ -6914,11 +6973,21 @@ impl HarnessActor {
                 }),
                 render,
             )
-            .map_err(DriveError::Store)?,
-        ];
+            .map_err(DriveError::Store)?;
         self.flush_pending_item_delta()
             .await
             .map_err(DriveError::Store)?;
+        let result = self
+            .uncommitted_envelope(
+                run_id,
+                EventPayload::ToolResult {
+                    call_id: call_id.to_owned(),
+                    result: result.clone(),
+                },
+                prompt_omit_render(),
+            )
+            .map_err(DriveError::Store)?;
+        let mut envelopes = [started, completed, result];
         self.store
             .append(&mut envelopes)
             .await
@@ -6939,6 +7008,57 @@ impl HarnessActor {
             .await
     }
 
+    /// Atomically publishes the request's `Thinking` transition and durable
+    /// cache-attempt marker when no context or rotation fact intervened.
+    async fn commit_request_attempt(
+        &mut self,
+        run_id: &RunId,
+        data: serde_json::Value,
+        thinking_pending: &mut bool,
+    ) -> Result<(), HaiderError> {
+        if !*thinking_pending {
+            return self
+                .commit_hidden_extension_marker(run_id, CACHE_REQUEST_ATTEMPT_EXTENSION_KIND, data)
+                .await;
+        }
+
+        self.flush_pending_item_delta().await?;
+        let thinking = self.uncommitted_envelope(
+            run_id,
+            EventPayload::RunState(RunState::Thinking),
+            prompt_omit_render(),
+        )?;
+        let item_id = self.next_item_id();
+        let item = TurnItem::Extension {
+            kind: CACHE_REQUEST_ATTEMPT_EXTENSION_KIND.to_owned(),
+            data,
+        };
+        let mut envelopes = [
+            thinking,
+            self.uncommitted_envelope(
+                run_id,
+                EventPayload::Item(ItemEvent::Started {
+                    item_id: item_id.clone(),
+                    item: item.clone(),
+                }),
+                hidden_prompt_omit_render(),
+            )?,
+            self.uncommitted_envelope(
+                run_id,
+                EventPayload::Item(ItemEvent::Completed { item_id, item }),
+                hidden_prompt_omit_render(),
+            )?,
+        ];
+        self.store.append(&mut envelopes).await?;
+        let [thinking, started, completed] = envelopes;
+        let _ = self.events.send(thinking);
+        self.state.send_replace(Some(RunState::Thinking));
+        let _ = self.events.send(started);
+        let _ = self.events.send(completed);
+        *thinking_pending = false;
+        Ok(())
+    }
+
     async fn commit_ui_extension_marker(
         &mut self,
         run_id: &RunId,
@@ -6954,17 +7074,51 @@ impl HarnessActor {
         run_id: &RunId,
         footprint: &ContextFootprint,
     ) -> Result<(), HaiderError> {
-        let item = footprint.extension_item().map_err(|error| {
-            HaiderError::new(
-                ErrorCode::Internal,
-                format!("context footprint could not serialize: {error}"),
-                false,
-            )
-        })?;
-        let TurnItem::Extension { kind, data } = item else {
-            unreachable!("context footprint always uses the extension carrier");
-        };
+        let (kind, data) = context_footprint_extension(footprint)?;
         self.commit_ui_extension_marker(run_id, &kind, data).await
+    }
+
+    /// Commits the exact context measurement immediately before the usage fact
+    /// in one append. Consumers observe the same envelope order, while a store
+    /// failure exposes all three facts or none of them.
+    async fn commit_usage_with_footprint(
+        &mut self,
+        run_id: &RunId,
+        footprint: Option<&ContextFootprint>,
+        usage: Usage,
+    ) -> Result<(), HaiderError> {
+        let Some(footprint) = footprint else {
+            self.commit_payload(run_id, EventPayload::Usage(usage), prompt_omit_render())
+                .await?;
+            return Ok(());
+        };
+
+        let (kind, data) = context_footprint_extension(footprint)?;
+        let item_id = self.next_item_id();
+        let item = TurnItem::Extension { kind, data };
+        let render = prompt_omit_render();
+        let started = self.uncommitted_envelope(
+            run_id,
+            EventPayload::Item(ItemEvent::Started {
+                item_id: item_id.clone(),
+                item: item.clone(),
+            }),
+            render,
+        )?;
+        let completed = self.uncommitted_envelope(
+            run_id,
+            EventPayload::Item(ItemEvent::Completed { item_id, item }),
+            render,
+        )?;
+        self.flush_pending_item_delta().await?;
+        let usage =
+            self.uncommitted_envelope(run_id, EventPayload::Usage(usage), prompt_omit_render())?;
+        let mut envelopes = [started, completed, usage];
+        self.store.append(&mut envelopes).await?;
+        for committed in envelopes {
+            let _ = self.events.send(committed);
+        }
+        Ok(())
     }
 
     async fn commit_extension_marker(
@@ -7279,6 +7433,26 @@ impl HarnessActor {
         } else {
             self.deferred_commands.push_back(command);
         }
+    }
+}
+
+fn context_footprint_extension(
+    footprint: &ContextFootprint,
+) -> Result<(String, serde_json::Value), HaiderError> {
+    let item = footprint.extension_item().map_err(|error| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            format!("context footprint could not serialize: {error}"),
+            false,
+        )
+    })?;
+    match item {
+        TurnItem::Extension { kind, data } => Ok((kind, data)),
+        _ => Err(HaiderError::new(
+            ErrorCode::Internal,
+            "context footprint did not use the extension carrier",
+            false,
+        )),
     }
 }
 
