@@ -13,7 +13,7 @@ use haider_rpc::{
     DescendantReplayCursorWire, DescendantStreamNodeWire, DescendantTruncationWire,
     SessionDescendantBaselineWire, SessionDescendantStreamEventWire,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::{MissedTickBehavior, interval};
 
@@ -116,7 +116,7 @@ pub(super) async fn prepare_descendant_stream(
         )
         .await?;
 
-    let mut requested = BTreeMap::<(SessionId, AgentId), u64>::new();
+    let mut requested = HashMap::<(SessionId, AgentId), u64>::new();
     for cursor in &cursors {
         if requested
             .insert(
