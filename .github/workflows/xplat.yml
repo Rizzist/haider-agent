@@ -42,6 +42,8 @@ jobs:
       # reasons as ci.yml; Git Bash serves this script on Windows.
       - name: test (per-crate)
         shell: bash
+        env:
+          RUST_MIN_STACK: ${{ runner.os == 'Windows' && '8388608' || '' }}
         run: bash scripts/ci-test.sh
 
   android-build:
