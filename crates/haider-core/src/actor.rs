@@ -5327,8 +5327,18 @@ impl HarnessActor {
         )
         .await
         .map_err(DriveError::Store)?;
-        self.resolve_or_wait_for_request_input(run_id, tools, index, cancel, request, menu, false)
-            .await
+        self.resolve_or_wait_for_request_input(
+            run_id,
+            tools,
+            index,
+            cancel,
+            RequestInputResolutionContext {
+                request,
+                menu,
+                recovered_open_menu: false,
+            },
+        )
+        .await
     }
 
     /// Journals the automatic settlement of a presented plan and returns its
@@ -5410,8 +5420,18 @@ impl HarnessActor {
                 .await;
         }
         let request = RequestInput::from_tool_args(args).map_err(tool_error_to_drive)?;
-        self.resolve_or_wait_for_request_input(run_id, tools, index, cancel, request, menu, true)
-            .await
+        self.resolve_or_wait_for_request_input(
+            run_id,
+            tools,
+            index,
+            cancel,
+            RequestInputResolutionContext {
+                request,
+                menu,
+                recovered_open_menu: true,
+            },
+        )
+        .await
     }
 
     async fn resolve_or_wait_for_request_input(
@@ -5420,10 +5440,13 @@ impl HarnessActor {
         tools: &mut Vec<ToolAccumulator>,
         index: usize,
         cancel: &CancelToken,
-        request: RequestInput,
-        menu: Menu,
-        recovered_open_menu: bool,
+        context: RequestInputResolutionContext,
     ) -> Result<Message, DriveError> {
+        let RequestInputResolutionContext {
+            request,
+            menu,
+            recovered_open_menu,
+        } = context;
         let gate = if request.has_declared_default() {
             InteractionGate::RequestInputWithDefault
         } else {
@@ -7232,6 +7255,12 @@ struct ToolAccumulator {
     call_id: String,
     name: String,
     args: String,
+}
+
+struct RequestInputResolutionContext {
+    request: RequestInput,
+    menu: Menu,
+    recovered_open_menu: bool,
 }
 
 enum GeneralToolOutcome {

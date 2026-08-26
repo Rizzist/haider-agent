@@ -297,6 +297,14 @@ pub struct HaiderError {
     pub presentation: Option<ErrorPresentation>,
 }
 
+impl std::fmt::Display for HaiderError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HaiderError {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
@@ -488,5 +496,12 @@ mod tests {
             serde_json::to_value(ErrorCode::WorkflowUnfinished).expect("serialize code"),
             serde_json::json!("workflow_unfinished")
         );
+    }
+
+    #[test]
+    fn haider_error_display_uses_its_message() {
+        let error = HaiderError::new(ErrorCode::Internal, "displayed failure", false);
+
+        assert_eq!(error.to_string(), "displayed failure");
     }
 }
