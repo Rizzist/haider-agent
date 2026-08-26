@@ -537,6 +537,8 @@ struct StoredMonitorToolReceipt {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// The `Monitor` prefix is part of each durable on-wire journal event tag.
+#[allow(clippy::enum_variant_names)]
 enum MonitorJournalEvent {
     MonitorRegistered {
         registration: MonitorRegistration,
@@ -1643,8 +1645,12 @@ impl MonitorService {
                 {
                     return Ok(result);
                 }
-                let Some(registration) = self.inner.registry.get(store.session_id(), &monitor_id)
-                else {
+                if self
+                    .inner
+                    .registry
+                    .get(store.session_id(), &monitor_id)
+                    .is_none()
+                {
                     let result = tool_result(
                         json!({"status": "not_found", "monitor_id": monitor_id}),
                         ToolResultStatus::Rejected,
@@ -1659,7 +1665,7 @@ impl MonitorService {
                     )
                     .await?;
                     return Ok(result);
-                };
+                }
                 let fact = MonitorJournalEvent::MonitorRemoved {
                     monitor_id: monitor_id.clone(),
                     reason: MonitorRemovalReason::Removed,
@@ -2757,6 +2763,8 @@ fn oldest_pending_per_monitor(
     pending
 }
 
+// These fields mirror the durable EventEnvelope identity and routing tuple.
+#[allow(clippy::too_many_arguments)]
 fn monitor_envelope(
     session_id: &SessionId,
     run_id: Option<&RunId>,

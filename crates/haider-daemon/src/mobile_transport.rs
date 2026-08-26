@@ -875,7 +875,6 @@ async fn connection_actor(
                     state,
                     connection_id,
                     &mut pending,
-                    &mut writer,
                 ).await {
                     break Err(error);
                 }
@@ -1141,16 +1140,12 @@ fn try_enqueue_bridge_event(
         .map_err(|_| TransportError::protocol("mobile chat output queue is full"))
 }
 
-async fn handle_inbound_frame<W>(
+async fn handle_inbound_frame(
     frame: Envelope,
     state: &Arc<TransportState>,
     connection_id: u64,
     pending: &mut HashMap<i64, oneshot::Sender<Result<Value, RequestFailure>>>,
-    writer: &mut W,
-) -> Result<(), TransportError>
-where
-    W: AsyncWrite + Unpin,
-{
+) -> Result<(), TransportError> {
     let frame_type = frame
         .body
         .get("type")
