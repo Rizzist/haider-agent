@@ -11,7 +11,7 @@ use haider_protocol::envelope::{PromptRender, RawEnvelope};
 use haider_protocol::error::{ErrorAction, ErrorCode, HaiderError};
 use haider_protocol::history::{CompactionIntent, CompactionResume, NodeKind, TreeNode};
 use haider_protocol::ids::{
-    AgentId, ArtifactRef, BranchId, EventId, MenuId, NodeId, RunId, SessionId,
+    AgentId, ArtifactRef, BranchId, EventId, ItemId, MenuId, NodeId, RunId, SessionId,
 };
 use haider_protocol::item::{ItemDelta, ItemEvent, OutputStream, TurnItem, UserCommandOriginV1};
 use haider_protocol::menu::{ErrorRecoveryCardKind, MenuKind};
@@ -23,9 +23,11 @@ use haider_protocol::tool::BoundedResult;
 use haider_provider::{Message, MessageRole, UserCommandRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tokio::sync::Mutex;
 
 const HISTORY_PAGE: usize = 256;
+const PROMPT_CACHE_SESSION_LIMIT: usize = 8;
 const PROMPT_CHECKPOINT_PROJECTION: &str = "prompt_history";
 const PROMPT_CHECKPOINT_SHAPE_VERSION: u32 = 1;
 /// Semantic compatibility of the prompt-history reducer.
@@ -55,9 +57,11 @@ pub struct PromptHistoryCompiler;
 /// Durable journal bytes remain the only authority: the cache first samples
 /// the session head, reads only the missing suffix, and keys a compiled
 /// projection by that head plus its compaction epoch and complete branch,
-/// agent, and current-run scope. On restart it may seed one exact timeline
-/// from a validated terminal compaction-boundary checkpoint; any absent or
-/// unreadable checkpoint falls back to the same journal fold from zero.
+/// agent, and current-run scope. Resident journals are capped across sessions,
+/// and each retained session owns one incrementally updated tree/fact index.
+/// On restart the cache may seed one exact timeline from a validated terminal
+/// compaction-boundary checkpoint; any absent or unreadable checkpoint falls
+/// back to the same journal fold from zero.
 #[derive(Default)]
 pub struct PromptHistoryCache {
     sessions: Mutex<HashMap<SessionId, CachedPromptSession>>,
@@ -68,9 +72,13 @@ struct CachedPromptSession {
     head_seq: u64,
     compaction_epochs: HashMap<PromptTimelineKey, u64>,
     envelopes: Vec<RawEnvelope>,
-    projections: HashMap<PromptProjectionKey, CompiledPromptProjection>,
+    projections: HashMap<PromptProjectionKey, CachedExactProjection>,
     append_prefixes: HashMap<PromptProjectionScope, CachedCompiledPrefix>,
+    render_facts: JournalFactsIndex,
+    tree_index: TreeProjection,
+    lineage_scopes: HashMap<Option<BranchId>, LineageIndex>,
     checkpoint_base: Option<PromptCheckpointBase>,
+    checkpoint_node_collision: bool,
     boundary_projector: TranscriptProjector,
     boundaries: HashMap<PromptTimelineKey, PromptBoundary>,
     saved_boundaries: HashMap<PromptTimelineKey, u64>,
@@ -100,6 +108,8 @@ struct PromptTimelineKey {
 
 struct PromptCheckpointBase {
     timeline: PromptTimelineKey,
+    prefix_node_ids: Vec<NodeId>,
+    prefix_run_ids: Vec<RunId>,
 }
 
 #[derive(Clone)]
@@ -113,7 +123,21 @@ struct PromptBoundary {
 struct CachedCompiledPrefix {
     head_seq: u64,
     current_run: RunId,
-    projection: CompiledPromptProjection,
+    current_run_terminal: bool,
+    projection: Arc<CompiledPromptProjection>,
+    cursor: PromptProjectionCursor,
+}
+
+#[derive(Clone)]
+struct CachedExactProjection {
+    projection: Arc<CompiledPromptProjection>,
+    cursor: PromptProjectionCursor,
+}
+
+#[derive(Clone)]
+enum PromptProjectionCursor {
+    Journal,
+    Tree { head_node: NodeId },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -128,6 +152,10 @@ struct DurablePromptCheckpoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent_id: Option<AgentId>,
     compaction_epoch: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    prefix_node_ids: Vec<NodeId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    prefix_run_ids: Vec<RunId>,
     messages: Vec<serde_json::Value>,
     stable_history_end: usize,
     current_user_start: usize,
@@ -323,9 +351,9 @@ impl PromptHistoryCompiler {
     ) -> Result<Vec<Message>, HaiderError> {
         let envelopes = read_all(store, session_id).await?;
         let lineage = ResolvedLineage::load(store, session_id, branch_id).await?;
-        let tree = TreeProjection::build(&envelopes, &lineage, agent_id)?;
+        let tree = TreeProjection::build(&envelopes);
         let ancestry = tree
-            .latest_ancestry(lineage.head.as_ref())?
+            .latest_ancestry(&envelopes, &lineage, agent_id, lineage.head.as_ref())?
             .ok_or_else(|| {
                 HaiderError::new(
                     ErrorCode::InvalidArgument,
@@ -335,7 +363,7 @@ impl PromptHistoryCompiler {
             })?;
         let tree_head_seq = ancestry.last().map_or(0, |entry| entry.seq);
         let mut projection =
-            compile_ancestry(&envelopes, &ancestry, Some(artifacts), agent_id, None).await?;
+            compile_ancestry(&envelopes, &ancestry, None, Some(artifacts), agent_id, None).await?;
         let tail = envelopes
             .iter()
             .filter(|envelope| {
@@ -360,9 +388,9 @@ impl PromptHistoryCompiler {
     ) -> Result<(Vec<Message>, Option<usize>), HaiderError> {
         let envelopes = read_all(store, session_id).await?;
         let lineage = ResolvedLineage::load(store, session_id, branch_id).await?;
-        let tree = TreeProjection::build(&envelopes, &lineage, agent_id)?;
+        let tree = TreeProjection::build(&envelopes);
         let ancestry = tree
-            .latest_ancestry(lineage.head.as_ref())?
+            .latest_ancestry(&envelopes, &lineage, agent_id, lineage.head.as_ref())?
             .ok_or_else(|| {
                 HaiderError::new(
                     ErrorCode::InvalidArgument,
@@ -372,7 +400,7 @@ impl PromptHistoryCompiler {
             })?;
         let tree_head_seq = ancestry.last().map_or(0, |entry| entry.seq);
         let mut projection =
-            compile_ancestry(&envelopes, &ancestry, Some(artifacts), agent_id, None).await?;
+            compile_ancestry(&envelopes, &ancestry, None, Some(artifacts), agent_id, None).await?;
         let boundary = projection.latest_compaction_summary_end;
         let tail = envelopes
             .iter()
@@ -399,9 +427,9 @@ impl PromptHistoryCompiler {
             return Ok(None);
         }
         let lineage = ResolvedLineage::load(store, session_id, branch_id).await?;
-        let tree = TreeProjection::build(&envelopes, &lineage, agent_id)?;
+        let tree = TreeProjection::build(&envelopes);
         Ok(tree
-            .latest_ancestry(lineage.head.as_ref())?
+            .latest_ancestry(&envelopes, &lineage, agent_id, lineage.head.as_ref())?
             .and_then(|ancestry| ancestry.last().map(|entry| entry.node.node.clone())))
     }
 
@@ -418,12 +446,14 @@ impl PromptHistoryCompiler {
     ) -> Result<CompactionIntent, HaiderError> {
         let envelopes = read_all(store, session_id).await?;
         let lineage = ResolvedLineage::load(store, session_id, branch_id).await?;
-        let tree = TreeProjection::build(&envelopes, &lineage, agent_id)?;
-        let ancestry = tree.ancestry_for_run(current_run)?.ok_or_else(|| {
-            corrupt(format!(
-                "cannot compact run {current_run} without a durable tree head"
-            ))
-        })?;
+        let tree = TreeProjection::build(&envelopes);
+        let ancestry = tree
+            .ancestry_for_run(&envelopes, &lineage, agent_id, current_run)?
+            .ok_or_else(|| {
+                corrupt(format!(
+                    "cannot compact run {current_run} without a durable tree head"
+                ))
+            })?;
         let current_start = ancestry
             .iter()
             .position(|entry| entry.run_id.as_ref() == Some(current_run))
@@ -453,9 +483,9 @@ impl PromptHistoryCompiler {
     ) -> Result<CompactionIntent, HaiderError> {
         let envelopes = read_all(store, session_id).await?;
         let lineage = ResolvedLineage::load(store, session_id, branch_id).await?;
-        let tree = TreeProjection::build(&envelopes, &lineage, agent_id)?;
+        let tree = TreeProjection::build(&envelopes);
         let ancestry = tree
-            .latest_ancestry(lineage.head.as_ref())?
+            .latest_ancestry(&envelopes, &lineage, agent_id, lineage.head.as_ref())?
             .ok_or_else(|| {
                 HaiderError::new(
                     ErrorCode::InvalidArgument,
@@ -513,6 +543,7 @@ impl PromptHistoryCache {
             && let Some(loaded) =
                 load_prompt_checkpoint(store, session_id, &timeline, head_seq, current_run).await
         {
+            let lineage = ResolvedLineage::load(store, session_id, branch_id).await?;
             let scope = PromptProjectionScope {
                 compaction_epoch: loaded.compaction_epoch,
                 branch_id: timeline.branch_id.clone(),
@@ -524,7 +555,12 @@ impl PromptHistoryCache {
                 .insert(timeline.clone(), loaded.compaction_epoch);
             cached.checkpoint_base = Some(PromptCheckpointBase {
                 timeline: timeline.clone(),
+                prefix_node_ids: loaded.prefix_node_ids,
+                prefix_run_ids: loaded.prefix_run_ids,
             });
+            cached
+                .lineage_scopes
+                .insert(timeline.branch_id.clone(), lineage.index);
             cached.append_prefixes.insert(scope, loaded.prefix);
         }
 
@@ -539,24 +575,12 @@ impl PromptHistoryCache {
                     break;
                 }
                 cursor = envelope.seq;
-                if serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
-                    |payload| {
-                        matches!(
-                            payload,
-                            EventPayload::NodeCommitted(TreeNode {
-                                kind: NodeKind::Compaction { .. },
-                                ..
-                            })
-                        )
-                    },
-                ) {
-                    let affects_checkpoint_timeline = envelope.branch_id == timeline.branch_id
-                        && envelope.agent_id == timeline.agent_id;
-                    cached.note_compaction(&envelope);
+                let affects_checkpoint_timeline = envelope.branch_id == timeline.branch_id
+                    && envelope.agent_id == timeline.agent_id;
+                if cached.push_envelope(envelope) {
                     compaction_after_checkpoint |=
                         cached.checkpoint_base.is_some() && affects_checkpoint_timeline;
                 }
-                cached.push_envelope(envelope);
             }
             if cached.envelopes.len() == before {
                 return Err(corrupt(format!(
@@ -569,43 +593,11 @@ impl PromptHistoryCache {
         // A later compaction resets the model context again. The prior
         // checkpoint cannot derive the new overlay without its omitted tree;
         // replay once from zero, then install the newer boundary checkpoint.
-        if compaction_after_checkpoint {
-            cached = CachedPromptSession::default();
-            let mut cursor = 0;
-            while cursor < head_seq {
-                let page = store.read(session_id, cursor, HISTORY_PAGE).await?;
-                let before = cached.envelopes.len();
-                for envelope in page {
-                    if envelope.seq > head_seq {
-                        break;
-                    }
-                    cursor = envelope.seq;
-                    if serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
-                        |payload| {
-                            matches!(
-                                payload,
-                                EventPayload::NodeCommitted(TreeNode {
-                                    kind: NodeKind::Compaction { .. },
-                                    ..
-                                })
-                            )
-                        },
-                    ) {
-                        cached.note_compaction(&envelope);
-                    }
-                    cached.push_envelope(envelope);
-                }
-                if cached.envelopes.len() == before {
-                    return Err(corrupt(format!(
-                        "prompt cache could not read durable head {head_seq} after sequence {cursor}"
-                    )));
-                }
-            }
-            cached.flush_boundary_rows();
+        if compaction_after_checkpoint || cached.checkpoint_node_collision {
+            cached = replay_cached_session(store, session_id, head_seq).await?;
         }
         if cached.head_seq < head_seq {
             cached.head_seq = head_seq;
-            cached.projections.clear();
             let changed_timelines = cached
                 .compaction_epochs
                 .iter()
@@ -621,6 +613,12 @@ impl PromptHistoryCache {
                         agent_id: scope.agent_id.clone(),
                     })
                 });
+                cached.projections.retain(|key, _| {
+                    !changed_timelines.contains(&PromptTimelineKey {
+                        branch_id: key.branch_id.clone(),
+                        agent_id: key.agent_id.clone(),
+                    })
+                });
             }
         }
 
@@ -630,46 +628,10 @@ impl PromptHistoryCache {
             branch_id: branch_id.cloned(),
             agent_id: agent_id.cloned(),
         };
-        if cached.checkpoint_base.is_some()
-            && cached.append_prefixes.get(&scope).is_none_or(|prefix| {
-                prefix.head_seq >= head_seq || prefix.current_run == *current_run
-            })
-        {
+        if cached.checkpoint_base.is_some() && !cached.append_prefixes.contains_key(&scope) {
             // A decoded checkpoint that cannot enter the existing suffix
             // extension seam proves nothing; rebuild with the oracle.
-            cached = CachedPromptSession::default();
-            let mut cursor = 0;
-            while cursor < head_seq {
-                let page = store.read(session_id, cursor, HISTORY_PAGE).await?;
-                let before = cached.envelopes.len();
-                for envelope in page {
-                    if envelope.seq > head_seq {
-                        break;
-                    }
-                    cursor = envelope.seq;
-                    if serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
-                        |payload| {
-                            matches!(
-                                payload,
-                                EventPayload::NodeCommitted(TreeNode {
-                                    kind: NodeKind::Compaction { .. },
-                                    ..
-                                })
-                            )
-                        },
-                    ) {
-                        cached.note_compaction(&envelope);
-                    }
-                    cached.push_envelope(envelope);
-                }
-                if cached.envelopes.len() == before {
-                    return Err(corrupt(format!(
-                        "prompt cache could not read durable head {head_seq} after sequence {cursor}"
-                    )));
-                }
-            }
-            cached.flush_boundary_rows();
-            cached.head_seq = head_seq;
+            cached = replay_cached_session(store, session_id, head_seq).await?;
         }
         let compaction_epoch = cached.compaction_epoch(&timeline);
         let scope = PromptProjectionScope {
@@ -685,32 +647,88 @@ impl PromptHistoryCache {
             current_run: current_run.clone(),
         };
         if let Some(projection) = cached.projections.get(&key).cloned() {
+            let projection = projection.projection.as_ref().clone();
             self.install(session_id.clone(), cached).await;
             return Ok(projection);
         }
-        let projection = match cached.append_prefixes.get(&scope) {
-            Some(prefix) if prefix.head_seq < head_seq && prefix.current_run != *current_run => {
-                extend_compiled_projection(
-                    prefix,
-                    &cached.envelopes,
-                    branch_id,
-                    agent_id,
-                    current_run,
-                )?
-            }
-            _ => {
-                compile_projection_from_envelopes(
+        let previous_exact = cached
+            .projections
+            .iter()
+            .filter(|(candidate, _)| {
+                candidate.head_seq < head_seq
+                    && candidate.compaction_epoch == compaction_epoch
+                    && candidate.branch_id == key.branch_id
+                    && candidate.agent_id == key.agent_id
+                    && candidate.current_run == *current_run
+            })
+            .max_by_key(|(candidate, _)| candidate.head_seq)
+            .map(|(candidate, projection)| (candidate.head_seq, projection.clone()));
+        let append_prefix = cached
+            .append_prefixes
+            .get(&scope)
+            .filter(|prefix| prefix.head_seq < head_seq && prefix.current_run != *current_run)
+            .cloned();
+        let (projection, projection_cursor) = if let Some(prefix) = append_prefix {
+            if let Some(extended) =
+                extend_compiled_projection(&prefix, &cached, branch_id, agent_id, current_run)?
+            {
+                extended
+            } else {
+                if cached.checkpoint_base.is_some() {
+                    cached = replay_cached_session(store, session_id, head_seq).await?;
+                }
+                compile_projection_from_cache(
+                    &mut cached,
                     store,
                     Some(artifacts),
                     session_id,
                     branch_id,
                     agent_id,
                     current_run,
-                    &cached.envelopes,
                 )
                 .await?
             }
+        } else if previous_exact.is_some() {
+            let (prefix_head_seq, prefix) = previous_exact
+                .as_ref()
+                .ok_or_else(|| corrupt("exact prompt prefix disappeared"))?;
+            if let Some(extended) = extend_exact_projection(
+                *prefix_head_seq,
+                prefix,
+                &cached,
+                branch_id,
+                agent_id,
+                current_run,
+            )? {
+                extended
+            } else {
+                if cached.checkpoint_base.is_some() {
+                    cached = replay_cached_session(store, session_id, head_seq).await?;
+                }
+                compile_projection_from_cache(
+                    &mut cached,
+                    store,
+                    Some(artifacts),
+                    session_id,
+                    branch_id,
+                    agent_id,
+                    current_run,
+                )
+                .await?
+            }
+        } else {
+            compile_projection_from_cache(
+                &mut cached,
+                store,
+                Some(artifacts),
+                session_id,
+                branch_id,
+                agent_id,
+                current_run,
+            )
+            .await?
         };
+        let projection = Arc::new(projection);
         // Keep the earliest request boundary for a live run. Later tool-round
         // recompiles intentionally suppress that run's assistant/tool output;
         // replacing this prefix at their later head would make those facts
@@ -719,17 +737,38 @@ impl PromptHistoryCache {
             .append_prefixes
             .get(&scope)
             .is_none_or(|prefix| prefix.current_run != *current_run)
+            && cached.can_seed_append_prefix(branch_id, agent_id, current_run, head_seq)
         {
+            let current_run_terminal = cached
+                .render_facts
+                .facts(branch_id, agent_id)?
+                .and_then(|facts| facts.terminal.get(current_run))
+                .is_some_and(RunState::is_terminal);
             cached.append_prefixes.insert(
                 scope,
                 CachedCompiledPrefix {
                     head_seq,
                     current_run: current_run.clone(),
-                    projection: projection.clone(),
+                    current_run_terminal,
+                    projection: Arc::clone(&projection),
+                    cursor: projection_cursor.clone(),
                 },
             );
         }
-        cached.projections.insert(key, projection.clone());
+        // One exact projection per branch+agent timeline is sufficient. The
+        // append prefix above keeps the earlier live-run boundary when it is
+        // semantically distinct; both maps share the same Arc at installation
+        // instead of cloning the complete message vector.
+        cached.projections.retain(|candidate, _| {
+            candidate.branch_id != key.branch_id || candidate.agent_id != key.agent_id
+        });
+        cached.projections.insert(
+            key,
+            CachedExactProjection {
+                projection: Arc::clone(&projection),
+                cursor: projection_cursor,
+            },
+        );
 
         if cached.checkpoint_base.is_none()
             && let Some(boundary) = cached.boundaries.get(&timeline).cloned()
@@ -770,7 +809,7 @@ impl PromptHistoryCache {
             }
         }
         self.install(session_id.clone(), cached).await;
-        Ok(projection)
+        Ok(projection.as_ref().clone())
     }
 
     async fn install(&self, session_id: SessionId, cached: CachedPromptSession) {
@@ -779,9 +818,46 @@ impl PromptHistoryCache {
             .get(&session_id)
             .is_none_or(|current| current.head_seq <= cached.head_seq)
         {
+            if !sessions.contains_key(&session_id)
+                && sessions.len() >= PROMPT_CACHE_SESSION_LIMIT
+                && let Some(evicted) = sessions
+                    .keys()
+                    .min_by(|left, right| left.as_str().cmp(right.as_str()))
+                    .cloned()
+            {
+                sessions.remove(&evicted);
+            }
             sessions.insert(session_id, cached);
         }
     }
+}
+
+async fn replay_cached_session(
+    store: &dyn StoreHandle,
+    session_id: &SessionId,
+    head_seq: u64,
+) -> Result<CachedPromptSession, HaiderError> {
+    let mut cached = CachedPromptSession::default();
+    let mut cursor = 0;
+    while cursor < head_seq {
+        let page = store.read(session_id, cursor, HISTORY_PAGE).await?;
+        let before = cached.envelopes.len();
+        for envelope in page {
+            if envelope.seq > head_seq {
+                break;
+            }
+            cursor = envelope.seq;
+            cached.push_envelope(envelope);
+        }
+        if cached.envelopes.len() == before {
+            return Err(corrupt(format!(
+                "prompt cache could not read durable head {head_seq} after sequence {cursor}"
+            )));
+        }
+    }
+    cached.flush_boundary_rows();
+    cached.head_seq = head_seq;
+    Ok(cached)
 }
 
 impl CachedPromptSession {
@@ -799,10 +875,121 @@ impl CachedPromptSession {
         self.compaction_epochs.get(timeline).copied().unwrap_or(0)
     }
 
-    fn push_envelope(&mut self, envelope: RawEnvelope) {
+    /// Advances every session-wide index from one decoded journal envelope.
+    /// Returns whether the envelope starts a new compaction epoch.
+    fn push_envelope(&mut self, envelope: RawEnvelope) -> bool {
+        let envelope_index = self.envelopes.len();
+        let payload = serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok();
+        let checkpoint_node_collision = self
+            .checkpoint_base
+            .as_ref()
+            .zip(payload.as_ref())
+            .is_some_and(|(base, payload)| {
+                let EventPayload::NodeCommitted(node) = payload else {
+                    return false;
+                };
+                envelope.agent_id == base.timeline.agent_id
+                    && self
+                        .lineage_scopes
+                        .get(&base.timeline.branch_id)
+                        .is_some_and(|lineage| {
+                            lineage.admits(envelope.branch_id.as_ref(), envelope.seq)
+                        })
+                    && base
+                        .prefix_node_ids
+                        .binary_search_by(|candidate| candidate.as_str().cmp(node.node.as_str()))
+                        .is_ok()
+            });
+        self.checkpoint_node_collision |= checkpoint_node_collision;
+        let is_compaction = matches!(
+            payload.as_ref(),
+            Some(EventPayload::NodeCommitted(TreeNode {
+                kind: NodeKind::Compaction { .. },
+                ..
+            }))
+        );
+        if is_compaction {
+            self.note_compaction(&envelope);
+        }
+        self.render_facts.push_decoded(&envelope, payload.as_ref());
+        self.tree_index
+            .push(envelope_index, &envelope, payload.as_ref());
         let rows = self.boundary_projector.push(&envelope);
         self.envelopes.push(envelope);
         self.note_boundary_rows(rows);
+        is_compaction
+    }
+
+    fn indexed_ancestry_for_run(
+        &self,
+        lineage: &ResolvedLineage,
+        agent_id: Option<&AgentId>,
+        current_run: &RunId,
+    ) -> Result<Option<Vec<TreeEntry>>, HaiderError> {
+        self.tree_index
+            .ancestry_for_run(&self.envelopes, lineage, agent_id, current_run)
+    }
+
+    fn indexed_extension_for_run(
+        &self,
+        lineage: &ResolvedLineage,
+        agent_id: Option<&AgentId>,
+        current_run: &RunId,
+        stop_node: &NodeId,
+    ) -> Result<Option<Vec<TreeEntry>>, HaiderError> {
+        self.tree_index.descendant_extension_for_run(
+            &self.envelopes,
+            lineage,
+            agent_id,
+            current_run,
+            stop_node,
+        )
+    }
+
+    /// A projection captured after current-run items have already committed
+    /// cannot become the next run's prefix: those items are deliberately
+    /// hidden while their run is current, but must appear once it is prior
+    /// history. Keep an earlier safe prefix when one exists, or skip seeding
+    /// so the next run performs the indexed full fold.
+    fn can_seed_append_prefix(
+        &self,
+        branch_id: Option<&BranchId>,
+        agent_id: Option<&AgentId>,
+        current_run: &RunId,
+        head_seq: u64,
+    ) -> bool {
+        // Tree-backed histories can jump directly to this run's first node,
+        // keeping the one-time safety check proportional to the live run
+        // rather than to all retained ancestry. Legacy node-less journals use
+        // zero because they have no equivalent durable boundary.
+        let run_key = (agent_id.cloned(), current_run.clone());
+        let start_after = self.tree_index.by_run.get(&run_key).and_then(|indices| {
+            indices.iter().find_map(|index| {
+                let indexed = self.tree_index.ordered.get(*index)?;
+                let envelope = self.envelopes.get(indexed.envelope_index)?;
+                (envelope.branch_id.as_ref() == branch_id).then_some(indexed.fragment_after)
+            })
+        });
+        let start = start_after.map_or(0, |seq| {
+            self.envelopes
+                .partition_point(|envelope| envelope.seq <= seq)
+        });
+        let end = self
+            .envelopes
+            .partition_point(|envelope| envelope.seq <= head_seq);
+        !self.envelopes[start..end].iter().any(|envelope| {
+            envelope.seq <= head_seq
+                && envelope.run_id.as_ref() == Some(current_run)
+                && scoped(envelope, branch_id, agent_id)
+                && serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+                    |payload| {
+                        matches!(
+                            payload,
+                            EventPayload::Item(_) | EventPayload::ToolResult { .. }
+                        )
+                    },
+                )
+        })
     }
 
     fn flush_boundary_rows(&mut self) {
@@ -851,6 +1038,8 @@ impl CachedPromptSession {
 
 struct LoadedPromptCheckpoint {
     compaction_epoch: u64,
+    prefix_node_ids: Vec<NodeId>,
+    prefix_run_ids: Vec<RunId>,
     prefix: CachedCompiledPrefix,
 }
 
@@ -889,7 +1078,7 @@ async fn load_prompt_checkpoint(
             return None;
         }
     };
-    let decoded = match serde_json::from_slice::<DurablePromptCheckpoint>(&stored.payload) {
+    let mut decoded = match serde_json::from_slice::<DurablePromptCheckpoint>(&stored.payload) {
         Ok(decoded) => decoded,
         Err(error) => {
             tracing::warn!(
@@ -941,6 +1130,85 @@ async fn load_prompt_checkpoint(
     {
         return None;
     }
+    let Ok(EventPayload::RunState(boundary_state)) =
+        serde_json::from_value::<EventPayload>(boundary.payload.clone())
+    else {
+        return None;
+    };
+    if !boundary_state.is_terminal() {
+        return None;
+    }
+    // Recover only the compacted prefix's tree head. It is usually the
+    // compaction node itself, but scanning through the terminal boundary also
+    // covers a valid committed node between compaction and terminal state.
+    let mut anchor_cursor = decoded.compaction_epoch.saturating_sub(1);
+    let mut checkpoint_head_node = None;
+    let mut saw_compaction = false;
+    while anchor_cursor < decoded.through_seq {
+        let page = match store.read(session_id, anchor_cursor, HISTORY_PAGE).await {
+            Ok(page) => page,
+            Err(error) => {
+                tracing::debug!(
+                    session_id = %session_id,
+                    ?error,
+                    "prompt checkpoint tree anchor could not be read; replaying journal"
+                );
+                return None;
+            }
+        };
+        let before = anchor_cursor;
+        for envelope in page {
+            if envelope.seq > decoded.through_seq {
+                break;
+            }
+            anchor_cursor = envelope.seq;
+            if envelope.branch_id != decoded.branch_id || envelope.agent_id != decoded.agent_id {
+                continue;
+            }
+            let Ok(EventPayload::NodeCommitted(node)) =
+                serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            else {
+                continue;
+            };
+            if envelope.seq == decoded.compaction_epoch {
+                if !matches!(node.kind, NodeKind::Compaction { .. }) {
+                    return None;
+                }
+                saw_compaction = true;
+            }
+            checkpoint_head_node = Some(node.node);
+        }
+        if anchor_cursor == before {
+            return None;
+        }
+    }
+    if !saw_compaction {
+        return None;
+    }
+    let checkpoint_head_node = checkpoint_head_node?;
+    let mut prefix_node_ids = std::mem::take(&mut decoded.prefix_node_ids);
+    prefix_node_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    if prefix_node_ids.windows(2).any(|pair| pair[0] == pair[1])
+        || prefix_node_ids
+            .binary_search_by(|candidate| candidate.as_str().cmp(checkpoint_head_node.as_str()))
+            .is_err()
+    {
+        // Older checkpoints did not persist the membership proof required to
+        // distinguish a suffix node from a duplicate of compacted ancestry.
+        return None;
+    }
+    let mut prefix_run_ids = std::mem::take(&mut decoded.prefix_run_ids);
+    prefix_run_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    if prefix_run_ids.windows(2).any(|pair| pair[0] == pair[1])
+        || prefix_run_ids
+            .binary_search_by(|candidate| candidate.as_str().cmp(decoded.boundary_run_id.as_str()))
+            .is_err()
+        || prefix_run_ids
+            .binary_search_by(|candidate| candidate.as_str().cmp(current_run.as_str()))
+            .is_ok()
+    {
+        return None;
+    }
     let messages = match decoded
         .messages
         .into_iter()
@@ -959,14 +1227,20 @@ async fn load_prompt_checkpoint(
     };
     Some(LoadedPromptCheckpoint {
         compaction_epoch: decoded.compaction_epoch,
+        prefix_node_ids,
+        prefix_run_ids,
         prefix: CachedCompiledPrefix {
             head_seq: decoded.through_seq,
             current_run: decoded.boundary_run_id,
-            projection: CompiledPromptProjection {
+            current_run_terminal: true,
+            projection: Arc::new(CompiledPromptProjection {
                 messages,
                 stable_history_end: decoded.stable_history_end,
                 current_user_start: decoded.current_user_start,
                 latest_compaction_summary_end: decoded.latest_compaction_summary_end,
+            }),
+            cursor: PromptProjectionCursor::Tree {
+                head_node: checkpoint_head_node,
             },
         },
     })
@@ -998,8 +1272,25 @@ async fn build_prompt_checkpoint(
             "prompt checkpoint boundary identity disagrees with the journal",
         ));
     }
+    let EventPayload::RunState(boundary_state) = serde_json::from_value::<EventPayload>(
+        boundary_envelope.payload.clone(),
+    )
+    .map_err(|error| corrupt(format!("prompt checkpoint boundary is malformed: {error}")))?
+    else {
+        return Err(corrupt(
+            "prompt checkpoint boundary is not a run-state event",
+        ));
+    };
+    if !boundary_state.is_terminal() {
+        return Err(corrupt(
+            "prompt checkpoint boundary run-state is not terminal",
+        ));
+    }
     let compaction_epoch = prefix
         .iter()
+        .filter(|envelope| {
+            envelope.branch_id == timeline.branch_id && envelope.agent_id == timeline.agent_id
+        })
         .filter_map(|envelope| {
             serde_json::from_value::<EventPayload>(envelope.payload.clone())
                 .is_ok_and(|payload| {
@@ -1015,6 +1306,35 @@ async fn build_prompt_checkpoint(
         })
         .max()
         .ok_or_else(|| corrupt("compaction boundary has no preceding compaction node"))?;
+    let lineage = ResolvedLineage::load(store, session_id, timeline.branch_id.as_ref()).await?;
+    let mut seen_node_ids = HashSet::new();
+    let mut prefix_node_ids = Vec::new();
+    let mut seen_run_ids = HashSet::new();
+    let mut prefix_run_ids = Vec::new();
+    for envelope in &prefix {
+        if envelope.agent_id != timeline.agent_id
+            || !lineage.admits(envelope.branch_id.as_ref(), envelope.seq)
+        {
+            continue;
+        }
+        if let Some(run_id) = &envelope.run_id
+            && seen_run_ids.insert(run_id.clone())
+        {
+            prefix_run_ids.push(run_id.clone());
+        }
+        let Ok(EventPayload::NodeCommitted(node)) =
+            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+        else {
+            continue;
+        };
+        if !seen_node_ids.insert(node.node.clone()) {
+            return Err(corrupt(format!(
+                "history tree contains duplicate node {}",
+                node.node
+            )));
+        }
+        prefix_node_ids.push(node.node);
+    }
     let projection = compile_idle_projection_at_prefix(
         store,
         artifacts,
@@ -1044,6 +1364,8 @@ async fn build_prompt_checkpoint(
         branch_id: timeline.branch_id.clone(),
         agent_id: timeline.agent_id.clone(),
         compaction_epoch,
+        prefix_node_ids,
+        prefix_run_ids,
         messages,
         stable_history_end: projection.stable_history_end,
         current_user_start: projection.current_user_start,
@@ -1060,32 +1382,102 @@ async fn build_prompt_checkpoint(
     })
 }
 
-/// Extends a completed request projection with only the journal suffix that
-/// accumulated before the next accepted run. The old request (including its
-/// user message) is now immutable history; rendering the suffix produces the
-/// preceding assistant/tool results followed by the new current user. A
-/// compaction epoch change never reaches this function and recompiles through
-/// the full oracle instead.
+/// Extends a completed request projection along the selected journal or tree
+/// path. The old request (including its user message) is now immutable history;
+/// rendering the extension produces the preceding assistant/tool results
+/// followed by the new current user. A compaction epoch change never reaches
+/// this function and recompiles through the full oracle instead.
 fn extend_compiled_projection(
     prefix: &CachedCompiledPrefix,
-    envelopes: &[RawEnvelope],
+    cached: &CachedPromptSession,
     branch_id: Option<&BranchId>,
     agent_id: Option<&AgentId>,
     current_run: &RunId,
-) -> Result<CompiledPromptProjection, HaiderError> {
-    let suffix = envelopes
-        .iter()
-        .filter(|envelope| envelope.seq > prefix.head_seq)
-        .cloned()
-        .collect::<Vec<_>>();
-    let rendered = render_journal(
-        &suffix,
-        envelopes,
-        branch_id,
-        agent_id,
-        Some(current_run),
-        true,
-    )?;
+) -> Result<Option<(CompiledPromptProjection, PromptProjectionCursor)>, HaiderError> {
+    let suffix_start = cached
+        .envelopes
+        .partition_point(|envelope| envelope.seq <= prefix.head_seq);
+    let suffix = &cached.envelopes[suffix_start..];
+    let (rendered, cursor) = match &prefix.cursor {
+        PromptProjectionCursor::Journal => {
+            // Surface the same scoped prepass corruption as a full render
+            // even when the suffix has no newly visible messages.
+            let _ = cached.render_facts.facts(branch_id, agent_id)?;
+            if suffix_revises_prior_facts(
+                &cached.envelopes[..suffix_start],
+                suffix,
+                branch_id,
+                agent_id,
+                &prefix.current_run,
+                cached
+                    .checkpoint_base
+                    .as_ref()
+                    .map(|base| base.prefix_run_ids.as_slice()),
+                true,
+                prefix.current_run_terminal,
+            )? {
+                return Ok(None);
+            }
+            let timeline = PromptTimelineKey {
+                branch_id: branch_id.cloned(),
+                agent_id: agent_id.cloned(),
+            };
+            if cached.tree_index.has_timeline(&timeline) {
+                return Ok(None);
+            }
+            let rendered = render_journal_with_indexed_facts(
+                suffix,
+                &cached.render_facts,
+                branch_id,
+                agent_id,
+                Some(current_run),
+                true,
+            )?;
+            (rendered, PromptProjectionCursor::Journal)
+        }
+        PromptProjectionCursor::Tree { head_node } => {
+            let branch_key = branch_id.cloned();
+            let Some(index) = cached.lineage_scopes.get(&branch_key).cloned() else {
+                return Ok(None);
+            };
+            if lineage_suffix_revises_prior_facts(
+                cached,
+                &index,
+                &cached.envelopes[..suffix_start],
+                suffix,
+                agent_id,
+                &prefix.current_run,
+                true,
+                prefix.current_run_terminal,
+            )? {
+                return Ok(None);
+            }
+            let lineage = ResolvedLineage { index, head: None };
+            let Some(extension) =
+                cached.indexed_extension_for_run(&lineage, agent_id, current_run, head_node)?
+            else {
+                return Ok(None);
+            };
+            if extension
+                .iter()
+                .any(|entry| matches!(entry.node.kind, NodeKind::Compaction { .. }))
+            {
+                return Ok(None);
+            }
+            let rendered = render_tree_extension(
+                &extension,
+                &cached.envelopes,
+                &cached.render_facts,
+                agent_id,
+                current_run,
+            )?;
+            let head_node = extension
+                .last()
+                .map(|entry| entry.node.node.clone())
+                .unwrap_or_else(|| head_node.clone());
+            (rendered, PromptProjectionCursor::Tree { head_node })
+        }
+    };
     let mut messages = prefix.projection.messages.clone();
     let offset = messages.len();
     let current_user_start = rendered
@@ -1097,11 +1489,463 @@ fn extend_compiled_projection(
             ))
         })?;
     messages.extend(rendered.messages);
+    Ok(Some((
+        CompiledPromptProjection {
+            stable_history_end: current_user_start,
+            current_user_start,
+            latest_compaction_summary_end: prefix.projection.latest_compaction_summary_end,
+            messages,
+        },
+        cursor,
+    )))
+}
+
+fn extend_exact_projection(
+    prefix_head_seq: u64,
+    prefix: &CachedExactProjection,
+    cached: &CachedPromptSession,
+    branch_id: Option<&BranchId>,
+    agent_id: Option<&AgentId>,
+    current_run: &RunId,
+) -> Result<Option<(CompiledPromptProjection, PromptProjectionCursor)>, HaiderError> {
+    let suffix_start = cached
+        .envelopes
+        .partition_point(|envelope| envelope.seq <= prefix_head_seq);
+    let suffix = &cached.envelopes[suffix_start..];
+    match &prefix.cursor {
+        PromptProjectionCursor::Journal => {
+            // Surface the same scoped prepass corruption as a full render
+            // even when the appended suffix has no visible messages.
+            let _ = cached.render_facts.facts(branch_id, agent_id)?;
+            if suffix_revises_prior_facts(
+                &cached.envelopes[..suffix_start],
+                suffix,
+                branch_id,
+                agent_id,
+                current_run,
+                cached
+                    .checkpoint_base
+                    .as_ref()
+                    .map(|base| base.prefix_run_ids.as_slice()),
+                false,
+                false,
+            )? {
+                return Ok(None);
+            }
+            let timeline = PromptTimelineKey {
+                branch_id: branch_id.cloned(),
+                agent_id: agent_id.cloned(),
+            };
+            if cached.tree_index.has_timeline(&timeline) {
+                return Ok(None);
+            }
+            let rendered = render_journal_with_indexed_facts(
+                suffix,
+                &cached.render_facts,
+                branch_id,
+                agent_id,
+                Some(current_run),
+                false,
+            )?;
+            let mut messages = prefix.projection.messages.clone();
+            messages.extend(rendered.messages);
+            Ok(Some((
+                CompiledPromptProjection {
+                    messages,
+                    stable_history_end: prefix.projection.stable_history_end,
+                    current_user_start: prefix.projection.current_user_start,
+                    latest_compaction_summary_end: prefix.projection.latest_compaction_summary_end,
+                },
+                PromptProjectionCursor::Journal,
+            )))
+        }
+        PromptProjectionCursor::Tree { head_node } => {
+            let branch_key = branch_id.cloned();
+            let Some(index) = cached.lineage_scopes.get(&branch_key).cloned() else {
+                return Ok(None);
+            };
+            if lineage_suffix_revises_prior_facts(
+                cached,
+                &index,
+                &cached.envelopes[..suffix_start],
+                suffix,
+                agent_id,
+                current_run,
+                false,
+                false,
+            )? {
+                return Ok(None);
+            }
+            let lineage = ResolvedLineage { index, head: None };
+            let Some(extension) =
+                cached.indexed_extension_for_run(&lineage, agent_id, current_run, head_node)?
+            else {
+                return Ok(None);
+            };
+            if extension
+                .iter()
+                .any(|entry| matches!(entry.node.kind, NodeKind::Compaction { .. }))
+            {
+                return Ok(None);
+            }
+            let projection = extend_tree_projection(
+                &prefix.projection,
+                &extension,
+                &cached.envelopes,
+                &cached.render_facts,
+                agent_id,
+                current_run,
+            )?;
+            let head_node = extension
+                .last()
+                .map(|entry| entry.node.node.clone())
+                .unwrap_or_else(|| head_node.clone());
+            Ok(Some((
+                projection,
+                PromptProjectionCursor::Tree { head_node },
+            )))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lineage_suffix_revises_prior_facts(
+    cached: &CachedPromptSession,
+    lineage: &LineageIndex,
+    prior: &[RawEnvelope],
+    suffix: &[RawEnvelope],
+    agent_id: Option<&AgentId>,
+    prefix_run: &RunId,
+    prefix_becomes_prior: bool,
+    prefix_was_terminal: bool,
+) -> Result<bool, HaiderError> {
+    let checkpoint_prefix_runs = cached
+        .checkpoint_base
+        .as_ref()
+        .map(|base| base.prefix_run_ids.as_slice());
+    let checkpoint_owns_prefix_run = checkpoint_prefix_runs.is_some_and(|runs| {
+        runs.binary_search_by(|candidate| candidate.as_str().cmp(prefix_run.as_str()))
+            .is_ok()
+    });
+    let mut prefix_owner_scopes = HashSet::<Option<BranchId>>::new();
+    if prefix_becomes_prior {
+        if let Some(indices) = cached
+            .tree_index
+            .by_run
+            .get(&(agent_id.cloned(), prefix_run.clone()))
+        {
+            for index in indices {
+                let Some(indexed) = cached.tree_index.ordered.get(*index) else {
+                    return Err(corrupt("prompt tree run index is out of bounds"));
+                };
+                if indexed.envelope_index >= prior.len() {
+                    continue;
+                }
+                let Some(envelope) = cached.envelopes.get(indexed.envelope_index) else {
+                    return Err(corrupt("prompt tree envelope index is out of bounds"));
+                };
+                if lineage.admits(envelope.branch_id.as_ref(), envelope.seq) {
+                    prefix_owner_scopes.insert(envelope.branch_id.clone());
+                }
+            }
+        }
+        if checkpoint_owns_prefix_run && let Some(base) = &cached.checkpoint_base {
+            prefix_owner_scopes.insert(base.timeline.branch_id.clone());
+        }
+        if prefix_owner_scopes.is_empty() {
+            // A tree prefix should identify its run-owning node. If truncated
+            // state cannot prove that owner, let the complete fold decide.
+            return Ok(true);
+        }
+    }
+    let mut affected_scopes = suffix
+        .iter()
+        .filter(|envelope| {
+            envelope.agent_id.as_ref() == agent_id
+                && envelope
+                    .branch_id
+                    .as_ref()
+                    .is_none_or(|branch| lineage.branches.contains_key(branch))
+        })
+        .map(|envelope| envelope.branch_id.clone())
+        .collect::<HashSet<_>>();
+    affected_scopes.extend(prefix_owner_scopes.iter().cloned());
+    let check_scope = |branch_id: Option<&BranchId>| -> Result<bool, HaiderError> {
+        // Only suffix owners and the prior run's indexed node owners can
+        // change an already-compiled projection. This keeps same-run warm
+        // steers proportional to the appended suffix instead of rescanning
+        // every branch and the complete journal.
+        let check = || -> Result<bool, HaiderError> {
+            let facts = cached.render_facts.facts(branch_id, agent_id)?;
+            let owns_prefix_run = prefix_owner_scopes.contains(&branch_id.cloned());
+            let prefix_scope_was_terminal = facts
+                .and_then(|facts| facts.terminal.get(prefix_run))
+                .is_some_and(RunState::is_terminal)
+                || (owns_prefix_run && checkpoint_owns_prefix_run && prefix_was_terminal);
+            suffix_revises_prior_facts(
+                prior,
+                suffix,
+                branch_id,
+                agent_id,
+                prefix_run,
+                checkpoint_prefix_runs,
+                prefix_becomes_prior && owns_prefix_run,
+                prefix_scope_was_terminal,
+            )
+        };
+        match check() {
+            result @ Ok(_) => result,
+            // This prepass includes scopes that selected ancestry may not
+            // render (including an irrelevant requested leaf). Rebuild
+            // through the oracle so it alone decides whether an error is live.
+            Err(_) => Ok(true),
+        }
+    };
+    let mut affected_scopes = affected_scopes.into_iter().collect::<Vec<_>>();
+    affected_scopes.sort_by(|left, right| match (left, right) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(left), Some(right)) => left.as_str().cmp(right.as_str()),
+    });
+    for branch in &affected_scopes {
+        if check_scope(branch.as_ref())? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn suffix_revises_prior_facts(
+    prior: &[RawEnvelope],
+    suffix: &[RawEnvelope],
+    branch_id: Option<&BranchId>,
+    agent_id: Option<&AgentId>,
+    prefix_run: &RunId,
+    checkpoint_prefix_runs: Option<&[RunId]>,
+    require_prefix_terminal: bool,
+    prefix_was_terminal: bool,
+) -> Result<bool, HaiderError> {
+    // Durable checkpoints intentionally retain the compiled projection rather
+    // than all pre-boundary render facts. Any later envelope for a run that is
+    // represented by that projection can depend on those omitted facts (for
+    // example, a completed assistant item after the run became terminal).
+    // Let the complete fold adjudicate every such continuation.
+    if checkpoint_prefix_runs.is_some_and(|runs| {
+        suffix.iter().any(|envelope| {
+            scoped(envelope, branch_id, agent_id)
+                && envelope.run_id.as_ref().is_some_and(|run_id| {
+                    runs.binary_search_by(|candidate| candidate.as_str().cmp(run_id.as_str()))
+                        .is_ok()
+                })
+        })
+    }) {
+        return Ok(true);
+    }
+    let mut terminal_other_runs = HashSet::new();
+    let mut prefix_final_state = None;
+    let mut suffix_partial_menus = HashMap::<MenuId, ItemId>::new();
+    let mut suffix_completed_items = HashSet::new();
+    for envelope in suffix {
+        if !scoped(envelope, branch_id, agent_id) {
+            continue;
+        }
+        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+            continue;
+        };
+        match payload {
+            EventPayload::RunState(state) => {
+                if let Some(run_id) = &envelope.run_id {
+                    if run_id == prefix_run {
+                        prefix_final_state = Some(state);
+                    } else {
+                        terminal_other_runs.insert(run_id.clone());
+                    }
+                }
+            }
+            EventPayload::MenuOpened(menu) => {
+                if let MenuKind::ErrorRecovery {
+                    card: ErrorRecoveryCardKind::PartialStream,
+                    source_item: Some(source_item),
+                    ..
+                } = menu.kind
+                {
+                    suffix_partial_menus.insert(menu.id, source_item);
+                }
+            }
+            EventPayload::Item(ItemEvent::Completed { item_id, .. }) => {
+                suffix_completed_items.insert(item_id);
+            }
+            _ => {}
+        }
+    }
+    if require_prefix_terminal
+        && prefix_final_state
+            .as_ref()
+            .map_or(!prefix_was_terminal, |state| !state.is_terminal())
+    {
+        return Ok(true);
+    }
+    // A non-current run whose complete history begins in the suffix is local
+    // to that suffix (the normal checkpoint-resume case). If any of its facts
+    // precede the seam, the terminal transition retroactively changes prefix
+    // visibility and requires the indexed full fold.
+    if !terminal_other_runs.is_empty()
+        && (prior.iter().any(|envelope| {
+            scoped(envelope, branch_id, agent_id)
+                && envelope
+                    .run_id
+                    .as_ref()
+                    .is_some_and(|run_id| terminal_other_runs.contains(run_id))
+        }) || checkpoint_prefix_runs.is_some_and(|runs| {
+            terminal_other_runs.iter().any(|run_id| {
+                runs.binary_search_by(|candidate| candidate.as_str().cmp(run_id.as_str()))
+                    .is_ok()
+            })
+        }))
+    {
+        return Ok(true);
+    }
+    for envelope in suffix {
+        if !scoped(envelope, branch_id, agent_id) {
+            continue;
+        }
+        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+            continue;
+        };
+        match payload {
+            EventPayload::MenuAnswered(answer) => {
+                let Some(source_item) = suffix_partial_menus.get(&answer.menu) else {
+                    return Ok(true);
+                };
+                if checkpoint_prefix_runs.is_some()
+                    || !suffix_completed_items.contains(source_item)
+                    || contains_scoped_item(prior, branch_id, agent_id, source_item)
+                {
+                    return Ok(true);
+                }
+            }
+            EventPayload::Item(ItemEvent::Completed { item, .. }) => {
+                if let Some(origin) =
+                    UserCommandOriginV1::try_from_extension_item(&item).map_err(|error| {
+                        corrupt(format!("malformed user-command origin marker: {error}"))
+                    })?
+                    && (checkpoint_prefix_runs.is_some()
+                        || !suffix_completed_items.contains(&origin.command_item_id)
+                        || contains_scoped_item(
+                            prior,
+                            branch_id,
+                            agent_id,
+                            &origin.command_item_id,
+                        ))
+                {
+                    return Ok(true);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
+fn contains_scoped_item(
+    envelopes: &[RawEnvelope],
+    branch_id: Option<&BranchId>,
+    agent_id: Option<&AgentId>,
+    item_id: &ItemId,
+) -> bool {
+    envelopes.iter().any(|envelope| {
+        if !scoped(envelope, branch_id, agent_id) {
+            return false;
+        }
+        serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(|payload| {
+            matches!(
+                payload,
+                EventPayload::Item(ItemEvent::Delta { item_id: candidate, .. })
+                    | EventPayload::Item(ItemEvent::Completed { item_id: candidate, .. })
+                    if &candidate == item_id
+            )
+        })
+    })
+}
+
+fn extend_tree_projection(
+    prefix: &CompiledPromptProjection,
+    extension: &[TreeEntry],
+    envelopes: &[RawEnvelope],
+    indexed_facts: &JournalFactsIndex,
+    agent_id: Option<&AgentId>,
+    current_run: &RunId,
+) -> Result<CompiledPromptProjection, HaiderError> {
+    let rendered =
+        render_tree_extension(extension, envelopes, indexed_facts, agent_id, current_run)?;
+    let mut messages = prefix.messages.clone();
+    messages.extend(rendered.messages);
     Ok(CompiledPromptProjection {
-        stable_history_end: current_user_start,
-        current_user_start,
-        latest_compaction_summary_end: prefix.projection.latest_compaction_summary_end,
         messages,
+        stable_history_end: prefix.stable_history_end,
+        current_user_start: prefix.current_user_start,
+        latest_compaction_summary_end: prefix.latest_compaction_summary_end,
+    })
+}
+
+fn render_tree_extension(
+    extension: &[TreeEntry],
+    envelopes: &[RawEnvelope],
+    indexed_facts: &JournalFactsIndex,
+    agent_id: Option<&AgentId>,
+    current_run: &RunId,
+) -> Result<RenderedJournal, HaiderError> {
+    let mut messages = Vec::new();
+    let mut current_user_seen = false;
+    let mut current_user_start = None;
+    let mut verbatim = Vec::new();
+    let mut owner = None::<Option<BranchId>>;
+    for entry in extension {
+        if owner.as_ref() != Some(&entry.owner_branch) {
+            if let Some(previous_owner) = owner.take() {
+                flush_verbatim(
+                    &mut verbatim,
+                    indexed_facts,
+                    previous_owner.as_ref(),
+                    agent_id,
+                    Some(current_run),
+                    &mut current_user_seen,
+                    &mut current_user_start,
+                    &mut messages,
+                )?;
+            }
+            owner = Some(entry.owner_branch.clone());
+        }
+        let start = envelopes.partition_point(|envelope| envelope.seq <= entry.fragment_after);
+        let end = envelopes.partition_point(|envelope| envelope.seq <= entry.seq);
+        verbatim.extend(
+            envelopes[start..end]
+                .iter()
+                .filter(|envelope| {
+                    envelope.branch_id.as_ref() == entry.owner_branch.as_ref()
+                        && envelope.agent_id.as_ref() == agent_id
+                })
+                .cloned(),
+        );
+    }
+    if let Some(owner) = owner {
+        flush_verbatim(
+            &mut verbatim,
+            indexed_facts,
+            owner.as_ref(),
+            agent_id,
+            Some(current_run),
+            &mut current_user_seen,
+            &mut current_user_start,
+            &mut messages,
+        )?;
+    }
+    Ok(RenderedJournal {
+        messages,
+        current_user_seen,
+        current_user_start,
     })
 }
 
@@ -1127,13 +1971,13 @@ async fn compile_idle_projection_at_prefix(
             Some((node.node, envelope.seq))
         });
     }
-    let tree = TreeProjection::build(envelopes, &lineage, agent_id)?;
+    let tree = TreeProjection::build(envelopes);
     let ancestry = tree
-        .latest_ancestry(lineage.head.as_ref())?
+        .latest_ancestry(envelopes, &lineage, agent_id, lineage.head.as_ref())?
         .ok_or_else(|| corrupt("compaction boundary has no durable history ancestry"))?;
     let tree_head_seq = ancestry.last().map_or(0, |entry| entry.seq);
     let mut projection =
-        compile_ancestry(envelopes, &ancestry, Some(artifacts), agent_id, None).await?;
+        compile_ancestry(envelopes, &ancestry, None, Some(artifacts), agent_id, None).await?;
     let tail = envelopes
         .iter()
         .filter(|envelope| envelope.seq > tree_head_seq && scoped(envelope, branch_id, agent_id))
@@ -1167,8 +2011,8 @@ async fn compile_projection_from_envelopes(
         .map(CompiledPromptProjection::from_rendered);
     }
     let lineage = ResolvedLineage::load(store, session_id, branch_id).await?;
-    let tree = TreeProjection::build(envelopes, &lineage, agent_id)?;
-    let Some(ancestry) = tree.ancestry_for_run(current_run)? else {
+    let tree = TreeProjection::build(envelopes);
+    let Some(ancestry) = tree.ancestry_for_run(envelopes, &lineage, agent_id, current_run)? else {
         return render_journal(
             envelopes,
             envelopes,
@@ -1179,17 +2023,90 @@ async fn compile_projection_from_envelopes(
         )
         .map(CompiledPromptProjection::from_rendered);
     };
-    compile_ancestry(envelopes, &ancestry, artifacts, agent_id, Some(current_run)).await
+    compile_ancestry(
+        envelopes,
+        &ancestry,
+        None,
+        artifacts,
+        agent_id,
+        Some(current_run),
+    )
+    .await
 }
 
-struct LineageScope {
-    branch_id: Option<BranchId>,
-    through_seq: u64,
+#[allow(clippy::too_many_arguments)]
+async fn compile_projection_from_cache(
+    cached: &mut CachedPromptSession,
+    store: &dyn StoreHandle,
+    artifacts: Option<&dyn ArtifactReader>,
+    session_id: &SessionId,
+    branch_id: Option<&BranchId>,
+    agent_id: Option<&AgentId>,
+    current_run: &RunId,
+) -> Result<(CompiledPromptProjection, PromptProjectionCursor), HaiderError> {
+    if legacy_journal_only(&cached.envelopes, branch_id, agent_id) {
+        let projection = render_journal_with_indexed_facts(
+            &cached.envelopes,
+            &cached.render_facts,
+            branch_id,
+            agent_id,
+            Some(current_run),
+            true,
+        )
+        .map(CompiledPromptProjection::from_rendered)?;
+        return Ok((projection, PromptProjectionCursor::Journal));
+    }
+    let lineage = ResolvedLineage::load(store, session_id, branch_id).await?;
+    cached
+        .lineage_scopes
+        .insert(branch_id.cloned(), lineage.index.clone());
+    let Some(ancestry) = cached.indexed_ancestry_for_run(&lineage, agent_id, current_run)? else {
+        let projection = render_journal_with_indexed_facts(
+            &cached.envelopes,
+            &cached.render_facts,
+            branch_id,
+            agent_id,
+            Some(current_run),
+            true,
+        )
+        .map(CompiledPromptProjection::from_rendered)?;
+        return Ok((projection, PromptProjectionCursor::Journal));
+    };
+    let head_node = ancestry
+        .last()
+        .map(|entry| entry.node.node.clone())
+        .ok_or_else(|| corrupt("indexed prompt ancestry is unexpectedly empty"))?;
+    let projection = compile_ancestry(
+        &cached.envelopes,
+        &ancestry,
+        Some(&cached.render_facts),
+        artifacts,
+        agent_id,
+        Some(current_run),
+    )
+    .await?;
+    Ok((projection, PromptProjectionCursor::Tree { head_node }))
+}
+
+#[derive(Clone)]
+struct LineageIndex {
+    main_through_seq: u64,
+    branches: HashMap<BranchId, u64>,
 }
 
 struct ResolvedLineage {
-    scopes: Vec<LineageScope>,
+    index: LineageIndex,
     head: Option<(NodeId, u64)>,
+}
+
+impl LineageIndex {
+    fn admits(&self, branch_id: Option<&BranchId>, seq: u64) -> bool {
+        branch_id.map_or(seq <= self.main_through_seq, |branch| {
+            self.branches
+                .get(branch)
+                .is_some_and(|through_seq| seq <= *through_seq)
+        })
+    }
 }
 
 impl ResolvedLineage {
@@ -1206,10 +2123,10 @@ impl ResolvedLineage {
                 ));
             }
             return Ok(Self {
-                scopes: vec![LineageScope {
-                    branch_id: None,
-                    through_seq: u64::MAX,
-                }],
+                index: LineageIndex {
+                    main_through_seq: u64::MAX,
+                    branches: HashMap::new(),
+                },
                 head: None,
             });
         };
@@ -1227,32 +2144,23 @@ impl ResolvedLineage {
             )));
         }
         validate_descriptor_chain(&descriptors)?;
-        let mut scopes = Vec::with_capacity(descriptors.len() + 1);
+        let mut branches = HashMap::with_capacity(descriptors.len());
         let mut ceiling = u64::MAX;
-        let mut concrete = Vec::with_capacity(descriptors.len());
         for descriptor in descriptors.iter().rev() {
-            concrete.push(LineageScope {
-                branch_id: Some(descriptor.branch_id.clone()),
-                through_seq: ceiling,
-            });
+            branches.insert(descriptor.branch_id.clone(), ceiling);
             ceiling = ceiling.min(descriptor.fork_seq);
         }
-        scopes.push(LineageScope {
-            branch_id: None,
-            through_seq: ceiling,
-        });
-        concrete.reverse();
-        scopes.extend(concrete);
         Ok(Self {
-            scopes,
+            index: LineageIndex {
+                main_through_seq: ceiling,
+                branches,
+            },
             head: Some((leaf.head_node_id.clone(), leaf.head_seq)),
         })
     }
 
     fn admits(&self, branch_id: Option<&BranchId>, seq: u64) -> bool {
-        self.scopes
-            .iter()
-            .any(|scope| scope.branch_id.as_ref() == branch_id && seq <= scope.through_seq)
+        self.index.admits(branch_id, seq)
     }
 }
 
@@ -1284,111 +2192,349 @@ struct TreeEntry {
     owner_branch: Option<BranchId>,
 }
 
+#[derive(Default)]
 struct TreeProjection {
-    ordered: Vec<TreeEntry>,
-    by_id: HashMap<NodeId, usize>,
+    // One session-wide node index. Lineage and agent scope are applied while
+    // resolving candidates, so touched branches never duplicate their common
+    // ancestry and each appended node is indexed exactly once.
+    ordered: Vec<IndexedTreeEntry>,
+    by_id: HashMap<(Option<AgentId>, NodeId), NodeIndices>,
+    by_run: HashMap<(Option<AgentId>, RunId), Vec<usize>>,
+    duplicate_ids: HashSet<(Option<AgentId>, NodeId)>,
+    latest_by_timeline: HashMap<PromptTimelineKey, usize>,
+    previous_node_seq: HashMap<PromptTimelineKey, u64>,
+}
+
+struct IndexedTreeEntry {
+    envelope_index: usize,
+    parent: Option<NodeId>,
+    fragment_after: u64,
+}
+
+enum NodeIndices {
+    One(usize),
+    Many(Vec<usize>),
+}
+
+impl NodeIndices {
+    fn push(&mut self, index: usize) {
+        match self {
+            Self::One(first) => *self = Self::Many(vec![*first, index]),
+            Self::Many(indices) => indices.push(index),
+        }
+    }
+
+    fn find(&self, mut predicate: impl FnMut(usize) -> bool) -> Option<usize> {
+        match self {
+            Self::One(index) => predicate(*index).then_some(*index),
+            Self::Many(indices) => indices.iter().copied().find(|index| predicate(*index)),
+        }
+    }
+
+    fn matching_count(&self, mut predicate: impl FnMut(usize) -> bool) -> usize {
+        match self {
+            Self::One(index) => {
+                if predicate(*index) {
+                    1
+                } else {
+                    0
+                }
+            }
+            Self::Many(indices) => indices
+                .iter()
+                .copied()
+                .filter(|index| predicate(*index))
+                .take(2)
+                .count(),
+        }
+    }
 }
 
 impl TreeProjection {
-    fn build(
+    fn build(envelopes: &[RawEnvelope]) -> Self {
+        let mut tree = Self::default();
+        for (envelope_index, envelope) in envelopes.iter().enumerate() {
+            let payload = serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok();
+            tree.push(envelope_index, envelope, payload.as_ref());
+        }
+        tree
+    }
+
+    fn push(
+        &mut self,
+        envelope_index: usize,
+        envelope: &RawEnvelope,
+        payload: Option<&EventPayload>,
+    ) {
+        let Some(EventPayload::NodeCommitted(node)) = payload else {
+            return;
+        };
+        let index = self.ordered.len();
+        let timeline = PromptTimelineKey {
+            branch_id: envelope.branch_id.clone(),
+            agent_id: envelope.agent_id.clone(),
+        };
+        let fragment_after = self.previous_node_seq.get(&timeline).copied().unwrap_or(0);
+        self.ordered.push(IndexedTreeEntry {
+            envelope_index,
+            parent: node.parent.clone(),
+            fragment_after,
+        });
+        let node_key = (envelope.agent_id.clone(), node.node.clone());
+        if let Some(candidates) = self.by_id.get_mut(&node_key) {
+            candidates.push(index);
+            self.duplicate_ids.insert(node_key);
+        } else {
+            self.by_id.insert(node_key, NodeIndices::One(index));
+        }
+        if let Some(run_id) = &envelope.run_id {
+            self.by_run
+                .entry((envelope.agent_id.clone(), run_id.clone()))
+                .or_default()
+                .push(index);
+        }
+        self.latest_by_timeline.insert(timeline.clone(), index);
+        self.previous_node_seq.insert(timeline, envelope.seq);
+    }
+
+    fn has_timeline(&self, timeline: &PromptTimelineKey) -> bool {
+        self.latest_by_timeline.contains_key(timeline)
+    }
+
+    fn ancestry_for_run(
+        &self,
         envelopes: &[RawEnvelope],
         lineage: &ResolvedLineage,
         agent_id: Option<&AgentId>,
-    ) -> Result<Self, HaiderError> {
-        let mut ordered = Vec::new();
-        let mut by_id = HashMap::new();
-        let mut previous_node_seq = HashMap::<Option<BranchId>, u64>::new();
-        for envelope in envelopes {
-            if envelope.agent_id.as_ref() != agent_id
-                || !lineage.admits(envelope.branch_id.as_ref(), envelope.seq)
-            {
-                continue;
-            }
-            let Ok(EventPayload::NodeCommitted(node)) =
-                serde_json::from_value::<EventPayload>(envelope.payload.clone())
-            else {
-                continue;
-            };
-            if by_id.contains_key(&node.node) {
-                return Err(corrupt(format!(
-                    "history tree contains duplicate node {}",
-                    node.node
-                )));
-            }
-            let index = ordered.len();
-            by_id.insert(node.node.clone(), index);
-            let owner_branch = envelope.branch_id.clone();
-            let fragment_after = previous_node_seq.get(&owner_branch).copied().unwrap_or(0);
-            ordered.push(TreeEntry {
-                node,
-                seq: envelope.seq,
-                fragment_after,
-                run_id: envelope.run_id.clone(),
-                owner_branch: owner_branch.clone(),
-            });
-            previous_node_seq.insert(owner_branch, envelope.seq);
-        }
-        Ok(Self { ordered, by_id })
-    }
-
-    fn ancestry_for_run(&self, run_id: &RunId) -> Result<Option<Vec<TreeEntry>>, HaiderError> {
-        let Some(index) = self
-            .ordered
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(index, entry)| (entry.run_id.as_ref() == Some(run_id)).then_some(index))
-        else {
+        run_id: &RunId,
+    ) -> Result<Option<Vec<TreeEntry>>, HaiderError> {
+        self.validate_duplicates(envelopes, lineage, agent_id)?;
+        let key = (agent_id.cloned(), run_id.clone());
+        let Some(index) = self.by_run.get(&key).and_then(|candidates| {
+            candidates
+                .iter()
+                .rev()
+                .copied()
+                .find(|index| self.admitted(envelopes, *index, lineage, agent_id))
+        }) else {
             return Ok(None);
         };
-        self.ancestry_from(index).map(Some)
+        self.ancestry_from(envelopes, lineage, agent_id, index)
+            .map(Some)
+    }
+
+    /// Resolves only the selected descendants after `stop_node`. Unlike a cold
+    /// ancestry compile, warm extension cost is proportional to the appended
+    /// path and a checkpoint anchor need not remain resident in the journal.
+    fn descendant_extension_for_run(
+        &self,
+        envelopes: &[RawEnvelope],
+        lineage: &ResolvedLineage,
+        agent_id: Option<&AgentId>,
+        run_id: &RunId,
+        stop_node: &NodeId,
+    ) -> Result<Option<Vec<TreeEntry>>, HaiderError> {
+        self.validate_duplicates(envelopes, lineage, agent_id)?;
+        let key = (agent_id.cloned(), run_id.clone());
+        let Some(mut index) = self.by_run.get(&key).and_then(|candidates| {
+            candidates
+                .iter()
+                .rev()
+                .copied()
+                .find(|index| self.admitted(envelopes, *index, lineage, agent_id))
+        }) else {
+            return Ok(None);
+        };
+        let mut reverse = Vec::new();
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(index) {
+                let envelope = self.envelope(envelopes, index)?;
+                return Err(corrupt(format!(
+                    "history tree contains a cycle at node {}",
+                    decode_tree_node(envelope)?.node
+                )));
+            }
+            let indexed = &self.ordered[index];
+            let envelope = self.envelope(envelopes, index)?;
+            let node = decode_tree_node(envelope)?;
+            if node.node == *stop_node {
+                reverse.reverse();
+                return Ok(Some(reverse));
+            }
+            let parent = indexed.parent.clone();
+            reverse.push(TreeEntry {
+                node,
+                seq: envelope.seq,
+                fragment_after: indexed.fragment_after,
+                run_id: envelope.run_id.clone(),
+                owner_branch: envelope.branch_id.clone(),
+            });
+            let Some(parent) = parent else {
+                return Ok(None);
+            };
+            if parent == *stop_node {
+                reverse.reverse();
+                return Ok(Some(reverse));
+            }
+            let Some(parent_index) = self.find_node(envelopes, lineage, agent_id, &parent) else {
+                // A checkpoint deliberately omits pre-boundary nodes, so a
+                // selected rewind can leave the resident index without being
+                // corrupt. The caller's full/replay fallback adjudicates the
+                // complete tree and still surfaces a genuinely absent parent.
+                return Ok(None);
+            };
+            index = parent_index;
+        }
     }
 
     fn latest_ancestry(
         &self,
+        envelopes: &[RawEnvelope],
+        lineage: &ResolvedLineage,
+        agent_id: Option<&AgentId>,
         head: Option<&(NodeId, u64)>,
     ) -> Result<Option<Vec<TreeEntry>>, HaiderError> {
+        self.validate_duplicates(envelopes, lineage, agent_id)?;
         let index = if let Some((head_node, head_seq)) = head {
-            let index = *self.by_id.get(head_node).ok_or_else(|| {
-                corrupt(format!("branch head references missing node {head_node}"))
-            })?;
-            if self.ordered[index].seq != *head_seq {
+            let index = self
+                .find_node(envelopes, lineage, agent_id, head_node)
+                .ok_or_else(|| {
+                    corrupt(format!("branch head references missing node {head_node}"))
+                })?;
+            let envelope = self.envelope(envelopes, index)?;
+            if envelope.seq != *head_seq {
                 return Err(corrupt(format!(
                     "branch head node {head_node} disagrees with sequence {head_seq}"
                 )));
             }
             index
-        } else if let Some(index) = self.ordered.len().checked_sub(1) {
-            index
         } else {
-            return Ok(None);
+            let timeline = PromptTimelineKey {
+                branch_id: None,
+                agent_id: agent_id.cloned(),
+            };
+            let Some(index) = self.latest_by_timeline.get(&timeline).copied() else {
+                return Ok(None);
+            };
+            index
         };
-        self.ancestry_from(index).map(Some)
+        self.ancestry_from(envelopes, lineage, agent_id, index)
+            .map(Some)
     }
 
-    fn ancestry_from(&self, mut index: usize) -> Result<Vec<TreeEntry>, HaiderError> {
+    fn ancestry_from(
+        &self,
+        envelopes: &[RawEnvelope],
+        lineage: &ResolvedLineage,
+        agent_id: Option<&AgentId>,
+        mut index: usize,
+    ) -> Result<Vec<TreeEntry>, HaiderError> {
         let mut reverse = Vec::new();
         let mut visited = HashSet::new();
         loop {
-            let entry = self.ordered[index].clone();
-            if !visited.insert(entry.node.node.clone()) {
+            if !visited.insert(index) {
+                let envelope = self.envelope(envelopes, index)?;
                 return Err(corrupt(format!(
                     "history tree contains a cycle at node {}",
-                    entry.node.node
+                    decode_tree_node(envelope)?.node
                 )));
             }
-            let parent = entry.node.parent.clone();
-            reverse.push(entry);
-            let Some(parent) = parent else {
+            let indexed = &self.ordered[index];
+            let envelope = self.envelope(envelopes, index)?;
+            let node = decode_tree_node(envelope)?;
+            reverse.push(TreeEntry {
+                node,
+                seq: envelope.seq,
+                fragment_after: indexed.fragment_after,
+                run_id: envelope.run_id.clone(),
+                owner_branch: envelope.branch_id.clone(),
+            });
+            let Some(parent) = &indexed.parent else {
                 break;
             };
-            index = *self.by_id.get(&parent).ok_or_else(|| {
-                corrupt(format!("history tree references missing parent {parent}"))
-            })?;
+            index = self
+                .find_node(envelopes, lineage, agent_id, parent)
+                .ok_or_else(|| {
+                    corrupt(format!("history tree references missing parent {parent}"))
+                })?;
         }
         reverse.reverse();
         Ok(reverse)
     }
+
+    fn validate_duplicates(
+        &self,
+        envelopes: &[RawEnvelope],
+        lineage: &ResolvedLineage,
+        agent_id: Option<&AgentId>,
+    ) -> Result<(), HaiderError> {
+        for (candidate_agent, node_id) in &self.duplicate_ids {
+            if candidate_agent.as_ref() != agent_id {
+                continue;
+            }
+            let admitted = self
+                .by_id
+                .get(&(candidate_agent.clone(), node_id.clone()))
+                .map_or(0, |indices| {
+                    indices
+                        .matching_count(|index| self.admitted(envelopes, index, lineage, agent_id))
+                });
+            if admitted > 1 {
+                return Err(corrupt(format!(
+                    "history tree contains duplicate node {node_id}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn find_node(
+        &self,
+        envelopes: &[RawEnvelope],
+        lineage: &ResolvedLineage,
+        agent_id: Option<&AgentId>,
+        node_id: &NodeId,
+    ) -> Option<usize> {
+        self.by_id
+            .get(&(agent_id.cloned(), node_id.clone()))
+            .and_then(|indices| {
+                indices.find(|index| self.admitted(envelopes, index, lineage, agent_id))
+            })
+    }
+
+    fn admitted(
+        &self,
+        envelopes: &[RawEnvelope],
+        index: usize,
+        lineage: &ResolvedLineage,
+        agent_id: Option<&AgentId>,
+    ) -> bool {
+        self.envelope(envelopes, index).is_ok_and(|envelope| {
+            envelope.agent_id.as_ref() == agent_id
+                && lineage.admits(envelope.branch_id.as_ref(), envelope.seq)
+        })
+    }
+
+    fn envelope<'a>(
+        &self,
+        envelopes: &'a [RawEnvelope],
+        index: usize,
+    ) -> Result<&'a RawEnvelope, HaiderError> {
+        envelopes
+            .get(self.ordered[index].envelope_index)
+            .ok_or_else(|| corrupt("history tree index points outside the journal"))
+    }
+}
+
+fn decode_tree_node(envelope: &RawEnvelope) -> Result<TreeNode, HaiderError> {
+    let EventPayload::NodeCommitted(node) =
+        serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            .map_err(|error| corrupt(format!("indexed history node is malformed: {error}")))?
+    else {
+        return Err(corrupt("history tree index points to a non-node event"));
+    };
+    Ok(node)
 }
 
 struct SummaryInsertion {
@@ -1578,11 +2724,21 @@ fn append_bounded_utf8(target: &mut String, value: &str) -> bool {
 async fn compile_ancestry(
     envelopes: &[RawEnvelope],
     ancestry: &[TreeEntry],
+    indexed_facts: Option<&JournalFactsIndex>,
     artifacts: Option<&dyn ArtifactReader>,
     agent_id: Option<&AgentId>,
     current_run: Option<&RunId>,
 ) -> Result<CompiledPromptProjection, HaiderError> {
     let plan = ProjectionPlan::build(ancestry)?;
+    // Rendering may flush once per owning branch and compaction boundary.
+    // Fold the journal-wide terminal/menu/origin facts once so those flushes
+    // do not each rescan the complete envelope vector.
+    let owned_facts = indexed_facts
+        .is_none()
+        .then(|| JournalFactsIndex::build(envelopes));
+    let Some(indexed_facts) = indexed_facts.or(owned_facts.as_ref()) else {
+        return Err(corrupt("prompt journal fact index was not installed"));
+    };
     // Index once by the already-fixed agent and owning branch. An ancestry
     // node can then select its `(fragment_after, seq]` slice with two binary
     // searches instead of rescanning the complete journal for every node.
@@ -1607,7 +2763,7 @@ async fn compile_ancestry(
             if let Some(owner) = verbatim_owner.take() {
                 flush_verbatim(
                     &mut verbatim,
-                    envelopes,
+                    indexed_facts,
                     owner.as_ref(),
                     agent_id,
                     current_run,
@@ -1648,7 +2804,7 @@ async fn compile_ancestry(
             if let Some(owner) = verbatim_owner.take() {
                 flush_verbatim(
                     &mut verbatim,
-                    envelopes,
+                    indexed_facts,
                     owner.as_ref(),
                     agent_id,
                     current_run,
@@ -1672,7 +2828,7 @@ async fn compile_ancestry(
     if let Some(owner) = verbatim_owner {
         flush_verbatim(
             &mut verbatim,
-            envelopes,
+            indexed_facts,
             owner.as_ref(),
             agent_id,
             current_run,
@@ -1700,7 +2856,7 @@ async fn compile_ancestry(
 #[allow(clippy::too_many_arguments)]
 fn flush_verbatim(
     verbatim: &mut Vec<RawEnvelope>,
-    all_envelopes: &[RawEnvelope],
+    indexed_facts: &JournalFactsIndex,
     branch_id: Option<&BranchId>,
     agent_id: Option<&AgentId>,
     current_run: Option<&RunId>,
@@ -1711,9 +2867,9 @@ fn flush_verbatim(
     if verbatim.is_empty() {
         return Ok(());
     }
-    let rendered = render_journal(
+    let rendered = render_journal_with_indexed_facts(
         verbatim,
-        all_envelopes,
+        indexed_facts,
         branch_id,
         agent_id,
         current_run,
@@ -1730,6 +2886,157 @@ fn flush_verbatim(
     Ok(())
 }
 
+#[derive(Default)]
+struct JournalFactsIndex {
+    timelines: HashMap<PromptTimelineKey, JournalFactsState>,
+}
+
+#[derive(Default)]
+struct JournalFactsState {
+    facts: JournalFacts,
+    error: Option<HaiderError>,
+}
+
+#[derive(Default)]
+struct JournalFacts {
+    terminal: HashMap<RunId, RunState>,
+    partial_menus: HashMap<MenuId, (haider_protocol::ids::ItemId, String, u32)>,
+    continued_partial_items: HashSet<haider_protocol::ids::ItemId>,
+    user_command_origins: HashMap<haider_protocol::ids::ItemId, UserCommandOriginV1>,
+}
+
+impl JournalFactsIndex {
+    fn build(envelopes: &[RawEnvelope]) -> Self {
+        let mut index = Self::default();
+        for envelope in envelopes {
+            index.push(envelope);
+        }
+        index
+    }
+
+    fn push(&mut self, envelope: &RawEnvelope) {
+        let payload = serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok();
+        self.push_decoded(envelope, payload.as_ref());
+    }
+
+    fn push_decoded(&mut self, envelope: &RawEnvelope, payload: Option<&EventPayload>) {
+        let timeline = PromptTimelineKey {
+            branch_id: envelope.branch_id.clone(),
+            agent_id: envelope.agent_id.clone(),
+        };
+        let state = self.timelines.entry(timeline).or_default();
+        if state.error.is_none()
+            && let Err(error) = state.facts.push(envelope, payload)
+        {
+            state.error = Some(error);
+        }
+    }
+
+    fn facts(
+        &self,
+        branch_id: Option<&BranchId>,
+        agent_id: Option<&AgentId>,
+    ) -> Result<Option<&JournalFacts>, HaiderError> {
+        let timeline = PromptTimelineKey {
+            branch_id: branch_id.cloned(),
+            agent_id: agent_id.cloned(),
+        };
+        let Some(state) = self.timelines.get(&timeline) else {
+            return Ok(None);
+        };
+        if let Some(error) = &state.error {
+            return Err(error.clone());
+        }
+        Ok(Some(&state.facts))
+    }
+}
+
+impl JournalFacts {
+    fn build(
+        envelopes: &[RawEnvelope],
+        branch_id: Option<&BranchId>,
+        agent_id: Option<&AgentId>,
+    ) -> Result<Self, HaiderError> {
+        let mut facts = Self::default();
+        for envelope in envelopes {
+            if scoped(envelope, branch_id, agent_id) {
+                let payload = serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok();
+                facts.push(envelope, payload.as_ref())?;
+            }
+        }
+        Ok(facts)
+    }
+
+    fn push(
+        &mut self,
+        envelope: &RawEnvelope,
+        payload: Option<&EventPayload>,
+    ) -> Result<(), HaiderError> {
+        let Some(run_id) = envelope.run_id.clone() else {
+            return Ok(());
+        };
+        let Some(payload) = payload else {
+            return Ok(());
+        };
+        match payload {
+            EventPayload::RunState(state) => {
+                self.terminal.insert(run_id, state.clone());
+            }
+            EventPayload::MenuOpened(menu) => {
+                if let MenuKind::ErrorRecovery {
+                    card: ErrorRecoveryCardKind::PartialStream,
+                    option_actions,
+                    source_item: Some(item_id),
+                    ..
+                } = &menu.kind
+                    && let Some(action_index) = option_actions
+                        .iter()
+                        .position(|action| *action == ErrorAction::ContinuePartial)
+                    && let Some(option) = menu.options.get(action_index)
+                {
+                    self.partial_menus.insert(
+                        menu.id.clone(),
+                        (
+                            item_id.clone(),
+                            option.key.clone(),
+                            u32::try_from(action_index).unwrap_or(u32::MAX),
+                        ),
+                    );
+                }
+            }
+            EventPayload::MenuAnswered(answer) => {
+                if let Some((item_id, continue_key, continue_index)) =
+                    self.partial_menus.get(&answer.menu)
+                    && answer
+                        .option_key
+                        .as_deref()
+                        .map_or(answer.option_index == *continue_index, |key| {
+                            key == continue_key
+                        })
+                {
+                    self.continued_partial_items.insert(item_id.clone());
+                }
+            }
+            EventPayload::Item(ItemEvent::Completed { item, .. }) => {
+                let origin =
+                    UserCommandOriginV1::try_from_extension_item(&item).map_err(|error| {
+                        corrupt(format!("malformed user-command origin marker: {error}"))
+                    })?;
+                if let Some(origin) = origin
+                    && self
+                        .user_command_origins
+                        .insert(origin.command_item_id.clone(), origin)
+                        .is_some()
+                {
+                    return Err(corrupt("duplicate user-command origin marker"));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 fn render_journal(
     selected: &[RawEnvelope],
     all_envelopes: &[RawEnvelope],
@@ -1738,76 +3045,45 @@ fn render_journal(
     current_run: Option<&RunId>,
     require_current_user: bool,
 ) -> Result<RenderedJournal, HaiderError> {
-    let mut terminal = HashMap::<RunId, RunState>::new();
-    let mut partial_menus = HashMap::<MenuId, (haider_protocol::ids::ItemId, String, u32)>::new();
-    let mut continued_partial_items = HashSet::new();
-    let mut user_command_origins =
-        HashMap::<haider_protocol::ids::ItemId, UserCommandOriginV1>::new();
-    for envelope in all_envelopes {
-        if !scoped(envelope, branch_id, agent_id) {
-            continue;
-        }
-        let Some(run_id) = envelope.run_id.clone() else {
-            continue;
-        };
-        if let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
-            match payload {
-                EventPayload::RunState(state) => {
-                    terminal.insert(run_id, state);
-                }
-                EventPayload::MenuOpened(menu) => {
-                    if let MenuKind::ErrorRecovery {
-                        card: ErrorRecoveryCardKind::PartialStream,
-                        option_actions,
-                        source_item: Some(item_id),
-                        ..
-                    } = &menu.kind
-                        && let Some(action_index) = option_actions
-                            .iter()
-                            .position(|action| *action == ErrorAction::ContinuePartial)
-                        && let Some(option) = menu.options.get(action_index)
-                    {
-                        partial_menus.insert(
-                            menu.id,
-                            (
-                                item_id.clone(),
-                                option.key.clone(),
-                                u32::try_from(action_index).unwrap_or(u32::MAX),
-                            ),
-                        );
-                    }
-                }
-                EventPayload::MenuAnswered(answer) => {
-                    if let Some((item_id, continue_key, continue_index)) =
-                        partial_menus.get(&answer.menu)
-                        && answer
-                            .option_key
-                            .as_deref()
-                            .map_or(answer.option_index == *continue_index, |key| {
-                                key == continue_key
-                            })
-                    {
-                        continued_partial_items.insert(item_id.clone());
-                    }
-                }
-                EventPayload::Item(ItemEvent::Completed { item, .. }) => {
-                    let origin =
-                        UserCommandOriginV1::try_from_extension_item(&item).map_err(|error| {
-                            corrupt(format!("malformed user-command origin marker: {error}"))
-                        })?;
-                    if let Some(origin) = origin
-                        && user_command_origins
-                            .insert(origin.command_item_id.clone(), origin)
-                            .is_some()
-                    {
-                        return Err(corrupt("duplicate user-command origin marker"));
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
+    let facts = JournalFacts::build(all_envelopes, branch_id, agent_id)?;
+    render_journal_with_facts(
+        selected,
+        &facts,
+        branch_id,
+        agent_id,
+        current_run,
+        require_current_user,
+    )
+}
 
+fn render_journal_with_indexed_facts(
+    selected: &[RawEnvelope],
+    indexed_facts: &JournalFactsIndex,
+    branch_id: Option<&BranchId>,
+    agent_id: Option<&AgentId>,
+    current_run: Option<&RunId>,
+    require_current_user: bool,
+) -> Result<RenderedJournal, HaiderError> {
+    let empty = JournalFacts::default();
+    let facts = indexed_facts.facts(branch_id, agent_id)?.unwrap_or(&empty);
+    render_journal_with_facts(
+        selected,
+        facts,
+        branch_id,
+        agent_id,
+        current_run,
+        require_current_user,
+    )
+}
+
+fn render_journal_with_facts(
+    selected: &[RawEnvelope],
+    facts: &JournalFacts,
+    branch_id: Option<&BranchId>,
+    agent_id: Option<&AgentId>,
+    current_run: Option<&RunId>,
+    require_current_user: bool,
+) -> Result<RenderedJournal, HaiderError> {
     let mut messages = Vec::new();
     let mut pending_tool_results = HashMap::<String, BoundedResult>::new();
     let mut user_command_outputs =
@@ -1834,7 +3110,7 @@ fn render_journal(
             continue;
         };
         let is_current = current_run.is_some_and(|current| run_id == *current);
-        let prior_state = terminal.get(&run_id);
+        let prior_state = facts.terminal.get(&run_id);
         // Invariant since the terminal-history flip (f53cb2c): every run that
         // was previously visible only through the narrow terminal
         // user-command lane (`!is_current && prior_state is terminal`) is now
@@ -1854,7 +3130,7 @@ fn render_journal(
             item_id,
             delta: ItemDelta::CommandOutput { stream, chunk_b64 },
         }) = &payload
-            && user_command_origins.contains_key(item_id)
+            && facts.user_command_origins.contains_key(item_id)
         {
             let bytes = BASE64.decode(chunk_b64).map_err(|error| {
                 corrupt(format!(
@@ -1888,7 +3164,7 @@ fn render_journal(
                     messages.push(Message::assistant(vec![Block::Text { text }]));
                 }
                 TurnItem::IncompleteAgentMessage { text, .. }
-                    if continued_partial_items.contains(&item_id) =>
+                    if facts.continued_partial_items.contains(&item_id) =>
                 {
                     messages.push(Message::assistant(vec![Block::Text { text }]));
                 }
@@ -1897,7 +3173,8 @@ fn render_journal(
                     command,
                     status,
                     exit_code,
-                } if user_command_origins
+                } if facts
+                    .user_command_origins
                     .get(&item_id)
                     .is_some_and(|origin| origin.call_id == call_id) =>
                 {
