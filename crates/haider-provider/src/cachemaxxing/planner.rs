@@ -199,6 +199,8 @@ impl InlineBreakpointPlan {
 /// stable header prefix and the newest closes immutable history. No provider
 /// marks the current-user/live tail. Tool-call/result pairs are indivisible.
 #[must_use]
+// Placement is a pure decision over nine independent provider and request facts.
+#[allow(clippy::too_many_arguments)]
 pub fn plan_inline_breakpoints(
     provider: &str,
     model: &str,

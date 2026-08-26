@@ -18,7 +18,4 @@ pub use provider_view::{
 };
 pub use telemetry::{CacheEconomicSample, CacheScenario, economic_cache_hit_rate};
 
-pub(crate) use provider_view::{
-    PROVIDER_VIEW_SERIALIZATION_VERSION, prepared_array_provider_view,
-    prepared_serialized_provider_view,
-};
+pub(crate) use provider_view::{prepared_array_provider_view, prepared_serialized_provider_view};

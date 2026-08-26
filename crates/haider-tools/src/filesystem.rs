@@ -1567,14 +1567,14 @@ struct FreshnessMetadata {
 impl FreshnessMetadata {
     fn from_stat(metadata: &rustix::fs::Stat) -> Self {
         Self {
-            device: metadata.st_dev as u64,
-            inode: metadata.st_ino as u64,
+            device: stat_field_u64(metadata.st_dev),
+            inode: metadata.st_ino,
             mode: metadata.st_mode as u64,
-            size: metadata.st_size as i64,
-            modified_seconds: metadata.st_mtime as i64,
-            modified_nanoseconds: metadata.st_mtime_nsec as i64,
-            changed_seconds: metadata.st_ctime as i64,
-            changed_nanoseconds: metadata.st_ctime_nsec as i64,
+            size: metadata.st_size,
+            modified_seconds: metadata.st_mtime,
+            modified_nanoseconds: stat_field_i64(metadata.st_mtime_nsec),
+            changed_seconds: metadata.st_ctime,
+            changed_nanoseconds: stat_field_i64(metadata.st_ctime_nsec),
         }
     }
 
@@ -1592,6 +1592,22 @@ impl FreshnessMetadata {
             hasher.update(&field.to_le_bytes());
         }
     }
+}
+
+#[cfg(unix)]
+fn stat_field_i64<N>(field: N) -> i64
+where
+    N: Into<i128>,
+{
+    field.into() as i64
+}
+
+#[cfg(unix)]
+fn stat_field_u64<N>(field: N) -> u64
+where
+    N: Into<i128>,
+{
+    field.into() as u64
 }
 
 #[cfg(windows)]

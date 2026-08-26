@@ -112,6 +112,8 @@ pub fn validate_provider_view_prefix(
     Ok(ProviderViewContinuity::AppendOnly)
 }
 
+// These arguments map ten independent adapter wire facts directly at each call site.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepared_array_provider_view(
     request: &TurnRequest,
     prompt_payload: &serde_json::Value,
