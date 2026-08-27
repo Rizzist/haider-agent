@@ -1564,6 +1564,7 @@ mod tests {
                 result: BoundedResult {
                     preview: "too late".into(),
                     truncated: false,
+                    data: None,
                     artifact: None,
                     images: Vec::new(),
                     cursor: None,
@@ -1594,6 +1595,7 @@ mod tests {
         let result = BoundedResult {
             preview: "ok".into(),
             truncated: false,
+            data: None,
             artifact: None,
             images: Vec::new(),
             cursor: None,

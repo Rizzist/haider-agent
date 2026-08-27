@@ -543,6 +543,7 @@ fn e8e_web_fetch_retry_note_on_completed_row_is_dim() {
                 result: BoundedResult {
                     preview: "{}".into(),
                     truncated: false,
+                    data: None,
                     artifact: None,
                     images: Vec::new(),
                     cursor: None,

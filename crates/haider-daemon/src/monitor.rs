@@ -4333,6 +4333,7 @@ fn tool_result(
     BoundedResult {
         preview: preview.to_string(),
         truncated: false,
+        data: None,
         artifact: None,
         images: Vec::new(),
         cursor: None,

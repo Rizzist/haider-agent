@@ -21,6 +21,8 @@ mod mobile;
 mod monitor;
 mod plan;
 mod process;
+mod redact;
+mod repo;
 mod request_input;
 mod shell;
 mod spawn_subagent;
@@ -51,9 +53,15 @@ pub use computer::{
 };
 pub use error::{FsEditAnchorMismatch, ToolError, ToolResult};
 pub use filesystem::{
-    CasSink, FsCaseMode, FsEdit, FsEditChange, FsGlob, FsPath, FsPathOperation, FsRead, FsSearch,
-    FsSearchMode, FsWrite, ResultBounds, TurnAttribution, fs_edit_manifest, fs_glob_manifest,
-    fs_path_manifest, fs_read_manifest, fs_search_manifest, fs_write_manifest,
+    CasSink, FsCaseMode, FsEdit, FsEditChange, FsFileGlob, FsGlob, FsPath, FsPathOperation, FsRead,
+    FsSearch, FsSearchContext, FsSearchMode, FsWrite, GLOB_ENTRY_LIMIT, GLOB_MAX_FILES_SCANNED,
+    GLOB_PATTERN_MAX_BYTES, ResultBounds, SEARCH_BINARY_SNIFF_BYTES, SEARCH_MAX_ENUMERATED_FILES,
+    SEARCH_MAX_FILES, SEARCH_MAX_LINE_BYTES, SEARCH_MAX_RESULT_BYTES, SEARCH_MAX_SCANNED_BYTES,
+    SEARCH_PATTERN_MAX_BYTES, SEARCH_PREVIEW_MATCHES, SEARCH_REGEX_DFA_SIZE_LIMIT,
+    SEARCH_REGEX_NEST_LIMIT, SEARCH_REGEX_PATTERN_MAX_BYTES, SEARCH_REGEX_SIZE_LIMIT,
+    SEARCH_RESULT_ACCOUNTING_OVERHEAD, SEARCH_SIMPLE_PATTERN_MAX_BYTES,
+    SEARCH_STRUCTURED_LINE_BYTES, SEARCH_WALL_TIME_BUDGET, TurnAttribution, fs_edit_manifest,
+    fs_glob_manifest, fs_path_manifest, fs_read_manifest, fs_search_manifest, fs_write_manifest,
 };
 pub use graph_evidence::{GraphEvidence, graph_evidence_manifest};
 pub use haider_protocol::computer::{ComputerAction, ScreenPoint, ScrollDirection};
@@ -76,15 +84,17 @@ pub use plan::{
     PLAN_BODY_MAX_BYTES, PLAN_DECISION_ACCEPT, PLAN_ORIGIN, PLAN_TITLE_MAX_BYTES, Plan, PlanResult,
 };
 pub use process::{
-    CommandOutputSink, NoopCommandOutputSink, PROCESS_OUTPUT_CHUNK_BYTES, ProcessBounds,
-    ProcessCancelHandle, ProcessControl, ProcessControlAction, ProcessControlResult, ProcessExec,
-    ProcessExecution, ProcessLifecycleEvent, ProcessLimit, ProcessOutputChunk, ProcessResult,
-    ProcessSignal, workspace_state_digest,
+    CommandOutputSink, NoopCommandOutputSink, PROCESS_ADAPTER_INPUT_BYTES,
+    PROCESS_MAX_OUTPUT_BYTES, PROCESS_OUTPUT_CHUNK_BYTES, ProcessBounds, ProcessCancelHandle,
+    ProcessControl, ProcessControlAction, ProcessControlResult, ProcessExec, ProcessExecution,
+    ProcessLifecycleEvent, ProcessLimit, ProcessOutputChunk, ProcessResult, ProcessSignal,
+    workspace_state_digest,
 };
 pub use request_input::{RequestInput, RequestInputAnswer, RequestInputKind, RequestInputOption};
 pub use shell::{
-    BuiltinResult, ComposerSubmission, EnvViewEntry, REDACTED_ENV_VALUE, ShellSession,
-    UserProcessExec,
+    BuiltinResult, ComposerSubmission, EnvViewEntry, OutputAdapter, REDACTED_ENV_VALUE,
+    REDUCED_TOOL_OUTPUT_MAX_BYTES, ReducedToolOutput, ShellSession, UserProcessExec,
+    estimated_tokens, reduce_tool_output,
 };
 pub use spawn_subagent::{SpawnSubagent, spawn_subagent_manifest};
 pub use tasks::{

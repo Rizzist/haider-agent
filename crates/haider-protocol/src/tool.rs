@@ -106,6 +106,10 @@ pub struct ToolInventorySnapshot {
 pub struct BoundedResult {
     pub preview: String,
     pub truncated: bool,
+    /// Additive, tool-specific structured facts. Text previews remain stable
+    /// for legacy consumers; typed clients can consume these facts directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<ToolResultData>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<ArtifactRef>,
     /// Bounded image artifacts produced by the tool. The journal stores only
@@ -126,6 +130,59 @@ pub struct BoundedResult {
     /// only for backward-compatible decoding of pre-E2 journals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presentation: Option<ErrorPresentation>,
+}
+
+/// Structured facts emitted by bounded tool results without replacing their
+/// compact, backwards-compatible text preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolResultData {
+    FsSearch {
+        matches: Vec<FsSearchMatch>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        truncated_reason: Option<ToolTruncationReason>,
+        binary_files_skipped: usize,
+        skipped_sensitive: usize,
+        files_scanned: usize,
+        bytes_scanned: usize,
+    },
+    FsGlob {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        truncated_reason: Option<ToolTruncationReason>,
+        skipped_sensitive: usize,
+        files_scanned: usize,
+        collapsed_directories: usize,
+    },
+    FsRead {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        truncated_reason: Option<ToolTruncationReason>,
+        entries_seen: usize,
+        collapsed_entries: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsSearchMatch {
+    pub path: String,
+    pub line: usize,
+    pub column: usize,
+    pub text: String,
+    pub context_before: Vec<String>,
+    pub context_after: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolTruncationReason {
+    TimeBudget,
+    MatchLimit,
+    BytesScanned,
+    FilesScanned,
+    EnumerationLimit,
+    ResultBytes,
+    LineTooLong,
+    EntryLimit,
+    PresentationReduced,
 }
 
 /// One validated, bounded image in the artifact store.

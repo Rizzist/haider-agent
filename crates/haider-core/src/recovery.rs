@@ -938,6 +938,7 @@ mod reducer_filter_tests {
             result: BoundedResult {
                 preview: "committed".into(),
                 truncated: false,
+                data: None,
                 artifact: None,
                 images: Vec::new(),
                 cursor: None,

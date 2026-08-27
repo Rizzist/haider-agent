@@ -4906,6 +4906,7 @@ fn append_tool_attempt(
                 result: BoundedResult {
                     preview: format!("{tool_name} result"),
                     truncated: false,
+                    data: None,
                     artifact: None,
                     images: Vec::new(),
                     cursor: None,

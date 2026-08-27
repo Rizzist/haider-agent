@@ -242,6 +242,7 @@ impl ToolDispatcher for ImageFixtureDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: "captured fixture image".into(),
             truncated: false,
+            data: None,
             artifact: None,
             images: vec![image],
             cursor: None,

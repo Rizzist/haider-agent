@@ -26,7 +26,7 @@ use haider_protocol::item::{ItemDelta, OutputStream, ToolStatus, TurnItem};
 use rustix::fs::{Mode, OFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::io::{Read, Write};
 #[cfg(unix)]
@@ -50,6 +50,12 @@ type DirectoryIdentity = haider_platform::WindowsFileIdentity;
 
 /// Maximum raw payload retained by one pipe-read chunk.
 pub const PROCESS_OUTPUT_CHUNK_BYTES: usize = 8 * 1024;
+/// Hard process-output ceiling. Keeping this equal to the adapter-input bound
+/// guarantees every accepted process is reduced from its complete raw result.
+pub const PROCESS_MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+/// Bounded raw result retained solely as deterministic adapter input. The
+/// process bound validator prevents diagnostic prefixes from being discarded.
+pub const PROCESS_ADAPTER_INPUT_BYTES: usize = PROCESS_MAX_OUTPUT_BYTES;
 
 /// Content-addresses the observable workspace tree before and after a process
 /// execution. Directory ordering and all field boundaries are canonical;
@@ -355,6 +361,11 @@ impl PreparedProcessExec {
         workspace_dir: OwnedFd,
         bounds: ProcessBounds,
     ) -> ToolResult<Self> {
+        if bounds.max_output_bytes == 0 || bounds.max_output_bytes > PROCESS_MAX_OUTPUT_BYTES {
+            return Err(ToolError::invalid_argument(format!(
+                "process max_output_bytes must be between 1 and {PROCESS_MAX_OUTPUT_BYTES}"
+            )));
+        }
         let operation = operation.resolved(workspace_root)?;
         let cwd_fd = open_directory_beneath(workspace_dir, workspace_root, &operation.cwd)?;
         let identity = directory_identity(&cwd_fd, &operation.cwd, "inspect process cwd")?;
@@ -487,8 +498,9 @@ pub struct ProcessResult {
     pub max_output_bytes: usize,
     /// Largest raw transcript payload retained in memory at one time.
     ///
-    /// This excludes the serialized spill file and includes the chunk being
-    /// serviced, making the spill bound observable in regression tests.
+    /// This excludes the serialized spill file and includes the bounded
+    /// adapter tail plus the chunk being serviced, making both caps observable
+    /// in regression tests.
     pub transcript_high_water_bytes: usize,
     /// Supervisor ordering trace used by process-lifecycle regression tests.
     #[doc(hidden)]
@@ -1169,6 +1181,35 @@ struct BufferedOutput {
     bytes: Vec<u8>,
 }
 
+fn retain_adapter_tail(
+    retained: &mut VecDeque<BufferedOutput>,
+    retained_bytes: &mut usize,
+    stream: OutputStream,
+    bytes: &[u8],
+) {
+    let bytes = if bytes.len() > PROCESS_ADAPTER_INPUT_BYTES {
+        bytes[bytes.len() - PROCESS_ADAPTER_INPUT_BYTES..].to_vec()
+    } else {
+        bytes.to_vec()
+    };
+    *retained_bytes = retained_bytes.saturating_add(bytes.len());
+    retained.push_back(BufferedOutput { stream, bytes });
+    while *retained_bytes > PROCESS_ADAPTER_INPUT_BYTES {
+        let excess = retained_bytes.saturating_sub(PROCESS_ADAPTER_INPUT_BYTES);
+        let Some(front) = retained.front_mut() else {
+            *retained_bytes = 0;
+            break;
+        };
+        if front.bytes.len() <= excess {
+            *retained_bytes = retained_bytes.saturating_sub(front.bytes.len());
+            retained.pop_front();
+        } else {
+            front.bytes.drain(..excess);
+            *retained_bytes = retained_bytes.saturating_sub(excess);
+        }
+    }
+}
+
 struct TranscriptSpill {
     file: tempfile::NamedTempFile,
     first: bool,
@@ -1250,6 +1291,8 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
     drop(captured_sender);
 
     let mut transcript = Vec::<BufferedOutput>::new();
+    let mut adapter_transcript = VecDeque::<BufferedOutput>::new();
+    let mut adapter_payload_bytes = 0usize;
     let mut transcript_payload_bytes = 0usize;
     let mut transcript_high_water_bytes = 0usize;
     let mut spill = None;
@@ -1358,18 +1401,29 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                         bytes.truncate(remaining);
                         transcript_hasher.update(&bytes);
                         transcript_high_water_bytes = transcript_high_water_bytes.max(
-                            transcript_payload_bytes.saturating_add(bytes.len())
+                            transcript_payload_bytes
+                                .saturating_add(adapter_payload_bytes)
+                                .saturating_add(bytes.len())
                         );
                         output_bytes = output_bytes.saturating_add(bytes.len());
                         if !bytes.is_empty() {
+                            retain_adapter_tail(
+                                &mut adapter_transcript,
+                                &mut adapter_payload_bytes,
+                                stream,
+                                &bytes,
+                            );
                             let chunk_b64 = BASE64.encode(&bytes);
-                            if let Err(error) = output.emit(
-                                &call_id,
-                                ItemDelta::CommandOutput {
-                                    stream,
-                                    chunk_b64: chunk_b64.clone(),
-                                },
-                            ).await {
+                            if let Err(error) = output
+                                .emit(
+                                    &call_id,
+                                    ItemDelta::CommandOutput {
+                                        stream,
+                                        chunk_b64: chunk_b64.clone(),
+                                    },
+                                )
+                                .await
+                            {
                                 fatal.get_or_insert(error);
                                 begin_group_termination(
                                     group,
@@ -1605,13 +1659,21 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
 
     let artifact_result = if transcript_failed {
         Ok(None)
-    } else if let Some(spill) = spill {
-        match spill.finish() {
+    } else {
+        let file = if let Some(spill) = spill {
+            spill.finish()
+        } else {
+            TranscriptSpill::new().and_then(|mut created| {
+                for buffered in &transcript {
+                    created.append(buffered.stream, &buffered.bytes)?;
+                }
+                created.finish()
+            })
+        };
+        match file {
             Ok(file) => cas.put_file(file.path()).await.map(Some),
             Err(error) => Err(error),
         }
-    } else {
-        Ok(None)
     };
     // Cancellation is sticky through artifact ingestion: a request arriving
     // while put_file is blocked owns both its success and failure arms.
@@ -1623,18 +1685,22 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
             None
         }
     };
-    let inline_output =
-        if !transcript_failed && artifact.is_none() && output_bytes <= bounds.max_inline_bytes {
-            transcript
-                .into_iter()
-                .map(|buffered| ProcessOutputChunk {
-                    stream: buffered.stream,
-                    chunk_b64: BASE64.encode(buffered.bytes),
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+    let adapter_input = if output_bytes <= bounds.max_inline_bytes {
+        transcript
+    } else {
+        adapter_transcript.into_iter().collect()
+    };
+    let inline_output = if transcript_failed {
+        Vec::new()
+    } else {
+        adapter_input
+            .into_iter()
+            .map(|buffered| ProcessOutputChunk {
+                stream: buffered.stream,
+                chunk_b64: BASE64.encode(buffered.bytes),
+            })
+            .collect()
+    };
     if exit_status.is_none() && !group_leaked {
         fatal.get_or_insert_with(|| ToolError::Runtime {
             message: format!("process `{call_id}` ended without an exit status"),
