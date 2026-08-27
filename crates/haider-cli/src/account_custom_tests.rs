@@ -60,6 +60,7 @@ fn provider() -> ProviderSummaryWire {
         models: vec!["alpha".into(), "beta".into()],
         model_details: Vec::new(),
         inventory_fetched_at_ms: Some(1),
+        inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Advisory,
         auth_methods: vec![AuthMethod::ApiKey],
         availability: ProviderAvailabilityWire::Available,
         availability_reason: None,

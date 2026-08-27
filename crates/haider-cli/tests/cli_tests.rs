@@ -1184,10 +1184,11 @@ fn one_shot_never_shuts_down_a_prestarted_incumbent() {
 
 /// MUTATION CHECK: drop the profile-default fallback, restore catalog-first
 /// substitution, restore the custom summary membership filter, bypass the
-/// selector path, or restore the per-turn model-list membership probe.
+/// selector path, treat the custom catalog as authoritative, skip its one
+/// refresh-on-miss probe, or restore the per-turn model-list membership probe.
 /// Expected runtime failure: the captured OpenAI-compatible chat body contains
 /// `canonical-other`, a provider prefix, no request, or a discovery count is
-/// nonzero.
+/// not exactly one. The 404 case pins that even refresh failure stays advisory.
 #[test]
 fn configured_custom_model_reaches_chat_wire_verbatim_despite_catalog() {
     const CATALOG: &[u8] =
@@ -1208,7 +1209,7 @@ fn configured_custom_model_reaches_chat_wire_verbatim_despite_catalog() {
         Some(CATALOG),
     );
     assert_eq!(unqualified["model"], "deepseek-v4-flash");
-    assert_eq!(unqualified_discoveries, 0);
+    assert_eq!(unqualified_discoveries, 1);
 
     let (qualified, qualified_discoveries) = run_custom_model_wire_case(
         "bench-proxy/deepseek-v4-flash",
@@ -1217,7 +1218,7 @@ fn configured_custom_model_reaches_chat_wire_verbatim_despite_catalog() {
         Some(CATALOG),
     );
     assert_eq!(qualified["model"], "deepseek-v4-flash");
-    assert_eq!(qualified_discoveries, 0);
+    assert_eq!(qualified_discoveries, 1);
 
     let (explicit, explicit_discoveries) = run_custom_model_wire_case(
         "bench-proxy/deepseek-v4-flash",
@@ -1226,12 +1227,16 @@ fn configured_custom_model_reaches_chat_wire_verbatim_despite_catalog() {
         Some(CATALOG),
     );
     assert_eq!(explicit["model"], "explicit-wire-model");
-    assert_eq!(explicit_discoveries, 0);
+    assert_eq!(explicit_discoveries, 1);
 
-    let (no_catalog, no_catalog_discoveries) =
-        run_custom_model_wire_case("bench-proxy/deepseek-v4-flash", None, &[], None);
+    let (no_catalog, no_catalog_discoveries) = run_custom_model_wire_case(
+        "bench-proxy/deepseek-v4-flash",
+        None,
+        &["canonical-other"],
+        None,
+    );
     assert_eq!(no_catalog["model"], "deepseek-v4-flash");
-    assert_eq!(no_catalog_discoveries, 0);
+    assert_eq!(no_catalog_discoveries, 1);
 }
 
 /// MUTATION CHECK: make print depend on a TTY/TERM, leak progress to stdout,

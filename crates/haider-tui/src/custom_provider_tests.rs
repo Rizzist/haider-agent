@@ -54,6 +54,7 @@ fn discovered_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
         models: vec!["router-fast".to_owned(), "router-deep".to_owned()],
         model_details: Vec::new(),
         inventory_fetched_at_ms: Some(1_725_000_000_000u64),
+        inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Advisory,
         auth_methods: vec![haider_protocol::credential::AuthMethod::ApiKey],
         availability: haider_rpc::ProviderAvailabilityWire::Available,
         availability_reason: None,

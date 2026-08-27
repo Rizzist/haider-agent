@@ -425,6 +425,7 @@ fn provider_summary_fixture(
         models: models.iter().map(|model| (*model).into()).collect(),
         model_details: Vec::new(),
         inventory_fetched_at_ms: None,
+        inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Unknown,
         auth_methods: vec![AuthMethod::OAuth],
         availability: ProviderAvailabilityWire::Available,
         availability_reason: None,

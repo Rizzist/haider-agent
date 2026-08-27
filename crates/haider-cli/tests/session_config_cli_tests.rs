@@ -25,6 +25,7 @@ fn provider_summary(provider: &str) -> ProviderSummaryWire {
         models: vec![],
         model_details: vec![],
         inventory_fetched_at_ms: None,
+        inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Unknown,
         auth_methods: vec![],
         availability: ProviderAvailabilityWire::Available,
         availability_reason: None,

@@ -12,7 +12,7 @@
 
 use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
 pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 26;
 
@@ -625,17 +625,7 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 26,
         sql: "
-            ALTER TABLE loom_agent_types ADD COLUMN archived INTEGER NOT NULL DEFAULT 0
-                CHECK (archived IN (0, 1));
-            ALTER TABLE loom_workflows ADD COLUMN archived INTEGER NOT NULL DEFAULT 0
-                CHECK (archived IN (0, 1));
-
-            ALTER TABLE loom_cli_install_jobs ADD COLUMN cancelled INTEGER NOT NULL DEFAULT 0
-                CHECK (cancelled IN (0, 1));
-            ALTER TABLE loom_cli_install_events ADD COLUMN cancelled INTEGER NOT NULL DEFAULT 0
-                CHECK (cancelled IN (0, 1));
-
-            CREATE TABLE loom_registry_events (
+            CREATE TABLE IF NOT EXISTS loom_registry_events (
                 cursor         INTEGER PRIMARY KEY AUTOINCREMENT CHECK (cursor > 0),
                 entry_kind     TEXT NOT NULL
                     CHECK (entry_kind IN ('agent_type', 'workflow')),
@@ -650,10 +640,10 @@ const MIGRATIONS: &[Migration] = &[
                 created_at_ms  INTEGER NOT NULL CHECK (created_at_ms >= 0)
             );
 
-            CREATE INDEX loom_registry_events_entry_cursor
+            CREATE INDEX IF NOT EXISTS loom_registry_events_entry_cursor
             ON loom_registry_events(entry_kind, entry_id, cursor);
 
-            CREATE TABLE loom_agent_type_revisions (
+            CREATE TABLE IF NOT EXISTS loom_agent_type_revisions (
                 id          TEXT NOT NULL,
                 rev         INTEGER NOT NULL CHECK (rev > 0),
                 digest      TEXT NOT NULL CHECK (length(digest) = 32),
@@ -661,7 +651,7 @@ const MIGRATIONS: &[Migration] = &[
                 PRIMARY KEY (id, rev)
             );
 
-            INSERT INTO loom_agent_type_revisions(id, rev, digest, record_json)
+            INSERT OR IGNORE INTO loom_agent_type_revisions(id, rev, digest, record_json)
             SELECT id, rev, digest, record_json FROM loom_agent_types;
         ",
     },
@@ -688,6 +678,7 @@ pub(crate) fn migrate(connection: &mut Connection) -> StoreResult<()> {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sqlite_error)?;
+        apply_guarded_columns(&transaction, migration.version)?;
         transaction
             .execute_batch(migration.sql)
             .map_err(sqlite_error)?;
@@ -704,6 +695,71 @@ pub(crate) fn migrate(connection: &mut Connection) -> StoreResult<()> {
     }
 
     validate_registry(connection)
+}
+
+/// Columns owned by an unshipped migration are added through an explicit
+/// schema guard instead of an unconditional `ALTER TABLE`. This preserves the
+/// numbered v26 owner while tolerating an interrupted/merged pre-release store
+/// whose column landed before its `user_version` and audit row did.
+fn apply_guarded_columns(transaction: &Transaction<'_>, version: u32) -> StoreResult<()> {
+    if version != 26 {
+        return Ok(());
+    }
+    for (table, column, declaration) in [
+        (
+            "loom_agent_types",
+            "archived",
+            "INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0, 1))",
+        ),
+        (
+            "loom_workflows",
+            "archived",
+            "INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0, 1))",
+        ),
+        (
+            "loom_cli_install_jobs",
+            "cancelled",
+            "INTEGER NOT NULL DEFAULT 0 CHECK (cancelled IN (0, 1))",
+        ),
+        (
+            "loom_cli_install_events",
+            "cancelled",
+            "INTEGER NOT NULL DEFAULT 0 CHECK (cancelled IN (0, 1))",
+        ),
+    ] {
+        add_column_if_missing(transaction, table, column, declaration)?;
+    }
+    Ok(())
+}
+
+/// Runs `PRAGMA table_info` before the one permitted `ADD COLUMN`. Table,
+/// column, and declaration inputs are compile-time migration constants, never
+/// database or user strings.
+fn add_column_if_missing(
+    transaction: &Transaction<'_>,
+    table: &str,
+    column: &str,
+    declaration: &str,
+) -> StoreResult<()> {
+    let mut statement = transaction
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(sqlite_error)?;
+    let present = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error)?
+        .iter()
+        .any(|name| name == column);
+    drop(statement);
+    if !present {
+        transaction
+            .execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {declaration};"
+            ))
+            .map_err(sqlite_error)?;
+    }
+    Ok(())
 }
 
 /// Checks the audit registry lists exactly versions `1..=CURRENT`, catching a

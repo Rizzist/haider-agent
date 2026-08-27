@@ -42,6 +42,7 @@ fn live_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
         models: Vec::new(),
         model_details: Vec::new(),
         inventory_fetched_at_ms: None,
+        inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Advisory,
         auth_methods: vec![AuthMethod::ApiKey],
         availability: haider_rpc::ProviderAvailabilityWire::Unavailable,
         availability_reason: Some("provider model inventory is unavailable".to_owned()),

@@ -635,6 +635,69 @@ fn migrations_apply_fresh_and_are_idempotent_on_reopen() {
     }
 }
 
+fn sqlite_master_schema(database_path: &std::path::Path) -> Vec<(String, String, String, String)> {
+    let connection = must(Connection::open(database_path));
+    let mut statement = must(connection.prepare(
+        "SELECT type, name, tbl_name, COALESCE(sql, '')
+         FROM sqlite_master
+         ORDER BY type, name, tbl_name",
+    ));
+    let rows = must(statement.query_map([], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    }));
+    must(rows.collect::<Result<Vec<_>, _>>())
+}
+
+/// OWNER UPGRADE LAW: 0.0.962 shipped schema v24. Migrating that exact table,
+/// index, and column shape must converge byte-for-byte in `sqlite_master` with
+/// a freshly migrated store; v25/v26 are additive and must not fork schemas.
+///
+/// MUTATION CHECK: omit a guarded v26 column addition or create a different
+/// definition on either migration route. Expected RUNTIME failure: the exact
+/// `sqlite_master` vectors differ.
+#[test]
+fn migration_from_0_0_962_shape_matches_fresh_schema_exactly() {
+    const LAST_0_0_962_SCHEMA_VERSION: u32 = 24;
+    let legacy_root = test_root();
+    let fresh_root = test_root();
+    let legacy_path = {
+        let store = must(Store::open(legacy_root.path()));
+        store.database_path().to_path_buf()
+    };
+    let fresh_path = {
+        let store = must(Store::open(fresh_root.path()));
+        store.database_path().to_path_buf()
+    };
+
+    let legacy = must(Connection::open(&legacy_path));
+    must(legacy.execute_batch(
+        "DROP TABLE loom_registry_events;
+         DROP TABLE loom_agent_type_revisions;
+         ALTER TABLE loom_agent_types DROP COLUMN archived;
+         ALTER TABLE loom_workflows DROP COLUMN archived;
+         ALTER TABLE loom_cli_install_jobs DROP COLUMN cancelled;
+         ALTER TABLE loom_cli_install_events DROP COLUMN cancelled;
+         DROP TABLE workflow_node_states;
+         DROP TABLE workflow_graph_instances;
+         ALTER TABLE profile_meta DROP COLUMN workflow_graph_backfill_version;
+         DELETE FROM schema_migrations WHERE version >= 25;
+         PRAGMA user_version = 24;",
+    ));
+    assert_eq!(
+        must(legacy.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))),
+        LAST_0_0_962_SCHEMA_VERSION
+    );
+    drop(legacy);
+
+    let migrated = must(Store::open(legacy_root.path()));
+    assert_eq!(must(migrated.schema_version()), 26);
+    drop(migrated);
+    assert_eq!(
+        sqlite_master_schema(&legacy_path),
+        sqlite_master_schema(&fresh_path)
+    );
+}
+
 #[test]
 fn typed_agent_install_job_schema_is_durable_and_bounded() {
     let root = test_root();

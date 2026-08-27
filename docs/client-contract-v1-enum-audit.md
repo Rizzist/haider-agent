@@ -45,6 +45,8 @@ still fails. Those enums are frozen or raw-preserved as listed below.
 | `ProviderApiFamilyWire` | Extensible with Unknown | display only; do not select a serializer |
 | `ProviderAuthRequirementWire` | Extensible with Unknown | do not infer an auth method |
 | `ProviderAvailabilityWire` | Extensible with Unknown | unknown is not healthy |
+| `ModelInventoryAuthorityWire` | Extensible with Unknown | unknown is not advisory and grants no passthrough exception |
+| `ModelInventoryStatusWire` | Extensible with Unknown | unknown is neither listed nor unlisted |
 | `SnapshotAvailabilityWire` | Extensible with Unknown | unknown is neither available nor unavailable |
 | `OAuthFlowStatusWire` | Extensible with Unknown | unknown is not ready and carries no usable credential reference |
 | `AccountAddMethod` | Extensible with Unknown | unknown add method is non-executable |
@@ -515,6 +517,10 @@ appendix list every spelling in context.
   `"api_key"` | `"o_auth"` | `"none"` | `"unknown"`; any other string → Rust `Unknown`.
 - `ProviderAvailabilityWire` (`crates/haider-rpc/src/frame.rs:804`):
   `"available"` | `"unavailable"` | `"unknown"`; any other string → Rust `Unknown`.
+- `ModelInventoryAuthorityWire` (`crates/haider-rpc/src/frame.rs`):
+  `"authoritative"` | `"advisory"` | `"unknown"`; any other string → Rust `Unknown`.
+- `ModelInventoryStatusWire` (`crates/haider-rpc/src/frame.rs`):
+  `"listed"` | `"unlisted"` | `"unknown"`; any other string → Rust `Unknown`.
 - `SnapshotAvailabilityWire` (`crates/haider-rpc/src/frame.rs:819`; `state` tag):
   `"available"` | `"unavailable"` | `"unknown"`; any other string → Rust `Unknown`.
 - `OAuthFlowStatusWire` (`crates/haider-rpc/src/frame.rs:926`; `status` tag):

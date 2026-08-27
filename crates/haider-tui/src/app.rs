@@ -14800,6 +14800,33 @@ impl AppModel {
                     selectable: true,
                 });
             }
+            // A session may legitimately run a caller-configured passthrough
+            // id that a custom server omitted from its advisory catalog. Keep
+            // the current pair visible and typed as unlisted, but do not add
+            // it to the discovered inventory or pretend it is an available
+            // picker row.
+            if self.identity.provider == summary.provider
+                && matches!(
+                    summary.inventory_authority,
+                    haider_rpc::ModelInventoryAuthorityWire::Advisory
+                )
+                && matches!(
+                    summary.model_inventory_status(&self.identity.model_short),
+                    haider_rpc::ModelInventoryStatusWire::Unlisted
+                )
+            {
+                rows.push(ModelPickerRow {
+                    provider: summary.provider.clone(),
+                    model: self.identity.model_short.clone(),
+                    auth,
+                    context_window: None,
+                    available: false,
+                    reason: Some("unlisted by advisory provider catalog".to_owned()),
+                    is_default: false,
+                    is_current: true,
+                    selectable: false,
+                });
+            }
         }
         rows
     }

@@ -19,11 +19,16 @@
 //!    custom chat-completions profiles, exactly the `session.create` rule.
 //!    Selecting a row on the session's (or parent's) CURRENT provider never
 //!    consults creatability: the session already runs it.
-//! 2. **Known inventory** — a provider with a non-empty discovered model list
-//!    must contain the selected model. A provider WITHOUT a discovered
-//!    inventory accepts honestly; provider errors surface at turn time.
+//! 2. **Known inventory** — a built-in provider with a non-empty discovered
+//!    model list must contain the selected model. Custom compatible catalogs
+//!    are advisory: a miss is typed `Unlisted` but the passthrough id remains
+//!    admissible. A provider WITHOUT a discovered inventory accepts honestly;
+//!    provider errors surface at turn time.
 
-use haider_rpc::{ProviderApiFamilyWire, ProviderAvailabilityWire, ProviderSummaryWire};
+use haider_rpc::{
+    ModelInventoryAuthorityWire, ModelInventoryStatusWire, ProviderApiFamilyWire,
+    ProviderAvailabilityWire, ProviderSummaryWire,
+};
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,6 +45,22 @@ pub(crate) struct ModelSelectionAuthority {
     /// Empty when no account facade is installed: every inventory is then
     /// unknown and selection stays honest rather than guessing.
     summaries: Vec<ProviderSummaryWire>,
+}
+
+/// One admitted explicit selection plus its honest relationship to the
+/// provider's latest inventory. `Unlisted` never mutates the provider summary
+/// or creates a pickable model row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ValidatedModelSelection {
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) inventory_status: ModelInventoryStatusWire,
+}
+
+impl ValidatedModelSelection {
+    fn into_pair(self) -> (String, String) {
+        (self.provider, self.model)
+    }
 }
 
 /// A typed G3 tuning refusal beside [`SelectionRefusal`]: `/effort` and
@@ -244,6 +265,20 @@ impl ModelSelectionAuthority {
         requested_provider: Option<&str>,
         model: &str,
     ) -> Result<(String, String), SelectionRefusal> {
+        self.validate_selection_with_status(current_provider, requested_provider, model)
+            .map(ValidatedModelSelection::into_pair)
+    }
+
+    /// The selection decision with the typed inventory telemetry retained for
+    /// daemon/UI consumers. Only an explicitly advisory custom inventory may
+    /// admit `Unlisted`; unknown and authoritative inventories keep the
+    /// built-in `ModelUnknown` refusal.
+    pub(crate) fn validate_selection_with_status(
+        &self,
+        current_provider: &str,
+        requested_provider: Option<&str>,
+        model: &str,
+    ) -> Result<ValidatedModelSelection, SelectionRefusal> {
         let model = model.trim();
         if model.is_empty() {
             return Err(SelectionRefusal::InvalidSelector {
@@ -261,8 +296,20 @@ impl ModelSelectionAuthority {
                 provider: provider.to_owned(),
             });
         }
-        if let Some(inventory) = self.known_inventory(provider)
-            && !inventory.iter().any(|known| known == model)
+        let summary = self
+            .summaries
+            .iter()
+            .find(|summary| summary.provider == provider);
+        let inventory_status = summary.map_or(ModelInventoryStatusWire::Unknown, |summary| {
+            summary.model_inventory_status(model)
+        });
+        if matches!(inventory_status, ModelInventoryStatusWire::Unlisted)
+            && !summary.is_some_and(|summary| {
+                matches!(
+                    summary.inventory_authority,
+                    ModelInventoryAuthorityWire::Advisory
+                )
+            })
         {
             return Err(SelectionRefusal::ModelUnknown {
                 provider: provider.to_owned(),
@@ -270,7 +317,11 @@ impl ModelSelectionAuthority {
                 inventory_age_ms: self.inventory_age_ms(provider),
             });
         }
-        Ok((provider.to_owned(), model.to_owned()))
+        Ok(ValidatedModelSelection {
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+            inventory_status,
+        })
     }
 
     /// The CURRENT pair's declared effort ladder (G3), in validation-truth

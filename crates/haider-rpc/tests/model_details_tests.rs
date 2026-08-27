@@ -54,6 +54,7 @@ fn provider_summary_model_details_round_trip_names_and_windows() {
             },
         ],
         inventory_fetched_at_ms: None,
+        inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Authoritative,
         auth_methods: vec![AuthMethod::ApiKey],
         availability: ProviderAvailabilityWire::Available,
         availability_reason: None,
@@ -107,9 +108,11 @@ fn provider_summary_response_open_timeout_preserves_typed_absence() {
 }
 
 /// MUTATION CHECK: dropping or renaming the additive fetch timestamp loses
-/// the cache-age authority; older bytes must still decode it as unknown.
+/// cache age; defaulting inventory authority to advisory grants old summaries
+/// a passthrough exception; or classifying/appending the missing id fabricates
+/// availability. Expected RUNTIME failure: the exact assertions below.
 #[test]
-fn provider_summary_inventory_fetch_time_is_additive_and_pinned() {
+fn provider_summary_inventory_fetch_time_and_authority_are_additive_and_pinned() {
     let mut summary: ProviderSummaryWire = serde_json::from_value(serde_json::json!({
         "provider": "custom-router",
         "api_family": "openai_chat_completions",
@@ -121,6 +124,10 @@ fn provider_summary_inventory_fetch_time_is_additive_and_pinned() {
     }))
     .expect("legacy provider summary");
     assert_eq!(summary.inventory_fetched_at_ms, None);
+    assert_eq!(
+        summary.inventory_authority,
+        haider_rpc::ModelInventoryAuthorityWire::Unknown
+    );
     summary.inventory_fetched_at_ms = Some(1_753_500_000_000);
     let encoded = serde_json::to_value(&summary).expect("encode fetch timestamp");
     assert_eq!(
@@ -130,4 +137,14 @@ fn provider_summary_inventory_fetch_time_is_additive_and_pinned() {
     summary.inventory_fetched_at_ms = None;
     let encoded = serde_json::to_value(&summary).expect("encode absent fetch timestamp");
     assert!(encoded.get("inventory_fetched_at_ms").is_none());
+    assert!(encoded.get("inventory_authority").is_none());
+
+    summary.inventory_authority = haider_rpc::ModelInventoryAuthorityWire::Advisory;
+    assert_eq!(
+        summary.model_inventory_status("passthrough-model"),
+        haider_rpc::ModelInventoryStatusWire::Unlisted
+    );
+    assert_eq!(summary.models, ["model-a"]);
+    let encoded = serde_json::to_value(&summary).expect("encode advisory authority");
+    assert_eq!(encoded["inventory_authority"], "advisory");
 }

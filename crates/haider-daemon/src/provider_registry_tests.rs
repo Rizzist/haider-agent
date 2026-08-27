@@ -371,6 +371,10 @@ fn gemini_is_a_builtin_generate_content_api_key_provider() {
     assert_eq!(summary.auth_methods, vec![AuthMethod::ApiKey]);
     assert_eq!(summary.models, vec!["gemini-2.5-flash"]);
     assert_eq!(summary.availability, ProviderAvailabilityWire::Available);
+    assert_eq!(
+        summary.inventory_authority,
+        haider_rpc::ModelInventoryAuthorityWire::Authoritative
+    );
 }
 
 /// MUTATION CHECK: pass `configured_models` instead of `discovered_models` to
@@ -520,8 +524,9 @@ fn summaries_report_pickable_discovered_models_not_profile_literals() {
 /// discovered catalog is only advisory picker inventory.
 ///
 /// MUTATION CHECK: restore the discovered-membership filter in
-/// `provider_summary`. Expected runtime failure: the configured default below
-/// becomes `None` for both the mismatched and empty catalogs.
+/// `provider_summary` or classify custom provenance as authoritative. Expected
+/// runtime failure: the configured default becomes `None` or the custom
+/// authority assertion differs for both the mismatched and empty catalogs.
 #[test]
 fn custom_summary_preserves_configured_default_across_mismatched_and_empty_catalog() {
     let profile = ProviderProfileV1 {
@@ -552,6 +557,10 @@ fn custom_summary_preserves_configured_default_across_mismatched_and_empty_catal
         .expect("mismatched summary");
     assert_eq!(mismatched.models, ["canonical-other"]);
     assert_eq!(
+        mismatched.inventory_authority,
+        haider_rpc::ModelInventoryAuthorityWire::Advisory
+    );
+    assert_eq!(
         mismatched.default_model.as_deref(),
         Some("deepseek-v4-flash")
     );
@@ -561,6 +570,10 @@ fn custom_summary_preserves_configured_default_across_mismatched_and_empty_catal
         .summary("bench-proxy", &|_| true)
         .expect("empty summary");
     assert!(empty.models.is_empty());
+    assert_eq!(
+        empty.inventory_authority,
+        haider_rpc::ModelInventoryAuthorityWire::Advisory
+    );
     assert_eq!(empty.default_model.as_deref(), Some("deepseek-v4-flash"));
 }
 

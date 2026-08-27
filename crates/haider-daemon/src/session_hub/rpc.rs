@@ -6347,6 +6347,15 @@ impl HubConnection {
             .iter()
             .find(|summary| summary.provider == provider)
             .is_some_and(|summary| summary.models.iter().any(|known| known == model));
+        let advisory_inventory = summaries
+            .iter()
+            .find(|summary| summary.provider == provider)
+            .is_some_and(|summary| {
+                matches!(
+                    summary.inventory_authority,
+                    haider_rpc::ModelInventoryAuthorityWire::Advisory
+                )
+            });
         let needs_refresh = summaries
             .iter()
             .find(|summary| summary.provider == provider)
@@ -6368,6 +6377,11 @@ impl HubConnection {
             })?;
         let refreshed = match facade.refresh_provider_models(provider.to_owned()).await {
             Ok(refreshed) => refreshed,
+            // A custom compatible catalog is advisory. Refresh-on-miss still
+            // probes exactly once, but discovery failure cannot veto a
+            // caller-configured passthrough id; the chat request remains the
+            // endpoint's authority and selection below is typed Unlisted.
+            Err(_) if advisory_inventory => return Ok(()),
             // TTL is a freshness policy, not an availability outage: a
             // transient refresh failure may keep serving a cached requested
             // model. A cache MISS still surfaces the typed discovery failure.
@@ -7278,11 +7292,28 @@ impl HubConnection {
             self.hub.creatable_providers()?,
             summaries,
         );
-        let (resolved_provider, resolved_model) =
-            match authority.validate_selection(&current.provider, provider.as_deref(), &model) {
-                Ok(pair) => pair,
-                Err(refusal) => return self.respond_selection_refusal(request_id, &refusal),
-            };
+        let validated = match authority.validate_selection_with_status(
+            &current.provider,
+            provider.as_deref(),
+            &model,
+        ) {
+            Ok(selection) => selection,
+            Err(refusal) => return self.respond_selection_refusal(request_id, &refusal),
+        };
+        if matches!(
+            validated.inventory_status,
+            haider_rpc::ModelInventoryStatusWire::Unlisted
+        ) {
+            tracing::info!(
+                provider = %validated.provider,
+                model = %validated.model,
+                inventory_status = "unlisted",
+                inventory_authority = "advisory",
+                "admitting a custom provider model absent from its advisory inventory"
+            );
+        }
+        let resolved_provider = validated.provider;
+        let resolved_model = validated.model;
         let target_descriptor = descriptors
             .iter()
             .find(|descriptor| descriptor.provider == resolved_provider && descriptor.active)
@@ -11247,8 +11278,21 @@ impl HubConnection {
             }
         }
         let authority = crate::model_select::ModelSelectionAuthority::new(creatable, summaries);
-        if let Err(refusal) = authority.validate_selection(&provider, None, &model) {
-            return self.respond_selection_refusal(request_id, &refusal);
+        let validated = match authority.validate_selection_with_status(&provider, None, &model) {
+            Ok(selection) => selection,
+            Err(refusal) => return self.respond_selection_refusal(request_id, &refusal),
+        };
+        if matches!(
+            validated.inventory_status,
+            haider_rpc::ModelInventoryStatusWire::Unlisted
+        ) {
+            tracing::info!(
+                provider = %validated.provider,
+                model = %validated.model,
+                inventory_status = "unlisted",
+                inventory_authority = "advisory",
+                "admitting a custom provider model absent from its advisory inventory"
+            );
         }
         let workspace = match validate_workspace(cwd).await {
             Ok(workspace) => workspace,

@@ -860,7 +860,7 @@ generation, or surface owner/revision as if they were one observation.
 | Current todo panel | latest open `TurnItem` lifecycle whose `item` is `"plan"`, at the applied raw-event cursor | There is no summary/digest todo projection. Use the exact reducer in §12; do not infer a plan from tool text. |
 | Accounts/defaults/active aliases | `account.list` snapshot | `AccountsChanged` only invalidates. Provider rows do not replace descriptors. |
 | OAuth import sources | `account.oauth_import_sources` snapshot | Never mirror the source list or infer daemon filesystem paths. |
-| Provider/model inventory | `provider.list` snapshot | Account rows and a client hardcoded model list do not override it. `provider.models_refresh` produces a newer snapshot. |
+| Provider/model inventory | `provider.list` snapshot | Account rows and a client hardcoded model list do not override it. `provider.models_refresh` produces a newer snapshot. This snapshot is authoritative picker metadata, but model-admission authority is the typed `inventory_authority`: built-ins reject an `unlisted` id after the bounded refresh, while custom compatible providers admit it verbatim as `unlisted`. |
 | Cross-account usage | `usage.report` | Session summaries contain only per-session promoted cache metrics, not the account report. |
 | Historical device-local usage | `usage.history_day` for a day or `usage.history_range` for heatmap totals | A missing day/slot is absence, not zero. Session summaries and `usage.report` are current projections and do not replace the ledger. Cross-device aggregation belongs to the client/cloud layer. |
 | Per-session cache health | `SessionSummary.cache_reread_hit_basis_points`; use `cache_lifetime_hit_basis_points` only for the separately labeled lifetime/all-input share | The same-summary nested `agent_metrics.usage.cache_reread_hit_basis_points` and `cache_hit_basis_points` are compatibility sources only when their promoted field is absent. Never calculate a substitute from token counts. |
@@ -1038,6 +1038,7 @@ or metadata-only digest.
 | provider configure `response_open_timeout_ms` | on update, preserve the stored response-header budget; on create, select the documented 60,000 ms compatible-transport default. A present value must be greater than zero |
 | provider configure `probe_vault_reference` | probe without a newly staged key; never substitute an empty key or a stored reference |
 | provider summary `inventory_fetched_at_ms` | the inventory has no known live-fetch time; never decode it as zero or fresh |
+| provider summary `inventory_authority` | authority is unknown; never infer advisory admission from absence |
 | `ModelUnknown.inventory_age` | the consulted inventory has no known live-fetch time; never decode it as age zero |
 | menu answer `input` | option needs no free-form value |
 | menu answer `request_id` | no correlated response; errors arrive as uncorrelated `ProtocolError` |
@@ -2620,7 +2621,7 @@ crash, the daemon cannot mistake the expected old descriptor for proof that
 the replacement committed. If no command-owned stage remains, it returns
 `restage_required` and waits for the same command with a fresh stage.
 
-Discovery is authoritative and bounded. It accepts the OpenAI list envelope
+Discovery is bounded. It accepts the OpenAI list envelope
 `{"data":[{"id":"…"}]}`, rejects redirects and oversized bodies, and
 returns a secret-free `ProviderProbeFailed` detail with one of
 `unreachable`, `unauthorized`, `non_open_ai_compatible_body`, or `empty_list`.
@@ -2636,9 +2637,15 @@ absence means seeded/configured or legacy inventory, never age zero. The
 documented freshness TTL is 15 minutes.
 An explicit `haider models --refresh [<alias>]` refreshes immediately. When an
 explicit `<alias>/<model>` is absent from a known cached inventory, the daemon
-refreshes that provider once before rejecting it; the typed `ModelUnknown`
-detail includes optional `inventory_age` for the inventory actually
-consulted.
+refreshes that provider once. Built-in provider inventories are authoritative:
+if the refreshed inventory still omits the id, the daemon returns typed
+`ModelUnknown`, whose detail includes optional `inventory_age` for the
+inventory actually consulted. A user-configured OpenAI-compatible provider's
+inventory is advisory: after the same one refresh attempt, Haider sends the
+configured id to the chat wire verbatim and reports its typed inventory status
+as `unlisted`. It does not append that id to the discovered model list or
+fabricate an available picker row; the TUI keeps a current unlisted pair
+visible as non-selectable catalog telemetry.
 
 The origin matrix is shared by discovery and inference. HTTPS origins anywhere
 are accepted without a provider allowlist, subject to the existing
@@ -2661,7 +2668,8 @@ laws in §15.4 apply unchanged.
 
 **Absence law.** Missing `probe_vault_reference` means discovery has no newly
 staged key; it never means an empty key. Missing inventory timestamps/ages are
-unknown, not fresh. Missing cache counters are `n/a`, not zero. An old daemon
+unknown, not fresh. Missing inventory authority is unknown, never advisory.
+Missing cache counters are `n/a`, not zero. An old daemon
 without an additive field keeps the prior provider-management behavior.
 Missing `account.login_api.replace_existing` is false and must never be
 inferred merely because an alias currently exists. A client must not invent

@@ -247,6 +247,55 @@ fn rows_mark_the_current_pair_and_provider_defaults() {
     assert!(text.contains('●'), "and its gutter dot");
 }
 
+/// OWNER LAW: a custom passthrough id omitted by `/v1/models` remains visible
+/// as the CURRENT pair, but it is typed/dimmed as unlisted and never inserted
+/// into the provider's pickable inventory.
+///
+/// MUTATION CHECK: omit the advisory-current branch, mark it available, or
+/// append it to `summary.models`. Expected RUNTIME failure: the exact row,
+/// rendered `unlisted` note, or no-fabrication assertion fails.
+#[test]
+fn advisory_custom_current_model_is_visible_as_unlisted_not_available() {
+    let mut model = seeded_launcher();
+    let mut custom = model.providers.providers[0].clone();
+    custom.provider = "bench-proxy".to_owned();
+    custom.api_family = haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions;
+    custom.models = vec!["catalog-model".to_owned()];
+    custom.model_details.clear();
+    custom.default_model = None;
+    custom.inventory_authority = haider_rpc::ModelInventoryAuthorityWire::Advisory;
+    model.providers.providers.push(custom);
+    model.identity.provider = "bench-proxy".to_owned();
+    model.identity.model_short = "passthrough-model".to_owned();
+
+    let rows = model.model_picker_rows();
+    let unlisted = rows
+        .iter()
+        .find(|row| row.provider == "bench-proxy" && row.model == "passthrough-model")
+        .expect("current custom passthrough row remains visible");
+    assert!(unlisted.is_current);
+    assert!(!unlisted.available);
+    assert!(!unlisted.selectable);
+    assert_eq!(
+        unlisted.reason.as_deref(),
+        Some("unlisted by advisory provider catalog")
+    );
+    assert_eq!(
+        model
+            .providers
+            .providers
+            .iter()
+            .find(|summary| summary.provider == "bench-proxy")
+            .expect("custom summary")
+            .models,
+        ["catalog-model"]
+    );
+
+    model.open_model_picker("passthrough-model".to_owned());
+    let text = draw_rows(&model, 110, 30).join("\n");
+    assert!(text.contains("unlisted by advisory provider catalog"));
+}
+
 /// The auth flavor rides every row — oauth vs api is what gets metered.
 #[test]
 fn rows_carry_the_auth_flavor_and_context_window() {

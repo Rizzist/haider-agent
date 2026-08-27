@@ -7,7 +7,10 @@
 //! resolve through the same functions, so these unit laws bind both.
 
 use super::{ModelSelectionAuthority, SelectionRefusal};
-use haider_rpc::{ProviderApiFamilyWire, ProviderAvailabilityWire, ProviderSummaryWire};
+use haider_rpc::{
+    ModelInventoryAuthorityWire, ModelInventoryStatusWire, ProviderApiFamilyWire,
+    ProviderAvailabilityWire, ProviderSummaryWire,
+};
 use std::collections::BTreeSet;
 
 fn summary(
@@ -23,6 +26,7 @@ fn summary(
         models: models.iter().map(|model| (*model).to_owned()).collect(),
         model_details: Vec::new(),
         inventory_fetched_at_ms: None,
+        inventory_authority: ModelInventoryAuthorityWire::Authoritative,
         auth_methods: Vec::new(),
         availability,
         availability_reason: None,
@@ -117,6 +121,48 @@ fn unknown_model_with_known_inventory_is_refused_typed() {
         }
     );
     assert_eq!(refusal.kind(), "model_unknown");
+}
+
+/// OWNER LAW (0.0.962 compatibility): built-in catalogs remain
+/// authoritative, while a custom compatible catalog is advisory after the
+/// same miss and reports `Unlisted` without fabricating an available row.
+///
+/// MUTATION CHECK: make every non-empty catalog authoritative or make every
+/// catalog advisory. Expected RUNTIME failure: one of the paired decisions
+/// below flips; appending the passthrough id to `models` flips the no-fabricate
+/// assertion.
+#[test]
+fn built_in_inventory_rejects_the_same_miss_custom_inventory_admits_as_unlisted() {
+    let built_in = summary(
+        "openai",
+        &["catalog-model"],
+        ProviderAvailabilityWire::Available,
+    );
+    let mut custom = summary(
+        "bench-proxy",
+        &["catalog-model"],
+        ProviderAvailabilityWire::Available,
+    );
+    custom.api_family = ProviderApiFamilyWire::OpenAiChatCompletions;
+    custom.inventory_authority = ModelInventoryAuthorityWire::Advisory;
+    let authority = authority(&["openai"], vec![built_in, custom.clone()]);
+
+    assert!(matches!(
+        authority.validate_selection_with_status("openai", None, "passthrough-model"),
+        Err(SelectionRefusal::ModelUnknown { provider, model, .. })
+            if provider == "openai" && model == "passthrough-model"
+    ));
+    let admitted = authority
+        .validate_selection_with_status("openai", Some("bench-proxy"), "passthrough-model")
+        .expect("custom advisory miss remains admissible");
+    assert_eq!(admitted.provider, "bench-proxy");
+    assert_eq!(admitted.model, "passthrough-model");
+    assert_eq!(
+        admitted.inventory_status,
+        ModelInventoryStatusWire::Unlisted
+    );
+    assert_eq!(custom.models, ["catalog-model"]);
+    assert!(custom.model_details.is_empty());
 }
 
 /// MUTATION CHECK: dropping the provider summary fetch timestamp from the

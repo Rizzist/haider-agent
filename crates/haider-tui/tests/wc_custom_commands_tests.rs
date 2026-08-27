@@ -311,6 +311,7 @@ fn provider_summary(provider: &str, models: Vec<String>) -> haider_rpc::Provider
         model_details: Vec::new(),
         models,
         inventory_fetched_at_ms: None,
+        inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Unknown,
         auth_methods: Vec::new(),
         availability: haider_rpc::ProviderAvailabilityWire::Available,
         availability_reason: None,

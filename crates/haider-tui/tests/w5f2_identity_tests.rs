@@ -57,6 +57,7 @@ fn provider_summary(
             })
             .collect(),
         inventory_fetched_at_ms: None,
+        inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Unknown,
         auth_methods: vec![AuthMethod::OAuth],
         availability: haider_rpc::ProviderAvailabilityWire::Available,
         availability_reason: None,

@@ -43,6 +43,7 @@ fn keyless_summary(provider: &str, models: Vec<String>) -> haider_rpc::ProviderS
         model_details: Vec::new(),
         models,
         inventory_fetched_at_ms: None,
+        inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Advisory,
         auth_methods: Vec::new(),
         availability: if available {
             haider_rpc::ProviderAvailabilityWire::Available

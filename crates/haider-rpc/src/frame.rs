@@ -30,6 +30,10 @@ fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
 
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    value == &T::default()
+}
+
 /// The logical wire protocol encoded by this crate.
 ///
 /// Decoding is deliberately strict about the top-level `"v"` field: any other
@@ -1031,6 +1035,38 @@ pub enum ProviderAvailabilityWire {
     Unknown,
 }
 
+/// Whether discovery may veto a model id for this provider.
+///
+/// Built-in adapters own authoritative inventories. User-configured,
+/// OpenAI-compatible servers publish advisory inventories because routers and
+/// local servers commonly omit otherwise valid passthrough ids from
+/// `/v1/models`. Unknown preserves the conservative behavior for older
+/// summaries and future provider kinds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ModelInventoryAuthorityWire {
+    Authoritative,
+    Advisory,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// Typed membership of one requested model in a provider's latest known
+/// inventory. `Unlisted` is not `Available`: it is an honest advisory-catalog
+/// miss that a custom compatible server may still accept on its chat wire.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ModelInventoryStatusWire {
+    Listed,
+    Unlisted,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
 /// Whether a whole snapshot-producing subsystem was available for one read.
 ///
 /// This is distinct from an empty successful snapshot: omitted means an old
@@ -1098,6 +1134,10 @@ pub struct ProviderSummaryWire {
     /// or no live inventory has been cached yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inventory_fetched_at_ms: Option<u64>,
+    /// Whether a known inventory miss may veto inference. Absent on an older
+    /// daemon means unknown, never advisory.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub inventory_authority: ModelInventoryAuthorityWire,
     #[serde(default)]
     pub auth_methods: Vec<haider_protocol::credential::AuthMethod>,
     pub availability: ProviderAvailabilityWire,
@@ -1106,6 +1146,22 @@ pub struct ProviderSummaryWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
     pub enabled: bool,
+}
+
+impl ProviderSummaryWire {
+    /// Classifies `model` without changing the advertised/pickable inventory.
+    /// In particular, an unlisted custom passthrough id is never appended to
+    /// `models` or fabricated as an available [`ModelDetailWire`] row.
+    #[must_use]
+    pub fn model_inventory_status(&self, model: &str) -> ModelInventoryStatusWire {
+        if self.models.is_empty() {
+            ModelInventoryStatusWire::Unknown
+        } else if self.models.iter().any(|known| known == model) {
+            ModelInventoryStatusWire::Listed
+        } else {
+            ModelInventoryStatusWire::Unlisted
+        }
+    }
 }
 
 /// Active account coordinate published beside `account.list`.

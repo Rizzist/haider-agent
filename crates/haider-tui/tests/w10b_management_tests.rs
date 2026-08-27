@@ -51,6 +51,7 @@ fn provider_summary(name: &str) -> haider_rpc::ProviderSummaryWire {
         models: vec!["m-1".into()],
         model_details: Vec::new(),
         inventory_fetched_at_ms: None,
+        inventory_authority: haider_rpc::ModelInventoryAuthorityWire::Unknown,
         auth_methods: Vec::new(),
         availability: haider_rpc::ProviderAvailabilityWire::Available,
         availability_reason: None,

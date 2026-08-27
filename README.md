@@ -114,7 +114,10 @@ $ haider account add hosted-router --base-url https://router.example.com --api-k
 Use the discovered ids as `local-router/<model>` or
 `hosted-router/<model>`. Re-probe one account with
 `haider account probe <alias>`, or force inventory refresh with
-`haider models --refresh [<alias>]`.
+`haider models --refresh [<alias>]`. Custom catalogs are advisory for
+inference: a caller-configured id omitted by `/v1/models` is refreshed once,
+then reaches the compatible chat wire verbatim and is shown as unlisted rather
+than fabricated into the available catalog.
 
 ## 04 / Tokenomics
 

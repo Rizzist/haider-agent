@@ -1564,8 +1564,8 @@ mod tests {
     use super::*;
 
     /// `--model` selects the model used by session.create. It must not also
-    /// schedule a redundant post-create session.select_model, whose picker
-    /// validation would make a custom endpoint's catalog authoritative.
+    /// schedule a redundant post-create session.select_model mutation after
+    /// the create door has already admitted the exact pair.
     #[test]
     fn cli_model_is_not_duplicated_into_post_create_session_config() {
         let parsed = parse_run_options_with_config(&[

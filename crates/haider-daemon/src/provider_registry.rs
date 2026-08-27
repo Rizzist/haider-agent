@@ -1063,6 +1063,11 @@ fn provider_summary(
         models: discovered_models,
         model_details,
         inventory_fetched_at_ms,
+        inventory_authority: match profile.provenance {
+            ProviderProvenance::BuiltIn => haider_rpc::ModelInventoryAuthorityWire::Authoritative,
+            ProviderProvenance::Custom => haider_rpc::ModelInventoryAuthorityWire::Advisory,
+            ProviderProvenance::Unknown => haider_rpc::ModelInventoryAuthorityWire::Unknown,
+        },
         auth_methods,
         availability: if available {
             ProviderAvailabilityWire::Available
