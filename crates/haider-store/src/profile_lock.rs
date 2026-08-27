@@ -5,10 +5,11 @@
 //!   Dropping it — including by process death or kill — releases the lock;
 //!   there is no stale-lock state to clean up.
 //! - A second opener fails fast with retryable `StoreLocked`.
-//! - The lock file stays empty and diagnostic readers never open it, avoiding
-//!   Windows' mandatory whole-file lock. Human-readable owner diagnostics
-//!   (pid, timestamp) are atomically published at `<root>/lock.owner`; nothing
-//!   ever reads them to make decisions. Normal release removes them
+//! - The lock file's bytes are never read or used for decisions; new files are
+//!   empty and legacy contents may remain untouched. Diagnostic readers use
+//!   only the separate human-readable owner token (pid, timestamp), atomically
+//!   published at `<root>/lock.owner`; nothing ever reads it to make decisions.
+//!   Normal release removes it
 //!   best-effort; process death may leave a harmless stale token that the next
 //!   owner atomically replaces.
 
@@ -18,6 +19,10 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(test)]
+#[path = "profile_lock_tests.rs"]
+mod tests;
 
 static NEXT_OWNER_STAGING: AtomicU64 = AtomicU64::new(0);
 
@@ -77,16 +82,6 @@ impl ProfileLock {
             }
         }
 
-        // The lock is ours; migrate any pre-split contents away and keep this
-        // inode as a pure lock target that no diagnostic reader opens.
-        if let Err(error) = file.set_len(0).and_then(|()| file.sync_all()) {
-            return Err(store_error(
-                ErrorCode::Internal,
-                format!("cannot clear profile lock {}: {error}", path.display()),
-                false,
-            ));
-        }
-
         let lock = Self {
             file,
             owner_path: root.join("lock.owner"),
@@ -114,13 +109,11 @@ impl ProfileLock {
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(owner_error(&self.owner_path, error)),
             };
-            let result = staged
-                .write_all(token)
-                .and_then(|()| staged.sync_all())
-                .and_then(|()| {
-                    drop(staged);
-                    haider_platform::replace_file(&staged_path, &self.owner_path)
-                });
+            // The token is diagnostic only; flock, not token durability, is authoritative.
+            let result = staged.write_all(token);
+            drop(staged);
+            let result =
+                result.and_then(|()| haider_platform::replace_file(&staged_path, &self.owner_path));
             if let Err(error) = result {
                 let _ = fs::remove_file(&staged_path);
                 return Err(owner_error(&self.owner_path, error));

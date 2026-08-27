@@ -226,7 +226,8 @@ impl EffectDiagnostics {
             for orphan in evidence {
                 diagnostics.append_locked(&mut writer, &DiagnosticRecord::surfaced(&orphan))?;
             }
-            writer.file.sync_data()
+            // Surfacing is a one-shot evidence boundary and retains full durability.
+            haider_platform::fs::sync_file(&writer.file, haider_platform::SyncPolicy::Full)
         })
         .await
         .map_err(|error| std::io::Error::other(format!("surface marker task failed: {error}")))?
@@ -238,30 +239,40 @@ impl EffectDiagnostics {
     ) -> std::io::Result<()> {
         let diagnostics = Arc::clone(self);
         let record = DiagnosticRecord::start(&breadcrumb);
-        tokio::task::spawn_blocking(move || diagnostics.append_synced(&record))
-            .await
-            .map_err(|error| {
-                std::io::Error::other(format!("start breadcrumb task failed: {error}"))
-            })?
+        tokio::task::spawn_blocking(move || {
+            // A durable start is the crash-evidence contract.
+            diagnostics.append_synced(&record, haider_platform::SyncPolicy::Full)
+        })
+        .await
+        .map_err(|error| std::io::Error::other(format!("start breadcrumb task failed: {error}")))?
     }
 
     pub(crate) async fn record_completion(
         self: &Arc<Self>,
         breadcrumb: EffectBreadcrumb,
     ) -> std::io::Result<()> {
+        // A power loss may drop this completion and cause one spurious prior
+        // unexpected-exit report; `record_surfaced` reports and clears it.
         let diagnostics = Arc::clone(self);
         let record = DiagnosticRecord::complete(&breadcrumb);
-        tokio::task::spawn_blocking(move || diagnostics.append_synced(&record))
-            .await
-            .map_err(|error| {
-                std::io::Error::other(format!("completion breadcrumb task failed: {error}"))
-            })?
+        tokio::task::spawn_blocking(move || {
+            // Completion is advisory after the durable start, so plain fsync is sufficient.
+            diagnostics.append_synced(&record, haider_platform::SyncPolicy::Plain)
+        })
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!("completion breadcrumb task failed: {error}"))
+        })?
     }
 
-    fn append_synced(&self, record: &DiagnosticRecord) -> std::io::Result<()> {
+    fn append_synced(
+        &self,
+        record: &DiagnosticRecord,
+        policy: haider_platform::SyncPolicy,
+    ) -> std::io::Result<()> {
         let mut writer = self.lock_writer()?;
         self.append_locked(&mut writer, record)?;
-        writer.file.sync_data()
+        haider_platform::fs::sync_file(&writer.file, policy)
     }
 
     fn append_locked(

@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Default)]
 struct RecordingCas {
     stored: Vec<Vec<u8>>,
+    batch_calls: usize,
 }
 
 #[async_trait]
@@ -23,6 +24,15 @@ impl CasSink for RecordingCas {
             "blake3:{}",
             blake3::hash(bytes).to_hex()
         )))
+    }
+
+    async fn put_batch(&mut self, blobs: &[Vec<u8>]) -> ToolResult<Vec<ArtifactRef>> {
+        self.batch_calls = self.batch_calls.saturating_add(1);
+        let mut artifacts = Vec::with_capacity(blobs.len());
+        for bytes in blobs {
+            artifacts.push(self.put(bytes).await?);
+        }
+        Ok(artifacts)
     }
 
     async fn put_file(&mut self, path: &Path) -> ToolResult<ArtifactRef> {
@@ -153,6 +163,7 @@ async fn freeze_checkpoint_marks_absent_and_over_limit_preimages_explicitly() {
     .expect("freeze checkpoint");
 
     assert_eq!(cas.stored, vec![bounded]);
+    assert_eq!(cas.batch_calls, 1, "all bounded pre-images share one batch");
     assert!(checkpoint.paths[0].pre_artifact.is_some());
     assert_eq!(
         checkpoint.paths[0].pre_digest.as_deref(),

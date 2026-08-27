@@ -19629,6 +19629,10 @@ impl Cas for Store {
         self.cas.put(bytes)
     }
 
+    fn put_batch(&self, blobs: &[Vec<u8>]) -> StoreResult<Vec<ArtifactRef>> {
+        self.cas.put_batch(blobs)
+    }
+
     fn put_file(&self, path: &Path) -> StoreResult<ArtifactRef> {
         self.cas.put_file(path)
     }

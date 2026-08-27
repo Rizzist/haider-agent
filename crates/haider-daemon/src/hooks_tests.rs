@@ -6,10 +6,12 @@ use super::{
     CapturedBytes, DecisionState, EngineState, HOOK_ENGINE_SNAPSHOT_FILE,
     HOOK_ENGINE_SNAPSHOT_VERSION, HookDefinition, HookEngine, HookEngineSnapshot,
     HookEngineSnapshotFile, HookKind, HookMatcher, HookService, HookSource, HookStartupHydrator,
-    HookTrustPolicy, MatchEvent, classify, discover, encode_hook_snapshot_file, hook_digest,
-    make_output, next_subscriber_backoff, prepare_hook_input, prune_terminal_run_trust,
-    reduce_durable_state, run_command,
+    HookTrustPolicy, MatchEvent, SnapshotSchedule, classify, discover, encode_hook_snapshot_file,
+    hook_digest, make_output, next_subscriber_backoff, prepare_hook_input,
+    prune_terminal_run_trust, reduce_durable_state, run_command,
 };
+#[cfg(unix)]
+use super::{HOOK_LEADER_EXIT_POLL_MAX, poll_hook_leader_exit};
 use crate::runtime::finish_hook_hydration_for_test;
 use crate::session_hub::{SessionHub, SessionHubConfig};
 #[cfg(windows)]
@@ -34,6 +36,56 @@ use haider_tools::{EffectBroker, JournalSink, PermissionPolicy, ProcessExec, Too
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+
+#[test]
+fn snapshot_schedule_restarts_idle_window_after_a_long_clean_gap() {
+    let start = std::time::Instant::now();
+    let mut schedule = SnapshotSchedule::new(start);
+    let commit = start + Duration::from_secs(10);
+    schedule.note_commit(commit);
+    assert_eq!(
+        schedule.deadline(),
+        Some(commit + super::HOOK_SNAPSHOT_IDLE_DELAY)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn leader_exit_poll_backoff_never_exceeds_detection_cap() {
+    let probes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&probes);
+    let mut remaining = 9_u8;
+    poll_hook_leader_exit(move || {
+        observed
+            .lock()
+            .expect("leader-exit probe log")
+            .push(tokio::time::Instant::now());
+        if remaining == 0 {
+            Ok(true)
+        } else {
+            remaining = remaining.saturating_sub(1);
+            Ok(false)
+        }
+    })
+    .await
+    .expect("leader exit observation");
+
+    let probes = probes.lock().expect("leader-exit probe observations");
+    let intervals = probes
+        .windows(2)
+        .map(|pair| pair[1].duration_since(pair[0]))
+        .collect::<Vec<_>>();
+    assert!(
+        intervals
+            .iter()
+            .all(|interval| *interval <= HOOK_LEADER_EXIT_POLL_MAX),
+        "the next probe always bounds exit detection latency"
+    );
+    assert!(
+        intervals.contains(&HOOK_LEADER_EXIT_POLL_MAX),
+        "the fixture reaches the 50 ms capped phase"
+    );
+}
 
 fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).expect("canonical path")
@@ -509,6 +561,9 @@ async fn checksum_mismatched_hook_snapshot_replays_from_zero_cleanly() {
     store.close().await.expect("store close");
 }
 
+/// MUTATION CHECK: treat the accelerator snapshot as authoritative and skip
+/// the journal suffix committed before a crash. Expected runtime failure: the
+/// suffix cannot bind the snapshotted intent to its permission menu.
 #[tokio::test]
 async fn valid_hook_snapshot_preserves_intent_until_ask_suffix_binds_it() {
     let root = tempfile::tempdir().expect("profile");
@@ -948,6 +1003,160 @@ impl EngineFixture {
         self.hub.shutdown().await.expect("hub shutdown");
         self.store.close().await.expect("store close");
     }
+}
+
+async fn wait_for_hook_outbox_drain(store: &SqliteStoreHandle) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if store
+                .pending_hook_dispatches(64)
+                .await
+                .expect("read hook outbox")
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("hook outbox drain deadline");
+}
+
+/// MUTATION CHECK: persist on every committed batch, omit the terminal or
+/// shutdown boundary. Expected runtime failure: one of the exact persist-count
+/// deltas changes.
+#[tokio::test]
+async fn snapshot_cadence_coalesces_batches_and_forces_terminal_delete_and_shutdown() {
+    let command = emit_command("terminal");
+    let fixture = EngineFixture::start_with_event_and_trust(
+        &command,
+        1_000,
+        false,
+        "exec",
+        true,
+        "run_finished",
+    )
+    .await;
+    wait_for_hook_outbox_drain(&fixture.store).await;
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let baseline = fixture.service.snapshot_persist_count();
+
+    for index in 0..4 {
+        let mut batch = [raw_event(
+            &fixture.session_id,
+            &fixture.run_id,
+            fixture.store.worker_generation(),
+            &format!("snapshot-burst-{index}"),
+            EventPayload::RunState(RunState::Thinking),
+        )];
+        fixture.hub.append(&mut batch).await.expect("commit burst");
+    }
+    wait_for_hook_outbox_drain(&fixture.store).await;
+    assert!(
+        fixture.service.snapshot_persist_count() - baseline <= 1,
+        "batches inside one second produce at most one snapshot persist"
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while fixture.service.snapshot_persist_count() == baseline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("idle snapshot deadline");
+    assert_eq!(
+        fixture.service.snapshot_persist_count() - baseline,
+        1,
+        "the burst coalesces into one idle persist"
+    );
+
+    let before_terminal = fixture.service.snapshot_persist_count();
+    let mut terminal = [raw_event(
+        &fixture.session_id,
+        &fixture.run_id,
+        fixture.store.worker_generation(),
+        "snapshot-terminal",
+        EventPayload::RunState(RunState::Done),
+    )];
+    fixture
+        .hub
+        .append(&mut terminal)
+        .await
+        .expect("commit terminal run");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while fixture.service.snapshot_persist_count() == before_terminal {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("terminal snapshot deadline");
+
+    let before_delete = fixture.service.snapshot_persist_count();
+    fixture.service.session_deleted(fixture.session_id.clone());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while fixture.service.snapshot_persist_count() == before_delete {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("session-delete snapshot deadline");
+
+    let before_shutdown = fixture.service.snapshot_persist_count();
+    fixture.engine.shutdown().await;
+    assert!(
+        fixture.service.snapshot_persist_count() > before_shutdown,
+        "shutdown forces a final snapshot persist"
+    );
+    fixture.hub.shutdown().await.expect("hub shutdown");
+    fixture.store.close().await.expect("store close");
+}
+
+/// MUTATION CHECK: restore the post-replay boot persist. Expected runtime
+/// failure: the count is two before any committed message exists.
+#[tokio::test]
+async fn hook_start_performs_exactly_one_immediate_snapshot_persist() {
+    let profile = tempfile::tempdir().expect("hook profile");
+    let profile_root = canonical(profile.path());
+    let store = SqliteStoreHandle::open(&profile_root).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let (service, engine) = HookEngine::start(profile_root, store.clone(), hub.clone())
+        .await
+        .expect("hook engine");
+    tokio::task::yield_now().await;
+    assert_eq!(service.snapshot_persist_count(), 1);
+    engine.shutdown().await;
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
+/// MUTATION CHECK: allocate a discovery cache per envelope instead of per
+/// committed batch. Expected runtime failure: three classifiable facts cause
+/// three stamp computations instead of one.
+#[tokio::test]
+async fn committed_batch_computes_discovery_stamp_once() {
+    let command = emit_command("stamped");
+    let fixture = EngineFixture::start(&command, 1_000, false, "exec").await;
+    wait_for_hook_outbox_drain(&fixture.store).await;
+    let baseline = fixture.service.discovery_stamp_count();
+    let mut batch = (0..3)
+        .map(|index| {
+            raw_event(
+                &fixture.session_id,
+                &fixture.run_id,
+                fixture.store.worker_generation(),
+                &format!("stamp-once-{index}"),
+                EventPayload::RunState(RunState::Thinking),
+            )
+        })
+        .collect::<Vec<_>>();
+    fixture
+        .hub
+        .append(&mut batch)
+        .await
+        .expect("commit classifiable batch");
+    wait_for_hook_outbox_drain(&fixture.store).await;
+    assert_eq!(fixture.service.discovery_stamp_count() - baseline, 1);
+    fixture.close().await;
 }
 
 /// MUTATION CHECK: execute an unpinned hook or suppress the refusal notice.

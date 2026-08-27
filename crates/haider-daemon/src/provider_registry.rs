@@ -243,13 +243,20 @@ impl ProviderRegistryStoreLike for JsonProviderRegistryStore {
             providers: profiles.to_vec(),
             fallback_chain,
         };
-        let bytes = serde_json::to_vec_pretty(&document).map_err(|error| {
+        let mut bytes = serde_json::to_vec_pretty(&document).map_err(|error| {
             HaiderError::new(
                 ErrorCode::Internal,
                 format!("could not serialize provider registry: {error}"),
                 false,
             )
         })?;
+        bytes.push(b'\n');
+        match fs::read(&self.path) {
+            Ok(current) if current == bytes => return Ok(()),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(file_error("compare", &self.path, error)),
+        }
         let temporary = self.path.with_extension("json.tmp");
         let mut file = OpenOptions::new()
             .write(true)
@@ -258,13 +265,14 @@ impl ProviderRegistryStoreLike for JsonProviderRegistryStore {
             .open(&temporary)
             .map_err(|error| file_error("open temporary file for", &temporary, error))?;
         file.write_all(&bytes)
-            .and_then(|()| file.write_all(b"\n"))
-            .and_then(|()| file.sync_all())
+            // A changed registry keeps its existing full-durability contract.
+            .and_then(|()| haider_platform::fs::sync_file(&file, haider_platform::SyncPolicy::Full))
             .map_err(|error| file_error("write", &temporary, error))?;
         drop(file);
         haider_platform::replace_file(&temporary, &self.path)
             .map_err(|error| file_error("replace", &self.path, error))?;
-        haider_platform::sync_directory(parent)
+        // The replacement must survive whenever changed registry bytes were installed.
+        haider_platform::fs::sync_directory(parent, haider_platform::SyncPolicy::Full)
             .map_err(|error| file_error("sync parent directory of", &self.path, error))
     }
 }

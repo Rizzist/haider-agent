@@ -50,14 +50,17 @@ pub async fn freeze_checkpoint<C: CasSink + ?Sized>(
     input: FreezeCheckpointInput,
     capture: CheckpointCapture,
 ) -> ToolResult<CheckpointRecorded> {
-    let mut paths = Vec::with_capacity(capture.paths.len());
-    for captured in capture.paths {
-        let (pre_artifact, truncated_reason) = match captured.pre_bytes {
+    let mut preimages = Vec::new();
+    let mut prepared = Vec::with_capacity(capture.paths.len());
+    for mut captured in capture.paths {
+        let (preimage_index, truncated_reason) = match captured.pre_bytes.take() {
             Some(bytes)
                 if u64::try_from(bytes.len()).unwrap_or(u64::MAX)
                     <= CHECKPOINT_PREIMAGE_MAX_BYTES =>
             {
-                (Some(cas.put(&bytes).await?), captured.truncated_reason)
+                let index = preimages.len();
+                preimages.push(bytes);
+                (Some(index), captured.truncated_reason.take())
             }
             Some(bytes) => (
                 None,
@@ -67,8 +70,31 @@ pub async fn freeze_checkpoint<C: CasSink + ?Sized>(
                     CHECKPOINT_PREIMAGE_MAX_BYTES
                 )),
             ),
-            None => (None, captured.truncated_reason),
+            None => (None, captured.truncated_reason.take()),
         };
+        prepared.push((captured, preimage_index, truncated_reason));
+    }
+    // Every pre-image receives a plain file+directory sync and the batch
+    // returns only after one trailing full flush, before CheckpointRecorded.
+    let artifacts = cas.put_batch(&preimages).await?;
+    if artifacts.len() != preimages.len() {
+        return Err(ToolError::cas(format!(
+            "checkpoint CAS returned {} artifact references for {} pre-images",
+            artifacts.len(),
+            preimages.len()
+        )));
+    }
+
+    let mut paths = Vec::with_capacity(prepared.len());
+    for (captured, preimage_index, truncated_reason) in prepared {
+        let pre_artifact = preimage_index
+            .map(|index| {
+                artifacts
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| ToolError::cas("checkpoint CAS batch result is incomplete"))
+            })
+            .transpose()?;
         paths.push(CheckpointPath {
             path: captured.path,
             pre_artifact,

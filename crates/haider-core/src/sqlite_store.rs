@@ -1990,6 +1990,13 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.put(&bytes))).await
     }
 
+    /// Durably stores one artifact-reference group with a single trailing
+    /// full device-cache flush on platforms that distinguish it.
+    pub async fn put_batch(&self, blobs: Vec<Vec<u8>>) -> Result<Vec<ArtifactRef>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.put_batch(&blobs))).await
+    }
+
     /// Durably streams an artifact file on the blocking pool.
     pub async fn put_file(&self, path: std::path::PathBuf) -> Result<ArtifactRef, HaiderError> {
         let owner = Arc::clone(&self.owner);
@@ -2317,6 +2324,12 @@ impl ArtifactReader for SqliteStoreHandle {
 impl CasSink for SqliteStoreHandle {
     async fn put(&mut self, bytes: &[u8]) -> ToolResult<ArtifactRef> {
         SqliteStoreHandle::put(self, bytes.to_vec())
+            .await
+            .map_err(|error| haider_tools::ToolError::cas(error.message))
+    }
+
+    async fn put_batch(&mut self, blobs: &[Vec<u8>]) -> ToolResult<Vec<ArtifactRef>> {
+        SqliteStoreHandle::put_batch(self, blobs.to_vec())
             .await
             .map_err(|error| haider_tools::ToolError::cas(error.message))
     }

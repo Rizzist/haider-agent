@@ -68,6 +68,55 @@ fn resilience_profiles() -> Vec<ProviderProfileV1> {
     )
 }
 
+/// MUTATION CHECK: remove the byte comparison or compare only after replacing
+/// the file. Expected runtime failure: an unchanged boot changes mtime/inode.
+#[test]
+fn unchanged_json_registry_boot_does_not_rewrite_the_file() {
+    let dir = tempfile::tempdir().expect("provider registry profile");
+    let store = JsonProviderRegistryStore::new(dir.path());
+    store
+        .save(&resilience_profiles())
+        .expect("seed provider registry");
+    let path = dir.path().join(PROVIDERS_FILE_NAME);
+    let before = std::fs::metadata(&path).expect("registry metadata before boot");
+
+    let _registry = ProviderRegistry::new(store, Vec::new(), model_source([]))
+        .expect("unchanged provider registry boot");
+    let after = std::fs::metadata(&path).expect("registry metadata after boot");
+
+    assert_eq!(before.modified().ok(), after.modified().ok());
+    assert_eq!(before.len(), after.len());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        assert_eq!(before.ino(), after.ino());
+    }
+}
+
+/// MUTATION CHECK: skip every boot save instead of only a byte-identical one.
+/// Expected runtime failure: the missing built-in profile is not published.
+#[test]
+fn changed_json_registry_boot_still_replaces_the_file() {
+    let dir = tempfile::tempdir().expect("provider registry profile");
+    let store = JsonProviderRegistryStore::new(dir.path());
+    let profiles = resilience_profiles();
+    store
+        .save(&profiles[..1])
+        .expect("seed incomplete provider registry");
+    let path = dir.path().join(PROVIDERS_FILE_NAME);
+    let before = std::fs::read(&path).expect("registry bytes before reconciliation");
+
+    let _registry = ProviderRegistry::new(store, profiles, model_source([]))
+        .expect("changed provider registry boot");
+    let after = std::fs::read(&path).expect("registry bytes after reconciliation");
+
+    assert_ne!(before, after);
+    let document: ProviderRegistryDocumentV1 =
+        serde_json::from_slice(&after).expect("reconciled registry document");
+    assert_eq!(document.providers.len(), 2);
+}
+
 /// MUTATION CHECK: stop splitting the environment form on commas, stop
 /// preferring it to the persisted chain, or accept unknown providers/empty
 /// models. Expected runtime failure: the exact typed coordinates differ or a

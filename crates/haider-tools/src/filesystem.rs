@@ -110,6 +110,15 @@ use std::time::{Duration, Instant};
 #[async_trait]
 pub trait CasSink: Send {
     async fn put(&mut self, bytes: &[u8]) -> ToolResult<ArtifactRef>;
+    /// Stores one reference group before the caller publishes any of its
+    /// journal references. Lightweight sinks retain the safe sequential form.
+    async fn put_batch(&mut self, blobs: &[Vec<u8>]) -> ToolResult<Vec<ArtifactRef>> {
+        let mut artifacts = Vec::with_capacity(blobs.len());
+        for bytes in blobs {
+            artifacts.push(self.put(bytes).await?);
+        }
+        Ok(artifacts)
+    }
     /// Streams a staged file into CAS without rebuilding it as one buffer.
     async fn put_file(&mut self, path: &Path) -> ToolResult<ArtifactRef>;
 

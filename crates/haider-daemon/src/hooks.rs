@@ -33,6 +33,7 @@ use haider_protocol::hook::{
 use haider_protocol::ids::{EffectId, EventId, MenuId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, TurnItem};
 use haider_protocol::menu::{AnswerVia, DecisionKind, Menu, MenuAnswer, MenuKind};
+use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::{DeliveryMode, EventPayload};
 use haider_rpc::{CommandId, HookSummaryWire, HookTrustStateWire};
@@ -52,7 +53,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -78,6 +79,12 @@ const MAX_USER_MESSAGE_TEXT_BYTES: usize = 32 * 1024;
 const SUBSCRIBE_QUEUE: usize = 64;
 const SUBSCRIBE_BACKOFF_MIN: Duration = Duration::from_millis(200);
 const SUBSCRIBE_BACKOFF_MAX: Duration = Duration::from_secs(5);
+const HOOK_SNAPSHOT_IDLE_DELAY: Duration = Duration::from_secs(1);
+const HOOK_SNAPSHOT_BUSY_INTERVAL: Duration = Duration::from_secs(5);
+#[cfg(unix)]
+const HOOK_LEADER_EXIT_POLL_MIN: Duration = Duration::from_millis(1);
+#[cfg(unix)]
+const HOOK_LEADER_EXIT_POLL_MAX: Duration = Duration::from_millis(50);
 #[cfg(unix)]
 const ENV_ALLOWLIST: [&str; 5] = ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR"];
 // `cmd.exe` and Windows system tools need these bootstrap variables even
@@ -285,9 +292,23 @@ struct HookServiceInner {
     /// deliberately bypass this cache again immediately before execution.
     discovery_cache: Mutex<HashMap<PathBuf, CachedDiscovery>>,
     next_event: AtomicU64,
+    #[cfg(test)]
+    snapshot_persist_count: AtomicU64,
+    #[cfg(test)]
+    discovery_stamp_count: AtomicU64,
 }
 
 impl HookService {
+    #[cfg(test)]
+    fn snapshot_persist_count(&self) -> u64 {
+        self.inner.snapshot_persist_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn discovery_stamp_count(&self) -> u64 {
+        self.inner.discovery_stamp_count.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn downgrade(&self) -> WeakHookService {
         WeakHookService {
             inner: Arc::downgrade(&self.inner),
@@ -716,9 +737,13 @@ impl HookEngine {
                 observed_trusted: Mutex::new(observed_trusted),
                 discovery_cache: Mutex::new(HashMap::new()),
                 next_event: AtomicU64::new(0),
+                #[cfg(test)]
+                snapshot_persist_count: AtomicU64::new(0),
+                #[cfg(test)]
+                discovery_stamp_count: AtomicU64::new(0),
             }),
         };
-        if let Err(error) = persist_engine_snapshot(&service.inner.store, &state).await {
+        if let Err(error) = persist_service_snapshot(&service, &state).await {
             tracing::warn!(target: "haider.hooks", %error, "hook-engine snapshot persistence failed; journal rebuild remains authoritative");
         }
         let manager_service = service.clone();
@@ -778,6 +803,9 @@ struct EngineState {
     notice_dedup: HashSet<String>,
     subscribers: HashMap<String, SubscriberHandle>,
 }
+
+type BatchDiscoveryCache =
+    HashMap<SessionId, Option<(SessionMetadataV1, Result<Discovery, String>)>>;
 
 struct SubscriberHandle {
     sender: mpsc::Sender<SubscriberMessage>,
@@ -1172,11 +1200,13 @@ async fn persist_engine_snapshot(
                 operation: "write",
                 source,
             })?;
-        file.sync_all()
-            .map_err(|source| HookSnapshotPersistError::Io {
+        // The snapshot is a restart accelerator, but unchanged sites retain full durability.
+        haider_platform::fs::sync_file(&file, haider_platform::SyncPolicy::Full).map_err(
+            |source| HookSnapshotPersistError::Io {
                 operation: "file sync",
                 source,
-            })?;
+            },
+        )?;
         drop(file);
         haider_platform::replace_file(&temporary, &path).map_err(|source| {
             HookSnapshotPersistError::Io {
@@ -1184,13 +1214,28 @@ async fn persist_engine_snapshot(
                 source,
             }
         })?;
-        haider_platform::sync_directory(&root).map_err(|source| HookSnapshotPersistError::Io {
-            operation: "directory sync",
-            source,
-        })
+        // The rename remains fully durable until the cadence policy explicitly relaxes it.
+        haider_platform::fs::sync_directory(&root, haider_platform::SyncPolicy::Full).map_err(
+            |source| HookSnapshotPersistError::Io {
+                operation: "directory sync",
+                source,
+            },
+        )
     })
     .await
     .map_err(HookSnapshotPersistError::Task)?
+}
+
+async fn persist_service_snapshot(
+    service: &HookService,
+    state: &EngineState,
+) -> Result<(), HookSnapshotPersistError> {
+    #[cfg(test)]
+    service
+        .inner
+        .snapshot_persist_count
+        .fetch_add(1, Ordering::Relaxed);
+    persist_engine_snapshot(&service.inner.store, state).await
 }
 
 fn reduce_durable_state(
@@ -1266,6 +1311,75 @@ fn hook_cursor_matches(envelope: &RawEnvelope, digest: &str) -> bool {
         )
 }
 
+struct SnapshotSchedule {
+    dirty: bool,
+    last_commit: Option<Instant>,
+    last_attempt: Instant,
+}
+
+impl SnapshotSchedule {
+    fn new(now: Instant) -> Self {
+        Self {
+            dirty: false,
+            last_commit: None,
+            last_attempt: now,
+        }
+    }
+
+    fn note_commit(&mut self, now: Instant) {
+        if !self.dirty {
+            // A fresh busy window starts at its first commit, not at an old persist.
+            self.last_attempt = now;
+        }
+        self.dirty = true;
+        self.last_commit = Some(now);
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        if !self.dirty {
+            return None;
+        }
+        let busy = checked_deadline(self.last_attempt, HOOK_SNAPSHOT_BUSY_INTERVAL);
+        let Some(last_commit) = self.last_commit else {
+            return Some(busy);
+        };
+        if self.last_attempt > last_commit {
+            return Some(busy);
+        }
+        let idle = checked_deadline(last_commit, HOOK_SNAPSHOT_IDLE_DELAY);
+        Some(idle.min(busy))
+    }
+
+    fn note_attempt(&mut self, now: Instant, succeeded: bool) {
+        self.last_attempt = now;
+        if succeeded {
+            self.dirty = false;
+        }
+    }
+}
+
+fn checked_deadline(start: Instant, delay: Duration) -> Instant {
+    start.checked_add(delay).unwrap_or(start)
+}
+
+async fn wait_for_snapshot_deadline(deadline: Option<Instant>) {
+    if let Some(deadline) = deadline {
+        tokio::time::sleep_until(deadline.into()).await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+async fn attempt_scheduled_snapshot(
+    service: &HookService,
+    state: &EngineState,
+    schedule: &mut SnapshotSchedule,
+) -> Result<(), HookSnapshotPersistError> {
+    let result = persist_service_snapshot(service, state).await;
+    schedule.note_attempt(Instant::now(), result.is_ok());
+    result
+}
+
 async fn run_engine(
     mut messages: mpsc::UnboundedReceiver<EngineMessage>,
     service: HookService,
@@ -1279,15 +1393,23 @@ async fn run_engine(
         return;
     }
     prune_terminal_run_trust(&mut state);
-    if let Err(error) = persist_engine_snapshot(&service.inner.store, &state).await {
-        tracing::warn!(target: "haider.hooks", %error, "hook-engine post-replay snapshot persistence failed; journal rebuild remains authoritative");
-    }
+    let mut snapshot_schedule = SnapshotSchedule::new(Instant::now());
     let mut blocked_run_acks = HashSet::new();
     loop {
+        let snapshot_deadline = snapshot_schedule.deadline();
         tokio::select! {
             biased;
             message = messages.recv() => {
-                let Some(message) = message else { break };
+                let Some(message) = message else {
+                    if let Err(error) = attempt_scheduled_snapshot(
+                        &service,
+                        &state,
+                        &mut snapshot_schedule,
+                    ).await {
+                        tracing::warn!(target: "haider.hooks", %error, "hook-engine snapshot persistence failed during drain; journal rebuild remains authoritative");
+                    }
+                    break;
+                };
                 // Drain cycle: consume the received message plus every
                 // already-queued Committed batch, then acknowledge all
                 // handled outbox rows in ONE durable transaction instead
@@ -1299,14 +1421,17 @@ async fn run_engine(
                 let mut acks: Vec<(SessionId, u64)> = Vec::new();
                 let mut ordered_ack_scopes = HashSet::new();
                 let mut terminal_trust_acks = HashSet::new();
-                let mut snapshot_dirty = false;
+                let mut terminal_snapshot = false;
                 let control = loop {
                     match next.take() {
                         Some(EngineMessage::Committed(envelopes)) => {
-                            snapshot_dirty = true;
+                            snapshot_schedule.note_commit(Instant::now());
+                            let mut batch_discoveries = BatchDiscoveryCache::new();
                             let mut aborted = false;
+                            let mut batch_terminal = false;
                             for envelope in envelopes {
                                 let terminal_scope = terminal_run_scope(&envelope);
+                                batch_terminal |= terminal_scope.is_some();
                                 // Run-scoped trust must remain replayable until
                                 // every earlier row in that run is acknowledged.
                                 // Handle those server hooks synchronously so
@@ -1323,6 +1448,7 @@ async fn run_engine(
                                     envelope,
                                     ordered_run_scope.is_none(),
                                     &mut acks,
+                                    &mut batch_discoveries,
                                 )
                                 .await
                                 {
@@ -1345,7 +1471,15 @@ async fn run_engine(
                                     terminal_trust_acks.insert(scope);
                                 }
                             }
-                            if aborted || acks.len() >= HOOK_ACK_BATCH_MAX {
+                            terminal_snapshot |= batch_terminal;
+                            let cadence_due = snapshot_schedule
+                                .deadline()
+                                .is_some_and(|deadline| deadline <= Instant::now());
+                            if aborted
+                                || batch_terminal
+                                || cadence_due
+                                || acks.len() >= HOOK_ACK_BATCH_MAX
+                            {
                                 break None;
                             }
                             match messages.try_recv() {
@@ -1364,10 +1498,17 @@ async fn run_engine(
                 } else {
                     blocked_run_acks.extend(ordered_ack_scopes);
                 }
-                if snapshot_dirty
-                    && let Err(error) = persist_engine_snapshot(&service.inner.store, &state).await
+                let cadence_due = snapshot_schedule
+                    .deadline()
+                    .is_some_and(|deadline| deadline <= Instant::now());
+                if (terminal_snapshot || cadence_due)
+                    && let Err(error) = attempt_scheduled_snapshot(
+                        &service,
+                        &state,
+                        &mut snapshot_schedule,
+                    ).await
                 {
-                    tracing::warn!(target: "haider.hooks", %error, "hook-engine snapshot persistence failed; journal rebuild remains authoritative");
+                    tracing::warn!(target: "haider.hooks", %error, "hook-engine scheduled snapshot persistence failed; journal rebuild remains authoritative");
                 }
                 match control {
                     Some(EngineMessage::TrustChanged(change)) => {
@@ -1393,8 +1534,11 @@ async fn run_engine(
                                 .as_ref()
                                 .is_none_or(|(candidate, _)| candidate != &session_id)
                         });
-                        if let Err(error) =
-                            persist_engine_snapshot(&service.inner.store, &state).await
+                        if let Err(error) = attempt_scheduled_snapshot(
+                            &service,
+                            &state,
+                            &mut snapshot_schedule,
+                        ).await
                         {
                             tracing::warn!(target: "haider.hooks", %error, "hook-engine snapshot persistence failed after session deletion");
                         }
@@ -1403,12 +1547,28 @@ async fn run_engine(
                         state.subscribers.clear();
                         jobs.abort_all();
                         while jobs.join_next().await.is_some() {}
+                        if let Err(error) = attempt_scheduled_snapshot(
+                            &service,
+                            &state,
+                            &mut snapshot_schedule,
+                        ).await {
+                            tracing::warn!(target: "haider.hooks", %error, "hook-engine snapshot persistence failed during shutdown; journal rebuild remains authoritative");
+                        }
                         let _ = done.send(());
                         break;
                     }
                     // The cycle loop only breaks with a non-Committed
                     // message or None; Committed is consumed above.
                     Some(EngineMessage::Committed(_)) | None => {}
+                }
+            }
+            _ = wait_for_snapshot_deadline(snapshot_deadline) => {
+                if let Err(error) = attempt_scheduled_snapshot(
+                    &service,
+                    &state,
+                    &mut snapshot_schedule,
+                ).await {
+                    tracing::warn!(target: "haider.hooks", %error, "hook-engine idle snapshot persistence failed; journal rebuild remains authoritative");
                 }
             }
             _ = jobs.join_next(), if !jobs.is_empty() => {}
@@ -1464,8 +1624,19 @@ async fn replay_pending_dispatches(
         // flush must land before the next `pending_hook_dispatches` read or
         // the same rows would be returned forever.
         let mut acks = Vec::with_capacity(pending.len());
+        let mut batch_discoveries = BatchDiscoveryCache::new();
         for envelope in pending {
-            if !handle_and_complete(service, state, jobs, envelope, false, &mut acks).await {
+            if !handle_and_complete(
+                service,
+                state,
+                jobs,
+                envelope,
+                false,
+                &mut acks,
+                &mut batch_discoveries,
+            )
+            .await
+            {
                 // Rows handled before the failure are still acknowledged so
                 // a restart replays exactly the unhandled remainder.
                 let _ = flush_hook_dispatch_acks(service, acks).await;
@@ -1485,6 +1656,7 @@ async fn handle_and_complete(
     envelope: RawEnvelope,
     defer_servers: bool,
     acks: &mut Vec<(SessionId, u64)>,
+    batch_discoveries: &mut BatchDiscoveryCache,
 ) -> bool {
     advance_durable_cursor(state, &envelope);
     let mut pending = Vec::new();
@@ -1496,6 +1668,7 @@ async fn handle_and_complete(
         envelope.clone(),
         &mut pending,
         &mut terminal_scope,
+        batch_discoveries,
     )
     .await
     {
@@ -1552,6 +1725,7 @@ async fn handle_committed(
     envelope: RawEnvelope,
     pending_servers: &mut Vec<PendingServerFire>,
     terminal_server_scope: &mut Option<(SessionId, RunId)>,
+    batch_discoveries: &mut BatchDiscoveryCache,
 ) -> bool {
     if HookEventPayload::is_engine_fact(&envelope.payload) {
         return true;
@@ -1572,20 +1746,39 @@ async fn handle_committed(
     let Some(facts) = classify(&envelope) else {
         return true;
     };
-    let metadata = match service
-        .inner
-        .store
-        .session_metadata(&envelope.session_id)
-        .await
-    {
-        Ok(Some(metadata)) => metadata,
-        Ok(None) => return true,
-        Err(error) => {
-            tracing::warn!(target: "haider.hooks", ?error, "hook metadata hydration failed");
-            return false;
-        }
+    let context = if let Some(context) = batch_discoveries.get(&envelope.session_id).cloned() {
+        context
+    } else {
+        let metadata = match service
+            .inner
+            .store
+            .session_metadata(&envelope.session_id)
+            .await
+        {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::warn!(target: "haider.hooks", ?error, "hook metadata hydration failed");
+                return false;
+            }
+        };
+        let context = if let Some(metadata) = metadata {
+            #[cfg(test)]
+            service
+                .inner
+                .discovery_stamp_count
+                .fetch_add(1, Ordering::Relaxed);
+            let discovery = discover_cached_async(service, PathBuf::from(&metadata.cwd)).await;
+            Some((metadata, discovery))
+        } else {
+            None
+        };
+        batch_discoveries.insert(envelope.session_id.clone(), context.clone());
+        context
     };
-    let discovery = match discover_cached_async(service, PathBuf::from(&metadata.cwd)).await {
+    let Some((metadata, discovery)) = context else {
+        return true;
+    };
+    let discovery = match discovery {
         Ok(discovery) => discovery,
         Err(reason) => {
             return journal_notice_once(
@@ -2657,11 +2850,21 @@ async fn observe_hook_leader_exit(
     pid: Option<haider_platform::ProcessId>,
 ) -> std::io::Result<Option<std::process::ExitStatus>> {
     let pid = pid.ok_or_else(|| std::io::Error::other("hook leader PID is unavailable"))?;
+    poll_hook_leader_exit(|| haider_platform::process_leader_exited(pid)).await?;
+    Ok(None)
+}
+
+#[cfg(unix)]
+async fn poll_hook_leader_exit(
+    mut exited: impl FnMut() -> std::io::Result<bool>,
+) -> std::io::Result<()> {
+    let mut backoff = HOOK_LEADER_EXIT_POLL_MIN;
     loop {
-        if haider_platform::process_leader_exited(pid)? {
-            return Ok(None);
+        if exited()? {
+            return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        tokio::time::sleep(backoff).await;
+        backoff = backoff.saturating_mul(2).min(HOOK_LEADER_EXIT_POLL_MAX);
     }
 }
 

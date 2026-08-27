@@ -109,7 +109,7 @@ impl ProviderViewStore {
         let mut persisted = HashSet::new();
         for blob in blobs {
             if persisted.insert(blob.block.clone()) {
-                let stored = self.cas.put(&blob.bytes)?;
+                let stored = self.cas.put_batched(&blob.bytes)?;
                 if stored.as_str() != blob.block.content_hash {
                     return Err(corrupt(
                         "provider-view CAS returned a different content address",
@@ -117,6 +117,8 @@ impl ProviderViewStore {
                 }
             }
         }
+        // Every blob is plain-fsynced before this one full flush and the index transaction.
+        self.cas.finish_batched_puts()?;
 
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
