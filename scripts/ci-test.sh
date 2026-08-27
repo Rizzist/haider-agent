@@ -42,8 +42,14 @@ fail=0
 for crate in $crates; do
   echo "::group::$crate"
   case "$crate" in
-    haider-daemon|haider-daemond)
+    haider-daemon)
       ${T:+"$T" 900} cargo test -p "$crate" --locked -- --test-threads=4 || { echo "FAIL: $crate"; fail=$((fail+1)); }
+      ;;
+    haider-daemond)
+      # Stream this crate's explicit test/phase diagnostics. Libtest's default
+      # capture loses a still-running test's stderr when the outer timeout
+      # kills the process, which is why Gate 19 named only the crate.
+      ${T:+"$T" 900} cargo test -p "$crate" --locked -- --test-threads=4 --nocapture || { echo "FAIL: $crate"; fail=$((fail+1)); }
       ;;
     *)
       ${T:+"$T" 900} cargo test -p "$crate" --locked || { echo "FAIL: $crate"; fail=$((fail+1)); }

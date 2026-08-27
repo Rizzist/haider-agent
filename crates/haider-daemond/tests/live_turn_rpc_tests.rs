@@ -72,6 +72,27 @@ use tokio::sync::Semaphore;
 #[cfg(windows)]
 const WINDOWS_PROCESS_START_DEADLINE: std::time::Duration = std::time::Duration::from_secs(240);
 
+// PowerShell, cmd.exe, and the Job-Object descendant probes are deliberately
+// real. Running several of them at once on a hosted Windows runner can starve
+// process creation long enough for every test to enter its bounded retry path,
+// whose combined wall time then outlives the crate runner. Serialize only this
+// integration binary's real-process tests; protocol-only tests stay parallel.
+#[cfg(windows)]
+static WINDOWS_REAL_PROCESS_TEST_GATE: Semaphore = Semaphore::const_new(1);
+
+#[cfg(windows)]
+async fn windows_real_process_test_guard(
+    test_name: &'static str,
+) -> tokio::sync::SemaphorePermit<'static> {
+    eprintln!("haider-daemond windows-process test={test_name} phase=waiting-for-gate");
+    let permit = WINDOWS_REAL_PROCESS_TEST_GATE
+        .acquire()
+        .await
+        .expect("Windows real-process test gate remains open");
+    eprintln!("haider-daemond windows-process test={test_name} phase=running");
+    permit
+}
+
 #[derive(Clone)]
 struct FakeFactory {
     fake: Arc<FakeProvider>,
@@ -1104,15 +1125,23 @@ async fn read_session(
         },
     )
     .await;
-    loop {
-        if let WireFrame::Response {
-            body: ResponseBody::SessionRead { result },
-            ..
-        } = client.next().await
-        {
-            return result.envelopes;
+    // On Windows `next` intentionally returns reserved keepalive Pongs so an
+    // independently bounded long operation stays connected (ee2b1ce). Own one
+    // continuous RPC deadline here; a per-frame deadline would restart after
+    // every Pong and could leave a missing SessionRead response unbounded.
+    tokio::time::timeout(support::DEADLINE, async {
+        loop {
+            if let WireFrame::Response {
+                body: ResponseBody::SessionRead { result },
+                ..
+            } = client.next().await
+            {
+                return result.envelopes;
+            }
         }
-    }
+    })
+    .await
+    .expect("session read response deadline")
 }
 
 async fn current_generation(
@@ -3375,6 +3404,11 @@ async fn scenario_9_restart_resumes_only_queued_and_terminalizes_streaming() {
 /// no-UserMessage, or PreAuthorized(UserTyped) assertions below fail.
 #[tokio::test]
 async fn w8a_shell_exec_is_receipted_exactly_once_and_user_preauthorized() {
+    #[cfg(windows)]
+    let _windows_process_test = windows_real_process_test_guard(
+        "w8a_shell_exec_is_receipted_exactly_once_and_user_preauthorized",
+    )
+    .await;
     let root = test_root("w8a-shell-");
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).expect("workspace");
@@ -3757,6 +3791,9 @@ async fn w8a_shell_exec_is_receipted_exactly_once_and_user_preauthorized() {
 /// supervised process tree before interrupted Idle is published.
 #[tokio::test]
 async fn w8a_shell_exec_cancel_kills_the_process_tree() {
+    #[cfg(windows)]
+    let _windows_process_test =
+        windows_real_process_test_guard("w8a_shell_exec_cancel_kills_the_process_tree").await;
     let root = test_root("w8a-shell-cancel-");
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).expect("workspace");
@@ -5939,6 +5976,11 @@ async fn session_create_requires_control_and_ready_welcome_advertises_implemente
 /// in W4a2.
 #[tokio::test]
 async fn w4a2_exec_is_cas_gated_streams_output_and_grants_only_the_exact_shape() {
+    #[cfg(windows)]
+    let _windows_process_test = windows_real_process_test_guard(
+        "w4a2_exec_is_cas_gated_streams_output_and_grants_only_the_exact_shape",
+    )
+    .await;
     let root = test_root("w4a2-exec-approval-");
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).expect("workspace");
@@ -7454,6 +7496,10 @@ async fn w4a1_dispatched_real_fs_edit_restarts_as_unknown_without_redispatch() {
 /// after daemon death and must become Unknown, never execute a second time.
 #[tokio::test]
 async fn w4a2_dispatched_exec_restarts_as_unknown_without_rerun() {
+    #[cfg(windows)]
+    let _windows_process_test =
+        windows_real_process_test_guard("w4a2_dispatched_exec_restarts_as_unknown_without_rerun")
+            .await;
     let root = test_root("w4a2-exec-restart-");
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).expect("workspace");
@@ -7611,6 +7657,9 @@ async fn w4a2_dispatched_exec_restarts_as_unknown_without_rerun() {
 /// higher-level fresh-attempt observation. Verified by revert in W4a2/win2.
 #[tokio::test]
 async fn w4a2_cancelled_exec_child_process_group_dies() {
+    #[cfg(windows)]
+    let _windows_process_test =
+        windows_real_process_test_guard("w4a2_cancelled_exec_child_process_group_dies").await;
     let root = test_root("w4a2-exec-cancel-");
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).expect("workspace");
@@ -7711,8 +7760,16 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
         0,
     )
     .await;
+    #[cfg(windows)]
+    eprintln!(
+        "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=waiting-for-first-start"
+    );
     let start =
         wait_for_exec_child_started(&mut client, &config, &session_id, &run_id, &heartbeat).await;
+    #[cfg(windows)]
+    eprintln!(
+        "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=first-start-observed result={start:?}"
+    );
     #[cfg(not(windows))]
     assert_eq!(
         start.expect("exec child starts within the deadline"),
@@ -7722,6 +7779,9 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
     let retry_start = !matches!(start, Ok(ProcessStartObservation::Started));
     #[cfg(windows)]
     let (run_id, answerer, process_start_attempts) = if retry_start {
+        eprintln!(
+            "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=settling-first-attempt"
+        );
         drop(answerer);
         let _previous_attempt = settle_process_start_attempt_before_retry(
             &mut client,
@@ -7779,6 +7839,9 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
             0,
         )
         .await;
+        eprintln!(
+            "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=waiting-for-retry-start"
+        );
         assert_eq!(
             wait_for_exec_child_started(
                 &mut client,
@@ -7819,6 +7882,10 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
     #[cfg(not(windows))]
     let events = events_until_terminal(&mut client, &run_id).await;
     #[cfg(windows)]
+    eprintln!(
+        "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=cancelling-live-attempt"
+    );
+    #[cfg(windows)]
     let events = cancel_live_windows_attempt(
         &mut client,
         &config,
@@ -7829,6 +7896,10 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
         "cancel-exec-rpc-command",
     )
     .await;
+    #[cfg(windows)]
+    eprintln!(
+        "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=cancelled-and-idle"
+    );
     assert!(matches!(
         events.last(),
         Some((_, EventPayload::RunState(RunState::Cancelled)))
@@ -7838,6 +7909,10 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
         next_idle(&mut client).await,
         "cancelled exec settles interrupted Idle only after dispatcher close"
     );
+    #[cfg(windows)]
+    eprintln!(
+        "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=reading-durable-session"
+    );
     let durable = read_session(
         &mut client,
         &config,
@@ -7845,6 +7920,10 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
         "cancel-exec-durable-read",
     )
     .await;
+    #[cfg(windows)]
+    eprintln!(
+        "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=durable-session-read"
+    );
     let run_items = payloads_for_run(&durable, &run_id)
         .filter_map(|payload| match payload {
             EventPayload::Item(item) => Some(item),
@@ -7905,6 +7984,20 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
     );
 
     task.shutdown_handle().request("test complete");
+    #[cfg(windows)]
+    {
+        eprintln!(
+            "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=joining-daemon"
+        );
+        tokio::time::timeout(support::DEADLINE, task.join())
+            .await
+            .expect("cancelled-exec daemon join deadline")
+            .expect("daemon joins");
+        eprintln!(
+            "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=complete"
+        );
+    }
+    #[cfg(not(windows))]
     task.join().await.expect("daemon joins");
 }
 
