@@ -277,7 +277,15 @@ pub async fn connect(path: &Path, config: ClientConfig) -> Result<Connected, Con
         Some("msgpack") => WireEncoding::MessagePack,
         _ => WireEncoding::Json,
     };
-    let client = RpcClient::start(stream, decoder, leftovers, &config, &welcome, encoding);
+    let client = RpcClient::start(
+        stream,
+        decoder,
+        leftovers,
+        &config,
+        &welcome,
+        encoding,
+        peer_credentials,
+    );
     Ok(Connected {
         client,
         welcome,
@@ -415,6 +423,8 @@ pub struct RpcClient {
     /// its affordances on what the daemon ADVERTISED — report §4.1's
     /// "hide/disable only the methods whose feature is absent".
     welcome: Welcome,
+    /// Kernel-authenticated identity captured before the stream was split.
+    peer_credentials: PeerCredentials,
 }
 
 impl RpcClient {
@@ -425,6 +435,7 @@ impl RpcClient {
         config: &ClientConfig,
         welcome: &Welcome,
         encoding: WireEncoding,
+        peer_credentials: PeerCredentials,
     ) -> Self {
         let (state, _) = watch::channel(ConnectionState::Connected);
         let shared = Arc::new(Shared {
@@ -473,6 +484,7 @@ impl RpcClient {
             encoding,
             tasks,
             welcome: welcome.clone(),
+            peer_credentials,
         }
     }
 
@@ -481,6 +493,12 @@ impl RpcClient {
     #[must_use]
     pub fn welcome(&self) -> &Welcome {
         &self.welcome
+    }
+
+    /// Kernel-authenticated identity of the peer serving this live connection.
+    #[must_use]
+    pub fn peer_credentials(&self) -> PeerCredentials {
+        self.peer_credentials
     }
 
     /// Current lifecycle state.

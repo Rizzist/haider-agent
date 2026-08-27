@@ -452,6 +452,52 @@ fn tight_welcome_omits_only_the_additive_user_command_feature() {
     assert_eq!(selected_full_body_len - (selected_tight.len() - 4), 8);
 }
 
+#[tokio::test]
+async fn standard_welcome_cache_reuses_byte_identical_golden_frame() {
+    let (_root, hub) = liveness_hub().await;
+    let context = liveness_context(hub);
+    let frame_limit = u32::try_from(context.frame_limit).expect("test frame limit");
+    let first = cached_standard_welcome(
+        &context,
+        haider_rpc::WIRE_PROTOCOL_VERSION,
+        frame_limit,
+        context.frame_limit,
+    )
+    .expect("first cached Welcome");
+    let second = cached_standard_welcome(
+        &context,
+        haider_rpc::WIRE_PROTOCOL_VERSION,
+        frame_limit,
+        context.frame_limit,
+    )
+    .expect("second cached Welcome");
+    let expected = uds_codec::encode(
+        &WireFrame::Welcome(Welcome {
+            protocol: haider_rpc::WIRE_PROTOCOL_VERSION,
+            instance_id: context.instance_id.clone(),
+            daemon_generation: context.daemon_generation,
+            frame_limit,
+            profile_id: context.profile_id.clone(),
+            daemon_version: env!("CARGO_PKG_VERSION").into(),
+            lifecycle_phase: LifecyclePhase::Ready,
+            capabilities_granted: CapabilitySet::from([Capability::View, Capability::Control]),
+            features: welcome_features(),
+            user_command_withheld: false,
+            encoding: None,
+        }),
+        context.frame_limit,
+    )
+    .expect("golden Welcome frame");
+
+    let (OutboundBytes::Contiguous(first), OutboundBytes::Contiguous(second)) = (&first, &second)
+    else {
+        panic!("standard JSON Welcome must use contiguous cached bytes");
+    };
+    assert!(Arc::ptr_eq(first, second));
+    assert_eq!(first.as_slice(), expected.as_slice());
+    assert_eq!(second.as_slice(), expected.as_slice());
+}
+
 /// MUTATION CHECK: replace the round-robin ring with one FIFO/hot-lane drain.
 /// Expected failure: `a-2` is returned before the waiting `b-1`.
 /// Verified by revert on 2026-07-27.

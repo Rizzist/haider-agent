@@ -74,7 +74,7 @@ use haider_rpc::{
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::IoSlice;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::time::Instant;
@@ -1843,20 +1843,27 @@ fn negotiate_hello(
     } else {
         LifecyclePhase::Ready
     };
-    let welcome = Welcome {
-        protocol: negotiated.protocol,
-        instance_id: context.instance_id.clone(),
-        daemon_generation: context.daemon_generation,
-        frame_limit,
-        profile_id: context.profile_id.clone(),
-        daemon_version: env!("CARGO_PKG_VERSION").into(),
-        lifecycle_phase,
-        capabilities_granted: negotiated.capabilities_granted.clone(),
-        features: welcome_features(),
-        user_command_withheld: false,
-        encoding: negotiated.encoding.clone(),
+    let bytes = if lifecycle_phase == LifecyclePhase::Ready
+        && negotiated.capabilities_granted == server_range.capabilities
+        && negotiated.encoding.is_none()
+    {
+        cached_standard_welcome(context, negotiated.protocol, frame_limit, outbound_limit)?
+    } else {
+        let welcome = Welcome {
+            protocol: negotiated.protocol,
+            instance_id: context.instance_id.clone(),
+            daemon_generation: context.daemon_generation,
+            frame_limit,
+            profile_id: context.profile_id.clone(),
+            daemon_version: env!("CARGO_PKG_VERSION").into(),
+            lifecycle_phase,
+            capabilities_granted: negotiated.capabilities_granted.clone(),
+            features: welcome_features(),
+            user_command_withheld: false,
+            encoding: negotiated.encoding.clone(),
+        };
+        encode_welcome_for_peer(welcome, outbound_limit)?.into()
     };
-    let bytes = encode_welcome_for_peer(welcome, outbound_limit)?;
     lane.try_push(LaneKey::System, QueuedFrame::welcome(bytes))?;
     // Retained, not discarded: the grant is what later frames are authorized
     // against (W3b2 reads it through `ConnectionGrant`).
@@ -1867,6 +1874,73 @@ fn negotiate_hello(
         Some("msgpack") => WireEncoding::MessagePack,
         _ => WireEncoding::Json,
     }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StandardWelcomeCacheKey {
+    protocol: u32,
+    instance_id: String,
+    daemon_generation: u64,
+    frame_limit: u32,
+    profile_id: String,
+}
+
+static STANDARD_WELCOME_CACHE: OnceLock<Mutex<HashMap<StandardWelcomeCacheKey, OutboundBytes>>> =
+    OnceLock::new();
+
+/// Caches the ordinary Ready + View/Control + JSON Welcome once per daemon.
+/// Tight, draining, capability-restricted, and MessagePack-negotiating peers
+/// retain the exact per-peer encoder below.
+fn cached_standard_welcome(
+    context: &ConnectionContext,
+    protocol: u32,
+    frame_limit: u32,
+    outbound_limit: usize,
+) -> Result<OutboundBytes, DaemonError> {
+    let key = StandardWelcomeCacheKey {
+        protocol,
+        instance_id: context.instance_id.clone(),
+        daemon_generation: context.daemon_generation,
+        frame_limit,
+        profile_id: context.profile_id.clone(),
+    };
+    let cache = STANDARD_WELCOME_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = match cache.lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(bytes) = cache.get(&key)
+        && bytes.len() <= outbound_limit.saturating_add(4)
+    {
+        return Ok(bytes.clone());
+    }
+    let welcome = Welcome {
+        protocol,
+        instance_id: context.instance_id.clone(),
+        daemon_generation: context.daemon_generation,
+        frame_limit,
+        profile_id: context.profile_id.clone(),
+        daemon_version: env!("CARGO_PKG_VERSION").into(),
+        lifecycle_phase: LifecyclePhase::Ready,
+        capabilities_granted: CapabilitySet::from([Capability::View, Capability::Control]),
+        features: welcome_features(),
+        user_command_withheld: false,
+        encoding: None,
+    };
+    match uds_codec::encode_zeroizing(&WireFrame::Welcome(welcome.clone()), outbound_limit) {
+        Ok(encoded) => {
+            let encoded = OutboundBytes::from(encoded);
+            cache.insert(key, encoded.clone());
+            Ok(encoded)
+        }
+        Err(haider_rpc::CodecError::FrameLimitExceeded { .. }) => {
+            drop(cache);
+            encode_welcome_for_peer(welcome, outbound_limit).map(OutboundBytes::from)
+        }
+        Err(error) => Err(DaemonError::Protocol {
+            message: format!("outbound frame rejected by peer limit: {error}"),
+        }),
+    }
 }
 
 fn welcome_features() -> BTreeSet<String> {

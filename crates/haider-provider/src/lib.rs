@@ -172,6 +172,27 @@ const HTTP_ERROR_BODY_LIMIT: usize = 64 * 1024;
 /// concurrently-started child turns. Reqwest negotiates HTTP/2 through ALPN;
 /// this only changes transport reuse, never request bodies or headers.
 pub(crate) const PROVIDER_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Transport keep-alives keep a pooled provider connection live across normal
+/// idle/tool gaps and surface a dead NAT mapping before the next request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProviderKeepAliveConfig {
+    pub(crate) http2_interval: Duration,
+    pub(crate) http2_while_idle: bool,
+    pub(crate) tcp_interval: Duration,
+}
+
+pub(crate) const PROVIDER_KEEP_ALIVE: ProviderKeepAliveConfig = ProviderKeepAliveConfig {
+    http2_interval: Duration::from_secs(30),
+    http2_while_idle: true,
+    tcp_interval: Duration::from_secs(30),
+};
+
+fn provider_http_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .http2_keep_alive_interval(PROVIDER_KEEP_ALIVE.http2_interval)
+        .http2_keep_alive_while_idle(PROVIDER_KEEP_ALIVE.http2_while_idle)
+        .tcp_keepalive(PROVIDER_KEEP_ALIVE.tcp_interval)
+}
 
 /// Digests Haider-owned tool definitions after recursively sorting object
 /// keys in their schemas.

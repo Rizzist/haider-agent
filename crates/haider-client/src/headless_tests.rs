@@ -1,11 +1,101 @@
 #![allow(clippy::expect_used)]
 
 use super::{
-    EnsureOptions, HeadlessAttachment, HeadlessRunError, HeadlessSessionConfig,
+    BufferedWireFrames, EnsureOptions, HEADLESS_EVENT_MEMORY_THRESHOLD_BYTES, HeadlessAttachment,
+    HeadlessEventLedgerWriter, HeadlessRunError, HeadlessRunEventStorage, HeadlessSessionConfig,
     headless_submit_body, load_attachment, load_pdf_attachment, normalize_session_config_features,
 };
-use haider_rpc::haider_protocol::ids::SessionId;
+use haider_rpc::haider_protocol::envelope::RawEnvelope;
+use haider_rpc::haider_protocol::ids::{RunId, SessionId};
 use haider_rpc::{CommandId, RequestBody};
+
+fn spool_test_envelope(seq: u64, payload: serde_json::Value) -> RawEnvelope {
+    serde_json::from_value(serde_json::json!({
+        "schema_version": 1,
+        "event_id": format!("spool-event-{seq}"),
+        "seq": seq,
+        "session_id": "spool-session",
+        "run_id": "spool-run",
+        "device_id": "spool-device",
+        "authority_epoch": 1,
+        "worker_generation": 1,
+        "committed_at_ms": seq,
+        "render": {"ui": true, "durable": true, "prompt": "omit"},
+        "payload": payload,
+    }))
+    .expect("raw spool envelope")
+}
+
+#[test]
+fn memory_and_forced_spool_ledgers_serialize_to_identical_bytes() {
+    let run_id = RunId::new("spool-run");
+    let envelopes = vec![
+        spool_test_envelope(1, serde_json::json!({"type": "one", "value": 1})),
+        spool_test_envelope(2, serde_json::json!({"type": "two", "value": 2})),
+    ];
+    let mut memory = HeadlessEventLedgerWriter::new(false);
+    let mut spool = HeadlessEventLedgerWriter::new(true);
+    for envelope in &envelopes {
+        memory.record(envelope);
+        spool.record(envelope);
+    }
+    let memory = memory
+        .finish(run_id.clone(), envelopes.len())
+        .expect("memory ledger");
+    let spool = spool
+        .finish(run_id, envelopes.len())
+        .expect("forced spool ledger");
+
+    assert!(matches!(
+        &memory.storage,
+        HeadlessRunEventStorage::Memory(_)
+    ));
+    assert!(matches!(&spool.storage, HeadlessRunEventStorage::Spool(_)));
+    assert_eq!(
+        serde_json::to_vec(&memory).expect("serialize memory ledger"),
+        serde_json::to_vec(&spool).expect("serialize spool ledger")
+    );
+}
+
+#[test]
+fn threshold_spill_moves_the_complete_prefix_and_preserves_order() {
+    let envelopes = vec![
+        spool_test_envelope(1, serde_json::json!({"type": "before"})),
+        spool_test_envelope(
+            2,
+            serde_json::json!({
+                "type": "large",
+                "value": "x".repeat(HEADLESS_EVENT_MEMORY_THRESHOLD_BYTES),
+            }),
+        ),
+        spool_test_envelope(3, serde_json::json!({"type": "after"})),
+    ];
+    let mut writer = HeadlessEventLedgerWriter::new(false);
+    for envelope in &envelopes {
+        writer.record(envelope);
+    }
+    let ledger = writer
+        .finish(RunId::new("spool-run"), envelopes.len())
+        .expect("threshold-spilled ledger");
+    assert!(matches!(&ledger.storage, HeadlessRunEventStorage::Spool(_)));
+    let replayed = ledger
+        .iter()
+        .expect("spool reader")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("complete spool");
+    assert_eq!(replayed, envelopes);
+}
+
+#[test]
+fn empty_replay_buffer_is_lazy_even_when_read_or_cleared() {
+    let mut buffered = BufferedWireFrames::new();
+    assert!(buffered.file.is_none());
+    assert!(buffered.cleanup.is_none());
+    assert_eq!(buffered.reader().expect("empty reader").count(), 0);
+    buffered.clear().expect("clear empty replay buffer");
+    assert!(buffered.file.is_none());
+    assert!(buffered.cleanup.is_none());
+}
 
 /// MUTATION CHECK: restore the client-only `session_account_select_v1`
 /// requirement and its bare `missing_feature` failure. This assertion then

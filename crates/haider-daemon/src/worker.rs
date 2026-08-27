@@ -154,7 +154,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 
 const MANAGER_CAPACITY: usize = 128;
@@ -2810,6 +2810,41 @@ impl<T> FutureTurn for T where
 {
 }
 
+type ActiveQueuedBudgetArm = QueuedBudgetArm<Result<HeadlessBudgetExpiry, HaiderError>>;
+
+pub(crate) struct QueuedBudgetArm<T> {
+    active_run: RunId,
+    queue_epoch: u64,
+    future: Pin<Box<dyn std::future::Future<Output = T> + Send>>,
+}
+
+impl<T> QueuedBudgetArm<T> {
+    pub(crate) fn new(
+        active_run: RunId,
+        queue_epoch: u64,
+        future: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> Self {
+        Self {
+            active_run,
+            queue_epoch,
+            future: Box::pin(future),
+        }
+    }
+
+    pub(crate) fn matches(&self, active_run: &RunId, queue_epoch: u64) -> bool {
+        self.active_run == *active_run && self.queue_epoch == queue_epoch
+    }
+
+    pub(crate) fn future_mut(&mut self) -> Pin<&mut (dyn std::future::Future<Output = T> + Send)> {
+        self.future.as_mut()
+    }
+}
+
+pub(crate) fn signal_queued_budget_change(queue_epoch: &mut u64, queue_changed: &Notify) {
+    *queue_epoch = queue_epoch.wrapping_add(1);
+    queue_changed.notify_waiters();
+}
+
 /// One session's turn loop: strictly serial turns from the bounded queue,
 /// with four live inputs while a turn runs — submissions (queued behind the
 /// active run), the hub's cancellation wake (durable `Cancelling` reconciled
@@ -2847,6 +2882,11 @@ async fn run_supervisor(
     let mut parked_checkpoint = false;
     let mut rescan_needed = false;
     let mut deferred_shell = VecDeque::<PendingShellExec>::new();
+    // The queued-budget scan/timer survives unrelated select re-entry. Only a
+    // queue mutation advances the epoch and installs a freshly scanned arm.
+    let queue_changed = Arc::new(Notify::new());
+    let mut queue_epoch = 0_u64;
+    let mut queued_budget_arm = None::<ActiveQueuedBudgetArm>;
     // A nudge's accepted user-message sequence is its process-stable delivery
     // key. Existing messages are already part of a restarted turn's compiled
     // prompt; new messages are inserted when they cross into the live harness.
@@ -2864,6 +2904,9 @@ async fn run_supervisor(
     }
 
     loop {
+        if active.is_none() {
+            queued_budget_arm = None;
+        }
         if active.is_none() && !stopping {
             if let Some(pending) = deferred_shell.pop_front() {
                 if let Err(error) = perform_shell_exec(
@@ -3111,6 +3154,26 @@ async fn run_supervisor(
         if let Some(turn) = active.as_mut() {
             let active_run = turn.run_id.clone();
             let active_cancel = turn.cancel.clone();
+            if queued_budget_arm
+                .as_ref()
+                .is_none_or(|arm| !arm.matches(&active_run, queue_epoch))
+            {
+                let future = wait_for_queued_headless_budget(
+                    lease.clone(),
+                    active_run.clone(),
+                    Arc::clone(&queue_changed),
+                );
+                queued_budget_arm = Some(QueuedBudgetArm::new(
+                    active_run.clone(),
+                    queue_epoch,
+                    future,
+                ));
+            }
+            let Some(queued_budget) = queued_budget_arm.as_mut() else {
+                tracing::error!(%active_run, "queued headless budget arm could not be installed");
+                let _ = lease.unregister_worker().await;
+                return false;
+            };
             tokio::select! {
                 biased;
                 exhausted = wait_for_budget(&mut turn.budget) => {
@@ -3146,7 +3209,7 @@ async fn run_supervisor(
                         }
                     }
                 }
-                queued_expiry = wait_for_queued_headless_budget(lease.clone(), active_run.clone()) => {
+                queued_expiry = queued_budget.future_mut() => {
                     let terminalized = match queued_expiry {
                         Ok(expiry) => terminalize_queued_budget_expiry(
                             &mut queue,
@@ -3158,7 +3221,9 @@ async fn run_supervisor(
                         Err(error) => Err(error),
                     };
                     match terminalized {
-                        Ok(()) => {}
+                        Ok(()) => {
+                            signal_queued_budget_change(&mut queue_epoch, &queue_changed);
+                        }
                         Err(error) => {
                             tracing::error!(?error, "queued headless budget could not be terminalized");
                             let _ = lease.unregister_worker().await;
@@ -3169,7 +3234,7 @@ async fn run_supervisor(
                 command = commands.recv() => {
                     match command {
                         Some(SupervisorCommand::Submit(pending)) => {
-                            admit_pending(
+                            if admit_pending(
                                 &mut queue,
                                 &mut rescan_needed,
                                 &lease,
@@ -3177,7 +3242,9 @@ async fn run_supervisor(
                                 &event_ids,
                                 Some(&active_run),
                                 *pending,
-                            ).await;
+                            ).await {
+                                signal_queued_budget_change(&mut queue_epoch, &queue_changed);
+                            }
                         }
                         Some(SupervisorCommand::WakeRetry {
                             run_id,
@@ -3261,7 +3328,7 @@ async fn run_supervisor(
                             } else {
                                 active_cancel.cancel();
                             }
-                            cancel_durable_queued_turns(
+                            let cancelled = cancel_durable_queued_turns(
                                 &mut queue,
                                 &lease,
                                 &device_id,
@@ -3269,18 +3336,23 @@ async fn run_supervisor(
                                 Some(&active_run),
                             )
                             .await;
+                            if cancelled.is_some() {
+                                signal_queued_budget_change(&mut queue_epoch, &queue_changed);
+                            }
                         }
                     }
                 }
                 changed = cancellation_wakes.changed() => {
                     if changed.is_ok() {
-                        reconcile_durable_cancellations(
+                        if reconcile_durable_cancellations(
                             &mut queue,
                             &lease,
                             &device_id,
                             &event_ids,
                             Some((&active_run, &active_cancel)),
-                        ).await;
+                        ).await {
+                            signal_queued_budget_change(&mut queue_epoch, &queue_changed);
+                        }
                     }
                 }
                 outcome = turn.outcome.as_mut() => {
@@ -3586,7 +3658,7 @@ async fn run_supervisor(
             tokio::select! {
                 command = commands.recv() => match command {
                     Some(SupervisorCommand::Submit(pending)) => {
-                        admit_pending(
+                        if admit_pending(
                             &mut queue,
                             &mut rescan_needed,
                             &lease,
@@ -3594,7 +3666,9 @@ async fn run_supervisor(
                             &event_ids,
                             None,
                             *pending,
-                        ).await;
+                        ).await {
+                            signal_queued_budget_change(&mut queue_epoch, &queue_changed);
+                        }
                     }
                     Some(SupervisorCommand::WakeRetry { completed, .. }) => {
                         // The backoff ended between receipt commit and worker
@@ -3667,6 +3741,7 @@ async fn run_supervisor(
                             None,
                         ).await;
                         if last.is_some() {
+                            signal_queued_budget_change(&mut queue_epoch, &queue_changed);
                             let _ = append_session_idle(&lease, &device_id, &event_ids, true)
                                 .await;
                         }
@@ -3674,13 +3749,15 @@ async fn run_supervisor(
                 },
                 changed = cancellation_wakes.changed() => {
                     if changed.is_ok() {
-                        reconcile_durable_cancellations(
+                        if reconcile_durable_cancellations(
                             &mut queue,
                             &lease,
                             &device_id,
                             &event_ids,
                             None,
-                        ).await;
+                        ).await {
+                            signal_queued_budget_change(&mut queue_epoch, &queue_changed);
+                        }
                     }
                 }
             }
@@ -3745,8 +3822,9 @@ async fn admit_pending(
     event_ids: &EventIdGenerator,
     active_run: Option<&RunId>,
     mut pending: PendingTurn,
-) {
+) -> bool {
     if pending.checkpoint.is_some() || pending.child_wait.is_some() {
+        let queue_changed = queue.len() < SUPERVISOR_CAPACITY;
         if queue.len() < SUPERVISOR_CAPACITY {
             queue.push_back(pending);
         } else if let Some(ready) = pending.recovery_ready.take() {
@@ -3756,14 +3834,18 @@ async fn admit_pending(
                 true,
             )));
         }
-        return;
+        return queue_changed;
     }
     let run_id = pending.accepted.run_id.clone();
     let branch_id = pending.accepted.branch_id.clone();
-    let state = durable_runs(store).await.ok().and_then(|runs| {
-        runs.into_iter()
-            .find_map(|(candidate, state, _, _, _)| (candidate == run_id).then_some(state))
-    });
+    let (state, scan_failed) = match durable_runs(store).await {
+        Ok(runs) => (
+            runs.into_iter()
+                .find_map(|(candidate, state, _, _, _)| (candidate == run_id).then_some(state)),
+            false,
+        ),
+        Err(_) => (None, true),
+    };
     match state {
         Some(RunState::Queued) => {
             if active_run == Some(&run_id)
@@ -3772,7 +3854,7 @@ async fn admit_pending(
                 if let Some(ready) = pending.recovery_ready.take() {
                     let _ = ready.send(Ok(()));
                 }
-                return;
+                return false;
             }
             if queue.len() < SUPERVISOR_CAPACITY {
                 if let Some(ready) = pending.recovery_ready.take() {
@@ -3783,6 +3865,7 @@ async fn admit_pending(
                     let _ = ready.send(Ok(()));
                 }
                 queue.push_back(pending);
+                true
             } else if pending.recovering {
                 let error = HaiderError::new(
                     ErrorCode::Busy,
@@ -3818,10 +3901,12 @@ async fn admit_pending(
                 if let Some(ready) = pending.recovery_ready.take() {
                     let _ = ready.send(terminalized);
                 }
+                true
             } else {
                 // The durable Queued/UserMessage pair is the overflow buffer.
                 // A later completion refills from the journal.
                 *rescan_needed = true;
+                true
             }
         }
         Some(RunState::Cancelling) => {
@@ -3849,12 +3934,14 @@ async fn admit_pending(
             if let Some(ready) = pending.recovery_ready.take() {
                 let _ = ready.send(terminalized);
             }
+            true
         }
         _ => {
             // Receipt replays for active or terminal runs are response-only.
             if let Some(ready) = pending.recovery_ready.take() {
                 let _ = ready.send(Ok(()));
             }
+            scan_failed
         }
     }
 }
@@ -3906,12 +3993,15 @@ async fn reconcile_durable_cancellations(
     device_id: &DeviceId,
     event_ids: &EventIdGenerator,
     active: Option<(&RunId, &CancelToken)>,
-) {
+) -> bool {
     let Ok(runs) = durable_runs(store).await else {
-        return;
+        // The watch version proves durable state changed even when the read
+        // failed. Re-arm so the next select entry repairs from the journal.
+        return true;
     };
     let active_run = active.map(|(run_id, _)| run_id);
     let mut terminalized = Vec::new();
+    let mut queue_change_observed = false;
     for (run_id, state, _, branch_id, _) in runs {
         if state != RunState::Cancelling {
             continue;
@@ -3922,6 +4012,9 @@ async fn reconcile_durable_cancellations(
             }
             continue;
         }
+        // A formerly queued run is durably Cancelling. Even if terminalizing
+        // it fails, the budget arm must rescan and stop treating it as queued.
+        queue_change_observed = true;
         match durable_user_command_scope(store, &run_id).await {
             Ok(Some(scope)) => {
                 let payloads = cancelled_resumption_payloads(store, store.session_id(), &run_id)
@@ -3971,6 +4064,7 @@ async fn reconcile_durable_cancellations(
     if !terminalized.is_empty() {
         let _ = append_session_idle(store, device_id, event_ids, true).await;
     }
+    queue_change_observed
 }
 
 const RUN_HEADS_PROJECTION: &str = "run_heads_v1";
@@ -7555,6 +7649,7 @@ async fn wait_for_startup_headless_budget(
 async fn wait_for_queued_headless_budget(
     store: HubStoreHandle,
     active_run: RunId,
+    queue_changed: Arc<Notify>,
 ) -> Result<HeadlessBudgetExpiry, HaiderError> {
     loop {
         let mut earliest = None;
@@ -7585,12 +7680,18 @@ async fn wait_for_queued_headless_budget(
             }
         }
         let Some((deadline_ms, run_id, branch_id, context)) = earliest else {
-            return std::future::pending().await;
+            queue_changed.notified().await;
+            continue;
         };
-        tokio::time::sleep(Duration::from_millis(
-            deadline_ms.saturating_sub(unix_time_ms()),
-        ))
-        .await;
+        if wait_for_queued_budget_deadline_or_change(
+            Duration::from_millis(deadline_ms.saturating_sub(unix_time_ms())),
+            &queue_changed,
+        )
+        .await
+            == QueuedBudgetWake::QueueChanged
+        {
+            continue;
+        }
         if let Some(exhausted) =
             check_run_budget(&store, &run_id, &context.spec, context.accepted_at_ms).await?
         {
@@ -7601,6 +7702,22 @@ async fn wait_for_queued_headless_budget(
                 fact_persisted: false,
             });
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueuedBudgetWake {
+    Deadline,
+    QueueChanged,
+}
+
+pub(crate) async fn wait_for_queued_budget_deadline_or_change(
+    delay: Duration,
+    queue_changed: &Notify,
+) -> QueuedBudgetWake {
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => QueuedBudgetWake::Deadline,
+        _ = queue_changed.notified() => QueuedBudgetWake::QueueChanged,
     }
 }
 

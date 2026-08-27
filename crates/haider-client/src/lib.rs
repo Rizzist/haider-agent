@@ -49,15 +49,16 @@ pub use graph::{
 pub use haider_rpc::{WorkflowInstanceSourceV1, WorkflowInstanceV1};
 pub use headless::{
     DEFAULT_TERMINAL_GRACE, ERROR_CODE_NO_ACTIVE_ACCOUNT, ERROR_CODE_NO_DEFAULT_MODEL,
-    HeadlessAttachment, HeadlessBackgroundTask, HeadlessBlockingReason, HeadlessEvent,
-    HeadlessFailureCode, HeadlessFileAttachment, HeadlessImageAttachment, HeadlessOutcome,
-    HeadlessPdfAttachment, HeadlessPermissionDenial, HeadlessRunError, HeadlessRunEventReader,
-    HeadlessRunEvents, HeadlessRunFailure, HeadlessRunRequest, HeadlessRunResult,
-    HeadlessRunStatus, HeadlessRunStopResult, HeadlessSessionConfig, headless_run_events,
-    headless_run_status, load_attachment, load_image_attachment, load_pdf_attachment,
-    load_text_attachment, required_headless_features, required_headless_features_with_attachments,
+    HEADLESS_EVENT_MEMORY_THRESHOLD_BYTES, HeadlessAttachment, HeadlessBackgroundTask,
+    HeadlessBlockingReason, HeadlessEvent, HeadlessEventMode, HeadlessFailureCode,
+    HeadlessFileAttachment, HeadlessImageAttachment, HeadlessOutcome, HeadlessPdfAttachment,
+    HeadlessPermissionDenial, HeadlessRunError, HeadlessRunEventReader, HeadlessRunEvents,
+    HeadlessRunFailure, HeadlessRunRequest, HeadlessRunResult, HeadlessRunStatus,
+    HeadlessRunStopResult, HeadlessSessionConfig, headless_run_events, headless_run_status,
+    load_attachment, load_image_attachment, load_pdf_attachment, load_text_attachment,
+    required_headless_features, required_headless_features_with_attachments,
     required_headless_features_with_hook_trust, run_headless, run_headless_with_session_config,
-    stop_headless_run,
+    run_headless_with_session_config_and_event_mode, stop_headless_run,
 };
 pub use observe::{
     DescendantLiveAttachment, DescendantView, ObserveClient, ObserveError, observe_stream_all,
