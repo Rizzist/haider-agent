@@ -29,7 +29,13 @@ async fn seeding_is_absent_only_and_never_clobbers_a_user_revision() {
     let mut revised = scout.clone();
     revised.job = "my own scout brief".into();
     store
-        .loom_register_agent_type(revised)
+        .loom_register_agent_type_with_install_cas(
+            revised,
+            haider_protocol::loom::LoomRevisionExpectation {
+                rev: scout.rev,
+                digest: Some(scout.digest()),
+            },
+        )
         .await
         .expect("user revision");
     seed_loom_registry(&store).await.expect("re-seed");

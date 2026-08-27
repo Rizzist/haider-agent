@@ -6,7 +6,9 @@
 
 use crate::typed_agent_installer::TypedAgentCliInstaller;
 use async_trait::async_trait;
-use haider_core::{SqliteStoreHandle, TypedAgentInstallCas, TypedAgentInstallItemCas};
+use haider_core::{
+    LoomRegistryMutation, SqliteStoreHandle, TypedAgentInstallCas, TypedAgentInstallItemCas,
+};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::typed_agent::{
     TypedAgentInstallItem, TypedAgentInstallJob, TypedAgentInstallState,
@@ -59,8 +61,24 @@ async fn resume_pending_installs_with(
         .map(|record| (record.id.clone(), (record.rev, record.digest())))
         .collect::<HashMap<_, _>>();
     for record in types {
-        if let Err(error) = store.loom_register_agent_type_with_install(record).await {
-            tracing::warn!(%error, "cannot backfill typed-agent required-CLI install job");
+        let expected = haider_protocol::loom::LoomRevisionExpectation {
+            rev: record.rev,
+            digest: Some(record.digest()),
+        };
+        match store
+            .loom_register_agent_type_with_install_cas(record, expected)
+            .await
+        {
+            Ok(LoomRegistryMutation::Applied { .. }) => {}
+            Ok(LoomRegistryMutation::Conflict(conflict)) => {
+                tracing::warn!(
+                    ?conflict,
+                    "typed-agent required-CLI backfill lost its registry CAS"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%error, "cannot backfill typed-agent required-CLI install job");
+            }
         }
     }
     let jobs = match store.typed_agent_install_jobs(None, None).await {

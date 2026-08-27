@@ -136,6 +136,16 @@ pub(crate) fn prepare_typed_dispatch(
         match job.state {
             TypedAgentInstallState::Succeeded => {}
             TypedAgentInstallState::Failed => {
+                if job.cancelled {
+                    return Err(TypedAgentDispatchRefusal {
+                        code: "typed_agent_install_cancelled",
+                        message: format!(
+                            "required-CLI installation {} was cancelled; retry it before dispatch",
+                            job.job_id
+                        ),
+                        install_job: Some(job),
+                    });
+                }
                 return Err(TypedAgentDispatchRefusal {
                     code: "typed_agent_install_failed",
                     message: job.error.clone().unwrap_or_else(|| {

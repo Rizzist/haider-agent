@@ -100,8 +100,8 @@
     {
       "request_method": "loom.list",
       "response_method": "loom.list",
-      "request": {"method":"loom.list"},
-      "response": {"method":"loom.list","workflow_catalog":[{"origin":"built_in","id":"catalog-one","main_session_eligible":true,"template":{"name":"catalog-one","version":1,"nodes":[]}}]}
+      "request": {"method":"loom.list","include_archived":true},
+      "response": {"method":"loom.list","workflow_catalog":[{"origin":"built_in","id":"catalog-one","main_session_eligible":true,"template":{"name":"catalog-one","version":1,"nodes":[]}}],"archived_entries":[{"kind":"agent_type","id":"archived-reviewer","rev":2,"digest":"0123456789abcdef0123456789abcdef","archived":true}]}
     },
     {
       "request_method": "loom.install.retry",
@@ -124,13 +124,13 @@
     {
       "request_method": "loom.register_agent_type",
       "response_method": "loom.registered",
-      "request": {"method":"loom.register_agent_type","record":{"id":"reviewer","name":"Reviewer","job":"Review changes","in_type":"Patch","out_type":"Verdict","clis":["rg"],"rev":0}},
+      "request": {"method":"loom.register_agent_type","record":{"id":"reviewer","name":"Reviewer","job":"Review changes","in_type":"Patch","out_type":"Verdict","clis":["rg"],"rev":0},"expected_rev":0},
       "response": {"method":"loom.registered","registration":{"id":"reviewer","rev":1,"digest":"digest-agent","updated":true},"install_job_id":"install:reviewer:1"}
     },
     {
       "request_method": "loom.register_workflow",
       "response_method": "loom.registered",
-      "request": {"method":"loom.register_workflow","source":"review: Patch -> Verdict\ncheck @reviewer \"Review\" | ship"},
+      "request": {"method":"loom.register_workflow","source":"review: Patch -> Verdict\ncheck @reviewer \"Review\" | ship","expected_rev":0},
       "response": {"method":"loom.registered","registration":{"id":"review","rev":1,"digest":"digest-workflow","updated":true}}
     },
     {
@@ -322,8 +322,38 @@
     {
       "request_method": "loom.author.confirm",
       "response_method": "loom.author.confirm",
-      "request": {"method":"loom.author.confirm","authoring_id":"loom-author-1","expected_revision":2,"kind":"workflow","text":"{\n  \"kind\": \"workflow\",\n  \"id\": \"research-review-publish\",\n  \"in_type\": \"Artifact\",\n  \"out_type\": \"Artifact\",\n  \"nodes\": [{\"id\":\"publish\",\"agent_type\":null,\"task\":\"publish\",\"in_type\":\"Artifact\",\"out_type\":\"Artifact\",\"gate\":\"command\",\"depends_on\":[],\"back_edge\":null,\"evidence\":{\"protocol\":\"instruct_pipe_v1\",\"tool\":\"graph_evidence\",\"required_green\":1}}]\n}"},
+      "request": {"method":"loom.author.confirm","authoring_id":"loom-author-1","expected_revision":2,"kind":"workflow","text":"{\n  \"kind\": \"workflow\",\n  \"id\": \"research-review-publish\",\n  \"in_type\": \"Artifact\",\n  \"out_type\": \"Artifact\",\n  \"nodes\": [{\"id\":\"publish\",\"agent_type\":null,\"task\":\"publish\",\"in_type\":\"Artifact\",\"out_type\":\"Artifact\",\"gate\":\"command\",\"depends_on\":[],\"back_edge\":null,\"evidence\":{\"protocol\":\"instruct_pipe_v1\",\"tool\":\"graph_evidence\",\"required_green\":1}}]\n}","expected_rev":0},
       "response": {"method":"loom.author.confirm","confirmed":{"authoring_id":"loom-author-1","kind":"workflow","canonical_text":"{\n  \"kind\": \"workflow\",\n  \"id\": \"research-review-publish\",\n  \"in_type\": \"Artifact\",\n  \"out_type\": \"Artifact\",\n  \"nodes\": [\n    {\n      \"id\": \"publish\",\n      \"task\": \"publish\",\n      \"in_type\": \"Artifact\",\n      \"out_type\": \"Artifact\",\n      \"gate\": \"command\",\n      \"depends_on\": [],\n      \"evidence\": {\n        \"protocol\": \"instruct_pipe_v1\",\n        \"tool\": \"graph_evidence\",\n        \"required_green\": 1\n      }\n    }\n  ]\n}","registration":{"id":"research-review-publish","rev":1,"digest":"0123456789abcdef0123456789abcdef","updated":true},"execution_digest":"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"}}
+    },
+    {
+      "request_method": "loom.install.cancel",
+      "response_method": "loom.install.cancel",
+      "request": {"method":"loom.install.cancel","install_job_id":"install-job-1"},
+      "response": {"method":"loom.install.cancel","receipt":{"install_job_id":"install-job-1","outcome":{"status":"cancelled"}}}
+    },
+    {
+      "request_method": "loom.archive",
+      "response_method": "loom.archive",
+      "request": {"method":"loom.archive","kind":"agent_type","id":"reviewer","expected_rev":3,"expected_digest":"digest-reviewer-3"},
+      "response": {"method":"loom.archive","receipt":{"kind":"agent_type","id":"reviewer","outcome":{"status":"changed","entry":{"kind":"agent_type","id":"reviewer","rev":3,"digest":"digest-reviewer-3","archived":true}}}}
+    },
+    {
+      "request_method": "loom.unarchive",
+      "response_method": "loom.unarchive",
+      "request": {"method":"loom.unarchive","kind":"workflow","id":"review","expected_rev":2,"expected_digest":"digest-review-2"},
+      "response": {"method":"loom.unarchive","receipt":{"kind":"workflow","id":"review","outcome":{"status":"changed","entry":{"kind":"workflow","id":"review","rev":2,"digest":"digest-review-2","archived":false}}}}
+    },
+    {
+      "request_method": "loom.validate",
+      "response_method": "loom.validate",
+      "request": {"method":"loom.validate","kind":"agent_type","text":"{\"kind\":\"agent_type\",\"id\":\"reviewer\",\"name\":\"Reviewer\",\"job\":\"Review\",\"in_type\":\"Patch\",\"out_type\":\"Verdict\",\"capability_keys\":[],\"grants\":[],\"denials\":[],\"skills\":[],\"scripts\":[],\"color\":\"\",\"glyph\":\"\"}"},
+      "response": {"method":"loom.validate","canonical_digest":"0123456789abcdef0123456789abcdef"}
+    },
+    {
+      "request_method": "loom.watch",
+      "response_method": "loom.watch",
+      "request": {"method":"loom.watch","after_cursor":41},
+      "response": {"method":"loom.watch","watch_id":"loom-watch-1","requested_after_cursor":41,"baseline":{"through_cursor":44,"entries":[{"entry":{"kind":"agent_type","id":"reviewer","rev":3,"digest":"digest-reviewer-3","archived":true},"record":{"kind":"agent_type","record":{"id":"reviewer","name":"Reviewer","job":"Review changes","in_type":"Patch","out_type":"Verdict","clis":["rg"],"color":"#445566","glyph":"R","rev":3}}}]}}
     }
   ]
 }

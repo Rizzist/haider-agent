@@ -37,6 +37,7 @@ fn job(record: &LoomAgentType, state: TypedAgentInstallState) -> TypedAgentInsta
         agent_type_rev: record.rev,
         agent_type_digest: record.digest(),
         state,
+        cancelled: false,
         progress: TypedAgentInstallProgress {
             total: 1,
             completed: u16::from(matches!(

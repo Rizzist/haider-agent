@@ -494,19 +494,41 @@ async fn issue(
         return false;
     }
     let context = CommandContext::of(&command);
-    if let Some((generation, epoch)) = context.loom_authoring
-        && !client
-            .welcome()
-            .features
-            .contains(haider_rpc::FEATURE_LOOM_AUTHORING_V1)
-    {
-        let _ = replies
-            .send(LiveReply::LoomAuthorFailed {
-                generation,
-                epoch,
-                message: "connected daemon does not advertise loom_authoring_v1".to_owned(),
-            })
-            .await;
+    let loom_required_features: &[&str] = match &command {
+        LiveCommand::LoomAuthorDraft { .. } | LiveCommand::LoomAuthorRevise { .. } => {
+            &[haider_rpc::FEATURE_LOOM_AUTHORING_V1]
+        }
+        LiveCommand::LoomAuthorConfirm { .. } => &[
+            haider_rpc::FEATURE_LOOM_AUTHORING_V1,
+            haider_rpc::FEATURE_LOOM_REGISTRY_CAS_V1,
+        ],
+        LiveCommand::LoomValidate { .. } => &[haider_rpc::FEATURE_LOOM_VALIDATION_V1],
+        LiveCommand::LoomArchive { .. } => &[haider_rpc::FEATURE_LOOM_REGISTRY_ARCHIVE_V1],
+        LiveCommand::LoomInstallCancel { .. } => {
+            &[haider_rpc::FEATURE_TYPED_AGENT_INSTALL_CANCEL_V1]
+        }
+        LiveCommand::LoomInstallStatus { .. } => &[haider_rpc::FEATURE_TYPED_AGENT_INSTALL_V1],
+        _ => &[],
+    };
+    let missing_loom_feature = loom_required_features
+        .iter()
+        .copied()
+        .find(|feature| !client.welcome().features.contains(*feature));
+    if let Some(feature) = missing_loom_feature {
+        let message = format!("connected daemon does not advertise {feature}");
+        if let Some((generation, epoch)) = context.loom_authoring {
+            let _ = replies
+                .send(LiveReply::LoomAuthorFailed {
+                    generation,
+                    epoch,
+                    message,
+                })
+                .await;
+        } else if let Some(epoch) = context.loom_archive_epoch {
+            let _ = replies
+                .send(LiveReply::LoomArchiveFailed { epoch, message })
+                .await;
+        }
         return false;
     }
     let is_attach = context.attach.is_some();
@@ -649,10 +671,16 @@ pub struct CommandContext {
     /// Round 4: the connection epoch a `loom.list` was issued under — the
     /// reply echoes it so a read that crossed a reconnect installs nothing.
     loom_epoch: Option<u64>,
+    /// Epoch fence for one archive mutation. Kept distinct from loom.list so
+    /// a conflict cannot masquerade as a failed inventory read.
+    loom_archive_epoch: Option<u64>,
     /// This request belongs to the typed Loom authoring editor. These RPCs
     /// deliberately carry no durable command id, so a wire failure must be
     /// routed back to the editor to release its pending latch.
     loom_authoring: Option<(u64, u64)>,
+    /// Exact job filter for an install-status read. The response can be
+    /// empty, so the requested identity cannot be reconstructed from it.
+    loom_install_status: Option<(u64, u64, String)>,
 }
 
 impl CommandContext {
@@ -737,6 +765,10 @@ impl CommandContext {
                 LiveCommand::LoomList { epoch } => Some(*epoch),
                 _ => None,
             },
+            loom_archive_epoch: match command {
+                LiveCommand::LoomArchive { epoch, .. } => Some(*epoch),
+                _ => None,
+            },
             loom_authoring: match command {
                 LiveCommand::LoomAuthorDraft {
                     generation, epoch, ..
@@ -746,7 +778,24 @@ impl CommandContext {
                 }
                 | LiveCommand::LoomAuthorConfirm {
                     generation, epoch, ..
+                }
+                | LiveCommand::LoomValidate {
+                    generation, epoch, ..
+                }
+                | LiveCommand::LoomInstallCancel {
+                    generation, epoch, ..
+                }
+                | LiveCommand::LoomInstallStatus {
+                    generation, epoch, ..
                 } => Some((*generation, *epoch)),
+                _ => None,
+            },
+            loom_install_status: match command {
+                LiveCommand::LoomInstallStatus {
+                    generation,
+                    epoch,
+                    job_id,
+                } => Some((*generation, *epoch, job_id.clone())),
                 _ => None,
             },
         }
@@ -1034,7 +1083,9 @@ pub fn request_body_for_features(
             after_cursor,
             limit: crate::live::WORKFLOW_GRAPH_WATCH_PAGE,
         },
-        LiveCommand::LoomList { .. } => RequestBody::LoomList {},
+        LiveCommand::LoomList { .. } => RequestBody::LoomList {
+            include_archived: false,
+        },
         LiveCommand::LoomAuthorDraft {
             session,
             kind,
@@ -1062,12 +1113,36 @@ pub fn request_body_for_features(
             expected_revision,
             kind,
             text,
+            expected_rev,
+            expected_digest,
             ..
         } => RequestBody::LoomAuthorConfirm {
             authoring_id,
             expected_revision,
             kind,
             text,
+            expected_rev: Some(expected_rev),
+            expected_digest,
+        },
+        LiveCommand::LoomValidate { kind, text, .. } => RequestBody::LoomValidate { kind, text },
+        LiveCommand::LoomArchive {
+            kind,
+            id,
+            expected_rev,
+            expected_digest,
+            ..
+        } => RequestBody::LoomArchive {
+            kind,
+            id,
+            expected_rev,
+            expected_digest: Some(expected_digest),
+        },
+        LiveCommand::LoomInstallCancel { job_id, .. } => RequestBody::LoomInstallCancel {
+            install_job_id: job_id,
+        },
+        LiveCommand::LoomInstallStatus { job_id, .. } => RequestBody::LoomInstallStatus {
+            job_id: Some(job_id),
+            agent_type_id: None,
         },
         LiveCommand::OpenPermissionSettings {
             session,
@@ -1552,6 +1627,7 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             workflows,
             cli_present,
             workflow_catalog,
+            archived_entries: _,
         } => vec![LiveReply::LoomRegistry {
             agent_types,
             workflows,
@@ -1578,6 +1654,46 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                     epoch,
                     confirmed,
                     errors,
+                }]
+            }),
+        ResponseBody::LoomValidate {
+            errors,
+            canonical_digest,
+        } => context
+            .loom_authoring
+            .map_or_else(Vec::new, |(generation, epoch)| {
+                vec![LiveReply::LoomValidated {
+                    generation,
+                    epoch,
+                    errors,
+                    canonical_digest,
+                }]
+            }),
+        ResponseBody::LoomArchive { receipt } => {
+            context.loom_archive_epoch.map_or_else(Vec::new, |epoch| {
+                vec![LiveReply::LoomArchived { epoch, receipt }]
+            })
+        }
+        ResponseBody::LoomInstallCancel { receipt } => {
+            context
+                .loom_authoring
+                .map_or_else(Vec::new, |(generation, epoch)| {
+                    vec![LiveReply::LoomInstallCancelled {
+                        generation,
+                        epoch,
+                        receipt,
+                    }]
+                })
+        }
+        ResponseBody::LoomInstallStatus { jobs, .. } => context
+            .loom_install_status
+            .clone()
+            .map_or_else(Vec::new, |(generation, epoch, job_id)| {
+                vec![LiveReply::LoomInstallStatus {
+                    generation,
+                    epoch,
+                    job_id,
+                    jobs,
                 }]
             }),
         ResponseBody::GraphStatus { status } => match context.graph.clone() {
@@ -2017,6 +2133,12 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 // latch instead of stranding /loom in a permanent LOADING.
                 if let Some(epoch) = context.loom_epoch {
                     return vec![LiveReply::LoomListFailed { epoch }];
+                }
+                if let Some(epoch) = context.loom_archive_epoch {
+                    return vec![LiveReply::LoomArchiveFailed {
+                        epoch,
+                        message: message.clone(),
+                    }];
                 }
                 if let Some((generation, epoch)) = context.loom_authoring {
                     return vec![LiveReply::LoomAuthorFailed {

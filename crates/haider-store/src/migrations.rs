@@ -14,7 +14,7 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 25;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 26;
 
 struct Migration {
     version: u32,
@@ -620,6 +620,38 @@ const MIGRATIONS: &[Migration] = &[
 
             CREATE INDEX workflow_node_states_session_phase
             ON workflow_node_states(session_id, phase, updated_seq DESC);
+        ",
+    },
+    Migration {
+        version: 26,
+        sql: "
+            ALTER TABLE loom_agent_types ADD COLUMN archived INTEGER NOT NULL DEFAULT 0
+                CHECK (archived IN (0, 1));
+            ALTER TABLE loom_workflows ADD COLUMN archived INTEGER NOT NULL DEFAULT 0
+                CHECK (archived IN (0, 1));
+
+            ALTER TABLE loom_cli_install_jobs ADD COLUMN cancelled INTEGER NOT NULL DEFAULT 0
+                CHECK (cancelled IN (0, 1));
+            ALTER TABLE loom_cli_install_events ADD COLUMN cancelled INTEGER NOT NULL DEFAULT 0
+                CHECK (cancelled IN (0, 1));
+
+            CREATE TABLE loom_registry_events (
+                cursor         INTEGER PRIMARY KEY AUTOINCREMENT CHECK (cursor > 0),
+                entry_kind     TEXT NOT NULL
+                    CHECK (entry_kind IN ('agent_type', 'workflow')),
+                entry_id       TEXT NOT NULL,
+                change_kind    TEXT NOT NULL
+                    CHECK (change_kind IN (
+                        'upserted', 'archived', 'unarchived', 'revision_added'
+                    )),
+                rev            INTEGER NOT NULL CHECK (rev > 0),
+                digest         TEXT NOT NULL CHECK (length(digest) = 32),
+                archived       INTEGER NOT NULL CHECK (archived IN (0, 1)),
+                created_at_ms  INTEGER NOT NULL CHECK (created_at_ms >= 0)
+            );
+
+            CREATE INDEX loom_registry_events_entry_cursor
+            ON loom_registry_events(entry_kind, entry_id, cursor);
         ",
     },
 ];

@@ -352,6 +352,31 @@ pub enum LiveCommand {
         expected_revision: u64,
         kind: haider_protocol::loom::LoomAuthorKind,
         text: String,
+        expected_rev: u32,
+        expected_digest: Option<String>,
+    },
+    LoomValidate {
+        generation: u64,
+        epoch: u64,
+        kind: haider_protocol::loom::LoomAuthorKind,
+        text: String,
+    },
+    LoomArchive {
+        epoch: u64,
+        kind: haider_protocol::loom::LoomRegistryEntryKind,
+        id: String,
+        expected_rev: u32,
+        expected_digest: String,
+    },
+    LoomInstallCancel {
+        generation: u64,
+        epoch: u64,
+        job_id: String,
+    },
+    LoomInstallStatus {
+        generation: u64,
+        epoch: u64,
+        job_id: String,
     },
     /// `graph.inspect` (M2c) — a ONE-SHOT paged read of graph telemetry
     /// (template rollups, tool-selection stats, evidence provenance with real
@@ -916,6 +941,10 @@ impl LiveCommand {
             | Self::LoomAuthorDraft { .. }
             | Self::LoomAuthorRevise { .. }
             | Self::LoomAuthorConfirm { .. }
+            | Self::LoomValidate { .. }
+            | Self::LoomArchive { .. }
+            | Self::LoomInstallCancel { .. }
+            | Self::LoomInstallStatus { .. }
             | Self::OpenPermissionSettings { .. }
             | Self::GraphInspect { .. }
             // A stage carries no durable identity BY DESIGN (see above).
@@ -979,6 +1008,31 @@ pub enum LiveReply {
         epoch: u64,
         confirmed: Option<haider_protocol::loom::LoomAuthorConfirmed>,
         errors: Vec<haider_protocol::loom::LoomAuthorValidationError>,
+    },
+    LoomValidated {
+        generation: u64,
+        epoch: u64,
+        errors: Vec<haider_protocol::loom::LoomAuthorValidationError>,
+        canonical_digest: Option<String>,
+    },
+    LoomArchived {
+        epoch: u64,
+        receipt: haider_rpc::LoomArchiveReceiptWire,
+    },
+    LoomArchiveFailed {
+        epoch: u64,
+        message: String,
+    },
+    LoomInstallCancelled {
+        generation: u64,
+        epoch: u64,
+        receipt: haider_rpc::TypedAgentInstallCancelReceiptWire,
+    },
+    LoomInstallStatus {
+        generation: u64,
+        epoch: u64,
+        job_id: String,
+        jobs: Vec<haider_protocol::typed_agent::TypedAgentInstallJob>,
     },
     LoomAuthorFailed {
         generation: u64,
@@ -2338,12 +2392,23 @@ impl LiveDriver {
                     authoring.pending = false;
                     authoring.errors.clear();
                     authoring.validated = true;
+                    let install_job_id = confirmed.install_job_id.clone();
                     authoring.confirmed = Some(confirmed);
                     replace_loom_author_text(model, &canonical_text);
                     model.dirty = true;
-                    return vec![LiveCommand::LoomList {
+                    let mut commands = vec![LiveCommand::LoomList {
                         epoch: self.connection_epoch,
                     }];
+                    if let Some(job_id) = install_job_id
+                        && model.daemon_serves(haider_rpc::FEATURE_TYPED_AGENT_INSTALL_V1)
+                    {
+                        commands.push(LiveCommand::LoomInstallStatus {
+                            generation,
+                            epoch: self.connection_epoch,
+                            job_id,
+                        });
+                    }
+                    return commands;
                 }
                 let Some(authoring) = model.loom_authoring.as_mut() else {
                     return Vec::new();
@@ -2352,6 +2417,122 @@ impl LiveDriver {
                 authoring.errors = errors;
                 authoring.validated = false;
                 model.flash = Some("· confirm rejected — fix the typed errors inline".to_owned());
+                model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::LoomValidated {
+                generation,
+                epoch,
+                errors,
+                canonical_digest,
+            } => {
+                if let Some(authoring) = &mut model.loom_authoring
+                    && authoring.generation == generation
+                    && epoch == self.connection_epoch
+                    && authoring.pending
+                {
+                    authoring.pending = false;
+                    // This receipt proves the text but does not advance the
+                    // L1 authoring session's ephemeral revision. Confirmation
+                    // remains gated on an ordinary Enter/revise round-trip.
+                    authoring.validated = false;
+                    authoring.errors = errors;
+                    authoring.preview_digest = canonical_digest;
+                    model.flash = Some(if let Some(digest) = &authoring.preview_digest {
+                        format!(
+                            "· valid without saving · {} · press ⏎ before confirm",
+                            crate::graph::digest_short(digest)
+                        )
+                    } else {
+                        "· validation found typed errors — nothing saved".to_owned()
+                    });
+                    model.dirty = true;
+                }
+                Vec::new()
+            }
+            LiveReply::LoomArchived { epoch, receipt } => {
+                if epoch != self.connection_epoch {
+                    return Vec::new();
+                }
+                model.flash = Some(match receipt.outcome {
+                    haider_rpc::LoomArchiveOutcomeWire::Changed { .. } => {
+                        format!("· archived {}", receipt.id)
+                    }
+                    haider_rpc::LoomArchiveOutcomeWire::Already { .. } => {
+                        format!("· {} was already archived", receipt.id)
+                    }
+                    haider_rpc::LoomArchiveOutcomeWire::NotFound => {
+                        format!("· {} is no longer in the registry", receipt.id)
+                    }
+                    _ => "· archive returned an unknown outcome".to_owned(),
+                });
+                model.dirty = true;
+                vec![LiveCommand::LoomList {
+                    epoch: self.connection_epoch,
+                }]
+            }
+            LiveReply::LoomArchiveFailed { epoch, message } => {
+                if epoch == self.connection_epoch {
+                    model.flash = Some(format!("· archive failed — {message}"));
+                    model.dirty = true;
+                }
+                Vec::new()
+            }
+            LiveReply::LoomInstallCancelled {
+                generation,
+                epoch,
+                receipt,
+            } => {
+                if epoch == self.connection_epoch
+                    && model
+                        .loom_authoring
+                        .as_ref()
+                        .is_some_and(|authoring| authoring.generation == generation)
+                {
+                    if let Some(authoring) = &mut model.loom_authoring {
+                        authoring.pending = false;
+                    }
+                    let refresh_job_id = receipt.install_job_id.clone();
+                    model.flash = Some(match receipt.outcome {
+                        haider_rpc::TypedAgentInstallCancelOutcomeWire::Cancelled => {
+                            "· typed-agent install cancelled; retry remains available".to_owned()
+                        }
+                        haider_rpc::TypedAgentInstallCancelOutcomeWire::AlreadyTerminal {
+                            state,
+                        } => format!("· install was already terminal ({state:?})"),
+                        _ => "· install job is unknown".to_owned(),
+                    });
+                    model.dirty = true;
+                    if model.daemon_serves(haider_rpc::FEATURE_TYPED_AGENT_INSTALL_V1) {
+                        return vec![LiveCommand::LoomInstallStatus {
+                            generation,
+                            epoch: self.connection_epoch,
+                            job_id: refresh_job_id,
+                        }];
+                    }
+                }
+                Vec::new()
+            }
+            LiveReply::LoomInstallStatus {
+                generation,
+                epoch,
+                job_id,
+                jobs,
+            } => {
+                if epoch != self.connection_epoch {
+                    return Vec::new();
+                }
+                let Some(authoring) = model
+                    .loom_authoring
+                    .as_mut()
+                    .filter(|authoring| authoring.generation == generation)
+                else {
+                    return Vec::new();
+                };
+                authoring.install_job = jobs.into_iter().find(|job| job.job_id == job_id);
+                if authoring.install_job.is_none() {
+                    model.flash = Some("· install status absent — job was not reported".to_owned());
+                }
                 model.dirty = true;
                 Vec::new()
             }
@@ -5330,6 +5511,8 @@ impl LiveDriver {
                 expected_revision,
                 kind,
                 text,
+                expected_rev,
+                expected_digest,
             } => {
                 if !model.daemon_serves(haider_rpc::FEATURE_LOOM_AUTHORING_V1) {
                     if let Some(authoring) = &mut model.loom_authoring
@@ -5347,6 +5530,37 @@ impl LiveDriver {
                     expected_revision,
                     kind,
                     text,
+                    expected_rev,
+                    expected_digest,
+                }]
+            }
+            AppRequest::LoomValidate {
+                generation,
+                kind,
+                text,
+            } => vec![LiveCommand::LoomValidate {
+                generation,
+                epoch: self.connection_epoch,
+                kind,
+                text,
+            }],
+            AppRequest::LoomArchive {
+                kind,
+                id,
+                expected_rev,
+                expected_digest,
+            } => vec![LiveCommand::LoomArchive {
+                epoch: self.connection_epoch,
+                kind,
+                id,
+                expected_rev,
+                expected_digest,
+            }],
+            AppRequest::LoomInstallCancel { generation, job_id } => {
+                vec![LiveCommand::LoomInstallCancel {
+                    generation,
+                    epoch: self.connection_epoch,
+                    job_id,
                 }]
             }
             AppRequest::HooksTrust { digest, trusted } => {

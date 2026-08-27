@@ -74,6 +74,10 @@ mod loom_author;
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod loom_authoring_tests;
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+#[path = "loom_registry_l4_tests.rs"]
+mod loom_registry_l4_tests;
 mod loom_seed;
 #[cfg(test)]
 mod loom_seed_tests;

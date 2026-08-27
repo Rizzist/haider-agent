@@ -274,6 +274,8 @@ async fn authoring_rpc_registers_and_executes_each_confirmed_hash() {
                 expected_revision: invalid.revision,
                 kind: invalid.kind,
                 text: invalid.text.clone(),
+                expected_rev: Some(0),
+                expected_digest: None,
             },
         )
         .await
@@ -329,6 +331,8 @@ async fn authoring_rpc_registers_and_executes_each_confirmed_hash() {
                 expected_revision: first.revision,
                 kind: first.kind,
                 text: first.text.clone(),
+                expected_rev: Some(0),
+                expected_digest: None,
             },
         )
         .await
@@ -350,6 +354,8 @@ async fn authoring_rpc_registers_and_executes_each_confirmed_hash() {
                 expected_revision: first.revision,
                 kind: first.kind,
                 text: first.text.clone(),
+                expected_rev: Some(0),
+                expected_digest: None,
             },
         )
         .await
@@ -418,6 +424,8 @@ async fn authoring_rpc_registers_and_executes_each_confirmed_hash() {
                 expected_revision: second.revision,
                 kind: second.kind,
                 text: second.text,
+                expected_rev: Some(first_confirmed.registration.rev),
+                expected_digest: Some(first_confirmed.registration.digest.clone()),
             },
         )
         .await
@@ -564,8 +572,21 @@ async fn prose_draft_edit_confirm_and_reedit_keep_both_executable_hashes() {
         panic!("workflow validation");
     };
     let second_registration = store
-        .loom_register_workflow(&source)
+        .loom_register_workflow_cas(
+            &source,
+            &haider_protocol::loom::LoomRevisionExpectation {
+                rev: first_registration.rev,
+                digest: Some(first_registration.digest.clone()),
+            },
+        )
         .expect("confirm second revision");
+    let haider_store::LoomRegistryMutation::Applied {
+        value: second_registration,
+        ..
+    } = second_registration
+    else {
+        panic!("current workflow expectation cannot conflict");
+    };
     let second = store
         .loom_workflow(&second_registration.id)
         .expect("read second")
@@ -762,10 +783,19 @@ async fn pinned_agent_resolution_uses_legacy_current_then_retained_revision() {
     let mut changed = typed_agent("writer", "Brief", "Draft");
     changed.job = "A newer writer role.".into();
     let second = store
-        .loom_register_agent_type_with_install(changed)
+        .loom_register_agent_type_with_install_cas(
+            changed,
+            haider_protocol::loom::LoomRevisionExpectation {
+                rev: first.rev,
+                digest: Some(first.digest.clone()),
+            },
+        )
         .await
-        .expect("register changed agent")
-        .registration;
+        .expect("register changed agent");
+    let haider_core::LoomRegistryMutation::Applied { value: second, .. } = second else {
+        panic!("current agent expectation cannot conflict");
+    };
+    let second = second.registration;
     assert_eq!(second.rev, 2);
     let retained = hub
         .pinned_loom_agent_type("writer", Some(first.rev), Some(&first.digest))

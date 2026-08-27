@@ -6,12 +6,14 @@ mod common;
 use common::{TEST_FRAME_LIMIT, golden_descriptor, raw_envelope, transcript};
 use haider_rpc::haider_protocol::typed_agent::{
     TypedAgentInstallItem, TypedAgentInstallJob, TypedAgentInstallProgress, TypedAgentInstallState,
-    TypedAgentRequiredCli,
+    TypedAgentInstallTerminalStateV1, TypedAgentRequiredCli,
 };
 use haider_rpc::{
     AttachmentId, CodecError, CommandId, FEATURE_ACCOUNT_OAUTH_IMPORT_V1, FEATURE_MONITOR_V1,
-    FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1, FEATURE_TYPED_AGENT_INSTALL_V1, RequestBody, RequestId,
-    ResponseBody, TypedAgentInstallRetryOutcomeWire, TypedAgentInstallRetryReceiptWire,
+    FEATURE_TYPED_AGENT_INSTALL_CANCEL_V1, FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1,
+    FEATURE_TYPED_AGENT_INSTALL_V1, RequestBody, RequestId, ResponseBody,
+    TypedAgentInstallCancelOutcomeWire, TypedAgentInstallCancelReceiptWire,
+    TypedAgentInstallRetryOutcomeWire, TypedAgentInstallRetryReceiptWire,
     TypedAgentInstallRetryRejectionWire, TypedAgentInstallWatchOutcomeWire,
     TypedAgentInstallWatchReceiptWire, TypedAgentInstallWatchRejectionWire, WireEncoding,
     WireFrame, decode_msgpack, encode_msgpack, haider_protocol::ids::SessionId, uds_codec,
@@ -139,6 +141,7 @@ fn typed_agent_install_status_round_trips_and_feature_is_pinned() {
         agent_type_rev: 1,
         agent_type_digest: "0123456789abcdef0123456789abcdef".into(),
         state: TypedAgentInstallState::Queued,
+        cancelled: false,
         progress: TypedAgentInstallProgress {
             total: 1,
             completed: 0,
@@ -220,6 +223,7 @@ fn typed_agent_install_control_receipts_and_watch_cursors_round_trip() {
         agent_type_rev: 1,
         agent_type_digest: "0123456789abcdef0123456789abcdef".into(),
         state: TypedAgentInstallState::Queued,
+        cancelled: false,
         progress: TypedAgentInstallProgress {
             total: 1,
             completed: 0,
@@ -361,6 +365,105 @@ fn typed_agent_install_control_receipts_and_watch_cursors_round_trip() {
                 }
             }
         })
+    );
+}
+
+/// MUTATION CHECK: remove/default/rename `TypedAgentInstallJob.cancelled`,
+/// grow the frozen lifecycle enum, or change the cancellation receipt's
+/// terminal type. Expected runtime failure: an old job no longer decodes or
+/// the distinct cancellation fact below disappears.
+#[test]
+fn typed_agent_install_cancel_preserves_the_962_state_enum() {
+    assert_eq!(
+        FEATURE_TYPED_AGENT_INSTALL_CANCEL_V1,
+        "typed_agent_install_cancel_v1"
+    );
+    let old_job = serde_json::json!({
+        "job_id": "install:reviewer:1",
+        "agent_type_id": "reviewer",
+        "agent_type_rev": 1,
+        "agent_type_digest": "0123456789abcdef0123456789abcdef",
+        "state": "queued",
+        "progress": {"total": 1, "completed": 0},
+        "created_at_ms": 1,
+        "updated_at_ms": 1
+    });
+    let mut job: TypedAgentInstallJob =
+        serde_json::from_value(old_job).expect("v0.0.962 job decodes");
+    assert!(!job.cancelled, "omission is the pre-cancel false fact");
+    job.state = TypedAgentInstallState::Failed;
+    job.cancelled = true;
+    job.error = Some("typed-agent installation was cancelled".into());
+    job.updated_at_ms = 2;
+    job.validate().expect("distinct cancellation carrier");
+    let value = serde_json::to_value(&job).expect("cancelled job JSON");
+    assert_eq!(value["state"], "failed", "the frozen enum does not grow");
+    assert_eq!(value["cancelled"], true, "cancellation remains distinct");
+    assert_eq!(
+        serde_json::to_value(TypedAgentInstallCancelOutcomeWire::Unknown)
+            .expect("unknown-job outcome JSON"),
+        serde_json::json!({"status": "unknown"}),
+        "an absent requested job uses the contract's exact unknown status"
+    );
+
+    let receipt = TypedAgentInstallCancelReceiptWire {
+        install_job_id: job.job_id.clone(),
+        outcome: TypedAgentInstallCancelOutcomeWire::AlreadyTerminal {
+            state: TypedAgentInstallTerminalStateV1::Cancelled,
+        },
+    };
+    let frames = [
+        WireFrame::Request {
+            request_id: RequestId::new("request-install-cancel"),
+            body: RequestBody::LoomInstallCancel {
+                install_job_id: job.job_id,
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-install-cancel"),
+            body: ResponseBody::LoomInstallCancel { receipt },
+        },
+    ];
+    for frame in frames {
+        let json = ws_codec::encode(&frame, TEST_FRAME_LIMIT).expect("cancel JSON");
+        assert_eq!(
+            ws_codec::decode(&json, TEST_FRAME_LIMIT).expect("cancel decode"),
+            frame
+        );
+    }
+}
+
+/// MUTATION CHECK: rename or merge any L4 feature token. Expected runtime
+/// failure: one negotiated group can no longer be distinguished verbatim.
+#[test]
+fn loom_l4_feature_tokens_are_exact_and_independent() {
+    assert_eq!(
+        haider_rpc::FEATURE_LOOM_REGISTRY_CAS_V1,
+        "loom_registry_cas_v1"
+    );
+    assert_eq!(
+        haider_rpc::FEATURE_LOOM_REGISTRY_ARCHIVE_V1,
+        "loom_registry_archive_v1"
+    );
+    assert_eq!(haider_rpc::FEATURE_LOOM_VALIDATION_V1, "loom_validation_v1");
+    assert_eq!(
+        haider_rpc::FEATURE_LOOM_REGISTRY_WATCH_V1,
+        "loom_registry_watch_v1"
+    );
+}
+
+/// MUTATION CHECK: remove the catch-all from the tagged registry record.
+/// Expected runtime failure: a future record kind rejects the whole baseline
+/// instead of remaining a typed, non-actionable unknown.
+#[test]
+fn loom_registry_record_kind_is_unknown_tolerant() {
+    let record: haider_rpc::haider_protocol::loom::LoomRegistryRecord = serde_json::from_value(
+        serde_json::json!({"kind": "future_registry_kind", "record": {"future": true}}),
+    )
+    .expect("future registry kind decodes");
+    assert_eq!(
+        record,
+        haider_rpc::haider_protocol::loom::LoomRegistryRecord::Unknown
     );
 }
 

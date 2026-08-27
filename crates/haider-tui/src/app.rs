@@ -2817,7 +2817,25 @@ pub enum AppRequest {
         expected_revision: u64,
         kind: haider_protocol::loom::LoomAuthorKind,
         text: String,
+        expected_rev: u32,
+        expected_digest: Option<String>,
     },
+    /// Pure L4 validation of the editor text. Unlike author revise this does
+    /// not advance the ephemeral authoring revision or mutate the registry.
+    LoomValidate {
+        generation: u64,
+        kind: haider_protocol::loom::LoomAuthorKind,
+        text: String,
+    },
+    /// Archive the selected user-owned registry row under its current CAS.
+    LoomArchive {
+        kind: haider_protocol::loom::LoomRegistryEntryKind,
+        id: String,
+        expected_rev: u32,
+        expected_digest: String,
+    },
+    /// Cancel the durable required-CLI install created by this confirmation.
+    LoomInstallCancel { generation: u64, job_id: String },
     /// `account.set_default_model` under the expected-revision CAS. The
     /// default marker moves only on the correlated reply.
     SetDefaultModel {
@@ -3299,6 +3317,12 @@ pub struct LoomAuthoringState {
     pub confirmed: Option<haider_protocol::loom::LoomAuthorConfirmed>,
     pub pending: bool,
     pub validated: bool,
+    /// Digest preview returned only by `loom.validate`; absence means it has
+    /// not been computed or the document is invalid, never an empty digest.
+    pub preview_digest: Option<String>,
+    /// Exact durable install progress for the confirmation's optional job.
+    /// Absence means no status response has installed, not succeeded.
+    pub install_job: Option<haider_protocol::typed_agent::TypedAgentInstallJob>,
 }
 
 /// One /workflows row (W-flow). The row space is FIXED-HEAD: the synthetic
@@ -6226,6 +6250,15 @@ impl AppModel {
                 }
                 KeyCode::Char('s') if self.screen == Screen::Loom => {
                     self.confirm_loom_authoring();
+                }
+                KeyCode::Char('v') if self.screen == Screen::Loom => {
+                    self.validate_loom_document();
+                }
+                KeyCode::Char('a') if self.screen == Screen::Loom => {
+                    self.archive_selected_loom();
+                }
+                KeyCode::Char('x') if self.screen == Screen::Loom => {
+                    self.cancel_loom_install();
                 }
                 KeyCode::Char('i') if self.screen == Screen::Loom => {
                     self.seed_cli_provisioning();
@@ -10738,6 +10771,8 @@ impl AppModel {
                 confirmed: None,
                 pending: false,
                 validated: false,
+                preview_digest: None,
+                install_job: None,
             });
         }
         let kind = self.loom_authoring.as_ref().map_or_else(
@@ -10822,6 +10857,8 @@ impl AppModel {
             confirmed: None,
             pending: false,
             validated: false,
+            preview_digest: None,
+            install_job: None,
         });
         self.flash = Some("· describe it in prose, then press ⏎ for a typed draft".to_owned());
     }
@@ -10841,6 +10878,8 @@ impl AppModel {
             authoring.errors.clear();
             authoring.validated = false;
             authoring.confirmed = None;
+            authoring.preview_digest = None;
+            authoring.install_job = None;
         }
     }
 
@@ -10850,7 +10889,11 @@ impl AppModel {
             self.flash = Some(self.stale_daemon_note("Loom authoring"));
             return;
         }
-        let Some(authoring) = &mut self.loom_authoring else {
+        if !self.daemon_serves(haider_rpc::FEATURE_LOOM_REGISTRY_CAS_V1) {
+            self.flash = Some(self.stale_daemon_note("Loom registry CAS"));
+            return;
+        }
+        let Some(authoring) = &self.loom_authoring else {
             self.flash = Some("· start a Loom draft first (⌃N)".to_owned());
             return;
         };
@@ -10875,15 +10918,194 @@ impl AppModel {
             self.flash = Some("· an empty Loom draft cannot be confirmed".to_owned());
             return;
         }
+        let generation = authoring.generation;
+        let kind = authoring.kind;
+        let Some((expected_rev, expected_digest)) = self.loom_registry_expectation(kind, &text)
+        else {
+            self.flash = Some(
+                "· cannot recover the registry coordinate — revise or refresh before confirming"
+                    .to_owned(),
+            );
+            return;
+        };
+        let Some(authoring) = &mut self.loom_authoring else {
+            return;
+        };
         authoring.pending = true;
         self.requests.push(AppRequest::LoomAuthorConfirm {
-            generation: authoring.generation,
+            generation,
             authoring_id,
             expected_revision,
-            kind: authoring.kind,
+            kind,
             text,
+            expected_rev,
+            expected_digest,
         });
         self.flash = Some("· confirming immutable Loom revision…".to_owned());
+    }
+
+    fn validate_loom_document(&mut self) {
+        self.dirty = true;
+        if !self.daemon_serves(haider_rpc::FEATURE_LOOM_VALIDATION_V1) {
+            self.flash = Some(self.stale_daemon_note("Loom validation"));
+            return;
+        }
+        let Some(authoring) = &mut self.loom_authoring else {
+            self.flash = Some("· open a Loom editor before validating".to_owned());
+            return;
+        };
+        if authoring.pending {
+            self.flash = Some("· Loom authoring request already in flight".to_owned());
+            return;
+        }
+        authoring.pending = true;
+        self.requests.push(AppRequest::LoomValidate {
+            generation: authoring.generation,
+            kind: authoring.kind,
+            text: self.composer.text().to_owned(),
+        });
+        self.flash = Some("· validating without saving…".to_owned());
+    }
+
+    fn archive_selected_loom(&mut self) {
+        self.dirty = true;
+        if !self.daemon_serves(haider_rpc::FEATURE_LOOM_REGISTRY_ARCHIVE_V1) {
+            self.flash = Some(self.stale_daemon_note("Loom archive"));
+            return;
+        }
+        let selected = if let Some(authoring) = &self.loom_authoring {
+            authoring.confirmed.as_ref().and_then(|confirmed| {
+                let kind = match confirmed.kind {
+                    haider_protocol::loom::LoomAuthorKind::AgentType => {
+                        haider_protocol::loom::LoomRegistryEntryKind::AgentType
+                    }
+                    haider_protocol::loom::LoomAuthorKind::Workflow => {
+                        haider_protocol::loom::LoomRegistryEntryKind::Workflow
+                    }
+                };
+                Some((
+                    kind,
+                    confirmed.registration.id.clone(),
+                    confirmed.registration.rev,
+                    confirmed.registration.digest.clone(),
+                ))
+            })
+        } else {
+            match self.loom_pane {
+                LoomPane::Types => match self.type_row(self.loom_selection) {
+                    Some(TypeRow::Registered(index)) => self.loom_types.get(index).map(|record| {
+                        (
+                            haider_protocol::loom::LoomRegistryEntryKind::AgentType,
+                            record.id.clone(),
+                            record.rev,
+                            record.digest(),
+                        )
+                    }),
+                    _ => None,
+                },
+                LoomPane::Workflows => match self.workflow_row(self.loom_selection) {
+                    Some(WorkflowRow::Registered(index)) => {
+                        self.loom_workflows.get(index).map(|record| {
+                            (
+                                haider_protocol::loom::LoomRegistryEntryKind::Workflow,
+                                record.id.clone(),
+                                record.rev,
+                                record.digest.clone(),
+                            )
+                        })
+                    }
+                    _ => None,
+                },
+            }
+        };
+        let Some((kind, id, expected_rev, expected_digest)) = selected else {
+            self.flash = Some(if self.loom_authoring.is_some() {
+                "· confirm this Loom document before archiving it".to_owned()
+            } else {
+                "· archive — select a registered user row".to_owned()
+            });
+            return;
+        };
+        self.flash = Some(format!("· archiving {id}…"));
+        self.requests.push(AppRequest::LoomArchive {
+            kind,
+            id,
+            expected_rev,
+            expected_digest,
+        });
+    }
+
+    fn cancel_loom_install(&mut self) {
+        self.dirty = true;
+        if !self.daemon_serves(haider_rpc::FEATURE_TYPED_AGENT_INSTALL_CANCEL_V1) {
+            self.flash = Some(self.stale_daemon_note("typed-agent install cancellation"));
+            return;
+        }
+        if self
+            .loom_authoring
+            .as_ref()
+            .is_some_and(|authoring| authoring.pending)
+        {
+            self.flash = Some("· Loom authoring request already in flight".to_owned());
+            return;
+        }
+        let Some((generation, job_id)) = self.loom_authoring.as_ref().and_then(|authoring| {
+            if authoring
+                .install_job
+                .as_ref()
+                .is_some_and(|job| job.state.is_terminal())
+            {
+                return None;
+            }
+            authoring
+                .confirmed
+                .as_ref()
+                .and_then(|confirmed| confirmed.install_job_id.clone())
+                .map(|job_id| (authoring.generation, job_id))
+        }) else {
+            self.flash = Some("· no cancellable install job in this editor".to_owned());
+            return;
+        };
+        self.requests
+            .push(AppRequest::LoomInstallCancel { generation, job_id });
+        if let Some(authoring) = &mut self.loom_authoring {
+            authoring.pending = true;
+        }
+        self.flash = Some("· cancelling typed-agent install…".to_owned());
+    }
+
+    fn loom_registry_expectation(
+        &self,
+        kind: haider_protocol::loom::LoomAuthorKind,
+        text: &str,
+    ) -> Option<(u32, Option<String>)> {
+        let signatures = self
+            .loom_types
+            .iter()
+            .map(|record| (record.id.as_str(), record.signature()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let Ok(spec) = haider_protocol::loom::validate_loom_author_text(text, kind, |id| {
+            signatures.get(id).cloned()
+        }) else {
+            // Confirmation is already gated on successful daemon validation,
+            // but a local skew must still fail closed. It cannot turn a
+            // missing coordinate into the rev-zero "must be absent" fence.
+            return None;
+        };
+        Some(match spec {
+            haider_protocol::loom::ValidatedLoomAuthorSpec::AgentType { record, .. } => self
+                .loom_types
+                .iter()
+                .find(|current| current.id == record.id)
+                .map_or((0, None), |current| (current.rev, Some(current.digest()))),
+            haider_protocol::loom::ValidatedLoomAuthorSpec::Workflow { source, .. } => {
+                let id = haider_protocol::loom::parse_pipe(&source).name;
+                id.and_then(|id| self.loom_workflows.iter().find(|current| current.id == id))
+                    .map_or((0, None), |current| {
+                        (current.rev, Some(current.digest.clone()))
+                    })
+            }
+        })
     }
 
     fn enter_graph(&mut self, arg: Option<&str>) {

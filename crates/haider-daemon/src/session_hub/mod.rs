@@ -868,6 +868,9 @@ struct HubInner {
     commit_projection: Arc<CommitProjection>,
     observe_digests: Arc<rpc::ObserveDigestCache>,
     roster_publications: broadcast::Sender<SessionId>,
+    /// Coalescing wake after a committed Loom registry event. Watchers always
+    /// repair from the durable cursor log; this channel is never authority.
+    loom_registry_publications: broadcast::Sender<u64>,
     /// Coalescing wake for the Haider Code plan poller. The generation moves
     /// only when attachment interest or a committed provider/model selection
     /// changes; ordinary turn traffic cannot wake an unauthorized account
@@ -1500,6 +1503,11 @@ pub struct HubConnection {
     /// One required-delivery, cursor-replayable monitor stream. A new
     /// `monitor.watch` replaces the prior registration on this connection.
     monitor_watch: Mutex<Option<MonitorWatchState>>,
+    /// One required-delivery Loom registry stream per connection.
+    loom_registry_watch: Mutex<Option<LoomRegistryWatchState>>,
+    /// Serializes attach/replacement setup while the synchronous state slot
+    /// remains available to close/drop for cancellation.
+    loom_registry_watch_serial: tokio::sync::Mutex<()>,
     /// Write-free metafork reviews awaiting an explicit acceptance on this
     /// connection. Shared with command-capture facades; dropped on disconnect.
     metafork_reviews: Arc<Mutex<HashMap<String, String>>>,
@@ -1518,6 +1526,12 @@ struct MonitorWatchState {
     stream_id: String,
     cancel: watch::Sender<bool>,
     task: JoinHandle<()>,
+}
+
+struct LoomRegistryWatchState {
+    watch_id: String,
+    cancel: watch::Sender<bool>,
+    task: Option<JoinHandle<()>>,
 }
 
 /// RAII ownership of an identity registered by `open_connection`.
@@ -1581,6 +1595,11 @@ impl Drop for HubConnection {
         {
             watch.cancel.send_replace(true);
             self.sink.purge_ordered(&watch.stream_id);
+        }
+        if let Ok(watch) = self.loom_registry_watch.get_mut()
+            && let Some(watch) = watch.take()
+        {
+            watch.cancel.send_replace(true);
         }
     }
 }
@@ -1685,6 +1704,7 @@ impl SessionHub {
         let append_commit_task = tokio::spawn(run_append_committer(store.clone(), append_receiver));
         let (surface_publications, _) = watch::channel(0_u64);
         let (roster_publications, _) = broadcast::channel(1_024);
+        let (loom_registry_publications, _) = broadcast::channel(1_024);
         let (descendant_lineage_publications, _) = watch::channel(0_u64);
         let (haider_code_plan_changes, _) = watch::channel(0_u64);
         let hooks = Arc::new(Mutex::new(None));
@@ -1730,6 +1750,7 @@ impl SessionHub {
             commit_projection,
             observe_digests,
             roster_publications,
+            loom_registry_publications,
             haider_code_plan_changes,
             usage_report: Mutex::new(None),
             tasks: crate::tasks::TaskRegistry::default(),
@@ -2291,6 +2312,7 @@ impl SessionHub {
     }
 
     /// E2 — plan-gated registration from the session agent's tool path.
+    #[cfg(test)]
     pub(crate) async fn loom_register_workflow(
         &self,
         source: String,
@@ -2298,10 +2320,37 @@ impl SessionHub {
         self.inner.store.loom_register_workflow(source).await
     }
 
-    pub(crate) async fn loom_register_agent_type(
+    pub(crate) async fn loom_register_workflow_cas(
+        &self,
+        source: String,
+        expected: haider_protocol::loom::LoomRevisionExpectation,
+    ) -> Result<
+        haider_core::LoomRegistryMutation<haider_protocol::loom::LoomRegistration>,
+        HaiderError,
+    > {
+        let outcome = self
+            .inner
+            .store
+            .loom_register_workflow_cas(source, expected)
+            .await?;
+        if let haider_core::LoomRegistryMutation::Applied {
+            publication_cursor: Some(cursor),
+            ..
+        } = &outcome
+        {
+            let _ = self.inner.loom_registry_publications.send(*cursor);
+        }
+        Ok(outcome)
+    }
+
+    pub(crate) async fn loom_register_agent_type_cas(
         &self,
         record: haider_protocol::loom::LoomAgentType,
-    ) -> Result<haider_core::LoomAgentTypeRegistration, HaiderError> {
+        expected: haider_protocol::loom::LoomRevisionExpectation,
+    ) -> Result<
+        haider_core::LoomRegistryMutation<haider_core::LoomAgentTypeRegistration>,
+        HaiderError,
+    > {
         if self.inner.draining.load(Ordering::Acquire) {
             return Err(HaiderError::new(
                 ErrorCode::Busy,
@@ -2323,11 +2372,20 @@ impl SessionHub {
         let outcome = self
             .inner
             .store
-            .loom_register_agent_type_with_install(record)
+            .loom_register_agent_type_with_install_cas(record, expected)
             .await?;
         drop(install_serial);
-        if let Some(job) = &outcome.install_job {
-            self.spawn_typed_install_job(job.job_id.clone())?;
+        if let haider_core::LoomRegistryMutation::Applied {
+            value,
+            publication_cursor,
+        } = &outcome
+        {
+            if let Some(cursor) = publication_cursor {
+                let _ = self.inner.loom_registry_publications.send(*cursor);
+            }
+            if let Some(job) = &value.install_job {
+                self.spawn_typed_install_job(job.job_id.clone())?;
+            }
         }
         Ok(outcome)
     }
@@ -2394,6 +2452,51 @@ impl SessionHub {
             .store
             .typed_agent_install_watch(job_id, after_cursor)
             .await
+    }
+
+    pub(crate) async fn typed_agent_install_cancel(
+        &self,
+        install_job_id: String,
+    ) -> Result<haider_core::TypedAgentInstallCancelResult, HaiderError> {
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(HaiderError::new(
+                ErrorCode::Busy,
+                "daemon is draining; typed-agent install cancellation is closed",
+                true,
+            ));
+        }
+        // Deliberately do not take `typed_install_serial`: cancellation races
+        // the runner's next durable CAS and makes that runner lose. Holding the
+        // process-wide package-manager lane would make a running job
+        // uncancellable until it had already become terminal.
+        self.inner
+            .store
+            .typed_agent_install_cancel(install_job_id)
+            .await
+    }
+
+    pub(crate) async fn loom_set_archived(
+        &self,
+        kind: haider_protocol::loom::LoomRegistryEntryKind,
+        id: String,
+        archived: bool,
+        expected: haider_protocol::loom::LoomRevisionExpectation,
+    ) -> Result<haider_core::LoomArchiveResult, HaiderError> {
+        let outcome = self
+            .inner
+            .store
+            .loom_set_archived(kind, id, archived, expected)
+            .await?;
+        if let haider_core::LoomArchiveResult::Changed {
+            publication_cursor, ..
+        } = &outcome
+        {
+            let _ = self
+                .inner
+                .loom_registry_publications
+                .send(*publication_cursor);
+        }
+        Ok(outcome)
     }
 
     /// Narrow daemon-internal session creation used by local delegation.
@@ -2797,6 +2900,8 @@ impl SessionHub {
             accounts_watch: Mutex::new(None),
             surface_watch: Mutex::new(None),
             monitor_watch: Mutex::new(None),
+            loom_registry_watch: Mutex::new(None),
+            loom_registry_watch_serial: tokio::sync::Mutex::new(()),
             metafork_reviews: Arc::new(Mutex::new(HashMap::new())),
             loom_author_sessions: Arc::new(Mutex::new(HashMap::new())),
             identity_lease,
