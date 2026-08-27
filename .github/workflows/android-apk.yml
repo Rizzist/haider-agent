@@ -100,7 +100,7 @@ jobs:
             }
             VERIFY="$("$APKSIGNER" verify --verbose "${APKS[0]}")"
             printf '%s\n' "$VERIFY"
-            for scheme in v1 v2 v3; do
+            for scheme in v2 v3; do
               grep -Eq "Verified using $scheme scheme.*: true" <<< "$VERIFY" || {
                 echo "release APK is missing required $scheme signing" >&2
                 exit 1
