@@ -4,7 +4,7 @@ use super::*;
 use crate::{CommittedRange, MemoryStore};
 use haider_accounts::{MemoryVault, Vault};
 use haider_protocol::branch::BranchDescriptor;
-use haider_protocol::provider::CapabilityDoc;
+use haider_protocol::provider::{CapabilityDoc, UsageSource};
 use haider_provider::{FakeProvider, FakeStep, OpenAiProvider, ProviderStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -14,6 +14,24 @@ struct AppendRecordingStore {
     batch_sizes: Mutex<Vec<usize>>,
     batches: Mutex<Vec<Vec<EventPayload>>>,
     reject_request_boundary: bool,
+}
+
+#[test]
+fn terminal_fence_reports_an_unresolved_promotion_without_waiting() {
+    let mailbox = Arc::new(PromotedSteerMailbox::default());
+    mailbox.begin_turn();
+    let (commands, _receiver) = mpsc::channel(1);
+    let reservation = mailbox
+        .reserve("later steer".into(), commands)
+        .expect("reservation opens");
+
+    assert!(mailbox.try_finish_boundary().is_none());
+    drop(reservation);
+    assert!(
+        mailbox
+            .try_finish_boundary()
+            .is_some_and(|promoted| promoted.is_empty())
+    );
 }
 
 impl AppendRecordingStore {
@@ -252,6 +270,22 @@ fn completed_extension_item<'a>(payloads: &'a [EventPayload], expected_kind: &st
         .expect("completed extension is present in request boundary")
 }
 
+fn reported_usage() -> Usage {
+    Usage {
+        input: 11,
+        output: 7,
+        reasoning: 2,
+        cached: 3,
+        source: UsageSource::ProviderReported,
+        account: None,
+        accounts: Vec::new(),
+        normalized: None,
+        scope: None,
+        cache_cost: None,
+        request: None,
+    }
+}
+
 /// MUTATION CHECK: move the provider-view marker back to a standalone append
 /// in the real request path. The production batch containing that marker is
 /// no longer the exact five-event pre-change journal sequence.
@@ -472,4 +506,149 @@ async fn provider_view_and_request_attempt_share_one_ordered_append() {
         })
         .collect::<Vec<_>>();
     assert_request_boundary_golden(&payloads);
+}
+
+/// MUTATION CHECK: restore the independent usage, message-completion, and
+/// Done appends. The terminal suffix no longer appears in one recorded batch.
+/// Reorder publication and the live event-id sequence differs from storage.
+#[tokio::test]
+async fn no_boundary_post_stream_facts_share_one_ordered_append() {
+    let session_id = SessionId::new("post-stream-terminal-batch");
+    let config = HarnessConfig::for_session(
+        session_id.clone(),
+        DeviceId::new("post-stream-terminal-device"),
+        1,
+        1,
+    );
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitText {
+            text: "batched terminal text".into(),
+        },
+        FakeStep::EmitUsage {
+            usage: reported_usage(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let store = Arc::new(AppendRecordingStore::new());
+    let handle = HarnessActor::spawn(config, provider, store.clone());
+    let mut live_events = handle.subscribe();
+
+    let outcome = handle
+        .submit_committed_turn(SubmitCommittedTurn {
+            run_id: RunId::new("post-stream-terminal-run"),
+            messages: vec![Message::user_text("finish in one append")],
+        })
+        .await
+        .expect("committed turn accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Done);
+
+    let terminal_batch = store
+        .batches()
+        .into_iter()
+        .find(|batch| {
+            batch
+                .iter()
+                .any(|payload| matches!(payload, EventPayload::RunState(RunState::Done)))
+        })
+        .expect("terminal append recorded");
+    assert!(matches!(
+        terminal_batch.as_slice(),
+        [
+            EventPayload::Usage(_),
+            EventPayload::Item(ItemEvent::Completed {
+                item: TurnItem::AgentMessage { .. },
+                ..
+            }),
+            EventPayload::NodeCommitted(_),
+            EventPayload::RunState(RunState::Done),
+        ]
+    ));
+
+    let journal = store.inner.events(&session_id).await;
+    let terminal = journal
+        .windows(4)
+        .find(|window| {
+            matches!(
+                window
+                    .iter()
+                    .map(|event| serde_json::from_value::<EventPayload>(event.payload.clone()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .as_deref(),
+                Ok([
+                    EventPayload::Usage(_),
+                    EventPayload::Item(ItemEvent::Completed {
+                        item: TurnItem::AgentMessage { .. },
+                        ..
+                    }),
+                    EventPayload::NodeCommitted(_),
+                    EventPayload::RunState(RunState::Done),
+                ])
+            )
+        })
+        .expect("terminal journal suffix");
+    assert!(
+        terminal
+            .windows(2)
+            .all(|pair| pair[1].seq == pair[0].seq + 1)
+    );
+
+    let terminal_ids = terminal
+        .iter()
+        .map(|event| event.event_id.clone())
+        .collect::<Vec<_>>();
+    let published_ids = std::iter::from_fn(|| live_events.try_recv().ok())
+        .filter(|event| terminal_ids.contains(&event.event_id))
+        .map(|event| event.event_id)
+        .collect::<Vec<_>>();
+    assert_eq!(published_ids, terminal_ids);
+}
+
+/// MUTATION CHECK: infer the boundary from the final empty tool accumulator
+/// instead of recording whether dispatch occurred. Text emitted after the
+/// tool then coalesces usage and Done across that external boundary.
+#[tokio::test]
+async fn tool_call_response_does_not_batch_usage_with_done() {
+    let session_id = SessionId::new("post-stream-tool-boundary");
+    let config =
+        HarnessConfig::for_session(session_id, DeviceId::new("post-stream-tool-device"), 1, 1);
+    let provider = Arc::new(FakeProvider::new(vec![
+        FakeStep::EmitToolCall {
+            call_id: "tool-boundary-call".into(),
+            name: "inspect".into(),
+            args: serde_json::json!({"path": "src/lib.rs"}),
+        },
+        FakeStep::EmitText {
+            text: "text after the tool boundary".into(),
+        },
+        FakeStep::EmitUsage {
+            usage: reported_usage(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]));
+    let store = Arc::new(AppendRecordingStore::new());
+    let handle = HarnessActor::spawn(config, provider, store.clone());
+
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("keep tool boundary"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("turn outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert!(!store.batches().iter().any(|batch| {
+        batch
+            .iter()
+            .any(|payload| matches!(payload, EventPayload::Usage(_)))
+            && batch
+                .iter()
+                .any(|payload| matches!(payload, EventPayload::RunState(RunState::Done)))
+    }));
 }

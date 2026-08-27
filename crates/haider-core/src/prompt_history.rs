@@ -7,7 +7,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use haider_protocol::EventPayload;
 use haider_protocol::branch::{BranchCreated, BranchDescriptor};
-use haider_protocol::envelope::{PromptRender, RawEnvelope};
+use haider_protocol::envelope::{PromptRender, RawEnvelope, envelope_weight_bytes};
 use haider_protocol::error::{ErrorAction, ErrorCode, HaiderError};
 use haider_protocol::history::{CompactionIntent, CompactionResume, NodeKind, TreeNode};
 use haider_protocol::ids::{
@@ -27,12 +27,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 
+#[cfg(test)]
+#[path = "prompt_history_cache_tests.rs"]
+mod prompt_history_cache_tests;
+
 const HISTORY_PAGE: usize = 256;
 const PROMPT_CACHE_SESSION_LIMIT: usize = 8;
-/// Serialized journal/projection bodies retained across all prompt-cache
-/// sessions. Durable journals remain authoritative; over-cap LRU entries keep
-/// only replay/checkpoint cursors and rebuild their bodies on the next touch.
-const PROMPT_CACHE_BODY_BYTES_LIMIT: usize = 32 * 1024 * 1024;
+/// Estimated retained heap across all prompt-cache sessions. In particular,
+/// `RawEnvelope` JSON value trees commonly retain about 3–4× their serialized
+/// body for short deltas; `envelope_weight_bytes` walks the actual owned IDs,
+/// arrays, objects, and strings instead of applying a wire-size multiplier.
+/// Durable journals remain authoritative; over-cap LRU entries keep only
+/// replay/checkpoint cursors and rebuild their bodies on the next touch.
+const PROMPT_CACHE_RETAINED_BYTES_LIMIT: usize = 32 * 1024 * 1024;
 const PROMPT_CHECKPOINT_PROJECTION: &str = "prompt_history";
 const PROMPT_CHECKPOINT_SHAPE_VERSION: u32 = 1;
 /// Semantic compatibility of the prompt-history reducer.
@@ -77,7 +84,7 @@ pub struct PromptHistoryCache {
 struct CachedPromptSession {
     last_touched: u64,
     bodies_evicted: bool,
-    journal_body_bytes: usize,
+    retained_envelope_bytes: usize,
     head_seq: u64,
     compaction_epochs: HashMap<PromptTimelineKey, u64>,
     envelopes: Vec<RawEnvelope>,
@@ -873,9 +880,9 @@ impl PromptHistoryCache {
             sessions.insert(session_id, cached);
             while sessions
                 .values()
-                .map(CachedPromptSession::resident_body_bytes)
+                .map(CachedPromptSession::retained_heap_bytes)
                 .fold(0_usize, usize::saturating_add)
-                > PROMPT_CACHE_BODY_BYTES_LIMIT
+                > PROMPT_CACHE_RETAINED_BYTES_LIMIT
             {
                 let Some(evicted) = sessions
                     .iter()
@@ -922,11 +929,21 @@ async fn replay_cached_session(
 }
 
 impl CachedPromptSession {
-    fn resident_body_bytes(&self) -> usize {
+    fn retained_heap_bytes(&self) -> usize {
         if self.bodies_evicted {
             return 0;
         }
-        let mut total = self.journal_body_bytes;
+        // `envelope_weight_bytes` charges each initialized vector slot. Add
+        // the live Vec's spare slots so eviction decisions reflect its actual
+        // retained allocation rather than only its logical length.
+        let envelope_capacity_slack = self
+            .envelopes
+            .capacity()
+            .saturating_sub(self.envelopes.len())
+            .saturating_mul(std::mem::size_of::<RawEnvelope>());
+        let mut total = self
+            .retained_envelope_bytes
+            .saturating_add(envelope_capacity_slack);
         let mut projections = HashSet::new();
         for prefix in self.append_prefixes.values() {
             if let Some(projection) = prefix.projection.as_ref()
@@ -946,9 +963,10 @@ impl CachedPromptSession {
     }
 
     fn evict_bodies(&mut self) {
-        self.journal_body_bytes = 0;
+        self.retained_envelope_bytes = 0;
         self.bodies_evicted = true;
-        self.envelopes.clear();
+        // `clear` would drop the values but retain the body-owning allocation.
+        self.envelopes = Vec::new();
         for prefix in self.append_prefixes.values_mut() {
             prefix.projection = None;
             prefix.body_bytes = 0;
@@ -983,15 +1001,11 @@ impl CachedPromptSession {
     /// Advances every session-wide index from one decoded journal envelope.
     /// Returns whether the envelope starts a new compaction epoch.
     fn push_envelope(&mut self, envelope: RawEnvelope) -> bool {
-        // Count the exact serialized array body: two brackets for the first
-        // envelope and one comma for each subsequent envelope.
-        let journal_delimiter_bytes = if self.envelopes.is_empty() { 2 } else { 1 };
-        self.journal_body_bytes = self
-            .journal_body_bytes
-            .saturating_add(serialized_body_bytes(&envelope))
-            .saturating_add(journal_delimiter_bytes);
+        self.retained_envelope_bytes = self
+            .retained_envelope_bytes
+            .saturating_add(envelope_weight_bytes(&envelope));
         let envelope_index = self.envelopes.len();
-        let payload = serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok();
+        let payload = EventPayload::deserialize(&envelope.payload).ok();
         let checkpoint_node_collision = self
             .checkpoint_base
             .as_ref()
@@ -3534,7 +3548,7 @@ mod cache_bound_tests {
             agent_id: None,
         };
         let mut cached = resident(42);
-        cached.journal_body_bytes = PROMPT_CACHE_BODY_BYTES_LIMIT.saturating_add(1);
+        cached.retained_envelope_bytes = PROMPT_CACHE_RETAINED_BYTES_LIMIT.saturating_add(1);
         cached.compaction_epochs.insert(timeline.clone(), 17);
         cached.saved_boundaries.insert(timeline.clone(), 31);
         let run_id = RunId::new("oversized-run");
@@ -3586,7 +3600,7 @@ mod cache_bound_tests {
             .get(&SessionId::new("oversized-session"))
             .expect("cursor shell remains resident");
         assert!(cached.bodies_evicted);
-        assert_eq!(cached.resident_body_bytes(), 0);
+        assert_eq!(cached.retained_heap_bytes(), 0);
         assert_eq!(cached.head_seq, 42);
         assert_eq!(cached.compaction_epochs.get(&timeline), Some(&17));
         assert_eq!(cached.saved_boundaries.get(&timeline), Some(&31));
