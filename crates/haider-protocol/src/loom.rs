@@ -694,14 +694,12 @@ fn json_error_path(
         code,
         LoomAuthorValidationCode::DuplicateValue | LoomAuthorValidationCode::InvalidField
     ) && let Some(leaf) = leaf
-    {
-        if let Some(span) = spans
+        && let Some(span) = spans
             .iter()
             .filter(|span| span.key.as_deref() == Some(leaf) && span.start <= offset)
             .min_by_key(|span| offset.saturating_sub(span.start))
-        {
-            return span.path.clone();
-        }
+    {
+        return span.path.clone();
     }
     let probe = offset.saturating_sub(1);
     let enclosing = spans

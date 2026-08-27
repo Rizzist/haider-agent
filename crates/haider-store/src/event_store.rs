@@ -16039,7 +16039,7 @@ fn load_loom_workflow_revision_tx(
 fn cas_evidence(
     cas: &FileCas,
     evidence_type: &str,
-    value: &impl serde::Serialize,
+    value: &(impl serde::Serialize + ?Sized),
     parents: Vec<ArtifactRef>,
 ) -> StoreResult<InstructEvidenceRef> {
     let bytes = serde_json::to_vec(value).map_err(|error| {
@@ -16264,7 +16264,9 @@ fn augment_workflow_graph_envelopes(
     let mut states = HashMap::<GraphId, WorkflowGraphState>::new();
     let mut graph_order = Vec::<GraphId>::new();
     let mut todo_inputs = HashMap::<GraphId, TodoGraphAttached>::new();
-    let mut evidence = BTreeMap::<(GraphId, GraphNodeName, u32), EvidenceRecorded>::new();
+    // Graph ids are opaque. Exact evidence lookup is hash-based; the only
+    // ordered selection below compares the stable numeric attempt.
+    let mut evidence = HashMap::<(GraphId, GraphNodeName, u32), EvidenceRecorded>::new();
     let mut planned = Vec::<(WorkflowGraphJournalEvent, EventId)>::new();
     let base_payloads = envelopes
         .iter()
@@ -16475,10 +16477,10 @@ fn augment_workflow_graph_envelopes(
                 {
                     let source_value = evidence
                         .iter()
-                        .rev()
-                        .find(|((graph_id, node, _), _)| {
+                        .filter(|((graph_id, node, _), _)| {
                             graph_id == &opened.graph_id && node == &source
                         })
+                        .max_by_key(|((_, _, attempt), _)| *attempt)
                         .map(|(_, recorded)| recorded)
                         .map_or_else(|| serde_json::to_value(opened), serde_json::to_value)
                         .map_err(|error| {
