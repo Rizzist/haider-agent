@@ -1274,6 +1274,7 @@ dependencies = [
  "async-trait",
  "base64",
  "blake3",
+ "haider-accounts",
  "haider-protocol",
  "haider-provider",
  "haider-store",

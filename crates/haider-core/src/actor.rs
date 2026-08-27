@@ -94,6 +94,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 
+#[cfg(test)]
+#[path = "actor_request_attempt_tests.rs"]
+mod actor_request_attempt_tests;
+
 const DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN: usize = 32;
 
 /// Profile-scoped secret used only for diagnostic prefix fingerprints.
@@ -2807,6 +2811,8 @@ impl HarnessActor {
                     )
                     .await;
             }
+            let mut persisted_provider_view = None;
+            let mut provider_view_attempt_data = None;
             if let Some(provider_view_ledger) = prepared
                 .as_ref()
                 .and_then(|prepared| prepared.provider_view())
@@ -2850,17 +2856,8 @@ impl HarnessActor {
                             .await;
                     }
                 };
-                if let Err(error) = self
-                    .commit_hidden_extension_marker(
-                        &run_id,
-                        PROVIDER_VIEW_ATTEMPT_EXTENSION_KIND,
-                        provider_view_data,
-                    )
-                    .await
-                {
-                    return self.errored_state_outcome(&run_id, error).await;
-                }
-                previous_provider_view = Some(stored_provider_view);
+                provider_view_attempt_data = Some(provider_view_data);
+                persisted_provider_view = Some(stored_provider_view);
             }
             let cache_control = prepared
                 .as_ref()
@@ -2910,10 +2907,18 @@ impl HarnessActor {
                 }
             };
             if let Err(error) = self
-                .commit_request_attempt(&run_id, request_attempt_data, &mut thinking_pending)
+                .commit_request_attempt(
+                    &run_id,
+                    provider_view_attempt_data,
+                    request_attempt_data,
+                    &mut thinking_pending,
+                )
                 .await
             {
                 return self.errored_state_outcome(&run_id, error).await;
+            }
+            if let Some(stored_provider_view) = persisted_provider_view {
+                previous_provider_view = Some(stored_provider_view);
             }
             // The durable attempt record above is the first post-compaction
             // request even if opening or streaming later fails. A retry gets
@@ -7464,55 +7469,84 @@ impl HarnessActor {
             .await
     }
 
-    /// Atomically publishes the request's `Thinking` transition and durable
-    /// cache-attempt marker when no context or rotation fact intervened.
+    /// Atomically publishes the exact provider-view marker, the request's
+    /// pending `Thinking` transition, and its cache-attempt marker. Their
+    /// journal order matches the former adjacent appends, but a crash can no
+    /// longer expose the provider-view marker without the attempt facts.
     async fn commit_request_attempt(
         &mut self,
         run_id: &RunId,
-        data: serde_json::Value,
+        provider_view_data: Option<serde_json::Value>,
+        cache_attempt_data: serde_json::Value,
         thinking_pending: &mut bool,
     ) -> Result<(), HaiderError> {
-        if !*thinking_pending {
-            return self
-                .commit_hidden_extension_marker(run_id, CACHE_REQUEST_ATTEMPT_EXTENSION_KIND, data)
-                .await;
-        }
-
         self.flush_pending_item_delta().await?;
-        let thinking = self.uncommitted_envelope(
+        let mut envelopes = Vec::with_capacity(
+            usize::from(provider_view_data.is_some()) * 2 + usize::from(*thinking_pending) + 2,
+        );
+        if let Some(data) = provider_view_data {
+            envelopes.extend(self.uncommitted_extension_marker(
+                run_id,
+                PROVIDER_VIEW_ATTEMPT_EXTENSION_KIND,
+                data,
+                hidden_prompt_omit_render(),
+            )?);
+        }
+        let thinking_index = if *thinking_pending {
+            let index = envelopes.len();
+            envelopes.push(self.uncommitted_envelope(
+                run_id,
+                EventPayload::RunState(RunState::Thinking),
+                prompt_omit_render(),
+            )?);
+            Some(index)
+        } else {
+            None
+        };
+        envelopes.extend(self.uncommitted_extension_marker(
             run_id,
-            EventPayload::RunState(RunState::Thinking),
-            prompt_omit_render(),
-        )?;
+            CACHE_REQUEST_ATTEMPT_EXTENSION_KIND,
+            cache_attempt_data,
+            hidden_prompt_omit_render(),
+        )?);
+        self.store.append(&mut envelopes).await?;
+        for (index, committed) in envelopes.into_iter().enumerate() {
+            let _ = self.events.send(committed);
+            if thinking_index == Some(index) {
+                self.state.send_replace(Some(RunState::Thinking));
+            }
+        }
+        *thinking_pending = false;
+        Ok(())
+    }
+
+    fn uncommitted_extension_marker(
+        &mut self,
+        run_id: &RunId,
+        kind: &str,
+        data: serde_json::Value,
+        render: RenderTargets,
+    ) -> Result<[RawEnvelope; 2], HaiderError> {
         let item_id = self.next_item_id();
         let item = TurnItem::Extension {
-            kind: CACHE_REQUEST_ATTEMPT_EXTENSION_KIND.to_owned(),
+            kind: kind.to_owned(),
             data,
         };
-        let mut envelopes = [
-            thinking,
+        Ok([
             self.uncommitted_envelope(
                 run_id,
                 EventPayload::Item(ItemEvent::Started {
                     item_id: item_id.clone(),
                     item: item.clone(),
                 }),
-                hidden_prompt_omit_render(),
+                render,
             )?,
             self.uncommitted_envelope(
                 run_id,
                 EventPayload::Item(ItemEvent::Completed { item_id, item }),
-                hidden_prompt_omit_render(),
+                render,
             )?,
-        ];
-        self.store.append(&mut envelopes).await?;
-        let [thinking, started, completed] = envelopes;
-        let _ = self.events.send(thinking);
-        self.state.send_replace(Some(RunState::Thinking));
-        let _ = self.events.send(started);
-        let _ = self.events.send(completed);
-        *thinking_pending = false;
-        Ok(())
+        ])
     }
 
     async fn commit_ui_extension_marker(
@@ -7584,26 +7618,7 @@ impl HarnessActor {
         data: serde_json::Value,
         render: RenderTargets,
     ) -> Result<(), HaiderError> {
-        let item_id = self.next_item_id();
-        let item = TurnItem::Extension {
-            kind: kind.to_owned(),
-            data,
-        };
-        let mut envelopes = [
-            self.uncommitted_envelope(
-                run_id,
-                EventPayload::Item(ItemEvent::Started {
-                    item_id: item_id.clone(),
-                    item: item.clone(),
-                }),
-                render,
-            )?,
-            self.uncommitted_envelope(
-                run_id,
-                EventPayload::Item(ItemEvent::Completed { item_id, item }),
-                render,
-            )?,
-        ];
+        let mut envelopes = self.uncommitted_extension_marker(run_id, kind, data, render)?;
         self.flush_pending_item_delta().await?;
         self.store.append(&mut envelopes).await?;
         for committed in envelopes {

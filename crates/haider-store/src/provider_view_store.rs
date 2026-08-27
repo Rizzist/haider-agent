@@ -19,14 +19,49 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+#[cfg(test)]
+#[path = "provider_view_store_tests.rs"]
+mod provider_view_store_tests;
 
 pub(crate) const PROVIDER_VIEW_HOT_BLOCK_CAP_BYTES: usize = 64 * 1024;
 pub(crate) const PROVIDER_VIEW_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 const PROVIDER_VIEW_SWEEP_REQUEST_BATCH: usize = 128;
+const PROVIDER_VIEW_SWEEP_PERSIST_INTERVAL: u64 = 64;
+const PROVIDER_VIEW_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 pub(crate) struct ProviderViewStore {
     cas: FileCas,
     hot_blocks: Mutex<HotBlockLru>,
+    sweep_schedule: Mutex<ProviderViewSweepSchedule>,
+}
+
+/// Monotonic provider-view maintenance watermark. The count bound prevents a
+/// busy long-lived daemon from postponing cleanup indefinitely, while the time
+/// bound ensures a quiet profile checks expiry on its next provider persist.
+struct ProviderViewSweepSchedule {
+    persists_since_sweep: u64,
+    next_sweep_at: Instant,
+}
+
+impl ProviderViewSweepSchedule {
+    fn after_sweep(now: Instant) -> Self {
+        Self {
+            persists_since_sweep: 0,
+            next_sweep_at: now + PROVIDER_VIEW_SWEEP_INTERVAL,
+        }
+    }
+
+    fn note_persist_and_is_due(&mut self, now: Instant) -> bool {
+        self.persists_since_sweep = self.persists_since_sweep.saturating_add(1);
+        self.persists_since_sweep >= PROVIDER_VIEW_SWEEP_PERSIST_INTERVAL
+            || now >= self.next_sweep_at
+    }
+
+    fn sweep_completed(&mut self, now: Instant) {
+        *self = Self::after_sweep(now);
+    }
 }
 
 impl ProviderViewStore {
@@ -34,6 +69,7 @@ impl ProviderViewStore {
         Ok(Self {
             cas: FileCas::open_namespace(profile_root, "provider-view-cas")?,
             hot_blocks: Mutex::new(HotBlockLru::new(PROVIDER_VIEW_HOT_BLOCK_CAP_BYTES)),
+            sweep_schedule: Mutex::new(ProviderViewSweepSchedule::after_sweep(Instant::now())),
         })
     }
 
@@ -341,6 +377,43 @@ impl ProviderViewStore {
         connection: &mut Connection,
         through_ms: u64,
     ) -> StoreResult<usize> {
+        let mut schedule = self.sweep_schedule()?;
+        let removed = self.sweep_expired_rows(connection, through_ms)?;
+        schedule.sweep_completed(Instant::now());
+        Ok(removed)
+    }
+
+    /// Runs expiry maintenance before a provider-view persist only when its
+    /// monotonic time/count watermark is due. A failed sweep stays due so the
+    /// next persist retries instead of silently postponing reclamation.
+    pub(crate) fn sweep_expired_if_due(
+        &self,
+        connection: &mut Connection,
+        through_ms: u64,
+    ) -> StoreResult<Option<usize>> {
+        self.sweep_expired_if_due_at(connection, Instant::now(), through_ms)
+    }
+
+    fn sweep_expired_if_due_at(
+        &self,
+        connection: &mut Connection,
+        monotonic_now: Instant,
+        through_ms: u64,
+    ) -> StoreResult<Option<usize>> {
+        let mut schedule = self.sweep_schedule()?;
+        if !schedule.note_persist_and_is_due(monotonic_now) {
+            return Ok(None);
+        }
+        let removed = self.sweep_expired_rows(connection, through_ms)?;
+        schedule.sweep_completed(monotonic_now);
+        Ok(Some(removed))
+    }
+
+    fn sweep_expired_rows(
+        &self,
+        connection: &mut Connection,
+        through_ms: u64,
+    ) -> StoreResult<usize> {
         let through_ms = to_sqlite_integer(through_ms)?;
         let batch_size = i64::try_from(PROVIDER_VIEW_SWEEP_REQUEST_BATCH)
             .map_err(|_| corrupt("provider-view sweep batch exceeds SQLite integer space"))?;
@@ -386,6 +459,12 @@ impl ProviderViewStore {
         }
         self.drain_gc(connection)?;
         Ok(removed)
+    }
+
+    fn sweep_schedule(&self) -> StoreResult<std::sync::MutexGuard<'_, ProviderViewSweepSchedule>> {
+        self.sweep_schedule
+            .lock()
+            .map_err(|_| corrupt("provider-view sweep schedule lock is poisoned"))
     }
 
     fn drain_gc(&self, connection: &Connection) -> StoreResult<()> {
