@@ -1217,25 +1217,26 @@ fn validate_author_workflow(
                         .iter()
                         .position(|node| compiler_error_names_node(&message, &node.id));
                     if let Some(index) = node_index {
+                        let type_mismatch = message.contains("type mismatch");
+                        let field = if type_mismatch {
+                            "in_type"
+                        } else if message.starts_with('↺') || message.starts_with("back target ")
+                        {
+                            "back_edge"
+                        } else {
+                            "depends_on"
+                        };
                         errors.push(author_node_error(
                             text,
                             &spec,
                             index,
-                            if message.contains("type mismatch") {
+                            if type_mismatch {
                                 LoomAuthorValidationCode::TypeMismatch
                             } else {
                                 LoomAuthorValidationCode::InvalidGraph
                             },
                             message,
-                            if message.contains("type mismatch") {
-                                "in_type"
-                            } else if message.starts_with('↺')
-                                || message.starts_with("back target ")
-                            {
-                                "back_edge"
-                            } else {
-                                "depends_on"
-                            },
+                            field,
                         ));
                     } else {
                         let output_mismatch = message.starts_with("pipe declares output ");

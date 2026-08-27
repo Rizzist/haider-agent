@@ -427,7 +427,9 @@ enum WorkerMessage {
         data: Vec<f32>,
         channels: usize,
     },
+    #[cfg(not(target_os = "android"))]
     StartRecording,
+    #[cfg(not(target_os = "android"))]
     StopRecording(mpsc::Sender<Vec<f32>>),
     #[cfg(not(target_os = "android"))]
     StreamError(String),
@@ -621,13 +623,24 @@ impl CaptureWorker {
     }
 
     /// Begins accumulating a recording (preroll included).
+    #[cfg(not(target_os = "android"))]
     pub fn start_recording(&self) -> Result<(), SttError> {
         self.commands
             .send(WorkerMessage::StartRecording)
             .map_err(|_| SttError::Io("capture worker is gone".into()))
     }
 
+    /// Android has no capture worker, so recording controls fail immediately
+    /// with the same honest availability result as [`Self::spawn`].
+    #[cfg(target_os = "android")]
+    pub fn start_recording(&self) -> Result<(), SttError> {
+        Err(SttError::MicUnavailable {
+            hint: "audio capture is unavailable on Android (Phase 1)".into(),
+        })
+    }
+
     /// Ends the recording and returns the full mono take.
+    #[cfg(not(target_os = "android"))]
     pub fn stop_recording(&self) -> Result<Vec<f32>, SttError> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.commands
@@ -636,6 +649,15 @@ impl CaptureWorker {
         reply_rx
             .recv_timeout(Duration::from_secs(15))
             .map_err(|_| SttError::Timeout("capture worker did not answer stop".into()))
+    }
+
+    /// Android has no capture worker, so recording controls fail immediately
+    /// with the same honest availability result as [`Self::spawn`].
+    #[cfg(target_os = "android")]
+    pub fn stop_recording(&self) -> Result<Vec<f32>, SttError> {
+        Err(SttError::MicUnavailable {
+            hint: "audio capture is unavailable on Android (Phase 1)".into(),
+        })
     }
 }
 

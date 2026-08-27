@@ -1317,7 +1317,7 @@ pub fn workflow_activation_ast_from_loom(
             .find(|meta| meta.node == spec.name)
             .ok_or_else(|| invalid_workflow_ast("compiled workflow node metadata is missing"))?;
         let incoming = if spec.depends_on.is_empty() {
-            vec![(None, workflow.input_type.clone())]
+            vec![(None, workflow.in_type.clone())]
         } else {
             let mut incoming = Vec::with_capacity(spec.depends_on.len());
             for dependency in &spec.depends_on {
@@ -1403,8 +1403,8 @@ pub fn workflow_activation_ast_from_loom(
     let ast = WorkflowActivationAst {
         workflow_id: workflow.id.clone(),
         workflow_digest: workflow.digest.clone(),
-        input_type: workflow.input_type.clone(),
-        output_type: workflow.output_type.clone(),
+        input_type: workflow.in_type.clone(),
+        output_type: workflow.out_type.clone(),
         nodes,
         edges,
         max_back_edge_activations: GRAPH_MAX_CONDITIONAL_HOPS,
