@@ -1,5 +1,9 @@
 #![allow(clippy::expect_used)]
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::ErrorCode;
@@ -15,7 +19,68 @@ use haider_store::{EventStore, Store};
 use crate::turn_recovery::{
     STARTUP_HYDRATION_PAYLOAD_KINDS, interrupted_recovery_payloads_for_test,
 };
-use crate::worker::{budget_usage_from_envelopes_for_test, exhausted_budget};
+use crate::worker::{
+    QueuedBudgetArm, QueuedBudgetWake, budget_usage_from_envelopes_for_test, exhausted_budget,
+    signal_queued_budget_change, wait_for_queued_budget_deadline_or_change,
+};
+
+#[tokio::test(start_paused = true)]
+async fn queued_budget_arm_survives_select_reentry_and_rearms_after_queue_change() {
+    let queue_changed = Arc::new(tokio::sync::Notify::new());
+    let scans = Arc::new(AtomicUsize::new(0));
+    let run_id = RunId::new("queued-budget-arm");
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(25);
+    let make_arm = |queue_epoch| {
+        let queue_changed = Arc::clone(&queue_changed);
+        let scans = Arc::clone(&scans);
+        QueuedBudgetArm::new(run_id.clone(), queue_epoch, async move {
+            scans.fetch_add(1, Ordering::SeqCst);
+            loop {
+                let delay = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if wait_for_queued_budget_deadline_or_change(delay, &queue_changed).await
+                    == QueuedBudgetWake::Deadline
+                {
+                    return;
+                }
+            }
+        })
+    };
+    let mut queue_epoch = 0;
+    let mut budget = make_arm(queue_epoch);
+
+    for _ in 0..64 {
+        tokio::select! {
+            biased;
+            () = budget.future_mut() => panic!("queued budget fired before its deadline"),
+            () = std::future::ready(()) => {}
+        }
+    }
+    assert_eq!(scans.load(Ordering::SeqCst), 1);
+
+    tokio::time::advance(Duration::from_millis(10)).await;
+    signal_queued_budget_change(&mut queue_epoch, &queue_changed);
+    assert!(!budget.matches(&run_id, queue_epoch));
+    drop(budget);
+    let mut budget = make_arm(queue_epoch);
+
+    tokio::select! {
+        biased;
+        () = budget.future_mut() => panic!("queue mutation fired the budget early"),
+        () = std::future::ready(()) => {}
+    }
+    assert_eq!(scans.load(Ordering::SeqCst), 2);
+
+    for _ in 0..64 {
+        tokio::select! {
+            biased;
+            () = budget.future_mut() => panic!("rearmed queued budget fired early"),
+            () = std::future::ready(()) => {}
+        }
+    }
+    tokio::time::advance(Duration::from_millis(15)).await;
+    budget.future_mut().await;
+    assert_eq!(scans.load(Ordering::SeqCst), 2);
+}
 
 fn envelope(seq: u64, run_id: &RunId, payload: serde_json::Value) -> RawEnvelope {
     serde_json::from_value(serde_json::json!({

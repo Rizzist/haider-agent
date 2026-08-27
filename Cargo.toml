@@ -91,7 +91,8 @@ large_enum_variant = "allow"
 debug = "line-tables-only"
 
 [profile.release]
-lto = "thin"
+codegen-units = 1
+lto = "fat"
 # Emit a separate dSYM (Mach-O), DWP (ELF), or PDB (MSVC), while retaining the
 # native image identity in the executable. Release packaging must archive that
 # companion by Mach-O UUID / ELF build ID / PDB GUID+age before uploading the

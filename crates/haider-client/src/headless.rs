@@ -1,9 +1,9 @@
 //! Reusable daemon-backed one-shot transaction for non-interactive clients.
 //!
 //! This module owns execution ordering, durable command retries, cursor replay,
-//! fail-closed permission handling, and terminal reduction. A lossless
-//! forwarding spool decouples that control plane from the caller's bounded
-//! [`HeadlessEvent`] stream; presentation owns only delivery and formatting.
+//! fail-closed permission handling, and terminal reduction. A lossless hybrid
+//! event ledger retains small runs in memory and spills larger runs without
+//! coupling control-plane progress to presentation formatting.
 
 #[cfg(test)]
 #[path = "headless_tests.rs"]
@@ -15,13 +15,13 @@ use std::future::{Future, pending};
 use std::io::{BufRead as _, BufReader, BufWriter, Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use haider_rpc::haider_protocol::EventPayload;
 use haider_rpc::haider_protocol::effect::{AuthorizationVerdict, EffectPhase};
-use haider_rpc::haider_protocol::envelope::RawEnvelope;
+use haider_rpc::haider_protocol::envelope::{RawEnvelope, envelope_weight_bytes};
 use haider_rpc::haider_protocol::error::{ErrorCode, ErrorPresentation};
 use haider_rpc::haider_protocol::headless::{
     HeadlessRunEventPayload, HeadlessRunSpecV1, ReplayDivergenceV1, RunBudgetExhaustedV1,
@@ -76,6 +76,13 @@ const ATTACH_HEALTH_POLL: Duration = Duration::from_millis(10);
 const EPHEMERAL_DRAIN_ALLOWANCE: Duration = Duration::from_secs(5);
 const EPHEMERAL_REAP_GRACE: Duration = Duration::from_millis(250);
 static COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// Correlated event bytes retained in memory before the ledger switches once
+/// to its private disk spool. The estimate deliberately counts retained JSON
+/// tree/string bytes without serializing each ordinary event.
+pub const HEADLESS_EVENT_MEMORY_THRESHOLD_BYTES: usize = 256 * 1024;
+/// A spilled ledger is flushed in bounded batches and once more at terminal.
+const HEADLESS_EVENT_SPOOL_FLUSH_BYTES: usize = 64 * 1024;
 
 const MAX_HEADLESS_ATTACHMENTS: usize = 5;
 const MAX_HEADLESS_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
@@ -444,6 +451,31 @@ pub enum HeadlessEvent {
     PermissionDenied(HeadlessPermissionDenial),
 }
 
+/// Delivery/retention policy for a headless output adapter.
+///
+/// All modes retain the correlated ledger. `FullRecordSet` starts that ledger
+/// on disk for single-JSON output, while ordinary runs retain small ledgers in
+/// memory and spill once at the documented threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadlessEventMode {
+    /// Stream every envelope (for JSONL and general API consumers).
+    Stream,
+    /// Stream announcements/denials only; retain the ledger for the result.
+    Summary,
+    /// Retain the complete ledger on disk for one final JSON document.
+    FullRecordSet,
+}
+
+impl HeadlessEventMode {
+    fn streams_envelopes(self) -> bool {
+        self == Self::Stream
+    }
+
+    fn spools_immediately(self) -> bool {
+        self == Self::FullRecordSet
+    }
+}
+
 /// Machine-readable permission denial made by the headless default policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeadlessPermissionDenial {
@@ -569,16 +601,25 @@ pub struct HeadlessRunResult {
     pub background_tasks_running: Vec<HeadlessBackgroundTask>,
 }
 
-/// Disk-backed, lossless correlated journal stream for a headless run.
+/// Lossless correlated journal stream for a headless run.
 ///
-/// Iteration decodes one envelope at a time, so retaining a run result is
-/// O(1) resident memory with respect to the total journal byte count. The
-/// private spool is deleted after the last clone is dropped.
+/// Small ledgers remain in memory. Once the retained-byte estimate crosses
+/// [`HEADLESS_EVENT_MEMORY_THRESHOLD_BYTES`], the complete prefix is written
+/// to one private spool and all later records stay there; memory and disk
+/// records therefore never interleave. The spool is deleted after the last
+/// clone is dropped.
 #[derive(Clone)]
 pub struct HeadlessRunEvents {
     run_id: RunId,
     len: usize,
-    spool: Option<Arc<HeadlessEventSpoolCleanup>>,
+    storage: HeadlessRunEventStorage,
+}
+
+#[derive(Clone)]
+enum HeadlessRunEventStorage {
+    Empty,
+    Memory(Arc<Vec<RawEnvelope>>),
+    Spool(Arc<HeadlessEventSpoolCleanup>),
 }
 
 impl HeadlessRunEvents {
@@ -587,7 +628,7 @@ impl HeadlessRunEvents {
         Self {
             run_id,
             len: 0,
-            spool: None,
+            storage: HeadlessRunEventStorage::Empty,
         }
     }
 
@@ -603,13 +644,18 @@ impl HeadlessRunEvents {
 
     /// Opens an independent streaming reader at the start of the ledger.
     pub fn iter(&self) -> std::io::Result<HeadlessRunEventReader> {
-        let file = self
-            .spool
-            .as_ref()
-            .map(|spool| File::open(&spool.path))
-            .transpose()?;
+        let storage = match &self.storage {
+            HeadlessRunEventStorage::Empty => HeadlessRunEventReaderStorage::Empty,
+            HeadlessRunEventStorage::Memory(events) => HeadlessRunEventReaderStorage::Memory {
+                events: Arc::clone(events),
+                index: 0,
+            },
+            HeadlessRunEventStorage::Spool(spool) => {
+                HeadlessRunEventReaderStorage::Spool(BufReader::new(File::open(&spool.path)?))
+            }
+        };
         Ok(HeadlessRunEventReader {
-            file: file.map(BufReader::new),
+            storage,
             run_id: self.run_id.clone(),
             expected: self.len,
             yielded: 0,
@@ -628,20 +674,12 @@ impl HeadlessRunEvents {
         Ok(())
     }
 
-    /// Builds a private disk ledger from an already bounded fixture batch.
+    /// Builds a hybrid ledger from an already bounded fixture batch.
     pub fn from_envelopes(
         run_id: RunId,
         envelopes: impl IntoIterator<Item = RawEnvelope>,
     ) -> Result<Self, HeadlessRunError> {
-        let spool = create_headless_event_spool()?;
-        let HeadlessEventSpool {
-            mut writer,
-            reader,
-            pending,
-            ..
-        } = spool;
-        drop(reader);
-        drop(pending);
+        let mut writer = HeadlessEventLedgerWriter::new(false);
         let mut len = 0_usize;
         for envelope in envelopes {
             if envelope.run_id.as_ref() != Some(&run_id) {
@@ -650,7 +688,7 @@ impl HeadlessRunEvents {
                     "fixture envelope does not match the ledger run id",
                 ));
             }
-            writer.push(&HeadlessEvent::Envelope(Box::new(envelope)));
+            writer.record_owned(envelope);
             len = len.saturating_add(1);
         }
         writer.finish(run_id, len)
@@ -691,9 +729,15 @@ impl Serialize for HeadlessRunEvents {
         S: serde::Serializer,
     {
         let mut sequence = serializer.serialize_seq(Some(self.len))?;
-        let events = self.iter().map_err(S::Error::custom)?;
-        for envelope in events {
-            sequence.serialize_element(&envelope.map_err(S::Error::custom)?)?;
+        if let HeadlessRunEventStorage::Memory(events) = &self.storage {
+            for envelope in events.iter() {
+                sequence.serialize_element(envelope)?;
+            }
+        } else {
+            let events = self.iter().map_err(S::Error::custom)?;
+            for envelope in events {
+                sequence.serialize_element(&envelope.map_err(S::Error::custom)?)?;
+            }
         }
         sequence.end()
     }
@@ -701,11 +745,20 @@ impl Serialize for HeadlessRunEvents {
 
 /// Streaming reader for [`HeadlessRunEvents`].
 pub struct HeadlessRunEventReader {
-    file: Option<BufReader<File>>,
+    storage: HeadlessRunEventReaderStorage,
     run_id: RunId,
     expected: usize,
     yielded: usize,
     failed: bool,
+}
+
+enum HeadlessRunEventReaderStorage {
+    Empty,
+    Memory {
+        events: Arc<Vec<RawEnvelope>>,
+        index: usize,
+    },
+    Spool(BufReader<File>),
 }
 
 impl Iterator for HeadlessRunEventReader {
@@ -715,8 +768,8 @@ impl Iterator for HeadlessRunEventReader {
         if self.failed {
             return None;
         }
-        loop {
-            let Some(file) = self.file.as_mut() else {
+        let event = match &mut self.storage {
+            HeadlessRunEventReaderStorage::Empty => {
                 if self.yielded == self.expected {
                     return None;
                 }
@@ -725,61 +778,81 @@ impl Iterator for HeadlessRunEventReader {
                     std::io::ErrorKind::UnexpectedEof,
                     "headless event ledger is absent",
                 )));
-            };
-            let mut record = Vec::new();
-            let read = match file.read_until(b'\n', &mut record) {
-                Ok(read) => read,
-                Err(error) => {
+            }
+            HeadlessRunEventReaderStorage::Memory { events, index } => {
+                let Some(event) = events.get(*index).cloned() else {
+                    if self.yielded == self.expected {
+                        return None;
+                    }
                     self.failed = true;
-                    return Some(Err(error));
-                }
-            };
-            if read == 0 {
-                if self.yielded == self.expected {
-                    return None;
-                }
-                self.failed = true;
-                return Some(Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    format!(
-                        "headless event ledger ended after {} of {} envelopes",
-                        self.yielded, self.expected
-                    ),
-                )));
+                    return Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "headless event ledger ended after {} of {} envelopes",
+                            self.yielded, self.expected
+                        ),
+                    )));
+                };
+                *index = index.saturating_add(1);
+                event
             }
-            if record.last() != Some(&b'\n') {
-                self.failed = true;
-                return Some(Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "headless event ledger has a partial final record",
-                )));
-            }
-            let event = match serde_json::from_slice::<HeadlessEvent>(&record[..record.len() - 1]) {
-                Ok(event) => event,
-                Err(error) => {
+            HeadlessRunEventReaderStorage::Spool(file) => {
+                let mut record = Vec::new();
+                let read = match file.read_until(b'\n', &mut record) {
+                    Ok(read) => read,
+                    Err(error) => {
+                        self.failed = true;
+                        return Some(Err(error));
+                    }
+                };
+                if read == 0 {
+                    if self.yielded == self.expected {
+                        return None;
+                    }
+                    self.failed = true;
+                    return Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "headless event ledger ended after {} of {} envelopes",
+                            self.yielded, self.expected
+                        ),
+                    )));
+                }
+                if record.last() != Some(&b'\n') {
                     self.failed = true;
                     return Some(Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!("cannot decode headless event ledger: {error}"),
+                        "headless event ledger has a partial final record",
                     )));
                 }
-            };
-            let HeadlessEvent::Envelope(envelope) = event else {
-                continue;
-            };
-            if envelope.run_id.as_ref() != Some(&self.run_id) {
-                continue;
+                match serde_json::from_slice::<RawEnvelope>(&record[..record.len() - 1]) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        self.failed = true;
+                        return Some(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("cannot decode headless event ledger: {error}"),
+                        )));
+                    }
+                }
             }
-            if self.yielded == self.expected {
-                self.failed = true;
-                return Some(Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "headless event ledger contains more envelopes than recorded",
-                )));
-            }
-            self.yielded = self.yielded.saturating_add(1);
-            return Some(Ok(*envelope));
+        };
+        if event.run_id.as_ref() != Some(&self.run_id) {
+            self.failed = true;
+            return Some(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "headless event ledger contains a mismatched run id",
+            )));
         }
+        if self.yielded == self.expected {
+            self.failed = true;
+            return Some(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "headless event ledger contains more envelopes than recorded",
+            )));
+        }
+        self.yielded = self.yielded.saturating_add(1);
+        Some(Ok(event))
     }
 }
 
@@ -1048,21 +1121,6 @@ enum ApplyStatus {
     Applied,
 }
 
-struct HeadlessEventSpoolWriter {
-    file: BufWriter<File>,
-    io_gate: Arc<Mutex<()>>,
-    ready: mpsc::Sender<()>,
-    output_open: Arc<AtomicBool>,
-    error: Arc<Mutex<Option<String>>>,
-    _cleanup: Arc<HeadlessEventSpoolCleanup>,
-}
-
-struct HeadlessEventSpoolReader {
-    file: BufReader<File>,
-    io_gate: Arc<Mutex<()>>,
-    _cleanup: Arc<HeadlessEventSpoolCleanup>,
-}
-
 struct HeadlessEventSpoolCleanup {
     path: PathBuf,
 }
@@ -1074,49 +1132,51 @@ impl Drop for HeadlessEventSpoolCleanup {
 }
 
 struct BufferedWireFrames {
-    file: BufWriter<File>,
+    file: Option<BufWriter<File>>,
     len: usize,
-    cleanup: Arc<HeadlessEventSpoolCleanup>,
+    cleanup: Option<Arc<HeadlessEventSpoolCleanup>>,
 }
 
 impl BufferedWireFrames {
-    fn create() -> Result<Self, HeadlessRunError> {
-        let path = std::env::temp_dir().join(format!("{}.jsonl", command_id("haider-replay")));
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let file = options
-            .open(&path)
-            .map_err(|error| HeadlessRunError::Protocol {
-                stage: "submit replay spool",
-                message: format!("cannot create private replay spool: {error}"),
-            })?;
-        Ok(Self {
-            file: BufWriter::new(file),
+    fn new() -> Self {
+        Self {
+            file: None,
             len: 0,
-            cleanup: Arc::new(HeadlessEventSpoolCleanup { path }),
-        })
+            cleanup: None,
+        }
+    }
+
+    fn ensure_file(&mut self) -> Result<&mut BufWriter<File>, HeadlessRunError> {
+        if self.file.is_none() {
+            let (file, cleanup) = create_private_spool("haider-replay", "submit replay spool")?;
+            self.file = Some(file);
+            self.cleanup = Some(cleanup);
+        }
+        self.file
+            .as_mut()
+            .ok_or_else(|| protocol_error("submit replay spool", "replay spool was not created"))
     }
 
     fn clear(&mut self) -> Result<(), HeadlessRunError> {
-        self.file
-            .flush()
-            .and_then(|()| self.file.get_mut().set_len(0))
-            .and_then(|()| self.file.get_mut().seek(std::io::SeekFrom::Start(0)))
-            .map_err(|error| HeadlessRunError::Protocol {
-                stage: "submit replay spool",
-                message: format!("cannot reset replay spool: {error}"),
-            })?;
+        if let Some(file) = self.file.as_mut() {
+            file.flush()
+                .and_then(|()| file.get_mut().set_len(0))
+                .and_then(|()| file.get_mut().seek(std::io::SeekFrom::Start(0)))
+                .map_err(|error| HeadlessRunError::Protocol {
+                    stage: "submit replay spool",
+                    message: format!("cannot reset replay spool: {error}"),
+                })?;
+        }
         self.len = 0;
         Ok(())
     }
 
     fn push(&mut self, frame: &WireFrame) -> Result<(), HeadlessRunError> {
-        serde_json::to_writer(&mut self.file, frame)
+        let file = self.ensure_file()?;
+        serde_json::to_writer(&mut *file, frame)
             .map_err(std::io::Error::other)
-            .and_then(|()| self.file.write_all(b"\n"))
-            .and_then(|()| self.file.flush())
+            .and_then(|()| file.write_all(b"\n"))
+            .and_then(|()| file.flush())
             .map_err(|error| HeadlessRunError::Protocol {
                 stage: "submit replay spool",
                 message: format!("cannot write replay spool: {error}"),
@@ -1126,32 +1186,37 @@ impl BufferedWireFrames {
     }
 
     fn reader(&mut self) -> Result<BufferedWireFrameReader, HeadlessRunError> {
-        self.file
-            .flush()
-            .map_err(|error| HeadlessRunError::Protocol {
+        if let Some(file) = self.file.as_mut() {
+            file.flush().map_err(|error| HeadlessRunError::Protocol {
                 stage: "submit replay spool",
                 message: format!("cannot flush replay spool: {error}"),
             })?;
-        let file = File::open(&self.cleanup.path).map_err(|error| HeadlessRunError::Protocol {
-            stage: "submit replay spool",
-            message: format!("cannot open replay spool: {error}"),
-        })?;
+        }
+        let file = self
+            .cleanup
+            .as_ref()
+            .map(|cleanup| File::open(&cleanup.path).map(BufReader::new))
+            .transpose()
+            .map_err(|error| HeadlessRunError::Protocol {
+                stage: "submit replay spool",
+                message: format!("cannot open replay spool: {error}"),
+            })?;
         Ok(BufferedWireFrameReader {
-            file: BufReader::new(file),
+            file,
             expected: self.len,
             yielded: 0,
             failed: false,
-            _cleanup: Arc::clone(&self.cleanup),
+            _cleanup: self.cleanup.clone(),
         })
     }
 }
 
 struct BufferedWireFrameReader {
-    file: BufReader<File>,
+    file: Option<BufReader<File>>,
     expected: usize,
     yielded: usize,
     failed: bool,
-    _cleanup: Arc<HeadlessEventSpoolCleanup>,
+    _cleanup: Option<Arc<HeadlessEventSpoolCleanup>>,
 }
 
 impl Iterator for BufferedWireFrameReader {
@@ -1161,8 +1226,18 @@ impl Iterator for BufferedWireFrameReader {
         if self.failed {
             return None;
         }
+        let Some(file) = self.file.as_mut() else {
+            if self.yielded == self.expected {
+                return None;
+            }
+            self.failed = true;
+            return Some(Err(protocol_error(
+                "submit replay spool",
+                "replay spool is absent before its recorded frame count",
+            )));
+        };
         let mut record = Vec::new();
-        let read = match self.file.read_until(b'\n', &mut record) {
+        let read = match file.read_until(b'\n', &mut record) {
             Ok(read) => read,
             Err(error) => {
                 self.failed = true;
@@ -1211,66 +1286,11 @@ impl Iterator for BufferedWireFrameReader {
     }
 }
 
-struct HeadlessEventSpool {
-    writer: HeadlessEventSpoolWriter,
-    reader: HeadlessEventSpoolReader,
-    pending: mpsc::Receiver<()>,
-    output_open: Arc<AtomicBool>,
-    error: Arc<Mutex<Option<String>>>,
-}
-
-impl HeadlessEventSpoolWriter {
-    fn push(&mut self, event: &HeadlessEvent) {
-        let _io_guard = match self.io_gate.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let written = serde_json::to_writer(&mut self.file, event)
-            .map_err(std::io::Error::other)
-            .and_then(|()| self.file.write_all(b"\n"))
-            .and_then(|()| self.file.flush());
-        if let Err(error) = written {
-            self.output_open.store(false, Ordering::Relaxed);
-            match self.error.lock() {
-                Ok(mut slot) => *slot = Some(error.to_string()),
-                Err(poisoned) => *poisoned.into_inner() = Some(error.to_string()),
-            }
-            return;
-        }
-        if self.output_open.load(Ordering::Relaxed) {
-            let _ = self.ready.try_send(());
-        }
-    }
-
-    fn finish(mut self, run_id: RunId, len: usize) -> Result<HeadlessRunEvents, HeadlessRunError> {
-        if let Err(error) = self.file.flush() {
-            return Err(HeadlessRunError::Protocol {
-                stage: "event spool",
-                message: format!("cannot flush event ledger: {error}"),
-            });
-        }
-        let error = match self.error.lock() {
-            Ok(mut error) => error.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
-        };
-        if let Some(message) = error {
-            return Err(HeadlessRunError::Protocol {
-                stage: "event spool",
-                message,
-            });
-        }
-        let cleanup = Arc::clone(&self._cleanup);
-        drop(self);
-        Ok(HeadlessRunEvents {
-            run_id,
-            len,
-            spool: Some(cleanup),
-        })
-    }
-}
-
-fn create_headless_event_spool() -> Result<HeadlessEventSpool, HeadlessRunError> {
-    let path = std::env::temp_dir().join(format!("{}.jsonl", command_id("haider-events")));
+fn create_private_spool(
+    prefix: &str,
+    stage: &'static str,
+) -> Result<(BufWriter<File>, Arc<HeadlessEventSpoolCleanup>), HeadlessRunError> {
+    let path = std::env::temp_dir().join(format!("{}.jsonl", command_id(prefix)));
     let mut options = OpenOptions::new();
     options.read(true).write(true).create_new(true);
     #[cfg(unix)]
@@ -1278,86 +1298,267 @@ fn create_headless_event_spool() -> Result<HeadlessEventSpool, HeadlessRunError>
     let file = options
         .open(&path)
         .map_err(|error| HeadlessRunError::Protocol {
-            stage: "event spool",
-            message: format!("cannot create private event spool: {error}"),
+            stage,
+            message: format!("cannot create private spool: {error}"),
         })?;
-    let reader = match File::open(&path) {
-        Ok(reader) => BufReader::new(reader),
-        Err(error) => {
-            drop(file);
-            let _ = fs::remove_file(&path);
-            return Err(HeadlessRunError::Protocol {
-                stage: "event spool",
-                message: format!("cannot open event spool reader: {error}"),
-            });
-        }
-    };
-    let (ready, pending) = mpsc::channel(1);
-    let output_open = Arc::new(AtomicBool::new(true));
-    let error = Arc::new(Mutex::new(None));
-    let io_gate = Arc::new(Mutex::new(()));
-    let cleanup = Arc::new(HeadlessEventSpoolCleanup { path });
-    Ok(HeadlessEventSpool {
-        writer: HeadlessEventSpoolWriter {
-            file: BufWriter::new(file),
-            io_gate: Arc::clone(&io_gate),
-            ready,
-            output_open: Arc::clone(&output_open),
-            error: Arc::clone(&error),
-            _cleanup: Arc::clone(&cleanup),
-        },
-        reader: HeadlessEventSpoolReader {
-            file: reader,
-            io_gate,
-            _cleanup: cleanup,
-        },
-        pending,
-        output_open,
-        error,
-    })
+    Ok((
+        BufWriter::new(file),
+        Arc::new(HeadlessEventSpoolCleanup { path }),
+    ))
 }
 
-async fn forward_spooled_events(
-    mut reader: HeadlessEventSpoolReader,
-    mut pending: mpsc::Receiver<()>,
-    output: mpsc::Sender<HeadlessEvent>,
-    output_open: Arc<AtomicBool>,
-) -> Result<(), String> {
-    loop {
-        let mut record = Vec::new();
-        loop {
-            let read = {
-                let _io_guard = match reader.io_gate.lock() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
+struct SpilledEventLedger {
+    file: BufWriter<File>,
+    cleanup: Arc<HeadlessEventSpoolCleanup>,
+    len: usize,
+    unflushed_bytes: usize,
+}
+
+enum HeadlessEventLedgerState {
+    Memory {
+        events: Vec<RawEnvelope>,
+        estimated_bytes: usize,
+    },
+    Spool(SpilledEventLedger),
+}
+
+struct HeadlessEventLedgerWriter {
+    state: HeadlessEventLedgerState,
+    spool_immediately: bool,
+    error: Option<String>,
+}
+
+impl HeadlessEventLedgerWriter {
+    fn new(spool_immediately: bool) -> Self {
+        Self {
+            state: HeadlessEventLedgerState::Memory {
+                events: Vec::new(),
+                estimated_bytes: 0,
+            },
+            spool_immediately,
+            error: None,
+        }
+    }
+
+    fn record(&mut self, envelope: &RawEnvelope) {
+        if self.error.is_some() {
+            return;
+        }
+        let estimate = envelope_weight_bytes(envelope);
+        let should_spill = match &self.state {
+            HeadlessEventLedgerState::Memory {
+                estimated_bytes, ..
+            } => {
+                self.spool_immediately
+                    || estimated_bytes.saturating_add(estimate)
+                        > HEADLESS_EVENT_MEMORY_THRESHOLD_BYTES
+            }
+            HeadlessEventLedgerState::Spool(_) => false,
+        };
+        if should_spill {
+            self.spill_and_record(envelope, estimate);
+            return;
+        }
+        match &mut self.state {
+            HeadlessEventLedgerState::Memory {
+                events,
+                estimated_bytes,
+            } => {
+                events.push(envelope.clone());
+                *estimated_bytes = estimated_bytes.saturating_add(estimate);
+            }
+            HeadlessEventLedgerState::Spool(spool) => {
+                if let Err(error) = write_event_spool_record(spool, envelope, estimate) {
+                    self.error = Some(error.to_string());
+                }
+            }
+        }
+    }
+
+    fn record_owned(&mut self, envelope: RawEnvelope) {
+        if self.error.is_some() {
+            return;
+        }
+        let estimate = envelope_weight_bytes(&envelope);
+        let should_spill = match &self.state {
+            HeadlessEventLedgerState::Memory {
+                estimated_bytes, ..
+            } => {
+                self.spool_immediately
+                    || estimated_bytes.saturating_add(estimate)
+                        > HEADLESS_EVENT_MEMORY_THRESHOLD_BYTES
+            }
+            HeadlessEventLedgerState::Spool(_) => false,
+        };
+        if should_spill {
+            self.spill_and_record(&envelope, estimate);
+            return;
+        }
+        match &mut self.state {
+            HeadlessEventLedgerState::Memory {
+                events,
+                estimated_bytes,
+            } => {
+                events.push(envelope);
+                *estimated_bytes = estimated_bytes.saturating_add(estimate);
+            }
+            HeadlessEventLedgerState::Spool(spool) => {
+                if let Err(error) = write_event_spool_record(spool, &envelope, estimate) {
+                    self.error = Some(error.to_string());
+                }
+            }
+        }
+    }
+
+    fn spill_and_record(&mut self, envelope: &RawEnvelope, estimate: usize) {
+        let previous = match std::mem::replace(
+            &mut self.state,
+            HeadlessEventLedgerState::Memory {
+                events: Vec::new(),
+                estimated_bytes: 0,
+            },
+        ) {
+            HeadlessEventLedgerState::Memory { events, .. } => events,
+            HeadlessEventLedgerState::Spool(spool) => {
+                self.state = HeadlessEventLedgerState::Spool(spool);
+                return;
+            }
+        };
+        let opened = create_private_spool("haider-events", "event spool").map(|(file, cleanup)| {
+            SpilledEventLedger {
+                file,
+                cleanup,
+                len: 0,
+                unflushed_bytes: 0,
+            }
+        });
+        let mut spool = match opened {
+            Ok(spool) => spool,
+            Err(error) => {
+                self.error = Some(error.to_string());
+                return;
+            }
+        };
+        for event in &previous {
+            if let Err(error) =
+                write_event_spool_record(&mut spool, event, envelope_weight_bytes(event))
+            {
+                self.error = Some(error.to_string());
+                return;
+            }
+        }
+        if let Err(error) = write_event_spool_record(&mut spool, envelope, estimate) {
+            self.error = Some(error.to_string());
+            return;
+        }
+        self.state = HeadlessEventLedgerState::Spool(spool);
+    }
+
+    fn finish(
+        mut self,
+        run_id: RunId,
+        expected_len: usize,
+    ) -> Result<HeadlessRunEvents, HeadlessRunError> {
+        if let Some(message) = self.error.take() {
+            return Err(HeadlessRunError::Protocol {
+                stage: "event spool",
+                message,
+            });
+        }
+        let (len, storage) = match self.state {
+            HeadlessEventLedgerState::Memory { events, .. } => {
+                let len = events.len();
+                let storage = if events.is_empty() {
+                    HeadlessRunEventStorage::Empty
+                } else {
+                    HeadlessRunEventStorage::Memory(Arc::new(events))
                 };
-                reader
+                (len, storage)
+            }
+            HeadlessEventLedgerState::Spool(mut spool) => {
+                spool
                     .file
-                    .read_until(b'\n', &mut record)
-                    .map_err(|error| format!("cannot read event spool: {error}"))?
-            };
-            if read == 0 {
-                break;
+                    .flush()
+                    .map_err(|error| HeadlessRunError::Protocol {
+                        stage: "event spool",
+                        message: format!("cannot flush event ledger at terminal: {error}"),
+                    })?;
+                (spool.len, HeadlessRunEventStorage::Spool(spool.cleanup))
             }
-            if record.last() != Some(&b'\n') {
-                let rewind = i64::try_from(record.len())
-                    .map_err(|_| "event spool record exceeds the seek range".to_owned())?;
-                reader.file.seek_relative(-rewind).map_err(|error| {
-                    format!("cannot rewind partial event spool record: {error}")
-                })?;
-                break;
-            }
-            let event = serde_json::from_slice::<HeadlessEvent>(&record[..record.len() - 1])
-                .map_err(|error| format!("cannot decode event spool: {error}"))?;
-            record.clear();
-            if output.send(event).await.is_err() {
-                output_open.store(false, Ordering::Relaxed);
-                return Ok(());
-            }
+        };
+        if len != expected_len {
+            return Err(protocol_error(
+                "event spool",
+                "correlated event count did not match the retained ledger",
+            ));
         }
-        if pending.recv().await.is_none() {
-            return Ok(());
+        Ok(HeadlessRunEvents {
+            run_id,
+            len,
+            storage,
+        })
+    }
+}
+
+fn write_event_spool_record(
+    spool: &mut SpilledEventLedger,
+    envelope: &RawEnvelope,
+    estimate: usize,
+) -> std::io::Result<()> {
+    serde_json::to_writer(&mut spool.file, envelope).map_err(std::io::Error::other)?;
+    spool.file.write_all(b"\n")?;
+    spool.len = spool.len.saturating_add(1);
+    spool.unflushed_bytes = spool.unflushed_bytes.saturating_add(estimate);
+    if spool.unflushed_bytes >= HEADLESS_EVENT_SPOOL_FLUSH_BYTES {
+        spool.file.flush()?;
+        spool.unflushed_bytes = 0;
+    }
+    Ok(())
+}
+
+struct HeadlessEventOutput {
+    sender: Option<mpsc::UnboundedSender<HeadlessEvent>>,
+    stream_envelopes: bool,
+    ledger: HeadlessEventLedgerWriter,
+}
+
+impl HeadlessEventOutput {
+    fn new(sender: mpsc::UnboundedSender<HeadlessEvent>, mode: HeadlessEventMode) -> Self {
+        Self {
+            sender: Some(sender),
+            stream_envelopes: mode.streams_envelopes(),
+            ledger: HeadlessEventLedgerWriter::new(mode.spools_immediately()),
         }
+    }
+
+    fn emit(&mut self, event: HeadlessEvent) {
+        let Some(sender) = self.sender.as_ref() else {
+            return;
+        };
+        if sender.send(event).is_err() {
+            self.sender = None;
+        }
+    }
+
+    fn emit_envelope(&mut self, envelope: RawEnvelope, correlated: bool) {
+        if correlated && !self.stream_envelopes {
+            self.ledger.record_owned(envelope);
+            return;
+        }
+        if correlated {
+            self.ledger.record(&envelope);
+        }
+        if self.stream_envelopes {
+            self.emit(HeadlessEvent::Envelope(Box::new(envelope)));
+        }
+    }
+
+    fn finish(
+        self,
+        run_id: RunId,
+        expected_len: usize,
+    ) -> Result<HeadlessRunEvents, HeadlessRunError> {
+        self.ledger.finish(run_id, expected_len)
     }
 }
 
@@ -1375,7 +1576,7 @@ struct HeadlessReducer {
     menu_resolutions: BTreeMap<String, DurableMenuResolution>,
     cancel_observed: bool,
     actions: VecDeque<ReducerAction>,
-    output: HeadlessEventSpoolWriter,
+    output: HeadlessEventOutput,
     /// W-A: task id → (name, running) from the additive task facts, in
     /// deterministic id order for the run summary.
     background_tasks: BTreeMap<String, (String, bool)>,
@@ -1384,7 +1585,7 @@ struct HeadlessReducer {
 }
 
 impl HeadlessReducer {
-    fn new(session_id: SessionId, output: HeadlessEventSpoolWriter) -> Self {
+    fn new(session_id: SessionId, output: HeadlessEventOutput) -> Self {
         Self {
             session_id,
             run_id: None,
@@ -1413,7 +1614,7 @@ impl HeadlessReducer {
     }
 
     fn emit(&mut self, event: HeadlessEvent) {
-        self.output.push(&event);
+        self.output.emit(event);
     }
 
     async fn apply(&mut self, envelope: RawEnvelope) -> ApplyStatus {
@@ -1427,19 +1628,25 @@ impl HeadlessReducer {
             return ApplyStatus::Gap;
         }
 
-        self.emit(HeadlessEvent::Envelope(Box::new(envelope.clone())));
         self.last_applied = envelope.seq;
         let correlated = self.is_correlated(&envelope);
         if correlated {
             self.event_count = self.event_count.saturating_add(1);
         }
+        let payload_type = envelope
+            .payload
+            .get("type")
+            .and_then(serde_json::Value::as_str);
         // W-A: background task facts are SESSION-scoped (they outlive turns
         // by design) and ride the additive union outside `EventPayload` —
         // track them regardless of run correlation so the run summary can
         // name still-running tasks honestly at exit.
-        if let Some(fact) = haider_rpc::haider_protocol::task::TaskEventPayload::from_payload_value(
-            &envelope.payload,
-        ) {
+        if matches!(payload_type, Some("task_started" | "task_completed"))
+            && let Some(fact) =
+                haider_rpc::haider_protocol::task::TaskEventPayload::from_payload_value(
+                    &envelope.payload,
+                )
+        {
             match fact {
                 haider_rpc::haider_protocol::task::TaskEventPayload::TaskStarted(started) => {
                     self.background_tasks
@@ -1453,128 +1660,129 @@ impl HeadlessReducer {
             }
         }
         if correlated
+            && payload_type == Some("run_budget_exhausted")
             && let Some(HeadlessRunEventPayload::RunBudgetExhausted(exhausted)) =
                 HeadlessRunEventPayload::from_payload_value(&envelope.payload)
         {
             self.budget_exhausted = Some(exhausted);
         }
-        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
-            return ApplyStatus::Applied;
-        };
-        if !correlated {
-            return ApplyStatus::Applied;
-        }
-
-        match payload {
-            EventPayload::Item(ItemEvent::Completed {
-                item: TurnItem::AgentMessage { text },
-                ..
-            }) => self.response = Some(text),
-            EventPayload::Item(ItemEvent::Completed {
-                item: TurnItem::IncompleteAgentMessage { text, .. },
-                ..
-            }) => self.response = Some(text),
-            EventPayload::Usage(usage) => self.usage = Some(usage),
-            EventPayload::Effect(EffectPhase::Intent(intent)) => {
-                self.effect_summaries
-                    .insert(intent.effect.as_str().to_owned(), intent.summary);
-            }
-            EventPayload::Effect(EffectPhase::Authorized {
-                effect,
-                verdict: AuthorizationVerdict::Deny { .. },
-            }) => {
-                let denial = HeadlessPermissionDenial {
-                    menu_id: effect.as_str().to_owned(),
-                    effect_summary: self
-                        .effect_summaries
-                        .remove(effect.as_str())
-                        .unwrap_or_else(|| effect.as_str().to_owned()),
-                    notice: "permission_denied_by_headless_default".into(),
-                };
-                self.permission_denials.push(denial.clone());
-                self.emit(HeadlessEvent::PermissionDenied(denial));
-            }
-            EventPayload::Effect(EffectPhase::Authorized { effect, .. }) => {
-                self.effect_summaries.remove(effect.as_str());
-            }
-            EventPayload::RunFailed {
-                code,
-                message,
-                retryable,
-                presentation,
-            } => {
-                let message = presentation
-                    .as_ref()
-                    .map_or(message, |safe| format!("{} — {}", safe.title, safe.detail));
-                self.pending_run_failure = Some((
-                    envelope.seq,
-                    HeadlessRunFailure {
-                        code: HeadlessFailureCode::Run(code),
-                        message,
-                        retryable,
-                        presentation,
-                    },
-                ));
-            }
-            EventPayload::RunState(state) => self.reduce_run_state(state, envelope.seq),
-            EventPayload::MenuOpened(menu) => match menu.kind {
-                MenuKind::Permission { effect_summary } => {
-                    let selected = menu
-                        .options
-                        .iter()
-                        .enumerate()
-                        .find(|(_, option)| option.decision == Some(DecisionKind::RejectOnce));
-                    let Some((index, option)) = selected else {
-                        self.actions.push_back(ReducerAction::Block(
-                            HeadlessBlockingReason::PermissionRejectUnavailable,
-                        ));
-                        return ApplyStatus::Applied;
-                    };
-                    let Ok(option_index) = u32::try_from(index) else {
-                        self.actions.push_back(ReducerAction::Block(
-                            HeadlessBlockingReason::PermissionRejectUnavailable,
-                        ));
-                        return ApplyStatus::Applied;
-                    };
+        // Correlation and the cheap tagged-union discriminator are resolved
+        // before cloning the JSON value into the large core event union.
+        let mut denial_to_emit = None;
+        if correlated
+            && payload_type.is_some()
+            && let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone())
+        {
+            match payload {
+                EventPayload::Item(ItemEvent::Completed {
+                    item: TurnItem::AgentMessage { text },
+                    ..
+                }) => self.response = Some(text),
+                EventPayload::Item(ItemEvent::Completed {
+                    item: TurnItem::IncompleteAgentMessage { text, .. },
+                    ..
+                }) => self.response = Some(text),
+                EventPayload::Usage(usage) => self.usage = Some(usage),
+                EventPayload::Effect(EffectPhase::Intent(intent)) => {
+                    self.effect_summaries
+                        .insert(intent.effect.as_str().to_owned(), intent.summary);
+                }
+                EventPayload::Effect(EffectPhase::Authorized {
+                    effect,
+                    verdict: AuthorizationVerdict::Deny { .. },
+                }) => {
                     let denial = HeadlessPermissionDenial {
-                        menu_id: menu.id.as_str().to_owned(),
-                        effect_summary,
+                        menu_id: effect.as_str().to_owned(),
+                        effect_summary: self
+                            .effect_summaries
+                            .remove(effect.as_str())
+                            .unwrap_or_else(|| effect.as_str().to_owned()),
                         notice: "permission_denied_by_headless_default".into(),
                     };
                     self.permission_denials.push(denial.clone());
-                    self.emit(HeadlessEvent::PermissionDenied(denial));
-                    self.actions.push_back(ReducerAction::RejectPermission {
-                        command_id: CommandId::new(command_id("headless-menu")),
-                        menu_id: menu.id,
-                        request_seq: envelope.seq,
-                        option_key: option.key.clone(),
-                        option_index,
-                    });
+                    denial_to_emit = Some(denial);
                 }
-                MenuKind::ErrorRecovery { presentation, .. } if menu.blocking => {
-                    self.blocking_presentation = Some(presentation);
-                    self.actions
-                        .push_back(ReducerAction::Block(HeadlessBlockingReason::InputRequired));
+                EventPayload::Effect(EffectPhase::Authorized { effect, .. }) => {
+                    self.effect_summaries.remove(effect.as_str());
                 }
-                _ if menu.blocking => self
-                    .actions
-                    .push_back(ReducerAction::Block(HeadlessBlockingReason::InputRequired)),
+                EventPayload::RunFailed {
+                    code,
+                    message,
+                    retryable,
+                    presentation,
+                } => {
+                    let message = presentation
+                        .as_ref()
+                        .map_or(message, |safe| format!("{} — {}", safe.title, safe.detail));
+                    self.pending_run_failure = Some((
+                        envelope.seq,
+                        HeadlessRunFailure {
+                            code: HeadlessFailureCode::Run(code),
+                            message,
+                            retryable,
+                            presentation,
+                        },
+                    ));
+                }
+                EventPayload::RunState(state) => self.reduce_run_state(state, envelope.seq),
+                EventPayload::MenuOpened(menu) => match menu.kind {
+                    MenuKind::Permission { effect_summary } => {
+                        let selected =
+                            menu.options.iter().enumerate().find(|(_, option)| {
+                                option.decision == Some(DecisionKind::RejectOnce)
+                            });
+                        if let Some((index, option)) = selected
+                            && let Ok(option_index) = u32::try_from(index)
+                        {
+                            let denial = HeadlessPermissionDenial {
+                                menu_id: menu.id.as_str().to_owned(),
+                                effect_summary,
+                                notice: "permission_denied_by_headless_default".into(),
+                            };
+                            self.permission_denials.push(denial.clone());
+                            denial_to_emit = Some(denial);
+                            self.actions.push_back(ReducerAction::RejectPermission {
+                                command_id: CommandId::new(command_id("headless-menu")),
+                                menu_id: menu.id,
+                                request_seq: envelope.seq,
+                                option_key: option.key.clone(),
+                                option_index,
+                            });
+                        } else {
+                            self.actions.push_back(ReducerAction::Block(
+                                HeadlessBlockingReason::PermissionRejectUnavailable,
+                            ));
+                        }
+                    }
+                    MenuKind::ErrorRecovery { presentation, .. } if menu.blocking => {
+                        self.blocking_presentation = Some(presentation);
+                        self.actions
+                            .push_back(ReducerAction::Block(HeadlessBlockingReason::InputRequired));
+                    }
+                    _ if menu.blocking => self
+                        .actions
+                        .push_back(ReducerAction::Block(HeadlessBlockingReason::InputRequired)),
+                    _ => {}
+                },
+                EventPayload::MenuAnswered(answer) => {
+                    self.menu_resolutions.insert(
+                        answer.menu.as_str().to_owned(),
+                        DurableMenuResolution::Answer {
+                            option_key: answer.option_key,
+                            option_index: answer.option_index,
+                        },
+                    );
+                }
+                EventPayload::MenuClosed { menu, .. } => {
+                    self.menu_resolutions
+                        .insert(menu.as_str().to_owned(), DurableMenuResolution::Closed);
+                }
                 _ => {}
-            },
-            EventPayload::MenuAnswered(answer) => {
-                self.menu_resolutions.insert(
-                    answer.menu.as_str().to_owned(),
-                    DurableMenuResolution::Answer {
-                        option_key: answer.option_key,
-                        option_index: answer.option_index,
-                    },
-                );
             }
-            EventPayload::MenuClosed { menu, .. } => {
-                self.menu_resolutions
-                    .insert(menu.as_str().to_owned(), DurableMenuResolution::Closed);
-            }
-            _ => {}
+        }
+        self.output.emit_envelope(envelope, correlated);
+        if let Some(denial) = denial_to_emit {
+            self.emit(HeadlessEvent::PermissionDenied(denial));
         }
         ApplyStatus::Applied
     }
@@ -1699,22 +1907,34 @@ pub async fn run_headless_with_session_config(
     session_config: HeadlessSessionConfig,
     output: mpsc::Sender<HeadlessEvent>,
 ) -> Result<HeadlessRunResult, HeadlessRunError> {
+    run_headless_with_session_config_and_event_mode(
+        profile,
+        ensure,
+        request,
+        session_config,
+        output,
+        HeadlessEventMode::Stream,
+    )
+    .await
+}
+
+/// [`run_headless_with_session_config`] with an explicit output-adapter event
+/// policy. This keeps single-JSON output off the live envelope channel while
+/// preserving its complete, byte-stable final ledger.
+pub async fn run_headless_with_session_config_and_event_mode(
+    profile: &ResolvedProfile,
+    ensure: EnsureOptions,
+    request: HeadlessRunRequest,
+    session_config: HeadlessSessionConfig,
+    output: mpsc::Sender<HeadlessEvent>,
+    event_mode: HeadlessEventMode,
+) -> Result<HeadlessRunResult, HeadlessRunError> {
     let daemon_lifetime = ensure.daemon_lifetime;
     let daemon_ownership = Arc::new(Mutex::new(None));
-    let HeadlessEventSpool {
-        writer: reducer_output,
-        reader: spool_reader,
-        pending: pending_output,
-        output_open,
-        error: spool_error,
-    } = create_headless_event_spool()?;
+    let (event_sender, event_receiver) = mpsc::unbounded_channel();
+    let reducer_output = HeadlessEventOutput::new(event_sender, event_mode);
+    let forwarder = tokio::spawn(forward_headless_events(event_receiver, output));
     let teardown_client = ensure.client.clone();
-    let forwarder = tokio::spawn(forward_spooled_events(
-        spool_reader,
-        pending_output,
-        output,
-        output_open,
-    ));
     let result = run_headless_inner(
         profile,
         ensure,
@@ -1724,26 +1944,10 @@ pub async fn run_headless_with_session_config(
         Arc::clone(&daemon_ownership),
     )
     .await;
-    let forwarding = match forwarder.await {
-        Ok(Ok(())) => match spool_error.lock() {
-            Ok(mut error) => error.take(),
-            Err(poisoned) => poisoned.into_inner().take(),
-        }
-        .map_or(Ok(()), |message| {
-            Err(HeadlessRunError::Protocol {
-                stage: "event spool",
-                message,
-            })
-        }),
-        Ok(Err(message)) => Err(HeadlessRunError::Protocol {
-            stage: "event spool",
-            message,
-        }),
-        Err(error) => Err(HeadlessRunError::Protocol {
-            stage: "event spool",
-            message: format!("event spool forwarder failed: {error}"),
-        }),
-    };
+    let forwarding = forwarder.await.map_err(|error| HeadlessRunError::Protocol {
+        stage: "event forwarding",
+        message: format!("in-memory event forwarder failed: {error}"),
+    });
     let teardown = if daemon_lifetime == DaemonLifetime::EphemeralIfSpawned {
         teardown_owned_daemon(profile, &teardown_client, &daemon_ownership).await
     } else {
@@ -1752,6 +1956,17 @@ pub async fn run_headless_with_session_config(
     match (result, forwarding, teardown) {
         (Ok(result), Ok(()), Ok(())) => Ok(result),
         (Err(error), _, _) | (Ok(_), Err(error), _) | (Ok(_), Ok(()), Err(error)) => Err(error),
+    }
+}
+
+async fn forward_headless_events(
+    mut events: mpsc::UnboundedReceiver<HeadlessEvent>,
+    output: mpsc::Sender<HeadlessEvent>,
+) {
+    while let Some(event) = events.recv().await {
+        if output.send(event).await.is_err() {
+            break;
+        }
     }
 }
 
@@ -1777,17 +1992,15 @@ async fn lifecycle_request(
 ) -> Result<ResponseBody, HeadlessRunError> {
     normalize_lifecycle_options(&mut ensure);
     let lifetime = ensure.daemon_lifetime;
-    let teardown_client = ensure.client.clone();
     let ownership = Arc::new(Mutex::new(None));
-    let connection = HeadlessConnection::open(profile, ensure, Arc::clone(&ownership)).await?;
+    let mut connection = HeadlessConnection::open(profile, ensure, Arc::clone(&ownership)).await?;
     let response = connection
         .client
         .request(body)
         .await
         .map_err(|error| client_error_as_headless(stage, error));
-    drop(connection);
     let teardown = if lifetime == DaemonLifetime::EphemeralIfSpawned {
-        teardown_owned_daemon(profile, &teardown_client, &ownership).await
+        teardown_owned_daemon_on_connection(profile, &mut connection, &ownership).await
     } else {
         Ok(())
     };
@@ -1890,15 +2103,7 @@ pub async fn headless_run_events(
     ensure: EnsureOptions,
     status: &HeadlessRunStatus,
 ) -> Result<HeadlessRunEvents, HeadlessRunError> {
-    let spool = create_headless_event_spool()?;
-    let HeadlessEventSpool {
-        mut writer,
-        reader,
-        pending,
-        ..
-    } = spool;
-    drop(reader);
-    drop(pending);
+    let mut writer = HeadlessEventLedgerWriter::new(false);
     let mut event_count = 0_usize;
     let mut start_seq = 1_u64;
     while start_seq <= status.head_seq {
@@ -1920,7 +2125,7 @@ pub async fn headless_run_events(
                     .into_iter()
                     .filter(|envelope| envelope.run_id.as_ref() == Some(&status.run_id))
                 {
-                    writer.push(&HeadlessEvent::Envelope(Box::new(envelope)));
+                    writer.record_owned(envelope);
                     event_count = event_count.saturating_add(1);
                 }
             }
@@ -1954,8 +2159,42 @@ async fn teardown_owned_daemon(
     client: &ClientConfig,
     daemon_ownership: &Mutex<Option<DaemonOwnershipToken>>,
 ) -> Result<(), HeadlessRunError> {
-    let Some(mut ownership) = lock_daemon_ownership(daemon_ownership).take() else {
+    let Some(ownership) = take_live_daemon_ownership(daemon_ownership)? else {
         return Ok(());
+    };
+    let request_deadline = Instant::now() + EPHEMERAL_DRAIN_ALLOWANCE;
+    let shutdown =
+        reconnect_and_shutdown_owned_daemon_peer(profile, client, &ownership, request_deadline)
+            .await;
+    finish_owned_daemon_teardown(ownership, shutdown, request_deadline).await
+}
+
+async fn teardown_owned_daemon_on_connection(
+    profile: &ResolvedProfile,
+    connection: &mut HeadlessConnection,
+    daemon_ownership: &Mutex<Option<DaemonOwnershipToken>>,
+) -> Result<(), HeadlessRunError> {
+    let Some(ownership) = take_live_daemon_ownership(daemon_ownership)? else {
+        return Ok(());
+    };
+    let request_deadline = Instant::now() + EPHEMERAL_DRAIN_ALLOWANCE;
+    let HeadlessConnection { client, events, .. } = connection;
+    let shutdown = shutdown_owned_daemon_peer(
+        &profile.profile_id,
+        client,
+        events,
+        &ownership,
+        request_deadline,
+    )
+    .await;
+    finish_owned_daemon_teardown(ownership, shutdown, request_deadline).await
+}
+
+fn take_live_daemon_ownership(
+    daemon_ownership: &Mutex<Option<DaemonOwnershipToken>>,
+) -> Result<Option<DaemonOwnershipToken>, HeadlessRunError> {
+    let Some(mut ownership) = lock_daemon_ownership(daemon_ownership).take() else {
+        return Ok(None);
     };
     if ownership
         .child
@@ -1963,55 +2202,66 @@ async fn teardown_owned_daemon(
         .map_err(|error| teardown_protocol(format!("could not inspect owned child: {error}")))?
         .is_some()
     {
-        return Ok(());
+        return Ok(None);
     }
-
-    let request_deadline = Instant::now() + EPHEMERAL_DRAIN_ALLOWANCE;
-    let shutdown = shutdown_owned_daemon_peer(profile, client, &ownership, request_deadline).await;
-    let reap_deadline = shutdown.as_ref().copied().unwrap_or(request_deadline);
-    let reap = reap_owned_daemon(ownership, reap_deadline).await;
-    match (shutdown, reap) {
-        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
-        (Ok(_), Ok(())) => Ok(()),
-    }
+    Ok(Some(ownership))
 }
 
-async fn shutdown_owned_daemon_peer(
+async fn reconnect_and_shutdown_owned_daemon_peer(
     profile: &ResolvedProfile,
-    client: &ClientConfig,
+    client_config: &ClientConfig,
     ownership: &DaemonOwnershipToken,
     request_deadline: Instant,
 ) -> Result<Instant, HeadlessRunError> {
     let connected = tokio::time::timeout_at(
         request_deadline,
-        connect(&profile.endpoint_path, client.clone()),
+        connect(&profile.endpoint_path, client_config.clone()),
     )
     .await
     .map_err(|_| teardown_protocol("timed out reconnecting to owned daemon"))?
     .map_err(|error| teardown_protocol(format!("could not reconnect to owned daemon: {error}")))?;
-    #[cfg(unix)]
-    let uid_changed = connected.peer_credentials.uid != effective_uid();
-    #[cfg(not(unix))]
-    let uid_changed = false;
-    if connected.welcome.profile_id != profile.profile_id
-        || connected.welcome.instance_id != ownership.instance_id
-        || connected.welcome.daemon_generation != ownership.daemon_generation
-        || uid_changed
-        || connected.peer_credentials.pid != Some(ownership.authenticated_pid)
-    {
-        connected.client.close();
-        return Err(teardown_protocol(
-            "owned daemon identity changed before one-shot teardown",
-        ));
-    }
     let mut events = connected
         .client
         .take_events()
         .ok_or_else(|| teardown_protocol("one-shot teardown could not retain daemon events"))?;
+    shutdown_owned_daemon_peer(
+        &profile.profile_id,
+        &connected.client,
+        &mut events,
+        ownership,
+        request_deadline,
+    )
+    .await
+}
+
+async fn shutdown_owned_daemon_peer(
+    expected_profile_id: &str,
+    client: &RpcClient,
+    events: &mut mpsc::Receiver<WireFrame>,
+    ownership: &DaemonOwnershipToken,
+    request_deadline: Instant,
+) -> Result<Instant, HeadlessRunError> {
+    let welcome = client.welcome();
+    let peer_credentials = client.peer_credentials();
+    #[cfg(unix)]
+    let uid_changed = peer_credentials.uid != effective_uid();
+    #[cfg(not(unix))]
+    let uid_changed = false;
+    if welcome.profile_id != expected_profile_id
+        || welcome.instance_id != ownership.instance_id
+        || welcome.daemon_generation != ownership.daemon_generation
+        || uid_changed
+        || peer_credentials.pid != Some(ownership.authenticated_pid)
+    {
+        client.close();
+        return Err(teardown_protocol(
+            "owned daemon identity changed before one-shot teardown",
+        ));
+    }
 
     let request = tokio::time::timeout_at(
         request_deadline,
-        connected.client.request(RequestBody::DaemonShutdown {}),
+        client.request(RequestBody::DaemonShutdown {}),
     )
     .await;
     let request_failure = match request {
@@ -2076,16 +2326,29 @@ async fn shutdown_owned_daemon_peer(
         )
     })?;
     if notice.0 != ownership.instance_id || notice.1 != ownership.daemon_generation {
-        connected.client.close();
+        client.close();
         return Err(teardown_protocol(
             "owned daemon drain notice did not match its authenticated Welcome",
         ));
     }
     let drain_deadline = daemon_drain_deadline(notice.2);
-    tokio::time::timeout_at(drain_deadline, connected.client.disconnected())
+    tokio::time::timeout_at(drain_deadline, client.disconnected())
         .await
         .map_err(|_| teardown_protocol("owned daemon disconnect timed out"))?;
     Ok(drain_deadline)
+}
+
+async fn finish_owned_daemon_teardown(
+    ownership: DaemonOwnershipToken,
+    shutdown: Result<Instant, HeadlessRunError>,
+    request_deadline: Instant,
+) -> Result<(), HeadlessRunError> {
+    let reap_deadline = shutdown.as_ref().copied().unwrap_or(request_deadline);
+    let reap = reap_owned_daemon(ownership, reap_deadline).await;
+    match (shutdown, reap) {
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        (Ok(_), Ok(())) => Ok(()),
+    }
 }
 
 fn daemon_drain_deadline(deadline_unix_ms: u64) -> Instant {
@@ -2133,7 +2396,7 @@ async fn run_headless_inner(
     mut ensure: EnsureOptions,
     request: HeadlessRunRequest,
     session_config: HeadlessSessionConfig,
-    output: HeadlessEventSpoolWriter,
+    output: HeadlessEventOutput,
     daemon_ownership: Arc<Mutex<Option<DaemonOwnershipToken>>>,
 ) -> Result<HeadlessRunResult, HeadlessRunError> {
     if request.attachments.len() > MAX_HEADLESS_ATTACHMENTS {
@@ -2362,7 +2625,7 @@ async fn run_headless_inner(
         submit_attachments,
         submit_spec,
     );
-    let mut buffered = BufferedWireFrames::create()?;
+    let mut buffered = BufferedWireFrames::new();
     let mut submit_timeout_grace = None;
     let run_id = loop {
         let pending_response = match connection.client.begin_request(submit_body.clone()).await {
@@ -2473,7 +2736,7 @@ async fn run_headless_inner(
     reducer.run_id = Some(run_id.clone());
     if request.detached {
         let events = HeadlessRunEvents::empty(run_id.clone());
-        return Ok(HeadlessRunResult {
+        let result = HeadlessRunResult {
             session_id,
             run_id,
             provider,
@@ -2489,7 +2752,12 @@ async fn run_headless_inner(
             failure: None,
             terminal_seq: None,
             background_tasks_running: Vec::new(),
-        });
+        };
+        if ensure.daemon_lifetime == DaemonLifetime::EphemeralIfSpawned {
+            teardown_owned_daemon_on_connection(profile, &mut connection, &daemon_ownership)
+                .await?;
+        }
+        return Ok(result);
     }
 
     let mut forced = submit_timeout_grace.map(|_| ForcedOutcome::Timeout);
@@ -2718,7 +2986,16 @@ async fn run_headless_inner(
         }
     }
 
-    finalize(reducer, run_id, provider, model, attachment_refs, forced)
+    let result = finalize(reducer, run_id, provider, model, attachment_refs, forced);
+    let teardown = if ensure.daemon_lifetime == DaemonLifetime::EphemeralIfSpawned {
+        teardown_owned_daemon_on_connection(profile, &mut connection, &daemon_ownership).await
+    } else {
+        Ok(())
+    };
+    match (result, teardown) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+    }
 }
 
 async fn upload_attachments(

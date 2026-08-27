@@ -7,10 +7,11 @@ use std::time::Duration;
 
 use haider_client::{
     ConnectError, DaemonLifetime, ERROR_CODE_NO_ACTIVE_ACCOUNT, ERROR_CODE_NO_DEFAULT_MODEL,
-    EnsureError, EnsureOptions, HeadlessEvent, HeadlessFailureCode, HeadlessOutcome,
-    HeadlessRunError, HeadlessRunEventReader, HeadlessRunEvents, HeadlessRunRequest,
-    HeadlessRunResult, HeadlessSessionConfig, ProfileEnv, headless_run_events, headless_run_status,
-    load_attachment, resolve_profile, run_headless_with_session_config, stop_headless_run,
+    EnsureError, EnsureOptions, HeadlessEvent, HeadlessEventMode, HeadlessFailureCode,
+    HeadlessOutcome, HeadlessRunError, HeadlessRunEventReader, HeadlessRunEvents,
+    HeadlessRunRequest, HeadlessRunResult, HeadlessSessionConfig, ProfileEnv, headless_run_events,
+    headless_run_status, load_attachment, resolve_profile,
+    run_headless_with_session_config_and_event_mode, stop_headless_run,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::error::ErrorCode;
@@ -723,8 +724,20 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
         },
         ..EnsureOptions::default()
     };
-    let result =
-        run_headless_with_session_config(&profile, ensure, request, session_config, events).await;
+    let event_mode = match options.output {
+        RunOutput::Jsonl => HeadlessEventMode::Stream,
+        RunOutput::Json => HeadlessEventMode::FullRecordSet,
+        RunOutput::Print => HeadlessEventMode::Summary,
+    };
+    let result = run_headless_with_session_config_and_event_mode(
+        &profile,
+        ensure,
+        request,
+        session_config,
+        events,
+        event_mode,
+    )
+    .await;
     let adapter_result = match adapter.await {
         Ok(result) => result,
         Err(error) => Err(io::Error::other(format!("output adapter failed: {error}"))),

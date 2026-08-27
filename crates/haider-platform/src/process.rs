@@ -365,18 +365,49 @@ pub(crate) fn close_inherited_descriptors_from(first: std::os::raw::c_int) {
         return;
     }
 
-    unsafe extern "C" {
-        fn close(fd: std::os::raw::c_int) -> std::os::raw::c_int;
-    }
-
     // Fallback for an older Linux kernel or a Unix without a bulk-close API.
-    // POSIX close(2) is async-signal-safe and EBADF is expected for unused
-    // slots. Do not use rustix::io::close here: its contract requires an open
-    // fd, and the Linux debug backend panics on EBADF. A panic after fork is
-    // converted into SIGABRT by Command's pre-exec guard.
-    for fd in first..65_536_i32 {
-        let _ = unsafe { close(fd) };
+    // `getrlimit(2)` and `close(2)` are raw, async-signal-safe libc calls; the
+    // pre-exec child must not enter an allocator or a libc wrapper which may
+    // hold a parent-thread lock. EBADF is expected for unused slots. Do not use
+    // rustix::io::close here: its contract requires an open fd, and the Linux
+    // debug backend panics on EBADF. A panic after fork is converted into
+    // SIGABRT by Command's pre-exec guard.
+    let upper_bound = inherited_descriptor_upper_bound();
+    for fd in first..upper_bound {
+        let _ = unsafe { libc::close(fd) };
     }
+}
+
+/// Returns the exact parent descriptor-table ceiling without allocating.
+///
+/// The parent never lowers `RLIMIT_NOFILE`, so every descriptor it could have
+/// handed to the fork child is below `rlim_cur`. A failed limit probe retains
+/// the historical conservative ceiling.
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "vita"))
+))]
+#[allow(unsafe_code)]
+fn inherited_descriptor_upper_bound() -> std::os::raw::c_int {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+        let capped = limit.rlim_cur.min(std::os::raw::c_int::MAX as libc::rlim_t);
+        return capped as std::os::raw::c_int;
+    }
+    65_536
+}
+
+// Newlib libc exposes `getrlimit` but no `RLIMIT_NOFILE` selector on these
+// non-daemon targets. Retain the historical conservative ceiling there.
+#[cfg(all(
+    unix,
+    any(target_os = "espidf", target_os = "horizon", target_os = "vita")
+))]
+fn inherited_descriptor_upper_bound() -> std::os::raw::c_int {
+    65_536
 }
 
 /// Runtime probe for Linux's 5.9+ `close_range(2)`. A kernel without the

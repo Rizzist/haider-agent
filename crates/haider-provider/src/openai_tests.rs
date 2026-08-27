@@ -19,6 +19,21 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::error::TryRecvError;
 
+#[test]
+fn shared_provider_builder_pins_idle_h2_and_tcp_keep_alive() {
+    assert_eq!(
+        crate::PROVIDER_KEEP_ALIVE,
+        crate::ProviderKeepAliveConfig {
+            http2_interval: std::time::Duration::from_secs(30),
+            http2_while_idle: true,
+            tcp_interval: std::time::Duration::from_secs(30),
+        }
+    );
+    crate::provider_http_client_builder()
+        .build()
+        .expect("keep-alive provider client builder");
+}
+
 fn serialized_json_body(payload: serde_json::Value) -> Vec<u8> {
     crate::serialize_json_body(payload).expect("serialize provider request body")
 }
