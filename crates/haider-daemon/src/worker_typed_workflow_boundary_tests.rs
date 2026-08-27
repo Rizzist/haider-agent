@@ -18,6 +18,7 @@ fn typed_executor_binding_ends_when_node_or_attempt_advances() {
         graph_id: graph_id.clone(),
         node: node.clone(),
         attempt: 2,
+        activation_iteration: 2,
         agent_type_id: "researcher".into(),
     };
     assert!(typed_workflow_coordinates_match(
@@ -91,6 +92,7 @@ fn native_typed_workflow_on_generic_child_fails_closed_without_graph_evidence() 
         out_type: "Sources".into(),
         clis: Vec::new(),
         apis: Vec::new(),
+        denials: Vec::new(),
         skills: Vec::new(),
         scripts: Vec::new(),
         color: String::new(),
