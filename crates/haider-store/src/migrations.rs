@@ -14,7 +14,7 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, TransactionBehavior, params};
 
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 24;
+pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 25;
 
 struct Migration {
     version: u32,
@@ -570,6 +570,56 @@ const MIGRATIONS: &[Migration] = &[
                     CHECK (length(content_hash) = 71),
                 queued_at_ms  INTEGER NOT NULL CHECK (queued_at_ms >= 0)
             );
+        ",
+    },
+    Migration {
+        version: 25,
+        sql: "
+            ALTER TABLE profile_meta ADD COLUMN workflow_graph_backfill_version INTEGER
+                NOT NULL DEFAULT 0 CHECK (workflow_graph_backfill_version >= 0);
+
+            CREATE TABLE workflow_graph_instances (
+                session_id       TEXT NOT NULL,
+                graph_id         TEXT NOT NULL,
+                through_seq      INTEGER NOT NULL CHECK (through_seq > 0),
+                phase            TEXT NOT NULL
+                    CHECK (phase IN ('active', 'completed', 'rejected')),
+                input_ready      INTEGER NOT NULL
+                    CHECK (input_ready IN (0, 1)),
+                state_json       TEXT NOT NULL CHECK (length(state_json) > 0),
+                PRIMARY KEY (session_id, graph_id),
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+                FOREIGN KEY (session_id, through_seq)
+                    REFERENCES events(session_id, seq)
+            );
+
+            CREATE INDEX workflow_graph_instances_session_head
+            ON workflow_graph_instances(session_id, through_seq DESC, graph_id ASC);
+
+            CREATE INDEX workflow_graph_instances_session_input
+            ON workflow_graph_instances(
+                session_id, phase, input_ready, through_seq DESC, graph_id ASC
+            );
+
+            CREATE TABLE workflow_node_states (
+                session_id       TEXT NOT NULL,
+                graph_id         TEXT NOT NULL,
+                node             TEXT NOT NULL,
+                phase            TEXT NOT NULL
+                    CHECK (phase IN ('waiting', 'activated', 'completed', 'rejected')),
+                iteration        INTEGER NOT NULL CHECK (iteration >= 0),
+                updated_seq      INTEGER NOT NULL CHECK (updated_seq > 0),
+                state_json       TEXT NOT NULL CHECK (length(state_json) > 0),
+                PRIMARY KEY (session_id, graph_id, node),
+                FOREIGN KEY (session_id, graph_id)
+                    REFERENCES workflow_graph_instances(session_id, graph_id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY (session_id, updated_seq)
+                    REFERENCES events(session_id, seq)
+            );
+
+            CREATE INDEX workflow_node_states_session_phase
+            ON workflow_node_states(session_id, phase, updated_seq DESC);
         ",
     },
 ];

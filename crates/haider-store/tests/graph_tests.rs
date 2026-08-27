@@ -4,7 +4,6 @@
 
 use std::collections::HashSet;
 
-use haider_protocol::EventPayload;
 use haider_protocol::effect::{
     AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase, WorkspaceMutation,
 };
@@ -18,11 +17,14 @@ use haider_protocol::graph::{
     GraphNodeName, GraphNodeSpec, GraphPhase, GraphPinned, GraphRunScope, GraphRunSetOpened,
     GraphSuperseded, GraphTemplateSpec, ParentGraphAttempt, ProcessSignalRecorded,
     ProcessSignalRef, SHIP_LOOP_TEMPLATE, STAGGERED_TEMPLATE, SUPER_SHIP_LOOP_TEMPLATE,
-    SubjectSelector, TodoGraphAttached, WorkspaceMutationRef, build_node,
-    child_contract_subject_digest, child_gate_structure, evidence_fingerprint, graph_template,
-    graph_template_catalog, graph_template_digest, implement_verify_child_template,
-    process_signal_subject_digest, reduce_graph_telemetry, ship_loop_nodes,
-    validate_graph_template,
+    SubjectSelector, TodoGraphAttached, WorkflowActivationAst, WorkflowActivationCause,
+    WorkflowActivationEdge, WorkflowActivationNode, WorkflowEdgeKind, WorkflowGraphJournalEvent,
+    WorkflowGraphStarted, WorkflowJoinSemantics, WorkflowNodeActivated, WorkflowNodeCompleted,
+    WorkflowNodeInput, WorkspaceMutationRef, build_node, child_contract_subject_digest,
+    child_gate_structure, evidence_fingerprint, graph_template, graph_template_catalog,
+    graph_template_digest, implement_verify_child_template, process_signal_subject_digest,
+    reduce_graph_telemetry, reduce_workflow_graphs, ship_loop_nodes, validate_graph_template,
+    workflow_activation_ast_digest, workflow_evidence_ledger_digest, workflow_input_ledger_digest,
 };
 use haider_protocol::history::{
     COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume, NodeKind, TodoItem,
@@ -34,18 +36,20 @@ use haider_protocol::ids::{
 };
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
+use haider_protocol::pipe::InstructEvidenceRef;
 use haider_protocol::state::RunState;
 use haider_protocol::task::{
     TaskCompleted, TaskCompletionDelivery, TaskEventPayload, TaskTerminalState,
 };
 use haider_protocol::tool::{BoundedResult, ToolResultStatus};
+use haider_protocol::{DeliveryMode, EventPayload};
 use haider_store::{
     Cas, ChildTemplateObservationCommand, ComputerEvidenceCommand, ComputerEvidenceOutcome,
     EventStore, GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand,
     GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome, GraphPinCommand,
     GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome, GraphSwitchCommand,
     GraphSwitchOutcome, MenuResolutionCommand, MenuResolutionOutcome, ProcessSignalCommand,
-    ProcessSignalOutcome, SessionCreateCommand, Store,
+    ProcessSignalOutcome, SessionCreateCommand, Store, TurnAcceptCommand,
 };
 use rusqlite::params;
 
@@ -164,6 +168,28 @@ fn pin(store: &Store, session_id: &SessionId, suffix: &str) -> GraphId {
         panic!("fresh pin must commit");
     };
     pinned.graph_id
+}
+
+fn submit_workflow_input(store: &Store, session_id: &SessionId, suffix: &str) {
+    store
+        .accept_turn(&TurnAcceptCommand {
+            command_id: format!("workflow-input-{suffix}"),
+            request_digest: format!("workflow-input-digest-{suffix}"),
+            request_json: format!(r#"{{"text":"workflow input {suffix}"}}"#),
+            session_id: session_id.clone(),
+            worker_generation: store.worker_generation(),
+            run_id: RunId::new(format!("workflow-input-run-{suffix}")),
+            agent_id: None,
+            branch_id: None,
+            text: format!("workflow input {suffix}"),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+            queued_event_id: EventId::new(format!("workflow-input-queued-{suffix}")),
+            user_event_id: EventId::new(format!("workflow-input-user-{suffix}")),
+            active_event_id: EventId::new(format!("workflow-input-active-{suffix}")),
+            device_id: DeviceId::new("graph-test"),
+        })
+        .expect("submit real workflow input");
 }
 
 fn finalization_command(
@@ -3141,6 +3167,65 @@ fn compiled_loom_red_targets_survive_registry_pin_and_converge_at_runtime() {
     else {
         panic!("fresh compiled workflow pin must commit");
     };
+    let waiting_activation = store
+        .workflow_graph_state(&session_id, Some(&pinned.graph_id))
+        .expect("activation projection")
+        .expect("compiled workflow activation graph");
+    assert_eq!(
+        waiting_activation.phase,
+        haider_protocol::graph::WorkflowGraphPhase::Active
+    );
+    assert_eq!(
+        waiting_activation
+            .node(&prepare)
+            .map(|node| (node.phase, node.iteration)),
+        Some((haider_protocol::graph::WorkflowNodePhase::Waiting, 0))
+    );
+    assert!(waiting_activation.seed.is_none());
+    submit_workflow_input(&store, &session_id, "compiled-loom-red-runtime");
+    let pinned_activation = store
+        .workflow_graph_state(&session_id, Some(&pinned.graph_id))
+        .expect("activation projection after input")
+        .expect("compiled workflow activation graph after input");
+    assert_eq!(
+        pinned_activation
+            .node(&prepare)
+            .map(|node| (node.phase, node.iteration)),
+        Some((haider_protocol::graph::WorkflowNodePhase::Activated, 1))
+    );
+    let seed_bytes = store
+        .get(
+            &pinned_activation
+                .seed
+                .as_ref()
+                .expect("real workflow input seed")
+                .artifact,
+        )
+        .expect("activation seed is a real CAS artifact");
+    assert!(matches!(
+        serde_json::from_slice::<EventPayload>(&seed_bytes).expect("decode workflow input seed"),
+        EventPayload::UserMessage { text, .. }
+            if text == "workflow input compiled-loom-red-runtime"
+    ));
+    let activation_cause = store
+        .read(&session_id, 0, 64)
+        .expect("read workflow activation cause")
+        .into_iter()
+        .find_map(|envelope| {
+            matches!(
+                WorkflowGraphJournalEvent::from_payload_value(&envelope.payload),
+                Ok(Some(WorkflowGraphJournalEvent::WorkflowNodeActivated(ref activated)))
+                    if activated.graph_id == pinned.graph_id && activated.node == prepare
+            )
+            .then_some(envelope.causation_id)
+        })
+        .expect("root activation fact");
+    assert_eq!(
+        activation_cause,
+        Some(EventId::new(
+            "workflow-input-user-compiled-loom-red-runtime"
+        ))
+    );
     let frozen_nodes = store
         .read(&session_id, 0, 64)
         .expect("read frozen pin")
@@ -3170,6 +3255,17 @@ fn compiled_loom_red_targets_survive_registry_pin_and_converge_at_runtime() {
         .expect("graph");
     assert_eq!(after_self.attempt, 2);
     assert_eq!(after_self.current_node, Some(prepare.clone()));
+    let after_self_activation = store
+        .workflow_graph_state(&session_id, Some(&pinned.graph_id))
+        .expect("activation projection")
+        .expect("activation graph");
+    assert_eq!(after_self_activation.back_edge_activations, 1);
+    assert_eq!(
+        after_self_activation
+            .node(&prepare)
+            .map(|node| (node.phase, node.iteration)),
+        Some((haider_protocol::graph::WorkflowNodePhase::Activated, 2))
+    );
 
     record(
         &store,
@@ -3196,6 +3292,17 @@ fn compiled_loom_red_targets_survive_registry_pin_and_converge_at_runtime() {
     assert_eq!(after_back.attempt, 3);
     assert_eq!(after_back.current_node, Some(prepare.clone()));
     assert!(after_back.nodes.iter().all(|node| !node.satisfied));
+    let after_back_activation = store
+        .workflow_graph_state(&session_id, Some(&pinned.graph_id))
+        .expect("activation projection")
+        .expect("activation graph");
+    assert_eq!(after_back_activation.back_edge_activations, 2);
+    assert_eq!(
+        after_back_activation
+            .node(&prepare)
+            .map(|node| (node.phase, node.iteration)),
+        Some((haider_protocol::graph::WorkflowNodePhase::Activated, 3))
+    );
 
     record(
         &store,
@@ -3221,6 +3328,118 @@ fn compiled_loom_red_targets_survive_registry_pin_and_converge_at_runtime() {
             .phase,
         GraphPhase::Completed
     );
+    let completed_activation = store
+        .workflow_graph_state(&session_id, Some(&pinned.graph_id))
+        .expect("activation projection")
+        .expect("activation graph");
+    assert_eq!(
+        completed_activation.phase,
+        haider_protocol::graph::WorkflowGraphPhase::Completed
+    );
+    assert!(
+        completed_activation
+            .node(&check)
+            .and_then(|node| node.convergence.as_ref())
+            .is_some(),
+        "the terminal convergence stamp remains inspectable in indexed state"
+    );
+}
+
+#[test]
+fn seedless_workflow_abandon_rejects_projection_and_replays_exactly() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "seedless-workflow-abandon");
+    store
+        .loom_register_workflow("seedless-abandon: Task -> Task\nwork \"work\"")
+        .expect("register seedless workflow");
+    let mut pin = pin_command(&store, &session_id, "seedless-workflow-abandon");
+    pin.template = "seedless-abandon".into();
+    let GraphPinOutcome::Committed { pinned, .. } =
+        store.pin_graph(&pin).expect("pin seedless workflow")
+    else {
+        panic!("fresh seedless workflow pin must commit");
+    };
+    let waiting = store
+        .workflow_graph_state(&session_id, Some(&pinned.graph_id))
+        .expect("read waiting workflow projection")
+        .expect("seedless workflow projection");
+    assert!(waiting.seed.is_none());
+    assert!(waiting.nodes.iter().all(|node| {
+        node.phase == haider_protocol::graph::WorkflowNodePhase::Waiting && node.iteration == 0
+    }));
+
+    let GraphAbandonOutcome::Committed { envelopes, .. } = store
+        .abandon_graph(&GraphAbandonCommand {
+            command_id: "abandon-seedless-workflow".into(),
+            request_digest: "abandon-seedless-workflow-digest".into(),
+            request_json: r#"{"why":"operator stopped before input"}"#.into(),
+            session_id: session_id.clone(),
+            worker_generation: store.worker_generation(),
+            why: "operator stopped before input".into(),
+            device_id: DeviceId::new("graph-test"),
+        })
+        .expect("abandon seedless workflow")
+    else {
+        panic!("fresh seedless workflow abandon must commit");
+    };
+    let abandoned_event_id = envelopes
+        .iter()
+        .find_map(|envelope| {
+            matches!(
+                serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                Ok(EventPayload::GraphAbandoned(_))
+            )
+            .then_some(envelope.event_id.clone())
+        })
+        .expect("abandonment cause");
+    let rejection_envelope = envelopes
+        .iter()
+        .find(|envelope| {
+            matches!(
+                WorkflowGraphJournalEvent::from_payload_value(&envelope.payload),
+                Ok(Some(WorkflowGraphJournalEvent::WorkflowNodeRejected(_)))
+            )
+        })
+        .expect("same-transaction workflow rejection");
+    assert_eq!(
+        rejection_envelope.causation_id.as_ref(),
+        Some(&abandoned_event_id),
+        "generated facts retain their individual triggering event"
+    );
+
+    let projected = store
+        .workflow_graph_state(&session_id, Some(&pinned.graph_id))
+        .expect("read abandoned workflow projection")
+        .expect("abandoned workflow projection");
+    assert_eq!(
+        projected.phase,
+        haider_protocol::graph::WorkflowGraphPhase::Rejected
+    );
+    assert!(projected.nodes.iter().all(|node| {
+        node.phase == haider_protocol::graph::WorkflowNodePhase::Rejected
+            && node.rejection.as_ref().is_some_and(|rejection| {
+                rejection.code == haider_protocol::graph::WorkflowNodeRejectCode::Abandoned
+            })
+    }));
+    let watched = store
+        .workflow_graph_watch(&session_id, 0, 128)
+        .expect("watch abandonment facts");
+    assert_eq!(watched.events.len(), 2);
+    assert!(matches!(
+        &watched.events[0].event,
+        WorkflowGraphJournalEvent::WorkflowGraphStarted(_)
+    ));
+    assert!(matches!(
+        &watched.events[1].event,
+        WorkflowGraphJournalEvent::WorkflowNodeRejected(rejected)
+            if rejected.code == haider_protocol::graph::WorkflowNodeRejectCode::Abandoned
+    ));
+    let journal = store
+        .read(&session_id, 0, 128)
+        .expect("read workflow journal");
+    let recomputed = reduce_workflow_graphs(&journal).expect("recompute workflow graph");
+    assert_eq!(projected, recomputed[&pinned.graph_id]);
 }
 
 #[test]
@@ -5905,4 +6124,207 @@ fn super_ship_loop_carries_the_owner_specified_five_stages() {
         ["TESTS", "CLEAN"],
         "optimize waits for green tests and clean code"
     );
+}
+
+#[test]
+fn v25_upgrade_backfills_activation_facts_and_projection_once() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let (database_path, session_id, graph_id) = {
+        let store = Store::open(root.path()).expect("open store");
+        let session_id = create_session(&store, "activation-upgrade");
+        store
+            .loom_register_workflow("activation-upgrade: Task -> Task\nwork \"work\"")
+            .expect("register workflow");
+        let mut command = pin_command(&store, &session_id, "activation-upgrade");
+        command.template = "activation-upgrade".into();
+        let GraphPinOutcome::Committed { pinned, .. } =
+            store.pin_graph(&command).expect("pin workflow")
+        else {
+            panic!("fresh workflow pin must commit")
+        };
+        submit_workflow_input(&store, &session_id, "activation-upgrade");
+        (
+            store.database_path().to_path_buf(),
+            session_id,
+            pinned.graph_id,
+        )
+    };
+    let raw = rusqlite::Connection::open(&database_path).expect("open raw store");
+    raw.execute_batch(
+        "DELETE FROM workflow_node_states;
+         DELETE FROM workflow_graph_instances;
+         DELETE FROM events WHERE payload_kind IN (
+             'workflow_graph_started',
+             'workflow_node_activated',
+             'workflow_node_completed',
+             'workflow_node_rejected'
+         );
+         UPDATE profile_meta SET workflow_graph_backfill_version = 0 WHERE singleton = 1;",
+    )
+    .expect("rewind activation runtime");
+    drop(raw);
+
+    let store = Store::open(root.path()).expect("upgrade activation journal");
+    let projected = store
+        .workflow_graph_state(&session_id, Some(&graph_id))
+        .expect("load backfilled projection")
+        .expect("backfilled activation graph");
+    assert_eq!(
+        projected.phase,
+        haider_protocol::graph::WorkflowGraphPhase::Active
+    );
+    assert_eq!(
+        projected.nodes[0].phase,
+        haider_protocol::graph::WorkflowNodePhase::Activated
+    );
+    let first_watch = store
+        .workflow_graph_watch(&session_id, 0, 128)
+        .expect("watch backfilled facts");
+    assert_eq!(first_watch.events.len(), 2);
+    drop(store);
+
+    let reopened = Store::open(root.path()).expect("reopen upgraded activation journal");
+    let second_watch = reopened
+        .workflow_graph_watch(&session_id, 0, 128)
+        .expect("watch idempotent backfill");
+    assert_eq!(second_watch.events, first_watch.events);
+}
+
+fn projected_evidence(
+    marker: char,
+    evidence_type: &str,
+    parents: Vec<ArtifactRef>,
+) -> InstructEvidenceRef {
+    InstructEvidenceRef::new(
+        ArtifactRef::new(format!("blake3:{}", marker.to_string().repeat(64))),
+        evidence_type,
+        1,
+        parents,
+    )
+}
+
+fn projected_event_envelope(
+    store: &Store,
+    session_id: &SessionId,
+    event_id: &str,
+    event: WorkflowGraphJournalEvent,
+) -> haider_protocol::envelope::RawEnvelope {
+    let mut envelope = raw_envelope(
+        store,
+        session_id,
+        &RunId::new("activation-projection-run"),
+        event_id,
+        EventPayload::IdleDecayed,
+    );
+    envelope.payload = event.to_payload_value().expect("activation payload");
+    envelope
+}
+
+#[test]
+fn workflow_graph_projection_equals_full_recompute_and_watch_replays_cursors() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("open store");
+    let session_id = create_session(&store, "activation-projection");
+    let graph_id = GraphId::new("activation-projection-graph");
+    let node = GraphNodeName::new("ONLY").expect("node");
+    let ast = WorkflowActivationAst {
+        workflow_id: "projection-flow".into(),
+        workflow_digest: "blake3:compiled-projection-flow".into(),
+        input_type: "Question".into(),
+        output_type: "Answer".into(),
+        nodes: vec![WorkflowActivationNode {
+            node: node.clone(),
+            input_type: "Question".into(),
+            output_type: "Answer".into(),
+            join: WorkflowJoinSemantics {
+                initial_all: vec![1],
+                reactivate_any: Vec::new(),
+            },
+            convergence_gate: false,
+        }],
+        edges: vec![WorkflowActivationEdge {
+            id: 1,
+            kind: WorkflowEdgeKind::GraphInput,
+            from: None,
+            to: node.clone(),
+            evidence_type: "Question".into(),
+        }],
+        max_back_edge_activations: 1,
+    };
+    let seed = projected_evidence('a', "Question", Vec::new());
+    let started = WorkflowGraphStarted {
+        graph_id: graph_id.clone(),
+        ast_digest: workflow_activation_ast_digest(&ast),
+        ast,
+        seed: None,
+    };
+    let inputs = vec![WorkflowNodeInput {
+        edge_id: 1,
+        evidence: seed.clone(),
+    }];
+    let activated = WorkflowNodeActivated {
+        graph_id: graph_id.clone(),
+        node: node.clone(),
+        iteration: 1,
+        activation_order: 1,
+        cause: WorkflowActivationCause::ForwardJoin,
+        input_ledger_digest: workflow_input_ledger_digest(&inputs),
+        inputs,
+    };
+    let output = projected_evidence('b', "Answer", vec![seed.artifact.clone()]);
+    let outputs = vec![output];
+    let completed = WorkflowNodeCompleted {
+        graph_id: graph_id.clone(),
+        node,
+        iteration: 1,
+        output_ledger_digest: workflow_evidence_ledger_digest(&outputs),
+        outputs,
+        convergence: None,
+    };
+    let mut activation_facts = vec![
+        projected_event_envelope(
+            &store,
+            &session_id,
+            "activation-started",
+            WorkflowGraphJournalEvent::WorkflowGraphStarted(started),
+        ),
+        projected_event_envelope(
+            &store,
+            &session_id,
+            "activation-activated",
+            WorkflowGraphJournalEvent::WorkflowNodeActivated(activated),
+        ),
+        projected_event_envelope(
+            &store,
+            &session_id,
+            "activation-completed",
+            WorkflowGraphJournalEvent::WorkflowNodeCompleted(completed),
+        ),
+    ];
+    store
+        .append(&mut activation_facts)
+        .expect("append activation facts");
+    drop(store);
+    let store = Store::open(root.path()).expect("reopen projected store");
+
+    let projected = store
+        .workflow_graph_state(&session_id, Some(&graph_id))
+        .expect("read projection")
+        .expect("projected graph");
+    let journal = store.read(&session_id, 0, 128).expect("read journal");
+    let recomputed = reduce_workflow_graphs(&journal).expect("full replay");
+    assert_eq!(projected, recomputed[&graph_id]);
+    assert_eq!(projected.seed.as_ref(), Some(&seed));
+
+    let first_page = store
+        .workflow_graph_watch(&session_id, 0, 2)
+        .expect("first watch page");
+    assert_eq!(first_page.events.len(), 2);
+    assert!(first_page.events[0].cursor < first_page.events[1].cursor);
+    let second_page = store
+        .workflow_graph_watch(&session_id, first_page.next_cursor, 2)
+        .expect("second watch page");
+    assert_eq!(second_page.events.len(), 1);
+    assert_eq!(second_page.next_cursor, projected.through_cursor);
+    assert_eq!(second_page.replay_through_cursor, projected.through_cursor);
 }

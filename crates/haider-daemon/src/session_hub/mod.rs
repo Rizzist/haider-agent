@@ -3068,6 +3068,31 @@ impl SessionHub {
             .map_err(Into::into)
     }
 
+    pub(crate) async fn workflow_graph_state(
+        &self,
+        session_id: &SessionId,
+        graph_id: Option<haider_protocol::ids::GraphId>,
+    ) -> Result<Option<haider_protocol::graph::WorkflowGraphState>, SessionHubError> {
+        self.inner
+            .store
+            .workflow_graph_state(session_id, graph_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn workflow_graph_watch(
+        &self,
+        session_id: &SessionId,
+        after_cursor: u64,
+        limit: u32,
+    ) -> Result<haider_protocol::graph::WorkflowGraphWatchPage, SessionHubError> {
+        self.inner
+            .store
+            .workflow_graph_watch(session_id, after_cursor, limit)
+            .await
+            .map_err(Into::into)
+    }
+
     pub(crate) async fn graph_inspect(
         &self,
         session_id: &SessionId,

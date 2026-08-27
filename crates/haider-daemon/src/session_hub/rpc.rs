@@ -3897,6 +3897,39 @@ impl HubConnection {
                 self.loom_install_watch(request_id, job_id, after_cursor)
                     .await
             }
+            RequestBody::WorkflowGraphState {
+                session_id,
+                graph_id,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.workflow_graph_state(request_id, session_id, graph_id)
+                    .await
+            }
+            RequestBody::WorkflowGraphWatch {
+                session_id,
+                after_cursor,
+                limit,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.workflow_graph_watch(request_id, session_id, after_cursor, limit)
+                    .await
+            }
             // `Unknown` and any future method decode alike: a typed,
             // correlated rejection instead of a dropped request.
             _ => self.respond_error(
@@ -7317,6 +7350,49 @@ impl HubConnection {
         })
     }
 
+    async fn workflow_graph_state(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+        graph_id: Option<haider_protocol::ids::GraphId>,
+    ) -> Result<(), SessionHubError> {
+        let state = match self.hub.workflow_graph_state(&session_id, graph_id).await {
+            Ok(state) => state,
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_graph_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::WorkflowGraphState { state },
+        })
+    }
+
+    async fn workflow_graph_watch(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+        after_cursor: u64,
+        limit: u32,
+    ) -> Result<(), SessionHubError> {
+        let page = match self
+            .hub
+            .workflow_graph_watch(&session_id, after_cursor, limit)
+            .await
+        {
+            Ok(page) => page,
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_graph_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::WorkflowGraphWatch { page },
+        })
+    }
+
     /// B1 — workflow registration from pipe source; the daemon compiles.
     async fn loom_register_workflow(
         &self,
@@ -7808,6 +7884,33 @@ impl HubConnection {
         request_id: RequestId,
         error: HaiderError,
     ) -> Result<(), SessionHubError> {
+        if error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            == Some("cursor_ahead")
+        {
+            let requested = error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("requested"))
+                .and_then(serde_json::Value::as_u64);
+            let head = error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("head"))
+                .and_then(serde_json::Value::as_u64);
+            if let (Some(requested), Some(head)) = (requested, head) {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_CURSOR_AHEAD,
+                    &error.message,
+                    error.retryable,
+                    Some(ErrorData::CursorAhead { requested, head }),
+                );
+            }
+        }
         if error.code == ErrorCode::RevisionConflict {
             let expected_digest = error
                 .details

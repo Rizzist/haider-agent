@@ -11,7 +11,7 @@ use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::cache::{ProviderViewBlobV1, ProviderViewBlockRefV1, ProviderViewLedgerV1};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
-use haider_protocol::ids::{AgentId, ArtifactRef, BranchId, RunId, SessionId};
+use haider_protocol::ids::{AgentId, ArtifactRef, BranchId, GraphId, RunId, SessionId};
 use haider_protocol::session::SessionMetadataV1;
 use haider_store::{
     AcceptedRunRetry, AcceptedShellExec, AcceptedTurn, BranchCreateCommand, BranchCreateOutcome,
@@ -284,6 +284,33 @@ impl SqliteStoreHandle {
         let owner = Arc::clone(&self.owner);
         let session_id = session_id.clone();
         run_blocking(move || owner.with_store(|store| store.graph_status(&session_id))).await
+    }
+
+    pub async fn workflow_graph_state(
+        &self,
+        session_id: &SessionId,
+        graph_id: Option<GraphId>,
+    ) -> Result<Option<haider_protocol::graph::WorkflowGraphState>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        run_blocking(move || {
+            owner.with_store(|store| store.workflow_graph_state(&session_id, graph_id.as_ref()))
+        })
+        .await
+    }
+
+    pub async fn workflow_graph_watch(
+        &self,
+        session_id: &SessionId,
+        after_cursor: u64,
+        limit: u32,
+    ) -> Result<haider_protocol::graph::WorkflowGraphWatchPage, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        run_blocking(move || {
+            owner.with_store(|store| store.workflow_graph_watch(&session_id, after_cursor, limit))
+        })
+        .await
     }
 
     pub async fn graph_status_by_id(

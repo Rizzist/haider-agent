@@ -47,11 +47,17 @@ use haider_protocol::graph::{
     GraphSignalProvenance, GraphStatus, GraphSuperseded, GraphTelemetryAccumulator,
     GraphTelemetryProjection, GraphTemplateRejection, GraphTemplateRollup, GraphTemplateSpec,
     GraphWorkspaceMutationProvenance, ProcessSignalRecorded, ProcessSignalRef, SubjectSelector,
-    TodoGraphAttached, WorkspaceMutationRef, build_node, child_contract_subject_digest,
-    child_gate_structure, computer_observation_subject_digest, evidence_fingerprint,
-    graph_template, graph_template_digest, graph_template_rollups, normalize_evidence_detail,
+    TodoGraphAttached, WORKFLOW_GRAPH_WATCH_MAX_EVENTS, WorkflowActivationCause, WorkflowEdgeKind,
+    WorkflowGraphJournalEvent, WorkflowGraphPhase, WorkflowGraphStarted, WorkflowGraphState,
+    WorkflowGraphWatchEvent, WorkflowGraphWatchPage, WorkflowNodeActivated, WorkflowNodeCompleted,
+    WorkflowNodeInput, WorkflowNodePhase, WorkflowNodeRejectCode, WorkflowNodeRejected,
+    WorkspaceMutationRef, build_node, child_contract_subject_digest, child_gate_structure,
+    computer_observation_subject_digest, evidence_fingerprint, graph_template,
+    graph_template_digest, graph_template_rollups, normalize_evidence_detail,
     process_signal_subject_digest, reduce_graphs, todo_child_graph_id, todo_run_set_id,
-    validate_graph_template, workspace_mutation_subject_digest,
+    validate_graph_template, workflow_activation_ast_digest, workflow_activation_ast_from_loom,
+    workflow_evidence_ledger_digest, workflow_input_ledger_digest,
+    workspace_mutation_subject_digest,
 };
 use haider_protocol::history::{COMPACTION_INTENT_EXTENSION_KIND, NodeKind, TodoItem, TreeNode};
 use haider_protocol::hook::HookEventPayload;
@@ -65,6 +71,7 @@ use haider_protocol::loom::{
 };
 use haider_protocol::menu::{Menu, MenuAnswer, MenuCloseReason, MenuKind};
 use haider_protocol::permission::PermissionEventPayload;
+use haider_protocol::pipe::InstructEvidenceRef;
 use haider_protocol::project_instructions::ProjectInstructionsLoaded;
 use haider_protocol::queue::{QueueChange, QueueDelta, QueueRow};
 use haider_protocol::retry::RunRetryEventPayload;
@@ -1771,6 +1778,7 @@ impl Store {
         let provider_views = ProviderViewStore::open(&root)?;
         provider_views.sweep_expired(&mut connection, now_ms()?)?;
         let worker_generation = next_worker_generation(&mut connection)?;
+        backfill_workflow_graph_journals(&mut connection, &cas, worker_generation)?;
         let graph_telemetry = rebuild_graph_telemetry_cache(&connection)?;
 
         Ok(Self {
@@ -3420,6 +3428,8 @@ impl Store {
             "DELETE FROM session_projection_checkpoints WHERE session_id = ?1",
             "DELETE FROM graph_telemetry_dirty WHERE session_id = ?1",
             "DELETE FROM graph_telemetry_projection WHERE session_id = ?1",
+            "DELETE FROM workflow_node_states WHERE session_id = ?1",
+            "DELETE FROM workflow_graph_instances WHERE session_id = ?1",
             "DELETE FROM hook_dispatch_outbox WHERE session_id = ?1",
             "DELETE FROM menu_resolutions WHERE session_id = ?1",
             "DELETE FROM branches WHERE session_id = ?1",
@@ -3465,6 +3475,122 @@ impl Store {
             .graph_reductions(&connection, session_id)?
             .active()
             .and_then(|reduction| reduction.status.clone()))
+    }
+
+    /// Reads the same-transaction indexed activation projection. When no id
+    /// is supplied, the most recently changed workflow graph is returned.
+    pub fn workflow_graph_state(
+        &self,
+        session_id: &SessionId,
+        graph_id: Option<&GraphId>,
+    ) -> StoreResult<Option<WorkflowGraphState>> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(map_sqlite_error)?;
+        require_session(&transaction, session_id)?;
+        let state = load_workflow_graph_state(&transaction, session_id, graph_id)?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(state)
+    }
+
+    /// Keyset replay of activation/completion/rejection facts. Cursor zero
+    /// starts from the beginning; an ahead cursor is rejected so clients can
+    /// repair explicitly instead of silently skipping a rewritten stream.
+    pub fn workflow_graph_watch(
+        &self,
+        session_id: &SessionId,
+        after_cursor: u64,
+        limit: u32,
+    ) -> StoreResult<WorkflowGraphWatchPage> {
+        if limit == 0 || limit > WORKFLOW_GRAPH_WATCH_MAX_EVENTS {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                format!("workflow.graph.watch limit must be 1..={WORKFLOW_GRAPH_WATCH_MAX_EVENTS}"),
+                false,
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(map_sqlite_error)?;
+        require_session(&transaction, session_id)?;
+        let replay_through_cursor = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(through_seq), 0)
+                 FROM workflow_graph_instances WHERE session_id = ?1",
+                [session_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(map_sqlite_error)
+            .and_then(|value| {
+                u64::try_from(value)
+                    .map_err(|_| corrupt("workflow graph projection has a negative cursor"))
+            })?;
+        if after_cursor > replay_through_cursor {
+            let mut error = store_error(
+                ErrorCode::InvalidArgument,
+                format!("workflow graph cursor {after_cursor} is ahead of {replay_through_cursor}"),
+                true,
+            );
+            error.details = Some(serde_json::json!({
+                "kind": "cursor_ahead",
+                "requested": after_cursor,
+                "head": replay_through_cursor,
+            }));
+            return Err(error);
+        }
+        let events = {
+            let mut statement = transaction
+                .prepare_cached(
+                    "SELECT seq, envelope_json
+                     FROM events INDEXED BY events_payload_kind_session_seq
+                     WHERE session_id = ?1 AND seq > ?2 AND seq <= ?3
+                       AND payload_kind IN (?4, ?5, ?6, ?7)
+                     ORDER BY seq ASC LIMIT ?8",
+                )
+                .map_err(map_sqlite_error)?;
+            let mut rows = statement
+                .query(params![
+                    session_id.as_str(),
+                    to_sqlite_integer(after_cursor)?,
+                    to_sqlite_integer(replay_through_cursor)?,
+                    "workflow_graph_started",
+                    "workflow_node_activated",
+                    "workflow_node_completed",
+                    "workflow_node_rejected",
+                    to_sqlite_integer(u64::from(limit))?,
+                ])
+                .map_err(map_sqlite_error)?;
+            let mut events = Vec::new();
+            while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+                let stored_seq: i64 = row.get(0).map_err(map_sqlite_error)?;
+                let cursor = u64::try_from(stored_seq)
+                    .map_err(|_| corrupt("workflow graph event has a negative cursor"))?;
+                let envelope = decode_envelope_column(row, 1).map_err(|error| {
+                    corrupt(format!(
+                        "invalid workflow graph envelope at {session_id}:{cursor}: {error}"
+                    ))
+                })?;
+                let event = workflow_graph_journal_event(&envelope.payload)?.ok_or_else(|| {
+                    corrupt(format!(
+                        "workflow graph event index selected a non-runtime fact at {session_id}:{cursor}"
+                    ))
+                })?;
+                events.push(WorkflowGraphWatchEvent { cursor, event });
+            }
+            events
+        };
+        transaction.commit().map_err(map_sqlite_error)?;
+        let next_cursor = events
+            .last()
+            .map_or(replay_through_cursor, |event| event.cursor);
+        Ok(WorkflowGraphWatchPage {
+            requested_after_cursor: after_cursor,
+            replay_through_cursor,
+            next_cursor,
+            events,
+        })
     }
 
     /// Queries any retained graph instance, including superseded roots.
@@ -4296,6 +4422,12 @@ impl Store {
             child_indexes.push((attached_index, pinned_index, opened_index));
         }
         let mut envelopes = graph_command_envelopes(command, payloads)?;
+        augment_workflow_graph_envelopes(
+            &transaction,
+            &self.cas,
+            &command.session_id,
+            &mut envelopes,
+        )?;
         append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
         let children = items
             .iter()
@@ -4475,6 +4607,12 @@ impl Store {
             )));
         }
         let mut envelopes = graph_command_envelopes(command, payloads)?;
+        augment_workflow_graph_envelopes(
+            &transaction,
+            &self.cas,
+            &command.session_id,
+            &mut envelopes,
+        )?;
         append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
         let pinned = PinnedGraph {
             session_id: command.session_id.clone(),
@@ -5152,6 +5290,12 @@ impl Store {
             )));
         }
         let mut envelopes = graph_command_envelopes(command, payloads)?;
+        augment_workflow_graph_envelopes(
+            &transaction,
+            &self.cas,
+            &command.session_id,
+            &mut envelopes,
+        )?;
         append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
         let switched = SwitchedGraph {
             session_id: command.session_id.clone(),
@@ -5282,6 +5426,12 @@ impl Store {
             }));
         }
         let mut envelopes = graph_command_envelopes(command, payloads)?;
+        augment_workflow_graph_envelopes(
+            &transaction,
+            &self.cas,
+            &command.session_id,
+            &mut envelopes,
+        )?;
         append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
         let abandoned = AbandonedGraph {
             session_id: command.session_id.clone(),
@@ -5915,6 +6065,12 @@ impl Store {
             now,
         )?;
         let mut envelopes = graph_command_envelopes(command, payloads)?;
+        augment_workflow_graph_envelopes(
+            &transaction,
+            &self.cas,
+            &command.session_id,
+            &mut envelopes,
+        )?;
         append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
         let recorded = RecordedGraphEvidence {
             graph_id,
@@ -7182,6 +7338,11 @@ impl Store {
             },
         )?;
         rebuild_run_head_projection(&transaction, &command.session_id)?;
+        update_workflow_graph_projection_after_append(
+            &transaction,
+            &command.session_id,
+            &child_envelopes,
+        )?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(SessionForkOutcome::Committed {
             created,
@@ -9076,6 +9237,12 @@ impl Store {
         for envelope in &mut envelopes {
             envelope.agent_id = command.agent_id.clone();
         }
+        augment_workflow_graph_envelopes(
+            &transaction,
+            &self.cas,
+            &command.session_id,
+            &mut envelopes,
+        )?;
         append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
         let accepted_seq = if same_run_delivery {
             envelopes[0].seq
@@ -10507,7 +10674,8 @@ impl Store {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite_error)?;
-        let outcome = resolve_menu_transaction(&transaction, command, self.worker_generation)?;
+        let outcome =
+            resolve_menu_transaction(&transaction, &self.cas, command, self.worker_generation)?;
         transaction.commit().map_err(map_sqlite_error)?;
         if let MenuResolutionOutcome::Committed {
             envelope,
@@ -11521,6 +11689,41 @@ fn load_graph_reduction_envelopes(
         envelopes.push(decode_envelope_column(row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid graph-reduction envelope in session {session_id}: {error}"
+            ))
+        })?);
+    }
+    Ok(envelopes)
+}
+
+/// Historical activation translation needs the first real workflow input in
+/// addition to legacy graph-reducer facts. Ordinary graph reads keep their
+/// narrower index scan; this is used only by the one-time migration.
+fn load_workflow_backfill_envelopes(
+    connection: &Connection,
+    session_id: &SessionId,
+) -> StoreResult<Vec<RawEnvelope>> {
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT envelope_json FROM events
+             WHERE session_id = ?1
+               AND (
+                   (payload_kind >= 'graph_' AND payload_kind < 'graph`')
+                   OR payload_kind = 'todo_graph_attached'
+                   OR payload_kind = 'evidence_recorded'
+                   OR payload_kind = 'user_message'
+                   OR (payload_kind >= 'menu_' AND payload_kind < 'menu`')
+               )
+             ORDER BY seq ASC",
+        )
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query([session_id.as_str()])
+        .map_err(map_sqlite_error)?;
+    let mut envelopes = Vec::new();
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        envelopes.push(decode_envelope_column(row, 0).map_err(|error| {
+            corrupt(format!(
+                "invalid workflow-backfill envelope in session {session_id}: {error}"
             ))
         })?);
     }
@@ -15286,6 +15489,1192 @@ fn unstamped_raw_command_envelope(
     })
 }
 
+fn workflow_graph_journal_event(
+    payload: &serde_json::Value,
+) -> StoreResult<Option<WorkflowGraphJournalEvent>> {
+    WorkflowGraphJournalEvent::from_payload_value(payload).map_err(|error| {
+        corrupt(format!(
+            "malformed workflow activation journal event: {error}"
+        ))
+    })
+}
+
+fn workflow_event_graph_id(event: &WorkflowGraphJournalEvent) -> &GraphId {
+    match event {
+        WorkflowGraphJournalEvent::WorkflowGraphStarted(started) => &started.graph_id,
+        WorkflowGraphJournalEvent::WorkflowNodeActivated(activated) => &activated.graph_id,
+        WorkflowGraphJournalEvent::WorkflowNodeCompleted(completed) => &completed.graph_id,
+        WorkflowGraphJournalEvent::WorkflowNodeRejected(rejected) => &rejected.graph_id,
+    }
+}
+
+fn load_workflow_graph_state(
+    connection: &Connection,
+    session_id: &SessionId,
+    graph_id: Option<&GraphId>,
+) -> StoreResult<Option<WorkflowGraphState>> {
+    let selected = match graph_id {
+        Some(graph_id) => connection
+            .query_row(
+                "SELECT graph_id, through_seq, phase, input_ready, state_json
+                 FROM workflow_graph_instances
+                 WHERE session_id = ?1 AND graph_id = ?2",
+                params![session_id.as_str(), graph_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_sqlite_error)?,
+        None => connection
+            .query_row(
+                "SELECT graph_id, through_seq, phase, input_ready, state_json
+                 FROM workflow_graph_instances
+                 WHERE session_id = ?1 ORDER BY through_seq DESC, graph_id ASC LIMIT 1",
+                [session_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_sqlite_error)?,
+    };
+    let Some((stored_graph_id, stored_through_cursor, stored_phase, stored_input_ready, json)) =
+        selected
+    else {
+        return Ok(None);
+    };
+    let state: WorkflowGraphState = serde_json::from_str(&json)
+        .map_err(|error| corrupt(format!("workflow graph projection is invalid: {error}")))?;
+    let stored_through_cursor = u64::try_from(stored_through_cursor)
+        .map_err(|_| corrupt("workflow graph projection has a negative cursor"))?;
+    state.validate_projection().map_err(|error| {
+        corrupt(format!(
+            "workflow graph projection is inconsistent: {error}"
+        ))
+    })?;
+    if stored_graph_id != state.graph_id.as_str()
+        || stored_through_cursor != state.through_cursor
+        || stored_phase != workflow_graph_phase_sql(state.phase)
+        || stored_input_ready != i64::from(state.seed.is_some())
+    {
+        return Err(corrupt(
+            "workflow graph projection index disagrees with its typed state",
+        ));
+    }
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT node, phase, iteration, updated_seq, state_json
+             FROM workflow_node_states
+             WHERE session_id = ?1 AND graph_id = ?2 ORDER BY node ASC",
+        )
+        .map_err(map_sqlite_error)?;
+    let rows = statement
+        .query_map(
+            params![session_id.as_str(), state.graph_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .map_err(map_sqlite_error)?;
+    let mut by_node = HashMap::new();
+    for row in rows {
+        let (stored_node, stored_phase, stored_iteration, stored_cursor, json) =
+            row.map_err(map_sqlite_error)?;
+        let node: haider_protocol::graph::WorkflowNodeState = serde_json::from_str(&json)
+            .map_err(|error| corrupt(format!("workflow node projection is invalid: {error}")))?;
+        let stored_iteration = u32::try_from(stored_iteration)
+            .map_err(|_| corrupt("workflow node projection has an invalid iteration"))?;
+        let stored_cursor = u64::try_from(stored_cursor)
+            .map_err(|_| corrupt("workflow node projection has a negative cursor"))?;
+        if stored_node != node.node.as_str()
+            || stored_phase != workflow_node_phase_sql(node.phase)
+            || stored_iteration != node.iteration
+            || stored_cursor != node.updated_cursor
+        {
+            return Err(corrupt(
+                "workflow node projection index disagrees with its typed state",
+            ));
+        }
+        if by_node.insert(node.node.clone(), node).is_some() {
+            return Err(corrupt(
+                "workflow node projection contains a duplicate node",
+            ));
+        }
+    }
+    if by_node.len() != state.ast.nodes.len() {
+        return Err(corrupt(
+            "workflow node projection does not cover the activation AST",
+        ));
+    }
+    let indexed_nodes = state
+        .ast
+        .nodes
+        .iter()
+        .map(|spec| {
+            by_node
+                .remove(&spec.node)
+                .ok_or_else(|| corrupt("workflow node projection omitted an AST node"))
+        })
+        .collect::<StoreResult<Vec<_>>>()?;
+    if indexed_nodes != state.nodes {
+        return Err(corrupt(
+            "workflow graph and node projection snapshots disagree",
+        ));
+    }
+    Ok(Some(state))
+}
+
+fn load_seedless_active_workflow_graph_state(
+    connection: &Connection,
+    session_id: &SessionId,
+) -> StoreResult<Option<WorkflowGraphState>> {
+    let graph_id = connection
+        .query_row(
+            "SELECT graph_id FROM workflow_graph_instances
+             WHERE session_id = ?1 AND phase = 'active' AND input_ready = 0
+             ORDER BY through_seq DESC, graph_id ASC LIMIT 1",
+            [session_id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_sqlite_error)?
+        .map(GraphId::new);
+    graph_id
+        .as_ref()
+        .map(|graph_id| load_workflow_graph_state(connection, session_id, Some(graph_id)))
+        .transpose()
+        .map(Option::flatten)
+}
+
+fn workflow_graph_phase_sql(phase: WorkflowGraphPhase) -> &'static str {
+    match phase {
+        WorkflowGraphPhase::Active => "active",
+        WorkflowGraphPhase::Completed => "completed",
+        WorkflowGraphPhase::Rejected => "rejected",
+    }
+}
+
+fn workflow_node_phase_sql(phase: WorkflowNodePhase) -> &'static str {
+    match phase {
+        WorkflowNodePhase::Waiting => "waiting",
+        WorkflowNodePhase::Activated => "activated",
+        WorkflowNodePhase::Completed => "completed",
+        WorkflowNodePhase::Rejected => "rejected",
+    }
+}
+
+fn persist_workflow_graph_state(
+    transaction: &Connection,
+    session_id: &SessionId,
+    state: &WorkflowGraphState,
+) -> StoreResult<()> {
+    let state_json = serde_json::to_string(state).map_err(|error| {
+        store_error(
+            ErrorCode::InvalidArgument,
+            format!("cannot encode workflow graph projection: {error}"),
+            false,
+        )
+    })?;
+    transaction
+        .execute(
+            "INSERT INTO workflow_graph_instances(
+                 session_id, graph_id, through_seq, phase, input_ready, state_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(session_id, graph_id) DO UPDATE SET
+                 through_seq = excluded.through_seq,
+                 phase = excluded.phase,
+                 input_ready = excluded.input_ready,
+                 state_json = excluded.state_json
+             WHERE excluded.through_seq > workflow_graph_instances.through_seq",
+            params![
+                session_id.as_str(),
+                state.graph_id.as_str(),
+                to_sqlite_integer(state.through_cursor)?,
+                workflow_graph_phase_sql(state.phase),
+                state.seed.is_some(),
+                state_json,
+            ],
+        )
+        .map_err(map_sqlite_error)?;
+    let mut upsert = transaction
+        .prepare_cached(
+            "INSERT INTO workflow_node_states(
+                 session_id, graph_id, node, phase, iteration, updated_seq, state_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(session_id, graph_id, node) DO UPDATE SET
+                 phase = excluded.phase,
+                 iteration = excluded.iteration,
+                 updated_seq = excluded.updated_seq,
+                 state_json = excluded.state_json
+             WHERE excluded.updated_seq >= workflow_node_states.updated_seq",
+        )
+        .map_err(map_sqlite_error)?;
+    // The graph snapshot advances every fact, but only nodes stamped at this
+    // cursor changed. Start events stamp all nodes; ordinary transitions
+    // update one node, while back edges also stamp the reset descendants.
+    for node in state
+        .nodes
+        .iter()
+        .filter(|node| node.updated_cursor == state.through_cursor)
+    {
+        let node_json = serde_json::to_string(node).map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot encode workflow node projection: {error}"),
+                false,
+            )
+        })?;
+        upsert
+            .execute(params![
+                session_id.as_str(),
+                state.graph_id.as_str(),
+                node.node.as_str(),
+                workflow_node_phase_sql(node.phase),
+                i64::from(node.iteration),
+                to_sqlite_integer(node.updated_cursor)?,
+                node_json,
+            ])
+            .map_err(map_sqlite_error)?;
+    }
+    Ok(())
+}
+
+fn update_workflow_graph_projection_after_append(
+    transaction: &Connection,
+    session_id: &SessionId,
+    envelopes: &[RawEnvelope],
+) -> StoreResult<()> {
+    let mut states = HashMap::<GraphId, WorkflowGraphState>::new();
+    for envelope in envelopes {
+        let Some(event) = workflow_graph_journal_event(&envelope.payload)? else {
+            continue;
+        };
+        let graph_id = workflow_event_graph_id(&event).clone();
+        if let WorkflowGraphJournalEvent::WorkflowGraphStarted(started) = event {
+            if load_workflow_graph_state(transaction, session_id, Some(&graph_id))?.is_some() {
+                return Err(corrupt(format!(
+                    "workflow graph {graph_id} was durably started more than once"
+                )));
+            }
+            let state = WorkflowGraphState::from_started(envelope.seq, started)
+                .map_err(|error| corrupt(format!("cannot reduce workflow graph start: {error}")))?;
+            persist_workflow_graph_state(transaction, session_id, &state)?;
+            states.insert(graph_id, state);
+            continue;
+        }
+        if !states.contains_key(&graph_id) {
+            let state = load_workflow_graph_state(transaction, session_id, Some(&graph_id))?
+                .ok_or_else(|| {
+                    corrupt(format!(
+                        "workflow activation fact for {graph_id} has no indexed start"
+                    ))
+                })?;
+            states.insert(graph_id.clone(), state);
+        }
+        let state = states
+            .get_mut(&graph_id)
+            .ok_or_else(|| corrupt("workflow graph projection cache lost its state"))?;
+        state.apply(envelope.seq, &event).map_err(|error| {
+            corrupt(format!(
+                "cannot reduce workflow activation at {}:{}: {error}",
+                session_id, envelope.seq
+            ))
+        })?;
+        persist_workflow_graph_state(transaction, session_id, state)?;
+    }
+    Ok(())
+}
+
+fn load_loom_workflow_revision_tx(
+    transaction: &Connection,
+    id: &str,
+    template_digest: &str,
+) -> StoreResult<Option<LoomWorkflow>> {
+    let mut statement = transaction
+        .prepare_cached(
+            "SELECT record_json FROM loom_workflow_revisions
+             WHERE id = ?1 ORDER BY rev DESC",
+        )
+        .map_err(map_sqlite_error)?;
+    let rows = statement
+        .query_map([id], |row| row.get::<_, String>(0))
+        .map_err(map_sqlite_error)?;
+    for row in rows {
+        let json = row.map_err(map_sqlite_error)?;
+        let workflow: LoomWorkflow = serde_json::from_str(&json)
+            .map_err(|_| corrupt("loom workflow revision is not decodable"))?;
+        if workflow.id == id && graph_template_digest(&workflow.template) == template_digest {
+            return Ok(Some(workflow));
+        }
+    }
+    Ok(None)
+}
+
+fn cas_evidence(
+    cas: &FileCas,
+    evidence_type: &str,
+    value: &impl serde::Serialize,
+    parents: Vec<ArtifactRef>,
+) -> StoreResult<InstructEvidenceRef> {
+    let bytes = serde_json::to_vec(value).map_err(|error| {
+        store_error(
+            ErrorCode::InvalidArgument,
+            format!("cannot encode InstructPipe evidence: {error}"),
+            false,
+        )
+    })?;
+    let byte_len = u64::try_from(bytes.len()).map_err(|_| {
+        store_error(
+            ErrorCode::InvalidArgument,
+            "InstructPipe evidence length exceeds u64",
+            false,
+        )
+    })?;
+    let artifact = cas.put(&bytes)?;
+    let evidence = InstructEvidenceRef::new(artifact, evidence_type, byte_len, parents);
+    evidence.validate().map_err(|error| {
+        store_error(
+            ErrorCode::InvalidArgument,
+            format!("cannot create InstructPipe evidence: {error}"),
+            false,
+        )
+    })?;
+    Ok(evidence)
+}
+
+fn append_planned_workflow_event(
+    states: &mut HashMap<GraphId, WorkflowGraphState>,
+    events: &mut Vec<(WorkflowGraphJournalEvent, EventId)>,
+    virtual_cursor: u64,
+    event: WorkflowGraphJournalEvent,
+    causation_id: EventId,
+) -> StoreResult<()> {
+    match &event {
+        WorkflowGraphJournalEvent::WorkflowGraphStarted(started) => {
+            let state = WorkflowGraphState::from_started(virtual_cursor, started.clone())
+                .map_err(|error| corrupt(format!("cannot plan workflow graph start: {error}")))?;
+            states.insert(started.graph_id.clone(), state);
+        }
+        _ => {
+            let graph_id = workflow_event_graph_id(&event).clone();
+            let state = states.get_mut(&graph_id).ok_or_else(|| {
+                corrupt(format!(
+                    "cannot plan workflow event without graph {graph_id}"
+                ))
+            })?;
+            state.apply(virtual_cursor, &event).map_err(|error| {
+                corrupt(format!("cannot plan workflow activation fact: {error}"))
+            })?;
+        }
+    }
+    events.push((event, causation_id));
+    Ok(())
+}
+
+fn workflow_output_evidence(
+    cas: &FileCas,
+    state: &WorkflowGraphState,
+    node: &GraphNodeName,
+    source: &impl serde::Serialize,
+) -> StoreResult<InstructEvidenceRef> {
+    let spec = state
+        .ast
+        .nodes
+        .iter()
+        .find(|candidate| &candidate.node == node)
+        .ok_or_else(|| corrupt("workflow output node is absent from its AST"))?;
+    let parents = state
+        .node(node)
+        .ok_or_else(|| corrupt("workflow output node has no projected state"))?
+        .inputs
+        .iter()
+        .map(|input| input.evidence.artifact.clone())
+        .collect();
+    cas_evidence(cas, &spec.output_type, source, parents)
+}
+
+fn forward_workflow_inputs(
+    state: &WorkflowGraphState,
+    node: &GraphNodeName,
+    graph_seed: Option<&InstructEvidenceRef>,
+) -> Option<Vec<WorkflowNodeInput>> {
+    let spec = state.ast.nodes.iter().find(|spec| &spec.node == node)?;
+    let mut inputs = Vec::with_capacity(spec.join.initial_all.len());
+    for edge_id in &spec.join.initial_all {
+        let edge = state.ast.edges.iter().find(|edge| edge.id == *edge_id)?;
+        let evidence = match edge.kind {
+            WorkflowEdgeKind::GraphInput => graph_seed.or(state.seed.as_ref())?.clone(),
+            WorkflowEdgeKind::Forward => {
+                let source = edge.from.as_ref()?;
+                state
+                    .node(source)?
+                    .outputs
+                    .iter()
+                    .find(|output| output.evidence_type == edge.evidence_type)?
+                    .clone()
+            }
+            WorkflowEdgeKind::Back => return None,
+        };
+        inputs.push(WorkflowNodeInput {
+            edge_id: *edge_id,
+            evidence,
+        });
+    }
+    Some(inputs)
+}
+
+fn back_workflow_input(
+    state: &WorkflowGraphState,
+    node: &GraphNodeName,
+) -> Option<WorkflowNodeInput> {
+    let spec = state.ast.nodes.iter().find(|spec| &spec.node == node)?;
+    for edge_id in &spec.join.reactivate_any {
+        let edge = state.ast.edges.iter().find(|edge| edge.id == *edge_id)?;
+        let source = edge.from.as_ref()?;
+        let evidence = state.node(source)?.rejection.as_ref()?.evidence.clone()?;
+        if evidence.evidence_type == edge.evidence_type {
+            return Some(WorkflowNodeInput {
+                edge_id: *edge_id,
+                evidence,
+            });
+        }
+    }
+    None
+}
+
+fn active_back_source(
+    state: &WorkflowGraphState,
+    target: &GraphNodeName,
+) -> Option<(GraphNodeName, u32, String)> {
+    state
+        .ast
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == WorkflowEdgeKind::Back && &edge.to == target)
+        .find_map(|edge| {
+            let source = edge.from.as_ref()?;
+            let node = state.node(source)?;
+            (node.phase == WorkflowNodePhase::Activated)
+                .then(|| (source.clone(), node.iteration, edge.evidence_type.clone()))
+        })
+}
+
+fn workflow_rejection(
+    cas: &FileCas,
+    state: &WorkflowGraphState,
+    node: &GraphNodeName,
+    iteration: u32,
+    code: WorkflowNodeRejectCode,
+    message: String,
+    evidence_type: Option<&str>,
+    source: &impl serde::Serialize,
+) -> StoreResult<WorkflowNodeRejected> {
+    let spec = state
+        .ast
+        .nodes
+        .iter()
+        .find(|candidate| &candidate.node == node)
+        .ok_or_else(|| corrupt("workflow rejection node is absent from its AST"))?;
+    let parents = state
+        .node(node)
+        .map(|state| {
+            state
+                .inputs
+                .iter()
+                .map(|input| input.evidence.artifact.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let evidence = evidence_type
+        .map(|evidence_type| cas_evidence(cas, evidence_type, source, parents))
+        .transpose()?;
+    Ok(WorkflowNodeRejected {
+        graph_id: state.graph_id.clone(),
+        node: node.clone(),
+        iteration,
+        code,
+        message,
+        evidence,
+        convergence_gate: spec.convergence_gate,
+    })
+}
+
+fn planned_workflow_cursor(latest: u64, base_len: u64, planned_len: usize) -> StoreResult<u64> {
+    let runtime_offset = u64::try_from(planned_len)
+        .map_err(|_| corrupt("workflow activation batch is too large"))?
+        .checked_add(1)
+        .ok_or_else(|| corrupt("workflow graph cursor space is exhausted"))?;
+    latest
+        .checked_add(base_len)
+        .and_then(|cursor| cursor.checked_add(runtime_offset))
+        .ok_or_else(|| corrupt("workflow graph cursor space is exhausted"))
+}
+
+fn augment_workflow_graph_envelopes(
+    transaction: &Connection,
+    cas: &FileCas,
+    session_id: &SessionId,
+    envelopes: &mut Vec<RawEnvelope>,
+) -> StoreResult<()> {
+    if envelopes.is_empty() {
+        return Ok(());
+    }
+    let latest = latest_seq_in_connection(transaction, session_id)?;
+    let base_len = u64::try_from(envelopes.len())
+        .map_err(|_| corrupt("workflow graph base batch is too large"))?;
+    let mut states = HashMap::<GraphId, WorkflowGraphState>::new();
+    let mut graph_order = Vec::<GraphId>::new();
+    let mut todo_inputs = HashMap::<GraphId, TodoGraphAttached>::new();
+    let mut evidence = BTreeMap::<(GraphId, GraphNodeName, u32), EvidenceRecorded>::new();
+    let mut planned = Vec::<(WorkflowGraphJournalEvent, EventId)>::new();
+    let base_payloads = envelopes
+        .iter()
+        .filter_map(|envelope| {
+            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                .ok()
+                .map(|payload| (envelope.event_id.clone(), payload))
+        })
+        .collect::<Vec<_>>();
+    for (causation_id, payload) in &base_payloads {
+        match payload {
+            EventPayload::TodoGraphAttached(attached) => {
+                todo_inputs.insert(attached.child_graph_id.clone(), attached.clone());
+            }
+            EventPayload::GraphPinned(pinned) => {
+                let Some(workflow) =
+                    load_loom_workflow_revision_tx(transaction, &pinned.template, &pinned.digest)?
+                else {
+                    continue;
+                };
+                let ast = workflow_activation_ast_from_loom(&workflow).map_err(|error| {
+                    store_error(
+                        ErrorCode::StoreCorrupt,
+                        format!("cannot materialize workflow activation AST: {error}"),
+                        false,
+                    )
+                })?;
+                let seed = todo_inputs
+                    .remove(&pinned.graph_id)
+                    .map(|attached| {
+                        cas_evidence(
+                            cas,
+                            &ast.input_type,
+                            &EventPayload::TodoGraphAttached(attached),
+                            Vec::new(),
+                        )
+                    })
+                    .transpose()?;
+                let started = WorkflowGraphStarted {
+                    graph_id: pinned.graph_id.clone(),
+                    ast_digest: workflow_activation_ast_digest(&ast),
+                    ast,
+                    seed,
+                };
+                let cursor = planned_workflow_cursor(latest, base_len, planned.len())?;
+                append_planned_workflow_event(
+                    &mut states,
+                    &mut planned,
+                    cursor,
+                    WorkflowGraphJournalEvent::WorkflowGraphStarted(started),
+                    causation_id.clone(),
+                )?;
+                graph_order.push(pinned.graph_id.clone());
+            }
+            EventPayload::UserMessage { .. } => {
+                if !graph_order.iter().rev().any(|graph_id| {
+                    states.get(graph_id).is_some_and(|state| {
+                        state.phase == WorkflowGraphPhase::Active && state.seed.is_none()
+                    })
+                }) && let Some(state) =
+                    load_seedless_active_workflow_graph_state(transaction, session_id)?
+                    && state.phase == WorkflowGraphPhase::Active
+                    && state.seed.is_none()
+                    && !states.contains_key(&state.graph_id)
+                {
+                    graph_order.push(state.graph_id.clone());
+                    states.insert(state.graph_id.clone(), state);
+                }
+                let Some(graph_id) = graph_order
+                    .iter()
+                    .rev()
+                    .find(|graph_id| {
+                        states.get(*graph_id).is_some_and(|state| {
+                            state.phase == WorkflowGraphPhase::Active && state.seed.is_none()
+                        })
+                    })
+                    .cloned()
+                else {
+                    continue;
+                };
+                let state = states
+                    .get(&graph_id)
+                    .ok_or_else(|| corrupt("workflow input graph vanished during planning"))?;
+                let Some(node) = state
+                    .ast
+                    .edges
+                    .iter()
+                    .find(|edge| edge.kind == WorkflowEdgeKind::GraphInput)
+                    .map(|edge| edge.to.clone())
+                else {
+                    return Err(corrupt("workflow activation AST has no graph input edge"));
+                };
+                let seed = cas_evidence(cas, &state.ast.input_type, payload, Vec::new())?;
+                let Some(inputs) = forward_workflow_inputs(state, &node, Some(&seed)) else {
+                    continue;
+                };
+                let mut activated = WorkflowNodeActivated {
+                    graph_id: graph_id.clone(),
+                    node,
+                    iteration: 1,
+                    activation_order: state.next_activation_order,
+                    cause: WorkflowActivationCause::ForwardJoin,
+                    inputs,
+                    input_ledger_digest: String::new(),
+                };
+                activated.input_ledger_digest = workflow_input_ledger_digest(&activated.inputs);
+                let cursor = planned_workflow_cursor(latest, base_len, planned.len())?;
+                append_planned_workflow_event(
+                    &mut states,
+                    &mut planned,
+                    cursor,
+                    WorkflowGraphJournalEvent::WorkflowNodeActivated(activated),
+                    causation_id.clone(),
+                )?;
+            }
+            EventPayload::EvidenceRecorded(recorded) => {
+                if states.contains_key(&recorded.graph_id)
+                    || load_workflow_graph_state(transaction, session_id, Some(&recorded.graph_id))?
+                        .is_some()
+                {
+                    evidence.insert(
+                        (
+                            recorded.graph_id.clone(),
+                            recorded.node.clone(),
+                            recorded.attempt,
+                        ),
+                        recorded.clone(),
+                    );
+                }
+            }
+            EventPayload::GraphGateSatisfied(satisfied) => {
+                if !states.contains_key(&satisfied.graph_id)
+                    && let Some(state) = load_workflow_graph_state(
+                        transaction,
+                        session_id,
+                        Some(&satisfied.graph_id),
+                    )?
+                {
+                    states.insert(satisfied.graph_id.clone(), state);
+                }
+                let Some(state) = states.get(&satisfied.graph_id) else {
+                    continue;
+                };
+                let node_state = state.node(&satisfied.node).ok_or_else(|| {
+                    corrupt("satisfied workflow node has no activation projection")
+                })?;
+                if node_state.phase != WorkflowNodePhase::Activated {
+                    return Err(corrupt(
+                        "Convergence Graph satisfied a workflow node that never activated",
+                    ));
+                }
+                let source = evidence
+                    .get(&(
+                        satisfied.graph_id.clone(),
+                        satisfied.node.clone(),
+                        satisfied.attempt,
+                    ))
+                    .map_or_else(|| serde_json::to_value(satisfied), serde_json::to_value)
+                    .map_err(|error| {
+                        store_error(
+                            ErrorCode::InvalidArgument,
+                            format!("cannot encode workflow completion source: {error}"),
+                            false,
+                        )
+                    })?;
+                let output = workflow_output_evidence(cas, state, &satisfied.node, &source)?;
+                let convergence = state
+                    .ast
+                    .nodes
+                    .iter()
+                    .find(|spec| spec.node == satisfied.node)
+                    .is_some_and(|spec| spec.convergence_gate)
+                    .then(|| haider_protocol::graph::WorkflowConvergenceStamp {
+                        decision_digest: output.ledger_digest.clone(),
+                    });
+                let completed = WorkflowNodeCompleted {
+                    graph_id: satisfied.graph_id.clone(),
+                    node: satisfied.node.clone(),
+                    iteration: node_state.iteration,
+                    outputs: vec![output],
+                    output_ledger_digest: String::new(),
+                    convergence,
+                };
+                let mut completed = completed;
+                completed.output_ledger_digest =
+                    workflow_evidence_ledger_digest(&completed.outputs);
+                let cursor = planned_workflow_cursor(latest, base_len, planned.len())?;
+                append_planned_workflow_event(
+                    &mut states,
+                    &mut planned,
+                    cursor,
+                    WorkflowGraphJournalEvent::WorkflowNodeCompleted(completed),
+                    causation_id.clone(),
+                )?;
+            }
+            EventPayload::GraphAttemptOpened(opened) => {
+                if !states.contains_key(&opened.graph_id)
+                    && let Some(state) =
+                        load_workflow_graph_state(transaction, session_id, Some(&opened.graph_id))?
+                {
+                    states.insert(opened.graph_id.clone(), state);
+                }
+                let Some(state) = states.get(&opened.graph_id) else {
+                    continue;
+                };
+                if let Some((source, iteration, target_type)) =
+                    active_back_source(state, &opened.node)
+                {
+                    let source_value = evidence
+                        .iter()
+                        .rev()
+                        .find(|((graph_id, node, _), _)| {
+                            graph_id == &opened.graph_id && node == &source
+                        })
+                        .map(|(_, recorded)| recorded)
+                        .map_or_else(|| serde_json::to_value(opened), serde_json::to_value)
+                        .map_err(|error| {
+                            store_error(
+                                ErrorCode::InvalidArgument,
+                                format!("cannot encode workflow reject source: {error}"),
+                                false,
+                            )
+                        })?;
+                    let rejected = workflow_rejection(
+                        cas,
+                        state,
+                        &source,
+                        iteration,
+                        WorkflowNodeRejectCode::EvidenceRejected,
+                        format!("node {source} rejected evidence and followed its back edge"),
+                        Some(&target_type),
+                        &source_value,
+                    )?;
+                    let cursor = planned_workflow_cursor(latest, base_len, planned.len())?;
+                    append_planned_workflow_event(
+                        &mut states,
+                        &mut planned,
+                        cursor,
+                        WorkflowGraphJournalEvent::WorkflowNodeRejected(rejected),
+                        causation_id.clone(),
+                    )?;
+                }
+                let state = states
+                    .get(&opened.graph_id)
+                    .ok_or_else(|| corrupt("workflow graph state vanished during activation"))?;
+                // A retry target can still have its original forward inputs
+                // in the projection. The explicit rejected back edge has
+                // precedence; choosing the stale forward join would attempt
+                // to activate a completed/rejected generation as iteration 1.
+                let (cause, inputs) = if let Some(input) = back_workflow_input(state, &opened.node)
+                {
+                    (WorkflowActivationCause::BackEdge, vec![input])
+                } else if let Some(inputs) = forward_workflow_inputs(state, &opened.node, None) {
+                    (WorkflowActivationCause::ForwardJoin, inputs)
+                } else {
+                    let node_state = state
+                        .node(&opened.node)
+                        .ok_or_else(|| corrupt("opened workflow node has no projected state"))?;
+                    let awaits_external_input = state.seed.is_none()
+                        && state
+                            .ast
+                            .nodes
+                            .iter()
+                            .find(|spec| spec.node == opened.node)
+                            .is_some_and(|spec| {
+                                spec.join.initial_all.iter().any(|edge_id| {
+                                    state.ast.edges.iter().any(|edge| {
+                                        edge.id == *edge_id
+                                            && edge.kind == WorkflowEdgeKind::GraphInput
+                                    })
+                                })
+                            });
+                    if awaits_external_input {
+                        continue;
+                    }
+                    let missing_iteration =
+                        node_state.iteration.checked_add(1).ok_or_else(|| {
+                            corrupt("workflow activation iteration space is exhausted")
+                        })?;
+                    let rejected = workflow_rejection(
+                        cas,
+                        state,
+                        &opened.node,
+                        missing_iteration,
+                        WorkflowNodeRejectCode::TypedInputMissing,
+                        format!(
+                            "node {} did not activate because its typed join inputs are missing",
+                            opened.node
+                        ),
+                        None,
+                        opened,
+                    )?;
+                    let cursor = planned_workflow_cursor(latest, base_len, planned.len())?;
+                    append_planned_workflow_event(
+                        &mut states,
+                        &mut planned,
+                        cursor,
+                        WorkflowGraphJournalEvent::WorkflowNodeRejected(rejected),
+                        causation_id.clone(),
+                    )?;
+                    continue;
+                };
+                let state = states
+                    .get(&opened.graph_id)
+                    .ok_or_else(|| corrupt("workflow graph state vanished before activation"))?;
+                let node_state = state
+                    .node(&opened.node)
+                    .ok_or_else(|| corrupt("opened workflow node has no projected state"))?;
+                let next_iteration = node_state
+                    .iteration
+                    .checked_add(1)
+                    .ok_or_else(|| corrupt("workflow activation iteration space is exhausted"))?;
+                if cause == WorkflowActivationCause::BackEdge
+                    && state.back_edge_activations >= state.ast.max_back_edge_activations
+                {
+                    let rejected = workflow_rejection(
+                        cas,
+                        state,
+                        &opened.node,
+                        next_iteration,
+                        WorkflowNodeRejectCode::IterationGuard,
+                        format!(
+                            "node {} was not reactivated because the bounded back-edge guard of {} was exhausted",
+                            opened.node, state.ast.max_back_edge_activations
+                        ),
+                        None,
+                        opened,
+                    )?;
+                    let cursor = planned_workflow_cursor(latest, base_len, planned.len())?;
+                    append_planned_workflow_event(
+                        &mut states,
+                        &mut planned,
+                        cursor,
+                        WorkflowGraphJournalEvent::WorkflowNodeRejected(rejected),
+                        causation_id.clone(),
+                    )?;
+                    continue;
+                }
+                let mut activated = WorkflowNodeActivated {
+                    graph_id: opened.graph_id.clone(),
+                    node: opened.node.clone(),
+                    iteration: next_iteration,
+                    activation_order: state.next_activation_order,
+                    cause,
+                    inputs,
+                    input_ledger_digest: String::new(),
+                };
+                activated.input_ledger_digest = workflow_input_ledger_digest(&activated.inputs);
+                let cursor = planned_workflow_cursor(latest, base_len, planned.len())?;
+                append_planned_workflow_event(
+                    &mut states,
+                    &mut planned,
+                    cursor,
+                    WorkflowGraphJournalEvent::WorkflowNodeActivated(activated),
+                    causation_id.clone(),
+                )?;
+            }
+            EventPayload::GraphBlocked(blocked) => {
+                if !states.contains_key(&blocked.graph_id)
+                    && let Some(state) =
+                        load_workflow_graph_state(transaction, session_id, Some(&blocked.graph_id))?
+                {
+                    states.insert(blocked.graph_id.clone(), state);
+                }
+                let Some(state) = states.get(&blocked.graph_id) else {
+                    continue;
+                };
+                let node_state = state
+                    .node(&blocked.node)
+                    .ok_or_else(|| corrupt("blocked workflow node has no projected state"))?;
+                if node_state.phase != WorkflowNodePhase::Activated {
+                    continue;
+                }
+                let code = if matches!(blocked.reason, GraphBlockReason::HumanHold) {
+                    WorkflowNodeRejectCode::ConvergenceRejected
+                } else if matches!(blocked.reason, GraphBlockReason::RoundsExhausted) {
+                    WorkflowNodeRejectCode::IterationGuard
+                } else {
+                    WorkflowNodeRejectCode::EvidenceRejected
+                };
+                let rejection_evidence_type = state
+                    .ast
+                    .nodes
+                    .iter()
+                    .find(|spec| spec.node == blocked.node && spec.convergence_gate)
+                    .map(|spec| spec.output_type.clone());
+                let rejected = workflow_rejection(
+                    cas,
+                    state,
+                    &blocked.node,
+                    node_state.iteration,
+                    code,
+                    format!(
+                        "convergence graph rejected node {}: {:?}",
+                        blocked.node, blocked.reason
+                    ),
+                    rejection_evidence_type.as_deref(),
+                    blocked,
+                )?;
+                let cursor = planned_workflow_cursor(latest, base_len, planned.len())?;
+                append_planned_workflow_event(
+                    &mut states,
+                    &mut planned,
+                    cursor,
+                    WorkflowGraphJournalEvent::WorkflowNodeRejected(rejected),
+                    causation_id.clone(),
+                )?;
+            }
+            EventPayload::GraphAbandoned(abandoned) => {
+                plan_terminal_workflow_rejections(
+                    transaction,
+                    cas,
+                    session_id,
+                    &mut states,
+                    &mut planned,
+                    causation_id,
+                    latest,
+                    base_len,
+                    &abandoned.graph_id,
+                    WorkflowNodeRejectCode::Abandoned,
+                    "workflow graph was abandoned",
+                    abandoned,
+                )?;
+            }
+            EventPayload::GraphSuperseded(superseded) => {
+                plan_terminal_workflow_rejections(
+                    transaction,
+                    cas,
+                    session_id,
+                    &mut states,
+                    &mut planned,
+                    causation_id,
+                    latest,
+                    base_len,
+                    &superseded.old,
+                    WorkflowNodeRejectCode::Superseded,
+                    "workflow graph was superseded",
+                    superseded,
+                )?;
+            }
+            _ => {}
+        }
+    }
+    if planned.is_empty() {
+        return Ok(());
+    }
+    let metadata = envelopes
+        .first()
+        .cloned()
+        .ok_or_else(|| corrupt("workflow graph batch lost its metadata envelope"))?;
+    for (index, (event, causation_id)) in planned.into_iter().enumerate() {
+        let payload_json = event.to_payload_value().map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot encode workflow activation event: {error}"),
+                false,
+            )
+        })?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"haider/workflow-activation-event/v1\0");
+        hasher.update(session_id.as_str().as_bytes());
+        let event_offset =
+            u64::try_from(index).map_err(|_| corrupt("workflow activation batch is too large"))?;
+        hasher.update(&event_offset.to_be_bytes());
+        hasher.update(payload_json.to_string().as_bytes());
+        envelopes.push(EventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: EventId::new(format!(
+                "workflow-activation-{}",
+                hasher.finalize().to_hex()
+            )),
+            seq: 0,
+            session_id: session_id.clone(),
+            branch_id: None,
+            run_id: metadata.run_id.clone(),
+            agent_id: metadata.agent_id.clone(),
+            device_id: metadata.device_id.clone(),
+            authority_epoch: metadata.authority_epoch,
+            worker_generation: metadata.worker_generation,
+            causation_id: Some(causation_id),
+            correlation_id: metadata.correlation_id.clone(),
+            committed_at_ms: 0,
+            render: RenderTargets {
+                // L3 consumes the indexed state/watch surfaces. Keeping raw
+                // runtime facts off the legacy live-view stream avoids
+                // teaching old EventPayload renderers about this additive
+                // journal family.
+                ui: false,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload: payload_json,
+        });
+    }
+    Ok(())
+}
+
+/// One-time v25 translation for pinned Loom graphs whose legacy journal was
+/// committed before activation facts existed. The translation appends the
+/// same typed facts used by live commands, then builds graph/node indexes in
+/// that transaction. Ordinary reads never rescan the journal.
+fn backfill_workflow_graph_journals(
+    connection: &mut Connection,
+    cas: &FileCas,
+    worker_generation: u64,
+) -> StoreResult<()> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_sqlite_error)?;
+    let version = transaction
+        .query_row(
+            "SELECT workflow_graph_backfill_version FROM profile_meta WHERE singleton = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(map_sqlite_error)?;
+    let version = u32::try_from(version)
+        .map_err(|_| corrupt("workflow graph backfill version is invalid"))?;
+    if version >= 1 {
+        transaction.commit().map_err(map_sqlite_error)?;
+        return Ok(());
+    }
+    let session_ids = {
+        let mut statement = transaction
+            .prepare_cached(
+                "SELECT DISTINCT session_id FROM events
+                 WHERE payload_kind = 'graph_pinned' ORDER BY session_id ASC",
+            )
+            .map_err(map_sqlite_error)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(map_sqlite_error)?;
+        let mut session_ids = Vec::new();
+        for row in rows {
+            session_ids.push(SessionId::new(row.map_err(map_sqlite_error)?));
+        }
+        session_ids
+    };
+    let committed_at_ms = now_ms()?;
+    for session_id in session_ids {
+        let mut historical = load_workflow_backfill_envelopes(&transaction, &session_id)?;
+        let historical_len = historical.len();
+        augment_workflow_graph_envelopes(&transaction, cas, &session_id, &mut historical)?;
+        if historical.len() == historical_len {
+            continue;
+        }
+        let mut generated = historical.split_off(historical_len);
+        for envelope in &mut generated {
+            envelope.worker_generation = worker_generation;
+            envelope.device_id = DeviceId::new("workflow-graph-backfill");
+            envelope.render.ui = false;
+        }
+        append_transaction_envelopes(&transaction, &session_id, committed_at_ms, &mut generated)?;
+    }
+    let changed = transaction
+        .execute(
+            "UPDATE profile_meta SET workflow_graph_backfill_version = 1
+             WHERE singleton = 1 AND workflow_graph_backfill_version < 1",
+            [],
+        )
+        .map_err(map_sqlite_error)?;
+    if changed != 1 {
+        return Err(corrupt(
+            "workflow graph backfill version did not advance exactly once",
+        ));
+    }
+    transaction.commit().map_err(map_sqlite_error)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_terminal_workflow_rejections(
+    transaction: &Connection,
+    cas: &FileCas,
+    session_id: &SessionId,
+    states: &mut HashMap<GraphId, WorkflowGraphState>,
+    planned: &mut Vec<(WorkflowGraphJournalEvent, EventId)>,
+    causation_id: &EventId,
+    latest: u64,
+    base_len: u64,
+    graph_id: &GraphId,
+    code: WorkflowNodeRejectCode,
+    message: &str,
+    source: &impl serde::Serialize,
+) -> StoreResult<()> {
+    if !states.contains_key(graph_id)
+        && let Some(state) = load_workflow_graph_state(transaction, session_id, Some(graph_id))?
+    {
+        states.insert(graph_id.clone(), state);
+    }
+    let Some(state) = states.get(graph_id) else {
+        return Ok(());
+    };
+    let active = state
+        .nodes
+        .iter()
+        .filter_map(|node| match node.phase {
+            WorkflowNodePhase::Waiting => node
+                .iteration
+                .checked_add(1)
+                .map(|iteration| (node.node.clone(), iteration)),
+            WorkflowNodePhase::Activated => Some((node.node.clone(), node.iteration)),
+            WorkflowNodePhase::Completed | WorkflowNodePhase::Rejected => None,
+        })
+        .collect::<Vec<_>>();
+    for (node, iteration) in active {
+        let state = states
+            .get(graph_id)
+            .ok_or_else(|| corrupt("workflow graph vanished during terminal rejection"))?;
+        let rejected = workflow_rejection(
+            cas,
+            state,
+            &node,
+            iteration,
+            code,
+            message.to_owned(),
+            None,
+            source,
+        )?;
+        let cursor = planned_workflow_cursor(latest, base_len, planned.len())?;
+        append_planned_workflow_event(
+            states,
+            planned,
+            cursor,
+            WorkflowGraphJournalEvent::WorkflowNodeRejected(rejected),
+            causation_id.clone(),
+        )?;
+    }
+    Ok(())
+}
+
 fn append_transaction_envelopes(
     transaction: &Transaction<'_>,
     session_id: &SessionId,
@@ -15340,6 +16729,7 @@ fn append_transaction_envelopes(
     }
     drop(insert);
     update_run_head_projection_after_append(transaction, session_id, envelopes)?;
+    update_workflow_graph_projection_after_append(transaction, session_id, envelopes)?;
     if envelopes
         .iter()
         .any(|envelope| graph_telemetry_event(&envelope.payload))
@@ -15610,6 +17000,7 @@ struct ResolutionRow {
 
 fn resolve_menu_transaction(
     transaction: &Transaction<'_>,
+    cas: &FileCas,
     command: &MenuResolutionCommand,
     current_worker_generation: u64,
 ) -> StoreResult<MenuResolutionOutcome> {
@@ -15944,6 +17335,7 @@ fn resolve_menu_transaction(
             }
         }
     }
+    augment_workflow_graph_envelopes(transaction, cas, &command.session_id, &mut envelopes)?;
     append_transaction_envelopes(
         transaction,
         &command.session_id,
@@ -15980,7 +17372,9 @@ fn resolve_menu_transaction(
 /// event's own transaction. Hook lifecycle/result facts are deliberately not
 /// recursive inputs; run trust and profile update/account facts are inputs.
 fn enqueue_hook_dispatch(transaction: &Connection, envelope: &RawEnvelope) -> StoreResult<()> {
-    if HookEventPayload::is_engine_fact(&envelope.payload) {
+    if HookEventPayload::is_engine_fact(&envelope.payload)
+        || workflow_graph_journal_event(&envelope.payload)?.is_some()
+    {
         return Ok(());
     }
     transaction
@@ -16451,6 +17845,7 @@ fn append_envelopes_in_transaction(
         }
     }
     update_run_head_projection_after_append(transaction, &session, &stamped)?;
+    update_workflow_graph_projection_after_append(transaction, &session, &stamped)?;
     update_branch_heads(transaction, &stamped)?;
     Ok(AppendTransactionOutcome {
         range: CommittedSeqRange {
@@ -20179,7 +21574,10 @@ mod run_head_projection_tests {
         }
         let raw = Connection::open(&database_path).expect("open raw v22 fixture");
         raw.execute_batch(
-            "DROP TABLE provider_view_gc;
+            "DROP TABLE workflow_node_states;
+             DROP TABLE workflow_graph_instances;
+             ALTER TABLE profile_meta DROP COLUMN workflow_graph_backfill_version;
+             DROP TABLE provider_view_gc;
              DROP TABLE provider_view_blocks;
              DROP TABLE provider_view_requests;
              DROP TABLE provider_view_session_cursors;
@@ -20193,7 +21591,7 @@ mod run_head_projection_tests {
 
         for pass in 0..2 {
             let store = Store::open(root.path()).expect("migrate v22 store");
-            assert_eq!(store.schema_version().expect("schema version"), 24);
+            assert_eq!(store.schema_version().expect("schema version"), 25);
             let connection = store.connection().expect("migrated journal connection");
             assert_eq!(
                 load_projected_run_heads(&connection, &SessionId::new("run-head-session"))

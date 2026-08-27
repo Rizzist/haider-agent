@@ -3639,6 +3639,160 @@ async fn cursor_ahead_is_correlated_and_carries_recovery_coordinates() {
     store.close().await.expect("store closes");
 }
 
+/// The additive activation-graph read doors use view authority, preserve
+/// not-found/argument errors, and expose typed cursor recovery coordinates.
+#[tokio::test]
+async fn workflow_graph_read_rpcs_are_authorized_bounded_and_replayable() {
+    let (_root, store, hub) = open_hub(None, 8).await;
+    let session_id = SessionId::new("workflow-graph-reads");
+    append_one(
+        &hub,
+        &session_id,
+        store.worker_generation(),
+        "workflow-graph-session",
+    )
+    .await;
+
+    let denied_sink = Arc::new(CollectSink::default());
+    let denied = hub
+        .open_connection(
+            CapabilitySet::new(),
+            denied_sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("denied connection");
+    denied
+        .request(
+            RequestId::new("workflow-state-denied"),
+            RequestBody::WorkflowGraphState {
+                session_id: session_id.clone(),
+                graph_id: None,
+            },
+        )
+        .await
+        .expect("state denial routes");
+    assert!(matches!(
+        denied_sink.next().await,
+        WireFrame::Response {
+            body: ResponseBody::Error { ref code, .. },
+            ..
+        } if code == ERROR_CODE_CAPABILITY_DENIED
+    ));
+
+    let sink = Arc::new(CollectSink::default());
+    let connection = hub
+        .open_connection(
+            CapabilitySet::from([Capability::View]),
+            sink.clone(),
+            ConnectionTransport::LocalSameUid,
+        )
+        .expect("view connection");
+    connection
+        .request(
+            RequestId::new("workflow-state-empty"),
+            RequestBody::WorkflowGraphState {
+                session_id: session_id.clone(),
+                graph_id: None,
+            },
+        )
+        .await
+        .expect("empty state routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            body: ResponseBody::WorkflowGraphState { state: None },
+            ..
+        }
+    ));
+
+    connection
+        .request(
+            RequestId::new("workflow-state-missing"),
+            RequestBody::WorkflowGraphState {
+                session_id: SessionId::new("missing-workflow-graph-session"),
+                graph_id: None,
+            },
+        )
+        .await
+        .expect("missing state routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            body: ResponseBody::Error { ref code, .. },
+            ..
+        } if code == haider_rpc::ERROR_CODE_NOT_FOUND
+    ));
+
+    connection
+        .request(
+            RequestId::new("workflow-watch-limit"),
+            RequestBody::WorkflowGraphWatch {
+                session_id: session_id.clone(),
+                after_cursor: 0,
+                limit: 0,
+            },
+        )
+        .await
+        .expect("invalid watch routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            body: ResponseBody::Error { ref code, .. },
+            ..
+        } if code == haider_rpc::ERROR_CODE_INVALID_ARGUMENT
+    ));
+
+    connection
+        .request(
+            RequestId::new("workflow-watch-ahead"),
+            RequestBody::WorkflowGraphWatch {
+                session_id: session_id.clone(),
+                after_cursor: 1,
+                limit: 1,
+            },
+        )
+        .await
+        .expect("ahead watch routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            body: ResponseBody::Error {
+                ref code,
+                data: Some(ErrorData::CursorAhead { requested: 1, head: 0 }),
+                ..
+            },
+            ..
+        } if code == haider_rpc::ERROR_CODE_CURSOR_AHEAD
+    ));
+
+    connection
+        .request(
+            RequestId::new("workflow-watch-empty"),
+            RequestBody::WorkflowGraphWatch {
+                session_id,
+                after_cursor: 0,
+                limit: 1,
+            },
+        )
+        .await
+        .expect("empty watch routes");
+    assert!(matches!(
+        sink.next().await,
+        WireFrame::Response {
+            body: ResponseBody::WorkflowGraphWatch { page },
+            ..
+        } if page.requested_after_cursor == 0
+            && page.replay_through_cursor == 0
+            && page.next_cursor == 0
+            && page.events.is_empty()
+    ));
+
+    denied.close().await.expect("denied connection closes");
+    connection.close().await.expect("view connection closes");
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
 /// MUTATION CHECK: remove the ownership-locked delivery check or purge before
 /// removing/cancelling the attachment. Expected failure: the gated event is
 /// queued after purge and survives the detach acknowledgement.

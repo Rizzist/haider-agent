@@ -194,12 +194,16 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// `FEATURE_LOOM_PIPE_DAG_V1`. Expected runtime failure: clients cannot
 /// discover the catalog snapshot or distinguish v0.0.961 fork/join/back-edge
 /// grammar from legacy `loom_v1`.
+///
+/// MUTATION CHECK: remove `FEATURE_WORKFLOW_GRAPH_V1`. Expected runtime
+/// failure: clients cannot discover the indexed activation state and
+/// cursor-replay surfaces served by this daemon.
 #[test]
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
         welcome_features().len(),
-        85,
-        "the ordinary Welcome advertises all 78 base and seven v0.0.962 feature tokens"
+        86,
+        "the ordinary Welcome advertises all 85 prior and one v0.0.963 feature tokens"
     );
     assert_eq!(
         welcome_features(),
@@ -236,6 +240,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_LOOM_V1.to_owned(),
             haider_rpc::FEATURE_LOOM_PIPE_DAG_V1.to_owned(),
             haider_rpc::FEATURE_WORKFLOW_CATALOG_V1.to_owned(),
+            haider_rpc::FEATURE_WORKFLOW_GRAPH_V1.to_owned(),
             haider_rpc::FEATURE_WORKFLOW_INSTANCE_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_WORKFLOW_STATE_V1.to_owned(),
             haider_rpc::FEATURE_MODELS_LIST_V1.to_owned(),

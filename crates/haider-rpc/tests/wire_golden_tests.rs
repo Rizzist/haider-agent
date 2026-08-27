@@ -264,6 +264,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "usage.history_day",
         "usage.history_range",
         "vault.stage",
+        "workflow.graph.state",
+        "workflow.graph.watch",
         "workflow.instance",
     ];
 
@@ -273,8 +275,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         expected_methods.len(),
-        86,
-        "the v1 contract covers all 78 base and eight v0.0.962 request methods"
+        88,
+        "the v1 contract covers all 86 prior and two v0.0.963 request methods"
     );
     assert_eq!(
         request_methods_declared_in_source(),

@@ -12,6 +12,7 @@ use crate::ids::{
     AgentId, ArtifactRef, BranchId, EffectId, EventId, GraphId, GraphRunSetId, ItemId, MenuId,
     RunId, SessionId, WorkspaceRevision,
 };
+use crate::pipe::InstructEvidenceRef;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -42,6 +43,9 @@ pub const GRAPH_MAX_TODO_CHILDREN: usize = 50;
 pub const GRAPH_TELEMETRY_MAX_RUN_ROWS: usize = 1_024;
 pub const GRAPH_TELEMETRY_MAX_ATTEMPT_ROWS: usize = 4_096;
 pub const GRAPH_TELEMETRY_MAX_TEMPLATE_ROWS: usize = 256;
+/// Maximum activation-graph events returned by one cursor watch page.
+pub const WORKFLOW_GRAPH_WATCH_MAX_EVENTS: u32 = 128;
+pub const WORKFLOW_NODE_REJECT_MESSAGE_MAX_BYTES: usize = 1_024;
 
 /// Bounded durable node identity. Node names are data, never control-flow
 /// discriminants. The accepted wire form is one ASCII upper-case identifier
@@ -203,6 +207,1351 @@ pub struct GraphTemplateSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_node: Option<GraphNodeName>,
     pub nodes: Vec<GraphNodeSpec>,
+}
+
+/// A typed runtime edge. Runtime ASTs use explicit input, forward, and
+/// back-edge sources; no execution decision is inferred from source order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowEdgeKind {
+    GraphInput,
+    Forward,
+    Back,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WorkflowActivationEdge {
+    pub id: u32,
+    pub kind: WorkflowEdgeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<GraphNodeName>,
+    pub to: GraphNodeName,
+    pub evidence_type: String,
+}
+
+/// Exact edge sets that can activate a node. The first activation requires
+/// every `initial_all` edge; a later iteration requires one explicit back
+/// edge from `reactivate_any`. This keeps fork/join and retry semantics typed
+/// and inspectable instead of smuggling control flow through node order.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WorkflowJoinSemantics {
+    pub initial_all: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reactivate_any: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WorkflowActivationNode {
+    pub node: GraphNodeName,
+    pub input_type: String,
+    pub output_type: String,
+    pub join: WorkflowJoinSemantics,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub convergence_gate: bool,
+}
+
+/// Immutable executable AST frozen into the journal when a registered Loom
+/// workflow is pinned. This is the runtime structure of record; the older
+/// GraphTemplateSpec remains the compatibility gate vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WorkflowActivationAst {
+    pub workflow_id: String,
+    pub workflow_digest: String,
+    pub input_type: String,
+    pub output_type: String,
+    pub nodes: Vec<WorkflowActivationNode>,
+    pub edges: Vec<WorkflowActivationEdge>,
+    pub max_back_edge_activations: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowGraphStarted {
+    pub graph_id: GraphId,
+    pub ast: WorkflowActivationAst,
+    pub ast_digest: String,
+    /// The exact external input is absent at pin time. It is captured from
+    /// the first graph-input activation so pinning can expose a waiting AST
+    /// without fabricating evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<InstructEvidenceRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowNodeInput {
+    pub edge_id: u32,
+    pub evidence: InstructEvidenceRef,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowActivationCause {
+    ForwardJoin,
+    BackEdge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowNodeActivated {
+    pub graph_id: GraphId,
+    pub node: GraphNodeName,
+    /// Node-local activation generation, starting at one.
+    pub iteration: u32,
+    /// Session-journal-stable total order across this graph instance.
+    pub activation_order: u64,
+    pub cause: WorkflowActivationCause,
+    pub inputs: Vec<WorkflowNodeInput>,
+    pub input_ledger_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowConvergenceStamp {
+    pub decision_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowNodeCompleted {
+    pub graph_id: GraphId,
+    pub node: GraphNodeName,
+    pub iteration: u32,
+    pub outputs: Vec<InstructEvidenceRef>,
+    pub output_ledger_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convergence: Option<WorkflowConvergenceStamp>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowNodeRejectCode {
+    EvidenceRejected,
+    TypedInputMissing,
+    IterationGuard,
+    ConvergenceRejected,
+    Abandoned,
+    Superseded,
+    InvariantViolation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowNodeRejected {
+    pub graph_id: GraphId,
+    pub node: GraphNodeName,
+    pub iteration: u32,
+    pub code: WorkflowNodeRejectCode,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<InstructEvidenceRef>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub convergence_gate: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowNodePhase {
+    Waiting,
+    Activated,
+    Completed,
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowNodeState {
+    pub node: GraphNodeName,
+    pub phase: WorkflowNodePhase,
+    pub iteration: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_order: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<WorkflowNodeInput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<InstructEvidenceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convergence: Option<WorkflowConvergenceStamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection: Option<WorkflowNodeRejected>,
+    pub updated_cursor: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowGraphPhase {
+    Active,
+    Completed,
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowActivationCoordinate {
+    pub activation_order: u64,
+    pub node: GraphNodeName,
+    pub iteration: u32,
+    pub cursor: u64,
+}
+
+/// Indexed read model derived exclusively from workflow activation facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowGraphState {
+    pub graph_id: GraphId,
+    pub ast: WorkflowActivationAst,
+    pub ast_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<InstructEvidenceRef>,
+    pub phase: WorkflowGraphPhase,
+    pub through_cursor: u64,
+    pub next_activation_order: u64,
+    pub back_edge_activations: u32,
+    pub nodes: Vec<WorkflowNodeState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activation_order: Vec<WorkflowActivationCoordinate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Additive activation-event family kept beside the frozen
+/// [`crate::EventPayload`] union. Older live-view clients therefore ignore
+/// these journal facts while graph-aware clients consume the dedicated state
+/// and watch RPCs.
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkflowGraphJournalEvent {
+    WorkflowGraphStarted(WorkflowGraphStarted),
+    WorkflowNodeActivated(WorkflowNodeActivated),
+    WorkflowNodeCompleted(WorkflowNodeCompleted),
+    WorkflowNodeRejected(WorkflowNodeRejected),
+}
+
+impl WorkflowGraphJournalEvent {
+    pub fn to_payload_value(&self) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(self)
+    }
+
+    pub fn from_payload_value(
+        value: &serde_json::Value,
+    ) -> Result<Option<Self>, serde_json::Error> {
+        let known = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| {
+                matches!(
+                    kind,
+                    "workflow_graph_started"
+                        | "workflow_node_activated"
+                        | "workflow_node_completed"
+                        | "workflow_node_rejected"
+                )
+            });
+        if !known {
+            return Ok(None);
+        }
+        serde_json::from_value(value.clone()).map(Some)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowGraphWatchEvent {
+    pub cursor: u64,
+    pub event: WorkflowGraphJournalEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowGraphWatchPage {
+    pub requested_after_cursor: u64,
+    pub replay_through_cursor: u64,
+    pub next_cursor: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<WorkflowGraphWatchEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowGraphReductionError {
+    InvalidAst(String),
+    InvalidEvent(String),
+}
+
+impl fmt::Display for WorkflowGraphReductionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidAst(message) | Self::InvalidEvent(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for WorkflowGraphReductionError {}
+
+impl WorkflowGraphState {
+    pub fn from_started(
+        cursor: u64,
+        started: WorkflowGraphStarted,
+    ) -> Result<Self, WorkflowGraphReductionError> {
+        if cursor == 0 || started.graph_id.as_str().is_empty() {
+            return Err(WorkflowGraphReductionError::InvalidEvent(
+                "workflow graph start has invalid journal coordinates".into(),
+            ));
+        }
+        validate_workflow_activation_ast(&started.ast)?;
+        if let Some(seed) = started.seed.as_ref() {
+            seed.validate().map_err(|error| {
+                WorkflowGraphReductionError::InvalidEvent(format!(
+                    "workflow graph seed is invalid: {error}"
+                ))
+            })?;
+            if seed.evidence_type != started.ast.input_type || !seed.parents.is_empty() {
+                return Err(WorkflowGraphReductionError::InvalidEvent(
+                    "workflow graph seed type or root lineage differs from the AST input".into(),
+                ));
+            }
+        }
+        if started.ast_digest != workflow_activation_ast_digest(&started.ast) {
+            return Err(WorkflowGraphReductionError::InvalidEvent(
+                "workflow activation AST digest does not match".into(),
+            ));
+        }
+        let nodes = started
+            .ast
+            .nodes
+            .iter()
+            .map(|node| WorkflowNodeState {
+                node: node.node.clone(),
+                phase: WorkflowNodePhase::Waiting,
+                iteration: 0,
+                activation_order: None,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                convergence: None,
+                rejection: None,
+                updated_cursor: cursor,
+            })
+            .collect();
+        Ok(Self {
+            graph_id: started.graph_id,
+            ast: started.ast,
+            ast_digest: started.ast_digest,
+            seed: started.seed,
+            phase: WorkflowGraphPhase::Active,
+            through_cursor: cursor,
+            next_activation_order: 1,
+            back_edge_activations: 0,
+            nodes,
+            activation_order: Vec::new(),
+        })
+    }
+
+    pub fn apply(
+        &mut self,
+        cursor: u64,
+        event: &WorkflowGraphJournalEvent,
+    ) -> Result<(), WorkflowGraphReductionError> {
+        if cursor <= self.through_cursor {
+            return Err(invalid_workflow_event(
+                "workflow activation cursor did not advance",
+            ));
+        }
+        match event {
+            WorkflowGraphJournalEvent::WorkflowGraphStarted(_) => {
+                return Err(invalid_workflow_event(
+                    "workflow graph was started more than once",
+                ));
+            }
+            WorkflowGraphJournalEvent::WorkflowNodeActivated(activated) => {
+                self.apply_activation(cursor, activated)?;
+            }
+            WorkflowGraphJournalEvent::WorkflowNodeCompleted(completed) => {
+                self.apply_completion(cursor, completed)?;
+            }
+            WorkflowGraphJournalEvent::WorkflowNodeRejected(rejected) => {
+                self.apply_rejection(cursor, rejected)?;
+            }
+        }
+        self.through_cursor = cursor;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn node(&self, node: &GraphNodeName) -> Option<&WorkflowNodeState> {
+        self.nodes.iter().find(|candidate| &candidate.node == node)
+    }
+
+    /// Checks the indexed snapshot without consulting the journal. Stores
+    /// use this at the projection trust boundary; replay remains the repair
+    /// oracle, not the ordinary read path.
+    pub fn validate_projection(&self) -> Result<(), WorkflowGraphReductionError> {
+        validate_workflow_activation_ast(&self.ast)?;
+        if let Some(seed) = self.seed.as_ref() {
+            seed.validate().map_err(|error| {
+                invalid_workflow_event(format!("workflow graph seed is invalid: {error}"))
+            })?;
+        }
+        let expected_next_order = u64::try_from(self.activation_order.len())
+            .ok()
+            .and_then(|count| count.checked_add(1));
+        if self.graph_id.as_str().is_empty()
+            || self.through_cursor == 0
+            || self.ast_digest != workflow_activation_ast_digest(&self.ast)
+            || self.seed.as_ref().is_some_and(|seed| {
+                seed.evidence_type != self.ast.input_type || !seed.parents.is_empty()
+            })
+            || (self.seed.is_none()
+                && (!self.activation_order.is_empty()
+                    || self.nodes.iter().any(|node| {
+                        matches!(
+                            node.phase,
+                            WorkflowNodePhase::Activated | WorkflowNodePhase::Completed
+                        )
+                    })))
+            || expected_next_order != Some(self.next_activation_order)
+            || self.back_edge_activations > self.ast.max_back_edge_activations
+            || self.nodes.len() != self.ast.nodes.len()
+            || self.nodes.iter().zip(&self.ast.nodes).any(|(state, spec)| {
+                state.node != spec.node
+                    || state.updated_cursor == 0
+                    || state.updated_cursor > self.through_cursor
+                    || (state.phase != WorkflowNodePhase::Waiting && state.iteration == 0)
+            })
+        {
+            return Err(invalid_workflow_event(
+                "workflow graph projection identity, counters, or node index is invalid",
+            ));
+        }
+        let mut previous_cursor = 0_u64;
+        for (index, coordinate) in self.activation_order.iter().enumerate() {
+            let expected_order = u64::try_from(index)
+                .ok()
+                .and_then(|value| value.checked_add(1));
+            if expected_order != Some(coordinate.activation_order)
+                || coordinate.iteration == 0
+                || coordinate.cursor <= previous_cursor
+                || coordinate.cursor > self.through_cursor
+                || self.node(&coordinate.node).is_none()
+            {
+                return Err(invalid_workflow_event(
+                    "workflow graph projection activation order is invalid",
+                ));
+            }
+            previous_cursor = coordinate.cursor;
+        }
+        match self.phase {
+            WorkflowGraphPhase::Completed if !self.terminal_nodes_completed() => {
+                return Err(invalid_workflow_event(
+                    "completed workflow graph projection has unfinished terminals",
+                ));
+            }
+            WorkflowGraphPhase::Rejected
+                if !self.nodes.iter().any(|node| node.rejection.is_some()) =>
+            {
+                return Err(invalid_workflow_event(
+                    "rejected workflow graph projection has no inspectable rejection",
+                ));
+            }
+            WorkflowGraphPhase::Active if self.terminal_nodes_completed() => {
+                return Err(invalid_workflow_event(
+                    "active workflow graph projection already completed every terminal",
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn apply_activation(
+        &mut self,
+        cursor: u64,
+        activated: &WorkflowNodeActivated,
+    ) -> Result<(), WorkflowGraphReductionError> {
+        if activated.graph_id != self.graph_id
+            || activated.activation_order != self.next_activation_order
+            || self.phase == WorkflowGraphPhase::Completed
+            || self.terminal_rejection_code().is_some()
+        {
+            return Err(invalid_workflow_event(
+                "workflow node activation has wrong graph, total order, or terminal phase",
+            ));
+        }
+        let spec = self
+            .ast
+            .nodes
+            .iter()
+            .find(|candidate| candidate.node == activated.node)
+            .cloned()
+            .ok_or_else(|| invalid_workflow_event("activated node is absent from the AST"))?;
+        let previous_iteration = self
+            .node(&activated.node)
+            .map(|node| node.iteration)
+            .ok_or_else(|| invalid_workflow_event("activated node has no projected state"))?;
+        let expected_iteration = previous_iteration
+            .checked_add(1)
+            .ok_or_else(|| invalid_workflow_event("node activation iteration overflowed"))?;
+        if activated.iteration != expected_iteration
+            || activated.input_ledger_digest != workflow_input_ledger_digest(&activated.inputs)
+        {
+            return Err(invalid_workflow_event(
+                "workflow activation iteration or input ledger is invalid",
+            ));
+        }
+        for input in &activated.inputs {
+            input.evidence.validate().map_err(|error| {
+                invalid_workflow_event(format!("workflow activation input is invalid: {error}"))
+            })?;
+            let edge = self
+                .ast
+                .edges
+                .iter()
+                .find(|edge| edge.id == input.edge_id && edge.to == activated.node)
+                .ok_or_else(|| invalid_workflow_event("activation names an unknown input edge"))?;
+            if edge.evidence_type != input.evidence.evidence_type {
+                return Err(invalid_workflow_event(
+                    "activation input evidence has the wrong edge type",
+                ));
+            }
+        }
+        match activated.cause {
+            WorkflowActivationCause::ForwardJoin => {
+                if self
+                    .node(&activated.node)
+                    .is_none_or(|node| node.phase != WorkflowNodePhase::Waiting)
+                    || edge_ids(&activated.inputs) != spec.join.initial_all
+                    || !self.initial_inputs_exist(activated)?
+                {
+                    return Err(invalid_workflow_event(
+                        "node activated before every typed initial input existed",
+                    ));
+                }
+            }
+            WorkflowActivationCause::BackEdge => {
+                if self.seed.is_none()
+                    || activated.iteration == 1
+                    || activated.inputs.len() != 1
+                    || !spec
+                        .join
+                        .reactivate_any
+                        .contains(&activated.inputs[0].edge_id)
+                    || !self.back_input_exists(&activated.inputs[0])
+                {
+                    return Err(invalid_workflow_event(
+                        "node reactivation lacks a typed rejected back-edge input",
+                    ));
+                }
+                let next = self.back_edge_activations.checked_add(1).ok_or_else(|| {
+                    invalid_workflow_event("back-edge activation count overflowed")
+                })?;
+                if next > self.ast.max_back_edge_activations {
+                    return Err(invalid_workflow_event(
+                        "back-edge activation exceeded the bounded iteration guard",
+                    ));
+                }
+                self.back_edge_activations = next;
+                self.reset_descendants(&activated.node, cursor);
+            }
+        }
+        if self.seed.is_none() {
+            self.seed = activated.inputs.iter().find_map(|input| {
+                self.ast
+                    .edges
+                    .iter()
+                    .find(|edge| {
+                        edge.id == input.edge_id && edge.kind == WorkflowEdgeKind::GraphInput
+                    })
+                    .map(|_| input.evidence.clone())
+            });
+        }
+        let node = self
+            .nodes
+            .iter_mut()
+            .find(|candidate| candidate.node == activated.node)
+            .ok_or_else(|| invalid_workflow_event("activated node has no projected state"))?;
+        if node.phase != WorkflowNodePhase::Waiting {
+            return Err(invalid_workflow_event(
+                "node activation requires a waiting projection",
+            ));
+        }
+        node.phase = WorkflowNodePhase::Activated;
+        node.iteration = activated.iteration;
+        node.activation_order = Some(activated.activation_order);
+        node.inputs.clone_from(&activated.inputs);
+        node.outputs.clear();
+        node.convergence = None;
+        node.rejection = None;
+        node.updated_cursor = cursor;
+        self.activation_order.push(WorkflowActivationCoordinate {
+            activation_order: activated.activation_order,
+            node: activated.node.clone(),
+            iteration: activated.iteration,
+            cursor,
+        });
+        self.next_activation_order = self
+            .next_activation_order
+            .checked_add(1)
+            .ok_or_else(|| invalid_workflow_event("activation total order overflowed"))?;
+        self.phase = WorkflowGraphPhase::Active;
+        Ok(())
+    }
+
+    fn apply_completion(
+        &mut self,
+        cursor: u64,
+        completed: &WorkflowNodeCompleted,
+    ) -> Result<(), WorkflowGraphReductionError> {
+        if completed.graph_id != self.graph_id
+            || completed.output_ledger_digest != workflow_evidence_ledger_digest(&completed.outputs)
+            || self.terminal_rejection_code().is_some()
+        {
+            return Err(invalid_workflow_event(
+                "workflow node completion has wrong graph or output ledger",
+            ));
+        }
+        let spec = self
+            .ast
+            .nodes
+            .iter()
+            .find(|candidate| candidate.node == completed.node)
+            .ok_or_else(|| invalid_workflow_event("completed node is absent from the AST"))?;
+        if completed.outputs.len() != 1 || completed.outputs[0].evidence_type != spec.output_type {
+            return Err(invalid_workflow_event(
+                "completed node did not produce its exact typed output",
+            ));
+        }
+        for output in &completed.outputs {
+            output.validate().map_err(|error| {
+                invalid_workflow_event(format!("workflow output evidence is invalid: {error}"))
+            })?;
+        }
+        let node = self
+            .nodes
+            .iter_mut()
+            .find(|candidate| candidate.node == completed.node)
+            .ok_or_else(|| invalid_workflow_event("completed node has no projected state"))?;
+        if node.phase != WorkflowNodePhase::Activated || node.iteration != completed.iteration {
+            return Err(invalid_workflow_event(
+                "only the current activated iteration may complete",
+            ));
+        }
+        let expected_parents = node
+            .inputs
+            .iter()
+            .map(|input| input.evidence.artifact.clone())
+            .collect::<Vec<_>>();
+        if completed.outputs[0].parents != expected_parents {
+            return Err(invalid_workflow_event(
+                "workflow output does not bind its ordered activation inputs",
+            ));
+        }
+        if spec.convergence_gate != completed.convergence.is_some()
+            || completed
+                .convergence
+                .as_ref()
+                .is_some_and(|stamp| stamp.decision_digest != completed.outputs[0].ledger_digest)
+        {
+            return Err(invalid_workflow_event(
+                "convergence gate completion lacks its output-bound inspectable stamp",
+            ));
+        }
+        node.phase = WorkflowNodePhase::Completed;
+        node.outputs.clone_from(&completed.outputs);
+        node.convergence.clone_from(&completed.convergence);
+        node.rejection = None;
+        node.updated_cursor = cursor;
+        if self.terminal_nodes_completed() {
+            self.phase = WorkflowGraphPhase::Completed;
+        }
+        Ok(())
+    }
+
+    fn apply_rejection(
+        &mut self,
+        cursor: u64,
+        rejected: &WorkflowNodeRejected,
+    ) -> Result<(), WorkflowGraphReductionError> {
+        let terminal_rejection = self.terminal_rejection_code();
+        if rejected.graph_id != self.graph_id
+            || rejected.message.trim().is_empty()
+            || rejected.message.len() > WORKFLOW_NODE_REJECT_MESSAGE_MAX_BYTES
+            || self.phase == WorkflowGraphPhase::Completed
+            || terminal_rejection.is_some_and(|code| code != rejected.code)
+        {
+            return Err(invalid_workflow_event(
+                "workflow node rejection has wrong graph, no detail, or a terminal phase",
+            ));
+        }
+        if let Some(evidence) = &rejected.evidence {
+            evidence.validate().map_err(|error| {
+                invalid_workflow_event(format!("workflow reject evidence is invalid: {error}"))
+            })?;
+        }
+        let spec = self
+            .ast
+            .nodes
+            .iter()
+            .find(|candidate| candidate.node == rejected.node)
+            .ok_or_else(|| invalid_workflow_event("rejected node is absent from the AST"))?;
+        if spec.convergence_gate != rejected.convergence_gate {
+            return Err(invalid_workflow_event(
+                "workflow rejection mislabels convergence authority",
+            ));
+        }
+        let expected_parents = self
+            .node(&rejected.node)
+            .ok_or_else(|| invalid_workflow_event("rejected node has no projected state"))?
+            .inputs
+            .iter()
+            .map(|input| input.evidence.artifact.clone())
+            .collect::<Vec<_>>();
+        if rejected
+            .evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.parents != expected_parents)
+        {
+            return Err(invalid_workflow_event(
+                "workflow rejection evidence does not bind its activation inputs",
+            ));
+        }
+        let node = self
+            .nodes
+            .iter_mut()
+            .find(|candidate| candidate.node == rejected.node)
+            .ok_or_else(|| invalid_workflow_event("rejected node has no projected state"))?;
+        let next_iteration = node.iteration.checked_add(1);
+        let rejects_missing_activation = next_iteration == Some(rejected.iteration)
+            && match rejected.code {
+                WorkflowNodeRejectCode::TypedInputMissing
+                | WorkflowNodeRejectCode::InvariantViolation
+                | WorkflowNodeRejectCode::Abandoned
+                | WorkflowNodeRejectCode::Superseded => node.phase == WorkflowNodePhase::Waiting,
+                // A guarded back hop can target the rejected source itself
+                // or an already-completed ancestor. It is still a rejected
+                // activation attempt and must be replayable journal truth.
+                WorkflowNodeRejectCode::IterationGuard => {
+                    node.phase != WorkflowNodePhase::Activated
+                }
+                _ => false,
+            };
+        if !rejects_missing_activation
+            && (node.phase != WorkflowNodePhase::Activated || node.iteration != rejected.iteration)
+        {
+            return Err(invalid_workflow_event(
+                "rejection does not name the current activation or a missing-input attempt",
+            ));
+        }
+        node.phase = WorkflowNodePhase::Rejected;
+        node.iteration = rejected.iteration;
+        node.outputs.clear();
+        node.convergence = None;
+        node.rejection = Some(rejected.clone());
+        node.updated_cursor = cursor;
+        self.phase = WorkflowGraphPhase::Rejected;
+        Ok(())
+    }
+
+    fn initial_inputs_exist(
+        &self,
+        activated: &WorkflowNodeActivated,
+    ) -> Result<bool, WorkflowGraphReductionError> {
+        for input in &activated.inputs {
+            let edge = self
+                .ast
+                .edges
+                .iter()
+                .find(|edge| edge.id == input.edge_id)
+                .ok_or_else(|| invalid_workflow_event("activation input edge disappeared"))?;
+            let exists = match edge.kind {
+                WorkflowEdgeKind::GraphInput => {
+                    edge.from.is_none()
+                        && self.seed.as_ref().map_or_else(
+                            || {
+                                input.evidence.evidence_type == self.ast.input_type
+                                    && input.evidence.parents.is_empty()
+                            },
+                            |seed| &input.evidence == seed,
+                        )
+                }
+                WorkflowEdgeKind::Forward => edge.from.as_ref().is_some_and(|source| {
+                    self.node(source).is_some_and(|node| {
+                        node.phase == WorkflowNodePhase::Completed
+                            && node.outputs.contains(&input.evidence)
+                    })
+                }),
+                WorkflowEdgeKind::Back => false,
+            };
+            if !exists {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn back_input_exists(&self, input: &WorkflowNodeInput) -> bool {
+        let Some(edge) = self
+            .ast
+            .edges
+            .iter()
+            .find(|edge| edge.id == input.edge_id && edge.kind == WorkflowEdgeKind::Back)
+        else {
+            return false;
+        };
+        edge.from.as_ref().is_some_and(|source| {
+            self.node(source)
+                .and_then(|node| node.rejection.as_ref())
+                .filter(|rejection| rejection.code == WorkflowNodeRejectCode::EvidenceRejected)
+                .and_then(|reject| reject.evidence.as_ref())
+                .is_some_and(|evidence| evidence == &input.evidence)
+        })
+    }
+
+    fn reset_descendants(&mut self, target: &GraphNodeName, cursor: u64) {
+        let mut reset = HashSet::from([target.clone()]);
+        loop {
+            let before = reset.len();
+            for edge in self
+                .ast
+                .edges
+                .iter()
+                .filter(|edge| edge.kind == WorkflowEdgeKind::Forward)
+            {
+                if edge.from.as_ref().is_some_and(|from| reset.contains(from)) {
+                    reset.insert(edge.to.clone());
+                }
+            }
+            if before == reset.len() {
+                break;
+            }
+        }
+        for node in &mut self.nodes {
+            if reset.contains(&node.node) {
+                node.phase = WorkflowNodePhase::Waiting;
+                node.activation_order = None;
+                node.inputs.clear();
+                node.outputs.clear();
+                node.convergence = None;
+                node.rejection = None;
+                node.updated_cursor = cursor;
+            }
+        }
+    }
+
+    fn terminal_nodes_completed(&self) -> bool {
+        self.ast
+            .nodes
+            .iter()
+            .filter(|node| {
+                !self.ast.edges.iter().any(|edge| {
+                    edge.kind == WorkflowEdgeKind::Forward && edge.from.as_ref() == Some(&node.node)
+                })
+            })
+            .all(|terminal| {
+                self.node(&terminal.node)
+                    .is_some_and(|state| state.phase == WorkflowNodePhase::Completed)
+            })
+    }
+
+    fn terminal_rejection_code(&self) -> Option<WorkflowNodeRejectCode> {
+        self.nodes.iter().find_map(|node| {
+            node.rejection.as_ref().and_then(|rejection| {
+                matches!(
+                    rejection.code,
+                    WorkflowNodeRejectCode::Abandoned | WorkflowNodeRejectCode::Superseded
+                )
+                .then_some(rejection.code)
+            })
+        })
+    }
+}
+
+#[must_use]
+pub fn workflow_activation_ast_digest(ast: &WorkflowActivationAst) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"haider/workflow-activation-ast/v1\0");
+    hash_graph_part(&mut hasher, ast.workflow_id.as_bytes());
+    hash_graph_part(&mut hasher, ast.workflow_digest.as_bytes());
+    hash_graph_part(&mut hasher, ast.input_type.as_bytes());
+    hash_graph_part(&mut hasher, ast.output_type.as_bytes());
+    hash_graph_part(
+        &mut hasher,
+        &u64::try_from(ast.nodes.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for node in &ast.nodes {
+        hash_graph_part(&mut hasher, node.node.as_str().as_bytes());
+        hash_graph_part(&mut hasher, node.input_type.as_bytes());
+        hash_graph_part(&mut hasher, node.output_type.as_bytes());
+        hash_graph_part(&mut hasher, &[u8::from(node.convergence_gate)]);
+        hash_graph_u32s(&mut hasher, &node.join.initial_all);
+        hash_graph_u32s(&mut hasher, &node.join.reactivate_any);
+    }
+    hash_graph_part(
+        &mut hasher,
+        &u64::try_from(ast.edges.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for edge in &ast.edges {
+        hash_graph_part(&mut hasher, &edge.id.to_be_bytes());
+        hash_graph_part(
+            &mut hasher,
+            &[match edge.kind {
+                WorkflowEdgeKind::GraphInput => 0,
+                WorkflowEdgeKind::Forward => 1,
+                WorkflowEdgeKind::Back => 2,
+            }],
+        );
+        hash_graph_part(
+            &mut hasher,
+            edge.from
+                .as_ref()
+                .map_or(&[], |from| from.as_str().as_bytes()),
+        );
+        hash_graph_part(&mut hasher, edge.to.as_str().as_bytes());
+        hash_graph_part(&mut hasher, edge.evidence_type.as_bytes());
+    }
+    hash_graph_part(&mut hasher, &ast.max_back_edge_activations.to_be_bytes());
+    format!("blake3:{}", hasher.finalize().to_hex())
+}
+
+#[must_use]
+pub fn workflow_input_ledger_digest(inputs: &[WorkflowNodeInput]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"haider/workflow-node-input-ledger/v1\0");
+    for input in inputs {
+        hash_graph_part(&mut hasher, &input.edge_id.to_be_bytes());
+        hash_graph_part(&mut hasher, input.evidence.ledger_digest.as_bytes());
+    }
+    format!("blake3:{}", hasher.finalize().to_hex())
+}
+
+#[must_use]
+pub fn workflow_evidence_ledger_digest(outputs: &[InstructEvidenceRef]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"haider/workflow-node-output-ledger/v1\0");
+    for output in outputs {
+        hash_graph_part(&mut hasher, output.ledger_digest.as_bytes());
+    }
+    format!("blake3:{}", hasher.finalize().to_hex())
+}
+
+pub fn validate_workflow_activation_ast(
+    ast: &WorkflowActivationAst,
+) -> Result<(), WorkflowGraphReductionError> {
+    if ast.workflow_id.is_empty()
+        || ast.workflow_digest.is_empty()
+        || !valid_workflow_evidence_type(&ast.input_type)
+        || !valid_workflow_evidence_type(&ast.output_type)
+        || ast.nodes.is_empty()
+        || ast.nodes.len() > GRAPH_MAX_NODES
+        || ast.edges.is_empty()
+        || ast.edges.len() > GRAPH_MAX_EDGES
+        || ast.max_back_edge_activations == 0
+        || ast.max_back_edge_activations > GRAPH_MAX_CONDITIONAL_HOPS
+    {
+        return Err(invalid_workflow_ast(
+            "workflow activation AST identity, bounds, or types are invalid",
+        ));
+    }
+    let nodes = ast
+        .nodes
+        .iter()
+        .map(|node| node.node.clone())
+        .collect::<HashSet<_>>();
+    if nodes.len() != ast.nodes.len() {
+        return Err(invalid_workflow_ast(
+            "workflow activation AST contains duplicate nodes",
+        ));
+    }
+    let edge_ids = ast.edges.iter().map(|edge| edge.id).collect::<HashSet<_>>();
+    let graph_input_count = ast
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == WorkflowEdgeKind::GraphInput)
+        .count();
+    if edge_ids.len() != ast.edges.len() || edge_ids.contains(&0) || graph_input_count != 1 {
+        return Err(invalid_workflow_ast(
+            "workflow activation AST needs unique nonzero edges and exactly one graph input",
+        ));
+    }
+    for edge in &ast.edges {
+        if !nodes.contains(&edge.to) || !valid_workflow_evidence_type(&edge.evidence_type) {
+            return Err(invalid_workflow_ast(
+                "workflow activation edge target or type is invalid",
+            ));
+        }
+        let target = ast
+            .nodes
+            .iter()
+            .find(|node| node.node == edge.to)
+            .ok_or_else(|| invalid_workflow_ast("workflow activation edge lost its target"))?;
+        match edge.kind {
+            WorkflowEdgeKind::GraphInput
+                if edge.from.is_none() && edge.evidence_type == ast.input_type => {}
+            WorkflowEdgeKind::Forward
+                if edge.from.as_ref().is_some_and(|from| {
+                    let source = ast.nodes.iter().position(|node| &node.node == from);
+                    let target = ast.nodes.iter().position(|node| node.node == edge.to);
+                    source
+                        .zip(target)
+                        .is_some_and(|(source_index, target_index)| {
+                            source_index < target_index
+                                && ast.nodes[source_index].output_type == edge.evidence_type
+                        })
+                }) => {}
+            WorkflowEdgeKind::Back
+                if edge
+                    .from
+                    .as_ref()
+                    .is_some_and(|from| workflow_forward_reaches(ast, &edge.to, from))
+                    && edge.evidence_type == target.input_type => {}
+            _ => {
+                return Err(invalid_workflow_ast(
+                    "workflow activation edge has an invalid source",
+                ));
+            }
+        }
+    }
+    for node in &ast.nodes {
+        let incoming_types = ast
+            .edges
+            .iter()
+            .filter(|edge| edge.to == node.node && edge.kind != WorkflowEdgeKind::Back)
+            .map(|edge| edge.evidence_type.clone())
+            .collect::<Vec<_>>();
+        let expected_initial = ast
+            .edges
+            .iter()
+            .filter(|edge| edge.to == node.node && edge.kind != WorkflowEdgeKind::Back)
+            .map(|edge| edge.id)
+            .collect::<Vec<_>>();
+        let expected_back = ast
+            .edges
+            .iter()
+            .filter(|edge| edge.to == node.node && edge.kind == WorkflowEdgeKind::Back)
+            .map(|edge| edge.id)
+            .collect::<Vec<_>>();
+        let unique_initial = node
+            .join
+            .initial_all
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let unique_back = node
+            .join
+            .reactivate_any
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        if !valid_workflow_evidence_type(&node.input_type)
+            || !valid_workflow_evidence_type(&node.output_type)
+            || node.join.initial_all.is_empty()
+            || unique_initial.len() != node.join.initial_all.len()
+            || unique_back.len() != node.join.reactivate_any.len()
+            || node.join.initial_all != expected_initial
+            || node.join.reactivate_any != expected_back
+            || !workflow_node_accepts_inputs(&node.input_type, &incoming_types)
+        {
+            return Err(invalid_workflow_ast(
+                "workflow node join or typed signature is invalid",
+            ));
+        }
+    }
+    let terminals = ast
+        .nodes
+        .iter()
+        .filter(|node| {
+            !ast.edges.iter().any(|edge| {
+                edge.kind == WorkflowEdgeKind::Forward && edge.from.as_ref() == Some(&node.node)
+            })
+        })
+        .collect::<Vec<_>>();
+    let terminal_types = terminals
+        .iter()
+        .map(|node| node.output_type.clone())
+        .collect::<Vec<_>>();
+    if terminals.is_empty() || !workflow_output_accepts(&ast.output_type, &terminal_types) {
+        return Err(invalid_workflow_ast(
+            "workflow activation terminals do not produce the workflow output type",
+        ));
+    }
+    Ok(())
+}
+
+fn workflow_forward_reaches(
+    ast: &WorkflowActivationAst,
+    ancestor: &GraphNodeName,
+    descendant: &GraphNodeName,
+) -> bool {
+    if ancestor == descendant {
+        return true;
+    }
+    let mut pending = VecDeque::from([ancestor.clone()]);
+    let mut visited = HashSet::from([ancestor.clone()]);
+    while let Some(source) = pending.pop_front() {
+        for target in ast.edges.iter().filter_map(|edge| {
+            (edge.kind == WorkflowEdgeKind::Forward && edge.from.as_ref() == Some(&source))
+                .then_some(&edge.to)
+        }) {
+            if target == descendant {
+                return true;
+            }
+            if visited.insert(target.clone()) {
+                pending.push_back(target.clone());
+            }
+        }
+    }
+    false
+}
+
+/// Materializes the immutable Loom record into the executable runtime AST.
+/// This consumes compiled metadata only; it never reparses or reinterprets
+/// authoring source.
+pub fn workflow_activation_ast_from_loom(
+    workflow: &crate::loom::LoomWorkflow,
+) -> Result<WorkflowActivationAst, WorkflowGraphReductionError> {
+    if workflow.template.nodes.len() != workflow.meta.len() {
+        return Err(invalid_workflow_ast(
+            "compiled workflow metadata does not cover every template node",
+        ));
+    }
+    let start =
+        workflow.template.start_node.as_ref().ok_or_else(|| {
+            invalid_workflow_ast("compiled workflow has no activation start node")
+        })?;
+    let mut next_edge_id = 1_u32;
+    let mut edges = Vec::new();
+    let mut nodes = Vec::new();
+    let mut output_types = BTreeMap::<GraphNodeName, String>::new();
+    for spec in &workflow.template.nodes {
+        let meta = workflow
+            .meta
+            .iter()
+            .find(|meta| meta.node == spec.name)
+            .ok_or_else(|| invalid_workflow_ast("compiled workflow node metadata is missing"))?;
+        let incoming = if spec.depends_on.is_empty() {
+            vec![(None, workflow.input_type.clone())]
+        } else {
+            let mut incoming = Vec::with_capacity(spec.depends_on.len());
+            for dependency in &spec.depends_on {
+                let evidence_type = output_types.get(dependency).cloned().ok_or_else(|| {
+                    invalid_workflow_ast("compiled workflow dependency is not in topological order")
+                })?;
+                incoming.push((Some(dependency.clone()), evidence_type));
+            }
+            incoming
+        };
+        let carried = merge_workflow_types(
+            &incoming
+                .iter()
+                .map(|(_, evidence_type)| evidence_type.clone())
+                .collect::<Vec<_>>(),
+        );
+        let input_type = meta.in_type.clone().unwrap_or_else(|| carried.clone());
+        let output_type = meta.out_type.clone().unwrap_or(carried);
+        let mut initial_all = Vec::with_capacity(incoming.len());
+        for (from, evidence_type) in incoming {
+            let id = next_edge_id;
+            next_edge_id = next_edge_id
+                .checked_add(1)
+                .ok_or_else(|| invalid_workflow_ast("workflow edge id space is exhausted"))?;
+            initial_all.push(id);
+            edges.push(WorkflowActivationEdge {
+                id,
+                kind: if from.is_some() {
+                    WorkflowEdgeKind::Forward
+                } else {
+                    WorkflowEdgeKind::GraphInput
+                },
+                from,
+                to: spec.name.clone(),
+                evidence_type,
+            });
+        }
+        nodes.push(WorkflowActivationNode {
+            node: spec.name.clone(),
+            input_type,
+            output_type: output_type.clone(),
+            join: WorkflowJoinSemantics {
+                initial_all,
+                reactivate_any: Vec::new(),
+            },
+            // Human decisions are explicit convergence points. Successful
+            // terminal gates also decide the workflow result and therefore
+            // carry an output-bound convergence stamp.
+            convergence_gate: matches!(spec.gate, GraphGateKind::HumanConfirm)
+                || !workflow
+                    .template
+                    .nodes
+                    .iter()
+                    .any(|candidate| candidate.depends_on.contains(&spec.name)),
+        });
+        output_types.insert(spec.name.clone(), output_type);
+    }
+    for spec in workflow
+        .template
+        .nodes
+        .iter()
+        .filter(|spec| !matches!(spec.gate, GraphGateKind::HumanConfirm))
+    {
+        let target = spec.red_target.as_ref().unwrap_or(start);
+        let target_index = nodes
+            .iter()
+            .position(|node| &node.node == target)
+            .ok_or_else(|| invalid_workflow_ast("workflow back edge has no target node"))?;
+        let evidence_type = nodes[target_index].input_type.clone();
+        let id = next_edge_id;
+        next_edge_id = next_edge_id
+            .checked_add(1)
+            .ok_or_else(|| invalid_workflow_ast("workflow edge id space is exhausted"))?;
+        edges.push(WorkflowActivationEdge {
+            id,
+            kind: WorkflowEdgeKind::Back,
+            from: Some(spec.name.clone()),
+            to: target.clone(),
+            evidence_type,
+        });
+        nodes[target_index].join.reactivate_any.push(id);
+    }
+    let ast = WorkflowActivationAst {
+        workflow_id: workflow.id.clone(),
+        workflow_digest: workflow.digest.clone(),
+        input_type: workflow.input_type.clone(),
+        output_type: workflow.output_type.clone(),
+        nodes,
+        edges,
+        max_back_edge_activations: GRAPH_MAX_CONDITIONAL_HOPS,
+    };
+    validate_workflow_activation_ast(&ast)?;
+    Ok(ast)
+}
+
+fn merge_workflow_types(inputs: &[String]) -> String {
+    if let [only] = inputs {
+        return only.clone();
+    }
+    let mut merged = Vec::<&str>::new();
+    for input in inputs {
+        for operand in input
+            .split('+')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+        {
+            if !merged.contains(&operand) {
+                merged.push(operand);
+            }
+        }
+    }
+    merged.join(" + ")
+}
+
+fn workflow_node_accepts_inputs(expected: &str, inputs: &[String]) -> bool {
+    let carried = merge_workflow_types(inputs);
+    if inputs.len() > 1 {
+        workflow_type_operands(expected) == workflow_type_operands(&carried)
+    } else {
+        expected == carried
+            || expected
+                .split('+')
+                .map(str::trim)
+                .any(|operand| operand == carried)
+    }
+}
+
+fn workflow_output_accepts(expected: &str, terminal_types: &[String]) -> bool {
+    let produced = merge_workflow_types(terminal_types);
+    if terminal_types.len() > 1 {
+        workflow_type_operands(expected) == workflow_type_operands(&produced)
+    } else {
+        workflow_node_accepts_inputs(expected, terminal_types)
+    }
+}
+
+fn workflow_type_operands(value: &str) -> Vec<&str> {
+    let mut operands = value
+        .split('+')
+        .map(str::trim)
+        .filter(|operand| !operand.is_empty())
+        .collect::<Vec<_>>();
+    operands.sort_unstable();
+    operands.dedup();
+    operands
+}
+
+fn valid_workflow_evidence_type(value: &str) -> bool {
+    crate::loom::valid_type_expr(value)
+}
+
+/// Strict from-scratch reducer used for replay verification and projection
+/// repair proofs. Unknown/non-activation facts are ignored; malformed known
+/// activation facts fail closed with their journal coordinates.
+pub fn reduce_workflow_graphs(
+    envelopes: &[RawEnvelope],
+) -> Result<HashMap<GraphId, WorkflowGraphState>, WorkflowGraphReductionError> {
+    let mut states = HashMap::new();
+    for envelope in envelopes {
+        let event = match WorkflowGraphJournalEvent::from_payload_value(&envelope.payload) {
+            Ok(Some(event)) => event,
+            Ok(None) => continue,
+            Err(error) => {
+                return Err(invalid_workflow_event(format!(
+                    "malformed workflow activation fact at cursor {}: {error}",
+                    envelope.seq
+                )));
+            }
+        };
+        let event = match event {
+            WorkflowGraphJournalEvent::WorkflowGraphStarted(started) => {
+                let graph_id = started.graph_id.clone();
+                if states.contains_key(&graph_id) {
+                    return Err(invalid_workflow_event(format!(
+                        "workflow graph {graph_id} started twice at cursor {}",
+                        envelope.seq
+                    )));
+                }
+                states.insert(
+                    graph_id,
+                    WorkflowGraphState::from_started(envelope.seq, started)?,
+                );
+                continue;
+            }
+            other => other,
+        };
+        let graph_id = match &event {
+            WorkflowGraphJournalEvent::WorkflowGraphStarted(started) => &started.graph_id,
+            WorkflowGraphJournalEvent::WorkflowNodeActivated(activated) => &activated.graph_id,
+            WorkflowGraphJournalEvent::WorkflowNodeCompleted(completed) => &completed.graph_id,
+            WorkflowGraphJournalEvent::WorkflowNodeRejected(rejected) => &rejected.graph_id,
+        };
+        let state = states.get_mut(graph_id).ok_or_else(|| {
+            invalid_workflow_event(format!(
+                "workflow activation fact for {graph_id} precedes its start at cursor {}",
+                envelope.seq
+            ))
+        })?;
+        state.apply(envelope.seq, &event)?;
+    }
+    Ok(states)
+}
+
+fn edge_ids(inputs: &[WorkflowNodeInput]) -> Vec<u32> {
+    inputs.iter().map(|input| input.edge_id).collect()
+}
+
+fn hash_graph_u32s(hasher: &mut blake3::Hasher, values: &[u32]) {
+    hash_graph_part(
+        hasher,
+        &u64::try_from(values.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for value in values {
+        hash_graph_part(hasher, &value.to_be_bytes());
+    }
+}
+
+fn hash_graph_part(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn invalid_workflow_ast(message: impl Into<String>) -> WorkflowGraphReductionError {
+    WorkflowGraphReductionError::InvalidAst(message.into())
+}
+
+fn invalid_workflow_event(message: impl Into<String>) -> WorkflowGraphReductionError {
+    WorkflowGraphReductionError::InvalidEvent(message.into())
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// One release-owned workflow and its selection class. Eligibility describes
@@ -4610,5 +5959,727 @@ mod tests {
         let d = decide_child_workflow_with_registry(Some(&sel), None, false, true);
         assert_eq!(d.template, None);
         assert_eq!(d.reason, "missing_workflow_trigger");
+    }
+
+    fn activation_node(value: &str) -> GraphNodeName {
+        GraphNodeName::new(value).expect("activation node")
+    }
+
+    fn activation_evidence(
+        marker: char,
+        evidence_type: &str,
+        parents: Vec<ArtifactRef>,
+    ) -> InstructEvidenceRef {
+        InstructEvidenceRef::new(
+            ArtifactRef::new(format!("blake3:{}", marker.to_string().repeat(64))),
+            evidence_type,
+            1,
+            parents,
+        )
+    }
+
+    fn diamond_activation_ast() -> WorkflowActivationAst {
+        let root = activation_node("ROOT");
+        let left = activation_node("LEFT");
+        let right = activation_node("RIGHT");
+        let join = activation_node("JOIN");
+        WorkflowActivationAst {
+            workflow_id: "activation-diamond".into(),
+            workflow_digest: "blake3:compiled-diamond".into(),
+            input_type: "Question".into(),
+            output_type: "Answer".into(),
+            nodes: vec![
+                WorkflowActivationNode {
+                    node: root.clone(),
+                    input_type: "Question".into(),
+                    output_type: "RootFact".into(),
+                    join: WorkflowJoinSemantics {
+                        initial_all: vec![1],
+                        reactivate_any: Vec::new(),
+                    },
+                    convergence_gate: false,
+                },
+                WorkflowActivationNode {
+                    node: left.clone(),
+                    input_type: "RootFact".into(),
+                    output_type: "LeftFact".into(),
+                    join: WorkflowJoinSemantics {
+                        initial_all: vec![2],
+                        reactivate_any: Vec::new(),
+                    },
+                    convergence_gate: false,
+                },
+                WorkflowActivationNode {
+                    node: right.clone(),
+                    input_type: "RootFact".into(),
+                    output_type: "RightFact".into(),
+                    join: WorkflowJoinSemantics {
+                        initial_all: vec![3],
+                        reactivate_any: Vec::new(),
+                    },
+                    convergence_gate: false,
+                },
+                WorkflowActivationNode {
+                    node: join.clone(),
+                    input_type: "LeftFact + RightFact".into(),
+                    output_type: "Answer".into(),
+                    join: WorkflowJoinSemantics {
+                        initial_all: vec![4, 5],
+                        reactivate_any: Vec::new(),
+                    },
+                    convergence_gate: false,
+                },
+            ],
+            edges: vec![
+                WorkflowActivationEdge {
+                    id: 1,
+                    kind: WorkflowEdgeKind::GraphInput,
+                    from: None,
+                    to: root.clone(),
+                    evidence_type: "Question".into(),
+                },
+                WorkflowActivationEdge {
+                    id: 2,
+                    kind: WorkflowEdgeKind::Forward,
+                    from: Some(root.clone()),
+                    to: left,
+                    evidence_type: "RootFact".into(),
+                },
+                WorkflowActivationEdge {
+                    id: 3,
+                    kind: WorkflowEdgeKind::Forward,
+                    from: Some(root),
+                    to: right,
+                    evidence_type: "RootFact".into(),
+                },
+                WorkflowActivationEdge {
+                    id: 4,
+                    kind: WorkflowEdgeKind::Forward,
+                    from: Some(activation_node("LEFT")),
+                    to: join.clone(),
+                    evidence_type: "LeftFact".into(),
+                },
+                WorkflowActivationEdge {
+                    id: 5,
+                    kind: WorkflowEdgeKind::Forward,
+                    from: Some(activation_node("RIGHT")),
+                    to: join,
+                    evidence_type: "RightFact".into(),
+                },
+            ],
+            max_back_edge_activations: 1,
+        }
+    }
+
+    fn started_activation_state(ast: WorkflowActivationAst) -> WorkflowGraphState {
+        let seed = activation_evidence('a', &ast.input_type, Vec::new());
+        WorkflowGraphState::from_started(
+            1,
+            WorkflowGraphStarted {
+                graph_id: GraphId::new("activation-graph"),
+                ast_digest: workflow_activation_ast_digest(&ast),
+                ast,
+                seed: Some(seed),
+            },
+        )
+        .expect("valid activation graph")
+    }
+
+    fn activation_seed(state: &WorkflowGraphState) -> InstructEvidenceRef {
+        state.seed.clone().expect("activation seed")
+    }
+
+    fn activation_event(
+        state: &WorkflowGraphState,
+        node: &str,
+        cause: WorkflowActivationCause,
+        inputs: Vec<WorkflowNodeInput>,
+    ) -> WorkflowGraphJournalEvent {
+        let node = activation_node(node);
+        let iteration = state
+            .node(&node)
+            .expect("projected activation node")
+            .iteration
+            .saturating_add(1);
+        WorkflowGraphJournalEvent::WorkflowNodeActivated(WorkflowNodeActivated {
+            graph_id: state.graph_id.clone(),
+            node,
+            iteration,
+            activation_order: state.next_activation_order,
+            input_ledger_digest: workflow_input_ledger_digest(&inputs),
+            inputs,
+            cause,
+        })
+    }
+
+    fn completion_event(
+        state: &WorkflowGraphState,
+        node: &str,
+        output: InstructEvidenceRef,
+    ) -> WorkflowGraphJournalEvent {
+        let node = activation_node(node);
+        let iteration = state
+            .node(&node)
+            .expect("projected completion node")
+            .iteration;
+        let outputs = vec![output];
+        WorkflowGraphJournalEvent::WorkflowNodeCompleted(WorkflowNodeCompleted {
+            graph_id: state.graph_id.clone(),
+            node,
+            iteration,
+            output_ledger_digest: workflow_evidence_ledger_digest(&outputs),
+            outputs,
+            convergence: None,
+        })
+    }
+
+    #[test]
+    fn activation_requires_typed_inputs_and_join_waits_for_every_branch() {
+        let mut state = started_activation_state(diamond_activation_ast());
+        let seed = activation_seed(&state);
+        let substituted_seed = InstructEvidenceRef::new(
+            seed.artifact.clone(),
+            seed.evidence_type.clone(),
+            seed.byte_len.saturating_add(1),
+            Vec::new(),
+        );
+        let substituted_activation = activation_event(
+            &state,
+            "ROOT",
+            WorkflowActivationCause::ForwardJoin,
+            vec![WorkflowNodeInput {
+                edge_id: 1,
+                evidence: substituted_seed,
+            }],
+        );
+        assert!(
+            state.apply(2, &substituted_activation).is_err(),
+            "a valid ledger row with the same address cannot replace the exact seed evidence"
+        );
+        let root_activation = activation_event(
+            &state,
+            "ROOT",
+            WorkflowActivationCause::ForwardJoin,
+            vec![WorkflowNodeInput {
+                edge_id: 1,
+                evidence: seed.clone(),
+            }],
+        );
+        state.apply(2, &root_activation).expect("root activates");
+        let root_output = activation_evidence('b', "RootFact", vec![seed.artifact.clone()]);
+        let root_completion = completion_event(&state, "ROOT", root_output.clone());
+        state.apply(3, &root_completion).expect("root completes");
+        let duplicate_root = activation_event(
+            &state,
+            "ROOT",
+            WorkflowActivationCause::ForwardJoin,
+            vec![WorkflowNodeInput {
+                edge_id: 1,
+                evidence: seed,
+            }],
+        );
+        assert!(
+            state.apply(4, &duplicate_root).is_err(),
+            "a completed node needs an explicit back-edge reset before reactivation"
+        );
+
+        for (cursor, node, edge) in [(4, "LEFT", 2), (5, "RIGHT", 3)] {
+            let event = activation_event(
+                &state,
+                node,
+                WorkflowActivationCause::ForwardJoin,
+                vec![WorkflowNodeInput {
+                    edge_id: edge,
+                    evidence: root_output.clone(),
+                }],
+            );
+            state.apply(cursor, &event).expect("branch activates");
+        }
+        let left_output = activation_evidence('c', "LeftFact", vec![root_output.artifact.clone()]);
+        let left_completion = completion_event(&state, "LEFT", left_output.clone());
+        state.apply(6, &left_completion).expect("left completes");
+
+        let absent_right =
+            activation_evidence('d', "RightFact", vec![root_output.artifact.clone()]);
+        let premature_join = activation_event(
+            &state,
+            "JOIN",
+            WorkflowActivationCause::ForwardJoin,
+            vec![
+                WorkflowNodeInput {
+                    edge_id: 4,
+                    evidence: left_output.clone(),
+                },
+                WorkflowNodeInput {
+                    edge_id: 5,
+                    evidence: absent_right,
+                },
+            ],
+        );
+        assert!(
+            state.apply(7, &premature_join).is_err(),
+            "a typed artifact not completed by its upstream branch cannot activate the join"
+        );
+
+        let right_output =
+            activation_evidence('e', "RightFact", vec![root_output.artifact.clone()]);
+        let right_completion = completion_event(&state, "RIGHT", right_output.clone());
+        state
+            .apply(7, &right_completion)
+            .expect("right completes after rejected mutation");
+        let complete_join = activation_event(
+            &state,
+            "JOIN",
+            WorkflowActivationCause::ForwardJoin,
+            vec![
+                WorkflowNodeInput {
+                    edge_id: 4,
+                    evidence: left_output,
+                },
+                WorkflowNodeInput {
+                    edge_id: 5,
+                    evidence: right_output,
+                },
+            ],
+        );
+        state
+            .apply(8, &complete_join)
+            .expect("join activates only after both branches complete");
+    }
+
+    #[test]
+    fn terminal_rejection_seals_waiting_sibling_activations() {
+        let mut state = started_activation_state(diamond_activation_ast());
+        let seed = activation_seed(&state);
+        let root_activation = activation_event(
+            &state,
+            "ROOT",
+            WorkflowActivationCause::ForwardJoin,
+            vec![WorkflowNodeInput {
+                edge_id: 1,
+                evidence: seed.clone(),
+            }],
+        );
+        state.apply(2, &root_activation).expect("root activates");
+        let root_output = activation_evidence('b', "RootFact", vec![seed.artifact]);
+        let root_completion = completion_event(&state, "ROOT", root_output.clone());
+        state.apply(3, &root_completion).expect("root completes");
+
+        let left_activation = activation_event(
+            &state,
+            "LEFT",
+            WorkflowActivationCause::ForwardJoin,
+            vec![WorkflowNodeInput {
+                edge_id: 2,
+                evidence: root_output.clone(),
+            }],
+        );
+        state.apply(4, &left_activation).expect("left activates");
+        let abandoned = WorkflowGraphJournalEvent::WorkflowNodeRejected(WorkflowNodeRejected {
+            graph_id: state.graph_id.clone(),
+            node: activation_node("LEFT"),
+            iteration: 1,
+            code: WorkflowNodeRejectCode::Abandoned,
+            message: "workflow graph was abandoned".into(),
+            evidence: None,
+            convergence_gate: false,
+        });
+        state.apply(5, &abandoned).expect("graph is abandoned");
+
+        let forged_sibling = activation_event(
+            &state,
+            "RIGHT",
+            WorkflowActivationCause::ForwardJoin,
+            vec![WorkflowNodeInput {
+                edge_id: 3,
+                evidence: root_output,
+            }],
+        );
+        assert!(
+            state.apply(6, &forged_sibling).is_err(),
+            "a terminal graph rejection seals every unfinished sibling"
+        );
+    }
+
+    #[test]
+    fn activation_ast_rechecks_node_inputs_and_merged_terminal_outputs() {
+        let mut invalid = diamond_activation_ast();
+        invalid.nodes[1].input_type = "DifferentFact".into();
+        assert!(validate_workflow_activation_ast(&invalid).is_err());
+
+        let mut zero_edge = diamond_activation_ast();
+        zero_edge.edges[0].id = 0;
+        zero_edge.nodes[0].join.initial_all[0] = 0;
+        assert!(validate_workflow_activation_ast(&zero_edge).is_err());
+
+        let mut duplicate_graph_input = diamond_activation_ast();
+        duplicate_graph_input.edges.push(WorkflowActivationEdge {
+            id: 6,
+            kind: WorkflowEdgeKind::GraphInput,
+            from: None,
+            to: activation_node("ROOT"),
+            evidence_type: "Question".into(),
+        });
+        duplicate_graph_input.nodes[0].join.initial_all.push(6);
+        assert!(validate_workflow_activation_ast(&duplicate_graph_input).is_err());
+
+        let mut forward_disguised_as_back = diamond_activation_ast();
+        forward_disguised_as_back
+            .edges
+            .push(WorkflowActivationEdge {
+                id: 6,
+                kind: WorkflowEdgeKind::Back,
+                from: Some(activation_node("ROOT")),
+                to: activation_node("JOIN"),
+                evidence_type: "LeftFact + RightFact".into(),
+            });
+        forward_disguised_as_back.nodes[3]
+            .join
+            .reactivate_any
+            .push(6);
+        assert!(validate_workflow_activation_ast(&forward_disguised_as_back).is_err());
+
+        let mut sibling_disguised_as_back = diamond_activation_ast();
+        sibling_disguised_as_back
+            .edges
+            .push(WorkflowActivationEdge {
+                id: 6,
+                kind: WorkflowEdgeKind::Back,
+                from: Some(activation_node("RIGHT")),
+                to: activation_node("LEFT"),
+                evidence_type: "RootFact".into(),
+            });
+        sibling_disguised_as_back.nodes[1]
+            .join
+            .reactivate_any
+            .push(6);
+        assert!(validate_workflow_activation_ast(&sibling_disguised_as_back).is_err());
+
+        for invalid_type in ["   ", "Question++Injected", "snowman-☃"] {
+            let mut invalid_type_ast = diamond_activation_ast();
+            invalid_type_ast.nodes[0].input_type = invalid_type.into();
+            assert!(validate_workflow_activation_ast(&invalid_type_ast).is_err());
+        }
+
+        let pipe = crate::loom::parse_pipe(
+            "terminals-runtime: Seed -> Right + Left\nstart\nleft @left <-start\nright @right <-start",
+        );
+        let workflow = crate::loom::compile_pipe(&pipe, |id| match id {
+            "left" => Some(crate::loom::LoomTypeSig {
+                in_type: "Seed".into(),
+                out_type: "Left".into(),
+            }),
+            "right" => Some(crate::loom::LoomTypeSig {
+                in_type: "Seed".into(),
+                out_type: "Right".into(),
+            }),
+            _ => None,
+        })
+        .expect("multi-terminal workflow compiles");
+        let ast = workflow_activation_ast_from_loom(&workflow)
+            .expect("multi-terminal workflow lowers to a valid activation AST");
+        assert_eq!(ast.output_type, "Right + Left");
+        assert!(!ast.nodes[0].convergence_gate);
+        assert!(ast.nodes[1..].iter().all(|node| node.convergence_gate));
+    }
+
+    fn loop_activation_ast() -> WorkflowActivationAst {
+        let root = activation_node("ROOT");
+        WorkflowActivationAst {
+            workflow_id: "activation-loop".into(),
+            workflow_digest: "blake3:compiled-loop".into(),
+            input_type: "Question".into(),
+            output_type: "Answer".into(),
+            nodes: vec![WorkflowActivationNode {
+                node: root.clone(),
+                input_type: "Question".into(),
+                output_type: "Answer".into(),
+                join: WorkflowJoinSemantics {
+                    initial_all: vec![1],
+                    reactivate_any: vec![2],
+                },
+                convergence_gate: false,
+            }],
+            edges: vec![
+                WorkflowActivationEdge {
+                    id: 1,
+                    kind: WorkflowEdgeKind::GraphInput,
+                    from: None,
+                    to: root.clone(),
+                    evidence_type: "Question".into(),
+                },
+                WorkflowActivationEdge {
+                    id: 2,
+                    kind: WorkflowEdgeKind::Back,
+                    from: Some(root.clone()),
+                    to: root,
+                    evidence_type: "Question".into(),
+                },
+            ],
+            max_back_edge_activations: 1,
+        }
+    }
+
+    fn reject_loop_iteration(
+        state: &WorkflowGraphState,
+        marker: char,
+    ) -> WorkflowGraphJournalEvent {
+        let root = activation_node("ROOT");
+        let node = state.node(&root).expect("loop node");
+        let parents = node
+            .inputs
+            .iter()
+            .map(|input| input.evidence.artifact.clone())
+            .collect();
+        WorkflowGraphJournalEvent::WorkflowNodeRejected(WorkflowNodeRejected {
+            graph_id: state.graph_id.clone(),
+            node: root,
+            iteration: node.iteration,
+            code: WorkflowNodeRejectCode::EvidenceRejected,
+            message: "loop evidence was rejected".into(),
+            evidence: Some(activation_evidence(marker, "Question", parents)),
+            convergence_gate: false,
+        })
+    }
+
+    #[test]
+    fn back_edge_reactivates_once_and_bounded_guard_records_the_next_rejection() {
+        let mut state = started_activation_state(loop_activation_ast());
+        let first = activation_event(
+            &state,
+            "ROOT",
+            WorkflowActivationCause::ForwardJoin,
+            vec![WorkflowNodeInput {
+                edge_id: 1,
+                evidence: activation_seed(&state),
+            }],
+        );
+        state.apply(2, &first).expect("first activation");
+        let first_reject = reject_loop_iteration(&state, 'b');
+        state.apply(3, &first_reject).expect("first reject");
+        let back_input = state
+            .node(&activation_node("ROOT"))
+            .and_then(|node| node.rejection.as_ref())
+            .and_then(|reject| reject.evidence.clone())
+            .expect("back evidence");
+        let second = activation_event(
+            &state,
+            "ROOT",
+            WorkflowActivationCause::BackEdge,
+            vec![WorkflowNodeInput {
+                edge_id: 2,
+                evidence: back_input,
+            }],
+        );
+        state.apply(4, &second).expect("bounded reactivation");
+        assert_eq!(state.back_edge_activations, 1);
+        assert_eq!(
+            state
+                .node(&activation_node("ROOT"))
+                .expect("root")
+                .iteration,
+            2
+        );
+
+        let second_reject = reject_loop_iteration(&state, 'c');
+        state.apply(5, &second_reject).expect("second reject");
+        let next_input = state
+            .node(&activation_node("ROOT"))
+            .and_then(|node| node.rejection.as_ref())
+            .and_then(|reject| reject.evidence.clone())
+            .expect("next back evidence");
+        let over_guard = activation_event(
+            &state,
+            "ROOT",
+            WorkflowActivationCause::BackEdge,
+            vec![WorkflowNodeInput {
+                edge_id: 2,
+                evidence: next_input,
+            }],
+        );
+        let guard_rejection =
+            WorkflowGraphJournalEvent::WorkflowNodeRejected(WorkflowNodeRejected {
+                graph_id: state.graph_id.clone(),
+                node: activation_node("ROOT"),
+                iteration: 3,
+                code: WorkflowNodeRejectCode::IterationGuard,
+                message: "bounded back-edge guard exhausted".into(),
+                evidence: None,
+                convergence_gate: false,
+            });
+        state
+            .apply(6, &guard_rejection)
+            .expect("guard rejection is durable state");
+        assert_eq!(
+            state
+                .node(&activation_node("ROOT"))
+                .and_then(|node| node.rejection.as_ref())
+                .map(|rejection| rejection.code),
+            Some(WorkflowNodeRejectCode::IterationGuard)
+        );
+        assert!(state.apply(7, &over_guard).is_err());
+    }
+
+    #[test]
+    fn back_edge_cannot_reopen_a_graph_that_never_received_external_input() {
+        let ast = loop_activation_ast();
+        let mut state = WorkflowGraphState::from_started(
+            1,
+            WorkflowGraphStarted {
+                graph_id: GraphId::new("activation-without-input"),
+                ast_digest: workflow_activation_ast_digest(&ast),
+                ast,
+                seed: None,
+            },
+        )
+        .expect("waiting graph");
+        let evidence = activation_evidence('b', "Question", Vec::new());
+        state
+            .apply(
+                2,
+                &WorkflowGraphJournalEvent::WorkflowNodeRejected(WorkflowNodeRejected {
+                    graph_id: state.graph_id.clone(),
+                    node: activation_node("ROOT"),
+                    iteration: 1,
+                    code: WorkflowNodeRejectCode::Abandoned,
+                    message: "abandoned before input".into(),
+                    evidence: Some(evidence.clone()),
+                    convergence_gate: false,
+                }),
+            )
+            .expect("terminal pre-input rejection remains inspectable");
+        let inputs = vec![WorkflowNodeInput {
+            edge_id: 2,
+            evidence,
+        }];
+        let replay_mutation =
+            WorkflowGraphJournalEvent::WorkflowNodeActivated(WorkflowNodeActivated {
+                graph_id: state.graph_id.clone(),
+                node: activation_node("ROOT"),
+                iteration: 2,
+                activation_order: 1,
+                cause: WorkflowActivationCause::BackEdge,
+                input_ledger_digest: workflow_input_ledger_digest(&inputs),
+                inputs,
+            });
+        assert!(state.apply(3, &replay_mutation).is_err());
+        state
+            .validate_projection()
+            .expect("the rejected no-input projection stays internally valid");
+    }
+
+    #[test]
+    fn convergence_gate_requires_a_stamp_or_an_inspectable_gate_rejection() {
+        let mut ast = loop_activation_ast();
+        ast.nodes[0].convergence_gate = true;
+        let mut state = started_activation_state(ast);
+        let activation = activation_event(
+            &state,
+            "ROOT",
+            WorkflowActivationCause::ForwardJoin,
+            vec![WorkflowNodeInput {
+                edge_id: 1,
+                evidence: activation_seed(&state),
+            }],
+        );
+        state.apply(2, &activation).expect("gate activates");
+        let output = activation_evidence('b', "Answer", vec![activation_seed(&state).artifact]);
+        let unstamped = completion_event(&state, "ROOT", output.clone());
+        assert!(state.apply(3, &unstamped).is_err());
+
+        let mut completed_state = state.clone();
+        let mut stamped = completion_event(&completed_state, "ROOT", output);
+        let WorkflowGraphJournalEvent::WorkflowNodeCompleted(completed) = &mut stamped else {
+            unreachable!("completion helper always constructs a completion")
+        };
+        completed.convergence = Some(WorkflowConvergenceStamp {
+            decision_digest: completed.outputs[0].ledger_digest.clone(),
+        });
+        completed_state
+            .apply(3, &stamped)
+            .expect("stamped convergence completion");
+        assert!(
+            completed_state
+                .node(&activation_node("ROOT"))
+                .and_then(|node| node.convergence.as_ref())
+                .is_some(),
+            "the state RPC projection retains the inspectable convergence stamp"
+        );
+
+        let mut rejection = WorkflowNodeRejected {
+            graph_id: state.graph_id.clone(),
+            node: activation_node("ROOT"),
+            iteration: 1,
+            code: WorkflowNodeRejectCode::ConvergenceRejected,
+            message: "loop evidence was rejected".into(),
+            evidence: Some(activation_evidence(
+                'c',
+                "Question",
+                vec![activation_seed(&state).artifact],
+            )),
+            convergence_gate: false,
+        };
+        let rejected = WorkflowGraphJournalEvent::WorkflowNodeRejected(rejection.clone());
+        assert!(state.apply(3, &rejected).is_err());
+        rejection.convergence_gate = true;
+        let rejected = WorkflowGraphJournalEvent::WorkflowNodeRejected(rejection);
+        state
+            .apply(3, &rejected)
+            .expect("gate rejection retains typed detail");
+        assert_eq!(
+            state
+                .node(&activation_node("ROOT"))
+                .and_then(|node| node.rejection.as_ref())
+                .map(|rejection| rejection.message.as_str()),
+            Some("loop evidence was rejected")
+        );
+    }
+
+    fn activation_fact(seq: u64, event: WorkflowGraphJournalEvent) -> RawEnvelope {
+        let mut envelope = graph_fact(seq, EventPayload::IdleDecayed);
+        envelope.payload = event.to_payload_value().expect("activation payload");
+        envelope
+    }
+
+    #[test]
+    fn replay_reproduces_activation_order_and_rejects_an_order_mutation() {
+        let ast = loop_activation_ast();
+        let started = WorkflowGraphStarted {
+            graph_id: GraphId::new("activation-graph"),
+            ast_digest: workflow_activation_ast_digest(&ast),
+            seed: Some(activation_evidence('a', &ast.input_type, Vec::new())),
+            ast,
+        };
+        let start_event = WorkflowGraphJournalEvent::WorkflowGraphStarted(started.clone());
+        let state = WorkflowGraphState::from_started(1, started).expect("replay start");
+        let activation = activation_event(
+            &state,
+            "ROOT",
+            WorkflowActivationCause::ForwardJoin,
+            vec![WorkflowNodeInput {
+                edge_id: 1,
+                evidence: activation_seed(&state),
+            }],
+        );
+        let journal = vec![
+            activation_fact(1, start_event),
+            activation_fact(2, activation.clone()),
+        ];
+        let replayed = reduce_workflow_graphs(&journal).expect("deterministic replay");
+        assert_eq!(
+            replayed[&GraphId::new("activation-graph")].activation_order[0].cursor,
+            2
+        );
+        replayed[&GraphId::new("activation-graph")]
+            .validate_projection()
+            .expect("replayed state validates as an indexed projection");
+        let mut projection_mutation = replayed[&GraphId::new("activation-graph")].clone();
+        projection_mutation.next_activation_order =
+            projection_mutation.next_activation_order.saturating_add(1);
+        assert!(projection_mutation.validate_projection().is_err());
+
+        let mut mutation = journal.clone();
+        mutation[1].payload["activation_order"] = serde_json::json!(2);
+        assert!(reduce_workflow_graphs(&mutation).is_err());
     }
 }

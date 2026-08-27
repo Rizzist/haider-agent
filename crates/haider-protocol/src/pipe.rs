@@ -3,11 +3,176 @@
 use crate::EventPayload;
 use crate::envelope::RawEnvelope;
 use crate::history::NodeKind;
+use crate::ids::ArtifactRef;
 use crate::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
 use crate::state::RunState;
 use crate::tool::{BoundedResult, ToolResultStatus};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+
+/// Wire revision for immutable evidence carried between activation-graph
+/// stages. The bytes live in the shared CAS; journal facts carry only this
+/// bounded, independently verifiable ledger row.
+pub const INSTRUCT_EVIDENCE_VERSION: u32 = 1;
+/// Evidence type expressions are compiled registry facts, but still bounded
+/// before they are accepted into a durable activation event.
+pub const INSTRUCT_EVIDENCE_TYPE_MAX_BYTES: usize = 256;
+/// One stage value is small enough to verify and inject at an executor
+/// boundary without allowing a journal reference to trigger an unbounded CAS
+/// read. Larger bodies belong in their own referenced artifact graph.
+pub const INSTRUCT_EVIDENCE_MAX_BYTES: u64 = 1_024 * 1_024;
+/// One evidence row cannot carry an unbounded parent ledger.
+pub const INSTRUCT_EVIDENCE_MAX_PARENTS: usize = 4_096;
+
+/// One immutable InstructPipe value. `ledger_digest` binds the content
+/// address, declared type, byte length, and ordered parent addresses using
+/// the same length-prefixed/domain-separated discipline as provider-view
+/// ledgers. Replaying a journal therefore never needs to reopen the CAS just
+/// to establish typed graph readiness.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct InstructEvidenceRef {
+    pub version: u32,
+    pub artifact: ArtifactRef,
+    pub evidence_type: String,
+    pub byte_len: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parents: Vec<ArtifactRef>,
+    pub ledger_digest: String,
+}
+
+impl InstructEvidenceRef {
+    #[must_use]
+    pub fn new(
+        artifact: ArtifactRef,
+        evidence_type: impl Into<String>,
+        byte_len: u64,
+        parents: Vec<ArtifactRef>,
+    ) -> Self {
+        let evidence_type = evidence_type.into();
+        let ledger_digest =
+            instruct_evidence_ledger_digest(&artifact, &evidence_type, byte_len, &parents);
+        Self {
+            version: INSTRUCT_EVIDENCE_VERSION,
+            artifact,
+            evidence_type,
+            byte_len,
+            parents,
+            ledger_digest,
+        }
+    }
+
+    /// Validates the hashes-only ledger. CAS readers additionally verify the
+    /// object bytes against `artifact` at their ordinary trust boundary.
+    pub fn validate(&self) -> Result<(), InstructEvidenceError> {
+        if self.version != INSTRUCT_EVIDENCE_VERSION {
+            return Err(InstructEvidenceError::UnsupportedVersion(self.version));
+        }
+        if !crate::loom::valid_type_expr(&self.evidence_type) {
+            return Err(InstructEvidenceError::InvalidType);
+        }
+        if self.byte_len == 0 || self.byte_len > INSTRUCT_EVIDENCE_MAX_BYTES {
+            return Err(InstructEvidenceError::InvalidLength);
+        }
+        if self.parents.len() > INSTRUCT_EVIDENCE_MAX_PARENTS {
+            return Err(InstructEvidenceError::TooManyParents);
+        }
+        if !valid_artifact_ref(&self.artifact)
+            || self
+                .parents
+                .iter()
+                .any(|parent| !valid_artifact_ref(parent))
+        {
+            return Err(InstructEvidenceError::InvalidArtifact);
+        }
+        let expected = instruct_evidence_ledger_digest(
+            &self.artifact,
+            &self.evidence_type,
+            self.byte_len,
+            &self.parents,
+        );
+        if self.ledger_digest != expected {
+            return Err(InstructEvidenceError::DigestMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Typed validation failures for a content-addressed InstructPipe row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstructEvidenceError {
+    UnsupportedVersion(u32),
+    InvalidType,
+    InvalidLength,
+    InvalidArtifact,
+    TooManyParents,
+    DigestMismatch,
+}
+
+impl std::fmt::Display for InstructEvidenceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedVersion(version) => {
+                write!(
+                    formatter,
+                    "unsupported InstructPipe evidence version {version}"
+                )
+            }
+            Self::InvalidType => formatter.write_str("invalid InstructPipe evidence type"),
+            Self::InvalidLength => formatter.write_str("invalid InstructPipe evidence length"),
+            Self::InvalidArtifact => formatter.write_str("invalid InstructPipe artifact address"),
+            Self::TooManyParents => {
+                formatter.write_str("InstructPipe evidence has too many parents")
+            }
+            Self::DigestMismatch => {
+                formatter.write_str("InstructPipe evidence ledger digest does not match")
+            }
+        }
+    }
+}
+
+impl std::error::Error for InstructEvidenceError {}
+
+/// Domain-separated digest of the complete hashes-only evidence ledger.
+#[must_use]
+pub fn instruct_evidence_ledger_digest(
+    artifact: &ArtifactRef,
+    evidence_type: &str,
+    byte_len: u64,
+    parents: &[ArtifactRef],
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"haider/instruct-pipe/evidence-ledger/v1\0");
+    hash_ledger_part(&mut hasher, artifact.as_str().as_bytes());
+    hash_ledger_part(&mut hasher, evidence_type.as_bytes());
+    hash_ledger_part(&mut hasher, &byte_len.to_be_bytes());
+    hash_ledger_part(
+        &mut hasher,
+        &u64::try_from(parents.len())
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    for parent in parents {
+        hash_ledger_part(&mut hasher, parent.as_str().as_bytes());
+    }
+    format!("blake3:{}", hasher.finalize().to_hex())
+}
+
+fn hash_ledger_part(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn valid_artifact_ref(artifact: &ArtifactRef) -> bool {
+    artifact
+        .as_str()
+        .strip_prefix("blake3:")
+        .is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        })
+}
 
 /// Maximum number of Unicode scalar values carried by a cold-history tool
 /// argument or result preview.
@@ -1831,5 +1996,69 @@ mod tests {
         let rows = projector.push(&run_state(3, "compact-run", RunState::Done));
         assert_eq!(rows.len(), 1);
         assert!(rows[0].is_compaction_boundary());
+    }
+
+    #[test]
+    fn instruct_evidence_ledger_binds_type_content_and_ordered_parents() {
+        let first_parent = ArtifactRef::new(format!("blake3:{}", "a".repeat(64)));
+        let second_parent = ArtifactRef::new(format!("blake3:{}", "c".repeat(64)));
+        let evidence = InstructEvidenceRef::new(
+            ArtifactRef::new(format!("blake3:{}", "b".repeat(64))),
+            "TypedResult",
+            17,
+            vec![first_parent, second_parent],
+        );
+        evidence.validate().expect("valid evidence ledger");
+        let mutate = |change: fn(&mut InstructEvidenceRef)| {
+            let mut changed = evidence.clone();
+            change(&mut changed);
+            assert_eq!(
+                changed.validate(),
+                Err(InstructEvidenceError::DigestMismatch)
+            );
+        };
+        mutate(|changed| changed.evidence_type = "DifferentType".into());
+        mutate(|changed| {
+            changed.artifact = ArtifactRef::new(format!("blake3:{}", "d".repeat(64)));
+        });
+        mutate(|changed| changed.byte_len = changed.byte_len.saturating_add(1));
+        mutate(|changed| changed.parents.reverse());
+        let oversized = InstructEvidenceRef::new(
+            evidence.artifact.clone(),
+            evidence.evidence_type.clone(),
+            INSTRUCT_EVIDENCE_MAX_BYTES.saturating_add(1),
+            evidence.parents.clone(),
+        );
+        assert_eq!(
+            oversized.validate(),
+            Err(InstructEvidenceError::InvalidLength)
+        );
+        for invalid_type in [
+            "   ",
+            "A++B",
+            "A + snowman-☃",
+            "A + B + C + D + E + F + G + H + I",
+        ] {
+            assert_eq!(
+                InstructEvidenceRef::new(
+                    evidence.artifact.clone(),
+                    invalid_type,
+                    evidence.byte_len,
+                    evidence.parents.clone(),
+                )
+                .validate(),
+                Err(InstructEvidenceError::InvalidType)
+            );
+        }
+        assert_eq!(
+            evidence.ledger_digest,
+            instruct_evidence_ledger_digest(
+                &evidence.artifact,
+                &evidence.evidence_type,
+                evidence.byte_len,
+                &evidence.parents,
+            ),
+            "the domain-separated encoding is deterministic"
+        );
     }
 }
