@@ -79,6 +79,52 @@ fn provider_probe_failure_text(
     }
 }
 
+fn checkpoint_page_summary(page: &haider_protocol::checkpoint::CheckpointListPage) -> String {
+    if page.checkpoints.is_empty() {
+        return "· no durable file checkpoints on this branch".to_owned();
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        });
+    let mut rows = page
+        .checkpoints
+        .iter()
+        .take(5)
+        .map(|checkpoint| {
+            let paths = checkpoint
+                .paths
+                .iter()
+                .map(|path| path.path.as_str())
+                .collect::<Vec<_>>()
+                .join(" → ");
+            let paths = if paths.is_empty() {
+                "(no path)"
+            } else {
+                &paths
+            };
+            let age_seconds = now_ms.saturating_sub(checkpoint.recorded_at_ms) / 1_000;
+            let age = if age_seconds < 60 {
+                format!("{age_seconds}s")
+            } else if age_seconds < 3_600 {
+                format!("{}m", age_seconds / 60)
+            } else {
+                format!("{}h", age_seconds / 3_600)
+            };
+            format!(
+                "{paths} · {} · {age} · run {}",
+                checkpoint.kind.as_str(),
+                checkpoint.run_id.as_str()
+            )
+        })
+        .collect::<Vec<_>>();
+    if page.checkpoints.len() > rows.len() {
+        rows.push(format!("+{} older", page.checkpoints.len() - rows.len()));
+    }
+    format!("· checkpoints — {}", rows.join(" | "))
+}
+
 fn recognized_payload(payload: &serde_json::Value) -> bool {
     serde_json::from_value::<haider_protocol::EventPayload>(payload.clone()).is_ok()
         || serde_json::from_value::<haider_protocol::agent::AgentEventPayload>(payload.clone())
@@ -245,6 +291,34 @@ pub enum LiveCommand {
         fork_node_id: haider_protocol::ids::NodeId,
         fork_seq: u64,
         name: Option<String>,
+    },
+    CheckpointList {
+        session: SessionId,
+        branch: Option<haider_protocol::ids::BranchId>,
+        cursor: Option<haider_protocol::checkpoint::CheckpointCursor>,
+        rollback: Option<String>,
+        runs: Vec<RunId>,
+    },
+    CheckpointUndo {
+        command_id: CommandId,
+        session: SessionId,
+        worker_generation: u64,
+        branch: Option<haider_protocol::ids::BranchId>,
+        target: String,
+    },
+    CheckpointRedo {
+        command_id: CommandId,
+        session: SessionId,
+        worker_generation: u64,
+        branch: Option<haider_protocol::ids::BranchId>,
+        target: String,
+    },
+    CheckpointRollbackTurn {
+        command_id: CommandId,
+        session: SessionId,
+        worker_generation: u64,
+        branch: Option<haider_protocol::ids::BranchId>,
+        run_id: RunId,
     },
     /// `agent.message` — one parent-authored message to a DIRECT child
     /// (S1's wire; S3 rides it from the chip composer). Receipt-backed:
@@ -912,6 +986,9 @@ impl LiveCommand {
             | Self::RunRetry { command_id, .. }
             | Self::Compact { command_id, .. }
             | Self::BranchCreate { command_id, .. }
+            | Self::CheckpointUndo { command_id, .. }
+            | Self::CheckpointRedo { command_id, .. }
+            | Self::CheckpointRollbackTurn { command_id, .. }
             | Self::AgentMessage { command_id, .. }
             | Self::ShellExec { command_id, .. }
             | Self::AccountRemove { command_id, .. }
@@ -937,6 +1014,7 @@ impl LiveCommand {
             Self::ConfigureProvider { command_id, .. } => Some(command_id),
             Self::AccountAddOAuth { command_id, .. } => Some(command_id),
             Self::List { .. }
+            | Self::CheckpointList { .. }
             | Self::Attach { .. }
             | Self::Detach { .. }
             | Self::AccountList
@@ -1170,6 +1248,17 @@ pub enum LiveReply {
         session: SessionId,
         branch_id: haider_protocol::ids::BranchId,
         name: String,
+    },
+    Checkpoints {
+        session: SessionId,
+        branch: Option<haider_protocol::ids::BranchId>,
+        rollback: Option<String>,
+        runs: Vec<RunId>,
+        page: haider_protocol::checkpoint::CheckpointListPage,
+    },
+    CheckpointMutated {
+        command_id: CommandId,
+        receipt: haider_protocol::checkpoint::CheckpointMutationReceipt,
     },
     /// `agent.message` answered with the daemon's delivery receipt (S1
     /// wire, S3 consumer): which child, steer-into-the-running-turn versus
@@ -3158,6 +3247,82 @@ impl LiveDriver {
                 model.dirty = true;
                 Vec::new()
             }
+            LiveReply::Checkpoints {
+                session,
+                branch,
+                rollback,
+                mut runs,
+                page,
+            } => {
+                if let Some(selector) = rollback {
+                    for checkpoint in &page.checkpoints {
+                        if checkpoint.origin == haider_protocol::checkpoint::CheckpointOrigin::Tool
+                            && !runs.contains(&checkpoint.run_id)
+                        {
+                            runs.push(checkpoint.run_id.clone());
+                        }
+                    }
+                    let run_id = match selector.as_str() {
+                        "current" => runs.first().cloned(),
+                        "previous" => runs.get(1).cloned(),
+                        explicit if !explicit.is_empty() => Some(RunId::new(explicit)),
+                        _ => None,
+                    };
+                    if run_id.is_none()
+                        && matches!(selector.as_str(), "current" | "previous")
+                        && let Some(cursor) = page.next_cursor
+                    {
+                        return vec![LiveCommand::CheckpointList {
+                            session,
+                            branch,
+                            cursor: Some(cursor),
+                            rollback: Some(selector),
+                            runs,
+                        }];
+                    }
+                    let Some(run_id) = run_id else {
+                        model.flash = Some(format!(
+                            "· /rollback {selector} — no matching durable turn on this branch"
+                        ));
+                        model.dirty = true;
+                        return Vec::new();
+                    };
+                    let command_id = self.mint();
+                    let worker_generation =
+                        self.generations.get(&session).copied().unwrap_or_default();
+                    model.flash = Some(format!("· rolling back turn {}…", run_id.as_str()));
+                    model.dirty = true;
+                    return vec![self.enqueue(LiveCommand::CheckpointRollbackTurn {
+                        command_id,
+                        session,
+                        worker_generation,
+                        branch,
+                        run_id,
+                    })];
+                }
+                model.flash = Some(checkpoint_page_summary(&page));
+                model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::CheckpointMutated {
+                command_id,
+                receipt,
+            } => {
+                self.retire(&command_id);
+                let paths = receipt
+                    .checkpoint
+                    .paths
+                    .iter()
+                    .map(|path| path.path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                model.flash = Some(format!(
+                    "· {} checkpoint applied — {paths}",
+                    receipt.checkpoint.origin.as_str()
+                ));
+                model.dirty = true;
+                Vec::new()
+            }
             LiveReply::Staged {
                 vault_reference,
                 provider,
@@ -3851,6 +4016,14 @@ impl LiveDriver {
                 retryable,
                 presentation,
             } => {
+                if code == "feature_missing" {
+                    if let Some(id) = &command_id {
+                        self.retire(id);
+                    }
+                    model.flash = Some(format!("· {message}"));
+                    model.dirty = true;
+                    return Vec::new();
+                }
                 if code == haider_rpc::ERROR_CODE_BUSY
                     && let Some(id) = command_id.as_ref()
                     && let Some(pending) = self
@@ -5853,6 +6026,46 @@ impl LiveDriver {
                     branch,
                 })]
             }
+            AppRequest::Checkpoints { branch, rollback } => {
+                let Some(session) = model.active_session.clone() else {
+                    return Vec::new();
+                };
+                vec![LiveCommand::CheckpointList {
+                    session,
+                    branch,
+                    cursor: None,
+                    rollback,
+                    runs: Vec::new(),
+                }]
+            }
+            AppRequest::CheckpointUndo { branch, target } => {
+                let Some(session) = model.active_session.clone() else {
+                    return Vec::new();
+                };
+                let command_id = self.mint();
+                let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
+                vec![self.enqueue(LiveCommand::CheckpointUndo {
+                    command_id,
+                    session,
+                    worker_generation,
+                    branch,
+                    target,
+                })]
+            }
+            AppRequest::CheckpointRedo { branch, target } => {
+                let Some(session) = model.active_session.clone() else {
+                    return Vec::new();
+                };
+                let command_id = self.mint();
+                let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
+                vec![self.enqueue(LiveCommand::CheckpointRedo {
+                    command_id,
+                    session,
+                    worker_generation,
+                    branch,
+                    target,
+                })]
+            }
             AppRequest::BranchCreate {
                 session,
                 source_branch,
@@ -6069,6 +6282,10 @@ const fn command_session(command: &LiveCommand) -> Option<&SessionId> {
         | LiveCommand::Cancel { session, .. }
         | LiveCommand::Compact { session, .. }
         | LiveCommand::BranchCreate { session, .. }
+        | LiveCommand::CheckpointList { session, .. }
+        | LiveCommand::CheckpointUndo { session, .. }
+        | LiveCommand::CheckpointRedo { session, .. }
+        | LiveCommand::CheckpointRollbackTurn { session, .. }
         | LiveCommand::AgentMessage { session, .. }
         | LiveCommand::ShellExec { session, .. }
         | LiveCommand::ToolsInventory { session }

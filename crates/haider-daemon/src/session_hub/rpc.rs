@@ -11,6 +11,11 @@
 //! nothing here may await provider work — the longest await is one store
 //! transaction or one workspace `spawn_blocking`.
 
+#[cfg(test)]
+#[path = "checkpoint_tests.rs"]
+#[allow(clippy::expect_used)]
+mod checkpoint_tests;
+
 use super::*;
 use crate::delegation::{DelegationHandle, MessageCoordinates};
 use base64::Engine as _;
@@ -27,6 +32,7 @@ use haider_protocol::state::RunState;
 use haider_rpc::{ERROR_CODE_RESTAGE_REQUIRED, ProviderSummaryWire};
 use haider_tools::MessageSubagent;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::{MissedTickBehavior, interval_at};
 
@@ -55,6 +61,214 @@ struct SessionSelectModelInput {
     model: String,
     provider: Option<String>,
     confirm_new_epoch: bool,
+}
+
+struct CheckpointDoorInput {
+    command_id: CommandId,
+    session_id: SessionId,
+    branch_id: Option<haider_protocol::ids::BranchId>,
+    worker_generation: u64,
+    action: CheckpointDoorAction,
+}
+
+enum CheckpointDoorAction {
+    Undo { target: String },
+    Redo { target: String },
+    RollbackTurn { run_id: haider_protocol::ids::RunId },
+}
+
+enum CheckpointDoorFailure {
+    Response {
+        code: &'static str,
+        message: String,
+        data: Option<ErrorData>,
+    },
+    Hub(SessionHubError),
+}
+
+impl CheckpointDoorFailure {
+    fn not_found(message: impl Into<String>) -> Self {
+        Self::Response {
+            code: ERROR_CODE_NOT_FOUND,
+            message: message.into(),
+            data: None,
+        }
+    }
+}
+
+struct CheckpointEffectEnvelopeInput<'a> {
+    session_id: SessionId,
+    branch_id: Option<haider_protocol::ids::BranchId>,
+    run_id: RunId,
+    effect_id: haider_protocol::ids::EffectId,
+    command_id: &'a str,
+    mutation_digest: String,
+    checkpoint: haider_protocol::checkpoint::CheckpointRecorded,
+    worker_generation: u64,
+    device_id: &'a DeviceId,
+}
+
+impl CheckpointDoorAction {
+    fn method(&self) -> &'static str {
+        match self {
+            Self::Undo { .. } => "checkpoint.undo",
+            Self::Redo { .. } => "checkpoint.redo",
+            Self::RollbackTurn { .. } => "checkpoint.rollback_turn",
+        }
+    }
+
+    fn origin(&self) -> haider_protocol::checkpoint::CheckpointOrigin {
+        match self {
+            Self::Undo { .. } => haider_protocol::checkpoint::CheckpointOrigin::Undo,
+            Self::Redo { .. } => haider_protocol::checkpoint::CheckpointOrigin::Redo,
+            Self::RollbackTurn { .. } => {
+                haider_protocol::checkpoint::CheckpointOrigin::RollbackTurn
+            }
+        }
+    }
+}
+
+fn checkpoint_action_json(action: &CheckpointDoorAction) -> serde_json::Value {
+    match action {
+        CheckpointDoorAction::Undo { target } => {
+            serde_json::json!({ "kind": "undo", "target": target })
+        }
+        CheckpointDoorAction::Redo { target } => {
+            serde_json::json!({ "kind": "redo", "target": target })
+        }
+        CheckpointDoorAction::RollbackTurn { run_id } => {
+            serde_json::json!({ "kind": "rollback_turn", "run_id": run_id })
+        }
+    }
+}
+
+fn checkpoint_bytes_digest(bytes: &[u8]) -> String {
+    format!("blake3:{}", blake3::hash(bytes).to_hex())
+}
+
+fn checkpoint_capture_digest(captures: &[haider_tools::CheckpointCapturePath]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for capture in captures {
+        for part in [
+            capture.path.as_str(),
+            capture.pre_digest.as_deref().unwrap_or("absent"),
+            capture.post_digest.as_deref().unwrap_or("absent"),
+        ] {
+            let part_len = u64::try_from(part.len()).unwrap_or(u64::MAX);
+            hasher.update(&part_len.to_be_bytes());
+            hasher.update(part.as_bytes());
+        }
+    }
+    format!("blake3:{}", hasher.finalize().to_hex())
+}
+
+fn checkpoint_effect_envelopes(
+    input: CheckpointEffectEnvelopeInput<'_>,
+) -> Result<Vec<RawEnvelope>, SessionHubError> {
+    let CheckpointEffectEnvelopeInput {
+        session_id,
+        branch_id,
+        run_id,
+        effect_id,
+        command_id,
+        mutation_digest,
+        checkpoint,
+        worker_generation,
+        device_id,
+    } = input;
+    let args_digest = checkpoint_capture_digest_from_record(&checkpoint);
+    let payloads = vec![
+        EventPayload::Effect(EffectPhase::Intent(EffectIntent {
+            effect: effect_id.clone(),
+            class: EffectClass::FsWrite,
+            summary: format!("{} workspace checkpoint", checkpoint.origin.as_str()),
+            args_digest,
+            workspace_revision: None,
+        })),
+        EventPayload::Effect(EffectPhase::Authorized {
+            effect: effect_id.clone(),
+            verdict: haider_protocol::effect::AuthorizationVerdict::Allow,
+        }),
+        EventPayload::Effect(EffectPhase::Dispatched {
+            effect: effect_id.clone(),
+        }),
+        EventPayload::Effect(EffectPhase::Outcome {
+            effect: effect_id.clone(),
+            outcome: haider_protocol::effect::EffectOutcome::Ok,
+            freshness: None,
+            workspace_mutation: Some(haider_protocol::effect::WorkspaceMutation {
+                effect_id: effect_id.clone(),
+                mutation_digest,
+                workspace_revision: None,
+                subject_digest: None,
+            }),
+        }),
+        EventPayload::CheckpointRecorded(checkpoint),
+    ];
+    payloads
+        .into_iter()
+        .enumerate()
+        .map(|(index, payload)| {
+            let ordinal = index + 1;
+            Ok(haider_protocol::envelope::EventEnvelope {
+                schema_version: haider_protocol::envelope::SCHEMA_VERSION,
+                event_id: EventId::new(format!("checkpoint-command-{command_id}-{ordinal}")),
+                seq: 0,
+                session_id: session_id.clone(),
+                branch_id: branch_id.clone(),
+                run_id: Some(run_id.clone()),
+                agent_id: None,
+                device_id: device_id.clone(),
+                authority_epoch: 0,
+                worker_generation,
+                causation_id: None,
+                correlation_id: None,
+                committed_at_ms: 0,
+                render: haider_protocol::envelope::RenderTargets {
+                    ui: false,
+                    durable: true,
+                    prompt: haider_protocol::envelope::PromptRender::Omit,
+                },
+                payload: serde_json::to_value(payload).map_err(|error| {
+                    SessionHubError::Task(format!(
+                        "cannot encode checkpoint effect envelope: {error}"
+                    ))
+                })?,
+            })
+        })
+        .collect()
+}
+
+fn checkpoint_capture_digest_from_record(
+    checkpoint: &haider_protocol::checkpoint::CheckpointRecorded,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for path in &checkpoint.paths {
+        for part in [
+            path.path.as_str(),
+            path.pre_digest.as_deref().unwrap_or("absent"),
+            path.post_digest.as_deref().unwrap_or("absent"),
+        ] {
+            let part_len = u64::try_from(part.len()).unwrap_or(u64::MAX);
+            hasher.update(&part_len.to_be_bytes());
+            hasher.update(part.as_bytes());
+        }
+    }
+    format!("blake3:{}", hasher.finalize().to_hex())
+}
+
+async fn rollback_failed_checkpoint_command(
+    plan: haider_tools::CheckpointRestorePlan,
+) -> Result<(), SessionHubError> {
+    match tokio::task::spawn_blocking(move || haider_tools::restore_checkpoint_plan(&plan)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(SessionHubError::Task(format!(
+            "checkpoint command failed and workspace recovery also failed: {error}"
+        ))),
+        Err(error) => Err(SessionHubError::Task(format!(
+            "checkpoint command recovery worker failed: {error}"
+        ))),
+    }
 }
 
 struct AccountLoginInput {
@@ -4317,6 +4531,108 @@ impl HubConnection {
                 }
                 self.loom_watch(request_id, after_cursor).await
             }
+            RequestBody::CheckpointList {
+                session_id,
+                branch_id,
+                cursor,
+                limit,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.checkpoint_list(request_id, session_id, branch_id, cursor, limit)
+                    .await
+            }
+            RequestBody::CheckpointUndo {
+                command_id,
+                session_id,
+                branch_id,
+                worker_generation,
+                target,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.checkpoint_mutate(
+                    request_id,
+                    CheckpointDoorInput {
+                        command_id,
+                        session_id,
+                        branch_id,
+                        worker_generation,
+                        action: CheckpointDoorAction::Undo { target },
+                    },
+                )
+                .await
+            }
+            RequestBody::CheckpointRedo {
+                command_id,
+                session_id,
+                branch_id,
+                worker_generation,
+                target,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.checkpoint_mutate(
+                    request_id,
+                    CheckpointDoorInput {
+                        command_id,
+                        session_id,
+                        branch_id,
+                        worker_generation,
+                        action: CheckpointDoorAction::Redo { target },
+                    },
+                )
+                .await
+            }
+            RequestBody::CheckpointRollbackTurn {
+                command_id,
+                session_id,
+                branch_id,
+                worker_generation,
+                run_id,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.checkpoint_mutate(
+                    request_id,
+                    CheckpointDoorInput {
+                        command_id,
+                        session_id,
+                        branch_id,
+                        worker_generation,
+                        action: CheckpointDoorAction::RollbackTurn { run_id },
+                    },
+                )
+                .await
+            }
             // `Unknown` and any future method decode alike: a typed,
             // correlated rejection instead of a dropped request.
             _ => self.respond_error(
@@ -6532,6 +6848,560 @@ impl HubConnection {
                 availability: Some(haider_rpc::SnapshotAvailabilityWire::Available),
             },
         })
+    }
+
+    async fn checkpoint_list(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+        branch_id: Option<haider_protocol::ids::BranchId>,
+        cursor: Option<haider_protocol::checkpoint::CheckpointCursor>,
+        limit: u16,
+    ) -> Result<(), SessionHubError> {
+        if self.hub.session_metadata(&session_id).await?.is_none() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "checkpoint session does not exist",
+                false,
+                None,
+            );
+        }
+        let page = match self
+            .hub
+            .inner
+            .store
+            .list_checkpoints(session_id, branch_id, cursor, limit)
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => return self.respond_turn_error(request_id, error),
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::CheckpointList { page },
+        })
+    }
+
+    async fn checkpoint_mutate(
+        &self,
+        request_id: RequestId,
+        input: CheckpointDoorInput,
+    ) -> Result<(), SessionHubError> {
+        let CheckpointDoorInput {
+            command_id,
+            session_id,
+            branch_id,
+            worker_generation,
+            action,
+        } = input;
+        let method = action.method();
+        let action_coordinate_is_empty = match &action {
+            CheckpointDoorAction::Undo { target } | CheckpointDoorAction::Redo { target } => {
+                target.trim().is_empty()
+            }
+            CheckpointDoorAction::RollbackTurn { run_id } => run_id.as_str().trim().is_empty(),
+        };
+        if command_id.as_str().trim().is_empty() || action_coordinate_is_empty {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "checkpoint command id and target/run coordinates must not be empty",
+                false,
+                None,
+            );
+        }
+        let _checkpoint_serial = self.hub.lock_checkpoint_mutation(&session_id).await;
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": &session_id,
+            "branch_id": &branch_id,
+            "worker_generation": worker_generation,
+            "action": checkpoint_action_json(&action),
+        }))
+        .map_err(|error| {
+            SessionHubError::Task(format!("cannot encode checkpoint command: {error}"))
+        })?;
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        match self
+            .hub
+            .checkpoint_command_receipt(&command_id, method, &request_digest, &request_json)
+            .await
+        {
+            Ok(Some(receipt)) => {
+                return self.respond_checkpoint_receipt(request_id, method, receipt);
+            }
+            Ok(None) => {}
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        }
+        if !self
+            .hub
+            .holds_control_attachment(&self.connection_id, &session_id)?
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_CAPABILITY_DENIED,
+                "checkpoint mutation requires a control attachment to this session",
+                false,
+                None,
+            );
+        }
+        if worker_generation != self.hub.inner.store.worker_generation() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_STALE_GENERATION,
+                "checkpoint command worker generation is stale",
+                false,
+                None,
+            );
+        }
+        // Hold the same serial used by turn admission from the idle check
+        // through workspace publication and journal commit. Otherwise a new
+        // tool mutation could race between checkpoint freshness verification
+        // and the durable receipt.
+        let _turn_admission_serial = self.hub.lock_workflow_selection(&session_id).await;
+        match self.hub.session_has_nonterminal_runs(&session_id).await {
+            Ok(false) => {}
+            Ok(true) => {
+                return self.respond_error(
+                    request_id,
+                    haider_rpc::ERROR_CODE_BUSY,
+                    "checkpoint mutation requires an idle session",
+                    true,
+                    None,
+                );
+            }
+            Err(error) => return self.respond_turn_error(request_id, error),
+        }
+        let Some(metadata) = self.hub.session_metadata(&session_id).await? else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "checkpoint session does not exist",
+                false,
+                None,
+            );
+        };
+        let source_checkpoints = match self
+            .resolve_checkpoint_action(&session_id, branch_id.as_ref(), &action)
+            .await
+        {
+            Ok(checkpoints) => checkpoints,
+            Err(CheckpointDoorFailure::Response {
+                code,
+                message,
+                data,
+            }) => return self.respond_error(request_id, code, &message, false, data),
+            Err(CheckpointDoorFailure::Hub(error)) => return Err(error),
+        };
+        let restored_checkpoint_ids = source_checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.checkpoint_id.clone())
+            .collect::<Vec<_>>();
+        let plan = match self
+            .checkpoint_restore_plan(&metadata.cwd, &source_checkpoints)
+            .await
+        {
+            Ok(plan) => plan,
+            Err(CheckpointDoorFailure::Response {
+                code,
+                message,
+                data,
+            }) => return self.respond_error(request_id, code, &message, false, data),
+            Err(CheckpointDoorFailure::Hub(error)) => return Err(error),
+        };
+        let plan_for_worker = plan.clone();
+        let captures = match tokio::task::spawn_blocking(move || {
+            haider_tools::restore_checkpoint_plan(&plan_for_worker)
+        })
+        .await
+        {
+            Ok(Ok(captures)) => captures,
+            Ok(Err(haider_tools::CheckpointRestoreError::Conflict(conflict))) => {
+                let data = if conflict.conflicts.len() == 1
+                    && !matches!(action, CheckpointDoorAction::RollbackTurn { .. })
+                {
+                    Some(ErrorData::CheckpointConflict {
+                        conflict: conflict.conflicts[0].clone(),
+                    })
+                } else {
+                    Some(ErrorData::CheckpointRollbackConflict { conflict })
+                };
+                return self.respond_error(
+                    request_id,
+                    haider_rpc::ERROR_CODE_CHECKPOINT_CONFLICT,
+                    "checkpoint freshness guard refused foreign workspace edits",
+                    false,
+                    data,
+                );
+            }
+            Ok(Err(haider_tools::CheckpointRestoreError::Tool(error))) => {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    &error.to_string(),
+                    false,
+                    None,
+                );
+            }
+            Err(error) => {
+                return Err(SessionHubError::Task(format!(
+                    "checkpoint restore worker failed: {error}"
+                )));
+            }
+        };
+        let mutation_digest = checkpoint_capture_digest(&captures);
+        let recovery_plan = haider_tools::CheckpointRestorePlan {
+            workspace_root: PathBuf::from(&metadata.cwd),
+            targets: captures
+                .iter()
+                .map(|capture| haider_tools::CheckpointRestoreTarget {
+                    path: capture.path.clone(),
+                    expected_digest: capture.post_digest.clone(),
+                    restore_bytes: capture.pre_bytes.clone(),
+                })
+                .collect(),
+        };
+        let command_run_id = RunId::new(format!("checkpoint-command:{}", command_id.as_str()));
+        let effect_id = haider_protocol::ids::EffectId::new(format!(
+            "checkpoint-effect:{}",
+            command_id.as_str()
+        ));
+        let checkpoint_kind = source_checkpoints.first().map_or(
+            haider_protocol::checkpoint::CheckpointKind::Write,
+            |checkpoint| checkpoint.kind,
+        );
+        let capture = haider_tools::CheckpointCapture {
+            kind: checkpoint_kind,
+            paths: captures,
+            post_digest: mutation_digest.clone(),
+        };
+        let mut cas = self.hub.inner.store.clone();
+        let checkpoint = match haider_tools::freeze_checkpoint(
+            &mut cas,
+            haider_tools::FreezeCheckpointInput {
+                session_id: session_id.clone(),
+                branch_id: branch_id.clone(),
+                run_id: command_run_id.clone(),
+                effect_id: effect_id.clone(),
+                call_id: command_id.as_str().to_owned(),
+                origin: action.origin(),
+                source_checkpoint_id: (source_checkpoints.len() == 1)
+                    .then(|| source_checkpoints[0].checkpoint_id.clone()),
+            },
+            capture,
+        )
+        .await
+        {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                rollback_failed_checkpoint_command(recovery_plan.clone()).await?;
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    &error.to_string(),
+                    false,
+                    None,
+                );
+            }
+        };
+        let envelopes = match checkpoint_effect_envelopes(CheckpointEffectEnvelopeInput {
+            session_id: session_id.clone(),
+            branch_id: branch_id.clone(),
+            run_id: command_run_id,
+            effect_id,
+            command_id: command_id.as_str(),
+            mutation_digest,
+            checkpoint,
+            worker_generation,
+            device_id: &self.hub.inner.device_id,
+        }) {
+            Ok(envelopes) => envelopes,
+            Err(error) => {
+                rollback_failed_checkpoint_command(recovery_plan.clone()).await?;
+                return Err(error);
+            }
+        };
+        let outcome = self
+            .hub
+            .commit_checkpoint(CheckpointCommitCommand {
+                command_id: command_id.0.clone(),
+                method: method.to_owned(),
+                request_digest: request_digest.clone(),
+                request_json: request_json.clone(),
+                session_id,
+                worker_generation,
+                restored_checkpoint_ids,
+                envelopes,
+            })
+            .await;
+        let receipt = match outcome {
+            Ok(CheckpointCommitOutcome::Committed { receipt, .. })
+            | Ok(CheckpointCommitOutcome::IdempotentReplay { receipt }) => receipt,
+            Err(CheckpointCommitFailure::DefinitelyUncommitted(SessionHubError::Store(error))) => {
+                rollback_failed_checkpoint_command(recovery_plan).await?;
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(CheckpointCommitFailure::DefinitelyUncommitted(error)) => {
+                rollback_failed_checkpoint_command(recovery_plan).await?;
+                return Err(error);
+            }
+            Err(CheckpointCommitFailure::Ambiguous(error)) => {
+                match self
+                    .hub
+                    .checkpoint_command_receipt(&command_id, method, &request_digest, &request_json)
+                    .await
+                {
+                    Ok(Some(receipt)) => receipt,
+                    Ok(None) => {
+                        rollback_failed_checkpoint_command(recovery_plan).await?;
+                        return Err(error);
+                    }
+                    Err(reconcile_error) => return Err(reconcile_error),
+                }
+            }
+        };
+        self.respond_checkpoint_receipt(request_id, method, receipt)
+    }
+
+    async fn resolve_checkpoint_action(
+        &self,
+        session_id: &SessionId,
+        branch_id: Option<&haider_protocol::ids::BranchId>,
+        action: &CheckpointDoorAction,
+    ) -> Result<Vec<haider_protocol::checkpoint::CheckpointRecorded>, CheckpointDoorFailure> {
+        if let CheckpointDoorAction::RollbackTurn { run_id } = action {
+            let checkpoints = self
+                .hub
+                .inner
+                .store
+                .checkpoints_for_run(session_id.clone(), branch_id.cloned(), run_id.clone())
+                .await
+                .map_err(|error| CheckpointDoorFailure::Hub(error.into()))?;
+            if checkpoints.is_empty() {
+                return Err(CheckpointDoorFailure::not_found(
+                    "the requested turn has no checkpoints on this branch",
+                ));
+            }
+            return Ok(checkpoints);
+        }
+        let target = match action {
+            CheckpointDoorAction::Undo { target } | CheckpointDoorAction::Redo { target } => target,
+            CheckpointDoorAction::RollbackTurn { .. } => {
+                return Err(CheckpointDoorFailure::Hub(SessionHubError::Task(
+                    "rollback action escaped its run lookup".into(),
+                )));
+            }
+        };
+        let selected = if target == "last" {
+            match action {
+                CheckpointDoorAction::Undo { .. } => self
+                    .hub
+                    .inner
+                    .store
+                    .list_checkpoints(session_id.clone(), branch_id.cloned(), None, 1)
+                    .await
+                    .map_err(|error| CheckpointDoorFailure::Hub(error.into()))?
+                    .checkpoints
+                    .into_iter()
+                    .next(),
+                CheckpointDoorAction::Redo { .. } => {
+                    self.find_redo_checkpoint(session_id, branch_id, None)
+                        .await?
+                }
+                CheckpointDoorAction::RollbackTurn { .. } => None,
+            }
+        } else {
+            let requested_id = haider_protocol::ids::CheckpointId::new(target);
+            let checkpoint = self
+                .hub
+                .inner
+                .store
+                .checkpoint(session_id.clone(), requested_id.clone())
+                .await
+                .map_err(|error| CheckpointDoorFailure::Hub(error.into()))?;
+            if let Some(checkpoint) = checkpoint.as_ref()
+                && checkpoint.branch_id.as_ref() != branch_id
+            {
+                return Err(CheckpointDoorFailure::Response {
+                    code: haider_rpc::ERROR_CODE_CHECKPOINT_BRANCH_MISMATCH,
+                    message: "checkpoint belongs to another branch".into(),
+                    data: Some(ErrorData::CheckpointBranchMismatch {
+                        checkpoint_id: checkpoint.checkpoint_id.clone(),
+                        checkpoint_branch_id: checkpoint.branch_id.clone(),
+                        requested_branch_id: branch_id.cloned(),
+                    }),
+                });
+            }
+            match (action, checkpoint) {
+                (CheckpointDoorAction::Redo { .. }, Some(checkpoint))
+                    if !matches!(
+                        checkpoint.origin,
+                        haider_protocol::checkpoint::CheckpointOrigin::Undo
+                            | haider_protocol::checkpoint::CheckpointOrigin::RollbackTurn
+                    ) =>
+                {
+                    if checkpoint.origin == haider_protocol::checkpoint::CheckpointOrigin::Redo {
+                        return Err(CheckpointDoorFailure::Response {
+                            code: ERROR_CODE_INVALID_ARGUMENT,
+                            message: "a redo checkpoint is not itself redoable; undo it instead"
+                                .into(),
+                            data: None,
+                        });
+                    }
+                    self.find_redo_checkpoint(
+                        session_id,
+                        branch_id,
+                        Some(&checkpoint.checkpoint_id),
+                    )
+                    .await?
+                }
+                (_, checkpoint) => checkpoint,
+            }
+        };
+        selected.map(|checkpoint| vec![checkpoint]).ok_or_else(|| {
+            CheckpointDoorFailure::not_found("no matching checkpoint exists on this branch")
+        })
+    }
+
+    async fn find_redo_checkpoint(
+        &self,
+        session_id: &SessionId,
+        branch_id: Option<&haider_protocol::ids::BranchId>,
+        source_checkpoint_id: Option<&haider_protocol::ids::CheckpointId>,
+    ) -> Result<Option<haider_protocol::checkpoint::CheckpointRecorded>, CheckpointDoorFailure>
+    {
+        let mut cursor = None;
+        loop {
+            let page = self
+                .hub
+                .inner
+                .store
+                .list_checkpoints(
+                    session_id.clone(),
+                    branch_id.cloned(),
+                    cursor,
+                    haider_protocol::checkpoint::CHECKPOINT_LIST_MAX_PAGE,
+                )
+                .await
+                .map_err(|error| CheckpointDoorFailure::Hub(error.into()))?;
+            let next_cursor = page.next_cursor;
+            if let Some(checkpoint) = page.checkpoints.into_iter().find(|checkpoint| {
+                matches!(
+                    checkpoint.origin,
+                    haider_protocol::checkpoint::CheckpointOrigin::Undo
+                        | haider_protocol::checkpoint::CheckpointOrigin::RollbackTurn
+                ) && source_checkpoint_id
+                    .is_none_or(|source| checkpoint.source_checkpoint_id.as_ref() == Some(source))
+            }) {
+                return Ok(Some(checkpoint));
+            }
+            let Some(next_cursor) = next_cursor else {
+                return Ok(None);
+            };
+            cursor = Some(next_cursor);
+        }
+    }
+
+    async fn checkpoint_restore_plan(
+        &self,
+        workspace_root: &str,
+        checkpoints: &[haider_protocol::checkpoint::CheckpointRecorded],
+    ) -> Result<haider_tools::CheckpointRestorePlan, CheckpointDoorFailure> {
+        let mut targets = BTreeMap::<String, haider_tools::CheckpointRestoreTarget>::new();
+        for checkpoint in checkpoints {
+            for path in &checkpoint.paths {
+                if let Some(reason) = &path.truncated_reason {
+                    return Err(CheckpointDoorFailure::Response {
+                        code: ERROR_CODE_INVALID_ARGUMENT,
+                        message: format!(
+                            "checkpoint {} cannot restore {}: {reason}",
+                            checkpoint.checkpoint_id, path.path
+                        ),
+                        data: None,
+                    });
+                }
+                let restore_bytes = match &path.pre_artifact {
+                    Some(artifact) => Some(
+                        self.hub
+                            .inner
+                            .store
+                            .get(artifact)
+                            .await
+                            .map_err(|error| CheckpointDoorFailure::Hub(error.into()))?,
+                    ),
+                    None => None,
+                };
+                if restore_bytes.as_deref().map(checkpoint_bytes_digest) != path.pre_digest {
+                    return Err(CheckpointDoorFailure::Response {
+                        code: ERROR_CODE_INVALID_ARGUMENT,
+                        message: format!(
+                            "checkpoint {} pre-image digest is inconsistent",
+                            checkpoint.checkpoint_id
+                        ),
+                        data: None,
+                    });
+                }
+                match targets.get_mut(&path.path) {
+                    Some(target) => {
+                        if target.restore_bytes.as_deref().map(checkpoint_bytes_digest)
+                            != path.post_digest
+                        {
+                            return Err(CheckpointDoorFailure::Response {
+                                code: haider_rpc::ERROR_CODE_CHECKPOINT_CONFLICT,
+                                message: "turn checkpoint chain is not contiguous".into(),
+                                data: Some(ErrorData::CheckpointConflict {
+                                    conflict: haider_protocol::checkpoint::CheckpointConflict {
+                                        path: path.path.clone(),
+                                        expected_digest: path.post_digest.clone(),
+                                        current_digest: target
+                                            .restore_bytes
+                                            .as_deref()
+                                            .map(checkpoint_bytes_digest),
+                                    },
+                                }),
+                            });
+                        }
+                        target.restore_bytes = restore_bytes;
+                    }
+                    None => {
+                        targets.insert(
+                            path.path.clone(),
+                            haider_tools::CheckpointRestoreTarget {
+                                path: path.path.clone(),
+                                expected_digest: path.post_digest.clone(),
+                                restore_bytes,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        Ok(haider_tools::CheckpointRestorePlan {
+            workspace_root: PathBuf::from(workspace_root),
+            targets: targets.into_values().collect(),
+        })
+    }
+
+    fn respond_checkpoint_receipt(
+        &self,
+        request_id: RequestId,
+        method: &str,
+        receipt: haider_protocol::checkpoint::CheckpointMutationReceipt,
+    ) -> Result<(), SessionHubError> {
+        let body = match method {
+            "checkpoint.undo" => ResponseBody::CheckpointUndo { receipt },
+            "checkpoint.redo" => ResponseBody::CheckpointRedo { receipt },
+            "checkpoint.rollback_turn" => ResponseBody::CheckpointRollbackTurn { receipt },
+            _ => {
+                return Err(SessionHubError::Task(
+                    "unsupported checkpoint response method".into(),
+                ));
+            }
+        };
+        self.send(WireFrame::Response { request_id, body })
     }
 
     #[allow(clippy::too_many_arguments)]

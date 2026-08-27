@@ -203,8 +203,8 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
         welcome_features().len(),
-        94,
-        "the ordinary Welcome advertises all 85 prior and nine v0.0.963 feature tokens"
+        95,
+        "the ordinary Welcome advertises all 94 v0.0.963 tokens plus checkpoint_v1"
     );
     assert_eq!(
         welcome_features(),
@@ -221,6 +221,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_ARTIFACT_PUT_V1.to_owned(),
             haider_rpc::FEATURE_EXPORT_SEQ_V1.to_owned(),
             haider_rpc::FEATURE_BRANCH_CREATE_V1.to_owned(),
+            haider_rpc::FEATURE_CHECKPOINT_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_FORK_V1.to_owned(),
             FEATURE_COMMAND_DOOR_V1.to_owned(),
             haider_rpc::FEATURE_COMPACTION_GUARD_V1.to_owned(),

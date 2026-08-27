@@ -820,7 +820,8 @@ fn migration_backfill_and_legacy_heal_preserve_the_pinned_digest() {
     )
     .expect("plant pre-stamp row");
     raw.execute_batch(
-        "DROP TABLE workflow_node_states;
+        "DROP TABLE checkpoints;
+         DROP TABLE workflow_node_states;
          DROP TABLE workflow_graph_instances;
          ALTER TABLE profile_meta DROP COLUMN workflow_graph_backfill_version;
          DROP TABLE provider_view_gc;
@@ -838,7 +839,7 @@ fn migration_backfill_and_legacy_heal_preserve_the_pinned_digest() {
     drop(raw);
 
     let store = Store::open(root.path()).expect("migrate legacy database");
-    assert_eq!(store.schema_version().expect("schema version"), 26);
+    assert_eq!(store.schema_version().expect("schema version"), 27);
     let legacy = store
         .loom_workflow("legacy-retained")
         .expect("read migrated current")

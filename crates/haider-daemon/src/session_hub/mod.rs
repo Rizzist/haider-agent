@@ -104,20 +104,21 @@ use descendant_stream::run_descendant_stream;
 use haider_core::{
     AbandonedGraph, AcceptedRunRetry, AcceptedShellExec, AcceptedTurn, AppendGroupBatch,
     BranchCreateCommand, BranchCreateOutcome, CacheDiagnosticKey, CancelledTurn,
-    ChildGraphAttachCommand, ChildGraphAttachOutcome, ChildTemplateCacheEntry,
-    ChildTemplateObservation, ChildTemplateObservationCommand, ComputerEvidenceCommand,
-    ComputerEvidenceOutcome, CreatedBranch, CreatedSession, CreatedSessionFork,
-    GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand, GraphEvidenceOutcome,
-    GraphFinalizationCommand, GraphFinalizationOutcome, GraphInspectResult, GraphPinCommand,
-    GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome, GraphSwitchCommand,
-    GraphSwitchOutcome, HarnessHandle, MenuResolutionCommand, MenuResolutionOutcome,
-    OpenedGraphRunSet, PinnedGraph, ProcessSignalCommand, ProcessSignalOutcome, ProfileStoreFault,
-    PromptHistoryCache, QueueConsumeCommand, QueueConsumeOutcome, QueuePromoteCommand,
-    QueuePromoteOutcome, QueueRemoveCommand, QueueRemoveOutcome, QueueSnapshot, RenamedSession,
-    RunRetryCommand, RunRetryOutcome, SeenSession, SelectedAgentType, SelectedEffort, SelectedFast,
-    SelectedModel, SessionCreateCommand, SessionCreateOutcome, SessionForkCommand,
-    SessionForkOutcome, SessionMetaforkCommit, SessionProjectionCheckpoint, SessionRenameCommand,
-    SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome, SessionSelectAgentTypeCommand,
+    CheckpointCommitCommand, CheckpointCommitOutcome, ChildGraphAttachCommand,
+    ChildGraphAttachOutcome, ChildTemplateCacheEntry, ChildTemplateObservation,
+    ChildTemplateObservationCommand, ComputerEvidenceCommand, ComputerEvidenceOutcome,
+    CreatedBranch, CreatedSession, CreatedSessionFork, GraphAbandonCommand, GraphAbandonOutcome,
+    GraphEvidenceCommand, GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome,
+    GraphInspectResult, GraphPinCommand, GraphPinOutcome, GraphRunSetOpenCommand,
+    GraphRunSetOpenOutcome, GraphSwitchCommand, GraphSwitchOutcome, HarnessHandle,
+    MenuResolutionCommand, MenuResolutionOutcome, OpenedGraphRunSet, PinnedGraph,
+    ProcessSignalCommand, ProcessSignalOutcome, ProfileStoreFault, PromptHistoryCache,
+    QueueConsumeCommand, QueueConsumeOutcome, QueuePromoteCommand, QueuePromoteOutcome,
+    QueueRemoveCommand, QueueRemoveOutcome, QueueSnapshot, RenamedSession, RunRetryCommand,
+    RunRetryOutcome, SeenSession, SelectedAgentType, SelectedEffort, SelectedFast, SelectedModel,
+    SessionCreateCommand, SessionCreateOutcome, SessionForkCommand, SessionForkOutcome,
+    SessionMetaforkCommit, SessionProjectionCheckpoint, SessionRenameCommand, SessionRenameOutcome,
+    SessionSeenCommand, SessionSeenOutcome, SessionSelectAgentTypeCommand,
     SessionSelectAgentTypeOutcome, SessionSelectEffortCommand, SessionSelectEffortOutcome,
     SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
     SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle,
@@ -830,6 +831,10 @@ struct HubInner {
     /// blocking daemon-internal workflow_author transitions inside an already
     /// fenced tool call.
     workflow_selection_serials: tokio::sync::Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>,
+    /// Serializes receipt lookup through workspace publication for checkpoint
+    /// commands. This makes same-command retries idempotent even when two
+    /// control connections race before either response is visible.
+    checkpoint_serials: tokio::sync::Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>,
     replay_tasks: Mutex<Vec<JoinHandle<ReplayCompletion>>>,
     attachments: Mutex<HashMap<AttachmentId, AttachmentOwner>>,
     /// Connection-scoped nested-subagent streams. They share the ordinary
@@ -1324,6 +1329,10 @@ enum ActorCommand {
         command: BranchCreateCommand,
         completed: oneshot::Sender<Result<BranchCreateOutcome, HaiderError>>,
     },
+    CommitCheckpoint {
+        command: CheckpointCommitCommand,
+        completed: oneshot::Sender<Result<CheckpointCommitOutcome, HaiderError>>,
+    },
     SelectModel {
         command: SessionSelectModelCommand,
         completed: oneshot::Sender<Result<SessionSelectModelOutcome, HaiderError>>,
@@ -1613,6 +1622,17 @@ pub enum SessionHubError {
     InvalidConfig(String),
 }
 
+#[derive(Debug)]
+enum CheckpointCommitFailure {
+    /// The command never reached a committing store transaction, or that
+    /// transaction returned an error under the store's rollback guarantee.
+    DefinitelyUncommitted(SessionHubError),
+    /// The actor accepted the command but its acknowledgement channel closed;
+    /// the transaction may already be durable, so compensating disk writes
+    /// would risk diverging the workspace from the journal.
+    Ambiguous(SessionHubError),
+}
+
 /// Whether the hub delivered every committed drain suffix during its grace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionHubShutdownOutcome {
@@ -1732,6 +1752,7 @@ impl SessionHub {
             actor_tasks: Mutex::new(Vec::new()),
             typed_install_serial: Arc::new(tokio::sync::Mutex::new(())),
             workflow_selection_serials: tokio::sync::Mutex::new(HashMap::new()),
+            checkpoint_serials: tokio::sync::Mutex::new(HashMap::new()),
             replay_tasks: Mutex::new(Vec::new()),
             attachments: Mutex::new(HashMap::new()),
             descendant_attachments: Mutex::new(HashMap::new()),
@@ -3115,6 +3136,48 @@ impl SessionHub {
             .map_err(Into::into)
     }
 
+    async fn checkpoint_command_receipt(
+        &self,
+        command_id: &CommandId,
+        method: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> Result<Option<haider_protocol::checkpoint::CheckpointMutationReceipt>, SessionHubError>
+    {
+        self.inner
+            .store
+            .checkpoint_command_receipt(
+                command_id.0.clone(),
+                method.to_owned(),
+                request_digest.to_owned(),
+                request_json.to_owned(),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn commit_checkpoint(
+        &self,
+        command: CheckpointCommitCommand,
+    ) -> Result<CheckpointCommitOutcome, CheckpointCommitFailure> {
+        let actor = self
+            .actor_for(command.session_id.clone())
+            .await
+            .map_err(CheckpointCommitFailure::DefinitelyUncommitted)?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::CommitCheckpoint { command, completed })
+            .await
+            .map_err(|_| CheckpointCommitFailure::DefinitelyUncommitted(SessionHubError::Closed))?;
+        result
+            .await
+            .map_err(|_| CheckpointCommitFailure::Ambiguous(SessionHubError::Closed))?
+            .map_err(|error| {
+                CheckpointCommitFailure::DefinitelyUncommitted(SessionHubError::Store(error))
+            })
+    }
+
     async fn command_receipt_worker_generation(
         &self,
         command_id: &CommandId,
@@ -4136,6 +4199,21 @@ impl SessionHub {
     ) -> tokio::sync::OwnedMutexGuard<()> {
         let serial = {
             let mut serials = self.inner.workflow_selection_serials.lock().await;
+            Arc::clone(
+                serials
+                    .entry(session_id.clone())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        serial.lock_owned().await
+    }
+
+    pub(crate) async fn lock_checkpoint_mutation(
+        &self,
+        session_id: &SessionId,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let serial = {
+            let mut serials = self.inner.checkpoint_serials.lock().await;
             Arc::clone(
                 serials
                     .entry(session_id.clone())

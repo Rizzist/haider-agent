@@ -17,7 +17,10 @@ use haider_protocol::ids::{
 use haider_protocol::state::RunState;
 use haider_rpc::{AttachmentId, CommandId, RequestBody, ResponseBody, SubmitDisposition};
 use haider_tui::app::{AppModel, AppRequest, RuntimeMode};
-use haider_tui::link::{CommandContext, map_response, request_body, request_body_for_features};
+use haider_tui::link::{
+    CommandContext, command_required_features, map_response, request_body,
+    request_body_for_features,
+};
 use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};
 use haider_tui::projection::RawOutcome;
 
@@ -30,6 +33,21 @@ fn sid(n: usize) -> SessionId {
 
 fn bid(name: &str) -> BranchId {
     BranchId::new(name)
+}
+
+#[test]
+fn checkpoint_commands_require_checkpoint_feature_at_send_time() {
+    let command = LiveCommand::CheckpointUndo {
+        command_id: CommandId::new("checkpoint-feature-pin"),
+        session: sid(1),
+        worker_generation: 3,
+        branch: Some(bid("feature-branch")),
+        target: "last".into(),
+    };
+    assert_eq!(
+        command_required_features(&command),
+        &[haider_rpc::FEATURE_CHECKPOINT_V1]
+    );
 }
 
 fn raw(session: &SessionId, seq: u64, payload: &EventPayload) -> RawEnvelope {

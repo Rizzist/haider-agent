@@ -47,6 +47,35 @@ impl JournalSink for RecordingJournal {
             .push(payload);
         Ok(())
     }
+
+    fn supports_checkpoint_batches(&self) -> bool {
+        true
+    }
+
+    fn supports_checkpoint_artifacts(&self) -> bool {
+        true
+    }
+
+    async fn put_checkpoint_artifact(&mut self, bytes: &[u8]) -> ToolResult<ArtifactRef> {
+        Ok(ArtifactRef::new(format!(
+            "blake3:{}",
+            blake3::hash(bytes).to_hex()
+        )))
+    }
+
+    async fn append_checkpointed(
+        &mut self,
+        outcome: EventPayload,
+        checkpoint: EventPayload,
+    ) -> ToolResult<()> {
+        let mut payloads = self
+            .0
+            .0
+            .lock()
+            .map_err(|_| ToolError::journal("recording journal poisoned"))?;
+        payloads.extend([outcome, checkpoint]);
+        Ok(())
+    }
 }
 
 struct FailFirstOutcomeJournal {
@@ -59,6 +88,32 @@ impl JournalSink for FailFirstOutcomeJournal {
         if matches!(payload, EventPayload::Effect(EffectPhase::Outcome { .. }))
             && !self.failed.swap(true, Ordering::SeqCst)
         {
+            return Err(ToolError::journal("injected terminal failure"));
+        }
+        Ok(())
+    }
+
+    fn supports_checkpoint_batches(&self) -> bool {
+        true
+    }
+
+    fn supports_checkpoint_artifacts(&self) -> bool {
+        true
+    }
+
+    async fn put_checkpoint_artifact(&mut self, bytes: &[u8]) -> ToolResult<ArtifactRef> {
+        Ok(ArtifactRef::new(format!(
+            "blake3:{}",
+            blake3::hash(bytes).to_hex()
+        )))
+    }
+
+    async fn append_checkpointed(
+        &mut self,
+        _outcome: EventPayload,
+        _checkpoint: EventPayload,
+    ) -> ToolResult<()> {
+        if !self.failed.swap(true, Ordering::SeqCst) {
             return Err(ToolError::journal("injected terminal failure"));
         }
         Ok(())

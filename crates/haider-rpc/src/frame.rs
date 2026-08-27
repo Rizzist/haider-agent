@@ -252,6 +252,10 @@ pub const ERROR_CODE_CACHE_EPOCH_CONFIRMATION_REQUIRED: &str = "cache_epoch_conf
 pub const ERROR_CODE_GRAPH_ALREADY_ACTIVE: &str = "graph_already_active";
 pub const ERROR_CODE_GRAPH_NOT_ACTIVE: &str = "graph_not_active";
 pub const ERROR_CODE_GRAPH_WRONG_NODE: &str = "graph_wrong_node";
+/// Undo/redo freshness refused to overwrite bytes not produced by the target.
+pub const ERROR_CODE_CHECKPOINT_CONFLICT: &str = "checkpoint_conflict";
+/// A checkpoint command addressed history owned by another branch.
+pub const ERROR_CODE_CHECKPOINT_BRANCH_MISMATCH: &str = "checkpoint_branch_mismatch";
 
 /// Daemon implements receipt-backed session creation and metadata.
 pub const FEATURE_SESSION_MUTATION_V1: &str = "session_mutation_v1";
@@ -532,6 +536,8 @@ pub const FEATURE_LOOM_REGISTRY_ARCHIVE_V1: &str = "loom_registry_archive_v1";
 pub const FEATURE_LOOM_VALIDATION_V1: &str = "loom_validation_v1";
 /// Replayable persist-before-publish Loom registry baselines and deltas.
 pub const FEATURE_LOOM_REGISTRY_WATCH_V1: &str = "loom_registry_watch_v1";
+/// Durable bounded workspace pre-images plus receipted undo/redo/rollback.
+pub const FEATURE_CHECKPOINT_V1: &str = "checkpoint_v1";
 
 /// Maximum UTF-8 bytes accepted for one mirrored input value or injected text.
 pub const SURFACE_INPUT_MAX_BYTES: usize = 64 * 1024;
@@ -3478,6 +3484,44 @@ pub enum RequestBody {
     /// Attach a connection-scoped registry baseline + durable delta stream.
     #[serde(rename = "loom.watch")]
     LoomWatch { after_cursor: u64 },
+    #[serde(rename = "checkpoint.list")]
+    CheckpointList {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch_id: Option<BranchId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<haider_protocol::checkpoint::CheckpointCursor>,
+        limit: u16,
+    },
+    #[serde(rename = "checkpoint.undo")]
+    CheckpointUndo {
+        command_id: CommandId,
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch_id: Option<BranchId>,
+        worker_generation: u64,
+        /// A checkpoint id or the literal `last`.
+        target: String,
+    },
+    #[serde(rename = "checkpoint.redo")]
+    CheckpointRedo {
+        command_id: CommandId,
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch_id: Option<BranchId>,
+        worker_generation: u64,
+        /// A checkpoint id or the literal `last`.
+        target: String,
+    },
+    #[serde(rename = "checkpoint.rollback_turn")]
+    CheckpointRollbackTurn {
+        command_id: CommandId,
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch_id: Option<BranchId>,
+        worker_generation: u64,
+        run_id: RunId,
+    },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline). W3b answers it with a protocol error, not a panic.
     #[serde(other)]
@@ -4219,6 +4263,22 @@ pub enum ResponseBody {
         requested_after_cursor: u64,
         baseline: haider_protocol::loom::LoomRegistrySnapshot,
     },
+    #[serde(rename = "checkpoint.list")]
+    CheckpointList {
+        page: haider_protocol::checkpoint::CheckpointListPage,
+    },
+    #[serde(rename = "checkpoint.undo")]
+    CheckpointUndo {
+        receipt: haider_protocol::checkpoint::CheckpointMutationReceipt,
+    },
+    #[serde(rename = "checkpoint.redo")]
+    CheckpointRedo {
+        receipt: haider_protocol::checkpoint::CheckpointMutationReceipt,
+    },
+    #[serde(rename = "checkpoint.rollback_turn")]
+    CheckpointRollbackTurn {
+        receipt: haider_protocol::checkpoint::CheckpointMutationReceipt,
+    },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline).
     #[serde(other)]
@@ -4400,6 +4460,19 @@ pub enum ErrorData {
         current_rev: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         current_digest: Option<String>,
+    },
+    CheckpointConflict {
+        conflict: haider_protocol::checkpoint::CheckpointConflict,
+    },
+    CheckpointRollbackConflict {
+        conflict: haider_protocol::checkpoint::CheckpointRollbackConflict,
+    },
+    CheckpointBranchMismatch {
+        checkpoint_id: haider_protocol::ids::CheckpointId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkpoint_branch_id: Option<BranchId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requested_branch_id: Option<BranchId>,
     },
     /// Decode artifact for a data kind this crate does not know (tolerance
     /// discipline).

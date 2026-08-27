@@ -64,6 +64,10 @@ string_id!(
     EffectId
 );
 string_id!(
+    #[doc = "One durable pre-image checkpoint for a workspace mutation."]
+    CheckpointId
+);
+string_id!(
     #[doc = "A history-tree node."]
     NodeId
 );

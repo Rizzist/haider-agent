@@ -6859,6 +6859,37 @@ impl JournalSink for PreDispatchCrashJournal {
         .append(payload)
         .await
     }
+
+    fn supports_checkpoint_batches(&self) -> bool {
+        true
+    }
+
+    fn supports_checkpoint_artifacts(&self) -> bool {
+        true
+    }
+
+    async fn put_checkpoint_artifact(
+        &mut self,
+        bytes: &[u8],
+    ) -> ToolResult<haider_protocol::ids::ArtifactRef> {
+        self.context
+            .store
+            .put_artifact(bytes.to_vec())
+            .await
+            .map_err(|error| ToolError::cas(error.message))
+    }
+
+    async fn append_checkpointed(
+        &mut self,
+        outcome: EventPayload,
+        checkpoint: EventPayload,
+    ) -> ToolResult<()> {
+        TestHubJournal {
+            context: self.context.clone(),
+        }
+        .append_checkpointed(outcome, checkpoint)
+        .await
+    }
 }
 
 #[async_trait]
@@ -7300,40 +7331,78 @@ struct TestHubJournal {
     context: WorkerToolContext,
 }
 
-#[async_trait]
-impl JournalSink for TestHubJournal {
-    async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
-        let mut envelopes = [EventEnvelope {
-            schema_version: SCHEMA_VERSION,
-            event_id: self.context.event_ids.next(),
-            seq: 0,
-            session_id: self.context.store.session_id().clone(),
-            branch_id: None,
-            run_id: Some(self.context.run_id.clone()),
-            agent_id: None,
-            device_id: self.context.device_id.clone(),
-            authority_epoch: 0,
-            worker_generation: self.context.store.worker_generation(),
-            causation_id: None,
-            correlation_id: None,
-            committed_at_ms: 0,
-            render: RenderTargets {
-                ui: true,
-                durable: true,
-                prompt: PromptRender::Omit,
-            },
-            payload: serde_json::to_value(payload).map_err(|error| {
-                haider_tools::ToolError::Runtime {
-                    message: error.to_string(),
-                }
-            })?,
-        }];
+impl TestHubJournal {
+    async fn append_payloads(&self, payloads: Vec<EventPayload>) -> ToolResult<()> {
+        let mut envelopes = payloads
+            .into_iter()
+            .map(|payload| {
+                Ok(EventEnvelope {
+                    schema_version: SCHEMA_VERSION,
+                    event_id: self.context.event_ids.next(),
+                    seq: 0,
+                    session_id: self.context.store.session_id().clone(),
+                    branch_id: None,
+                    run_id: Some(self.context.run_id.clone()),
+                    agent_id: None,
+                    device_id: self.context.device_id.clone(),
+                    authority_epoch: 0,
+                    worker_generation: self.context.store.worker_generation(),
+                    causation_id: None,
+                    correlation_id: None,
+                    committed_at_ms: 0,
+                    render: RenderTargets {
+                        ui: true,
+                        durable: true,
+                        prompt: PromptRender::Omit,
+                    },
+                    payload: serde_json::to_value(payload).map_err(|error| {
+                        haider_tools::ToolError::Runtime {
+                            message: error.to_string(),
+                        }
+                    })?,
+                })
+            })
+            .collect::<ToolResult<Vec<_>>>()?;
         StoreHandle::append(&self.context.store, &mut envelopes)
             .await
             .map_err(|error| haider_tools::ToolError::Runtime {
                 message: error.message,
             })?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl JournalSink for TestHubJournal {
+    async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
+        self.append_payloads(vec![payload]).await
+    }
+
+    fn supports_checkpoint_batches(&self) -> bool {
+        true
+    }
+
+    fn supports_checkpoint_artifacts(&self) -> bool {
+        true
+    }
+
+    async fn put_checkpoint_artifact(
+        &mut self,
+        bytes: &[u8],
+    ) -> ToolResult<haider_protocol::ids::ArtifactRef> {
+        self.context
+            .store
+            .put_artifact(bytes.to_vec())
+            .await
+            .map_err(|error| ToolError::cas(error.message))
+    }
+
+    async fn append_checkpointed(
+        &mut self,
+        outcome: EventPayload,
+        checkpoint: EventPayload,
+    ) -> ToolResult<()> {
+        self.append_payloads(vec![outcome, checkpoint]).await
     }
 }
 

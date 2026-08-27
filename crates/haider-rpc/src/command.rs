@@ -116,6 +116,26 @@ pub const COMMANDS: &[CommandSpec] = &[
         "[new|name]",
     ),
     session_client_cmd(
+        "undo",
+        "Undo the latest durable file checkpoint",
+        "[last|id]",
+    ),
+    session_client_cmd(
+        "redo",
+        "Redo the latest undone file checkpoint",
+        "[last|id]",
+    ),
+    session_client_cmd(
+        "checkpoints",
+        "List durable file checkpoints for this branch",
+        "",
+    ),
+    session_client_cmd(
+        "rollback",
+        "Roll back every file edit from one turn",
+        "[current|previous|run-id]",
+    ),
+    session_client_cmd(
         "attach",
         "Attach a file — image or UTF-8 text, uploaded now, rides your next message",
         "<path>",

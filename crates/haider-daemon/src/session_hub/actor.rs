@@ -447,6 +447,33 @@ pub(super) async fn run_session_actor(
                 }
                 let _ = completed.send(result);
             }
+            ActorCommand::CommitCheckpoint { command, completed } => {
+                let result = store.commit_checkpoint_command(command).await;
+                if let Ok(CheckpointCommitOutcome::Committed { envelopes, .. }) = &result {
+                    if let Some(last) = envelopes.last() {
+                        head = last.seq;
+                        authority_epoch = last.authority_epoch;
+                    }
+                    observer.observe(HubObservation::Persisted {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                    let envelopes = Arc::<[RawEnvelope]>::from(envelopes.clone());
+                    pipe_sidecar.enqueue(Arc::clone(&envelopes));
+                    publish(
+                        &mut attachments,
+                        &envelopes,
+                        catch_up_byte_budget,
+                        &metrics,
+                        &hooks,
+                    );
+                    observer.observe(HubObservation::Published {
+                        session_id: session_id.clone(),
+                        through_seq: head,
+                    });
+                }
+                let _ = completed.send(result);
+            }
             ActorCommand::SelectModel { command, completed } => {
                 // The metadata update, model_selected fact, and R2 receipt
                 // are one transaction. Only the committed fact is

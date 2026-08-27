@@ -45,15 +45,18 @@
 //!   after the outcome append succeeds; daemon reconstruction replays those
 //!   same session-scoped outcomes before the next turn creates its dispatcher.
 
+use crate::checkpoint::{CheckpointCapture, FreezeCheckpointInput, freeze_checkpoint};
+use crate::filesystem::CasSink;
 use crate::process::ProcessRegistry;
 use crate::{ComputerCancelToken, MobileCancelToken, ToolError, ToolResult};
 use async_trait::async_trait;
 use haider_protocol::EventPayload;
+use haider_protocol::checkpoint::CheckpointRecorded;
 use haider_protocol::effect::{
     AuthorizationSource, AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome,
     EffectPhase, FileFreshness, WorkspaceMutation,
 };
-use haider_protocol::ids::{EffectId, MenuId, SessionId, WorkspaceRevision};
+use haider_protocol::ids::{ArtifactRef, EffectId, MenuId, SessionId, WorkspaceRevision};
 use haider_protocol::menu::{DecisionKind, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -85,6 +88,41 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[async_trait]
 pub trait JournalSink: Send {
     async fn append(&mut self, payload: EventPayload) -> ToolResult<()>;
+
+    /// Declares support for committing an outcome/checkpoint pair atomically.
+    /// The broker checks this before a filesystem worker can mutate bytes.
+    fn supports_checkpoint_batches(&self) -> bool {
+        false
+    }
+
+    /// Declares support for the journal-owned checkpoint CAS fallback used by
+    /// the compatibility mutation entry points that do not receive a CAS.
+    fn supports_checkpoint_artifacts(&self) -> bool {
+        false
+    }
+
+    /// Durably freezes one checkpoint pre-image and returns its content
+    /// address. A successful return promises that a later restore can resolve
+    /// the artifact independently of this sink value.
+    async fn put_checkpoint_artifact(&mut self, _bytes: &[u8]) -> ToolResult<ArtifactRef> {
+        Err(ToolError::cas(
+            "journal sink does not support checkpoint artifact storage",
+        ))
+    }
+
+    /// Appends a terminal mutation outcome and its checkpoint as one durable
+    /// unit. Implementations that cannot make the pair atomic must fail before
+    /// recording either payload; a sequential fallback could strand a durable
+    /// outcome without the checkpoint required to reverse it.
+    async fn append_checkpointed(
+        &mut self,
+        _outcome: EventPayload,
+        _checkpoint: EventPayload,
+    ) -> ToolResult<()> {
+        Err(ToolError::journal(
+            "journal sink does not support atomic checkpoint batches",
+        ))
+    }
 }
 
 /// Effects reconciled during an orderly broker shutdown.
@@ -499,11 +537,66 @@ impl BrokerJournal {
             .clone()
     }
 
+    async fn require_checkpoint_support(&self, external_cas: bool) -> ToolResult<()> {
+        let sink = self.sink.lock().await;
+        if !sink.supports_checkpoint_batches() {
+            return Err(ToolError::journal(
+                "journal sink cannot atomically commit filesystem checkpoints",
+            ));
+        }
+        if !external_cas && !sink.supports_checkpoint_artifacts() {
+            return Err(ToolError::cas(
+                "journal sink cannot durably freeze filesystem checkpoints",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn freeze_checkpoint(
+        &self,
+        input: FreezeCheckpointInput,
+        capture: CheckpointCapture,
+    ) -> ToolResult<CheckpointRecorded> {
+        let mut sink = self.sink.lock().await;
+        let mut cas = JournalCheckpointCas { sink: &mut **sink };
+        freeze_checkpoint(&mut cas, input, capture).await
+    }
+
     async fn append_phase(&self, phase: EffectPhase) -> ToolResult<()> {
         self.sink
             .lock()
             .await
             .append(EventPayload::Effect(phase.clone()))
+            .await?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let EffectPhase::Outcome {
+            freshness: Some(freshness),
+            ..
+        } = &phase
+        {
+            state
+                .freshness
+                .insert(PathBuf::from(&freshness.path), freshness.digest.clone());
+        }
+        state.journaled_phases.push(phase);
+        Ok(())
+    }
+
+    async fn append_phase_with_checkpoint(
+        &self,
+        phase: EffectPhase,
+        checkpoint: CheckpointRecorded,
+    ) -> ToolResult<()> {
+        self.sink
+            .lock()
+            .await
+            .append_checkpointed(
+                EventPayload::Effect(phase.clone()),
+                EventPayload::CheckpointRecorded(checkpoint),
+            )
             .await?;
         let mut state = self
             .state
@@ -741,10 +834,30 @@ impl BrokerJournal {
         let Some(claim) = self.claim_terminal(intent)? else {
             return result;
         };
-        match claim.append(outcome, freshness, workspace_mutation).await {
+        match claim
+            .append(outcome, freshness, workspace_mutation, None)
+            .await
+        {
             Ok(()) => result,
             Err(error) => Err(error),
         }
+    }
+}
+
+struct JournalCheckpointCas<'a> {
+    sink: &'a mut dyn JournalSink,
+}
+
+#[async_trait]
+impl CasSink for JournalCheckpointCas<'_> {
+    async fn put(&mut self, bytes: &[u8]) -> ToolResult<ArtifactRef> {
+        self.sink.put_checkpoint_artifact(bytes).await
+    }
+
+    async fn put_file(&mut self, path: &Path) -> ToolResult<ArtifactRef> {
+        let bytes = fs::read(path)
+            .map_err(|error| ToolError::io("read journal checkpoint artifact", path, error))?;
+        self.put(&bytes).await
     }
 }
 
@@ -776,6 +889,7 @@ impl TerminalClaim {
         outcome: EffectOutcome,
         freshness: Option<FileFreshness>,
         workspace_mutation: Option<WorkspaceMutation>,
+        checkpoint: Option<CheckpointRecorded>,
     ) -> ToolResult<()> {
         self.dispatched = true;
         let phase = EffectPhase::Outcome {
@@ -784,7 +898,15 @@ impl TerminalClaim {
             freshness,
             workspace_mutation,
         };
-        match self.journal.append_phase(phase).await {
+        let appended = match checkpoint {
+            Some(checkpoint) => {
+                self.journal
+                    .append_phase_with_checkpoint(phase, checkpoint)
+                    .await
+            }
+            None => self.journal.append_phase(phase).await,
+        };
+        match appended {
             Ok(()) => {
                 self.journal.mark_outcome(&self.effect);
                 self.settled = true;
@@ -828,6 +950,14 @@ impl FinalizerObserver {
 }
 
 impl EffectFinish {
+    pub(crate) async fn freeze_checkpoint(
+        &self,
+        input: FreezeCheckpointInput,
+        capture: CheckpointCapture,
+    ) -> ToolResult<CheckpointRecorded> {
+        self.journal.freeze_checkpoint(input, capture).await
+    }
+
     #[allow(dead_code)]
     pub(crate) async fn finish<T>(self, result: ToolResult<T>) -> ToolResult<T> {
         self.journal
@@ -857,12 +987,37 @@ impl EffectFinish {
             .await
     }
 
+    pub(crate) async fn finish_with_checkpoint<T>(
+        self,
+        result: ToolResult<T>,
+        freshness: Option<FileFreshness>,
+        workspace_mutation: Option<WorkspaceMutation>,
+        checkpoint: Option<CheckpointRecorded>,
+    ) -> ToolResult<T> {
+        let outcome = match &result {
+            Ok(_) => EffectOutcome::Ok,
+            Err(error) => EffectOutcome::Failed {
+                error: error.to_string(),
+            },
+        };
+        let Some(claim) = self.journal.claim_terminal(&self.intent)? else {
+            return result;
+        };
+        match claim
+            .append(outcome, freshness, workspace_mutation, checkpoint)
+            .await
+        {
+            Ok(()) => result,
+            Err(error) => Err(error),
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) async fn finish_outcome(self, outcome: EffectOutcome) -> ToolResult<()> {
         let Some(claim) = self.journal.claim_terminal(&self.intent)? else {
             return Ok(());
         };
-        claim.append(outcome, None, None).await
+        claim.append(outcome, None, None, None).await
     }
 
     pub(crate) async fn finish_outcome_with_workspace_mutation(
@@ -873,7 +1028,7 @@ impl EffectFinish {
         let Some(claim) = self.journal.claim_terminal(&self.intent)? else {
             return Ok(());
         };
-        claim.append(outcome, None, workspace_mutation).await
+        claim.append(outcome, None, workspace_mutation, None).await
     }
 }
 
@@ -1551,6 +1706,10 @@ impl EffectBroker {
         }
     }
 
+    pub(crate) async fn require_checkpoint_support(&self, external_cas: bool) -> ToolResult<()> {
+        self.journal.require_checkpoint_support(external_cas).await
+    }
+
     pub(crate) fn register_finalizer<F>(&mut self, finalizer: F) -> u64
     where
         F: Future<Output = Option<ToolError>> + Send + 'static,
@@ -1587,7 +1746,9 @@ impl EffectBroker {
     ) -> (u64, tokio::sync::oneshot::Receiver<ToolResult<()>>) {
         let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
         let id = self.register_finalizer(async move {
-            let result = claim.append(outcome, freshness, workspace_mutation).await;
+            let result = claim
+                .append(outcome, freshness, workspace_mutation, None)
+                .await;
             let error = result.as_ref().err().cloned();
             let _ = result_sender.send(result);
             error

@@ -29,6 +29,33 @@ impl JournalSink for RecordingJournal {
         self.payloads.push(payload);
         Ok(())
     }
+
+    fn supports_checkpoint_batches(&self) -> bool {
+        true
+    }
+
+    fn supports_checkpoint_artifacts(&self) -> bool {
+        true
+    }
+
+    async fn put_checkpoint_artifact(
+        &mut self,
+        bytes: &[u8],
+    ) -> ToolResult<haider_protocol::ids::ArtifactRef> {
+        Ok(haider_protocol::ids::ArtifactRef::new(format!(
+            "blake3:{}",
+            blake3::hash(bytes).to_hex()
+        )))
+    }
+
+    async fn append_checkpointed(
+        &mut self,
+        outcome: EventPayload,
+        checkpoint: EventPayload,
+    ) -> ToolResult<()> {
+        self.payloads.extend([outcome, checkpoint]);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1011,6 +1038,36 @@ impl JournalSink for SharedJournal {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(payload);
+        Ok(())
+    }
+
+    fn supports_checkpoint_batches(&self) -> bool {
+        true
+    }
+
+    fn supports_checkpoint_artifacts(&self) -> bool {
+        true
+    }
+
+    async fn put_checkpoint_artifact(
+        &mut self,
+        bytes: &[u8],
+    ) -> ToolResult<haider_protocol::ids::ArtifactRef> {
+        Ok(haider_protocol::ids::ArtifactRef::new(format!(
+            "blake3:{}",
+            blake3::hash(bytes).to_hex()
+        )))
+    }
+
+    async fn append_checkpointed(
+        &mut self,
+        outcome: EventPayload,
+        checkpoint: EventPayload,
+    ) -> ToolResult<()> {
+        self.payloads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend([outcome, checkpoint]);
         Ok(())
     }
 }

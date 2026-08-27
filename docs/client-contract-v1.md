@@ -203,7 +203,7 @@ An operation not listed here is part of the v1 base surface. “Field” means t
 client may use that field only when it is present; the named token permits an
 affordance before the response exists.
 
-The ordinary v0.0.963 `welcome_features()` set contains all 94 tokens below.
+The ordinary v0.0.964 `welcome_features()` set contains all 95 tokens below.
 The re-verification anchors are
 `crates/haider-daemon/src/connection.rs:1871-1968` for the assembled set and
 `crates/haider-rpc/src/frame.rs:249-527` for the exact string constants. The
@@ -223,6 +223,7 @@ one peer-specific withholding exception is §4.1.
 | `fallback_chain_v1` | durable fallback-lane events and next-lane continuation; no separate method |
 | `compaction_guard_v1` | durable compaction-guard/promotion events; no separate method |
 | `artifact_put_v1` | `artifact.put` |
+| `checkpoint_v1` | durable `CheckpointRecorded` facts plus `checkpoint.list`, `checkpoint.undo`, `checkpoint.redo`, and `checkpoint.rollback_turn` |
 | `branch_create_v1` | `branch.create`, branch-scoped submit/compact fields and responses |
 | `session_fork_v1` | `session.fork`, `session.metafork` |
 | `session_observe_v1` | `session.observe` |
@@ -436,6 +437,10 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | `loom.watch` | `LoomWatch` then registry stream frames | archive-aware baseline and persist-before-publish delta suffix |
 | `workflow.graph.state` | `WorkflowGraphState` | indexed typed activation snapshot; optional `graph_id` selects an exact graph |
 | `workflow.graph.watch` | `WorkflowGraphWatch` | bounded durable activation-event replay strictly after the applied cursor |
+| `checkpoint.list` | `CheckpointList` | cursor-paged newest-first snapshot scoped to one session and branch |
+| `checkpoint.undo` | `CheckpointUndo` | idempotent durable guarded mutation receipt |
+| `checkpoint.redo` | `CheckpointRedo` | idempotent durable guarded mutation receipt |
+| `checkpoint.rollback_turn` | `CheckpointRollbackTurn` | atomic reverse-order guarded turn rollback receipt |
 | `vault.stage` | `VaultStage` | connection-local ephemeral dedupe, deliberately not durable |
 | `account.login_api`, `account.oauth_import`, `account.import_device`, `account.add`, `account.set_active`, `account.remove`, `account.set_default_model` | same-named response | durable account mutation |
 | `account.oauth_start`, `account.oauth_status`, `account.oauth_cancel`, `account.oauth_import_sources`, `account.device_candidates` | same-named response | connection-bound flow/catalog reads/actions |
@@ -447,7 +452,7 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 The golden matrix at
 `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`, combined
 with the historical `wire_transcript.json`, pins a request and successful
-response for every one of the 99 v1 request methods. `menu.answer` and resident
+response for every one of the 103 v1 request methods. `menu.answer` and resident
 binding are top-level frames, not `RequestBody` methods.
 
 ### 5.3 Advertised runtime with no client method
@@ -2412,8 +2417,8 @@ The machine-checkable contract lives in these fixtures/tests:
   receipts; the appended monitor and Loom registry delta/caught-up entries pin
   both dedicated non-chat streams. The exact current transcript count is 133.
 - `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`: the
-  59 methods added after the historical matrix, completing its 40 with golden
-  request and successful response coverage for all 99 request methods and all
+  63 methods added after the historical matrix, completing its 40 with golden
+  request and successful response coverage for all 103 request methods and all
   five command dynamic slots.
 - `crates/haider-rpc/tests/fixtures/snapshot_availability_compat_v1.json`:
   old and new account/provider/usage response bytes.
@@ -2525,7 +2530,53 @@ Absence laws:
   protocol/feature skew `76`, blocked or budget-exhausted `77`, and explicit
   user cancellation `130`.
 
-### 15.4 Prompt-cache cohort key v3
+### 15.4 v0.0.964 checkpoint contract
+
+`checkpoint_v1` exposes the daemon's durable pre-images for agent filesystem
+mutations. A `CheckpointRecorded` raw event follows the matching terminal
+`FsWrite` effect outcome in the same append. Its key binds session, branch,
+run, effect/tool-call, journal sequence, and store-stamped workspace revision.
+Each relative path carries its exact pre-image CAS artifact and digest, its
+post digest, or the explicit absent marker (`pre_artifact` and `pre_digest`
+both absent). Pre-images are bounded to 8 MiB per file. An over-limit or
+unsupported directory image has no artifact and MUST carry
+`truncated_reason`; it is not restorable and is never represented as absence.
+Session forks do not inherit `CheckpointRecorded` facts: restore coordinates
+and their CAS roots remain owned by the source session, even when ordinary
+conversational history is copied into the child.
+
+`checkpoint.list` is a View read, scoped to an exact session and branch, and
+returns at most 100 records newest first. Its sequence cursor is exclusive.
+`checkpoint.undo` and `checkpoint.redo` are Control commands with a durable
+`command_id` and `worker_generation` fence. Their target is a checkpoint id or
+`"last"`; a new mutation also requires an idle session and is serialized
+against turn admission. Undo requires every current path digest to equal the
+selected checkpoint's post digest. Redo selects the append-only undo/rollback
+checkpoint and requires its post digest, restoring the exact bytes re-frozen
+when undo ran. A mismatch returns `checkpoint_conflict` with typed expected
+and current digests. A checkpoint id owned by another branch returns
+`checkpoint_branch_mismatch`; the daemon never retargets it.
+
+`checkpoint.rollback_turn` takes a `run_id`, resolves every checkpoint from
+that run on the requested branch newest first, verifies the complete composed
+path plan, and publishes no restoration if any preflight digest conflicts.
+The typed rollback conflict reports both verified and conflicting paths.
+Undo, redo, and rollback are themselves `FsWrite` effects and append a fresh
+`CheckpointRecorded` fact. Their post-state is never rewritten into an older
+record, and neither journal rows nor CAS objects are deleted.
+
+The exact v0.0.964 recount is 95 Welcome feature tokens and 103 request
+methods: one feature and four methods beyond v0.0.963's actual 94/99 base.
+
+**Absence law.** Without `checkpoint_v1`, a client MUST NOT call any checkpoint
+method, infer pre-images from ordinary file-change summaries, replay local
+editor history, or claim a workspace can be restored. In particular, clients
+without the bit MUST NOT fabricate undo. A static command catalog may retain
+discoverability, but invoking such a row against an unadvertised peer must
+stop locally with an unsupported-feature error and must not send a checkpoint
+request.
+
+### 15.5 Prompt-cache cohort key v3
 
 OpenAI-family prompt-cache routing uses the internal schema
 `haider.prompt-cache-cohort.v3`. The key binds the provider, model, active
@@ -2549,7 +2600,7 @@ means a fresh child cohort, not permission to reuse the parent route. Because
 this schema is not negotiated, clients must treat its absence as no routing
 authority and must not infer it from cache-hit telemetry.
 
-### 15.5 Response-open timeout budget
+### 15.6 Response-open timeout budget
 
 `provider.configure.response_open_timeout_ms` is an optional durable override
 for the time from request dispatch until an OpenAI-compatible or standard
@@ -2572,7 +2623,7 @@ means “leave the stored value unchanged.” A client must not clear a stored
 override by omission, merge this budget with connect/chunk-idle timeouts, or
 assume the transport may outlive the enclosing run deadline.
 
-### 15.6 Custom OpenAI-compatible providers (local or web)
+### 15.7 Custom OpenAI-compatible providers (local or web)
 
 A custom provider is a durable provider profile whose caller-chosen alias is
 its stable identity and model-id namespace. Haider does not route among
@@ -2664,7 +2715,7 @@ non-reconciling cache fields remain unavailable; no zero or hit rate is
 fabricated. Unknown prices remain unknown. Custom OpenAI-family turns also
 use `haider.prompt-cache-cohort.v3`; the custom alias is the account scope,
 including no-auth profiles, and all provider/model/header/cohort isolation
-laws in §15.4 apply unchanged.
+laws in §15.5 apply unchanged.
 
 **Absence law.** Missing `probe_vault_reference` means discovery has no newly
 staged key; it never means an empty key. Missing inventory timestamps/ages are
@@ -2704,6 +2755,9 @@ most dangerous thing in the room precisely because it resembles the missing one.
   does not make the daemon own or enumerate panes;
 - **[STRUCTURAL]** there is no independent current-todo snapshot; normal raw replay supplies
   the durable lifecycle;
+- **[STRUCTURAL]** a checkpoint with `truncated_reason` has no restorable
+  pre-image. Clients may display the durable limitation but must not fetch a
+  substitute, reconstruct bytes from diffs, or bypass the freshness guard;
 - **[STRUCTURAL]** `SessionSummary.account_alias` is not populated because
   **there is no per-session account binding to report**. `RequestBody` carries
   no account-selection request, session creation accepts only provider/model,

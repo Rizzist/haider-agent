@@ -6,6 +6,11 @@
 //! [`ChangeLedger`] for the later verification gate.
 
 mod broker;
+mod checkpoint;
+#[cfg(test)]
+#[path = "checkpoint_tests.rs"]
+#[allow(clippy::expect_used)]
+mod checkpoint_tests;
 mod computer;
 mod error;
 mod filesystem;
@@ -28,6 +33,11 @@ pub use broker::{
     ALLOW_SCREEN_CONTROL_SESSION_GRANT, ALLOW_SCREEN_SESSION_GRANT, AlwaysAllowRule, EffectBroker,
     EffectBrokerCloseError, EffectBrokerCloseReport, EffectOperation, JournalSink,
     PermissionPolicy, PolicyDecision, SessionGrant, SessionGrantScope,
+};
+pub use checkpoint::{
+    CheckpointCapture, CheckpointCapturePath, CheckpointRestoreError, CheckpointRestorePlan,
+    CheckpointRestoreTarget, FreezeCheckpointInput, freeze_checkpoint, restore_checkpoint_plan,
+    verify_checkpoint_restore_plan,
 };
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub use computer::ExcludeRegionScreenshotRedaction;

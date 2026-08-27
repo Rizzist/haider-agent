@@ -354,6 +354,30 @@
       "response_method": "loom.watch",
       "request": {"method":"loom.watch","after_cursor":41},
       "response": {"method":"loom.watch","watch_id":"loom-watch-1","requested_after_cursor":41,"baseline":{"through_cursor":44,"entries":[{"entry":{"kind":"agent_type","id":"reviewer","rev":3,"digest":"digest-reviewer-3","archived":true},"record":{"kind":"agent_type","record":{"id":"reviewer","name":"Reviewer","job":"Review changes","in_type":"Patch","out_type":"Verdict","clis":["rg"],"color":"#445566","glyph":"R","rev":3}}}]}}
+    },
+    {
+      "request_method": "checkpoint.list",
+      "response_method": "checkpoint.list",
+      "request": {"method":"checkpoint.list","session_id":"session-1","limit":25},
+      "response": {"method":"checkpoint.list","page":{"checkpoints":[{"checkpoint_id":"checkpoint-1","session_id":"session-1","run_id":"run-1","effect_id":"effect-1","call_id":"call-1","seq":45,"workspace_revision":"workspace-revision-1","kind":"edit","origin":"tool","paths":[{"path":"src/lib.rs","pre_artifact":"blake3:0000000000000000000000000000000000000000000000000000000000000000","pre_digest":"blake3:0000000000000000000000000000000000000000000000000000000000000000","post_digest":"blake3:1111111111111111111111111111111111111111111111111111111111111111"}],"post_digest":"blake3:2222222222222222222222222222222222222222222222222222222222222222","recorded_at_ms":1720000000000}]}}
+    },
+    {
+      "request_method": "checkpoint.undo",
+      "response_method": "checkpoint.undo",
+      "request": {"method":"checkpoint.undo","command_id":"command-checkpoint-undo","session_id":"session-1","worker_generation":7,"target":"last"},
+      "response": {"method":"checkpoint.undo","receipt":{"checkpoint":{"checkpoint_id":"checkpoint-undo-1","session_id":"session-1","run_id":"checkpoint-command:command-checkpoint-undo","effect_id":"checkpoint-effect:command-checkpoint-undo","call_id":"command-checkpoint-undo","seq":50,"workspace_revision":"workspace-revision-2","kind":"edit","origin":"undo","source_checkpoint_id":"checkpoint-1","paths":[{"path":"src/lib.rs","pre_artifact":"blake3:1111111111111111111111111111111111111111111111111111111111111111","pre_digest":"blake3:1111111111111111111111111111111111111111111111111111111111111111","post_digest":"blake3:0000000000000000000000000000000000000000000000000000000000000000"}],"post_digest":"blake3:3333333333333333333333333333333333333333333333333333333333333333","recorded_at_ms":1720000001000},"restored_checkpoint_ids":["checkpoint-1"],"worker_generation":7}}
+    },
+    {
+      "request_method": "checkpoint.redo",
+      "response_method": "checkpoint.redo",
+      "request": {"method":"checkpoint.redo","command_id":"command-checkpoint-redo","session_id":"session-1","worker_generation":7,"target":"last"},
+      "response": {"method":"checkpoint.redo","receipt":{"checkpoint":{"checkpoint_id":"checkpoint-redo-1","session_id":"session-1","run_id":"checkpoint-command:command-checkpoint-redo","effect_id":"checkpoint-effect:command-checkpoint-redo","call_id":"command-checkpoint-redo","seq":55,"workspace_revision":"workspace-revision-3","kind":"edit","origin":"redo","source_checkpoint_id":"checkpoint-undo-1","paths":[{"path":"src/lib.rs","pre_artifact":"blake3:0000000000000000000000000000000000000000000000000000000000000000","pre_digest":"blake3:0000000000000000000000000000000000000000000000000000000000000000","post_digest":"blake3:1111111111111111111111111111111111111111111111111111111111111111"}],"post_digest":"blake3:4444444444444444444444444444444444444444444444444444444444444444","recorded_at_ms":1720000002000},"restored_checkpoint_ids":["checkpoint-undo-1"],"worker_generation":7}}
+    },
+    {
+      "request_method": "checkpoint.rollback_turn",
+      "response_method": "checkpoint.rollback_turn",
+      "request": {"method":"checkpoint.rollback_turn","command_id":"command-checkpoint-rollback","session_id":"session-1","worker_generation":7,"run_id":"run-1"},
+      "response": {"method":"checkpoint.rollback_turn","receipt":{"checkpoint":{"checkpoint_id":"checkpoint-rollback-1","session_id":"session-1","run_id":"checkpoint-command:command-checkpoint-rollback","effect_id":"checkpoint-effect:command-checkpoint-rollback","call_id":"command-checkpoint-rollback","seq":60,"workspace_revision":"workspace-revision-4","kind":"edit","origin":"rollback_turn","paths":[{"path":"src/lib.rs","pre_artifact":"blake3:1111111111111111111111111111111111111111111111111111111111111111","pre_digest":"blake3:1111111111111111111111111111111111111111111111111111111111111111","post_digest":"blake3:0000000000000000000000000000000000000000000000000000000000000000"}],"post_digest":"blake3:5555555555555555555555555555555555555555555555555555555555555555","recorded_at_ms":1720000003000},"restored_checkpoint_ids":["checkpoint-1"],"worker_generation":7}}
     }
   ]
 }

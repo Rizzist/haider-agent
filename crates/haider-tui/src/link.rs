@@ -494,29 +494,29 @@ async fn issue(
         return false;
     }
     let context = CommandContext::of(&command);
-    let loom_required_features: &[&str] = match &command {
-        LiveCommand::LoomAuthorDraft { .. } | LiveCommand::LoomAuthorRevise { .. } => {
-            &[haider_rpc::FEATURE_LOOM_AUTHORING_V1]
-        }
-        LiveCommand::LoomAuthorConfirm { .. } => &[
-            haider_rpc::FEATURE_LOOM_AUTHORING_V1,
-            haider_rpc::FEATURE_LOOM_REGISTRY_CAS_V1,
-        ],
-        LiveCommand::LoomValidate { .. } => &[haider_rpc::FEATURE_LOOM_VALIDATION_V1],
-        LiveCommand::LoomArchive { .. } => &[haider_rpc::FEATURE_LOOM_REGISTRY_ARCHIVE_V1],
-        LiveCommand::LoomInstallCancel { .. } => {
-            &[haider_rpc::FEATURE_TYPED_AGENT_INSTALL_CANCEL_V1]
-        }
-        LiveCommand::LoomInstallStatus { .. } => &[haider_rpc::FEATURE_TYPED_AGENT_INSTALL_V1],
-        _ => &[],
-    };
-    let missing_loom_feature = loom_required_features
+    let missing_feature = command_required_features(&command)
         .iter()
         .copied()
         .find(|feature| !client.welcome().features.contains(*feature));
-    if let Some(feature) = missing_loom_feature {
+    if let Some(feature) = missing_feature {
         let message = format!("connected daemon does not advertise {feature}");
-        if let Some((generation, epoch)) = context.loom_authoring {
+        if matches!(
+            command,
+            LiveCommand::CheckpointList { .. }
+                | LiveCommand::CheckpointUndo { .. }
+                | LiveCommand::CheckpointRedo { .. }
+                | LiveCommand::CheckpointRollbackTurn { .. }
+        ) {
+            let _ = replies
+                .send(LiveReply::Failed {
+                    command_id: context.command_id.clone(),
+                    code: "feature_missing".into(),
+                    message,
+                    retryable: false,
+                    presentation: None,
+                })
+                .await;
+        } else if let Some((generation, epoch)) = context.loom_authoring {
             let _ = replies
                 .send(LiveReply::LoomAuthorFailed {
                     generation,
@@ -609,6 +609,32 @@ async fn issue(
     is_attach
 }
 
+/// Features checked at the final send boundary. Durable commands can survive
+/// reconnect in the outbox, so composer-time gating alone is insufficient.
+#[must_use]
+pub fn command_required_features(command: &LiveCommand) -> &'static [&'static str] {
+    match command {
+        LiveCommand::LoomAuthorDraft { .. } | LiveCommand::LoomAuthorRevise { .. } => {
+            &[haider_rpc::FEATURE_LOOM_AUTHORING_V1]
+        }
+        LiveCommand::LoomAuthorConfirm { .. } => &[
+            haider_rpc::FEATURE_LOOM_AUTHORING_V1,
+            haider_rpc::FEATURE_LOOM_REGISTRY_CAS_V1,
+        ],
+        LiveCommand::LoomValidate { .. } => &[haider_rpc::FEATURE_LOOM_VALIDATION_V1],
+        LiveCommand::LoomArchive { .. } => &[haider_rpc::FEATURE_LOOM_REGISTRY_ARCHIVE_V1],
+        LiveCommand::LoomInstallCancel { .. } => {
+            &[haider_rpc::FEATURE_TYPED_AGENT_INSTALL_CANCEL_V1]
+        }
+        LiveCommand::LoomInstallStatus { .. } => &[haider_rpc::FEATURE_TYPED_AGENT_INSTALL_V1],
+        LiveCommand::CheckpointList { .. }
+        | LiveCommand::CheckpointUndo { .. }
+        | LiveCommand::CheckpointRedo { .. }
+        | LiveCommand::CheckpointRollbackTurn { .. } => &[haider_rpc::FEATURE_CHECKPOINT_V1],
+        _ => &[],
+    }
+}
+
 /// What a response needs from its request to be interpretable (the wire
 /// deliberately does not echo, e.g., which session an attach was for).
 ///
@@ -630,6 +656,12 @@ pub struct CommandContext {
     /// id, so without this a failure cannot be correlated back to the
     /// session it wedged (review P1-5).
     attach: Option<haider_protocol::ids::SessionId>,
+    checkpoint_list: Option<(
+        haider_protocol::ids::SessionId,
+        Option<haider_protocol::ids::BranchId>,
+        Option<String>,
+        Vec<haider_protocol::ids::RunId>,
+    )>,
     /// The provider a `provider.models_refresh` was for — the request has
     /// no durable id, and its failure must land on the PROVIDER ROW, not
     /// the status-bar flash (owner bug: boot-time auto-refresh of a dead
@@ -721,6 +753,21 @@ impl CommandContext {
             },
             attach: match command {
                 LiveCommand::Attach { session, .. } => Some(session.clone()),
+                _ => None,
+            },
+            checkpoint_list: match command {
+                LiveCommand::CheckpointList {
+                    session,
+                    branch,
+                    rollback,
+                    runs,
+                    ..
+                } => Some((
+                    session.clone(),
+                    branch.clone(),
+                    rollback.clone(),
+                    runs.clone(),
+                )),
                 _ => None,
             },
             upload: match command {
@@ -989,6 +1036,57 @@ pub fn request_body_for_features(
             fork_node_id,
             fork_seq,
             name,
+        },
+        LiveCommand::CheckpointList {
+            session,
+            branch,
+            cursor,
+            rollback: _,
+            runs: _,
+        } => RequestBody::CheckpointList {
+            session_id: session,
+            branch_id: branch,
+            cursor,
+            limit: haider_protocol::checkpoint::CHECKPOINT_LIST_MAX_PAGE,
+        },
+        LiveCommand::CheckpointUndo {
+            command_id,
+            session,
+            worker_generation,
+            branch,
+            target,
+        } => RequestBody::CheckpointUndo {
+            command_id,
+            session_id: session,
+            branch_id: branch,
+            worker_generation,
+            target,
+        },
+        LiveCommand::CheckpointRedo {
+            command_id,
+            session,
+            worker_generation,
+            branch,
+            target,
+        } => RequestBody::CheckpointRedo {
+            command_id,
+            session_id: session,
+            branch_id: branch,
+            worker_generation,
+            target,
+        },
+        LiveCommand::CheckpointRollbackTurn {
+            command_id,
+            session,
+            worker_generation,
+            branch,
+            run_id,
+        } => RequestBody::CheckpointRollbackTurn {
+            command_id,
+            session_id: session,
+            branch_id: branch,
+            worker_generation,
+            run_id,
         },
         // S3: the chip composer's steer rides S1's `agent.message` wire —
         // the agent id crosses as the OPAQUE protocol id (§5.1: callsigns
@@ -1564,6 +1662,29 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 name,
             }]
         }),
+        ResponseBody::CheckpointList { page } => context.checkpoint_list.clone().map_or_else(
+            Vec::new,
+            |(session, branch, rollback, runs)| {
+                vec![LiveReply::Checkpoints {
+                    session,
+                    branch,
+                    rollback,
+                    runs,
+                    page,
+                }]
+            },
+        ),
+        ResponseBody::CheckpointUndo { receipt }
+        | ResponseBody::CheckpointRedo { receipt }
+        | ResponseBody::CheckpointRollbackTurn { receipt } => context
+            .command_id
+            .clone()
+            .map_or_else(Vec::new, |command_id| {
+                vec![LiveReply::CheckpointMutated {
+                    command_id,
+                    receipt,
+                }]
+            }),
         // S3: the delivery receipt is DAEMON truth — steer vs queued was
         // the daemon's choice, and only the flash consumes it (the rows
         // ride the journal facts on the attachment stream).

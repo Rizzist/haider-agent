@@ -49,6 +49,256 @@ fn availability_compat_fixture_path() -> PathBuf {
         .join("snapshot_availability_compat_v1.json")
 }
 
+/// MUTATION CHECK: rename a checkpoint error kind/field or either public
+/// literal. Expected runtime failure: typed clients lose the coordinates
+/// needed to present freshness and cross-branch refusals without prose parsing.
+#[test]
+fn checkpoint_error_codes_and_typed_coordinates_are_pinned() {
+    assert_eq!(
+        [
+            haider_rpc::ERROR_CODE_CHECKPOINT_CONFLICT,
+            haider_rpc::ERROR_CODE_CHECKPOINT_BRANCH_MISMATCH,
+        ],
+        ["checkpoint_conflict", "checkpoint_branch_mismatch"]
+    );
+    assert_eq!(
+        serde_json::to_value(ErrorData::CheckpointConflict {
+            conflict: haider_protocol::checkpoint::CheckpointConflict {
+                path: "src/lib.rs".into(),
+                expected_digest: Some("blake3:expected".into()),
+                current_digest: Some("blake3:current".into()),
+            },
+        })
+        .expect("encode checkpoint conflict"),
+        serde_json::json!({
+            "kind": "checkpoint_conflict",
+            "conflict": {
+                "path": "src/lib.rs",
+                "expected_digest": "blake3:expected",
+                "current_digest": "blake3:current"
+            }
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(ErrorData::CheckpointRollbackConflict {
+            conflict: haider_protocol::checkpoint::CheckpointRollbackConflict {
+                verified: vec!["src/ok.rs".into()],
+                conflicts: vec![haider_protocol::checkpoint::CheckpointConflict {
+                    path: "src/foreign.rs".into(),
+                    expected_digest: None,
+                    current_digest: Some("blake3:foreign".into()),
+                }],
+            },
+        })
+        .expect("encode checkpoint rollback conflict"),
+        serde_json::json!({
+            "kind": "checkpoint_rollback_conflict",
+            "conflict": {
+                "verified": ["src/ok.rs"],
+                "conflicts": [{
+                    "path": "src/foreign.rs",
+                    "current_digest": "blake3:foreign"
+                }]
+            }
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(ErrorData::CheckpointBranchMismatch {
+            checkpoint_id: haider_protocol::ids::CheckpointId::new("checkpoint-other"),
+            checkpoint_branch_id: Some(haider_protocol::ids::BranchId::new("branch-other")),
+            requested_branch_id: None,
+        })
+        .expect("encode checkpoint branch mismatch"),
+        serde_json::json!({
+            "kind": "checkpoint_branch_mismatch",
+            "checkpoint_id": "checkpoint-other",
+            "checkpoint_branch_id": "branch-other"
+        })
+    );
+}
+
+/// MUTATION CHECK: remove or rename any optional checkpoint coordinate.
+/// Expected runtime failure: the complete list/checkpoint JSON no longer
+/// matches this additive v0.0.964 field pin.
+#[test]
+fn checkpoint_list_and_record_optional_fields_are_pinned() {
+    let request = RequestBody::CheckpointList {
+        session_id: haider_protocol::ids::SessionId::new("session-checkpoint-wire"),
+        branch_id: Some(haider_protocol::ids::BranchId::new(
+            "branch-checkpoint-wire",
+        )),
+        cursor: Some(haider_protocol::checkpoint::CheckpointCursor(41)),
+        limit: 25,
+    };
+    assert_eq!(
+        serde_json::to_value(request).expect("encode checkpoint list request"),
+        serde_json::json!({
+            "method": "checkpoint.list",
+            "session_id": "session-checkpoint-wire",
+            "branch_id": "branch-checkpoint-wire",
+            "cursor": 41,
+            "limit": 25
+        })
+    );
+    for (request, expected) in [
+        (
+            RequestBody::CheckpointUndo {
+                command_id: haider_rpc::CommandId::new("checkpoint-undo-wire"),
+                session_id: haider_protocol::ids::SessionId::new("session-checkpoint-wire"),
+                branch_id: Some(haider_protocol::ids::BranchId::new(
+                    "branch-checkpoint-wire",
+                )),
+                worker_generation: 7,
+                target: "last".into(),
+            },
+            serde_json::json!({
+                "method": "checkpoint.undo",
+                "command_id": "checkpoint-undo-wire",
+                "session_id": "session-checkpoint-wire",
+                "branch_id": "branch-checkpoint-wire",
+                "worker_generation": 7,
+                "target": "last"
+            }),
+        ),
+        (
+            RequestBody::CheckpointRedo {
+                command_id: haider_rpc::CommandId::new("checkpoint-redo-wire"),
+                session_id: haider_protocol::ids::SessionId::new("session-checkpoint-wire"),
+                branch_id: Some(haider_protocol::ids::BranchId::new(
+                    "branch-checkpoint-wire",
+                )),
+                worker_generation: 8,
+                target: "checkpoint-source-wire".into(),
+            },
+            serde_json::json!({
+                "method": "checkpoint.redo",
+                "command_id": "checkpoint-redo-wire",
+                "session_id": "session-checkpoint-wire",
+                "branch_id": "branch-checkpoint-wire",
+                "worker_generation": 8,
+                "target": "checkpoint-source-wire"
+            }),
+        ),
+        (
+            RequestBody::CheckpointRollbackTurn {
+                command_id: haider_rpc::CommandId::new("checkpoint-rollback-wire"),
+                session_id: haider_protocol::ids::SessionId::new("session-checkpoint-wire"),
+                branch_id: Some(haider_protocol::ids::BranchId::new(
+                    "branch-checkpoint-wire",
+                )),
+                worker_generation: 9,
+                run_id: haider_protocol::ids::RunId::new("run-checkpoint-wire"),
+            },
+            serde_json::json!({
+                "method": "checkpoint.rollback_turn",
+                "command_id": "checkpoint-rollback-wire",
+                "session_id": "session-checkpoint-wire",
+                "branch_id": "branch-checkpoint-wire",
+                "worker_generation": 9,
+                "run_id": "run-checkpoint-wire"
+            }),
+        ),
+    ] {
+        assert_eq!(
+            serde_json::to_value(request).expect("encode checkpoint mutation request"),
+            expected
+        );
+    }
+
+    let record = haider_protocol::checkpoint::CheckpointRecorded {
+        checkpoint_id: haider_protocol::ids::CheckpointId::new("checkpoint-wire"),
+        session_id: haider_protocol::ids::SessionId::new("session-checkpoint-wire"),
+        branch_id: Some(haider_protocol::ids::BranchId::new(
+            "branch-checkpoint-wire",
+        )),
+        run_id: haider_protocol::ids::RunId::new("run-checkpoint-wire"),
+        effect_id: haider_protocol::ids::EffectId::new("effect-checkpoint-wire"),
+        call_id: "call-checkpoint-wire".into(),
+        seq: 42,
+        workspace_revision: Some(haider_protocol::ids::WorkspaceRevision::new(
+            "workspace-revision-wire",
+        )),
+        kind: haider_protocol::checkpoint::CheckpointKind::Move,
+        origin: haider_protocol::checkpoint::CheckpointOrigin::Undo,
+        source_checkpoint_id: Some(haider_protocol::ids::CheckpointId::new(
+            "checkpoint-source-wire",
+        )),
+        paths: vec![
+            haider_protocol::checkpoint::CheckpointPath {
+                path: "src/from.rs".into(),
+                pre_artifact: Some(haider_protocol::ids::ArtifactRef::new("blake3:artifact")),
+                pre_digest: Some("blake3:pre".into()),
+                post_digest: None,
+                truncated_reason: None,
+            },
+            haider_protocol::checkpoint::CheckpointPath {
+                path: "src/large.rs".into(),
+                pre_artifact: None,
+                pre_digest: Some("blake3:large".into()),
+                post_digest: Some("blake3:large-post".into()),
+                truncated_reason: Some("pre-image exceeds 8388608 bytes".into()),
+            },
+        ],
+        post_digest: "blake3:aggregate".into(),
+        recorded_at_ms: 1_720_000_000_000,
+    };
+    let event = serde_json::to_value(haider_protocol::EventPayload::CheckpointRecorded(
+        record.clone(),
+    ))
+    .expect("encode checkpoint event discriminant");
+    assert_eq!(
+        event.get("type").and_then(Value::as_str),
+        Some("checkpoint_recorded")
+    );
+    assert_eq!(
+        event.get("checkpoint_id").and_then(Value::as_str),
+        Some("checkpoint-wire")
+    );
+    let response = ResponseBody::CheckpointList {
+        page: haider_protocol::checkpoint::CheckpointListPage {
+            checkpoints: vec![record],
+            next_cursor: Some(haider_protocol::checkpoint::CheckpointCursor(42)),
+        },
+    };
+    assert_eq!(
+        serde_json::to_value(response).expect("encode complete checkpoint page"),
+        serde_json::json!({
+            "method": "checkpoint.list",
+            "page": {
+                "checkpoints": [{
+                    "checkpoint_id": "checkpoint-wire",
+                    "session_id": "session-checkpoint-wire",
+                    "branch_id": "branch-checkpoint-wire",
+                    "run_id": "run-checkpoint-wire",
+                    "effect_id": "effect-checkpoint-wire",
+                    "call_id": "call-checkpoint-wire",
+                    "seq": 42,
+                    "workspace_revision": "workspace-revision-wire",
+                    "kind": "move",
+                    "origin": "undo",
+                    "source_checkpoint_id": "checkpoint-source-wire",
+                    "paths": [
+                        {
+                            "path": "src/from.rs",
+                            "pre_artifact": "blake3:artifact",
+                            "pre_digest": "blake3:pre"
+                        },
+                        {
+                            "path": "src/large.rs",
+                            "pre_digest": "blake3:large",
+                            "post_digest": "blake3:large-post",
+                            "truncated_reason": "pre-image exceeds 8388608 bytes"
+                        }
+                    ],
+                    "post_digest": "blake3:aggregate",
+                    "recorded_at_ms": 1720000000000_u64
+                }],
+                "next_cursor": 42
+            }
+        })
+    );
+}
+
 /// MUTATION CHECK: the configure probe reference is an additive, optional
 /// field and the typed failure/add-method variants keep their exact spellings.
 #[test]
@@ -268,6 +518,10 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "agent.message",
         "artifact.put",
         "branch.create",
+        "checkpoint.list",
+        "checkpoint.redo",
+        "checkpoint.rollback_turn",
+        "checkpoint.undo",
         "command.invoke",
         "command.list",
         "computer.permission_open_settings",
@@ -357,8 +611,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         expected_methods.len(),
-        99,
-        "the v1 contract covers all 86 prior and 13 v0.0.963 request methods"
+        103,
+        "the v1 contract covers all 99 prior and 4 v0.0.964 checkpoint methods"
     );
     assert_eq!(
         request_methods_declared_in_source(),
