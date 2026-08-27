@@ -203,10 +203,10 @@ An operation not listed here is part of the v1 base surface. “Field” means t
 client may use that field only when it is present; the named token permits an
 affordance before the response exists.
 
-The ordinary v0.0.964 `welcome_features()` set contains all 95 tokens below.
+The ordinary v0.0.964 `welcome_features()` set contains all 96 tokens below.
 The re-verification anchors are
-`crates/haider-daemon/src/connection.rs:1871-1968` for the assembled set and
-`crates/haider-rpc/src/frame.rs:249-527` for the exact string constants. The
+`crates/haider-daemon/src/connection.rs:1872-1969` for the assembled set and
+`crates/haider-rpc/src/frame.rs:261-541` for the exact string constants. The
 one peer-specific withholding exception is §4.1.
 
 | Feature token | Methods, frames, or fields it publishes |
@@ -223,7 +223,6 @@ one peer-specific withholding exception is §4.1.
 | `fallback_chain_v1` | durable fallback-lane events and next-lane continuation; no separate method |
 | `compaction_guard_v1` | durable compaction-guard/promotion events; no separate method |
 | `artifact_put_v1` | `artifact.put` |
-| `checkpoint_v1` | durable `CheckpointRecorded` facts plus `checkpoint.list`, `checkpoint.undo`, `checkpoint.redo`, and `checkpoint.rollback_turn` |
 | `branch_create_v1` | `branch.create`, branch-scoped submit/compact fields and responses |
 | `session_fork_v1` | `session.fork`, `session.metafork` |
 | `session_observe_v1` | `session.observe` |
@@ -251,7 +250,6 @@ one peer-specific withholding exception is §4.1.
 | `account_rotation_v1` | live same-provider active-account rotation behavior |
 | `account_list_watch_v1` | `account.list_watch`, `AccountsChanged` |
 | `account_label_v1` | `account.set_label`, descriptor `label` |
-| `account_identity_v1` | additive descriptor `account_identity` and `created_at_ms`, `account.refresh`, and typed local-login adoption notices |
 | `provider_management_v1` | `provider.list` |
 | `provider_configure_v1` | `provider.configure` |
 | `provider_remove_v1` | `provider.remove` |
@@ -307,13 +305,15 @@ one peer-specific withholding exception is §4.1.
 | `export_seq_v1` | CLI export `seq`, `head_seq`, and exact `--since`; no RPC method |
 | `pipe_native_v2` | `session.pipe_path` plus v2-or-newer native sidecar laws (current file version is 6) |
 | `pipe_tool_status_v1` | typed `status` on native-pipe tool rows and the explicit `status=` coordinate in pipe-style tool lines |
+| `account_identity_v1` | additive descriptor `account_identity` and `created_at_ms`, `account.refresh`, and typed local-login adoption notices |
+| `checkpoint_v1` | durable `CheckpointRecorded` facts plus `checkpoint.list`, `checkpoint.undo`, `checkpoint.redo`, and `checkpoint.rollback_turn` |
 
 ### 4.1 The one feature with an explicit withheld marker
 
 Normally a feature token means “this daemon implements the named surface,” so
 its absence reads as unimplemented. `FEATURE_USER_COMMAND_V1`
 (`"user_command_v1"`) is the sole exception. In
-`crates/haider-daemon/src/connection.rs:1967-1987`, `encode_welcome_for_peer`
+`crates/haider-daemon/src/connection.rs:1982-2002`, `encode_welcome_for_peer`
 removes only this token and retries the otherwise unchanged `Welcome` when
 advertising that token is exactly what pushes the frame past the peer's
 receive-frame limit. Every other encoding failure remains fatal. The reason
@@ -438,27 +438,23 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | `loom.watch` | `LoomWatch` then registry stream frames | archive-aware baseline and persist-before-publish delta suffix |
 | `workflow.graph.state` | `WorkflowGraphState` | indexed typed activation snapshot; optional `graph_id` selects an exact graph |
 | `workflow.graph.watch` | `WorkflowGraphWatch` | bounded durable activation-event replay strictly after the applied cursor |
-| `checkpoint.list` | `CheckpointList` | cursor-paged newest-first snapshot scoped to one session and branch |
-| `checkpoint.undo` | `CheckpointUndo` | idempotent durable guarded mutation receipt |
-| `checkpoint.redo` | `CheckpointRedo` | idempotent durable guarded mutation receipt |
-| `checkpoint.rollback_turn` | `CheckpointRollbackTurn` | atomic reverse-order guarded turn rollback receipt |
 | `vault.stage` | `VaultStage` | connection-local ephemeral dedupe, deliberately not durable |
 | `account.login_api`, `account.oauth_import`, `account.import_device`, `account.add`, `account.set_active`, `account.remove`, `account.set_default_model` | same-named response | durable account mutation |
 | `account.oauth_start`, `account.oauth_status`, `account.oauth_cancel`, `account.oauth_import_sources`, `account.device_candidates` | same-named response | connection-bound flow/catalog reads/actions |
 | `account.set_label` | `AccountSetLabel` | control mutation; alias remains identity |
-| `account.refresh` | `AccountRefresh` | re-derives informational identity from the vault-held credential; no secret field exists |
 | `provider.models_refresh` | `ProviderModelsRefresh` | provider snapshot refresh |
 | `provider.configure`, `provider.remove` | same-named response | durable provider mutation |
 | `transcription.secret_get`, `transcription.secret_set` | same-named response | same-UID UDS-only secret read/write, not a command receipt |
+| `account.refresh` | `AccountRefresh` | re-derives informational identity from the vault-held credential; no secret field exists |
+| `checkpoint.list` | `CheckpointList` | cursor-paged newest-first snapshot scoped to one session and branch |
+| `checkpoint.undo` | `CheckpointUndo` | idempotent durable guarded mutation receipt |
+| `checkpoint.redo` | `CheckpointRedo` | idempotent durable guarded mutation receipt |
+| `checkpoint.rollback_turn` | `CheckpointRollbackTurn` | atomic reverse-order guarded turn rollback receipt |
 
 The golden matrix at
 `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`, combined
 with the historical `wire_transcript.json`, pins a request and successful
-<<<<<<< HEAD
-response for every one of the 100 v1 request methods. `menu.answer` and resident
-=======
-response for every one of the 103 v1 request methods. `menu.answer` and resident
->>>>>>> wave-964-c
+response for every one of the 104 v1 request methods. `menu.answer` and resident
 binding are top-level frames, not `RequestBody` methods.
 
 ### 5.3 Account identity and local-login adoption
@@ -2459,13 +2455,8 @@ The machine-checkable contract lives in these fixtures/tests:
   receipts; the appended monitor and Loom registry delta/caught-up entries pin
   both dedicated non-chat streams. The exact current transcript count is 133.
 - `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`: the
-<<<<<<< HEAD
-  60 methods added after the historical matrix, completing its 40 with golden
-  request and successful response coverage for all 100 request methods and all
-=======
-  63 methods added after the historical matrix, completing its 40 with golden
-  request and successful response coverage for all 103 request methods and all
->>>>>>> wave-964-c
+  64 methods added after the historical matrix, completing its 40 with golden
+  request and successful response coverage for all 104 request methods and all
   five command dynamic slots.
 - `crates/haider-rpc/tests/fixtures/snapshot_availability_compat_v1.json`:
   old and new account/provider/usage response bytes.
@@ -2612,8 +2603,8 @@ Undo, redo, and rollback are themselves `FsWrite` effects and append a fresh
 `CheckpointRecorded` fact. Their post-state is never rewritten into an older
 record, and neither journal rows nor CAS objects are deleted.
 
-The exact v0.0.964 recount is 95 Welcome feature tokens and 103 request
-methods: one feature and four methods beyond v0.0.963's actual 94/99 base.
+The exact v0.0.964 recount is 96 Welcome feature tokens and 104 request
+methods: two features and five methods beyond v0.0.963's actual 94/99 base.
 
 **Absence law.** Without `checkpoint_v1`, a client MUST NOT call any checkpoint
 method, infer pre-images from ordinary file-change summaries, replay local

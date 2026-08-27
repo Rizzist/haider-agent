@@ -13,7 +13,6 @@
 
 #[cfg(test)]
 #[path = "checkpoint_tests.rs"]
-#[allow(clippy::expect_used)]
 mod checkpoint_tests;
 
 use super::*;

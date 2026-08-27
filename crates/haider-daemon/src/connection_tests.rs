@@ -203,12 +203,8 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
         welcome_features().len(),
-        95,
-<<<<<<< HEAD
-        "the ordinary Welcome advertises all 94 prior and one v0.0.964 feature token"
-=======
-        "the ordinary Welcome advertises all 94 v0.0.963 tokens plus checkpoint_v1"
->>>>>>> wave-964-c
+        96,
+        "the ordinary Welcome advertises all 94 v0.0.963 tokens plus account_identity_v1 and checkpoint_v1"
     );
     assert_eq!(
         welcome_features(),
@@ -225,7 +221,6 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_ARTIFACT_PUT_V1.to_owned(),
             haider_rpc::FEATURE_EXPORT_SEQ_V1.to_owned(),
             haider_rpc::FEATURE_BRANCH_CREATE_V1.to_owned(),
-            haider_rpc::FEATURE_CHECKPOINT_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_FORK_V1.to_owned(),
             FEATURE_COMMAND_DOOR_V1.to_owned(),
             haider_rpc::FEATURE_COMPACTION_GUARD_V1.to_owned(),
@@ -282,7 +277,6 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_SESSION_NEEDS_INPUT_V1.to_owned(),
             haider_rpc::FEATURE_ACCOUNT_LIST_WATCH_V1.to_owned(),
             haider_rpc::FEATURE_ACCOUNT_LABEL_V1.to_owned(),
-            haider_rpc::FEATURE_ACCOUNT_IDENTITY_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_FLEET_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_DESCENDANT_STREAM_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_OBSERVE_V1.to_owned(),
@@ -309,6 +303,8 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_QUEUE_CONTROL_V1.to_owned(),
             haider_rpc::FEATURE_COMPUTER_PERMISSION_ACTIONS_V1.to_owned(),
             FEATURE_VAULT_STAGE_V1.to_owned(),
+            haider_rpc::FEATURE_ACCOUNT_IDENTITY_V1.to_owned(),
+            haider_rpc::FEATURE_CHECKPOINT_V1.to_owned(),
         ])
     );
 }

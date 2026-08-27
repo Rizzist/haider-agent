@@ -303,8 +303,6 @@ pub const FEATURE_ACCOUNT_LIST_WATCH_V1: &str = "account_list_watch_v1";
 /// descriptors, so a surface can show an operator-chosen name instead of an
 /// alias or a provider identity string.
 pub const FEATURE_ACCOUNT_LABEL_V1: &str = "account_label_v1";
-/// Account descriptors carry optional rich identity and creation metadata.
-pub const FEATURE_ACCOUNT_IDENTITY_V1: &str = "account_identity_v1";
 /// Daemon implements provider management reads.
 pub const FEATURE_PROVIDER_MANAGEMENT_V1: &str = "provider_management_v1";
 /// Daemon implements durable `provider.configure`.
@@ -537,6 +535,8 @@ pub const FEATURE_LOOM_REGISTRY_ARCHIVE_V1: &str = "loom_registry_archive_v1";
 pub const FEATURE_LOOM_VALIDATION_V1: &str = "loom_validation_v1";
 /// Replayable persist-before-publish Loom registry baselines and deltas.
 pub const FEATURE_LOOM_REGISTRY_WATCH_V1: &str = "loom_registry_watch_v1";
+/// Account descriptors carry optional rich identity and creation metadata.
+pub const FEATURE_ACCOUNT_IDENTITY_V1: &str = "account_identity_v1";
 /// Durable bounded workspace pre-images plus receipted undo/redo/rollback.
 pub const FEATURE_CHECKPOINT_V1: &str = "checkpoint_v1";
 
@@ -3501,12 +3501,10 @@ pub enum RequestBody {
     /// Attach a connection-scoped registry baseline + durable delta stream.
     #[serde(rename = "loom.watch")]
     LoomWatch { after_cursor: u64 },
-<<<<<<< HEAD
     /// Re-derives public identity metadata from the credential already held
     /// by the daemon. Secret material never crosses this method.
     #[serde(rename = "account.refresh")]
     AccountRefresh { alias: String },
-=======
     #[serde(rename = "checkpoint.list")]
     CheckpointList {
         session_id: SessionId,
@@ -3545,7 +3543,6 @@ pub enum RequestBody {
         worker_generation: u64,
         run_id: RunId,
     },
->>>>>>> wave-964-c
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline). W3b answers it with a protocol error, not a panic.
     #[serde(other)]
@@ -4289,12 +4286,11 @@ pub enum ResponseBody {
         requested_after_cursor: u64,
         baseline: haider_protocol::loom::LoomRegistrySnapshot,
     },
-<<<<<<< HEAD
     #[serde(rename = "account.refresh")]
     AccountRefresh {
         descriptor: haider_protocol::credential::CredentialDescriptor,
         revision: u64,
-=======
+    },
     #[serde(rename = "checkpoint.list")]
     CheckpointList {
         page: haider_protocol::checkpoint::CheckpointListPage,
@@ -4310,7 +4306,6 @@ pub enum ResponseBody {
     #[serde(rename = "checkpoint.rollback_turn")]
     CheckpointRollbackTurn {
         receipt: haider_protocol::checkpoint::CheckpointMutationReceipt,
->>>>>>> wave-964-c
     },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline).

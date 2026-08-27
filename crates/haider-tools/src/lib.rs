@@ -9,7 +9,6 @@ mod broker;
 mod checkpoint;
 #[cfg(test)]
 #[path = "checkpoint_tests.rs"]
-#[allow(clippy::expect_used)]
 mod checkpoint_tests;
 mod computer;
 mod error;

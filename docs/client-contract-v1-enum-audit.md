@@ -553,9 +553,9 @@ appendix list every spelling in context.
 - `HookTrustStateWire` (`crates/haider-rpc/src/frame.rs:1565`):
   `"trusted"` | `"untrusted"` | `"revoked_by_edit"`.
 - `RequestBody` (`crates/haider-rpc/src/frame.rs`; `method` tag):
-  the pre-checkpoint spellings remain in their original order; the additive tail is `"checkpoint.list"` | `"checkpoint.undo"` | `"checkpoint.redo"` | `"checkpoint.rollback_turn"` | unknown. The exhaustive 103-method spelling pin is `wire_golden_tests::every_request_method_has_a_golden_request_and_success_response`; any other string → Rust `Unknown`.
+  the v0.0.963 spellings remain in their original order; the additive tail is `"account.refresh"` | `"checkpoint.list"` | `"checkpoint.undo"` | `"checkpoint.redo"` | `"checkpoint.rollback_turn"` | unknown. The exhaustive 104-method spelling pin is `wire_golden_tests::every_request_method_has_a_golden_request_and_success_response`; any other string → Rust `Unknown`.
 - `ResponseBody` (`crates/haider-rpc/src/frame.rs`; `method` tag):
-  the pre-checkpoint response spellings remain in their original order; the additive tail is `"checkpoint.list"` | `"checkpoint.undo"` | `"checkpoint.redo"` | `"checkpoint.rollback_turn"` | unknown. Any other string → Rust `Unknown`.
+  the v0.0.963 response spellings remain in their original order; the additive tail is `"account.refresh"` | `"checkpoint.list"` | `"checkpoint.undo"` | `"checkpoint.redo"` | `"checkpoint.rollback_turn"` | unknown. Any other string → Rust `Unknown`.
 - `SubmitDisposition` (`crates/haider-rpc/src/frame.rs:3953`):
   `"started"` | `"queued"` | `"steer_pending"` | `"subturn_pending"` | `"unknown"`; any other string → Rust `Unknown`.
 - `CancelStatus` (`crates/haider-rpc/src/frame.rs:3966`):

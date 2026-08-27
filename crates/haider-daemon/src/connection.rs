@@ -1882,7 +1882,6 @@ fn welcome_features() -> BTreeSet<String> {
         FEATURE_ACCOUNT_ROTATION_V1.to_owned(),
         FEATURE_ARTIFACT_PUT_V1.to_owned(),
         FEATURE_BRANCH_CREATE_V1.to_owned(),
-        FEATURE_CHECKPOINT_V1.to_owned(),
         FEATURE_SESSION_FORK_V1.to_owned(),
         FEATURE_COMMAND_DOOR_V1.to_owned(),
         FEATURE_COMPACTION_GUARD_V1.to_owned(),
@@ -1940,7 +1939,6 @@ fn welcome_features() -> BTreeSet<String> {
         haider_rpc::FEATURE_SESSION_NEEDS_INPUT_V1.to_owned(),
         haider_rpc::FEATURE_ACCOUNT_LIST_WATCH_V1.to_owned(),
         haider_rpc::FEATURE_ACCOUNT_LABEL_V1.to_owned(),
-        haider_rpc::FEATURE_ACCOUNT_IDENTITY_V1.to_owned(),
         FEATURE_SESSION_FLEET_V1.to_owned(),
         FEATURE_SESSION_DESCENDANT_STREAM_V1.to_owned(),
         FEATURE_SESSION_OBSERVE_V1.to_owned(),
@@ -1967,6 +1965,8 @@ fn welcome_features() -> BTreeSet<String> {
         haider_rpc::FEATURE_QUEUE_CONTROL_V1.to_owned(),
         haider_rpc::FEATURE_COMPUTER_PERMISSION_ACTIONS_V1.to_owned(),
         FEATURE_VAULT_STAGE_V1.to_owned(),
+        haider_rpc::FEATURE_ACCOUNT_IDENTITY_V1.to_owned(),
+        FEATURE_CHECKPOINT_V1.to_owned(),
     ])
 }
 

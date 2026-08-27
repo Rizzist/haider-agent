@@ -612,13 +612,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         expected_methods.len(),
-<<<<<<< HEAD
-        100,
-        "the v1 contract covers all 99 prior and one v0.0.964 request method"
-=======
-        103,
-        "the v1 contract covers all 99 prior and 4 v0.0.964 checkpoint methods"
->>>>>>> wave-964-c
+        104,
+        "the v1 contract covers all 99 v0.0.963 methods, account.refresh, and 4 checkpoint methods"
     );
     assert_eq!(
         request_methods_declared_in_source(),

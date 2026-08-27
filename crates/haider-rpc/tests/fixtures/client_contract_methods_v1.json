@@ -356,12 +356,12 @@
       "response": {"method":"loom.watch","watch_id":"loom-watch-1","requested_after_cursor":41,"baseline":{"through_cursor":44,"entries":[{"entry":{"kind":"agent_type","id":"reviewer","rev":3,"digest":"digest-reviewer-3","archived":true},"record":{"kind":"agent_type","record":{"id":"reviewer","name":"Reviewer","job":"Review changes","in_type":"Patch","out_type":"Verdict","clis":["rg"],"color":"#445566","glyph":"R","rev":3}}}]}}
     },
     {
-<<<<<<< HEAD
       "request_method": "account.refresh",
       "response_method": "account.refresh",
       "request": {"method":"account.refresh","alias":"openai-oauth"},
       "response": {"method":"account.refresh","descriptor":{"alias":"openai-oauth","provider":"openai-oauth","auth_method":"oauth","identity":"person@example.invalid","status":{"status":"ok"},"active":true,"account_identity":{"email":"person@example.invalid","plan":"pro","captured_at":964,"verified":false}},"revision":25}
-=======
+    },
+    {
       "request_method": "checkpoint.list",
       "response_method": "checkpoint.list",
       "request": {"method":"checkpoint.list","session_id":"session-1","limit":25},
@@ -384,7 +384,6 @@
       "response_method": "checkpoint.rollback_turn",
       "request": {"method":"checkpoint.rollback_turn","command_id":"command-checkpoint-rollback","session_id":"session-1","worker_generation":7,"run_id":"run-1"},
       "response": {"method":"checkpoint.rollback_turn","receipt":{"checkpoint":{"checkpoint_id":"checkpoint-rollback-1","session_id":"session-1","run_id":"checkpoint-command:command-checkpoint-rollback","effect_id":"checkpoint-effect:command-checkpoint-rollback","call_id":"command-checkpoint-rollback","seq":60,"workspace_revision":"workspace-revision-4","kind":"edit","origin":"rollback_turn","paths":[{"path":"src/lib.rs","pre_artifact":"blake3:1111111111111111111111111111111111111111111111111111111111111111","pre_digest":"blake3:1111111111111111111111111111111111111111111111111111111111111111","post_digest":"blake3:0000000000000000000000000000000000000000000000000000000000000000"}],"post_digest":"blake3:5555555555555555555555555555555555555555555555555555555555555555","recorded_at_ms":1720000003000},"restored_checkpoint_ids":["checkpoint-1"],"worker_generation":7}}
->>>>>>> wave-964-c
     }
   ]
 }

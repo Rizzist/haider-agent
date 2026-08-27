@@ -17,10 +17,12 @@ use serde::de::{IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use zeroize::Zeroizing;
 
+#[cfg(test)]
+use crate::oauth::PlatformClaudeNativeCredentialStore;
 use crate::oauth::{
-    ClaudeNativeCredentialStore, ClaudeNativeReadEvent, PlatformClaudeNativeCredentialStore,
-    SecretJson, claude_subscription_identity, load_claude_credential_input, oauth_home_dir,
-    oauth_import_path, parse_claude_credential_metadata,
+    ClaudeNativeCredentialStore, ClaudeNativeReadEvent, SecretJson, claude_subscription_identity,
+    load_claude_credential_input, oauth_home_dir, oauth_import_path,
+    parse_claude_credential_metadata,
 };
 
 const DISCOVERY_FILE_LIMIT: u64 = 256 * 1024;
@@ -41,7 +43,7 @@ pub(crate) struct DeviceCandidate {
     pub content_fingerprint: Option<[u8; 32]>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn discover_device_candidates(disabled: bool) -> Vec<DeviceCandidate> {
     discover_device_candidates_with_native(
         disabled,
@@ -93,7 +95,7 @@ pub(crate) fn discovery_is_disabled(profile_disabled: bool) -> bool {
     profile_disabled || discovery_disabled_by_env()
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn candidate_by_id(disabled: bool, id: &str) -> Option<DeviceCandidate> {
     candidate_by_id_with_native(
         disabled,
@@ -232,7 +234,7 @@ fn discover_claude(
     discover_claude_at_event(&path, native, event)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn discover_claude_at(
     path: &Path,
     native: &dyn ClaudeNativeCredentialStore,

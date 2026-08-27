@@ -390,7 +390,7 @@ fn close_inherited_descriptor_range(first: std::os::raw::c_int) -> bool {
             libc::SYS_close_range,
             first as libc::c_uint,
             libc::c_uint::MAX,
-            0 as libc::c_uint,
+            0_u32,
         ) == 0
     }
 }

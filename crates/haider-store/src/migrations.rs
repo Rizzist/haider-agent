@@ -19,12 +19,8 @@ use crate::{StoreResult, now_ms, store_error, to_sqlite_integer};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
-<<<<<<< HEAD
-pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 26;
-const LATEST_SCHEMA_VERSION: u32 = 26;
-=======
 pub(crate) const CURRENT_SCHEMA_VERSION: u32 = 27;
->>>>>>> wave-964-c
+const LATEST_SCHEMA_VERSION: u32 = 27;
 
 struct Migration {
     version: u32,
@@ -733,6 +729,27 @@ CREATE TABLE branches (
                 FOREIGN KEY (session_id, head_seq) REFERENCES events(session_id, seq)
             );
 
+CREATE TABLE checkpoints (
+                session_id         TEXT NOT NULL,
+                seq                INTEGER NOT NULL CHECK (seq > 0),
+                checkpoint_id      TEXT NOT NULL UNIQUE,
+                branch_id          TEXT,
+                run_id             TEXT NOT NULL,
+                effect_id          TEXT NOT NULL,
+                call_id            TEXT NOT NULL,
+                workspace_revision TEXT NOT NULL,
+                kind               TEXT NOT NULL
+                    CHECK (kind IN ('edit', 'write', 'create', 'delete', 'move')),
+                origin             TEXT NOT NULL
+                    CHECK (origin IN ('tool', 'undo', 'redo', 'rollback_turn')),
+                post_digest        TEXT NOT NULL,
+                recorded_at_ms     INTEGER NOT NULL CHECK (recorded_at_ms >= 0),
+                record_json        TEXT NOT NULL CHECK (length(record_json) > 0),
+                PRIMARY KEY (session_id, seq),
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+                FOREIGN KEY (session_id, seq) REFERENCES events(session_id, seq)
+            );
+
 CREATE TABLE "command_receipts" (
                 command_id       TEXT PRIMARY KEY,
                 method           TEXT NOT NULL,
@@ -1091,6 +1108,12 @@ CREATE TABLE workflow_node_states (
 
 CREATE INDEX branches_source
             ON branches(session_id, source_branch_id);
+
+CREATE INDEX checkpoints_session_branch_seq
+            ON checkpoints(session_id, branch_id, seq DESC);
+
+CREATE INDEX checkpoints_session_run_seq
+            ON checkpoints(session_id, run_id, seq DESC);
 
 CREATE INDEX delegations_parent_run
             ON delegations(parent_session_id, parent_run_id);

@@ -542,26 +542,6 @@ fn is_hidden_path(relative: &Path, _path: &Path) -> bool {
     }
 }
 
-/// Cheap tracked-file approximation for consumers that need repository-aware
-/// inventory without linking git2/gix or launching a `git` subprocess.
-#[allow(dead_code)]
-pub(crate) fn tracked_files(
-    workspace_root: &Path,
-    search_root: &Path,
-    max_files: usize,
-) -> ToolResult<WalkOutcome> {
-    walk_files(
-        workspace_root,
-        search_root,
-        WalkOptions {
-            respect_gitignore: true,
-            include_hidden: false,
-            max_files,
-            deadline: None,
-        },
-    )
-}
-
 #[cfg(test)]
 #[path = "repo/tests/repo_tests.rs"]
 mod tests;
