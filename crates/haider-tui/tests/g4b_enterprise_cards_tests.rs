@@ -7,7 +7,6 @@
 //! the seeded model inventory, and chain the key card; the footer offers
 //! the new keys and buttons; a daemon that does not list the builtin gets
 //! a stale-daemon note instead of a card.
-#![allow(clippy::expect_used)]
 
 use haider_tui::app::{AccountAddKind, AppModel, CustomField, Hit, RuntimeMode, Screen};
 use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};

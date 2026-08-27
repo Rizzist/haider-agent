@@ -9,7 +9,6 @@
 //! account, instant ✗ ERRORED), and the create carried `max_tokens =
 //! 200_000`, which providers read as the per-request OUTPUT cap and
 //! Anthropic rejects outright.
-#![allow(clippy::expect_used)]
 
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_protocol::ids::CredentialAlias;

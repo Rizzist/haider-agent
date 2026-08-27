@@ -7,8 +7,6 @@
 //! including a live mid-session pair switch (LW8). Loopback mock servers and
 //! injected stubs only — nothing here dials the real network.
 
-#![allow(clippy::expect_used)]
-
 use crate::session_hub::{SessionHub, SessionHubConfig};
 use crate::worker::{
     BrokerToolFactory, ProviderFactory, ResolvedTurnProvider, TurnToolFactory,

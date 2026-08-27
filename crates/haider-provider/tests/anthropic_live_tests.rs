@@ -4,8 +4,6 @@
 //!
 //! These tests are ignored by default. The C1 lane must not run them.
 
-#![allow(clippy::expect_used)]
-
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -8,8 +8,6 @@
 //! passes, a second signal that arrives during a step) are driven far more
 //! precisely with synthetic futures than with a real daemon.
 
-#![allow(clippy::expect_used)]
-
 use super::*;
 use std::future::pending;
 use std::time::Duration;

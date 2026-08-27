@@ -11,8 +11,6 @@
 //! silent wire gap becomes a confident wrong claim about the operator's
 //! machine.
 
-#![allow(clippy::expect_used)]
-
 use haider_protocol::loom::LoomAgentType;
 use haider_tui::app::{AppModel, LoomPane, RuntimeMode, Screen};
 use haider_tui::render::{missing_clis, render};

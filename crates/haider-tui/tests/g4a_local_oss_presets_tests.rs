@@ -7,7 +7,6 @@
 //! model discovery. LK10 pins the card prefills, the key-card skip, the
 //! wire auth requirement, the footer hints, and the "start the server"
 //! row hint for an empty local inventory.
-#![allow(clippy::expect_used)]
 
 use haider_protocol::credential::AuthMethod;
 use haider_tui::app::{

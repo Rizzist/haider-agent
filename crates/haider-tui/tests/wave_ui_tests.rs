@@ -4,7 +4,6 @@
 //! rows, the `/workflows` pane) and the subagents tree speaks a child's
 //! pinned-workflow DAG (`agent_graph_rollup_v1` → the chip row, sim
 //! tui.js:5410-5428 / the Image #26 law).
-#![allow(clippy::expect_used)]
 
 use haider_protocol::EventPayload;
 use haider_protocol::agent::{

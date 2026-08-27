@@ -5,8 +5,6 @@
 //! These are integration tests because the hub's public worker/connection
 //! seams are sufficient. No crate-internal test module is needed.
 
-#![allow(clippy::expect_used)]
-
 use base64::Engine as _;
 use haider_core::{
     DelegationRecord, DelegationState, HarnessActor, HarnessConfig, SessionCreateCommand,

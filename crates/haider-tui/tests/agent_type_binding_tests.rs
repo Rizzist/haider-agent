@@ -6,7 +6,6 @@
 //! the `agent_type_selected` fact moving `identity.agent_type` (and a
 //! clearing fact reverting it), the session-accent surfaces painting from
 //! the bound type's registry color, and the roster-row summary join.
-#![allow(clippy::expect_used)]
 
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RawEnvelope, RenderTargets};
 use haider_protocol::ids::{DeviceId, EventId, SessionId};

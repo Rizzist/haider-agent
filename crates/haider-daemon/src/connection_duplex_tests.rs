@@ -7,8 +7,6 @@
 //! cancellation failures reproducible in sandboxes that cannot bind a named
 //! pipe or Unix socket.
 
-#![allow(clippy::expect_used)]
-
 use super::*;
 use base64::Engine as _;
 use haider_protocol::EventPayload;

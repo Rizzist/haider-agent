@@ -5,7 +5,6 @@
 //! `identity.provider` locally and flash success, so the TUI announced a
 //! switch the daemon never heard and the next turn still ran on the old
 //! provider.
-#![allow(clippy::expect_used)]
 
 use haider_protocol::ids::SessionId;
 use haider_tui::app::{AppModel, AppRequest, RuntimeMode, Screen};

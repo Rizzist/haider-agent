@@ -5,8 +5,6 @@
 //! resolves through. Two recording fake providers make the landing provider
 //! an asserted fact, not an inference.
 
-#![allow(clippy::expect_used)]
-
 use crate::accounts::ConnectionTransport;
 use crate::session_hub::{
     FrameSendError, FrameSink, SessionHub, SessionHubConfig, SessionHubError,

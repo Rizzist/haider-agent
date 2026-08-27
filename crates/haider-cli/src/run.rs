@@ -1652,25 +1652,30 @@ mod tests {
             .expect("raw replay envelope")
         }
 
-        let first_tool = vec![envelope(
+        let events = |envelopes| {
+            HeadlessRunEvents::from_envelopes(RunId::new("run-replay"), envelopes)
+                .expect("replay event ledger")
+        };
+
+        let first_tool = events(vec![envelope(
             1,
             serde_json::json!({
                 "type": "tool_result",
                 "call_id": "provider-call-a",
                 "result": {"status": "completed", "preview": "ok", "truncated": false},
             }),
-        )];
-        let second_tool = vec![envelope(
+        )]);
+        let second_tool = events(vec![envelope(
             1,
             serde_json::json!({
                 "type": "tool_result",
                 "call_id": "provider-call-b",
                 "result": {"status": "completed", "preview": "ok", "truncated": false},
             }),
-        )];
-        assert_ne!(
-            replay_tool_trace(&first_tool),
-            replay_tool_trace(&second_tool)
+        )]);
+        assert!(
+            !replay_trace_matches(&first_tool, &second_tool, ReplayTraceKind::Tool)
+                .expect("compare tool traces")
         );
 
         let terminal = |message: &str| {
@@ -1690,9 +1695,13 @@ mod tests {
                 ),
             ]
         };
+        let first_terminal =
+            replay_signature(&events(terminal("first failure"))).expect("first terminal signature");
+        let second_terminal = replay_signature(&events(terminal("different failure")))
+            .expect("second terminal signature");
         assert_ne!(
-            replay_terminal(&terminal("first failure")),
-            replay_terminal(&terminal("different failure"))
+            (first_terminal.failure, first_terminal.terminal),
+            (second_terminal.failure, second_terminal.terminal)
         );
 
         let budget = |tokens| {
@@ -1715,7 +1724,9 @@ mod tests {
                 }),
             )]
         };
-        assert_ne!(replay_terminal(&budget(10)), replay_terminal(&budget(11)));
+        let first_budget = replay_signature(&events(budget(10))).expect("first budget signature");
+        let second_budget = replay_signature(&events(budget(11))).expect("second budget signature");
+        assert_ne!(first_budget.budget, second_budget.budget);
     }
 
     #[test]

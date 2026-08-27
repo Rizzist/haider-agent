@@ -10,7 +10,6 @@
 //! owner's ruling (2026-08-22) keeps a LIVE COMPOSER on both loom panes:
 //! every printable key belongs to it, exactly as on the session screen.
 //! That is pinned below — a bare `p` must TYPE, never pin.
-#![allow(clippy::expect_used)]
 
 use haider_protocol::graph::{GraphPhase, GraphStatus};
 use haider_protocol::ids::{GraphId, SessionId};

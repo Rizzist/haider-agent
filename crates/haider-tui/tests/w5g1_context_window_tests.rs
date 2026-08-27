@@ -8,7 +8,6 @@
 //! codex catalog declares real windows per model; a declared window always
 //! wins, and with none declared the seed stands — an honest fallback, not
 //! a fabrication.
-#![allow(clippy::expect_used)]
 
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
 use haider_protocol::ids::CredentialAlias;

@@ -16824,7 +16824,7 @@ fn augment_workflow_graph_envelopes(
                 else {
                     return Err(corrupt("workflow activation AST has no graph input edge"));
                 };
-                let seed = cas_evidence(cas, &state.ast.input_type, payload, Vec::new())?;
+                let seed = cas_evidence(cas, &state.ast.input_type, &payload, Vec::new())?;
                 let Some(inputs) = forward_workflow_inputs(state, &node, Some(&seed)) else {
                     continue;
                 };
@@ -21507,6 +21507,10 @@ fn append_loom_registry_snapshot_rows(
             LoomRegistryEntryKind::Unknown => {
                 return Err(corrupt("unknown Loom registry snapshot kind"));
             }
+            // `LoomRegistryEntryKind` is deliberately non-exhaustive across
+            // crate boundaries. A newer kind cannot be decoded through either
+            // of the two schema-specific record variants available here.
+            _ => return Err(corrupt("unsupported Loom registry snapshot kind")),
         };
         *resident_bytes = next_resident_bytes;
         entries.push(LoomRegistrySnapshotEntry {

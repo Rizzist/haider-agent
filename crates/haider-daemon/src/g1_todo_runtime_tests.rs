@@ -4,8 +4,6 @@
 //! routing (L1), live-turn Plan fact flow (L3), the durable Todos node (L4),
 //! and the root-only tool pack (L5).
 
-#![allow(clippy::expect_used)]
-
 use crate::session_hub::{SessionHub, SessionHubConfig};
 use crate::worker::{
     BrokerToolFactory, ProviderFactory, RegisteredToolRoute, ResolvedTurnProvider, TurnToolFactory,

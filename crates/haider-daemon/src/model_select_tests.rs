@@ -6,8 +6,6 @@
 //! The live-session switch (`session.select_model`) and the spawn selector
 //! resolve through the same functions, so these unit laws bind both.
 
-#![allow(clippy::expect_used)]
-
 use super::{ModelSelectionAuthority, SelectionRefusal};
 use haider_rpc::{ProviderApiFamilyWire, ProviderAvailabilityWire, ProviderSummaryWire};
 use std::collections::BTreeSet;

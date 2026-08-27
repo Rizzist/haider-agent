@@ -2475,6 +2475,7 @@ async fn run_headless_inner(
     };
     reducer.run_id = Some(run_id.clone());
     if request.detached {
+        let events = HeadlessRunEvents::empty(run_id.clone());
         return Ok(HeadlessRunResult {
             session_id,
             run_id,
@@ -2484,7 +2485,7 @@ async fn run_headless_inner(
             outcome: HeadlessOutcome::Started,
             response: None,
             usage: None,
-            events: HeadlessRunEvents::empty(run_id.clone()),
+            events,
             budget_exhausted: None,
             replay: None,
             permission_denials: Vec::new(),

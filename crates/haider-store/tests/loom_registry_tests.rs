@@ -4,7 +4,6 @@
 //! The store is the compiler authority (callers send SOURCE, the registry
 //! compiles inside the transaction) and owns the rev law: new id → rev 1,
 //! identical content → idempotent no-op, changed content → rev + 1.
-#![allow(clippy::expect_used)]
 
 use haider_protocol::ids::{DeviceId, EventId, GraphId, SessionId};
 use haider_protocol::loom::{LoomAgentType, LoomRegistration, LoomRevisionExpectation};
