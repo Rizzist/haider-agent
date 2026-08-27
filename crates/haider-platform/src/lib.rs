@@ -40,15 +40,16 @@ pub use process::{
     configure_process_environment, configure_process_group, exit_signal, kill_process_tree,
     process_error_is_missing, process_error_is_permission, process_group, process_group_exists,
     process_id, process_leader_exited, register_process_group, release_process_group,
-    signal_process, signal_process_group, signal_process_group_id,
+    signal_process, signal_process_group, signal_process_group_id, wait_for_child_exit,
 };
 #[cfg(windows)]
 pub use process::{windows_command_interpreter, windows_powershell};
 pub use shutdown::{ShutdownInstallError, ShutdownSignal, ShutdownSignals, shutdown_signal};
 pub use spawn::{
-    DAEMON_LOG_DIRECTORY, DAEMON_LOG_FILE, DAEMON_LOG_PATH_ENV, DAEMON_LOG_RETENTION, DaemonSpawn,
-    DaemonSpawnError, allocate_daemon_log_path, publish_active_daemon_log, spawn_daemon,
-    spawn_daemon_with_piped_stderr,
+    DAEMON_LOG_DIRECTORY, DAEMON_LOG_FILE, DAEMON_LOG_PATH_ENV, DAEMON_LOG_RETENTION,
+    DAEMON_READINESS_ARG, DaemonReadiness, DaemonReadyNotifier, DaemonSpawn, DaemonSpawnError,
+    SpawnedDaemon, allocate_daemon_log_path, publish_active_daemon_log, spawn_daemon,
+    spawn_daemon_with_piped_stderr, spawn_daemon_with_readiness,
 };
 pub use system::local_device_name;
 pub use user::{effective_user_id, is_owner_private_directory};

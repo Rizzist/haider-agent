@@ -347,6 +347,8 @@ pub async fn ensure_daemon(
 ) -> Result<EnsuredDaemon, EnsureError> {
     let mut log_path = None;
     let mut child: Option<Child> = None;
+    let mut readiness: Option<haider_platform::DaemonReadiness> = None;
+    let mut readiness_channel_error = None;
     let mut spawned = false;
     let mut race_lost = false;
     let mut child_status: Option<ExitStatus> = None;
@@ -414,10 +416,37 @@ pub async fn ensure_daemon(
                     // The one spawn decision (R8 step 5): only a missing or
                     // refused endpoint ever launches a candidate, and only
                     // one candidate per launcher.
-                    let (candidate, candidate_log_path) = spawn_daemon(profile, &options)?;
-                    child = Some(candidate);
-                    log_path = Some(candidate_log_path);
+                    let candidate = spawn_daemon(profile, &options)?;
+                    child = Some(candidate.child);
+                    readiness = Some(candidate.readiness);
+                    log_path = Some(candidate.log_path);
                     spawned = true;
+                } else if let Some(status) = child_status.take() {
+                    if status.code() == Some(RACE_LOSER_EXIT_CODE) {
+                        child_status = Some(status);
+                    } else if !status.success() {
+                        return Err(EnsureError::DaemonExited {
+                            status,
+                            log_path: log_path
+                                .unwrap_or_else(|| profile.store_dir.join(DAEMON_LOG_FILE)),
+                        });
+                    } else {
+                        let readiness_log = log_path
+                            .as_ref()
+                            .cloned()
+                            .unwrap_or_else(|| profile.store_dir.join(DAEMON_LOG_FILE));
+                        return Err(EnsureError::Spawn {
+                            binary: daemon_binary(&options)?,
+                            message: format!(
+                                "daemon candidate exited without publishing listener readiness \
+                                 ({}); see {}",
+                                readiness_channel_error
+                                    .as_deref()
+                                    .unwrap_or("channel closed"),
+                                readiness_log.display()
+                            ),
+                        });
+                    }
                 }
             }
             Attach::NotYet => {}
@@ -438,6 +467,60 @@ pub async fn ensure_daemon(
                 if let Attach::Spawnable(_) = try_attach(profile, &options).await {
                     return Err(EnsureError::DaemonExited {
                         status,
+                        log_path: log_path
+                            .unwrap_or_else(|| profile.store_dir.join(DAEMON_LOG_FILE)),
+                    });
+                }
+            }
+        }
+        if let Some(notification) = readiness.take() {
+            // Gate 20 contract: this wait replaces post-spawn polling only.
+            // A handshake EOF never authorizes spawning; it remains retryable
+            // solely after NotFound/ConnectionRefused authorized this exact
+            // candidate. The buffered byte also covers Ready-before-await.
+            match tokio::time::timeout_at(deadline, notification.wait()).await {
+                Ok(Ok(())) => continue,
+                Ok(Err(error)) => {
+                    readiness_channel_error = Some(error.to_string());
+                    let Some(active) = child.take() else {
+                        continue;
+                    };
+                    match tokio::time::timeout_at(
+                        deadline,
+                        haider_platform::wait_for_child_exit(active),
+                    )
+                    .await
+                    {
+                        Ok(Ok(status)) => {
+                            if status.code() == Some(RACE_LOSER_EXIT_CODE) {
+                                race_lost = true;
+                            }
+                            child_status = Some(status);
+                        }
+                        Ok(Err(wait_error)) => {
+                            return Err(EnsureError::Spawn {
+                                binary: daemon_binary(&options)?,
+                                message: format!(
+                                    "cannot observe daemon candidate exit after readiness channel \
+                                     failure: {wait_error}"
+                                ),
+                            });
+                        }
+                        Err(_) => {
+                            return Err(EnsureError::StartupTimeout {
+                                last_error,
+                                child_status,
+                                log_path: log_path
+                                    .unwrap_or_else(|| profile.store_dir.join(DAEMON_LOG_FILE)),
+                            });
+                        }
+                    }
+                    continue;
+                }
+                Err(_) => {
+                    return Err(EnsureError::StartupTimeout {
+                        last_error,
+                        child_status,
                         log_path: log_path
                             .unwrap_or_else(|| profile.store_dir.join(DAEMON_LOG_FILE)),
                     });
@@ -482,10 +565,16 @@ fn daemon_binary(options: &EnsureOptions) -> Result<PathBuf, EnsureError> {
     })
 }
 
+struct SpawnedCandidate {
+    child: Child,
+    readiness: haider_platform::DaemonReadiness,
+    log_path: PathBuf,
+}
+
 fn spawn_daemon(
     profile: &ResolvedProfile,
     options: &EnsureOptions,
-) -> Result<(Child, PathBuf), EnsureError> {
+) -> Result<SpawnedCandidate, EnsureError> {
     let binary = daemon_binary(options)?;
     let log_path =
         haider_platform::allocate_daemon_log_path(&profile.store_dir).map_err(|error| {
@@ -494,7 +583,7 @@ fn spawn_daemon(
                 message: format!("cannot allocate per-process daemon log: {error}"),
             }
         })?;
-    let child = haider_platform::spawn_daemon(haider_platform::DaemonSpawn {
+    let spawned = haider_platform::spawn_daemon_with_readiness(haider_platform::DaemonSpawn {
         binary: &binary,
         profile_id: &profile.profile_id,
         store_dir: &profile.store_dir,
@@ -509,11 +598,18 @@ fn spawn_daemon(
             haider_platform::DaemonSpawnError::CloneLog(error) => {
                 format!("cannot clone daemon log handle: {error}")
             }
+            haider_platform::DaemonSpawnError::Readiness(error) => {
+                format!("cannot create daemon readiness channel: {error}")
+            }
             haider_platform::DaemonSpawnError::Spawn(error) => error.to_string(),
         };
         EnsureError::Spawn { binary, message }
     })?;
-    Ok((child, log_path))
+    Ok(SpawnedCandidate {
+        child: spawned.child,
+        readiness: spawned.readiness,
+        log_path,
+    })
 }
 
 /// Starts an explicitly named daemon sibling and returns the live child.
@@ -530,11 +626,36 @@ pub fn spawn_daemon_retained(
     profile: &ResolvedProfile,
     binary: impl Into<PathBuf>,
 ) -> Result<Child, EnsureError> {
-    let options = EnsureOptions {
-        daemon_binary: Some(binary.into()),
-        ..EnsureOptions::default()
-    };
-    spawn_daemon(profile, &options).map(|(child, _)| child)
+    let binary = binary.into();
+    let log_path =
+        haider_platform::allocate_daemon_log_path(&profile.store_dir).map_err(|error| {
+            EnsureError::Spawn {
+                binary: binary.clone(),
+                message: format!("cannot allocate per-process daemon log: {error}"),
+            }
+        })?;
+    haider_platform::spawn_daemon(haider_platform::DaemonSpawn {
+        binary: &binary,
+        profile_id: &profile.profile_id,
+        store_dir: &profile.store_dir,
+        runtime_dir: &profile.runtime_dir,
+        log_path: &log_path,
+    })
+    .map_err(|error| {
+        let message = match error {
+            haider_platform::DaemonSpawnError::OpenLog(error) => {
+                format!("cannot open daemon log {}: {error}", log_path.display())
+            }
+            haider_platform::DaemonSpawnError::CloneLog(error) => {
+                format!("cannot clone daemon log handle: {error}")
+            }
+            haider_platform::DaemonSpawnError::Readiness(error) => {
+                format!("cannot create daemon readiness channel: {error}")
+            }
+            haider_platform::DaemonSpawnError::Spawn(error) => error.to_string(),
+        };
+        EnsureError::Spawn { binary, message }
+    })
 }
 
 /// Sends the one graceful termination signal to an authenticated UDS peer.

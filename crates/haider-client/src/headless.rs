@@ -1969,7 +1969,7 @@ async fn teardown_owned_daemon(
     let request_deadline = Instant::now() + EPHEMERAL_DRAIN_ALLOWANCE;
     let shutdown = shutdown_owned_daemon_peer(profile, client, &ownership, request_deadline).await;
     let reap_deadline = shutdown.as_ref().copied().unwrap_or(request_deadline);
-    let reap = reap_owned_daemon(&mut ownership, reap_deadline).await;
+    let reap = reap_owned_daemon(ownership, reap_deadline).await;
     match (shutdown, reap) {
         (Err(error), _) | (Ok(_), Err(error)) => Err(error),
         (Ok(_), Ok(())) => Ok(()),
@@ -2101,26 +2101,23 @@ fn daemon_drain_deadline(deadline_unix_ms: u64) -> Instant {
 }
 
 async fn reap_owned_daemon(
-    ownership: &mut DaemonOwnershipToken,
+    ownership: DaemonOwnershipToken,
     deadline: Instant,
 ) -> Result<(), HeadlessRunError> {
-    loop {
-        match ownership.child.try_wait() {
-            Ok(Some(_)) => return Ok(()),
-            Ok(None) if Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            Ok(None) => {
-                return Err(teardown_protocol(
-                    "owned daemon did not exit before drain deadline",
-                ));
-            }
-            Err(error) => {
-                return Err(teardown_protocol(format!(
-                    "could not reap owned daemon: {error}"
-                )));
-            }
-        }
+    let child = ownership.child;
+    // `std::process::Child::wait` blocks on the OS process-exit notification
+    // (waitpid on Unix, the process handle on Windows). The platform waiter
+    // uses a detached OS thread, so a missed deadline cannot pin Tokio runtime
+    // shutdown; while this process remains alive, it still eventually reaps.
+    let wait = haider_platform::wait_for_child_exit(child);
+    match tokio::time::timeout_at(deadline, wait).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(teardown_protocol(format!(
+            "could not reap owned daemon: {error}"
+        ))),
+        Err(_) => Err(teardown_protocol(
+            "owned daemon did not exit before drain deadline",
+        )),
     }
 }
 

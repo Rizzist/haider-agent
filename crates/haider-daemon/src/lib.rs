@@ -144,7 +144,8 @@ pub use profile_vault::{ProfileVault, scoped_vault_alias};
 pub use provider_registry::{ProductionProviderEndpointValidator, ProviderEndpointValidator};
 pub use runtime::{
     DaemonTask, DaemonTaskDiagnosticSnapshot, DaemonTaskDiagnostics, run_with_signals,
-    run_with_signals_and_dependencies, spawn, spawn_with_dependencies,
+    run_with_signals_and_dependencies, run_with_signals_and_dependencies_and_readiness, spawn,
+    spawn_with_dependencies,
 };
 pub use session_hub::{
     AdmissionTicket, FrameSendError, FrameSink, HubConnection, HubObservation, HubStoreHandle,

@@ -1,5 +1,9 @@
 use std::process::ExitStatus;
 
+#[cfg(test)]
+#[path = "process_tests.rs"]
+mod tests;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ProcessSignal {
     Hangup,
@@ -30,6 +34,32 @@ impl ProcessSignal {
     pub const KILL: Self = Self::Kill;
     pub const USR1: Self = Self::User1;
     pub const USR2: Self = Self::User2;
+}
+
+/// Waits for a retained child through the operating system's process-exit
+/// notification without blocking an async executor worker.
+///
+/// The waiter is an ordinary detached thread rather than a Tokio blocking
+/// task. Dropping this future at a deadline therefore cannot make Tokio's
+/// runtime shutdown wait for a child that missed that deadline; while the
+/// launcher remains alive, the thread still retains and eventually reaps the
+/// child.
+pub async fn wait_for_child_exit(mut child: std::process::Child) -> std::io::Result<ExitStatus> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("haider-child-wait".into())
+        .spawn(move || {
+            let _ = sender.send(child.wait());
+        })
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("could not start child wait thread: {error}"),
+            )
+        })?;
+    receiver
+        .await
+        .map_err(|error| std::io::Error::other(format!("child wait thread failed: {error}")))?
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -325,17 +355,100 @@ pub fn configure_background_process(command: &mut tokio::process::Command) {
 #[cfg(unix)]
 #[allow(unsafe_code)]
 pub(crate) fn close_inherited_descriptors() {
+    close_inherited_descriptors_from(3);
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub(crate) fn close_inherited_descriptors_from(first: std::os::raw::c_int) {
+    if close_inherited_descriptor_range(first) {
+        return;
+    }
+
     unsafe extern "C" {
         fn close(fd: std::os::raw::c_int) -> std::os::raw::c_int;
     }
 
+    // Fallback for an older Linux kernel or a Unix without a bulk-close API.
     // POSIX close(2) is async-signal-safe and EBADF is expected for unused
     // slots. Do not use rustix::io::close here: its contract requires an open
     // fd, and the Linux debug backend panics on EBADF. A panic after fork is
     // converted into SIGABRT by Command's pre-exec guard.
-    for fd in 3..65_536_i32 {
+    for fd in first..65_536_i32 {
         let _ = unsafe { close(fd) };
     }
+}
+
+/// Runtime probe for Linux's 5.9+ `close_range(2)`. A kernel without the
+/// syscall returns `ENOSYS`; seccomp and other runtime refusals also fall back
+/// to the conservative individual-close loop.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(unsafe_code)]
+fn close_inherited_descriptor_range(first: std::os::raw::c_int) -> bool {
+    unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            first as libc::c_uint,
+            libc::c_uint::MAX,
+            0 as libc::c_uint,
+        ) == 0
+    }
+}
+
+/// The BSD libc implementations provide `closefrom(2)` as one bulk close.
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+#[allow(unsafe_code)]
+fn close_inherited_descriptor_range(first: std::os::raw::c_int) -> bool {
+    let _ = unsafe { libc::closefrom(first) };
+    true
+}
+
+/// macOS and other Unix targets use the loop when their deployed libc exposes
+/// no async-signal-safe bulk-close primitive.
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "netbsd",
+    target_os = "openbsd"
+)))]
+fn close_inherited_descriptor_range(_first: std::os::raw::c_int) -> bool {
+    false
+}
+
+/// Moves the daemon's one inherited readiness writer to descriptor 3.
+///
+/// This runs after `fork` and before `exec`, so it uses only async-signal-safe
+/// libc calls. Descriptor 3 is then excluded from the background close sweep;
+/// the daemon restores `FD_CLOEXEC` as soon as it adopts the writer.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub(crate) fn install_daemon_readiness_descriptor(
+    source: std::os::raw::c_int,
+) -> std::io::Result<()> {
+    const DAEMON_READINESS_FD: std::os::raw::c_int = 3;
+    const F_SETFD: std::os::raw::c_int = 2;
+
+    unsafe extern "C" {
+        fn dup2(oldfd: std::os::raw::c_int, newfd: std::os::raw::c_int) -> std::os::raw::c_int;
+        fn fcntl(fd: std::os::raw::c_int, command: std::os::raw::c_int, ...)
+        -> std::os::raw::c_int;
+    }
+
+    if source != DAEMON_READINESS_FD && unsafe { dup2(source, DAEMON_READINESS_FD) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { fcntl(DAEMON_READINESS_FD, F_SETFD, 0) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    close_inherited_descriptors_from(DAEMON_READINESS_FD + 1);
+    Ok(())
 }
 
 #[cfg(windows)]
