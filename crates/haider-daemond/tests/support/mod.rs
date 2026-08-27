@@ -24,7 +24,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -109,6 +109,28 @@ fn trace_ring() -> DiagnosticRing {
     Arc::clone(TRACE.get_or_init(|| Arc::new(StdMutex::new(VecDeque::new()))))
 }
 
+fn trace_observers() -> &'static StdMutex<Vec<Weak<StdMutex<String>>>> {
+    static OBSERVERS: OnceLock<StdMutex<Vec<Weak<StdMutex<String>>>>> = OnceLock::new();
+    OBSERVERS.get_or_init(|| StdMutex::new(Vec::new()))
+}
+
+fn push_trace(ring: &DiagnosticRing, line: String) {
+    trace_observers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|observer| {
+            let Some(output) = observer.upgrade() else {
+                return false;
+            };
+            output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push_str(&line);
+            true
+        });
+    push_diagnostic(ring, line);
+}
+
 struct TraceFields<'a>(&'a mut String);
 
 impl tracing::field::Visit for TraceFields<'_> {
@@ -134,14 +156,14 @@ impl tracing::Subscriber for TraceCapture {
             attributes.metadata().name()
         );
         attributes.record(&mut TraceFields(&mut line));
-        push_diagnostic(&self.output, line);
+        push_trace(&self.output, line);
         tracing::span::Id::from_u64(self.next_span.fetch_add(1, Ordering::Relaxed).max(1))
     }
 
     fn record(&self, _span: &tracing::span::Id, values: &tracing::span::Record<'_>) {
         let mut line = String::from("span-record ");
         values.record(&mut TraceFields(&mut line));
-        push_diagnostic(&self.output, line);
+        push_trace(&self.output, line);
     }
 
     fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
@@ -153,7 +175,7 @@ impl tracing::Subscriber for TraceCapture {
             event.metadata().name()
         );
         event.record(&mut TraceFields(&mut line));
-        push_diagnostic(&self.output, line);
+        push_trace(&self.output, line);
     }
 
     fn enter(&self, _span: &tracing::span::Id) {}
@@ -161,16 +183,20 @@ impl tracing::Subscriber for TraceCapture {
     fn exit(&self, _span: &tracing::span::Id) {}
 }
 
+fn trace_install_state() -> &'static OnceLock<bool> {
+    static INSTALLED: OnceLock<bool> = OnceLock::new();
+    &INSTALLED
+}
+
 fn install_trace_capture() -> DiagnosticRing {
-    static INSTALLED: OnceLock<()> = OnceLock::new();
     let output = trace_ring();
-    INSTALLED.get_or_init(|| {
-        if tracing::subscriber::set_global_default(TraceCapture {
+    trace_install_state().get_or_init(|| {
+        let installed = tracing::subscriber::set_global_default(TraceCapture {
             output: Arc::clone(&output),
             next_span: AtomicU64::new(1),
         })
-        .is_err()
-        {
+        .is_ok();
+        if !installed {
             push_diagnostic(
                 &output,
                 "daemon trace capture unavailable because a global subscriber already exists"
@@ -183,7 +209,27 @@ fn install_trace_capture() -> DiagnosticRing {
             push_diagnostic(&panic_output, format!("panic: {info}"));
             previous(info);
         }));
+        installed
     });
+    output
+}
+
+/// Captures the complete tracing stream while the returned observer is alive.
+/// The shared harness subscriber remains the sole process-global owner, so
+/// parallel tests cannot race to replace it.
+pub fn capture_trace_output() -> Arc<StdMutex<String>> {
+    let output = Arc::new(StdMutex::new(String::new()));
+    trace_observers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(Arc::downgrade(&output));
+    let _trace = install_trace_capture();
+    assert!(
+        *trace_install_state()
+            .get()
+            .expect("trace installation state"),
+        "install tracing capture"
+    );
     output
 }
 

@@ -8,7 +8,6 @@
 mod support;
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -38,7 +37,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use sha2::{Digest, Sha256};
-use support::{DEADLINE, UdsClient, ready_with_dependencies, test_root};
+use support::{DEADLINE, UdsClient, capture_trace_output, ready_with_dependencies, test_root};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use url::Url;
@@ -53,55 +52,6 @@ const ROTATED_ACCESS: &str = "OAUTH_ROTATED_BARRIER_ACCESS_f1a7";
 const ROTATED_REFRESH: &str = "OAUTH_ROTATED_BARRIER_REFRESH_0c42";
 const SCOPES: &str = "openid inference profile";
 const LIMIT: usize = DEFAULT_FRAME_LIMIT;
-
-#[derive(Clone)]
-struct TraceCapture {
-    output: Arc<Mutex<String>>,
-    next_span: Arc<AtomicU64>,
-}
-
-struct TraceFields<'a>(&'a Arc<Mutex<String>>);
-
-impl tracing::field::Visit for TraceFields<'_> {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if let Ok(mut output) = self.0.lock() {
-            let _ = write!(output, "{}={value:?};", field.name());
-        }
-    }
-}
-
-impl tracing::Subscriber for TraceCapture {
-    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-        true
-    }
-
-    fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        attributes.record(&mut TraceFields(&self.output));
-        tracing::span::Id::from_u64(self.next_span.fetch_add(1, Ordering::Relaxed).max(1))
-    }
-
-    fn record(&self, _span: &tracing::span::Id, values: &tracing::span::Record<'_>) {
-        values.record(&mut TraceFields(&self.output));
-    }
-
-    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-    fn event(&self, event: &tracing::Event<'_>) {
-        if let Ok(mut output) = self.output.lock() {
-            let _ = write!(
-                output,
-                "target={};name={};",
-                event.metadata().target(),
-                event.metadata().name()
-            );
-        }
-        event.record(&mut TraceFields(&self.output));
-    }
-
-    fn enter(&self, _span: &tracing::span::Id) {}
-
-    fn exit(&self, _span: &tracing::span::Id) {}
-}
 
 fn assert_tree_secret_free(
     root: &std::path::Path,
@@ -756,12 +706,7 @@ async fn ready_reference(
 
 #[tokio::test]
 async fn real_uds_oauth_add_is_capability_and_connection_bound_durable_and_secret_clean() {
-    let tracing_output = Arc::new(Mutex::new(String::new()));
-    tracing::subscriber::set_global_default(TraceCapture {
-        output: Arc::clone(&tracing_output),
-        next_span: Arc::new(AtomicU64::new(1)),
-    })
-    .expect("install tracing capture");
+    let tracing_output = capture_trace_output();
     let root = test_root("haoW");
     let store_dir = root.path().join("store");
     let mut config = DaemonConfig::new("oauth-wire", store_dir.clone(), root.path());
