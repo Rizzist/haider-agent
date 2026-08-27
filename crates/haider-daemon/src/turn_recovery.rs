@@ -190,8 +190,12 @@ pub(crate) trait StartupJournalVisitor: Send {
     ) -> Result<(), HaiderError>;
 }
 
+#[cfg(test)]
+#[allow(clippy::expect_used)]
 struct NoopStartupJournalVisitor;
 
+#[cfg(test)]
+#[allow(clippy::expect_used)]
 #[async_trait::async_trait]
 impl StartupJournalVisitor for NoopStartupJournalVisitor {
     async fn start_session(&mut self, _session_id: &SessionId) -> Result<u64, HaiderError> {
@@ -213,15 +217,6 @@ impl StartupJournalVisitor for NoopStartupJournalVisitor {
     ) -> Result<(), HaiderError> {
         Ok(())
     }
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) async fn recover_interrupted_turns_report(
-    store: &SqliteStoreHandle,
-    device_id: &DeviceId,
-) -> Result<StartupTurnRecovery, HaiderError> {
-    recover_interrupted_turns_report_with_visitor(store, device_id, &mut NoopStartupJournalVisitor)
-        .await
 }
 
 pub(crate) async fn recover_interrupted_turns_report_with_visitor(
@@ -563,13 +558,18 @@ async fn put_recovery_checkpoint(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 pub(crate) async fn recover_interrupted_turns(
     store: &SqliteStoreHandle,
     device_id: &DeviceId,
 ) -> Result<Vec<RecoveredWork>, HaiderError> {
-    Ok(recover_interrupted_turns_report(store, device_id)
-        .await?
-        .work)
+    Ok(recover_interrupted_turns_report_with_visitor(
+        store,
+        device_id,
+        &mut NoopStartupJournalVisitor,
+    )
+    .await?
+    .work)
 }
 
 fn checkpoint_state_matches(state: &RunState, checkpoint: &RequestInputCheckpoint) -> bool {
@@ -1368,13 +1368,11 @@ mod streaming_checkpoint_tests {
             .expect("checkpoint exists");
         assert_eq!(resumed_bytes, checkpoint.payload);
 
-        let recovery = recover_interrupted_turns_report(
-            &store,
-            &DeviceId::new("turn-checkpoint-resume-device"),
-        )
-        .await
-        .expect("fold checkpoint suffix");
-        assert!(recovery.work.is_empty());
+        let recovered =
+            recover_interrupted_turns(&store, &DeviceId::new("turn-checkpoint-resume-device"))
+                .await
+                .expect("fold checkpoint suffix");
+        assert!(recovered.is_empty());
         let (resumed, cursor) = load_recovery_checkpoint(&store, &session_id)
             .await
             .expect("load advanced checkpoint");
@@ -1421,7 +1419,7 @@ mod streaming_checkpoint_tests {
         assert_eq!(cursor, 0);
         assert!(reductions.is_empty());
 
-        recover_interrupted_turns_report(&store, &DeviceId::new("turn-checkpoint-corrupt-device"))
+        recover_interrupted_turns(&store, &DeviceId::new("turn-checkpoint-corrupt-device"))
             .await
             .expect("full streaming fallback repairs checkpoint");
         let (reductions, cursor) = load_recovery_checkpoint(&store, &session_id)

@@ -3668,8 +3668,6 @@ struct DurableRunHeadsProjection {
 struct DurableRunHeadRow {
     run_id: String,
     state: RunState,
-    #[allow(dead_code)]
-    state_seq: Option<u64>,
     accepted_seq: Option<u64>,
     branch_id: Option<String>,
     prompt_run_id: Option<String>,

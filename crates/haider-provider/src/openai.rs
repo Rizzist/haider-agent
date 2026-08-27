@@ -488,18 +488,6 @@ impl OpenAiHttp {
         request.build().map_err(transport_error)
     }
 
-    async fn post_json_request(
-        &self,
-        url: &str,
-        payload: &serde_json::Value,
-    ) -> Result<reqwest::Request, ProviderError> {
-        self.validate_origin(url).await?;
-        self.json_request_builder(url)?
-            .json(payload)
-            .build()
-            .map_err(transport_error)
-    }
-
     fn json_request_builder(&self, url: &str) -> Result<reqwest::RequestBuilder, ProviderError> {
         let mut request = self.with_auth_header(
             self.client

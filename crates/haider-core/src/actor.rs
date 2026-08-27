@@ -2344,8 +2344,8 @@ impl HarnessActor {
             let request_images_will_mutate = !self.config.tool_result_images_supported
                 || request_image_count > TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN
                 || request_image_bytes > TOOL_RESULT_IMAGE_MAX_BYTES_PER_TURN;
-            let mut request_only_tool_results = request_images_will_mutate
-                .then(|| {
+            let mut request_only_tool_results =
+                if request_images_will_mutate {
                     request_messages
                         .iter()
                         .enumerate()
@@ -2365,8 +2365,9 @@ impl HarnessActor {
                             )
                         })
                         .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+                } else {
+                    Vec::new()
+                };
             let snapshot_insert_at = current_turn_start.min(request_messages.len());
             let mut request_stable_history_end = stable_history_end.min(request_messages.len());
             let mut request_cacheable_history_end =

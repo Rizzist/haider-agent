@@ -760,18 +760,7 @@ impl AnthropicProvider {
         Ok(value)
     }
 
-    pub(crate) async fn request(
-        &self,
-        payload: &serde_json::Value,
-    ) -> Result<reqwest::Request, ProviderError> {
-        self.request_builder(payload)
-            .await?
-            .json(payload)
-            .build()
-            .map_err(transport_error)
-    }
-
-    async fn request_body(
+    pub(crate) async fn request_body(
         &self,
         payload: serde_json::Value,
     ) -> Result<reqwest::Request, ProviderError> {
@@ -1221,9 +1210,11 @@ impl Provider for AnthropicProvider {
             && anthropic_cache_controls_would_emit(request, &full_payload, &wire_plan);
         let legacy_observable = cache_ttl.is_some()
             && anthropic_cache_controls_legacy_observable(request, &full_payload, &wire_plan);
-        let boundaries = legacy_observable
-            .then(|| ledger_plan.ledger_boundaries())
-            .unwrap_or_default();
+        let boundaries = if legacy_observable {
+            ledger_plan.ledger_boundaries()
+        } else {
+            Vec::new()
+        };
         let messages = full_payload.get("messages")?.as_array()?;
         let (history_blocks, previous_history_blocks, previous_history_block_len) =
             crate::serialized_provider_view_history(
@@ -1776,7 +1767,7 @@ mod oauth_cache_tests {
             "the volatile current turn stays beyond the stable breakpoint"
         );
         let oauth_request = oauth
-            .request(&oauth_payload)
+            .request_body(oauth_payload)
             .await
             .expect("OAuth HTTP request");
         assert_eq!(
@@ -1800,7 +1791,7 @@ mod oauth_cache_tests {
             "the API-key TTL policy is unchanged"
         );
         let api_request = api_key
-            .request(&api_payload)
+            .request_body(api_payload)
             .await
             .expect("API-key HTTP request");
         assert!(api_request.headers().contains_key("x-api-key"));

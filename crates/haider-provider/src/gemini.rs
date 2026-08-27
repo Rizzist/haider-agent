@@ -366,18 +366,7 @@ impl GeminiProvider {
         Ok(value)
     }
 
-    pub(crate) async fn request(
-        &self,
-        payload: &serde_json::Value,
-    ) -> Result<reqwest::Request, ProviderError> {
-        self.request_builder()
-            .await?
-            .json(payload)
-            .build()
-            .map_err(transport_error)
-    }
-
-    async fn request_body(
+    pub(crate) async fn request_body(
         &self,
         payload: serde_json::Value,
     ) -> Result<reqwest::Request, ProviderError> {

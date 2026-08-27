@@ -389,19 +389,16 @@ impl ProviderViewStore {
     }
 
     fn drain_gc(&self, connection: &Connection) -> StoreResult<()> {
-        loop {
-            let Some(hash) = connection
-                .query_row(
-                    "SELECT content_hash FROM provider_view_gc
-                     ORDER BY content_hash LIMIT 1",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(sqlite_read_error)?
-            else {
-                break;
-            };
+        while let Some(hash) = connection
+            .query_row(
+                "SELECT content_hash FROM provider_view_gc
+                 ORDER BY content_hash LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sqlite_read_error)?
+        {
             let references: i64 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM provider_view_blocks WHERE content_hash = ?1",

@@ -394,6 +394,12 @@ where
     Some(writer.byte_len)
 }
 
+pub(crate) type SerializedProviderViewHistory = (
+    Vec<Vec<u8>>,
+    Option<Vec<haider_protocol::cache::ProviderViewBlockRefV1>>,
+    Option<usize>,
+);
+
 /// Serializes the current stable history once for M4's CAS. When the prior
 /// boundary is a true prefix, its ledger refs are derived from those same
 /// bytes instead of serializing the old history again.
@@ -402,11 +408,7 @@ pub(crate) fn serialized_provider_view_history(
     history_wire_start: usize,
     stable_wire_end: usize,
     previous_wire_end: Option<usize>,
-) -> Option<(
-    Vec<Vec<u8>>,
-    Option<Vec<haider_protocol::cache::ProviderViewBlockRefV1>>,
-    Option<usize>,
-)> {
+) -> Option<SerializedProviderViewHistory> {
     let start = history_wire_start.min(history.len());
     let stable_end = stable_wire_end.max(start).min(history.len());
     let blocks = history[start..stable_end]

@@ -101,7 +101,7 @@ fn gemini_credential_client_ignores_inherited_proxy_environment() {
 async fn x_goog_api_key_is_sensitive_and_request_consumes_fixed_origin_guard() {
     let provider = provider_with_resolver(SocketAddr::from(([93, 184, 216, 34], 443)));
     let request = provider
-        .request(&serde_json::json!({"contents": []}))
+        .request_body(serde_json::json!({"contents": []}))
         .await
         .expect("builds pinned request");
     assert_eq!(
@@ -147,7 +147,7 @@ async fn private_or_special_dns_answers_fail_before_api_key_request_building() {
     ] {
         let provider = provider_with_resolver(address);
         let error = provider
-            .request(&serde_json::json!({"contents": []}))
+            .request_body(serde_json::json!({"contents": []}))
             .await
             .expect_err("private resolution is rejected");
         assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);

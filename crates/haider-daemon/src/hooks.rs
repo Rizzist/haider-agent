@@ -670,7 +670,8 @@ pub(crate) struct HookEngine {
 }
 
 impl HookEngine {
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
+    #[allow(clippy::expect_used)]
     pub(crate) async fn start(
         profile_root: PathBuf,
         store: haider_core::SqliteStoreHandle,

@@ -126,7 +126,7 @@ async fn anthropic_oauth_subscription_is_bearer_beta_without_api_key_and_fixed_o
     )
     .expect("Anthropic subscription provider");
     let request = provider
-        .request(&serde_json::json!({"model":"claude-audit"}))
+        .request_body(serde_json::json!({"model":"claude-audit"}))
         .await
         .expect("fixed request");
     assert_eq!(
@@ -220,7 +220,7 @@ async fn anthropic_oauth_subscription_is_bearer_beta_without_api_key_and_fixed_o
         )
         .expect("construct fixed-host rebound audit");
         let rebound_error = rebound
-            .request(&serde_json::json!({"model":"claude-audit"}))
+            .request_body(serde_json::json!({"model":"claude-audit"}))
             .await
             .expect_err("loopback/private DNS answer must fail before bearer construction");
         assert_eq!(rebound_error.kind, ProviderErrorKind::InvalidRequest);
@@ -1232,7 +1232,10 @@ async fn native_computer_beta_is_sent_on_bedrock_and_vertex_only_when_advertised
     let payload = bedrock
         .request_payload(&bedrock_turn)
         .expect("bedrock native payload");
-    let request = bedrock.request(&payload).await.expect("bedrock request");
+    let request = bedrock
+        .request_body(payload)
+        .await
+        .expect("bedrock request");
     assert_eq!(
         request
             .headers()
@@ -1253,7 +1256,7 @@ async fn native_computer_beta_is_sent_on_bedrock_and_vertex_only_when_advertised
     let payload = vertex
         .request_payload(&vertex_turn)
         .expect("vertex native payload");
-    let request = vertex.request(&payload).await.expect("vertex request");
+    let request = vertex.request_body(payload).await.expect("vertex request");
     assert_eq!(
         request
             .headers()
@@ -1266,7 +1269,7 @@ async fn native_computer_beta_is_sent_on_bedrock_and_vertex_only_when_advertised
         .request_payload(&one_line_turn("claude-sonnet-4-5@20250929"))
         .expect("vertex generic payload");
     let generic_request = vertex
-        .request(&generic_payload)
+        .request_body(generic_payload)
         .await
         .expect("vertex generic request");
     assert!(
@@ -1286,7 +1289,7 @@ async fn native_computer_beta_composes_with_fast_and_oauth_headers() {
     let api_key = model_payload_provider(false, "claude-opus-5").with_fast(true);
     let payload = api_key.request_payload(&turn).expect("native fast payload");
     let request = api_key
-        .request(&payload)
+        .request_body(payload)
         .await
         .expect("native fast request");
     assert_eq!(
@@ -1315,7 +1318,10 @@ async fn native_computer_beta_composes_with_fast_and_oauth_headers() {
     .expect("OAuth native provider")
     .with_fast(true);
     let payload = oauth.request_payload(&turn).expect("OAuth native payload");
-    let request = oauth.request(&payload).await.expect("OAuth native request");
+    let request = oauth
+        .request_body(payload)
+        .await
+        .expect("OAuth native request");
     assert_eq!(
         request
             .headers()
@@ -1470,7 +1476,7 @@ async fn fast_mode_sets_speed_body_and_comma_joined_beta_header() {
     // Header, api-key mode: the fast beta alone.
     let api_key = payload_provider(false).with_fast(true);
     let request = api_key
-        .request(&serde_json::json!({"model": "claude-audit"}))
+        .request_body(serde_json::json!({"model": "claude-audit"}))
         .await
         .expect("api-key fast request");
     assert_eq!(
@@ -1483,7 +1489,7 @@ async fn fast_mode_sets_speed_body_and_comma_joined_beta_header() {
 
     // Header, api-key mode, fast OFF: no beta header at all (pre-G3 shape).
     let request = payload_provider(false)
-        .request(&serde_json::json!({"model": "claude-audit"}))
+        .request_body(serde_json::json!({"model": "claude-audit"}))
         .await
         .expect("api-key standard request");
     assert!(request.headers().get(ANTHROPIC_OAUTH_BETA_HEADER).is_none());
@@ -1505,7 +1511,7 @@ async fn fast_mode_sets_speed_body_and_comma_joined_beta_header() {
     .expect("Anthropic subscription provider")
     .with_fast(true);
     let request = oauth
-        .request(&serde_json::json!({"model": "claude-audit"}))
+        .request_body(serde_json::json!({"model": "claude-audit"}))
         .await
         .expect("oauth fast request");
     assert_eq!(
@@ -1605,7 +1611,10 @@ async fn lb1_bedrock_mantle_golden_url_headers_body_and_sse() {
         Some("anthropic.claude-opus-5"),
         "the mantle model rides IN THE BODY"
     );
-    let request = provider.request(&payload).await.expect("mantle request");
+    let request = provider
+        .request_body(payload)
+        .await
+        .expect("mantle request");
     assert_eq!(
         request.url().as_str(),
         "https://bedrock-mantle.us-east-1.api.aws/anthropic/v1/messages"
@@ -1736,7 +1745,10 @@ async fn lv1_vertex_golden_model_in_url_version_in_body_bearer_header() {
         Some("vertex-2023-10-16"),
         "the vertex body versions through anthropic_version"
     );
-    let request = provider.request(&payload).await.expect("vertex request");
+    let request = provider
+        .request_body(payload)
+        .await
+        .expect("vertex request");
     assert_eq!(
         request.url().as_str(),
         "https://aiplatform.googleapis.com/v1/projects/acme-ai/locations/global/publishers/anthropic/models/claude-sonnet-4-5@20250929:streamRawPredict",

@@ -19,6 +19,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::error::TryRecvError;
 
+fn serialized_json_body(payload: serde_json::Value) -> Vec<u8> {
+    crate::serialize_json_body(payload).expect("serialize provider request body")
+}
+
 struct HangingFixture {
     first_chunk: Option<Vec<u8>>,
     dropped: Arc<AtomicBool>,
@@ -395,9 +399,9 @@ async fn dropping_openai_stream_aborts_its_hanging_source() {
 /// MUTATION CHECK: remove the resolved-address call to
 /// `validate_resolved_compatible_origin`.
 ///
-/// Safe code rejects before `get_request` or `post_json_request` can construct
-/// a request carrying the bearer. The mutation makes the metadata-host request
-/// observable here with the exact sentinel header.
+/// Safe code rejects before `get_request` or `post_json_body_request` can
+/// construct a request carrying the bearer. The mutation makes the
+/// metadata-host request observable here with the exact sentinel header.
 /// Verified by revert on 2026-07-29.
 #[tokio::test]
 async fn hostname_resolution_rejects_every_forbidden_answer_before_bearer_construction() {
@@ -440,9 +444,9 @@ async fn hostname_resolution_rejects_every_forbidden_answer_before_bearer_constr
         assert_forbidden_origin_request(
             provider
                 .http
-                .post_json_request(
+                .post_json_body_request(
                     &provider.chat_url,
-                    &serde_json::json!({"model":"audit-model"}),
+                    serialized_json_body(serde_json::json!({"model":"audit-model"})),
                 )
                 .await,
             "POST",
@@ -714,7 +718,10 @@ async fn openai_oauth_subscription_is_codex_bearer_lite_and_fixed_origin() {
     .expect("OpenAI subscription provider");
     let request = provider
         .http
-        .post_json_request(&provider.api_url, &serde_json::json!({"model":"gpt-audit"}))
+        .post_json_body_request(
+            &provider.api_url,
+            serialized_json_body(serde_json::json!({"model":"gpt-audit"})),
+        )
         .await
         .expect("fixed request");
     assert_eq!(
@@ -804,7 +811,10 @@ async fn openai_oauth_subscription_is_codex_bearer_lite_and_fixed_origin() {
         .expect("construct fixed-host rebound audit");
         let rebound_error = rebound
             .http
-            .post_json_request(&rebound.api_url, &serde_json::json!({"model":"gpt-audit"}))
+            .post_json_body_request(
+                &rebound.api_url,
+                serialized_json_body(serde_json::json!({"model":"gpt-audit"})),
+            )
             .await
             .expect_err("loopback/private DNS answer must fail before bearer construction");
         assert_eq!(rebound_error.kind, ProviderErrorKind::InvalidRequest);
@@ -1040,9 +1050,9 @@ async fn lk1_keyless_placeholder_bearer_reaches_the_wire_header() {
 
     let post = provider
         .http
-        .post_json_request(
+        .post_json_body_request(
             &provider.chat_url,
-            &serde_json::json!({"model":"llama3.1:8b"}),
+            serialized_json_body(serde_json::json!({"model":"llama3.1:8b"})),
         )
         .await
         .expect("chat POST request");
@@ -3032,7 +3042,7 @@ async fn haider_code_request_uses_fixed_chat_completions_bearer_and_model() {
 
     let outbound = provider
         .http
-        .post_json_request(&provider.chat_url, &payload)
+        .post_json_body_request(&provider.chat_url, serialized_json_body(payload))
         .await
         .expect("build fixed Haider Code request");
     assert_eq!(
@@ -3083,7 +3093,7 @@ async fn grok_oauth_proxy_request_pins_complete_header_contract() {
     let payload = provider.request_payload(&request).expect("Grok payload");
     let outbound = provider
         .http
-        .post_json_request(&provider.chat_url, &payload)
+        .post_json_body_request(&provider.chat_url, serialized_json_body(payload))
         .await
         .expect("build Grok proxy request");
     assert_eq!(
@@ -3757,7 +3767,10 @@ async fn kimi_fixed_origin_allows_exact_chat_and_models_endpoints() {
 
     let chat = provider
         .http
-        .post_json_request(&provider.chat_url, &serde_json::json!({"bounded": true}))
+        .post_json_body_request(
+            &provider.chat_url,
+            serialized_json_body(serde_json::json!({"bounded": true})),
+        )
         .await
         .expect("exact chat endpoint");
     assert_eq!(
@@ -3907,7 +3920,7 @@ async fn lz1_azure_request_rides_api_key_header_and_deployment_model() {
     );
     let post = provider
         .http
-        .post_json_request(&provider.chat_url, &payload)
+        .post_json_body_request(&provider.chat_url, serialized_json_body(payload))
         .await
         .expect("azure chat POST");
     assert_eq!(
