@@ -5234,10 +5234,11 @@ async fn api_login_rekeys_an_existing_alias_in_place() {
     assert_eq!(descriptor.identity, "replacement identity");
     assert_eq!(descriptor.label.as_deref(), Some("operator label"));
     assert!(descriptor.active);
-    let published = snapshot.lock().expect("account snapshot");
-    assert_eq!(published.len(), 1);
-    assert_eq!(published[0], descriptor);
-    drop(published);
+    {
+        let published = snapshot.lock().expect("account snapshot");
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0], descriptor);
+    }
     assert_eq!(
         vault
             .resolve(&alias)
