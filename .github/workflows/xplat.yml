@@ -50,6 +50,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: install SDK packages
+        run: |
+          yes | sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools" >/dev/null || true
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
@@ -77,3 +93,6 @@ jobs:
           echo "RANLIB_aarch64_linux_android=$toolchain/llvm-ranlib" >> "$GITHUB_ENV"
       - name: build Android Phase 1 binaries
         run: cargo build --locked --target aarch64-linux-android -p haider-cli -p haider-daemond
+      - name: compile Android Kotlin app
+        working-directory: android
+        run: gradle :app:compileReleaseKotlin --no-daemon --stacktrace

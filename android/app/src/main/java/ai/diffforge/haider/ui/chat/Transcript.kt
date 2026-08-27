@@ -123,10 +123,11 @@ private fun UserBubble(message: Message) {
     val colors = Forge.colors
     val type = Forge.type
     BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+        val maxBubbleWidth = maxWidth * 0.72f
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
             Box(
                 modifier = Modifier
-                    .widthIn(max = maxWidth * 0.72f)
+                    .widthIn(max = maxBubbleWidth)
                     .clip(USER_SHAPE)
                     .background(colors.accent.copy(alpha = 0.12f))
                     .border(1.dp, colors.accentSoft.copy(alpha = 0.28f), USER_SHAPE)
