@@ -336,6 +336,7 @@ fn adapter_cache_profile(provider: &str, endpoint: &str) -> ProviderSummaryWire 
         provider: provider.to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some(endpoint.to_owned()),
+        response_open_timeout_ms: None,
         models: vec!["adapter-cache-model".to_owned()],
         model_details: Vec::new(),
         auth_methods: vec![AuthMethod::ApiKey],
@@ -399,11 +400,23 @@ fn production_adapter_cache_separates_policy_and_credential_configurations() {
     let first = build_cached_adapter(&builder, &vault, &trusted_lan, &descriptor, &registry);
     let same = build_cached_adapter(&builder, &vault, &trusted_lan, &descriptor, &registry);
     let different_policy = build_cached_adapter(&builder, &vault, &azure, &descriptor, &registry);
+    let mut slower_open = trusted_lan.clone();
+    slower_open.response_open_timeout_ms = Some(75_000);
+    let different_timeout =
+        build_cached_adapter(&builder, &vault, &slower_open, &descriptor, &registry);
 
     assert!(Arc::ptr_eq(&first, &same));
     assert!(
         !Arc::ptr_eq(&first, &different_policy),
         "TrustedLan/Bearer and strict Azure/api-key configurations need distinct guarded clients"
+    );
+    assert!(
+        !Arc::ptr_eq(&first, &different_timeout),
+        "the typed profile response-open budget needs a distinct retained adapter"
+    );
+    assert_eq!(
+        openai_transport_config(Some(&slower_open)).response_open_timeout,
+        Duration::from_secs(75)
     );
     vault
         .put(&descriptor.alias, b"rotated-adapter-policy-secret")
@@ -627,6 +640,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
         provider: provider.to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some("http://127.0.0.1:11434/v1".to_owned()),
+        response_open_timeout_ms: None,
         models: vec!["llama-fixture".to_owned()],
         model_details: vec![
             ModelDetailWire {
@@ -723,6 +737,7 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
         provider: provider.to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some("http://127.0.0.1:11434/v1".to_owned()),
+        response_open_timeout_ms: None,
         models: vec!["model-small".to_owned(), "model-large".to_owned()],
         model_details: vec![
             ModelDetailWire {
@@ -845,6 +860,7 @@ fn keyless_summary(provider: &str, origin: &str) -> ProviderSummaryWire {
         provider: provider.to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some(origin.to_owned()),
+        response_open_timeout_ms: None,
         models: vec!["llama3.1:8b".to_owned()],
         model_details: vec![ModelDetailWire {
             name: "llama3.1:8b".to_owned(),
@@ -1054,6 +1070,7 @@ async fn lk2_keyless_preset_configure_persists_and_mock_discovery_flips_availabl
             enabled: true,
             models: vec!["llama3.1:8b".to_owned()],
             default_model: Some("llama3.1:8b".to_owned()),
+            response_open_timeout_ms: None,
         })
         .expect("keyless preset configure");
     assert_eq!(
@@ -4793,6 +4810,7 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
                 enabled: true,
                 models: vec!["model-a".into(), "model-b".into()],
                 default_model: Some("model-a".into()),
+                response_open_timeout_ms: None,
             },
             0,
         ))
@@ -4863,6 +4881,7 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
                 enabled: true,
                 models: vec!["model-a".into()],
                 default_model: Some("model-a".into()),
+                response_open_timeout_ms: None,
             },
             2,
         ))
@@ -5013,6 +5032,7 @@ fn endpoint_edit_profile(provider: &str, origin: &str) -> ProviderProfileV1 {
         display_name: provider.to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         base_url: Some(origin.to_owned()),
+        response_open_timeout_ms: None,
         enabled: true,
         auth_requirement: ProviderAuthRequirementWire::ApiKey,
         configured_models: vec!["model-a".to_owned()],
@@ -5057,6 +5077,7 @@ fn endpoint_repoint_input(provider: &str, origin: &str) -> ProviderConfigureInpu
         enabled: true,
         models: vec!["model-a".to_owned()],
         default_model: Some("model-a".to_owned()),
+        response_open_timeout_ms: None,
     }
 }
 
@@ -5069,6 +5090,7 @@ fn endpoint_create_input(provider: &str, origin: &str) -> ProviderConfigureInput
         enabled: true,
         models: vec!["model-a".to_owned()],
         default_model: Some("model-a".to_owned()),
+        response_open_timeout_ms: None,
     }
 }
 
@@ -5767,6 +5789,7 @@ async fn pre_v8_pending_provider_receipts_reconcile_without_a_discovered_cache()
             display_name: "legacy-default".to_owned(),
             api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
             base_url: Some("https://legacy-default.example.invalid".to_owned()),
+            response_open_timeout_ms: None,
             enabled: true,
             auth_requirement: ProviderAuthRequirementWire::ApiKey,
             configured_models: vec![
@@ -5782,6 +5805,7 @@ async fn pre_v8_pending_provider_receipts_reconcile_without_a_discovered_cache()
             display_name: "legacy-configure".to_owned(),
             api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
             base_url: Some("https://legacy-configure.example.invalid".to_owned()),
+            response_open_timeout_ms: None,
             enabled: true,
             auth_requirement: ProviderAuthRequirementWire::ApiKey,
             configured_models: vec!["frontier-legacy-old".to_owned()],
@@ -5828,6 +5852,7 @@ async fn pre_v8_pending_provider_receipts_reconcile_without_a_discovered_cache()
         enabled: true,
         models: vec!["frontier-legacy-new".to_owned()],
         default_model: Some("frontier-legacy-new".to_owned()),
+        response_open_timeout_ms: None,
     };
     let configure_identity = ProviderConfigureIdentity {
         input: configure_input.clone(),
@@ -6120,6 +6145,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
             display_name: key_provider.to_owned(),
             api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
             base_url: Some(key_origin.to_owned()),
+            response_open_timeout_ms: None,
             enabled: true,
             auth_requirement: ProviderAuthRequirementWire::ApiKey,
             configured_models: vec!["seed-key".to_owned()],
@@ -6132,6 +6158,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
             display_name: no_auth_provider.to_owned(),
             api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
             base_url: Some(no_auth_origin.to_owned()),
+            response_open_timeout_ms: None,
             enabled: true,
             auth_requirement: ProviderAuthRequirementWire::None,
             configured_models: vec!["seed-none".to_owned()],
@@ -6144,6 +6171,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
             display_name: GEMINI_PROVIDER_NAME.to_owned(),
             api_family: ProviderApiFamilyWire::GeminiGenerateContent,
             base_url: Some(haider_provider::GEMINI_API_BASE_URL.to_owned()),
+            response_open_timeout_ms: None,
             enabled: true,
             auth_requirement: ProviderAuthRequirementWire::ApiKey,
             configured_models: Vec::new(),
@@ -8658,6 +8686,7 @@ fn removable_provider_profile(provider: &str) -> ProviderProfileV1 {
         display_name: provider.to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         base_url: Some("https://custom.example.invalid".to_owned()),
+        response_open_timeout_ms: None,
         enabled: true,
         auth_requirement: ProviderAuthRequirementWire::ApiKey,
         configured_models: vec!["custom-model".to_owned()],
@@ -8692,6 +8721,7 @@ async fn provider_remove_commits_replays_fences_and_beats_restart_resurrection()
         enabled: true,
         models: vec!["custom-model".to_owned()],
         default_model: Some("custom-model".to_owned()),
+        response_open_timeout_ms: None,
     };
     let older_identity = ProviderConfigureIdentity {
         input: older_configure.clone(),
@@ -9060,6 +9090,7 @@ fn custom_login_targets_only_chat_completions_profiles() {
                 provider: "custom-llama".to_owned(),
                 api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
                 endpoint: Some("http://127.0.0.1:18123/v1".to_owned()),
+                response_open_timeout_ms: None,
                 models: vec!["llama3.1:8b".to_owned()],
                 model_details: Vec::new(),
                 auth_methods: Vec::new(),
@@ -9072,6 +9103,7 @@ fn custom_login_targets_only_chat_completions_profiles() {
                 provider: "openai".to_owned(),
                 api_family: ProviderApiFamilyWire::OpenAiResponses,
                 endpoint: Some("https://api.openai.com/v1/responses".to_owned()),
+                response_open_timeout_ms: None,
                 models: Vec::new(),
                 model_details: Vec::new(),
                 auth_methods: Vec::new(),
@@ -9084,6 +9116,7 @@ fn custom_login_targets_only_chat_completions_profiles() {
                 provider: DEEPSEEK_PROVIDER_NAME.to_owned(),
                 api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
                 endpoint: Some(DEEPSEEK_BASE_URL.to_owned()),
+                response_open_timeout_ms: None,
                 models: haider_provider::DEEPSEEK_SEED_MODELS
                     .iter()
                     .map(|model| (*model).to_owned())
@@ -9744,6 +9777,7 @@ fn stale_effort_clamps_for_anthropic_and_drops_for_declared_openai_ladders() {
         provider: "openai-oauth".to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiResponses,
         endpoint: None,
+        response_open_timeout_ms: None,
         models: vec!["gpt-5.5".to_owned()],
         model_details: vec![
             ModelDetailWire {
@@ -9820,6 +9854,7 @@ fn enterprise_summary(provider: &str, endpoint: Option<&str>) -> ProviderSummary
         provider: provider.to_owned(),
         api_family: ProviderApiFamilyWire::AnthropicMessages,
         endpoint: endpoint.map(str::to_owned),
+        response_open_timeout_ms: None,
         models: models.clone(),
         model_details: Vec::new(),
         auth_methods: vec![AuthMethod::ApiKey],
@@ -10326,6 +10361,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
             enabled: true,
             models: vertex_models,
             default_model: Some("claude-fable-5".to_owned()),
+            response_open_timeout_ms: None,
         })
         .expect("configure vertex endpoint");
     let management = ManagementSnapshot::new(
@@ -10712,6 +10748,7 @@ async fn each_turn_resolves_the_currently_active_account() {
         provider: provider.to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some("http://127.0.0.1:11434/v1".to_owned()),
+        response_open_timeout_ms: None,
         models: vec!["llama-fixture".to_owned()],
         model_details: vec![ModelDetailWire {
             name: "llama-fixture".to_owned(),

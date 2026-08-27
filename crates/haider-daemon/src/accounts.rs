@@ -51,9 +51,9 @@ use haider_provider::{
     DEEPSEEK_PROVIDER_NAME, DiscoveredCatalog, DiscoveredModel, GEMINI_PROVIDER_NAME,
     GROK_OAUTH_PROVIDER_NAME, GeminiProvider, HAIDER_CODE_BASE_URL, HAIDER_CODE_PROVIDER_NAME,
     KIMI_OAUTH_PROVIDER_NAME, Message, OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME,
-    OPENAI_PROVIDER_NAME, OpenAiCompatibleProvider, OpenAiProvider, Provider, ProviderErrorKind,
-    TurnRequest, VERTEX_PROVIDER_NAME, XAI_BASE_URL, XAI_PROVIDER_NAME, azure_openai_origin,
-    discover_models,
+    OPENAI_PROVIDER_NAME, OpenAiCompatibleProvider, OpenAiProvider, OpenAiTransportConfig,
+    Provider, ProviderErrorKind, TurnRequest, VERTEX_PROVIDER_NAME, XAI_BASE_URL,
+    XAI_PROVIDER_NAME, azure_openai_origin, discover_models,
 };
 use haider_rpc::{
     ERROR_CODE_BUSY, ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_INVALID_ARGUMENT,
@@ -6070,6 +6070,7 @@ const ACCOUNT_PROVIDER_ADAPTER_CACHE_CAPACITY: usize = 64;
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct AccountProviderProfileCacheKey {
     endpoint: Option<String>,
+    response_open_timeout_ms: Option<u64>,
     openai_chat_completions: bool,
     auth_methods: Vec<AuthMethod>,
     selected_model: Option<AccountProviderModelCacheKey>,
@@ -6093,6 +6094,7 @@ impl AccountProviderProfileCacheKey {
             });
         Self {
             endpoint: profile.endpoint.clone(),
+            response_open_timeout_ms: profile.response_open_timeout_ms,
             openai_chat_completions: matches!(
                 profile.api_family,
                 ProviderApiFamilyWire::OpenAiChatCompletions
@@ -6156,9 +6158,9 @@ impl From<&DiscoveredModel> for AccountProviderCatalogModelCacheKey {
 /// Every non-secret input that can change adapter construction. Account,
 /// endpoint, auth/header mode, origin policy, tuning, and catalog facts are
 /// explicit; the credential fingerprint separates rotations without
-/// retaining another copy of the secret. Proxy, timeout, TLS, redirect, and
-/// DNS-resolver implementations are constructor constants in one process, so
-/// the provider/profile route selects their exact policy.
+/// retaining another copy of the secret. The typed profile response-open
+/// timeout participates through `profile`; proxy, TLS, redirect, and DNS
+/// resolver implementations remain constructor constants in one process.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct AccountProviderAdapterCacheKey {
     provider: String,
@@ -6460,6 +6462,7 @@ fn build_account_provider(
     let anthropic_fast = anthropic_fast_for(provider, tuning, model);
     let anthropic_effort = anthropic_effort_for(tuning, model);
     let openai_effort = openai_effort_for(tuning, profile, model);
+    let openai_transport = openai_transport_config(profile);
     let adapter: Arc<dyn Provider> = match (provider, auth_method) {
         // W-B: FIRST-PARTY Anthropic pairs declare the server web tools;
         // Bedrock/Vertex below deliberately never take the flag (the
@@ -6514,6 +6517,8 @@ fn build_account_provider(
         (OPENAI_PROVIDER_NAME, AuthMethod::ApiKey) => Arc::new(
             OpenAiProvider::new(credential, model)
                 .map_err(|error| adapter_construction_error(provider, error))?
+                .with_transport_config(openai_transport)
+                .map_err(|error| adapter_construction_error(provider, error))?
                 .with_account(alias.clone())
                 .with_effort(openai_effort.clone())
                 // W-B: hosted web_search on the API-key Responses pair; the
@@ -6533,15 +6538,21 @@ fn build_account_provider(
         (DEEPSEEK_PROVIDER_NAME, AuthMethod::ApiKey) => Arc::new(
             OpenAiCompatibleProvider::new_deepseek_api(credential, model, DEEPSEEK_BASE_URL)
                 .map_err(|error| adapter_construction_error(provider, error))?
+                .with_transport_config(openai_transport)
+                .map_err(|error| adapter_construction_error(provider, error))?
                 .with_account(alias.clone()),
         ),
         (HAIDER_CODE_PROVIDER_NAME, AuthMethod::ApiKey) => Arc::new(
             OpenAiCompatibleProvider::new_haider_code_api(credential, model, HAIDER_CODE_BASE_URL)
                 .map_err(|error| adapter_construction_error(provider, error))?
+                .with_transport_config(openai_transport)
+                .map_err(|error| adapter_construction_error(provider, error))?
                 .with_account(alias.clone()),
         ),
         (XAI_PROVIDER_NAME, AuthMethod::ApiKey) => Arc::new(
             OpenAiCompatibleProvider::new_xai_api(credential, model, XAI_BASE_URL)
+                .map_err(|error| adapter_construction_error(provider, error))?
+                .with_transport_config(openai_transport)
                 .map_err(|error| adapter_construction_error(provider, error))?
                 .with_account(alias.clone()),
         ),
@@ -6555,6 +6566,8 @@ fn build_account_provider(
             })?;
             Arc::new(
                 OpenAiCompatibleProvider::new(credential, model, base_url)
+                    .map_err(|error| adapter_construction_error(provider, error))?
+                    .with_transport_config(openai_transport)
                     .map_err(|error| adapter_construction_error(provider, error))?
                     .with_account(alias.clone()),
             )
@@ -6582,6 +6595,8 @@ fn build_account_provider(
             })?;
             Arc::new(
                 custom_compatible_adapter(provider, credential, model, base_url)?
+                    .with_transport_config(openai_transport)
+                    .map_err(|error| adapter_construction_error(provider, error))?
                     .with_account(alias.clone()),
             )
         }
@@ -6605,6 +6620,8 @@ fn build_account_provider(
             })?;
             Arc::new(
                 custom_compatible_adapter(provider, credential, model, base_url)?
+                    .with_transport_config(openai_transport)
+                    .map_err(|error| adapter_construction_error(provider, error))?
                     .with_account(alias.clone()),
             )
         }
@@ -6627,6 +6644,8 @@ fn build_account_provider(
             }
             Arc::new(
                 OpenAiProvider::new_subscription(credential, model, inference.base_url)
+                    .map_err(|error| adapter_construction_error(provider, error))?
+                    .with_transport_config(openai_transport)
                     .map_err(|error| adapter_construction_error(provider, error))?
                     .with_account(alias.clone())
                     .with_effort(openai_effort.clone()),
@@ -6685,6 +6704,8 @@ fn build_account_provider(
                 inference.base_url,
             )
             .map_err(|error| adapter_construction_error(provider, error))?
+            .with_transport_config(openai_transport)
+            .map_err(|error| adapter_construction_error(provider, error))?
             .with_account(alias.clone())
             .with_cached_catalog_model(catalog_model);
             // G3: inject ONLY what the kimi catalog declared for this model
@@ -6740,6 +6761,8 @@ fn build_account_provider(
                     inference.base_url,
                 )
                 .map_err(|error| adapter_construction_error(provider, error))?
+                .with_transport_config(openai_transport)
+                .map_err(|error| adapter_construction_error(provider, error))?
                 .with_account(alias.clone())
                 .with_cached_catalog_model(catalog_model),
             )
@@ -6755,6 +6778,14 @@ fn build_account_provider(
         }
     };
     Ok(adapter)
+}
+
+fn openai_transport_config(profile: Option<&ProviderSummaryWire>) -> OpenAiTransportConfig {
+    let mut config = haider_provider::OPENAI_DEFAULT_TRANSPORT_CONFIG;
+    if let Some(timeout_ms) = profile.and_then(|profile| profile.response_open_timeout_ms) {
+        config.response_open_timeout = Duration::from_millis(timeout_ms);
+    }
+    config
 }
 
 /// G3 fast gate at construction: fast is validated at TOGGLE time, but a

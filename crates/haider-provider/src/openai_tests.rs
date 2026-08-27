@@ -315,58 +315,188 @@ async fn hanging_openai_fixture_times_out_only_the_idle_chunk_await() {
         .expect_err("idle deadline is typed");
     assert_eq!(error.kind, ProviderErrorKind::Transport);
     assert!(
-        !error.retryable,
-        "an idle deadline must terminalize before an outer process timeout"
+        error.retryable,
+        "an idle timeout is transient; core still refuses replay after content"
     );
-    assert!(error.message.contains("90 seconds"));
+    assert_eq!(error.opened_within_ms, Some(90_000));
+    assert_eq!(error.budget_ms, Some(90_000));
     assert!(receiver.recv().await.is_none());
     stream_task.await.expect("stream task exits");
     assert!(dropped.load(Ordering::SeqCst));
 }
 
 #[test]
-fn openai_silent_phase_deadlines_precede_common_run_supervisors() {
+fn openai_transport_defaults_split_connect_open_and_idle_budgets() {
     let config = OpenAiProvider::transport_config();
-    let supervisor_deadline = Duration::from_secs(15);
-    assert_eq!(config.connect_timeout, Duration::from_secs(5));
-    assert_eq!(config.response_open_timeout, Duration::from_secs(5));
-    assert_eq!(config.chunk_idle_timeout, Duration::from_secs(5));
-    assert!(config.response_open_timeout < supervisor_deadline);
-    assert!(config.chunk_idle_timeout < supervisor_deadline);
+    assert_eq!(config.connect_timeout, Duration::from_secs(10));
+    assert_eq!(config.response_open_timeout, Duration::from_secs(60));
+    assert_eq!(config.chunk_idle_timeout, Duration::from_secs(90));
 
-    let open = response_open_timeout_error(config.response_open_timeout);
+    let open =
+        response_open_timeout_error(config.response_open_timeout, config.response_open_timeout);
     assert_eq!(open.kind, ProviderErrorKind::Transport);
     assert_eq!(open.presentation.subcode.as_str(), "provider-timeout");
-    assert!(
-        !open.retryable,
-        "a silent request must not start a 10-try loop"
-    );
+    assert!(open.retryable, "response-open timeouts are transient");
+    assert_eq!(open.opened_within_ms, Some(60_000));
+    assert_eq!(open.budget_ms, Some(60_000));
+    assert_eq!(open.presentation.opened_within_ms, Some(60_000));
+    assert_eq!(open.presentation.budget_ms, Some(60_000));
+    let connect = connect_timeout_error(config.connect_timeout);
+    assert_eq!(connect.kind, ProviderErrorKind::Transport);
+    assert_eq!(connect.presentation.subcode.as_str(), "provider-timeout");
+    assert!(connect.retryable, "connect timeouts are transient");
+    assert_eq!(connect.opened_within_ms, Some(10_000));
+    assert_eq!(connect.budget_ms, Some(10_000));
+    assert_eq!(connect.presentation.opened_within_ms, Some(10_000));
+    assert_eq!(connect.presentation.budget_ms, Some(10_000));
     let idle = stream_idle_error(config.chunk_idle_timeout);
     assert_eq!(idle.kind, ProviderErrorKind::Transport);
     assert_eq!(idle.presentation.subcode.as_str(), "provider-timeout");
-    assert!(
-        !idle.retryable,
-        "an idle stream must become a finite failure"
-    );
+    assert!(idle.retryable, "stream-idle timeouts are transient");
+}
+
+#[test]
+fn response_open_budget_is_a_typed_per_provider_override() {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("transport-profile");
+    vault
+        .put(&alias, b"transport-profile-secret")
+        .expect("store credential");
+    let override_config = OpenAiTransportConfig {
+        response_open_timeout: Duration::from_secs(75),
+        ..OPENAI_DEFAULT_TRANSPORT_CONFIG
+    };
+    let provider = OpenAiProvider::new(
+        vault.resolve(&alias).expect("resolve credential"),
+        "gpt-5.6",
+    )
+    .expect("construct provider")
+    .with_transport_config(override_config)
+    .expect("apply profile transport override");
+    assert_eq!(provider.http.transport_config, override_config);
+
+    let compatible = OpenAiCompatibleProvider::new_deepseek_api(
+        vault
+            .resolve(&alias)
+            .expect("resolve compatible credential"),
+        "deepseek-reasoner",
+        DEEPSEEK_BASE_URL,
+    )
+    .expect("construct compatible provider")
+    .with_transport_config(override_config)
+    .expect("apply compatible profile transport override");
+    assert_eq!(compatible.http.transport_config, override_config);
 }
 
 #[tokio::test(start_paused = true)]
-async fn response_open_deadline_expires_a_silent_request() {
-    let opening = tokio::spawn(response_before_deadline(
-        Duration::from_secs(5),
-        future::pending::<Result<(), ProviderError>>(),
-    ));
-    tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_secs(4)).await;
+async fn response_open_budget_accepts_a_mock_upstream_that_opens_at_twenty_seconds() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind slow-open fixture");
+    let origin = format!("http://{}", listener.local_addr().expect("fixture address"));
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let fixture = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept inference request");
+        let mut request = [0_u8; 8192];
+        let read = socket
+            .read(&mut request)
+            .await
+            .expect("read inference request");
+        assert!(read > 0, "fixture received an HTTP request");
+        accepted_tx.send(()).expect("signal accepted request");
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            )
+            .await
+            .expect("write delayed response");
+    });
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("slow-open-20s");
+    vault
+        .put(&alias, b"slow-open-secret")
+        .expect("store credential");
+    let provider = OpenAiCompatibleProvider::new_custom(
+        vault.resolve(&alias).expect("resolve credential"),
+        "slow-open-model",
+        &origin,
+    )
+    .expect("construct loopback provider");
+    let opening = tokio::spawn(async move {
+        provider
+            .capture_response(&probe_request("slow-open-model"))
+            .await
+    });
+    accepted_rx.await.expect("request reached slow upstream");
+    tokio::time::advance(Duration::from_secs(19)).await;
     assert!(!opening.is_finished());
     tokio::time::advance(Duration::from_secs(1)).await;
+    let capture = opening
+        .await
+        .expect("open task exits")
+        .expect("20-second response opens under the default budget");
+    assert_eq!(capture.status, 200);
+    assert_eq!(capture.body, b"{}");
+    fixture.await.expect("slow-open fixture exits");
+}
+
+#[tokio::test(start_paused = true)]
+async fn response_open_budget_fails_typed_after_sixty_one_seconds() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind over-budget fixture");
+    let origin = format!("http://{}", listener.local_addr().expect("fixture address"));
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let fixture = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept inference request");
+        let mut request = [0_u8; 8192];
+        let read = socket
+            .read(&mut request)
+            .await
+            .expect("read inference request");
+        assert!(read > 0, "fixture received an HTTP request");
+        accepted_tx.send(()).expect("signal accepted request");
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        let _ = socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            )
+            .await;
+    });
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("slow-open-61s");
+    vault
+        .put(&alias, b"slow-open-secret")
+        .expect("store credential");
+    let provider = OpenAiCompatibleProvider::new_custom(
+        vault.resolve(&alias).expect("resolve credential"),
+        "slow-open-model",
+        &origin,
+    )
+    .expect("construct loopback provider");
+    let opening = tokio::spawn(async move {
+        provider
+            .capture_response(&probe_request("slow-open-model"))
+            .await
+    });
+    accepted_rx.await.expect("request reached slow upstream");
+    tokio::time::advance(Duration::from_secs(59)).await;
+    assert!(!opening.is_finished());
+    tokio::time::advance(Duration::from_secs(2)).await;
     let error = opening
         .await
         .expect("timeout task exits")
         .expect_err("the local request deadline fires");
     assert_eq!(error.kind, ProviderErrorKind::Transport);
-    assert!(!error.retryable);
-    assert!(error.message.contains("5 seconds"));
+    assert!(error.retryable);
+    assert_eq!(error.opened_within_ms, Some(60_000));
+    assert_eq!(error.budget_ms, Some(60_000));
+    assert_eq!(error.presentation.opened_within_ms, Some(60_000));
+    assert_eq!(error.presentation.budget_ms, Some(60_000));
+    assert!(error.message.contains("opened_within_ms=60000"));
+    assert!(error.message.contains("budget_ms=60000"));
+    fixture.await.expect("over-budget fixture exits");
 }
 
 #[tokio::test]
@@ -863,6 +993,7 @@ async fn metadata_origin_guard_prevents_credential_bearing_request() {
             codex_responses_lite: false,
             auth_header_mode: OpenAiAuthHeaderMode::Bearer,
             grok_subscription_headers: false,
+            transport_config: OPENAI_DEFAULT_TRANSPORT_CONFIG,
         },
         base_url: endpoints.base_url,
         chat_url: endpoints.chat_url,
@@ -1779,6 +1910,7 @@ fn cm2_cache_metadata(provider: &str, stable_history_end: usize) -> PromptCacheM
         compaction_epoch: "compaction-a".into(),
         provider: provider.into(),
         session_scope: "session-a".into(),
+        cache_cohort: None,
         account_scope: Some("account-a".into()),
         stable_prefix_tokens: 8_192,
         expected_later_reads: 2,
@@ -2016,12 +2148,12 @@ fn prepared_openai_and_compatible_wire_bytes_match_legacy_final_render() {
     );
 }
 
-/// CM2d — the routing key identifies an account/model/base cohort. Rendered
-/// prefix diagnostics do not rotate it; the provider-view header epoch is the
-/// one authoritative address of the actual shared base.
+/// CM2d — the routing key identifies one account/model/header/fork cohort.
+/// Rendered prefix diagnostics do not rotate it; the provider-view header
+/// epoch is the one authoritative address of the actual stable base.
 ///
-/// MUTATION CHECK: put history/compaction/session into the key or replace the
-/// header epoch with a second system/tool digest path; an assertion fails.
+/// MUTATION CHECK: put history/compaction into the key or replace the header
+/// epoch with a second system/tool digest path; an assertion fails.
 #[test]
 fn cm2d_openai_prompt_cache_key_is_stable_and_domain_sensitive() {
     let mut request = probe_request("gpt-5.6");
@@ -2171,24 +2303,36 @@ fn routed_adapters_finalize_their_rendered_system_base_into_the_cohort() {
     );
 }
 
-/// CACHE ITEM 962. MUTATION CHECK: add `session_scope` back to the cohort;
-/// identical sibling sessions stop sharing their cold-start route.
+/// HAIDER963(a-c). MUTATION CHECK: omit the session fallback, trust every
+/// same-account session, or ignore an inherited C3 root. The unrelated/fresh
+/// inequalities or inherited-fork equality fail.
 #[test]
-fn openai_prompt_cache_key_matches_across_session_scopes_for_identical_base() {
-    let mut request = probe_request("gpt-5.6");
-    request.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
-    let first = openai_prompt_cache_key(&request).expect("first session key");
+fn openai_prompt_cache_key_isolates_sessions_and_shares_only_an_inherited_fork_root() {
+    let mut parent = probe_request("gpt-5.6");
+    parent.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
+    let parent_key = openai_prompt_cache_key(&parent).expect("parent session key");
 
-    request
+    let mut child = parent.clone();
+    child
         .cache_metadata
         .as_mut()
-        .expect("metadata")
+        .expect("child metadata")
         .session_scope = "session-b".into();
-    let second = openai_prompt_cache_key(&request).expect("second session key");
+    let fresh_key = openai_prompt_cache_key(&child).expect("fresh child key");
+    assert_ne!(
+        parent_key, fresh_key,
+        "unrelated sessions and fresh-epoch forks must remain isolated"
+    );
 
+    child
+        .cache_metadata
+        .as_mut()
+        .expect("child metadata")
+        .cache_cohort = Some("session-a".into());
+    let inherited_key = openai_prompt_cache_key(&child).expect("inherited child key");
     assert_eq!(
-        first, second,
-        "trusted same-account/model/base siblings must share one cache cohort"
+        parent_key, inherited_key,
+        "a byte-identical inherited fork must share its durable root cohort"
     );
 }
 
@@ -2321,10 +2465,15 @@ fn openai_rendered_prefix_bytes_are_stable_across_turns() {
             .as_mut()
             .expect("metadata")
             .session_scope = "session-b".into();
+        first_turn
+            .cache_metadata
+            .as_mut()
+            .expect("metadata")
+            .cache_cohort = Some("session-a".into());
         assert_eq!(
             openai_prompt_cache_key(&first_turn),
             openai_prompt_cache_key(&second_turn),
-            "a different session with the same base must use the cohort route"
+            "an inherited fork with the same bytes must use its root cohort route"
         );
     }
 }
@@ -2946,9 +3095,24 @@ fn kimi_requests_use_bearer_and_max_completion_tokens() {
         .as_str()
         .expect("other Kimi cache key")
         .to_owned();
-    assert_eq!(
+    assert_ne!(
         first_key, other_session_key,
-        "same-account Kimi siblings share the cohort key"
+        "unrelated same-account Kimi sessions must not share a cohort key"
+    );
+    next_turn
+        .cache_metadata
+        .as_mut()
+        .expect("cache metadata")
+        .cache_cohort = Some("session-a".into());
+    let inherited_session_key = provider
+        .request_payload(&next_turn)
+        .expect("inherited Kimi session")["prompt_cache_key"]
+        .as_str()
+        .expect("inherited Kimi cache key")
+        .to_owned();
+    assert_eq!(
+        first_key, inherited_session_key,
+        "an inherited Kimi fork shares the parent root cohort"
     );
     next_turn
         .cache_metadata
@@ -3179,8 +3343,8 @@ async fn grok_oauth_proxy_request_pins_complete_header_contract() {
 }
 
 /// HAIDER952XAI(a) + CACHE ITEM 962. MUTATION CHECK: remove the xAI inference
-/// header, derive it from a turn-varying component, restore per-session
-/// routing, cross an account boundary, or apply it to model discovery.
+/// header, derive it from a turn-varying component, restore unrelated-session
+/// sharing, cross an account boundary, or apply it to model discovery.
 #[tokio::test]
 async fn xai_inference_uses_stable_opaque_cohort_cache_route() {
     use haider_protocol::provider::CacheControlObservationV1;
@@ -3258,10 +3422,24 @@ async fn xai_inference_uses_stable_opaque_cohort_cache_route() {
         .inference_request(&request)
         .await
         .expect("other xAI session request");
-    assert_eq!(
+    assert_ne!(
         other.headers()[XAI_CONVERSATION_ID_HEADER],
         first_id,
-        "same-account/model/base siblings share xAI routing"
+        "unrelated same-account xAI sessions must not share routing"
+    );
+    request
+        .cache_metadata
+        .as_mut()
+        .expect("cache metadata")
+        .cache_cohort = Some("session-a".into());
+    let inherited = provider
+        .inference_request(&request)
+        .await
+        .expect("inherited xAI fork request");
+    assert_eq!(
+        inherited.headers()[XAI_CONVERSATION_ID_HEADER],
+        first_id,
+        "an inherited xAI fork shares the parent root route"
     );
 
     request

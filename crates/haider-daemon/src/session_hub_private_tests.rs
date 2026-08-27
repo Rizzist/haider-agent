@@ -41,6 +41,7 @@ fn provider_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
         provider: provider.to_owned(),
         api_family: haider_rpc::ProviderApiFamilyWire::Unknown,
         endpoint: None,
+        response_open_timeout_ms: None,
         models: Vec::new(),
         model_details: Vec::new(),
         auth_methods: Vec::new(),

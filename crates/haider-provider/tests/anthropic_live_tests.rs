@@ -180,6 +180,7 @@ fn cache_assertion_request(
             compaction_epoch: "live-root-compaction".into(),
             provider: "anthropic".into(),
             session_scope: "live-cache-assertion-session".into(),
+            cache_cohort: None,
             account_scope: Some("anthropic-env".into()),
             stable_prefix_tokens: 5_000,
             expected_later_reads: 2,

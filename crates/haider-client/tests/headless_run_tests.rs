@@ -421,6 +421,7 @@ fn provider_summary_fixture(
         provider: provider.into(),
         api_family: ProviderApiFamilyWire::OpenAiResponses,
         endpoint: Some("https://example.test/v1/responses".into()),
+        response_open_timeout_ms: None,
         models: models.iter().map(|model| (*model).into()).collect(),
         model_details: Vec::new(),
         auth_methods: vec![AuthMethod::OAuth],

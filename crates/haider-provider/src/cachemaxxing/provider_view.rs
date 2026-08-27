@@ -333,6 +333,7 @@ mod tests {
                 compaction_epoch: "root".into(),
                 provider: "openai".into(),
                 session_scope: "session".into(),
+                cache_cohort: None,
                 account_scope: Some("account".into()),
                 stable_prefix_tokens: 1_024,
                 expected_later_reads: 2,

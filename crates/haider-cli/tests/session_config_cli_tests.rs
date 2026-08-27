@@ -21,6 +21,7 @@ fn provider_summary(provider: &str) -> ProviderSummaryWire {
         provider: provider.to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: None,
+        response_open_timeout_ms: None,
         models: vec![],
         model_details: vec![],
         auth_methods: vec![],

@@ -1034,6 +1034,7 @@ or metadata-only digest.
 | provider configure `api_family`, `auth_requirement` | on update, leave create-only metadata unchanged; creation requires both fields |
 | provider configure `origin` | on update, leave the origin unchanged; custom providers may instead supply a replacement origin under `expected_revision` (fixed release-owned origins remain immutable except their explicit enterprise configuration surfaces) |
 | provider configure `default_model` | no declared default/clear according to mutation validation; never choose one client-side |
+| provider configure `response_open_timeout_ms` | on update, preserve the stored response-header budget; on create, select the documented 60,000 ms OpenAI-family default. A present value must be greater than zero |
 | menu answer `input` | option needs no free-form value |
 | menu answer `request_id` | no correlated response; errors arrive as uncorrelated `ProtocolError` |
 
@@ -2442,11 +2443,11 @@ surface from these implementation facts:
 |---|---|
 | cachemaxxing | Provider-view ledgers, breakpoint placement, cache lifecycle, header epochs, and economic cache accounting refine the existing published cache metrics. They add no RPC method; clients still read the authorities in §1.1 and §9.1. |
 | C1 | A provider-only graph/Loom/inventory snapshot is frozen once per turn and placed in that turn's immutable provider prefix. It is not journaled or exposed as a client field. |
-| C2 | Prompt-cache routing uses an account/model/provider-view-header cohort shared by trusted sibling sessions. The opaque provider key is not a session identity or client surface. |
-| C3 | A byte-identical fork may inherit the parent provider-view segment. The client-visible raw `SessionForked` fact now carries required `context_epoch: fresh | inherited` and optional `inherited_cache_segment`. The segment records provider/model/account scope, cache route/epoch, exact prefix digest and stable boundary, and source provider-view coordinates. `inherited` is authoritative only with a present descriptor; no new `session.fork` request or response field was added. |
+| C2 | OpenAI-family prompt-cache routing hashes provider + model + account scope + finalized provider-view header epoch + cohort. Cohort defaults to the session identity, so unrelated same-account sessions are isolated. The opaque provider key is not a client surface. |
+| C3 | A byte-identical fork may inherit the parent provider-view segment and its fork-cohort root; only `context_epoch: inherited` with a present, still-active `inherited_cache_segment` shares that route. A `fresh` fork, or an inherited child after its provider view diverges from the recorded segment, uses its own session cohort. The segment records provider/model/account scope, cache route/epoch, exact prefix digest and stable boundary, and source provider-view coordinates; no new `session.fork` request or response field was added. |
 | C4 | Pure filesystem reads and validated web responses may be served from bounded, freshness-checked process-local memos. Tool results retain their existing wire and journal shapes. |
 | S1 | Launch-race and terminal-theme probe latency changed; discovery, framing, and launcher ownership rules in §§2–3 did not. |
-| S2 | Exact-config provider adapters retain bounded shared HTTP connection pools. Cache warm/keepalive work uses the same retained adapter/client. |
+| S2 | Exact-config provider adapters retain bounded shared HTTP connection pools. Cache warm/keepalive work uses the same retained adapter/client. OpenAI-family profiles use distinct 10 s connect, 60 s response-open, and 90 s chunk-idle defaults; durable `provider.configure.response_open_timeout_ms` overrides the response-open budget and remains subordinate to the run deadline. `provider.list` projects the stored override. Timeout telemetry retains `opened_within_ms` and `budget_ms`, and transient provider timeouts enter the existing bounded retry/backoff policy. |
 | S4 + S6 | Adjacent actor facts form one logical append and already-queued logical appends may share one outer journal transaction. Envelope order, per-session sequence allocation, persist-before-publish, and method-specific receipt atomicity are unchanged. |
 | M1 | Headless commands select a lean Tokio runtime without changing their request, response, or exit semantics. |
 | M3 | Completed background-task live buffers are released after CAS publication; cursor pages read the same bytes and offsets through the durable artifact. |

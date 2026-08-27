@@ -39,6 +39,7 @@ fn enterprise_summary(
         provider: provider.to_owned(),
         api_family: haider_rpc::ProviderApiFamilyWire::AnthropicMessages,
         endpoint: endpoint.map(str::to_owned),
+        response_open_timeout_ms: None,
         models: models.iter().map(|model| (*model).to_owned()).collect(),
         model_details: Vec::new(),
         auth_methods: vec![haider_protocol::credential::AuthMethod::ApiKey],

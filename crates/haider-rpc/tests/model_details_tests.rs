@@ -33,6 +33,7 @@ fn provider_summary_model_details_round_trip_names_and_windows() {
         provider: "openai".to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiResponses,
         endpoint: Some("https://api.openai.com/v1/responses".to_owned()),
+        response_open_timeout_ms: None,
         models: vec!["frontier-a".to_owned(), "frontier-b".to_owned()],
         model_details: vec![
             ModelDetailWire {

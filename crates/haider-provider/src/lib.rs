@@ -550,18 +550,19 @@ pub use openai::{
     HAIDER_CODE_ACCOUNT_URL, HAIDER_CODE_BASE_URL, HAIDER_CODE_PROVIDER_NAME,
     HAIDER_CODE_SEED_MODELS, KIMI_OAUTH_BASE_URL, KIMI_OAUTH_PROVIDER_NAME, KimiThinkingConfig,
     KimiThinkingType, OPENAI_ALPHA_SEARCH_URL, OPENAI_CODEX_RESPONSES_LITE_HEADER,
-    OPENAI_CODEX_RESPONSES_LITE_VALUE, OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME,
-    OPENAI_PROVIDER_NAME, OPENAI_RESPONSES_API_URL, OPENAI_SUBSCRIPTION_BASE_URL,
-    OPENAI_SUBSCRIPTION_RESPONSES_URL, OpenAiCapture, OpenAiCompatibleProvider, OpenAiProvider,
-    OpenAiRetryPolicy, OpenAiTransportConfig, XAI_BASE_URL, XAI_PROVIDER_NAME,
-    XAI_SEED_MODEL_CONTEXT_WINDOWS, XAI_SEED_MODELS, azure_openai_origin,
-    codex_alpha_search_request_body, codex_alpha_search_response_text, codex_alpha_search_url,
-    grok_client_version, openai_http_client_build_count, replay_deepseek_chat_sse,
-    replay_deepseek_models_response, replay_grok_chat_sse, replay_grok_models_response,
-    replay_haider_code_chat_sse, replay_haider_code_models_response, replay_kimi_chat_sse,
-    replay_kimi_models_response, replay_openai_chat_sse, replay_openai_http_error,
-    replay_openai_models_response, replay_openai_native_computer_sse, replay_openai_responses_sse,
-    replay_xai_chat_sse, replay_xai_models_response, validate_openai_compatible_endpoint,
+    OPENAI_CODEX_RESPONSES_LITE_VALUE, OPENAI_COMPATIBLE_PROVIDER_NAME,
+    OPENAI_DEFAULT_TRANSPORT_CONFIG, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME,
+    OPENAI_RESPONSES_API_URL, OPENAI_SUBSCRIPTION_BASE_URL, OPENAI_SUBSCRIPTION_RESPONSES_URL,
+    OpenAiCapture, OpenAiCompatibleProvider, OpenAiProvider, OpenAiRetryPolicy,
+    OpenAiTransportConfig, XAI_BASE_URL, XAI_PROVIDER_NAME, XAI_SEED_MODEL_CONTEXT_WINDOWS,
+    XAI_SEED_MODELS, azure_openai_origin, codex_alpha_search_request_body,
+    codex_alpha_search_response_text, codex_alpha_search_url, grok_client_version,
+    openai_http_client_build_count, replay_deepseek_chat_sse, replay_deepseek_models_response,
+    replay_grok_chat_sse, replay_grok_models_response, replay_haider_code_chat_sse,
+    replay_haider_code_models_response, replay_kimi_chat_sse, replay_kimi_models_response,
+    replay_openai_chat_sse, replay_openai_http_error, replay_openai_models_response,
+    replay_openai_native_computer_sse, replay_openai_responses_sse, replay_xai_chat_sse,
+    replay_xai_models_response, validate_openai_compatible_endpoint,
 };
 pub use origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
 pub use pricing::{
@@ -953,8 +954,14 @@ pub struct PromptCacheMetadata {
     pub compaction_epoch: String,
     /// Provider name selected for this request.
     pub provider: String,
-    /// Session scope used only for ownership of ephemeral provider resources.
+    /// Session identity used for ephemeral resource ownership and as the
+    /// fail-closed cache cohort when no inherited fork root is present.
     pub session_scope: String,
+    /// Opaque cache-routing cohort. Empty/absent means the session scope;
+    /// inherited forks carry the durable C3 root route only while the exact
+    /// inherited provider-view segment remains active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_cohort: Option<String>,
     /// Non-secret account/cache routing scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_scope: Option<String>,
@@ -1131,6 +1138,12 @@ pub struct ProviderError {
     pub retryable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<u64>,
+    /// Elapsed transport-phase wait when a local timeout budget fired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_within_ms: Option<u64>,
+    /// Exact local transport-phase budget selected for the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_ms: Option<u64>,
     #[serde(default)]
     pub presentation: ErrorPresentation,
 }
@@ -1150,6 +1163,8 @@ impl ProviderError {
             message: message.into(),
             retryable: kind.default_retryable(),
             retry_after_ms: None,
+            opened_within_ms: None,
+            budget_ms: None,
             presentation,
         }
     }
@@ -1169,6 +1184,18 @@ impl ProviderError {
             .presentation
             .with_http_status(status)
             .with_request_id(request_id);
+        self
+    }
+
+    /// Attaches provider-timeout telemetry without changing the recovery
+    /// policy, and mirrors it into the durable operator presentation.
+    #[must_use]
+    pub fn with_timeout_budget(mut self, opened_within_ms: u64, budget_ms: u64) -> Self {
+        self.opened_within_ms = Some(opened_within_ms);
+        self.budget_ms = Some(budget_ms);
+        self.presentation = self
+            .presentation
+            .with_timeout_budget(opened_within_ms, budget_ms);
         self
     }
 
@@ -1197,6 +1224,8 @@ impl ProviderError {
             .clone_from(&self.presentation.provider_request_id);
         presentation.retry_after_ms = self.presentation.retry_after_ms;
         presentation.reset_at_ms = self.presentation.reset_at_ms;
+        presentation.opened_within_ms = self.presentation.opened_within_ms;
+        presentation.budget_ms = self.presentation.budget_ms;
         self.presentation = presentation;
         self
     }
