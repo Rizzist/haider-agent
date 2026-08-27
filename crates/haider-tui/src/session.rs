@@ -75,6 +75,13 @@ pub struct SessionState {
     /// session (or `None`). Checked in/out with the session so the strip
     /// never leaks one session's graph onto another.
     pub graph: Option<haider_protocol::graph::GraphStatus>,
+    /// L3: cursor-exact live node states for this session's running workflow.
+    /// Kept beside `graph` so checking another session out can never leak the
+    /// previous session's active/rejected nodes into its workflow detail.
+    pub workflow_graph: haider_client::WorkflowGraphProjection,
+    /// Thin retained L2 state used only to reduce the next watch page into
+    /// `workflow_graph`; it is checked in/out under the same session fence.
+    pub workflow_graph_rpc: haider_client::WorkflowGraphRpcAdapter,
     /// W-A: the session-scoped background task rows (journal projection) —
     /// checked in/out whole with the session; never split per branch.
     pub tasks: crate::taskrows::TaskPanel,
@@ -156,6 +163,8 @@ impl SessionState {
             branch_state: crate::branch::BranchState::default(),
             hook_facts: crate::hooks::HookFactsLog::default(),
             graph: None,
+            workflow_graph: haider_client::WorkflowGraphProjection::default(),
+            workflow_graph_rpc: haider_client::WorkflowGraphRpcAdapter::default(),
             tasks: crate::taskrows::TaskPanel::default(),
             msg_queue: Vec::new(),
             queue_mode: false,
@@ -359,10 +368,10 @@ impl SessionState {
                                 );
                             }
                         }
-                        // S3/W-A: the additive agent- and task-event unions
-                        // ride raw envelopes OUTSIDE `EventPayload` — try
-                        // them before counting the payload unknown (both
-                        // twins).
+                        // S3/W-A/L3: additive agent, task, and workflow graph
+                        // event unions ride raw envelopes OUTSIDE
+                        // `EventPayload` — try them before counting the
+                        // payload unknown (both twins).
                         Err(_) if admission == Admission::Apply => {
                             if !route_agent_event(
                                 &mut self.branch_state,
@@ -374,7 +383,8 @@ impl SessionState {
                                 &mut self.branch_state,
                                 &mut self.projection,
                                 envelope,
-                            ) {
+                            ) && !route_workflow_graph_event(envelope)
+                            {
                                 self.projection.count_unknown_payload();
                             }
                         }
@@ -746,6 +756,22 @@ pub fn route_task_event(
         BranchScope::Aggregate => {}
     }
     true
+}
+
+/// Recognize one L2 workflow activation fact without reducing it into the
+/// generic transcript. Runtime graph state has exactly one authority: the
+/// `workflow.graph.state`/`workflow.graph.watch` adapter. The raw session
+/// stream still carries these facts to wake that reader, so both attached
+/// and background routers must consume their known tag rather than inflate
+/// the forward-compatibility unknown counter.
+pub fn is_workflow_graph_event(payload: &serde_json::Value) -> bool {
+    haider_protocol::graph::WorkflowGraphJournalEvent::from_payload_value(payload)
+        .is_ok_and(|event| event.is_some())
+}
+
+/// Recognize an L2 workflow activation envelope without projecting it twice.
+pub fn route_workflow_graph_event(envelope: &RawEnvelope) -> bool {
+    is_workflow_graph_event(&envelope.payload)
 }
 
 /// Route an additive computer OS-permission event (outside `EventPayload`) to

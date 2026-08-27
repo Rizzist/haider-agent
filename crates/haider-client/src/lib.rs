@@ -30,6 +30,8 @@ pub mod shell;
 pub mod spawn;
 pub mod surface;
 pub mod transcription;
+pub mod workflow_graph;
+pub mod workflow_graph_rpc;
 
 pub use client::{
     ClientConfig, ClientError, ConnectError, Connected, ConnectionState, DisconnectReason,
@@ -82,6 +84,12 @@ pub use surface::{
     session_surface_publish, session_surface_watch, surface_publish_ack, surface_publish_request,
     surface_watch_request, surface_watch_snapshot,
 };
+pub use workflow_graph::{
+    WorkflowEvidenceRef, WorkflowGraphChange, WorkflowGraphEdge, WorkflowGraphEdgeKind,
+    WorkflowGraphProjection, WorkflowGraphProjectionError, WorkflowGraphState,
+    WorkflowGraphWatchPage, WorkflowNodeProjection, WorkflowNodeRejection, WorkflowNodeState,
+};
+pub use workflow_graph_rpc::{WorkflowGraphRpcAdapter, WorkflowGraphRpcAdapterError};
 
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-client";

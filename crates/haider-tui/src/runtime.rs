@@ -1792,6 +1792,8 @@ impl DemoDriver {
             // never fabricated in demo; the feature gate drops the read,
             // and the mutations refuse honestly upstream.
             | AppRequest::GraphRefresh
+            | AppRequest::WorkflowGraphRefresh
+            | AppRequest::WorkflowGraphResume
             | AppRequest::GraphInspectRefresh
             | AppRequest::RunRetry { .. }
             | AppRequest::Seen { .. }

@@ -604,6 +604,12 @@ pub struct CommandContext {
     /// no session id, so this is the ONLY thing that tags the reduction back
     /// to its session (the stale-reply guard) and lands an error on the strip.
     graph: Option<haider_protocol::ids::SessionId>,
+    /// Session identity for either workflow graph read. Both response bodies
+    /// omit it, so stale-reply fencing depends on this request context.
+    workflow_graph: Option<(
+        haider_protocol::ids::SessionId,
+        crate::live::WorkflowGraphRead,
+    )>,
     /// This request was a transcription-secret RPC (T2). Same identity
     /// pattern: neither carries a durable command id, so the error reply
     /// is tagged with WHICH operation failed and lands on the talk flow.
@@ -673,6 +679,15 @@ impl CommandContext {
             graph: match command {
                 LiveCommand::GraphStatus { session } => Some(session.clone()),
                 LiveCommand::GraphInspect { session } => Some(session.clone()),
+                _ => None,
+            },
+            workflow_graph: match command {
+                LiveCommand::WorkflowGraphState { session } => {
+                    Some((session.clone(), crate::live::WorkflowGraphRead::State))
+                }
+                LiveCommand::WorkflowGraphWatch { session, .. } => {
+                    Some((session.clone(), crate::live::WorkflowGraphRead::Watch))
+                }
                 _ => None,
             },
             transcription: match command {
@@ -958,6 +973,18 @@ pub fn request_body_for_features(
         },
         LiveCommand::GraphStatus { session } => RequestBody::GraphStatus {
             session_id: session,
+        },
+        LiveCommand::WorkflowGraphState { session } => RequestBody::WorkflowGraphState {
+            session_id: session,
+            graph_id: None,
+        },
+        LiveCommand::WorkflowGraphWatch {
+            session,
+            after_cursor,
+        } => RequestBody::WorkflowGraphWatch {
+            session_id: session,
+            after_cursor,
+            limit: crate::live::WORKFLOW_GRAPH_WATCH_PAGE,
         },
         LiveCommand::LoomList { .. } => RequestBody::LoomList {},
         LiveCommand::OpenPermissionSettings {
@@ -1457,6 +1484,28 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             }],
             None => Vec::new(),
         },
+        ResponseBody::WorkflowGraphState { state } => {
+            context
+                .workflow_graph
+                .clone()
+                .map_or_else(Vec::new, |(session, _)| {
+                    vec![LiveReply::WorkflowGraphState {
+                        session,
+                        state: Box::new(state),
+                    }]
+                })
+        }
+        ResponseBody::WorkflowGraphWatch { page } => {
+            context
+                .workflow_graph
+                .clone()
+                .map_or_else(Vec::new, |(session, _)| {
+                    vec![LiveReply::WorkflowGraphPage {
+                        session,
+                        page: Box::new(page),
+                    }]
+                })
+        }
         ResponseBody::GraphInspect { snapshot, .. } => match context.graph.clone() {
             Some(session) => vec![LiveReply::GraphInspect {
                 session,
@@ -1832,6 +1881,13 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 // gate (background read — the held reduction stays).
                 if context.graph.is_some() {
                     return vec![LiveReply::GraphFailed];
+                }
+                if let Some((session, operation)) = context.workflow_graph.clone() {
+                    return vec![LiveReply::WorkflowGraphFailed {
+                        session,
+                        operation,
+                        message: message.clone(),
+                    }];
                 }
                 // T2: a transcription-secret error is identity-tagged with
                 // its OPERATION — the failure lands on the talk flow (the

@@ -5260,22 +5260,12 @@ pub fn missing_clis(
         .collect()
 }
 
-/// Lay a workflow's node graph out in dependency LAYERS and draw it, so the
-/// shape of a flow is visible at a glance instead of reconstructed from a
-/// flat list of `← after` clauses (owner 2026-08-22).
-///
-/// Layer(n) = 0 when a node has no dependencies, else 1 + max(layer(deps)).
-/// Nodes that share a layer run concurrently — which is exactly the fact a
-/// flat list hides. The walk is iteration-capped: template validation already
-/// rejects cycles, but a renderer must not hang on a malformed one.
-pub fn workflow_dag_lines(
+fn workflow_dependency_layers(
     template: &haider_protocol::graph::GraphTemplateSpec,
-    theme: &Theme,
-) -> Vec<Line<'static>> {
+) -> std::collections::HashMap<&str, usize> {
     use haider_protocol::graph::GraphNodeName;
-    use std::collections::HashMap;
 
-    let mut layer: HashMap<&str, usize> = HashMap::new();
+    let mut layers = std::collections::HashMap::new();
     let known: std::collections::HashSet<&str> = template
         .nodes
         .iter()
@@ -5290,11 +5280,11 @@ pub fn workflow_dag_lines(
                 .depends_on
                 .iter()
                 .map(GraphNodeName::as_str)
-                .filter(|dep| known.contains(dep))
-                .map(|dep| layer.get(dep).map_or(0, |value| value + 1))
+                .filter(|dependency| known.contains(dependency))
+                .map(|dependency| layers.get(dependency).map_or(0, |value| value + 1))
                 .max()
                 .unwrap_or(0);
-            let entry = layer.entry(node.name.as_str()).or_insert(0);
+            let entry = layers.entry(node.name.as_str()).or_insert(0);
             if depth > *entry {
                 *entry = depth;
                 changed = true;
@@ -5304,7 +5294,24 @@ pub fn workflow_dag_lines(
             break;
         }
     }
+    layers
+}
 
+/// Lay a workflow's node graph out in dependency LAYERS and draw it, so the
+/// shape of a flow is visible at a glance instead of reconstructed from a
+/// flat list of `← after` clauses (owner 2026-08-22).
+///
+/// Layer(n) = 0 when a node has no dependencies, else 1 + max(layer(deps)).
+/// Nodes that share a layer run concurrently — which is exactly the fact a
+/// flat list hides. The walk is iteration-capped: template validation already
+/// rejects cycles, but a renderer must not hang on a malformed one.
+pub fn workflow_dag_lines(
+    template: &haider_protocol::graph::GraphTemplateSpec,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    use haider_protocol::graph::GraphNodeName;
+
+    let layer = workflow_dependency_layers(template);
     let depth = layer.values().copied().max().unwrap_or(0);
     let mut lines = vec![Line::from(vec![
         Span::styled("  DAG", theme.bright_style().add_modifier(Modifier::BOLD)),
@@ -5380,6 +5387,216 @@ pub fn workflow_dag_lines(
                 "        concurrent — these run together",
                 theme.faint_style(),
             ));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines
+}
+
+/// Draw the exact frozen runtime topology from L2's activation AST. The
+/// mutable workflow catalog may decorate the surrounding row, but never
+/// supplies edges or node identity for a graph that is already running.
+pub fn workflow_live_dag_lines(
+    projection: &haider_client::WorkflowGraphProjection,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    use haider_client::{WorkflowGraphEdgeKind, WorkflowNodeState};
+    use std::collections::HashMap;
+
+    let mut incoming: HashMap<String, Vec<String>> = HashMap::new();
+    let mut outgoing: HashMap<String, Vec<String>> = HashMap::new();
+    let mut back: HashMap<String, Vec<String>> = HashMap::new();
+    for edge in projection.edges() {
+        if edge.kind == WorkflowGraphEdgeKind::Forward
+            && let Some(source) = &edge.from
+        {
+            incoming
+                .entry(edge.to.clone())
+                .or_default()
+                .push(source.clone());
+            outgoing
+                .entry(source.clone())
+                .or_default()
+                .push(edge.to.clone());
+        } else if edge.kind == WorkflowGraphEdgeKind::Back
+            && let Some(source) = &edge.from
+        {
+            back.entry(source.clone())
+                .or_default()
+                .push(edge.to.clone());
+        }
+    }
+    let mut layer: HashMap<String, usize> = HashMap::new();
+    let node_count = projection.nodes().count();
+    for _ in 0..=node_count {
+        let mut changed = false;
+        for node in projection.nodes() {
+            let depth = incoming
+                .get(&node.node_id)
+                .into_iter()
+                .flatten()
+                .map(|source| layer.get(source).map_or(0, |value| value + 1))
+                .max()
+                .unwrap_or(0);
+            let entry = layer.entry(node.node_id.clone()).or_insert(0);
+            if depth > *entry {
+                *entry = depth;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let depth = layer.values().copied().max().unwrap_or(0);
+    let mut lines = vec![Line::from(vec![
+        Span::styled("  LIVE", theme.gold_style().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            projection.cursor().map_or_else(
+                || "  · connecting…".to_owned(),
+                |cursor| format!("  · cursor {cursor}"),
+            ),
+            theme.dim_style(),
+        ),
+        Span::styled(
+            projection
+                .graph_id()
+                .map_or_else(String::new, |graph_id| format!("  · {graph_id}")),
+            theme.faint_style(),
+        ),
+    ])];
+
+    for level in 0..=depth {
+        let here: Vec<&haider_client::WorkflowNodeProjection> = projection
+            .nodes()
+            .filter(|node| layer.get(&node.node_id).copied().unwrap_or(0) == level)
+            .collect();
+        if here.is_empty() {
+            continue;
+        }
+        if level > 0 {
+            lines.push(Line::styled("      │", theme.faint_style()));
+        }
+        for node in here {
+            let parents = incoming.get(&node.node_id).cloned().unwrap_or_default();
+            if parents.len() > 1 {
+                lines.push(Line::styled(
+                    format!("      └─ join ← {}", parents.join(" + ")),
+                    theme.faint_style(),
+                ));
+            }
+            let branch_parent = parents.iter().find(|source| {
+                outgoing
+                    .get(*source)
+                    .is_some_and(|targets| targets.len() > 1)
+            });
+            let stem = if level == 0 {
+                "   "
+            } else if let Some(source) = branch_parent {
+                if outgoing.get(source).and_then(|targets| targets.last()) == Some(&node.node_id) {
+                    "  └"
+                } else {
+                    "  ├"
+                }
+            } else {
+                "  ▼"
+            };
+            let (glyph, label, style) = match node.status {
+                WorkflowNodeState::Waiting => {
+                    let has_input = node.present_input_count() > 0;
+                    if has_input {
+                        ("◐", "waiting", theme.dim_style())
+                    } else {
+                        ("○", "waiting on evidence", theme.faint_style())
+                    }
+                }
+                WorkflowNodeState::Ready => ("◆", "ready", theme.gold_style()),
+                WorkflowNodeState::Active => (
+                    "◉",
+                    "active",
+                    theme.selection_style().add_modifier(Modifier::BOLD),
+                ),
+                WorkflowNodeState::Complete => (
+                    "✓",
+                    "complete",
+                    Style::default()
+                        .fg(theme.ok.into())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                WorkflowNodeState::Rejected => (
+                    "✗",
+                    "rejected",
+                    Style::default()
+                        .fg(theme.err.into())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                // `WorkflowNodeState` is intentionally non-exhaustive across
+                // the client/TUI crate boundary. A newer state stays visible
+                // and neutral until this renderer learns its semantics.
+                _ => ("?", "unknown state", theme.faint_style()),
+            };
+            let mut spans = vec![
+                Span::styled(format!("{stem} "), theme.faint_style()),
+                Span::styled(format!("{glyph} "), style),
+                Span::styled(node.node_id.clone(), style),
+                Span::styled(format!("  {label}"), style),
+            ];
+            if !node.inputs_present.is_empty() {
+                spans.push(Span::styled("  inputs ", theme.dim_style()));
+                for present in &node.inputs_present {
+                    spans.push(Span::styled(
+                        if *present { "●" } else { "○" },
+                        if *present {
+                            theme.gold_style()
+                        } else {
+                            theme.faint_style()
+                        },
+                    ));
+                }
+            }
+            if !parents.is_empty() {
+                spans.push(Span::styled(
+                    format!("  ← {}", parents.join(" + ")),
+                    theme.faint_style(),
+                ));
+            }
+            lines.push(Line::from(spans));
+            if let Some(rejection) = projection.rejection(&node.node_id) {
+                lines.push(Line::from(vec![
+                    Span::styled("      ↳ reject ", theme.dim_style()),
+                    Span::styled(rejection.code_label(), theme.maroon_style()),
+                    Span::styled(
+                        format!(" · journal cursor {}", rejection.cursor),
+                        theme.faint_style(),
+                    ),
+                ]));
+                if let Some(reference) = &rejection.evidence {
+                    lines.push(Line::from(vec![
+                        Span::styled("        evidence ", theme.dim_style()),
+                        Span::styled(reference.as_str().to_owned(), theme.maroon_style()),
+                    ]));
+                } else {
+                    lines.push(Line::styled(
+                        "        no evidence artifact published",
+                        theme.faint_style(),
+                    ));
+                }
+            }
+            if let Some(targets) = outgoing
+                .get(&node.node_id)
+                .filter(|targets| targets.len() > 1)
+            {
+                lines.push(Line::styled(
+                    format!("      ├─ fork → {}", targets.join(" + ")),
+                    theme.faint_style(),
+                ));
+            }
+            if let Some(targets) = back.get(&node.node_id) {
+                lines.push(Line::styled(
+                    format!("      ↺ reject back → {}", targets.join(" + ")),
+                    theme.warn_style(),
+                ));
+            }
         }
     }
     lines.push(Line::raw(""));
@@ -6574,7 +6791,21 @@ fn render_loom(
                 ),
             ]));
             lines.push(Line::raw(""));
-            lines.extend(workflow_dag_lines(&template, theme));
+            let showing_live = model
+                .daemon_features
+                .contains(haider_rpc::FEATURE_WORKFLOW_GRAPH_V1)
+                && model.workflow_graph.workflow_id() == Some(template.name.as_str());
+            if showing_live {
+                lines.extend(workflow_live_dag_lines(&model.workflow_graph, theme));
+            } else {
+                lines.extend(workflow_dag_lines(&template, theme));
+            }
+            if showing_live && let Some(error) = &model.workflow_graph_error {
+                lines.push(Line::from(vec![
+                    Span::styled("  live view paused · ", theme.warn_style()),
+                    Span::styled(error.clone(), theme.dim_style()),
+                ]));
+            }
             lines.push(Line::styled("NODES", theme.gold_style()));
             for node in &template.nodes {
                 let mut spans = vec![
@@ -6638,7 +6869,21 @@ fn render_loom(
                 ),
             ]));
             lines.push(Line::raw(""));
-            lines.extend(workflow_dag_lines(&workflow.template, theme));
+            let showing_live = model
+                .daemon_features
+                .contains(haider_rpc::FEATURE_WORKFLOW_GRAPH_V1)
+                && model.workflow_graph.workflow_id() == Some(workflow.id.as_str());
+            if showing_live {
+                lines.extend(workflow_live_dag_lines(&model.workflow_graph, theme));
+            } else {
+                lines.extend(workflow_dag_lines(&workflow.template, theme));
+            }
+            if showing_live && let Some(error) = &model.workflow_graph_error {
+                lines.push(Line::from(vec![
+                    Span::styled("  live view paused · ", theme.warn_style()),
+                    Span::styled(error.clone(), theme.dim_style()),
+                ]));
+            }
             lines.push(Line::styled("NODES", theme.gold_style()));
             for meta in &workflow.meta {
                 let mut spans = vec![Span::styled(
@@ -6675,8 +6920,81 @@ fn render_loom(
                 }
             }
         }
+        let selected_workflow_id = match model.workflow_row(selection) {
+            Some(crate::app::WorkflowRow::BuiltIn(template)) => Some(template.name),
+            Some(crate::app::WorkflowRow::Registered(index)) => model
+                .loom_workflows
+                .get(index)
+                .map(|workflow| workflow.id.clone()),
+            Some(crate::app::WorkflowRow::None) | None => None,
+        };
+        let showing_selected_live = !on_types
+            && model
+                .daemon_features
+                .contains(haider_rpc::FEATURE_WORKFLOW_GRAPH_V1)
+            && model.workflow_graph.workflow_id() == selected_workflow_id.as_deref();
+        let current_inspection = model
+            .workflow_evidence_inspection
+            .as_ref()
+            .filter(|inspection| {
+                model
+                    .workflow_graph
+                    .rejection(&inspection.node_id)
+                    .is_some_and(|rejection| rejection.cursor == inspection.cursor)
+            });
+        if showing_selected_live && let Some(inspection) = current_inspection {
+            lines.push(Line::raw(""));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "REJECT EVIDENCE — OPEN",
+                    theme.maroon_style().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  · {}", inspection.node_id), theme.dim_style()),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  reason ", theme.dim_style()),
+                Span::styled(inspection.code.clone(), theme.maroon_style()),
+                Span::styled(
+                    format!(" · journal cursor {}", inspection.cursor),
+                    theme.faint_style(),
+                ),
+            ]));
+            let width = (area.width as usize).saturating_sub(4).max(8);
+            for chunk in wrap_plain(&inspection.message, width) {
+                lines.push(Line::styled(format!("  {chunk}"), theme.text_style()));
+            }
+            if let Some(reference) = &inspection.reference {
+                lines.push(Line::styled("  evidence artifact", theme.dim_style()));
+                for chunk in wrap_plain(reference, width) {
+                    lines.push(Line::styled(format!("  {chunk}"), theme.text_style()));
+                }
+                lines.push(Line::styled(
+                    "  evidence bytes are not exposed by workflow.graph RPC",
+                    theme.faint_style(),
+                ));
+            } else {
+                lines.push(Line::styled(
+                    "  no evidence artifact published · reason remains inspectable",
+                    theme.faint_style(),
+                ));
+            }
+        }
+        let rejected_evidence_available = showing_selected_live
+            && model
+                .workflow_graph
+                .nodes()
+                .any(|node| model.workflow_graph.rejection(&node.node_id).is_some());
         lines.push(Line::raw(""));
-        lines.push(Line::styled("esc back to the list", theme.dim_style()));
+        lines.push(Line::styled(
+            if showing_selected_live && current_inspection.is_some() {
+                "esc close reject evidence"
+            } else if rejected_evidence_available {
+                "⏎ inspect / next reject · esc back to the list"
+            } else {
+                "esc back to the list"
+            },
+            theme.dim_style(),
+        ));
     } else if on_types {
         lines.push(Line::styled("AGENT TYPES", theme.gold_style()));
         // W-flow inline identity: the fixed head mirrors the workflows pane
@@ -6778,7 +7096,7 @@ fn render_loom(
             if index == selection {
                 selected_line = lines.len();
             }
-            lines.push(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     if index == selection { "❯ " } else { "  " },
                     theme.gold_style(),
@@ -6796,7 +7114,15 @@ fn render_loom(
                     ),
                     theme.dim_style(),
                 ),
-            ]));
+            ];
+            if model
+                .daemon_features
+                .contains(haider_rpc::FEATURE_WORKFLOW_GRAPH_V1)
+                && model.workflow_graph.workflow_id() == Some(template.name.as_str())
+            {
+                spans.push(Span::styled("  ● LIVE", theme.gold_style()));
+            }
+            lines.push(Line::from(spans));
         }
         lines.push(Line::raw(""));
         lines.push(Line::styled("REGISTERED", theme.gold_style()));
@@ -6847,6 +7173,16 @@ fn render_loom(
                 format!(" · rev {}", workflow.rev),
                 theme.faint_style(),
             ));
+            if model
+                .daemon_features
+                .contains(haider_rpc::FEATURE_WORKFLOW_GRAPH_V1)
+                && model.workflow_graph.workflow_id() == Some(workflow.id.as_str())
+            {
+                spans.push(Span::styled("  ● LIVE", theme.gold_style()));
+                if model.workflow_graph.workflow_digest() != Some(workflow.digest.as_str()) {
+                    spans.push(Span::styled(" · frozen revision", theme.warn_style()));
+                }
+            }
             lines.push(Line::from(spans));
         }
         lines.push(Line::raw(""));
