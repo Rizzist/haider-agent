@@ -105,7 +105,14 @@ impl ProviderViewStore {
             ));
         }
 
-        self.queue_gc(connection, &expected)?;
+        // Queue potential CAS orphans and publish their index references in
+        // one SQLite transaction. The filesystem writes remain between those
+        // SQL phases, preserving the former operation order while removing a
+        // standalone WAL commit.
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_write_error)?;
+        self.queue_gc(&transaction, &expected)?;
         let mut persisted = HashSet::new();
         for blob in blobs {
             if persisted.insert(blob.block.clone()) {
@@ -118,9 +125,6 @@ impl ProviderViewStore {
             }
         }
 
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sqlite_write_error)?;
         transaction
             .execute(
                 "INSERT OR IGNORE INTO provider_view_session_cursors(
@@ -196,13 +200,15 @@ impl ProviderViewStore {
                 expires_at_ms,
             )?;
         }
-        for block in &expected {
-            transaction
-                .execute(
-                    "DELETE FROM provider_view_gc WHERE content_hash = ?1",
-                    [&block.content_hash],
-                )
+        {
+            let mut delete_gc = transaction
+                .prepare_cached("DELETE FROM provider_view_gc WHERE content_hash = ?1")
                 .map_err(sqlite_write_error)?;
+            for block in &expected {
+                delete_gc
+                    .execute([&block.content_hash])
+                    .map_err(sqlite_write_error)?;
+            }
         }
         transaction.commit().map_err(sqlite_write_error)?;
         ledger.storage = Some(ProviderViewStorageV1 {
@@ -255,7 +261,7 @@ impl ProviderViewStore {
         }
 
         let mut statement = connection
-            .prepare(
+            .prepare_cached(
                 "SELECT section, block_ordinal, content_hash, byte_len, expires_at_ms
                  FROM provider_view_blocks
                  WHERE session_id = ?1 AND request_ordinal = ?2
@@ -308,23 +314,22 @@ impl ProviderViewStore {
 
     fn queue_gc(
         &self,
-        connection: &mut Connection,
+        transaction: &rusqlite::Transaction<'_>,
         blocks: &HashSet<ProviderViewBlockRefV1>,
     ) -> StoreResult<()> {
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sqlite_write_error)?;
         let queued_at_ms = to_sqlite_integer(now_ms()?)?;
+        let mut insert = transaction
+            .prepare_cached(
+                "INSERT OR IGNORE INTO provider_view_gc(content_hash, queued_at_ms)
+                 VALUES (?1, ?2)",
+            )
+            .map_err(sqlite_write_error)?;
         for block in blocks {
-            transaction
-                .execute(
-                    "INSERT OR IGNORE INTO provider_view_gc(content_hash, queued_at_ms)
-                     VALUES (?1, ?2)",
-                    params![&block.content_hash, queued_at_ms],
-                )
+            insert
+                .execute(params![&block.content_hash, queued_at_ms])
                 .map_err(sqlite_write_error)?;
         }
-        transaction.commit().map_err(sqlite_write_error)
+        Ok(())
     }
 
     /// Lazily reads one verified block. Callers reconstructing a request must
@@ -623,27 +628,29 @@ fn insert_block(
     block: &ProviderViewBlockRefV1,
     expires_at_ms: u64,
 ) -> StoreResult<()> {
-    transaction
-        .execute(
+    let mut statement = transaction
+        .prepare_cached(
             "INSERT INTO provider_view_blocks(
                 provider, model, cache_epoch, session_id, request_ordinal,
                 section, block_ordinal, content_hash, byte_len, expires_at_ms
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                &ledger.provider,
-                &ledger.model,
-                &ledger.cache_epoch,
-                session_id.as_str(),
-                request_ordinal,
-                section,
-                i64::try_from(block_ordinal).map_err(|_| {
-                    invalid("provider-view block ordinal exceeds SQLite integer space")
-                })?,
-                &block.content_hash,
-                to_sqlite_integer(block.byte_len)?,
-                to_sqlite_integer(expires_at_ms)?,
-            ],
         )
+        .map_err(sqlite_write_error)?;
+    statement
+        .execute(params![
+            &ledger.provider,
+            &ledger.model,
+            &ledger.cache_epoch,
+            session_id.as_str(),
+            request_ordinal,
+            section,
+            i64::try_from(block_ordinal).map_err(|_| {
+                invalid("provider-view block ordinal exceeds SQLite integer space")
+            })?,
+            &block.content_hash,
+            to_sqlite_integer(block.byte_len)?,
+            to_sqlite_integer(expires_at_ms)?,
+        ])
         .map_err(sqlite_write_error)?;
     Ok(())
 }

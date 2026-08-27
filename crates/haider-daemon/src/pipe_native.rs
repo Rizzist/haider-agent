@@ -32,6 +32,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(test)]
+#[path = "pipe_native_tests.rs"]
+mod pipe_native_tests;
+
 const RECONCILE_PAGE_ENVELOPES: usize = 1_024;
 const RECONCILE_PAGE_BYTES: usize = 4 * 1_024 * 1_024;
 pub(crate) const PIPE_PROJECTION_PAYLOAD_KINDS: &[&str] = &[
@@ -395,6 +399,8 @@ pub(crate) struct PipeNativeWriter {
     pipe_dir: PathBuf,
     reconciled: Mutex<HashMap<SessionId, ReconciledSidecar>>,
     dirty: Mutex<HashSet<SessionId>>,
+    #[cfg(test)]
+    journal_head_reads: AtomicU64,
 }
 
 impl PipeNativeWriter {
@@ -403,7 +409,22 @@ impl PipeNativeWriter {
             pipe_dir: store_root.join("pipe"),
             reconciled: Mutex::new(HashMap::new()),
             dirty: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            journal_head_reads: AtomicU64::new(0),
         }
+    }
+
+    async fn journal_head(
+        &self,
+        store: &SqliteStoreHandle,
+        session_id: &SessionId,
+    ) -> Result<u64, PipeNativeError> {
+        #[cfg(test)]
+        self.journal_head_reads.fetch_add(1, Ordering::Relaxed);
+        store
+            .latest_seq(session_id)
+            .await
+            .map_err(|error| PipeNativeError(format!("journal head inspection failed: {error:?}")))
     }
 
     /// Forgets an in-memory cursor after an asynchronous writer exits before
@@ -430,9 +451,7 @@ impl PipeNativeWriter {
     ) -> Result<PipeBootSession, PipeNativeError> {
         let path = self.sidecar_path(session_id)?;
         let state = inspect_sidecar(path.clone(), session_id.clone()).await?;
-        let latest_seq = store.latest_seq(session_id).await.map_err(|error| {
-            PipeNativeError(format!("journal head inspection failed: {error:?}"))
-        })?;
+        let latest_seq = self.journal_head(store, session_id).await?;
         match state {
             SidecarState::Ready(cursor) if cursor.seq <= latest_seq => {
                 let prewarm_start = cursor.seq.saturating_sub(JOIN_PREWARM_ENVELOPES);
@@ -501,8 +520,11 @@ impl PipeNativeWriter {
         store: &SqliteStoreHandle,
         session_id: &SessionId,
         committed: &[RawEnvelope],
+        known_committed_head: u64,
     ) -> Result<(), PipeNativeError> {
-        let result = self.maintain_inner(store, session_id, committed).await;
+        let result = self
+            .maintain_inner(store, session_id, committed, known_committed_head)
+            .await;
         if result.is_err() {
             self.invalidate(session_id);
         }
@@ -540,6 +562,7 @@ impl PipeNativeWriter {
         store: &SqliteStoreHandle,
         session_id: &SessionId,
         committed: &[RawEnvelope],
+        known_committed_head: u64,
     ) -> Result<(), PipeNativeError> {
         let path = self.sidecar_path(session_id)?;
         let known = self
@@ -555,29 +578,45 @@ impl PipeNativeWriter {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(session_id);
         let state = if let Some(mut state) = known {
-            let durable_head = store.latest_seq(session_id).await.map_err(|error| {
-                PipeNativeError(format!("journal head inspection failed: {error:?}"))
-            })?;
-            let (data, mut next_cursor) =
-                render_hot_batch(committed, durable_head, state.cursor, &mut state.projector)?;
-            if !data.is_empty() {
-                let mut sealed_root = None;
-                let (file, segment) = write_segmented_open(
-                    state.file,
-                    data,
-                    &state.base_path,
-                    session_id,
-                    state.cursor.generation,
-                    state.cursor.segment,
-                    false,
-                    &mut sealed_root,
-                )
-                .await?;
-                state.file = file;
-                next_cursor.segment = segment;
+            let directly_follows = committed
+                .first()
+                .is_some_and(|first| state.cursor.pending_seq.checked_add(1) == Some(first.seq));
+            if !directly_follows {
+                let latest_seq = self.journal_head(store, session_id).await?;
+                let cursor = state.cursor;
+                let generation = cursor.generation;
+                drop(state);
+                if cursor.seq > latest_seq {
+                    self.rebuild(store, session_id, path, generation).await?
+                } else {
+                    self.reconcile_from(store, session_id, path, cursor).await?
+                }
+            } else {
+                let (data, mut next_cursor) = render_hot_batch(
+                    committed,
+                    known_committed_head,
+                    state.cursor,
+                    &mut state.projector,
+                )?;
+                if !data.is_empty() {
+                    let mut sealed_root = None;
+                    let (file, segment) = write_segmented_open(
+                        state.file,
+                        data,
+                        &state.base_path,
+                        session_id,
+                        state.cursor.generation,
+                        state.cursor.segment,
+                        false,
+                        &mut sealed_root,
+                    )
+                    .await?;
+                    state.file = file;
+                    next_cursor.segment = segment;
+                }
+                state.cursor = next_cursor;
+                state
             }
-            state.cursor = next_cursor;
-            state
         } else {
             let state = inspect_sidecar(path.clone(), session_id.clone()).await?;
             if dirty {
@@ -590,9 +629,7 @@ impl PipeNativeWriter {
                         self.rebuild(store, session_id, path, generation).await?
                     }
                     SidecarState::Ready(cursor) => {
-                        let latest_seq = store.latest_seq(session_id).await.map_err(|error| {
-                            PipeNativeError(format!("journal head inspection failed: {error:?}"))
-                        })?;
+                        let latest_seq = self.journal_head(store, session_id).await?;
                         if cursor.seq > latest_seq {
                             self.rebuild(store, session_id, path, cursor.generation)
                                 .await?

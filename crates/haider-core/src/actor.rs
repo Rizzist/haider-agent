@@ -83,10 +83,10 @@ use haider_protocol::tool::{
 };
 use haider_protocol::verify::VerifyVerdict;
 use haider_provider::{
-    Message, PromptCacheMetadata, Provider, ProviderError, ProviderErrorKind, ResolvedAttachment,
-    ToolDefinition, TurnRequest, apply_tool_result_image_budget, canonical_tool_definitions,
-    canonical_tool_definitions_digest, degrade_tool_result_images_to_placeholders,
-    validate_provider_view_prefix,
+    Message, PromptCacheMetadata, Provider, ProviderError, ProviderErrorKind, ProviderStream,
+    ProviderStreamItem, ResolvedAttachment, ToolDefinition, TurnRequest,
+    apply_tool_result_image_budget, canonical_tool_definitions, canonical_tool_definitions_digest,
+    degrade_tool_result_images_to_placeholders, validate_provider_view_prefix,
 };
 use haider_tools::{Plan, RequestInput, TodoWrite};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1597,20 +1597,28 @@ impl PromotedSteerMailbox {
             .collect()
     }
 
+    /// Completes the terminal promotion fence without waiting when every
+    /// reservation has already resolved. `None` means a caller must preserve
+    /// any pending durable facts before awaiting [`Self::finish_boundary`].
+    fn try_finish_boundary(&self) -> Option<Vec<String>> {
+        let mut state = self.state();
+        if !state.committed.is_empty() {
+            return Some(state.committed.drain(..).map(|(_, text)| text).collect());
+        }
+        if state.reserved.is_empty() {
+            state.accepting = false;
+            return Some(Vec::new());
+        }
+        None
+    }
+
     async fn finish_boundary(&self) -> Vec<String> {
         loop {
             // Register before inspecting the reservation set so commit/drop
             // cannot land between the predicate and the wait.
             let changed = self.changed.notified();
-            {
-                let mut state = self.state();
-                if !state.committed.is_empty() {
-                    return state.committed.drain(..).map(|(_, text)| text).collect();
-                }
-                if state.reserved.is_empty() {
-                    state.accepting = false;
-                    return Vec::new();
-                }
+            if let Some(committed) = self.try_finish_boundary() {
+                return committed;
             }
             changed.await;
         }
@@ -2931,6 +2939,12 @@ impl HarnessActor {
             // another compaction.
             cache_rewarm_pending = None;
             let mut request_usage: Option<Usage> = None;
+            let mut pending_usage_commit: Option<PendingUsageCommit> = None;
+            // A terminal coalescing batch is valid only for a response that
+            // never crossed a tool boundary. Tool accumulators may already
+            // be empty again after dispatch, so their final shape alone is
+            // not enough to prove that no external await intervened.
+            let mut crossed_tool_boundary = false;
             let attempt_provider = Arc::clone(&provider);
             let mut opening =
                 Box::pin(attempt_provider.stream_prepared_turn_ref(&provider_request, prepared));
@@ -3100,8 +3114,33 @@ impl HarnessActor {
             let mut provider_content_seen = false;
             let mut refusal_reason = String::new();
             loop {
+                // Coalesce only a Finish already buffered immediately after
+                // Usage. If polling would suspend, preserve the old durability
+                // boundary by committing Usage before awaiting anything else.
+                let immediate_next = (pending_usage_commit.is_some() && !cancel.is_cancelled())
+                    .then(|| poll_provider_stream_now(&mut stream))
+                    .flatten();
+                if pending_usage_commit.is_some()
+                    && immediate_next.is_none()
+                    && let Err(error) = self
+                        .commit_pending_usage(&run_id, &mut pending_usage_commit)
+                        .await
+                {
+                    return self
+                        .drive_error_outcome_with_items(
+                            &run_id,
+                            &mut message,
+                            &mut reasoning,
+                            &mut tools,
+                            DriveError::Store(error),
+                        )
+                        .await;
+                }
                 let pending_delta_deadline = self.pending_item_delta_deadline;
-                let next = tokio::select! {
+                let next = if let Some(next) = immediate_next {
+                    next
+                } else {
+                    tokio::select! {
                     // Cancellation owns ties. Provider progress is polled
                     // before command service on every round so an unbounded
                     // command arrival rate cannot starve the active stream.
@@ -3162,9 +3201,41 @@ impl HarnessActor {
                         self.service_command_without_menu(command);
                         continue;
                     }
+                    }
                 };
 
+                let finish_follows_usage = matches!(&next, Some(Ok(StreamEvent::Finish { .. })));
+                if !finish_follows_usage
+                    && let Err(error) = self
+                        .commit_pending_usage(&run_id, &mut pending_usage_commit)
+                        .await
+                {
+                    return self
+                        .drive_error_outcome_with_items(
+                            &run_id,
+                            &mut message,
+                            &mut reasoning,
+                            &mut tools,
+                            DriveError::Store(error),
+                        )
+                        .await;
+                }
+
                 if cancel.is_cancelled() {
+                    if let Err(error) = self
+                        .commit_pending_usage(&run_id, &mut pending_usage_commit)
+                        .await
+                    {
+                        return self
+                            .drive_error_outcome_with_items(
+                                &run_id,
+                                &mut message,
+                                &mut reasoning,
+                                &mut tools,
+                                DriveError::Store(error),
+                            )
+                            .await;
+                    }
                     return self
                         .cancelled_outcome_with_items(
                             &run_id,
@@ -3456,6 +3527,16 @@ impl HarnessActor {
                         }
                     }
                 }
+                if matches!(
+                    &event,
+                    StreamEvent::ToolCallStart { .. }
+                        | StreamEvent::ToolCallArgsDelta { .. }
+                        | StreamEvent::ToolCallEnd { .. }
+                        | StreamEvent::ServerToolUse { .. }
+                        | StreamEvent::ServerToolResult { .. }
+                ) {
+                    crossed_tool_boundary = true;
+                }
 
                 let event_result: Result<Option<Message>, DriveError> = match event {
                     StreamEvent::TextDelta { text } => {
@@ -3737,20 +3818,46 @@ impl HarnessActor {
                             context_footprint_from_usage(&self.config, &usage, &messages);
                         request_usage = Some(usage.clone());
                         match cumulative_usage(completed_usage.as_ref(), &usage) {
-                            Ok(usage) => self
-                                .commit_usage_with_footprint(
-                                    &run_id,
-                                    self.config.context_compaction_v1.then_some(&footprint),
+                            Ok(usage) => {
+                                if let Err(error) = self.flush_pending_item_delta().await {
+                                    return self
+                                        .drive_error_outcome_with_items(
+                                            &run_id,
+                                            &mut message,
+                                            &mut reasoning,
+                                            &mut tools,
+                                            DriveError::Store(error),
+                                        )
+                                        .await;
+                                }
+                                pending_usage_commit = Some(PendingUsageCommit {
+                                    footprint: self
+                                        .config
+                                        .context_compaction_v1
+                                        .then_some(footprint),
                                     usage,
-                                )
-                                .await
-                                .map(|()| None)
-                                .map_err(DriveError::Store),
+                                });
+                                Ok(None)
+                            }
                             Err(error) => Err(error),
                         }
                     }
                     StreamEvent::Finish { reason } => {
                         if reason == FinishReason::Cancelled {
+                            if let Err(error) = self
+                                .commit_pending_usage(&run_id, &mut pending_usage_commit)
+                                .await
+                            {
+                                return self
+                                    .drive_error_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        DriveError::Store(error),
+                                    )
+                                    .await;
+                            }
                             return self
                                 .cancelled_outcome_with_items(
                                     &run_id,
@@ -3761,6 +3868,20 @@ impl HarnessActor {
                                 .await;
                         }
                         if reason == FinishReason::Error {
+                            if let Err(error) = self
+                                .commit_pending_usage(&run_id, &mut pending_usage_commit)
+                                .await
+                            {
+                                return self
+                                    .drive_error_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        DriveError::Store(error),
+                                    )
+                                    .await;
+                            }
                             let error = HaiderError::new(
                                 ErrorCode::ProviderError,
                                 "provider finished the turn with an error",
@@ -3776,37 +3897,69 @@ impl HarnessActor {
                                 )
                                 .await;
                         }
-                        if let Err(error) = self.complete_text(&run_id, &mut message, false).await {
-                            return self
-                                .drive_error_outcome_with_items(
-                                    &run_id,
-                                    &mut message,
-                                    &mut reasoning,
-                                    &mut tools,
-                                    error,
-                                )
-                                .await;
+                        let mut post_stream_batch = reason == FinishReason::EndTurn
+                            && pending_usage_commit.is_some()
+                            && message.is_some()
+                            && self.tree_head_initialized
+                            && !crossed_tool_boundary
+                            && tools.is_empty()
+                            && deferred.is_empty()
+                            && server_calls.is_empty()
+                            && self.pending_subturns.is_empty()
+                            && self.pending_nudges.is_empty()
+                            && web_sources.is_empty()
+                            && self.config.finalization_guard.is_none();
+                        if !post_stream_batch {
+                            if let Err(error) = self
+                                .commit_pending_usage(&run_id, &mut pending_usage_commit)
+                                .await
+                            {
+                                return self
+                                    .drive_error_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        DriveError::Store(error),
+                                    )
+                                    .await;
+                            }
+                            if let Err(error) =
+                                self.complete_text(&run_id, &mut message, false).await
+                            {
+                                return self
+                                    .drive_error_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        error,
+                                    )
+                                    .await;
+                            }
+                            if let Err(error) =
+                                self.complete_text(&run_id, &mut reasoning, true).await
+                            {
+                                return self
+                                    .drive_error_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        error,
+                                    )
+                                    .await;
+                            }
                         }
-                        if let Err(error) = self.complete_text(&run_id, &mut reasoning, true).await
-                        {
-                            return self
-                                .drive_error_outcome_with_items(
+                        if !post_stream_batch
+                            && let Err(error) = self
+                                .complete_non_deferred_tools(
                                     &run_id,
-                                    &mut message,
-                                    &mut reasoning,
                                     &mut tools,
-                                    error,
+                                    &deferred,
+                                    ToolStatus::Pending,
                                 )
-                                .await;
-                        }
-                        if let Err(error) = self
-                            .complete_non_deferred_tools(
-                                &run_id,
-                                &mut tools,
-                                &deferred,
-                                ToolStatus::Pending,
-                            )
-                            .await
+                                .await
                         {
                             return self
                                 .drive_error_outcome_with_items(
@@ -3819,6 +3972,20 @@ impl HarnessActor {
                                 .await;
                         }
                         if cancel.is_cancelled() {
+                            if let Err(error) = self
+                                .commit_pending_usage(&run_id, &mut pending_usage_commit)
+                                .await
+                            {
+                                return self
+                                    .drive_error_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        DriveError::Store(error),
+                                    )
+                                    .await;
+                            }
                             return self
                                 .cancelled_outcome_with_items(
                                     &run_id,
@@ -4150,7 +4317,61 @@ impl HarnessActor {
                                 }
                             }
                         }
-                        let promoted = self.promoted_steers.finish_boundary().await;
+                        let promoted = if post_stream_batch {
+                            match self.promoted_steers.try_finish_boundary() {
+                                Some(promoted) => promoted,
+                                None => {
+                                    // A live reservation would suspend the
+                                    // terminal fence. Restore the historical
+                                    // Usage/Completed durability boundaries
+                                    // before waiting and disable batching.
+                                    if let Err(error) = self
+                                        .commit_pending_usage(&run_id, &mut pending_usage_commit)
+                                        .await
+                                    {
+                                        return self
+                                            .drive_error_outcome_with_items(
+                                                &run_id,
+                                                &mut message,
+                                                &mut reasoning,
+                                                &mut tools,
+                                                DriveError::Store(error),
+                                            )
+                                            .await;
+                                    }
+                                    if let Err(error) =
+                                        self.complete_text(&run_id, &mut message, false).await
+                                    {
+                                        return self
+                                            .drive_error_outcome_with_items(
+                                                &run_id,
+                                                &mut message,
+                                                &mut reasoning,
+                                                &mut tools,
+                                                error,
+                                            )
+                                            .await;
+                                    }
+                                    if let Err(error) =
+                                        self.complete_text(&run_id, &mut reasoning, true).await
+                                    {
+                                        return self
+                                            .drive_error_outcome_with_items(
+                                                &run_id,
+                                                &mut message,
+                                                &mut reasoning,
+                                                &mut tools,
+                                                error,
+                                            )
+                                            .await;
+                                    }
+                                    post_stream_batch = false;
+                                    self.promoted_steers.finish_boundary().await
+                                }
+                            }
+                        } else {
+                            self.promoted_steers.finish_boundary().await
+                        };
                         if !promoted.is_empty() {
                             // MUTATION CHECK: this is the final atomic fence
                             // between provider Finish and durable Done. A
@@ -4170,10 +4391,106 @@ impl HarnessActor {
                                     )
                                     .await;
                             }
+                            if post_stream_batch {
+                                if let Err(error) = self
+                                    .commit_pending_usage(&run_id, &mut pending_usage_commit)
+                                    .await
+                                {
+                                    return self
+                                        .drive_error_outcome_with_items(
+                                            &run_id,
+                                            &mut message,
+                                            &mut reasoning,
+                                            &mut tools,
+                                            DriveError::Store(error),
+                                        )
+                                        .await;
+                                }
+                                if let Err(error) =
+                                    self.complete_text(&run_id, &mut message, false).await
+                                {
+                                    return self
+                                        .drive_error_outcome_with_items(
+                                            &run_id,
+                                            &mut message,
+                                            &mut reasoning,
+                                            &mut tools,
+                                            error,
+                                        )
+                                        .await;
+                                }
+                                if let Err(error) =
+                                    self.complete_text(&run_id, &mut reasoning, true).await
+                                {
+                                    return self
+                                        .drive_error_outcome_with_items(
+                                            &run_id,
+                                            &mut message,
+                                            &mut reasoning,
+                                            &mut tools,
+                                            error,
+                                        )
+                                        .await;
+                                }
+                            }
                             messages.extend(promoted.into_iter().map(Message::user_text));
                             provider_attempt = 0;
                             thinking_pending = true;
                             continue 'requests;
+                        }
+                        if post_stream_batch {
+                            // Cancellation owns the last synchronous seam
+                            // before the one terminal append. If it has won,
+                            // preserve Usage and use normal item cleanup.
+                            if cancel.is_cancelled() {
+                                if let Err(error) = self
+                                    .commit_pending_usage(&run_id, &mut pending_usage_commit)
+                                    .await
+                                {
+                                    return self
+                                        .drive_error_outcome_with_items(
+                                            &run_id,
+                                            &mut message,
+                                            &mut reasoning,
+                                            &mut tools,
+                                            DriveError::Store(error),
+                                        )
+                                        .await;
+                                }
+                                return self
+                                    .cancelled_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                    )
+                                    .await;
+                            }
+                            return match self
+                                .commit_post_stream_facts(
+                                    &run_id,
+                                    &mut message,
+                                    &mut reasoning,
+                                    &mut pending_usage_commit,
+                                )
+                                .await
+                            {
+                                Ok(()) => TurnOutcome {
+                                    state: RunState::Done,
+                                    finish_reason: reason,
+                                    error: None,
+                                },
+                                Err(error) => {
+                                    self.drive_error_outcome_with_items(
+                                        &run_id,
+                                        &mut message,
+                                        &mut reasoning,
+                                        &mut tools,
+                                        DriveError::Store(error),
+                                    )
+                                    .await
+                                }
+                            };
                         }
                         return self.finish_outcome(&run_id, reason).await;
                     }
@@ -4205,6 +4522,20 @@ impl HarnessActor {
                     }
                 }
                 if cancel.is_cancelled() {
+                    if let Err(error) = self
+                        .commit_pending_usage(&run_id, &mut pending_usage_commit)
+                        .await
+                    {
+                        return self
+                            .drive_error_outcome_with_items(
+                                &run_id,
+                                &mut message,
+                                &mut reasoning,
+                                &mut tools,
+                                DriveError::Store(error),
+                            )
+                            .await;
+                    }
                     return self
                         .cancelled_outcome_with_items(
                             &run_id,
@@ -4229,6 +4560,12 @@ impl HarnessActor {
         let open = match accumulator.take() {
             Some(open) => open,
             None => {
+                // Resolve the eventual assistant node's parent before any
+                // terminal Usage can be produced. The post-stream batch may
+                // then build every fact synchronously up to its one append.
+                if !reasoning {
+                    self.tree_parent().await.map_err(DriveError::Store)?;
+                }
                 let item_id = self.next_item_id();
                 let empty = if reasoning {
                     TurnItem::Reasoning {
@@ -7594,37 +7931,149 @@ impl HarnessActor {
         footprint: Option<&ContextFootprint>,
         usage: Usage,
     ) -> Result<(), HaiderError> {
-        let Some(footprint) = footprint else {
-            self.commit_payload(run_id, EventPayload::Usage(usage), prompt_omit_render())
-                .await?;
-            return Ok(());
-        };
-
-        let (kind, data) = context_footprint_extension(footprint)?;
-        let item_id = self.next_item_id();
-        let item = TurnItem::Extension { kind, data };
-        let render = prompt_omit_render();
-        let started = self.uncommitted_envelope(
-            run_id,
-            EventPayload::Item(ItemEvent::Started {
-                item_id: item_id.clone(),
-                item: item.clone(),
-            }),
-            render,
-        )?;
-        let completed = self.uncommitted_envelope(
-            run_id,
-            EventPayload::Item(ItemEvent::Completed { item_id, item }),
-            render,
-        )?;
         self.flush_pending_item_delta().await?;
-        let usage =
-            self.uncommitted_envelope(run_id, EventPayload::Usage(usage), prompt_omit_render())?;
-        let mut envelopes = [started, completed, usage];
+        let mut envelopes = self.uncommitted_usage_envelopes(run_id, footprint, usage)?;
         self.store.append(&mut envelopes).await?;
         for committed in envelopes {
             let _ = self.events.send(committed);
         }
+        Ok(())
+    }
+
+    fn uncommitted_usage_envelopes(
+        &mut self,
+        run_id: &RunId,
+        footprint: Option<&ContextFootprint>,
+        usage: Usage,
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        let mut envelopes = Vec::with_capacity(1 + usize::from(footprint.is_some()) * 2);
+        if let Some(footprint) = footprint {
+            let (kind, data) = context_footprint_extension(footprint)?;
+            envelopes.extend(self.uncommitted_extension_marker(
+                run_id,
+                &kind,
+                data,
+                prompt_omit_render(),
+            )?);
+        }
+        envelopes.push(self.uncommitted_envelope(
+            run_id,
+            EventPayload::Usage(usage),
+            prompt_omit_render(),
+        )?);
+        Ok(envelopes)
+    }
+
+    async fn commit_pending_usage(
+        &mut self,
+        run_id: &RunId,
+        pending: &mut Option<PendingUsageCommit>,
+    ) -> Result<(), HaiderError> {
+        let Some(pending) = pending.take() else {
+            return Ok(());
+        };
+        self.commit_usage_with_footprint(run_id, pending.footprint.as_ref(), pending.usage)
+            .await
+    }
+
+    /// Commits the no-boundary post-stream suffix in one append. Usage stays
+    /// before item completion because that is the existing sequence/publish
+    /// order; `Done` remains last. A crash before this append can therefore
+    /// leave the run at `Started`/`Streaming` without `Done`, which the
+    /// interrupted-turn recovery path already terminalizes. After success all
+    /// facts are durable before any of them are published.
+    async fn commit_post_stream_facts(
+        &mut self,
+        run_id: &RunId,
+        message: &mut Option<TextAccumulator>,
+        reasoning: &mut Option<TextAccumulator>,
+        pending_usage: &mut Option<PendingUsageCommit>,
+    ) -> Result<(), HaiderError> {
+        if self.pending_item_delta.is_some() {
+            return Err(HaiderError::new(
+                ErrorCode::Internal,
+                "post-stream batch crossed an unflushed item delta",
+                false,
+            ));
+        }
+        let pending_usage = pending_usage.as_ref().ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                "post-stream batch has no usage fact",
+                false,
+            )
+        })?;
+        if message.is_some() && !self.tree_head_initialized {
+            return Err(HaiderError::new(
+                ErrorCode::Internal,
+                "post-stream batch has no initialized tree parent",
+                false,
+            ));
+        }
+        let message_parent = self.tree_head.clone();
+        let mut envelopes = self.uncommitted_usage_envelopes(
+            run_id,
+            pending_usage.footprint.as_ref(),
+            pending_usage.usage.clone(),
+        )?;
+
+        let message_node = if let Some(active) = message.as_ref() {
+            let node = TreeNode {
+                node: self.next_node_id(),
+                parent: message_parent,
+                kind: NodeKind::AssistantCommit {
+                    text: active.text.clone(),
+                    verdict: VerifyVerdict::NotApplicable,
+                },
+            };
+            envelopes.push(self.uncommitted_envelope(
+                run_id,
+                EventPayload::Item(ItemEvent::Completed {
+                    item_id: active.item_id.clone(),
+                    item: TurnItem::AgentMessage {
+                        text: active.text.clone(),
+                    },
+                }),
+                prompt_verbatim_render(),
+            )?);
+            envelopes.push(self.uncommitted_envelope(
+                run_id,
+                EventPayload::NodeCommitted(node.clone()),
+                prompt_omit_render(),
+            )?);
+            Some(node)
+        } else {
+            None
+        };
+        if let Some(active) = reasoning.as_ref() {
+            envelopes.push(self.uncommitted_envelope(
+                run_id,
+                EventPayload::Item(ItemEvent::Completed {
+                    item_id: active.item_id.clone(),
+                    item: TurnItem::Reasoning {
+                        summary: active.text.clone(),
+                    },
+                }),
+                prompt_verbatim_render(),
+            )?);
+        }
+        envelopes.push(self.uncommitted_envelope(
+            run_id,
+            EventPayload::RunState(RunState::Done),
+            prompt_omit_render(),
+        )?);
+
+        self.store.append(&mut envelopes).await?;
+        for committed in envelopes {
+            let _ = self.events.send(committed);
+        }
+        if let Some(node) = message_node {
+            self.tree_head = Some(node.node);
+        }
+        *message = None;
+        *reasoning = None;
+        *pending_usage = None;
+        self.state.send_replace(Some(RunState::Done));
         Ok(())
     }
 
@@ -7951,6 +8400,22 @@ async fn delta_flush_timer(deadline: Option<tokio::time::Instant>) {
     }
 }
 
+/// Polls one provider event without ever yielding the actor task. Receiver
+/// reads are cancel-safe, so dropping the pending future leaves the item for
+/// the ordinary `recv` path. This is the exact adjacency test used by the
+/// post-stream batching seam: `None` means an await would be required, while
+/// `Some(None)` is an already-observed EOF.
+fn poll_provider_stream_now(stream: &mut ProviderStream) -> Option<Option<ProviderStreamItem>> {
+    let waker = std::task::Waker::noop();
+    let mut context = std::task::Context::from_waker(waker);
+    let recv = stream.recv();
+    let mut recv = std::pin::pin!(recv);
+    match std::future::Future::poll(recv.as_mut(), &mut context) {
+        std::task::Poll::Ready(item) => Some(item),
+        std::task::Poll::Pending => None,
+    }
+}
+
 fn merge_contiguous_item_delta(existing: &mut ItemDelta, incoming: &ItemDelta) -> bool {
     match (existing, incoming) {
         (ItemDelta::Text { text: accumulated }, ItemDelta::Text { text })
@@ -7993,6 +8458,11 @@ struct ProviderRetryContext<'a> {
 struct TextAccumulator {
     item_id: ItemId,
     text: String,
+}
+
+struct PendingUsageCommit {
+    footprint: Option<ContextFootprint>,
+    usage: Usage,
 }
 
 /// One as-yet-uncommitted provider-stream delta. It is intentionally limited

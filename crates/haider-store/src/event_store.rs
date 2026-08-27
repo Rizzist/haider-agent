@@ -79,7 +79,7 @@ use haider_protocol::loom::{
 use haider_protocol::menu::{Menu, MenuAnswer, MenuCloseReason, MenuKind};
 use haider_protocol::permission::PermissionEventPayload;
 use haider_protocol::pipe::InstructEvidenceRef;
-use haider_protocol::project_instructions::ProjectInstructionsLoaded;
+use haider_protocol::project_instructions::ProjectInstructionsEventPayload;
 use haider_protocol::queue::{QueueChange, QueueDelta, QueueRow};
 use haider_protocol::retry::RunRetryEventPayload;
 use haider_protocol::session::{
@@ -112,8 +112,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
+#[cfg(test)]
+#[path = "event_store_append_tests.rs"]
+mod event_store_append_tests;
+
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const REPLAY_PAGE_SIZE: usize = 1_024;
+/// The store currently has 58 distinct `prepare_cached` call sites. An append
+/// touches 8–12 of them, so 16 entries churned under ordinary mixed traffic;
+/// 128 keeps the full census resident with room for adjacent projections.
+const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 128;
 /// A v25 upgrade may need old graph facts, but profile open must never retain
 /// an unbounded copy of the journal. `envelope_weight_bytes` conservatively
 /// charges the decoded heap representation, not just its compact SQLite bytes.
@@ -1854,7 +1862,7 @@ impl Store {
         migrations::migrate(&mut connection)?;
         backfill_payload_kinds(&mut connection)?;
         backfill_run_head_projections(&mut connection)?;
-        connection.set_prepared_statement_cache_capacity(16);
+        connection.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
         let cas = FileCas::open(&root)?;
         let provider_views = ProviderViewStore::open(&root)?;
         provider_views.sweep_expired(&mut connection, now_ms()?)?;
@@ -15624,7 +15632,7 @@ fn apply_run_head_envelope(
     };
     if kind == "run_retried" {
         let Ok(RunRetryEventPayload::RunRetried { prompt_run_id, .. }) =
-            RunRetryEventPayload::from_payload_value(envelope.payload.clone())
+            decode_payload::<RunRetryEventPayload>(&envelope.payload)
         else {
             return Ok(());
         };
@@ -15649,7 +15657,7 @@ fn apply_run_head_envelope(
     if !matches!(kind, "run_state" | "user_message") {
         return Ok(());
     }
-    let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+    let Ok(payload) = decode_payload::<EventPayload>(&envelope.payload) else {
         return Ok(());
     };
     match payload {
@@ -16494,11 +16502,26 @@ fn unstamped_raw_command_envelope(
 fn workflow_graph_journal_event(
     payload: &serde_json::Value,
 ) -> StoreResult<Option<WorkflowGraphJournalEvent>> {
-    WorkflowGraphJournalEvent::from_payload_value(payload).map_err(|error| {
+    if !workflow_graph_journal_event_kind(payload) {
+        return Ok(None);
+    }
+    decode_payload(payload).map(Some).map_err(|error| {
         corrupt(format!(
             "malformed workflow activation journal event: {error}"
         ))
     })
+}
+
+fn workflow_graph_journal_event_kind(payload: &serde_json::Value) -> bool {
+    matches!(
+        payload.get("type").and_then(serde_json::Value::as_str),
+        Some(
+            "workflow_graph_started"
+                | "workflow_node_activated"
+                | "workflow_node_completed"
+                | "workflow_node_rejected"
+        )
+    )
 }
 
 fn workflow_event_graph_id(event: &WorkflowGraphJournalEvent) -> &GraphId {
@@ -17074,7 +17097,7 @@ fn augment_workflow_graph_envelopes(
     // already owns its bounded envelope page and must not retain a second
     // O(page bytes) vector of cloned payload trees.
     for envelope in envelopes.iter() {
-        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+        let Ok(payload) = decode_payload::<EventPayload>(&envelope.payload) else {
             continue;
         };
         let causation_id = &envelope.event_id;
@@ -17778,7 +17801,7 @@ fn append_transaction_envelopes(
         envelope.committed_at_ms = committed_at_ms;
         stamp_queue_delta(envelope)?;
         stamp_workspace_mutation(transaction, envelope)?;
-        stamp_checkpoint_record(transaction, envelope)?;
+        let checkpoint = stamp_checkpoint_record(transaction, envelope)?;
         let bytes = encode_envelope(envelope).map_err(|error| {
             store_error(
                 ErrorCode::InvalidArgument,
@@ -17797,7 +17820,9 @@ fn append_transaction_envelopes(
             ])
             .map_err(map_sqlite_error)?;
         enqueue_hook_dispatch(transaction, envelope)?;
-        project_checkpoint_record(transaction, envelope)?;
+        if let Some(checkpoint) = checkpoint.as_ref() {
+            project_checkpoint_record(transaction, envelope, checkpoint)?;
+        }
     }
     drop(insert);
     update_run_head_projection_after_append(transaction, session_id, envelopes)?;
@@ -18895,7 +18920,7 @@ fn append_envelopes_in_transaction(
             envelope.committed_at_ms = committed_at_ms;
             stamp_queue_delta(&mut envelope)?;
             stamp_workspace_mutation(transaction, &mut envelope)?;
-            stamp_checkpoint_record(transaction, &mut envelope)?;
+            let checkpoint = stamp_checkpoint_record(transaction, &mut envelope)?;
             let envelope_bytes = encode_envelope(&envelope).map_err(|error| {
                 store_error(
                     ErrorCode::InvalidArgument,
@@ -18914,7 +18939,9 @@ fn append_envelopes_in_transaction(
                 ])
                 .map_err(map_sqlite_error)?;
             enqueue_hook_dispatch(transaction, &envelope)?;
-            project_checkpoint_record(transaction, &envelope)?;
+            if let Some(checkpoint) = checkpoint.as_ref() {
+                project_checkpoint_record(transaction, &envelope, checkpoint)?;
+            }
             stamped.push(envelope);
         }
     }
@@ -18976,15 +19003,14 @@ fn stamp_queue_delta(envelope: &mut RawEnvelope) -> StoreResult<()> {
     // MUTATION CHECK: making this decode fail-open permits a reserved
     // queue_changed payload without its required revision to commit and ride
     // the ordinary attachment stream.
-    let EventPayload::QueueChanged(mut delta) =
-        serde_json::from_value::<EventPayload>(envelope.payload.clone()).map_err(|error| {
-            store_error(
-                ErrorCode::InvalidArgument,
-                format!("invalid reserved queue_changed payload: {error}"),
-                false,
-            )
-        })?
-    else {
+    let payload = decode_payload::<EventPayload>(&envelope.payload).map_err(|error| {
+        store_error(
+            ErrorCode::InvalidArgument,
+            format!("invalid reserved queue_changed payload: {error}"),
+            false,
+        )
+    })?;
+    let EventPayload::QueueChanged(mut delta) = payload else {
         return Err(store_error(
             ErrorCode::InvalidArgument,
             "reserved queue_changed payload decoded as another event type",
@@ -19011,32 +19037,47 @@ fn stamp_workspace_mutation(
     transaction: &Connection,
     envelope: &mut RawEnvelope,
 ) -> StoreResult<()> {
-    if let Ok(EventPayload::Effect(EffectPhase::Outcome {
-        effect,
-        workspace_mutation: Some(mut mutation),
-        outcome,
-        freshness,
-    })) = serde_json::from_value::<EventPayload>(envelope.payload.clone())
+    if envelope
+        .payload
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        == Some("effect")
     {
-        validate_workspace_mutation_intent(transaction, envelope, &effect, &mutation)?;
-        stamp_workspace_mutation_fields(envelope.seq, &effect, &mut mutation);
-        envelope.payload = serde_json::to_value(EventPayload::Effect(EffectPhase::Outcome {
+        if let Ok(EventPayload::Effect(EffectPhase::Outcome {
             effect,
+            workspace_mutation: Some(mut mutation),
             outcome,
             freshness,
-            workspace_mutation: Some(mutation),
-        }))
-        .map_err(|error| {
-            store_error(
-                ErrorCode::InvalidArgument,
-                format!("cannot serialize workspace mutation outcome: {error}"),
-                false,
-            )
-        })?;
+        })) = decode_payload::<EventPayload>(&envelope.payload)
+        {
+            validate_workspace_mutation_intent(transaction, envelope, &effect, &mutation)?;
+            stamp_workspace_mutation_fields(envelope.seq, &effect, &mut mutation);
+            envelope.payload = serde_json::to_value(EventPayload::Effect(EffectPhase::Outcome {
+                effect,
+                outcome,
+                freshness,
+                workspace_mutation: Some(mutation),
+            }))
+            .map_err(|error| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("cannot serialize workspace mutation outcome: {error}"),
+                    false,
+                )
+            })?;
+        }
         return Ok(());
     }
-    let Some(TaskEventPayload::TaskCompleted(mut completed)) =
-        TaskEventPayload::from_payload_value(&envelope.payload)
+    if envelope
+        .payload
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        != Some("task_completed")
+    {
+        return Ok(());
+    }
+    let Ok(TaskEventPayload::TaskCompleted(mut completed)) =
+        decode_payload::<TaskEventPayload>(&envelope.payload)
     else {
         return Ok(());
     };
@@ -19072,11 +19113,19 @@ fn stamp_workspace_mutation_fields(seq: u64, effect: &EffectId, mutation: &mut W
 fn stamp_checkpoint_record(
     transaction: &Connection,
     envelope: &mut RawEnvelope,
-) -> StoreResult<()> {
+) -> StoreResult<Option<CheckpointRecorded>> {
+    if envelope
+        .payload
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        != Some("checkpoint_recorded")
+    {
+        return Ok(None);
+    }
     let Ok(EventPayload::CheckpointRecorded(mut checkpoint)) =
-        serde_json::from_value::<EventPayload>(envelope.payload.clone())
+        decode_payload::<EventPayload>(&envelope.payload)
     else {
-        return Ok(());
+        return Ok(None);
     };
     if checkpoint.session_id != envelope.session_id
         || checkpoint.branch_id != envelope.branch_id
@@ -19172,23 +19221,22 @@ fn stamp_checkpoint_record(
     checkpoint.seq = envelope.seq;
     checkpoint.workspace_revision = Some(revision);
     checkpoint.recorded_at_ms = envelope.committed_at_ms;
-    envelope.payload =
-        serde_json::to_value(EventPayload::CheckpointRecorded(checkpoint)).map_err(|error| {
-            store_error(
-                ErrorCode::InvalidArgument,
-                format!("cannot serialize stamped checkpoint: {error}"),
-                false,
-            )
-        })?;
-    Ok(())
+    envelope.payload = serde_json::to_value(EventPayload::CheckpointRecorded(checkpoint.clone()))
+        .map_err(|error| {
+        store_error(
+            ErrorCode::InvalidArgument,
+            format!("cannot serialize stamped checkpoint: {error}"),
+            false,
+        )
+    })?;
+    Ok(Some(checkpoint))
 }
 
-fn project_checkpoint_record(transaction: &Connection, envelope: &RawEnvelope) -> StoreResult<()> {
-    let Ok(EventPayload::CheckpointRecorded(checkpoint)) =
-        serde_json::from_value::<EventPayload>(envelope.payload.clone())
-    else {
-        return Ok(());
-    };
+fn project_checkpoint_record(
+    transaction: &Connection,
+    envelope: &RawEnvelope,
+    checkpoint: &CheckpointRecorded,
+) -> StoreResult<()> {
     let revision = checkpoint.workspace_revision.as_ref().ok_or_else(|| {
         corrupt(format!(
             "checkpoint {} reached projection without a workspace revision",
@@ -19201,7 +19249,7 @@ fn project_checkpoint_record(transaction: &Connection, envelope: &RawEnvelope) -
             checkpoint.checkpoint_id
         )));
     }
-    let record_json = serde_json::to_string(&checkpoint).map_err(|error| {
+    let record_json = serde_json::to_string(checkpoint).map_err(|error| {
         store_error(
             ErrorCode::InvalidArgument,
             format!("cannot serialize checkpoint projection row: {error}"),
@@ -19352,25 +19400,26 @@ fn graph_telemetry_event(payload: &serde_json::Value) -> bool {
     }
 }
 
-fn budget_terminal_runs(envelopes: &[RawEnvelope]) -> HashSet<RunId> {
+fn budget_terminal_runs(
+    envelopes: &[RawEnvelope],
+    payloads: &[Result<EventPayload, serde_json::Error>],
+) -> HashSet<RunId> {
     envelopes
         .windows(2)
-        .filter_map(|pair| {
-            let run_id = pair[0].run_id.as_ref()?;
-            if pair[1].run_id.as_ref() != Some(run_id) {
+        .zip(payloads.windows(2))
+        .filter_map(|(envelopes, payloads)| {
+            let run_id = envelopes[0].run_id.as_ref()?;
+            if envelopes[1].run_id.as_ref() != Some(run_id) {
                 return None;
             }
             let budget_failure = matches!(
-                serde_json::from_value::<EventPayload>(pair[0].payload.clone()),
+                &payloads[0],
                 Ok(EventPayload::RunFailed {
                     code: ErrorCode::BudgetExhausted,
                     ..
                 })
             );
-            let errored = matches!(
-                serde_json::from_value::<EventPayload>(pair[1].payload.clone()),
-                Ok(EventPayload::RunState(RunState::Errored))
-            );
+            let errored = matches!(&payloads[1], Ok(EventPayload::RunState(RunState::Errored)));
             (budget_failure && errored).then(|| run_id.clone())
         })
         .collect()
@@ -19435,6 +19484,13 @@ fn validate_worker_run_transitions(
     envelopes: &[RawEnvelope],
     projection_run_count: u64,
 ) -> StoreResult<()> {
+    // The validator needs the complete core union to preserve its typed
+    // invalid-payload error. Decode it once, then share those results across
+    // the manual-compaction, graph guard, budget, and transition consumers.
+    let payloads = envelopes
+        .iter()
+        .map(|envelope| decode_payload::<EventPayload>(&envelope.payload))
+        .collect::<Vec<_>>();
     let mut states = latest_run_states_for(
         transaction,
         session_id,
@@ -19448,9 +19504,10 @@ fn validate_worker_run_transitions(
     // does not finalize provider work or discharge graph obligations.
     let manual_compaction_runs = envelopes
         .iter()
-        .filter_map(|envelope| {
+        .zip(&payloads)
+        .filter_map(|(envelope, payload)| {
             let manual_node = matches!(
-                serde_json::from_value::<EventPayload>(envelope.payload.clone()),
+                payload,
                 Ok(EventPayload::NodeCommitted(TreeNode {
                     kind: NodeKind::Compaction {
                         resume_cause: haider_protocol::history::CompactionResume::ManualIdle,
@@ -19467,15 +19524,13 @@ fn validate_worker_run_transitions(
             .then_some(run_id.clone())
         })
         .collect::<HashSet<_>>();
-    let budget_terminal_runs = budget_terminal_runs(envelopes);
-    let commits_graph_guarded_done = envelopes.iter().any(|envelope| {
-        matches!(
-            serde_json::from_value::<EventPayload>(envelope.payload.clone()),
-            Ok(EventPayload::RunState(RunState::Done))
-        ) && envelope
-            .run_id
-            .as_ref()
-            .is_none_or(|run_id| !manual_compaction_runs.contains(run_id))
+    let budget_terminal_runs = budget_terminal_runs(envelopes, &payloads);
+    let commits_graph_guarded_done = envelopes.iter().zip(&payloads).any(|(envelope, payload)| {
+        matches!(payload, Ok(EventPayload::RunState(RunState::Done)))
+            && envelope
+                .run_id
+                .as_ref()
+                .is_none_or(|run_id| !manual_compaction_runs.contains(run_id))
     });
     if commits_graph_guarded_done
         && load_graph_reduction(transaction, session_id)?
@@ -19498,15 +19553,23 @@ fn validate_worker_run_transitions(
             false,
         ));
     }
-    for envelope in envelopes {
-        let supplemental_project_instructions =
-            ProjectInstructionsLoaded::from_payload_value(&envelope.payload).is_some();
+    for (envelope, payload) in envelopes.iter().zip(payloads) {
+        let kind = envelope
+            .payload
+            .get("type")
+            .and_then(serde_json::Value::as_str);
+        let supplemental_project_instructions = kind == Some("project_instructions_loaded")
+            && decode_payload::<ProjectInstructionsEventPayload>(&envelope.payload).is_ok();
         let supplemental_computer_permission =
-            PermissionEventPayload::from_payload_value(envelope.payload.clone()).is_ok();
-        let supplemental_run_budget = matches!(
-            HeadlessRunEventPayload::from_payload_value(&envelope.payload),
-            Some(HeadlessRunEventPayload::RunBudgetExhausted(_))
-        );
+            matches!(
+                kind,
+                Some("permission_grant_needed" | "permission_grant_resolved")
+            ) && decode_payload::<PermissionEventPayload>(&envelope.payload).is_ok();
+        let supplemental_run_budget = kind == Some("run_budget_exhausted")
+            && matches!(
+                decode_payload::<HeadlessRunEventPayload>(&envelope.payload),
+                Ok(HeadlessRunEventPayload::RunBudgetExhausted(_))
+            );
         let Some(run_id) = envelope.run_id.as_ref() else {
             if supplemental_project_instructions
                 || supplemental_computer_permission
@@ -19540,7 +19603,7 @@ fn validate_worker_run_transitions(
                 false,
             ));
         }
-        let payload = match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
+        let payload = match payload {
             Ok(payload) => Some(payload),
             Err(_)
                 if supplemental_project_instructions
@@ -19867,14 +19930,13 @@ fn validate_metafork_commit(
 /// Content address for the complete exact provider view used to justify a
 /// fork cache-prefix inheritance decision.
 pub fn fork_provider_view_prefix_digest(provider_view: &serde_json::Value) -> StoreResult<String> {
-    let ledger =
-        serde_json::from_value::<ProviderViewLedgerV1>(provider_view.clone()).map_err(|error| {
-            store_error(
-                ErrorCode::InvalidArgument,
-                format!("cannot decode fork provider-view ledger: {error}"),
-                false,
-            )
-        })?;
+    let ledger = decode_payload::<ProviderViewLedgerV1>(provider_view).map_err(|error| {
+        store_error(
+            ErrorCode::InvalidArgument,
+            format!("cannot decode fork provider-view ledger: {error}"),
+            false,
+        )
+    })?;
     ledger.prefix_digest().map_err(|error| {
         store_error(
             ErrorCode::InvalidArgument,
@@ -19951,7 +20013,7 @@ fn inherited_fork_cache_segment(
         if envelope.agent_id.as_ref() != source_owner_agent {
             continue;
         }
-        let payload = match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
+        let payload = match decode_payload::<EventPayload>(&envelope.payload) {
             Ok(payload) => payload,
             Err(_)
                 if raw_provider_view_kind(&envelope.payload)
@@ -20326,7 +20388,7 @@ fn append_fork_boundary_closures(
     for envelope in envelopes.iter() {
         if let Some(run_id) = envelope.run_id.clone()
             && let Ok(EventPayload::RunState(state)) =
-                serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                decode_payload::<EventPayload>(&envelope.payload)
         {
             run_states.insert((run_id, envelope.agent_id.clone()), state);
         }
@@ -20445,7 +20507,7 @@ fn validate_branch_fork(
         if !admitted {
             continue;
         }
-        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+        let Ok(payload) = decode_payload::<EventPayload>(&envelope.payload) else {
             continue;
         };
         match payload {
@@ -20584,8 +20646,16 @@ fn update_branch_heads(transaction: &Connection, envelopes: &[RawEnvelope]) -> S
         if envelope.agent_id.is_some() {
             continue;
         }
+        if envelope
+            .payload
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            != Some("node_committed")
+        {
+            continue;
+        }
         let Ok(EventPayload::NodeCommitted(node)) =
-            serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            decode_payload::<EventPayload>(&envelope.payload)
         else {
             continue;
         };

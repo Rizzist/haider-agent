@@ -27,8 +27,14 @@ const PIPE_SIDECAR_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::fro
 struct PipeSidecarTask {
     session_id: SessionId,
     writer: Arc<crate::pipe_native::PipeNativeWriter>,
-    batches: Option<mpsc::UnboundedSender<Arc<[RawEnvelope]>>>,
+    latest_enqueued_head: Arc<AtomicU64>,
+    batches: Option<mpsc::UnboundedSender<PipeCommittedBatch>>,
     task: Option<JoinHandle<()>>,
+}
+
+struct PipeCommittedBatch {
+    envelopes: Arc<[RawEnvelope]>,
+    head_seq: u64,
 }
 
 impl PipeSidecarTask {
@@ -37,13 +43,26 @@ impl PipeSidecarTask {
         store: SqliteStoreHandle,
         session_id: SessionId,
     ) -> Self {
-        let (batches, mut receiver) = mpsc::unbounded_channel::<Arc<[RawEnvelope]>>();
+        let (batches, mut receiver) = mpsc::unbounded_channel::<PipeCommittedBatch>();
         let task_writer = Arc::clone(&writer);
         let task_session = session_id.clone();
+        let latest_enqueued_head = Arc::new(AtomicU64::new(0));
+        let task_latest_enqueued_head = Arc::clone(&latest_enqueued_head);
         let task = tokio::spawn(async move {
-            while let Some(envelopes) = receiver.recv().await {
+            while let Some(batch) = receiver.recv().await {
+                // The actor can enqueue another already-committed batch while
+                // this writer is behind. Use the shared queue high-water mark
+                // so an earlier batch is not mistaken for durable EOF.
+                let latest_enqueued_head = task_latest_enqueued_head
+                    .load(Ordering::Acquire)
+                    .max(batch.head_seq);
                 if let Err(error) = task_writer
-                    .maintain(&store, &task_session, envelopes.as_ref())
+                    .maintain(
+                        &store,
+                        &task_session,
+                        batch.envelopes.as_ref(),
+                        latest_enqueued_head,
+                    )
                     .await
                 {
                     tracing::warn!(
@@ -57,16 +76,26 @@ impl PipeSidecarTask {
         Self {
             session_id,
             writer,
+            latest_enqueued_head,
             batches: Some(batches),
             task: Some(task),
         }
     }
 
     fn enqueue(&self, envelopes: Arc<[RawEnvelope]>) {
+        let Some(head_seq) = envelopes.last().map(|envelope| envelope.seq) else {
+            return;
+        };
+        let batch = PipeCommittedBatch {
+            envelopes,
+            head_seq,
+        };
+        self.latest_enqueued_head
+            .fetch_max(head_seq, Ordering::Release);
         if self
             .batches
             .as_ref()
-            .is_none_or(|batches| batches.send(envelopes).is_err())
+            .is_none_or(|batches| batches.send(batch).is_err())
         {
             self.writer.invalidate(&self.session_id);
         }
