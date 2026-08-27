@@ -66,14 +66,22 @@ use crate::broker::{EffectBroker, EffectOperation, PermissionPolicy};
 use crate::ledger::{ChangeLedgerSink, FsWriteRecord};
 use crate::{FsEditAnchorMismatch, ToolError, ToolResult};
 use async_trait::async_trait;
+use globset::{GlobBuilder, GlobMatcher};
 use haider_platform::WorkspaceDirectory as OwnedFd;
 use haider_protocol::effect::{EffectClass, FileFreshness, WorkspaceMutation};
 use haider_protocol::ids::{ArtifactRef, RunId, SessionId};
 use haider_protocol::tool::{BoundedResult, DispatchMode, ToolManifest};
+use haider_protocol::tool::{FsSearchMatch, ToolResultData, ToolTruncationReason};
+use regex::{Regex, RegexBuilder};
+use regex_syntax::ParserBuilder as RegexParserBuilder;
+use regex_syntax::hir::{Capture, Hir, HirKind, Look};
 #[cfg(unix)]
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use serde_json::{Value, json};
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::borrow::Cow;
+#[cfg(test)]
+use std::collections::HashSet;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 #[cfg(unix)]
 use std::ffi::CStr;
 #[cfg(unix)]
@@ -81,7 +89,7 @@ use std::ffi::OsStr;
 #[cfg(unix)]
 use std::ffi::OsString;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Cursor, Read, Write};
 #[cfg(windows)]
 use std::io::{Seek, SeekFrom};
 #[cfg(unix)]
@@ -90,7 +98,8 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Port for storing the complete result when its prompt preview is truncated.
 #[async_trait]
@@ -324,6 +333,13 @@ fn read_memo_weight(key: &ReadMemoCallKey, value: &MemoizedRead) -> usize {
                 .artifact
                 .as_ref()
                 .map_or(0, |artifact| artifact.0.capacity()),
+        )
+        .saturating_add(
+            result
+                .data
+                .as_ref()
+                .and_then(|data| serde_json::to_vec(data).ok())
+                .map_or(0, |encoded| encoded.len()),
         );
     let freshness_bytes = value.freshness.as_ref().map_or(0, |freshness| {
         freshness.path.capacity() + freshness.digest.capacity()
@@ -350,7 +366,7 @@ fn invalidate_read_memo(workspace: &Path) {
 pub fn fs_read_manifest() -> ToolManifest {
     ToolManifest {
         name: "fs_read".into(),
-        description: "Read a bounded UTF-8 file slice or list a directory".into(),
+        description: "Read a redacted, bounded UTF-8 file slice or list a directory; use offset/limit for range reads and the artifact handle for full owner-authorized bytes".into(),
         effects: vec![EffectClass::FsRead],
         dispatch: DispatchMode::Await,
         input_schema: json!({
@@ -369,14 +385,17 @@ pub fn fs_read_manifest() -> ToolManifest {
 pub fn fs_glob_manifest() -> ToolManifest {
     ToolManifest {
         name: "fs_glob".into(),
-        description: "List workspace files matching a bounded glob".into(),
+        description: "List redacted workspace files matching a bounded repository-aware glob"
+            .into(),
         effects: vec![EffectClass::FsRead],
         dispatch: DispatchMode::Await,
         input_schema: json!({
             "type": "object",
             "properties": {
-                "pattern": {"type": "string", "minLength": 1},
-                "path": {"type": "string", "minLength": 1}
+                "pattern": {"type": "string", "minLength": 1, "maxLength": GLOB_PATTERN_MAX_BYTES},
+                "path": {"type": "string", "minLength": 1},
+                "respect_gitignore": {"type": "boolean", "default": true},
+                "include_hidden": {"type": "boolean", "default": false}
             },
             "required": ["pattern"],
             "additionalProperties": false
@@ -387,20 +406,41 @@ pub fn fs_glob_manifest() -> ToolManifest {
 pub fn fs_search_manifest() -> ToolManifest {
     ToolManifest {
         name: "fs_search".into(),
-        description: "Search bounded workspace file contents".into(),
+        description: "Search redacted, bounded repository file contents with literal, simple, or safe Rust-regex matching".into(),
         effects: vec![EffectClass::FsRead],
         dispatch: DispatchMode::Await,
         input_schema: json!({
             "type": "object",
             "properties": {
-                "pattern": {"type": "string", "minLength": 1},
+                "pattern": {"type": "string", "minLength": 1, "maxLength": SEARCH_PATTERN_MAX_BYTES},
                 "path": {"type": "string", "minLength": 1},
-                "glob": {"type": "string", "minLength": 1},
+                "glob": {"type": "string", "minLength": 1, "maxLength": GLOB_PATTERN_MAX_BYTES},
                 "case": {"type": "string", "enum": ["sensitive", "insensitive", "smart"]},
-                "mode": {"type": "string", "enum": ["literal", "simple"]},
+                "mode": {"type": "string", "enum": ["literal", "simple", "regex"], "description": "regex sources are additionally capped at 1024 UTF-8 bytes before Unicode expansion"},
+                "multiline": {"type": "boolean", "default": false, "description": "Make ^ and $ match physical line boundaries in the line-streamed regex engine"},
+                "context": {
+                    "type": "object",
+                    "properties": {
+                        "before": {"type": "integer", "minimum": 0, "maximum": 5},
+                        "after": {"type": "integer", "minimum": 0, "maximum": 5}
+                    },
+                    "additionalProperties": false
+                },
+                "max_matches": {"type": "integer", "minimum": 1, "maximum": SEARCH_PREVIEW_MATCHES},
+                "file_glob": {
+                    "type": "object",
+                    "properties": {
+                        "include": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": GLOB_PATTERN_MAX_BYTES}, "maxItems": 32},
+                        "exclude": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": GLOB_PATTERN_MAX_BYTES}, "maxItems": 32}
+                    },
+                    "additionalProperties": false
+                },
+                "respect_gitignore": {"type": "boolean", "default": true},
+                "include_hidden": {"type": "boolean", "default": false},
                 "query": {
                     "type": "string",
                     "minLength": 1,
+                    "maxLength": SEARCH_PATTERN_MAX_BYTES,
                     "description": "Legacy alias for pattern"
                 },
                 "root": {
@@ -559,6 +599,12 @@ pub struct FsSearch {
     pub glob: Option<String>,
     pub case_mode: FsCaseMode,
     pub mode: FsSearchMode,
+    pub multiline: bool,
+    pub context: FsSearchContext,
+    pub max_matches: usize,
+    pub file_glob: FsFileGlob,
+    pub respect_gitignore: bool,
+    pub include_hidden: bool,
 }
 
 impl FsSearch {
@@ -569,6 +615,12 @@ impl FsSearch {
             glob: None,
             case_mode: FsCaseMode::Sensitive,
             mode: FsSearchMode::Literal,
+            multiline: false,
+            context: FsSearchContext::default(),
+            max_matches: SEARCH_PREVIEW_MATCHES,
+            file_glob: FsFileGlob::default(),
+            respect_gitignore: true,
+            include_hidden: false,
         }
     }
 
@@ -586,6 +638,50 @@ impl FsSearch {
         self.mode = mode;
         self
     }
+
+    pub fn with_multiline(mut self, multiline: bool) -> Self {
+        self.multiline = multiline;
+        self
+    }
+
+    pub fn with_context(mut self, before: usize, after: usize) -> Self {
+        self.context = FsSearchContext { before, after };
+        self
+    }
+
+    pub fn with_max_matches(mut self, max_matches: usize) -> Self {
+        self.max_matches = max_matches;
+        self
+    }
+
+    pub fn with_file_glob(mut self, file_glob: FsFileGlob) -> Self {
+        self.file_glob = file_glob;
+        self
+    }
+
+    pub fn with_repo_options(mut self, respect_gitignore: bool, include_hidden: bool) -> Self {
+        self.respect_gitignore = respect_gitignore;
+        self.include_hidden = include_hidden;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FsSearchContext {
+    pub before: usize,
+    pub after: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FsFileGlob {
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+}
+
+impl FsFileGlob {
+    pub fn new(include: Vec<String>, exclude: Vec<String>) -> Self {
+        Self { include, exclude }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -600,10 +696,12 @@ pub enum FsCaseMode {
 pub enum FsSearchMode {
     #[default]
     Literal,
-    /// Dependency-free wildcard matching: `*` matches any run and `?`
-    /// matches one scalar. This is the brief's documented simple-pattern
-    /// fallback; full regular expressions require a future dependency wave.
+    /// Compatibility wildcards: `*` matches any run and `?` one scalar. The
+    /// pattern is translated once into the same bounded linear-time engine.
     Simple,
+    /// Rust's linear-time regex engine, compiled with explicit syntax, NFA,
+    /// nesting, and DFA cache limits before any file is opened.
+    Regex,
 }
 
 impl EffectOperation for FsSearch {
@@ -620,6 +718,12 @@ impl EffectOperation for FsSearch {
             "case": case_mode_argument(self.case_mode),
             "glob": self.glob,
             "mode": search_mode_argument(self.mode),
+            "multiline": self.multiline,
+            "context": {"before": self.context.before, "after": self.context.after},
+            "max_matches": self.max_matches,
+            "file_glob": {"include": self.file_glob.include, "exclude": self.file_glob.exclude},
+            "respect_gitignore": self.respect_gitignore,
+            "include_hidden": self.include_hidden,
             "query": self.query,
             "root": path_argument(&self.root)?,
         }))
@@ -631,6 +735,12 @@ impl EffectOperation for FsSearch {
             "case": case_mode_argument(self.case_mode),
             "glob": self.glob,
             "mode": search_mode_argument(self.mode),
+            "multiline": self.multiline,
+            "context": {"before": self.context.before, "after": self.context.after},
+            "max_matches": self.max_matches,
+            "file_glob": {"include": self.file_glob.include, "exclude": self.file_glob.exclude},
+            "respect_gitignore": self.respect_gitignore,
+            "include_hidden": self.include_hidden,
             "query": self.query,
             "root": path_argument(&root)?,
         }))
@@ -641,6 +751,8 @@ impl EffectOperation for FsSearch {
 pub struct FsGlob {
     pub root: PathBuf,
     pub pattern: String,
+    pub respect_gitignore: bool,
+    pub include_hidden: bool,
 }
 
 impl FsGlob {
@@ -648,7 +760,15 @@ impl FsGlob {
         Self {
             root: root.into(),
             pattern: pattern.into(),
+            respect_gitignore: true,
+            include_hidden: false,
         }
+    }
+
+    pub fn with_repo_options(mut self, respect_gitignore: bool, include_hidden: bool) -> Self {
+        self.respect_gitignore = respect_gitignore;
+        self.include_hidden = include_hidden;
+        self
     }
 }
 
@@ -665,6 +785,8 @@ impl EffectOperation for FsGlob {
         Ok(json!({
             "pattern": self.pattern,
             "root": path_argument(&self.root)?,
+            "respect_gitignore": self.respect_gitignore,
+            "include_hidden": self.include_hidden,
         }))
     }
 
@@ -673,6 +795,8 @@ impl EffectOperation for FsGlob {
         Ok(json!({
             "pattern": self.pattern,
             "root": path_argument(&root)?,
+            "respect_gitignore": self.respect_gitignore,
+            "include_hidden": self.include_hidden,
         }))
     }
 }
@@ -980,7 +1104,18 @@ impl EffectBroker {
         let (result, freshness, footprint) = match read {
             Ok(read) => {
                 let footprint = read.footprint;
-                let result = bounded(read.contents, bounds, cas).await;
+                let sensitive_path = crate::redact::is_sensitive_path(&operation.path)
+                    || (crate::redact::is_token_config_path(&operation.path)
+                        && crate::redact::token_config_contains_secret(read.contents.as_bytes()));
+                let result = bounded_read(
+                    read.contents,
+                    read.preview_contents,
+                    read.data,
+                    sensitive_path,
+                    bounds,
+                    cas,
+                )
+                .await;
                 let freshness = result.as_ref().ok().and_then(|_| {
                     read.digest.map(|digest| FileFreshness {
                         path: freshness_path,
@@ -1030,13 +1165,20 @@ impl EffectBroker {
             operation.query.clone(),
         )
         .with_case_mode(operation.case_mode)
-        .with_mode(operation.mode);
+        .with_mode(operation.mode)
+        .with_multiline(operation.multiline)
+        .with_context(operation.context.before, operation.context.after)
+        .with_max_matches(operation.max_matches)
+        .with_file_glob(operation.file_glob.clone())
+        .with_repo_options(operation.respect_gitignore, operation.include_hidden);
         if let Some(glob) = requested_glob {
             operation = operation.with_glob(glob);
         }
         let owned = operation.clone();
         let relative = anchored_relative_path(self.workspace_root(), &operation.root)?;
         let workspace_dir = self.duplicate_workspace_dir()?;
+        let workspace_root = self.workspace_root().to_path_buf();
+        let max_matches = owned.max_matches;
         let intent = self.begin(&operation, policy).await?;
         let memo_key = read_memo_key(&intent, self.workspace_root(), "fs_search", bounds);
         if let Ok(memo_dir) = self.duplicate_workspace_dir()
@@ -1044,10 +1186,46 @@ impl EffectBroker {
         {
             return self.finish(&intent, Ok(cached.result)).await;
         }
-        let result = run_blocking(move || {
-            search_files_at(workspace_dir, &relative, &owned, bounds.max_preview_bytes)
-        })
+        let wall_started = Instant::now();
+        let permit = tokio::time::timeout(
+            SEARCH_WALL_TIME_BUDGET,
+            search_worker_gate().acquire_owned(),
+        )
         .await;
+        let result = match permit {
+            Ok(Ok(permit)) => {
+                let mut worker = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    search_files_at(
+                        workspace_dir,
+                        &workspace_root,
+                        &relative,
+                        &owned,
+                        bounds.max_preview_bytes,
+                    )
+                });
+                let remaining = SEARCH_WALL_TIME_BUDGET.saturating_sub(wall_started.elapsed());
+                match tokio::time::timeout(remaining, &mut worker).await {
+                    Ok(joined) => joined.unwrap_or_else(|error| {
+                        Err(ToolError::Runtime {
+                            message: format!("blocking search worker failed: {error}"),
+                        })
+                    }),
+                    Err(_) => timed_out_search(bounds.max_preview_bytes, max_matches),
+                }
+            }
+            Ok(Err(error)) => Err(ToolError::Runtime {
+                message: format!("search worker gate closed: {error}"),
+            }),
+            Err(_) => timed_out_search(bounds.max_preview_bytes, max_matches),
+        };
+        let result = result.and_then(|matches| {
+            if matches.truncated_reason == Some(ToolTruncationReason::TimeBudget) {
+                timed_out_search_output(bounds.max_preview_bytes, max_matches)
+            } else {
+                Ok(matches)
+            }
+        });
         let (result, footprint) = match result {
             Ok(mut matches) => {
                 let footprint = matches.footprint.take();
@@ -1091,10 +1269,12 @@ impl EffectBroker {
                 PathResolution::Existing,
             )?,
             operation.pattern.clone(),
-        );
+        )
+        .with_repo_options(operation.respect_gitignore, operation.include_hidden);
         let owned = operation.clone();
         let relative = anchored_relative_path(self.workspace_root(), &operation.root)?;
         let workspace_dir = self.duplicate_workspace_dir()?;
+        let workspace_root = self.workspace_root().to_path_buf();
         let intent = self.begin(&operation, policy).await?;
         let memo_key = read_memo_key(&intent, self.workspace_root(), "fs_glob", bounds);
         if let Ok(memo_dir) = self.duplicate_workspace_dir()
@@ -1102,14 +1282,13 @@ impl EffectBroker {
         {
             return self.finish(&intent, Ok(cached.result)).await;
         }
-        let result = run_blocking(move || glob_files_at(workspace_dir, &relative, &owned)).await;
+        let result =
+            run_blocking(move || glob_files_at(workspace_dir, &workspace_root, &relative, &owned))
+                .await;
         let (result, footprint) = match result {
-            Ok(output) => {
-                let footprint = output.footprint;
-                (
-                    bounded_with_truncation(output.contents, output.truncated, bounds, cas).await,
-                    footprint,
-                )
+            Ok(mut output) => {
+                let footprint = output.footprint.take();
+                (bounded_glob(output, bounds, cas).await, footprint)
             }
             Err(error) => (Err(error), None),
         };
@@ -1528,6 +1707,10 @@ impl ReadFootprintBuilder {
         self.cacheable.then(|| ReadFootprint::new(self.entries))
     }
 
+    fn is_cacheable(&self) -> bool {
+        self.cacheable
+    }
+
     fn disable(&mut self) {
         self.entries = Vec::new();
         self.path_bytes = 0;
@@ -1716,8 +1899,10 @@ fn read_footprint_is_current(workspace_dir: OwnedFd, footprint: &ReadFootprint) 
 
 struct ReadPathOutput {
     contents: String,
+    preview_contents: Option<String>,
     digest: Option<String>,
     footprint: ReadFootprint,
+    data: Option<ToolResultData>,
 }
 
 #[cfg(unix)]
@@ -1757,6 +1942,15 @@ fn read_path_at(
         FileType::RegularFile => {
             let contents = read_utf8_file(fs::File::from(target), display_path)?;
             let digest = mutation_digest(contents.as_bytes());
+            let preview_contents = if offset.is_some() || limit.is_some() {
+                Some(select_numbered_lines(
+                    &crate::redact::redact_private_key_lines(&contents).text,
+                    offset.unwrap_or(1),
+                    limit,
+                ))
+            } else {
+                None
+            };
             let contents = if offset.is_some() || limit.is_some() {
                 select_numbered_lines(&contents, offset.unwrap_or(1), limit)
             } else {
@@ -1764,15 +1958,22 @@ fn read_path_at(
             };
             Ok(ReadPathOutput {
                 contents,
+                preview_contents,
                 digest: Some(digest),
                 footprint: footprint(),
+                data: None,
             })
         }
-        FileType::Directory => Ok(ReadPathOutput {
-            contents: list_directory_fd(target, display_path)?,
-            digest: None,
-            footprint: footprint(),
-        }),
+        FileType::Directory => {
+            let listing = list_directory_fd(target, display_path)?;
+            Ok(ReadPathOutput {
+                contents: listing.contents,
+                preview_contents: None,
+                digest: None,
+                footprint: footprint(),
+                data: Some(listing.data),
+            })
+        }
         _ => Err(ToolError::invalid_argument(format!(
             "{} is neither a regular file nor a directory",
             display_path.display()
@@ -1812,177 +2013,292 @@ fn select_numbered_lines(contents: &str, offset: usize, limit: Option<usize>) ->
         .collect()
 }
 
+/// Shallow directory listings share the glob entry cap before first send.
+pub const FS_DIRECTORY_ENTRY_LIMIT: usize = GLOB_ENTRY_LIMIT;
+const DIRECTORY_EXTENSION_COLLAPSE_THRESHOLD: usize = 8;
+const DIRECTORY_EXTENSION_EXAMPLES: usize = 3;
+
+struct DirectoryListing {
+    contents: String,
+    data: ToolResultData,
+}
+
+struct DirectoryCollector {
+    entries: BinaryHeap<(String, bool)>,
+    entries_seen: usize,
+}
+
+impl DirectoryCollector {
+    fn new() -> Self {
+        Self {
+            entries: BinaryHeap::new(),
+            entries_seen: 0,
+        }
+    }
+
+    fn push(&mut self, name: String, is_directory: bool) {
+        self.entries_seen = self.entries_seen.saturating_add(1);
+        if self.entries.len() < FS_DIRECTORY_ENTRY_LIMIT {
+            self.entries.push((name, is_directory));
+        } else if self
+            .entries
+            .peek()
+            .is_some_and(|largest| name.as_str() < largest.0.as_str())
+        {
+            self.entries.pop();
+            self.entries.push((name, is_directory));
+        }
+    }
+
+    fn finish(self) -> DirectoryListing {
+        directory_listing(self.entries.into_sorted_vec(), self.entries_seen)
+    }
+}
+
 #[cfg(unix)]
-fn list_directory_fd(directory: OwnedFd, display_path: &Path) -> ToolResult<String> {
+fn list_directory_fd(directory: OwnedFd, display_path: &Path) -> ToolResult<DirectoryListing> {
     let mut entries = rustix::fs::Dir::new(directory)
         .map_err(|error| ToolError::io("list", display_path, error))?;
-    let mut listed = Vec::new();
+    let mut listed = DirectoryCollector::new();
     while let Some(entry) = entries.read() {
         let entry = entry.map_err(|error| ToolError::io("list", display_path, error))?;
         if is_dot_entry(entry.file_name()) {
             continue;
         }
         let mut name = entry.file_name().to_string_lossy().into_owned();
-        if entry.file_type() == FileType::Directory {
+        let is_directory = entry.file_type() == FileType::Directory;
+        if is_directory {
             name.push('/');
         }
-        listed.push(name);
+        listed.push(name, is_directory);
     }
-    listed.sort();
-    Ok(join_lines(listed))
+    Ok(listed.finish())
 }
 
-#[cfg(unix)]
+fn directory_listing(entries: Vec<(String, bool)>, entries_seen: usize) -> DirectoryListing {
+    let raw = entries
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let collapsed_entries = directory_preview(&entries).1;
+    DirectoryListing {
+        contents: join_lines(raw),
+        data: ToolResultData::FsRead {
+            truncated_reason: if entries_seen > FS_DIRECTORY_ENTRY_LIMIT {
+                Some(ToolTruncationReason::EntryLimit)
+            } else if collapsed_entries > 0 {
+                Some(ToolTruncationReason::PresentationReduced)
+            } else {
+                None
+            },
+            entries_seen,
+            collapsed_entries,
+        },
+    }
+}
+
+fn directory_preview(entries: &[(String, bool)]) -> (String, usize) {
+    let mut extension_counts = HashMap::<String, usize>::new();
+    for (name, directory) in entries {
+        if !directory
+            && let Some(extension) = Path::new(name).extension().and_then(|value| value.to_str())
+        {
+            *extension_counts
+                .entry(extension.to_ascii_lowercase())
+                .or_insert(0) += 1;
+        }
+    }
+    let mut extension_seen = HashMap::<String, usize>::new();
+    let mut preview = Vec::new();
+    let mut collapsed = 0usize;
+    for (name, directory) in entries {
+        let path = Path::new(name.trim_end_matches('/'));
+        if crate::redact::is_sensitive_path(path) || crate::redact::is_token_config_path(path) {
+            preview.push("[REDACTED:sensitive_path]".to_owned());
+            collapsed = collapsed.saturating_add(1);
+            continue;
+        }
+        if *directory
+            && matches!(
+                name.trim_end_matches('/').to_ascii_lowercase().as_str(),
+                "node_modules" | "target" | "vendor" | ".venv" | "dist"
+            )
+        {
+            preview.push(format!("{name} [collapsed vendor directory]"));
+            collapsed = collapsed.saturating_add(1);
+            continue;
+        }
+        let Some(extension) = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase)
+        else {
+            preview.push(name.clone());
+            continue;
+        };
+        let count = extension_counts.get(&extension).copied().unwrap_or(0);
+        let seen = extension_seen.entry(extension.clone()).or_insert(0);
+        *seen = seen.saturating_add(1);
+        if count < DIRECTORY_EXTENSION_COLLAPSE_THRESHOLD || *seen <= DIRECTORY_EXTENSION_EXAMPLES {
+            preview.push(name.clone());
+        } else if *seen == DIRECTORY_EXTENSION_EXAMPLES.saturating_add(1) {
+            let omitted = count.saturating_sub(DIRECTORY_EXTENSION_EXAMPLES);
+            preview.push(format!("[… {omitted} more .{extension} files]"));
+            collapsed = collapsed.saturating_add(omitted);
+        }
+    }
+    (join_lines(preview), collapsed)
+}
+
 fn search_files_at(
     workspace_dir: OwnedFd,
+    workspace_root: &Path,
     relative: &Path,
     operation: &FsSearch,
     max_preview_bytes: usize,
 ) -> ToolResult<SearchOutput> {
-    if operation.query.is_empty() {
-        return Err(ToolError::invalid_argument(
-            "fs_search query cannot be empty",
-        ));
-    }
-    let directory = open_directory_at(workspace_dir, relative, "open for search", &operation.root)?;
-    let root_metadata = rustix::fs::fstat(&directory)
-        .map_err(|error| ToolError::io("inspect search root", &operation.root, error))?;
-    let mut footprint = ReadFootprintBuilder::new();
-    footprint.push(FreshnessStamp {
-        path: relative.to_path_buf(),
-        metadata: FreshnessMetadata::from_stat(&root_metadata),
-    });
-    let mut matches = SearchCollector::new(max_preview_bytes)?;
-    collect_search_matches_at(
-        directory,
-        Path::new(""),
-        relative,
+    let started = Instant::now();
+    validate_search(operation)?;
+    let compiled = CompiledSearch::new(operation)?;
+    let path_filters = CompiledPathFilters::new(operation)?;
+    let walked = crate::repo::walk_files(
+        workspace_root,
         &operation.root,
-        operation,
-        &mut matches,
-        &mut footprint,
+        crate::repo::WalkOptions {
+            respect_gitignore: operation.respect_gitignore,
+            include_hidden: operation.include_hidden,
+            max_files: SEARCH_MAX_ENUMERATED_FILES,
+            deadline: Some(started + SEARCH_WALL_TIME_BUDGET),
+        },
     )?;
-    Ok(matches.finish(footprint.finish()))
-}
-
-#[cfg(unix)]
-fn collect_search_matches_at(
-    directory: OwnedFd,
-    relative: &Path,
-    workspace_prefix: &Path,
-    display_root: &Path,
-    operation: &FsSearch,
-    matches: &mut SearchCollector,
-    footprint: &mut ReadFootprintBuilder,
-) -> ToolResult<()> {
-    let mut entries = rustix::fs::Dir::read_from(&directory)
-        .map_err(|error| ToolError::io("list", display_root.join(relative), error))?;
-    let mut names = Vec::new();
-    while let Some(entry) = entries.read() {
-        let entry =
-            entry.map_err(|error| ToolError::io("list", display_root.join(relative), error))?;
-        let name = entry.file_name();
-        if !is_dot_entry(name) {
-            names.push(OsString::from_vec(name.to_bytes().to_vec()));
+    let mut footprint =
+        if !operation.respect_gitignore && !walked.truncated && !walked.time_budget_reached {
+            repository_read_footprint(&workspace_dir, &walked.directories, &walked.files)
+        } else {
+            None
+        };
+    let mut matches = SearchCollector::new(max_preview_bytes, operation.max_matches)?;
+    matches.skipped_sensitive = walked
+        .hidden_sensitive_files
+        .iter()
+        .filter_map(|path| path_under_search_root(workspace_root, relative, path).ok())
+        .filter_map(|path| portable_relative_path(path).ok())
+        .filter(|path| path_filters.matches(path))
+        .count();
+    if walked.time_budget_reached {
+        matches.truncate(ToolTruncationReason::TimeBudget);
+    }
+    if walked.truncated {
+        matches.truncate(ToolTruncationReason::EnumerationLimit);
+    }
+    for workspace_path in walked.files {
+        if started.elapsed() >= SEARCH_WALL_TIME_BUDGET {
+            matches.truncate(ToolTruncationReason::TimeBudget);
+            break;
+        }
+        let path_under_root = path_under_search_root(workspace_root, relative, &workspace_path)?;
+        let match_path = portable_relative_path(path_under_root)?;
+        if !path_filters.matches(&match_path) {
+            continue;
+        }
+        if crate::redact::is_sensitive_path(&workspace_path) {
+            matches.skip_sensitive();
+            continue;
+        }
+        if matches.files_scanned == SEARCH_MAX_FILES {
+            matches.truncate(ToolTruncationReason::FilesScanned);
+            break;
+        }
+        let entry_path = workspace_root.join(&workspace_path);
+        let file = open_search_file(&workspace_dir, &workspace_path, &entry_path)?;
+        matches.file_scanned();
+        collect_streamed_file_matches(
+            file,
+            &workspace_path,
+            &entry_path,
+            operation,
+            &compiled,
+            started,
+            &mut matches,
+        )?;
+        if matches.truncated_reason == Some(ToolTruncationReason::TimeBudget)
+            || matches.truncated_reason == Some(ToolTruncationReason::BytesScanned)
+            || matches.truncated_reason == Some(ToolTruncationReason::ResultBytes)
+            || matches.truncated_reason == Some(ToolTruncationReason::LineTooLong)
+            || matches.truncated_reason == Some(ToolTruncationReason::MatchLimit)
+        {
+            break;
         }
     }
-    names.sort();
-
-    for name in names {
-        let display_path = relative.join(&name);
-        let entry_path = display_root.join(&display_path);
-        let metadata = rustix::fs::statat(&directory, &name, AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(|error| anchored_io_error("inspect", &entry_path, error))?;
-        footprint.push(FreshnessStamp {
-            path: workspace_prefix.join(&display_path),
-            metadata: FreshnessMetadata::from_stat(&metadata),
-        });
-        match FileType::from_raw_mode(metadata.st_mode) {
-            FileType::Symlink => {}
-            FileType::Directory => {
-                let child = openat_nofollow(
-                    &directory,
-                    &name,
-                    OFlags::RDONLY | OFlags::DIRECTORY,
-                    "open search directory",
-                    &entry_path,
-                )?;
-                collect_search_matches_at(
-                    child,
-                    &display_path,
-                    workspace_prefix,
-                    display_root,
-                    operation,
-                    matches,
-                    footprint,
-                )?;
-            }
-            FileType::RegularFile => {
-                let match_path = path_argument(&display_path)?;
-                if operation
-                    .glob
-                    .as_deref()
-                    .is_some_and(|glob| !glob_matches(glob, match_path))
-                {
-                    continue;
-                }
-                let file = openat_nofollow(
-                    &directory,
-                    &name,
-                    OFlags::RDONLY | OFlags::NONBLOCK,
-                    "open search file",
-                    &entry_path,
-                )?;
-                let opened = rustix::fs::fstat(&file)
-                    .map_err(|error| ToolError::io("inspect", &entry_path, error))?;
-                if FileType::from_raw_mode(opened.st_mode) == FileType::RegularFile {
-                    collect_file_matches(
-                        file,
-                        &workspace_prefix.join(&display_path),
-                        &entry_path,
-                        operation,
-                        matches,
-                    )?;
-                }
-            }
-            _ => {}
-        }
+    if matches.truncated_reason == Some(ToolTruncationReason::TimeBudget) {
+        footprint = None;
     }
-    Ok(())
+    Ok(matches.finish(footprint))
 }
 
-#[cfg(unix)]
-fn collect_file_matches(
-    file: OwnedFd,
-    display_path: &Path,
-    entry_path: &Path,
-    operation: &FsSearch,
-    matches: &mut SearchCollector,
-) -> ToolResult<()> {
-    let mut bytes = Vec::new();
-    fs::File::from(file)
-        .read_to_end(&mut bytes)
-        .map_err(|error| ToolError::io("read", entry_path, error))?;
-    let Ok(contents) = std::str::from_utf8(&bytes) else {
-        return Ok(());
-    };
-    for (index, line) in contents.lines().enumerate() {
-        if search_line_matches(line, operation) {
-            matches.push(format!("{}:{}:{}", display_path.display(), index + 1, line))?;
-        }
-    }
-    Ok(())
+/// Maximum structured/preview matches accepted from one search call.
+pub const SEARCH_PREVIEW_MATCHES: usize = 200;
+/// Maximum stable paths returned by one glob call.
+pub const GLOB_ENTRY_LIMIT: usize = 500;
+/// Hard file-enumeration cap for one search.
+pub const SEARCH_MAX_FILES: usize = 10_000;
+/// File-enumeration ceiling before content/path filters are applied.
+pub const SEARCH_MAX_ENUMERATED_FILES: usize = 100_000;
+/// Hard total content bytes inspected by one search.
+pub const SEARCH_MAX_SCANNED_BYTES: usize = 16 * 1024 * 1024;
+/// A single physical line never occupies more than this much resident memory.
+pub const SEARCH_MAX_LINE_BYTES: usize = 256 * 1024;
+/// First-file bytes inspected for binary NUL sniffing.
+pub const SEARCH_BINARY_SNIFF_BYTES: usize = 8 * 1024;
+/// Hard observable search deadline. Internal checks stop cooperatively; an
+/// outer async timeout returns an empty typed TimeBudget result. A one-per-
+/// process gate prevents non-interruptible regex/directory-sort workers from
+/// accumulating while the bounded timed-out worker finishes off-thread.
+pub const SEARCH_WALL_TIME_BUDGET: Duration = Duration::from_secs(2);
+
+fn search_worker_gate() -> Arc<tokio::sync::Semaphore> {
+    static GATE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    Arc::clone(GATE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1))))
 }
 
-const SEARCH_PREVIEW_MATCHES: usize = 200;
-const GLOB_ENTRY_LIMIT: usize = 500;
+/// Aggregate raw-spool/structured budget and hard serialized first-send cap.
+pub const SEARCH_MAX_RESULT_BYTES: usize = 4 * 1024 * 1024;
+/// Conservative envelope/counter allowance in total-result accounting.
+pub const SEARCH_RESULT_ACCOUNTING_OVERHEAD: usize = 1024;
+/// Per-line ceiling inside structured match/context fields.
+pub const SEARCH_STRUCTURED_LINE_BYTES: usize = 4 * 1024;
+/// Regex syntax/NFA construction limit.
+pub const SEARCH_REGEX_SIZE_LIMIT: usize = 1024 * 1024;
+/// Lazy DFA cache limit; regex falls back safely rather than growing freely.
+pub const SEARCH_REGEX_DFA_SIZE_LIMIT: usize = 2 * 1024 * 1024;
+/// Parser nesting limit for adversarial grouped expressions.
+pub const SEARCH_REGEX_NEST_LIMIT: u32 = 128;
+/// Maximum UTF-8 bytes accepted in any search pattern.
+pub const SEARCH_PATTERN_MAX_BYTES: usize = 64 * 1024;
+/// Tighter untrusted regex-source ceiling before Unicode HIR expansion. This
+/// bounds the pre-RegexBuilder boundary-rewrite stage to a small fixed heap.
+pub const SEARCH_REGEX_PATTERN_MAX_BYTES: usize = 1024;
+/// The wildcard compatibility mode has a smaller source ceiling.
+pub const SEARCH_SIMPLE_PATTERN_MAX_BYTES: usize = 4 * 1024;
+/// Maximum UTF-8 bytes in any path glob before compilation.
+pub const GLOB_PATTERN_MAX_BYTES: usize = 1024;
+/// Enumeration cap for glob before the 500-entry presentation reduction.
+pub const GLOB_MAX_FILES_SCANNED: usize = 50_000;
 
 struct SearchOutput {
     preview: String,
+    preview_saturated: bool,
     match_count: usize,
+    max_matches: usize,
     total_bytes: usize,
     complete: tempfile::NamedTempFile,
     footprint: Option<ReadFootprint>,
+    structured: Vec<FsSearchMatch>,
+    truncated_reason: Option<ToolTruncationReason>,
+    binary_files_skipped: usize,
+    skipped_sensitive: usize,
+    files_scanned: usize,
+    bytes_scanned: usize,
 }
 
 struct SearchCollector {
@@ -1990,12 +2306,33 @@ struct SearchCollector {
     match_count: usize,
     total_bytes: usize,
     max_preview_bytes: usize,
+    max_matches: usize,
     preview_saturated: bool,
     complete: tempfile::NamedTempFile,
+    structured: Vec<FsSearchMatch>,
+    structured_bytes: usize,
+    truncated_reason: Option<ToolTruncationReason>,
+    binary_files_skipped: usize,
+    skipped_sensitive: usize,
+    files_scanned: usize,
+    bytes_scanned: usize,
+}
+
+fn timed_out_search(max_preview_bytes: usize, max_matches: usize) -> ToolResult<SearchOutput> {
+    timed_out_search_output(max_preview_bytes, max_matches)
+}
+
+fn timed_out_search_output(
+    max_preview_bytes: usize,
+    max_matches: usize,
+) -> ToolResult<SearchOutput> {
+    let mut collector = SearchCollector::new(max_preview_bytes, max_matches)?;
+    collector.truncate(ToolTruncationReason::TimeBudget);
+    Ok(collector.finish(None))
 }
 
 impl SearchCollector {
-    fn new(max_preview_bytes: usize) -> ToolResult<Self> {
+    fn new(max_preview_bytes: usize, max_matches: usize) -> ToolResult<Self> {
         let complete = tempfile::NamedTempFile::new()
             .map_err(|error| ToolError::io("create search result spool", "<search>", error))?;
         Ok(Self {
@@ -2003,51 +2340,829 @@ impl SearchCollector {
             match_count: 0,
             total_bytes: 0,
             max_preview_bytes,
+            max_matches,
             preview_saturated: false,
             complete,
+            structured: Vec::new(),
+            structured_bytes: 0,
+            truncated_reason: None,
+            binary_files_skipped: 0,
+            skipped_sensitive: 0,
+            files_scanned: 0,
+            bytes_scanned: 0,
         })
     }
 
-    fn push(&mut self, line: String) -> ToolResult<()> {
+    fn push_line(
+        &mut self,
+        raw_line: &str,
+        preview_line: &str,
+        mut structured: Vec<FsSearchMatch>,
+    ) -> ToolResult<Vec<usize>> {
+        let projected_bytes = self
+            .total_bytes
+            .saturating_add(raw_line.len())
+            .saturating_add(1);
+        if projected_bytes
+            .saturating_add(self.structured_bytes)
+            .saturating_add(SEARCH_RESULT_ACCOUNTING_OVERHEAD)
+            > SEARCH_MAX_RESULT_BYTES
+        {
+            self.truncate(ToolTruncationReason::ResultBytes);
+            return Ok(Vec::new());
+        }
         self.complete
-            .write_all(line.as_bytes())
+            .write_all(raw_line.as_bytes())
             .and_then(|()| self.complete.write_all(b"\n"))
             .map_err(|error| ToolError::io("write search result spool", "<search>", error))?;
-        self.total_bytes = self
-            .total_bytes
-            .saturating_add(line.len())
-            .saturating_add(1);
-        if self.match_count < SEARCH_PREVIEW_MATCHES
+        self.total_bytes = projected_bytes;
+        let first_match_index = self.match_count;
+        self.match_count = self.match_count.saturating_add(structured.len());
+        if self.match_count > self.max_matches {
+            self.truncate(ToolTruncationReason::MatchLimit);
+        }
+        if first_match_index < self.max_matches
             && self.preview.len() < self.max_preview_bytes
             && !self.preview_saturated
         {
             let remaining = self.max_preview_bytes - self.preview.len();
-            self.preview.push_str(utf8_prefix(&line, remaining));
-            if line.len() < remaining {
+            self.preview.push_str(utf8_prefix(preview_line, remaining));
+            if preview_line.len() < remaining {
                 self.preview.push('\n');
             } else {
                 self.preview_saturated = true;
             }
         }
-        self.match_count = self.match_count.saturating_add(1);
+        let remaining = self.max_matches.saturating_sub(self.structured.len());
+        structured.truncate(remaining);
+        let start = self.structured.len();
+        for found in structured {
+            let retained_bytes = structured_match_bytes(&found)?;
+            if self
+                .total_bytes
+                .saturating_add(self.structured_bytes)
+                .saturating_add(retained_bytes)
+                .saturating_add(SEARCH_RESULT_ACCOUNTING_OVERHEAD)
+                > SEARCH_MAX_RESULT_BYTES
+            {
+                self.truncate(ToolTruncationReason::ResultBytes);
+                break;
+            }
+            self.structured_bytes = self.structured_bytes.saturating_add(retained_bytes);
+            self.structured.push(found);
+        }
+        Ok((start..self.structured.len()).collect())
+    }
+
+    fn append_context_after(&mut self, index: usize, line: &str) -> ToolResult<()> {
+        let Some(found) = self.structured.get(index) else {
+            return Ok(());
+        };
+        let old_bytes = structured_match_bytes(found)?;
+        let mut candidate = found.clone();
+        candidate.context_after.push(line.to_owned());
+        let new_bytes = structured_match_bytes(&candidate)?;
+        let projected = self
+            .total_bytes
+            .saturating_add(self.structured_bytes.saturating_sub(old_bytes))
+            .saturating_add(new_bytes)
+            .saturating_add(SEARCH_RESULT_ACCOUNTING_OVERHEAD);
+        if projected > SEARCH_MAX_RESULT_BYTES {
+            self.truncate(ToolTruncationReason::ResultBytes);
+            return Ok(());
+        }
+        self.structured_bytes = self
+            .structured_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(new_bytes);
+        self.structured[index] = candidate;
         Ok(())
+    }
+
+    fn add_bytes_scanned(&mut self, bytes: usize) {
+        self.bytes_scanned = self.bytes_scanned.saturating_add(bytes);
+    }
+
+    fn file_scanned(&mut self) {
+        self.files_scanned = self.files_scanned.saturating_add(1);
+    }
+
+    fn skip_binary(&mut self) {
+        self.binary_files_skipped = self.binary_files_skipped.saturating_add(1);
+    }
+
+    fn skip_sensitive(&mut self) {
+        self.skipped_sensitive = self.skipped_sensitive.saturating_add(1);
+    }
+
+    fn truncate(&mut self, reason: ToolTruncationReason) {
+        let priority = |candidate| match candidate {
+            ToolTruncationReason::TimeBudget => 6,
+            ToolTruncationReason::BytesScanned => 5,
+            ToolTruncationReason::FilesScanned => 4,
+            ToolTruncationReason::EnumerationLimit => 4,
+            ToolTruncationReason::ResultBytes => 3,
+            ToolTruncationReason::LineTooLong => 3,
+            ToolTruncationReason::MatchLimit => 2,
+            ToolTruncationReason::EntryLimit => 1,
+            ToolTruncationReason::PresentationReduced => 1,
+        };
+        if self
+            .truncated_reason
+            .is_none_or(|current| priority(reason) > priority(current))
+        {
+            self.truncated_reason = Some(reason);
+        }
     }
 
     fn finish(self, footprint: Option<ReadFootprint>) -> SearchOutput {
         SearchOutput {
             preview: self.preview,
+            preview_saturated: self.preview_saturated,
             match_count: self.match_count,
+            max_matches: self.max_matches,
             total_bytes: self.total_bytes,
             complete: self.complete,
             footprint,
+            structured: self.structured,
+            truncated_reason: self.truncated_reason,
+            binary_files_skipped: self.binary_files_skipped,
+            skipped_sensitive: self.skipped_sensitive,
+            files_scanned: self.files_scanned,
+            bytes_scanned: self.bytes_scanned,
+        }
+    }
+}
+
+fn structured_match_bytes(found: &FsSearchMatch) -> ToolResult<usize> {
+    serde_json::to_vec(found)
+        .map(|encoded| encoded.len())
+        .map_err(|error| ToolError::Runtime {
+            message: format!("serialize structured fs_search match: {error}"),
+        })
+}
+
+struct CompiledSearch {
+    regex: Option<[Regex; 4]>,
+    case_sensitive: bool,
+}
+
+impl CompiledSearch {
+    fn new(operation: &FsSearch) -> ToolResult<Self> {
+        let case_sensitive = match operation.case_mode {
+            FsCaseMode::Sensitive => true,
+            FsCaseMode::Insensitive => false,
+            FsCaseMode::Smart => operation.query.chars().any(char::is_uppercase),
+        };
+        let regex_source = match operation.mode {
+            FsSearchMode::Regex => Some(Cow::Borrowed(operation.query.as_str())),
+            FsSearchMode::Simple => Some(Cow::Owned(simple_regex_pattern(&operation.query))),
+            FsSearchMode::Literal => None,
+        };
+        let regex = if let Some(regex_source) = regex_source {
+            Some(compile_boundary_regexes(
+                &regex_source,
+                case_sensitive,
+                operation.mode == FsSearchMode::Regex && operation.multiline,
+                operation.mode,
+            )?)
+        } else {
+            None
+        };
+        Ok(Self {
+            regex,
+            case_sensitive,
+        })
+    }
+
+    fn columns(
+        &self,
+        line: &str,
+        operation: &FsSearch,
+        limit: usize,
+        line_number: usize,
+        is_last_line: bool,
+    ) -> Vec<usize> {
+        match operation.mode {
+            FsSearchMode::Regex => self.regex.as_ref().map_or_else(Vec::new, |regex| {
+                regex_columns(
+                    &regex[boundary_regex_index(line_number == 1, is_last_line)],
+                    line,
+                    limit,
+                )
+            }),
+            FsSearchMode::Literal => {
+                let (haystack, needle) = if self.case_sensitive {
+                    (line.to_owned(), operation.query.clone())
+                } else {
+                    (line.to_lowercase(), operation.query.to_lowercase())
+                };
+                haystack.find(&needle).map_or_else(Vec::new, |column| {
+                    vec![haystack[..column].chars().count().saturating_add(1)]
+                })
+            }
+            FsSearchMode::Simple => self
+                .regex
+                .as_ref()
+                .is_some_and(|regex| regex[0].is_match(line))
+                .then_some(vec![1])
+                .unwrap_or_default(),
+        }
+    }
+}
+
+fn compile_boundary_regexes(
+    source: &str,
+    case_sensitive: bool,
+    multiline: bool,
+    mode: FsSearchMode,
+) -> ToolResult<[Regex; 4]> {
+    let error = |error: &dyn std::fmt::Display| ToolError::InvalidArgument {
+        message: if mode == FsSearchMode::Regex {
+            format!("invalid fs_search regex: {error}")
+        } else {
+            format!("invalid fs_search simple pattern: {error}")
+        },
+    };
+    let hir = RegexParserBuilder::new()
+        .nest_limit(SEARCH_REGEX_NEST_LIMIT)
+        .multi_line(multiline)
+        .case_insensitive(!case_sensitive)
+        .build()
+        .parse(source)
+        .map_err(|compile_error| error(&compile_error))?;
+    let mut compiled = Vec::with_capacity(4);
+    for first_line in [false, true] {
+        for last_line in [false, true] {
+            let bounded_source = rewrite_file_boundaries(&hir, first_line, last_line).to_string();
+            compiled.push(
+                RegexBuilder::new(&bounded_source)
+                    .size_limit(SEARCH_REGEX_SIZE_LIMIT)
+                    .dfa_size_limit(SEARCH_REGEX_DFA_SIZE_LIMIT)
+                    .nest_limit(SEARCH_REGEX_NEST_LIMIT)
+                    .build()
+                    .map_err(|compile_error| error(&compile_error))?,
+            );
+        }
+    }
+    compiled.try_into().map_err(|_| ToolError::Runtime {
+        message: "fs_search did not construct all boundary regex variants".into(),
+    })
+}
+
+fn rewrite_file_boundaries(hir: &Hir, first_line: bool, last_line: bool) -> Hir {
+    match hir.kind() {
+        HirKind::Empty => Hir::empty(),
+        HirKind::Literal(literal) => Hir::literal(literal.0.clone()),
+        HirKind::Class(class) => Hir::class(class.clone()),
+        HirKind::Look(look) => match look {
+            Look::Start => first_line
+                .then_some(Hir::look(Look::Start))
+                .unwrap_or_else(Hir::fail),
+            Look::End => last_line
+                .then_some(Hir::look(Look::End))
+                .unwrap_or_else(Hir::fail),
+            Look::StartLF | Look::StartCRLF => Hir::look(Look::Start),
+            Look::EndLF | Look::EndCRLF => Hir::look(Look::End),
+            other => Hir::look(*other),
+        },
+        HirKind::Repetition(repetition) => Hir::repetition(repetition.with(
+            rewrite_file_boundaries(&repetition.sub, first_line, last_line),
+        )),
+        HirKind::Capture(capture) => Hir::capture(Capture {
+            index: capture.index,
+            name: capture.name.clone(),
+            sub: Box::new(rewrite_file_boundaries(&capture.sub, first_line, last_line)),
+        }),
+        HirKind::Concat(expressions) => Hir::concat(
+            expressions
+                .iter()
+                .map(|expression| rewrite_file_boundaries(expression, first_line, last_line))
+                .collect(),
+        ),
+        HirKind::Alternation(expressions) => Hir::alternation(
+            expressions
+                .iter()
+                .map(|expression| rewrite_file_boundaries(expression, first_line, last_line))
+                .collect(),
+        ),
+    }
+}
+
+const fn boundary_regex_index(first_line: bool, last_line: bool) -> usize {
+    (first_line as usize) * 2 + last_line as usize
+}
+
+fn simple_regex_pattern(pattern: &str) -> String {
+    let mut translated = String::with_capacity(pattern.len());
+    let mut characters = pattern.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '*' => translated.push_str(".*"),
+            '?' => translated.push('.'),
+            '\\' => {
+                if let Some(literal) = characters.next() {
+                    push_escaped_regex_char(&mut translated, literal);
+                } else {
+                    translated.push_str(r"\\");
+                }
+            }
+            literal => push_escaped_regex_char(&mut translated, literal),
+        }
+    }
+    translated
+}
+
+fn push_escaped_regex_char(output: &mut String, character: char) {
+    let mut encoded = [0_u8; 4];
+    output.push_str(&regex::escape(character.encode_utf8(&mut encoded)));
+}
+
+fn regex_columns(regex: &Regex, line: &str, limit: usize) -> Vec<usize> {
+    regex
+        .find_iter(line)
+        .take(limit)
+        .map(|found| line[..found.start()].chars().count().saturating_add(1))
+        .collect()
+}
+
+fn validate_search(operation: &FsSearch) -> ToolResult<()> {
+    if operation.query.is_empty() {
+        return Err(ToolError::invalid_argument(
+            "fs_search query cannot be empty",
+        ));
+    }
+    if operation.query.len() > SEARCH_PATTERN_MAX_BYTES {
+        return Err(ToolError::invalid_argument(format!(
+            "fs_search pattern cannot exceed {SEARCH_PATTERN_MAX_BYTES} UTF-8 bytes",
+        )));
+    }
+    if operation.mode == FsSearchMode::Regex
+        && operation.query.len() > SEARCH_REGEX_PATTERN_MAX_BYTES
+    {
+        return Err(ToolError::invalid_argument(format!(
+            "fs_search regex cannot exceed {SEARCH_REGEX_PATTERN_MAX_BYTES} UTF-8 bytes",
+        )));
+    }
+    if operation.mode == FsSearchMode::Simple
+        && operation.query.len() > SEARCH_SIMPLE_PATTERN_MAX_BYTES
+    {
+        return Err(ToolError::invalid_argument(format!(
+            "fs_search simple pattern cannot exceed {SEARCH_SIMPLE_PATTERN_MAX_BYTES} UTF-8 bytes",
+        )));
+    }
+    if operation.context.before > 5 || operation.context.after > 5 {
+        return Err(ToolError::invalid_argument(
+            "fs_search context before/after cannot exceed 5",
+        ));
+    }
+    if operation.max_matches == 0 || operation.max_matches > SEARCH_PREVIEW_MATCHES {
+        return Err(ToolError::invalid_argument(format!(
+            "fs_search max_matches must be between 1 and {SEARCH_PREVIEW_MATCHES}",
+        )));
+    }
+    if operation.file_glob.include.len() > 32 || operation.file_glob.exclude.len() > 32 {
+        return Err(ToolError::invalid_argument(
+            "fs_search file_glob include/exclude cannot exceed 32 patterns",
+        ));
+    }
+    if operation
+        .file_glob
+        .include
+        .iter()
+        .chain(&operation.file_glob.exclude)
+        .any(String::is_empty)
+    {
+        return Err(ToolError::invalid_argument(
+            "fs_search file_glob patterns cannot be empty",
+        ));
+    }
+    Ok(())
+}
+
+struct CompiledPathFilters {
+    legacy: Option<GlobMatcher>,
+    include: Vec<GlobMatcher>,
+    exclude: Vec<GlobMatcher>,
+}
+
+impl CompiledPathFilters {
+    fn new(operation: &FsSearch) -> ToolResult<Self> {
+        let legacy = operation
+            .glob
+            .as_deref()
+            .map(|pattern| compile_path_glob(pattern, "fs_search glob"))
+            .transpose()?;
+        let include = operation
+            .file_glob
+            .include
+            .iter()
+            .map(|pattern| compile_path_glob(pattern, "fs_search file_glob.include"))
+            .collect::<ToolResult<Vec<_>>>()?;
+        let exclude = operation
+            .file_glob
+            .exclude
+            .iter()
+            .map(|pattern| compile_path_glob(pattern, "fs_search file_glob.exclude"))
+            .collect::<ToolResult<Vec<_>>>()?;
+        Ok(Self {
+            legacy,
+            include,
+            exclude,
+        })
+    }
+
+    fn matches(&self, path: &str) -> bool {
+        self.legacy
+            .as_ref()
+            .is_none_or(|matcher| matcher.is_match(path))
+            && (self.include.is_empty()
+                || self.include.iter().any(|matcher| matcher.is_match(path)))
+            && !self.exclude.iter().any(|matcher| matcher.is_match(path))
+    }
+}
+
+fn compile_path_glob(pattern: &str, argument: &str) -> ToolResult<GlobMatcher> {
+    if pattern.is_empty() || pattern.len() > GLOB_PATTERN_MAX_BYTES {
+        return Err(ToolError::invalid_argument(format!(
+            "{argument} must contain between 1 and {GLOB_PATTERN_MAX_BYTES} UTF-8 bytes",
+        )));
+    }
+    let mut builder = GlobBuilder::new(pattern);
+    builder.literal_separator(true).backslash_escape(true);
+    builder
+        .build()
+        .map(|glob| glob.compile_matcher())
+        .map_err(|error| ToolError::InvalidArgument {
+            message: format!("invalid {argument} pattern: {error}"),
+        })
+}
+
+fn portable_relative_path(path: &Path) -> ToolResult<String> {
+    Ok(path_argument(path)?.replace('\\', "/"))
+}
+
+fn path_under_search_root<'a>(
+    workspace_root: &Path,
+    search_root: &Path,
+    workspace_path: &'a Path,
+) -> ToolResult<&'a Path> {
+    let relative =
+        workspace_path
+            .strip_prefix(search_root)
+            .map_err(|_| ToolError::WorkspaceBoundary {
+                workspace_root: workspace_root.to_path_buf(),
+                requested_path: workspace_path.to_path_buf(),
+                resolved_path: Some(workspace_root.join(workspace_path)),
+            })?;
+    if relative.as_os_str().is_empty() {
+        return workspace_path.file_name().map(Path::new).ok_or_else(|| {
+            ToolError::InvalidArgument {
+                message: format!("search root has no file name: {}", workspace_path.display()),
+            }
+        });
+    }
+    Ok(relative)
+}
+
+fn repository_read_footprint(
+    workspace_dir: &OwnedFd,
+    directories: &[PathBuf],
+    files: &[PathBuf],
+) -> Option<ReadFootprint> {
+    let mut footprint = ReadFootprintBuilder::new();
+    for path in directories.iter().chain(files) {
+        if !footprint.is_cacheable() {
+            return None;
+        }
+        let stamp = freshness_stamp_at(workspace_dir, path)?;
+        footprint.push(stamp);
+    }
+    footprint.finish()
+}
+
+#[cfg(unix)]
+fn freshness_stamp_at(workspace_dir: &OwnedFd, path: &Path) -> Option<FreshnessStamp> {
+    let root = rustix::io::dup(workspace_dir).ok()?;
+    let metadata = freshness_stat_at(root, path).ok()?;
+    Some(FreshnessStamp {
+        path: path.to_path_buf(),
+        metadata: FreshnessMetadata::from_stat(&metadata),
+    })
+}
+
+#[cfg(windows)]
+fn freshness_stamp_at(workspace_dir: &OwnedFd, path: &Path) -> Option<FreshnessStamp> {
+    let (_parent, _target, entry) = windows_anchored_entry(workspace_dir, path, path).ok()?;
+    Some(FreshnessStamp {
+        path: path.to_path_buf(),
+        metadata: FreshnessMetadata(entry.identity),
+    })
+}
+
+#[cfg(unix)]
+fn open_search_file(
+    workspace_dir: &OwnedFd,
+    relative: &Path,
+    display_path: &Path,
+) -> ToolResult<fs::File> {
+    let root = rustix::io::dup(workspace_dir)
+        .map_err(|error| ToolError::io("duplicate workspace root", display_path, error))?;
+    let file = open_target_at(
+        root,
+        relative,
+        OFlags::RDONLY | OFlags::NONBLOCK,
+        "open search file",
+        display_path,
+    )?;
+    let metadata = rustix::fs::fstat(&file)
+        .map_err(|error| ToolError::io("inspect search file", display_path, error))?;
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile {
+        return Err(ToolError::PathChanged {
+            path: display_path.to_path_buf(),
+            message: "enumerated search file is no longer a regular file".into(),
+        });
+    }
+    Ok(fs::File::from(file))
+}
+
+#[cfg(windows)]
+fn open_search_file(
+    workspace_dir: &OwnedFd,
+    relative: &Path,
+    display_path: &Path,
+) -> ToolResult<fs::File> {
+    let (_parent, _target, entry) = windows_anchored_entry(workspace_dir, relative, display_path)?;
+    if entry.identity.directory {
+        return Err(ToolError::PathChanged {
+            path: display_path.to_path_buf(),
+            message: "enumerated search file became a directory".into(),
+        });
+    }
+    Ok(entry.handle)
+}
+
+struct PendingContext {
+    match_index: usize,
+    remaining: usize,
+}
+
+fn collect_streamed_file_matches(
+    file: fs::File,
+    display_path: &Path,
+    entry_path: &Path,
+    operation: &FsSearch,
+    compiled: &CompiledSearch,
+    started: Instant,
+    matches: &mut SearchCollector,
+) -> ToolResult<()> {
+    let remaining = SEARCH_MAX_SCANNED_BYTES.saturating_sub(matches.bytes_scanned);
+    if remaining == 0 {
+        matches.truncate(ToolTruncationReason::BytesScanned);
+        return Ok(());
+    }
+    let mut file = file;
+    let sniff_limit = remaining.min(SEARCH_BINARY_SNIFF_BYTES);
+    let mut sniff = Vec::with_capacity(sniff_limit);
+    file.by_ref()
+        .take(sniff_limit as u64)
+        .read_to_end(&mut sniff)
+        .map_err(|error| ToolError::io("sniff search file", entry_path, error))?;
+    if started.elapsed() >= SEARCH_WALL_TIME_BUDGET {
+        matches.add_bytes_scanned(sniff.len());
+        matches.truncate(ToolTruncationReason::TimeBudget);
+        return Ok(());
+    }
+    if sniff.contains(&0) {
+        matches.add_bytes_scanned(sniff.len());
+        matches.skip_binary();
+        if matches.bytes_scanned == SEARCH_MAX_SCANNED_BYTES
+            && file
+                .metadata()
+                .is_ok_and(|metadata| metadata.len() > sniff.len() as u64)
+        {
+            matches.truncate(ToolTruncationReason::BytesScanned);
+        }
+        return Ok(());
+    }
+    let chained = Cursor::new(sniff).chain(file);
+    let mut reader = BufReader::with_capacity(SEARCH_BINARY_SNIFF_BYTES, chained);
+
+    let mut before = VecDeque::<String>::new();
+    let mut pending = Vec::<PendingContext>::new();
+    let mut buffer = Vec::new();
+    let mut line_number = 0usize;
+    let mut private_key = false;
+    loop {
+        if started.elapsed() >= SEARCH_WALL_TIME_BUDGET {
+            matches.truncate(ToolTruncationReason::TimeBudget);
+            break;
+        }
+        let remaining = SEARCH_MAX_SCANNED_BYTES.saturating_sub(matches.bytes_scanned);
+        if remaining == 0 {
+            matches.truncate(ToolTruncationReason::BytesScanned);
+            break;
+        }
+        let read = read_bounded_search_line(
+            &mut reader,
+            &mut buffer,
+            remaining,
+            started + SEARCH_WALL_TIME_BUDGET,
+        )
+        .map_err(|error| ToolError::io("read search file", entry_path, error))?;
+        matches.add_bytes_scanned(read.bytes_scanned);
+        if read.time_budget_reached {
+            matches.truncate(ToolTruncationReason::TimeBudget);
+            break;
+        }
+        if read.eof && read.bytes_scanned == 0 {
+            break;
+        }
+        line_number = line_number.saturating_add(1);
+        if read.budget_exhausted {
+            matches.truncate(ToolTruncationReason::BytesScanned);
+            break;
+        }
+        if read.overlong {
+            matches.truncate(ToolTruncationReason::LineTooLong);
+            break;
+        }
+        if buffer.last() == Some(&b'\n') {
+            buffer.pop();
+        }
+        if buffer.last() == Some(&b'\r') {
+            buffer.pop();
+        }
+        let Ok(line) = std::str::from_utf8(&buffer) else {
+            matches.skip_binary();
+            break;
+        };
+        let redacted = crate::redact::redact_line_with_private_key_state(line, &mut private_key);
+        let structured_line = utf8_prefix(&redacted.text, SEARCH_STRUCTURED_LINE_BYTES).to_owned();
+        for context in &mut pending {
+            matches.append_context_after(context.match_index, &structured_line)?;
+            context.remaining = context.remaining.saturating_sub(1);
+        }
+        pending.retain(|context| context.remaining > 0);
+
+        let is_last_line = read.eof
+            || reader
+                .fill_buf()
+                .map_err(|error| ToolError::io("peek search file", entry_path, error))?
+                .is_empty();
+        let remaining_matches = operation
+            .max_matches
+            .saturating_sub(matches.match_count)
+            .saturating_add(1);
+        let columns = compiled.columns(
+            line,
+            operation,
+            remaining_matches,
+            line_number,
+            is_last_line,
+        );
+        if started.elapsed() >= SEARCH_WALL_TIME_BUDGET {
+            matches.truncate(ToolTruncationReason::TimeBudget);
+            break;
+        }
+        if !columns.is_empty() {
+            let display = portable_relative_path(display_path)?;
+            let raw_legacy = format!("{display}:{line_number}:{line}");
+            let preview_legacy = format!("{display}:{line_number}:{}", redacted.text);
+            let structured = columns
+                .into_iter()
+                .map(|column| FsSearchMatch {
+                    path: display.clone(),
+                    line: line_number,
+                    column,
+                    text: structured_line.clone(),
+                    context_before: before.iter().cloned().collect(),
+                    context_after: Vec::new(),
+                })
+                .collect();
+            let indices = matches.push_line(&raw_legacy, &preview_legacy, structured)?;
+            if operation.context.after > 0 {
+                pending.extend(indices.into_iter().map(|match_index| PendingContext {
+                    match_index,
+                    remaining: operation.context.after,
+                }));
+            }
+        }
+        before.push_back(structured_line);
+        while before.len() > operation.context.before {
+            before.pop_front();
+        }
+        if matches.truncated_reason == Some(ToolTruncationReason::ResultBytes)
+            || matches.truncated_reason == Some(ToolTruncationReason::MatchLimit)
+        {
+            break;
+        }
+        if read.eof {
+            break;
+        }
+    }
+    Ok(())
+}
+
+struct SearchLineRead {
+    bytes_scanned: usize,
+    eof: bool,
+    overlong: bool,
+    budget_exhausted: bool,
+    time_budget_reached: bool,
+}
+
+fn read_bounded_search_line<R: BufRead>(
+    reader: &mut R,
+    output: &mut Vec<u8>,
+    budget: usize,
+    deadline: Instant,
+) -> std::io::Result<SearchLineRead> {
+    output.clear();
+    let mut scanned = 0usize;
+    let mut overlong = false;
+    loop {
+        if Instant::now() >= deadline {
+            return Ok(SearchLineRead {
+                bytes_scanned: scanned,
+                eof: false,
+                overlong,
+                budget_exhausted: false,
+                time_budget_reached: true,
+            });
+        }
+        let available = reader.fill_buf()?;
+        if Instant::now() >= deadline {
+            return Ok(SearchLineRead {
+                bytes_scanned: scanned,
+                eof: false,
+                overlong,
+                budget_exhausted: false,
+                time_budget_reached: true,
+            });
+        }
+        if available.is_empty() {
+            return Ok(SearchLineRead {
+                bytes_scanned: scanned,
+                eof: true,
+                overlong,
+                budget_exhausted: false,
+                time_budget_reached: false,
+            });
+        }
+        let segment = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index.saturating_add(1));
+        let allowed = segment.min(budget.saturating_sub(scanned));
+        let retained = allowed.min(SEARCH_MAX_LINE_BYTES.saturating_sub(output.len()));
+        output.extend_from_slice(&available[..retained]);
+        overlong |= retained < allowed;
+        let line_complete =
+            allowed == segment && available.get(segment.saturating_sub(1)) == Some(&b'\n');
+        reader.consume(allowed);
+        scanned = scanned.saturating_add(allowed);
+        if allowed < segment {
+            return Ok(SearchLineRead {
+                bytes_scanned: scanned,
+                eof: false,
+                overlong,
+                budget_exhausted: true,
+                time_budget_reached: false,
+            });
+        }
+        if line_complete {
+            let budget_exhausted = scanned == budget && !reader.fill_buf()?.is_empty();
+            return Ok(SearchLineRead {
+                bytes_scanned: scanned,
+                eof: false,
+                overlong,
+                budget_exhausted,
+                time_budget_reached: false,
+            });
+        }
+        if scanned == budget {
+            let eof = reader.fill_buf()?.is_empty();
+            return Ok(SearchLineRead {
+                bytes_scanned: scanned,
+                eof,
+                overlong,
+                budget_exhausted: !eof,
+                time_budget_reached: false,
+            });
         }
     }
 }
 
 struct CappedOutput {
     contents: String,
+    preview: String,
     truncated: bool,
     footprint: Option<ReadFootprint>,
+    truncated_reason: Option<ToolTruncationReason>,
+    skipped_sensitive: usize,
+    files_scanned: usize,
+    collapsed_directories: usize,
 }
 
 struct GlobCollector {
@@ -2080,9 +3195,9 @@ impl GlobCollector {
     }
 }
 
-#[cfg(unix)]
 fn glob_files_at(
     workspace_dir: OwnedFd,
+    workspace_root: &Path,
     relative: &Path,
     operation: &FsGlob,
 ) -> ToolResult<CappedOutput> {
@@ -2091,118 +3206,150 @@ fn glob_files_at(
             "fs_glob pattern cannot be empty",
         ));
     }
-    let directory = open_directory_at(workspace_dir, relative, "open for glob", &operation.root)?;
-    let root_metadata = rustix::fs::fstat(&directory)
-        .map_err(|error| ToolError::io("inspect glob root", &operation.root, error))?;
-    let mut footprint = ReadFootprintBuilder::new();
-    footprint.push(FreshnessStamp {
-        path: relative.to_path_buf(),
-        metadata: FreshnessMetadata::from_stat(&root_metadata),
-    });
-    let mut paths = GlobCollector::new();
-    collect_glob_paths_at(
-        directory,
-        Path::new(""),
-        relative,
+    let pattern = compile_path_glob(&operation.pattern, "fs_glob")?;
+    let walked = crate::repo::walk_files(
+        workspace_root,
         &operation.root,
-        &operation.pattern,
-        &mut paths,
-        &mut footprint,
+        crate::repo::WalkOptions {
+            respect_gitignore: operation.respect_gitignore,
+            include_hidden: operation.include_hidden,
+            max_files: GLOB_MAX_FILES_SCANNED,
+            deadline: None,
+        },
     )?;
+    let footprint = if !operation.respect_gitignore && !walked.truncated {
+        repository_read_footprint(&workspace_dir, &walked.directories, &walked.files)
+    } else {
+        None
+    };
+    let mut paths = GlobCollector::new();
+    let mut skipped_sensitive = walked
+        .hidden_sensitive_files
+        .iter()
+        .filter_map(|path| path_under_search_root(workspace_root, relative, path).ok())
+        .filter_map(|path| portable_relative_path(path).ok())
+        .filter(|path| pattern.is_match(path))
+        .count();
+    let mut files_scanned = 0usize;
+    for workspace_path in walked.files {
+        files_scanned = files_scanned.saturating_add(1);
+        let path_under_root = path_under_search_root(workspace_root, relative, &workspace_path)?;
+        let candidate = portable_relative_path(path_under_root)?;
+        if !pattern.is_match(&candidate) {
+            continue;
+        }
+        if crate::redact::is_sensitive_path(&workspace_path) {
+            skipped_sensitive = skipped_sensitive.saturating_add(1);
+            continue;
+        }
+        let display_path = workspace_root.join(&workspace_path);
+        let file = open_search_file(&workspace_dir, &workspace_path, &display_path)?;
+        drop(file);
+        paths.push(portable_relative_path(&workspace_path)?);
+    }
     let truncated = paths.truncated;
+    let entries = paths.entries.into_sorted_vec();
+    let (preview, collapsed_directories) = glob_preview(&entries);
     Ok(CappedOutput {
-        contents: join_lines(paths.entries.into_sorted_vec()),
-        truncated,
-        footprint: footprint.finish(),
+        contents: join_lines(entries),
+        preview,
+        truncated: truncated || walked.truncated || collapsed_directories > 0,
+        footprint,
+        truncated_reason: if walked.truncated {
+            Some(ToolTruncationReason::EnumerationLimit)
+        } else if truncated {
+            Some(ToolTruncationReason::EntryLimit)
+        } else if collapsed_directories > 0 {
+            Some(ToolTruncationReason::PresentationReduced)
+        } else {
+            None
+        },
+        skipped_sensitive,
+        files_scanned,
+        collapsed_directories,
     })
 }
 
-#[cfg(unix)]
-fn collect_glob_paths_at(
-    directory: OwnedFd,
-    relative: &Path,
-    workspace_prefix: &Path,
-    display_root: &Path,
-    pattern: &str,
-    paths: &mut GlobCollector,
-    footprint: &mut ReadFootprintBuilder,
-) -> ToolResult<()> {
-    let mut entries = rustix::fs::Dir::read_from(&directory)
-        .map_err(|error| ToolError::io("list", display_root.join(relative), error))?;
-    let mut names = Vec::new();
-    while let Some(entry) = entries.read() {
-        let entry =
-            entry.map_err(|error| ToolError::io("list", display_root.join(relative), error))?;
-        if !is_dot_entry(entry.file_name()) {
-            names.push(OsString::from_vec(entry.file_name().to_bytes().to_vec()));
+fn glob_preview(entries: &[String]) -> (String, usize) {
+    let mut vendor_counts = HashMap::<String, usize>::new();
+    let mut extension_counts = HashMap::<(String, String), usize>::new();
+    for path in entries {
+        if let Some(vendor) = ["node_modules", "target", "vendor", ".venv"]
+            .into_iter()
+            .find(|vendor| path.split('/').any(|part| part == *vendor))
+        {
+            *vendor_counts.entry(vendor.to_owned()).or_insert(0) += 1;
+            continue;
         }
+        let parent = Path::new(path)
+            .parent()
+            .and_then(Path::to_str)
+            .unwrap_or("")
+            .to_owned();
+        let extension = Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        *extension_counts.entry((parent, extension)).or_insert(0) += 1;
     }
-    names.sort();
-
-    for name in names {
-        let child_relative = relative.join(&name);
-        let entry_path = display_root.join(&child_relative);
-        let metadata = rustix::fs::statat(&directory, &name, AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(|error| anchored_io_error("inspect", &entry_path, error))?;
-        footprint.push(FreshnessStamp {
-            path: workspace_prefix.join(&child_relative),
-            metadata: FreshnessMetadata::from_stat(&metadata),
-        });
-        match FileType::from_raw_mode(metadata.st_mode) {
-            FileType::Symlink => {}
-            FileType::Directory => {
-                let child = openat_nofollow(
-                    &directory,
-                    &name,
-                    OFlags::RDONLY | OFlags::DIRECTORY,
-                    "open glob directory",
-                    &entry_path,
-                )?;
-                collect_glob_paths_at(
-                    child,
-                    &child_relative,
-                    workspace_prefix,
-                    display_root,
-                    pattern,
-                    paths,
-                    footprint,
-                )?;
-            }
-            FileType::RegularFile => {
-                let match_path = path_argument(&child_relative)?;
-                if glob_matches(pattern, match_path) {
-                    paths.push(
-                        relative_path_argument(&workspace_prefix.join(&child_relative))?.to_owned(),
-                    );
-                }
-            }
-            _ => {}
+    let mut extension_seen = HashMap::<(String, String), usize>::new();
+    let mut preview = Vec::new();
+    let mut collapsed = vendor_counts.values().copied().sum::<usize>();
+    for path in entries {
+        if ["node_modules", "target", "vendor", ".venv"]
+            .into_iter()
+            .any(|vendor| path.split('/').any(|part| part == vendor))
+        {
+            continue;
         }
+        let parent = Path::new(path)
+            .parent()
+            .and_then(Path::to_str)
+            .unwrap_or("")
+            .to_owned();
+        let extension = Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let key = (parent.clone(), extension.clone());
+        let count = extension_counts.get(&key).copied().unwrap_or(0);
+        let seen = extension_seen.entry(key).or_insert(0);
+        *seen = seen.saturating_add(1);
+        if count >= DIRECTORY_EXTENSION_COLLAPSE_THRESHOLD && *seen > DIRECTORY_EXTENSION_EXAMPLES {
+            if *seen == DIRECTORY_EXTENSION_EXAMPLES + 1 {
+                let prefix = if parent.is_empty() {
+                    String::new()
+                } else {
+                    format!("{parent}/")
+                };
+                let label = if extension.is_empty() {
+                    "files".to_owned()
+                } else {
+                    format!(".{extension} files")
+                };
+                preview.push(format!(
+                    "{prefix}[… {} more {label}]",
+                    count.saturating_sub(DIRECTORY_EXTENSION_EXAMPLES)
+                ));
+            }
+            collapsed = collapsed.saturating_add(1);
+            continue;
+        }
+        preview.push(path.clone());
     }
-    Ok(())
+    let mut vendors = vendor_counts.into_iter().collect::<Vec<_>>();
+    vendors.sort_by(|left, right| left.0.cmp(&right.0));
+    preview.extend(
+        vendors
+            .into_iter()
+            .map(|(vendor, count)| format!("{vendor}/: {count} paths collapsed")),
+    );
+    (join_lines(preview), collapsed)
 }
 
-fn search_line_matches(line: &str, operation: &FsSearch) -> bool {
-    let case_sensitive = match operation.case_mode {
-        FsCaseMode::Sensitive => true,
-        FsCaseMode::Insensitive => false,
-        FsCaseMode::Smart => operation.query.chars().any(char::is_uppercase),
-    };
-    let (line, query) = if case_sensitive {
-        (line.to_owned(), operation.query.clone())
-    } else {
-        (line.to_lowercase(), operation.query.to_lowercase())
-    };
-    match operation.mode {
-        FsSearchMode::Literal => line.contains(&query),
-        FsSearchMode::Simple => wildcard_matches(&format!("*{query}*"), &line, false),
-    }
-}
-
-fn glob_matches(pattern: &str, text: &str) -> bool {
-    wildcard_matches(pattern, text, true)
-}
-
+#[cfg(test)]
 fn wildcard_matches(pattern: &str, text: &str, slash_sensitive: bool) -> bool {
     let pattern = pattern.chars().collect::<Vec<_>>();
     let text = text.chars().collect::<Vec<_>>();
@@ -2360,7 +3507,7 @@ mod read_memo_tests {
             .expect("unchanged read bypasses refusing CAS");
         assert_eq!(repeated_read, first_read);
 
-        let search = FsSearch::new(".", "needle");
+        let search = FsSearch::new(".", "needle").with_repo_options(false, false);
         let first_search = broker
             .fs_search(
                 &search,
@@ -2410,6 +3557,7 @@ mod read_memo_tests {
             result: BoundedResult {
                 preview: byte.to_string().repeat(900),
                 truncated: true,
+                data: None,
                 artifact: Some(ArtifactRef::new(format!("blake3:{byte}"))),
                 images: Vec::new(),
                 cursor: None,
@@ -2505,6 +3653,15 @@ fn read_path_at(
     if metadata.is_file() {
         let contents = read_utf8_file(entry.handle, display_path)?;
         let digest = format!("blake3:{}", blake3::hash(contents.as_bytes()).to_hex());
+        let preview_contents = if offset.is_some() || limit.is_some() {
+            Some(select_numbered_lines(
+                &crate::redact::redact_private_key_lines(&contents).text,
+                offset.unwrap_or(1),
+                limit,
+            ))
+        } else {
+            None
+        };
         let contents = if offset.is_some() || limit.is_some() {
             select_numbered_lines(&contents, offset.unwrap_or(1), limit)
         } else {
@@ -2512,29 +3669,32 @@ fn read_path_at(
         };
         Ok(ReadPathOutput {
             contents,
+            preview_contents,
             digest: Some(digest),
             footprint,
+            data: None,
         })
     } else if metadata.is_dir() {
-        let mut entries = fs::read_dir(&target)
-            .map_err(|error| ToolError::io("list directory", display_path, error))?
-            .collect::<Result<Vec<_>, _>>()
+        let entries = fs::read_dir(&target)
             .map_err(|error| ToolError::io("list directory", display_path, error))?;
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        let contents = entries
-            .into_iter()
-            .map(|entry| {
-                let mut name = entry.file_name().to_string_lossy().into_owned();
-                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                    name.push('/');
-                }
-                name
-            })
-            .collect::<Vec<_>>();
+        let mut collector = DirectoryCollector::new();
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| ToolError::io("list directory", display_path, error))?;
+            let mut name = entry.file_name().to_string_lossy().into_owned();
+            let is_directory = entry.file_type().is_ok_and(|kind| kind.is_dir());
+            if is_directory {
+                name.push('/');
+            }
+            collector.push(name, is_directory);
+        }
+        let listing = collector.finish();
         Ok(ReadPathOutput {
-            contents: join_lines(contents),
+            contents: listing.contents,
+            preview_contents: None,
             digest: None,
             footprint,
+            data: Some(listing.data),
         })
     } else {
         Err(ToolError::invalid_argument(format!(
@@ -2542,135 +3702,6 @@ fn read_path_at(
             display_path.display()
         )))
     }
-}
-
-#[cfg(windows)]
-fn search_files_at(
-    workspace_dir: OwnedFd,
-    relative: &Path,
-    operation: &FsSearch,
-    max_preview_bytes: usize,
-) -> ToolResult<SearchOutput> {
-    if operation.query.is_empty() {
-        return Err(ToolError::invalid_argument(
-            "fs_search query cannot be empty",
-        ));
-    }
-    let (_parent, root, entry) = windows_anchored_entry(&workspace_dir, relative, &operation.root)?;
-    let mut matches = SearchCollector::new(max_preview_bytes)?;
-    let mut footprint = ReadFootprintBuilder::new();
-    windows_walk_files(&root, entry, relative, &mut footprint, &mut |path, file| {
-        let path_under_root = path.strip_prefix(&root).unwrap_or(path);
-        let match_path = windows_relative_path(path_under_root)?;
-        if operation
-            .glob
-            .as_deref()
-            .is_some_and(|glob| !glob_matches(glob, &match_path))
-        {
-            return Ok(());
-        }
-        let mut bytes = Vec::new();
-        file.seek(SeekFrom::Start(0))
-            .and_then(|_| file.read_to_end(&mut bytes))
-            .map_err(|error| ToolError::io("read", path, error))?;
-        let Ok(contents) = std::str::from_utf8(&bytes) else {
-            return Ok(());
-        };
-        for (index, line) in contents.lines().enumerate() {
-            if search_line_matches(line, operation) {
-                let display_path = windows_relative_path(&relative.join(path_under_root))?;
-                matches.push(format!("{display_path}:{}:{line}", index + 1))?;
-            }
-        }
-        Ok(())
-    })?;
-    Ok(matches.finish(footprint.finish()))
-}
-
-#[cfg(windows)]
-fn glob_files_at(
-    workspace_dir: OwnedFd,
-    relative: &Path,
-    operation: &FsGlob,
-) -> ToolResult<CappedOutput> {
-    if operation.pattern.is_empty() {
-        return Err(ToolError::invalid_argument(
-            "fs_glob pattern cannot be empty",
-        ));
-    }
-    let (_parent, root, entry) = windows_anchored_entry(&workspace_dir, relative, &operation.root)?;
-    let mut matches = GlobCollector::new();
-    let mut footprint = ReadFootprintBuilder::new();
-    windows_walk_files(
-        &root,
-        entry,
-        relative,
-        &mut footprint,
-        &mut |path, _file| {
-            let path_under_root = path.strip_prefix(&root).unwrap_or(path);
-            let candidate = windows_relative_path(path_under_root)?;
-            if glob_matches(&operation.pattern, &candidate) {
-                matches.push(windows_relative_path(&relative.join(path_under_root))?);
-            }
-            Ok(())
-        },
-    )?;
-    // Same collector → output conversion as the Unix glob path.
-    let truncated = matches.truncated;
-    Ok(CappedOutput {
-        contents: join_lines(matches.entries.into_sorted_vec()),
-        truncated,
-        footprint: footprint.finish(),
-    })
-}
-
-#[cfg(windows)]
-fn windows_walk_files(
-    root: &Path,
-    entry: WindowsPathEntry,
-    workspace_prefix: &Path,
-    footprint: &mut ReadFootprintBuilder,
-    visit: &mut impl FnMut(&Path, &mut fs::File) -> ToolResult<()>,
-) -> ToolResult<()> {
-    windows_walk_files_inner(root, root, entry, workspace_prefix, footprint, visit)
-}
-
-#[cfg(windows)]
-fn windows_walk_files_inner(
-    root: &Path,
-    path: &Path,
-    mut entry: WindowsPathEntry,
-    workspace_prefix: &Path,
-    footprint: &mut ReadFootprintBuilder,
-    visit: &mut impl FnMut(&Path, &mut fs::File) -> ToolResult<()>,
-) -> ToolResult<()> {
-    let path_under_root = path.strip_prefix(root).unwrap_or(path);
-    footprint.push(FreshnessStamp {
-        path: workspace_prefix.join(path_under_root),
-        metadata: FreshnessMetadata(entry.identity),
-    });
-    if !entry.identity.directory {
-        return visit(path, &mut entry.handle);
-    }
-    // `entry.handle` omits FILE_SHARE_DELETE and remains live while read_dir
-    // opens the pathname, so the enumerated directory cannot be swapped for a
-    // junction after validation.
-    let mut entries = fs::read_dir(path)
-        .map_err(|error| ToolError::io("list", path, error))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| ToolError::io("list", root, error))?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-        let path = entry.path();
-        let child = open_windows_path_entry(&path, &path, false)?;
-        windows_walk_files_inner(root, &path, child, workspace_prefix, footprint, visit)?;
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn windows_relative_path(path: &Path) -> ToolResult<String> {
-    Ok(path_argument(path)?.replace('\\', "/"))
 }
 
 #[cfg(windows)]
@@ -2983,6 +4014,7 @@ fn apply_windows_write(
                 operation.path.display()
             ),
             truncated: false,
+            data: None,
             artifact: None,
             images: Vec::new(),
             cursor: None,
@@ -3096,6 +4128,7 @@ fn apply_windows_edit(
                 if replacements == 1 { "" } else { "s" }
             ),
             truncated: false,
+            data: None,
             artifact: None,
             images: Vec::new(),
             cursor: None,
@@ -4493,6 +5526,7 @@ fn apply_write_at(
                 operation.path.display()
             ),
             truncated: false,
+            data: None,
             artifact: None,
             images: Vec::new(),
             cursor: None,
@@ -4706,6 +5740,7 @@ fn apply_edit_at_with_commit_hooks(
                 if replacements == 1 { "" } else { "s" }
             ),
             truncated: false,
+            data: None,
             artifact: None,
             images: Vec::new(),
             cursor: None,
@@ -5106,6 +6141,7 @@ fn mutation_result(preview: String) -> BoundedResult {
     BoundedResult {
         preview,
         truncated: false,
+        data: None,
         artifact: None,
         images: Vec::new(),
         cursor: None,
@@ -6037,39 +7073,50 @@ fn is_dot_entry(name: &CStr) -> bool {
     matches!(name.to_bytes(), b"." | b"..")
 }
 
-/// Applies the result bound: a small result passes through untruncated; an
-/// oversized one freezes its complete payload in the CAS and keeps a preview
-/// cut back to the nearest UTF-8 character boundary.
-async fn bounded<C>(
+/// Redacts exactly once at the fs_read preview boundary. Raw bytes never enter
+/// the preview, but a changed or oversized value is retained in CAS for the
+/// existing owner-authorized item-inspection door.
+async fn bounded_read<C>(
     contents: String,
+    preview_contents: Option<String>,
+    data: Option<ToolResultData>,
+    sensitive_path: bool,
     bounds: ResultBounds,
     cas: &mut C,
 ) -> ToolResult<BoundedResult>
 where
     C: CasSink,
 {
-    if contents.len() <= bounds.max_preview_bytes {
-        return Ok(BoundedResult {
-            preview: contents,
-            truncated: false,
-            artifact: None,
-            images: Vec::new(),
-            cursor: None,
-            status: haider_protocol::tool::ToolResultStatus::Completed,
-            reason: None,
-            presentation: None,
-        });
-    }
-
-    let mut preview_end = bounds.max_preview_bytes.min(contents.len());
-    while preview_end > 0 && !contents.is_char_boundary(preview_end) {
-        preview_end -= 1;
-    }
-    let artifact = cas.put(contents.as_bytes()).await?;
+    let semantic_truncated = matches!(
+        &data,
+        Some(ToolResultData::FsRead {
+            truncated_reason: Some(_),
+            ..
+        })
+    );
+    let presented = if sensitive_path {
+        "[REDACTED:sensitive_file]\n".to_owned()
+    } else if matches!(&data, Some(ToolResultData::FsRead { .. })) {
+        let entries = contents
+            .lines()
+            .map(|line| (line.to_owned(), line.ends_with('/')))
+            .collect::<Vec<_>>();
+        directory_preview(&entries).0
+    } else {
+        preview_contents.unwrap_or_else(|| contents.clone())
+    };
+    let redacted = crate::redact::redact_text(&presented);
+    let presentation_reduced = presented != contents || redacted.replacements > 0;
+    let truncated = semantic_truncated
+        || presentation_reduced
+        || contents.len() > bounds.max_preview_bytes
+        || redacted.text.len() > bounds.max_preview_bytes;
+    let artifact = Some(cas.put(contents.as_bytes()).await?);
     Ok(BoundedResult {
-        preview: contents[..preview_end].to_owned(),
-        truncated: true,
-        artifact: Some(artifact),
+        preview: utf8_prefix(&redacted.text, bounds.max_preview_bytes).to_owned(),
+        truncated,
+        data,
+        artifact,
         images: Vec::new(),
         cursor: None,
         status: haider_protocol::tool::ToolResultStatus::Completed,
@@ -6086,53 +7133,100 @@ async fn bounded_search<C>(
 where
     C: CasSink,
 {
-    let match_truncated = output.match_count > SEARCH_PREVIEW_MATCHES;
+    let match_truncated = output.match_count > output.max_matches;
     let byte_truncated = output.total_bytes > bounds.max_preview_bytes;
-    if !match_truncated && !byte_truncated {
-        return Ok(BoundedResult {
-            preview: output.preview,
-            truncated: false,
-            artifact: None,
-            images: Vec::new(),
-            cursor: None,
-            status: haider_protocol::tool::ToolResultStatus::Completed,
-            reason: None,
-            presentation: None,
-        });
-    }
-    let artifact = cas.put_file(output.complete.path()).await?;
-    Ok(BoundedResult {
+    let preview_truncated = output.preview_saturated;
+    let semantic_truncated = output.truncated_reason.is_some();
+    let truncated = match_truncated || byte_truncated || preview_truncated || semantic_truncated;
+    let truncated_reason = output.truncated_reason.or_else(|| {
+        if byte_truncated || preview_truncated {
+            Some(ToolTruncationReason::ResultBytes)
+        } else if match_truncated {
+            Some(ToolTruncationReason::MatchLimit)
+        } else {
+            None
+        }
+    });
+    let artifact = Some(cas.put_file(output.complete.path()).await?);
+    let mut result = BoundedResult {
         preview: output.preview,
-        truncated: true,
-        artifact: Some(artifact),
+        truncated,
+        data: Some(ToolResultData::FsSearch {
+            matches: output.structured,
+            truncated_reason,
+            binary_files_skipped: output.binary_files_skipped,
+            skipped_sensitive: output.skipped_sensitive,
+            files_scanned: output.files_scanned,
+            bytes_scanned: output.bytes_scanned,
+        }),
+        artifact,
         images: Vec::new(),
         cursor: None,
         status: haider_protocol::tool::ToolResultStatus::Completed,
         reason: None,
         presentation: None,
-    })
+    };
+    enforce_search_wire_cap(&mut result)?;
+    Ok(result)
 }
 
-async fn bounded_with_truncation<C>(
-    contents: String,
-    semantic_truncation: bool,
+fn enforce_search_wire_cap(result: &mut BoundedResult) -> ToolResult<()> {
+    let encoded_len = |value: &BoundedResult| {
+        serde_json::to_vec(value)
+            .map(|encoded| encoded.len())
+            .map_err(|error| ToolError::Runtime {
+                message: format!("serialize bounded fs_search result: {error}"),
+            })
+    };
+    while encoded_len(result)? > SEARCH_MAX_RESULT_BYTES {
+        result.truncated = true;
+        let Some(ToolResultData::FsSearch {
+            matches,
+            truncated_reason,
+            ..
+        }) = result.data.as_mut()
+        else {
+            return Err(ToolError::Runtime {
+                message: "bounded fs_search result lost its structured payload".into(),
+            });
+        };
+        *truncated_reason = Some(ToolTruncationReason::ResultBytes);
+        if matches.pop().is_none() {
+            if result.preview.is_empty() {
+                return Err(ToolError::Runtime {
+                    message: "fs_search metadata exceeded its hard result-byte cap".into(),
+                });
+            }
+            result.preview.clear();
+        }
+    }
+    Ok(())
+}
+
+async fn bounded_glob<C>(
+    output: CappedOutput,
     bounds: ResultBounds,
     cas: &mut C,
 ) -> ToolResult<BoundedResult>
 where
     C: CasSink,
 {
-    if !semantic_truncation {
-        return bounded(contents, bounds, cas).await;
-    }
-    let artifact = if contents.len() > bounds.max_preview_bytes {
-        Some(cas.put(contents.as_bytes()).await?)
-    } else {
-        None
-    };
+    let byte_truncated = output.contents.len() > bounds.max_preview_bytes
+        || output.preview.len() > bounds.max_preview_bytes;
+    let truncated = output.truncated || byte_truncated;
+    let truncated_reason = output
+        .truncated_reason
+        .or_else(|| byte_truncated.then_some(ToolTruncationReason::ResultBytes));
+    let artifact = Some(cas.put(output.contents.as_bytes()).await?);
     Ok(BoundedResult {
-        preview: utf8_prefix(&contents, bounds.max_preview_bytes).to_owned(),
-        truncated: true,
+        preview: utf8_prefix(&output.preview, bounds.max_preview_bytes).to_owned(),
+        truncated,
+        data: Some(ToolResultData::FsGlob {
+            truncated_reason,
+            skipped_sensitive: output.skipped_sensitive,
+            files_scanned: output.files_scanned,
+            collapsed_directories: output.collapsed_directories,
+        }),
         artifact,
         images: Vec::new(),
         cursor: None,
@@ -6189,6 +7283,7 @@ fn search_mode_argument(mode: FsSearchMode) -> &'static str {
     match mode {
         FsSearchMode::Literal => "literal",
         FsSearchMode::Simple => "simple",
+        FsSearchMode::Regex => "regex",
     }
 }
 

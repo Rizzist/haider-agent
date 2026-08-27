@@ -425,6 +425,7 @@ impl TaskFacade {
                 })
                 .to_string(),
                 truncated: false,
+                data: None,
                 artifact: None,
                 images: Vec::new(),
                 cursor: None,
@@ -517,6 +518,7 @@ impl TaskFacade {
             })
             .to_string(),
             truncated: false,
+            data: None,
             artifact: None,
             images: Vec::new(),
             cursor: None,
@@ -771,6 +773,7 @@ impl TaskFacade {
         Ok(BoundedResult {
             preview: preview.to_string(),
             truncated,
+            data: None,
             artifact,
             images: Vec::new(),
             cursor: result_cursor,
@@ -806,6 +809,7 @@ impl TaskFacade {
                 })
                 .to_string(),
                 truncated: false,
+                data: None,
                 artifact: None,
                 images: Vec::new(),
                 cursor: None,
@@ -830,6 +834,7 @@ impl TaskFacade {
             })
             .to_string(),
             truncated: false,
+            data: None,
             artifact: None,
             images: Vec::new(),
             cursor: None,
@@ -1200,6 +1205,7 @@ fn unknown_task_result(task_id: &str) -> BoundedResult {
         })
         .to_string(),
         truncated: false,
+        data: None,
         artifact: None,
         images: Vec::new(),
         cursor: None,

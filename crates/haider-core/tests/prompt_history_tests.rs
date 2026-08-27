@@ -1912,6 +1912,7 @@ async fn tree_compilation_is_byte_identical_to_journal_rendering() {
                 result: BoundedResult {
                     preview: "exact\nresult".into(),
                     truncated: true,
+                    data: None,
                     artifact: None,
                     images: Vec::new(),
                     cursor: Some("cursor-7".into()),
@@ -4369,6 +4370,7 @@ async fn tool_result_is_presented_after_its_completed_tool_call() {
                 result: BoundedResult {
                     preview: "contents".into(),
                     truncated: false,
+                    data: None,
                     artifact: None,
                     images: Vec::new(),
                     cursor: None,
@@ -5646,6 +5648,7 @@ async fn cancelled_and_errored_runs_keep_their_committed_history() {
                 result: BoundedResult {
                     preview: "grep output".into(),
                     truncated: false,
+                    data: None,
                     artifact: None,
                     images: Vec::new(),
                     cursor: None,

@@ -32,6 +32,7 @@ fn apply_tool(
         result: BoundedResult {
             preview: "{}".into(),
             truncated: false,
+            data: None,
             artifact: None,
             images: Vec::new(),
             cursor: None,

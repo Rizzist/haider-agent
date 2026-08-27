@@ -12,9 +12,9 @@ use haider_protocol::ids::{ArtifactRef, SessionId};
 use haider_protocol::item::{ItemDelta, ToolStatus};
 use haider_tools::{
     BuiltinResult, CasSink, CommandOutputSink, ComposerSubmission, EffectBroker, JournalSink,
-    PROCESS_OUTPUT_CHUNK_BYTES, PermissionPolicy, ProcessBounds, ProcessControl, ProcessExec,
-    ProcessLifecycleEvent, ProcessOutputChunk, REDACTED_ENV_VALUE, ShellSession, ToolError,
-    ToolResult,
+    PROCESS_ADAPTER_INPUT_BYTES, PROCESS_OUTPUT_CHUNK_BYTES, PermissionPolicy, ProcessBounds,
+    ProcessControl, ProcessExec, ProcessLifecycleEvent, ProcessOutputChunk, REDACTED_ENV_VALUE,
+    ShellSession, ToolError, ToolResult,
 };
 use std::fs;
 use std::path::Path;
@@ -260,7 +260,11 @@ async fn process_exec_streams_exact_bytes_freezes_overflow_and_journals_four_pha
             blake3::hash(&[0xff, b'a', b'b', b'c']).to_hex()
         )
     );
-    assert!(result.inline_output.is_empty());
+    assert_eq!(
+        result.inline_output.len(),
+        1,
+        "adapter tail retains exact bytes"
+    );
     assert!(result.artifact.is_some());
     assert_eq!(
         output_bytes(&output_observer.lock().expect("output observer")),
@@ -383,10 +387,11 @@ async fn output_flood_spills_while_streaming_and_completes_under_paused_time() {
         result.transcript_digest,
         format!("blake3:{}", blake3::hash(&vec![0_u8; 1_048_576]).to_hex())
     );
-    assert!(result.inline_output.is_empty());
+    assert!(!result.inline_output.is_empty());
     assert!(result.artifact.is_some());
     assert!(
-        result.transcript_high_water_bytes <= 1024 + PROCESS_OUTPUT_CHUNK_BYTES,
+        result.transcript_high_water_bytes
+            <= 1024 + PROCESS_ADAPTER_INPUT_BYTES + PROCESS_OUTPUT_CHUNK_BYTES,
         "transcript payload high-water {} exceeded cap + one read chunk",
         result.transcript_high_water_bytes
     );

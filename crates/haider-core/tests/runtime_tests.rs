@@ -1820,6 +1820,7 @@ impl ToolDispatcher for CompletingDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: "done".into(),
             truncated: false,
+            data: None,
             artifact: None,
             images: Vec::new(),
             cursor: None,
@@ -1849,6 +1850,7 @@ impl ToolDispatcher for DelayedCompletingDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: "done after a long tool wait".into(),
             truncated: false,
+            data: None,
             artifact: None,
             images: Vec::new(),
             cursor: None,
@@ -1952,6 +1954,7 @@ impl ToolDispatcher for LargeResultDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: self.preview.clone(),
             truncated: false,
+            data: None,
             artifact: None,
             images: Vec::new(),
             cursor: None,
@@ -1980,6 +1983,7 @@ impl ToolDispatcher for ForgedImageDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: "forged image".into(),
             truncated: false,
+            data: None,
             artifact: None,
             images: vec![self.image.clone()],
             cursor: None,
@@ -3447,6 +3451,7 @@ impl ToolDispatcher for BoundaryRecordingDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: "done".into(),
             truncated: false,
+            data: None,
             artifact: None,
             images: Vec::new(),
             cursor: None,
@@ -3981,6 +3986,7 @@ impl ToolDispatcher for DurableRunningToolDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: "atomic result".into(),
             truncated: false,
+            data: None,
             artifact: None,
             images: Vec::new(),
             cursor: None,

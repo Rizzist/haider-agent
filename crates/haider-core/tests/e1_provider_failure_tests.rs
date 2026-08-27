@@ -45,6 +45,7 @@ impl ToolDispatcher for StatusDispatcher {
         Ok(ToolDispatchResult::Completed(BoundedResult {
             preview: "tool result".into(),
             truncated: false,
+            data: None,
             artifact: None,
             images: Vec::new(),
             cursor: None,

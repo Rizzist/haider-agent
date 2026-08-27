@@ -141,11 +141,12 @@ use haider_store::{MenuResolutionCommand, MenuResolutionOutcome};
 use haider_tools::{
     CasSink, ChangeLedger, CommandOutputSink, ComputerBackend, ComputerCancelToken, ComputerError,
     ComputerOperation, ComputerOutput, ComputerPermissionPoll, EffectBroker, FsCaseMode, FsEdit,
-    FsEditChange, FsGlob, FsPath, FsPathOperation, FsRead, FsSearch, FsSearchMode, FsWrite,
-    GraphEvidence, JournalSink, MessageSubagent, MobileBackend, MobileCancelToken, MobileError,
-    MobileOperation, MobileOutput, MonitorRequest, PermissionPolicy, ProcessBounds, ProcessExec,
-    ProcessResult, ResultBounds, ScreenshotRedactionPolicy, SessionGrant, SessionGrantScope,
-    ShellSession, SpawnSubagent, ToolError, ToolResult, TurnAttribution, WebFetch, WorkflowAuthor,
+    FsEditChange, FsFileGlob, FsGlob, FsPath, FsPathOperation, FsRead, FsSearch, FsSearchMode,
+    FsWrite, GraphEvidence, JournalSink, MessageSubagent, MobileBackend, MobileCancelToken,
+    MobileError, MobileOperation, MobileOutput, MonitorRequest, PermissionPolicy, ProcessBounds,
+    ProcessExec, ProcessResult, ResultBounds, ScreenshotRedactionPolicy, SessionGrant,
+    SessionGrantScope, ShellSession, SpawnSubagent, ToolError, ToolResult, TurnAttribution,
+    WebFetch, WorkflowAuthor,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -5164,7 +5165,10 @@ async fn perform_shell_exec(
         run_id.clone(),
         pending.accepted.item_id.clone(),
         pending.command_id,
-        PromptRender::Verbatim,
+        // Interactive shell bytes remain visible in the UI but never enter a
+        // later model prompt; tool-loop process calls expose only the bounded
+        // deterministic result adapter.
+        PromptRender::Omit,
     );
     let execution = match broker
         .process_exec_user(
@@ -9857,10 +9861,14 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
             "monitor(operation, source?, filter?, action?, occurrence?, lifetime?, monitor_id?) — durable watches; register needs source+action; timeout needs timeout_ms; non-SMS fails closed"
         }
         "fs_read" => {
-            "fs_read(path, offset?, limit?) — read a bounded UTF-8 file slice; a directory path lists it"
+            "fs_read(path, offset?, limit?) — read a redacted 8 KiB UTF-8 preview; prefer offset/limit range reads; directories are capped; full owner-authorized bytes use the artifact re-read handle"
         }
-        "fs_glob" => "fs_glob(pattern, path?) — list workspace files matching a glob",
-        "fs_search" => "fs_search(pattern, path?, glob?, case?, mode?) — search file contents",
+        "fs_glob" => {
+            "fs_glob(pattern, path?, respect_gitignore?, include_hidden?) — stable, redacted repository-aware file listing; .git is always excluded"
+        }
+        "fs_search" => {
+            "fs_search(pattern, path?, glob?, case?, mode?, multiline?, context?, max_matches?, file_glob?, respect_gitignore?, include_hidden?) — redacted bounded line-streamed search; context.before/after ≤5; regex is linear-time and multiline toggles ^/$ at physical line boundaries"
+        }
         "fs_write" => {
             "fs_write(path, content) — create or replace one UTF-8 file, making parent dirs"
         }
@@ -9871,7 +9879,7 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
             "fs_path(operation, source, destination?, overwrite?) — move/delete/copy; destination is required for move and copy"
         }
         "process_exec" => {
-            "process_exec(command, cwd?, background?, name?) — run one shell command in the workspace; background=true returns a task_id, outlives the turn, and its completion posts as a session message (read task_output, stop task_kill)"
+            "process_exec(command, cwd?, background?, name?) — run one shell command in the workspace; foreground output is deterministically reduced with raw transcript in the artifact; background=true returns a task_id, outlives the turn, and its completion posts as a session message (read task_output, stop task_kill)"
         }
         "task_output" => {
             "task_output(task_id, cursor?) — read a background task's output; no cursor = rolling tail, cursor = page from that byte offset"
@@ -11456,6 +11464,57 @@ impl BrokerToolDispatcher {
                         )
                     })?;
                 let glob = optional_string(args, "glob")?;
+                let multiline = optional_bool(args, "multiline")?.unwrap_or(false);
+                let respect_gitignore = optional_bool(args, "respect_gitignore")?.unwrap_or(true);
+                let include_hidden = optional_bool(args, "include_hidden")?.unwrap_or(false);
+                let max_matches = optional_u64(args, "max_matches")?
+                    .map(usize::try_from)
+                    .transpose()
+                    .map_err(|_| {
+                        HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            "tool argument `max_matches` is too large",
+                            false,
+                        )
+                    })?
+                    .unwrap_or(haider_tools::SEARCH_PREVIEW_MATCHES);
+                let (context_before, context_after) = match args.get("context") {
+                    None => (0, 0),
+                    Some(serde_json::Value::Object(context)) => {
+                        let value = serde_json::Value::Object(context.clone());
+                        let before = optional_u64(&value, "before")?
+                            .map(usize::try_from)
+                            .transpose()
+                            .map_err(|_| {
+                                HaiderError::new(
+                                    ErrorCode::InvalidArgument,
+                                    "tool argument `context.before` is too large",
+                                    false,
+                                )
+                            })?
+                            .unwrap_or(0);
+                        let after = optional_u64(&value, "after")?
+                            .map(usize::try_from)
+                            .transpose()
+                            .map_err(|_| {
+                                HaiderError::new(
+                                    ErrorCode::InvalidArgument,
+                                    "tool argument `context.after` is too large",
+                                    false,
+                                )
+                            })?
+                            .unwrap_or(0);
+                        (before, after)
+                    }
+                    Some(_) => {
+                        return Err(HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            "tool argument `context` must be an object when provided",
+                            false,
+                        ));
+                    }
+                };
+                let file_glob = parse_fs_file_glob(args.get("file_glob"))?;
                 let case_mode = match optional_string(args, "case")?.as_deref() {
                     None | Some("sensitive") => FsCaseMode::Sensitive,
                     Some("insensitive") => FsCaseMode::Insensitive,
@@ -11471,6 +11530,7 @@ impl BrokerToolDispatcher {
                 let mode = match optional_string(args, "mode")?.as_deref() {
                     None | Some("literal") => FsSearchMode::Literal,
                     Some("simple") => FsSearchMode::Simple,
+                    Some("regex") => FsSearchMode::Regex,
                     Some(value) => {
                         return Err(HaiderError::new(
                             ErrorCode::InvalidArgument,
@@ -11481,7 +11541,12 @@ impl BrokerToolDispatcher {
                 };
                 let mut operation = FsSearch::new(root, query)
                     .with_case_mode(case_mode)
-                    .with_mode(mode);
+                    .with_mode(mode)
+                    .with_multiline(multiline)
+                    .with_context(context_before, context_after)
+                    .with_max_matches(max_matches)
+                    .with_file_glob(file_glob)
+                    .with_repo_options(respect_gitignore, include_hidden);
                 if let Some(glob) = glob {
                     operation = operation.with_glob(glob);
                 }
@@ -11490,7 +11555,11 @@ impl BrokerToolDispatcher {
             RegisteredToolRoute::FsGlob => {
                 let root = optional_string(args, "path")?.unwrap_or_else(|| ".".into());
                 let pattern = required_string(args, "pattern")?;
-                Ok(ParsedToolOperation::FsGlob(FsGlob::new(root, pattern)))
+                let respect_gitignore = optional_bool(args, "respect_gitignore")?.unwrap_or(true);
+                let include_hidden = optional_bool(args, "include_hidden")?.unwrap_or(false);
+                Ok(ParsedToolOperation::FsGlob(
+                    FsGlob::new(root, pattern).with_repo_options(respect_gitignore, include_hidden),
+                ))
             }
             RegisteredToolRoute::ProcessExec => {
                 let command = required_string(args, "command")?;
@@ -12001,6 +12070,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
             return Ok(ToolDispatchResult::Completed(BoundedResult {
                 preview,
                 truncated: false,
+                data: None,
                 artifact: None,
                 images: Vec::new(),
                 cursor: None,
@@ -12033,6 +12103,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     })
                     .to_string(),
                     truncated: false,
+                    data: None,
                     artifact: None,
                     images: Vec::new(),
                     cursor: None,
@@ -12098,6 +12169,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 })
                 .to_string(),
                 truncated: false,
+                data: None,
                 artifact: None,
                 images: Vec::new(),
                 cursor: None,
@@ -12154,6 +12226,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         })
                         .to_string(),
                         truncated: false,
+                        data: None,
                         artifact: None,
                         images: Vec::new(),
                         cursor: None,
@@ -12189,6 +12262,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             })
                             .to_string(),
                             truncated: false,
+                            data: None,
                             artifact: None,
                             images: Vec::new(),
                             cursor: None,
@@ -12344,6 +12418,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         })
                         .to_string(),
                         truncated: false,
+                        data: None,
                         artifact: None,
                         images: Vec::new(),
                         cursor: None,
@@ -12364,6 +12439,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
             return Ok(ToolDispatchResult::Completed(BoundedResult {
                 preview,
                 truncated: false,
+                data: None,
                 artifact: None,
                 images: Vec::new(),
                 cursor: None,
@@ -12429,6 +12505,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     return Ok(ToolDispatchResult::Completed(BoundedResult {
                         preview: serde_json::json!({ "ok": false, "error": reason }).to_string(),
                         truncated: false,
+                        data: None,
                         artifact: None,
                         images: Vec::new(),
                         cursor: None,
@@ -12466,6 +12543,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         run_id.clone(),
                         item_id.clone(),
                         call_id.to_owned(),
+                        // Raw live chunks remain UI-visible/durable and are
+                        // frozen in CAS, but prompt omission leaves the
+                        // deterministic bounded result as the model's sole
+                        // view. No model-visible prefix is rewritten.
                         PromptRender::Omit,
                     );
                     let started = SystemTime::now();
@@ -12536,6 +12617,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 let completed = |value: serde_json::Value| BoundedResult {
                     preview: value.to_string(),
                     truncated: false,
+                    data: None,
                     artifact: None,
                     images: Vec::new(),
                     cursor: None,
@@ -12715,6 +12797,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         })
                         .to_string(),
                         truncated: false,
+                        data: None,
                         artifact: None,
                         images: Vec::new(),
                         cursor: None,
@@ -12774,6 +12857,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                         outcome.final_url, outcome.content_type, outcome.text
                                     ),
                                     truncated: outcome.truncated,
+                                    data: None,
                                     artifact: None,
                                     images: Vec::new(),
                                     cursor: None,
@@ -12798,6 +12882,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 Ok(BoundedResult {
                                     preview: format!("web_fetch failed: {message}"),
                                     truncated: false,
+                                    data: None,
                                     artifact: None,
                                     images: Vec::new(),
                                     cursor: None,
@@ -12894,6 +12979,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             "web_search is unavailable: no subscription search executor is configured"
                                 .into(),
                         truncated: false,
+                        data: None,
                         artifact: None,
                         images: Vec::new(),
                         cursor: None,
@@ -12911,6 +12997,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 Ok(BoundedResult {
                                     preview,
                                     truncated,
+                                    data: None,
                                     artifact: None,
                                     images: Vec::new(),
                                     cursor: None,
@@ -12929,6 +13016,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 Ok(BoundedResult {
                                     preview: format!("web_search failed: {}", failure.message),
                                     truncated: false,
+                                    data: None,
                                     artifact: None,
                                     images: Vec::new(),
                                     cursor: None,
@@ -13073,6 +13161,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                                 image.width, image.height
                                             ),
                                             truncated: false,
+                                            data: None,
                                             artifact: None,
                                             images: vec![image],
                                             cursor: None,
@@ -13102,6 +13191,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             Ok(BoundedResult {
                                 preview: serde_json::json!({"x": x, "y": y}).to_string(),
                                 truncated: false,
+                                data: None,
                                 artifact: None,
                                 images: Vec::new(),
                                 cursor: None,
@@ -13173,6 +13263,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                         Ok(BoundedResult {
                                             preview,
                                             truncated: false,
+                                            data: None,
                                             artifact: None,
                                             images: vec![image],
                                             cursor: None,
@@ -13202,6 +13293,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             Ok(BoundedResult {
                                 preview: format!("{action} completed"),
                                 truncated: false,
+                                data: None,
                                 artifact: None,
                                 images: Vec::new(),
                                 cursor: None,
@@ -13268,6 +13360,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                             image.width, image.height
                                         ),
                                         truncated: false,
+                                        data: None,
                                         artifact: None,
                                         images: vec![image],
                                         cursor: None,
@@ -13324,6 +13417,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             Ok(BoundedResult {
                                 preview,
                                 truncated: false,
+                                data: None,
                                 artifact: None,
                                 images: Vec::new(),
                                 cursor: None,
@@ -13891,6 +13985,7 @@ fn computer_failure_result(error: &ComputerError) -> BoundedResult {
         })
         .to_string(),
         truncated: false,
+        data: None,
         artifact: None,
         images: Vec::new(),
         cursor: None,
@@ -13948,6 +14043,7 @@ fn mobile_failure_result(error: &MobileError) -> BoundedResult {
         })
         .to_string(),
         truncated: false,
+        data: None,
         artifact: None,
         images: Vec::new(),
         cursor: None,
@@ -13982,6 +14078,7 @@ fn typed_error_result(
     BoundedResult {
         preview: body.to_string(),
         truncated: false,
+        data: None,
         artifact: None,
         images: Vec::new(),
         cursor: None,
@@ -14010,6 +14107,7 @@ fn selection_rejection_result(refusal: &crate::model_select::SelectionRefusal) -
         })
         .to_string(),
         truncated: false,
+        data: None,
         artifact: None,
         images: Vec::new(),
         cursor: None,
@@ -14031,6 +14129,7 @@ fn recursion_limit_result() -> BoundedResult {
         })
         .to_string(),
         truncated: false,
+        data: None,
         artifact: None,
         images: Vec::new(),
         cursor: None,
@@ -14057,6 +14156,7 @@ fn subagent_limit_result(error: &HaiderError) -> BoundedResult {
         })
         .to_string(),
         truncated: false,
+        data: None,
         artifact: None,
         images: Vec::new(),
         cursor: None,
@@ -14079,6 +14179,7 @@ fn typed_workflow_boundary_result(message: &str) -> BoundedResult {
         })
         .to_string(),
         truncated: false,
+        data: None,
         artifact: None,
         images: Vec::new(),
         cursor: None,
@@ -14103,6 +14204,7 @@ fn grant_ceiling_result(name: &str) -> BoundedResult {
         })
         .to_string(),
         truncated: false,
+        data: None,
         artifact: None,
         images: Vec::new(),
         cursor: None,
@@ -14127,6 +14229,7 @@ fn mobile_capability_denied_result() -> BoundedResult {
         })
         .to_string(),
         truncated: false,
+        data: None,
         artifact: None,
         images: Vec::new(),
         cursor: None,
@@ -14158,6 +14261,7 @@ fn graph_evidence_rejection(
         })
         .to_string(),
         truncated: false,
+        data: None,
         artifact: None,
         images: Vec::new(),
         cursor: None,
@@ -14443,6 +14547,60 @@ fn optional_u64(args: &serde_json::Value, field: &str) -> Result<Option<u64>, Ha
     })
 }
 
+fn parse_fs_file_glob(value: Option<&serde_json::Value>) -> Result<FsFileGlob, HaiderError> {
+    let Some(value) = value else {
+        return Ok(FsFileGlob::default());
+    };
+    let Some(object) = value.as_object() else {
+        return Err(HaiderError::new(
+            ErrorCode::InvalidArgument,
+            "tool argument `file_glob` must be an object when provided",
+            false,
+        ));
+    };
+    let parse_patterns = |field: &str| -> Result<Vec<String>, HaiderError> {
+        let Some(value) = object.get(field) else {
+            return Ok(Vec::new());
+        };
+        let Some(values) = value.as_array() else {
+            return Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                format!("tool argument `file_glob.{field}` must be an array"),
+                false,
+            ));
+        };
+        if values.len() > 32 {
+            return Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                format!("tool argument `file_glob.{field}` cannot exceed 32 patterns"),
+                false,
+            ));
+        }
+        values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| {
+                        HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            format!(
+                                "tool argument `file_glob.{field}` entries must be non-empty strings"
+                            ),
+                            false,
+                        )
+                    })
+            })
+            .collect()
+    };
+    Ok(FsFileGlob::new(
+        parse_patterns("include")?,
+        parse_patterns("exclude")?,
+    ))
+}
+
 #[cfg(all(test, unix))]
 pub(crate) fn process_result(result: ProcessResult) -> BoundedResult {
     process_result_with_signal(result, None)
@@ -14476,40 +14634,55 @@ fn process_output_preview(result: &ProcessResult) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+fn process_combined_output(result: &ProcessResult) -> String {
+    let mut bytes = Vec::with_capacity(result.output_bytes);
+    for chunk in &result.inline_output {
+        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&chunk.chunk_b64) {
+            bytes.extend_from_slice(&decoded);
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 fn process_result_with_signal(
     result: ProcessResult,
     signal: Option<&ProcessSignalRecorded>,
 ) -> BoundedResult {
     let artifact = result.artifact.clone();
-    let truncated = artifact.is_some() || result.limit_reached.is_some();
+    let raw_output = process_combined_output(&result);
+    let failed = result.status != haider_protocol::item::ToolStatus::Completed;
+    let reduced = haider_tools::reduce_tool_output("process_exec", &raw_output, failed);
+    let mut truncated = result.limit_reached.is_some() || reduced.text != raw_output;
     let reason = process_failure_reason(&result);
-    BoundedResult {
-        preview: serde_json::json!({
+    let mut presented_output = reduced.text.clone();
+    let mut preview = process_result_preview_json(&result, signal, &reduced, &presented_output);
+    for max_output_bytes in [4_096usize, 2_048, 1_024, 0] {
+        if preview.len() <= 8 * 1024 {
+            break;
+        }
+        presented_output = utf8_bounded_prefix(&reduced.text, max_output_bytes).to_owned();
+        preview = process_result_preview_json(&result, signal, &reduced, &presented_output);
+    }
+    truncated |= presented_output != reduced.text;
+    if preview.len() > 8 * 1024 {
+        truncated = true;
+        preview = serde_json::json!({
             "status": result.status,
             "effect_id": result.effect,
             "exit_code": result.exit_code,
-            "signal": result.signal,
             "output_bytes": result.output_bytes,
             "command_arg_digest": result.command_arg_digest,
             "transcript_digest": result.transcript_digest,
-            "workspace_revision": signal.and_then(|signal| signal.workspace_revision.as_ref()),
-            "subject_digest": signal.map(|signal| signal.subject_digest.as_str()),
-            "process_signal": signal.map(|signal| ProcessSignalRef {
-                run_id: signal.run_id.clone(),
-                call_id: signal.call_id.clone(),
-                effect_id: signal.effect_id.clone(),
-            }),
-            "inline_output": result.inline_output,
-            "artifact": artifact,
-            "limit_reached": result.limit_reached,
-            "limits": {
-                "wall_timeout_ms": result.wall_timeout_ms,
-                "max_output_bytes": result.max_output_bytes,
-            },
-            "escalation_note": result.escalation_note,
+            "artifact": result.artifact,
+            "output_adapter": reduced.adapter,
+            "output_omitted": "preview metadata exceeded byte cap; use artifact",
         })
-        .to_string(),
+        .to_string();
+    }
+    BoundedResult {
+        preview,
         truncated,
+        data: None,
         artifact,
         images: Vec::new(),
         cursor: None,
@@ -14526,6 +14699,52 @@ fn process_result_with_signal(
         reason,
         presentation: None,
     }
+}
+
+fn process_result_preview_json(
+    result: &ProcessResult,
+    signal: Option<&ProcessSignalRecorded>,
+    reduced: &haider_tools::ReducedToolOutput,
+    output: &str,
+) -> String {
+    serde_json::json!({
+        "status": result.status,
+        "effect_id": result.effect,
+        "exit_code": result.exit_code,
+        "signal": result.signal,
+        "output_bytes": result.output_bytes,
+        "command_arg_digest": result.command_arg_digest,
+        "transcript_digest": result.transcript_digest,
+        "workspace_revision": signal.and_then(|signal| signal.workspace_revision.as_ref()),
+        "subject_digest": signal.map(|signal| signal.subject_digest.as_str()),
+        "process_signal": signal.map(|signal| ProcessSignalRef {
+            run_id: signal.run_id.clone(),
+            call_id: signal.call_id.clone(),
+            effect_id: signal.effect_id.clone(),
+        }),
+        "output": output,
+        "output_adapter": reduced.adapter,
+        "token_estimate": {
+            "before": reduced.before_tokens,
+            "after": haider_tools::estimated_tokens(output.len()),
+        },
+        "artifact": result.artifact,
+        "limit_reached": result.limit_reached,
+        "limits": {
+            "wall_timeout_ms": result.wall_timeout_ms,
+            "max_output_bytes": result.max_output_bytes,
+        },
+        "escalation_note": result.escalation_note,
+    })
+    .to_string()
+}
+
+fn utf8_bounded_prefix(text: &str, max_bytes: usize) -> &str {
+    let mut end = text.len().min(max_bytes);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 fn process_failure_reason(result: &ProcessResult) -> Option<String> {

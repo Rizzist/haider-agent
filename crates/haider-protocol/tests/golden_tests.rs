@@ -43,9 +43,9 @@ use haider_protocol::project_instructions::{
 use haider_protocol::retry::RunRetryEventPayload;
 use haider_protocol::state::{RunState, SessionState, VerifyStep, WaitReason};
 use haider_protocol::tool::{
-    BoundedResult, DispatchMode, ImageBlockRef, RememberedGrantScope, RememberedSessionGrant,
-    ToolInventoryEntry, ToolInventorySnapshot, ToolManifest, ToolPermissionDefault,
-    ToolResultStatus,
+    BoundedResult, DispatchMode, FsSearchMatch, ImageBlockRef, RememberedGrantScope,
+    RememberedSessionGrant, ToolInventoryEntry, ToolInventorySnapshot, ToolManifest,
+    ToolPermissionDefault, ToolResultData, ToolResultStatus, ToolTruncationReason,
 };
 use haider_protocol::verify::{Diagnostic, GateReport, Severity, VerifyVerdict};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -519,6 +519,7 @@ fn golden_error_presentation_contract() {
             result: BoundedResult {
                 preview: "tool failed".into(),
                 truncated: false,
+                data: None,
                 artifact: None,
                 images: Vec::new(),
                 cursor: None,
@@ -597,6 +598,7 @@ fn golden_image_bearing_tool_result_is_additive_and_legacy_decodes_empty() {
             result: BoundedResult {
                 preview: "captured dashboard".into(),
                 truncated: false,
+                data: None,
                 artifact: None,
                 images: vec![ImageBlockRef {
                     artifact: ArtifactRef::new(
@@ -625,6 +627,68 @@ fn golden_image_bearing_tool_result_is_additive_and_legacy_decodes_empty() {
         serde_json::to_value(&legacy).expect("legacy result encodes"),
         serde_json::json!({"preview": "legacy text-only result", "truncated": false})
     );
+}
+
+/// MUTATION CHECK: remove a kept search field, rename its additive kind, or
+/// make legacy `data` mandatory. Expected failure: exact wire JSON drifts or
+/// the pre-E result stops decoding.
+#[test]
+fn structured_search_result_wire_is_additive_and_legacy_decodes() {
+    let result = BoundedResult {
+        preview: "src/lib.rs:7:needle\n".into(),
+        truncated: true,
+        data: Some(ToolResultData::FsSearch {
+            matches: vec![FsSearchMatch {
+                path: "src/lib.rs".into(),
+                line: 7,
+                column: 3,
+                text: "needle".into(),
+                context_before: vec!["before".into()],
+                context_after: vec!["after".into()],
+            }],
+            truncated_reason: Some(ToolTruncationReason::MatchLimit),
+            binary_files_skipped: 2,
+            skipped_sensitive: 1,
+            files_scanned: 9,
+            bytes_scanned: 4096,
+        }),
+        artifact: Some(ArtifactRef::new("blake3:search")),
+        images: Vec::new(),
+        cursor: None,
+        status: ToolResultStatus::Completed,
+        reason: None,
+        presentation: None,
+    };
+    assert_eq!(
+        serde_json::to_value(&result).expect("structured search wire"),
+        serde_json::json!({
+            "preview": "src/lib.rs:7:needle\n",
+            "truncated": true,
+            "data": {
+                "kind": "fs_search",
+                "matches": [{
+                    "path": "src/lib.rs",
+                    "line": 7,
+                    "column": 3,
+                    "text": "needle",
+                    "context_before": ["before"],
+                    "context_after": ["after"]
+                }],
+                "truncated_reason": "match_limit",
+                "binary_files_skipped": 2,
+                "skipped_sensitive": 1,
+                "files_scanned": 9,
+                "bytes_scanned": 4096
+            },
+            "artifact": "blake3:search"
+        })
+    );
+    let legacy: BoundedResult = serde_json::from_value(serde_json::json!({
+        "preview": "old",
+        "truncated": false
+    }))
+    .expect("legacy bounded result");
+    assert!(legacy.data.is_none());
 }
 
 /// MUTATION CHECK: rename `run_retried` or omit any source coordinate.

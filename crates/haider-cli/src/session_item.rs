@@ -474,6 +474,7 @@ mod tests {
         BoundedResult {
             preview: preview.to_owned(),
             truncated: false,
+            data: None,
             artifact: None,
             images: Vec::new(),
             cursor: None,

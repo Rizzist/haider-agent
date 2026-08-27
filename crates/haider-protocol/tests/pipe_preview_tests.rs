@@ -47,6 +47,7 @@ fn result_preview_is_bounded_and_absent_when_empty() {
     let result = BoundedResult {
         preview: format!("{}\n tail", "y".repeat(4_000)),
         truncated: true,
+        data: None,
         artifact: None,
         images: Vec::new(),
         cursor: None,
@@ -61,6 +62,7 @@ fn result_preview_is_bounded_and_absent_when_empty() {
     let empty = BoundedResult {
         preview: String::new(),
         truncated: false,
+        data: None,
         artifact: None,
         images: Vec::new(),
         cursor: None,

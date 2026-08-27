@@ -3643,6 +3643,7 @@ impl HarnessActor {
                             let result = BoundedResult {
                                 preview,
                                 truncated: false,
+                                data: None,
                                 artifact: None,
                                 images: Vec::new(),
                                 cursor: None,
@@ -5193,6 +5194,7 @@ impl HarnessActor {
                 tool.name
             ),
             truncated: false,
+            data: None,
             artifact: None,
             images: Vec::new(),
             cursor: None,
@@ -5250,6 +5252,7 @@ impl HarnessActor {
                 })
                 .to_string(),
                 truncated: false,
+                data: None,
                 artifact: None,
                 images: Vec::new(),
                 cursor: None,
@@ -5690,6 +5693,7 @@ impl HarnessActor {
                 BoundedResult {
                     preview: request.result_echo().to_string(),
                     truncated: false,
+                    data: None,
                     artifact: None,
                     images: Vec::new(),
                     cursor: None,
@@ -5708,6 +5712,7 @@ impl HarnessActor {
                 })
                 .to_string(),
                 truncated: false,
+                data: None,
                 artifact: None,
                 images: Vec::new(),
                 cursor: None,
@@ -5881,6 +5886,7 @@ impl HarnessActor {
         let bounded = BoundedResult {
             preview: result.clone(),
             truncated: false,
+            data: None,
             artifact: None,
             images: Vec::new(),
             cursor: None,
@@ -6019,6 +6025,7 @@ impl HarnessActor {
         let bounded = BoundedResult {
             preview: result.clone(),
             truncated: false,
+            data: None,
             artifact: None,
             images: Vec::new(),
             cursor: None,
@@ -6054,6 +6061,7 @@ impl HarnessActor {
                 result: BoundedResult {
                     preview: result.clone(),
                     truncated: false,
+                    data: None,
                     artifact: None,
                     images: Vec::new(),
                     cursor: None,
@@ -6537,6 +6545,7 @@ impl HarnessActor {
             let bounded = BoundedResult {
                 preview: result.clone(),
                 truncated: false,
+                data: None,
                 artifact: None,
                 images: Vec::new(),
                 cursor: None,
@@ -6629,6 +6638,7 @@ impl HarnessActor {
                     completion.report.agent, completion.report.summary
                 ),
                 truncated: completion.truncated,
+                data: None,
                 artifact: None,
                 images: Vec::new(),
                 cursor: None,

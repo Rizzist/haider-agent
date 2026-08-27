@@ -166,8 +166,8 @@ async fn file_read_range_is_line_numbered_bounded_and_tracks_the_full_digest() {
 
 /// MUTATION CHECK: follow a descendant symlink or remove either result cap.
 /// Expected RUNTIME failure: escaped content appears, search loses its full
-/// CAS object/200-line preview, or glob returns more than 500 entries without
-/// its truncation flag.
+/// CAS object/200-line preview, or glob loses its 500-entry raw artifact and
+/// deterministic extension reduction.
 #[tokio::test]
 async fn search_and_glob_are_root_confined_sorted_and_bounded() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -226,9 +226,13 @@ async fn search_and_glob_are_root_confined_sorted_and_bounded() {
         .await
         .expect("glob");
     assert!(glob.truncated);
-    assert_eq!(glob.preview.lines().count(), 500);
+    assert_eq!(glob.preview.lines().count(), 4);
     assert_eq!(glob.preview.lines().next(), Some("entry-000.rs"));
-    assert_eq!(glob.preview.lines().last(), Some("entry-499.rs"));
+    assert_eq!(glob.preview.lines().last(), Some("[… 497 more .rs files]"));
+    let raw_glob = String::from_utf8(cas.writes.last().expect("raw glob CAS").clone())
+        .expect("UTF-8 glob CAS");
+    assert_eq!(raw_glob.lines().count(), 500);
+    assert_eq!(raw_glob.lines().last(), Some("entry-499.rs"));
 
     let (mut refused, observer) = broker(&workspace, "refused", 2);
     let error = refused
@@ -1015,9 +1019,8 @@ async fn landed_write_with_ledger_failure_still_updates_freshness() {
     );
 }
 
-/// MUTATION CHECK: alter the legacy result projection while adding freshness.
-/// Expected RUNTIME failure: one of the exact old preview/flag/ref assertions
-/// differs despite C1-only options being unused.
+/// MUTATION CHECK: alter the legacy preview/flags or remove the E4 owner re-read
+/// handle. Expected RUNTIME failure: one of these exact assertions differs.
 #[tokio::test]
 async fn existing_read_and_create_write_results_remain_byte_exact() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -1034,7 +1037,7 @@ async fn existing_read_and_create_write_results_remain_byte_exact() {
         .expect("read");
     assert_eq!(read.preview, "exact\n");
     assert!(!read.truncated);
-    assert!(read.artifact.is_none());
+    assert!(read.artifact.is_some());
     assert!(read.cursor.is_none());
 
     let canonical = fs::canonicalize(directory.path())
