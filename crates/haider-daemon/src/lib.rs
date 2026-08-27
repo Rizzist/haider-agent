@@ -72,10 +72,8 @@ mod image_events;
 mod lifecycle;
 mod loom_author;
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod loom_authoring_tests;
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 #[path = "loom_registry_l4_tests.rs"]
 mod loom_registry_l4_tests;
 mod loom_seed;
@@ -94,7 +92,6 @@ mod profile_vault;
 mod project_instructions;
 mod provider_registry;
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 #[path = "run_budget_tests.rs"]
 mod run_budget_tests;
 mod runtime;

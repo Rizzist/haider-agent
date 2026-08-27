@@ -830,7 +830,7 @@ fn invalid_edit_is_typed_rejected_at_the_offending_field_and_line() {
         .enumerate()
         .filter(|(_, line)| line.contains("\"required_green\""))
         .map(|(line, _)| u32::try_from(line + 1).expect("bounded test line"))
-        .next_back()
+        .last()
         .expect("required_green line");
     let errors = validate(&invalid, LoomAuthorKind::Workflow, &[]).expect_err("zero green rejects");
     assert!(errors.iter().any(|error| {
@@ -948,7 +948,7 @@ fn semantic_graph_edits_report_the_edited_field_or_containing_node() {
         .enumerate()
         .filter(|(_, line)| line.trim() == "{")
         .map(|(line, _)| u32::try_from(line + 1).expect("bounded node line"))
-        .next_back()
+        .last()
         .expect("node object line");
     let errors = validate(&missing_text, LoomAuthorKind::Workflow, &[])
         .expect_err("missing semantic evidence rejects");
@@ -1024,7 +1024,7 @@ fn agent_capability_denials_are_content_bearing_and_never_grants() {
                     .enumerate()
                     .filter(|(_, line)| line.contains("api:example.invalid:443"))
                     .map(|(line, _)| u32::try_from(line + 1).expect("bounded test line"))
-                    .next_back()
+                    .last()
                     .expect("offending grant line")
     }));
 }
