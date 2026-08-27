@@ -122,10 +122,13 @@ pub use accounts::{
 };
 pub use config::DaemonConfig;
 pub use diagnostics::{BUILD_UUID, BUILD_VERSION, process_started_unix_ms};
+pub use endpoint::DAEMON_PID_FILE;
 pub use error::{DaemonError, IncumbentDiagnostics};
 pub use gcloud::{GcloudAccessTokenSource, GcloudCli};
 pub use haider_tools::MonitorSourceKind;
-pub use lifecycle::{DaemonState, Readiness, ShutdownDisposition, ShutdownHandle, ShutdownOutcome};
+pub use lifecycle::{
+    DaemonState, Readiness, ShutdownDisposition, ShutdownHandle, ShutdownOutcome, ShutdownReason,
+};
 pub use monitor::{
     MAX_MONITORS_PER_SESSION, MAX_PENDING_MONITOR_REPORTS_PER_SESSION, MONITOR_COALESCE_WINDOW,
     MONITOR_RATE_LIMIT_MATCHES, MONITOR_RATE_LIMIT_WINDOW, MonitorDeliveryReceipt,
@@ -144,8 +147,8 @@ pub use profile_vault::{ProfileVault, scoped_vault_alias};
 pub use provider_registry::{ProductionProviderEndpointValidator, ProviderEndpointValidator};
 pub use runtime::{
     DaemonTask, DaemonTaskDiagnosticSnapshot, DaemonTaskDiagnostics, run_with_signals,
-    run_with_signals_and_dependencies, run_with_signals_and_dependencies_and_readiness, spawn,
-    spawn_with_dependencies,
+    run_with_signals_and_dependencies, run_with_signals_and_dependencies_and_readiness,
+    run_with_signals_and_dependencies_and_readiness_and_liveness, spawn, spawn_with_dependencies,
 };
 pub use session_hub::{
     AdmissionTicket, FrameSendError, FrameSink, HubConnection, HubObservation, HubStoreHandle,

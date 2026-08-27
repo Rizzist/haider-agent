@@ -14,7 +14,8 @@ pub struct DaemonConfig {
     pub profile_id: String,
     /// Root of the profile store — the lifetime lock and SQLite journal.
     pub store_dir: PathBuf,
-    /// Per-user runtime directory (forced to `0700`) holding the socket (R2).
+    /// Per-profile runtime directory (forced to `0700`) holding the socket,
+    /// pid file, and daemon temporary directory (R2).
     pub runtime_dir: PathBuf,
     /// Maximum inbound frame size; also advertised in `Welcome.frame_limit`,
     /// so it must fit `u32`.
@@ -103,14 +104,13 @@ impl DaemonConfig {
         }
     }
 
-    /// Fixed-length, profile-derived rendezvous path (R2).
+    /// Fixed-length rendezvous path inside the profile-derived runtime (R2).
     ///
     /// Delegates to the ONE shared derivation in `haider-client`
     /// (`endpoint_path_for`), which both `haider` and `haiderd` resolve
-    /// through — the R8 no-duplicated-path-logic law. Hashing the profile id
-    /// keeps the socket name a constant 32 hex chars regardless of
-    /// profile-id length or charset, which protects the tight OS limit on
-    /// Unix socket path length (`sun_path`, ~104 bytes on macOS).
+    /// through — the R8 no-duplicated-path-logic law. The runtime directory
+    /// carries the profile scope and the fixed short basename protects the
+    /// tight Unix socket path limit (`sun_path`, ~104 bytes on macOS).
     pub fn endpoint_path(&self) -> PathBuf {
         haider_client::endpoint_path_for(&self.runtime_dir, &self.profile_id)
     }

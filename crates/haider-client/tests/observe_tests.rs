@@ -89,6 +89,7 @@ fn profile() -> (tempfile::TempDir, ResolvedProfile) {
         profile_dir: Some(root.path().join("profile")),
         home: None,
         model: None,
+        runtime_dir: None,
         xdg_runtime_dir: None,
     })
     .expect("resolve profile");

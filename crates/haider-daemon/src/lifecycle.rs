@@ -151,8 +151,47 @@ impl StatePublisher {
 #[derive(Debug, Clone)]
 pub(crate) enum ShutdownRequest {
     None,
-    Graceful { reason: String },
-    Forced { reason: String },
+    Graceful {
+        reason: ShutdownReason,
+    },
+    /// The ephemeral launcher vanished. Start the ordinary graceful barrier
+    /// only after every currently or subsequently attached client is gone.
+    GracefulWhenIdle {
+        reason: ShutdownReason,
+    },
+    Forced {
+        reason: ShutdownReason,
+    },
+}
+
+/// Typed origin retained by the shutdown control journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShutdownReason {
+    /// The client process that spawned an ephemeral daemon disappeared.
+    ClientVanished,
+    /// Existing signal/RPC/internal reasons preserved verbatim.
+    Message(String),
+}
+
+impl std::fmt::Display for ShutdownReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ClientVanished => formatter.write_str("spawning client vanished"),
+            Self::Message(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+impl From<String> for ShutdownReason {
+    fn from(reason: String) -> Self {
+        Self::Message(reason)
+    }
+}
+
+impl From<&str> for ShutdownReason {
+    fn from(reason: &str) -> Self {
+        Self::Message(reason.to_owned())
+    }
 }
 
 /// What one [`ShutdownHandle::request`] call did (first vs. later request).
@@ -226,7 +265,7 @@ impl ShutdownHandle {
 
     /// First request starts draining; every later request forces termination.
     pub fn request(&self, reason: impl Into<String>) -> ShutdownDisposition {
-        let reason = reason.into();
+        let reason = ShutdownReason::Message(reason.into());
         let _transition = lock_transition(&self.inner);
         let prior = self.inner.requests.load(Ordering::Acquire);
         self.inner
@@ -243,6 +282,20 @@ impl ShutdownHandle {
                 .send_replace(ShutdownRequest::Forced { reason });
             ShutdownDisposition::Forced
         }
+    }
+
+    /// Records an ephemeral launcher death without disconnecting unrelated
+    /// live clients. Returns whether this installed the first shutdown demand.
+    pub(crate) fn request_when_idle(&self, reason: ShutdownReason) -> bool {
+        let _transition = lock_transition(&self.inner);
+        if self.inner.requests.load(Ordering::Acquire) != 0 {
+            return false;
+        }
+        self.inner.requests.store(1, Ordering::Release);
+        self.inner
+            .sender
+            .send_replace(ShutdownRequest::GracefulWhenIdle { reason });
+        true
     }
 }
 

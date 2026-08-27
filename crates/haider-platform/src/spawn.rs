@@ -11,6 +11,9 @@ mod readiness_tests;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 
 #[cfg(windows)]
+use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+
+#[cfg(windows)]
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
 pub const DAEMON_LOG_DIRECTORY: &str = "daemon-logs";
@@ -18,10 +21,13 @@ pub const DAEMON_LOG_FILE: &str = "daemon.log";
 pub const DAEMON_LOG_RETENTION: usize = 32;
 pub const DAEMON_LOG_PATH_ENV: &str = "HAIDER_DAEMON_PROCESS_LOG";
 pub const DAEMON_READINESS_ARG: &str = "--startup-ready";
+pub const DAEMON_LIVENESS_ARG: &str = "--launcher-liveness";
 #[cfg(unix)]
 const DAEMON_READINESS_TOKEN: &str = "3";
 #[cfg(windows)]
 const DAEMON_READINESS_TOKEN: &str = "stdin";
+#[cfg(unix)]
+const DAEMON_LIVENESS_TOKEN: &str = "4";
 static LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Fully resolved inputs for launching the packaged sibling daemon.
@@ -47,6 +53,25 @@ pub enum DaemonSpawnError {
 pub struct SpawnedDaemon {
     pub child: Child,
     pub readiness: DaemonReadiness,
+}
+
+/// Launcher-owned half of an ephemeral daemon's process-liveness channel.
+///
+/// On Unix the open writer is the proof that the launcher still exists. On
+/// Windows the daemon waits on an inherited handle to the launcher process;
+/// this marker keeps the ownership contract explicit at the call site even
+/// though process termination, rather than handle closure, is the signal.
+pub struct DaemonLivenessGuard {
+    #[cfg(unix)]
+    _writer: OwnedFd,
+}
+
+/// Daemon-owned half of an ephemeral launcher's process-liveness channel.
+pub struct DaemonLivenessWatcher {
+    #[cfg(unix)]
+    reader: OwnedFd,
+    #[cfg(windows)]
+    launcher: OwnedHandle,
 }
 
 /// The launcher side of a one-byte daemon readiness notification.
@@ -81,10 +106,10 @@ impl DaemonReadiness {
             if read == 1 && byte == [1] {
                 return Ok(());
             }
-            return Err(std::io::Error::new(
+            Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "daemon readiness channel closed without a notification",
-            ));
+            ))
         }
         #[cfg(windows)]
         {
@@ -181,6 +206,112 @@ impl DaemonReadyNotifier {
 
             let mut pipe = self.pipe;
             pipe.write_all(&[1])
+        }
+    }
+}
+
+impl DaemonLivenessWatcher {
+    /// Adopts the liveness coordinate inherited from an ephemeral launcher.
+    #[allow(unsafe_code)]
+    pub fn from_spawn_token(token: &str) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            if token != DAEMON_LIVENESS_TOKEN {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid launcher-liveness descriptor",
+                ));
+            }
+            // SAFETY: the launcher moves its owned pipe reader to descriptor 4
+            // in `pre_exec` and passes exactly that descriptor in argv. This is
+            // the daemon's first and only adoption of it.
+            let reader = unsafe { OwnedFd::from_raw_fd(4) };
+            rustix::io::fcntl_setfd(&reader, rustix::io::FdFlags::CLOEXEC)
+                .map_err(std::io::Error::from)?;
+            Ok(Self { reader })
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+
+            let raw = token.parse::<usize>().map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid launcher process handle: {error}"),
+                )
+            })? as std::os::windows::io::RawHandle;
+            if raw.is_null() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "launcher process handle is null",
+                ));
+            }
+            // SAFETY: the launcher passes the numeric value of the real,
+            // inheritable process handle copied into this daemon by
+            // CreateProcess. This is the child's first and only adoption.
+            let launcher = unsafe { OwnedHandle::from_raw_handle(raw) };
+            if unsafe {
+                SetHandleInformation(launcher.as_raw_handle().cast(), HANDLE_FLAG_INHERIT, 0)
+            } == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Self { launcher })
+        }
+    }
+
+    /// Waits for the launcher to disappear. No client cleanup code is needed:
+    /// Unix reports EOF after the last writer closes, while Windows signals
+    /// the inherited process handle for every exit path, including kill.
+    pub async fn wait(self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            let reader = tokio::io::unix::AsyncFd::new(self.reader)?;
+            let mut byte = [0_u8; 1];
+            let read = reader
+                .async_io(tokio::io::Interest::READABLE, |reader| {
+                    rustix::io::read(reader, &mut byte).map_err(std::io::Error::from)
+                })
+                .await?;
+            if read == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "launcher-liveness channel carried unexpected data",
+                ))
+            }
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0};
+            use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            std::thread::Builder::new()
+                .name("haider-launcher-liveness".into())
+                .spawn(move || {
+                    let result = unsafe {
+                        WaitForSingleObject(self.launcher.as_raw_handle().cast(), INFINITE)
+                    };
+                    let outcome = match result {
+                        WAIT_OBJECT_0 => Ok(()),
+                        WAIT_FAILED => Err(std::io::Error::last_os_error()),
+                        other => Err(std::io::Error::other(format!(
+                            "launcher process wait returned unexpected status {other}"
+                        ))),
+                    };
+                    let _ = sender.send(outcome);
+                })
+                .map_err(|error| {
+                    std::io::Error::new(
+                        error.kind(),
+                        format!("could not start launcher-liveness thread: {error}"),
+                    )
+                })?;
+            receiver.await.map_err(|error| {
+                std::io::Error::other(format!("launcher-liveness thread failed: {error}"))
+            })?
         }
     }
 }
@@ -323,7 +454,7 @@ impl std::error::Error for DaemonSpawnError {
 /// Spawns the sibling daemon with its fixed argv/stdout/stderr contract and
 /// the platform's detach + inheritance hygiene.
 pub fn spawn_daemon(spec: DaemonSpawn<'_>) -> Result<Child, DaemonSpawnError> {
-    spawn_daemon_with_stderr(spec, false, None)
+    spawn_daemon_with_stderr(spec, false, None, None)
 }
 
 /// Spawns a daemon with a private one-shot readiness notification.
@@ -335,11 +466,39 @@ pub fn spawn_daemon_with_readiness(
     let coordinate = prepared
         .child_coordinate()
         .map_err(DaemonSpawnError::Readiness)?;
-    let child = spawn_daemon_with_stderr(spec, false, Some((&token, coordinate)))?;
+    let child = spawn_daemon_with_stderr(spec, false, Some((&token, coordinate)), None)?;
     Ok(SpawnedDaemon {
         child,
         readiness: prepared.into_receiver(),
     })
+}
+
+/// Spawns an ephemeral daemon with F1's unchanged readiness notification plus
+/// a reverse channel that independently proves launcher process liveness.
+pub fn spawn_daemon_with_readiness_and_liveness(
+    spec: DaemonSpawn<'_>,
+) -> Result<(SpawnedDaemon, DaemonLivenessGuard), DaemonSpawnError> {
+    let readiness = prepare_readiness().map_err(DaemonSpawnError::Readiness)?;
+    let readiness_token = readiness.token().to_owned();
+    let readiness_coordinate = readiness
+        .child_coordinate()
+        .map_err(DaemonSpawnError::Readiness)?;
+    let liveness = prepare_liveness().map_err(DaemonSpawnError::Readiness)?;
+    let liveness_token = liveness.token().to_owned();
+    let liveness_coordinate = liveness.child_coordinate();
+    let child = spawn_daemon_with_stderr(
+        spec,
+        false,
+        Some((&readiness_token, readiness_coordinate)),
+        Some((&liveness_token, liveness_coordinate)),
+    )?;
+    Ok((
+        SpawnedDaemon {
+            child,
+            readiness: readiness.into_receiver(),
+        },
+        liveness.into_guard(),
+    ))
 }
 
 /// Test/diagnostic variant of [`spawn_daemon`] that leaves the child's stderr
@@ -350,14 +509,19 @@ pub fn spawn_daemon_with_readiness(
 /// cannot block on a full pipe.
 #[doc(hidden)]
 pub fn spawn_daemon_with_piped_stderr(spec: DaemonSpawn<'_>) -> Result<Child, DaemonSpawnError> {
-    spawn_daemon_with_stderr(spec, true, None)
+    spawn_daemon_with_stderr(spec, true, None, None)
 }
 
 fn spawn_daemon_with_stderr(
     spec: DaemonSpawn<'_>,
     pipe_stderr: bool,
     readiness: Option<(&str, ReadinessChildCoordinate)>,
+    liveness: Option<(&str, LivenessChildCoordinate)>,
 ) -> Result<Child, DaemonSpawnError> {
+    // The daemon creates this directory only after it owns the profile lock.
+    // Merely naming it here keeps a launcher killed before `exec` from
+    // leaving an empty runtime tree behind.
+    let runtime_temp = spec.runtime_dir.join("tmp");
     let mut log_options = std::fs::OpenOptions::new();
     log_options.create(true).append(true);
     #[cfg(unix)]
@@ -387,11 +551,22 @@ fn spawn_daemon_with_stderr(
     if let Some((token, _)) = readiness.as_ref() {
         command.arg(DAEMON_READINESS_ARG).arg(*token);
     }
+    if let Some((token, _)) = liveness.as_ref() {
+        command.arg(DAEMON_LIVENESS_ARG).arg(*token);
+    }
+    #[cfg(unix)]
+    command.env("TMPDIR", &runtime_temp);
+    #[cfg(windows)]
+    command.env("TEMP", &runtime_temp).env("TMP", &runtime_temp);
 
     #[cfg(unix)]
     {
         command.stdin(Stdio::null());
-        configure_daemon(&mut command, readiness.map(|(_, coordinate)| coordinate));
+        configure_daemon(
+            &mut command,
+            readiness.map(|(_, coordinate)| coordinate),
+            liveness.map(|(_, coordinate)| coordinate),
+        );
         command.spawn().map_err(DaemonSpawnError::Spawn)
     }
     #[cfg(windows)]
@@ -409,6 +584,12 @@ type ReadinessChildCoordinate = std::os::raw::c_int;
 #[cfg(windows)]
 type ReadinessChildCoordinate = std::fs::File;
 
+#[cfg(unix)]
+type LivenessChildCoordinate = std::os::raw::c_int;
+
+#[cfg(windows)]
+type LivenessChildCoordinate = ();
+
 struct PreparedReadiness {
     token: String,
     receiver: DaemonReadiness,
@@ -416,6 +597,34 @@ struct PreparedReadiness {
     writer: OwnedFd,
     #[cfg(windows)]
     writer: std::fs::File,
+}
+
+struct PreparedLiveness {
+    token: String,
+    guard: DaemonLivenessGuard,
+    #[cfg(unix)]
+    reader: OwnedFd,
+    #[cfg(windows)]
+    _launcher: OwnedHandle,
+}
+
+impl PreparedLiveness {
+    fn token(&self) -> &str {
+        &self.token
+    }
+
+    fn child_coordinate(&self) -> LivenessChildCoordinate {
+        #[cfg(unix)]
+        {
+            self.reader.as_raw_fd()
+        }
+        #[cfg(windows)]
+        {}
+    }
+
+    fn into_guard(self) -> DaemonLivenessGuard {
+        self.guard
+    }
 }
 
 impl PreparedReadiness {
@@ -451,16 +660,29 @@ fn prepare_readiness() -> std::io::Result<PreparedReadiness> {
     })
 }
 
+#[cfg(unix)]
+fn prepare_liveness() -> std::io::Result<PreparedLiveness> {
+    let (reader, writer) = readiness_pipe()?;
+    let reader = readiness_writer_above_stdio(&reader)?;
+    Ok(PreparedLiveness {
+        token: DAEMON_LIVENESS_TOKEN.to_owned(),
+        guard: DaemonLivenessGuard { _writer: writer },
+        reader,
+    })
+}
+
 #[cfg(all(unix, not(target_os = "espidf")))]
 fn readiness_writer_above_stdio(writer: &OwnedFd) -> std::io::Result<OwnedFd> {
-    rustix::io::fcntl_dupfd_cloexec(writer, 3).map_err(std::io::Error::from)
+    // Keep both source descriptors above the fixed daemon coordinates 3 and
+    // 4, so installing one can never overwrite the other's source.
+    rustix::io::fcntl_dupfd_cloexec(writer, 5).map_err(std::io::Error::from)
 }
 
 #[cfg(all(unix, target_os = "espidf"))]
 fn readiness_writer_above_stdio(writer: &OwnedFd) -> std::io::Result<OwnedFd> {
     // ESP-IDF lacks F_DUPFD_CLOEXEC. Duplicate above stdio, then apply the
     // same immediate CLOEXEC fallback used by its pipe creation path.
-    let duplicated = rustix::io::fcntl_dupfd(writer, 3).map_err(std::io::Error::from)?;
+    let duplicated = rustix::io::fcntl_dupfd(writer, 5).map_err(std::io::Error::from)?;
     rustix::io::fcntl_setfd(&duplicated, rustix::io::FdFlags::CLOEXEC)
         .map_err(std::io::Error::from)?;
     Ok(duplicated)
@@ -537,10 +759,44 @@ fn prepare_readiness() -> std::io::Result<PreparedReadiness> {
     })
 }
 
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn prepare_liveness() -> std::io::Result<PreparedLiveness> {
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcessId, OpenProcess};
+
+    // Frozen Win32 access-right bit. Pin it locally because windows-sys has
+    // moved the public module home of SYNCHRONIZE between supported releases.
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+
+    let raw = unsafe { OpenProcess(SYNCHRONIZE, 1, GetCurrentProcessId()) };
+    if raw.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: OpenProcess returned one newly owned real handle.
+    let launcher = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
+    if unsafe {
+        SetHandleInformation(
+            launcher.as_raw_handle().cast(),
+            HANDLE_FLAG_INHERIT,
+            HANDLE_FLAG_INHERIT,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(PreparedLiveness {
+        token: (launcher.as_raw_handle() as usize).to_string(),
+        guard: DaemonLivenessGuard {},
+        _launcher: launcher,
+    })
+}
+
 #[cfg(unix)]
 fn configure_daemon(
     command: &mut std::process::Command,
     readiness: Option<ReadinessChildCoordinate>,
+    liveness: Option<LivenessChildCoordinate>,
 ) {
     use std::os::unix::process::CommandExt as _;
     command.process_group(0);
@@ -549,8 +805,8 @@ fn configure_daemon(
     #[allow(unsafe_code)]
     unsafe {
         command.pre_exec(move || {
-            if let Some(readiness) = readiness {
-                crate::process::install_daemon_readiness_descriptor(readiness)?;
+            if readiness.is_some() || liveness.is_some() {
+                crate::process::install_daemon_spawn_descriptors(readiness, liveness)?;
             } else {
                 crate::process::close_inherited_descriptors();
             }

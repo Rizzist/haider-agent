@@ -409,6 +409,7 @@ impl RestartFixture {
             profile_dir: Some(root.path().join("profile")),
             home: None,
             model: None,
+            runtime_dir: None,
             xdg_runtime_dir: None,
         })
         .expect("resolve update profile");
@@ -780,6 +781,7 @@ fn resolved_test_profile(path: PathBuf) -> ResolvedProfile {
         profile_dir: Some(path),
         home: None,
         model: None,
+        runtime_dir: None,
         xdg_runtime_dir: None,
     })
     .expect("resolve test profile")

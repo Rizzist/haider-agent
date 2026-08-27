@@ -7,7 +7,7 @@
 use haider_daemon::{
     BUILD_UUID, BUILD_VERSION, DaemonConfig, DaemonDependencies, ProviderFactory,
     ProviderFactoryConfig, ResolvedTurnProvider, ShutdownOutcome, process_started_unix_ms,
-    run_with_signals_and_dependencies_and_readiness,
+    run_with_signals_and_dependencies_and_readiness_and_liveness,
 };
 use haider_protocol::error::HaiderError;
 use haider_protocol::session::SessionMetadataV1;
@@ -56,8 +56,14 @@ const DAEMON_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 #[cfg(not(windows))]
 fn main() -> ExitCode {
     initialize_process_diagnostics();
+    let Some(parsed) = (match prepare_dispatch() {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
+    }) else {
+        return ExitCode::SUCCESS;
+    };
     match daemon_runtime() {
-        Ok(runtime) => runtime.block_on(dispatch()),
+        Ok(runtime) => runtime.block_on(dispatch(parsed)),
         Err(error) => {
             eprintln!("haiderd: could not start async runtime: {error}");
             ExitCode::from(EX_SOFTWARE)
@@ -72,10 +78,16 @@ fn main() -> ExitCode {
 #[cfg(windows)]
 fn main() -> ExitCode {
     initialize_process_diagnostics();
+    let Some(parsed) = (match prepare_dispatch() {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
+    }) else {
+        return ExitCode::SUCCESS;
+    };
     let launched = std::thread::Builder::new()
         .name("haiderd-main".into())
         .stack_size(DAEMON_THREAD_STACK_BYTES)
-        .spawn(|| daemon_runtime().map(|runtime| runtime.block_on(dispatch())));
+        .spawn(move || daemon_runtime().map(|runtime| runtime.block_on(dispatch(parsed))));
     match launched {
         Ok(thread) => match thread.join() {
             Ok(Ok(code)) => code,
@@ -125,19 +137,41 @@ fn initialize_process_diagnostics() {
     }));
 }
 
-async fn dispatch() -> ExitCode {
+fn prepare_dispatch() -> Result<Option<ParsedArgs>, ExitCode> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if matches!(args.as_slice(), [argument] if argument == "--version") {
         println!("haiderd {}", env!("CARGO_PKG_VERSION"));
-        return ExitCode::SUCCESS;
+        return Ok(None);
     }
     let parsed = match parse_args(args.into_iter()) {
         Ok(parsed) => parsed,
         Err(message) => {
             eprintln!("haiderd: {message}");
-            return ExitCode::from(64);
+            return Err(ExitCode::from(64));
         }
     };
+    configure_runtime_temp(&parsed.config.runtime_dir);
+    Ok(Some(parsed))
+}
+
+#[allow(unsafe_code)]
+fn configure_runtime_temp(runtime_dir: &std::path::Path) {
+    let temp = runtime_dir.join("tmp");
+    // SAFETY: process entry calls this before constructing Tokio or spawning
+    // the Windows entry thread, so no other thread can read the environment
+    // while these process-wide variables are updated.
+    unsafe {
+        #[cfg(unix)]
+        std::env::set_var("TMPDIR", &temp);
+        #[cfg(windows)]
+        {
+            std::env::set_var("TEMP", &temp);
+            std::env::set_var("TMP", &temp);
+        }
+    }
+}
+
+async fn dispatch(parsed: ParsedArgs) -> ExitCode {
     let dependencies = match test_dependencies() {
         Ok(dependencies) => dependencies,
         Err(message) => {
@@ -145,10 +179,11 @@ async fn dispatch() -> ExitCode {
             return ExitCode::from(64);
         }
     };
-    match run_with_signals_and_dependencies_and_readiness(
+    match run_with_signals_and_dependencies_and_readiness_and_liveness(
         parsed.config,
         dependencies,
         parsed.readiness,
+        parsed.liveness,
     )
     .await
     {
@@ -248,6 +283,7 @@ impl ProviderFactory for FakeFactory {
 struct ParsedArgs {
     config: DaemonConfig,
     readiness: Option<haider_platform::DaemonReadyNotifier>,
+    liveness: Option<haider_platform::DaemonLivenessWatcher>,
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<ParsedArgs, String> {
@@ -255,6 +291,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ParsedArgs, String> 
     let mut store_dir = None;
     let mut runtime_dir = None;
     let mut readiness = None;
+    let mut liveness = None;
     let mut args = args;
     while let Some(argument) = args.next() {
         let value = args
@@ -265,6 +302,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ParsedArgs, String> 
             "--store-dir" => store_dir = Some(PathBuf::from(value)),
             "--runtime-dir" => runtime_dir = Some(PathBuf::from(value)),
             haider_platform::DAEMON_READINESS_ARG => readiness = Some(value),
+            haider_platform::DAEMON_LIVENESS_ARG => liveness = Some(value),
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -311,7 +349,15 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ParsedArgs, String> 
         .map(|token| haider_platform::DaemonReadyNotifier::from_spawn_token(&token))
         .transpose()
         .map_err(|error| format!("invalid startup readiness coordinate: {error}"))?;
-    Ok(ParsedArgs { config, readiness })
+    let liveness = liveness
+        .map(|token| haider_platform::DaemonLivenessWatcher::from_spawn_token(&token))
+        .transpose()
+        .map_err(|error| format!("invalid launcher-liveness coordinate: {error}"))?;
+    Ok(ParsedArgs {
+        config,
+        readiness,
+        liveness,
+    })
 }
 
 #[cfg(test)]

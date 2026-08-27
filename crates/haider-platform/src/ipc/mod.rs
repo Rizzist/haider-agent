@@ -16,11 +16,32 @@ pub use windows::{
     peer_credentials, peer_is_owner, split, sweep_stale_endpoints, write_immediate,
 };
 
+/// Creates and validates one profile's private runtime and temporary
+/// directories without binding its endpoint.
+#[cfg(unix)]
+pub fn prepare_runtime_directory(runtime_dir: &Path) -> Result<(), EndpointError> {
+    unix::prepare_runtime_directory(runtime_dir)
+}
+
+/// Windows named pipes do not use the filesystem runtime for rendezvous, but
+/// the profile-local pid and temporary files still do.
+#[cfg(windows)]
+pub fn prepare_runtime_directory(runtime_dir: &Path) -> Result<(), EndpointError> {
+    let temp = runtime_dir.join("tmp");
+    std::fs::create_dir_all(&temp)
+        .map_err(|error| EndpointError::io("create profile runtime directories", &temp, error))?;
+    crate::set_mode(runtime_dir, 0o700).map_err(|error| {
+        EndpointError::io("secure profile runtime directory", runtime_dir, error)
+    })?;
+    crate::set_mode(&temp, 0o700)
+        .map_err(|error| EndpointError::io("secure daemon temporary directory", &temp, error))
+}
+
 /// One deterministic per-profile rendezvous name.
 ///
-/// The digest is deliberately the same on every operating system. Unix joins
-/// the historical socket basename under the runtime directory; Windows maps
-/// that digest to a named pipe.
+/// Unix uses a fixed basename because the containing directory is already
+/// profile-scoped. Windows has no filesystem rendezvous directory, so it maps
+/// a profile digest to a named pipe instead.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Endpoint {
     address: PathBuf,
@@ -29,12 +50,15 @@ pub struct Endpoint {
 impl Endpoint {
     #[must_use]
     pub fn new(runtime_dir: impl AsRef<Path>, profile_id: &str) -> Self {
-        let digest = blake3::hash(profile_id.as_bytes()).to_hex();
-        let short = &digest.as_str()[..32];
         #[cfg(unix)]
-        let address = runtime_dir.as_ref().join(format!("haider-{short}.sock"));
+        let address = {
+            let _ = profile_id;
+            runtime_dir.as_ref().join("h.sock")
+        };
         #[cfg(windows)]
         let address = {
+            let digest = blake3::hash(profile_id.as_bytes()).to_hex();
+            let short = &digest.as_str()[..32];
             let _ = runtime_dir;
             PathBuf::from(format!(r"\\.\pipe\haider-{short}"))
         };
@@ -152,15 +176,11 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn unix_endpoint_keeps_the_historical_name() {
+    fn unix_endpoint_uses_the_short_profile_scoped_name() {
         let profile = "profile-alpha";
-        let digest = blake3::hash(profile.as_bytes()).to_hex();
         assert_eq!(
             Endpoint::new("/tmp/haider-7", profile).address(),
-            Path::new(&format!(
-                "/tmp/haider-7/haider-{}.sock",
-                &digest.as_str()[..32]
-            ))
+            Path::new("/tmp/haider-7/h.sock")
         );
     }
 

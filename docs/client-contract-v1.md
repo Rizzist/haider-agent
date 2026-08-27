@@ -112,17 +112,20 @@ published here for independent implementations, not as permission to diverge.
 3. Compute `profile_id` as lowercase BLAKE3 hex over the exact byte string
    `haider-profile-id-v1\n` followed by the canonical UTF-8 store path, with no
    separator added after the path.
-4. Select the runtime directory. `HAIDER_RUNTIME_DIR` is intentionally ignored.
-   On Linux, use `$XDG_RUNTIME_DIR/haider` only when `XDG_RUNTIME_DIR` is a real
-   directory owned by the effective UID with mode `0700`; otherwise use
-   `/tmp/haider-<effective-uid>`. macOS and other Unix targets always use that
-   `/tmp` form. Windows uses the process temporary directory joined with
-   `haider`, although its named-pipe address does not contain that path.
-5. Compute lowercase BLAKE3 of the UTF-8 `profile_id`, take the first 32 hex
-   characters, and form:
-
-   - Unix: `<runtime_dir>/haider-<32hex>.sock`
-   - Windows: `\\.\pipe\haider-<32hex>`
+4. Select a runtime root: `HAIDER_RUNTIME_DIR` when set (for gates/CI), else a
+   verified owner-private `$XDG_RUNTIME_DIR/haider` on Linux, a verified
+   `$TMPDIR/haider` or `$PREFIX/tmp/haider` on Unix, the per-UID
+   `/tmp/haider-<effective-uid>` fallback, or the Windows process temporary
+   directory joined with `haider`. The actual runtime directory is always the
+   root plus the first 20 hex characters of `profile_id`; it is mode `0700`
+   and contains that profile's socket, `haiderd.pid`, and daemon `tmp/`
+   directory, so unrelated profiles never share writable runtime state.
+5. On Unix, form `<runtime_dir>/h.sock`; the containing directory already
+   supplies the profile identity and the fixed basename preserves room under
+   the platform `sockaddr_un` limit. On Windows, compute lowercase BLAKE3 of
+   the UTF-8 `profile_id`, take the first 32 hex characters, and form
+   `\\.\pipe\haider-<32hex>`; the profile-scoped filesystem runtime still
+   holds its pid and temporary files.
 
 The endpoint name is the discovery mechanism. Do not scan the runtime
 directory and do not parse lock files. Connect first. Only a missing or
