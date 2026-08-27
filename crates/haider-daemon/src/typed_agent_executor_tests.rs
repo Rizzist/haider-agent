@@ -144,7 +144,7 @@ fn cli_free_type_needs_no_install_job() {
 #[test]
 fn pinned_open_node_selects_its_type_without_model_arguments() {
     let ast = parse_pipe("typed-flow: Question -> Sources\nresearch @researcher \"find sources\"");
-    let mut workflow = compile_pipe(&ast, |id| {
+    let mut workflow = compile_pipe(&ast, |id: &str| {
         (id == "researcher").then(|| LoomTypeSig {
             in_type: "Question".into(),
             out_type: "Sources".into(),

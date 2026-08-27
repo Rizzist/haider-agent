@@ -10,11 +10,12 @@
 mod tests;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fs::{self, File, OpenOptions};
 use std::future::{Future, pending};
-use std::io::Read as _;
-use std::path::Path;
+use std::io::{BufRead as _, BufReader, BufWriter, Read as _, Write as _};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -43,6 +44,9 @@ use haider_rpc::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt as _;
 
 use crate::client::{
     ClientConfig, ClientError, ConnectionState, DisconnectReason, RpcClient, connect,
@@ -424,7 +428,8 @@ pub struct HeadlessSessionConfig {
 }
 
 /// Incremental facts exposed to output adapters.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum HeadlessEvent {
     /// Durable turn acceptance, emitted before any replayed/model envelope.
     Accepted {
@@ -828,6 +833,156 @@ enum ApplyStatus {
     Applied,
 }
 
+struct HeadlessEventSpoolWriter {
+    file: BufWriter<File>,
+    io_gate: Arc<Mutex<()>>,
+    ready: mpsc::Sender<()>,
+    output_open: Arc<AtomicBool>,
+    error: Arc<Mutex<Option<String>>>,
+    _cleanup: Arc<HeadlessEventSpoolCleanup>,
+}
+
+struct HeadlessEventSpoolReader {
+    file: BufReader<File>,
+    io_gate: Arc<Mutex<()>>,
+    _cleanup: Arc<HeadlessEventSpoolCleanup>,
+}
+
+struct HeadlessEventSpoolCleanup {
+    path: PathBuf,
+}
+
+impl Drop for HeadlessEventSpoolCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+struct HeadlessEventSpool {
+    writer: HeadlessEventSpoolWriter,
+    reader: HeadlessEventSpoolReader,
+    pending: mpsc::Receiver<()>,
+    output_open: Arc<AtomicBool>,
+    error: Arc<Mutex<Option<String>>>,
+}
+
+impl HeadlessEventSpoolWriter {
+    fn push(&mut self, event: &HeadlessEvent) {
+        if !self.output_open.load(Ordering::Relaxed) {
+            return;
+        }
+        let _io_guard = match self.io_gate.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let written = serde_json::to_writer(&mut self.file, event)
+            .map_err(std::io::Error::other)
+            .and_then(|()| self.file.write_all(b"\n"))
+            .and_then(|()| self.file.flush());
+        if let Err(error) = written {
+            self.output_open.store(false, Ordering::Relaxed);
+            match self.error.lock() {
+                Ok(mut slot) => *slot = Some(error.to_string()),
+                Err(poisoned) => *poisoned.into_inner() = Some(error.to_string()),
+            }
+            return;
+        }
+        let _ = self.ready.try_send(());
+    }
+}
+
+fn create_headless_event_spool() -> Result<HeadlessEventSpool, HeadlessRunError> {
+    let path = std::env::temp_dir().join(format!("{}.jsonl", command_id("haider-events")));
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options
+        .open(&path)
+        .map_err(|error| HeadlessRunError::Protocol {
+            stage: "event spool",
+            message: format!("cannot create private event spool: {error}"),
+        })?;
+    let reader = match File::open(&path) {
+        Ok(reader) => BufReader::new(reader),
+        Err(error) => {
+            drop(file);
+            let _ = fs::remove_file(&path);
+            return Err(HeadlessRunError::Protocol {
+                stage: "event spool",
+                message: format!("cannot open event spool reader: {error}"),
+            });
+        }
+    };
+    let (ready, pending) = mpsc::channel(1);
+    let output_open = Arc::new(AtomicBool::new(true));
+    let error = Arc::new(Mutex::new(None));
+    let io_gate = Arc::new(Mutex::new(()));
+    let cleanup = Arc::new(HeadlessEventSpoolCleanup { path });
+    Ok(HeadlessEventSpool {
+        writer: HeadlessEventSpoolWriter {
+            file: BufWriter::new(file),
+            io_gate: Arc::clone(&io_gate),
+            ready,
+            output_open: Arc::clone(&output_open),
+            error: Arc::clone(&error),
+            _cleanup: Arc::clone(&cleanup),
+        },
+        reader: HeadlessEventSpoolReader {
+            file: reader,
+            io_gate,
+            _cleanup: cleanup,
+        },
+        pending,
+        output_open,
+        error,
+    })
+}
+
+async fn forward_spooled_events(
+    mut reader: HeadlessEventSpoolReader,
+    mut pending: mpsc::Receiver<()>,
+    output: mpsc::Sender<HeadlessEvent>,
+    output_open: Arc<AtomicBool>,
+) -> Result<(), String> {
+    loop {
+        let mut record = Vec::new();
+        loop {
+            let read = {
+                let _io_guard = match reader.io_gate.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                reader
+                    .file
+                    .read_until(b'\n', &mut record)
+                    .map_err(|error| format!("cannot read event spool: {error}"))?
+            };
+            if read == 0 {
+                break;
+            }
+            if record.last() != Some(&b'\n') {
+                let rewind = i64::try_from(record.len())
+                    .map_err(|_| "event spool record exceeds the seek range".to_owned())?;
+                reader.file.seek_relative(-rewind).map_err(|error| {
+                    format!("cannot rewind partial event spool record: {error}")
+                })?;
+                break;
+            }
+            let event = serde_json::from_slice::<HeadlessEvent>(&record[..record.len() - 1])
+                .map_err(|error| format!("cannot decode event spool: {error}"))?;
+            record.clear();
+            if output.send(event).await.is_err() {
+                output_open.store(false, Ordering::Relaxed);
+                return Ok(());
+            }
+        }
+        if pending.recv().await.is_none() {
+            return Ok(());
+        }
+    }
+}
+
 struct HeadlessReducer {
     session_id: SessionId,
     run_id: Option<RunId>,
@@ -842,8 +997,7 @@ struct HeadlessReducer {
     menu_resolutions: BTreeMap<String, DurableMenuResolution>,
     cancel_observed: bool,
     actions: VecDeque<ReducerAction>,
-    output: mpsc::UnboundedSender<HeadlessEvent>,
-    output_closed: bool,
+    output: HeadlessEventSpoolWriter,
     /// W-A: task id → (name, running) from the additive task facts, in
     /// deterministic id order for the run summary.
     background_tasks: BTreeMap<String, (String, bool)>,
@@ -852,7 +1006,7 @@ struct HeadlessReducer {
 }
 
 impl HeadlessReducer {
-    fn new(session_id: SessionId, output: mpsc::UnboundedSender<HeadlessEvent>) -> Self {
+    fn new(session_id: SessionId, output: HeadlessEventSpoolWriter) -> Self {
         Self {
             session_id,
             run_id: None,
@@ -871,7 +1025,6 @@ impl HeadlessReducer {
             events: Vec::new(),
             budget_exhausted: None,
             output,
-            output_closed: false,
         }
     }
 
@@ -881,10 +1034,8 @@ impl HeadlessReducer {
             .is_some_and(|run_id| envelope.run_id.as_ref() == Some(run_id))
     }
 
-    async fn emit(&mut self, event: HeadlessEvent) {
-        if !self.output_closed && self.output.send(event).is_err() {
-            self.output_closed = true;
-        }
+    fn emit(&mut self, event: HeadlessEvent) {
+        self.output.push(&event);
     }
 
     async fn apply(&mut self, envelope: RawEnvelope) -> ApplyStatus {
@@ -898,8 +1049,7 @@ impl HeadlessReducer {
             return ApplyStatus::Gap;
         }
 
-        self.emit(HeadlessEvent::Envelope(Box::new(envelope.clone())))
-            .await;
+        self.emit(HeadlessEvent::Envelope(Box::new(envelope.clone())));
         self.last_applied = envelope.seq;
         let correlated = self.is_correlated(&envelope);
         if correlated {
@@ -964,7 +1114,7 @@ impl HeadlessReducer {
                     notice: "permission_denied_by_headless_default".into(),
                 };
                 self.permission_denials.push(denial.clone());
-                self.emit(HeadlessEvent::PermissionDenied(denial)).await;
+                self.emit(HeadlessEvent::PermissionDenied(denial));
             }
             EventPayload::Effect(EffectPhase::Authorized { effect, .. }) => {
                 self.effect_summaries.remove(effect.as_str());
@@ -1014,7 +1164,7 @@ impl HeadlessReducer {
                         notice: "permission_denied_by_headless_default".into(),
                     };
                     self.permission_denials.push(denial.clone());
-                    self.emit(HeadlessEvent::PermissionDenied(denial)).await;
+                    self.emit(HeadlessEvent::PermissionDenied(denial));
                     self.actions.push_back(ReducerAction::RejectPermission {
                         command_id: CommandId::new(command_id("headless-menu")),
                         menu_id: menu.id,
@@ -1173,32 +1323,57 @@ pub async fn run_headless_with_session_config(
 ) -> Result<HeadlessRunResult, HeadlessRunError> {
     let daemon_lifetime = ensure.daemon_lifetime;
     let daemon_ownership = Arc::new(Mutex::new(None));
-    let (reducer_output, mut pending_output) = mpsc::unbounded_channel();
-    let forwarder = tokio::spawn(async move {
-        while let Some(event) = pending_output.recv().await {
-            if output.send(event).await.is_err() {
-                break;
-            }
-        }
-    });
+    let HeadlessEventSpool {
+        writer: reducer_output,
+        reader: spool_reader,
+        pending: pending_output,
+        output_open,
+        error: spool_error,
+    } = create_headless_event_spool()?;
+    let teardown_client = ensure.client.clone();
+    let forwarder = tokio::spawn(forward_spooled_events(
+        spool_reader,
+        pending_output,
+        output,
+        output_open,
+    ));
     let result = run_headless_inner(
         profile,
-        ensure.clone(),
+        ensure,
         request,
         session_config,
         reducer_output,
         Arc::clone(&daemon_ownership),
     )
     .await;
-    let _ = forwarder.await;
+    let forwarding = match forwarder.await {
+        Ok(Ok(())) => match spool_error.lock() {
+            Ok(mut error) => error.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        }
+        .map_or(Ok(()), |message| {
+            Err(HeadlessRunError::Protocol {
+                stage: "event spool",
+                message,
+            })
+        }),
+        Ok(Err(message)) => Err(HeadlessRunError::Protocol {
+            stage: "event spool",
+            message,
+        }),
+        Err(error) => Err(HeadlessRunError::Protocol {
+            stage: "event spool",
+            message: format!("event spool forwarder failed: {error}"),
+        }),
+    };
     let teardown = if daemon_lifetime == DaemonLifetime::EphemeralIfSpawned {
-        teardown_owned_daemon(profile, &ensure, &daemon_ownership).await
+        teardown_owned_daemon(profile, &teardown_client, &daemon_ownership).await
     } else {
         Ok(())
     };
-    match (result, teardown) {
-        (Ok(result), Ok(())) => Ok(result),
-        (Ok(_), Err(error)) | (Err(error), _) => Err(error),
+    match (result, forwarding, teardown) {
+        (Ok(result), Ok(()), Ok(())) => Ok(result),
+        (Err(error), _, _) | (Ok(_), Err(error), _) | (Ok(_), Ok(()), Err(error)) => Err(error),
     }
 }
 
@@ -1224,9 +1399,9 @@ async fn lifecycle_request(
 ) -> Result<ResponseBody, HeadlessRunError> {
     normalize_lifecycle_options(&mut ensure);
     let lifetime = ensure.daemon_lifetime;
+    let teardown_client = ensure.client.clone();
     let ownership = Arc::new(Mutex::new(None));
-    let connection =
-        HeadlessConnection::open(profile, ensure.clone(), Arc::clone(&ownership)).await?;
+    let connection = HeadlessConnection::open(profile, ensure, Arc::clone(&ownership)).await?;
     let response = connection
         .client
         .request(body)
@@ -1234,7 +1409,7 @@ async fn lifecycle_request(
         .map_err(|error| client_error_as_headless(stage, error));
     drop(connection);
     let teardown = if lifetime == DaemonLifetime::EphemeralIfSpawned {
-        teardown_owned_daemon(profile, &ensure, &ownership).await
+        teardown_owned_daemon(profile, &teardown_client, &ownership).await
     } else {
         Ok(())
     };
@@ -1387,7 +1562,7 @@ pub async fn headless_run_events(
 
 async fn teardown_owned_daemon(
     profile: &ResolvedProfile,
-    ensure: &EnsureOptions,
+    client: &ClientConfig,
     daemon_ownership: &Mutex<Option<DaemonOwnershipToken>>,
 ) -> Result<(), HeadlessRunError> {
     let Some(mut ownership) = lock_daemon_ownership(daemon_ownership).take() else {
@@ -1403,7 +1578,7 @@ async fn teardown_owned_daemon(
     }
 
     let request_deadline = Instant::now() + EPHEMERAL_DRAIN_ALLOWANCE;
-    let shutdown = shutdown_owned_daemon_peer(profile, ensure, &ownership, request_deadline).await;
+    let shutdown = shutdown_owned_daemon_peer(profile, client, &ownership, request_deadline).await;
     let reap_deadline = shutdown.as_ref().copied().unwrap_or(request_deadline);
     let reap = reap_owned_daemon(&mut ownership, reap_deadline).await;
     match (shutdown, reap) {
@@ -1414,13 +1589,13 @@ async fn teardown_owned_daemon(
 
 async fn shutdown_owned_daemon_peer(
     profile: &ResolvedProfile,
-    ensure: &EnsureOptions,
+    client: &ClientConfig,
     ownership: &DaemonOwnershipToken,
     request_deadline: Instant,
 ) -> Result<Instant, HeadlessRunError> {
     let connected = tokio::time::timeout_at(
         request_deadline,
-        connect(&profile.endpoint_path, ensure.client.clone()),
+        connect(&profile.endpoint_path, client.clone()),
     )
     .await
     .map_err(|_| teardown_protocol("timed out reconnecting to owned daemon"))?
@@ -1572,7 +1747,7 @@ async fn run_headless_inner(
     mut ensure: EnsureOptions,
     request: HeadlessRunRequest,
     session_config: HeadlessSessionConfig,
-    output: mpsc::UnboundedSender<HeadlessEvent>,
+    output: HeadlessEventSpoolWriter,
     daemon_ownership: Arc<Mutex<Option<DaemonOwnershipToken>>>,
 ) -> Result<HeadlessRunResult, HeadlessRunError> {
     if request.attachments.len() > MAX_HEADLESS_ATTACHMENTS {
@@ -1745,12 +1920,10 @@ async fn run_headless_inner(
     // turn.submit response: consumers need the session identity as the
     // FIRST event, ahead of any envelope. The adapter dedupes the later
     // acceptance-time emission, whose head_seq refines this baseline.
-    reducer
-        .emit(HeadlessEvent::Accepted {
-            session_id: session_id.clone(),
-            head_seq: created_seq,
-        })
-        .await;
+    reducer.emit(HeadlessEvent::Accepted {
+        session_id: session_id.clone(),
+        head_seq: created_seq,
+    });
     connection.worker_generation = created_generation;
     before_acceptance_deadline(
         timeout_deadline,
@@ -1871,12 +2044,10 @@ async fn run_headless_inner(
                 },
             ) if accepted_session == session_id => {
                 connection.worker_generation = worker_generation;
-                reducer
-                    .emit(HeadlessEvent::Accepted {
-                        session_id: accepted_session,
-                        head_seq: accepted_seq,
-                    })
-                    .await;
+                reducer.emit(HeadlessEvent::Accepted {
+                    session_id: accepted_session,
+                    head_seq: accepted_seq,
+                });
                 break run_id;
             }
             Ok(ResponseBody::Error {

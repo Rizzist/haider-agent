@@ -3697,18 +3697,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Deferred)
             .map_err(map_sqlite_error)?;
         require_session(&transaction, session_id)?;
-        let replay_through_cursor = transaction
-            .query_row(
-                "SELECT COALESCE(MAX(through_seq), 0)
-                 FROM workflow_graph_instances WHERE session_id = ?1",
-                [session_id.as_str()],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(map_sqlite_error)
-            .and_then(|value| {
-                u64::try_from(value)
-                    .map_err(|_| corrupt("workflow graph projection has a negative cursor"))
-            })?;
+        let replay_through_cursor = latest_seq_in_connection(&transaction, session_id)?;
         if after_cursor > replay_through_cursor {
             let mut error = store_error(
                 ErrorCode::InvalidArgument,
@@ -15993,7 +15982,7 @@ fn update_workflow_graph_projection_after_append(
                     "workflow graph {graph_id} was durably started more than once"
                 )));
             }
-            let state = WorkflowGraphState::from_started(envelope.seq, started)
+            let state = WorkflowGraphState::from_started(envelope.seq, *started)
                 .map_err(|error| corrupt(format!("cannot reduce workflow graph start: {error}")))?;
             persist_workflow_graph_state(transaction, session_id, &state)?;
             states.insert(graph_id, state);
@@ -16088,7 +16077,7 @@ fn append_planned_workflow_event(
 ) -> StoreResult<()> {
     match &event {
         WorkflowGraphJournalEvent::WorkflowGraphStarted(started) => {
-            let state = WorkflowGraphState::from_started(virtual_cursor, started.clone())
+            let state = WorkflowGraphState::from_started(virtual_cursor, started.as_ref().clone())
                 .map_err(|error| corrupt(format!("cannot plan workflow graph start: {error}")))?;
             states.insert(started.graph_id.clone(), state);
         }
@@ -16118,7 +16107,7 @@ fn workflow_output_evidence(
         .ast
         .nodes
         .iter()
-        .find(|candidate| &candidate.node == node)
+        .find(|candidate| candidate.node.eq(node))
         .ok_or_else(|| corrupt("workflow output node is absent from its AST"))?;
     let parents = state
         .node(node)
@@ -16135,7 +16124,7 @@ fn forward_workflow_inputs(
     node: &GraphNodeName,
     graph_seed: Option<&InstructEvidenceRef>,
 ) -> Option<Vec<WorkflowNodeInput>> {
-    let spec = state.ast.nodes.iter().find(|spec| &spec.node == node)?;
+    let spec = state.ast.nodes.iter().find(|spec| spec.node.eq(node))?;
     let mut inputs = Vec::with_capacity(spec.join.initial_all.len());
     for edge_id in &spec.join.initial_all {
         let edge = state.ast.edges.iter().find(|edge| edge.id == *edge_id)?;
@@ -16164,7 +16153,7 @@ fn back_workflow_input(
     state: &WorkflowGraphState,
     node: &GraphNodeName,
 ) -> Option<WorkflowNodeInput> {
-    let spec = state.ast.nodes.iter().find(|spec| &spec.node == node)?;
+    let spec = state.ast.nodes.iter().find(|spec| spec.node.eq(node))?;
     for edge_id in &spec.join.reactivate_any {
         let edge = state.ast.edges.iter().find(|edge| edge.id == *edge_id)?;
         let source = edge.from.as_ref()?;
@@ -16187,7 +16176,7 @@ fn active_back_source(
         .ast
         .edges
         .iter()
-        .filter(|edge| edge.kind == WorkflowEdgeKind::Back && &edge.to == target)
+        .filter(|edge| edge.kind == WorkflowEdgeKind::Back && edge.to.eq(target))
         .find_map(|edge| {
             let source = edge.from.as_ref()?;
             let node = state.node(source)?;
@@ -16196,21 +16185,34 @@ fn active_back_source(
         })
 }
 
-fn workflow_rejection(
-    cas: &FileCas,
-    state: &WorkflowGraphState,
-    node: &GraphNodeName,
+struct WorkflowRejectionInput<'a, S: ?Sized> {
+    state: &'a WorkflowGraphState,
+    node: &'a GraphNodeName,
     iteration: u32,
     code: WorkflowNodeRejectCode,
     message: String,
-    evidence_type: Option<&str>,
-    source: &impl serde::Serialize,
+    evidence_type: Option<&'a str>,
+    source: &'a S,
+}
+
+fn workflow_rejection<S: serde::Serialize + ?Sized>(
+    cas: &FileCas,
+    input: WorkflowRejectionInput<'_, S>,
 ) -> StoreResult<WorkflowNodeRejected> {
+    let WorkflowRejectionInput {
+        state,
+        node,
+        iteration,
+        code,
+        message,
+        evidence_type,
+        source,
+    } = input;
     let spec = state
         .ast
         .nodes
         .iter()
-        .find(|candidate| &candidate.node == node)
+        .find(|candidate| candidate.node.eq(node))
         .ok_or_else(|| corrupt("workflow rejection node is absent from its AST"))?;
     let parents = state
         .node(node)
@@ -16312,7 +16314,7 @@ fn augment_workflow_graph_envelopes(
                     &mut states,
                     &mut planned,
                     cursor,
-                    WorkflowGraphJournalEvent::WorkflowGraphStarted(started),
+                    WorkflowGraphJournalEvent::WorkflowGraphStarted(Box::new(started)),
                     causation_id.clone(),
                 )?;
                 graph_order.push(pinned.graph_id.clone());
@@ -16488,13 +16490,17 @@ fn augment_workflow_graph_envelopes(
                         })?;
                     let rejected = workflow_rejection(
                         cas,
-                        state,
-                        &source,
-                        iteration,
-                        WorkflowNodeRejectCode::EvidenceRejected,
-                        format!("node {source} rejected evidence and followed its back edge"),
-                        Some(&target_type),
-                        &source_value,
+                        WorkflowRejectionInput {
+                            state,
+                            node: &source,
+                            iteration,
+                            code: WorkflowNodeRejectCode::EvidenceRejected,
+                            message: format!(
+                                "node {source} rejected evidence and followed its back edge"
+                            ),
+                            evidence_type: Some(&target_type),
+                            source: &source_value,
+                        },
                     )?;
                     let cursor = planned_workflow_cursor(latest, base_len, planned.len())?;
                     append_planned_workflow_event(
@@ -16544,16 +16550,18 @@ fn augment_workflow_graph_envelopes(
                         })?;
                     let rejected = workflow_rejection(
                         cas,
-                        state,
-                        &opened.node,
-                        missing_iteration,
-                        WorkflowNodeRejectCode::TypedInputMissing,
-                        format!(
-                            "node {} did not activate because its typed join inputs are missing",
-                            opened.node
-                        ),
-                        None,
-                        opened,
+                        WorkflowRejectionInput {
+                            state,
+                            node: &opened.node,
+                            iteration: missing_iteration,
+                            code: WorkflowNodeRejectCode::TypedInputMissing,
+                            message: format!(
+                                "node {} did not activate because its typed join inputs are missing",
+                                opened.node
+                            ),
+                            evidence_type: None,
+                            source: opened,
+                        },
                     )?;
                     let cursor = planned_workflow_cursor(latest, base_len, planned.len())?;
                     append_planned_workflow_event(
@@ -16580,16 +16588,18 @@ fn augment_workflow_graph_envelopes(
                 {
                     let rejected = workflow_rejection(
                         cas,
-                        state,
-                        &opened.node,
-                        next_iteration,
-                        WorkflowNodeRejectCode::IterationGuard,
-                        format!(
-                            "node {} was not reactivated because the bounded back-edge guard of {} was exhausted",
-                            opened.node, state.ast.max_back_edge_activations
-                        ),
-                        None,
-                        opened,
+                        WorkflowRejectionInput {
+                            state,
+                            node: &opened.node,
+                            iteration: next_iteration,
+                            code: WorkflowNodeRejectCode::IterationGuard,
+                            message: format!(
+                                "node {} was not reactivated because the bounded back-edge guard of {} was exhausted",
+                                opened.node, state.ast.max_back_edge_activations
+                            ),
+                            evidence_type: None,
+                            source: opened,
+                        },
                     )?;
                     let cursor = planned_workflow_cursor(latest, base_len, planned.len())?;
                     append_planned_workflow_event(
@@ -16651,16 +16661,18 @@ fn augment_workflow_graph_envelopes(
                     .map(|spec| spec.output_type.clone());
                 let rejected = workflow_rejection(
                     cas,
-                    state,
-                    &blocked.node,
-                    node_state.iteration,
-                    code,
-                    format!(
-                        "convergence graph rejected node {}: {:?}",
-                        blocked.node, blocked.reason
-                    ),
-                    rejection_evidence_type.as_deref(),
-                    blocked,
+                    WorkflowRejectionInput {
+                        state,
+                        node: &blocked.node,
+                        iteration: node_state.iteration,
+                        code,
+                        message: format!(
+                            "convergence graph rejected node {}: {:?}",
+                            blocked.node, blocked.reason
+                        ),
+                        evidence_type: rejection_evidence_type.as_deref(),
+                        source: blocked,
+                    },
                 )?;
                 let cursor = planned_workflow_cursor(latest, base_len, planned.len())?;
                 append_planned_workflow_event(
@@ -16672,36 +16684,36 @@ fn augment_workflow_graph_envelopes(
                 )?;
             }
             EventPayload::GraphAbandoned(abandoned) => {
-                plan_terminal_workflow_rejections(
+                plan_terminal_workflow_rejections(TerminalWorkflowRejectionInput {
                     transaction,
                     cas,
                     session_id,
-                    &mut states,
-                    &mut planned,
+                    states: &mut states,
+                    planned: &mut planned,
                     causation_id,
                     latest,
                     base_len,
-                    &abandoned.graph_id,
-                    WorkflowNodeRejectCode::Abandoned,
-                    "workflow graph was abandoned",
-                    abandoned,
-                )?;
+                    graph_id: &abandoned.graph_id,
+                    code: WorkflowNodeRejectCode::Abandoned,
+                    message: "workflow graph was abandoned",
+                    source: abandoned,
+                })?;
             }
             EventPayload::GraphSuperseded(superseded) => {
-                plan_terminal_workflow_rejections(
+                plan_terminal_workflow_rejections(TerminalWorkflowRejectionInput {
                     transaction,
                     cas,
                     session_id,
-                    &mut states,
-                    &mut planned,
+                    states: &mut states,
+                    planned: &mut planned,
                     causation_id,
                     latest,
                     base_len,
-                    &superseded.old,
-                    WorkflowNodeRejectCode::Superseded,
-                    "workflow graph was superseded",
-                    superseded,
-                )?;
+                    graph_id: &superseded.old,
+                    code: WorkflowNodeRejectCode::Superseded,
+                    message: "workflow graph was superseded",
+                    source: superseded,
+                })?;
             }
             _ => {}
         }
@@ -16832,21 +16844,38 @@ fn backfill_workflow_graph_journals(
     transaction.commit().map_err(map_sqlite_error)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn plan_terminal_workflow_rejections(
-    transaction: &Connection,
-    cas: &FileCas,
-    session_id: &SessionId,
-    states: &mut HashMap<GraphId, WorkflowGraphState>,
-    planned: &mut Vec<(WorkflowGraphJournalEvent, EventId)>,
-    causation_id: &EventId,
+struct TerminalWorkflowRejectionInput<'a, S: ?Sized> {
+    transaction: &'a Connection,
+    cas: &'a FileCas,
+    session_id: &'a SessionId,
+    states: &'a mut HashMap<GraphId, WorkflowGraphState>,
+    planned: &'a mut Vec<(WorkflowGraphJournalEvent, EventId)>,
+    causation_id: &'a EventId,
     latest: u64,
     base_len: u64,
-    graph_id: &GraphId,
+    graph_id: &'a GraphId,
     code: WorkflowNodeRejectCode,
-    message: &str,
-    source: &impl serde::Serialize,
+    message: &'a str,
+    source: &'a S,
+}
+
+fn plan_terminal_workflow_rejections<S: serde::Serialize + ?Sized>(
+    input: TerminalWorkflowRejectionInput<'_, S>,
 ) -> StoreResult<()> {
+    let TerminalWorkflowRejectionInput {
+        transaction,
+        cas,
+        session_id,
+        states,
+        planned,
+        causation_id,
+        latest,
+        base_len,
+        graph_id,
+        code,
+        message,
+        source,
+    } = input;
     if !states.contains_key(graph_id)
         && let Some(state) = load_workflow_graph_state(transaction, session_id, Some(graph_id))?
     {
@@ -16873,13 +16902,15 @@ fn plan_terminal_workflow_rejections(
             .ok_or_else(|| corrupt("workflow graph vanished during terminal rejection"))?;
         let rejected = workflow_rejection(
             cas,
-            state,
-            &node,
-            iteration,
-            code,
-            message.to_owned(),
-            None,
-            source,
+            WorkflowRejectionInput {
+                state,
+                node: &node,
+                iteration,
+                code,
+                message: message.to_owned(),
+                evidence_type: None,
+                source,
+            },
         )?;
         let cursor = planned_workflow_cursor(latest, base_len, planned.len())?;
         append_planned_workflow_event(

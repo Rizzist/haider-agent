@@ -410,7 +410,7 @@ pub struct WorkflowGraphState {
 /// and watch RPCs.
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkflowGraphJournalEvent {
-    WorkflowGraphStarted(WorkflowGraphStarted),
+    WorkflowGraphStarted(Box<WorkflowGraphStarted>),
     WorkflowNodeActivated(WorkflowNodeActivated),
     WorkflowNodeCompleted(WorkflowNodeCompleted),
     WorkflowNodeRejected(WorkflowNodeRejected),
@@ -564,7 +564,7 @@ impl WorkflowGraphState {
 
     #[must_use]
     pub fn node(&self, node: &GraphNodeName) -> Option<&WorkflowNodeState> {
-        self.nodes.iter().find(|candidate| &candidate.node == node)
+        self.nodes.iter().find(|candidate| candidate.node.eq(node))
     }
 
     /// Checks the indexed snapshot without consulting the journal. Stores
@@ -955,7 +955,7 @@ impl WorkflowGraphState {
                                 input.evidence.evidence_type == self.ast.input_type
                                     && input.evidence.parents.is_empty()
                             },
-                            |seed| &input.evidence == seed,
+                            |seed| input.evidence.eq(seed),
                         )
                 }
                 WorkflowEdgeKind::Forward => edge.from.as_ref().is_some_and(|source| {
@@ -1177,7 +1177,7 @@ pub fn validate_workflow_activation_ast(
                 if edge.from.is_none() && edge.evidence_type == ast.input_type => {}
             WorkflowEdgeKind::Forward
                 if edge.from.as_ref().is_some_and(|from| {
-                    let source = ast.nodes.iter().position(|node| &node.node == from);
+                    let source = ast.nodes.iter().position(|node| node.node.eq(from));
                     let target = ast.nodes.iter().position(|node| node.node == edge.to);
                     source
                         .zip(target)
@@ -1384,7 +1384,7 @@ pub fn workflow_activation_ast_from_loom(
         let target = spec.red_target.as_ref().unwrap_or(start);
         let target_index = nodes
             .iter()
-            .position(|node| &node.node == target)
+            .position(|node| node.node.eq(target))
             .ok_or_else(|| invalid_workflow_ast("workflow back edge has no target node"))?;
         let evidence_type = nodes[target_index].input_type.clone();
         let id = next_edge_id;
@@ -1498,7 +1498,7 @@ pub fn reduce_workflow_graphs(
                 }
                 states.insert(
                     graph_id,
-                    WorkflowGraphState::from_started(envelope.seq, started)?,
+                    WorkflowGraphState::from_started(envelope.seq, *started)?,
                 );
                 continue;
             }
@@ -6364,7 +6364,7 @@ mod tests {
         let pipe = crate::loom::parse_pipe(
             "terminals-runtime: Seed -> Right + Left\nstart\nleft @left <-start\nright @right <-start",
         );
-        let workflow = crate::loom::compile_pipe(&pipe, |id| match id {
+        let workflow = crate::loom::compile_pipe(&pipe, |id: &str| match id {
             "left" => Some(crate::loom::LoomTypeSig {
                 in_type: "Seed".into(),
                 out_type: "Left".into(),
@@ -6650,7 +6650,8 @@ mod tests {
             seed: Some(activation_evidence('a', &ast.input_type, Vec::new())),
             ast,
         };
-        let start_event = WorkflowGraphJournalEvent::WorkflowGraphStarted(started.clone());
+        let start_event =
+            WorkflowGraphJournalEvent::WorkflowGraphStarted(Box::new(started.clone()));
         let state = WorkflowGraphState::from_started(1, started).expect("replay start");
         let activation = activation_event(
             &state,

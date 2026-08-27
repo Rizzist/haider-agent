@@ -241,7 +241,7 @@ one peer-specific withholding exception is §4.1.
 | `monitor_delivery_v1` | replayable `monitor.watch`, `MonitorDelivery`, and `MonitorDeliveryCaughtUp` |
 | `vault_stage_v1` | `vault.stage` |
 | `account_login_api_v1` | `account.login_api` |
-| `account_oauth_pkce_v1` | browser/loopback `account.oauth_start/status/cancel` |
+| `account_oauth_pkce_v1` | browser/loopback `account.oauth_start`, `account.oauth_status`, and `account.oauth_cancel` |
 | `account_oauth_device_v1` | device-code forms of the same OAuth methods and `user_code` |
 | `account_oauth_import_v1` | `account.oauth_import` |
 | `account_oauth_import_sources_v1` | `account.oauth_import_sources` |
@@ -271,7 +271,7 @@ one peer-specific withholding exception is §4.1.
 | `input_mirror_attachments_v1` | input-surface `attachments` |
 | `status_segment_v1` | status portion of surface publish/watch/delta |
 | `status_segment_structured_v1` | status `state` and `detail` |
-| `transcription_v1` | `transcription.secret_get/set` |
+| `transcription_v1` | `transcription.secret_get` and `transcription.secret_set` |
 | `usage_report_v1` | `usage.report` |
 | `usage_history_v1` | `usage.history_day`, `usage.history_range` |
 | `haider_code_plan_status_v1` | unsolicited `HaiderCodePlanStatus` |
@@ -385,6 +385,7 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 
 | Method | Success response | Kind |
 |---|---|---|
+| `daemon.shutdown` | `DaemonShutdown` | Control-gated graceful daemon lifecycle request |
 | `artifact.put` | `ArtifactPut` | receipt-free content-addressed upload |
 | `session.create` | `SessionCreate` | durable receipt |
 | `branch.create` | `BranchCreate` | durable receipt |
@@ -427,11 +428,11 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | `workflow.graph.watch` | `WorkflowGraphWatch` | bounded durable activation-event replay strictly after the applied cursor |
 | `vault.stage` | `VaultStage` | connection-local ephemeral dedupe, deliberately not durable |
 | `account.login_api`, `account.oauth_import`, `account.import_device`, `account.add`, `account.set_active`, `account.remove`, `account.set_default_model` | same-named response | durable account mutation |
-| `account.oauth_start/status/cancel`, `account.oauth_import_sources`, `account.device_candidates` | same-named response | connection-bound flow/catalog reads/actions |
+| `account.oauth_start`, `account.oauth_status`, `account.oauth_cancel`, `account.oauth_import_sources`, `account.device_candidates` | same-named response | connection-bound flow/catalog reads/actions |
 | `account.set_label` | `AccountSetLabel` | control mutation; alias remains identity |
 | `provider.models_refresh` | `ProviderModelsRefresh` | provider snapshot refresh |
 | `provider.configure`, `provider.remove` | same-named response | durable provider mutation |
-| `transcription.secret_get/set` | same-named response | same-UID UDS-only secret read/write, not a command receipt |
+| `transcription.secret_get`, `transcription.secret_set` | same-named response | same-UID UDS-only secret read/write, not a command receipt |
 
 The golden matrix at
 `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`, combined
@@ -1983,6 +1984,48 @@ The concepts are intentionally disjoint:
 - the agent-lineage graph is delegation ancestry from `SessionSummary.kind`
   plus `parent_session_id`. It is not the workflow DAG and MUST NOT be folded
   into one client graph.
+
+#### 13.3.1 Typed activation graph state and replay
+
+`workflow_graph_v1` exposes the executable typed activation graph through two
+View methods. `workflow.graph.state` takes `session_id` and an optional
+`graph_id`; omission selects the most recently changed activation graph for
+that session. Its response contains
+`state: Option<WorkflowGraphState>`. `None` means that no matching retained
+activation graph exists; it is not an empty graph and does not authorize a
+client to infer one from `GraphStatus`, a Loom registry entry, or session
+lineage.
+
+`WorkflowGraphState` is the baseline of record. It carries the immutable AST
+and its digest, optional typed seed evidence, graph phase, complete typed node
+states and activation order, plus `through_cursor`. A client starts
+`workflow.graph.watch` at that exact cursor. The watch request takes
+`session_id`, `after_cursor`, and a limit in `1..=128`. The response seals a
+bounded interval as `{requested_after_cursor, replay_through_cursor,
+next_cursor, events}`. Event cursors strictly increase, are ordinary owning
+session journal sequences, and never exceed `replay_through_cursor`. A cursor
+ahead of the sealed owning-session journal head is a typed `cursor_ahead` error
+and is never clamped.
+
+Sparse pages are authoritative: non-workflow session facts can advance the
+sealed head, so `events: []` may legitimately return
+`next_cursor == replay_through_cursor`. Otherwise the client applies events in
+order, persists `next_cursor`, and pages until it equals
+`replay_through_cursor`. An event for another graph, a cursor discontinuity,
+or an invalid reduction requires a fresh state baseline; a client MUST NOT
+guess across graphs or repair typed state from presentation events.
+
+The daemon updates the retained state index in the same transaction that
+commits the activation facts. The client adapter reduces those same typed
+facts into the one `WorkflowGraphProjection` consumed by the live view. There
+is no second L3 graph reducer and no fallback through legacy raw-event
+rendering.
+
+**Absence law.** If Welcome omits `workflow_graph_v1`, both methods and the
+typed live graph are unavailable. A client MUST NOT call either method, show a
+cached graph as current, reinterpret `session_workflow_state_v1` or
+`convergence_graph_v1` as this activation surface, or synthesize the graph
+from Loom source, ordinary events, todos, or delegation ancestry.
 
 ### 13.4 Immutable workflow instances and selection fences
 

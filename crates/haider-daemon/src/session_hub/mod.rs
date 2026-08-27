@@ -330,8 +330,7 @@ fn load_or_create_cache_diagnostic_key(
             Ok(mut file) => {
                 file.write_all(&bytes)?;
                 file.sync_all()?;
-                #[cfg(unix)]
-                std::fs::File::open(root)?.sync_all()?;
+                haider_platform::sync_directory(root)?;
                 return Ok(CacheDiagnosticKey::from_bytes(bytes));
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,

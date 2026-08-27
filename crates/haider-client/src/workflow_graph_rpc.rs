@@ -231,7 +231,7 @@ fn project_node(
         .ast
         .nodes
         .iter()
-        .find(|candidate| &candidate.node == node_id)
+        .find(|candidate| candidate.node.eq(node_id))
         .ok_or(WorkflowGraphRpcAdapterError::InvalidState(
             "AST node disappeared during projection",
         ))?;
@@ -392,7 +392,7 @@ fn input_is_present(
         .ast
         .edges
         .iter()
-        .find(|edge| edge.id == edge_id && &edge.to == node_id)
+        .find(|edge| edge.id == edge_id && edge.to.eq(node_id))
     else {
         return false;
     };

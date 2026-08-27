@@ -502,7 +502,7 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
     };
     match options.action.clone() {
         RunAction::Status(run_id) => {
-            return match headless_run_status(&profile, lifecycle_ensure.clone(), run_id).await {
+            return match headless_run_status(&profile, lifecycle_ensure, run_id).await {
                 Ok(status) => match write_lifecycle_value(
                     io::stdout().lock(),
                     options.output,
@@ -521,7 +521,7 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
             };
         }
         RunAction::Stop(run_id) => {
-            return match stop_headless_run(&profile, lifecycle_ensure.clone(), run_id).await {
+            return match stop_headless_run(&profile, lifecycle_ensure, run_id).await {
                 Ok(stopped) => match write_lifecycle_value(
                     io::stdout().lock(),
                     options.output,

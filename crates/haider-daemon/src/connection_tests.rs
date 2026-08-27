@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! Private fair-outbox, reply-floor, and drain-order tests.
 //!
 //! This module is crate-internal only because `OutboundLane`, `LaneKey`, and
@@ -6,7 +8,6 @@
 // Keep this transport-specific suite unavailable off Unix even if its parent
 // module declaration is accidentally broadened in the future.
 #![cfg(unix)]
-#![allow(clippy::expect_used)]
 
 use super::*;
 use std::future::Future;

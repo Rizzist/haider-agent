@@ -35,6 +35,18 @@ const MAX_ATTACHMENT_BYTES_PER_TURN: usize = 16 * 1024 * 1024;
 const MAX_ATTACHMENT_BYTES_PER_PDF_TURN: usize = 64 * 1024 * 1024;
 const MAX_SURFACE_WATCHES_PER_CONNECTION: usize = 16;
 
+struct TurnSubmitInput {
+    command_id: CommandId,
+    session_id: SessionId,
+    worker_generation: u64,
+    branch_id: Option<haider_protocol::ids::BranchId>,
+    text: String,
+    attachments: Vec<haider_protocol::tool::AttachmentBlock>,
+    mode: DeliveryMode,
+    trust_hooks: bool,
+    headless_spec: Option<haider_protocol::headless::HeadlessRunSpecV1>,
+}
+
 /// Profile-vault alias holding the transcription secret (the Deepgram API
 /// key). Daemon-internal: clients only ever speak
 /// `transcription.secret_get`/`transcription.secret_set` — the alias never
@@ -2582,15 +2594,17 @@ impl HubConnection {
                 }
                 self.turn_submit(
                     request_id,
-                    command_id,
-                    session_id,
-                    worker_generation,
-                    branch_id,
-                    text,
-                    attachments,
-                    mode,
-                    false,
-                    None,
+                    TurnSubmitInput {
+                        command_id,
+                        session_id,
+                        worker_generation,
+                        branch_id,
+                        text,
+                        attachments,
+                        mode,
+                        trust_hooks: false,
+                        headless_spec: None,
+                    },
                 )
                 .await
             }
@@ -2625,15 +2639,17 @@ impl HubConnection {
                 }
                 self.turn_submit(
                     request_id,
-                    command_id,
-                    session_id,
-                    worker_generation,
-                    None,
-                    text,
-                    attachments,
-                    mode,
-                    false,
-                    None,
+                    TurnSubmitInput {
+                        command_id,
+                        session_id,
+                        worker_generation,
+                        branch_id: None,
+                        text,
+                        attachments,
+                        mode,
+                        trust_hooks: false,
+                        headless_spec: None,
+                    },
                 )
                 .await
             }
@@ -2669,15 +2685,17 @@ impl HubConnection {
                 }
                 self.turn_submit(
                     request_id,
-                    command_id,
-                    session_id,
-                    worker_generation,
-                    branch_id,
-                    text,
-                    attachments,
-                    mode,
-                    false,
-                    None,
+                    TurnSubmitInput {
+                        command_id,
+                        session_id,
+                        worker_generation,
+                        branch_id,
+                        text,
+                        attachments,
+                        mode,
+                        trust_hooks: false,
+                        headless_spec: None,
+                    },
                 )
                 .await
             }
@@ -2713,15 +2731,17 @@ impl HubConnection {
                 }
                 self.turn_submit(
                     request_id,
-                    command_id,
-                    session_id,
-                    worker_generation,
-                    branch_id,
-                    text,
-                    attachments,
-                    mode,
-                    true,
-                    None,
+                    TurnSubmitInput {
+                        command_id,
+                        session_id,
+                        worker_generation,
+                        branch_id,
+                        text,
+                        attachments,
+                        mode,
+                        trust_hooks: true,
+                        headless_spec: None,
+                    },
                 )
                 .await
             }
@@ -2757,15 +2777,17 @@ impl HubConnection {
                 }
                 self.turn_submit(
                     request_id,
-                    command_id,
-                    session_id,
-                    worker_generation,
-                    None,
-                    text,
-                    attachments,
-                    DeliveryMode::Queue,
-                    trust_hooks,
-                    Some(spec),
+                    TurnSubmitInput {
+                        command_id,
+                        session_id,
+                        worker_generation,
+                        branch_id: None,
+                        text,
+                        attachments,
+                        mode: DeliveryMode::Queue,
+                        trust_hooks,
+                        headless_spec: Some(spec),
+                    },
                 )
                 .await
             }
@@ -7986,7 +8008,7 @@ impl HubConnection {
             haider_protocol::loom::ValidatedLoomAuthorSpec::AgentType {
                 record,
                 canonical_text,
-            } => match self.hub.loom_register_agent_type(record).await {
+            } => match self.hub.loom_register_agent_type(*record).await {
                 Ok(outcome) => haider_protocol::loom::LoomAuthorConfirmed {
                     authoring_id: authoring_id.clone(),
                     kind,
@@ -9316,20 +9338,22 @@ impl HubConnection {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn turn_submit(
         &self,
         request_id: RequestId,
-        command_id: CommandId,
-        session_id: SessionId,
-        worker_generation: u64,
-        branch_id: Option<haider_protocol::ids::BranchId>,
-        text: String,
-        attachments: Vec<haider_protocol::tool::AttachmentBlock>,
-        mode: haider_protocol::DeliveryMode,
-        trust_hooks: bool,
-        headless_spec: Option<haider_protocol::headless::HeadlessRunSpecV1>,
+        input: TurnSubmitInput,
     ) -> Result<(), SessionHubError> {
+        let TurnSubmitInput {
+            command_id,
+            session_id,
+            worker_generation,
+            branch_id,
+            text,
+            attachments,
+            mode,
+            trust_hooks,
+            headless_spec,
+        } = input;
         if command_id.as_str().is_empty() || text.trim().is_empty() {
             return self.respond_error(
                 request_id,

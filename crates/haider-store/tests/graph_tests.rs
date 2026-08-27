@@ -6286,7 +6286,7 @@ fn workflow_graph_projection_equals_full_recompute_and_watch_replays_cursors() {
             &store,
             &session_id,
             "activation-started",
-            WorkflowGraphJournalEvent::WorkflowGraphStarted(started),
+            WorkflowGraphJournalEvent::WorkflowGraphStarted(Box::new(started)),
         ),
         projected_event_envelope(
             &store,
@@ -6315,6 +6315,17 @@ fn workflow_graph_projection_equals_full_recompute_and_watch_replays_cursors() {
     let recomputed = reduce_workflow_graphs(&journal).expect("full replay");
     assert_eq!(projected, recomputed[&graph_id]);
     assert_eq!(projected.seed.as_ref(), Some(&seed));
+    let mut unrelated = vec![raw_envelope(
+        &store,
+        &session_id,
+        &RunId::new("activation-projection-run"),
+        "activation-unrelated",
+        EventPayload::IdleDecayed,
+    )];
+    store
+        .append(&mut unrelated)
+        .expect("append unrelated session fact");
+    let session_head = unrelated[0].seq;
 
     let first_page = store
         .workflow_graph_watch(&session_id, 0, 2)
@@ -6326,5 +6337,11 @@ fn workflow_graph_projection_equals_full_recompute_and_watch_replays_cursors() {
         .expect("second watch page");
     assert_eq!(second_page.events.len(), 1);
     assert_eq!(second_page.next_cursor, projected.through_cursor);
-    assert_eq!(second_page.replay_through_cursor, projected.through_cursor);
+    assert_eq!(second_page.replay_through_cursor, session_head);
+    let sparse_page = store
+        .workflow_graph_watch(&session_id, second_page.next_cursor, 2)
+        .expect("sparse watch page");
+    assert!(sparse_page.events.is_empty());
+    assert_eq!(sparse_page.replay_through_cursor, session_head);
+    assert_eq!(sparse_page.next_cursor, session_head);
 }

@@ -5661,7 +5661,7 @@ async fn start_turn(
                 .then_some(())
                 .and(status.current_node.as_ref())
                 .filter(|node| status.node_is_ready(node))
-                .and_then(|node| workflow.meta.iter().find(|meta| &meta.node == node));
+                .and_then(|node| workflow.meta.iter().find(|meta| meta.node.eq(node)));
             match expected_meta.and_then(|meta| {
                 meta.agent_type.as_deref().map(|type_id| {
                     (
@@ -6350,17 +6350,17 @@ async fn start_turn(
         resolved.provider_name.as_str(),
         ANTHROPIC_PROVIDER_NAME | ANTHROPIC_OAUTH_PROVIDER_NAME
     ) && !web_degrade.anthropic_web_tools;
-    Ok(active_turn(
-        accepted.run_id,
-        accepted.branch_id,
+    Ok(active_turn(ActiveTurnInit {
+        run_id: accepted.run_id,
+        branch_id: accepted.branch_id,
         harness,
-        actor.into_inner(),
+        actor: actor.into_inner(),
         dispatcher,
         handle,
         effect_dispatched,
         anthropic_web_tools,
         budget_check,
-    ))
+    }))
 }
 
 /// Whether a provider's reported cache-read count is already included in its
@@ -7248,8 +7248,7 @@ async fn prepare_compaction_messages(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn active_turn(
+struct ActiveTurnInit {
     run_id: RunId,
     branch_id: Option<BranchId>,
     harness: haider_core::HarnessHandle,
@@ -7259,7 +7258,20 @@ fn active_turn(
     effect_dispatched: Arc<AtomicBool>,
     anthropic_web_tools: bool,
     budget_check: Option<BudgetCheckContext>,
-) -> ActiveTurn {
+}
+
+fn active_turn(init: ActiveTurnInit) -> ActiveTurn {
+    let ActiveTurnInit {
+        run_id,
+        branch_id,
+        harness,
+        actor,
+        dispatcher,
+        handle,
+        effect_dispatched,
+        anthropic_web_tools,
+        budget_check,
+    } = init;
     let cancel = handle.cancel_token();
     let (budget, budget_task) = budget_check
         .as_ref()
@@ -7498,6 +7510,8 @@ struct BudgetUsageComponent {
     cost_usd: Option<f64>,
 }
 
+type BudgetUsageChunks = BTreeMap<String, BudgetUsageComponent>;
+
 async fn run_budget_usage(
     store: &HubStoreHandle,
     run_id: &RunId,
@@ -7505,7 +7519,7 @@ async fn run_budget_usage(
     elapsed_ms: u64,
 ) -> Result<HeadlessRunUsageV1, HaiderError> {
     let mut cursor = 0_u64;
-    let mut envelopes = Vec::new();
+    let mut chunks = BudgetUsageChunks::new();
     loop {
         let page = store.read(store.session_id(), cursor, 256).await?;
         if page.is_empty() {
@@ -7513,28 +7527,27 @@ async fn run_budget_usage(
         }
         let page_len = page.len();
         cursor = page.last().map_or(cursor, |envelope| envelope.seq);
-        envelopes.extend(page);
+        collect_budget_usage(
+            &mut chunks,
+            store.session_id(),
+            run_id,
+            fallback_model,
+            page,
+        );
         if page_len < 256 {
             break;
         }
     }
-    Ok(budget_usage_from_envelopes(
-        store.session_id(),
-        run_id,
-        fallback_model,
-        elapsed_ms,
-        envelopes,
-    ))
+    Ok(finish_budget_usage(chunks, elapsed_ms))
 }
 
-fn budget_usage_from_envelopes(
+fn collect_budget_usage(
+    chunks: &mut BudgetUsageChunks,
     session_id: &SessionId,
     run_id: &RunId,
     fallback_model: &str,
-    elapsed_ms: u64,
     envelopes: impl IntoIterator<Item = haider_protocol::envelope::RawEnvelope>,
-) -> HeadlessRunUsageV1 {
-    let mut chunks = BTreeMap::<String, BudgetUsageComponent>::new();
+) {
     for envelope in envelopes {
         let envelope_run = envelope.run_id.clone();
         let envelope_agent = envelope.agent_id.clone();
@@ -7606,6 +7619,9 @@ fn budget_usage_from_envelopes(
             },
         );
     }
+}
+
+fn finish_budget_usage(chunks: BudgetUsageChunks, elapsed_ms: u64) -> HeadlessRunUsageV1 {
     let mut result = HeadlessRunUsageV1 {
         elapsed_ms,
         estimated_cost_microusd: Some(0),
@@ -7652,7 +7668,9 @@ pub(crate) fn budget_usage_from_envelopes_for_test(
     fallback_model: &str,
     envelopes: Vec<haider_protocol::envelope::RawEnvelope>,
 ) -> HeadlessRunUsageV1 {
-    budget_usage_from_envelopes(session_id, run_id, fallback_model, 0, envelopes)
+    let mut chunks = BudgetUsageChunks::new();
+    collect_budget_usage(&mut chunks, session_id, run_id, fallback_model, envelopes);
+    finish_budget_usage(chunks, 0)
 }
 
 fn unix_time_ms() -> u64 {
@@ -9339,7 +9357,7 @@ fn loom_control_execution_state(
             ),
         }));
     };
-    let Some(meta) = workflow.meta.iter().find(|meta| &meta.node == node) else {
+    let Some(meta) = workflow.meta.iter().find(|meta| meta.node.eq(node)) else {
         return Err(HaiderError::new(
             ErrorCode::StoreCorrupt,
             format!("pinned Loom workflow has no metadata for control node {node}"),
@@ -9372,7 +9390,7 @@ fn loom_control_execution_state(
     let attempt = status
         .nodes
         .iter()
-        .find(|candidate| &candidate.node == node)
+        .find(|candidate| candidate.node.eq(node))
         .and_then(|candidate| candidate.current_attempt)
         .ok_or_else(|| {
             HaiderError::new(
@@ -10707,7 +10725,7 @@ impl BrokerToolDispatcher {
             .then_some(())
             .and(status.current_node.as_ref())
             .filter(|node| status.node_is_ready(node))
-            .and_then(|node| workflow.meta.iter().find(|meta| &meta.node == node));
+            .and_then(|node| workflow.meta.iter().find(|meta| meta.node.eq(node)));
         let Some((type_id, type_rev, type_digest)) = expected_meta.and_then(|meta| {
             meta.agent_type.as_deref().map(|type_id| {
                 (

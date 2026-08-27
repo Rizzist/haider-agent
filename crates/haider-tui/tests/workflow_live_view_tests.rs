@@ -168,7 +168,7 @@ fn raw_workflow_started(session: SessionId, seq: u64) -> RawEnvelope {
         }],
         max_back_edge_activations: 1,
     };
-    let started = WorkflowGraphJournalEvent::WorkflowGraphStarted(WorkflowGraphStarted {
+    let started = WorkflowGraphJournalEvent::WorkflowGraphStarted(Box::new(WorkflowGraphStarted {
         graph_id: GraphId::new("graph-release"),
         ast_digest: workflow_activation_ast_digest(&ast),
         ast,
@@ -178,7 +178,7 @@ fn raw_workflow_started(session: SessionId, seq: u64) -> RawEnvelope {
             7,
             Vec::new(),
         )),
-    });
+    }));
     EventEnvelope {
         schema_version: 1,
         event_id: EventId::new(format!("workflow-event-{seq}")),

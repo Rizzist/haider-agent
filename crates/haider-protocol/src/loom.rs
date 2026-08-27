@@ -392,7 +392,7 @@ pub enum LoomAuthorSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidatedLoomAuthorSpec {
     AgentType {
-        record: LoomAgentType,
+        record: Box<LoomAgentType>,
         canonical_text: String,
     },
     Workflow {
@@ -924,7 +924,7 @@ fn validate_author_agent_type(
         )]);
     }
     Ok(ValidatedLoomAuthorSpec::AgentType {
-        record: LoomAgentType {
+        record: Box::new(LoomAgentType {
             id: spec.id,
             name: spec.name,
             job: spec.job,
@@ -938,7 +938,7 @@ fn validate_author_agent_type(
             color: spec.color,
             glyph: spec.glyph,
             rev: 0,
-        },
+        }),
         canonical_text,
     })
 }
@@ -1208,7 +1208,7 @@ fn validate_author_workflow(
     }
     if errors.is_empty() {
         let ast = parse_pipe(&source);
-        match compile_pipe(&ast, |id| lookup(id)) {
+        match compile_pipe(&ast, lookup) {
             Ok(workflow) => source = workflow.source,
             Err(compile_errors) => {
                 for message in compile_errors {
