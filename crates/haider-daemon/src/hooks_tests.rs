@@ -2901,6 +2901,10 @@ async fn fire_time_reverification_refuses_a_swapped_pinned_definition() {
 // ── hooks_server_v1 lifecycle (v0.0.934) ────────────────────────────────
 
 fn write_server_hook(workspace: &Path, command: &str, idle_timeout_ms: u64) {
+    // A cold PowerShell process can take more than two seconds to reach its
+    // first JSONL response under the full Windows per-crate test load. This is
+    // fixture setup latency, not the server lifecycle behavior under test.
+    let timeout_ms = if cfg!(windows) { 10_000 } else { 2_000 };
     std::fs::write(
         workspace.join("hooks.json"),
         serde_json::to_vec(&serde_json::json!({
@@ -2910,7 +2914,7 @@ fn write_server_hook(workspace: &Path, command: &str, idle_timeout_ms: u64) {
                     "matcher": {"event": "user_message"},
                     "kind": "exec",
                     "command": command,
-                    "timeout_ms": 2_000,
+                    "timeout_ms": timeout_ms,
                     "decision": false,
                     "mode": "server",
                     "idle_timeout_ms": idle_timeout_ms,
@@ -3044,10 +3048,27 @@ async fn fired_count(fixture: &EngineFixture) -> usize {
         .count()
 }
 
-// Outer TEST observation budget only. Server command and idle timeouts remain
-// product-owned and unchanged; full-suite scheduling and SQLite/process I/O
-// may legitimately delay when their already-bounded outcomes become visible.
-const SERVER_MODE_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(15);
+async fn successful_server_fire_count(fixture: &EngineFixture) -> usize {
+    fixture
+        .events()
+        .await
+        .iter()
+        .filter_map(|event| HookEventPayload::from_payload_value(event.payload.clone()).ok())
+        .filter(|payload| {
+            matches!(
+                payload,
+                HookEventPayload::HookFired(fired)
+                    if fired.exit_code == Some(0) && !fired.timed_out
+            )
+        })
+        .count()
+}
+
+// Outer TEST observation budget only. The fixture exchange timeout above and
+// the product-owned idle timeout remain independently bounded; full-suite
+// scheduling and SQLite/process I/O may legitimately delay observation.
+const SERVER_MODE_OBSERVATION_TIMEOUT: Duration =
+    Duration::from_secs(if cfg!(windows) { 30 } else { 15 });
 
 fn server_test_state(fixture: &EngineFixture) -> Arc<super::hooks_server::ServerTestState> {
     fixture
@@ -3129,6 +3150,88 @@ async fn fire_user_message(fixture: &EngineFixture, index: usize) {
         .expect("append user message fact");
 }
 
+/// Sends distinctly identified events until one more successful server
+/// exchange and its exact spawn count are observable. Spawn/setup failures
+/// are facts too, so waiting for an arbitrary `HookFired` can mistake a failed
+/// cold Windows launch for lifecycle progress.
+async fn fire_fresh_events_until_spawn_count(
+    fixture: &EngineFixture,
+    spawn_log: &Path,
+    next_index: &mut usize,
+    expected: usize,
+) {
+    let successful_target = successful_server_fire_count(fixture).await + 1;
+    let observed = tokio::time::timeout(SERVER_MODE_OBSERVATION_TIMEOUT, async {
+        loop {
+            let spawns = spawn_count(spawn_log);
+            assert!(
+                spawns <= expected,
+                "server spawned {spawns} times before exact target {expected}"
+            );
+            if spawns == expected
+                && successful_server_fire_count(fixture).await >= successful_target
+            {
+                return;
+            }
+
+            let fires_before = fired_count(fixture).await;
+            fire_user_message(fixture, *next_index).await;
+            *next_index += 1;
+            while fired_count(fixture).await == fires_before {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    })
+    .await;
+    if observed.is_err() {
+        let successful = successful_server_fire_count(fixture).await;
+        panic!(
+            "server spawn observation deadline: expected {expected}, spawns={}, \
+             successful fires={successful}",
+            spawn_count(spawn_log)
+        );
+    }
+}
+
+/// Sends exactly one event after an observed idle reap or child exit. Unlike
+/// cold-launch setup retries, this must not let a later event hide a failure
+/// to respawn on the very next event.
+async fn fire_one_event_and_expect_spawn_count(
+    fixture: &EngineFixture,
+    spawn_log: &Path,
+    index: usize,
+    expected: usize,
+) {
+    let fires_before = fired_count(fixture).await;
+    let successful_before = successful_server_fire_count(fixture).await;
+    fire_user_message(fixture, index).await;
+    let observed = tokio::time::timeout(SERVER_MODE_OBSERVATION_TIMEOUT, async {
+        loop {
+            let spawns = spawn_count(spawn_log);
+            assert!(
+                spawns <= expected,
+                "server spawned {spawns} times before exact target {expected}"
+            );
+            if spawns == expected
+                && fired_count(fixture).await > fires_before
+                && successful_server_fire_count(fixture).await > successful_before
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if observed.is_err() {
+        let successful = successful_server_fire_count(fixture).await;
+        panic!(
+            "single-event spawn observation deadline: expected {expected}, spawns={}, \
+             successful fires={successful}",
+            spawn_count(spawn_log)
+        );
+    }
+}
+
 /// MUTATION CHECK (hooks_server_v1): make server-mode dispatch spawn per
 /// event like spawn mode. Expected runtime failure: the spawn log below
 /// records three pids instead of one.
@@ -3184,19 +3287,19 @@ async fn post_shutdown_dispatch_never_spawns_a_server_actor() {
 }
 
 /// MUTATION CHECK (hooks_server_v1): drop the idle reaper (treat every
-/// idle_timeout_ms as 0). Expected runtime failure: the second event below
-/// reuses the first pid and the spawn log stays at one line.
+/// idle_timeout_ms as 0). Expected runtime failure: the product-synchronized
+/// stop observation times out while the first server remains running; if that
+/// premise were bypassed, the next event would reuse it and leave one spawn.
 #[tokio::test]
 async fn server_mode_reaps_idle_and_respawns_for_the_next_event() {
     let (fixture, spawn_log) = server_fixture(150, TestServerKind::Resident).await;
-    fire_user_message(&fixture, 0).await;
-    wait_for_server_fires(&fixture, 1).await;
+    let mut next_index = 0;
+    fire_fresh_events_until_spawn_count(&fixture, &spawn_log, &mut next_index, 1).await;
     let state = server_test_state(&fixture);
     // The actor flips this only when its idle branch has killed and dropped
     // the process. This is the product synchronization point, not wall time.
     wait_for_server_stopped(&state).await;
-    fire_user_message(&fixture, 1).await;
-    wait_for_server_fires(&fixture, 2).await;
+    fire_one_event_and_expect_spawn_count(&fixture, &spawn_log, next_index, 2).await;
     assert_eq!(
         spawn_count(&spawn_log),
         2,
@@ -3207,21 +3310,22 @@ async fn server_mode_reaps_idle_and_respawns_for_the_next_event() {
 
 /// A server that exits after one response is a crash from the registry's
 /// view: the NEXT event respawns and still succeeds — no wedged hook.
+///
+/// MUTATION CHECK: change the exited-child `try_wait` branch to `Ok(None)`.
+/// The one allowed next event fails on the dead pipe and cannot produce the
+/// exact second successful spawn before the outer deadline.
 #[tokio::test]
 async fn server_mode_respawns_after_the_process_exits() {
     let (fixture, spawn_log) = server_fixture(0, TestServerKind::OneShot).await;
-    for index in 0..2 {
-        fire_user_message(&fixture, index).await;
-        wait_for_server_fires(&fixture, index + 1).await;
-        if index == 0 {
-            // Read the daemon-owned PID, not a nested script's `$$`: shell
-            // tail-exec is an optimization and differs across Unix variants.
-            let pid = server_test_state(&fixture)
-                .leader_pid()
-                .expect("server leader pid");
-            wait_for_server_leader_exit(pid).await;
-        }
-    }
+    let mut next_index = 0;
+    fire_fresh_events_until_spawn_count(&fixture, &spawn_log, &mut next_index, 1).await;
+    // Read the daemon-owned PID, not a nested script's `$$`: shell tail-exec
+    // is an optimization and differs across Unix variants.
+    let pid = server_test_state(&fixture)
+        .leader_pid()
+        .expect("server leader pid");
+    wait_for_server_leader_exit(pid).await;
+    fire_one_event_and_expect_spawn_count(&fixture, &spawn_log, next_index, 2).await;
     assert_eq!(
         spawn_count(&spawn_log),
         2,

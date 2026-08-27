@@ -10,6 +10,11 @@
 set -o pipefail
 export HAIDER_DISCOVERY_DISABLED=1
 export CARGO_INCREMENTAL=0
+# In-process daemon tests execute the same large, finite async state machines
+# that production runs on explicit 8 MiB main/runtime stacks. Preserve any
+# non-empty caller override, but do not leave Linux libtest on its 2 MiB
+# default (Gate 17's wb_web_runtime_tests stack-overflow mutation pin).
+export RUST_MIN_STACK="${RUST_MIN_STACK:-8388608}"
 # Deterministic device for fixed-width render pins: CI hostnames run 60+
 # chars and shed row segments host-dependently.
 export HAIDER_TEST_DEVICE_NAME=test-mac

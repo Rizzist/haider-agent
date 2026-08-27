@@ -42,8 +42,8 @@ jobs:
       # reasons as ci.yml; Git Bash serves this script on Windows.
       - name: test (per-crate)
         shell: bash
-        env:
-          RUST_MIN_STACK: ${{ runner.os == 'Windows' && '8388608' || '' }}
+        # ci-test.sh gives every OS the production daemon's 8 MiB stack
+        # default while preserving a non-empty caller override.
         run: bash scripts/ci-test.sh
 
   android-build:

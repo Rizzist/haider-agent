@@ -7606,7 +7606,9 @@ async fn w4a2_dispatched_exec_restarts_as_unknown_without_rerun() {
 ///
 /// MUTATION CHECK: remove `ProcessExecution::drop` cancellation or make the
 /// dispatcher detach the handle. The heartbeat continues growing after
-/// Cancelled+Idle and this test fails. Verified by revert in W4a2.
+/// Cancelled+Idle and this test fails. On Windows, also swallow the reserved
+/// keepalive Pong restored from ee2b1ce: the per-frame deadline preempts the
+/// higher-level fresh-attempt observation. Verified by revert in W4a2/win2.
 #[tokio::test]
 async fn w4a2_cancelled_exec_child_process_group_dies() {
     let root = test_root("w4a2-exec-cancel-");

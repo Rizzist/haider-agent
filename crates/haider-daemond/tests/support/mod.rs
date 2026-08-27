@@ -468,6 +468,21 @@ impl UdsClient {
     /// the liveness contract. Use this only around deliberately slow setup;
     /// tests that exercise silent-peer teardown must keep using `receive`.
     pub async fn next_with_keepalive(&mut self, limit: usize) -> WireFrame {
+        #[cfg(windows)]
+        {
+            // Keep the win2 contract from ee2b1ce verbatim: a reserved Pong is
+            // a received frame on Windows. Returning it keeps repeated calls
+            // alive while their caller owns the one continuous long-wait
+            // deadline; swallowing it here reintroduces a per-frame deadline.
+            tokio::time::timeout(DEADLINE, self.try_next_with_keepalive(limit))
+                .await
+                .expect("frame deadline")
+                .unwrap_or_else(|| {
+                    self.report_connection_failure("connection closed during keepalive receive");
+                    panic!("connection closed before a frame arrived")
+                })
+        }
+        #[cfg(not(windows))]
         match tokio::time::timeout(DEADLINE, self.try_next_with_keepalive(limit)).await {
             Ok(Some(frame)) => frame,
             Ok(None) => {
@@ -502,6 +517,14 @@ impl UdsClient {
                 continue;
             }
             let remaining = self.next_keepalive.saturating_duration_since(now);
+            #[cfg(windows)]
+            if let Ok(frame) = tokio::time::timeout(remaining, self.try_receive()).await {
+                // ee2b1ce intentionally returns the reserved keepalive Pong:
+                // the Windows caller, not this per-frame helper, owns the
+                // continuous operation deadline and EOF reconnect policy.
+                return frame;
+            }
+            #[cfg(not(windows))]
             match tokio::time::timeout(remaining, self.try_receive()).await {
                 // Transport-control replies are not test observations. Keeping
                 // this reserved Pong inside the same call also preserves the
