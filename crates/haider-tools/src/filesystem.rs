@@ -8277,7 +8277,7 @@ fn capture_windows_entry_preimage(
         });
     }
     let snapshot = windows_stable_snapshot(&mut entry.handle, display_path)?;
-    if snapshot.identity != entry.identity {
+    if snapshot.identity != entry.identity.file {
         return Err(ToolError::PathChanged {
             path: display_path.to_path_buf(),
             message: "checkpoint source identity changed while snapshotting".into(),

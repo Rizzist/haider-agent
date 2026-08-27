@@ -410,14 +410,17 @@ fn close_inherited_descriptor_range(first: std::os::raw::c_int) -> bool {
 
 /// macOS and other Unix targets use the loop when their deployed libc exposes
 /// no async-signal-safe bulk-close primitive.
-#[cfg(not(any(
-    target_os = "android",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "linux",
-    target_os = "netbsd",
-    target_os = "openbsd"
-)))]
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))
+))]
 fn close_inherited_descriptor_range(_first: std::os::raw::c_int) -> bool {
     false
 }
