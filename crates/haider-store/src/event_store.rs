@@ -16626,11 +16626,21 @@ fn back_workflow_input(
     for edge_id in &spec.join.reactivate_any {
         let edge = state.ast.edges.iter().find(|edge| edge.id == *edge_id)?;
         let source = edge.from.as_ref()?;
-        let evidence = state.node(source)?.rejection.as_ref()?.evidence.clone()?;
+        // Several conditional sources may converge on one retry target. An
+        // earlier source without a live rejection is not evidence that every
+        // later source is inactive, so keep searching the ordered candidates.
+        let Some(evidence) = state
+            .node(source)?
+            .rejection
+            .as_ref()
+            .and_then(|rejection| rejection.evidence.as_ref())
+        else {
+            continue;
+        };
         if evidence.evidence_type == edge.evidence_type {
             return Some(WorkflowNodeInput {
                 edge_id: *edge_id,
-                evidence,
+                evidence: evidence.clone(),
             });
         }
     }

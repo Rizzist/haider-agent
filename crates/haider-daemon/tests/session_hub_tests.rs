@@ -3647,6 +3647,11 @@ async fn cursor_ahead_is_correlated_and_carries_recovery_coordinates() {
 
 /// The additive activation-graph read doors use view authority, preserve
 /// not-found/argument errors, and expose typed cursor recovery coordinates.
+///
+/// MUTATION CHECK: deriving the watch head only from graph-event rows makes
+/// the ahead error report `head: 0` and the empty page stop at cursor zero;
+/// both assertions below must fail because watch cursors live in the sparse
+/// session-journal coordinate space.
 #[tokio::test]
 async fn workflow_graph_read_rpcs_are_authorized_bounded_and_replayable() {
     let (_root, store, hub) = open_hub(None, 8).await;
@@ -3753,7 +3758,7 @@ async fn workflow_graph_read_rpcs_are_authorized_bounded_and_replayable() {
             RequestId::new("workflow-watch-ahead"),
             RequestBody::WorkflowGraphWatch {
                 session_id: session_id.clone(),
-                after_cursor: 1,
+                after_cursor: 2,
                 limit: 1,
             },
         )
@@ -3764,7 +3769,7 @@ async fn workflow_graph_read_rpcs_are_authorized_bounded_and_replayable() {
         WireFrame::Response {
             body: ResponseBody::Error {
                 ref code,
-                data: Some(ErrorData::CursorAhead { requested: 1, head: 0 }),
+                data: Some(ErrorData::CursorAhead { requested: 2, head: 1 }),
                 ..
             },
             ..
@@ -3788,8 +3793,8 @@ async fn workflow_graph_read_rpcs_are_authorized_bounded_and_replayable() {
             body: ResponseBody::WorkflowGraphWatch { page },
             ..
         } if page.requested_after_cursor == 0
-            && page.replay_through_cursor == 0
-            && page.next_cursor == 0
+            && page.replay_through_cursor == 1
+            && page.next_cursor == 1
             && page.events.is_empty()
     ));
 

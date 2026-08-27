@@ -869,7 +869,6 @@ fn exec_child_started(envelope: &RawEnvelope, run_id: &RunId, _output_tail: &mut
         })
 }
 
-#[cfg(windows)]
 fn run_terminal(envelope: &RawEnvelope, run_id: &RunId) -> bool {
     envelope.run_id.as_ref() == Some(run_id)
         && serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
@@ -3206,6 +3205,9 @@ async fn worker_aware_drain_terminalizes_durable_queued_turns_before_store_close
 /// or fail to rediscover a prior-generation Queued run. Expected failure:
 /// the interrupted prompt is sent twice, the queued prompt is never sent, or
 /// the interrupted run lacks its durable recovery failure/terminal state.
+/// Discard the restart attach replay or ignore its queued terminal fact.
+/// Expected failure: when recovered work wins the attach race, the test waits
+/// for a live duplicate that can never arrive and reaches the frame deadline.
 #[tokio::test]
 async fn scenario_9_restart_resumes_only_queued_and_terminalizes_streaming() {
     let root = test_root("w3c-live-");
@@ -3291,7 +3293,7 @@ async fn scenario_9_restart_resumes_only_queued_and_terminalizes_streaming() {
         ClientKind::Headless,
     )
     .await;
-    attach_existing(
+    let replay = attach_existing(
         &mut second,
         &config,
         session_id.clone(),
@@ -3299,7 +3301,12 @@ async fn scenario_9_restart_resumes_only_queued_and_terminalizes_streaming() {
         "restart-attach",
     )
     .await;
-    let _ = events_until_terminal(&mut second, &queued_run).await;
+    if !replay
+        .iter()
+        .any(|envelope| run_terminal(envelope, &queued_run))
+    {
+        let _ = events_until_terminal(&mut second, &queued_run).await;
+    }
     let envelopes = read_session(&mut second, &config, session_id, "restart-read-terminal").await;
     let streaming = payloads_for_run(&envelopes, &streaming_run).collect::<Vec<_>>();
     let queued = payloads_for_run(&envelopes, &queued_run).collect::<Vec<_>>();

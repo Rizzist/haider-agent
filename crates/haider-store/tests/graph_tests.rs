@@ -3274,6 +3274,9 @@ fn compiled_loom_red_targets_survive_registry_pin_and_converge_at_runtime() {
         EvidenceVerdict::Green,
         "prepare converged after self-loop",
     );
+    // MUTATION CHECK: PREPARE's inactive self-edge precedes CHECK's live
+    // back edge in `reactivate_any`. Returning on the first missing rejection
+    // makes CHECK's eighth red fall through to an invalid forward activation.
     for serial in 30_009..30_017 {
         record(
             &store,

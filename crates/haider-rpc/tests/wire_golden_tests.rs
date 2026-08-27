@@ -2630,20 +2630,20 @@ fn device_discovery_goldens_are_additive_and_tolerance_re_proved() {
         .expect("D1 welcome frame in the golden transcript");
     // D1's six frames stay contiguous at their original offset; T1 then
     // appended seven transcription-secret frames, U1 three usage-report
-    // frames, G2 three session-rename frames, G3 four tuning frames, and F1
-    // three fleet frames AFTER them — each append pinned by its own additive
-    // law — so D1 ends at the NEXT appended
+    // frames, G2 three session-rename frames, G3 four tuning frames, F1 three
+    // fleet frames, and L4 two loom-registry stream frames AFTER them — each
+    // append pinned by its own additive law — so D1 ends at the NEXT appended
     // welcome (whichever wave owns it) and nothing before `d1_start` can
     // have moved.
     assert_eq!(
         frames.len() - d1_start,
-        6 + 7 + 3 + 3 + 4 + 3 + 4 + 1 + 2,
+        6 + 7 + 3 + 3 + 4 + 3 + 4 + 1 + 2 + 2,
         "six D1 frames, then T1's seven transcription frames, then U1's \
          three usage frames, then G2's three session-rename frames, then \
          G3's four session-tuning frames, F1's three fleet frames, then \
          WIRE-GAPS' four read frames, Slice 2's folded response, then #6's \
-         two monitor-delivery frames — the accounted tail pins that nothing \
-         before d1_start moved"
+         two monitor-delivery frames, then L4's two loom-registry stream frames \
+         — the accounted tail pins that nothing before d1_start moved"
     );
     for frame in &frames[d1_start..d1_start + 6] {
         let encoded = ws_codec::encode(frame, TEST_FRAME_LIMIT).expect("encode D1 frame");
@@ -2894,8 +2894,8 @@ fn session_rename_frames_are_additive_and_golden() {
 
     // The G2 frames were appended at the then-END of the transcript: three
     // frames, append-only; G3 later appended its four session-tuning frames
-    // and F1 its three fleet frames strictly AFTER them (each pinned by its
-    // own law).
+    // and F1 its three fleet frames strictly AFTER them, followed by L4's two
+    // loom-registry stream frames (each pinned by its own law).
     let frames = transcript();
     let g2_start = frames
         .iter()
@@ -2909,10 +2909,10 @@ fn session_rename_frames_are_additive_and_golden() {
         .expect("G2 welcome frame in the golden transcript");
     assert_eq!(
         frames.len() - g2_start,
-        3 + 4 + 3 + 4 + 1 + 2,
+        3 + 4 + 3 + 4 + 1 + 2 + 2,
         "G2's three frames, then G3's four tuning frames, F1's three fleet frames, \
          WIRE-GAPS' four read frames, Slice 2's folded response, then #6's two \
-         monitor-delivery frames"
+         monitor-delivery frames, then L4's two loom-registry stream frames"
     );
 
     // Exact golden bytes for the titled request/response pair.
@@ -3042,9 +3042,10 @@ fn transcription_secret_frames_are_additive_and_redacted() {
     // The seven T1 frames sit directly before U1's three usage frames,
     // G2's three session-rename frames, G3's four session-tuning frames, F1's
     // three fleet frames, WIRE-GAPS' four reads, Slice 2's folded response,
-    // and #6's two monitor-delivery frames (each later wave's own law pins its
-    // append). Anchor the intended block by identity so a later tail append
-    // cannot silently slide this sequence window onto unrelated frames.
+    // #6's two monitor-delivery frames, and L4's two loom-registry stream
+    // frames (each later wave's own law pins its append). Anchor the intended
+    // block by identity so a later tail append cannot silently slide this
+    // sequence window onto unrelated frames.
     let frames = transcript();
     let t1_start = frames
         .iter()
@@ -3060,10 +3061,11 @@ fn transcription_secret_frames_are_additive_and_redacted() {
         .expect("T1 first set request in the golden transcript");
     assert_eq!(
         frames.len() - t1_start,
-        7 + 3 + 3 + 4 + 3 + 4 + 1 + 2,
+        7 + 3 + 3 + 4 + 3 + 4 + 1 + 2 + 2,
         "T1's seven frames, U1's three usage frames, G2's three rename frames, \
          G3's four tuning frames, F1's three fleet frames, WIRE-GAPS' four read \
-         frames, Slice 2's folded response, then #6's two monitor-delivery frames"
+         frames, Slice 2's folded response, #6's two monitor-delivery frames, \
+         then L4's two loom-registry stream frames"
     );
     let tail = &frames[t1_start..t1_start + 7];
     let methods: Vec<String> = tail
@@ -3177,7 +3179,8 @@ fn usage_report_goldens_are_additive_normalized_and_secret_free() {
 
     // The U1 frames were appended at the then-END of the transcript: three
     // frames, append-only; G2 later appended three session-rename frames, G3
-    // four tuning frames, and F1 three fleet frames strictly AFTER them.
+    // four tuning frames, F1 three fleet frames, and L4 two loom-registry
+    // stream frames strictly AFTER them.
     let frames = transcript();
     let u1_start = frames
         .iter()
@@ -3191,11 +3194,12 @@ fn usage_report_goldens_are_additive_normalized_and_secret_free() {
         .expect("U1 welcome frame in the golden transcript");
     assert_eq!(
         frames.len() - u1_start,
-        3 + 3 + 4 + 3 + 4 + 1 + 2,
+        3 + 3 + 4 + 3 + 4 + 1 + 2 + 2,
         "three U1 frames, then G2's three session-rename frames, then G3's \
          four session-tuning frames, F1's three fleet frames, then \
          WIRE-GAPS' four read frames, Slice 2's folded response, then #6's two \
-         monitor-delivery frames (each later wave's own law pins its append)"
+         monitor-delivery frames, then L4's two loom-registry stream frames \
+         (each later wave's own law pins its append)"
     );
     for frame in &frames[u1_start..u1_start + 3] {
         let encoded = ws_codec::encode(frame, TEST_FRAME_LIMIT).expect("encode U1 frame");
@@ -3577,6 +3581,10 @@ fn model_detail_tuning_fields_are_additive_and_skip_empty() {
 /// FLEET WIRE LAW: the new feature/request/response trio is the exact
 /// historical transcript block, keeps protocol v1, and retains the open-enum tolerance
 /// used throughout the existing read surfaces.
+///
+/// MUTATION CHECK: remove either final L4 stream frame or move it before the
+/// fleet block. Expected runtime failure: the exact suffix count below or
+/// L4's exact tail indices no longer match.
 #[test]
 fn session_fleet_frames_are_additive_and_unknown_tolerant() {
     assert_eq!(haider_rpc::FEATURE_SESSION_FLEET_V1, "session_fleet_v1");
@@ -3594,9 +3602,10 @@ fn session_fleet_frames_are_additive_and_unknown_tolerant() {
         .expect("fleet feature welcome");
     assert_eq!(
         frames.len() - fleet_start,
-        3 + 4 + 1 + 2,
+        3 + 4 + 1 + 2 + 2,
         "three fleet frames, then WIRE-GAPS' four read frames, Slice 2's \
-         folded response, and #6's two monitor-delivery frames"
+         folded response, #6's two monitor-delivery frames, and L4's two \
+         loom-registry stream frames"
     );
     assert!(matches!(
         &frames[fleet_start],

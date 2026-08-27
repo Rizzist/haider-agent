@@ -11,7 +11,6 @@
 // re-audit when helpers are added.
 #![allow(dead_code)]
 
-#[cfg(windows)]
 use haider_daemon::DaemonTaskDiagnostics;
 use haider_daemon::{
     DaemonConfig, DaemonDependencies, DaemonState, DaemonTask, spawn, spawn_with_dependencies,
@@ -19,17 +18,12 @@ use haider_daemon::{
 use haider_rpc::{
     Capability, CapabilitySet, ClientKind, Hello, WIRE_PROTOCOL_VERSION, WireFrame, uds_codec,
 };
-#[cfg(windows)]
 use std::collections::HashMap;
 use std::collections::VecDeque;
-#[cfg(windows)]
 use std::fmt::Write as _;
 use std::path::Path;
-#[cfg(windows)]
 use std::path::PathBuf;
-#[cfg(windows)]
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(windows)]
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -45,24 +39,19 @@ pub const DEADLINE: Duration = Duration::from_secs(60);
 /// deadline. Long scenario-specific waits may exceed both values; this cadence
 /// keeps their connections non-idle for the whole outer wait.
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const KEEPALIVE_NONCE: u64 = u64::MAX - 1;
 
-#[cfg(windows)]
 const DIAGNOSTIC_LINES: usize = 200;
-#[cfg(windows)]
 const DIAGNOSTIC_LINE_BYTES: usize = 4 * 1024;
-#[cfg(windows)]
 const DIAGNOSTIC_TRACE_PRINT_LINES: usize = 50;
 
-#[cfg(windows)]
 type DiagnosticRing = Arc<StdMutex<VecDeque<String>>>;
 
-#[cfg(windows)]
 fn daemon_tasks() -> &'static StdMutex<HashMap<PathBuf, DaemonTaskDiagnostics>> {
     static TASKS: OnceLock<StdMutex<HashMap<PathBuf, DaemonTaskDiagnostics>>> = OnceLock::new();
     TASKS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
-#[cfg(windows)]
 fn register_daemon(config: &DaemonConfig, task: &DaemonTask) {
     daemon_tasks()
         .lock()
@@ -70,7 +59,6 @@ fn register_daemon(config: &DaemonConfig, task: &DaemonTask) {
         .insert(config.endpoint_path(), task.diagnostics());
 }
 
-#[cfg(windows)]
 fn daemon_diagnostics(path: &Path) -> Option<DaemonTaskDiagnostics> {
     daemon_tasks()
         .lock()
@@ -79,7 +67,6 @@ fn daemon_diagnostics(path: &Path) -> Option<DaemonTaskDiagnostics> {
         .cloned()
 }
 
-#[cfg(windows)]
 fn push_diagnostic(ring: &DiagnosticRing, mut line: String) {
     if line.len() > DIAGNOSTIC_LINE_BYTES {
         let mut end = DIAGNOSTIC_LINE_BYTES.saturating_sub('…'.len_utf8());
@@ -98,7 +85,6 @@ fn push_diagnostic(ring: &DiagnosticRing, mut line: String) {
     output.push_back(line);
 }
 
-#[cfg(windows)]
 fn ring_snapshot(ring: &DiagnosticRing) -> Vec<String> {
     ring.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -107,7 +93,6 @@ fn ring_snapshot(ring: &DiagnosticRing) -> Vec<String> {
         .collect()
 }
 
-#[cfg(windows)]
 fn ring_tail(ring: &DiagnosticRing, limit: usize) -> Vec<String> {
     let output = ring
         .lock()
@@ -119,29 +104,24 @@ fn ring_tail(ring: &DiagnosticRing, limit: usize) -> Vec<String> {
         .collect()
 }
 
-#[cfg(windows)]
 fn trace_ring() -> DiagnosticRing {
     static TRACE: OnceLock<DiagnosticRing> = OnceLock::new();
     Arc::clone(TRACE.get_or_init(|| Arc::new(StdMutex::new(VecDeque::new()))))
 }
 
-#[cfg(windows)]
 struct TraceFields<'a>(&'a mut String);
 
-#[cfg(windows)]
 impl tracing::field::Visit for TraceFields<'_> {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         let _ = write!(self.0, "{}={value:?};", field.name());
     }
 }
 
-#[cfg(windows)]
 struct TraceCapture {
     output: DiagnosticRing,
     next_span: AtomicU64,
 }
 
-#[cfg(windows)]
 impl tracing::Subscriber for TraceCapture {
     fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
         true
@@ -181,7 +161,6 @@ impl tracing::Subscriber for TraceCapture {
     fn exit(&self, _span: &tracing::span::Id) {}
 }
 
-#[cfg(windows)]
 fn install_trace_capture() -> DiagnosticRing {
     static INSTALLED: OnceLock<()> = OnceLock::new();
     let output = trace_ring();
@@ -208,11 +187,10 @@ fn install_trace_capture() -> DiagnosticRing {
     output
 }
 
-/// Prints the bounded in-process daemon trace and wire transcript when a
-/// Windows test unwinds. There is no child stdout/stderr or OS ExitStatus in
-/// this harness; the trace/panic ring and typed daemon-task outcome are the
-/// truthful equivalents.
-#[cfg(windows)]
+/// Prints the bounded in-process daemon trace and wire transcript when a test
+/// unwinds. There is no child stdout/stderr or OS ExitStatus in this harness;
+/// the trace/panic ring and typed daemon-task outcome are the truthful
+/// equivalents on every platform.
 pub struct FailureDiagnostics {
     label: &'static str,
     daemon: DaemonTaskDiagnostics,
@@ -220,7 +198,6 @@ pub struct FailureDiagnostics {
     clients: Vec<DiagnosticRing>,
 }
 
-#[cfg(windows)]
 impl FailureDiagnostics {
     pub fn install(label: &'static str, task: &DaemonTask) -> Self {
         Self {
@@ -236,16 +213,12 @@ impl FailureDiagnostics {
     }
 }
 
-#[cfg(windows)]
 impl Drop for FailureDiagnostics {
     fn drop(&mut self) {
         if !std::thread::panicking() {
             return;
         }
-        eprintln!(
-            "===== {} Windows daemon failure diagnostics =====",
-            self.label
-        );
+        eprintln!("===== {} daemon failure diagnostics =====", self.label);
         eprintln!(
             "daemon is in-process (no child stdout/stderr or OS exit status); task={:?}",
             self.daemon.snapshot()
@@ -305,10 +278,8 @@ fn hermetic(config: &DaemonConfig) -> DaemonConfig {
 }
 
 pub async fn ready(config: &DaemonConfig) -> DaemonTask {
-    #[cfg(windows)]
     let _trace = install_trace_capture();
     let task = spawn(hermetic(config));
-    #[cfg(windows)]
     register_daemon(config, &task);
     await_ready(task).await
 }
@@ -317,10 +288,8 @@ pub async fn ready_with_dependencies(
     config: &DaemonConfig,
     dependencies: DaemonDependencies,
 ) -> DaemonTask {
-    #[cfg(windows)]
     let _trace = install_trace_capture();
     let task = spawn_with_dependencies(hermetic(config), dependencies);
-    #[cfg(windows)]
     register_daemon(config, &task);
     await_ready(task).await
 }
@@ -347,13 +316,9 @@ pub struct UdsClient {
     pub stream: haider_platform::IpcStream,
     decoder: uds_codec::Decoder,
     pending: VecDeque<WireFrame>,
-    #[cfg(windows)]
     frame_limit: usize,
-    #[cfg(windows)]
     next_keepalive: tokio::time::Instant,
-    #[cfg(windows)]
     history: DiagnosticRing,
-    #[cfg(windows)]
     daemon: Option<DaemonTaskDiagnostics>,
 }
 
@@ -363,13 +328,9 @@ impl UdsClient {
             stream: haider_platform::connect(path).await?,
             decoder: uds_codec::Decoder::new(frame_limit),
             pending: VecDeque::new(),
-            #[cfg(windows)]
             frame_limit,
-            #[cfg(windows)]
             next_keepalive: tokio::time::Instant::now() + KEEPALIVE_INTERVAL,
-            #[cfg(windows)]
             history: Arc::new(StdMutex::new(VecDeque::new())),
-            #[cfg(windows)]
             daemon: daemon_diagnostics(path),
         })
     }
@@ -392,9 +353,8 @@ impl UdsClient {
         .await
     }
 
-    /// Windows-only long-wait handshake that reports an EOF instead of
-    /// panicking, while preserving the daemon's negotiated-peer keepalive.
-    #[cfg(windows)]
+    /// Long-wait handshake that reports an EOF instead of panicking, while
+    /// preserving the daemon's negotiated-peer keepalive.
     pub async fn try_connect_control_with_keepalive(
         path: &Path,
         frame_limit: usize,
@@ -455,7 +415,6 @@ impl UdsClient {
     }
 
     pub async fn send(&mut self, frame: &WireFrame, limit: usize) {
-        #[cfg(windows)]
         self.record_frame("send", frame);
         let bytes = uds_codec::encode(frame, limit).expect("test frame encodes");
         self.stream.write_all(&bytes).await.expect("frame writes");
@@ -464,27 +423,17 @@ impl UdsClient {
     /// Best-effort send for retry loops: a rejected connection may already be
     /// closed by the time the test writes.
     pub async fn try_send(&mut self, frame: &WireFrame, limit: usize) -> bool {
-        #[cfg(windows)]
         self.record_frame("send", frame);
         let bytes = uds_codec::encode(frame, limit).expect("test frame encodes");
         self.stream.write_all(&bytes).await.is_ok()
     }
 
     pub async fn receive(&mut self) -> WireFrame {
-        #[cfg(not(windows))]
-        {
-            self.try_receive()
-                .await
-                .expect("connection closed before a frame arrived")
-        }
-        #[cfg(windows)]
-        {
-            match self.try_receive().await {
-                Some(frame) => frame,
-                None => {
-                    self.report_connection_failure("connection closed before a frame arrived");
-                    panic!("connection closed before a frame arrived")
-                }
+        match self.try_receive().await {
+            Some(frame) => frame,
+            None => {
+                self.report_connection_failure("connection closed before a frame arrived");
+                panic!("connection closed before a frame arrived")
             }
         }
     }
@@ -502,75 +451,38 @@ impl UdsClient {
     }
 
     pub async fn next(&mut self) -> WireFrame {
-        #[cfg(windows)]
-        {
-            self.next_with_keepalive(self.frame_limit).await
-        }
-        #[cfg(not(windows))]
-        {
-            tokio::time::timeout(DEADLINE, self.receive())
-                .await
-                .expect("frame deadline")
-        }
+        self.next_with_keepalive(self.frame_limit).await
     }
 
     /// Deadline-bounded counterpart to [`Self::receive_reply`].
     pub async fn next_reply(&mut self) -> WireFrame {
-        #[cfg(windows)]
-        {
-            loop {
-                let frame = self.next_with_keepalive(self.frame_limit).await;
-                if !matches!(frame, WireFrame::ResidentSessionBinding { .. }) {
-                    return frame;
-                }
+        loop {
+            let frame = self.next_with_keepalive(self.frame_limit).await;
+            if !matches!(frame, WireFrame::ResidentSessionBinding { .. }) {
+                return frame;
             }
         }
-        #[cfg(not(windows))]
-        tokio::time::timeout(DEADLINE, self.receive_reply())
-            .await
-            .expect("reply deadline")
     }
 
     /// Waits for one frame while preserving the negotiated peer's R9 side of
     /// the liveness contract. Use this only around deliberately slow setup;
     /// tests that exercise silent-peer teardown must keep using `receive`.
     pub async fn next_with_keepalive(&mut self, limit: usize) -> WireFrame {
-        #[cfg(windows)]
-        {
-            tokio::time::timeout(DEADLINE, self.try_next_with_keepalive(limit))
-                .await
-                .expect("frame deadline")
-                .unwrap_or_else(|| {
-                    self.report_connection_failure("connection closed during keepalive receive");
-                    panic!("connection closed before a frame arrived")
-                })
-        }
-        #[cfg(not(windows))]
-        {
-            tokio::time::timeout(DEADLINE, async {
-                loop {
-                    match tokio::time::timeout(KEEPALIVE_INTERVAL, self.receive()).await {
-                        Ok(frame) => return frame,
-                        Err(_) => {
-                            self.send(
-                                &WireFrame::Ping {
-                                    nonce: u64::MAX - 1,
-                                },
-                                limit,
-                            )
-                            .await;
-                        }
-                    }
-                }
-            })
-            .await
-            .expect("frame deadline")
+        match tokio::time::timeout(DEADLINE, self.try_next_with_keepalive(limit)).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                self.report_connection_failure("connection closed during keepalive receive");
+                panic!("connection closed before a frame arrived")
+            }
+            Err(_) => {
+                self.report_connection_failure("frame deadline elapsed during keepalive receive");
+                panic!("frame deadline")
+            }
         }
     }
 
-    /// EOF-aware Windows counterpart used inside an independently bounded
-    /// process-start wait. It deliberately has no second outer deadline.
-    #[cfg(windows)]
+    /// EOF-aware counterpart used inside an independently bounded long wait.
+    /// It deliberately has no second outer deadline.
     pub async fn try_next_with_keepalive(&mut self, limit: usize) -> Option<WireFrame> {
         loop {
             let now = tokio::time::Instant::now();
@@ -578,7 +490,7 @@ impl UdsClient {
                 if !self
                     .try_send(
                         &WireFrame::Ping {
-                            nonce: u64::MAX - 1,
+                            nonce: KEEPALIVE_NONCE,
                         },
                         limit,
                     )
@@ -590,13 +502,17 @@ impl UdsClient {
                 continue;
             }
             let remaining = self.next_keepalive.saturating_duration_since(now);
-            if let Ok(frame) = tokio::time::timeout(remaining, self.try_receive()).await {
-                return frame;
+            match tokio::time::timeout(remaining, self.try_receive()).await {
+                // Transport-control replies are not test observations. Keeping
+                // this reserved Pong inside the same call also preserves the
+                // caller's one continuous outer frame deadline.
+                Ok(Some(WireFrame::Pong { nonce })) if nonce == KEEPALIVE_NONCE => {}
+                Ok(frame) => return frame,
+                Err(_) => {}
             }
         }
     }
 
-    #[cfg(windows)]
     pub fn inherit_diagnostics_from(&mut self, previous: &Self) {
         let current = self.history_snapshot();
         self.history = Arc::clone(&previous.history);
@@ -606,17 +522,14 @@ impl UdsClient {
         }
     }
 
-    #[cfg(windows)]
     pub fn history_snapshot(&self) -> Vec<String> {
         ring_snapshot(&self.history)
     }
 
-    #[cfg(windows)]
     fn record_frame(&self, direction: &str, frame: &WireFrame) {
         push_diagnostic(&self.history, format!("{direction}: {frame:?}"));
     }
 
-    #[cfg(windows)]
     pub fn report_connection_failure(&self, reason: &str) {
         eprintln!("{reason}");
         match &self.daemon {
@@ -642,15 +555,11 @@ impl UdsClient {
     /// Next frame, or `None` when the daemon closed the connection first.
     pub async fn try_receive(&mut self) -> Option<WireFrame> {
         if let Some(frame) = self.pending.pop_front() {
-            #[cfg(windows)]
             self.record_frame("recv", &frame);
             return Some(frame);
         }
         loop {
             let mut bytes = [0_u8; 16 * 1024];
-            #[cfg(not(windows))]
-            let read = self.stream.read(&mut bytes).await.expect("frame reads");
-            #[cfg(windows)]
             let read = match self.stream.read(&mut bytes).await {
                 Ok(read) => read,
                 Err(error) => {
@@ -665,7 +574,6 @@ impl UdsClient {
             assert!(batch.error.is_none(), "server sent an invalid frame");
             self.pending.extend(batch.frames);
             if let Some(frame) = self.pending.pop_front() {
-                #[cfg(windows)]
                 self.record_frame("recv", &frame);
                 return Some(frame);
             }
