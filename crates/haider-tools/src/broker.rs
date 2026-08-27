@@ -976,17 +976,6 @@ impl EffectFinish {
             .await
     }
 
-    pub(crate) async fn finish_with_workspace_mutation<T>(
-        self,
-        result: ToolResult<T>,
-        freshness: Option<FileFreshness>,
-        workspace_mutation: Option<WorkspaceMutation>,
-    ) -> ToolResult<T> {
-        self.journal
-            .finish_in_finalizer(&self.intent, result, freshness, workspace_mutation)
-            .await
-    }
-
     pub(crate) async fn finish_with_checkpoint<T>(
         self,
         result: ToolResult<T>,

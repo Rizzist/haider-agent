@@ -14673,12 +14673,14 @@ fn waiting_why(
         haider_rpc::ObserveRunStateWire::ParkedInput => {
             let menu = menu_for(|_| true);
             let kind = menu.map_or(WaitingWhyKindWire::Question, |menu| {
-                matches!(
+                if matches!(
                     menu.kind.as_str(),
                     "graph_human_confirm" | "graph_abandon_confirm" | "trust_hook" | "update"
-                )
-                .then_some(WaitingWhyKindWire::Approval)
-                .unwrap_or(WaitingWhyKindWire::Question)
+                ) {
+                    WaitingWhyKindWire::Approval
+                } else {
+                    WaitingWhyKindWire::Question
+                }
             });
             Some(WaitingWhyWire {
                 kind,

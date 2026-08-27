@@ -437,7 +437,7 @@ fn read_anchored_optional(workspace_root: &Path, relative: &Path) -> ToolResult<
             "ignore control has no file name",
         ));
     };
-    let parent_relative = relative.parent().unwrap_or_else(|| Path::new(""));
+    let parent_relative = relative.parent().unwrap_or(Path::new(""));
     let root = haider_platform::open_workspace_directory(workspace_root)
         .map_err(|error| ToolError::io("open ignore workspace", workspace_root, error))?;
     let parent = match haider_platform::open_workspace_subdirectory(root, parent_relative, false) {

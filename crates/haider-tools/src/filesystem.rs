@@ -2810,12 +2810,17 @@ impl CompiledSearch {
                     vec![haystack[..column].chars().count().saturating_add(1)]
                 })
             }
-            FsSearchMode::Simple => self
-                .regex
-                .as_ref()
-                .is_some_and(|regex| regex[0].is_match(line))
-                .then_some(vec![1])
-                .unwrap_or_default(),
+            FsSearchMode::Simple => {
+                if self
+                    .regex
+                    .as_ref()
+                    .is_some_and(|regex| regex[0].is_match(line))
+                {
+                    vec![1]
+                } else {
+                    Vec::new()
+                }
+            }
         }
     }
 }
@@ -2865,12 +2870,20 @@ fn rewrite_file_boundaries(hir: &Hir, first_line: bool, last_line: bool) -> Hir 
         HirKind::Literal(literal) => Hir::literal(literal.0.clone()),
         HirKind::Class(class) => Hir::class(class.clone()),
         HirKind::Look(look) => match look {
-            Look::Start => first_line
-                .then_some(Hir::look(Look::Start))
-                .unwrap_or_else(Hir::fail),
-            Look::End => last_line
-                .then_some(Hir::look(Look::End))
-                .unwrap_or_else(Hir::fail),
+            Look::Start => {
+                if first_line {
+                    Hir::look(Look::Start)
+                } else {
+                    Hir::fail()
+                }
+            }
+            Look::End => {
+                if last_line {
+                    Hir::look(Look::End)
+                } else {
+                    Hir::fail()
+                }
+            }
             Look::StartLF | Look::StartCRLF => Hir::look(Look::Start),
             Look::EndLF | Look::EndCRLF => Hir::look(Look::End),
             other => Hir::look(*other),
@@ -4139,7 +4152,7 @@ fn sync_mutation_parents(paths: &[PathBuf]) -> ToolResult<()> {
         .map(|path| {
             path.parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."))
+                .unwrap_or(Path::new("."))
                 .to_path_buf()
         })
         .collect::<Vec<_>>();
@@ -4822,7 +4835,7 @@ fn windows_mutation_target(
         .ok_or_else(|| ToolError::invalid_argument("filesystem path has no leaf name"))?;
     let root = haider_platform::duplicate_workspace_directory(workspace_root)
         .map_err(|error| ToolError::io("duplicate workspace root", display_path, error))?;
-    let relative_parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let relative_parent = relative.parent().unwrap_or(Path::new(""));
     let parent =
         haider_platform::open_workspace_subdirectory(root, relative_parent, create_parents)
             .map_err(|error| ToolError::io("open anchored mutation parent", display_path, error))?;
@@ -7776,17 +7789,6 @@ fn open_target_at(
 }
 
 #[cfg(unix)]
-fn open_directory_at(
-    workspace_dir: OwnedFd,
-    relative: &Path,
-    operation: &'static str,
-    display_path: &Path,
-) -> ToolResult<OwnedFd> {
-    let components = normal_components(relative);
-    walk_directories(workspace_dir, &components, operation, display_path)
-}
-
-#[cfg(unix)]
 fn open_parent_at(
     workspace_dir: OwnedFd,
     relative: &Path,
@@ -7982,15 +7984,15 @@ where
     let preview_truncated = output.preview_saturated;
     let semantic_truncated = output.truncated_reason.is_some();
     let truncated = match_truncated || byte_truncated || preview_truncated || semantic_truncated;
-    let truncated_reason = output.truncated_reason.or_else(|| {
-        if byte_truncated || preview_truncated {
+    let truncated_reason = output
+        .truncated_reason
+        .or(if byte_truncated || preview_truncated {
             Some(ToolTruncationReason::ResultBytes)
         } else if match_truncated {
             Some(ToolTruncationReason::MatchLimit)
         } else {
             None
-        }
-    });
+        });
     let artifact = Some(cas.put_file(output.complete.path()).await?);
     let mut result = BoundedResult {
         preview: output.preview,
@@ -8060,7 +8062,7 @@ where
     let truncated = output.truncated || byte_truncated;
     let truncated_reason = output
         .truncated_reason
-        .or_else(|| byte_truncated.then_some(ToolTruncationReason::ResultBytes));
+        .or(byte_truncated.then_some(ToolTruncationReason::ResultBytes));
     let artifact = Some(cas.put(output.contents.as_bytes()).await?);
     Ok(BoundedResult {
         preview: utf8_prefix(&output.preview, bounds.max_preview_bytes).to_owned(),

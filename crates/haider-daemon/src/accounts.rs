@@ -1386,15 +1386,6 @@ async fn run_account_actor(
     }
     if let Some(discovery_disabled) = startup_discovery_disabled {
         let _ = discover_candidates(
-            &store,
-            &mut accounts,
-            Arc::clone(&vault),
-            &snapshot,
-            management.as_ref(),
-            &providers,
-            &reserved_aliases,
-            &refresh_fences,
-            Arc::clone(&gcloud),
             Arc::clone(&claude_native),
             discovery_disabled,
             ClaudeNativeReadEvent::AdoptionDiscovery,
@@ -1513,15 +1504,6 @@ async fn run_account_actor(
                 completed,
             } => {
                 let discovered = discover_candidates(
-                    &store,
-                    &mut accounts,
-                    Arc::clone(&vault),
-                    &snapshot,
-                    management.as_ref(),
-                    &providers,
-                    &reserved_aliases,
-                    &refresh_fences,
-                    Arc::clone(&gcloud),
                     Arc::clone(&claude_native),
                     discovery_disabled,
                     ClaudeNativeReadEvent::AdoptionDiscovery,
@@ -5378,17 +5360,7 @@ fn canonical_positive_decimal(value: &str) -> bool {
         && value.as_bytes()[1..].iter().all(u8::is_ascii_digit)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn discover_candidates(
-    _store: &SqliteStoreHandle,
-    _accounts: &mut AccountStore<Box<dyn StoreLike>>,
-    _vault: Arc<dyn Vault>,
-    _snapshot: &AccountsSnapshot,
-    _management: Option<&ManagementSnapshot>,
-    _providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
-    _reserved_aliases: &HashSet<String>,
-    _refresh_fences: &RefreshFenceRegistry,
-    _gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
     claude_native: Arc<dyn ClaudeNativeCredentialStore>,
     discovery_disabled: bool,
     event: ClaudeNativeReadEvent,

@@ -3551,7 +3551,7 @@ impl LiveDriver {
                 self.provider_model_refreshes(model)
             }
             LiveReply::ProviderModelsRefreshed { provider, revision } => {
-                self.models_requested.remove(&provider);
+                self.models_requested.remove(&provider.provider);
                 if model.providers.apply_models_refresh(provider, revision) {
                     // The catalog is here: NOW the bootstrap can adopt the
                     // provider's real default model (W5f-2d).

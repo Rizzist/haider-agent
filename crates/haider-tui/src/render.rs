@@ -4704,11 +4704,12 @@ fn render_session(
         // Fixed-width readout, left-anchored above the composer (owner
         // 2026-08-21): 24 bar columns then a 5-char rate field, so the row
         // never shifts as digits (or the ~ marker) come and go.
+        let rate_width = 5_usize.saturating_sub(tilde.len());
         let mut spans = vec![
             Span::raw(" "),
             Span::styled(readout.spark.clone(), spark_ink),
             Span::styled(
-                format!(" {:>5} tps", format!("{tilde}{}", readout.tps)),
+                format!(" {tilde}{:>rate_width$} tps", readout.tps),
                 rate_ink,
             ),
         ];

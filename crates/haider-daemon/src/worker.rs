@@ -15253,17 +15253,17 @@ impl JournalSink for HubJournalSink {
             }
             return Err(error);
         }
-        if let (Some(diagnostics), Some(breadcrumb)) = (&self.diagnostics, dispatched) {
-            if let Err(error) = diagnostics.record_start(breadcrumb).await {
-                // Diagnostics are a best-effort crash breadcrumb, never part
-                // of the journal transaction's success value. Waiting here
-                // preserves Start-before-Complete ordering while swallowing
-                // failure preserves JournalSink's Err-means-no-commit law.
-                tracing::warn!(
-                    %error,
-                    "effect dispatch committed but start diagnostic update failed"
-                );
-            }
+        if let (Some(diagnostics), Some(breadcrumb)) = (&self.diagnostics, dispatched)
+            && let Err(error) = diagnostics.record_start(breadcrumb).await
+        {
+            // Diagnostics are a best-effort crash breadcrumb, never part
+            // of the journal transaction's success value. Waiting here
+            // preserves Start-before-Complete ordering while swallowing
+            // failure preserves JournalSink's Err-means-no-commit law.
+            tracing::warn!(
+                %error,
+                "effect dispatch committed but start diagnostic update failed"
+            );
         }
         if let (Some(diagnostics), Some(breadcrumb)) = (&self.diagnostics, completed) {
             let diagnostics = Arc::clone(diagnostics);

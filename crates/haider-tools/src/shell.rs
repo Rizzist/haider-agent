@@ -186,13 +186,12 @@ fn reduce_rust_compiler(input: &str) -> String {
             keep_first_arrow = false;
             continue;
         }
-        if trimmed.contains("could not compile")
+        if (trimmed.contains("could not compile")
             || trimmed.contains("error emitted")
-            || trimmed.starts_with("error: aborting")
+            || trimmed.starts_with("error: aborting"))
+            && seen.insert(trimmed.to_owned())
         {
-            if seen.insert(trimmed.to_owned()) {
-                kept.push(line.to_owned());
-            }
+            kept.push(line.to_owned());
         }
     }
     collapse_repeated_lines(&kept)
@@ -231,7 +230,8 @@ fn reduce_test_output(input: &str, failed: bool) -> String {
                 lines
                     .iter()
                     .zip(retained)
-                    .filter_map(|(line, retain)| retain.then_some((*line).to_owned()))
+                    .filter(|(_, retain)| *retain)
+                    .map(|(line, _)| (*line).to_owned())
                     .collect(),
             ));
             return output;
@@ -301,10 +301,7 @@ fn json_scalar(value: &serde_json::Value) -> String {
         serde_json::Value::Bool(value) => value.to_string(),
         _ => String::new(),
     };
-    scalar
-        .replace('\t', " ")
-        .replace('\r', " ")
-        .replace('\n', " ")
+    scalar.replace(['\t', '\r', '\n'], " ")
 }
 
 fn reduce_git_output(input: &str) -> String {
