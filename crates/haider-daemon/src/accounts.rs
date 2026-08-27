@@ -40,8 +40,8 @@ use haider_core::{
     LoginReceiptResponse, ManagementClaim, PROVIDER_CONFIGURE_METHOD, PROVIDER_REMOVE_METHOD,
 };
 use haider_protocol::credential::{
-    AuthMethod, CredentialAttentionReason, CredentialDescriptor, CredentialStatus, RotationCause,
-    RotationEvent,
+    AccountIdentity, AuthMethod, CredentialAttentionReason, CredentialDescriptor, CredentialStatus,
+    RotationCause, RotationEvent,
 };
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::CredentialAlias;
@@ -52,8 +52,9 @@ use haider_provider::{
     GEMINI_PROVIDER_NAME, GROK_OAUTH_PROVIDER_NAME, GeminiProvider, HAIDER_CODE_BASE_URL,
     HAIDER_CODE_PROVIDER_NAME, KIMI_OAUTH_PROVIDER_NAME, Message, OPENAI_COMPATIBLE_PROVIDER_NAME,
     OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME, OpenAiCompatibleProvider, OpenAiProvider,
-    OpenAiTransportConfig, Provider, ProviderErrorKind, TurnRequest, VERTEX_PROVIDER_NAME,
-    XAI_BASE_URL, XAI_PROVIDER_NAME, azure_openai_origin, discover_models,
+    OpenAiTransportConfig, PreparedTurn, Provider, ProviderError, ProviderErrorKind,
+    ProviderStream, ToolDefinition, TurnRequest, VERTEX_PROVIDER_NAME, XAI_BASE_URL,
+    XAI_PROVIDER_NAME, azure_openai_origin, discover_models,
 };
 use haider_rpc::{
     ERROR_CODE_BUSY, ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_INVALID_ARGUMENT,
@@ -1029,6 +1030,11 @@ pub(crate) struct SetLabelJob {
     pub route: LoginRoute,
 }
 
+pub(crate) struct RefreshIdentityJob {
+    pub alias: String,
+    pub route: LoginRoute,
+}
+
 pub(crate) struct RemoveAccountJob {
     pub command_id: String,
     pub alias: String,
@@ -1105,6 +1111,7 @@ pub(crate) enum AccountCommand {
     ImportDevice(Box<DeviceImportJob>),
     SetActive(Box<SetActiveJob>),
     SetLabel(Box<SetLabelJob>),
+    RefreshIdentity(Box<RefreshIdentityJob>),
     Remove(Box<RemoveAccountJob>),
     SetDefaultModel(Box<SetDefaultModelJob>),
     ConfigureProvider(Box<ProviderConfigureJob>),
@@ -1372,8 +1379,13 @@ async fn run_account_actor(
     let mut model_refresh_routes = HashMap::new();
     let mut refreshing_providers = HashSet::new();
     let mut draining = false;
+    if backfill_oauth_identities(&mut accounts, vault.as_ref()).await {
+        refresh_resolver_snapshot(&snapshot, &accounts);
+        let _ = publish_next_management_revision(&store, &snapshot, management.as_ref(), &accounts)
+            .await;
+    }
     if let Some(discovery_disabled) = startup_discovery_disabled {
-        let _ = discover_and_auto_adopt(
+        let _ = discover_candidates(
             &store,
             &mut accounts,
             Arc::clone(&vault),
@@ -1385,7 +1397,7 @@ async fn run_account_actor(
             Arc::clone(&gcloud),
             Arc::clone(&claude_native),
             discovery_disabled,
-            ClaudeNativeReadEvent::AutoAdoptDiscovery,
+            ClaudeNativeReadEvent::AdoptionDiscovery,
         )
         .await;
     }
@@ -1490,6 +1502,7 @@ async fn run_account_actor(
                     None,
                     OAuthCommitResponse::ImportLegacy,
                     None,
+                    None,
                     ClaudeNativeReadEvent::Significant,
                     Arc::clone(&claude_native),
                 )
@@ -1499,7 +1512,7 @@ async fn run_account_actor(
                 discovery_disabled,
                 completed,
             } => {
-                let candidates = discover_and_auto_adopt(
+                let discovered = discover_candidates(
                     &store,
                     &mut accounts,
                     Arc::clone(&vault),
@@ -1511,12 +1524,17 @@ async fn run_account_actor(
                     Arc::clone(&gcloud),
                     Arc::clone(&claude_native),
                     discovery_disabled,
-                    ClaudeNativeReadEvent::AutoAdoptDiscovery,
+                    ClaudeNativeReadEvent::AdoptionDiscovery,
                 )
-                .await
-                .into_iter()
-                .map(|candidate| candidate.wire)
-                .collect();
+                .await;
+                let adoption_available = discovered
+                    .iter()
+                    .filter_map(|candidate| adoption_notice(&candidate.wire, accounts.list()))
+                    .collect();
+                let candidates = discovered
+                    .into_iter()
+                    .map(|candidate| candidate.wire)
+                    .collect();
                 respond(
                     &completed,
                     ResponseBody::AccountDeviceCandidates {
@@ -1524,6 +1542,7 @@ async fn run_account_actor(
                             discovery_disabled,
                         ),
                         candidates,
+                        adoption_available,
                     },
                 );
             }
@@ -1545,6 +1564,17 @@ async fn run_account_actor(
             }
             AccountCommand::SetLabel(job) => {
                 handle_set_label(&store, &mut accounts, &snapshot, management.as_ref(), *job).await;
+            }
+            AccountCommand::RefreshIdentity(job) => {
+                handle_refresh_identity(
+                    &store,
+                    &mut accounts,
+                    vault.as_ref(),
+                    &snapshot,
+                    management.as_ref(),
+                    *job,
+                )
+                .await;
             }
             AccountCommand::SetActive(job) => {
                 handle_set_active(
@@ -1757,6 +1787,103 @@ async fn run_account_actor(
             break;
         }
     }
+}
+
+async fn backfill_oauth_identities(
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: &dyn Vault,
+) -> bool {
+    let targets = accounts
+        .list()
+        .iter()
+        .filter(|descriptor| {
+            descriptor.auth_method == AuthMethod::OAuth && descriptor.account_identity.is_none()
+        })
+        .map(|descriptor| (descriptor.alias.clone(), descriptor.provider.clone()))
+        .collect::<Vec<_>>();
+    let mut changed = false;
+    for (alias, provider) in targets {
+        let Ok(stored) = vault.resolve(&alias) else {
+            continue;
+        };
+        let Ok(bundle) = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret()) else {
+            continue;
+        };
+        let identity = bundle.account_identity.clone().or_else(|| {
+            let source = haider_provider::oauth_identity_source(&provider)?;
+            source
+                .identity_from_tokens(&haider_provider::OAuthTokens {
+                    access_token: bundle.access_token(),
+                    refresh_token: bundle.refresh_token(),
+                    id_token: bundle.id_token(),
+                    captured_at: unix_ms_after(Duration::ZERO),
+                })
+                .ok()
+                .flatten()
+        });
+        if let Some(identity) = identity
+            && accounts
+                .backfill_identity(&alias, identity)
+                .unwrap_or(false)
+        {
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn adoption_notice(
+    candidate: &haider_rpc::DeviceCredentialCandidateWire,
+    accounts: &[CredentialDescriptor],
+) -> Option<haider_rpc::AccountAdoptionAvailable> {
+    if !candidate.import_supported || !matches!(candidate.source.as_str(), "codex" | "claude-code")
+    {
+        return None;
+    }
+    let identity = candidate.identity.as_ref();
+    let email = identity.and_then(|identity| identity.email.clone());
+    let already_present = accounts.iter().any(|descriptor| {
+        descriptor.provider == candidate.provider
+            && descriptor
+                .account_identity
+                .as_ref()
+                .zip(identity)
+                .is_some_and(|(existing, candidate)| account_identities_match(candidate, existing))
+    });
+    (!already_present).then(|| haider_rpc::AccountAdoptionAvailable {
+        source: candidate.source.clone(),
+        email,
+    })
+}
+
+fn account_identities_match(candidate: &AccountIdentity, existing: &AccountIdentity) -> bool {
+    if candidate
+        .account_id
+        .as_deref()
+        .zip(existing.account_id.as_deref())
+        .is_some_and(|(candidate, existing)| candidate == existing)
+        || candidate
+            .email
+            .as_deref()
+            .zip(existing.email.as_deref())
+            .is_some_and(|(candidate, existing)| candidate.eq_ignore_ascii_case(existing))
+    {
+        return true;
+    }
+    // Claude Code currently exposes only a provider-normalized subscription
+    // identity. Match that complete available tuple, but never let it
+    // override a disagreeing stable email/account id.
+    if candidate.account_id.is_some()
+        || candidate.email.is_some()
+        || existing.account_id.is_some()
+        || existing.email.is_some()
+    {
+        return false;
+    }
+    (candidate.display_name.is_some() || candidate.plan.is_some())
+        && candidate.display_name == existing.display_name
+        && candidate.plan == existing.plan
+        && candidate.issuer == existing.issuer
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2834,6 +2961,117 @@ async fn handle_set_label(
     respond(
         &job.route,
         ResponseBody::AccountSetLabel {
+            descriptor,
+            revision,
+        },
+    );
+}
+
+/// Rebuilds public identity from the credential already inside Haider's
+/// vault. OAuth providers all pass through the provider-owned abstraction;
+/// no token bytes enter the response, receipt, or diagnostic path.
+async fn handle_refresh_identity(
+    store: &SqliteStoreHandle,
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: &dyn Vault,
+    snapshot: &AccountsSnapshot,
+    management: Option<&ManagementSnapshot>,
+    job: RefreshIdentityJob,
+) {
+    let alias = CredentialAlias::new(job.alias.trim());
+    let Some(current) = accounts
+        .list()
+        .iter()
+        .find(|descriptor| descriptor.alias == alias)
+        .cloned()
+    else {
+        respond_management_error(
+            &job.route,
+            &HaiderError::new(
+                ErrorCode::CredentialMissing,
+                format!("no credential named `{alias}`"),
+                false,
+            ),
+        );
+        return;
+    };
+    let stored = match vault.resolve(&alias) {
+        Ok(stored) => stored,
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
+    let identity = match current.auth_method {
+        AuthMethod::ApiKey => Some(api_key_identity(&current.provider, stored.expose_secret())),
+        AuthMethod::OAuth => {
+            let bundle = match haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret()) {
+                Ok(bundle) => bundle,
+                Err(error) => {
+                    respond_management_error(&job.route, &error);
+                    return;
+                }
+            };
+            let Some(source) = haider_provider::oauth_identity_source(&current.provider) else {
+                respond_management_error(
+                    &job.route,
+                    &HaiderError::new(
+                        ErrorCode::ProviderError,
+                        format!(
+                            "provider `{}` has no OAuth identity adapter",
+                            current.provider
+                        ),
+                        false,
+                    ),
+                );
+                return;
+            };
+            match source.identity_from_tokens(&haider_provider::OAuthTokens {
+                access_token: bundle.access_token(),
+                refresh_token: bundle.refresh_token(),
+                id_token: bundle.id_token(),
+                captured_at: unix_ms_after(Duration::ZERO),
+            }) {
+                Ok(Some(identity)) => Some(identity),
+                Ok(None) => bundle
+                    .account_identity
+                    .clone()
+                    .or(current.account_identity.clone()),
+                Err(_) => {
+                    respond_management_error(
+                        &job.route,
+                        &HaiderError::new(
+                            ErrorCode::ProviderError,
+                            format!(
+                                "stored OAuth identity for provider `{}` is malformed",
+                                current.provider
+                            ),
+                            false,
+                        ),
+                    );
+                    return;
+                }
+            }
+        }
+    };
+    let descriptor = match accounts.set_identity(&alias, identity) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+    };
+    let revision =
+        match publish_next_management_revision(store, snapshot, management, accounts).await {
+            Ok(revision) => revision,
+            Err(error) => {
+                respond_management_error(&job.route, &error);
+                return;
+            }
+        };
+    respond(
+        &job.route,
+        ResponseBody::AccountRefresh {
             descriptor,
             revision,
         },
@@ -4540,7 +4778,7 @@ async fn handle_login(
         if !replace_existing && accounts.get(&alias).is_none() && vault.resolve(&alias).is_ok() {
             drop(secret);
             pending.remove(&command_id);
-            let descriptor = descriptor_for(&identity, &alias, None);
+            let descriptor = descriptor_for(&identity, &alias, None, None);
             if let Err(error) = accounts.add(descriptor) {
                 respond_error(
                     &route,
@@ -4622,9 +4860,15 @@ async fn handle_login(
                 );
                 return;
             }
+            let account_identity = api_key_identity(&provider, &secret);
             drop(secret);
             pending.remove(&command_id);
-            let descriptor = descriptor_for(&identity, &alias, Some(validated.identity));
+            let descriptor = descriptor_for(
+                &identity,
+                &alias,
+                Some(validated.identity),
+                Some(account_identity),
+            );
             let descriptor_result = if replacing {
                 accounts.replace(descriptor)
             } else {
@@ -5079,6 +5323,7 @@ async fn handle_device_import(
         );
         return;
     };
+    let expected_source_fingerprint = candidate.content_fingerprint;
     // G4b (LV2): the gcloud candidate imports through the SHELL-OUT source,
     // not an OAuth bundle file — its own arm, before the bundle machinery.
     if source == crate::device_discovery::GCLOUD_IMPORT_SOURCE {
@@ -5105,6 +5350,7 @@ async fn handle_device_import(
         None,
         OAuthCommitResponse::ImportDevice,
         receipt_candidate,
+        expected_source_fingerprint,
         ClaudeNativeReadEvent::Significant,
         claude_native,
     )
@@ -5132,164 +5378,17 @@ fn canonical_positive_decimal(value: &str) -> bool {
         && value.as_bytes()[1..].iter().all(u8::is_ascii_digit)
 }
 
-fn fresh_auto_adopt_command_id(source: &str) -> Result<String, HaiderError> {
-    let mut random = [0_u8; 32];
-    getrandom::fill(&mut random).map_err(|_| {
-        HaiderError::new(
-            ErrorCode::Internal,
-            "cannot mint an automatic credential-adoption command id",
-            true,
-        )
-    })?;
-    Ok(format!(
-        "auto-adopt-{source}-{}",
-        blake3::hash(&random).to_hex()
-    ))
-}
-
-async fn auto_adopt_oauth_needed(
-    store: &SqliteStoreHandle,
-    accounts: &AccountStore<Box<dyn StoreLike>>,
-    vault: Arc<dyn Vault>,
-    command_id: &str,
-    source: &str,
-) -> Result<bool, HaiderError> {
-    let spec = oauth_import_source_spec(source)?;
-    let alias = select_oauth_import_alias(
-        store,
-        accounts,
-        command_id,
-        spec.source,
-        spec.provider,
-        spec.default_alias,
-    )
-    .await?;
-    if is_probe_account_alias(alias.as_str()) {
-        return Ok(false);
-    }
-    let Some(descriptor) = accounts.get(&alias) else {
-        return Ok(true);
-    };
-    match descriptor.status {
-        CredentialStatus::Expired | CredentialStatus::NeedsAttention { .. } => return Ok(true),
-        CredentialStatus::Revoked => return Ok(false),
-        CredentialStatus::Ok | CredentialStatus::Limited { .. } => {}
-    }
-    let alias_for_read = alias.clone();
-    let stored = tokio::task::spawn_blocking(move || vault.resolve(&alias_for_read))
-        .await
-        .map_err(|_| {
-            HaiderError::new(ErrorCode::ProviderError, "OAuth vault worker failed", true)
-        })?;
-    let Ok(stored) = stored else {
-        return Ok(true);
-    };
-    let Ok(bundle) = haider_accounts::OAuthTokenBundleV1::decode(stored.expose_secret()) else {
-        return Ok(true);
-    };
-    Ok(bundle.expires_at_unix_ms <= unix_ms_after(Duration::ZERO))
-}
-
 #[allow(clippy::too_many_arguments)]
-async fn auto_adopt_device_candidates(
-    store: &SqliteStoreHandle,
-    accounts: &mut AccountStore<Box<dyn StoreLike>>,
-    vault: Arc<dyn Vault>,
-    snapshot: &AccountsSnapshot,
-    management: Option<&ManagementSnapshot>,
-    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
-    reserved_aliases: &HashSet<String>,
-    refresh_fences: &RefreshFenceRegistry,
-    gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
-    claude_native: Arc<dyn ClaudeNativeCredentialStore>,
-    candidates: &[crate::device_discovery::DeviceCandidate],
-) {
-    for candidate in candidates
-        .iter()
-        .filter(|candidate| candidate.wire.import_supported)
-    {
-        let Some(source) = candidate.import_source else {
-            continue;
-        };
-        let Ok(command_id) = fresh_auto_adopt_command_id(source) else {
-            continue;
-        };
-        let sink = Arc::new(OAuthImportHealSink::default());
-        let route = LoginRoute {
-            request_id: RequestId::new(command_id.clone()),
-            sink: sink.clone(),
-        };
-        if source == crate::device_discovery::GCLOUD_IMPORT_SOURCE {
-            let alias = CredentialAlias::new(crate::gcloud::VERTEX_GCLOUD_ALIAS);
-            if accounts.get(&alias).is_some_and(|descriptor| {
-                matches!(
-                    descriptor.status,
-                    CredentialStatus::Ok
-                        | CredentialStatus::Limited { .. }
-                        | CredentialStatus::Revoked
-                )
-            }) {
-                continue;
-            }
-            handle_gcloud_import(
-                store,
-                accounts,
-                Arc::clone(&vault),
-                snapshot,
-                management,
-                providers,
-                Arc::clone(&gcloud),
-                DeviceImportJob {
-                    command_id,
-                    candidate: candidate.wire.candidate.clone(),
-                    discovery_disabled: false,
-                    route,
-                },
-            )
-            .await;
-            continue;
-        }
-        let needed =
-            auto_adopt_oauth_needed(store, accounts, Arc::clone(&vault), &command_id, source)
-                .await
-                .unwrap_or(false);
-        if !needed {
-            continue;
-        }
-        handle_oauth_import(
-            store,
-            accounts,
-            Arc::clone(&vault),
-            snapshot,
-            management,
-            reserved_aliases,
-            refresh_fences,
-            OAuthImportJob {
-                command_id,
-                source: source.to_owned(),
-                route,
-            },
-            None,
-            OAuthCommitResponse::ImportLegacy,
-            None,
-            ClaudeNativeReadEvent::Ordinary,
-            Arc::clone(&claude_native),
-        )
-        .await;
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn discover_and_auto_adopt(
-    store: &SqliteStoreHandle,
-    accounts: &mut AccountStore<Box<dyn StoreLike>>,
-    vault: Arc<dyn Vault>,
-    snapshot: &AccountsSnapshot,
-    management: Option<&ManagementSnapshot>,
-    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
-    reserved_aliases: &HashSet<String>,
-    refresh_fences: &RefreshFenceRegistry,
-    gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
+async fn discover_candidates(
+    _store: &SqliteStoreHandle,
+    _accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    _vault: Arc<dyn Vault>,
+    _snapshot: &AccountsSnapshot,
+    _management: Option<&ManagementSnapshot>,
+    _providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    _reserved_aliases: &HashSet<String>,
+    _refresh_fences: &RefreshFenceRegistry,
+    _gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
     claude_native: Arc<dyn ClaudeNativeCredentialStore>,
     discovery_disabled: bool,
     event: ClaudeNativeReadEvent,
@@ -5304,20 +5403,8 @@ async fn discover_and_auto_adopt(
     })
     .await
     .unwrap_or_default();
-    auto_adopt_device_candidates(
-        store,
-        accounts,
-        vault,
-        snapshot,
-        management,
-        providers,
-        reserved_aliases,
-        refresh_fences,
-        gcloud,
-        claude_native,
-        &candidates,
-    )
-    .await;
+    // Discovery is metadata-only. Import is exclusively the explicit,
+    // Control-authorized account.import_device/account.oauth_import door.
     candidates
 }
 
@@ -5353,6 +5440,7 @@ async fn handle_gcloud_import(
             return;
         }
     };
+    let account_identity = api_key_identity(haider_provider::VERTEX_PROVIDER_NAME, &token);
     let alias = CredentialAlias::new(crate::gcloud::VERTEX_GCLOUD_ALIAS);
     let vault_for_write = Arc::clone(&vault);
     let alias_for_write = alias.clone();
@@ -5376,7 +5464,13 @@ async fn handle_gcloud_import(
     let result = if refreshed {
         // Re-import refreshed the vault token; the descriptor only needs
         // its status healed.
-        accounts.set_status(&alias, CredentialStatus::Ok)
+        accounts
+            .set_status(&alias, CredentialStatus::Ok)
+            .and_then(|()| {
+                accounts
+                    .set_identity(&alias, Some(account_identity))
+                    .map(|_| ())
+            })
     } else {
         accounts.add(CredentialDescriptor {
             alias: alias.clone(),
@@ -5387,6 +5481,8 @@ async fn handle_gcloud_import(
             status: CredentialStatus::Ok,
             active: true,
             label: None,
+            account_identity: Some(account_identity),
+            created_at_ms: None,
         })
     };
     if let Err(error) = result {
@@ -5679,6 +5775,7 @@ async fn handle_oauth_import_heal(
         Some(imported),
         OAuthCommitResponse::ImportLegacy,
         None,
+        None,
         ClaudeNativeReadEvent::Ordinary,
         claude_native,
     )
@@ -5753,6 +5850,7 @@ async fn handle_oauth_import(
     preloaded_material: Option<OAuthImportMaterial>,
     response_kind: OAuthCommitResponse,
     receipt_candidate: Option<String>,
+    expected_source_fingerprint: Option<[u8; 32]>,
     native_read_event: ClaudeNativeReadEvent,
     claude_native: Arc<dyn ClaudeNativeCredentialStore>,
 ) {
@@ -6014,6 +6112,17 @@ async fn handle_oauth_import(
         );
         return;
     }
+    if !confirmed_source_matches(expected_source_fingerprint, imported.source_fingerprint) {
+        respond_management_error(
+            &job.route,
+            &HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "device credential changed after confirmation; review it and confirm import again",
+                false,
+            ),
+        );
+        return;
+    }
     if resume
         && let Some(prior) = prior_bundle.as_ref()
         && same_oauth_import(prior, &imported.bundle)
@@ -6076,6 +6185,10 @@ async fn handle_oauth_import(
         response_kind,
     )
     .await;
+}
+
+fn confirmed_source_matches(expected: Option<[u8; 32]>, actual: [u8; 32]) -> bool {
+    expected.is_none_or(|expected| expected == actual)
 }
 
 async fn select_oauth_import_alias(
@@ -6381,6 +6494,10 @@ fn oauth_descriptor_for(
         status: CredentialStatus::Ok,
         active,
         label: None,
+        account_identity: bundle.account_identity.clone(),
+        // AccountStore::add owns the record-creation timestamp. Replacement
+        // preserves the prior value, including None for pre-964 rows.
+        created_at_ms: None,
     }
 }
 
@@ -6471,6 +6588,7 @@ fn descriptor_for(
     identity: &LoginIdentity,
     alias: &CredentialAlias,
     validated_identity: Option<String>,
+    account_identity: Option<AccountIdentity>,
 ) -> CredentialDescriptor {
     CredentialDescriptor {
         alias: alias.clone(),
@@ -6483,6 +6601,42 @@ fn descriptor_for(
         // store deselects the previous active in the same snapshot.
         active: true,
         label: None,
+        account_identity,
+        // AccountStore::add owns the first-commit timestamp for every auth
+        // method. Replacement preserves the prior value, including legacy
+        // None, instead of turning a re-key into a new account.
+        created_at_ms: None,
+    }
+}
+
+fn api_key_identity(provider: &str, secret: &[u8]) -> AccountIdentity {
+    let last_four = std::str::from_utf8(secret)
+        .ok()
+        .map(str::trim)
+        .filter(|secret| !secret.is_empty())
+        .map(|secret| {
+            let mut fingerprint = secret
+                .chars()
+                .rev()
+                .filter(|character| !character.is_control())
+                .take(4)
+                .collect::<Vec<_>>();
+            fingerprint.reverse();
+            fingerprint.into_iter().collect::<String>()
+        })
+        .and_then(|fingerprint| AccountIdentity::sanitized_field(&fingerprint))
+        .map(|fingerprint| format!("…{fingerprint}"));
+    AccountIdentity {
+        email: None,
+        display_name: Some(last_four.map_or_else(
+            || format!("{provider} API key"),
+            |fingerprint| format!("{provider} API key {fingerprint}"),
+        )),
+        account_id: None,
+        plan: None,
+        issuer: None,
+        captured_at: unix_ms_after(Duration::ZERO),
+        verified: false,
     }
 }
 
@@ -7847,7 +8001,7 @@ impl AccountsProviderFactory {
                     .into_iter()
                     .find(|model| model.slug == metadata.model)
             });
-        self.builder.build_tuned_with_cache(
+        let provider = self.builder.build_tuned_with_cache(
             profile.as_ref(),
             descriptor,
             credential,
@@ -7855,7 +8009,32 @@ impl AccountsProviderFactory {
             tuning,
             catalog_model.as_ref(),
             Arc::clone(&self.gemini_cache_registry),
-        )
+        )?;
+        if descriptor.provider == OPENAI_OAUTH_PROVIDER_NAME {
+            let summary = descriptor.account_identity.as_ref().map_or_else(
+                || {
+                    let legacy = descriptor
+                        .identity
+                        .chars()
+                        .filter(|character| !character.is_control())
+                        .take(512)
+                        .collect::<String>();
+                    let legacy = legacy.trim();
+                    if legacy.is_empty() {
+                        descriptor.alias.as_str().to_owned()
+                    } else {
+                        legacy.to_owned()
+                    }
+                },
+                AccountIdentity::summary,
+            );
+            Ok(Arc::new(IdentityAnnotatedProvider {
+                inner: provider,
+                summary,
+            }))
+        } else {
+            Ok(provider)
+        }
     }
 
     /// G4a keyless resolution: an ENABLED custom chat-completions profile
@@ -7894,6 +8073,8 @@ impl AccountsProviderFactory {
             status: CredentialStatus::Ok,
             active: true,
             label: None,
+            account_identity: None,
+            created_at_ms: None,
         };
         let credential = keyless_construction_credential().ok()?;
         Some((
@@ -8044,6 +8225,112 @@ impl AccountsProviderFactory {
         let provider = self.build_provider(&resolved.descriptor, credential, metadata, tuning)?;
         Ok((resolved, provider, oauth_access_fingerprint))
     }
+}
+
+/// Decorates only the operator-facing ChatGPT model-entitlement rejection.
+/// The summary is public descriptor metadata; token bytes never enter this
+/// adapter or its error stream.
+struct IdentityAnnotatedProvider {
+    inner: Arc<dyn Provider>,
+    summary: String,
+}
+
+impl std::fmt::Debug for IdentityAnnotatedProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IdentityAnnotatedProvider")
+            .field("summary", &self.summary)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for IdentityAnnotatedProvider {
+    fn credential_surface(&self) -> haider_provider::ProviderCredentialSurface {
+        self.inner.credential_surface()
+    }
+
+    fn usage_lane_dimensions(&self) -> haider_protocol::provider::UsageLaneDimensions {
+        self.inner.usage_lane_dimensions()
+    }
+
+    fn rendered_cache_prefix_digests(
+        &self,
+        request: &TurnRequest,
+    ) -> Option<haider_protocol::provider::PrefixDigests> {
+        self.inner.rendered_cache_prefix_digests(request)
+    }
+
+    fn prepare_turn(&self, request: &TurnRequest) -> Option<PreparedTurn> {
+        self.inner.prepare_turn(request)
+    }
+
+    fn prepare_turn_with_tools(
+        &self,
+        request: &TurnRequest,
+        tools: &[ToolDefinition],
+    ) -> Option<PreparedTurn> {
+        self.inner.prepare_turn_with_tools(request, tools)
+    }
+
+    async fn prewarm(&self) {
+        self.inner.prewarm().await;
+    }
+
+    async fn capabilities(&self) -> haider_protocol::provider::CapabilityDoc {
+        self.inner.capabilities().await
+    }
+
+    async fn stream_turn(&self, request: TurnRequest) -> Result<ProviderStream, ProviderError> {
+        annotate_provider_stream(self.inner.stream_turn(request).await, &self.summary)
+    }
+
+    async fn stream_prepared_turn(
+        &self,
+        request: TurnRequest,
+        prepared: Option<PreparedTurn>,
+    ) -> Result<ProviderStream, ProviderError> {
+        annotate_provider_stream(
+            self.inner.stream_prepared_turn(request, prepared).await,
+            &self.summary,
+        )
+    }
+
+    async fn stream_prepared_turn_ref(
+        &self,
+        request: &TurnRequest,
+        prepared: Option<PreparedTurn>,
+    ) -> Result<ProviderStream, ProviderError> {
+        annotate_provider_stream(
+            self.inner.stream_prepared_turn_ref(request, prepared).await,
+            &self.summary,
+        )
+    }
+}
+
+fn annotate_provider_stream(
+    result: Result<ProviderStream, ProviderError>,
+    summary: &str,
+) -> Result<ProviderStream, ProviderError> {
+    let mut stream = result.map_err(|error| annotate_model_rejection(error, summary))?;
+    let summary = summary.to_owned();
+    let (sender, receiver) = mpsc::channel(32);
+    let producer = tokio::spawn(async move {
+        while let Some(item) = stream.recv().await {
+            let item = item.map_err(|error| annotate_model_rejection(error, &summary));
+            if sender.send(item).await.is_err() {
+                break;
+            }
+        }
+    });
+    Ok(ProviderStream::owned(receiver, producer))
+}
+
+fn annotate_model_rejection(mut error: ProviderError, summary: &str) -> ProviderError {
+    if error.message.contains("ChatGPT account") && !error.message.contains("account used:") {
+        error.message = format!("{} (account used: {summary})", error.message);
+    }
+    error
 }
 
 struct AccountsAttemptResolver {
@@ -8774,7 +9061,7 @@ pub(crate) async fn reconcile_login_receipts(
                     continue;
                 };
                 if vault.resolve(&alias).is_ok() {
-                    let descriptor = descriptor_for(&identity, &alias, None);
+                    let descriptor = descriptor_for(&identity, &alias, None, None);
                     accounts.add(descriptor)?;
                     finalize_reconciled(store, accounts, &row.command_id, &alias).await?;
                 }
@@ -9326,6 +9613,10 @@ fn import_bedrock_env_bearer(
     ) else {
         return;
     };
+    let account_identity = vault
+        .resolve(&alias)
+        .ok()
+        .map(|secret| api_key_identity(BEDROCK_PROVIDER_NAME, secret.expose_secret()));
     let descriptor = CredentialDescriptor {
         alias: alias.clone(),
         provider: BEDROCK_PROVIDER_NAME.to_owned(),
@@ -9335,6 +9626,8 @@ fn import_bedrock_env_bearer(
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity,
+        created_at_ms: None,
     };
     if accounts.add(descriptor).is_err() {
         // The descriptor store refused (never a duplicate — checked above);

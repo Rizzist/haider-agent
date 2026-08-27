@@ -4,6 +4,58 @@
 use crate::ids::CredentialAlias;
 use serde::{Deserialize, Serialize};
 
+/// Informational, secret-free account facts captured at credential intake.
+///
+/// These fields are never authentication authority. In particular,
+/// `verified = false` is the only honest value for claims decoded from a JWT
+/// without checking its signature against the issuer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountIdentity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    pub captured_at: u64,
+    pub verified: bool,
+}
+
+impl AccountIdentity {
+    /// Normalizes one untrusted informational claim before it can reach a
+    /// descriptor or operator surface.
+    #[must_use]
+    pub fn sanitized_field(value: &str) -> Option<String> {
+        let value: String = value
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(512)
+            .collect();
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    }
+
+    /// A concise operator-facing label with no credential material.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let principal = self
+            .email
+            .as_deref()
+            .or(self.display_name.as_deref())
+            .or(self.account_id.as_deref())
+            .and_then(Self::sanitized_field)
+            .unwrap_or_else(|| "unknown account".to_owned());
+        self.plan
+            .as_deref()
+            .and_then(Self::sanitized_field)
+            .map_or(principal.clone(), |plan| format!("{principal} · {plan}"))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CredentialDescriptor {
     pub alias: CredentialAlias,
@@ -26,6 +78,13 @@ pub struct CredentialDescriptor {
     /// `alias`. Free-form text, bounded and control-stripped by the daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Additive v0.0.964 account identity. Older account rows omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_identity: Option<AccountIdentity>,
+    /// Epoch milliseconds when Haider first committed this account. Rows
+    /// written before v0.0.964 retain `None` rather than inventing a date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

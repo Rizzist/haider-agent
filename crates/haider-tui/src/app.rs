@@ -18,7 +18,7 @@ use haider_protocol::menu::{
 use haider_protocol::state::{HarnessStatus, RunState};
 use haider_protocol::{DeliveryMode, EventPayload};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 /// Sim `autoBlurb` (tui.js:401-406): strip a leading slash-command token,
 /// keep the first seven words, cap at 46 chars, capitalize the first letter.
@@ -262,6 +262,8 @@ pub struct AccountRow {
     pub provider: String,
     pub method: haider_protocol::credential::AuthMethod,
     pub identity: String,
+    pub account_identity: Option<haider_protocol::credential::AccountIdentity>,
+    pub created_at_ms: Option<u64>,
     /// `Ok` renders the sim's literal `active`; Limited/Expired/Revoked are
     /// additive W5 status vocabulary with their own snapshots.
     pub status: haider_protocol::credential::CredentialStatus,
@@ -278,6 +280,8 @@ impl AccountRow {
             provider: descriptor.provider.clone(),
             method: descriptor.auth_method,
             identity: descriptor.identity.clone(),
+            account_identity: descriptor.account_identity.clone(),
+            created_at_ms: descriptor.created_at_ms,
             status: descriptor.status.clone(),
             selected: descriptor.active,
             base_url: descriptor.base_url.clone(),
@@ -335,6 +339,11 @@ pub struct AccountsState {
     /// masked, so the screen never OPENS revealed (the U2 ⌃C lesson: the
     /// enter-door reset covers exits that bypass `exit_accounts`).
     pub revealed: bool,
+    /// One explicit local-login copy awaiting y/n. Candidate ids are opaque;
+    /// no credential bytes ever enter TUI state.
+    pub adoption_candidate: Option<haider_rpc::DeviceCredentialCandidateWire>,
+    /// Notice identity already shown on this TUI session.
+    pub adoption_noticed: HashSet<String>,
 }
 
 /// Round 4 — a plan proposal's identity for scroll-reset purposes: menu id
@@ -566,9 +575,8 @@ impl AppModel {
             || haider_client::required_user_command_features().is_subset(&self.daemon_features)
     }
 
-    /// Whether the connected daemon can run the hidden device-credential
-    /// auto-adoption refresh. The discovery report is no longer rendered;
-    /// this feature gate only schedules the daemon policy pass.
+    /// Whether the connected daemon can report local-login adoption offers.
+    /// Discovery is metadata-only; confirmation owns the separate import.
     #[must_use]
     pub fn device_discovery_available(&self) -> bool {
         !self.mode.fabricates_locally()
@@ -2717,6 +2725,8 @@ pub enum AppRequest {
     },
     /// W10b: durable account removal (receipt-backed `account.remove`).
     AccountRemove { alias: String },
+    /// Explicitly confirmed copy of a discovered first-party CLI login.
+    AccountImportDevice { candidate: String, source: String },
     /// W10b: durable custom-provider removal (`provider.remove`) — the
     /// daemon refuses builtins and account-referenced providers with
     /// typed reasons; the client never pre-judges.
@@ -2874,9 +2884,8 @@ pub enum AppRequest {
     /// screen entry and after a successful add commit; the demo driver
     /// answers from the seed list.
     AccountsRefresh,
-    /// Trigger the daemon's device-credential auto-adoption pass through
-    /// the existing discovery RPC. Pushed on accounts/provider entry only;
-    /// its metadata response is intentionally not rendered.
+    /// Trigger metadata-only device credential discovery. Pushed on
+    /// accounts/provider entry and once per live connection.
     DeviceCandidatesRefresh,
     /// `account.set_active` for the clicked/entered row. The model already
     /// holds `pending_select` — the dot moves only when the driver's reply
@@ -3812,6 +3821,8 @@ pub struct ModelPickerRow {
     /// `oauth` / `api` — what a turn on this row meters.
     pub auth: &'static str,
     pub context_window: Option<u64>,
+    /// Age in milliseconds of the provider inventory used for this row.
+    pub inventory_age_ms: Option<u64>,
     /// Provider availability — unavailable rows render dimmed and refuse
     /// with the reason instead of silently failing.
     pub available: bool,
@@ -5276,7 +5287,19 @@ impl AppModel {
             .rows
             .iter()
             .map(|row| {
-                let mut desc = format!("{} · {}", row.provider, auth_label(row.method));
+                let identity = row.account_identity.as_ref().map_or_else(
+                    || row.identity.clone(),
+                    haider_protocol::credential::AccountIdentity::summary,
+                );
+                let created = row.created_at_ms.map_or_else(
+                    || "unknown (added before 0.0.964)".to_owned(),
+                    |created| created.to_string(),
+                );
+                let mut desc = format!(
+                    "{} · {} · {identity} · added {created}",
+                    row.provider,
+                    auth_label(row.method)
+                );
                 if row.selected {
                     desc.push_str(" · in use");
                 }
@@ -8828,16 +8851,20 @@ impl AppModel {
         if self.screen == Screen::Accounts {
             return;
         }
-        self.accounts.message = None;
+        self.accounts.message = self.accounts.adoption_candidate.as_ref().map(|candidate| {
+            format!(
+                "import {} login? y confirms · n cancels · `haider account import {} --confirm`",
+                candidate.source_label, candidate.source
+            )
+        });
         // P1 MASK LAW (the U2 owner addendum): every open starts masked —
         // a reveal never survives into a later visit, whichever way the
         // last one ended (esc, ⌃C, a screen switch).
         self.accounts.revealed = false;
         self.switch_surface(Screen::Accounts);
         self.requests.push(AppRequest::AccountsRefresh);
-        // Automatic device adoption rides the existing screen-entry
-        // discovery cadence. Its report stays hidden; the daemon commits
-        // any roster changes and the reply chains a fresh account list.
+        // Local-login detection rides screen entry. The report is
+        // metadata-only; copying requires the separate y/confirm action.
         if self.device_discovery_available() {
             self.requests.push(AppRequest::DeviceCandidatesRefresh);
         }
@@ -9139,8 +9166,7 @@ impl AppModel {
         self.providers.message = None;
         self.switch_surface(Screen::Providers);
         self.requests.push(AppRequest::ProvidersRefresh);
-        // Preserve the existing discovery cadence as a hidden auto-adopt
-        // trigger; the candidate report itself has no TUI surface.
+        // Re-check for a secret-free adoption offer on provider entry.
         if self.device_discovery_available() {
             self.requests.push(AppRequest::DeviceCandidatesRefresh);
         }
@@ -9761,6 +9787,8 @@ impl AppModel {
                             provider: provider.to_owned(),
                             method: haider_protocol::credential::AuthMethod::OAuth,
                             identity: identity.to_owned(),
+                            account_identity: None,
+                            created_at_ms: None,
                             status: haider_protocol::credential::CredentialStatus::Ok,
                             selected: true,
                             base_url: None,
@@ -9820,6 +9848,8 @@ impl AppModel {
             provider: summary.provider.clone(),
             method: haider_protocol::credential::AuthMethod::ApiKey,
             identity: String::new(),
+            account_identity: None,
+            created_at_ms: None,
             status: haider_protocol::credential::CredentialStatus::Ok,
             selected: false,
             base_url: None,
@@ -9950,6 +9980,8 @@ impl AppModel {
                 provider: summary.provider.clone(),
                 method: haider_protocol::credential::AuthMethod::ApiKey,
                 identity: String::new(),
+                account_identity: None,
+                created_at_ms: None,
                 status: haider_protocol::credential::CredentialStatus::Ok,
                 selected: false,
                 base_url: None,
@@ -10098,6 +10130,8 @@ impl AppModel {
                 provider: summary.provider.clone(),
                 method: haider_protocol::credential::AuthMethod::ApiKey,
                 identity: String::new(),
+                account_identity: None,
+                created_at_ms: None,
                 status: haider_protocol::credential::CredentialStatus::Ok,
                 selected: false,
                 base_url: None,
@@ -10492,6 +10526,8 @@ impl AppModel {
             provider: provider.clone(),
             method: haider_protocol::credential::AuthMethod::ApiKey,
             identity,
+            account_identity: None,
+            created_at_ms: None,
             status: haider_protocol::credential::CredentialStatus::Ok,
             selected: true,
             base_url: Some(base_url.to_owned()),
@@ -10514,6 +10550,24 @@ impl AppModel {
             return;
         }
         match code {
+            KeyCode::Char('y') if self.accounts.adoption_candidate.is_some() => {
+                if let Some(candidate) = self.accounts.adoption_candidate.take() {
+                    self.accounts.message = Some(format!("importing {} login…", candidate.source));
+                    self.requests.push(AppRequest::AccountImportDevice {
+                        candidate: candidate.candidate,
+                        source: candidate.source,
+                    });
+                    self.dirty = true;
+                }
+            }
+            KeyCode::Char('n') if self.accounts.adoption_candidate.is_some() => {
+                self.accounts.adoption_candidate = None;
+                self.accounts.message = Some("local login import cancelled".to_owned());
+                if self.device_discovery_available() {
+                    self.requests.push(AppRequest::DeviceCandidatesRefresh);
+                }
+                self.dirty = true;
+            }
             KeyCode::Esc if self.accounts.pending_remove.is_some() => {
                 self.accounts.pending_remove = None;
                 self.accounts.message = None;
@@ -10582,6 +10636,42 @@ impl AppModel {
             }
             _ => {}
         }
+    }
+
+    /// Surfaces one typed, secret-free adoption offer at most once per TUI
+    /// session. Import remains a separate explicit y/confirm action.
+    pub fn account_adoption_available(
+        &mut self,
+        notice: &haider_rpc::AccountAdoptionAvailable,
+        candidate: haider_rpc::DeviceCredentialCandidateWire,
+    ) -> bool {
+        let key = format!(
+            "{}\u{1f}{}",
+            notice.source,
+            notice.email.as_deref().unwrap_or("unknown")
+        );
+        if self.accounts.adoption_candidate.is_some()
+            || self.accounts.adoption_noticed.contains(&key)
+        {
+            return false;
+        }
+        self.accounts.adoption_noticed.insert(key);
+        let identity = candidate.identity.as_ref().map_or_else(
+            || "unknown account".to_owned(),
+            |identity| identity.summary(),
+        );
+        let command = format!("haider account import {} --confirm", candidate.source);
+        self.flash = Some(format!(
+            "· {} login available: {identity} · `{command}`",
+            candidate.source_label
+        ));
+        self.accounts.message = Some(format!(
+            "import {} login ({identity})? y confirms · n cancels · `{command}`",
+            candidate.source_label
+        ));
+        self.accounts.adoption_candidate = Some(candidate);
+        self.dirty = true;
+        true
     }
 
     /// THE ONE DOOR into `/hooks` (H4). Session-scoped like `/tools`; the
@@ -12144,11 +12234,24 @@ impl AppModel {
                     if self.accounts.rows.is_empty() {
                         self.enter_accounts();
                     } else {
-                        let names: Vec<&str> = self
+                        let names: Vec<String> = self
                             .accounts
                             .rows
                             .iter()
-                            .map(|row| row.alias.as_str())
+                            .map(|row| {
+                                let identity = row.account_identity.as_ref().map_or_else(
+                                    || row.identity.clone(),
+                                    haider_protocol::credential::AccountIdentity::summary,
+                                );
+                                let created = row.created_at_ms.map_or_else(
+                                    || "unknown (added before 0.0.964)".to_owned(),
+                                    |created| created.to_string(),
+                                );
+                                format!(
+                                    "{} [{} · {} · added {created}]",
+                                    row.alias, row.provider, identity
+                                )
+                            })
                             .collect();
                         self.flash = Some(format!("· accounts — {}", names.join(" · ")));
                     }
@@ -14738,6 +14841,10 @@ impl AppModel {
     pub fn model_picker_rows(&self) -> Vec<ModelPickerRow> {
         use haider_protocol::credential::AuthMethod;
         let mut rows = Vec::new();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
         for summary in &self.providers.providers {
             if !summary.enabled {
                 continue;
@@ -14750,6 +14857,9 @@ impl AppModel {
                 .availability_reason
                 .clone()
                 .or_else(|| (!available).then(|| "provider unavailable".to_owned()));
+            let inventory_age_ms = now_ms
+                .zip(summary.inventory_fetched_at_ms)
+                .map(|(now, fetched_at)| now.saturating_sub(fetched_at));
             // Auth flavor: the provider key's own encoding, the selected
             // account's method, then a single declared method — the same
             // truth order as the composer identity (F2c).
@@ -14778,6 +14888,7 @@ impl AppModel {
                     model: String::new(),
                     auth,
                     context_window: None,
+                    inventory_age_ms,
                     available,
                     reason: Some(reason.unwrap_or_else(|| "no discovered models".to_owned())),
                     is_default: false,
@@ -14792,6 +14903,7 @@ impl AppModel {
                     model: model.clone(),
                     auth,
                     context_window: self.providers.declared_window(&summary.provider, model),
+                    inventory_age_ms,
                     available,
                     reason: reason.clone(),
                     is_default: summary.default_model.as_deref() == Some(model),
@@ -14820,6 +14932,7 @@ impl AppModel {
                     model: self.identity.model_short.clone(),
                     auth,
                     context_window: None,
+                    inventory_age_ms,
                     available: false,
                     reason: Some("unlisted by advisory provider catalog".to_owned()),
                     is_default: false,

@@ -1843,12 +1843,23 @@ fn render_accounts(
                     // identity renders MASKED unless this visit revealed
                     // it (`r`) — one authority, `format::mask_identity`.
                     format!(
-                        " · {} · {status_text}",
+                        " · {} · {status_text} · added {}",
                         if model.accounts.revealed {
-                            row.identity.clone()
+                            row.account_identity
+                                .as_ref()
+                                .map_or_else(|| row.identity.clone(), |identity| identity.summary())
                         } else {
-                            crate::format::mask_identity(&row.identity)
-                        }
+                            crate::format::mask_identity(
+                                &row.account_identity.as_ref().map_or_else(
+                                    || row.identity.clone(),
+                                    |identity| identity.summary(),
+                                ),
+                            )
+                        },
+                        row.created_at_ms.map_or_else(
+                            || "unknown (added before 0.0.964)".to_owned(),
+                            |created| created.to_string(),
+                        ),
                     ),
                     theme.dim_style(),
                 ),
@@ -3765,6 +3776,12 @@ fn render_model_picker(
                 theme.dim_style(),
             ),
         ];
+        if let Some(age) = row.inventory_age_ms {
+            spans.push(Span::styled(
+                format!("  age {}", fmt_inventory_age(age)),
+                theme.faint_style(),
+            ));
+        }
         if row.is_current {
             spans.push(Span::styled("  current", theme.gold_style()));
         }
@@ -3810,6 +3827,16 @@ fn render_model_picker(
         )),
         hint_area,
     );
+}
+
+fn fmt_inventory_age(age_ms: u64) -> String {
+    if age_ms < 60_000 {
+        format!("{}s", age_ms / 1_000)
+    } else if age_ms < 3_600_000 {
+        format!("{}m", age_ms / 60_000)
+    } else {
+        format!("{}h", age_ms / 3_600_000)
+    }
 }
 
 fn render_session(

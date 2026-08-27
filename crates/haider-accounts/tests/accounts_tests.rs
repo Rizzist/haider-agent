@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(target_os = "macos")]
 use haider_accounts::KeychainVault;
 use haider_accounts::{
-    AccountStore, AccountsResult, AuthMethod, CredentialAlias, CredentialDescriptor,
-    CredentialStatus, ErrorCode, JsonFileStore, MemoryVault, Resolver, RotationCallback,
-    RotationDecision, RotationTrigger, StoreLike, Vault, import_env,
+    AccountIdentity, AccountStore, AccountsResult, AuthMethod, CredentialAlias,
+    CredentialDescriptor, CredentialStatus, ErrorCode, JsonFileStore, MemoryVault, Resolver,
+    RotationCallback, RotationDecision, RotationTrigger, StoreLike, Vault, import_env,
 };
 use haider_protocol::credential::RotationCause;
 
@@ -40,6 +40,8 @@ fn descriptor(
         status,
         active,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     }
 }
 
@@ -119,6 +121,45 @@ fn account_store_enforces_one_active_account_per_provider() {
     let reloaded = AccountStore::new(store).unwrap();
     assert_active(&reloaded, "openai", "first");
     assert_eq!(reloaded.list().len(), 2);
+}
+
+#[test]
+fn new_accounts_are_timestamped_while_legacy_rows_stay_unknown() {
+    let legacy = descriptor("legacy", "openai", CredentialStatus::Ok, true);
+    let mut accounts = AccountStore::new(SnapshotStore::with_descriptors(vec![legacy])).unwrap();
+    assert_eq!(accounts.list()[0].created_at_ms, None);
+    accounts
+        .backfill_identity(
+            &CredentialAlias::new("legacy"),
+            AccountIdentity {
+                email: Some("owner@example.test".into()),
+                display_name: None,
+                account_id: None,
+                plan: Some("pro".into()),
+                issuer: None,
+                captured_at: 964,
+                verified: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(accounts.list()[0].created_at_ms, None);
+
+    accounts
+        .add(descriptor("fresh", "openai", CredentialStatus::Ok, false))
+        .unwrap();
+    let created = accounts
+        .get(&CredentialAlias::new("fresh"))
+        .and_then(|descriptor| descriptor.created_at_ms);
+    assert!(created.is_some());
+    accounts
+        .replace(descriptor("fresh", "openai", CredentialStatus::Ok, false))
+        .unwrap();
+    assert_eq!(
+        accounts
+            .get(&CredentialAlias::new("fresh"))
+            .and_then(|descriptor| descriptor.created_at_ms),
+        created
+    );
 }
 
 #[test]

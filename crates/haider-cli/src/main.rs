@@ -255,7 +255,7 @@ async fn dispatch(args: &[String]) -> ExitCode {
                  session <id> config [--json] [--model <model|provider/model>] [--effort <level>] [--speed <fast|normal>] [--account <alias>], \
                  session <id> seen, session <id> recover [--json] [--probe|--mark-done|--retry|--abandon], \
                  session <id> item <seq> --json [--masked] [--no-spawn], \
-                 account list [--json], account remove <alias> --confirm, \
+                 account list [--json], account import <codex|claude-code> [--confirm], account refresh <alias>, account remove <alias> --confirm, \
                  account add <alias> --base-url <url> [--api-key <key>|--api-key-env <VAR>|--api-key-stdin|--no-auth] [--api-family openai|anthropic] [--response-open-timeout <dur>] [--json], \
                  account probe <alias> [--json], account update <alias> [--base-url <url>] [--api-key <key>|--api-key-env <VAR>|--api-key-stdin] [--response-open-timeout <dur>] [--json], \
                  models [--json] [--refresh [<alias>]], \
@@ -349,20 +349,6 @@ impl ImportSource {
             Self::ClaudeCode => "claude-code",
         }
     }
-
-    fn env_override(self) -> &'static str {
-        match self {
-            Self::Codex => "HAIDER_CODEX_AUTH_PATH",
-            Self::ClaudeCode => "HAIDER_CLAUDE_CREDS_PATH",
-        }
-    }
-
-    fn home_relative_path(self) -> &'static str {
-        match self {
-            Self::Codex => ".codex/auth.json",
-            Self::ClaudeCode => ".claude/.credentials.json",
-        }
-    }
 }
 
 pub(crate) fn parse_import_dispatch(rest: &[String]) -> Result<ImportDispatch, String> {
@@ -385,82 +371,21 @@ async fn import_command(rest: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let ImportDispatch::Source(source) = dispatch else {
-        for source in [ImportSource::Codex, ImportSource::ClaudeCode] {
-            let path = import_source_path(source);
-            let status = if path.is_file() { "exists" } else { "missing" };
-            println!("{}: {status} ({})", source.as_str(), path.display());
-        }
-        return ExitCode::SUCCESS;
-    };
-    let env = haider_client::ProfileEnv::capture();
-    let profile = match haider_client::resolve_profile(&env) {
-        Ok(profile) => profile,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let mut options = haider_client::EnsureOptions::default();
-    options
-        .required_features
-        .insert(haider_rpc::FEATURE_ACCOUNT_OAUTH_IMPORT_V1.to_owned());
-    let ensured = match haider_client::ensure_daemon(&profile, options).await {
-        Ok(ensured) => ensured,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let response = ensured
-        .client
-        .request(haider_rpc::RequestBody::AccountOAuthImport {
-            command_id: haider_rpc::CommandId::new(import_command_id()),
-            source: source.as_str().to_owned(),
-        })
-        .await;
-    ensured.client.close();
-    match response {
-        Ok(haider_rpc::ResponseBody::AccountOAuthImport { descriptor, .. }) => {
-            println!(
-                "imported {} ({}) — {}",
-                descriptor.alias, descriptor.provider, descriptor.identity
-            );
+    match dispatch {
+        ImportDispatch::List => {
+            println!("transcript sources: codex, claude-code");
+            println!("credential adoption: haider account import <source> --confirm");
             ExitCode::SUCCESS
         }
-        Ok(haider_rpc::ResponseBody::Error { message, .. }) => {
-            eprintln!("{message}");
-            ExitCode::FAILURE
-        }
-        Ok(_) => {
-            eprintln!("daemon returned an unexpected response to account.oauth_import");
-            ExitCode::FAILURE
-        }
-        Err(error) => {
-            eprintln!("{error}");
-            ExitCode::FAILURE
+        ImportDispatch::Source(source) => {
+            eprintln!(
+                "haider import {} is the transcript-import namespace; credential adoption requires `haider account import {} --confirm`",
+                source.as_str(),
+                source.as_str()
+            );
+            ExitCode::from(2)
         }
     }
-}
-
-fn import_source_path(source: ImportSource) -> PathBuf {
-    if let Some(path) = std::env::var_os(source.env_override()).filter(|value| !value.is_empty()) {
-        return PathBuf::from(path);
-    }
-    std::env::var_os("HOME").map_or_else(
-        || PathBuf::from("~").join(source.home_relative_path()),
-        |home| PathBuf::from(home).join(source.home_relative_path()),
-    )
-}
-
-fn import_command_id() -> String {
-    format!(
-        "oauth-import-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |since| since.as_nanos())
-    )
 }
 
 /// What the front door does once the daemon is ready.

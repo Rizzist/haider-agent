@@ -31,6 +31,8 @@ fn oauth_descriptor(provider: &str, alias: &str, active: bool) -> CredentialDesc
         status: CredentialStatus::Ok,
         active,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     }
 }
 

@@ -33,6 +33,8 @@ fn row(alias: &str) -> AccountRow {
         provider: "openai".to_owned(),
         method: AuthMethod::ApiKey,
         identity: "x".to_owned(),
+        account_identity: None,
+        created_at_ms: None,
         status: CredentialStatus::Ok,
         selected: false,
         base_url: None,

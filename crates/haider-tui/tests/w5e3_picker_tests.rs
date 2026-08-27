@@ -5,7 +5,9 @@
 
 use haider_tui::app::{AppModel, RuntimeMode};
 use haider_tui::commands::{PaletteItem, palette_items};
+use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};
 use haider_tui::mock::{seed_account_rows, seed_provider_summaries};
+use haider_tui::runtime::live_pass;
 
 mod common;
 use common::{launcher_model, run_slash};
@@ -86,6 +88,76 @@ fn model_slot_follows_the_active_provider() {
     );
 }
 
+#[test]
+fn model_picker_rows_surface_provider_inventory_age() {
+    let mut model = model_with_catalog();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let now = u64::try_from(now).expect("clock fits u64");
+    let openai = model
+        .providers
+        .providers
+        .iter_mut()
+        .find(|summary| summary.provider == "openai")
+        .expect("openai summary");
+    openai.inventory_fetched_at_ms = Some(now.saturating_sub(42_000));
+    let age = model
+        .model_picker_rows()
+        .into_iter()
+        .find(|row| row.provider == "openai" && !row.model.is_empty())
+        .and_then(|row| row.inventory_age_ms)
+        .expect("inventory age");
+    assert!((42_000..=43_000).contains(&age));
+}
+
+#[test]
+fn opening_model_picker_refreshes_a_stale_selected_provider() {
+    let mut model = model_with_catalog();
+    let openai = model
+        .providers
+        .providers
+        .iter_mut()
+        .find(|summary| summary.provider == "openai")
+        .expect("openai summary");
+    openai.inventory_fetched_at_ms = Some(1);
+    let provider_snapshot = model.providers.providers.clone();
+    let mut driver = LiveDriver::new("picker-refresh");
+
+    run_slash(&mut model, "/model");
+    let initial = live_pass(&mut driver, &mut model, None, std::time::Instant::now()).commands;
+    assert!(initial.contains(&LiveCommand::ProviderList));
+    let followups = driver.apply(
+        &mut model,
+        LiveReply::Providers {
+            providers: provider_snapshot.clone(),
+            revision: 2,
+        },
+    );
+    assert!(followups.contains(&LiveCommand::RefreshProviderModels {
+        provider: "openai".to_owned(),
+    }));
+
+    driver.apply(
+        &mut model,
+        LiveReply::ModelsRefreshFailed {
+            provider: "openai".to_owned(),
+            message: "temporary catalog failure".to_owned(),
+        },
+    );
+    let retry = driver.apply(
+        &mut model,
+        LiveReply::Providers {
+            providers: provider_snapshot,
+            revision: 3,
+        },
+    );
+    assert!(retry.contains(&LiveCommand::RefreshProviderModels {
+        provider: "openai".to_owned(),
+    }));
+}
+
 /// `/provider` lists the registry with honest health; `/account` lists live
 /// aliases and marks the one in use.
 #[test]
@@ -116,6 +188,14 @@ fn provider_and_account_slots_are_daemon_truth() {
         "the active alias is marked: {in_use:?}"
     );
     assert!(in_use.contains("oauth"), "auth label rides: {in_use:?}");
+    assert!(
+        in_use.contains("ChatGPT"),
+        "the account identity rides the picker: {in_use:?}"
+    );
+    assert!(
+        in_use.contains("added before 0.0.964"),
+        "legacy creation absence stays explicit: {in_use:?}"
+    );
 }
 
 /// Prefix filtering works on the dynamic rows like any slot.

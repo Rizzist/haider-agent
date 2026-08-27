@@ -498,6 +498,42 @@ impl ObserveClient {
             )),
         }
     }
+
+    /// Detects first-party CLI logins that are not represented in Haider.
+    /// This read returns only public identity metadata and never imports.
+    pub async fn account_adoption_available(
+        &self,
+    ) -> Result<Vec<haider_rpc::AccountAdoptionAvailable>, ObserveError> {
+        if !self
+            .welcome
+            .features
+            .contains(haider_rpc::FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1)
+        {
+            return Ok(Vec::new());
+        }
+        match self
+            .client
+            .request(RequestBody::AccountDeviceCandidates)
+            .await?
+        {
+            ResponseBody::AccountDeviceCandidates {
+                adoption_available, ..
+            } => Ok(adoption_available),
+            ResponseBody::Error {
+                code,
+                message,
+                retryable,
+                ..
+            } => Err(ObserveError::Rpc {
+                code,
+                message,
+                retryable,
+            }),
+            _ => Err(ObserveError::Protocol(
+                "account.device_candidates response method mismatch",
+            )),
+        }
+    }
 }
 
 fn observe_client_config() -> ClientConfig {

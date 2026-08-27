@@ -23,6 +23,8 @@ const ACCOUNTS_SCHEMA: &str = "haider.accounts.v1";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AccountCommand {
     List { json: bool },
+    Import { source: String, confirm: bool },
+    Refresh { alias: String },
     Remove { alias: String, confirm: bool },
     Add(CustomAccountOptions),
     Probe { alias: String, json: bool },
@@ -74,8 +76,8 @@ struct AccountView {
     alias: String,
     provider: String,
     auth_kind: &'static str,
-    /// `account.list` does not publish account creation time. `null` is an
-    /// honest machine-readable value; the human projection renders `unknown`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity: Option<haider_protocol::credential::AccountIdentity>,
     created: Option<u64>,
 }
 
@@ -173,6 +175,31 @@ pub(crate) fn parse_account_command(rest: &[String]) -> Result<AccountCommand, S
         [command, flag] if command == "list" && flag == "--json" => {
             Ok(AccountCommand::List { json: true })
         }
+        [command, source]
+            if command == "import" && matches!(source.as_str(), "codex" | "claude-code") =>
+        {
+            Ok(AccountCommand::Import {
+                source: source.clone(),
+                confirm: false,
+            })
+        }
+        [command, source, flag]
+            if command == "import"
+                && matches!(source.as_str(), "codex" | "claude-code")
+                && flag == "--confirm" =>
+        {
+            Ok(AccountCommand::Import {
+                source: source.clone(),
+                confirm: true,
+            })
+        }
+        [command, alias]
+            if command == "refresh" && !alias.is_empty() && !alias.starts_with('-') =>
+        {
+            Ok(AccountCommand::Refresh {
+                alias: alias.clone(),
+            })
+        }
         [command, alias] if command == "remove" && !alias.is_empty() && !alias.starts_with('-') => {
             Ok(AccountCommand::Remove {
                 alias: alias.clone(),
@@ -225,7 +252,7 @@ pub(crate) fn parse_account_command(rest: &[String]) -> Result<AccountCommand, S
 }
 
 fn account_usage() -> String {
-    "expected list [--json], remove <alias> --confirm, add <alias> --base-url <url> [--api-key <key> | --api-key-env <VAR> | --api-key-stdin | --no-auth] [--api-family openai|anthropic] [--response-open-timeout <duration>] [--json], probe <alias> [--json], or update <alias> [mutable options] [--json]".into()
+    "expected list [--json], import <codex|claude-code> [--confirm], refresh <alias>, remove <alias> --confirm, add <alias> --base-url <url> [--api-key <key> | --api-key-env <VAR> | --api-key-stdin | --no-auth] [--api-family openai|anthropic] [--response-open-timeout <duration>] [--json], probe <alias> [--json], or update <alias> [mutable options] [--json]".into()
 }
 
 fn parse_custom_options(
@@ -374,14 +401,27 @@ pub(crate) async fn account_command(rest: &[String]) -> ExitCode {
         }
     };
     let capabilities = match &command {
-        AccountCommand::List { .. } => CapabilitySet::from([Capability::View]),
-        AccountCommand::Remove { .. }
+        AccountCommand::List { .. } | AccountCommand::Import { confirm: false, .. } => {
+            CapabilitySet::from([Capability::View])
+        }
+        AccountCommand::Import { confirm: true, .. }
+        | AccountCommand::Refresh { .. }
+        | AccountCommand::Remove { .. }
         | AccountCommand::Add(_)
         | AccountCommand::Probe { .. }
         | AccountCommand::Update(_) => CapabilitySet::from([Capability::View, Capability::Control]),
     };
     let mut required_features =
         BTreeSet::from([haider_rpc::FEATURE_ACCOUNT_MANAGEMENT_V1.to_owned()]);
+    if matches!(
+        &command,
+        AccountCommand::Import { .. } | AccountCommand::Refresh { .. }
+    ) {
+        required_features.insert(haider_rpc::FEATURE_ACCOUNT_IDENTITY_V1.to_owned());
+    }
+    if matches!(&command, AccountCommand::Import { .. }) {
+        required_features.insert(haider_rpc::FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1.to_owned());
+    }
     if matches!(&command, AccountCommand::Add(_) | AccountCommand::Update(_)) {
         required_features.insert(haider_rpc::FEATURE_PROVIDER_CONFIGURE_V1.to_owned());
         required_features.insert(haider_rpc::FEATURE_PROVIDER_MODELS_V1.to_owned());
@@ -441,6 +481,10 @@ async fn execute(
                 write_human(&document)
             })
         }
+        AccountCommand::Import { source, confirm } => {
+            execute_import(client, &source, confirm).await
+        }
+        AccountCommand::Refresh { alias } => execute_refresh(client, alias).await,
         AccountCommand::Remove {
             alias,
             confirm: true,
@@ -497,6 +541,138 @@ async fn execute(
         AccountCommand::Add(options) => execute_custom(client, options, true).await,
         AccountCommand::Update(options) => execute_custom(client, options, false).await,
         AccountCommand::Probe { alias, json } => execute_probe(client, alias, json).await,
+    }
+}
+
+async fn execute_refresh(
+    client: &impl AccountClient,
+    alias: String,
+) -> Result<ExitCode, AccountError> {
+    match client
+        .request(RequestBody::AccountRefresh { alias })
+        .await
+        .map_err(AccountError::Client)?
+    {
+        ResponseBody::AccountRefresh { descriptor, .. } => {
+            let summary = descriptor.account_identity.as_ref().map_or_else(
+                || "identity unavailable".to_owned(),
+                |identity| identity.summary(),
+            );
+            println!(
+                "refreshed {} ({}) — {summary}",
+                descriptor.alias, descriptor.provider
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            data,
+        } => Err(AccountError::Rpc {
+            code,
+            message,
+            retryable,
+            data,
+        }),
+        _ => Err(AccountError::Protocol("account.refresh response mismatch")),
+    }
+}
+
+async fn execute_import(
+    client: &impl AccountClient,
+    source: &str,
+    confirm: bool,
+) -> Result<ExitCode, AccountError> {
+    let candidates = match client
+        .request(RequestBody::AccountDeviceCandidates)
+        .await
+        .map_err(AccountError::Client)?
+    {
+        ResponseBody::AccountDeviceCandidates { candidates, .. } => candidates,
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            data,
+        } => {
+            return Err(AccountError::Rpc {
+                code,
+                message,
+                retryable,
+                data,
+            });
+        }
+        _ => {
+            return Err(AccountError::Protocol(
+                "account.device_candidates response mismatch",
+            ));
+        }
+    };
+    let candidate = candidates
+        .into_iter()
+        .find(|candidate| candidate.source == source)
+        .ok_or_else(|| AccountError::MissingAlias(format!("{source} local login")))?;
+    if !candidate.import_supported {
+        return Err(AccountError::Protocol(
+            "the discovered local login cannot be imported safely",
+        ));
+    }
+    let summary = candidate.identity.as_ref().map_or_else(
+        || {
+            candidate
+                .account_label
+                .clone()
+                .unwrap_or_else(|| "unknown account".to_owned())
+        },
+        haider_protocol::credential::AccountIdentity::summary,
+    );
+    println!("found {source} login: {summary}");
+    if !confirm {
+        eprintln!(
+            "haider account: review the identity, then run `haider account import {source} --confirm`"
+        );
+        return Ok(ExitCode::from(EX_USAGE));
+    }
+    match client
+        .request(RequestBody::AccountImportDevice {
+            command_id: CommandId::new(command_id("account-import")),
+            candidate: candidate.candidate,
+        })
+        .await
+        .map_err(AccountError::Client)?
+    {
+        ResponseBody::AccountImportDevice { descriptor, .. } => {
+            println!(
+                "imported {} ({}) — {}",
+                descriptor.alias,
+                descriptor.provider,
+                descriptor.account_identity.as_ref().map_or(
+                    descriptor.identity.as_str(),
+                    |identity| {
+                        identity
+                            .email
+                            .as_deref()
+                            .unwrap_or(descriptor.identity.as_str())
+                    }
+                )
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            data,
+        } => Err(AccountError::Rpc {
+            code,
+            message,
+            retryable,
+            data,
+        }),
+        _ => Err(AccountError::Protocol(
+            "account.import_device response mismatch",
+        )),
     }
 }
 
@@ -875,7 +1051,8 @@ fn account_view(descriptor: CredentialDescriptor) -> AccountView {
             AuthMethod::ApiKey => "api_key",
             AuthMethod::OAuth => "oauth",
         },
-        created: None,
+        identity: descriptor.account_identity,
+        created: descriptor.created_at_ms,
     }
 }
 
@@ -898,13 +1075,17 @@ fn write_human(document: &AccountsDocument) -> ExitCode {
     let mut text = String::new();
     for account in &document.accounts {
         text.push_str(&format!(
-            "{}  provider={}  auth_kind={}  created={}\n",
+            "{}  provider={}  identity={}  created={}\n",
             account.alias,
             account.provider,
-            account.auth_kind,
             account
-                .created
-                .map_or_else(|| "unknown".to_owned(), |created| created.to_string())
+                .identity
+                .as_ref()
+                .map_or_else(|| "unknown".to_owned(), |identity| identity.summary()),
+            account.created.map_or_else(
+                || "unknown (added before 0.0.964)".to_owned(),
+                |created| created.to_string(),
+            )
         ));
     }
     let stdout = io::stdout();

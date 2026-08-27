@@ -19,7 +19,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use haider_accounts::{OAuthIdentityV1, OAuthTokenBundleV1};
 use haider_accounts::{SecretHandle, Vault, VaultRefreshLock};
-use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
+use haider_protocol::credential::{
+    AccountIdentity, AuthMethod, CredentialDescriptor, CredentialStatus,
+};
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
 use haider_protocol::ids::CredentialAlias;
 use haider_provider::Provider as _;
@@ -1219,15 +1221,15 @@ pub(crate) enum ClaudeNativeCredentialFailure {
 
 /// Explicit-import reads may retry a previously failed no-UI probe and, on
 /// macOS, request protected data interactively. Ordinary provider read-throughs
-/// and auto-adopt discovery never permit credential UI; the latter remains a
-/// distinct event so one successful no-UI read can pass directly to import.
+/// and adoption discovery never permit credential UI; the latter remains a
+/// distinct event so one successful no-UI read can feed candidate lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClaudeNativeReadEvent {
     Ordinary,
     /// Explicit user-issued import. This is the only event permitted to ask
     /// macOS Keychain for protected credential data.
     Significant,
-    AutoAdoptDiscovery,
+    AdoptionDiscovery,
 }
 
 #[cfg(any(test, target_os = "macos"))]
@@ -1316,14 +1318,14 @@ pub(crate) struct ClaudeNativeCredentialAccess {
 #[derive(Default)]
 struct ClaudeNativeCredentialAccessState {
     last_failure: Option<ClaudeNativeCredentialFailure>,
-    /// A significant discovery read and its immediate auto-adopt are one
-    /// policy operation. Hand the already-authorized bytes to the importer
-    /// once so macOS "Allow Once" never requires a second Keychain query.
-    significant_handoff: Option<(Instant, ClaudeCredentialInput)>,
+    /// A metadata discovery read and its immediate candidate lookup are one
+    /// observational operation. Hand the bytes to the lookup once; explicit
+    /// import still owns its separate `Significant` read.
+    discovery_handoff: Option<(Instant, ClaudeCredentialInput)>,
 }
 
 impl ClaudeNativeCredentialAccess {
-    const SIGNIFICANT_HANDOFF_TTL: Duration = Duration::from_secs(5);
+    const DISCOVERY_HANDOFF_TTL: Duration = Duration::from_secs(5);
 
     pub(crate) fn new(store: Arc<dyn ClaudeNativeCredentialStore>) -> Self {
         Self {
@@ -1343,8 +1345,8 @@ impl ClaudeNativeCredentialStore for ClaudeNativeCredentialAccess {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if event == ClaudeNativeReadEvent::Ordinary {
-            if let Some((observed_at, input)) = state.significant_handoff.take()
-                && observed_at.elapsed() <= Self::SIGNIFICANT_HANDOFF_TTL
+            if let Some((observed_at, input)) = state.discovery_handoff.take()
+                && observed_at.elapsed() <= Self::DISCOVERY_HANDOFF_TTL
             {
                 return Ok(input);
             }
@@ -1355,12 +1357,12 @@ impl ClaudeNativeCredentialStore for ClaudeNativeCredentialAccess {
         match self.store.read(event) {
             Ok(input) => {
                 state.last_failure = None;
-                state.significant_handoff = (event == ClaudeNativeReadEvent::AutoAdoptDiscovery)
+                state.discovery_handoff = (event == ClaudeNativeReadEvent::AdoptionDiscovery)
                     .then(|| (Instant::now(), input.clone()));
                 Ok(input)
             }
             Err(error) => {
-                state.significant_handoff = None;
+                state.discovery_handoff = None;
                 state.last_failure = Some(error);
                 Err(error)
             }
@@ -1694,6 +1696,9 @@ pub(crate) fn load_claude_credential_input(
 
 pub(crate) struct OAuthImportMaterial {
     pub bundle: OAuthTokenBundleV1,
+    /// One-way digest of the exact source-store bytes parsed into `bundle`.
+    /// Used only to bind an explicit device-candidate confirmation.
+    pub source_fingerprint: [u8; 32],
     pub kimi_device_id: Option<Zeroizing<Vec<u8>>>,
     /// Claude Code remains the credential owner, so expiry resolution must
     /// read through to its native store and must not spend Haider's snapshot.
@@ -1787,6 +1792,7 @@ fn load_oauth_import_material_from_input(
     let claude_native_owner = input.native_owner;
     let path = input.location;
     let bytes = input.bytes;
+    let source_fingerprint = *blake3::hash(&bytes).as_bytes();
     let registration = OAuthProviderCatalog::default()
         .registration(spec.provider)
         .ok_or_else(|| {
@@ -1839,6 +1845,7 @@ fn load_oauth_import_material_from_input(
     };
     Ok(OAuthImportMaterial {
         bundle,
+        source_fingerprint,
         kimi_device_id,
         claude_native_owner,
     })
@@ -1932,6 +1939,29 @@ fn codex_import_bundle(
 ) -> Result<OAuthTokenBundleV1, HaiderError> {
     let auth: CodexAuthFile =
         serde_json::from_slice(bytes).map_err(|error| malformed_import(path, "codex", &error))?;
+    let captured_at = now_ms().ok_or_else(|| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            "cannot timestamp imported OAuth identity",
+            true,
+        )
+    })?;
+    let account_identity = haider_provider::oauth_identity_source(&registration.provider_id)
+        .and_then(|source| {
+            source
+                .identity_from_tokens(&haider_provider::OAuthTokens {
+                    access_token: auth.tokens.access_token.0.as_slice(),
+                    refresh_token: Some(auth.tokens.refresh_token.0.as_slice()),
+                    id_token: auth
+                        .tokens
+                        .id_token
+                        .as_ref()
+                        .map(|token| token.0.as_slice()),
+                    captured_at,
+                })
+                .ok()
+                .flatten()
+        });
     let source_access_fingerprint = *blake3::hash(auth.tokens.access_token.0.as_slice()).as_bytes();
     let parsed_expiry = unverified_jwt_expiry_ms(auth.tokens.access_token.0.as_slice());
     let refresh_on_first_use = parsed_expiry.is_none();
@@ -1952,6 +1982,7 @@ fn codex_import_bundle(
         .as_ref()
         .and_then(|token| decode_unverified_jwt_payload::<ImportedJwtClaims>(token.0.as_slice()))
         .unwrap_or_default();
+    let email = identity_claims.email.and_then(nonempty);
     let account_id = identity_claims
         .chatgpt_account_id
         .and_then(nonempty)
@@ -1961,17 +1992,28 @@ fn codex_import_bundle(
                 .and_then(|claims| claims.chatgpt_account_id.and_then(nonempty))
         })
         .or_else(|| auth.tokens.account_id.and_then(nonempty));
-    let display_identity = identity_claims
-        .email
-        .and_then(nonempty)
+    let display_identity = email
+        .clone()
         .or_else(|| account_id.clone())
         .unwrap_or_else(|| "imported".to_owned());
     let subject = identity_claims
         .sub
         .and_then(nonempty)
-        .or(account_id)
+        .or_else(|| account_id.clone())
         .unwrap_or_else(|| "imported".to_owned());
-    let bundle = OAuthTokenBundleV1::new(
+    let account_identity = account_identity.or_else(|| {
+        (email.is_some() || account_id.is_some()).then(|| AccountIdentity {
+            email,
+            display_name: None,
+            account_id,
+            plan: None,
+            issuer: Some(registration.issuer.clone()),
+            captured_at,
+            verified: false,
+        })
+    });
+    let id_token = auth.tokens.id_token.map(|token| token.0);
+    let mut bundle = OAuthTokenBundleV1::new(
         registration.provider_id.clone(),
         registration.issuer.clone(),
         registration.audience.clone(),
@@ -1989,6 +2031,12 @@ fn codex_import_bundle(
         generation,
     )
     .map_err(|_| invalid_import(path, "codex"))?;
+    if let Some(identity) = account_identity {
+        bundle = bundle.with_account_identity(identity);
+    }
+    if let Some(id_token) = id_token {
+        bundle = bundle.with_id_token(id_token);
+    }
     let bundle = bundle.with_import_source_access_fingerprint(source_access_fingerprint);
     Ok(if refresh_on_first_use {
         bundle.with_refresh_on_first_use()
@@ -2052,19 +2100,21 @@ fn claude_import_bundle(
     {
         return Err(invalid_import(path, "claude-code"));
     }
-    let display_identity = match credentials.oauth.subscription_type.as_deref() {
-        Some("max") => "Claude Max subscription",
-        Some("pro") => "Claude Pro subscription",
-        Some("team") => "Claude Team subscription",
-        Some("enterprise") => "Claude Enterprise subscription",
-        _ => "Claude Code subscription",
-    };
+    let (display_identity, plan) =
+        claude_subscription_identity(credentials.oauth.subscription_type.as_deref());
     let identity = OAuthIdentityV1 {
         subject_hash: blake3::hash(credentials.oauth.access_token.0.as_slice())
             .to_hex()
             .to_string(),
         display_identity: display_identity.into(),
     };
+    let captured_at = now_ms().ok_or_else(|| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            "cannot timestamp imported OAuth identity",
+            true,
+        )
+    })?;
     OAuthTokenBundleV1::new(
         registration.provider_id.clone(),
         registration.issuer.clone(),
@@ -2079,8 +2129,32 @@ fn claude_import_bundle(
         identity,
         generation,
     )
-    .map(|bundle| bundle.with_import_source_access_fingerprint(source_access_fingerprint))
+    .map(|bundle| {
+        bundle
+            .with_account_identity(AccountIdentity {
+                email: None,
+                display_name: Some(display_identity.to_owned()),
+                account_id: None,
+                plan: plan.map(str::to_owned),
+                issuer: Some(registration.issuer.clone()),
+                captured_at,
+                verified: false,
+            })
+            .with_import_source_access_fingerprint(source_access_fingerprint)
+    })
     .map_err(|_| invalid_import(path, "claude-code"))
+}
+
+pub(crate) fn claude_subscription_identity(
+    subscription_type: Option<&str>,
+) -> (&'static str, Option<&'static str>) {
+    match subscription_type {
+        Some("max") => ("Claude Max subscription", Some("max")),
+        Some("pro") => ("Claude Pro subscription", Some("pro")),
+        Some("team") => ("Claude Team subscription", Some("team")),
+        Some("enterprise") => ("Claude Enterprise subscription", Some("enterprise")),
+        _ => ("Claude Code subscription", None),
+    }
 }
 
 fn parse_claude_credentials(
@@ -2094,6 +2168,7 @@ pub(crate) struct ClaudeCredentialMetadata {
     pub expires_at_ms: u64,
     pub has_inference_scope: bool,
     pub custom_client: bool,
+    pub subscription_type: Option<String>,
 }
 
 pub(crate) fn parse_claude_credential_metadata(
@@ -2119,6 +2194,7 @@ pub(crate) fn parse_claude_credential_metadata(
             .client_id
             .as_deref()
             .is_some_and(|client_id| client_id != CLAUDE_DEFAULT_CLIENT_ID),
+        subscription_type: credentials.oauth.subscription_type,
     })
 }
 
@@ -2302,7 +2378,7 @@ fn codex_import_fallback_refresh_candidate(bundle: &OAuthTokenBundleV1, now: u64
 }
 
 fn nonempty(value: String) -> Option<String> {
-    (!value.trim().is_empty()).then_some(value)
+    AccountIdentity::sanitized_field(&value)
 }
 
 fn malformed_import(path: &Path, source: &str, error: &serde_json::Error) -> HaiderError {
@@ -4403,6 +4479,31 @@ async fn token_bundle_from_response(
         },
     };
     let now = now_ms().ok_or_else(|| OAuthPublicError::new("clock_unavailable", true))?;
+    let mut account_identity =
+        match haider_provider::oauth_identity_source(&registration.provider_id) {
+            Some(source) => source
+                .identity_from_tokens(&haider_provider::OAuthTokens {
+                    access_token: response.access_token.0.as_slice(),
+                    refresh_token: response
+                        .refresh_token
+                        .as_ref()
+                        .map(|token| token.0.as_slice())
+                        .or(prior_refresh),
+                    id_token: response.id_token.as_ref().map(|token| token.0.as_slice()),
+                    captured_at: now,
+                })
+                .map_err(|_| OAuthPublicError::new("identity_claims_malformed", false))?,
+            None => None,
+        };
+    if matches!(
+        &registration.identity_mode,
+        RuntimeIdentityMode::VerifiedIdToken(_)
+    ) && let Some(account_identity) = account_identity.as_mut()
+    {
+        // The generic decoder is informational; this bit is promoted only
+        // because the flow independently verified this exact ID token.
+        account_identity.verified = true;
+    }
     let expires_at = now
         .checked_add(response.expires_in.saturating_mul(1000))
         .ok_or_else(|| OAuthPublicError::new("invalid_token_response", false))?;
@@ -4419,7 +4520,8 @@ async fn token_bundle_from_response(
         }
         None => None,
     };
-    let bundle = OAuthTokenBundleV1::new(
+    let id_token = response.id_token.map(|token| token.0);
+    let mut bundle = OAuthTokenBundleV1::new(
         registration.provider_id.clone(),
         registration.issuer.clone(),
         registration.audience.clone(),
@@ -4434,6 +4536,12 @@ async fn token_bundle_from_response(
         generation,
     )
     .map_err(|_| OAuthPublicError::new("invalid_token_response", false))?;
+    if let Some(identity) = account_identity {
+        bundle = bundle.with_account_identity(identity);
+    }
+    if let Some(id_token) = id_token {
+        bundle = bundle.with_id_token(id_token);
+    }
     Ok(
         if registration.refresh_policy == OAuthRefreshPolicy::SerializedRotating {
             bundle.with_refresh_after(kimi_refresh_after(now, response.expires_in))
@@ -6337,6 +6445,12 @@ fn refresh_bundle_from_response(
     if let Some(fingerprint) = prior.import_source_access_fingerprint() {
         bundle = bundle.with_import_source_access_fingerprint(fingerprint);
     }
+    if let Some(identity) = prior.account_identity.clone() {
+        bundle = bundle.with_account_identity(identity);
+    }
+    if let Some(id_token) = prior.id_token() {
+        bundle = bundle.with_id_token(Zeroizing::new(id_token.to_vec()));
+    }
     Ok(
         if registration.refresh_policy == OAuthRefreshPolicy::SerializedRotating {
             bundle.with_refresh_after(kimi_refresh_after(now, response.expires_in))
@@ -6414,7 +6528,9 @@ fn imported_credential_expired(descriptor: &CredentialDescriptor, source: &str) 
         descriptor,
         haider_accounts::RotationTrigger::AuthExpired,
         false,
-        &format!("credential expired — re-run `haider import {source}` or sign in again"),
+        &format!(
+            "credential expired — re-run `haider account import {source} --confirm` or sign in again"
+        ),
     );
     if let Some(details) = error
         .details

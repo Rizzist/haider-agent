@@ -3680,6 +3680,18 @@ impl HubConnection {
                 }
                 self.account_set_label(request_id, alias, label)
             }
+            RequestBody::AccountRefresh { alias } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.account_refresh(request_id, alias)
+            }
             RequestBody::AccountSetActive {
                 command_id,
                 alias,
@@ -6155,6 +6167,30 @@ impl HubConnection {
                     sink: Arc::clone(&self.sink),
                 },
             })),
+        )
+    }
+
+    fn account_refresh(&self, request_id: RequestId, alias: String) -> Result<(), SessionHubError> {
+        if alias.trim().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "account.refresh requires an alias",
+                false,
+                None,
+            );
+        }
+        self.send_management_command(
+            request_id.clone(),
+            crate::accounts::AccountCommand::RefreshIdentity(Box::new(
+                crate::accounts::RefreshIdentityJob {
+                    alias,
+                    route: crate::accounts::LoginRoute {
+                        request_id,
+                        sink: Arc::clone(&self.sink),
+                    },
+                },
+            )),
         )
     }
 

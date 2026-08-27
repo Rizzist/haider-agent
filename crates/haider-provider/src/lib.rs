@@ -24,6 +24,7 @@ mod effort_tests;
 mod gemini;
 #[cfg(test)]
 mod gemini_tests;
+mod oauth_identity;
 mod openai;
 mod origin;
 mod pricing;
@@ -154,6 +155,11 @@ pub use cachemaxxing::{
     CacheWritePrice, InlineBreakpointPlan, PreparedProviderView, ProviderViewContinuity,
     ProviderViewInvariantError, cache_placement_capabilities, economic_cache_hit_rate,
     plan_inline_breakpoints, validate_provider_view_prefix,
+};
+pub use oauth_identity::{
+    AnthropicOAuthIdentitySource, GrokOAuthIdentitySource, IdentityEndpoint, IdentityError,
+    KimiOAuthIdentitySource, OAuthIdentitySource, OAuthTokens, OpenAiOAuthIdentitySource,
+    oauth_identity_source,
 };
 
 const HTTP_ERROR_BODY_LIMIT: usize = 64 * 1024;

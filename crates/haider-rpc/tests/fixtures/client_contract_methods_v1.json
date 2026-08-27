@@ -354,6 +354,12 @@
       "response_method": "loom.watch",
       "request": {"method":"loom.watch","after_cursor":41},
       "response": {"method":"loom.watch","watch_id":"loom-watch-1","requested_after_cursor":41,"baseline":{"through_cursor":44,"entries":[{"entry":{"kind":"agent_type","id":"reviewer","rev":3,"digest":"digest-reviewer-3","archived":true},"record":{"kind":"agent_type","record":{"id":"reviewer","name":"Reviewer","job":"Review changes","in_type":"Patch","out_type":"Verdict","clis":["rg"],"color":"#445566","glyph":"R","rev":3}}}]}}
+    },
+    {
+      "request_method": "account.refresh",
+      "response_method": "account.refresh",
+      "request": {"method":"account.refresh","alias":"openai-oauth"},
+      "response": {"method":"account.refresh","descriptor":{"alias":"openai-oauth","provider":"openai-oauth","auth_method":"oauth","identity":"person@example.invalid","status":{"status":"ok"},"active":true,"account_identity":{"email":"person@example.invalid","plan":"pro","captured_at":964,"verified":false}},"revision":25}
     }
   ]
 }

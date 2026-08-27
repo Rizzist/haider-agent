@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! Device-discovery laws (D1): metadata-only reports, silent skip of absent
 //! or malformed stores, and the honest disabled state.
 //!
@@ -6,8 +8,6 @@
 //! process whose home is a fixture directory and whose override variables are
 //! scrubbed. The parent arm of each test only builds fixtures and supervises
 //! the child.
-#![allow(clippy::expect_used)]
-
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -258,7 +258,13 @@ fn codex_access_jwt() -> String {
 }
 
 fn codex_id_jwt() -> String {
-    fake_jwt(&serde_json::json!({ "email": "person@example.invalid" }))
+    fake_jwt(&serde_json::json!({
+        "email": "person@example.invalid",
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "pro",
+            "chatgpt_account_id": "acct-fake-codex-1"
+        }
+    }))
 }
 
 fn populated_home(home: &Path) -> (String, String) {
@@ -352,6 +358,15 @@ fn discovery_reports_metadata_never_token_bytes() {
         5,
         "expected codex + claude + kimi + grok + gemini candidates, got {candidates:?}"
     );
+    let codex = candidates
+        .iter()
+        .find(|candidate| candidate.wire.source == "codex")
+        .expect("Codex candidate");
+    let identity = codex.wire.identity.as_ref().expect("Codex identity");
+    assert_eq!(identity.email.as_deref(), Some("person@example.invalid"));
+    assert_eq!(identity.plan.as_deref(), Some("pro"));
+    assert_eq!(identity.account_id.as_deref(), Some("acct-fake-codex-1"));
+    assert!(!identity.verified);
 
     let response = serde_json::to_string(&haider_rpc::ResponseBody::AccountDeviceCandidates {
         discovery_disabled: false,
@@ -359,6 +374,7 @@ fn discovery_reports_metadata_never_token_bytes() {
             .iter()
             .map(|candidate| candidate.wire.clone())
             .collect(),
+        adoption_available: Vec::new(),
     })
     .expect("serialize discovery response");
 
@@ -535,6 +551,37 @@ fn discovery_profile_switch_disables_and_stays_honest() {
     assert!(candidate_by_id(true, &candidate_id).is_none());
     assert!(discovery_is_disabled(true));
     assert!(!discovery_is_disabled(false));
+}
+
+#[test]
+fn candidate_id_stops_matching_when_the_source_login_changes() {
+    let home = fixture_home();
+    populated_home(home.path());
+    if run_in_isolated_home(
+        "device_discovery::tests::candidate_id_stops_matching_when_the_source_login_changes",
+        home.path(),
+        &[],
+    ) {
+        return;
+    }
+
+    let candidate = discover_device_candidates(false)
+        .into_iter()
+        .find(|candidate| candidate.wire.source == "codex")
+        .expect("Codex candidate");
+    let old_id = candidate.wire.candidate;
+    let path = PathBuf::from(candidate.wire.path);
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read fixture")).expect("fixture JSON");
+    document["tokens"]["refresh_token"] =
+        serde_json::Value::String("changed-refresh-token".to_owned());
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&document).expect("encode fixture"),
+    )
+    .expect("update fixture");
+
+    assert!(candidate_by_id(false, &old_id).is_none());
 }
 
 /// `HAIDER_DEVICE_DISCOVERY_DISABLED` disables discovery for the whole daemon

@@ -108,6 +108,8 @@ fn oauth_alias_derives_the_smallest_free_suffix() {
         provider: "openai".into(),
         method: AuthMethod::OAuth,
         identity: "x".into(),
+        account_identity: None,
+        created_at_ms: None,
         status: CredentialStatus::Ok,
         selected: false,
         base_url: None,
@@ -190,6 +192,8 @@ fn cancel_closes_and_late_replies_are_ghosts() {
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
     let message_before = model.accounts.message.clone();
     model.oauth_add_completed(attempt, &descriptor);

@@ -385,6 +385,8 @@ fn a_selected_api_key_account_triggers_model_discovery() {
         status: haider_protocol::credential::CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
     let pass = live_pass(
         &mut driver,

@@ -1398,6 +1398,7 @@ pub enum LiveReply {
     DeviceCandidates {
         discovery_disabled: bool,
         candidates: Vec<haider_rpc::DeviceCredentialCandidateWire>,
+        adoption_available: Vec<haider_rpc::AccountAdoptionAvailable>,
     },
     /// `account.import_device` committed (D2): the daemon's receipt. It
     /// retires the outbox entry and chains the `account.list` refresh —
@@ -3034,6 +3035,7 @@ impl LiveDriver {
                 }
             }
             LiveReply::ModelsRefreshFailed { provider, message } => {
+                self.models_requested.remove(&provider);
                 for summary in &mut model.providers.providers {
                     if summary.provider == provider {
                         summary.availability = haider_rpc::ProviderAvailabilityWire::Unavailable;
@@ -3289,10 +3291,24 @@ impl LiveDriver {
                 // discovered before the picker or the bootstrap can work.
                 self.provider_model_refreshes(model)
             }
-            LiveReply::DeviceCandidates { .. } => {
-                // The daemon has completed its auto-adoption pass. Candidate
-                // metadata has no TUI surface; re-read roster/provider truth.
-                vec![LiveCommand::AccountList, LiveCommand::ProviderList]
+            LiveReply::DeviceCandidates {
+                candidates,
+                adoption_available,
+                ..
+            } => {
+                for notice in &adoption_available {
+                    let Some(candidate) = candidates
+                        .iter()
+                        .find(|candidate| candidate.source == notice.source)
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    if model.account_adoption_available(notice, candidate) {
+                        break;
+                    }
+                }
+                Vec::new()
             }
             LiveReply::DeviceImported {
                 command_id,
@@ -3330,7 +3346,11 @@ impl LiveDriver {
                     crate::format::mask_identity(&descriptor.identity)
                 ));
                 model.dirty = true;
-                vec![LiveCommand::AccountList, LiveCommand::ProviderList]
+                vec![
+                    LiveCommand::AccountList,
+                    LiveCommand::ProviderList,
+                    LiveCommand::DeviceCandidates,
+                ]
             }
             LiveReply::AccountSelected {
                 command_id,
@@ -3366,6 +3386,7 @@ impl LiveDriver {
                 self.provider_model_refreshes(model)
             }
             LiveReply::ProviderModelsRefreshed { provider, revision } => {
+                self.models_requested.remove(&provider);
                 if model.providers.apply_models_refresh(provider, revision) {
                     // The catalog is here: NOW the bootstrap can adopt the
                     // provider's real default model (W5f-2d).
@@ -5035,7 +5056,8 @@ impl LiveDriver {
     /// Discover the catalog for any ACTIVE OAuth account whose provider has
     /// no models yet (W5f-2d): the picker and the identity bootstrap both
     /// need real slugs, and the fetch needs the account's token. One request
-    /// per provider per connection — the dedup set stops a snapshot storm.
+    /// per provider in flight — the dedup set stops a snapshot storm and is
+    /// released when the refreshed snapshot lands, so TTL expiry can recur.
     fn provider_model_refreshes(&mut self, model: &AppModel) -> Vec<LiveCommand> {
         let mut commands = Vec::new();
         for row in &model.accounts.rows {
@@ -5046,13 +5068,24 @@ impl LiveDriver {
             if !row.selected {
                 continue;
             }
-            let has_models = model
+            let summary = model
                 .providers
                 .providers
                 .iter()
-                .find(|summary| summary.provider == row.provider)
-                .is_some_and(|summary| !summary.models.is_empty());
-            if has_models || self.models_requested.contains(&row.provider) {
+                .find(|summary| summary.provider == row.provider);
+            let needs_refresh = summary.is_none_or(|summary| {
+                summary.models.is_empty()
+                    || summary.inventory_fetched_at_ms.is_some_and(|fetched_at| {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .ok()
+                            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+                            .is_some_and(|now| {
+                                now.saturating_sub(fetched_at) >= haider_rpc::MODEL_INVENTORY_TTL_MS
+                            })
+                    })
+            });
+            if !needs_refresh || self.models_requested.contains(&row.provider) {
                 continue;
             }
             self.models_requested.insert(row.provider.clone());
@@ -5099,6 +5132,9 @@ impl LiveDriver {
             LiveCommand::AccountList,
             LiveCommand::ProviderList,
         ];
+        if model.daemon_serves(haider_rpc::FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1) {
+            commands.push(LiveCommand::DeviceCandidates);
+        }
         // Priority order: the attached surface first, then the sessions the
         // user is waiting on, then the rest — so a capped working set
         // rebuilds the ones that matter.
@@ -5824,6 +5860,14 @@ impl LiveDriver {
                     command_id,
                     alias,
                     expected_revision,
+                })]
+            }
+            AppRequest::AccountImportDevice { candidate, source } => {
+                let command_id = self.mint();
+                self.pending_device_import = Some((command_id.clone(), source));
+                vec![self.enqueue(LiveCommand::DeviceImport {
+                    command_id,
+                    candidate,
                 })]
             }
             AppRequest::ProviderRemove { provider } => {
