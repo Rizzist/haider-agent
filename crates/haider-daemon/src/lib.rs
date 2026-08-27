@@ -135,6 +135,8 @@ pub use provider_registry::{ProductionProviderEndpointValidator, ProviderEndpoin
 pub use runtime::{
     DaemonTask, run_with_signals, run_with_signals_and_dependencies, spawn, spawn_with_dependencies,
 };
+#[cfg(windows)]
+pub use runtime::{DaemonTaskDiagnosticSnapshot, DaemonTaskDiagnostics};
 pub use session_hub::{
     AdmissionTicket, FrameSendError, FrameSink, HubConnection, HubObservation, HubStoreHandle,
     IMAGE_ATTACHMENT_MIME_ALLOWLIST, SendAdmission, SessionHub, SessionHubConfig, SessionHubError,
