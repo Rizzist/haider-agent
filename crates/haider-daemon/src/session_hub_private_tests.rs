@@ -20,6 +20,23 @@ use haider_store::{
     GraphEvidenceCommand, GraphPinCommand, QueuePromoteCommand, QueueRemoveCommand,
     SessionCreateCommand, ShellExecAcceptCommand, ShellExecAcceptOutcome, TurnAcceptCommand,
 };
+
+/// MUTATION CHECK: requiring a fetch timestamp before considering a known
+/// inventory miss skips refresh-on-miss for legacy cached inventories.
+#[test]
+fn model_inventory_miss_refreshes_even_without_a_fetch_timestamp() {
+    let mut summary = provider_summary("openai-oauth");
+    summary.models = vec!["known-model".to_owned()];
+    summary.inventory_fetched_at_ms = None;
+    assert!(super::rpc::provider_inventory_needs_refresh(
+        &summary,
+        "new-model"
+    ));
+    assert!(!super::rpc::provider_inventory_needs_refresh(
+        &summary,
+        "known-model"
+    ));
+}
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -43,6 +60,7 @@ fn provider_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
         response_open_timeout_ms: None,
         models: Vec::new(),
         model_details: Vec::new(),
+        inventory_fetched_at_ms: None,
         auth_methods: Vec::new(),
         availability: haider_rpc::ProviderAvailabilityWire::Unknown,
         availability_reason: None,
@@ -2735,6 +2753,9 @@ async fn provider_models_refresh_requires_control_and_hands_off_correlation() {
         panic!("unexpected actor command");
     };
     assert_eq!(provider, "openai-oauth");
+    let crate::accounts::ProviderModelsRefreshCompletion::Wire(completed) = completed else {
+        panic!("RPC refresh must carry a wire completion");
+    };
     completed
         .sink
         .try_send(WireFrame::Response {

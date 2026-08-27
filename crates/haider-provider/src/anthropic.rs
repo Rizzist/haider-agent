@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 /// history both count toward it.
 const ANTHROPIC_PDF_REQUEST_MAX_BYTES: usize = 32 * 1024 * 1024;
 
+use crate::openai::CustomCompatibleOriginGuard;
 #[cfg(test)]
 use crate::origin::FixedDnsResolver;
 use crate::origin::{FixedOriginGuard, SystemFixedDnsResolver};
@@ -154,19 +155,23 @@ fn anthropic_computer_beta_from_payload(payload: &serde_json::Value) -> Option<&
 
 fn build_anthropic_client(
     fixed_origin_guard: Option<Arc<FixedOriginGuard>>,
+    compatible_origin_guard: Option<Arc<CustomCompatibleOriginGuard>>,
+    transport_config: AnthropicTransportConfig,
 ) -> Result<reqwest::Client, ProviderError> {
     ANTHROPIC_CLIENT_BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
-    let transport = AnthropicProvider::transport_config();
     let mut client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .retry(match transport.retry_policy {
+        .retry(match transport_config.retry_policy {
             AnthropicRetryPolicy::Never => reqwest::retry::never(),
         })
         .pool_idle_timeout(crate::PROVIDER_POOL_IDLE_TIMEOUT)
         .http2_adaptive_window(true)
-        .connect_timeout(transport.connect_timeout);
+        .connect_timeout(transport_config.connect_timeout);
     if let Some(guard) = fixed_origin_guard {
+        client = client.dns_resolver(guard);
+    }
+    if let Some(guard) = compatible_origin_guard {
         client = client.dns_resolver(guard);
     }
     client.build().map_err(|error| {
@@ -216,6 +221,8 @@ pub struct AnthropicProvider {
     auth_mode: AnthropicAuthMode,
     endpoint_shape: AnthropicEndpointShape,
     fixed_origin_guard: Option<Arc<FixedOriginGuard>>,
+    compatible_origin_guard: Option<Arc<CustomCompatibleOriginGuard>>,
+    transport_config: AnthropicTransportConfig,
     /// Session-selected effort (G3), injected as `output_config.effort`.
     /// The DAEMON gates it at construction: post-switch stale levels clamp
     /// down the documented ladder (`anthropic_effort_clamp`), so the adapter
@@ -276,6 +283,7 @@ pub const fn select_anthropic_cache_ttl(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnthropicAuthMode {
     ApiKey,
+    None,
     OAuthBearer,
     /// G4b Vertex: a plain `Authorization: Bearer` GCP access token — no
     /// OAuth beta header and no Claude Code system-identity shape.
@@ -325,7 +333,7 @@ impl AnthropicProvider {
             ANTHROPIC_API_HOST,
             Arc::new(SystemFixedDnsResolver),
         )?);
-        let client = build_anthropic_client(Some(Arc::clone(&guard)))?;
+        let client = build_anthropic_client(Some(Arc::clone(&guard)), None, TRANSPORT_CONFIG)?;
         Ok(Self {
             client,
             credential,
@@ -335,6 +343,8 @@ impl AnthropicProvider {
             auth_mode: AnthropicAuthMode::OAuthBearer,
             endpoint_shape: AnthropicEndpointShape::Standard,
             fixed_origin_guard: Some(guard),
+            compatible_origin_guard: None,
+            transport_config: TRANSPORT_CONFIG,
             effort: None,
             fast: false,
             web_tools: false,
@@ -384,6 +394,57 @@ impl AnthropicProvider {
         Ok(provider)
     }
 
+    /// Constructs a user-owned standard Messages endpoint under the custom
+    /// TrustedLan origin policy.
+    pub fn new_custom(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: &str,
+    ) -> Result<Self, ProviderError> {
+        Self::new_custom_with_auth(credential, model, base_url, AnthropicAuthMode::ApiKey)
+    }
+
+    /// Constructs a user-owned standard Messages endpoint without emitting
+    /// any credential header.
+    pub fn new_custom_no_auth(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: &str,
+    ) -> Result<Self, ProviderError> {
+        Self::new_custom_with_auth(credential, model, base_url, AnthropicAuthMode::None)
+    }
+
+    fn new_custom_with_auth(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: &str,
+        auth_mode: AnthropicAuthMode,
+    ) -> Result<Self, ProviderError> {
+        let (base_url, guard) = CustomCompatibleOriginGuard::for_base_url(base_url)?;
+        let api_root = if base_url.ends_with("/v1") {
+            base_url
+        } else {
+            format!("{base_url}/v1")
+        };
+        let client = build_anthropic_client(None, Some(Arc::clone(&guard)), TRANSPORT_CONFIG)?;
+        Ok(Self {
+            client,
+            credential,
+            account: None,
+            model: model.into(),
+            api_url: format!("{api_root}/messages"),
+            auth_mode,
+            endpoint_shape: AnthropicEndpointShape::Standard,
+            fixed_origin_guard: None,
+            compatible_origin_guard: Some(guard),
+            transport_config: TRANSPORT_CONFIG,
+            effort: None,
+            fast: false,
+            web_tools: false,
+            prompt_caching_verified: false,
+        })
+    }
+
     /// Constructs the Claude-on-Vertex adapter (G4b, LV1): the base URL must
     /// match the Vertex publishers-models shape; the request URL appends
     /// `/{model}:streamRawPredict`, the body drops `model` and carries
@@ -407,7 +468,7 @@ impl AnthropicProvider {
         auth_mode: AnthropicAuthMode,
         fixed_origin_guard: Option<Arc<FixedOriginGuard>>,
     ) -> Result<Self, ProviderError> {
-        let client = build_anthropic_client(fixed_origin_guard.clone())?;
+        let client = build_anthropic_client(fixed_origin_guard.clone(), None, TRANSPORT_CONFIG)?;
         Ok(Self {
             client,
             credential,
@@ -417,6 +478,8 @@ impl AnthropicProvider {
             auth_mode,
             endpoint_shape: AnthropicEndpointShape::Standard,
             fixed_origin_guard,
+            compatible_origin_guard: None,
+            transport_config: TRANSPORT_CONFIG,
             effort: None,
             fast: false,
             web_tools: false,
@@ -435,6 +498,28 @@ impl AnthropicProvider {
     pub fn with_account(mut self, account: CredentialAlias) -> Self {
         self.account = Some(account);
         self
+    }
+
+    pub fn with_transport_config(
+        mut self,
+        transport_config: AnthropicTransportConfig,
+    ) -> Result<Self, ProviderError> {
+        if transport_config.connect_timeout.is_zero()
+            || transport_config.response_open_timeout.is_zero()
+            || transport_config.chunk_idle_timeout.is_zero()
+        {
+            return Err(ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                "Anthropic transport timeouts must be greater than zero",
+            ));
+        }
+        self.client = build_anthropic_client(
+            self.fixed_origin_guard.clone(),
+            self.compatible_origin_guard.clone(),
+            transport_config,
+        )?;
+        self.transport_config = transport_config;
+        Ok(self)
     }
 
     /// Sets the session-selected effort injected as `output_config.effort`.
@@ -505,6 +590,7 @@ impl AnthropicProvider {
                     && metadata.account_scope.is_some()
                     && match self.auth_mode {
                         AnthropicAuthMode::ApiKey => metadata.provider == ANTHROPIC_PROVIDER_NAME,
+                        AnthropicAuthMode::None => true,
                         AnthropicAuthMode::OAuthBearer => {
                             metadata.provider == ANTHROPIC_OAUTH_PROVIDER_NAME
                         }
@@ -551,9 +637,9 @@ impl AnthropicProvider {
         cache_ttl: Option<AnthropicCacheTtl>,
     ) -> Result<serde_json::Value, ProviderError> {
         let system_shape = match self.auth_mode {
-            AnthropicAuthMode::ApiKey | AnthropicAuthMode::CloudBearer => {
-                AnthropicSystemShape::ApiKey
-            }
+            AnthropicAuthMode::ApiKey
+            | AnthropicAuthMode::None
+            | AnthropicAuthMode::CloudBearer => AnthropicSystemShape::ApiKey,
             AnthropicAuthMode::OAuthBearer => AnthropicSystemShape::OAuthClaudeCode,
         };
         let mut payload = request_json(
@@ -777,7 +863,24 @@ impl AnthropicProvider {
         payload: &serde_json::Value,
     ) -> Result<reqwest::RequestBuilder, ProviderError> {
         if let Some(guard) = &self.fixed_origin_guard {
-            guard.validate_endpoint(&self.api_url).await?;
+            tokio::time::timeout(
+                self.transport_config.connect_timeout,
+                guard.validate_endpoint(&self.api_url),
+            )
+            .await
+            .map_err(|_| {
+                anthropic_connect_timeout_error(self.transport_config.connect_timeout)
+            })??;
+        }
+        if let Some(guard) = &self.compatible_origin_guard {
+            tokio::time::timeout(
+                self.transport_config.connect_timeout,
+                guard.validate_endpoint(&self.api_url),
+            )
+            .await
+            .map_err(|_| {
+                anthropic_connect_timeout_error(self.transport_config.connect_timeout)
+            })??;
         }
         let mut request = self
             .client
@@ -805,6 +908,7 @@ impl AnthropicProvider {
                     request.header(ANTHROPIC_OAUTH_BETA_HEADER, betas.join(","))
                 }
             }
+            AnthropicAuthMode::None => request,
             AnthropicAuthMode::OAuthBearer => {
                 // Optional feature betas APPEND after the OAuth identity in
                 // ONE comma-joined header — the subscription token must
@@ -852,11 +956,9 @@ impl AnthropicProvider {
         };
         let request = self.request_body(payload).await?;
         let opening = self.client.execute(request);
-        tokio::time::timeout(Self::transport_config().response_open_timeout, opening)
+        tokio::time::timeout(self.transport_config.response_open_timeout, opening)
             .await
-            .map_err(|_| {
-                response_open_timeout_error(Self::transport_config().response_open_timeout)
-            })?
+            .map_err(|_| response_open_timeout_error(self.transport_config.response_open_timeout))?
             .map_err(transport_error)
     }
 
@@ -890,7 +992,7 @@ impl AnthropicProvider {
 
         let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
         let account = self.account.clone();
-        let chunk_idle_timeout = Self::transport_config().chunk_idle_timeout;
+        let chunk_idle_timeout = self.transport_config.chunk_idle_timeout;
         let producer = tokio::spawn(async move {
             stream_response(
                 response,
@@ -1151,6 +1253,7 @@ impl Provider for AnthropicProvider {
     fn credential_surface(&self) -> crate::ProviderCredentialSurface {
         match self.auth_mode {
             AnthropicAuthMode::ApiKey => crate::ProviderCredentialSurface::ApiKey,
+            AnthropicAuthMode::None => crate::ProviderCredentialSurface::ApiKey,
             AnthropicAuthMode::OAuthBearer => {
                 crate::ProviderCredentialSurface::OAuthSubscriptionBearer
             }
@@ -1262,9 +1365,9 @@ impl Provider for AnthropicProvider {
                 request,
                 &mut full_payload,
                 match self.auth_mode {
-                    AnthropicAuthMode::ApiKey | AnthropicAuthMode::CloudBearer => {
-                        AnthropicSystemShape::ApiKey
-                    }
+                    AnthropicAuthMode::ApiKey
+                    | AnthropicAuthMode::None
+                    | AnthropicAuthMode::CloudBearer => AnthropicSystemShape::ApiKey,
                     AnthropicAuthMode::OAuthBearer => AnthropicSystemShape::OAuthClaudeCode,
                 },
                 self.web_tools,
@@ -1462,6 +1565,17 @@ fn response_open_timeout_error(timeout: Duration) -> ProviderError {
             timeout.as_secs()
         ),
     )
+}
+
+fn anthropic_connect_timeout_error(timeout: Duration) -> ProviderError {
+    let budget_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+    ProviderError::new(
+        ProviderErrorKind::Transport,
+        format!(
+            "Anthropic connection preflight did not finish within its configured budget; opened_within_ms={budget_ms} budget_ms={budget_ms}"
+        ),
+    )
+    .with_timeout_budget(budget_ms, budget_ms)
 }
 
 /// One DNS-safe label: non-empty, bounded, lowercase ASCII letters, digits,

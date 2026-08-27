@@ -23,8 +23,9 @@ use haider_protocol::provider::{CacheStatAvailability, NormalizedUsage, Reasonin
 use haider_provider::{
     ANTHROPIC_OAUTH_USAGE_URL, CacheWriteTtl, KIMI_OAUTH_USAGE_URL, MeterUnavailable,
     OPENAI_OAUTH_USAGE_URL, UsageMeterEndpoint, estimate_cache_input_costs,
-    estimate_cache_rewarm_cost_usd, estimate_chunk_cost_usd, model_rate, normalize_utilization,
-    parse_rfc3339_to_unix_ms,
+    estimate_cache_input_costs_for, estimate_cache_rewarm_cost_usd, estimate_chunk_cost_usd,
+    estimate_chunk_cost_usd_for, estimate_normalized_usage_cost_usd_for, model_rate,
+    normalize_utilization, parse_rfc3339_to_unix_ms,
 };
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -327,6 +328,47 @@ fn cm1b_subset_pricing_does_not_double_count_openai_or_gemini_reads() {
     let gemini = estimate_chunk_cost_usd("gemini-2.5-flash", 1_000_000, 0, 0, 900_000)
         .expect("Gemini price");
     assert!((gemini - 0.057).abs() < 1e-12, "Gemini cost: {gemini}");
+}
+
+/// Q4 law: current usage is priced by provider and model together. A custom
+/// router serving a built-in-looking slug has no known price; it must not
+/// inherit the built-in vendor's totals or cache economics.
+///
+/// MUTATION CHECK: replace any qualified lookup below with its model-only
+/// compatibility lookup. The three `router-lab` assertions become `Some`.
+#[test]
+fn custom_provider_model_slug_collision_stays_unpriced() {
+    let usage = NormalizedUsage {
+        logical_input: 1_000_000,
+        uncached_input: 200_000,
+        cache_read_input: 800_000,
+        billed_output: 100_000,
+        cache_status: CacheStatAvailability::Present,
+        cache_telemetry_input: 1_000_000,
+        ..NormalizedUsage::default()
+    };
+
+    assert_eq!(
+        estimate_chunk_cost_usd_for("router-lab", "gpt-5", 1_000_000, 100_000, 0, 800_000),
+        None
+    );
+    assert_eq!(
+        estimate_normalized_usage_cost_usd_for("router-lab", "gpt-5", &usage),
+        None
+    );
+    assert_eq!(
+        estimate_cache_input_costs_for("router-lab", "gpt-5", &usage),
+        None
+    );
+
+    assert!(
+        estimate_normalized_usage_cost_usd_for("openai", "gpt-5", &usage).is_some(),
+        "the provider-qualified path must retain registered built-in pricing"
+    );
+    assert!(
+        estimate_cache_input_costs_for("openai", "gpt-5", &usage).is_some(),
+        "the provider-qualified path must retain registered cache pricing"
+    );
 }
 
 /// CM1e — an Anthropic 1h creation is billed at the registry's 2x write

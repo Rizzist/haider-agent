@@ -41,12 +41,58 @@ fn live_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
         response_open_timeout_ms: None,
         models: Vec::new(),
         model_details: Vec::new(),
+        inventory_fetched_at_ms: None,
         auth_methods: vec![AuthMethod::ApiKey],
         availability: haider_rpc::ProviderAvailabilityWire::Unavailable,
         availability_reason: Some("provider model inventory is unavailable".to_owned()),
         default_model: None,
         enabled: true,
     }
+}
+
+fn staged_configure(driver: &mut LiveDriver, model: &mut AppModel, secret: &str) -> LiveCommand {
+    for _ in 0..5 {
+        if model
+            .custom_add
+            .as_ref()
+            .is_some_and(|card| card.focus == CustomField::Key)
+        {
+            break;
+        }
+        key(model, KeyCode::Tab);
+    }
+    type_text(model, secret);
+    key(model, KeyCode::Enter);
+    let now = std::time::Instant::now();
+    let pass = live_pass(driver, model, None, now);
+    let (provider, alias, attempt) = pass
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            LiveCommand::Stage {
+                provider,
+                alias,
+                attempt,
+                ..
+            } => Some((provider.clone(), alias.clone(), *attempt)),
+            _ => None,
+        })
+        .expect("credential stage issued");
+    live_pass(
+        driver,
+        model,
+        Some(LiveReply::Staged {
+            vault_reference: "vault-ref-custom-test".to_owned(),
+            provider,
+            alias,
+            attempt,
+        }),
+        now,
+    )
+    .commands
+    .into_iter()
+    .find(|command| matches!(command, LiveCommand::ConfigureProvider { .. }))
+    .expect("configure issued after stage")
 }
 
 /// MUTATION CHECK (W5g-4): make the demo `[1]` land a row under the BARE
@@ -118,31 +164,16 @@ fn the_live_card_edits_and_submits_under_the_snapshot_revision() {
         key(&mut model, KeyCode::Backspace);
     }
     type_text(&mut model, "11434/v1");
-    // An empty model REFUSES the submit — an enabled create without an
-    // inventory and default would bounce at the daemon (W5g-5).
-    key(&mut model, KeyCode::Enter);
-    {
-        let card = model.custom_add.as_ref().expect("card");
-        assert!(matches!(card.phase, CustomPhase::Editing { .. }));
-        assert_eq!(card.focus, CustomField::Model, "the missing field focuses");
-    }
-    type_text(&mut model, "llama3.1:8b");
-    key(&mut model, KeyCode::Enter);
-    assert!(matches!(
-        model.custom_add.as_ref().expect("card").phase,
-        CustomPhase::Submitting
-    ));
-
-    let pass = live_pass(&mut driver, &mut model, None, std::time::Instant::now());
+    let command = staged_configure(&mut driver, &mut model, "test-key");
     assert!(
-        pass.commands.iter().any(|command| matches!(
+        matches!(
             command,
             LiveCommand::ConfigureProvider { provider, origin, model, expected_revision, .. }
                 if provider == "custom-llama"
                     && origin == "http://127.0.0.1:11434/v1"
-                    && model == "llama3.1:8b"
-                    && *expected_revision == 7
-        )),
+                    && model.is_empty()
+                    && expected_revision == 7
+        ),
         "the configure rides the edited fields under the snapshot revision"
     );
 }
@@ -161,21 +192,10 @@ fn a_committed_configure_chains_into_the_key_card() {
     let mut driver = LiveDriver::new("test");
 
     open_card(&mut model);
-    key(&mut model, KeyCode::Tab);
-    key(&mut model, KeyCode::Tab);
-    type_text(&mut model, "llama3.1:8b");
-    key(&mut model, KeyCode::Enter);
-    let pass = live_pass(&mut driver, &mut model, None, std::time::Instant::now());
-    let command_id = pass
-        .commands
-        .iter()
-        .find_map(|command| match command {
-            LiveCommand::ConfigureProvider { command_id, .. } => Some(command_id.clone()),
-            _ => None,
-        })
-        .expect("configure issued");
+    let configure = staged_configure(&mut driver, &mut model, "test-key");
+    let command_id = configure.command_id().expect("configure id").clone();
 
-    live_pass(
+    let pass = live_pass(
         &mut driver,
         &mut model,
         Some(LiveReply::ProviderConfigured {
@@ -184,6 +204,12 @@ fn a_committed_configure_chains_into_the_key_card() {
             revision: 8,
         }),
         std::time::Instant::now(),
+    );
+    assert!(
+        pass.commands
+            .iter()
+            .any(|command| matches!(command, LiveCommand::LoginApi { .. })),
+        "the staged reference is consumed by account login"
     );
     assert!(model.custom_add.is_none(), "the card closed on commit");
     assert!(
@@ -197,6 +223,10 @@ fn a_committed_configure_chains_into_the_key_card() {
     let login = model.login.as_ref().expect("the key card opened — chained");
     assert_eq!(login.provider, "custom");
     assert_eq!(login.focus, LoginFocus::Key);
+    assert!(matches!(
+        login.stage,
+        haider_tui::app::LoginStage::Submitting
+    ));
 }
 
 /// MUTATION CHECK (W5g-4): drop the error correlation (never call
@@ -213,19 +243,8 @@ fn a_failed_configure_reopens_the_fields_with_the_reason() {
     let mut driver = LiveDriver::new("test");
 
     open_card(&mut model);
-    key(&mut model, KeyCode::Tab);
-    key(&mut model, KeyCode::Tab);
-    type_text(&mut model, "llama3.1:8b");
-    key(&mut model, KeyCode::Enter);
-    let pass = live_pass(&mut driver, &mut model, None, std::time::Instant::now());
-    let command_id = pass
-        .commands
-        .iter()
-        .find_map(|command| match command {
-            LiveCommand::ConfigureProvider { command_id, .. } => Some(command_id.clone()),
-            _ => None,
-        })
-        .expect("configure issued");
+    let configure = staged_configure(&mut driver, &mut model, "test-key");
+    let command_id = configure.command_id().expect("configure id").clone();
 
     live_pass(
         &mut driver,
@@ -308,19 +327,8 @@ fn the_chained_key_card_is_visible_on_the_accounts_screen() {
     model.providers.apply_snapshot(Vec::new(), 7);
     let mut driver = LiveDriver::new("test");
     open_card(&mut model);
-    key(&mut model, KeyCode::Tab);
-    key(&mut model, KeyCode::Tab);
-    type_text(&mut model, "probe-model");
-    key(&mut model, KeyCode::Enter);
-    let pass = live_pass(&mut driver, &mut model, None, std::time::Instant::now());
-    let command_id = pass
-        .commands
-        .iter()
-        .find_map(|command| match command {
-            LiveCommand::ConfigureProvider { command_id, .. } => Some(command_id.clone()),
-            _ => None,
-        })
-        .expect("configure issued");
+    let configure = staged_configure(&mut driver, &mut model, "test-key");
+    let command_id = configure.command_id().expect("configure id").clone();
     live_pass(
         &mut driver,
         &mut model,

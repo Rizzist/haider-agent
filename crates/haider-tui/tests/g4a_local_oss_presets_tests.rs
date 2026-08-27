@@ -42,6 +42,7 @@ fn keyless_summary(provider: &str, models: Vec<String>) -> haider_rpc::ProviderS
         response_open_timeout_ms: None,
         model_details: Vec::new(),
         models,
+        inventory_fetched_at_ms: None,
         auth_methods: Vec::new(),
         availability: if available {
             haider_rpc::ProviderAvailabilityWire::Available
@@ -234,6 +235,7 @@ fn footer_hints_and_add_buttons_offer_the_local_presets() {
 fn empty_keyless_discovery_hints_start_the_server_then_refresh() {
     let mut model = live_model();
     let keyed = haider_rpc::ProviderSummaryWire {
+        inventory_fetched_at_ms: None,
         auth_methods: vec![AuthMethod::ApiKey],
         provider: "hf-proxy".to_owned(),
         ..keyless_summary("hf-proxy", Vec::new())

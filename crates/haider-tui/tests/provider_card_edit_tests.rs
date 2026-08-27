@@ -34,6 +34,7 @@ fn provider_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
         response_open_timeout_ms: None,
         model_details: Vec::new(),
         models: vec!["model-a".to_owned()],
+        inventory_fetched_at_ms: None,
         auth_methods: Vec::new(),
         availability: haider_rpc::ProviderAvailabilityWire::Available,
         availability_reason: None,

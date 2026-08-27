@@ -16,9 +16,9 @@ use haider_provider::{
     GROK_OAUTH_PROVIDER_NAME, HAIDER_CODE_BASE_URL, HAIDER_CODE_PROVIDER_NAME,
     HAIDER_CODE_SEED_MODELS, KIMI_OAUTH_BASE_URL, KIMI_OAUTH_PROVIDER_NAME,
     OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME,
-    OPENAI_RESPONSES_API_URL, OPENAI_SUBSCRIPTION_RESPONSES_URL, VERTEX_PROVIDER_NAME,
-    VERTEX_SEED_MODELS, XAI_BASE_URL, XAI_PROVIDER_NAME, XAI_SEED_MODEL_CONTEXT_WINDOWS,
-    XAI_SEED_MODELS, azure_openai_origin, pickable,
+    OPENAI_RESPONSES_API_URL, OPENAI_SUBSCRIPTION_RESPONSES_URL, ProviderErrorKind,
+    VERTEX_PROVIDER_NAME, VERTEX_SEED_MODELS, XAI_BASE_URL, XAI_PROVIDER_NAME,
+    XAI_SEED_MODEL_CONTEXT_WINDOWS, XAI_SEED_MODELS, azure_openai_origin, pickable,
 };
 use haider_rpc::{
     ModelDetailWire, ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
@@ -52,7 +52,12 @@ impl ProviderEndpointValidator for ProductionProviderEndpointValidator {
         )
         .await
         .map_err(|error| {
-            HaiderError::new(ErrorCode::InvalidArgument, error.message, error.retryable)
+            let code = match error.kind {
+                ProviderErrorKind::InvalidRequest => ErrorCode::InvalidArgument,
+                ProviderErrorKind::Transport => ErrorCode::ProviderError,
+                _ => ErrorCode::Internal,
+            };
+            HaiderError::new(code, error.message, error.retryable)
         })
     }
 }
@@ -294,7 +299,9 @@ impl ProviderRegistryStoreLike for Box<dyn ProviderRegistryStoreLike> {
 
 pub(crate) trait ProviderModelSourceLike: Send + Sync {
     fn models(&self, provider: &str) -> Option<Vec<DiscoveredModel>>;
-    fn replace(&self, provider: String, models: Vec<DiscoveredModel>);
+    fn fetched_at_ms(&self, provider: &str) -> Option<u64>;
+    fn replace(&self, provider: String, models: Vec<DiscoveredModel>, fetched_at_ms: Option<u64>);
+    fn touch(&self, provider: &str, fetched_at_ms: u64);
     fn remove(&self, provider: &str);
 }
 
@@ -306,6 +313,7 @@ pub(crate) trait ProviderModelSourceLike: Send + Sync {
 #[derive(Default)]
 pub(crate) struct CachedProviderModelSource {
     models: std::sync::Mutex<HashMap<String, Vec<DiscoveredModel>>>,
+    fetched_at_ms: std::sync::Mutex<HashMap<String, u64>>,
 }
 
 impl ProviderModelSourceLike for CachedProviderModelSource {
@@ -317,15 +325,50 @@ impl ProviderModelSourceLike for CachedProviderModelSource {
             .cloned()
     }
 
-    fn replace(&self, provider: String, models: Vec<DiscoveredModel>) {
+    fn fetched_at_ms(&self, provider: &str) -> Option<u64> {
+        self.fetched_at_ms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(provider)
+            .copied()
+    }
+
+    fn replace(&self, provider: String, models: Vec<DiscoveredModel>, fetched_at_ms: Option<u64>) {
         self.models
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(provider, models);
+            .insert(provider.clone(), models);
+        let mut fetched = self
+            .fetched_at_ms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(fetched_at_ms) = fetched_at_ms {
+            fetched.insert(provider, fetched_at_ms);
+        } else {
+            fetched.remove(&provider);
+        }
+    }
+
+    fn touch(&self, provider: &str, fetched_at_ms: u64) {
+        if self
+            .models
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(provider)
+        {
+            self.fetched_at_ms
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(provider.to_owned(), fetched_at_ms);
+        }
     }
 
     fn remove(&self, provider: &str) {
         self.models
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(provider);
+        self.fetched_at_ms
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(provider);
@@ -446,8 +489,17 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             .map(|profile| self.summary_profile(profile, has_credential))
     }
 
-    pub(crate) fn replace_models(&self, provider: String, models: Vec<DiscoveredModel>) {
-        self.model_source.replace(provider, models);
+    pub(crate) fn replace_models(
+        &self,
+        provider: String,
+        models: Vec<DiscoveredModel>,
+        fetched_at_ms: Option<u64>,
+    ) {
+        self.model_source.replace(provider, models, fetched_at_ms);
+    }
+
+    pub(crate) fn touch_models(&self, provider: &str, fetched_at_ms: u64) {
+        self.model_source.touch(provider, fetched_at_ms);
     }
 
     pub(crate) fn configure(
@@ -460,11 +512,31 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         Ok(profile)
     }
 
+    pub(crate) fn configure_with_inventory(
+        &mut self,
+        input: ProviderConfigureInput,
+        discovered_models: &[String],
+    ) -> Result<ProviderProfileV1, HaiderError> {
+        let (next, profile) = self.configured_profiles_with_inventory(input, discovered_models)?;
+        self.store.save(&next)?;
+        self.profiles = next;
+        Ok(profile)
+    }
+
     pub(crate) fn validate_configure(
         &self,
         input: ProviderConfigureInput,
     ) -> Result<bool, HaiderError> {
         self.configured_profiles(input)
+            .map(|(next, _)| next != self.profiles)
+    }
+
+    pub(crate) fn validate_configure_with_inventory(
+        &self,
+        input: ProviderConfigureInput,
+        discovered_models: &[String],
+    ) -> Result<bool, HaiderError> {
+        self.configured_profiles_with_inventory(input, discovered_models)
             .map(|(next, _)| next != self.profiles)
     }
 
@@ -583,9 +655,13 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             let auth_requirement = input.auth_requirement.ok_or_else(|| {
                 invalid("new provider configuration requires an auth requirement")
             })?;
-            if !matches!(api_family, ProviderApiFamilyWire::OpenAiChatCompletions) {
+            if !matches!(
+                api_family,
+                ProviderApiFamilyWire::OpenAiChatCompletions
+                    | ProviderApiFamilyWire::AnthropicMessages
+            ) {
                 return Err(invalid(
-                    "custom providers must use the openai_chat_completions API family",
+                    "custom providers must use the openai_chat_completions or anthropic_messages API family",
                 ));
             }
             if !matches!(
@@ -785,6 +861,7 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             model_details,
             seeded_fallback,
             has_credential(&profile.provider_id),
+            self.model_source.fetched_at_ms(&profile.provider_id),
         )
     }
 }
@@ -928,6 +1005,7 @@ fn provider_summary(
     model_details: Vec<ModelDetailWire>,
     seeded_fallback: bool,
     credentialed: bool,
+    inventory_fetched_at_ms: Option<u64>,
 ) -> ProviderSummaryWire {
     let discovered_models = model_details
         .iter()
@@ -971,6 +1049,7 @@ fn provider_summary(
         response_open_timeout_ms: profile.response_open_timeout_ms,
         models: discovered_models,
         model_details,
+        inventory_fetched_at_ms,
         auth_methods,
         availability: if available {
             ProviderAvailabilityWire::Available

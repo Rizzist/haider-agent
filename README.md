@@ -91,9 +91,30 @@ The exact filenames and verification steps are in the Download table above. The 
 
 ## 03 / Any provider, or none
 
-**The model is a lane.** The current provider crate exports [13 built-in provider classes](crates/haider-provider/src/lib.rs): API-key and OAuth lanes for the supported hosted services, Haider Code, and OpenAI-compatible transport. The daemon also accepts custom OpenAI-compatible profiles with an API key or no authentication, including validated trusted-LAN endpoints for local servers.
+**The model is a lane.** The current provider crate exports [13 built-in provider classes](crates/haider-provider/src/lib.rs): API-key and OAuth lanes for the supported hosted services, Haider Code, and OpenAI-compatible transport. The daemon also accepts custom OpenAI-compatible profiles (standard OpenAI Chat Completions or Anthropic Messages) with an API key or no authentication, including validated trusted-LAN endpoints for local servers.
 
 Catalog availability is daemon-owned: unavailable stays unavailable, never an invented default. `session.select_model` is a receipted mutation; the next turn resolves through the newly selected provider/model pair while the durable session and transcript remain in place. See the [provider registry](crates/haider-daemon/src/provider_registry.rs), [pair-switch tests](crates/haider-daemon/src/pair_switch_runtime_tests.rs), and the [client contract](docs/client-contract-v1.md).
+
+Add a local router with no key; Haider validates the trusted-LAN origin and
+discovers its live `/v1/models` inventory before making it selectable:
+
+```console
+$ haider account add local-router --base-url http://127.0.0.1:8000 --no-auth --api-family openai
+```
+
+For a hosted endpoint, keep the key out of command arguments and source it
+from an environment variable. The value is staged directly into the daemon
+vault and is never printed in JSON or terminal output:
+
+```console
+$ export HAIDER_ROUTER_API_KEY='…'
+$ haider account add hosted-router --base-url https://router.example.com --api-key-env HAIDER_ROUTER_API_KEY --api-family openai
+```
+
+Use the discovered ids as `local-router/<model>` or
+`hosted-router/<model>`. Re-probe one account with
+`haider account probe <alias>`, or force inventory refresh with
+`haider models --refresh [<alias>]`.
 
 ## 04 / Tokenomics
 

@@ -10,21 +10,23 @@ use std::path::PathBuf;
 use common::{TEST_FRAME_LIMIT, transcript};
 use haider_protocol::session::SessionPermissionOverridesV1;
 use haider_rpc::{
-    CancelStatus, DEFAULT_FRAME_LIMIT, ERROR_CODE_ALREADY_RESOLVED, ERROR_CODE_ARTIFACT_TOO_LARGE,
-    ERROR_CODE_ATTACHMENT_MIME_UNSUPPORTED, ERROR_CODE_ATTACHMENT_NOT_FOUND,
-    ERROR_CODE_ATTACHMENT_TOO_LARGE, ERROR_CODE_ATTACHMENTS_TOO_LARGE, ERROR_CODE_BUSY,
-    ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_CURSOR_AHEAD,
-    ERROR_CODE_DRAINING, ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_INVALID_CURSOR,
-    ERROR_CODE_NOT_FOUND, ERROR_CODE_OVERLOADED, ERROR_CODE_PERMISSION_DENIED,
-    ERROR_CODE_PROVIDER_ERROR, ERROR_CODE_PROVIDER_REMOVE_REFUSED, ERROR_CODE_RESTAGE_REQUIRED,
-    ERROR_CODE_REVISION_CONFLICT, ERROR_CODE_RUN_NOT_ACTIVE, ERROR_CODE_STALE_GENERATION,
-    ERROR_CODE_TOO_MANY_ATTACHMENTS, ERROR_CODE_UNAUTHORIZED, ERROR_CODE_VAULT_UNSUPPORTED,
-    ERROR_CODE_VISION_UNSUPPORTED, ErrorData, FEATURE_ACCOUNT_LOGIN_API_V1,
-    FEATURE_ACCOUNT_MANAGEMENT_V1, FEATURE_ACCOUNT_OAUTH_DEVICE_V1, FEATURE_ACCOUNT_OAUTH_PKCE_V1,
-    FEATURE_ACCOUNT_ROTATION_V1, FEATURE_PROVIDER_CONFIGURE_V1, FEATURE_PROVIDER_MANAGEMENT_V1,
-    FEATURE_PROVIDER_MODELS_V1, FEATURE_PROVIDER_REMOVE_V1, FEATURE_SESSION_MUTATION_V1,
-    FEATURE_TURN_CONTROL_V1, FEATURE_VAULT_STAGE_V1, Hello, RequestBody, ResponseBody,
-    SubmitDisposition, WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec, ws_codec,
+    AccountAddMethod, CancelStatus, DEFAULT_FRAME_LIMIT, ERROR_CODE_ALREADY_RESOLVED,
+    ERROR_CODE_ARTIFACT_TOO_LARGE, ERROR_CODE_ATTACHMENT_MIME_UNSUPPORTED,
+    ERROR_CODE_ATTACHMENT_NOT_FOUND, ERROR_CODE_ATTACHMENT_TOO_LARGE,
+    ERROR_CODE_ATTACHMENTS_TOO_LARGE, ERROR_CODE_BUSY, ERROR_CODE_CAPABILITY_DENIED,
+    ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_CURSOR_AHEAD, ERROR_CODE_DRAINING,
+    ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_INVALID_CURSOR, ERROR_CODE_NOT_FOUND,
+    ERROR_CODE_OVERLOADED, ERROR_CODE_PERMISSION_DENIED, ERROR_CODE_PROVIDER_ERROR,
+    ERROR_CODE_PROVIDER_REMOVE_REFUSED, ERROR_CODE_RESTAGE_REQUIRED, ERROR_CODE_REVISION_CONFLICT,
+    ERROR_CODE_RUN_NOT_ACTIVE, ERROR_CODE_STALE_GENERATION, ERROR_CODE_TOO_MANY_ATTACHMENTS,
+    ERROR_CODE_UNAUTHORIZED, ERROR_CODE_VAULT_UNSUPPORTED, ERROR_CODE_VISION_UNSUPPORTED,
+    ErrorData, FEATURE_ACCOUNT_LOGIN_API_V1, FEATURE_ACCOUNT_MANAGEMENT_V1,
+    FEATURE_ACCOUNT_OAUTH_DEVICE_V1, FEATURE_ACCOUNT_OAUTH_PKCE_V1, FEATURE_ACCOUNT_ROTATION_V1,
+    FEATURE_PROVIDER_CONFIGURE_V1, FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_PROVIDER_MODELS_V1,
+    FEATURE_PROVIDER_REMOVE_V1, FEATURE_SESSION_MUTATION_V1, FEATURE_TURN_CONTROL_V1,
+    FEATURE_VAULT_STAGE_V1, Hello, ProviderApiFamilyWire, ProviderAuthRequirementWire,
+    ProviderProbeFailureWire, RequestBody, ResponseBody, SubmitDisposition, WIRE_PROTOCOL_VERSION,
+    Welcome, WireFrame, uds_codec, ws_codec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -45,6 +47,75 @@ fn availability_compat_fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join("snapshot_availability_compat_v1.json")
+}
+
+/// MUTATION CHECK: the configure probe reference is an additive, optional
+/// field and the typed failure/add-method variants keep their exact spellings.
+#[test]
+fn custom_provider_probe_wire_fields_are_pinned() {
+    let request = RequestBody::ProviderConfigure {
+        command_id: haider_rpc::CommandId::new("probe-wire-pin"),
+        provider: "router".into(),
+        api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+        origin: Some("http://127.0.0.1:8080".into()),
+        auth_requirement: Some(ProviderAuthRequirementWire::ApiKey),
+        enabled: true,
+        models: Vec::new(),
+        default_model: None,
+        response_open_timeout_ms: Some(45_000),
+        probe_vault_reference: Some("opaque-stage-reference".into()),
+        expected_revision: 7,
+    };
+    let encoded = serde_json::to_value(&request).expect("serialize provider.configure");
+    assert_eq!(
+        encoded.get("probe_vault_reference").and_then(Value::as_str),
+        Some("opaque-stage-reference")
+    );
+    assert!(matches!(
+        serde_json::from_value::<RequestBody>(encoded).expect("decode provider.configure"),
+        RequestBody::ProviderConfigure {
+            probe_vault_reference: Some(reference),
+            ..
+        } if reference == "opaque-stage-reference"
+    ));
+
+    let error = ErrorData::ProviderProbeFailed {
+        provider: "router".into(),
+        failure: ProviderProbeFailureWire::NonOpenAiCompatibleBody,
+    };
+    assert_eq!(
+        serde_json::to_value(error).expect("serialize typed probe error"),
+        serde_json::json!({
+            "kind": "provider_probe_failed",
+            "provider": "router",
+            "failure": "non_open_ai_compatible_body"
+        })
+    );
+    for (failure, spelling) in [
+        (ProviderProbeFailureWire::Unreachable, "unreachable"),
+        (ProviderProbeFailureWire::Unauthorized, "unauthorized"),
+        (
+            ProviderProbeFailureWire::NonOpenAiCompatibleBody,
+            "non_open_ai_compatible_body",
+        ),
+        (ProviderProbeFailureWire::EmptyList, "empty_list"),
+        (ProviderProbeFailureWire::Unavailable, "unavailable"),
+        (ProviderProbeFailureWire::Unknown, "unknown"),
+    ] {
+        assert_eq!(
+            serde_json::to_value(failure).expect("serialize probe failure class"),
+            Value::String(spelling.to_owned())
+        );
+    }
+    assert_eq!(
+        serde_json::to_string(&AccountAddMethod::ApiKey).expect("serialize API-key add method"),
+        r#""api_key""#
+    );
+    assert_eq!(
+        serde_json::to_string(&AccountAddMethod::MenuSecret)
+            .expect("serialize menu-secret add method"),
+        r#""menu_secret""#
+    );
 }
 
 #[test]
@@ -2053,6 +2124,7 @@ fn account_methods_are_kind_tagged_and_unknown_field_tolerant() {
                 RequestBody::AccountLoginApi {
                     alias,
                     validation_model,
+                    replace_existing,
                     ..
                 },
             ..
@@ -2060,9 +2132,22 @@ fn account_methods_are_kind_tagged_and_unknown_field_tolerant() {
             // Optional additive fields default to None for older writers.
             assert_eq!(alias, None);
             assert_eq!(validation_model, None);
+            assert!(!replace_existing);
         }
         other => panic!("expected AccountLoginApi, got {other:?}"),
     }
+    let replacing = RequestBody::AccountLoginApi {
+        command_id: CommandId::new("replace-key"),
+        provider: "router".into(),
+        alias: Some("router".into()),
+        vault_reference: "opaque-stage-reference".into(),
+        validation_model: Some("router-model".into()),
+        replace_existing: true,
+    };
+    assert_eq!(
+        serde_json::to_value(replacing).expect("encode replacement login")["replace_existing"],
+        true
+    );
     let stage_json = format!(
         r#"{{"v":{WIRE_PROTOCOL_VERSION},"kind":"request","request_id":"r2","body":{{
             "method":"vault.stage","stage_id":"s1","purpose":"quantum_key","secret":"x"}}}}"#
@@ -2851,6 +2936,7 @@ fn model_selection_refusals_are_typed_and_golden() {
     let unknown = serde_json::to_value(ErrorData::ModelUnknown {
         provider: "anthropic-oauth".into(),
         model: "fable-9-imaginary".into(),
+        inventory_age_ms: None,
     })
     .expect("encode model refusal data");
     assert_eq!(
@@ -2859,6 +2945,21 @@ fn model_selection_refusals_are_typed_and_golden() {
             "kind": "model_unknown",
             "provider": "anthropic-oauth",
             "model": "fable-9-imaginary",
+        })
+    );
+    let aged_unknown = serde_json::to_value(ErrorData::ModelUnknown {
+        provider: "anthropic-oauth".into(),
+        model: "fable-9-imaginary".into(),
+        inventory_age_ms: Some(42_000),
+    })
+    .expect("encode aged model refusal data");
+    assert_eq!(
+        aged_unknown,
+        serde_json::json!({
+            "kind": "model_unknown",
+            "provider": "anthropic-oauth",
+            "model": "fable-9-imaginary",
+            "inventory_age": 42_000,
         })
     );
     // Older peers decode both as tolerated Unknown data, never a hard error.

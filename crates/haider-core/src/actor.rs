@@ -8933,7 +8933,11 @@ fn attach_usage_scope_and_cost(
     // short prompt components cannot be guessed offline from the journal.
     scope.prefix_digests = None;
     usage.cache_cost = usage.normalized.as_ref().and_then(|normalized| {
-        haider_provider::estimate_cache_input_costs(&config.model, normalized)
+        haider_provider::estimate_cache_input_costs_for(
+            &config.usage_scope.provider,
+            &config.model,
+            normalized,
+        )
     });
     usage.scope = Some(scope);
 }

@@ -22,6 +22,7 @@ fn summary(
         response_open_timeout_ms: None,
         models: models.iter().map(|model| (*model).to_owned()).collect(),
         model_details: Vec::new(),
+        inventory_fetched_at_ms: None,
         auth_methods: Vec::new(),
         availability,
         availability_reason: None,
@@ -112,9 +113,34 @@ fn unknown_model_with_known_inventory_is_refused_typed() {
         SelectionRefusal::ModelUnknown {
             provider: "anthropic-oauth".to_owned(),
             model: "fable-9-imaginary".to_owned(),
+            inventory_age_ms: None,
         }
     );
     assert_eq!(refusal.kind(), "model_unknown");
+}
+
+/// MUTATION CHECK: dropping the provider summary fetch timestamp from the
+/// refusal erases the cache-age coordinate clients need after refresh-on-miss.
+#[test]
+fn model_unknown_carries_inventory_age_when_fetch_time_is_known() {
+    let mut fetched = summary(
+        "custom-router",
+        &["known-model"],
+        ProviderAvailabilityWire::Available,
+    );
+    fetched.inventory_fetched_at_ms = Some(1);
+    let authority = authority(&["openai", "custom-router"], vec![fetched]);
+    let refusal = authority
+        .validate_selection("openai", Some("custom-router"), "new-model")
+        .expect_err("unknown model");
+    let SelectionRefusal::ModelUnknown {
+        inventory_age_ms: Some(inventory_age_ms),
+        ..
+    } = refusal
+    else {
+        panic!("known fetch time must produce a typed inventory age");
+    };
+    assert!(inventory_age_ms > 0);
 }
 
 /// A provider WITHOUT a discovered inventory accepts honestly — provider
@@ -143,21 +169,26 @@ fn current_provider_rows_skip_creatability() {
     );
 }
 
-/// An enabled custom chat-completions profile is creatable without a static
-/// registry row — the same rule `session.create` applies.
+/// Enabled custom OpenAI and Anthropic profiles are creatable without static
+/// registry rows — the same rule `session.create` applies.
 #[test]
-fn enabled_custom_chat_completions_profile_is_creatable() {
-    let mut custom = summary(
-        "my-endpoint",
-        &["local-model"],
-        ProviderAvailabilityWire::Available,
-    );
-    custom.api_family = ProviderApiFamilyWire::OpenAiChatCompletions;
-    let authority = ModelSelectionAuthority::new(creatable(&["openai"]), vec![custom]);
-    assert_eq!(
-        authority.validate_selection("openai", Some("my-endpoint"), "local-model"),
-        Ok(("my-endpoint".to_owned(), "local-model".to_owned()))
-    );
+fn enabled_custom_openai_and_anthropic_profiles_are_creatable() {
+    for family in [
+        ProviderApiFamilyWire::OpenAiChatCompletions,
+        ProviderApiFamilyWire::AnthropicMessages,
+    ] {
+        let mut custom = summary(
+            "my-endpoint",
+            &["local-model"],
+            ProviderAvailabilityWire::Available,
+        );
+        custom.api_family = family;
+        let authority = ModelSelectionAuthority::new(creatable(&["openai"]), vec![custom]);
+        assert_eq!(
+            authority.validate_selection("openai", Some("my-endpoint"), "local-model"),
+            Ok(("my-endpoint".to_owned(), "local-model".to_owned()))
+        );
+    }
 }
 
 /// An empty model is a malformed selector, not a lookup.

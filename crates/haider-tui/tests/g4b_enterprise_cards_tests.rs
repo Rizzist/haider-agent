@@ -43,6 +43,7 @@ fn enterprise_summary(
         response_open_timeout_ms: None,
         models: models.iter().map(|model| (*model).to_owned()).collect(),
         model_details: Vec::new(),
+        inventory_fetched_at_ms: None,
         auth_methods: vec![haider_protocol::credential::AuthMethod::ApiKey],
         availability: haider_rpc::ProviderAvailabilityWire::Unavailable,
         availability_reason: Some("provider has no credential".to_owned()),

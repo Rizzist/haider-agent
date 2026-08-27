@@ -1566,6 +1566,68 @@ fn one_line_turn(model: &str) -> TurnRequest {
     }
 }
 
+/// LAW (Q custom auth): a keyed custom Messages server receives exactly
+/// `x-api-key`, while a no-auth server receives neither credential header.
+/// Both retain the standard Anthropic version header and `/v1/messages` URL.
+#[tokio::test]
+async fn custom_anthropic_keyed_and_no_auth_headers_are_exact() {
+    let keyed = AnthropicProvider::new_custom(
+        secret_credential("custom-anthropic-keyed", b"custom-anthropic-secret"),
+        "claude-local",
+        "http://127.0.0.1:18181",
+    )
+    .expect("keyed custom Anthropic provider");
+    let keyed_request = keyed
+        .request_body(serde_json::json!({"model":"claude-local"}))
+        .await
+        .expect("keyed request");
+    assert_eq!(keyed_request.url().path(), "/v1/messages");
+    assert_eq!(
+        keyed_request
+            .headers()
+            .get("x-api-key")
+            .expect("custom key header"),
+        "custom-anthropic-secret"
+    );
+    assert!(!keyed_request.headers().contains_key(AUTHORIZATION));
+    assert_eq!(
+        keyed_request
+            .headers()
+            .get("anthropic-version")
+            .expect("standard version header"),
+        "2023-06-01"
+    );
+    let escaped = keyed.with_api_url("http://169.254.169.254/v1/messages");
+    let error = escaped
+        .request_body(serde_json::json!({"model":"claude-local"}))
+        .await
+        .expect_err("custom key must not leave its pinned origin");
+    assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+    assert!(error.message.contains("left its pinned origin"));
+    assert!(!error.message.contains("custom-anthropic-secret"));
+
+    let no_auth = AnthropicProvider::new_custom_no_auth(
+        secret_credential("custom-anthropic-no-auth", b"must-not-leak"),
+        "claude-local",
+        "http://127.0.0.1:18181/v1",
+    )
+    .expect("no-auth custom Anthropic provider");
+    let no_auth_request = no_auth
+        .request_body(serde_json::json!({"model":"claude-local"}))
+        .await
+        .expect("no-auth request");
+    assert_eq!(no_auth_request.url().path(), "/v1/messages");
+    assert!(!no_auth_request.headers().contains_key("x-api-key"));
+    assert!(!no_auth_request.headers().contains_key(AUTHORIZATION));
+    assert_eq!(
+        no_auth_request
+            .headers()
+            .get("anthropic-version")
+            .expect("standard version header"),
+        "2023-06-01"
+    );
+}
+
 /// CM1a — captured Anthropic usage keeps its separate read/write semantics,
 /// including the provider's 5m/1h creation detail.
 ///

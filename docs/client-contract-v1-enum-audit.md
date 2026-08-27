@@ -49,6 +49,7 @@ still fails. Those enums are frozen or raw-preserved as listed below.
 | `OAuthFlowStatusWire` | Extensible with Unknown | unknown is not ready and carries no usable credential reference |
 | `AccountAddMethod` | Extensible with Unknown | unknown add method is non-executable |
 | `StagePurpose` | Extensible with Unknown | daemon refuses an unknown purpose |
+| `ProviderProbeFailureWire` | Extensible with Unknown | unknown failure remains a failed probe with no inferred cause |
 | `AttachMode` | Extensible with Unknown | unknown mode grants no authority |
 | `SurfaceInjectOp` | Extensible with Unknown | unknown operation is not applied |
 | `ObserveRunStateWire` | Extensible with Unknown | render an unknown state without inventing controls |
@@ -189,8 +190,9 @@ appendix list every spelling in context.
 | `ClientKind::{Cli, Tui, Gui}` | `"cli"`, `"tui"`, `"gui"` | snake case |
 | `ProviderApiFamilyWire::{OpenAiResponses, OpenAiChatCompletions}` | `"openai_responses"`, `"openai_chat_completions"` | explicit renames |
 | `ProviderAuthRequirementWire::{ApiKey, OAuth}` | `"api_key"`, `"o_auth"` | snake case; `OAuth` is the shipped wart |
-| `AccountAddMethod::OAuth` | `"oauth"` | explicit rename |
+| `AccountAddMethod::{OAuth, ApiKey, MenuSecret}` | `"oauth"`, `"api_key"`, `"menu_secret"` | snake case; explicit `OAuth` rename |
 | `StagePurpose::ApiKey` | `"api_key"` | snake case |
+| `ProviderProbeFailureWire::{Unreachable, Unauthorized, NonOpenAiCompatibleBody, EmptyList, Unavailable}` | `"unreachable"`, `"unauthorized"`, `"non_open_ai_compatible_body"`, `"empty_list"`, `"unavailable"` | snake case |
 | `RequestBody::{TurnSubmitFromCli, AccountLoginApi, AccountOAuthStart, AccountOAuthStatus, AccountOAuthCancel, AccountOAuthImport}` | `"turn.submit_from_cli"`, `"account.login_api"`, `"account.oauth_start"`, `"account.oauth_status"`, `"account.oauth_cancel"`, `"account.oauth_import"` | explicit method renames |
 | `ResponseBody::{AccountLoginApi, AccountOAuthStart, AccountOAuthStatus, AccountOAuthCancel, AccountOAuthImport}` | `"account.login_api"`, `"account.oauth_start"`, `"account.oauth_status"`, `"account.oauth_cancel"`, `"account.oauth_import"` | explicit method renames |
 | `ErrorData::{PdfTooLarge, PdfTooManyPages, PdfMalformed}` | `"pdf_too_large"`, `"pdf_too_many_pages"`, `"pdf_malformed"` | snake case |
@@ -519,10 +521,12 @@ appendix list every spelling in context.
   `"waiting_browser"` | `"waiting_device"` | `"exchanging"` | `"ready"` | `"failed"` | `"expired"` | `"cancelled"` | `"unknown"`; any other string → Rust `Unknown`.
 - `OAuthImportSourceUnavailableCodeWire` (`crates/haider-rpc/src/frame.rs:807`):
   `"not_found"` | `"unreadable"` | `"unknown"`; any other string → Rust `Unknown`, while the containing reason's `message` remains available for display.
-- `AccountAddMethod` (`crates/haider-rpc/src/frame.rs:948`):
-  `"oauth"` | `"unknown"`; any other string → Rust `Unknown`.
-- `StagePurpose` (`crates/haider-rpc/src/frame.rs:960`):
+- `AccountAddMethod` (`crates/haider-rpc/src/frame.rs:1180`):
+  `"oauth"` | `"api_key"` | `"menu_secret"` | `"unknown"`; any other string → Rust `Unknown`.
+- `StagePurpose` (`crates/haider-rpc/src/frame.rs:1194`):
   `"api_key"` | `"menu_secret"` | `"unknown"`; any other string → Rust `Unknown`.
+- `ProviderProbeFailureWire` (`crates/haider-rpc/src/frame.rs:4358`):
+  `"unreachable"` | `"unauthorized"` | `"non_open_ai_compatible_body"` | `"empty_list"` | `"unavailable"` | `"unknown"`; any other string → Rust `Unknown`.
 - `AttachMode` (`crates/haider-rpc/src/frame.rs:987`):
   `"view"` | `"control"` | `"unknown"`; any other string → Rust `Unknown`.
 - `SessionKindWire` (`crates/haider-rpc/src/frame.rs:1168`): `"root"` | `"subagent"`.

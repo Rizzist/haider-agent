@@ -671,6 +671,14 @@ pub enum CustomField {
     Name,
     Origin,
     Model,
+    /// Generic discovery-backed cards choose bearer-key versus no auth.
+    Auth,
+    /// Generic discovery-backed cards choose OpenAI-compatible versus
+    /// Anthropic Messages transport.
+    ApiFamily,
+    /// The generic card's API key. Its value is never exposed through the
+    /// field-value helpers or renderer; only its capped mask length is used.
+    Key,
     /// G4b: the vertex card's second coordinate (location); unused by
     /// every other card kind.
     Extra,
@@ -710,7 +718,6 @@ pub enum CustomPhase {
 /// `[1] add http://127.0.0.1:8000/v1 (demo)`. The EDITABLE name/origin
 /// fields are the live extension (report §4.4: "custom provider rows are
 /// created/edited through provider.configure" — the sim only fabricates).
-#[derive(Debug)]
 pub struct CustomProviderCard {
     /// Provider id — doubles as the row name (`custom`, `local-llama`).
     pub name: String,
@@ -737,6 +744,17 @@ pub struct CustomProviderCard {
     /// `auth_requirement: none` and commit SKIPS the key card, going
     /// straight to model discovery.
     pub keyless: bool,
+    /// API family selected for a discovery-backed generic provider. Presets
+    /// and enterprise cards retain their fixed family.
+    pub family: haider_rpc::ProviderApiFamilyWire,
+    /// `true` only for the user-authored custom-server card. Unlike legacy
+    /// presets, this shape leaves the inventory empty so the daemon probes
+    /// the server and publishes its live `/v1/models` list.
+    pub discover_models: bool,
+    /// Raw API key while the custom card is being edited. This is the same
+    /// zeroize-on-drop boundary as [`LoginCard`]: Debug is redacted, render
+    /// receives only [`Self::masked_key_len`], and submit takes/wipes it.
+    secret: zeroize::Zeroizing<String>,
     /// G4b: which provider surface this card configures.
     pub kind: CustomCardKind,
     /// G4b: the vertex LOCATION field; empty for every other kind.
@@ -745,6 +763,15 @@ pub struct CustomProviderCard {
 
 impl CustomProviderCard {
     fn has_field(&self, field: CustomField) -> bool {
+        if self.kind == CustomCardKind::Generic && self.discover_models {
+            return matches!(
+                field,
+                CustomField::Name
+                    | CustomField::Origin
+                    | CustomField::Auth
+                    | CustomField::ApiFamily
+            ) || (!self.keyless && field == CustomField::Key);
+        }
         matches!(
             (self.kind, field),
             (
@@ -768,21 +795,23 @@ impl CustomProviderCard {
             && !(self.edit && field == CustomField::Name)
     }
 
-    fn field_value(&self, field: CustomField) -> &str {
+    fn field_value(&self, field: CustomField) -> Option<&str> {
         match field {
-            CustomField::Name => &self.name,
-            CustomField::Origin => &self.origin,
-            CustomField::Model => &self.model,
-            CustomField::Extra => &self.extra,
+            CustomField::Name => Some(&self.name),
+            CustomField::Origin => Some(&self.origin),
+            CustomField::Model => Some(&self.model),
+            CustomField::Extra => Some(&self.extra),
+            CustomField::Auth | CustomField::ApiFamily | CustomField::Key => None,
         }
     }
 
-    fn field_value_mut(&mut self, field: CustomField) -> &mut String {
+    fn field_value_mut(&mut self, field: CustomField) -> Option<&mut String> {
         match field {
-            CustomField::Name => &mut self.name,
-            CustomField::Origin => &mut self.origin,
-            CustomField::Model => &mut self.model,
-            CustomField::Extra => &mut self.extra,
+            CustomField::Name => Some(&mut self.name),
+            CustomField::Origin => Some(&mut self.origin),
+            CustomField::Model => Some(&mut self.model),
+            CustomField::Extra => Some(&mut self.extra),
+            CustomField::Auth | CustomField::ApiFamily | CustomField::Key => None,
         }
     }
 
@@ -791,24 +820,32 @@ impl CustomProviderCard {
             return false;
         }
         self.focus = field;
-        self.cursor = character.min(self.field_value(field).chars().count());
+        self.cursor = self
+            .field_value(field)
+            .map_or(0, |value| character.min(value.chars().count()));
         true
     }
 
     fn focus_end(&mut self, field: CustomField) {
         self.focus = field;
-        self.cursor = self.field_value(field).chars().count();
+        self.cursor = self
+            .field_value(field)
+            .map_or(0, |value| value.chars().count());
     }
 
     fn insert_char(&mut self, character: char) -> bool {
         if !self.can_edit_field(self.focus) {
             return false;
         }
-        let cursor = self
-            .cursor
-            .min(self.field_value(self.focus).chars().count());
-        let byte = byte_index_at_character(self.field_value(self.focus), cursor);
-        self.field_value_mut(self.focus).insert(byte, character);
+        let Some(value) = self.field_value(self.focus) else {
+            return false;
+        };
+        let cursor = self.cursor.min(value.chars().count());
+        let byte = byte_index_at_character(value, cursor);
+        let Some(value) = self.field_value_mut(self.focus) else {
+            return false;
+        };
+        value.insert(byte, character);
         self.cursor = cursor + 1;
         true
     }
@@ -817,16 +854,19 @@ impl CustomProviderCard {
         if !self.can_edit_field(self.focus) || self.cursor == 0 {
             return false;
         }
-        let cursor = self
-            .cursor
-            .min(self.field_value(self.focus).chars().count());
+        let Some(value) = self.field_value(self.focus) else {
+            return false;
+        };
+        let cursor = self.cursor.min(value.chars().count());
         if cursor == 0 {
             return false;
         }
-        let start = byte_index_at_character(self.field_value(self.focus), cursor - 1);
-        let end = byte_index_at_character(self.field_value(self.focus), cursor);
-        self.field_value_mut(self.focus)
-            .replace_range(start..end, "");
+        let start = byte_index_at_character(value, cursor - 1);
+        let end = byte_index_at_character(value, cursor);
+        let Some(value) = self.field_value_mut(self.focus) else {
+            return false;
+        };
+        value.replace_range(start..end, "");
         self.cursor = cursor - 1;
         true
     }
@@ -835,15 +875,20 @@ impl CustomProviderCard {
         if !self.can_edit_field(self.focus) {
             return false;
         }
-        let characters = self.field_value(self.focus).chars().count();
+        let Some(value) = self.field_value(self.focus) else {
+            return false;
+        };
+        let characters = value.chars().count();
         let cursor = self.cursor.min(characters);
         if cursor == characters {
             return false;
         }
-        let start = byte_index_at_character(self.field_value(self.focus), cursor);
-        let end = byte_index_at_character(self.field_value(self.focus), cursor + 1);
-        self.field_value_mut(self.focus)
-            .replace_range(start..end, "");
+        let start = byte_index_at_character(value, cursor);
+        let end = byte_index_at_character(value, cursor + 1);
+        let Some(value) = self.field_value_mut(self.focus) else {
+            return false;
+        };
+        value.replace_range(start..end, "");
         self.cursor = cursor;
         true
     }
@@ -860,12 +905,130 @@ impl CustomProviderCard {
         if !self.can_edit_field(self.focus) {
             return false;
         }
-        let end = self.field_value(self.focus).chars().count();
+        let Some(value) = self.field_value(self.focus) else {
+            return false;
+        };
+        let end = value.chars().count();
         if self.cursor >= end {
             return false;
         }
         self.cursor += 1;
         true
+    }
+
+    fn cycle_choice(&mut self) -> bool {
+        if !self.can_edit_field(self.focus) {
+            return false;
+        }
+        match self.focus {
+            CustomField::Auth => {
+                self.keyless = !self.keyless;
+                if self.keyless {
+                    zeroize::Zeroize::zeroize(&mut *self.secret);
+                }
+            }
+            CustomField::ApiFamily => {
+                self.family = if matches!(
+                    self.family,
+                    haider_rpc::ProviderApiFamilyWire::AnthropicMessages
+                ) {
+                    haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions
+                } else {
+                    haider_rpc::ProviderApiFamilyWire::AnthropicMessages
+                };
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn move_focus(&mut self, backwards: bool) {
+        const GENERIC_DISCOVERY_KEYED: &[CustomField] = &[
+            CustomField::Name,
+            CustomField::Origin,
+            CustomField::Auth,
+            CustomField::ApiFamily,
+            CustomField::Key,
+        ];
+        const GENERIC_DISCOVERY_KEYLESS: &[CustomField] = &[
+            CustomField::Name,
+            CustomField::Origin,
+            CustomField::Auth,
+            CustomField::ApiFamily,
+        ];
+        const GENERIC_CREATE: &[CustomField] =
+            &[CustomField::Name, CustomField::Origin, CustomField::Model];
+        const GENERIC_EDIT: &[CustomField] = &[CustomField::Origin, CustomField::Model];
+        const BEDROCK: &[CustomField] = &[CustomField::Origin];
+        const VERTEX: &[CustomField] = &[CustomField::Origin, CustomField::Extra];
+
+        let fields = match (self.kind, self.discover_models, self.edit, self.keyless) {
+            (CustomCardKind::Generic, true, _, false) => GENERIC_DISCOVERY_KEYED,
+            (CustomCardKind::Generic, true, _, true) => GENERIC_DISCOVERY_KEYLESS,
+            (CustomCardKind::Generic, false, true, _) => GENERIC_EDIT,
+            (CustomCardKind::Generic | CustomCardKind::Azure, false, false, _) => GENERIC_CREATE,
+            (CustomCardKind::Bedrock, _, _, _) => BEDROCK,
+            (CustomCardKind::Vertex, _, _, _) => VERTEX,
+            (CustomCardKind::Azure, true, _, _) => GENERIC_CREATE,
+        };
+        let current = fields
+            .iter()
+            .position(|field| *field == self.focus)
+            .unwrap_or(0);
+        let next = if backwards {
+            current.checked_sub(1).unwrap_or(fields.len() - 1)
+        } else {
+            (current + 1) % fields.len()
+        };
+        self.focus_end(fields[next]);
+    }
+
+    fn push_key(&mut self, character: char) -> bool {
+        if self.focus != CustomField::Key
+            || !self.can_edit_field(CustomField::Key)
+            || character.is_control()
+        {
+            return false;
+        }
+        self.secret.push(character);
+        true
+    }
+
+    fn key_backspace(&mut self) -> bool {
+        self.focus == CustomField::Key
+            && self.can_edit_field(CustomField::Key)
+            && self.secret.pop().is_some()
+    }
+
+    #[must_use]
+    pub fn masked_key_len(&self) -> usize {
+        self.secret.chars().count()
+    }
+
+    fn take_key(&mut self) -> haider_rpc::SecretWire {
+        let value = std::mem::take(&mut *self.secret);
+        haider_rpc::SecretWire::new(value)
+    }
+}
+
+impl std::fmt::Debug for CustomProviderCard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CustomProviderCard")
+            .field("name", &self.name)
+            .field("origin", &self.origin)
+            .field("model", &self.model)
+            .field("focus", &self.focus)
+            .field("phase", &self.phase)
+            .field("attempt", &self.attempt)
+            .field("edit", &self.edit)
+            .field("keyless", &self.keyless)
+            .field("family", &self.family)
+            .field("discover_models", &self.discover_models)
+            .field("secret", &"<redacted>")
+            .field("kind", &self.kind)
+            .field("extra", &self.extra)
+            .finish()
     }
 }
 
@@ -2286,6 +2449,8 @@ fn insert_custom_card_character(card: &mut CustomProviderCard, character: char) 
         CustomField::Origin | CustomField::Model | CustomField::Extra => {
             !character.is_control() && card.insert_char(character)
         }
+        CustomField::Key => card.push_key(character),
+        CustomField::Auth | CustomField::ApiFamily => false,
     }
 }
 
@@ -2890,6 +3055,10 @@ pub enum AppRequest {
     },
     /// Cancel the card's flow (`account.oauth_cancel` when one is bound).
     OAuthAddCancel { attempt: u64 },
+    /// Retire a custom-provider card whose staged credential/configure may
+    /// still be in flight. The stage is connection-scoped and not durable;
+    /// a late reply for this attempt must not configure anything.
+    CustomProviderRetired { attempt: u64 },
     /// Create or edit a custom OpenAI-compatible provider
     /// (`provider.configure`, W5g-4/W10b). The provider name is the stable
     /// identity; origin and model are mutable under the daemon revision CAS.
@@ -2904,6 +3073,10 @@ pub enum AppRequest {
         /// G4a: true for auth-None presets — the wire carries
         /// `auth_requirement: none` instead of `api_key`.
         keyless: bool,
+        /// Present only for the discovery-backed generic card. The raw key
+        /// crosses no durable command: the driver stages it first, then
+        /// sends only the opaque vault reference to configure/login.
+        secret: Option<haider_rpc::SecretWire>,
         /// G4b: the profile API family — chat-completions for
         /// customs/azure, anthropic-messages for the enterprise builtins.
         family: haider_rpc::ProviderApiFamilyWire,
@@ -7538,6 +7711,21 @@ impl AppModel {
         self.dirty = true;
     }
 
+    /// Continue a custom-server add after its masked key was staged and the
+    /// discovery-backed provider configuration committed. The login card is
+    /// reused as the typed account-login result surface, but starts directly
+    /// in `Submitting`: it never receives or reconstructs the raw key.
+    fn open_staged_login_card(&mut self, provider: &str, alias: String) -> u64 {
+        self.stash_draft();
+        self.login_attempt_seq += 1;
+        let attempt = self.login_attempt_seq;
+        let mut card = LoginCard::new(provider.to_owned(), alias, attempt);
+        card.stage = LoginStage::Submitting;
+        self.login = Some(card);
+        self.dirty = true;
+        attempt
+    }
+
     /// Close the masked card and RETURN the band it borrowed (TUI6.2
     /// fix 5 + TUI6.2c finding 5): the open's stash parked the surface's
     /// draft — text AND history ring — and every close path must restore
@@ -9623,20 +9811,19 @@ impl AppModel {
         if self.custom_add.is_some() || self.oauth_add.is_some() {
             return;
         }
-        let taken: Vec<AccountRow> = self
-            .providers
-            .providers
-            .iter()
-            .map(|summary| AccountRow {
-                alias: summary.provider.clone(),
-                provider: summary.provider.clone(),
-                method: haider_protocol::credential::AuthMethod::ApiKey,
-                identity: String::new(),
-                status: haider_protocol::credential::CredentialStatus::Ok,
-                selected: false,
-                base_url: None,
-            })
-            .collect();
+        // The custom alias is both the stable provider identity and the
+        // immediately registered account alias. Avoid collisions in either
+        // daemon-owned namespace before the user starts editing.
+        let mut taken = self.accounts.rows.clone();
+        taken.extend(self.providers.providers.iter().map(|summary| AccountRow {
+            alias: summary.provider.clone(),
+            provider: summary.provider.clone(),
+            method: haider_protocol::credential::AuthMethod::ApiKey,
+            identity: String::new(),
+            status: haider_protocol::credential::CredentialStatus::Ok,
+            selected: false,
+            base_url: None,
+        }));
         self.custom_attempt_seq += 1;
         self.accounts.message = None;
         let name = smallest_free_alias("custom", &taken);
@@ -9651,6 +9838,9 @@ impl AppModel {
             attempt: self.custom_attempt_seq,
             edit: false,
             keyless: false,
+            family: haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions,
+            discover_models: true,
+            secret: zeroize::Zeroizing::new(String::new()),
             kind: CustomCardKind::Generic,
             extra: String::new(),
         });
@@ -9689,6 +9879,9 @@ impl AppModel {
             attempt: self.custom_attempt_seq,
             edit: true,
             keyless: summary.auth_methods.is_empty(),
+            family: summary.api_family,
+            discover_models: false,
+            secret: zeroize::Zeroizing::new(String::new()),
             kind: CustomCardKind::Generic,
             extra: String::new(),
         });
@@ -9773,6 +9966,9 @@ impl AppModel {
             attempt: self.custom_attempt_seq,
             edit: false,
             keyless: false,
+            family: haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions,
+            discover_models: false,
+            secret: zeroize::Zeroizing::new(String::new()),
             kind: CustomCardKind::Azure,
             extra: String::new(),
         });
@@ -9853,6 +10049,16 @@ impl AppModel {
             attempt: self.custom_attempt_seq,
             edit: false,
             keyless: false,
+            family: match kind {
+                CustomCardKind::Bedrock | CustomCardKind::Vertex => {
+                    haider_rpc::ProviderApiFamilyWire::AnthropicMessages
+                }
+                CustomCardKind::Generic | CustomCardKind::Azure => {
+                    haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions
+                }
+            },
+            discover_models: false,
+            secret: zeroize::Zeroizing::new(String::new()),
             kind,
             extra,
         });
@@ -9908,6 +10114,9 @@ impl AppModel {
             attempt: self.custom_attempt_seq,
             edit: false,
             keyless,
+            family: haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions,
+            discover_models: false,
+            secret: zeroize::Zeroizing::new(String::new()),
             kind: CustomCardKind::Generic,
             extra: String::new(),
         });
@@ -9915,7 +10124,12 @@ impl AppModel {
     }
 
     fn cancel_custom_add(&mut self) {
-        if self.custom_add.take().is_some() {
+        if let Some(card) = self.custom_add.take() {
+            if !self.mode.fabricates_locally() {
+                self.requests.push(AppRequest::CustomProviderRetired {
+                    attempt: card.attempt,
+                });
+            }
             self.dirty = true;
         }
     }
@@ -9966,10 +10180,16 @@ impl AppModel {
         // (daemon law) — the card refuses to submit what would bounce.
         // Bedrock/vertex carry the profile's SEEDED inventory instead of a
         // typed model.
-        if matches!(card.kind, CustomCardKind::Generic | CustomCardKind::Azure)
+        if !card.discover_models
+            && matches!(card.kind, CustomCardKind::Generic | CustomCardKind::Azure)
             && card.model.trim().is_empty()
         {
             card.focus_end(CustomField::Model);
+            self.dirty = true;
+            return;
+        }
+        if card.discover_models && !card.keyless && card.secret.is_empty() {
+            card.focus_end(CustomField::Key);
             self.dirty = true;
             return;
         }
@@ -9978,12 +10198,9 @@ impl AppModel {
         let model = card.model.trim().to_owned();
         let keyless = card.keyless;
         let (origin, family, models, default_model) = match card.kind {
-            CustomCardKind::Generic => (
-                card.origin.trim().to_owned(),
-                haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions,
-                Vec::new(),
-                None,
-            ),
+            CustomCardKind::Generic => {
+                (card.origin.trim().to_owned(), card.family, Vec::new(), None)
+            }
             CustomCardKind::Azure => (
                 azure_v1_base(card.origin.trim()),
                 haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions,
@@ -10018,6 +10235,7 @@ impl AppModel {
         let Some(card) = self.custom_add.as_mut() else {
             return;
         };
+        let secret = (card.discover_models && !card.keyless).then(|| card.take_key());
         card.phase = CustomPhase::Submitting;
         self.requests.push(AppRequest::ProviderConfigure {
             attempt,
@@ -10025,6 +10243,7 @@ impl AppModel {
             origin,
             model,
             keyless,
+            secret,
             family,
             models,
             default_model,
@@ -10042,6 +10261,12 @@ impl AppModel {
             card.phase = CustomPhase::Editing {
                 error: Some(message.to_owned()),
             };
+            if card.discover_models && !card.keyless {
+                // Submit already moved the only raw-key copy into the
+                // zeroizing stage frame. Any failure must request a retype;
+                // retaining or reconstructing the key is forbidden.
+                card.focus_end(CustomField::Key);
+            }
             self.dirty = true;
         }
     }
@@ -10051,15 +10276,22 @@ impl AppModel {
     /// it can serve anything (report §4.4: custom = base URL + key).
     /// G4a: a KEYLESS card skips the key card entirely — there is no
     /// credential to add — and goes straight to model discovery.
-    pub fn custom_add_committed(&mut self, attempt: u64) {
+    pub fn custom_add_committed(&mut self, attempt: u64, credential_staged: bool) -> Option<u64> {
         let Some(card) = self.custom_add.take_if(|card| card.attempt == attempt) else {
-            return;
+            return None;
         };
         if card.keyless {
-            self.providers.message = Some(format!(
-                "✓ provider {} created · keyless — discovering models…",
-                card.name
-            ));
+            self.providers.message = Some(if card.discover_models {
+                format!(
+                    "✓ provider {} created · no auth · live models discovered",
+                    card.name
+                )
+            } else {
+                format!(
+                    "✓ provider {} created · keyless — discovering models…",
+                    card.name
+                )
+            });
             // Keyless presets finish at provider.configure (there is no
             // credential/login receipt and intentionally no account row).
             // Still re-read the daemon-owned roster once after a NEW
@@ -10069,11 +10301,22 @@ impl AppModel {
             if !card.edit {
                 self.requests.push(AppRequest::AccountsRefresh);
             }
-            self.requests.push(AppRequest::ProviderModelsRefresh {
-                provider: card.name,
-            });
+            if !card.discover_models {
+                self.requests.push(AppRequest::ProviderModelsRefresh {
+                    provider: card.name,
+                });
+            }
             self.dirty = true;
-            return;
+            return None;
+        }
+        if credential_staged {
+            self.accounts.message = Some(format!(
+                "✓ provider {} configured · registering its account and live models…",
+                card.name
+            ));
+            let login_attempt = self.open_staged_login_card(&card.name, card.name.clone());
+            self.dirty = true;
+            return Some(login_attempt);
         }
         // G4b: every keyed kind chains into the masked key card; the copy
         // names what the "key" actually is on each surface.
@@ -10097,6 +10340,7 @@ impl AppModel {
         });
         self.open_login_card(&card.name, None);
         self.dirty = true;
+        None
     }
 
     /// Keys on the custom-provider card. DEMO is the sim's verbatim key
@@ -10118,29 +10362,7 @@ impl AppModel {
                 if let Some(card) = self.custom_add.as_mut()
                     && matches!(card.phase, CustomPhase::Editing { .. })
                 {
-                    let next = if card.edit {
-                        // A custom provider's endpoint is repointable in
-                        // place: NAME stays the locked stable identity, but
-                        // Origin and Model both take focus so the endpoint
-                        // can be changed. Tab cycles origin ↔ model and
-                        // never lands on the identity line.
-                        match card.focus {
-                            CustomField::Origin => CustomField::Model,
-                            _ => CustomField::Origin,
-                        }
-                    } else {
-                        match (card.kind, card.focus) {
-                            // Bedrock has ONE field (the region).
-                            (CustomCardKind::Bedrock, _) => CustomField::Origin,
-                            // Vertex cycles project ↔ location.
-                            (CustomCardKind::Vertex, CustomField::Origin) => CustomField::Extra,
-                            (CustomCardKind::Vertex, _) => CustomField::Origin,
-                            (_, CustomField::Name) => CustomField::Origin,
-                            (_, CustomField::Origin) => CustomField::Model,
-                            (_, CustomField::Model | CustomField::Extra) => CustomField::Name,
-                        }
-                    };
-                    card.focus_end(next);
+                    card.move_focus(false);
                     self.dirty = true;
                 }
             }
@@ -10148,30 +10370,13 @@ impl AppModel {
                 if let Some(card) = self.custom_add.as_mut()
                     && matches!(card.phase, CustomPhase::Editing { .. })
                 {
-                    let next = if card.edit {
-                        // Mirror Tab in edit mode: origin ↔ model only, the
-                        // identity line stays locked in both directions.
-                        match card.focus {
-                            CustomField::Origin => CustomField::Model,
-                            _ => CustomField::Origin,
-                        }
-                    } else {
-                        match (card.kind, card.focus) {
-                            (CustomCardKind::Bedrock, _) => CustomField::Origin,
-                            (CustomCardKind::Vertex, CustomField::Origin) => CustomField::Extra,
-                            (CustomCardKind::Vertex, _) => CustomField::Origin,
-                            (_, CustomField::Name) => CustomField::Model,
-                            (_, CustomField::Origin) => CustomField::Name,
-                            (_, CustomField::Model | CustomField::Extra) => CustomField::Origin,
-                        }
-                    };
-                    card.focus_end(next);
+                    card.move_focus(true);
                     self.dirty = true;
                 }
             }
             KeyCode::Backspace => {
                 if let Some(card) = self.custom_add.as_mut()
-                    && card.backspace()
+                    && (card.key_backspace() || card.backspace())
                 {
                     self.dirty = true;
                 }
@@ -10185,14 +10390,21 @@ impl AppModel {
             }
             KeyCode::Left => {
                 if let Some(card) = self.custom_add.as_mut()
-                    && card.move_left()
+                    && (card.cycle_choice() || card.move_left())
                 {
                     self.dirty = true;
                 }
             }
             KeyCode::Right => {
                 if let Some(card) = self.custom_add.as_mut()
-                    && card.move_right()
+                    && (card.cycle_choice() || card.move_right())
+                {
+                    self.dirty = true;
+                }
+            }
+            KeyCode::Char(' ') => {
+                if let Some(card) = self.custom_add.as_mut()
+                    && card.cycle_choice()
                 {
                     self.dirty = true;
                 }
@@ -10210,7 +10422,9 @@ impl AppModel {
                 if let Some(card) = self.custom_add.as_mut()
                     && card.can_edit_field(card.focus)
                 {
-                    let end = card.field_value(card.focus).chars().count();
+                    let end = card
+                        .field_value(card.focus)
+                        .map_or(0, |value| value.chars().count());
                     if card.cursor != end {
                         card.cursor = end;
                         self.dirty = true;
@@ -14555,6 +14769,7 @@ impl AppModel {
                 }
             } else {
                 match summary.auth_methods.as_slice() {
+                    [] => "none",
                     [AuthMethod::OAuth] => "oauth",
                     _ => "api",
                 }
@@ -15363,6 +15578,10 @@ pub fn tools_card(seq: u64) -> Menu {
         timeout_option: None,
     }
 }
+
+#[cfg(test)]
+#[path = "custom_provider_tests.rs"]
+mod custom_provider_tests;
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]

@@ -168,6 +168,9 @@ pub const ERROR_CODE_PROVIDER_ERROR: &str = "provider_error";
 /// inventory lookup. This asserts no fact about whether the provider or its
 /// models exist; clients may retry after refreshing daemon state.
 pub const ERROR_CODE_PROVIDER_MODELS_UNKNOWN: &str = "provider_models_unknown";
+/// Live provider inventories are refreshed after fifteen minutes. Clients
+/// may display this policy, but the daemon remains the refresh authority.
+pub const MODEL_INVENTORY_TTL_MS: u64 = 15 * 60 * 1_000;
 /// Stable code for a credential that failed authentication (HTTP 401):
 /// the key is invalid. Non-retryable.
 pub const ERROR_CODE_UNAUTHORIZED: &str = "unauthorized";
@@ -1090,6 +1093,11 @@ pub struct ProviderSummaryWire {
     pub models: Vec<String>,
     #[serde(default)]
     pub model_details: Vec<ModelDetailWire>,
+    /// Unix time when the daemon last completed live discovery for this
+    /// provider. Absent means the published rows are seeded/configured facts
+    /// or no live inventory has been cached yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_fetched_at_ms: Option<u64>,
     #[serde(default)]
     pub auth_methods: Vec<haider_protocol::credential::AuthMethod>,
     pub availability: ProviderAvailabilityWire,
@@ -1172,6 +1180,8 @@ pub enum OAuthFlowStatusWire {
 pub enum AccountAddMethod {
     #[serde(rename = "oauth")]
     OAuth,
+    ApiKey,
+    MenuSecret,
     #[serde(other)]
     Unknown,
 }
@@ -3047,7 +3057,9 @@ pub enum RequestBody {
     /// lost-response retry may supply a freshly staged reference under the
     /// same command id and still recover the original committed result.
     /// `validation_model: None` means the release-owned full model ID in
-    /// the resolved profile.
+    /// the resolved profile. `replace_existing` is an explicit recovery
+    /// coordinate for in-place key rotation; omission keeps legacy add/login
+    /// semantics.
     #[serde(rename = "account.login_api")]
     AccountLoginApi {
         command_id: CommandId,
@@ -3057,6 +3069,8 @@ pub enum RequestBody {
         vault_reference: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         validation_model: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        replace_existing: bool,
     },
     /// Starts a daemon-owned loopback authorization flow. The response is
     /// delivered asynchronously after the coordinator binds `127.0.0.1:0`;
@@ -3197,6 +3211,13 @@ pub enum RequestBody {
         /// value on update and selects the 60-second default on create.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         response_open_timeout_ms: Option<u64>,
+        /// Ephemeral staged API key used only to authenticate model
+        /// discovery before this mutation is accepted. The daemon borrows
+        /// the connection-scoped stage without consuming it, excludes the
+        /// reference and bytes from durable command identity/recovery, and
+        /// leaves the same reference available to `account.login_api`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        probe_vault_reference: Option<String>,
         expected_revision: u64,
     },
     /// Durably removes one custom provider. Release-owned providers and
@@ -4252,12 +4273,30 @@ pub enum ErrorData {
     },
     /// The provider did not serve a model catalog to the active credential.
     ProviderModelsUnavailable { provider: String, reason: String },
+    /// A custom provider's pre-configuration `/v1/models` probe failed.
+    /// Public coordinates only: neither a staged reference nor credential
+    /// material may appear here.
+    ProviderProbeFailed {
+        provider: String,
+        failure: ProviderProbeFailureWire,
+    },
     /// A model selection named a row whose provider attribute is not
     /// creatable on this daemon ([`ERROR_CODE_PROVIDER_UNAVAILABLE`]).
     ProviderUnavailable { provider: String },
     /// A model selection named a model outside the implied provider's KNOWN
     /// discovered inventory ([`ERROR_CODE_MODEL_UNKNOWN`]).
-    ModelUnknown { provider: String, model: String },
+    ModelUnknown {
+        provider: String,
+        model: String,
+        /// Age of the live inventory consulted, in milliseconds. Absent for
+        /// seeded/legacy inventories whose fetch time is unknown.
+        #[serde(
+            rename = "inventory_age",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        inventory_age_ms: Option<u64>,
+    },
     /// An effort selection named a level outside the CURRENT pair's declared
     /// ladder ([`ERROR_CODE_EFFORT_UNSUPPORTED`]). `supported` is the exact
     /// ladder the daemon validated against — EMPTY means the pair declares
@@ -4308,6 +4347,20 @@ pub enum ErrorData {
     },
     /// Decode artifact for a data kind this crate does not know (tolerance
     /// discipline).
+    #[serde(other)]
+    Unknown,
+}
+
+/// Stable, secret-free failure class for custom-provider discovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ProviderProbeFailureWire {
+    Unreachable,
+    Unauthorized,
+    NonOpenAiCompatibleBody,
+    EmptyList,
+    Unavailable,
     #[serde(other)]
     Unknown,
 }

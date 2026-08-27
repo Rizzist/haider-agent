@@ -56,6 +56,20 @@ struct SessionSelectModelInput {
     confirm_new_epoch: bool,
 }
 
+struct AccountLoginInput {
+    command_id: CommandId,
+    provider: String,
+    alias: Option<String>,
+    vault_reference: String,
+    validation_model: Option<String>,
+    replace_existing: bool,
+}
+
+enum InventoryRefreshError {
+    Hub(SessionHubError),
+    Provider(crate::accounts::ProviderModelsRefreshFailure),
+}
+
 /// Profile-vault alias holding the transcription secret (the Deepgram API
 /// key). Daemon-internal: clients only ever speak
 /// `transcription.secret_get`/`transcription.secret_set` — the alias never
@@ -638,6 +652,17 @@ fn fleet_now_ms() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+pub(super) fn provider_inventory_needs_refresh(summary: &ProviderSummaryWire, model: &str) -> bool {
+    let misses_known_inventory =
+        !summary.models.is_empty() && !summary.models.iter().any(|known| known == model);
+    misses_known_inventory
+        || summary
+            .inventory_fetched_at_ms
+            .is_some_and(|fetched_at_ms| {
+                fleet_now_ms().saturating_sub(fetched_at_ms) >= haider_rpc::MODEL_INVENTORY_TTL_MS
+            })
 }
 
 /// Projects one replayed truth into the summary's additive wire fields.
@@ -3493,6 +3518,7 @@ impl HubConnection {
                 alias,
                 vault_reference,
                 validation_model,
+                replace_existing,
             } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
                     return self.respond_error(
@@ -3505,11 +3531,14 @@ impl HubConnection {
                 }
                 self.account_login(
                     request_id,
-                    command_id,
-                    provider,
-                    alias,
-                    vault_reference,
-                    validation_model,
+                    AccountLoginInput {
+                        command_id,
+                        provider,
+                        alias,
+                        vault_reference,
+                        validation_model,
+                        replace_existing,
+                    },
                 )
             }
             RequestBody::AccountOAuthStart {
@@ -3752,6 +3781,7 @@ impl HubConnection {
                 models,
                 default_model,
                 response_open_timeout_ms,
+                probe_vault_reference,
                 expected_revision,
             } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
@@ -3763,6 +3793,38 @@ impl HubConnection {
                         None,
                     );
                 }
+                let probe_secret = if let Some(vault_reference) = probe_vault_reference {
+                    if self.secret_surface_facade(&request_id)?.is_none() {
+                        return Ok(());
+                    }
+                    let borrowed = {
+                        let mut stages = lock(&self.stages)?;
+                        stages.probe(&vault_reference)
+                    };
+                    match borrowed {
+                        Some((haider_rpc::StagePurpose::ApiKey, secret)) => Some(secret),
+                        Some(_) => {
+                            return self.respond_error(
+                                request_id,
+                                ERROR_CODE_INVALID_ARGUMENT,
+                                "staged secret was not staged for api_key use",
+                                false,
+                                None,
+                            );
+                        }
+                        None => {
+                            return self.respond_error(
+                                request_id,
+                                ERROR_CODE_RESTAGE_REQUIRED,
+                                "staged secret is no longer available; stage the key again and retry",
+                                true,
+                                None,
+                            );
+                        }
+                    }
+                } else {
+                    None
+                };
                 self.provider_configure(
                     request_id,
                     command_id,
@@ -3776,6 +3838,7 @@ impl HubConnection {
                         default_model,
                         response_open_timeout_ms,
                     },
+                    probe_secret,
                     expected_revision,
                 )
             }
@@ -5501,12 +5564,16 @@ impl HubConnection {
     fn account_login(
         &self,
         request_id: RequestId,
-        command_id: CommandId,
-        provider: String,
-        alias: Option<String>,
-        vault_reference: String,
-        validation_model: Option<String>,
+        input: AccountLoginInput,
     ) -> Result<(), SessionHubError> {
+        let AccountLoginInput {
+            command_id,
+            provider,
+            alias,
+            vault_reference,
+            validation_model,
+            replace_existing,
+        } = input;
         let Some(facade) = self.secret_surface_facade(&request_id)? else {
             return Ok(());
         };
@@ -5556,6 +5623,7 @@ impl HubConnection {
             provider,
             display_alias: alias.filter(|value| !value.trim().is_empty()),
             validation_model: validation_model.filter(|value| !value.trim().is_empty()),
+            replace_existing,
             secret,
             route: crate::accounts::LoginRoute {
                 request_id: request_id.clone(),
@@ -6161,6 +6229,7 @@ impl HubConnection {
         request_id: RequestId,
         command_id: CommandId,
         input: crate::provider_registry::ProviderConfigureInput,
+        probe_secret: Option<zeroize::Zeroizing<Vec<u8>>>,
         expected_revision: u64,
     ) -> Result<(), SessionHubError> {
         if command_id.as_str().trim().is_empty() || input.provider.trim().is_empty() {
@@ -6196,6 +6265,7 @@ impl HubConnection {
                 crate::accounts::ProviderConfigureJob {
                     command_id: command_id.0,
                     input,
+                    probe_secret,
                     expected_revision,
                     route: crate::accounts::LoginRoute {
                         request_id,
@@ -6256,12 +6326,73 @@ impl HubConnection {
             request_id.clone(),
             crate::accounts::AccountCommand::RefreshProviderModels {
                 provider,
-                completed: crate::accounts::LoginRoute {
-                    request_id,
-                    sink: Arc::clone(&self.sink),
-                },
+                completed: crate::accounts::ProviderModelsRefreshCompletion::Wire(
+                    crate::accounts::LoginRoute {
+                        request_id,
+                        sink: Arc::clone(&self.sink),
+                    },
+                ),
             },
         )
+    }
+
+    async fn refresh_inventory_if_needed(
+        &self,
+        summaries: &mut Vec<ProviderSummaryWire>,
+        provider: &str,
+        model: &str,
+    ) -> Result<(), InventoryRefreshError> {
+        let cached_serves_model = summaries
+            .iter()
+            .find(|summary| summary.provider == provider)
+            .is_some_and(|summary| summary.models.iter().any(|known| known == model));
+        let needs_refresh = summaries
+            .iter()
+            .find(|summary| summary.provider == provider)
+            .is_some_and(|summary| provider_inventory_needs_refresh(summary, model));
+        if !needs_refresh {
+            return Ok(());
+        }
+        let facade = self
+            .hub
+            .accounts()
+            .map_err(InventoryRefreshError::Hub)?
+            .ok_or_else(|| {
+                InventoryRefreshError::Provider(crate::accounts::ProviderModelsRefreshFailure {
+                    code: haider_rpc::ERROR_CODE_PROVIDER_MODELS_UNKNOWN.to_owned(),
+                    message: "provider model refresh is unavailable".to_owned(),
+                    retryable: true,
+                    data: None,
+                })
+            })?;
+        let refreshed = match facade.refresh_provider_models(provider.to_owned()).await {
+            Ok(refreshed) => refreshed,
+            // TTL is a freshness policy, not an availability outage: a
+            // transient refresh failure may keep serving a cached requested
+            // model. A cache MISS still surfaces the typed discovery failure.
+            Err(error) if cached_serves_model && error.retryable => return Ok(()),
+            // Seeded/manual inventories have no live catalog. The attempted
+            // refresh satisfies refresh-on-miss; validation below then emits
+            // ModelUnknown against that unchanged known inventory.
+            Err(error)
+                if matches!(
+                    &error.data,
+                    Some(ErrorData::ProviderModelsUnavailable { .. })
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(InventoryRefreshError::Provider(error)),
+        };
+        if let Some(summary) = summaries
+            .iter_mut()
+            .find(|summary| summary.provider == provider)
+        {
+            *summary = refreshed;
+        } else {
+            summaries.push(refreshed);
+        }
+        Ok(())
     }
 
     /// `account.list`: inline snapshot read (short command; the actor is the
@@ -7113,7 +7244,7 @@ impl HubConnection {
                 None,
             );
         };
-        let (summaries, descriptors) = self
+        let (mut summaries, descriptors) = self
             .hub
             .accounts()?
             .and_then(|facade| facade.management.read())
@@ -7121,6 +7252,27 @@ impl HubConnection {
                 || (Vec::new(), Vec::new()),
                 |view| (view.providers, view.descriptors),
             );
+        let selected_provider = provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|provider| !provider.is_empty())
+            .unwrap_or(&current.provider);
+        match self
+            .refresh_inventory_if_needed(&mut summaries, selected_provider, model.trim())
+            .await
+        {
+            Ok(()) => {}
+            Err(InventoryRefreshError::Hub(error)) => return Err(error),
+            Err(InventoryRefreshError::Provider(error)) => {
+                return self.respond_error(
+                    request_id,
+                    &error.code,
+                    &error.message,
+                    error.retryable,
+                    error.data,
+                );
+            }
+        }
         let authority = crate::model_select::ModelSelectionAuthority::new(
             self.hub.creatable_providers()?,
             summaries,
@@ -7213,11 +7365,16 @@ impl HubConnection {
                     provider: provider.clone(),
                 }),
             ),
-            SelectionRefusal::ModelUnknown { provider, model } => (
+            SelectionRefusal::ModelUnknown {
+                provider,
+                model,
+                inventory_age_ms,
+            } => (
                 haider_rpc::ERROR_CODE_MODEL_UNKNOWN,
                 Some(ErrorData::ModelUnknown {
                     provider: provider.clone(),
                     model: model.clone(),
+                    inventory_age_ms: *inventory_age_ms,
                 }),
             ),
             SelectionRefusal::ModelNotResolvable { .. }
@@ -11025,7 +11182,7 @@ impl HubConnection {
         // D3-5: the dependency configuration is the ONE authority on
         // creatable providers. Production answers the built-in adapter set;
         // "fake" exists only under injected test configurations. Since
-        // W5g-5 an ENABLED custom chat-completions profile is creatable
+        // W5g-5 an enabled custom OpenAI/Anthropic profile is creatable
         // too — it exists only because a durable, validated
         // `provider.configure` committed it, and the turn path routes it
         // by family.
@@ -11042,6 +11199,7 @@ impl HubConnection {
                             && matches!(
                                 profile.api_family,
                                 haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions
+                                    | haider_rpc::ProviderApiFamilyWire::AnthropicMessages
                             )
                     })
                 })
@@ -11065,6 +11223,31 @@ impl HubConnection {
                 false,
                 None,
             );
+        }
+        let mut summaries = self
+            .hub
+            .accounts()?
+            .and_then(|facade| facade.management.read())
+            .map_or_else(Vec::new, |view| view.providers);
+        match self
+            .refresh_inventory_if_needed(&mut summaries, &provider, model.trim())
+            .await
+        {
+            Ok(()) => {}
+            Err(InventoryRefreshError::Hub(error)) => return Err(error),
+            Err(InventoryRefreshError::Provider(error)) => {
+                return self.respond_error(
+                    request_id,
+                    &error.code,
+                    &error.message,
+                    error.retryable,
+                    error.data,
+                );
+            }
+        }
+        let authority = crate::model_select::ModelSelectionAuthority::new(creatable, summaries);
+        if let Err(refusal) = authority.validate_selection(&provider, None, &model) {
+            return self.respond_selection_refusal(request_id, &refusal);
         }
         let workspace = match validate_workspace(cwd).await {
             Ok(workspace) => workspace,

@@ -529,8 +529,35 @@ pub fn estimate_chunk_cost_usd(
     cached: u64,
 ) -> Option<f64> {
     let rate = model_rate(model)?;
-    let per_token = |count: u64, per_mtok: f64| (count as f64) * per_mtok / 1_000_000.0;
     let policy = cache_pricing_policy(model)?;
+    estimate_chunk_cost_usd_with_policy(rate, policy, input, output, reasoning, cached)
+}
+
+/// Provider-qualified variant for current usage rows. A custom provider that
+/// happens to serve a vendor-shaped model id must remain unpriced unless a
+/// provider/model row is explicitly registered.
+pub fn estimate_chunk_cost_usd_for(
+    provider: &str,
+    model: &str,
+    input: u64,
+    output: u64,
+    reasoning: u64,
+    cached: u64,
+) -> Option<f64> {
+    let rate = model_rate(model)?;
+    let policy = cache_pricing_policy_for(provider, model)?;
+    estimate_chunk_cost_usd_with_policy(rate, policy, input, output, reasoning, cached)
+}
+
+fn estimate_chunk_cost_usd_with_policy(
+    rate: &ModelRate,
+    policy: &CachePricingPolicy,
+    input: u64,
+    output: u64,
+    reasoning: u64,
+    cached: u64,
+) -> Option<f64> {
+    let per_token = |count: u64, per_mtok: f64| (count as f64) * per_mtok / 1_000_000.0;
     let cached_rate = policy
         .cached_input_per_mtok
         .or(rate.cached_input_per_mtok)
@@ -553,6 +580,26 @@ pub fn estimate_cache_input_costs(
     model: &str,
     usage: &haider_protocol::provider::NormalizedUsage,
 ) -> Option<haider_protocol::provider::CacheCostEstimate> {
+    let policy = cache_pricing_policy(model)?;
+    estimate_cache_input_costs_with_policy(model, policy, usage)
+}
+
+/// Provider-qualified cache-cost estimate for current usage rows. This is the
+/// authoritative entry point whenever `UsageScope.provider` is present.
+pub fn estimate_cache_input_costs_for(
+    provider: &str,
+    model: &str,
+    usage: &haider_protocol::provider::NormalizedUsage,
+) -> Option<haider_protocol::provider::CacheCostEstimate> {
+    let policy = cache_pricing_policy_for(provider, model)?;
+    estimate_cache_input_costs_with_policy(model, policy, usage)
+}
+
+fn estimate_cache_input_costs_with_policy(
+    model: &str,
+    policy: &CachePricingPolicy,
+    usage: &haider_protocol::provider::NormalizedUsage,
+) -> Option<haider_protocol::provider::CacheCostEstimate> {
     use haider_protocol::provider::{CacheCostEstimate, CacheStatAvailability};
 
     if usage.cache_status != CacheStatAvailability::Present
@@ -560,7 +607,6 @@ pub fn estimate_cache_input_costs(
     {
         return None;
     }
-    let policy = cache_pricing_policy(model)?;
     let base = model_rate(model);
     let input_rate = policy
         .input_per_mtok
@@ -625,6 +671,31 @@ pub fn estimate_normalized_usage_cost_usd(
 
     let base = model_rate(model)?;
     let input_cost = estimate_cache_input_costs(model, usage)
+        .map(|cost| cost.input_with_cache_usd)
+        .unwrap_or_else(|| (usage.logical_input as f64) * base.input_per_mtok / 1_000_000.0);
+    let billed_output = match usage.reasoning_accounting {
+        ReasoningAccounting::AdditionalToOutput => {
+            usage.billed_output.saturating_add(usage.reasoning_detail)
+        }
+        ReasoningAccounting::SubsetOfOutput | ReasoningAccounting::Unavailable => {
+            usage.billed_output
+        }
+    };
+    Some(input_cost + (billed_output as f64) * base.output_per_mtok / 1_000_000.0)
+}
+
+/// Provider-qualified total estimate for current usage rows. Unknown custom
+/// provider pricing remains `None`, even for a colliding built-in model id.
+pub fn estimate_normalized_usage_cost_usd_for(
+    provider: &str,
+    model: &str,
+    usage: &haider_protocol::provider::NormalizedUsage,
+) -> Option<f64> {
+    use haider_protocol::provider::ReasoningAccounting;
+
+    cache_pricing_policy_for(provider, model)?;
+    let base = model_rate(model)?;
+    let input_cost = estimate_cache_input_costs_for(provider, model, usage)
         .map(|cost| cost.input_with_cache_usd)
         .unwrap_or_else(|| (usage.logical_input as f64) * base.input_per_mtok / 1_000_000.0);
     let billed_output = match usage.reasoning_accounting {

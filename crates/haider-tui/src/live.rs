@@ -57,6 +57,28 @@ fn replace_loom_author_text(model: &mut AppModel, text: &str) {
     }
 }
 
+fn provider_probe_failure_text(
+    failure: haider_rpc::ProviderProbeFailureWire,
+    detail: &str,
+) -> String {
+    let class = match failure {
+        haider_rpc::ProviderProbeFailureWire::Unreachable => "server unreachable",
+        haider_rpc::ProviderProbeFailureWire::Unauthorized => "API key unauthorized",
+        haider_rpc::ProviderProbeFailureWire::NonOpenAiCompatibleBody => {
+            "response is not an OpenAI-compatible model list"
+        }
+        haider_rpc::ProviderProbeFailureWire::EmptyList => "server returned an empty model list",
+        haider_rpc::ProviderProbeFailureWire::Unavailable => "model discovery unavailable",
+        haider_rpc::ProviderProbeFailureWire::Unknown => "model discovery failed",
+        _ => "model discovery failed",
+    };
+    if detail.is_empty() {
+        class.to_owned()
+    } else {
+        format!("{class} — {detail}")
+    }
+}
+
 fn recognized_payload(payload: &serde_json::Value) -> bool {
     serde_json::from_value::<haider_protocol::EventPayload>(payload.clone()).is_ok()
         || serde_json::from_value::<haider_protocol::agent::AgentEventPayload>(payload.clone())
@@ -642,6 +664,9 @@ pub enum LiveCommand {
         /// G4b: explicit inventory echo; EMPTY derives `[model]`.
         models: Vec<String>,
         default_model: Option<String>,
+        /// Ephemeral, connection-scoped key staged for authenticated model
+        /// discovery. The raw key never enters this durable command.
+        probe_vault_reference: Option<String>,
         expected_revision: u64,
     },
     /// `transcription.secret_get` (T2): read the vaulted Deepgram key for
@@ -1111,6 +1136,16 @@ pub enum LiveReply {
         code: String,
         message: String,
     },
+    /// `provider.configure` discovery failed with a stable machine-readable
+    /// class. Keeping this separate from generic `Failed` prevents the card
+    /// from inferring unauthorized/body/empty/unreachable from prose.
+    ProviderProbeFailed {
+        command_id: CommandId,
+        provider: String,
+        failure: haider_rpc::ProviderProbeFailureWire,
+        message: String,
+        retryable: bool,
+    },
     /// `account.login_api` committed; `identity` is the descriptor's
     /// display identity (never a secret).
     LoggedIn {
@@ -1570,6 +1605,34 @@ struct OAuthFlight {
     add_command: Option<CommandId>,
 }
 
+/// Non-secret coordinates retained while the generic custom card's raw key
+/// is in `vault.stage`. A cancelled/retired attempt drops this whole flight,
+/// so a late stage reply cannot mint a durable configure command.
+#[derive(Debug, Clone, PartialEq)]
+struct CustomConfigureFlight {
+    attempt: u64,
+    name: String,
+    origin: String,
+    model: String,
+    keyless: bool,
+    family: haider_rpc::ProviderApiFamilyWire,
+    models: Vec<String>,
+    default_model: Option<String>,
+    expected_revision: u64,
+}
+
+/// Correlation for a durable `provider.configure`. A present vault reference
+/// belongs to the discovery-backed API-key flow and is consumed by the
+/// immediately chained `account.login_api` after configure commits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingCustom {
+    command_id: CommandId,
+    attempt: u64,
+    provider: String,
+    account_alias: String,
+    vault_reference: Option<String>,
+}
+
 /// `account.oauth_status` poll cadence while the browser owns the flow.
 const OAUTH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1500);
 const SESSION_SEEN_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(750);
@@ -1740,8 +1803,14 @@ pub struct LiveDriver {
     /// surface on the owning screen; successes come as typed replies.
     pending_account_remove: Option<(CommandId, String)>,
     pending_provider_remove: Option<(CommandId, String)>,
-    /// The in-flight `provider.configure`: (command, card attempt).
-    pending_custom: Option<(CommandId, u64)>,
+    /// Custom card waiting for its non-durable key stage.
+    custom_stage: Option<CustomConfigureFlight>,
+    /// The in-flight durable `provider.configure` and optional staged key.
+    pending_custom: Option<PendingCustom>,
+    /// Stage start for the same bounded recovery used by ordinary API-key
+    /// login. Cleared as soon as staging answers; endpoint probing keeps its
+    /// own daemon transport budget.
+    custom_stage_started: Option<std::time::Instant>,
     /// The in-flight `hooks.trust`/`hooks.revoke`: (command, digest) — a
     /// failure surfaces on the hooks screen and releases its gate (H4).
     pending_hook_trust: Option<(CommandId, String)>,
@@ -1884,7 +1953,9 @@ impl LiveDriver {
             pending_agent_type: None,
             pending_account_remove: None,
             pending_provider_remove: None,
+            custom_stage: None,
             pending_custom: None,
+            custom_stage_started: None,
             pending_hook_trust: None,
             pending_graph_mutation: None,
             hooks_cwd: None,
@@ -3093,6 +3164,38 @@ impl LiveDriver {
                 alias,
                 attempt,
             } => {
+                let custom_live = self.custom_stage.as_ref().is_some_and(|flight| {
+                    flight.attempt == attempt
+                        && flight.name == provider
+                        && alias.as_deref() == Some(flight.name.as_str())
+                }) && model.custom_add.as_ref().map(|card| card.attempt)
+                    == Some(attempt);
+                if custom_live {
+                    let Some(flight) = self.custom_stage.take() else {
+                        return Vec::new();
+                    };
+                    self.custom_stage_started = None;
+                    let command_id = self.mint();
+                    self.pending_custom = Some(PendingCustom {
+                        command_id: command_id.clone(),
+                        attempt,
+                        provider: flight.name.clone(),
+                        account_alias: flight.name.clone(),
+                        vault_reference: Some(vault_reference.clone()),
+                    });
+                    return vec![self.enqueue(LiveCommand::ConfigureProvider {
+                        command_id,
+                        provider: flight.name,
+                        origin: flight.origin,
+                        model: flight.model,
+                        keyless: flight.keyless,
+                        family: flight.family,
+                        models: flight.models,
+                        default_model: flight.default_model,
+                        probe_vault_reference: Some(vault_reference),
+                        expected_revision: flight.expected_revision,
+                    })];
+                }
                 // TUI6.4 (review r4 finding 1): correlation is by the
                 // reply's OWN attempt identity — carried through the
                 // link's request context, never guessed from queue
@@ -3398,18 +3501,34 @@ impl LiveDriver {
                 revision,
             } => {
                 self.retire(&command_id);
-                let Some((_, attempt)) = self
+                let Some(pending) = self
                     .pending_custom
-                    .take_if(|(pending, _)| *pending == command_id)
+                    .take_if(|pending| pending.command_id == command_id)
                 else {
                     return Vec::new();
                 };
                 // Upsert semantics — the created profile joins the list
                 // under the commit's revision.
                 model.providers.apply_models_refresh(provider, revision);
-                model.custom_add_committed(attempt);
+                let credential_staged = pending.vault_reference.is_some();
+                let login_attempt = model.custom_add_committed(pending.attempt, credential_staged);
                 model.dirty = true;
-                Vec::new()
+                let (Some(vault_reference), Some(login_attempt)) =
+                    (pending.vault_reference, login_attempt)
+                else {
+                    return Vec::new();
+                };
+                let login_command = self.mint();
+                self.login_attempt = Some(login_attempt);
+                self.login_started = Some(self.now);
+                self.login_command = Some(login_command.clone());
+                vec![self.enqueue(LiveCommand::LoginApi {
+                    command_id: login_command,
+                    provider: pending.provider,
+                    alias: Some(pending.account_alias),
+                    vault_reference,
+                    attempt: login_attempt,
+                })]
             }
             LiveReply::OAuthStarted {
                 attempt_id,
@@ -3672,6 +3791,17 @@ impl LiveDriver {
                 code,
                 message,
             } => {
+                let custom_live = self
+                    .custom_stage
+                    .as_ref()
+                    .is_some_and(|flight| flight.attempt == attempt)
+                    && model.custom_add.as_ref().map(|card| card.attempt) == Some(attempt);
+                if custom_live {
+                    self.custom_stage = None;
+                    self.custom_stage_started = None;
+                    model.custom_add_failed(attempt, &format!("{code} — {message}"));
+                    return Vec::new();
+                }
                 // TUI6.4: the stage-level error arrives identity-tagged
                 // (the link's context knows which attempt staged), so the
                 // LIVE attempt's card takes the recovery immediately —
@@ -3687,6 +3817,31 @@ impl LiveDriver {
                     model.login_result(Err((code, message)));
                     model.dirty = true;
                 }
+                Vec::new()
+            }
+            LiveReply::ProviderProbeFailed {
+                command_id,
+                provider,
+                failure,
+                message,
+                retryable: _,
+            } => {
+                let Some(pending) = self
+                    .pending_custom
+                    .take_if(|pending| pending.command_id == command_id)
+                else {
+                    model.flash = Some(format!(
+                        "· {provider}: {}",
+                        provider_probe_failure_text(failure, &message)
+                    ));
+                    model.dirty = true;
+                    return Vec::new();
+                };
+                self.retire(&command_id);
+                model.custom_add_failed(
+                    pending.attempt,
+                    &provider_probe_failure_text(failure, &message),
+                );
                 Vec::new()
             }
             LiveReply::Failed {
@@ -3962,13 +4117,16 @@ impl LiveDriver {
                     && self
                         .pending_custom
                         .as_ref()
-                        .is_some_and(|(pending, _)| pending == id)
-                    && let Some((_, attempt)) = self.pending_custom.take()
+                        .is_some_and(|pending| &pending.command_id == id)
+                    && let Some(pending) = self.pending_custom.take()
                 {
-                    if !retryable {
-                        self.retire(id);
-                    }
-                    model.custom_add_failed(attempt, &message);
+                    // A discovery-backed configure carries a connection-
+                    // scoped staged reference. Whether the refusal is
+                    // retryable or permanent, this issuance cannot safely
+                    // resend after returning the card to editing: retire it
+                    // and require a fresh masked-key stage.
+                    self.retire(id);
+                    model.custom_add_failed(pending.attempt, &message);
                     if code == haider_rpc::ERROR_CODE_REVISION_CONFLICT {
                         return vec![self.enqueue(LiveCommand::ProviderList)];
                     }
@@ -4162,6 +4320,10 @@ impl LiveDriver {
                 // at "validating…" refuses input until Esc, which is a dead
                 // end the user has no way to read (review W3c3 D2-5).
                 self.abandon_login(model, "the connection dropped mid-validation");
+                self.abandon_custom_stage(
+                    model,
+                    "the connection dropped during credential staging — re-enter the key",
+                );
                 // No reply crosses a socket: retired ids awaiting silent
                 // consumption die with the connection (TUI6.4).
                 self.retired_logins.clear();
@@ -4374,6 +4536,27 @@ impl LiveDriver {
         }
     }
 
+    /// Give up on a custom card's connection-scoped key stage (or a
+    /// configure that still carries its borrowed reference). The raw key was
+    /// taken from the card at submit, so recovery is always a visible retype.
+    fn abandon_custom_stage(&mut self, model: &mut AppModel, why: &str) {
+        let attempt = if let Some(flight) = self.custom_stage.take() {
+            Some(flight.attempt)
+        } else if let Some(pending) = self
+            .pending_custom
+            .take_if(|pending| pending.vault_reference.is_some())
+        {
+            self.retire(&pending.command_id);
+            Some(pending.attempt)
+        } else {
+            None
+        };
+        self.custom_stage_started = None;
+        if let Some(attempt) = attempt {
+            model.custom_add_failed(attempt, why);
+        }
+    }
+
     /// The next instant this driver has something to do with no inbound
     /// reply to trigger it — the shell's wakeup, so a deadline is BOUNDED
     /// rather than dependent on unrelated traffic (W3c3.1 r2, P2-B).
@@ -4388,6 +4571,9 @@ impl LiveDriver {
         let login = self
             .login_started
             .map(|started| started + LOGIN_STAGE_TIMEOUT);
+        let custom_stage = self
+            .custom_stage_started
+            .map(|started| started + LOGIN_STAGE_TIMEOUT);
         // The OAuth poll cadence: wake when the next status poll is due.
         let oauth = self
             .oauth_flight
@@ -4400,7 +4586,11 @@ impl LiveDriver {
             .iter()
             .filter_map(|pending| pending.retry_at)
             .min();
-        let existing = match (login, oauth) {
+        let login_or_custom = match (login, custom_stage) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let existing = match (login_or_custom, oauth) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
@@ -4463,6 +4653,12 @@ impl LiveDriver {
             .is_some_and(|started| self.now.duration_since(started) >= LOGIN_STAGE_TIMEOUT)
         {
             self.abandon_login(model, "validation timed out");
+        }
+        if self
+            .custom_stage_started
+            .is_some_and(|started| self.now.duration_since(started) >= LOGIN_STAGE_TIMEOUT)
+        {
+            self.abandon_custom_stage(model, "credential staging timed out — re-enter the key");
         }
     }
 
@@ -4872,6 +5068,7 @@ impl LiveDriver {
             let keyless = matches!(
                 summary.api_family,
                 haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions
+                    | haider_rpc::ProviderApiFamilyWire::AnthropicMessages
             ) && summary.endpoint.is_some()
                 && summary.auth_methods.is_empty()
                 && summary.enabled;
@@ -4934,6 +5131,10 @@ impl LiveDriver {
         // a guaranteed `restage_required` and leaves the entry pending
         // forever (review W3c3 D2-5).
         self.abandon_login(model, "the connection dropped mid-validation");
+        self.abandon_custom_stage(
+            model,
+            "the connection dropped during credential staging — re-enter the key",
+        );
         // Session-scoped mutations WAIT for their attachment: `turn.submit`,
         // `turn.cancel` and `MenuAnswer` all require an established control
         // attachment, and a resend issued alongside the attach races it into
@@ -5232,16 +5433,15 @@ impl LiveDriver {
                 origin,
                 model: served_model,
                 keyless,
+                secret,
                 family,
                 models,
                 default_model,
                 expected_revision,
             } => {
-                let command_id = self.mint();
-                self.pending_custom = Some((command_id.clone(), attempt));
-                vec![self.enqueue(LiveCommand::ConfigureProvider {
-                    command_id,
-                    provider: name,
+                let flight = CustomConfigureFlight {
+                    attempt,
+                    name,
                     origin,
                     model: served_model,
                     keyless,
@@ -5249,7 +5449,51 @@ impl LiveDriver {
                     models,
                     default_model,
                     expected_revision,
+                };
+                if let Some(secret) = secret {
+                    self.next_command += 1;
+                    self.custom_stage_started = Some(self.now);
+                    self.custom_stage = Some(flight.clone());
+                    return vec![LiveCommand::Stage {
+                        stage_id: format!("{}-custom-stage-{}", self.instance, self.next_command),
+                        secret,
+                        provider: flight.name.clone(),
+                        alias: Some(flight.name),
+                        attempt,
+                    }];
+                }
+                let command_id = self.mint();
+                self.pending_custom = Some(PendingCustom {
+                    command_id: command_id.clone(),
+                    attempt,
+                    provider: flight.name.clone(),
+                    account_alias: flight.name.clone(),
+                    vault_reference: None,
+                });
+                vec![self.enqueue(LiveCommand::ConfigureProvider {
+                    command_id,
+                    provider: flight.name,
+                    origin: flight.origin,
+                    model: flight.model,
+                    keyless: flight.keyless,
+                    family: flight.family,
+                    models: flight.models,
+                    default_model: flight.default_model,
+                    probe_vault_reference: None,
+                    expected_revision: flight.expected_revision,
                 })]
+            }
+            AppRequest::CustomProviderRetired { attempt } => {
+                self.custom_stage
+                    .take_if(|flight| flight.attempt == attempt);
+                self.custom_stage_started = None;
+                if let Some(pending) = self
+                    .pending_custom
+                    .take_if(|pending| pending.attempt == attempt)
+                {
+                    self.retire(&pending.command_id);
+                }
+                Vec::new()
             }
             // G4a: an explicit models re-discovery (the `f` key and the
             // keyless commit chain). A read — not outboxed, no receipt.

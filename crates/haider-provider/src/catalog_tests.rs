@@ -1,10 +1,55 @@
 #![allow(clippy::expect_used)]
 
+use std::net::SocketAddr;
+use std::sync::Arc;
+
 use reqwest::header::AUTHORIZATION;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use crate::catalog::{CatalogSource, apply_catalog_credential, discover_models};
+use crate::catalog::{
+    CatalogError, CatalogSource, apply_catalog_credential, discover_models,
+    discover_models_with_resolver,
+};
+
+struct OneAddressResolver(SocketAddr);
+
+#[async_trait::async_trait]
+impl crate::origin::FixedDnsResolver for OneAddressResolver {
+    async fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<SocketAddr>> {
+        Ok(vec![self.0])
+    }
+}
+
+async fn one_shot_catalog(
+    status: &'static str,
+    body: &'static [u8],
+) -> (String, tokio::task::JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind one-shot catalog");
+    let origin = format!("http://{}", listener.local_addr().expect("catalog address"));
+    let fixture = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept catalog request");
+        let mut request = vec![0_u8; 8_192];
+        let read = socket
+            .read(&mut request)
+            .await
+            .expect("read catalog request");
+        let request = String::from_utf8_lossy(&request[..read]).into_owned();
+        let headers = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        socket
+            .write_all(headers.as_bytes())
+            .await
+            .expect("write catalog headers");
+        socket.write_all(body).await.expect("write catalog body");
+        request
+    });
+    (origin, fixture)
+}
 
 fn request(source: &CatalogSource, credential: Option<&str>) -> reqwest::Request {
     let client = reqwest::Client::builder()
@@ -56,6 +101,20 @@ fn catalog_auth_mode_is_source_specific_and_existing_sources_are_identical() {
     assert_eq!(key, "GEMINI_CATALOG_KEY_SENTINEL_42cd");
     assert!(key.is_sensitive());
     assert!(!gemini.headers().contains_key(AUTHORIZATION));
+
+    let anthropic = request(
+        &CatalogSource::AnthropicCompatible {
+            origin: "https://anthropic-compatible.example.invalid".into(),
+        },
+        Some("ANTHROPIC_CATALOG_KEY_SENTINEL_8ee4"),
+    );
+    let key = anthropic
+        .headers()
+        .get("x-api-key")
+        .expect("custom Anthropic catalog API key");
+    assert_eq!(key, "ANTHROPIC_CATALOG_KEY_SENTINEL_8ee4");
+    assert!(key.is_sensitive());
+    assert!(!anthropic.headers().contains_key(AUTHORIZATION));
 }
 
 #[test]
@@ -72,10 +131,14 @@ fn catalog_without_a_credential_keeps_auth_headers_absent() {
         CatalogSource::OpenAiCompatible {
             origin: "http://127.0.0.1:11434/v1".into(),
         },
+        CatalogSource::AnthropicCompatible {
+            origin: "http://127.0.0.1:11434/v1".into(),
+        },
     ] {
         let request = request(&source, None);
         assert!(!request.headers().contains_key(AUTHORIZATION));
         assert!(!request.headers().contains_key("x-goog-api-key"));
+        assert!(!request.headers().contains_key("x-api-key"));
     }
 }
 
@@ -119,6 +182,9 @@ async fn unpinned_compatible_catalog_still_discovers() {
             request.starts_with("GET /v1/models HTTP/1.1"),
             "unexpected catalog request: {request}"
         );
+        let lower = request.to_ascii_lowercase();
+        assert!(!lower.contains("authorization:"));
+        assert!(!lower.contains("api-key:"));
 
         let body = br#"{"data":[{"id":"discovered-model","object":"model"}]}"#;
         let headers = format!(
@@ -146,6 +212,100 @@ async fn unpinned_compatible_catalog_still_discovers() {
         .expect("catalog fixture joins");
     assert_eq!(catalog.models.len(), 1);
     assert_eq!(catalog.models[0].slug, "discovered-model");
+}
+
+/// MUTATION CHECK: replace the caller-supplied resolver with the system
+/// resolver in the custom branch. The reserved fixture hostname no longer
+/// reaches the pinned loopback server and discovery fails.
+#[tokio::test]
+async fn custom_catalog_discovery_uses_its_injected_resolver_for_the_request() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind pinned catalog fixture");
+    let address = listener.local_addr().expect("pinned catalog address");
+    let origin = format!("http://router.test:{}/v1", address.port());
+    let fixture = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept pinned request");
+        let mut request = vec![0_u8; 4096];
+        let read = socket
+            .read(&mut request)
+            .await
+            .expect("read pinned request");
+        let request = String::from_utf8_lossy(&request[..read]);
+        assert!(request.starts_with("GET /v1/models HTTP/1.1"));
+        assert!(request.to_ascii_lowercase().contains("host: router.test:"));
+        let body = br#"{"data":[{"id":"pinned-model"}]}"#;
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        socket
+            .write_all(head.as_bytes())
+            .await
+            .expect("write pinned headers");
+        socket.write_all(body).await.expect("write pinned body");
+    });
+
+    let catalog = discover_models_with_resolver(
+        CatalogSource::OpenAiCompatible { origin },
+        Some("resolver-sentinel"),
+        None,
+        Arc::new(OneAddressResolver(address)),
+    )
+    .await
+    .expect("custom discovery through injected resolver");
+    fixture.await.expect("pinned fixture joins");
+    assert_eq!(catalog.models[0].slug, "pinned-model");
+}
+
+#[tokio::test]
+async fn custom_anthropic_discovery_uses_standard_keyed_models_get() {
+    let (origin, fixture) = one_shot_catalog(
+        "200 OK",
+        br#"{"data":[{"id":"claude-local","type":"model"}]}"#,
+    )
+    .await;
+    let catalog = discover_models(
+        CatalogSource::AnthropicCompatible { origin },
+        Some("anthropic-catalog-secret"),
+        None,
+    )
+    .await
+    .expect("custom Anthropic discovery");
+    let request = fixture.await.expect("catalog fixture");
+    assert!(request.starts_with("GET /v1/models HTTP/1.1"));
+    assert!(request.contains("x-api-key: anthropic-catalog-secret\r\n"));
+    assert!(request.contains("anthropic-version: 2023-06-01\r\n"));
+    assert!(!request.to_ascii_lowercase().contains("authorization:"));
+    assert_eq!(catalog.models[0].slug, "claude-local");
+}
+
+/// The daemon maps these three discovery errors to the public Q probe
+/// taxonomy; pin the transport/parser source classifications at the mocked
+/// `/v1/models` boundary.
+#[tokio::test]
+async fn custom_catalog_reports_unauthorized_invalid_body_and_empty_list() {
+    for (status, body, expected) in [
+        (
+            "401 Unauthorized",
+            br#"{"error":"unauthorized"}"#.as_slice(),
+            "unauthorized",
+        ),
+        ("200 OK", b"not-json".as_slice(), "invalid_body"),
+        ("200 OK", br#"{"data":[]}"#.as_slice(), "empty"),
+    ] {
+        let (origin, fixture) = one_shot_catalog(status, body).await;
+        let error = discover_models(CatalogSource::OpenAiCompatible { origin }, None, None)
+            .await
+            .expect_err("scripted catalog failure");
+        fixture.await.expect("catalog fixture");
+        assert!(matches!(
+            (expected, error),
+            ("unauthorized", CatalogError::Unauthorized)
+                | ("invalid_body", CatalogError::InvalidBody { .. })
+                | ("empty", CatalogError::Empty)
+        ));
+    }
 }
 
 /// WH3 request half — the named DeepSeek catalog source is a Bearer GET to

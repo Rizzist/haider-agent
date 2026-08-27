@@ -110,6 +110,12 @@ pub enum CatalogError {
     Unavailable { reason: String },
     /// Transport/guard failure — retryable.
     Transport { reason: String },
+    /// The endpoint explicitly rejected the supplied credential.
+    Unauthorized,
+    /// A successful response was not an OpenAI-compatible model document.
+    InvalidBody { reason: String },
+    /// A syntactically compatible document declared no usable model ids.
+    Empty,
 }
 
 impl std::fmt::Display for CatalogError {
@@ -119,6 +125,9 @@ impl std::fmt::Display for CatalogError {
             Self::Unavailable { reason } | Self::Transport { reason } => {
                 write!(formatter, "{reason}")
             }
+            Self::Unauthorized => write!(formatter, "model catalog authentication failed"),
+            Self::InvalidBody { reason } => write!(formatter, "{reason}"),
+            Self::Empty => write!(formatter, "provider returned an empty model list"),
         }
     }
 }
@@ -138,6 +147,8 @@ pub enum CatalogSource {
     GeminiApiKey,
     /// An OpenAI-compatible custom profile's stored API origin.
     OpenAiCompatible { origin: String },
+    /// A custom standard Anthropic Messages profile at a user-owned origin.
+    AnthropicCompatible { origin: String },
     /// DeepSeek's fixed OpenAI-compatible API-key catalog.
     DeepSeekApi,
     /// Haider Code's fixed OpenAI-compatible API-key catalog.
@@ -164,6 +175,7 @@ pub fn catalog_request_url(source: CatalogSource, endpoint: &str) -> String {
         | CatalogSource::GrokOAuth
         | CatalogSource::GeminiApiKey
         | CatalogSource::OpenAiCompatible { .. }
+        | CatalogSource::AnthropicCompatible { .. }
         | CatalogSource::DeepSeekApi
         | CatalogSource::HaiderCodeApi
         | CatalogSource::XaiApi => endpoint.to_owned(),
@@ -184,8 +196,8 @@ impl CatalogSource {
             Self::KimiOAuth => format!("{}/models", crate::KIMI_OAUTH_BASE_URL),
             Self::GrokOAuth => format!("{}/models", crate::GROK_OAUTH_BASE_URL),
             Self::GeminiApiKey => crate::GEMINI_MODELS_URL.to_owned(),
-            Self::OpenAiCompatible { origin } => {
-                format!("{}/models", origin.trim().trim_end_matches('/'))
+            Self::OpenAiCompatible { origin } | Self::AnthropicCompatible { origin } => {
+                openai_compatible_catalog_endpoint(origin).unwrap_or_default()
             }
             Self::DeepSeekApi => format!("{}/models", crate::DEEPSEEK_BASE_URL),
             Self::HaiderCodeApi => format!("{}/models", crate::HAIDER_CODE_BASE_URL),
@@ -201,6 +213,7 @@ impl CatalogSource {
             Self::GrokOAuth => Some("cli-chat-proxy.grok.com"),
             Self::GeminiApiKey => Some("generativelanguage.googleapis.com"),
             Self::OpenAiCompatible { .. } => None,
+            Self::AnthropicCompatible { .. } => None,
             Self::DeepSeekApi => Some("api.deepseek.com"),
             Self::HaiderCodeApi => Some("haidercode.ai"),
             Self::XaiApi => Some("api.x.ai"),
@@ -215,6 +228,7 @@ enum CatalogAuthMode {
     /// Azure OpenAI v1 (G4b): API keys authenticate with the bare
     /// `api-key` header — Bearer is documented only for Entra tokens.
     AzureApiKey,
+    AnthropicApiKey,
 }
 
 impl CatalogSource {
@@ -227,6 +241,7 @@ impl CatalogSource {
             Self::OpenAiCompatible { origin } if crate::openai::azure_openai_origin(origin) => {
                 CatalogAuthMode::AzureApiKey
             }
+            Self::AnthropicCompatible { .. } => CatalogAuthMode::AnthropicApiKey,
             Self::OpenAiSubscription
             | Self::AnthropicSubscription
             | Self::KimiOAuth
@@ -249,53 +264,11 @@ impl CatalogSource {
 /// link-local `169.254.0.0/16`, multicast, and other special-use literals
 /// are refused entirely; every other remote origin must use HTTPS.
 pub fn openai_compatible_catalog_endpoint(origin: &str) -> Result<String, CatalogError> {
-    let origin = origin.trim().trim_end_matches('/');
-    let parsed = reqwest::Url::parse(origin).map_err(|_| CatalogError::Unavailable {
-        reason: "custom model catalog origin is not a valid URL".to_owned(),
-    })?;
-    if !matches!(parsed.scheme(), "http" | "https")
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
-        return Err(CatalogError::Unavailable {
-            reason: "custom model catalog origin must be an http(s) URL without credentials, query, or fragment"
-                .to_owned(),
-        });
-    }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| CatalogError::Unavailable {
-            reason: "custom model catalog origin must include a host".to_owned(),
-        })?
-        .trim_start_matches('[')
-        .trim_end_matches(']');
-    let ip = host.parse::<std::net::IpAddr>().ok();
-    if ip.is_some_and(|address| {
-        crate::openai::blocked_credential_target_with_policy(
-            address,
-            crate::CompatibleOriginPolicy::TrustedLan,
-        )
-    }) {
-        return Err(CatalogError::Unavailable {
-            reason:
-                "custom model catalog origin must not target a link-local, multicast, or special-use IP address"
-                    .to_owned(),
-        });
-    }
-    let plain_http_host = host.eq_ignore_ascii_case("localhost")
-        || ip.is_some_and(|address| {
-            address.is_loopback() || crate::openai::rfc1918_private(address)
-        });
-    if parsed.scheme() == "http" && !plain_http_host {
-        return Err(CatalogError::Unavailable {
-            reason:
-                "custom remote model catalog origins must use HTTPS; HTTP is allowed only for loopback or RFC1918 LAN hosts"
-                    .to_owned(),
-        });
-    }
-    Ok(format!("{origin}/models"))
+    crate::openai::compatible_endpoints(origin, crate::CompatibleOriginPolicy::TrustedLan)
+        .map(|endpoints| endpoints.models_url)
+        .map_err(|error| CatalogError::Unavailable {
+            reason: error.message,
+        })
 }
 
 /// Discovers a provider's model list with an optional bearer credential.
@@ -319,9 +292,25 @@ pub async fn discover_models_with_resolver(
     etag: Option<&str>,
     resolver: Arc<dyn FixedDnsResolver>,
 ) -> Result<DiscoveredCatalog, CatalogError> {
-    let (endpoint, guard) = match &source {
-        CatalogSource::OpenAiCompatible { origin } => {
-            (openai_compatible_catalog_endpoint(origin)?, None)
+    let (endpoint, guard, custom_client) = match &source {
+        CatalogSource::OpenAiCompatible { origin }
+        | CatalogSource::AnthropicCompatible { origin } => {
+            let transport = crate::openai::openai_compatible_catalog_transport(
+                origin,
+                crate::CompatibleOriginPolicy::TrustedLan,
+                CATALOG_TIMEOUT,
+                resolver,
+            )
+            .await
+            .map_err(|error| match error.kind {
+                crate::ProviderErrorKind::Transport => CatalogError::Transport {
+                    reason: error.message,
+                },
+                _ => CatalogError::Unavailable {
+                    reason: error.message,
+                },
+            })?;
+            (transport.models_url, None, Some(transport.client))
         }
         CatalogSource::OpenAiSubscription
         | CatalogSource::AnthropicSubscription
@@ -358,20 +347,24 @@ pub async fn discover_models_with_resolver(
                 .map_err(|error| CatalogError::Unavailable {
                     reason: format!("model catalog endpoint refused: {}", error.message),
                 })?;
-            (endpoint, Some(guard))
+            (endpoint, Some(guard), None)
         }
     };
-    let mut client = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(crate::OPENAI_DEFAULT_TRANSPORT_CONFIG.connect_timeout)
-        .timeout(CATALOG_TIMEOUT);
-    if let Some(guard) = &guard {
-        client = client.dns_resolver(Arc::clone(guard));
-    }
-    let client = client.build().map_err(|_| CatalogError::Transport {
-        reason: "model catalog transport is unavailable".to_owned(),
-    })?;
+    let client = if let Some(client) = custom_client {
+        client
+    } else {
+        let mut client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(crate::OPENAI_DEFAULT_TRANSPORT_CONFIG.connect_timeout)
+            .timeout(CATALOG_TIMEOUT);
+        if let Some(guard) = &guard {
+            client = client.dns_resolver(Arc::clone(guard));
+        }
+        client.build().map_err(|_| CatalogError::Transport {
+            reason: "model catalog transport is unavailable".to_owned(),
+        })?
+    };
 
     let request_url = catalog_request_url(source.clone(), &endpoint);
     let mut request = client
@@ -390,6 +383,8 @@ pub async fn discover_models_with_resolver(
         request = request
             .header("anthropic-beta", crate::ANTHROPIC_OAUTH_BETA_VALUE)
             .header("anthropic-version", "2023-06-01");
+    } else if matches!(source, CatalogSource::AnthropicCompatible { .. }) {
+        request = request.header("anthropic-version", "2023-06-01");
     }
 
     let catalog_budget_ms = duration_ms(CATALOG_TIMEOUT);
@@ -421,6 +416,9 @@ pub async fn discover_models_with_resolver(
     }
     if !response.status().is_success() {
         let status = response.status().as_u16();
+        if status == 401 {
+            return Err(CatalogError::Unauthorized);
+        }
         // Grok round 2: the proxy's 402/426 are its client-version gate —
         // an ACTIONABLE misconfiguration, never generic unavailability.
         if matches!(status, 402 | 426) {
@@ -462,14 +460,12 @@ pub async fn discover_models_with_resolver(
         body.extend_from_slice(&chunk);
     }
     let value: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|error| CatalogError::Unavailable {
+        serde_json::from_slice(&body).map_err(|error| CatalogError::InvalidBody {
             reason: format!("model catalog response is not JSON: {error}"),
         })?;
     let models = parse_catalog(source, &value)?;
     if models.is_empty() {
-        return Err(CatalogError::Unavailable {
-            reason: "provider returned an empty model list".to_owned(),
-        });
+        return Err(CatalogError::Empty);
     }
     Ok(DiscoveredCatalog {
         models,
@@ -491,12 +487,13 @@ pub fn parse_catalog(
         | CatalogSource::KimiOAuth
         | CatalogSource::GrokOAuth
         | CatalogSource::OpenAiCompatible { .. }
+        | CatalogSource::AnthropicCompatible { .. }
         | CatalogSource::DeepSeekApi
         | CatalogSource::HaiderCodeApi
         | CatalogSource::XaiApi => value.get("data"),
     }
     .and_then(serde_json::Value::as_array)
-    .ok_or_else(|| CatalogError::Unavailable {
+    .ok_or_else(|| CatalogError::InvalidBody {
         reason: "model catalog response has no model array".to_owned(),
     })?;
 
@@ -530,6 +527,7 @@ pub fn parse_catalog(
         if matches!(
             source,
             CatalogSource::OpenAiCompatible { .. }
+                | CatalogSource::AnthropicCompatible { .. }
                 | CatalogSource::DeepSeekApi
                 | CatalogSource::HaiderCodeApi
                 | CatalogSource::XaiApi
@@ -606,6 +604,7 @@ pub fn parse_catalog(
             CatalogSource::AnthropicSubscription
             | CatalogSource::GeminiApiKey
             | CatalogSource::OpenAiCompatible { .. }
+            | CatalogSource::AnthropicCompatible { .. }
             | CatalogSource::DeepSeekApi
             | CatalogSource::HaiderCodeApi
             | CatalogSource::XaiApi => None,
@@ -705,6 +704,9 @@ pub(crate) fn apply_catalog_credential(
             sensitive_credential_header(request, "x-goog-api-key", credential)
         }
         CatalogAuthMode::AzureApiKey => sensitive_credential_header(request, "api-key", credential),
+        CatalogAuthMode::AnthropicApiKey => {
+            sensitive_credential_header(request, "x-api-key", credential)
+        }
     }
 }
 

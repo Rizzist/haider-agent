@@ -393,6 +393,7 @@ pub fn seed_provider_summaries() -> Vec<haider_rpc::ProviderSummaryWire> {
                 supports_thinking_type: None,
             })
             .collect(),
+        inventory_fetched_at_ms: None,
         auth_methods: auth.to_vec(),
         availability,
         availability_reason: reason.map(str::to_owned),
