@@ -1449,7 +1449,12 @@ fn cancellable_exec_command() -> String {
         "$cmd=Join-Path ([Environment]::SystemDirectory) 'cmd.exe';",
         "$start=[Diagnostics.ProcessStartInfo]::new();$start.FileName=$cmd;",
         "$start.Arguments='/D /S /C \"echo ready>descendant-started.log & ",
-        "ping -n 2 127.0.0.1 >nul & ",
+        // Do not let the short-lived descendant outrun a starved parent before
+        // PowerShell returns from Process.Start and publishes the two-byte
+        // heartbeat. That same file releases the descendant, which then retains
+        // the original one-second escape oracle used by the post-cancel check.
+        "for /L %i in (1,1,55) do @if not exist heartbeat.log ",
+        "ping -n 2 127.0.0.1 >nul & ping -n 2 127.0.0.1 >nul & ",
         "echo survived>descendant-survived.log\"';",
         "$start.WorkingDirectory=$workspace;$start.UseShellExecute=$false;",
         "$start.CreateNoWindow=$true;$child=[Diagnostics.Process]::Start($start);",
@@ -1469,7 +1474,7 @@ fn cancellable_exec_command() -> String {
         "if($child.HasExited){$child.Dispose();",
         "throw 'descendant exited immediately after its ready marker'};",
         "$child.Dispose();",
-        "[IO.File]::AppendAllText($heartbeat,'x',[Text.Encoding]::ASCII);",
+        "[IO.File]::AppendAllText($heartbeat,'xx',[Text.Encoding]::ASCII);",
         "[Console]::Out.Write('started');[Console]::Out.Flush();",
         "while($true){[IO.File]::AppendAllText($heartbeat,'x',[Text.Encoding]::ASCII);",
         "[Console]::Out.Write('y');[Console]::Out.Flush();Start-Sleep -Milliseconds 10}"
