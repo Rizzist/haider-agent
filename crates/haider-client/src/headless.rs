@@ -2351,6 +2351,7 @@ async fn run_headless_inner(
         permission_overrides: created_metadata.permission_overrides.unwrap_or_default(),
         trust_hooks: request.trust_hooks,
         budget: request.budget.clone(),
+        request_deadline_unix_ms: timeout_deadline.map(deadline_unix_ms),
         replay_of: request.replay_of.clone(),
     });
     let submit_body = headless_submit_body_with_spec(
@@ -4093,6 +4094,21 @@ async fn wait_until(deadline: Option<Instant>) {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => pending::<()>().await,
     }
+}
+
+fn deadline_unix_ms(deadline: Instant) -> u64 {
+    let remaining_ms = u64::try_from(
+        deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        });
+    now_ms.saturating_add(remaining_ms)
 }
 
 async fn before_acceptance_deadline<T>(

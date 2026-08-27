@@ -346,6 +346,7 @@ struct DaemonContextCompactor {
     provider: Arc<dyn Provider>,
     model: String,
     max_tokens: u64,
+    provider_deadline: Option<tokio::time::Instant>,
     context_window: Option<u64>,
     reserved_output_tokens: u64,
     post_compaction_system_prompt: Option<String>,
@@ -848,7 +849,12 @@ impl ContextCompactor for DaemonContextCompactor {
             request_ordinal,
             request_cache_epoch,
             request_cache_diagnostic,
-        ) = match self.provider.stream_prepared_turn(request, prepared).await {
+        ) = match haider_provider::before_provider_request_deadline(
+            self.provider_deadline,
+            self.provider.stream_prepared_turn(request, prepared),
+        )
+        .await
+        {
             Ok(stream) => (
                 stream,
                 replay_request_messages,
@@ -865,6 +871,13 @@ impl ContextCompactor for DaemonContextCompactor {
                     ErrorCode::ProviderError,
                     format!("context summarization could not start: {error}"),
                     true,
+                ));
+            }
+            Err(error) if error.presentation.subcode.as_str() == "provider-timeout" => {
+                return Err(HaiderError::new(
+                    ErrorCode::ProviderTimeout,
+                    format!("context summarization could not start: {error}"),
+                    false,
                 ));
             }
             Err(_) => {
@@ -948,9 +961,19 @@ impl ContextCompactor for DaemonContextCompactor {
                 );
                 self.record_cache_request_attempt(run_id, 2, &fallback_cache_diagnostic)
                     .await?;
-                let stream = self.provider.stream_turn(fallback).await.map_err(|error| {
+                let stream = haider_provider::before_provider_request_deadline(
+                    self.provider_deadline,
+                    self.provider.stream_turn(fallback),
+                )
+                .await
+                .map_err(|error| {
+                    let code = if error.presentation.subcode.as_str() == "provider-timeout" {
+                        ErrorCode::ProviderTimeout
+                    } else {
+                        ErrorCode::ProviderError
+                    };
                     HaiderError::new(
-                        ErrorCode::ProviderError,
+                        code,
                         format!("context summarization could not start: {error}"),
                         error.retryable,
                     )
@@ -4981,6 +5004,7 @@ async fn perform_manual_compaction(
         provider: resolved.provider,
         model: resolved.model,
         max_tokens: metadata.max_tokens,
+        provider_deadline: None,
         context_window: resolved.context_window,
         reserved_output_tokens: metadata.max_tokens,
         post_compaction_system_prompt: Some(post_compaction_system_prompt),
@@ -5582,6 +5606,7 @@ async fn start_turn(
         recovering: _,
     } = pending;
     let headless = headless_run_context(lease, &accepted.run_id).await?;
+    let provider_deadline = headless.as_ref().and_then(provider_request_deadline);
     let mut pinned_metadata = metadata.clone();
     if let Some(context) = headless.as_ref() {
         let spec = &context.spec;
@@ -6025,6 +6050,7 @@ async fn start_turn(
         lease.worker_generation(),
     )
     .with_event_ids(Arc::clone(&event_ids));
+    config.provider_deadline = provider_deadline;
     let provider_request_state = provider_derived_request_state(
         &resolved.provider_name,
         &provider_capabilities,
@@ -6215,6 +6241,7 @@ async fn start_turn(
         provider: Arc::clone(&resolved.provider),
         model: config.model.clone(),
         max_tokens: config.max_tokens,
+        provider_deadline,
         context_window: config.context_window,
         reserved_output_tokens: config.reserved_output_tokens,
         post_compaction_system_prompt: config.system_prompt.clone(),
@@ -7461,6 +7488,23 @@ struct DurableHeadlessRunContext {
     spec: HeadlessRunSpecV1,
     accepted_at_ms: u64,
     exhausted: Option<RunBudgetExhaustedV1>,
+}
+
+fn provider_request_deadline(context: &DurableHeadlessRunContext) -> Option<tokio::time::Instant> {
+    let budget_deadline = context
+        .spec
+        .budget
+        .max_time_ms
+        .map(|limit| context.accepted_at_ms.saturating_add(limit));
+    let deadline_ms = match (budget_deadline, context.spec.request_deadline_unix_ms) {
+        (Some(budget), Some(request)) => Some(budget.min(request)),
+        (Some(budget), None) => Some(budget),
+        (None, Some(request)) => Some(request),
+        (None, None) => None,
+    }?;
+    tokio::time::Instant::now().checked_add(Duration::from_millis(
+        deadline_ms.saturating_sub(unix_time_ms()),
+    ))
 }
 
 struct HeadlessBudgetExpiry {

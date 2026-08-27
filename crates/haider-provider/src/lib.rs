@@ -51,7 +51,12 @@ use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, Instant, sleep};
+
+/// Time reserved after a provider request is stopped so the daemon can
+/// durably terminalize the run and the client can receive that fact before
+/// its own wall-clock deadline.
+pub const PROVIDER_DEADLINE_SAFETY_MARGIN: Duration = Duration::from_secs(1);
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
@@ -1095,6 +1100,10 @@ tokio::task_local! {
     static PREPARED_WIRE_PAYLOAD: RefCell<Option<PreparedWire>>;
 }
 
+tokio::task_local! {
+    static PROVIDER_REQUEST_DEADLINE: Option<Instant>;
+}
+
 pub(crate) fn take_prepared_wire_payload() -> Option<PreparedWire> {
     PREPARED_WIRE_PAYLOAD
         .try_with(|payload| payload.borrow_mut().take())
@@ -1110,6 +1119,41 @@ pub(crate) async fn scope_prepared_wire<T>(
     PREPARED_WIRE_PAYLOAD
         .scope(RefCell::new(payload), future)
         .await
+}
+
+/// Typed reason attached to a local provider timeout. Additive serialization
+/// keeps older scripted-provider fixtures wire-compatible when no reason is
+/// present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderTimeoutReason {
+    DeadlineExhausted,
+}
+
+/// Selects one request-phase budget from the provider's configured budget and
+/// the remaining run/turn deadline. This is the sole deadline arithmetic for
+/// provider connect/open waits and the actor's provider-open backstop.
+pub fn effective_request_budget(
+    provider_budget: Duration,
+    remaining_deadline: Option<Duration>,
+    safety_margin: Duration,
+) -> Result<Duration, ProviderTimeoutReason> {
+    let Some(remaining) = remaining_deadline else {
+        return Ok(provider_budget);
+    };
+    if remaining <= safety_margin {
+        return Err(ProviderTimeoutReason::DeadlineExhausted);
+    }
+    Ok(provider_budget.min(remaining - safety_margin))
+}
+
+fn current_provider_deadline_remaining() -> Option<Duration> {
+    PROVIDER_REQUEST_DEADLINE
+        .try_with(|deadline| {
+            deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        })
+        .ok()
+        .flatten()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1151,6 +1195,9 @@ pub struct ProviderError {
     /// Exact local transport-phase budget selected for the request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_ms: Option<u64>,
+    /// Why a deadline-derived provider timeout fired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_reason: Option<ProviderTimeoutReason>,
     #[serde(default)]
     pub presentation: ErrorPresentation,
 }
@@ -1172,6 +1219,7 @@ impl ProviderError {
             retry_after_ms: None,
             opened_within_ms: None,
             budget_ms: None,
+            timeout_reason: None,
             presentation,
         }
     }
@@ -1203,6 +1251,12 @@ impl ProviderError {
         self.presentation = self
             .presentation
             .with_timeout_budget(opened_within_ms, budget_ms);
+        self
+    }
+
+    #[must_use]
+    pub fn with_timeout_reason(mut self, reason: ProviderTimeoutReason) -> Self {
+        self.timeout_reason = Some(reason);
         self
     }
 
@@ -1481,6 +1535,72 @@ impl fmt::Display for ProviderError {
 }
 
 impl std::error::Error for ProviderError {}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+pub(crate) fn provider_timeout_presentation() -> ErrorPresentation {
+    ErrorPresentation::new(
+        "provider-timeout",
+        "Provider request timed out",
+        "Haider stopped waiting for the provider before the run deadline.",
+        ErrorScope::Turn,
+        [ErrorAction::Retry],
+    )
+}
+
+fn deadline_exhausted_error(budget: Duration, elapsed: Duration) -> ProviderError {
+    let budget_ms = duration_ms(budget);
+    let opened_within_ms = duration_ms(elapsed.min(budget));
+    let mut error = ProviderError::new(
+        ProviderErrorKind::Transport,
+        format!(
+            "provider request could not open before the run deadline; reason=deadline_exhausted opened_within_ms={opened_within_ms} budget_ms={budget_ms}"
+        ),
+    )
+    .with_presentation(ErrorPresentation::new(
+        "provider-timeout",
+        "Provider request timed out",
+        "The run deadline is exhausted (reason=deadline_exhausted); this request cannot be retried in time.",
+        ErrorScope::Turn,
+        [ErrorAction::None],
+    ))
+    .with_timeout_budget(opened_within_ms, budget_ms)
+    .with_timeout_reason(ProviderTimeoutReason::DeadlineExhausted);
+    error.retryable = false;
+    error
+}
+
+/// Runs one provider-open future under the request's absolute deadline while
+/// making the same deadline visible to adapter-local connect/open phases.
+/// Dropping the timed-out future cancels injected/fake providers too, so an
+/// adapter that never opens cannot outlive the terminal run.
+#[doc(hidden)]
+pub async fn before_provider_request_deadline<T>(
+    deadline: Option<Instant>,
+    opening: impl std::future::Future<Output = Result<T, ProviderError>>,
+) -> Result<T, ProviderError> {
+    PROVIDER_REQUEST_DEADLINE
+        .scope(deadline, async move {
+            let remaining =
+                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            let budget =
+                effective_request_budget(Duration::MAX, remaining, PROVIDER_DEADLINE_SAFETY_MARGIN)
+                    .map_err(|ProviderTimeoutReason::DeadlineExhausted| {
+                        deadline_exhausted_error(Duration::ZERO, Duration::ZERO)
+                    })?;
+            if deadline.is_none() {
+                return opening.await;
+            }
+            let started = Instant::now();
+            match tokio::time::timeout(budget, opening).await {
+                Ok(result) => result,
+                Err(_) => Err(deadline_exhausted_error(budget, started.elapsed())),
+            }
+        })
+        .await
+}
 
 pub type ProviderStreamItem = Result<StreamEvent, ProviderError>;
 

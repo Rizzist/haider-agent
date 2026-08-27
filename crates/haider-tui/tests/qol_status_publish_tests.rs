@@ -36,6 +36,24 @@ fn live_session() -> AppModel {
     model
 }
 
+#[test]
+fn provider_open_wait_surfaces_elapsed_and_remaining_budget() {
+    let mut model = live_session();
+    model
+        .projection
+        .apply(&haider_protocol::EventPayload::RunState(
+            haider_protocol::state::RunState::Thinking,
+        ));
+    model.provider_wait_started_at_ms = Some(1_000);
+    model.clock_ms = 13_000;
+
+    let strip = status_left_string(&model, 180);
+    assert!(
+        strip.contains("waiting for provider · 12s elapsed · 48s left"),
+        "the existing status strip makes the default 60s provider wait visible: {strip}"
+    );
+}
+
 fn draw_rows(model: &AppModel, width: u16, height: u16) -> Vec<String> {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("test terminal");

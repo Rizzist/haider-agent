@@ -344,6 +344,79 @@ fn openai_transport_defaults_split_connect_open_and_idle_budgets() {
 }
 
 #[test]
+fn effective_request_budget_obeys_provider_and_run_deadlines() {
+    let margin = crate::PROVIDER_DEADLINE_SAFETY_MARGIN;
+    assert_eq!(
+        crate::effective_request_budget(
+            Duration::from_secs(60),
+            Some(Duration::from_secs(15)),
+            margin,
+        ),
+        Ok(Duration::from_secs(14)),
+        "a 15s run reserves the terminalization margin from a 60s provider open"
+    );
+    assert_eq!(
+        crate::effective_request_budget(Duration::from_secs(60), None, margin),
+        Ok(Duration::from_secs(60)),
+        "interactive requests retain the provider's 60s default"
+    );
+    assert_eq!(
+        crate::effective_request_budget(
+            Duration::from_secs(5),
+            Some(Duration::from_secs(15)),
+            margin,
+        ),
+        Ok(Duration::from_secs(5)),
+        "a shorter provider budget remains authoritative"
+    );
+    assert_eq!(
+        crate::effective_request_budget(
+            Duration::from_secs(60),
+            Some(margin.saturating_sub(Duration::from_millis(1))),
+            margin,
+        ),
+        Err(crate::ProviderTimeoutReason::DeadlineExhausted),
+        "an exhausted terminalization margin fails immediately"
+    );
+}
+
+#[test]
+fn retry_requires_one_complete_provider_budget_after_the_margin() {
+    let margin = crate::PROVIDER_DEADLINE_SAFETY_MARGIN;
+    let provider_budget = Duration::from_secs(5);
+    let full =
+        crate::effective_request_budget(provider_budget, Some(provider_budget + margin), margin);
+    assert_eq!(full, Ok(provider_budget));
+    let partial = crate::effective_request_budget(
+        provider_budget,
+        Some(provider_budget + margin - Duration::from_millis(1)),
+        margin,
+    );
+    assert!(partial.is_ok_and(|selected| selected < provider_budget));
+}
+
+#[tokio::test]
+async fn exhausted_run_deadline_is_an_immediate_terminal_provider_timeout() {
+    let error = crate::before_provider_request_deadline(
+        Some(tokio::time::Instant::now()),
+        std::future::pending::<Result<(), ProviderError>>(),
+    )
+    .await
+    .expect_err("an exhausted deadline does not poll the provider indefinitely");
+    assert_eq!(error.kind, ProviderErrorKind::Transport);
+    assert_eq!(
+        error.timeout_reason,
+        Some(crate::ProviderTimeoutReason::DeadlineExhausted)
+    );
+    assert_eq!(error.presentation.subcode.as_str(), "provider-timeout");
+    assert!(!error.retryable);
+    assert_eq!(
+        error.presentation.allowed_actions,
+        vec![haider_protocol::error::ErrorAction::None]
+    );
+}
+
+#[test]
 fn response_open_budget_is_a_typed_per_provider_override() {
     let vault = MemoryVault::new();
     let alias = CredentialAlias::new("transport-profile");
