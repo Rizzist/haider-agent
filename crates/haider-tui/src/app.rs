@@ -4381,6 +4381,11 @@ pub struct AppModel {
     /// state: never persisted, and terminal chips never read it (their
     /// figure is frozen from journal timestamps).
     pub clock_ms: u64,
+    /// Journal timestamp of the current provider-open wait. `Thinking` begins
+    /// one request attempt; every other run state clears it. The existing
+    /// status strip combines this with the selected provider's open budget so
+    /// a slow interactive request is visible rather than looking hung.
+    pub provider_wait_started_at_ms: Option<u64>,
     /// Whether the terminal renders 24-bit color — set once at startup by the
     /// runtime (see [`crate::runtime::truecolor_capable`]) and read by render
     /// to pick the Thinking verb's shimmer fidelity: `true` rides the full
@@ -4594,6 +4599,7 @@ impl Default for AppModel {
             dirty: true,
             anim_phase: 0,
             clock_ms: 0,
+            provider_wait_started_at_ms: None,
             // Assume truecolor until the runtime proves otherwise at startup
             // (the app emits 24-bit color everywhere); tests and demo stay
             // true and render the full-fidelity shimmer.
@@ -5100,7 +5106,35 @@ impl AppModel {
                 Some(format!("{live} subagent{plural}")),
             );
         }
+        if let Some(progress) = self.provider_wait_progress() {
+            return (state, Some(progress));
+        }
         (state, detail)
+    }
+
+    /// Interactive provider-open progress for the existing status line. The
+    /// provider roster carries custom overrides; absent facts retain the
+    /// lane-O 60-second default.
+    #[must_use]
+    pub fn provider_wait_progress(&self) -> Option<String> {
+        if !self.projection.is_thinking() {
+            return None;
+        }
+        let started_at_ms = self.provider_wait_started_at_ms?;
+        let budget_ms = self
+            .providers
+            .providers
+            .iter()
+            .find(|summary| summary.provider == self.identity.provider)
+            .and_then(|summary| summary.response_open_timeout_ms)
+            .unwrap_or(60_000);
+        let elapsed_ms = self.clock_ms.saturating_sub(started_at_ms).min(budget_ms);
+        let remaining_ms = budget_ms.saturating_sub(elapsed_ms);
+        Some(format!(
+            "waiting for provider · {} elapsed · {} left",
+            crate::format::fmt_elapsed(elapsed_ms),
+            crate::format::fmt_elapsed(remaining_ms)
+        ))
     }
 
     /// TUI4d item 14 — TRUE while ANY pulsing element is on screen: the
@@ -13218,7 +13252,13 @@ impl AppModel {
                     crate::session::chip_apply(chip, payload, at_ms);
                 }
             }
-            Destination::Session => self.handle_envelope(payload),
+            Destination::Session => {
+                if let EventPayload::RunState(state) = payload {
+                    self.provider_wait_started_at_ms =
+                        matches!(state, RunState::Thinking).then_some(at_ms);
+                }
+                self.handle_envelope(payload);
+            }
         }
     }
 

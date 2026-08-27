@@ -1,21 +1,33 @@
 #![allow(clippy::expect_used)]
 
+use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
-use haider_protocol::error::ErrorCode;
+use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::headless::{
     HeadlessRunEventPayload, HeadlessRunSpecV1, HeadlessRunUsageV1, RunBudgetDimensionV1,
     RunBudgetExhaustedV1, RunBudgetV1,
 };
-use haider_protocol::ids::{RunId, SessionId};
+use haider_protocol::ids::{DeviceId, EventId, RunId, SessionId};
 use haider_protocol::session::SessionPermissionOverridesV1;
 use haider_protocol::state::{RunState, SessionState};
+use haider_provider::{FakeProvider, Provider, ProviderError, ProviderStream, TurnRequest};
 use haider_store::{EventStore, Store};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::time::{Duration, Instant, timeout};
 
+use crate::session_hub::{SessionHub, SessionHubConfig};
 use crate::turn_recovery::{
     STARTUP_HYDRATION_PAYLOAD_KINDS, interrupted_recovery_payloads_for_test,
 };
-use crate::worker::{budget_usage_from_envelopes_for_test, exhausted_budget};
+use crate::worker::{
+    BrokerToolFactory, ProviderFactory, ResolvedTurnProvider, WorkerDependencies, WorkerManager,
+    budget_usage_from_envelopes_for_test, exhausted_budget,
+};
+use haider_core::{SessionCreateCommand, SqliteStoreHandle, StoreHandle, TurnAcceptCommand};
+use haider_protocol::session::SessionMetadataV1;
 
 fn envelope(seq: u64, run_id: &RunId, payload: serde_json::Value) -> RawEnvelope {
     serde_json::from_value(serde_json::json!({
@@ -49,6 +61,7 @@ fn headless_spec() -> HeadlessRunSpecV1 {
             max_time_ms: Some(25),
             ..RunBudgetV1::default()
         },
+        request_deadline_unix_ms: None,
         replay_of: None,
     }
 }
@@ -517,4 +530,252 @@ fn a_budget_fact_without_headless_configuration_cannot_override_cancellation() {
         .append_worker(&mut budget_terminal)
         .expect_err("unconfigured budget terminal must not override cancellation");
     assert_eq!(error.code, ErrorCode::RunNotActive);
+}
+
+struct NeverOpensProvider {
+    fallback: FakeProvider,
+    requests: AtomicUsize,
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl NeverOpensProvider {
+    fn new(in_flight: Arc<AtomicUsize>) -> Self {
+        Self {
+            fallback: FakeProvider::new(Vec::new()),
+            requests: AtomicUsize::new(0),
+            in_flight,
+        }
+    }
+}
+
+struct InFlightRequest(Arc<AtomicUsize>);
+
+impl Drop for InFlightRequest {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for NeverOpensProvider {
+    async fn capabilities(&self) -> haider_protocol::provider::CapabilityDoc {
+        self.fallback.capabilities().await
+    }
+
+    async fn stream_turn(&self, _request: TurnRequest) -> Result<ProviderStream, ProviderError> {
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        let _guard = InFlightRequest(Arc::clone(&self.in_flight));
+        std::future::pending().await
+    }
+}
+
+struct DeadlineProviderFactory {
+    provider: Arc<NeverOpensProvider>,
+}
+
+#[async_trait::async_trait]
+impl ProviderFactory for DeadlineProviderFactory {
+    async fn resolve_for_turn(
+        &self,
+        metadata: &SessionMetadataV1,
+    ) -> Result<ResolvedTurnProvider, HaiderError> {
+        Ok(ResolvedTurnProvider {
+            provider: Arc::clone(&self.provider) as Arc<dyn Provider>,
+            provider_name: metadata.provider.clone(),
+            model: metadata.model.clone(),
+            context_window: None,
+            account_alias: None,
+            initial_rotation: None,
+            rotation_budget_consumed: false,
+            attempt_resolver: None,
+            compaction_promotion: None,
+        })
+    }
+}
+
+/// Gate regression: a provider that never returns response headers is stopped
+/// early enough for the durable structured failure and terminal state to reach
+/// a headless client before the three-second run deadline. Dropping the open
+/// future must also release its request guard.
+#[tokio::test]
+async fn never_opening_provider_terminalizes_before_headless_run_deadline() {
+    let root = tempfile::tempdir().expect("temp profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(NeverOpensProvider::new(Arc::clone(&in_flight)));
+    let manager = WorkerManager::start(
+        hub.clone(),
+        WorkerDependencies {
+            diagnostics: None,
+            provider_factory: Arc::new(DeadlineProviderFactory {
+                provider: Arc::clone(&provider),
+            }),
+            tool_factory: Arc::new(BrokerToolFactory),
+            delegation: None,
+            web_search: None,
+        },
+        false,
+    );
+    hub.install_worker_manager(manager.handle())
+        .expect("install worker manager");
+
+    let session_id = SessionId::new("deadline-provider-session");
+    let run_id = RunId::new("deadline-provider-run");
+    let device_id = DeviceId::new("deadline-provider-device");
+    let cwd = std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+        .expect("canonical cwd")
+        .to_string_lossy()
+        .into_owned();
+    hub.create_internal_session(SessionCreateCommand {
+        command_id: "deadline-provider-create".into(),
+        request_digest: "deadline-provider-create-digest".into(),
+        request_json: r#"{"session":"deadline-provider"}"#.into(),
+        session_id: session_id.clone(),
+        cwd: cwd.clone(),
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 64,
+        permission_overrides: None,
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
+        event_id: EventId::new("deadline-provider-created"),
+        device_id: device_id.clone(),
+    })
+    .await
+    .expect("create session");
+    let request_deadline_unix_ms = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock after Unix epoch")
+            .as_millis(),
+    )
+    .expect("test epoch milliseconds fit u64")
+    .saturating_add(3_000);
+    let spec = HeadlessRunSpecV1 {
+        cwd,
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_output_tokens: 64,
+        effort: None,
+        fast: false,
+        seed: None,
+        permission_overrides: SessionPermissionOverridesV1::default(),
+        trust_hooks: false,
+        budget: RunBudgetV1 {
+            max_time_ms: Some(5_000),
+            ..RunBudgetV1::default()
+        },
+        request_deadline_unix_ms: Some(request_deadline_unix_ms),
+        replay_of: None,
+    };
+    let request_json = serde_json::json!({
+        "session_id": &session_id,
+        "text": "never open",
+        "headless": spec,
+    })
+    .to_string();
+    let accepted = hub
+        .accept_internal_turn(TurnAcceptCommand {
+            command_id: "deadline-provider-turn".into(),
+            request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+            request_json,
+            session_id: session_id.clone(),
+            worker_generation: store.worker_generation(),
+            run_id: run_id.clone(),
+            agent_id: None,
+            branch_id: None,
+            text: "never open".into(),
+            attachments: Vec::new(),
+            mode: DeliveryMode::Queue,
+            queued_event_id: EventId::new("deadline-provider-queued"),
+            user_event_id: EventId::new("deadline-provider-user"),
+            active_event_id: EventId::new("deadline-provider-active"),
+            device_id,
+        })
+        .await
+        .expect("accept headless turn");
+    let started = Instant::now();
+    manager
+        .handle()
+        .submit(accepted)
+        .await
+        .expect("submit headless turn");
+
+    let failure = timeout(Duration::from_millis(2_900), async {
+        loop {
+            let events = store.read(&session_id, 0, 512).await.expect("read run");
+            let failure = events
+                .iter()
+                .filter(|event| event.run_id.as_ref() == Some(&run_id))
+                .find_map(|event| {
+                    serde_json::from_value::<EventPayload>(event.payload.clone())
+                        .ok()
+                        .and_then(|payload| match payload {
+                            EventPayload::RunFailed {
+                                code,
+                                message,
+                                retryable,
+                                presentation,
+                            } => Some((code, message, retryable, presentation)),
+                            _ => None,
+                        })
+                });
+            let terminal = events.iter().any(|event| {
+                event.run_id.as_ref() == Some(&run_id)
+                    && serde_json::from_value::<EventPayload>(event.payload.clone())
+                        .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Errored))
+            });
+            if let Some(unexpected) = events
+                .iter()
+                .filter(|event| event.run_id.as_ref() == Some(&run_id))
+                .filter_map(|event| {
+                    serde_json::from_value::<EventPayload>(event.payload.clone()).ok()
+                })
+                .find(|payload| {
+                    matches!(
+                        payload,
+                        EventPayload::RunState(state)
+                            if state.is_terminal() && *state != RunState::Errored
+                    )
+                })
+            {
+                panic!("never-opening provider reached the wrong terminal: {unexpected:?}");
+            }
+            if let Some(failure) = failure.filter(|_| terminal) {
+                break failure;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("structured terminal arrives before the three-second deadline");
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(failure.0, ErrorCode::ProviderTimeout);
+    assert!(failure.1.contains("reason=deadline_exhausted"));
+    assert!(!failure.2, "no full retry can fit before the deadline");
+    assert_eq!(
+        failure
+            .3
+            .as_ref()
+            .expect("typed provider-timeout presentation")
+            .subcode
+            .as_str(),
+        "provider-timeout"
+    );
+    timeout(Duration::from_millis(250), async {
+        while in_flight.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("timed-out provider request is not orphaned");
+    assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
+
+    manager.shutdown().await.expect("manager shutdown");
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
 }

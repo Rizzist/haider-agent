@@ -204,6 +204,41 @@ fn assert_request_boundary_golden(payloads: &[EventPayload]) {
     ));
 }
 
+#[test]
+fn provider_timeout_retry_requires_a_full_post_backoff_budget() {
+    let provider_budget_ms = 5_000;
+    let timeout = ProviderError::new(ProviderErrorKind::Transport, "provider timeout")
+        .with_presentation(ErrorPresentation::new(
+            "provider-timeout",
+            "Provider request timed out",
+            "The provider did not open in time.",
+            ErrorScope::Turn,
+            [ErrorAction::Retry],
+        ))
+        .with_timeout_budget(provider_budget_ms, provider_budget_ms)
+        .with_retry_after_ms(Some(250));
+    let run_id = RunId::new("provider-timeout-retry-budget");
+
+    let mut roomy = timeout.clone();
+    assert!(provider_error_allows_retry(
+        &mut roomy,
+        Some(tokio::time::Instant::now() + std::time::Duration::from_secs(7)),
+        &run_id,
+        1,
+    ));
+    assert!(roomy.retryable);
+
+    let mut short = timeout;
+    assert!(!provider_error_allows_retry(
+        &mut short,
+        Some(tokio::time::Instant::now() + std::time::Duration::from_secs(5)),
+        &run_id,
+        1,
+    ));
+    assert!(!short.retryable);
+    assert_eq!(short.presentation.allowed_actions, vec![ErrorAction::None]);
+}
+
 fn completed_extension_item<'a>(payloads: &'a [EventPayload], expected_kind: &str) -> &'a TurnItem {
     payloads
         .iter()

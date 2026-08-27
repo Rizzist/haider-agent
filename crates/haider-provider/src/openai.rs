@@ -18,7 +18,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use haider_accounts::SecretHandle;
 use haider_protocol::computer::{ComputerAction, ScreenPoint, ScrollDirection};
-use haider_protocol::error::{ErrorAction, ErrorPresentation, ErrorScope};
 use haider_protocol::ids::CredentialAlias;
 use haider_protocol::provider::{
     Block, CacheStatAvailability, CapabilityDoc, FeatureResolve, FinishReason, NormalizedUsage,
@@ -6194,8 +6193,9 @@ fn transport_error_with_config(
         error.message = format!(
             "OpenAI connection did not open within the configured connect budget; opened_within_ms={budget_ms} budget_ms={budget_ms}"
         );
-        error.presentation = provider_timeout_presentation();
+        error.presentation = crate::provider_timeout_presentation();
         error = error.with_timeout_budget(budget_ms, budget_ms);
+        error.retryable = full_request_budget_fits(transport_config.connect_timeout);
     }
     error
 }
@@ -6220,10 +6220,18 @@ async fn response_before_deadline<T>(
     timeout: Duration,
     opening: impl Future<Output = Result<T, ProviderError>>,
 ) -> Result<T, ProviderError> {
+    let selected = request_phase_budget(timeout)?;
     let started = tokio::time::Instant::now();
-    match tokio::time::timeout(timeout, opening).await {
+    match tokio::time::timeout(selected, opening).await {
         Ok(result) => result,
-        Err(_) => Err(response_open_timeout_error(timeout, started.elapsed())),
+        Err(_) if selected < timeout => {
+            Err(crate::deadline_exhausted_error(selected, started.elapsed()))
+        }
+        Err(_) => {
+            let mut error = response_open_timeout_error(timeout, started.elapsed());
+            error.retryable = full_request_budget_fits(timeout);
+            Err(error)
+        }
     }
 }
 
@@ -6231,10 +6239,40 @@ async fn connect_before_deadline<T>(
     timeout: Duration,
     connecting: impl Future<Output = Result<T, ProviderError>>,
 ) -> Result<T, ProviderError> {
-    match tokio::time::timeout(timeout, connecting).await {
+    let selected = request_phase_budget(timeout)?;
+    let started = tokio::time::Instant::now();
+    match tokio::time::timeout(selected, connecting).await {
         Ok(result) => result,
-        Err(_) => Err(connect_timeout_error(timeout)),
+        Err(_) if selected < timeout => {
+            Err(crate::deadline_exhausted_error(selected, started.elapsed()))
+        }
+        Err(_) => {
+            let mut error = connect_timeout_error(timeout);
+            error.retryable = full_request_budget_fits(timeout);
+            Err(error)
+        }
     }
+}
+
+fn request_phase_budget(configured: Duration) -> Result<Duration, ProviderError> {
+    crate::effective_request_budget(
+        configured,
+        crate::current_provider_deadline_remaining(),
+        crate::PROVIDER_DEADLINE_SAFETY_MARGIN,
+    )
+    .map_err(|crate::ProviderTimeoutReason::DeadlineExhausted| {
+        crate::deadline_exhausted_error(Duration::ZERO, Duration::ZERO)
+    })
+}
+
+fn full_request_budget_fits(configured: Duration) -> bool {
+    let remaining = crate::current_provider_deadline_remaining();
+    crate::effective_request_budget(
+        configured,
+        remaining,
+        crate::PROVIDER_DEADLINE_SAFETY_MARGIN,
+    )
+    .is_ok_and(|selected| selected == configured)
 }
 
 fn connect_timeout_error(timeout: Duration) -> ProviderError {
@@ -6245,7 +6283,7 @@ fn connect_timeout_error(timeout: Duration) -> ProviderError {
             "OpenAI connection preflight did not finish within the configured connect budget; opened_within_ms={budget_ms} budget_ms={budget_ms}"
         ),
     )
-    .with_presentation(provider_timeout_presentation())
+    .with_presentation(crate::provider_timeout_presentation())
     .with_timeout_budget(budget_ms, budget_ms)
 }
 
@@ -6258,7 +6296,7 @@ fn response_open_timeout_error(timeout: Duration, elapsed: Duration) -> Provider
             "OpenAI response did not open within the configured response-open budget; opened_within_ms={opened_within_ms} budget_ms={budget_ms}"
         ),
     )
-    .with_presentation(provider_timeout_presentation())
+    .with_presentation(crate::provider_timeout_presentation())
     .with_timeout_budget(opened_within_ms, budget_ms)
 }
 
@@ -6270,18 +6308,8 @@ fn stream_idle_error(timeout: Duration) -> ProviderError {
             "OpenAI SSE stream received no data within the configured idle budget; opened_within_ms={budget_ms} budget_ms={budget_ms}"
         ),
     )
-    .with_presentation(provider_timeout_presentation())
+    .with_presentation(crate::provider_timeout_presentation())
     .with_timeout_budget(budget_ms, budget_ms)
-}
-
-fn provider_timeout_presentation() -> ErrorPresentation {
-    ErrorPresentation::new(
-        "provider-timeout",
-        "Provider request timed out",
-        "Haider stopped waiting for the provider before the run deadline.",
-        ErrorScope::Turn,
-        [ErrorAction::Retry],
-    )
 }
 
 fn invalid_request(message: impl Into<String>) -> ProviderError {

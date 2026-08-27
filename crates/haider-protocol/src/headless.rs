@@ -61,6 +61,11 @@ pub struct HeadlessRunSpecV1 {
     pub trust_hooks: bool,
     #[serde(default, skip_serializing_if = "RunBudgetV1::is_empty")]
     pub budget: RunBudgetV1,
+    /// Absolute client/run deadline. Unlike `budget.max_time_ms`, which starts
+    /// at durable acceptance, this preserves time already spent connecting
+    /// and configuring a `haider run --timeout` request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_deadline_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_of: Option<RunId>,
 }

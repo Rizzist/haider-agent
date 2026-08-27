@@ -11047,7 +11047,7 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
     // block (model / auth / reasoning) moved to the composer's top rule.
     // Narrow dignity: the meter YIELDS whole when the bar cannot hold it
     // beside the badge (the badge always survives, never clipped chrome).
-    let badge_cells = 1 + badge.chars().count() + 4;
+    let mut badge_cells = 1 + badge.chars().count() + 4;
     let mut segments = vec![
         StatusSegment {
             text: " ".to_owned(),
@@ -11074,6 +11074,17 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
             detail: None,
         },
     ];
+    if let Some(progress) = model.provider_wait_progress()
+        && badge_cells + progress.chars().count() + 2 <= width as usize
+    {
+        badge_cells += progress.chars().count() + 2;
+        segments.push(StatusSegment {
+            text: format!("  {progress}"),
+            tone: StatusSegmentTone::Dim,
+            state: None,
+            detail: None,
+        });
+    }
     let meter_shown = badge_cells + 2 + meter.chars().count() <= width as usize;
     if meter_shown {
         segments.push(StatusSegment {

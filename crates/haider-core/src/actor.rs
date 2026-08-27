@@ -83,10 +83,11 @@ use haider_protocol::tool::{
 };
 use haider_protocol::verify::VerifyVerdict;
 use haider_provider::{
-    Message, PromptCacheMetadata, Provider, ProviderError, ProviderErrorKind, ResolvedAttachment,
-    ToolDefinition, TurnRequest, apply_tool_result_image_budget, canonical_tool_definitions,
+    Message, PROVIDER_DEADLINE_SAFETY_MARGIN, PromptCacheMetadata, Provider, ProviderError,
+    ProviderErrorKind, ResolvedAttachment, ToolDefinition, TurnRequest,
+    apply_tool_result_image_budget, before_provider_request_deadline, canonical_tool_definitions,
     canonical_tool_definitions_digest, degrade_tool_result_images_to_placeholders,
-    validate_provider_view_prefix,
+    effective_request_budget, validate_provider_view_prefix,
 };
 use haider_tools::{Plan, RequestInput, TodoWrite};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -193,6 +194,10 @@ pub struct HarnessConfig {
     pub worker_generation: u64,
     pub model: String,
     pub max_tokens: u64,
+    /// Absolute deadline for provider-open work in this logical turn. The
+    /// daemon derives it from headless/client budgets; interactive sessions
+    /// leave it absent and retain provider-local timeout defaults.
+    pub provider_deadline: Option<tokio::time::Instant>,
     /// Provider-declared active-model context window. `None` stays unknown;
     /// inferred adapter tables are not authoritative for compaction policy.
     pub context_window: Option<u64>,
@@ -360,6 +365,7 @@ impl HarnessConfig {
             worker_generation,
             model: "fake-model".into(),
             max_tokens: 4096,
+            provider_deadline: None,
             context_window: None,
             reserved_output_tokens: 4096,
             cached_input_is_subset: true,
@@ -2932,8 +2938,10 @@ impl HarnessActor {
             cache_rewarm_pending = None;
             let mut request_usage: Option<Usage> = None;
             let attempt_provider = Arc::clone(&provider);
-            let mut opening =
-                Box::pin(attempt_provider.stream_prepared_turn_ref(&provider_request, prepared));
+            let mut opening = Box::pin(before_provider_request_deadline(
+                self.config.provider_deadline,
+                attempt_provider.stream_prepared_turn_ref(&provider_request, prepared),
+            ));
             let mut stream = loop {
                 let opened = tokio::select! {
                     biased;
@@ -4289,7 +4297,7 @@ impl HarnessActor {
         capability_fallback_consumed: &mut bool,
         provider_pair_switch_ordinal: &mut u32,
         thinking_pending: &mut bool,
-        error: ProviderError,
+        mut error: ProviderError,
     ) -> Result<(), DriveError> {
         let hosted_fallback = error.presentation.subcode.as_str() == "provider-web-tool-rejected"
             && !*capability_fallback_consumed;
@@ -4430,7 +4438,13 @@ impl HarnessActor {
                 }
             }
         }
-        if provider_error_allows_retry(&error) && *provider_attempt < MAX_API_RETRIES {
+        if provider_error_allows_retry(
+            &mut error,
+            self.config.provider_deadline,
+            context.run_id,
+            *provider_attempt,
+        ) && *provider_attempt < MAX_API_RETRIES
+        {
             self.wait_before_provider_retry(
                 context.run_id,
                 context.cancel,
@@ -4944,6 +4958,7 @@ impl HarnessActor {
                 retry_after_ms: error.retry_after_ms,
                 opened_within_ms: error.opened_within_ms,
                 budget_ms: error.budget_ms,
+                timeout_reason: error.timeout_reason,
                 presentation: error.presentation.clone(),
             };
             return Err(DriveError::Provider(capped));
@@ -8273,6 +8288,7 @@ fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {
         "retry_after_ms": provider_error.retry_after_ms,
         "opened_within_ms": provider_error.opened_within_ms,
         "budget_ms": provider_error.budget_ms,
+        "reason": provider_error.timeout_reason,
     }));
     error.presentation = Some(provider_error.presentation);
     error
@@ -8577,15 +8593,52 @@ pub fn presentation_for_haider_error(error: &HaiderError) -> ErrorPresentation {
     )
 }
 
-fn provider_error_allows_retry(error: &ProviderError) -> bool {
-    error.retryable
-        && matches!(
+fn provider_error_allows_retry(
+    error: &mut ProviderError,
+    deadline: Option<tokio::time::Instant>,
+    run_id: &RunId,
+    failed_attempt: usize,
+) -> bool {
+    if !error.retryable
+        || !matches!(
             error.kind,
             ProviderErrorKind::Transport
                 | ProviderErrorKind::StreamInterrupted
                 | ProviderErrorKind::RateLimited
                 | ProviderErrorKind::Overloaded
         )
+    {
+        return false;
+    }
+    let Some(deadline) = deadline else {
+        return true;
+    };
+    if error.presentation.subcode.as_str() != "provider-timeout" {
+        return true;
+    }
+    let Some(budget_ms) = error.budget_ms else {
+        error.retryable = false;
+        error.presentation.allowed_actions = vec![ErrorAction::None];
+        return false;
+    };
+    let delay_ms = error
+        .retry_after_ms
+        .unwrap_or_else(|| retry_jittered_backoff_ms(run_id, failed_attempt));
+    let remaining_after_delay = deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .saturating_sub(std::time::Duration::from_millis(delay_ms));
+    let provider_budget = std::time::Duration::from_millis(budget_ms);
+    let can_retry = effective_request_budget(
+        provider_budget,
+        Some(remaining_after_delay),
+        PROVIDER_DEADLINE_SAFETY_MARGIN,
+    )
+    .is_ok_and(|selected| selected == provider_budget);
+    if !can_retry {
+        error.retryable = false;
+        error.presentation.allowed_actions = vec![ErrorAction::None];
+    }
+    can_retry
 }
 
 /// Transport failures never require a user decision. Before any provider
