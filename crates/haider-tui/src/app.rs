@@ -965,7 +965,7 @@ impl CustomProviderCard {
         let fields = match (self.kind, self.discover_models, self.edit, self.keyless) {
             (CustomCardKind::Generic, true, _, false) => GENERIC_DISCOVERY_KEYED,
             (CustomCardKind::Generic, true, _, true) => GENERIC_DISCOVERY_KEYLESS,
-            (CustomCardKind::Generic, false, true, _) => GENERIC_EDIT,
+            (CustomCardKind::Generic | CustomCardKind::Azure, false, true, _) => GENERIC_EDIT,
             (CustomCardKind::Generic | CustomCardKind::Azure, false, false, _) => GENERIC_CREATE,
             (CustomCardKind::Bedrock, _, _, _) => BEDROCK,
             (CustomCardKind::Vertex, _, _, _) => VERTEX,

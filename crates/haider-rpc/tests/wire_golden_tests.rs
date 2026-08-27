@@ -2137,7 +2137,7 @@ fn account_methods_are_kind_tagged_and_unknown_field_tolerant() {
         other => panic!("expected AccountLoginApi, got {other:?}"),
     }
     let replacing = RequestBody::AccountLoginApi {
-        command_id: CommandId::new("replace-key"),
+        command_id: haider_rpc::CommandId::new("replace-key"),
         provider: "router".into(),
         alias: Some("router".into()),
         vault_reference: "opaque-stage-reference".into(),

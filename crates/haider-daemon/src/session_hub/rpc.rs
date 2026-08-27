@@ -24,6 +24,7 @@ use haider_protocol::item::ItemEvent;
 use haider_protocol::menu::{Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::permission::{PermissionEventPayload, SystemPermission};
 use haider_protocol::state::RunState;
+use haider_rpc::{ERROR_CODE_RESTAGE_REQUIRED, ProviderSummaryWire};
 use haider_tools::MessageSubagent;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
