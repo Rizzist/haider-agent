@@ -323,6 +323,17 @@ pub struct HarnessConfig {
     started_at_ms: Option<u64>,
 }
 
+/// Immutable daemon-cached tool packs installed together for one provider lane.
+#[derive(Debug, Clone)]
+pub struct SharedToolPacks {
+    pub base: Arc<[ToolDefinition]>,
+    pub local_web_tool_names: Vec<String>,
+    pub current: Arc<[ToolDefinition]>,
+    pub current_digest: String,
+    pub fallback: Option<(Arc<[ToolDefinition]>, String)>,
+    pub variants: HashMap<Vec<String>, (Arc<[ToolDefinition]>, String)>,
+}
+
 impl HarnessConfig {
     /// Convenience constructor with v0 defaults (fake model, small channels).
     pub fn for_session(
@@ -515,14 +526,17 @@ impl HarnessConfig {
     /// Pair switches can still derive a new selection from the shared base.
     pub fn install_shared_tool_packs(
         &mut self,
-        base: Arc<[ToolDefinition]>,
-        local_web_tool_names: Vec<String>,
-        current: Arc<[ToolDefinition]>,
-        current_digest: String,
-        fallback: Option<(Arc<[ToolDefinition]>, String)>,
-        variants: HashMap<Vec<String>, (Arc<[ToolDefinition]>, String)>,
+        packs: SharedToolPacks,
         state: &ProviderDerivedRequestState,
     ) {
+        let SharedToolPacks {
+            base,
+            local_web_tool_names,
+            current,
+            current_digest,
+            fallback,
+            variants,
+        } = packs;
         self.provider_local_web_tools.clear();
         self.shared_provider_local_web_tool_names = local_web_tool_names;
         self.provider_tool_base = None;
@@ -9981,12 +9995,14 @@ mod cu1_actor_tests {
             provider_fallback_local_web_tool_names: Vec::new(),
         };
         config.install_shared_tool_packs(
-            Arc::clone(&base),
-            Vec::new(),
-            Arc::clone(&base),
-            digest.clone(),
-            None,
-            variants,
+            SharedToolPacks {
+                base: Arc::clone(&base),
+                local_web_tool_names: Vec::new(),
+                current: Arc::clone(&base),
+                current_digest: digest.clone(),
+                fallback: None,
+                variants,
+            },
             &initial,
         );
 

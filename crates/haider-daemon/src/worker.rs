@@ -67,12 +67,12 @@ use haider_core::{
     GraphSwitchCommand, GraphSwitchOutcome, HarnessActor, HarnessConfig, PartialStreamCheckpoint,
     PreviousCacheRequest, ProcessSignalCommand, ProcessSignalOutcome, PromptHistoryCompiler,
     ProviderDerivedRequestState, ProviderPairSwitch, ProviderPairSwitchCommitter,
-    RequestInputCheckpoint, SessionSelectModelCommand, SessionSelectModelOutcome, StoreHandle,
-    SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn,
-    ToolDispatchResult, ToolDispatcher, TurnHandle, build_cache_request_diagnostic,
-    classify_cache_request, context_soft_threshold_tokens, effect_recovery_evidence,
-    estimate_provider_request_input_tokens, presentation_for_haider_error,
-    sanitized_failure_message,
+    RequestInputCheckpoint, SessionSelectModelCommand, SessionSelectModelOutcome, SharedToolPacks,
+    StoreHandle, SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn,
+    SubmitPartialStreamTurn, ToolDispatchResult, ToolDispatcher, TurnHandle,
+    build_cache_request_diagnostic, classify_cache_request, context_soft_threshold_tokens,
+    effect_recovery_evidence, estimate_provider_request_input_tokens,
+    presentation_for_haider_error, sanitized_failure_message,
 };
 use haider_protocol::agent::Grant;
 use haider_protocol::cache::{
@@ -5792,12 +5792,14 @@ async fn start_turn(
         provider_tool_variants.insert(names, (Arc::clone(&pack.definitions), pack.digest.clone()));
     }
     config.install_shared_tool_packs(
-        Arc::clone(&provider_tool_base.definitions),
-        local_web_tool_names,
-        Arc::clone(&provider_tools.definitions),
-        provider_tools.digest.clone(),
-        provider_fallback_tools,
-        provider_tool_variants,
+        SharedToolPacks {
+            base: Arc::clone(&provider_tool_base.definitions),
+            local_web_tool_names,
+            current: Arc::clone(&provider_tools.definitions),
+            current_digest: provider_tools.digest.clone(),
+            fallback: provider_fallback_tools,
+            variants: provider_tool_variants,
+        },
         &provider_request_state,
     );
     // Cache prefix law: common policy + the manual for the exact advertised
