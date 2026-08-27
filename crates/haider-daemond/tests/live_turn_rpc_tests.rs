@@ -33,7 +33,9 @@ use haider_protocol::envelope::{
 };
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::hook::HookEventPayload;
-use haider_protocol::ids::{ArtifactRef, DeviceId, EffectId, EventId, RunId, SessionId};
+#[cfg(windows)]
+use haider_protocol::ids::ItemId;
+use haider_protocol::ids::{ArtifactRef, DeviceId, EffectId, EventId, MenuId, RunId, SessionId};
 use haider_protocol::item::{ItemDelta, ItemEvent, OutputStream, TurnItem, UserCommandOriginV1};
 use haider_protocol::menu::{Menu, MenuAnswer};
 use haider_protocol::provider::{
@@ -98,6 +100,59 @@ struct FakeFactory {
     fake: Arc<FakeProvider>,
 }
 
+trait FakeRequestCounter {
+    fn request_count(&self) -> usize;
+}
+
+impl<T> FakeRequestCounter for Arc<T>
+where
+    T: FakeRequestCounter + ?Sized,
+{
+    fn request_count(&self) -> usize {
+        self.as_ref().request_count()
+    }
+}
+
+impl FakeRequestCounter for FakeProvider {
+    fn request_count(&self) -> usize {
+        self.requests().len()
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct WindowsExecFakeFactory {
+    active: Arc<StdMutex<Arc<FakeProvider>>>,
+    first_attempt: Arc<FakeProvider>,
+    retry: Arc<FakeProvider>,
+}
+
+#[cfg(windows)]
+impl WindowsExecFakeFactory {
+    fn arm_retry(&self) {
+        match self.active.lock() {
+            Ok(mut active) => *active = Arc::clone(&self.retry),
+            Err(poisoned) => *poisoned.into_inner() = Arc::clone(&self.retry),
+        }
+    }
+
+    fn first_attempt_request_count(&self) -> usize {
+        self.first_attempt.requests().len()
+    }
+
+    fn retry_request_count(&self) -> usize {
+        self.retry.requests().len()
+    }
+}
+
+#[cfg(windows)]
+impl FakeRequestCounter for WindowsExecFakeFactory {
+    fn request_count(&self) -> usize {
+        self.first_attempt_request_count()
+            .saturating_add(self.retry_request_count())
+    }
+}
+
 fn expected_request_usage(ordinal: u64, usage: &Usage) -> RequestUsage {
     RequestUsage {
         ordinal,
@@ -139,6 +194,31 @@ impl ProviderFactory for FakeFactory {
     }
 }
 
+#[cfg(windows)]
+#[async_trait]
+impl ProviderFactory for WindowsExecFakeFactory {
+    async fn resolve_for_turn(
+        &self,
+        metadata: &SessionMetadataV1,
+    ) -> Result<ResolvedTurnProvider, haider_protocol::error::HaiderError> {
+        let provider = match self.active.lock() {
+            Ok(active) => Arc::clone(&active),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        };
+        Ok(ResolvedTurnProvider {
+            provider,
+            provider_name: metadata.provider.clone(),
+            model: metadata.model.clone(),
+            context_window: None,
+            account_alias: None,
+            initial_rotation: None,
+            rotation_budget_consumed: false,
+            attempt_resolver: None,
+            compaction_promotion: None,
+        })
+    }
+}
+
 fn fake_dependencies(script: Vec<FakeStep>) -> (DaemonDependencies, Arc<FakeProvider>) {
     fake_dependencies_for_provider(script, "fake")
 }
@@ -152,6 +232,28 @@ fn fake_dependencies_for_provider(
         provider_factory: ProviderFactoryConfig::Injected {
             factory: Arc::new(FakeFactory { fake: fake.clone() }),
             providers: std::collections::BTreeSet::from([provider_name.to_owned()]),
+        },
+        ..DaemonDependencies::default()
+    };
+    (dependencies, fake)
+}
+
+#[cfg(windows)]
+fn windows_exec_fake_dependencies(
+    first_attempt_script: Vec<FakeStep>,
+    retry_script: Vec<FakeStep>,
+) -> (DaemonDependencies, Arc<WindowsExecFakeFactory>) {
+    let first_attempt = Arc::new(FakeProvider::new(first_attempt_script));
+    let retry = Arc::new(FakeProvider::new(retry_script));
+    let fake = Arc::new(WindowsExecFakeFactory {
+        active: Arc::new(StdMutex::new(Arc::clone(&first_attempt))),
+        first_attempt,
+        retry,
+    });
+    let dependencies = DaemonDependencies {
+        provider_factory: ProviderFactoryConfig::Injected {
+            factory: fake.clone(),
+            providers: std::collections::BTreeSet::from(["fake".to_owned()]),
         },
         ..DaemonDependencies::default()
     };
@@ -653,36 +755,57 @@ const OBSERVED_FRAME_TRACE_LIMIT: usize = 200;
 #[cfg(windows)]
 struct WindowsProcessStartTrace {
     test_name: &'static str,
+    run_id: RunId,
     started_at: tokio::time::Instant,
     observed_frames: usize,
+    last_progress: Option<(bool, u64)>,
+    enabled: bool,
 }
 
 #[cfg(windows)]
 impl WindowsProcessStartTrace {
     fn new(test_name: &'static str, run_id: &RunId, heartbeat: &std::path::Path) -> Self {
-        eprintln!(
-            "haider-daemond windows-process test={test_name} phase=first-start-wait-begin run_id={run_id} heartbeat={} exists={}",
-            heartbeat.display(),
-            heartbeat.exists(),
-        );
+        let enabled = windows_test_process_trace_enabled();
+        if enabled {
+            eprintln!(
+                "haider-daemond windows-process test={test_name} phase=first-start-wait-begin run_id={run_id} heartbeat={} exists={}",
+                heartbeat.display(),
+                heartbeat.exists(),
+            );
+        }
         Self {
             test_name,
+            run_id: run_id.clone(),
             started_at: tokio::time::Instant::now(),
             observed_frames: 0,
+            last_progress: None,
+            enabled,
         }
     }
 
-    fn heartbeat_started(&self, heartbeat: &std::path::Path) -> bool {
+    fn heartbeat_started(
+        &mut self,
+        heartbeat: &std::path::Path,
+        workspace: &std::path::Path,
+    ) -> bool {
         let bytes = fs::metadata(heartbeat).map_or(0, |metadata| metadata.len());
-        eprintln!(
-            "haider-daemond windows-process test={} phase=heartbeat-size bytes={bytes} elapsed_ms={}",
-            self.test_name,
-            self.started_at.elapsed().as_millis(),
-        );
+        let ps_alive = workspace.join("ps-alive.log").exists();
+        if self.enabled && self.last_progress != Some((ps_alive, bytes)) {
+            eprintln!(
+                "haider-daemond windows-process test={} phase=ps-alive exists={ps_alive} heartbeat_bytes={bytes} elapsed_ms={}",
+                self.test_name,
+                self.started_at.elapsed().as_millis(),
+            );
+            self.last_progress = Some((ps_alive, bytes));
+        }
         bytes > 1
     }
 
     fn observed_frame(&mut self, frame: &WireFrame) {
+        if !self.enabled {
+            return;
+        }
+        self.trace_run_event(frame);
         if self.observed_frames < OBSERVED_FRAME_TRACE_LIMIT {
             eprintln!(
                 "haider-daemond windows-process test={} phase=observed-frame kind={} elapsed_ms={}",
@@ -699,6 +822,108 @@ impl WindowsProcessStartTrace {
         }
         self.observed_frames = self.observed_frames.saturating_add(1);
     }
+
+    fn trace_run_event(&self, frame: &WireFrame) {
+        let WireFrame::Event { envelope, .. } = frame else {
+            return;
+        };
+        if envelope.run_id.as_ref() != Some(&self.run_id) {
+            return;
+        }
+        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+            return;
+        };
+        match payload {
+            EventPayload::RunState(state) => eprintln!(
+                "haider-daemond windows-process test={} phase=run-state seq={} state={state:?}",
+                self.test_name, envelope.seq,
+            ),
+            EventPayload::MenuOpened(menu) => eprintln!(
+                "haider-daemond windows-process test={} phase=menu-opened seq={} menu_id={} origin={}",
+                self.test_name, envelope.seq, menu.id, menu.origin,
+            ),
+            EventPayload::Item(ItemEvent::Delta {
+                delta: ItemDelta::CommandOutput { stream, chunk_b64 },
+                ..
+            }) => match BASE64.decode(chunk_b64) {
+                Ok(bytes) => {
+                    let capped_len = bytes.len().min(512);
+                    let decoded = String::from_utf8_lossy(&bytes[..capped_len]);
+                    eprintln!(
+                        "haider-daemond windows-process test={} phase=command-output seq={} stream={stream:?} bytes={} truncated={} decoded={decoded:?}",
+                        self.test_name,
+                        envelope.seq,
+                        bytes.len(),
+                        bytes.len() > capped_len,
+                    );
+                }
+                Err(error) => eprintln!(
+                    "haider-daemond windows-process test={} phase=command-output seq={} stream={stream:?} decode_error={error}",
+                    self.test_name, envelope.seq,
+                ),
+            },
+            _ => {}
+        }
+    }
+
+    fn failure_diagnostics(
+        &self,
+        workspace: &std::path::Path,
+        fake: &dyn FakeRequestCounter,
+        result: &Result<ProcessStartObservation, tokio::time::error::Elapsed>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        match result {
+            Err(error) => eprintln!(
+                "haider-daemond windows-process test={} phase=start-observation-failed result=Err({error:?})",
+                self.test_name,
+            ),
+            Ok(ProcessStartObservation::Failed { reason }) => eprintln!(
+                "haider-daemond windows-process test={} phase=start-observation-failed result=Failed reason={reason:?}",
+                self.test_name,
+            ),
+            _ => return,
+        }
+        eprintln!(
+            "haider-daemond windows-process test={} phase=workspace-listing entries={:?}",
+            self.test_name,
+            workspace_listing(workspace),
+        );
+        eprintln!(
+            "haider-daemond windows-process test={} phase=fake-requests count={}",
+            self.test_name,
+            fake.request_count(),
+        );
+    }
+}
+
+#[cfg(windows)]
+fn windows_test_process_trace_enabled() -> bool {
+    std::env::var("HAIDER_TEST_PROCESS_TRACE").is_ok_and(|value| value == "1")
+}
+
+#[cfg(windows)]
+fn workspace_listing(workspace: &std::path::Path) -> Vec<String> {
+    let entries = match fs::read_dir(workspace) {
+        Ok(entries) => entries,
+        Err(error) => return vec![format!("<read_dir failed: {error}>")],
+    };
+    let mut listing = entries
+        .map(|entry| match entry {
+            Ok(entry) => {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                match entry.metadata() {
+                    Ok(metadata) => format!("{name}:{}", metadata.len()),
+                    Err(error) => format!("{name}:<metadata failed: {error}>"),
+                }
+            }
+            Err(error) => format!("<entry failed: {error}>"),
+        })
+        .collect::<Vec<_>>();
+    listing.sort();
+    listing
 }
 
 #[cfg(windows)]
@@ -776,11 +1001,331 @@ fn observed_item_kind(event: &str, item: &TurnItem) -> String {
     }
 }
 
+#[cfg(windows)]
+const PROCESS_START_FAILURE_OUTPUT_TAIL: usize = 4 * 1024;
+
+#[cfg(windows)]
+struct WindowsExecStartObserver {
+    approved_menu: MenuId,
+    exec_item: Option<ItemId>,
+    exec_call_id: Option<String>,
+    tool_result: Option<(String, String)>,
+    output_tail: Vec<u8>,
+    stdout_tail: Vec<u8>,
+    stderr_tail: Vec<u8>,
+}
+
+#[cfg(windows)]
+impl WindowsExecStartObserver {
+    fn new(approved_menu: &MenuId) -> Self {
+        Self {
+            approved_menu: approved_menu.clone(),
+            exec_item: None,
+            exec_call_id: None,
+            tool_result: None,
+            output_tail: Vec::new(),
+            stdout_tail: Vec::new(),
+            stderr_tail: Vec::new(),
+        }
+    }
+
+    fn observe(
+        &mut self,
+        envelope: &RawEnvelope,
+        run_id: &RunId,
+    ) -> Option<ProcessStartObservation> {
+        if envelope.run_id.as_ref() != Some(run_id) {
+            return None;
+        }
+        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+            return None;
+        };
+        match payload {
+            EventPayload::MenuOpened(menu) if menu.id != self.approved_menu => {
+                Some(self.failed(format!(
+                    "second menu {} opened at seq {} before the exec start signal",
+                    menu.id, envelope.seq
+                )))
+            }
+            EventPayload::RunState(RunState::PermissionRequired { menu })
+                if menu != self.approved_menu =>
+            {
+                Some(self.failed(format!(
+                    "run re-entered PermissionRequired for second menu {menu} at seq {} before the exec start signal",
+                    envelope.seq
+                )))
+            }
+            EventPayload::RunState(state) if state.is_terminal() => {
+                Some(ProcessStartObservation::Terminal)
+            }
+            EventPayload::Item(ItemEvent::Started {
+                item_id,
+                item:
+                    TurnItem::ToolCall {
+                        call_id, name, ..
+                    },
+            }) if name == "exec" => {
+                self.exec_item = Some(item_id);
+                self.exec_call_id = Some(call_id);
+                None
+            }
+            EventPayload::Item(ItemEvent::Delta {
+                item_id,
+                delta: ItemDelta::CommandOutput { stream, chunk_b64 },
+            }) if self.exec_item.as_ref() == Some(&item_id) => {
+                let bytes = match BASE64.decode(chunk_b64) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        return Some(self.failed(format!(
+                            "exec command output at seq {} was not valid base64: {error}",
+                            envelope.seq
+                        )));
+                    }
+                };
+                self.output_tail.extend_from_slice(&bytes);
+                match stream {
+                    OutputStream::Stdout => self.stdout_tail.extend_from_slice(&bytes),
+                    OutputStream::Stderr => self.stderr_tail.extend_from_slice(&bytes),
+                }
+                let started = self
+                    .stdout_tail
+                    .windows(b"started".len())
+                    .any(|window| window == b"started");
+                retain_tail(&mut self.output_tail, PROCESS_START_FAILURE_OUTPUT_TAIL);
+                retain_tail(&mut self.stdout_tail, PROCESS_START_FAILURE_OUTPUT_TAIL);
+                retain_tail(&mut self.stderr_tail, PROCESS_START_FAILURE_OUTPUT_TAIL);
+                started.then_some(ProcessStartObservation::Started)
+            }
+            EventPayload::ToolResult { call_id, result }
+                if self.exec_call_id.as_deref() == Some(call_id.as_str()) =>
+            {
+                self.tool_result = Some((
+                    call_id,
+                    format!(
+                        "status={:?} reason={:?} preview={}",
+                        result.status, result.reason, result.preview
+                    ),
+                ));
+                None
+            }
+            // `ItemEvent` has one terminal variant; success versus failure is
+            // carried by the completed tool item's `ToolStatus`.
+            EventPayload::Item(ItemEvent::Completed {
+                item_id,
+                item:
+                    TurnItem::ToolCall {
+                        call_id,
+                        name,
+                        status,
+                        ..
+                    },
+            }) if name == "exec"
+                && self
+                    .exec_item
+                    .as_ref()
+                    .is_none_or(|exec_item| exec_item == &item_id) =>
+            {
+                Some(self.failed(format!(
+                    "exec tool-call {call_id} item {item_id} completed before the start signal with status {status:?}"
+                )))
+            }
+            _ => None,
+        }
+    }
+
+    fn failed(&self, reason: String) -> ProcessStartObservation {
+        let tool_result = self
+            .tool_result
+            .as_ref()
+            .map_or("<not observed>", |(_, result)| result.as_str());
+        let output = String::from_utf8_lossy(&self.output_tail);
+        let stderr = String::from_utf8_lossy(&self.stderr_tail);
+        ProcessStartObservation::Failed {
+            reason: format!(
+                "{reason}; tool_result={tool_result}; decoded_output={output:?}; decoded_stderr={stderr:?}"
+            ),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn retain_tail(bytes: &mut Vec<u8>, max_len: usize) {
+    if bytes.len() > max_len {
+        let tail = bytes.split_off(bytes.len() - max_len);
+        *bytes = tail;
+    }
+}
+
+#[cfg(windows)]
+fn process_start_observer_event(run_id: &RunId, seq: u64, payload: EventPayload) -> RawEnvelope {
+    let mut envelope = recovery_fixture_envelope(
+        &SessionId::new("process-start-observer-session"),
+        run_id,
+        1,
+        &format!("process-start-observer-event-{seq}"),
+        payload,
+        PromptRender::Omit,
+    );
+    envelope.seq = seq;
+    envelope
+}
+
+#[cfg(windows)]
+fn process_start_observer_menu(id: MenuId) -> Menu {
+    Menu {
+        id,
+        kind: haider_protocol::menu::MenuKind::Permission {
+            effect_summary: "run fixture command".into(),
+        },
+        title: "Allow fixture?".into(),
+        body: Vec::new(),
+        options: Vec::new(),
+        blocking: true,
+        scope: haider_protocol::menu::MenuScope::Session,
+        origin: "process-start-observer-test".into(),
+        ttl_ms: None,
+        timeout_option: None,
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn process_start_observer_surfaces_second_permission_and_terminal_exec_text() {
+    let run_id = RunId::new("process-start-observer-run");
+    let approved_menu = MenuId::new("process-start-observer-approved");
+    let second_menu = MenuId::new("process-start-observer-second");
+    let mut permissions = WindowsExecStartObserver::new(&approved_menu);
+    assert_eq!(
+        permissions.observe(
+            &process_start_observer_event(
+                &run_id,
+                1,
+                EventPayload::MenuOpened(process_start_observer_menu(approved_menu.clone())),
+            ),
+            &run_id,
+        ),
+        None,
+        "replay of the approved menu is not a second permission"
+    );
+    assert!(matches!(
+        permissions.observe(
+            &process_start_observer_event(
+                &run_id,
+                2,
+                EventPayload::MenuOpened(process_start_observer_menu(second_menu.clone())),
+            ),
+            &run_id,
+        ),
+        Some(ProcessStartObservation::Failed { reason })
+            if reason.contains("second menu")
+    ));
+    assert!(matches!(
+        permissions.observe(
+            &process_start_observer_event(
+                &run_id,
+                3,
+                EventPayload::RunState(RunState::PermissionRequired {
+                    menu: second_menu,
+                }),
+            ),
+            &run_id,
+        ),
+        Some(ProcessStartObservation::Failed { reason })
+            if reason.contains("PermissionRequired")
+    ));
+
+    let item_id = ItemId::new("process-start-observer-exec-item");
+    let call_id = "process-start-observer-exec";
+    let mut terminal = WindowsExecStartObserver::new(&approved_menu);
+    assert_eq!(
+        terminal.observe(
+            &process_start_observer_event(
+                &run_id,
+                4,
+                EventPayload::Item(ItemEvent::Started {
+                    item_id: item_id.clone(),
+                    item: TurnItem::ToolCall {
+                        call_id: call_id.into(),
+                        name: "exec".into(),
+                        args: serde_json::json!({}),
+                        status: haider_protocol::item::ToolStatus::InProgress,
+                    },
+                }),
+            ),
+            &run_id,
+        ),
+        None
+    );
+    assert_eq!(
+        terminal.observe(
+            &process_start_observer_event(
+                &run_id,
+                5,
+                EventPayload::Item(ItemEvent::Delta {
+                    item_id: item_id.clone(),
+                    delta: ItemDelta::CommandOutput {
+                        stream: OutputStream::Stderr,
+                        chunk_b64: BASE64.encode(b"fixture stderr echoed started source"),
+                    },
+                }),
+            ),
+            &run_id,
+        ),
+        None
+    );
+    assert_eq!(
+        terminal.observe(
+            &process_start_observer_event(
+                &run_id,
+                6,
+                EventPayload::ToolResult {
+                    call_id: call_id.into(),
+                    result: haider_protocol::tool::BoundedResult {
+                        preview: "fixture tool result".into(),
+                        truncated: false,
+                        artifact: None,
+                        images: Vec::new(),
+                        cursor: None,
+                        status: haider_protocol::tool::ToolResultStatus::Failed,
+                        reason: Some("fixture failed".into()),
+                        presentation: None,
+                    },
+                },
+            ),
+            &run_id,
+        ),
+        None
+    );
+    assert!(matches!(
+        terminal.observe(
+            &process_start_observer_event(
+                &run_id,
+                7,
+                EventPayload::Item(ItemEvent::Completed {
+                    item_id,
+                    item: TurnItem::ToolCall {
+                        call_id: call_id.into(),
+                        name: "exec".into(),
+                        args: serde_json::json!({}),
+                        status: haider_protocol::item::ToolStatus::Failed,
+                    },
+                }),
+            ),
+            &run_id,
+        ),
+        Some(ProcessStartObservation::Failed { reason })
+            if reason.contains("fixture tool result")
+                && reason.contains("fixture stderr echoed started source")
+    ));
+}
+
 async fn wait_for_direct_shell_process_tree(
     client: &mut UdsClient,
     config: &DaemonConfig,
     _run_id: &RunId,
     heartbeat: &std::path::Path,
+    _workspace: &std::path::Path,
+    _fake: &dyn FakeRequestCounter,
 ) -> Result<ProcessStartObservation, tokio::time::error::Elapsed> {
     #[cfg(not(windows))]
     {
@@ -810,11 +1355,11 @@ async fn wait_for_direct_shell_process_tree(
             _run_id,
             heartbeat,
         );
-        tokio::time::timeout(process_start_deadline(), async {
+        let result = tokio::time::timeout(process_start_deadline(), async {
             let mut poll = tokio::time::interval(std::time::Duration::from_millis(10));
             poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                if trace.heartbeat_started(heartbeat) {
+                if trace.heartbeat_started(heartbeat, _workspace) {
                     return ProcessStartObservation::Started;
                 }
                 tokio::select! {
@@ -836,16 +1381,22 @@ async fn wait_for_direct_shell_process_tree(
                 }
             }
         })
-        .await
+        .await;
+        trace.failure_diagnostics(_workspace, _fake, &result);
+        result
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_exec_child_started(
     client: &mut UdsClient,
     config: &DaemonConfig,
     _session_id: &SessionId,
     run_id: &RunId,
     _heartbeat: &std::path::Path,
+    _workspace: &std::path::Path,
+    _fake: &dyn FakeRequestCounter,
+    _approved_menu: &MenuId,
 ) -> Result<ProcessStartObservation, tokio::time::error::Elapsed> {
     #[cfg(windows)]
     let mut trace = WindowsProcessStartTrace::new(
@@ -853,13 +1404,34 @@ async fn wait_for_exec_child_started(
         run_id,
         _heartbeat,
     );
-    tokio::time::timeout(process_start_deadline(), async {
+    #[cfg(windows)]
+    let mut observer = WindowsExecStartObserver::new(_approved_menu);
+    let result = tokio::time::timeout(process_start_deadline(), async {
         #[cfg(windows)]
         let mut reconnects = 0_u64;
+        #[cfg(windows)]
+        if let Some(observation) = reconnect_exec_start_observer(
+            client,
+            config,
+            _session_id,
+            run_id,
+            _workspace,
+            _heartbeat,
+            "initial-replay",
+            &mut reconnects,
+            &mut trace,
+            &mut observer,
+            false,
+        )
+        .await
+        {
+            return observation;
+        }
+        #[cfg(not(windows))]
         let mut output_tail = Vec::new();
         loop {
             #[cfg(windows)]
-            if trace.heartbeat_started(_heartbeat) {
+            if trace.heartbeat_started(_heartbeat, _workspace) {
                 return ProcessStartObservation::Started;
             }
             #[cfg(not(windows))]
@@ -877,10 +1449,13 @@ async fn wait_for_exec_child_started(
                     config,
                     _session_id,
                     run_id,
+                    _workspace,
                     _heartbeat,
                     "wait",
                     &mut reconnects,
                     &mut trace,
+                    &mut observer,
+                    true,
                 )
                 .await
                 {
@@ -889,23 +1464,31 @@ async fn wait_for_exec_child_started(
             };
             if let WireFrame::Event { envelope, .. } = frame {
                 #[cfg(windows)]
-                if run_terminal(&envelope, run_id) {
-                    return ProcessStartObservation::Terminal;
+                if let Some(observation) = observer.observe(&envelope, run_id) {
+                    return observation;
                 }
+                #[cfg(not(windows))]
                 if exec_child_started(&envelope, run_id, &mut output_tail) {
                     return ProcessStartObservation::Started;
                 }
             }
         }
     })
-    .await
+    .await;
+    #[cfg(windows)]
+    trace.failure_diagnostics(_workspace, _fake, &result);
+    result
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ProcessStartObservation {
     Started,
     #[cfg(windows)]
     Terminal,
+    #[cfg(windows)]
+    Failed {
+        reason: String,
+    },
 }
 
 #[cfg(windows)]
@@ -915,10 +1498,13 @@ async fn reconnect_exec_start_observer(
     config: &DaemonConfig,
     session_id: &SessionId,
     run_id: &RunId,
+    workspace: &std::path::Path,
     heartbeat: &std::path::Path,
     phase: &str,
     reconnects: &mut u64,
     trace: &mut WindowsProcessStartTrace,
+    observer: &mut WindowsExecStartObserver,
+    heartbeat_can_short_circuit: bool,
 ) -> Option<ProcessStartObservation> {
     loop {
         *reconnects += 1;
@@ -958,11 +1544,8 @@ async fn reconnect_exec_start_observer(
 
         let mut response_seen = false;
         let mut caught_up_seen = false;
-        let mut started_seen = false;
-        let mut terminal_seen = false;
-        let mut output_tail = Vec::new();
         loop {
-            if trace.heartbeat_started(heartbeat) {
+            if heartbeat_can_short_circuit && trace.heartbeat_started(heartbeat, workspace) {
                 return Some(ProcessStartObservation::Started);
             }
             let Some(frame) = client.try_next_with_keepalive(config.frame_limit).await else {
@@ -976,45 +1559,17 @@ async fn reconnect_exec_start_observer(
                 } => response_seen = true,
                 WireFrame::AttachCaughtUp { .. } => caught_up_seen = true,
                 WireFrame::Event { envelope, .. } => {
-                    started_seen |= exec_child_started(&envelope, run_id, &mut output_tail);
-                    terminal_seen |= run_terminal(&envelope, run_id);
+                    if let Some(observation) = observer.observe(&envelope, run_id) {
+                        return Some(observation);
+                    }
                 }
                 _ => {}
             }
             if response_seen && caught_up_seen {
-                return if terminal_seen {
-                    Some(ProcessStartObservation::Terminal)
-                } else if started_seen {
-                    Some(ProcessStartObservation::Started)
-                } else {
-                    None
-                };
+                return None;
             }
         }
     }
-}
-
-#[cfg(windows)]
-fn exec_child_started(envelope: &RawEnvelope, run_id: &RunId, output_tail: &mut Vec<u8>) -> bool {
-    if envelope.run_id.as_ref() != Some(run_id) {
-        return false;
-    }
-    let Ok(EventPayload::Item(ItemEvent::Delta {
-        delta: ItemDelta::CommandOutput { chunk_b64, .. },
-        ..
-    })) = serde_json::from_value::<EventPayload>(envelope.payload.clone())
-    else {
-        return false;
-    };
-    output_tail.extend(BASE64.decode(chunk_b64).expect("command output base64"));
-    let started = output_tail
-        .windows(b"started".len())
-        .any(|window| window == b"started");
-    if output_tail.len() > 64 {
-        let retained = output_tail.split_off(output_tail.len() - 64);
-        *output_tail = retained;
-    }
-    started
 }
 
 #[cfg(not(windows))]
@@ -1247,6 +1802,7 @@ async fn clean_timed_out_process_start_files(
     );
     for path in [
         heartbeat.to_path_buf(),
+        workspace.join("ps-alive.log"),
         workspace.join("descendant-started.log"),
     ] {
         match fs::remove_file(path) {
@@ -1443,7 +1999,10 @@ fn cancellable_exec_command() -> String {
     // PowerShell's location and .NET's relative-path base aligned: they are
     // distinct process state on Windows and can otherwise name different dirs.
     windows_powershell_command(concat!(
-        "$workspace=(Get-Location).Path;[Environment]::CurrentDirectory=$workspace;",
+        "[IO.File]::WriteAllText((Join-Path (Get-Location).Path 'ps-alive.log'),",
+        "'x',[Text.Encoding]::ASCII);",
+        "$workspace=(Get-Location).Path;Write-Error ('resolved-workspace='+$workspace);",
+        "[Environment]::CurrentDirectory=$workspace;",
         "$ready=Join-Path $workspace 'descendant-started.log';",
         "$heartbeat=Join-Path $workspace 'heartbeat.log';",
         "$cmd=Join-Path ([Environment]::SystemDirectory) 'cmd.exe';",
@@ -1479,6 +2038,25 @@ fn cancellable_exec_command() -> String {
         "while($true){[IO.File]::AppendAllText($heartbeat,'x',[Text.Encoding]::ASCII);",
         "[Console]::Out.Write('y');[Console]::Out.Flush();Start-Sleep -Milliseconds 10}"
     ))
+}
+
+#[cfg(windows)]
+fn cancellable_exec_attempt_script(command: String) -> Vec<FakeStep> {
+    vec![
+        // `Finish` seals this run's only tool-call segment. Its sole possible
+        // continuation is `Hang`, so an unexpectedly self-terminating exec can
+        // never consume another tool-call segment and open a second menu. The
+        // retry uses a different FakeProvider, explicitly armed by the test.
+        FakeStep::EmitToolCall {
+            call_id: "cancel-exec".into(),
+            name: "exec".into(),
+            args: serde_json::json!({"command": command}),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::ToolUse,
+        },
+        FakeStep::Hang,
+    ]
 }
 
 /// Scenario 1: the production runtime is constructed with an injected,
@@ -4001,7 +4579,15 @@ async fn w8a_shell_exec_cancel_kills_the_process_tree() {
         } => (run_id, item_id),
         other => panic!("expected cancellable shell receipt, got {other:?}"),
     };
-    let start = wait_for_direct_shell_process_tree(&mut client, &config, &run_id, &heartbeat).await;
+    let start = wait_for_direct_shell_process_tree(
+        &mut client,
+        &config,
+        &run_id,
+        &heartbeat,
+        &workspace,
+        &fake,
+    )
+    .await;
     #[cfg(not(windows))]
     assert_eq!(
         start.expect("direct shell process tree starts"),
@@ -4068,6 +4654,8 @@ async fn w8a_shell_exec_cancel_kills_the_process_tree() {
                     &config,
                     &retry_receipt.0,
                     &heartbeat,
+                    &workspace,
+                    &fake,
                 )
                 .await
                 .expect("direct shell process tree starts on its single retry"),
@@ -7863,7 +8451,7 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
         root.path().join("runtime"),
     );
     #[cfg(not(windows))]
-    let fake_script = vec![
+    let (dependencies, fake) = fake_dependencies(vec![
         FakeStep::EmitToolCall {
             call_id: "cancel-exec".into(),
             name: "exec".into(),
@@ -7872,27 +8460,12 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
         FakeStep::Finish {
             reason: FinishReason::ToolUse,
         },
-    ];
+    ]);
     #[cfg(windows)]
-    let fake_script = vec![
-        FakeStep::EmitToolCall {
-            call_id: "cancel-exec".into(),
-            name: "exec".into(),
-            args: serde_json::json!({"command": command.clone()}),
-        },
-        FakeStep::Finish {
-            reason: FinishReason::ToolUse,
-        },
-        FakeStep::EmitToolCall {
-            call_id: "cancel-exec".into(),
-            name: "exec".into(),
-            args: serde_json::json!({"command": command}),
-        },
-        FakeStep::Finish {
-            reason: FinishReason::ToolUse,
-        },
-    ];
-    let (dependencies, fake) = fake_dependencies(fake_script);
+    let (dependencies, fake) = windows_exec_fake_dependencies(
+        cancellable_exec_attempt_script(command.clone()),
+        cancellable_exec_attempt_script(command),
+    );
     let task = ready_with_dependencies(&config, dependencies).await;
     #[cfg(windows)]
     let mut failure_diagnostics = support::FailureDiagnostics::install("w4a2-exec-cancel", &task);
@@ -7939,6 +8512,7 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
         "exec-cancel-answerer-attach",
     )
     .await;
+    let approved_menu = menu.id.clone();
     answer_menu(
         &mut answerer,
         &config,
@@ -7956,8 +8530,17 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
     eprintln!(
         "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=waiting-for-first-start"
     );
-    let start =
-        wait_for_exec_child_started(&mut client, &config, &session_id, &run_id, &heartbeat).await;
+    let start = wait_for_exec_child_started(
+        &mut client,
+        &config,
+        &session_id,
+        &run_id,
+        &heartbeat,
+        &workspace,
+        &fake,
+        &approved_menu,
+    )
+    .await;
     #[cfg(windows)]
     eprintln!(
         "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=first-start-observed result={start:?}"
@@ -7998,6 +8581,7 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
             eprintln!(
                 "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=submitting-retry"
             );
+            fake.arm_retry();
             send_request(
                 &mut client,
                 &config,
@@ -8030,6 +8614,7 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
                 "exec-cancel-answerer-attach-retry",
             )
             .await;
+            let retry_approved_menu = retry_menu.id.clone();
             answer_menu(
                 &mut retry_answerer,
                 &config,
@@ -8053,6 +8638,9 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
                     &session_id,
                     &retry_run_id,
                     &heartbeat,
+                    &workspace,
+                    &fake,
+                    &retry_approved_menu,
                 )
                 .await
                 .expect("exec child starts within the deadline on its single retry"),
@@ -8187,12 +8775,17 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
         );
     }
     #[cfg(not(windows))]
-    assert_eq!(fake.requests().len(), 1);
+    assert_eq!(fake.request_count(), 1);
+    #[cfg(windows)]
+    assert!(
+        (1..=2).contains(&fake.first_attempt_request_count()),
+        "attempt 1 has one tool-call request and at most its isolated Hang continuation"
+    );
     #[cfg(windows)]
     assert_eq!(
-        fake.requests().len(),
-        process_start_attempts,
-        "provider is called exactly once per bounded process-start attempt"
+        fake.retry_request_count(),
+        process_start_attempts - 1,
+        "the separately armed retry provider receives exactly one tool-call request"
     );
 
     task.shutdown_handle().request("test complete");
