@@ -90,9 +90,8 @@ use haider_provider::{
 };
 use haider_tools::{Plan, RequestInput, TodoWrite};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 
 const DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN: usize = 32;
@@ -217,6 +216,12 @@ pub struct HarnessConfig {
     pub volatile_user_tail: Option<String>,
     /// General tools the paired dispatcher can execute.
     pub tools: Vec<ToolDefinition>,
+    /// Daemon-owned immutable pack; standalone embedders keep using `tools`.
+    shared_tools: Option<Arc<[ToolDefinition]>>,
+    /// Canonical digest of `tools` when the daemon installed an immutable
+    /// tool-pack view. Standalone embedders that mutate `tools` directly leave
+    /// this unset and retain canonical on-demand behavior.
+    tool_pack_digest: Option<String>,
     /// Enforce `tools` as an authorization ceiling even for root sessions.
     /// Delegated children always enforce it through `agent_id`; daemon-owned
     /// workflows enable this bit so actor-owned tools cannot bypass a dynamic
@@ -225,12 +230,18 @@ pub struct HarnessConfig {
     /// Local equivalents advertised after one exact provider-hosted-tool
     /// rejection. Empty means this provider has no safe fallback pack.
     pub provider_tool_fallback_tools: Vec<ToolDefinition>,
+    shared_provider_tool_fallback_tools: Option<Arc<[ToolDefinition]>>,
+    /// Canonical digest paired with `provider_tool_fallback_tools`.
+    provider_tool_fallback_digest: Option<String>,
     /// Frozen turn-authorized tool pack before provider-specific local web
     /// selection. `None` leaves standalone embedders' packs untouched.
     pub provider_tool_base: Option<Vec<ToolDefinition>>,
+    shared_provider_tool_base: Option<Arc<[ToolDefinition]>>,
+    shared_provider_tool_variants: HashMap<Vec<String>, (Arc<[ToolDefinition]>, String)>,
     /// Turn-authorized local web definitions within [`Self::provider_tool_base`].
     /// Non-web user and registry tools never enter this pool.
     pub provider_local_web_tools: Vec<ToolDefinition>,
+    shared_provider_local_web_tool_names: Vec<String>,
     /// CAS-backed attachments resolved before crossing the provider boundary.
     pub attachments: Vec<ResolvedAttachment>,
     /// Whether the resolved provider/model accepts vision inputs. Unsupported
@@ -338,10 +349,17 @@ impl HarnessConfig {
             system_prompt: None,
             volatile_user_tail: None,
             tools: Vec::new(),
+            shared_tools: None,
+            tool_pack_digest: None,
             enforce_advertised_tool_ceiling: false,
             provider_tool_fallback_tools: Vec::new(),
+            shared_provider_tool_fallback_tools: None,
+            provider_tool_fallback_digest: None,
             provider_tool_base: None,
+            shared_provider_tool_base: None,
+            shared_provider_tool_variants: HashMap::new(),
             provider_local_web_tools: Vec::new(),
+            shared_provider_local_web_tool_names: Vec::new(),
             attachments: Vec::new(),
             tool_result_images_supported: false,
             usage_account: None,
@@ -405,12 +423,71 @@ impl HarnessConfig {
     /// Replaces only provider-selected local web definitions, preserving the
     /// rest of the turn-authorized tool pack byte-for-byte.
     pub fn install_provider_derived_request_state(&mut self, state: &ProviderDerivedRequestState) {
+        let current_key = normalized_selected_tool_names(
+            &state.local_web_tool_names,
+            &self.shared_provider_local_web_tool_names,
+        );
+        if let Some((tools, digest)) = self.shared_provider_tool_variants.get(&current_key) {
+            self.tools.clear();
+            self.shared_tools = Some(Arc::clone(tools));
+            self.tool_pack_digest = Some(digest.clone());
+            self.provider_tool_fallback_tools.clear();
+            let fallback_key = normalized_selected_tool_names(
+                &state.provider_fallback_local_web_tool_names,
+                &self.shared_provider_local_web_tool_names,
+            );
+            let fallback = if state.provider_fallback_local_web_tool_names.is_empty() {
+                None
+            } else {
+                self.shared_provider_tool_variants.get(&fallback_key)
+            };
+            self.shared_provider_tool_fallback_tools = fallback.map(|(tools, _)| Arc::clone(tools));
+            self.provider_tool_fallback_digest = fallback.map(|(_, digest)| digest.clone());
+            self.tool_result_images_supported = state.tool_result_images_supported;
+            return;
+        }
+        if let Some(base) = self.shared_provider_tool_base.as_ref() {
+            let tools: Arc<[ToolDefinition]> = select_provider_tools_by_name(
+                base,
+                &self.shared_provider_local_web_tool_names,
+                &state.local_web_tool_names,
+            )
+            .into();
+            self.tool_pack_digest = Some(canonical_tool_definitions_digest(&tools));
+            self.tools.clear();
+            self.shared_tools = Some(tools);
+            self.provider_tool_fallback_tools.clear();
+            self.shared_provider_tool_fallback_tools =
+                if state.provider_fallback_local_web_tool_names.is_empty() {
+                    None
+                } else {
+                    Some(
+                        select_provider_tools_by_name(
+                            base,
+                            &self.shared_provider_local_web_tool_names,
+                            &state.provider_fallback_local_web_tool_names,
+                        )
+                        .into(),
+                    )
+                };
+            self.provider_tool_fallback_digest = self
+                .shared_provider_tool_fallback_tools
+                .as_deref()
+                .map(canonical_tool_definitions_digest);
+            self.tool_result_images_supported = state.tool_result_images_supported;
+            return;
+        }
         if let Some(base) = self.provider_tool_base.as_ref() {
             self.tools = canonical_tool_definitions(&select_provider_tools(
                 base,
                 &self.provider_local_web_tools,
                 &state.local_web_tool_names,
             ));
+            self.shared_tools = None;
+            // These vectors are a pre-existing public standalone seam and can
+            // be mutated after installation. Only immutable Arc-backed packs
+            // may retain a cached digest.
+            self.tool_pack_digest = None;
             self.provider_tool_fallback_tools =
                 if state.provider_fallback_local_web_tool_names.is_empty() {
                     Vec::new()
@@ -421,10 +498,85 @@ impl HarnessConfig {
                         &state.provider_fallback_local_web_tool_names,
                     ))
                 };
-        } else {
-            self.provider_tool_fallback_tools.clear();
+            self.shared_provider_tool_fallback_tools = None;
+            self.provider_tool_fallback_digest = None;
+            self.tool_result_images_supported = state.tool_result_images_supported;
+            return;
         }
+        self.shared_tools = None;
+        self.tool_pack_digest = None;
+        self.provider_tool_fallback_tools.clear();
+        self.shared_provider_tool_fallback_tools = None;
+        self.provider_tool_fallback_digest = None;
         self.tool_result_images_supported = state.tool_result_images_supported;
+    }
+
+    /// Installs daemon-cached immutable packs for the initial provider lane.
+    /// Pair switches can still derive a new selection from the shared base.
+    pub fn install_shared_tool_packs(
+        &mut self,
+        base: Arc<[ToolDefinition]>,
+        local_web_tool_names: Vec<String>,
+        current: Arc<[ToolDefinition]>,
+        current_digest: String,
+        fallback: Option<(Arc<[ToolDefinition]>, String)>,
+        variants: HashMap<Vec<String>, (Arc<[ToolDefinition]>, String)>,
+        state: &ProviderDerivedRequestState,
+    ) {
+        self.provider_local_web_tools.clear();
+        self.shared_provider_local_web_tool_names = local_web_tool_names;
+        self.provider_tool_base = None;
+        self.shared_provider_tool_base = Some(base);
+        self.shared_provider_tool_variants = variants;
+        self.tools.clear();
+        self.shared_tools = Some(current);
+        self.tool_pack_digest = Some(current_digest);
+        self.provider_tool_fallback_tools.clear();
+        let (fallback_tools, fallback_digest) = fallback.unzip();
+        self.shared_provider_tool_fallback_tools = fallback_tools;
+        self.provider_tool_fallback_digest = fallback_digest;
+        self.tool_result_images_supported = state.tool_result_images_supported;
+    }
+
+    /// Returns the active definitions without materializing an immutable pack.
+    #[must_use]
+    pub fn tool_definitions(&self) -> &[ToolDefinition] {
+        self.shared_tools.as_deref().unwrap_or(&self.tools)
+    }
+
+    /// Clones only the active Arc handle. Standalone definitions are promoted
+    /// to shared storage once at this boundary.
+    #[must_use]
+    pub fn shared_tool_definitions(&self) -> Arc<[ToolDefinition]> {
+        self.shared_tools
+            .as_ref()
+            .map_or_else(|| self.tools.clone().into(), Arc::clone)
+    }
+
+    fn has_provider_tool_fallback(&self) -> bool {
+        self.shared_provider_tool_fallback_tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+            || !self.provider_tool_fallback_tools.is_empty()
+    }
+
+    fn activate_provider_tool_fallback(&mut self) {
+        self.shared_tools = self.shared_provider_tool_fallback_tools.take();
+        self.tools = if self.shared_tools.is_some() {
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.provider_tool_fallback_tools)
+        };
+        self.tool_pack_digest = self.provider_tool_fallback_digest.take();
+    }
+
+    /// Returns the pinned tool-pack digest, or canonicalizes directly for a
+    /// standalone config whose public `tools` field was populated manually.
+    #[must_use]
+    pub fn canonical_tool_pack_digest(&self) -> String {
+        self.tool_pack_digest
+            .clone()
+            .unwrap_or_else(|| canonical_tool_definitions_digest(self.tool_definitions()))
     }
 }
 
@@ -442,6 +594,33 @@ fn select_provider_tools(
         })
         .cloned()
         .collect()
+}
+
+fn select_provider_tools_by_name(
+    base: &[ToolDefinition],
+    provider_local_web_tool_names: &[String],
+    selected_names: &[String],
+) -> Vec<ToolDefinition> {
+    base.iter()
+        .filter(|definition| {
+            !provider_local_web_tool_names
+                .iter()
+                .any(|candidate| candidate == &definition.name)
+                || selected_names.iter().any(|name| name == &definition.name)
+        })
+        .cloned()
+        .collect()
+}
+
+fn normalized_selected_tool_names(names: &[String], available: &[String]) -> Vec<String> {
+    let mut names = names
+        .iter()
+        .filter(|name| available.contains(name))
+        .cloned()
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 /// Thread-safe event-ID namespace shared by core and tool journals.
@@ -819,6 +998,29 @@ pub trait ToolDispatcher: Send + Sync {
         args: serde_json::Value,
         cancel: &CancelToken,
     ) -> Result<ToolDispatchResult, HaiderError>;
+
+    /// Arc-backed production path for approval retries. Existing injected
+    /// dispatchers retain the owned compatibility method; dispatchers that can
+    /// consume borrowed arguments override this hook to avoid deep JSON clones.
+    async fn execute_shared(
+        &self,
+        run_id: &RunId,
+        item_id: &ItemId,
+        call_id: &str,
+        name: &str,
+        args: Arc<serde_json::Value>,
+        cancel: &CancelToken,
+    ) -> Result<ToolDispatchResult, HaiderError> {
+        self.execute(
+            run_id,
+            item_id,
+            call_id,
+            name,
+            args.as_ref().clone(),
+            cancel,
+        )
+        .await
+    }
 
     /// Returns the provider-only context snapshot for a new turn. `None`
     /// means this dispatcher does not manage volatile context; `Some("")`
@@ -1850,9 +2052,13 @@ impl HarnessActor {
         // recursively canonicalize schemas once at the conversation-store
         // boundary so standalone harnesses receive the same stability as
         // daemon-built turns.
-        self.config.tools = canonical_tool_definitions(&self.config.tools);
-        self.config.provider_tool_fallback_tools =
-            canonical_tool_definitions(&self.config.provider_tool_fallback_tools);
+        if self.config.shared_tools.is_none() {
+            self.config.tools = canonical_tool_definitions(&self.config.tools);
+        }
+        if self.config.shared_provider_tool_fallback_tools.is_none() {
+            self.config.provider_tool_fallback_tools =
+                canonical_tool_definitions(&self.config.provider_tool_fallback_tools);
+        }
         let (run_id, mut messages, checkpoint, partial_stream, child_wait) = match submit {
             TurnSubmission::Local(submit) => {
                 let run_id = self.next_run_id();
@@ -1952,6 +2158,7 @@ impl HarnessActor {
                 call_id: checkpoint.call_id.clone(),
                 name: checkpoint.tool_name.clone(),
                 args: checkpoint.args.clone(),
+                parsed_args: OnceLock::new(),
             });
             let tool_call = match provider_tool_block(&tools, &checkpoint.call_id) {
                 Ok(tool_call) => tool_call,
@@ -2064,6 +2271,7 @@ impl HarnessActor {
                     call_id: checkpoint.call_id.clone(),
                     name: checkpoint.tool_name,
                     args: checkpoint.args,
+                    parsed_args: OnceLock::new(),
                 });
                 match provider_tool_block(&tools, &checkpoint.call_id) {
                     Ok(block) => assistant_blocks.push(block),
@@ -2441,27 +2649,41 @@ impl HarnessActor {
                 usage_account.as_ref(),
                 volatile_context_epoch.as_deref(),
             );
+            // Built-in adapters render directly from the daemon's Arc-backed
+            // definitions. Standalone/injected providers retain the owned Vec
+            // compatibility path below.
+            let shared_request_tools = self.config.shared_tools.as_ref().map(Arc::clone);
+            let request_tools = if shared_request_tools.is_some() {
+                Vec::new()
+            } else {
+                std::mem::take(&mut self.config.tools)
+            };
             let mut provider_request = TurnRequest {
                 messages: request_messages,
                 model: self.config.model.clone(),
                 max_tokens: self.config.max_tokens,
                 system_prompt: self.config.system_prompt.take(),
-                tools: std::mem::take(&mut self.config.tools),
+                tools: request_tools,
                 attachments: request_attachments,
                 cache_metadata: Some(cache_metadata.clone()),
             };
-            let mut prepared = provider.prepare_turn(&provider_request);
+            let mut prepared = shared_request_tools.as_ref().map_or_else(
+                || provider.prepare_turn(&provider_request),
+                |tools| provider.prepare_turn_with_tools(&provider_request, tools),
+            );
             let retained_wire = prepared
                 .as_ref()
                 .is_some_and(haider_provider::PreparedTurn::has_rendered_wire);
             self.config.system_prompt = provider_request.system_prompt.take();
-            self.config.tools = std::mem::take(&mut provider_request.tools);
+            if shared_request_tools.is_none() {
+                self.config.tools = std::mem::take(&mut provider_request.tools);
+            }
             if retained_wire {
                 // Anthropic's stream decoder needs only this capability bit;
                 // the complete schemas already live in the retained wire.
                 provider_request.tools.extend(
                     self.config
-                        .tools
+                        .tool_definitions()
                         .iter()
                         .filter(|tool| tool.name == "computer")
                         .cloned(),
@@ -2472,7 +2694,9 @@ impl HarnessActor {
                 provider_request
                     .system_prompt
                     .clone_from(&self.config.system_prompt);
-                provider_request.tools.clone_from(&self.config.tools);
+                provider_request
+                    .tools
+                    .extend(self.config.tool_definitions().iter().cloned());
             }
             let previous_prefix_digests = if let Some(rendered) =
                 prepared.as_ref().map(|prepared| prepared.prefix_digests())
@@ -4067,7 +4291,7 @@ impl HarnessActor {
                             "provider capability fallback returned inconsistent coordinates",
                         )));
                     }
-                    if self.config.provider_tool_fallback_tools.is_empty() {
+                    if !self.config.has_provider_tool_fallback() {
                         return Err(DriveError::Provider(error));
                     }
                     self.commit_ui_extension_marker(
@@ -4083,8 +4307,7 @@ impl HarnessActor {
                     .map_err(DriveError::Store)?;
                     *provider = fallback;
                     *account = Some(fallback_account);
-                    self.config.tools =
-                        std::mem::take(&mut self.config.provider_tool_fallback_tools);
+                    self.config.activate_provider_tool_fallback();
                     *capability_fallback_consumed = true;
                     return Ok(());
                 }
@@ -4293,7 +4516,8 @@ impl HarnessActor {
         self.config.cached_input_is_subset = target.cached_input_is_subset;
         self.config
             .install_provider_derived_request_state(&target.provider_request_state);
-        self.config.cache_expected_later_reads = u32::from(!self.config.tools.is_empty()) * 2;
+        self.config.cache_expected_later_reads =
+            u32::from(!self.config.tool_definitions().is_empty()) * 2;
         self.config.usage_account = Some(target.account.clone());
         self.config.usage_scope.provider = target.provider_name.clone();
         self.config.usage_scope.model = target.model.clone();
@@ -4303,7 +4527,7 @@ impl HarnessActor {
         self.config.usage_scope.api_family = dimensions.api_family;
         self.config.usage_scope.effort = dimensions.effort;
         self.config.usage_scope.speed = dimensions.speed;
-        let tool_pack_digest = canonical_tool_definitions_digest(&self.config.tools);
+        let tool_pack_digest = self.config.canonical_tool_pack_digest();
         if let Some(boundaries) = self.config.usage_scope.cache_boundaries.as_mut() {
             boundaries.tool_pack = tool_pack_digest.clone();
         }
@@ -4887,6 +5111,7 @@ impl HarnessActor {
             call_id,
             name,
             args: String::new(),
+            parsed_args: OnceLock::new(),
         });
         Ok(())
     }
@@ -4903,6 +5128,7 @@ impl HarnessActor {
                 "provider streamed arguments for unknown tool call `{call_id}`",
             ))));
         };
+        let _ = tool.parsed_args.take();
         tool.args.push_str(&args_fragment);
         self.commit_item(
             run_id,
@@ -5098,17 +5324,17 @@ impl HarnessActor {
         &mut self,
         run_id: &RunId,
         tool: &ToolAccumulator,
-        args: serde_json::Value,
+        args: Arc<serde_json::Value>,
         cancel: &CancelToken,
         dispatcher: &Arc<dyn ToolDispatcher>,
     ) -> Result<GeneralToolOutcome, DriveError> {
         loop {
-            let execution = dispatcher.execute(
+            let execution = dispatcher.execute_shared(
                 run_id,
                 &tool.item_id,
                 &tool.call_id,
                 &tool.name,
-                args.clone(),
+                Arc::clone(&args),
                 cancel,
             );
             let result = tokio::select! {
@@ -5159,7 +5385,7 @@ impl HarnessActor {
                         tool_item_id: tool.item_id.clone(),
                         call_id: tool.call_id.clone(),
                         tool_name: tool.name.clone(),
-                        args: serde_json::to_string(&args).map_err(|error| {
+                        args: serde_json::to_string(args.as_ref()).map_err(|error| {
                             DriveError::Store(HaiderError::new(
                                 ErrorCode::Internal,
                                 format!("tool approval arguments could not serialize: {error}"),
@@ -5432,7 +5658,7 @@ impl HarnessActor {
         index: usize,
     ) -> Result<Message, DriveError> {
         let args = parse_tool_args(&tools[index])?;
-        let result = match TodoWrite::from_tool_args(args) {
+        let result = match TodoWrite::from_tool_args(args.as_ref().clone()) {
             Ok(request) => {
                 self.emit_plan_facts(run_id, &request).await?;
                 BoundedResult {
@@ -5557,7 +5783,7 @@ impl HarnessActor {
         let args = parse_tool_args(&tools[index])?;
         let name = tools[index].name.clone();
         if name == "plan" {
-            let plan = Plan::from_tool_args(args).map_err(tool_error_to_drive)?;
+            let plan = Plan::from_tool_args(args.as_ref().clone()).map_err(tool_error_to_drive)?;
             let menu = plan.menu(self.next_menu_id());
             self.commit_payload(
                 run_id,
@@ -5570,7 +5796,8 @@ impl HarnessActor {
                 .complete_plan(run_id, tools, index, &plan, &menu, false)
                 .await;
         }
-        let request = RequestInput::from_tool_args(args).map_err(tool_error_to_drive)?;
+        let request =
+            RequestInput::from_tool_args(args.as_ref().clone()).map_err(tool_error_to_drive)?;
         let mut menu = request.menu(self.next_menu_id());
         let request_gate = if request.has_declared_default() {
             InteractionGate::RequestInputWithDefault
@@ -5652,7 +5879,7 @@ impl HarnessActor {
         let args = parse_tool_args(&tools[index])?;
         let name = tools[index].name.clone();
         if name == "plan" {
-            let plan = Plan::from_tool_args(args).map_err(tool_error_to_drive)?;
+            let plan = Plan::from_tool_args(args.as_ref().clone()).map_err(tool_error_to_drive)?;
             let answer_already_committed = self
                 .committed_menus
                 .borrow_and_update()
@@ -5668,7 +5895,8 @@ impl HarnessActor {
                 .complete_plan(run_id, tools, index, &plan, &menu, answer_already_committed)
                 .await;
         }
-        let request = RequestInput::from_tool_args(args).map_err(tool_error_to_drive)?;
+        let request =
+            RequestInput::from_tool_args(args.as_ref().clone()).map_err(tool_error_to_drive)?;
         self.resolve_or_wait_for_request_input(
             run_id,
             tools,
@@ -6620,7 +6848,7 @@ impl HarnessActor {
         let args = if matches!(status, ToolStatus::Failed | ToolStatus::Cancelled) {
             tool_args_or_raw(tool)
         } else {
-            parse_tool_args(tool)?
+            parse_tool_args(tool)?.as_ref().clone()
         };
         self.commit_item(
             run_id,
@@ -6695,7 +6923,7 @@ impl HarnessActor {
         let args = if matches!(status, ToolStatus::Failed | ToolStatus::Cancelled) {
             tool_args_or_raw(tool)
         } else {
-            parse_tool_args(tool)?
+            parse_tool_args(tool)?.as_ref().clone()
         };
 
         self.flush_pending_item_delta()
@@ -7739,6 +7967,7 @@ struct ToolAccumulator {
     call_id: String,
     name: String,
     args: String,
+    parsed_args: OnceLock<Result<Arc<serde_json::Value>, String>>,
 }
 
 struct RequestInputResolutionContext {
@@ -7769,12 +7998,18 @@ struct DeferredAccumulator {
     item_completed: bool,
 }
 
-fn parse_tool_args(tool: &ToolAccumulator) -> Result<serde_json::Value, DriveError> {
-    if tool.args.is_empty() {
-        return Ok(serde_json::json!({}));
-    }
-    serde_json::from_str(&tool.args).map_err(|error| {
-        DriveError::Provider(
+fn parse_tool_args(tool: &ToolAccumulator) -> Result<Arc<serde_json::Value>, DriveError> {
+    match tool.parsed_args.get_or_init(|| {
+        if tool.args.is_empty() {
+            Ok(Arc::new(serde_json::json!({})))
+        } else {
+            serde_json::from_str(&tool.args)
+                .map(Arc::new)
+                .map_err(|error| error.to_string())
+        }
+    }) {
+        Ok(args) => Ok(Arc::clone(args)),
+        Err(error) => Err(DriveError::Provider(
             ProviderError::new(
                 ProviderErrorKind::MalformedFrame,
                 format!(
@@ -7789,8 +8024,8 @@ fn parse_tool_args(tool: &ToolAccumulator) -> Result<serde_json::Value, DriveErr
                 ErrorScope::Tool,
                 [ErrorAction::Retry],
             )),
-        )
-    })
+        )),
+    }
 }
 
 fn validate_permission_selection(menu: &Menu, answer: &MenuAnswer) -> Result<(), HaiderError> {
@@ -7827,11 +8062,17 @@ fn provider_tool_block(tools: &[ToolAccumulator], call_id: &str) -> Result<Block
     Ok(Block::ToolCall {
         call_id: tool.call_id.clone(),
         name: tool.name.clone(),
-        args: parse_tool_args(tool)?,
+        args: parse_tool_args(tool)?.as_ref().clone(),
     })
 }
 
 fn tool_args_or_raw(tool: &ToolAccumulator) -> serde_json::Value {
+    if let Some(parsed) = tool.parsed_args.get() {
+        return match parsed {
+            Ok(args) => args.as_ref().clone(),
+            Err(_) => serde_json::Value::String(tool.args.clone()),
+        };
+    }
     if tool.args.is_empty() {
         return serde_json::json!({});
     }
@@ -7844,7 +8085,7 @@ fn tool_call_within_advertised_ceiling(config: &HarnessConfig, name: &str) -> bo
         return true;
     }
     config
-        .tools
+        .tool_definitions()
         .iter()
         .any(|definition| definition.name == name)
 }
@@ -8400,7 +8641,7 @@ fn digest_json(value: &impl serde::Serialize) -> String {
 fn usage_prefix_digests(config: &HarnessConfig, immutable_history: &[Message]) -> PrefixDigests {
     PrefixDigests {
         system: digest_json(&config.system_prompt),
-        tools: canonical_tool_definitions_digest(&config.tools),
+        tools: config.canonical_tool_pack_digest(),
         immutable_history: digest_json(&immutable_history),
         model: digest_json(&config.model),
         auth_mode: digest_json(&config.usage_scope.auth_scope),
@@ -8921,7 +9162,7 @@ fn estimated_request_input_tokens(config: &HarnessConfig, messages: &[Message]) 
     estimate_provider_request_input_tokens_raw(
         &projection,
         &config.system_prompt,
-        &config.tools,
+        config.tool_definitions(),
         &config.attachments,
     )
 }
@@ -9683,6 +9924,7 @@ mod cu1_actor_tests {
             call_id: "call-malformed-args".into(),
             name: "shell".into(),
             args: r#"{"command":"#.into(),
+            parsed_args: OnceLock::new(),
         };
         let error = parse_tool_args(&tool).expect_err("truncated JSON must fail");
         let DriveError::Provider(error) = error else {
@@ -9692,6 +9934,100 @@ mod cu1_actor_tests {
         assert_eq!(
             error.presentation.subcode.as_str(),
             "malformed-tool-arguments"
+        );
+        assert!(matches!(tool.parsed_args.get(), Some(Err(_))));
+        assert_eq!(
+            tool_args_or_raw(&tool),
+            serde_json::Value::String(tool.args.clone())
+        );
+    }
+
+    #[test]
+    fn completed_tool_arguments_reuse_one_parsed_value() {
+        let tool = ToolAccumulator {
+            item_id: ItemId::new("item-cached-args"),
+            call_id: "call-cached-args".into(),
+            name: "shell".into(),
+            args: r#"{"command":"pwd","nested":{"limit":2}}"#.into(),
+            parsed_args: OnceLock::new(),
+        };
+
+        let first = parse_tool_args(&tool).expect("initial parse");
+        let second = parse_tool_args(&tool).expect("cached parse");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(tool_args_or_raw(&tool), first.as_ref().clone());
+    }
+
+    fn tool_definition(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.into(),
+            description: format!("{name} fixture"),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+            }),
+        }
+    }
+
+    #[test]
+    fn shared_pair_switch_retains_fallback_when_requested_web_tool_is_unauthorized() {
+        let mut config = actor_config(false);
+        let base: Arc<[ToolDefinition]> = vec![tool_definition("fs_read")].into();
+        let digest = canonical_tool_definitions_digest(&base);
+        let variants = HashMap::from([(Vec::new(), (Arc::clone(&base), digest.clone()))]);
+        let initial = ProviderDerivedRequestState {
+            tool_result_images_supported: false,
+            local_web_tool_names: Vec::new(),
+            provider_fallback_local_web_tool_names: Vec::new(),
+        };
+        config.install_shared_tool_packs(
+            Arc::clone(&base),
+            Vec::new(),
+            Arc::clone(&base),
+            digest.clone(),
+            None,
+            variants,
+            &initial,
+        );
+
+        config.install_provider_derived_request_state(&ProviderDerivedRequestState {
+            tool_result_images_supported: false,
+            local_web_tool_names: Vec::new(),
+            provider_fallback_local_web_tool_names: vec!["web_fetch".into()],
+        });
+
+        assert!(config.has_provider_tool_fallback());
+        config.activate_provider_tool_fallback();
+        assert_eq!(config.tool_definitions(), base.as_ref());
+        assert_eq!(config.canonical_tool_pack_digest(), digest);
+    }
+
+    #[test]
+    fn standalone_mutable_tool_vectors_never_retain_cached_digests() {
+        let mut config = actor_config(false);
+        let fs_read = tool_definition("fs_read");
+        let web_fetch = tool_definition("web_fetch");
+        config.provider_tool_base = Some(vec![fs_read.clone(), web_fetch.clone()]);
+        config.provider_local_web_tools = vec![web_fetch];
+        config.install_provider_derived_request_state(&ProviderDerivedRequestState {
+            tool_result_images_supported: false,
+            local_web_tool_names: Vec::new(),
+            provider_fallback_local_web_tool_names: vec!["web_fetch".into()],
+        });
+
+        assert!(config.tool_pack_digest.is_none());
+        assert!(config.provider_tool_fallback_digest.is_none());
+        config.tools.push(tool_definition("late_current"));
+        assert_eq!(
+            config.canonical_tool_pack_digest(),
+            canonical_tool_definitions_digest(&config.tools)
+        );
+
+        config.activate_provider_tool_fallback();
+        config.tools.push(tool_definition("late_fallback"));
+        assert_eq!(
+            config.canonical_tool_pack_digest(),
+            canonical_tool_definitions_digest(&config.tools)
         );
     }
 

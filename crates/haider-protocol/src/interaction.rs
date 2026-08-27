@@ -103,6 +103,7 @@ impl Default for InteractionResolutionPolicy {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

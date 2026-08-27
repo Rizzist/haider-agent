@@ -10,6 +10,17 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::{oneshot as tokio_oneshot, watch as tokio_watch};
 use tokio::time::timeout;
 
+#[test]
+fn monitor_event_payload_rejects_unknown_variant_fields() {
+    let error = serde_json::from_value::<MonitorEventPayload>(serde_json::json!({
+        "kind": "process",
+        "line": "ready",
+        "unexpected": true,
+    }))
+    .expect_err("unknown process payload field must be rejected");
+    assert!(error.to_string().contains("unexpected"));
+}
+
 fn registration(filter: Option<MonitorFilter>) -> MonitorRegistration {
     MonitorRegistration {
         monitor_id: "monitor-test".into(),

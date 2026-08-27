@@ -24,10 +24,15 @@ use haider_provider::{Message, MessageRole, UserCommandRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 
 const HISTORY_PAGE: usize = 256;
 const PROMPT_CACHE_SESSION_LIMIT: usize = 8;
+/// Serialized journal/projection bodies retained across all prompt-cache
+/// sessions. Durable journals remain authoritative; over-cap LRU entries keep
+/// only replay/checkpoint cursors and rebuild their bodies on the next touch.
+const PROMPT_CACHE_BODY_BYTES_LIMIT: usize = 32 * 1024 * 1024;
 const PROMPT_CHECKPOINT_PROJECTION: &str = "prompt_history";
 const PROMPT_CHECKPOINT_SHAPE_VERSION: u32 = 1;
 /// Semantic compatibility of the prompt-history reducer.
@@ -65,10 +70,14 @@ pub struct PromptHistoryCompiler;
 #[derive(Default)]
 pub struct PromptHistoryCache {
     sessions: Mutex<HashMap<SessionId, CachedPromptSession>>,
+    touch_clock: AtomicU64,
 }
 
 #[derive(Default)]
 struct CachedPromptSession {
+    last_touched: u64,
+    bodies_evicted: bool,
+    journal_body_bytes: usize,
     head_seq: u64,
     compaction_epochs: HashMap<PromptTimelineKey, u64>,
     envelopes: Vec<RawEnvelope>,
@@ -124,13 +133,15 @@ struct CachedCompiledPrefix {
     head_seq: u64,
     current_run: RunId,
     current_run_terminal: bool,
-    projection: Arc<CompiledPromptProjection>,
+    projection: Option<Arc<CompiledPromptProjection>>,
+    body_bytes: usize,
     cursor: PromptProjectionCursor,
 }
 
 #[derive(Clone)]
 struct CachedExactProjection {
-    projection: Arc<CompiledPromptProjection>,
+    projection: Option<Arc<CompiledPromptProjection>>,
+    body_bytes: usize,
     cursor: PromptProjectionCursor,
 }
 
@@ -528,6 +539,14 @@ impl PromptHistoryCache {
             .unwrap_or_default();
         if cached.head_seq > head_seq {
             cached = CachedPromptSession::default();
+        } else if cached.bodies_evicted {
+            let saved_boundaries = std::mem::take(&mut cached.saved_boundaries);
+            let retained_projections = std::mem::take(&mut cached.projections);
+            let retained_append_prefixes = std::mem::take(&mut cached.append_prefixes);
+            cached = replay_cached_session(store, session_id, head_seq).await?;
+            cached.saved_boundaries = saved_boundaries;
+            cached.projections = retained_projections;
+            cached.append_prefixes = retained_append_prefixes;
         }
 
         // A checkpoint truncates only ONE exact branch+agent timeline. A
@@ -646,8 +665,13 @@ impl PromptHistoryCache {
             agent_id: agent_id.cloned(),
             current_run: current_run.clone(),
         };
-        if let Some(projection) = cached.projections.get(&key).cloned() {
-            let projection = projection.projection.as_ref().clone();
+        if let Some(projection) = cached
+            .projections
+            .get(&key)
+            .and_then(|cached| cached.projection.as_ref())
+            .cloned()
+        {
+            let projection = projection.as_ref().clone();
             self.install(session_id.clone(), cached).await;
             return Ok(projection);
         }
@@ -661,12 +685,17 @@ impl PromptHistoryCache {
                     && candidate.agent_id == key.agent_id
                     && candidate.current_run == *current_run
             })
+            .filter(|(_, projection)| projection.projection.is_some())
             .max_by_key(|(candidate, _)| candidate.head_seq)
             .map(|(candidate, projection)| (candidate.head_seq, projection.clone()));
         let append_prefix = cached
             .append_prefixes
             .get(&scope)
-            .filter(|prefix| prefix.head_seq < head_seq && prefix.current_run != *current_run)
+            .filter(|prefix| {
+                prefix.projection.is_some()
+                    && prefix.head_seq < head_seq
+                    && prefix.current_run != *current_run
+            })
             .cloned();
         let (projection, projection_cursor) = if let Some(prefix) = append_prefix {
             if let Some(extended) =
@@ -728,6 +757,7 @@ impl PromptHistoryCache {
             )
             .await?
         };
+        let projection_body_bytes = serialized_body_bytes(&projection.messages);
         let projection = Arc::new(projection);
         // Keep the earliest request boundary for a live run. Later tool-round
         // recompiles intentionally suppress that run's assistant/tool output;
@@ -736,7 +766,7 @@ impl PromptHistoryCache {
         if cached
             .append_prefixes
             .get(&scope)
-            .is_none_or(|prefix| prefix.current_run != *current_run)
+            .is_none_or(|prefix| prefix.projection.is_none() || prefix.current_run != *current_run)
             && cached.can_seed_append_prefix(branch_id, agent_id, current_run, head_seq)
         {
             let current_run_terminal = cached
@@ -750,7 +780,8 @@ impl PromptHistoryCache {
                     head_seq,
                     current_run: current_run.clone(),
                     current_run_terminal,
-                    projection: Arc::clone(&projection),
+                    projection: Some(Arc::clone(&projection)),
+                    body_bytes: projection_body_bytes,
                     cursor: projection_cursor.clone(),
                 },
             );
@@ -765,7 +796,8 @@ impl PromptHistoryCache {
         cached.projections.insert(
             key,
             CachedExactProjection {
-                projection: Arc::clone(&projection),
+                projection: Some(Arc::clone(&projection)),
+                body_bytes: projection_body_bytes,
                 cursor: projection_cursor,
             },
         );
@@ -812,8 +844,19 @@ impl PromptHistoryCache {
         Ok(projection.as_ref().clone())
     }
 
-    async fn install(&self, session_id: SessionId, cached: CachedPromptSession) {
+    async fn install(&self, session_id: SessionId, mut cached: CachedPromptSession) {
+        let last_touched = self
+            .touch_clock
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        cached.last_touched = last_touched;
         let mut sessions = self.sessions.lock().await;
+        if let Some(current) = sessions.get_mut(&session_id)
+            && current.head_seq > cached.head_seq
+        {
+            current.last_touched = last_touched;
+            return;
+        }
         if sessions
             .get(&session_id)
             .is_none_or(|current| current.head_seq <= cached.head_seq)
@@ -821,13 +864,31 @@ impl PromptHistoryCache {
             if !sessions.contains_key(&session_id)
                 && sessions.len() >= PROMPT_CACHE_SESSION_LIMIT
                 && let Some(evicted) = sessions
-                    .keys()
-                    .min_by(|left, right| left.as_str().cmp(right.as_str()))
-                    .cloned()
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last_touched)
+                    .map(|(session_id, _)| session_id.clone())
             {
                 sessions.remove(&evicted);
             }
             sessions.insert(session_id, cached);
+            while sessions
+                .values()
+                .map(CachedPromptSession::resident_body_bytes)
+                .fold(0_usize, usize::saturating_add)
+                > PROMPT_CACHE_BODY_BYTES_LIMIT
+            {
+                let Some(evicted) = sessions
+                    .iter()
+                    .filter(|(_, entry)| !entry.bodies_evicted)
+                    .min_by_key(|(_, entry)| entry.last_touched)
+                    .map(|(session_id, _)| session_id.clone())
+                else {
+                    break;
+                };
+                if let Some(entry) = sessions.get_mut(&evicted) {
+                    entry.evict_bodies();
+                }
+            }
         }
     }
 }
@@ -861,6 +922,50 @@ async fn replay_cached_session(
 }
 
 impl CachedPromptSession {
+    fn resident_body_bytes(&self) -> usize {
+        if self.bodies_evicted {
+            return 0;
+        }
+        let mut total = self.journal_body_bytes;
+        let mut projections = HashSet::new();
+        for prefix in self.append_prefixes.values() {
+            if let Some(projection) = prefix.projection.as_ref()
+                && projections.insert(Arc::as_ptr(projection) as usize)
+            {
+                total = total.saturating_add(prefix.body_bytes);
+            }
+        }
+        for exact in self.projections.values() {
+            if let Some(projection) = exact.projection.as_ref()
+                && projections.insert(Arc::as_ptr(projection) as usize)
+            {
+                total = total.saturating_add(exact.body_bytes);
+            }
+        }
+        total
+    }
+
+    fn evict_bodies(&mut self) {
+        self.journal_body_bytes = 0;
+        self.bodies_evicted = true;
+        self.envelopes.clear();
+        for prefix in self.append_prefixes.values_mut() {
+            prefix.projection = None;
+            prefix.body_bytes = 0;
+        }
+        for exact in self.projections.values_mut() {
+            exact.projection = None;
+            exact.body_bytes = 0;
+        }
+        self.render_facts = JournalFactsIndex::default();
+        self.tree_index = TreeProjection::default();
+        self.lineage_scopes.clear();
+        self.checkpoint_base = None;
+        self.checkpoint_node_collision = false;
+        self.boundary_projector = TranscriptProjector::default();
+        self.boundaries.clear();
+    }
+
     fn note_compaction(&mut self, envelope: &RawEnvelope) {
         self.compaction_epochs.insert(
             PromptTimelineKey {
@@ -878,6 +983,13 @@ impl CachedPromptSession {
     /// Advances every session-wide index from one decoded journal envelope.
     /// Returns whether the envelope starts a new compaction epoch.
     fn push_envelope(&mut self, envelope: RawEnvelope) -> bool {
+        // Count the exact serialized array body: two brackets for the first
+        // envelope and one comma for each subsequent envelope.
+        let journal_delimiter_bytes = if self.envelopes.is_empty() { 2 } else { 1 };
+        self.journal_body_bytes = self
+            .journal_body_bytes
+            .saturating_add(serialized_body_bytes(&envelope))
+            .saturating_add(journal_delimiter_bytes);
         let envelope_index = self.envelopes.len();
         let payload = serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok();
         let checkpoint_node_collision = self
@@ -1233,12 +1345,13 @@ async fn load_prompt_checkpoint(
             head_seq: decoded.through_seq,
             current_run: decoded.boundary_run_id,
             current_run_terminal: true,
-            projection: Arc::new(CompiledPromptProjection {
+            body_bytes: serialized_body_bytes(&messages),
+            projection: Some(Arc::new(CompiledPromptProjection {
                 messages,
                 stable_history_end: decoded.stable_history_end,
                 current_user_start: decoded.current_user_start,
                 latest_compaction_summary_end: decoded.latest_compaction_summary_end,
-            }),
+            })),
             cursor: PromptProjectionCursor::Tree {
                 head_node: checkpoint_head_node,
             },
@@ -1394,6 +1507,9 @@ fn extend_compiled_projection(
     agent_id: Option<&AgentId>,
     current_run: &RunId,
 ) -> Result<Option<(CompiledPromptProjection, PromptProjectionCursor)>, HaiderError> {
+    let Some(prefix_projection) = prefix.projection.as_ref() else {
+        return Ok(None);
+    };
     let suffix_start = cached
         .envelopes
         .partition_point(|envelope| envelope.seq <= prefix.head_seq);
@@ -1478,7 +1594,7 @@ fn extend_compiled_projection(
             (rendered, PromptProjectionCursor::Tree { head_node })
         }
     };
-    let mut messages = prefix.projection.messages.clone();
+    let mut messages = prefix_projection.messages.clone();
     let offset = messages.len();
     let current_user_start = rendered
         .current_user_start
@@ -1493,7 +1609,7 @@ fn extend_compiled_projection(
         CompiledPromptProjection {
             stable_history_end: current_user_start,
             current_user_start,
-            latest_compaction_summary_end: prefix.projection.latest_compaction_summary_end,
+            latest_compaction_summary_end: prefix_projection.latest_compaction_summary_end,
             messages,
         },
         cursor,
@@ -1508,6 +1624,9 @@ fn extend_exact_projection(
     agent_id: Option<&AgentId>,
     current_run: &RunId,
 ) -> Result<Option<(CompiledPromptProjection, PromptProjectionCursor)>, HaiderError> {
+    let Some(prefix_projection) = prefix.projection.as_ref() else {
+        return Ok(None);
+    };
     let suffix_start = cached
         .envelopes
         .partition_point(|envelope| envelope.seq <= prefix_head_seq);
@@ -1547,14 +1666,14 @@ fn extend_exact_projection(
                 Some(current_run),
                 false,
             )?;
-            let mut messages = prefix.projection.messages.clone();
+            let mut messages = prefix_projection.messages.clone();
             messages.extend(rendered.messages);
             Ok(Some((
                 CompiledPromptProjection {
                     messages,
-                    stable_history_end: prefix.projection.stable_history_end,
-                    current_user_start: prefix.projection.current_user_start,
-                    latest_compaction_summary_end: prefix.projection.latest_compaction_summary_end,
+                    stable_history_end: prefix_projection.stable_history_end,
+                    current_user_start: prefix_projection.current_user_start,
+                    latest_compaction_summary_end: prefix_projection.latest_compaction_summary_end,
                 },
                 PromptProjectionCursor::Journal,
             )))
@@ -1589,7 +1708,7 @@ fn extend_exact_projection(
                 return Ok(None);
             }
             let projection = extend_tree_projection(
-                &prefix.projection,
+                prefix_projection,
                 &extension,
                 &cached.envelopes,
                 &cached.render_facts,
@@ -3364,4 +3483,124 @@ fn provider_opaque_extension(data: serde_json::Value) -> Option<Block> {
 
 fn corrupt(message: impl Into<String>) -> HaiderError {
     HaiderError::new(ErrorCode::StoreCorrupt, message, false)
+}
+
+fn serialized_body_bytes(value: &(impl Serialize + ?Sized)) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod cache_bound_tests {
+    use super::*;
+
+    fn resident(head_seq: u64) -> CachedPromptSession {
+        CachedPromptSession {
+            head_seq,
+            ..CachedPromptSession::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn session_limit_evicts_the_least_recently_touched_entry() {
+        let cache = PromptHistoryCache::default();
+        for index in 0..PROMPT_CACHE_SESSION_LIMIT {
+            cache
+                .install(SessionId::new(format!("session-{index}")), resident(1))
+                .await;
+        }
+        let touched = cache
+            .sessions
+            .lock()
+            .await
+            .remove(&SessionId::new("session-0"))
+            .expect("oldest session remains resident before touch");
+        cache.install(SessionId::new("session-0"), touched).await;
+        cache
+            .install(SessionId::new("session-new"), resident(1))
+            .await;
+
+        let sessions = cache.sessions.lock().await;
+        assert!(sessions.contains_key(&SessionId::new("session-0")));
+        assert!(!sessions.contains_key(&SessionId::new("session-1")));
+        assert!(sessions.contains_key(&SessionId::new("session-new")));
+    }
+
+    #[tokio::test]
+    async fn body_cap_retains_replay_cursors_while_dropping_lru_bodies() {
+        let cache = PromptHistoryCache::default();
+        let timeline = PromptTimelineKey {
+            branch_id: None,
+            agent_id: None,
+        };
+        let mut cached = resident(42);
+        cached.journal_body_bytes = PROMPT_CACHE_BODY_BYTES_LIMIT.saturating_add(1);
+        cached.compaction_epochs.insert(timeline.clone(), 17);
+        cached.saved_boundaries.insert(timeline.clone(), 31);
+        let run_id = RunId::new("oversized-run");
+        let projection = Arc::new(CompiledPromptProjection {
+            messages: vec![Message::user_text("cached body")],
+            stable_history_end: 0,
+            current_user_start: 0,
+            latest_compaction_summary_end: None,
+        });
+        let projection_key = PromptProjectionKey {
+            head_seq: 42,
+            compaction_epoch: 17,
+            branch_id: None,
+            agent_id: None,
+            current_run: run_id.clone(),
+        };
+        cached.projections.insert(
+            projection_key.clone(),
+            CachedExactProjection {
+                projection: Some(Arc::clone(&projection)),
+                body_bytes: serialized_body_bytes(&projection.messages),
+                cursor: PromptProjectionCursor::Journal,
+            },
+        );
+        let projection_scope = PromptProjectionScope {
+            compaction_epoch: 17,
+            branch_id: None,
+            agent_id: None,
+        };
+        cached.append_prefixes.insert(
+            projection_scope.clone(),
+            CachedCompiledPrefix {
+                head_seq: 42,
+                current_run: run_id,
+                current_run_terminal: true,
+                projection: Some(projection),
+                body_bytes: 1,
+                cursor: PromptProjectionCursor::Tree {
+                    head_node: NodeId::new("cached-head"),
+                },
+            },
+        );
+        cache
+            .install(SessionId::new("oversized-session"), cached)
+            .await;
+
+        let sessions = cache.sessions.lock().await;
+        let cached = sessions
+            .get(&SessionId::new("oversized-session"))
+            .expect("cursor shell remains resident");
+        assert!(cached.bodies_evicted);
+        assert_eq!(cached.resident_body_bytes(), 0);
+        assert_eq!(cached.head_seq, 42);
+        assert_eq!(cached.compaction_epochs.get(&timeline), Some(&17));
+        assert_eq!(cached.saved_boundaries.get(&timeline), Some(&31));
+        let exact = cached
+            .projections
+            .get(&projection_key)
+            .expect("projection hash and cursor remain resident");
+        assert!(exact.projection.is_none());
+        assert!(matches!(exact.cursor, PromptProjectionCursor::Journal));
+        let prefix = cached
+            .append_prefixes
+            .get(&projection_scope)
+            .expect("append hash and cursor remain resident");
+        assert!(prefix.projection.is_none());
+        assert!(matches!(prefix.cursor, PromptProjectionCursor::Tree { .. }));
+    }
 }

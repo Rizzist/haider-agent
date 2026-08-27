@@ -95,9 +95,9 @@ pub enum SessionForkMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ForkContextEpoch {
-    /// The child has a new session-scoped cache key and an independent
-    /// sidecar root. A first rebuild starts a fresh physical generation at
-    /// segment zero and may segment immediately; no parent bytes are inherited.
+    /// The child remains keyed by the actual C2 cohort key (provider, account,
+    /// model, and provider-view header epoch) but starts an independent C3
+    /// segment at zero; no parent segment bytes are inherited.
     Fresh,
     /// The child continues the exact provider-visible cache prefix recorded
     /// by [`SessionForked::inherited_cache_segment`]. The first appended byte

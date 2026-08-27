@@ -2072,6 +2072,14 @@ carrier. The monitor direct enums `MonitorSourceKindWire`,
 replacement field/type, feature-gated method, or wire-version change; a client
 MUST NOT map an unfamiliar literal to one of its shipped values.
 
+The C3 fork additions are also part of this supplemental enum audit.
+`SessionForkMode` (`"fork" | "metafork"`), `ForkContextEpoch`
+(`"fresh" | "inherited"`), and the tagged `SessionForkEventPayload` are
+normatively **Extensible** because each has a `#[serde(other)]` `Unknown` arm.
+An unknown fork mode, context epoch, or future fork-event type supplies no
+inheritance authority; in particular, a client MUST NOT treat it as `fresh`
+or `inherited` by default.
+
 Never derive an enum's wire spelling from its Rust variant name. Read the
 variant's `#[serde(rename = "...")]` first, then its enum-level serde rule, and
 use the exact-spelling audit below. This is especially important for
@@ -2115,19 +2123,21 @@ Existing fields do not change meaning. A frozen enum does not grow. A required
 field or incompatible meaning requires a new type/field or a wire-version
 change. Months-old session payloads remain raw-decodable.
 
-### 15.2 v0.0.962 internal integration lanes
+### 15.2 v0.0.962 integration lanes
 
-The twelve integration lanes below do not add a client request method or a
-Welcome feature token. The exact totals therefore remain 86 request methods
-and 85 feature tokens, and the existing wire frames remain byte-identical.
-Clients MUST NOT infer new callable surfaces from these implementation facts:
+The integration lanes below do not add a client request method or a Welcome
+feature token. The exact totals therefore remain 86 request methods and 85
+feature tokens. They do not all preserve old event bytes: C3 additively exposes
+fork inheritance fields on `SessionForked`. The golden transcript recount
+remains 131 frames. Clients MUST NOT infer a new callable surface from these
+facts:
 
 | Lane | Client-contract effect |
 |---|---|
 | cachemaxxing | Provider-view ledgers, breakpoint placement, cache lifecycle, header epochs, and economic cache accounting refine the existing published cache metrics. They add no RPC method; clients still read the authorities in §1.1 and §9.1. |
 | C1 | A provider-only graph/Loom/inventory snapshot is frozen once per turn and placed in that turn's immutable provider prefix. It is not journaled or exposed as a client field. |
 | C2 | Prompt-cache routing uses an account/model/provider-view-header cohort shared by trusted sibling sessions. The opaque provider key is not a session identity or client surface. |
-| C3 | A byte-identical fork may inherit the parent provider-view segment. Its durable internal fork record binds the decision to the exact ledger digest; no new `session.fork` request or response field is promised here. |
+| C3 | A byte-identical fork may inherit the parent provider-view segment. The client-visible raw `SessionForked` fact now carries required `context_epoch: fresh | inherited` and optional `inherited_cache_segment`. The segment records provider/model/account scope, cache route/epoch, exact prefix digest and stable boundary, and source provider-view coordinates. `inherited` is authoritative only with a present descriptor; no new `session.fork` request or response field was added. |
 | C4 | Pure filesystem reads and validated web responses may be served from bounded, freshness-checked process-local memos. Tool results retain their existing wire and journal shapes. |
 | S1 | Launch-race and terminal-theme probe latency changed; discovery, framing, and launcher ownership rules in §§2–3 did not. |
 | S2 | Exact-config provider adapters retain bounded shared HTTP connection pools. Cache warm/keepalive work uses the same retained adapter/client. |
@@ -2135,6 +2145,7 @@ Clients MUST NOT infer new callable surfaces from these implementation facts:
 | M1 | Headless commands select a lean Tokio runtime without changing their request, response, or exit semantics. |
 | M3 | Completed background-task live buffers are released after CAS publication; cursor pages read the same bytes and offsets through the durable artifact. |
 | T1 | Daemon tests moved to sibling test modules. Production symbols and wire bytes did not change. |
+| X1 | The live TUI captures its active composer's `branch_id` when issuing a shell command and sends the scope-capable `ShellExecScoped` representation under the unchanged `shell.exec` method spelling. The generic typed shell SDK serializes the caller-supplied `branch_id`/`agent_id`, binding the durable command record to the branch/agent whose next turn consumes it. That SDK requires all of `shell_exec_v1`, `turn_control_v1`, and `user_command_v1` and fails closed before sending if any is absent; it does not silently erase a supplied scope. |
 
 These lanes are deliberately absent from the feature-token table: performance,
 storage, cache-routing, and test-layout changes are not negotiable client
@@ -2222,6 +2233,15 @@ Success returns `attachment_id` plus one complete
 `SessionDescendantBaselineWire`. `session.detach` ends this attachment just as
 it ends an ordinary session attachment. The response is enqueued before any
 stream frame naming the new attachment id.
+
+The typed `ObserveClient` samples its connection loss counter before attach
+and returns that sample as `DescendantLiveAttachment.lost_events_at_attach`.
+While the attachment is live, callers MUST compare it with
+`ObserveClient::lost_events()`. Any increase means an uncorrelated descendant
+frame may have been dropped, including during attach; the live view is then
+invalid even if no sequence gap has yet become visible. Stop applying it and
+reattach using each child's greatest fully applied sequence as the cursor.
+Never advance a cursor from the loss counter or from the baseline alone.
 
 The baseline contains `session_id`, `generated_at_ms`, `fanout`,
 `truncation`, and nested `roots`. `fanout` carries `requested_children`,

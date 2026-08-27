@@ -1525,6 +1525,23 @@ pub trait Provider: Send + Sync {
             })
     }
 
+    /// Prepares one request while borrowing an immutable tool-definition
+    /// pack. Built-in adapters override this hook and render directly from the
+    /// borrowed slice; injected providers retain compatibility through one
+    /// owned materialization at their boundary.
+    fn prepare_turn_with_tools(
+        &self,
+        request: &TurnRequest,
+        tools: &[ToolDefinition],
+    ) -> Option<PreparedTurn> {
+        if request.tools.as_slice() == tools {
+            return self.prepare_turn(request);
+        }
+        let mut owned = request.clone();
+        owned.tools = tools.to_vec();
+        self.prepare_turn(&owned)
+    }
+
     /// Optionally establishes the provider origin's pooled TLS/ALPN
     /// connection. Disabled unless `HAIDER_PROVIDER_PREWARM=1`; failures are
     /// deliberately advisory and cannot change turn admission or request

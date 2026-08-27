@@ -756,10 +756,19 @@ impl Provider for OpenAiProvider {
     }
 
     fn prepare_turn(&self, request: &TurnRequest) -> Option<crate::PreparedTurn> {
+        <Self as Provider>::prepare_turn_with_tools(self, request, &request.tools)
+    }
+
+    fn prepare_turn_with_tools(
+        &self,
+        request: &TurnRequest,
+        tools: &[crate::ToolDefinition],
+    ) -> Option<crate::PreparedTurn> {
         let boundary = request.cache_metadata.as_ref()?.cacheable_history_end();
         self.http.validate_model(request).ok()?;
         let rendered = responses_request_json_neutral_with_boundary(
             request,
+            tools,
             self.http.codex_responses_lite,
             self.effort.as_deref(),
             self.web_search,
@@ -789,7 +798,7 @@ impl Provider for OpenAiProvider {
             metadata.previous_stable_history_end,
             metadata.latest_compaction_summary_end,
             request.system_prompt.is_some(),
-            !request.tools.is_empty(),
+            !tools.is_empty(),
             metadata.stable_prefix_tokens,
         );
         let history_wire_start =
@@ -834,6 +843,7 @@ impl Provider for OpenAiProvider {
             &mut full_payload,
             &message_wire_ends,
             boundary,
+            !tools.is_empty(),
             Some(header_epoch),
         );
         let cache_control = openai_cache_control_observation(request, &full_payload);
@@ -1639,11 +1649,20 @@ impl Provider for OpenAiCompatibleProvider {
     }
 
     fn prepare_turn(&self, request: &TurnRequest) -> Option<crate::PreparedTurn> {
+        <Self as Provider>::prepare_turn_with_tools(self, request, &request.tools)
+    }
+
+    fn prepare_turn_with_tools(
+        &self,
+        request: &TurnRequest,
+        tools: &[crate::ToolDefinition],
+    ) -> Option<crate::PreparedTurn> {
         let boundary = request.cache_metadata.as_ref()?.cacheable_history_end();
         self.http.validate_model(request).ok()?;
         let (mut full_payload, stable_wire_end, previous_wire_end) =
             chat_request_json_with_boundary(
                 request,
+                tools,
                 self.dialect,
                 self.kimi_thinking.as_ref(),
                 self.kimi_reasoning_effort.as_deref(),
@@ -3811,6 +3830,7 @@ fn responses_request_json_with_boundary(
 ) -> Result<(serde_json::Value, usize, Option<usize>), ProviderError> {
     let mut rendered = responses_request_json_neutral_with_boundary(
         request,
+        &request.tools,
         codex_responses_lite,
         effort,
         hosted_web_search,
@@ -3822,6 +3842,7 @@ fn responses_request_json_with_boundary(
         &mut rendered.payload,
         &rendered.message_wire_ends,
         stable_history_end,
+        !request.tools.is_empty(),
         None,
     );
     Ok((
@@ -3833,6 +3854,7 @@ fn responses_request_json_with_boundary(
 
 fn responses_request_json_neutral_with_boundary(
     request: &TurnRequest,
+    tools: &[crate::ToolDefinition],
     codex_responses_lite: bool,
     effort: Option<&str>,
     hosted_web_search: bool,
@@ -4129,8 +4151,7 @@ fn responses_request_json_neutral_with_boundary(
             previous_wire_end = Some(input.len());
         }
     }
-    let mut tools = request
-        .tools
+    let mut tools = tools
         .iter()
         .map(|tool| {
             if tool.name == "computer" {
@@ -4520,6 +4541,7 @@ fn apply_openai_cache_controls(
     payload: &mut serde_json::Value,
     message_wire_ends: &[usize],
     stable_history_end: usize,
+    has_tools: bool,
     header_epoch: Option<&str>,
 ) {
     let Some(input) = payload
@@ -4556,7 +4578,7 @@ fn apply_openai_cache_controls(
             metadata.previous_stable_history_end,
             metadata.latest_compaction_summary_end,
             request.system_prompt.is_some(),
-            !request.tools.is_empty(),
+            has_tools,
             metadata.stable_prefix_tokens,
         );
         for boundary in plan.history_ends {
@@ -4779,6 +4801,7 @@ fn chat_request_json(
 ) -> Result<serde_json::Value, ProviderError> {
     chat_request_json_with_boundary(
         request,
+        &request.tools,
         dialect,
         kimi_thinking,
         kimi_reasoning_effort,
@@ -4789,6 +4812,7 @@ fn chat_request_json(
 
 fn chat_request_json_with_boundary(
     request: &TurnRequest,
+    tools: &[crate::ToolDefinition],
     dialect: CompatibleDialect,
     kimi_thinking: Option<&KimiThinkingConfig>,
     kimi_reasoning_effort: Option<&str>,
@@ -4949,8 +4973,7 @@ fn chat_request_json_with_boundary(
             previous_wire_end = Some(messages.len());
         }
     }
-    let tools = request
-        .tools
+    let tools = tools
         .iter()
         .map(|tool| {
             serde_json::json!({

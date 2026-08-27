@@ -407,6 +407,7 @@ impl GeminiProvider {
                     });
                 let (payload, boundary, _) = gemini_request_json_with_boundary(
                     request,
+                    &request.tools,
                     self.effort.as_deref(),
                     self.web_builtins,
                     boundary,
@@ -504,11 +505,20 @@ impl Provider for GeminiProvider {
     }
 
     fn prepare_turn(&self, request: &TurnRequest) -> Option<crate::PreparedTurn> {
+        <Self as Provider>::prepare_turn_with_tools(self, request, &request.tools)
+    }
+
+    fn prepare_turn_with_tools(
+        &self,
+        request: &TurnRequest,
+        tools: &[crate::ToolDefinition],
+    ) -> Option<crate::PreparedTurn> {
         let boundary = request.cache_metadata.as_ref()?.cacheable_history_end();
         self.validate_model(request).ok()?;
         let (full_payload, history_boundary, previous_history_boundary) =
             gemini_request_json_with_boundary(
                 request,
+                tools,
                 self.effort.as_deref(),
                 self.web_builtins,
                 boundary,
@@ -755,6 +765,7 @@ impl GeminiCacheRegistry {
     ) -> serde_json::Value {
         let history_boundary = gemini_request_json_with_boundary(
             request,
+            &request.tools,
             effort,
             web_builtins,
             request
@@ -1026,12 +1037,19 @@ pub(crate) fn gemini_request_json(
     effort: Option<&str>,
     web_builtins: bool,
 ) -> Result<serde_json::Value, ProviderError> {
-    gemini_request_json_with_boundary(request, effort, web_builtins, request.messages.len())
-        .map(|(payload, _, _)| payload)
+    gemini_request_json_with_boundary(
+        request,
+        &request.tools,
+        effort,
+        web_builtins,
+        request.messages.len(),
+    )
+    .map(|(payload, _, _)| payload)
 }
 
 fn gemini_request_json_with_boundary(
     request: &TurnRequest,
+    tools: &[crate::ToolDefinition],
     effort: Option<&str>,
     web_builtins: bool,
     stable_history_end: usize,
@@ -1252,8 +1270,7 @@ fn gemini_request_json_with_boundary(
         ));
     }
 
-    let declarations = request
-        .tools
+    let declarations = tools
         .iter()
         .map(|tool| {
             serde_json::json!({

@@ -43,6 +43,7 @@ pub(crate) enum AnthropicSystemShape {
 
 pub(crate) fn request_json(
     request: &TurnRequest,
+    tools: &[crate::ToolDefinition],
     system_shape: AnthropicSystemShape,
     effort: Option<&str>,
     fast: bool,
@@ -51,7 +52,7 @@ pub(crate) fn request_json(
 ) -> Result<serde_json::Value, ProviderError> {
     let attachments = attachment_index(request)?;
     let native_computer = crate::anthropic::anthropic_computer_tool_version(&request.model)
-        .filter(|_| request.tools.iter().any(|tool| tool.name == "computer"));
+        .filter(|_| tools.iter().any(|tool| tool.name == "computer"));
     let mut messages = request
         .messages
         .iter()
@@ -72,8 +73,7 @@ pub(crate) fn request_json(
             }))
         })
         .collect::<Result<Vec<_>, ProviderError>>()?;
-    let mut tools = request
-        .tools
+    let mut tools = tools
         .iter()
         .map(|tool| {
             if tool.name == "computer"

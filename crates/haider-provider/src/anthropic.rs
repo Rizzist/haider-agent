@@ -547,6 +547,7 @@ impl AnthropicProvider {
     fn render_payload(
         &self,
         request: &TurnRequest,
+        tools: &[crate::ToolDefinition],
         cache_ttl: Option<AnthropicCacheTtl>,
     ) -> Result<serde_json::Value, ProviderError> {
         let system_shape = match self.auth_mode {
@@ -557,6 +558,7 @@ impl AnthropicProvider {
         };
         let mut payload = request_json(
             request,
+            tools,
             system_shape,
             self.effort.as_deref(),
             self.fast,
@@ -569,6 +571,7 @@ impl AnthropicProvider {
                 &mut payload,
                 system_shape,
                 self.web_tools,
+                !tools.is_empty(),
                 cache_ttl,
             );
         }
@@ -603,7 +606,7 @@ impl AnthropicProvider {
     ) -> Result<serde_json::Value, ProviderError> {
         self.validate_model(request)?;
         let cache_ttl = self.request_cache_ttl(request);
-        let payload = self.render_payload(request, cache_ttl)?;
+        let payload = self.render_payload(request, &request.tools, cache_ttl)?;
         self.validate_pdf_request_size(request, &payload)?;
         Ok(payload)
     }
@@ -1012,6 +1015,7 @@ fn apply_anthropic_cache_controls(
     payload: &mut serde_json::Value,
     system_shape: AnthropicSystemShape,
     web_tools: bool,
+    has_tools: bool,
     ttl: AnthropicCacheTtl,
 ) -> bool {
     let Some(metadata) = request.cache_metadata.as_ref() else {
@@ -1025,7 +1029,7 @@ fn apply_anthropic_cache_controls(
         metadata.previous_stable_history_end,
         metadata.latest_compaction_summary_end,
         request.system_prompt.is_some(),
-        !request.tools.is_empty() || web_tools,
+        has_tools || web_tools,
         metadata.stable_prefix_tokens,
     );
     let Some(object) = payload.as_object_mut() else {
@@ -1179,9 +1183,17 @@ impl Provider for AnthropicProvider {
     }
 
     fn prepare_turn(&self, request: &TurnRequest) -> Option<crate::PreparedTurn> {
+        <Self as Provider>::prepare_turn_with_tools(self, request, &request.tools)
+    }
+
+    fn prepare_turn_with_tools(
+        &self,
+        request: &TurnRequest,
+        tools: &[crate::ToolDefinition],
+    ) -> Option<crate::PreparedTurn> {
         let boundary = request.cache_metadata.as_ref()?.cacheable_history_end();
         self.validate_model(request).ok()?;
-        let mut full_payload = self.render_payload(request, None).ok()?;
+        let mut full_payload = self.render_payload(request, tools, None).ok()?;
         let metadata = request.cache_metadata.as_ref()?;
         let ledger_plan = crate::plan_inline_breakpoints(
             &metadata.provider,
@@ -1191,7 +1203,7 @@ impl Provider for AnthropicProvider {
             metadata.previous_stable_history_end,
             metadata.latest_compaction_summary_end,
             request.system_prompt.is_some(),
-            !request.tools.is_empty(),
+            !tools.is_empty(),
             metadata.stable_prefix_tokens,
         );
         let wire_plan = crate::plan_inline_breakpoints(
@@ -1202,7 +1214,7 @@ impl Provider for AnthropicProvider {
             metadata.previous_stable_history_end,
             metadata.latest_compaction_summary_end,
             request.system_prompt.is_some(),
-            !request.tools.is_empty() || self.web_tools,
+            !tools.is_empty() || self.web_tools,
             metadata.stable_prefix_tokens,
         );
         let cache_ttl = self.request_cache_ttl(request);
@@ -1256,6 +1268,7 @@ impl Provider for AnthropicProvider {
                     AnthropicAuthMode::OAuthBearer => AnthropicSystemShape::OAuthClaudeCode,
                 },
                 self.web_tools,
+                !tools.is_empty(),
                 ttl,
             )
         });

@@ -71,14 +71,69 @@ pub struct SmsIncomingEvent {
 
 /// Payload carried on the source hub. It remains free of session coordinates
 /// so a transport can never choose which conversation gets woken.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MonitorEventPayload {
     Sms(SmsIncomingEvent),
     Process { line: String },
     File { payload: String },
     Poll { payload: String },
     Timer { fired_at_ms: u64 },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum MonitorEventPayloadWire {
+    Sms(SmsIncomingEvent),
+    Process(MonitorProcessEvent),
+    File(MonitorFileEvent),
+    Poll(MonitorPollEvent),
+    Timer(MonitorTimerEvent),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MonitorProcessEvent {
+    line: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MonitorFileEvent {
+    payload: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MonitorPollEvent {
+    payload: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MonitorTimerEvent {
+    fired_at_ms: u64,
+}
+
+impl<'de> Deserialize<'de> for MonitorEventPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match MonitorEventPayloadWire::deserialize(deserializer)? {
+            MonitorEventPayloadWire::Sms(event) => Self::Sms(event),
+            MonitorEventPayloadWire::Process(event) => Self::Process { line: event.line },
+            MonitorEventPayloadWire::File(event) => Self::File {
+                payload: event.payload,
+            },
+            MonitorEventPayloadWire::Poll(event) => Self::Poll {
+                payload: event.payload,
+            },
+            MonitorEventPayloadWire::Timer(event) => Self::Timer {
+                fired_at_ms: event.fired_at_ms,
+            },
+        })
+    }
 }
 
 impl MonitorEventPayload {

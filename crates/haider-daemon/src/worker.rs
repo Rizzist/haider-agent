@@ -43,6 +43,12 @@ mod pair_switch_runtime_tests;
 #[cfg(test)]
 #[path = "wd_pdf_runtime_tests.rs"]
 mod wd_pdf_runtime_tests;
+#[cfg(test)]
+#[path = "worker_tool_catalog_tests.rs"]
+mod worker_tool_catalog_tests;
+#[cfg(test)]
+#[path = "worker_turn_setup_reduction_tests.rs"]
+mod worker_turn_setup_reduction_tests;
 
 use crate::delegation::{DelegationHandle, MessageCoordinates, SpawnCoordinates};
 use crate::diagnostics::{EffectBreadcrumb, EffectDiagnostics};
@@ -78,7 +84,9 @@ use haider_protocol::effect::{
     AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome, EffectPhase, FileFreshness,
     WorkspaceMutation,
 };
-use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
+use haider_protocol::envelope::{
+    EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
+};
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
 use haider_protocol::graph::{
     ComputerObservationKind, GraphGateKind, GraphNodeName, GraphPhase, ProcessSignalRecorded,
@@ -137,7 +145,8 @@ use haider_tools::{
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
@@ -324,7 +333,8 @@ struct DaemonContextCompactor {
     post_compaction_system_prompt: Option<String>,
     post_compaction_volatile_tail: Option<String>,
     post_compaction_grant_scope: String,
-    post_compaction_tools: Vec<ToolDefinition>,
+    post_compaction_tools: Arc<[ToolDefinition]>,
+    post_compaction_tool_digest: String,
     reasoning_settings: String,
     cache_expected_later_reads: u32,
     cache_reuse_gap_ms: Option<u64>,
@@ -483,7 +493,7 @@ impl DaemonContextCompactor {
         let stable_prefix_tokens = estimate_provider_request_input_tokens(
             &messages[..stable_history_end],
             &self.post_compaction_system_prompt,
-            &self.post_compaction_tools,
+            self.post_compaction_tools.as_ref(),
             &[],
         );
         PromptCacheMetadata {
@@ -637,7 +647,7 @@ impl ContextCompactor for DaemonContextCompactor {
         replay_messages.push(Message::user_text(COMPACTION_SUMMARY_INSTRUCTION));
         let mut prefix_digests = PrefixDigests {
             system: digest_json(&self.post_compaction_system_prompt),
-            tools: canonical_tool_definitions_digest(&self.post_compaction_tools),
+            tools: self.post_compaction_tool_digest.clone(),
             immutable_history: immutable_history_digest.clone(),
             model: digest_json(&self.model),
             auth_mode: digest_json(&self.usage_scope.auth_scope),
@@ -667,14 +677,36 @@ impl ContextCompactor for DaemonContextCompactor {
             // real output room — 4K forced truncation into total failure.
             max_tokens: self.max_tokens.min(8_192),
             system_prompt: self.post_compaction_system_prompt.clone(),
-            tools: self.post_compaction_tools.clone(),
+            tools: Vec::new(),
             // Round 5: the ACTOR resolved these exactly as the live lane
             // does, so an image-bearing prefix replays instead of always
             // detouring through the uncached fallback.
             attachments,
             cache_metadata: Some(cache_metadata.clone()),
         };
-        let mut prepared = self.provider.prepare_turn(&request);
+        let mut prepared = self
+            .provider
+            .prepare_turn_with_tools(&request, &self.post_compaction_tools);
+        if prepared
+            .as_ref()
+            .is_some_and(haider_provider::PreparedTurn::has_rendered_wire)
+        {
+            // Anthropic's stream decoder needs only the native-computer
+            // capability bit; the full Arc-backed schemas are already frozen
+            // into the retained wire rendered above by reference.
+            request.tools.extend(
+                self.post_compaction_tools
+                    .iter()
+                    .filter(|tool| tool.name == "computer")
+                    .cloned(),
+            );
+        } else {
+            // Compatibility providers that do not retain rendered wire still
+            // receive an owned pack at their boundary.
+            request
+                .tools
+                .extend(self.post_compaction_tools.iter().cloned());
+        }
         if let Some(rendered) = prepared.as_ref().map(|prepared| prepared.prefix_digests()) {
             prefix_digests = rendered.clone();
             previous_prefix_digests = prepared
@@ -826,7 +858,7 @@ impl ContextCompactor for DaemonContextCompactor {
                 };
                 let fallback_prefix_digests = PrefixDigests {
                     system: digest_json(&fallback_system_prompt),
-                    tools: canonical_tool_definitions_digest(&[]),
+                    tools: empty_tool_definitions_digest().to_owned(),
                     immutable_history: immutable_history_digest.clone(),
                     model: digest_json(&self.model),
                     auth_mode: digest_json(&self.usage_scope.auth_scope),
@@ -1047,7 +1079,7 @@ impl ContextCompactor for DaemonContextCompactor {
             let post_compaction_input = estimate_provider_request_input_tokens(
                 &post_compaction_messages,
                 &self.post_compaction_system_prompt,
-                &self.post_compaction_tools,
+                self.post_compaction_tools.as_ref(),
                 &[],
             );
             let footprint = ContextFootprint {
@@ -1188,10 +1220,38 @@ pub struct WorkerToolContext {
 pub trait TurnToolFactory: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
 
+    /// Immutable definition storage for turn-time filtering. Injected
+    /// factories retain the owned compatibility hook above; the production
+    /// registry overrides this so nested schemas are not rebuilt before every
+    /// turn.
+    fn shared_definitions(&self) -> Arc<[ToolDefinition]> {
+        self.definitions().into()
+    }
+
     async fn create(
         &self,
         context: WorkerToolContext,
     ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError>;
+
+    /// Starts a dispatcher from the journal snapshot already reduced for this
+    /// turn. Custom factories retain their existing `create` seam and opt into
+    /// the conservative completion scan; the broker factory consumes both
+    /// snapshots directly.
+    #[doc(hidden)]
+    async fn create_with_turn_snapshot(
+        &self,
+        context: WorkerToolContext,
+        _durable_grants: Vec<SessionGrant>,
+        _durable_bindings: HashMap<MenuId, (EffectClass, String)>,
+        _durable_freshness: HashMap<String, FileFreshness>,
+        effect_dispatched: Arc<AtomicBool>,
+    ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
+        let dispatcher = self.create(context).await?;
+        if dispatcher.is_some() {
+            effect_dispatched.store(true, Ordering::Release);
+        }
+        Ok(dispatcher)
+    }
 }
 
 /// How the daemon obtains its per-turn provider factory, and — the D3-5
@@ -2628,6 +2688,9 @@ struct ActiveTurn {
     harness: haider_core::HarnessHandle,
     dispatcher: Option<Arc<dyn ToolDispatcher>>,
     actor: Option<JoinHandle<()>>,
+    /// Conservative latch: false proves this turn needs no completion effect
+    /// scan; true means a dispatch may have reached the durable journal.
+    effect_dispatched: Arc<AtomicBool>,
     /// W-B: whether this turn declared the anthropic SERVER web tools —
     /// the precondition for the invalid-request degrade latch.
     anthropic_web_tools: bool,
@@ -3074,11 +3137,12 @@ async fn run_supervisor(
                         {
                             lease.hub().degrade_anthropic_web_tools(lease.session_id());
                         }
+                        let durable_before_close =
+                            durable_run_state(&lease, &finished.run_id).await;
                         let cancellation_requested = matches!(
                             outcome_state.as_ref(),
                             Some(RunState::Cancelled)
-                        ) || durable_run_state(&lease, &finished.run_id).await
-                            == Some(RunState::Cancelling);
+                        ) || durable_before_close == Some(RunState::Cancelling);
                         if let Some(dispatcher) = finished.dispatcher.take()
                             && let Err(error) = if cancellation_requested {
                                 dispatcher.cancel().await
@@ -3178,34 +3242,44 @@ async fn run_supervisor(
                         // non-terminal in daemon mode. Orderly cancellation
                         // closes every abandoned dispatch as Cancelled before
                         // the run itself crosses its terminal boundary.
-                        let durable = match reconcile_unknown_effects(
-                            &lease,
-                            &device_id,
-                            &finished.run_id,
-                            finished.branch_id.as_ref(),
-                            &event_ids,
-                            if cancellation_requested {
-                                UnknownReconcile::Cancel
-                            } else {
-                                UnknownReconcile::EvidenceOnly
-                            },
-                        )
-                        .await
-                        {
-                            Ok(durable) => durable,
-                            Err(error) => {
-                                // Never cross the terminal boundary while a
-                                // Dispatched effect still lacks an outcome. A
-                                // later startup/fresh supervisor may reconcile
-                                // it, but this exit must not synthesize Cancelled.
-                                tracing::error!(
-                                    run_id = %finished.run_id,
-                                    ?error,
-                                    "effect reconciliation failed; terminal commit remains fenced"
-                                );
-                                let _ = lease.unregister_worker().await;
-                                return false;
+                        let durable = if finished.effect_dispatched.load(Ordering::Acquire) {
+                            match reconcile_unknown_effects(
+                                &lease,
+                                &device_id,
+                                &finished.run_id,
+                                finished.branch_id.as_ref(),
+                                &event_ids,
+                                if cancellation_requested {
+                                    UnknownReconcile::Cancel
+                                } else {
+                                    UnknownReconcile::EvidenceOnly
+                                },
+                            )
+                            .await
+                            {
+                                Ok(durable) => durable,
+                                Err(error) => {
+                                    // Never cross the terminal boundary while a
+                                    // Dispatched effect still lacks an outcome. A
+                                    // later startup/fresh supervisor may reconcile
+                                    // it, but this exit must not synthesize Cancelled.
+                                    tracing::error!(
+                                        run_id = %finished.run_id,
+                                        ?error,
+                                        "effect reconciliation failed; terminal commit remains fenced"
+                                    );
+                                    let _ = lease.unregister_worker().await;
+                                    return false;
+                                }
                             }
+                        } else if cancellation_wakes.has_changed().unwrap_or(false) {
+                            // A cancellation can commit while dispatcher/harness
+                            // shutdown is awaited. Preserve the old post-close
+                            // cancellation observation without paying the
+                            // effect-history scan on the ordinary no-effect path.
+                            durable_run_state(&lease, &finished.run_id).await
+                        } else {
+                            durable_before_close
                         };
                         if durable == Some(RunState::EffectOutcomeUnknown) {
                             let _ = lease.unregister_worker().await;
@@ -4552,16 +4626,18 @@ async fn perform_manual_compaction(
     let mobile_use_active = durable_session_tool_state(lease, lease.session_id())
         .await?
         .mobile_use_active;
-    let post_compaction_tools = advertised_tool_definitions_for_mobile_state(
+    let post_compaction_tool_pack = advertised_tool_pack_for_mobile_state(
         &dependencies.tool_factory,
         grant,
         &resolved.provider_name,
         web_degrade,
         mobile_use_active,
     );
+    let post_compaction_tools = Arc::clone(&post_compaction_tool_pack.definitions);
+    let post_compaction_tool_digest = post_compaction_tool_pack.digest.clone();
     let post_compaction_grant_scope = cache_grant_scope_digest(grant)?;
     let post_compaction_system_prompt = SystemPromptBuilder::shared_immutable_base(
-        &post_compaction_tools,
+        post_compaction_tools.as_ref(),
         &post_compaction_grant_scope,
     );
     let post_compaction_volatile_tail = SystemPromptBuilder::session_context_with_handoff(
@@ -4586,7 +4662,7 @@ async fn perform_manual_compaction(
         &auth_scope,
         &reasoning_settings,
         &Some(post_compaction_system_prompt.clone()),
-        &post_compaction_tools,
+        &post_compaction_tool_digest,
     );
     stamp_usage_lane_dimensions(&mut usage_scope, resolved.provider.usage_lane_dimensions());
     let (mut messages, latest_compaction_summary_end) =
@@ -4673,6 +4749,7 @@ async fn perform_manual_compaction(
         post_compaction_volatile_tail: Some(post_compaction_volatile_tail),
         post_compaction_grant_scope,
         post_compaction_tools,
+        post_compaction_tool_digest,
         reasoning_settings,
         cache_expected_later_reads,
         cache_reuse_gap_ms: None,
@@ -4826,6 +4903,7 @@ async fn perform_shell_exec(
         diagnostics,
         workspace_root_digest: EffectDiagnostics::workspace_digest(&metadata.cwd),
         active_tool_name: Arc::new(StdMutex::new(Some("shell_exec".into()))),
+        effect_dispatched: Arc::new(AtomicBool::new(false)),
         intent_digests: HashMap::new(),
         pending_breadcrumbs: HashMap::new(),
     };
@@ -5429,6 +5507,24 @@ async fn start_turn(
         .handoff_dir_for_child_session(lease.session_id(), &metadata.cwd)
         .await?;
     let instructions = project_instructions::load(&metadata.cwd).await;
+    let auth_scope = credential_surface_name(resolved.provider.credential_surface()).to_owned();
+    let account_scope = resolved
+        .account_alias
+        .as_deref()
+        .map(haider_protocol::ids::CredentialAlias::new);
+    let mut setup_reduction = reduce_turn_setup_journal(
+        lease,
+        TurnSetupReductionSelector {
+            run_id: accepted.run_id.clone(),
+            branch_id: accepted.branch_id.clone(),
+            agent_id: agent_id.clone(),
+            provider: resolved.provider_name.clone(),
+            model: resolved.model.clone(),
+            account_scope: account_scope.clone(),
+            auth_scope: auth_scope.clone(),
+        },
+    )
+    .await?;
     journal_project_instructions_if_changed(
         lease,
         device_id,
@@ -5437,6 +5533,7 @@ async fn start_turn(
         agent_id.as_ref(),
         &event_ids,
         instructions.as_ref(),
+        &mut setup_reduction,
     )
     .await?;
     let prewarm = (std::env::var_os("HAIDER_PROVIDER_PREWARM").as_deref()
@@ -5564,30 +5661,40 @@ async fn start_turn(
             "The daemon selects and capability-scopes each typed node. The current volatile typed-executor binding is authoritative; stop using a prior specialist role whenever that binding changes.",
         );
     }
-    let mobile_use_active = durable_session_tool_state(lease, lease.session_id())
-        .await?
-        .mobile_use_active;
+    let DurableToolState {
+        grants: durable_grants,
+        bindings: durable_bindings,
+        freshness: durable_freshness,
+        mobile_use_active,
+    } = setup_reduction.durable_tool_state();
+    let effect_dispatched = Arc::new(AtomicBool::new(false));
     let dispatcher = dependencies
         .tool_factory
-        .create(WorkerToolContext {
-            metadata: metadata.clone(),
-            store: lease.clone(),
-            run_id: accepted.run_id.clone(),
-            branch_id: accepted.branch_id.clone(),
-            device_id: device_id.clone(),
-            event_ids: Arc::clone(&event_ids),
-            delegation,
-            tasks: crate::tasks::TaskFacade::new(lease.hub().clone()),
-            agent_id: agent_id.clone(),
-            session_context_tail: session_context.clone(),
-            grant: delegation_grant.clone(),
-            mobile_use_active,
-            cli_scope,
-            typed_workflow_execution,
-            loom_provider_fenced,
-            web_search: dependencies.web_search.clone(),
-            diagnostics: dependencies.diagnostics.clone(),
-        })
+        .create_with_turn_snapshot(
+            WorkerToolContext {
+                metadata: metadata.clone(),
+                store: lease.clone(),
+                run_id: accepted.run_id.clone(),
+                branch_id: accepted.branch_id.clone(),
+                device_id: device_id.clone(),
+                event_ids: Arc::clone(&event_ids),
+                delegation,
+                tasks: crate::tasks::TaskFacade::new(lease.hub().clone()),
+                agent_id: agent_id.clone(),
+                session_context_tail: session_context.clone(),
+                grant: delegation_grant.clone(),
+                mobile_use_active,
+                cli_scope,
+                typed_workflow_execution,
+                loom_provider_fenced,
+                web_search: dependencies.web_search.clone(),
+                diagnostics: dependencies.diagnostics.clone(),
+            },
+            durable_grants,
+            durable_bindings,
+            durable_freshness,
+            Arc::clone(&effect_dispatched),
+        )
         .await?;
     let mut config = HarnessConfig::for_session(
         lease.session_id().clone(),
@@ -5632,40 +5739,85 @@ async fn start_turn(
     }
     let provider_grant = loom_turn_grant.as_ref().or(delegation_grant.as_ref());
     let provider_grant_scope = cache_grant_scope_digest(provider_grant)?;
-    let provider_tool_base = authorized_tool_definitions(
+    let provider_tool_base = authorized_tool_definition_pack(
         &dependencies.tool_factory,
         provider_grant,
         mobile_use_active,
     );
-    config.provider_local_web_tools = provider_tool_base
+    let provider_tools = tool_definition_pack_for_web_names(
+        &dependencies.tool_factory,
+        provider_grant,
+        mobile_use_active,
+        &provider_request_state.local_web_tool_names,
+    );
+    let provider_fallback_tools = (!provider_request_state
+        .provider_fallback_local_web_tool_names
+        .is_empty())
+    .then(|| {
+        let pack = tool_definition_pack_for_web_names(
+            &dependencies.tool_factory,
+            provider_grant,
+            mobile_use_active,
+            &provider_request_state.provider_fallback_local_web_tool_names,
+        );
+        (Arc::clone(&pack.definitions), pack.digest.clone())
+    });
+    let local_web_tool_names = provider_tool_base
+        .definitions
         .iter()
         .filter(|definition| is_local_web_tool(&definition.name))
-        .cloned()
-        .collect();
-    config.provider_tool_base = Some(provider_tool_base);
-    config.install_provider_derived_request_state(&provider_request_state);
+        .map(|definition| definition.name.clone())
+        .collect::<Vec<_>>();
+    let mut name_variants = vec![Vec::new()];
+    for name in &local_web_tool_names {
+        let additions = name_variants
+            .iter()
+            .cloned()
+            .map(|mut names| {
+                names.push(name.clone());
+                names
+            })
+            .collect::<Vec<_>>();
+        name_variants.extend(additions);
+    }
+    let mut provider_tool_variants = HashMap::new();
+    for mut names in name_variants {
+        names.sort_unstable();
+        let pack = tool_definition_pack_for_web_names(
+            &dependencies.tool_factory,
+            provider_grant,
+            mobile_use_active,
+            &names,
+        );
+        provider_tool_variants.insert(names, (Arc::clone(&pack.definitions), pack.digest.clone()));
+    }
+    config.install_shared_tool_packs(
+        Arc::clone(&provider_tool_base.definitions),
+        local_web_tool_names,
+        Arc::clone(&provider_tools.definitions),
+        provider_tools.digest.clone(),
+        provider_fallback_tools,
+        provider_tool_variants,
+        &provider_request_state,
+    );
     // Cache prefix law: common policy + the manual for the exact advertised
     // schema pack are the complete system prompt. Session/task/identity state
     // follows as a volatile user message, after providers have rendered the
     // tool schemas, so trusted sibling sessions share a byte-identical base.
     config.system_prompt = Some(SystemPromptBuilder::shared_immutable_base(
-        &config.tools,
+        config.tool_definitions(),
         &provider_grant_scope,
     ));
     config.volatile_user_tail = Some(join_volatile_context_tail(
         graph_brief.as_deref().unwrap_or_default(),
         &session_context,
     ));
-    let auth_scope = credential_surface_name(resolved.provider.credential_surface()).to_owned();
-    let account_scope = resolved
-        .account_alias
-        .as_deref()
-        .map(haider_protocol::ids::CredentialAlias::new);
     config.reasoning_settings = serde_json::to_string(&serde_json::json!({
         "effort": metadata.effort,
         "fast": metadata.fast,
     }))
     .unwrap_or_default();
+    let tool_pack_digest = config.canonical_tool_pack_digest();
     config.usage_scope = usage_scope_for(
         &resolved.provider_name,
         &config.model,
@@ -5673,7 +5825,7 @@ async fn start_turn(
         &auth_scope,
         &config.reasoning_settings,
         &config.system_prompt,
-        &config.tools,
+        &tool_pack_digest,
     );
     stamp_usage_lane_dimensions(
         &mut config.usage_scope,
@@ -5686,7 +5838,7 @@ async fn start_turn(
                 .map(LoadedProjectInstructions::fact)
                 .unwrap_or_default(),
         ),
-        tool_pack: canonical_tool_definitions_digest(&config.tools),
+        tool_pack: tool_pack_digest,
         system_version: SystemPromptBuilder::VERSION.to_owned(),
         web_tools: format!(
             "anthropic_web_tools={} openai_alpha_search={}",
@@ -5702,29 +5854,23 @@ async fn start_turn(
         &event_ids,
         metadata,
         &config.usage_scope,
+        &mut setup_reduction,
     )
     .await?;
     let (previous_cache_request, previous_provider_view, cache_initial_rewarm) =
-        prior_cache_request_context(
-            lease,
-            &config.usage_scope,
-            config.branch_id.as_ref(),
-            config.agent_id.as_ref(),
-        )
-        .await?;
+        setup_reduction.prior_cache_request_context();
     config.cache_diagnostic_key = lease.hub().cache_diagnostic_key();
     config.cache_previous_request = previous_cache_request;
     config.cache_previous_provider_view = previous_provider_view;
     config.cache_initial_rewarm = cache_initial_rewarm;
-    config.cache_reuse_gap_ms =
-        prior_cache_domain_gap_ms(lease, &accepted.run_id, &config.usage_scope).await?;
+    config.cache_reuse_gap_ms = setup_reduction.prior_cache_domain_gap_ms();
     config.cache_stable_history_end = Some(compiled_stable_history_end);
     config.cache_current_user_start = Some(compiled_current_user_start);
     config.cache_compaction_summary_end = compiled_compaction_summary_end;
     // A coding turn with an advertised tool pack is expected to reuse a
     // sufficiently large immutable prefix for at least a tool loop and a
     // later turn. Toolless lanes retain the zero-reuse safe fallback.
-    config.cache_expected_later_reads = u32::from(!config.tools.is_empty()) * 2;
+    config.cache_expected_later_reads = u32::from(!config.tool_definitions().is_empty()) * 2;
     config.usage_account = account_scope;
     // W6c children retain the spawn tool. The coordinator derives their
     // durable depth from the parent delegation and returns a typed tool
@@ -5750,7 +5896,8 @@ async fn start_turn(
         // replay a stale dynamic binding after graph advancement.
         post_compaction_volatile_tail: Some(session_context),
         post_compaction_grant_scope: provider_grant_scope,
-        post_compaction_tools: config.tools.clone(),
+        post_compaction_tools: config.shared_tool_definitions(),
+        post_compaction_tool_digest: config.canonical_tool_pack_digest(),
         reasoning_settings: config.reasoning_settings.clone(),
         cache_expected_later_reads: config.cache_expected_later_reads,
         cache_reuse_gap_ms: config.cache_reuse_gap_ms,
@@ -5900,6 +6047,7 @@ async fn start_turn(
         actor.into_inner(),
         dispatcher,
         handle,
+        effect_dispatched,
         anthropic_web_tools,
     ))
 }
@@ -5928,6 +6076,13 @@ fn digest_json(value: &(impl serde::Serialize + ?Sized)) -> String {
         |_| blake3::hash(b"serialization-error").to_hex().to_string(),
         |bytes| blake3::hash(&bytes).to_hex().to_string(),
     )
+}
+
+fn empty_tool_definitions_digest() -> &'static str {
+    static DIGEST: OnceLock<String> = OnceLock::new();
+    DIGEST
+        .get_or_init(|| canonical_tool_definitions_digest(&[]))
+        .as_str()
 }
 
 /// Canonical non-secret identity for the effective authorization boundary
@@ -5972,7 +6127,7 @@ fn usage_scope_for(
     auth_scope: &str,
     reasoning_settings: &str,
     system_prompt: &Option<String>,
-    tools: &[ToolDefinition],
+    tool_pack_digest: &str,
 ) -> UsageScope {
     let cache_epoch = digest_json(&serde_json::json!({
         "provider": provider,
@@ -5981,7 +6136,7 @@ fn usage_scope_for(
         "auth": auth_scope,
         "reasoning": reasoning_settings,
         "system": digest_json(system_prompt),
-        "tools": canonical_tool_definitions_digest(tools),
+        "tools": tool_pack_digest,
     }));
     UsageScope {
         provider: provider.to_owned(),
@@ -6010,58 +6165,323 @@ fn stamp_usage_lane_dimensions(
     scope.speed = dimensions.speed;
 }
 
-/// Returns the observed wall-clock gap since the latest completed request in
-/// the same provider/model/account/auth domain. This reads existing usage
-/// telemetry only; it adds no journal facts and unknown clocks/history retain
-/// the conservative short-TTL fallback.
-async fn prior_cache_domain_gap_ms(
+const TURN_SETUP_REDUCTION_PAYLOAD_KINDS: &[&str] = &[
+    "project_instructions_loaded",
+    "effect",
+    "menu_opened",
+    "menu_answered",
+    "user_message",
+    "usage",
+    "node_committed",
+    "item",
+];
+
+struct TurnSetupReductionSelector {
+    run_id: RunId,
+    branch_id: Option<BranchId>,
+    agent_id: Option<AgentId>,
+    provider: String,
+    model: String,
+    account_scope: Option<haider_protocol::ids::CredentialAlias>,
+    auth_scope: String,
+}
+
+/// The turn-start journal heads that used to be derived by independent full
+/// scans. One filtered decode pass feeds each reducer, while setup-authored
+/// instruction/cache facts are reflected here after their durable append so
+/// later heads preserve the old post-append ordering.
+struct TurnSetupReduction {
+    selector: TurnSetupReductionSelector,
+    latest_instruction_fact: Option<ProjectInstructionsLoaded>,
+    same_run_instruction_fact: Option<ProjectInstructionsLoaded>,
+    durable_tools: DurableToolStateReduction,
+    latest_main_usage_scope: Option<UsageScope>,
+    latest_lane_usage_seq: u64,
+    previous_cache_request: Option<PreviousCacheRequest>,
+    previous_provider_view: Option<ProviderViewLedgerV1>,
+    latest_deliberate_boundary: Option<(u64, CacheRewarmReasonV1)>,
+    latest_cache_domain_request_ms: Option<u64>,
+    emitted_cache_transitions: HashSet<(CacheEpochTransitionReason, String)>,
+    latest_seq: u64,
+}
+
+impl TurnSetupReduction {
+    fn new(selector: TurnSetupReductionSelector) -> Self {
+        Self {
+            selector,
+            latest_instruction_fact: None,
+            same_run_instruction_fact: None,
+            durable_tools: DurableToolStateReduction::default(),
+            latest_main_usage_scope: None,
+            latest_lane_usage_seq: 0,
+            previous_cache_request: None,
+            previous_provider_view: None,
+            latest_deliberate_boundary: None,
+            latest_cache_domain_request_ms: None,
+            emitted_cache_transitions: HashSet::new(),
+            latest_seq: 0,
+        }
+    }
+
+    fn observe_envelope(&mut self, envelope: RawEnvelope) -> Result<(), HaiderError> {
+        self.latest_seq = self.latest_seq.max(envelope.seq);
+        let payload_kind = envelope
+            .payload
+            .get("type")
+            .and_then(serde_json::Value::as_str);
+        if payload_kind == Some("project_instructions_loaded") {
+            if let Some(fact) = ProjectInstructionsLoaded::from_payload_value(&envelope.payload) {
+                self.observe_instruction_fact(
+                    envelope.run_id.as_ref(),
+                    envelope.branch_id.as_ref(),
+                    fact,
+                );
+            }
+            return Ok(());
+        }
+        if !matches!(
+            payload_kind,
+            Some(
+                "effect"
+                    | "menu_opened"
+                    | "menu_answered"
+                    | "user_message"
+                    | "usage"
+                    | "node_committed"
+                    | "item"
+            )
+        ) {
+            return Ok(());
+        }
+        let seq = envelope.seq;
+        let committed_at_ms = envelope.committed_at_ms;
+        let run_id = envelope.run_id;
+        let branch_id = envelope.branch_id;
+        let agent_id = envelope.agent_id;
+        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
+            return Ok(());
+        };
+        self.durable_tools.observe(agent_id.as_ref(), &payload);
+        match &payload {
+            EventPayload::Usage(usage) => {
+                self.observe_usage(
+                    seq,
+                    committed_at_ms,
+                    run_id.as_ref(),
+                    branch_id.as_ref(),
+                    usage,
+                );
+            }
+            EventPayload::NodeCommitted(TreeNode {
+                kind: NodeKind::Compaction { .. },
+                ..
+            }) => {
+                self.latest_deliberate_boundary =
+                    Some((seq, CacheRewarmReasonV1::PlannedCompaction));
+            }
+            EventPayload::Item(ItemEvent::Completed { item, .. }) => {
+                self.observe_provider_view(branch_id.as_ref(), agent_id.as_ref(), item)?;
+                if let Some(transition) = CacheEpochTransitionV1::from_extension_item(item) {
+                    self.observe_cache_transition(seq, &transition);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn observe_instruction_fact(
+        &mut self,
+        run_id: Option<&RunId>,
+        branch_id: Option<&BranchId>,
+        fact: ProjectInstructionsLoaded,
+    ) {
+        if run_id == Some(&self.selector.run_id) {
+            if branch_id != self.selector.branch_id.as_ref() {
+                return;
+            }
+            self.same_run_instruction_fact = Some(fact.clone());
+        }
+        self.latest_instruction_fact = Some(fact);
+    }
+
+    fn observe_usage(
+        &mut self,
+        seq: u64,
+        committed_at_ms: u64,
+        run_id: Option<&RunId>,
+        branch_id: Option<&BranchId>,
+        usage: &Usage,
+    ) {
+        let Some(scope) = usage.scope.as_ref() else {
+            return;
+        };
+        if scope.request_kind == UsageRequestKind::MainTurn && scope.agent.is_none() {
+            self.latest_main_usage_scope = Some(scope.clone());
+        }
+        let selected_request_kind = if self.selector.agent_id.is_some() {
+            UsageRequestKind::DelegatedAgent
+        } else {
+            UsageRequestKind::MainTurn
+        };
+        if branch_id == self.selector.branch_id.as_ref()
+            && scope.request_kind == selected_request_kind
+            && scope.agent.as_ref() == self.selector.agent_id.as_ref()
+            && self.scope_matches_lane(scope)
+        {
+            self.latest_lane_usage_seq = seq;
+            self.previous_cache_request = usage.request.as_ref().and_then(|request| {
+                request.cache.as_ref().map(|cache| PreviousCacheRequest {
+                    history_message_count: usize::try_from(cache.history_message_count)
+                        .unwrap_or(usize::MAX),
+                    breakpoint_hashes: cache.breakpoint_hashes.clone(),
+                    cache_domain_hash: cache.cache_domain_hash.clone(),
+                })
+            });
+        }
+        if run_id != Some(&self.selector.run_id)
+            && scope.request_kind == UsageRequestKind::MainTurn
+            && self.scope_matches_lane(scope)
+        {
+            self.latest_cache_domain_request_ms = Some(
+                self.latest_cache_domain_request_ms
+                    .map_or(committed_at_ms, |timestamp| timestamp.max(committed_at_ms)),
+            );
+        }
+    }
+
+    fn scope_matches_lane(&self, scope: &UsageScope) -> bool {
+        scope.provider == self.selector.provider
+            && scope.model == self.selector.model
+            && scope.account_scope == self.selector.account_scope
+            && scope.auth_scope == self.selector.auth_scope
+    }
+
+    fn observe_provider_view(
+        &mut self,
+        branch_id: Option<&BranchId>,
+        agent_id: Option<&AgentId>,
+        item: &TurnItem,
+    ) -> Result<(), HaiderError> {
+        if branch_id != self.selector.branch_id.as_ref()
+            || agent_id != self.selector.agent_id.as_ref()
+        {
+            return Ok(());
+        }
+        match ProviderViewAttemptV1::try_from_extension_item(item) {
+            Ok(Some(attempt))
+                if attempt.view.provider == self.selector.provider
+                    && attempt.view.model == self.selector.model
+                    && attempt.view.account_scope.as_deref()
+                        == self
+                            .selector
+                            .account_scope
+                            .as_ref()
+                            .map(haider_protocol::ids::CredentialAlias::as_str) =>
+            {
+                self.previous_provider_view = Some(attempt.view);
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(error) => {
+                return Err(HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("durable provider-view ledger is malformed: {error}"),
+                    false,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn observe_cache_transition(&mut self, seq: u64, transition: &CacheEpochTransitionV1) {
+        self.emitted_cache_transitions
+            .insert((transition.reason, transition.transition_id.clone()));
+        let reason =
+            if transition.reason == CacheEpochTransitionReason::Compaction || transition.planned {
+                CacheRewarmReasonV1::PlannedCompaction
+            } else {
+                CacheRewarmReasonV1::ConfigurationChange
+            };
+        self.latest_deliberate_boundary = Some((seq, reason));
+    }
+
+    fn record_instruction_fact(&mut self, fact: ProjectInstructionsLoaded) {
+        self.same_run_instruction_fact = Some(fact.clone());
+        self.latest_instruction_fact = Some(fact);
+    }
+
+    fn record_cache_transition(&mut self, transition: &CacheEpochTransitionV1) {
+        self.latest_seq = self.latest_seq.saturating_add(1);
+        self.observe_cache_transition(self.latest_seq, transition);
+    }
+
+    fn durable_tool_state(&self) -> DurableToolState {
+        self.durable_tools.snapshot()
+    }
+
+    fn prior_cache_request_context(
+        &self,
+    ) -> (
+        Option<PreviousCacheRequest>,
+        Option<ProviderViewLedgerV1>,
+        Option<CacheRewarmReasonV1>,
+    ) {
+        let pending = self
+            .latest_deliberate_boundary
+            .as_ref()
+            .filter(|(seq, _)| *seq > self.latest_lane_usage_seq)
+            .map(|(_, reason)| *reason);
+        (
+            self.previous_cache_request.clone(),
+            self.previous_provider_view.clone(),
+            pending,
+        )
+    }
+
+    fn cache_transition_was_emitted(&self, transition: &CacheEpochTransitionV1) -> bool {
+        self.emitted_cache_transitions
+            .contains(&(transition.reason, transition.transition_id.clone()))
+    }
+
+    /// Returns the observed wall-clock gap since the latest completed request
+    /// in this provider/model/account/auth domain. Unknown clocks/history retain
+    /// the conservative short-TTL fallback.
+    fn prior_cache_domain_gap_ms(&self) -> Option<u64> {
+        let latest = self
+            .latest_cache_domain_request_ms
+            .filter(|timestamp| *timestamp > 0)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())?;
+        Some(now.saturating_sub(latest))
+    }
+}
+
+async fn reduce_turn_setup_journal(
     store: &HubStoreHandle,
-    current_run: &RunId,
-    scope: &UsageScope,
-) -> Result<Option<u64>, HaiderError> {
+    selector: TurnSetupReductionSelector,
+) -> Result<TurnSetupReduction, HaiderError> {
+    let mut reduction = TurnSetupReduction::new(selector);
     let mut cursor = 0_u64;
-    let mut latest = None::<u64>;
     loop {
-        let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
+        let page = StoreHandle::read_reducer_page(
+            store,
+            store.session_id(),
+            cursor,
+            256,
+            usize::MAX,
+            TURN_SETUP_REDUCTION_PAYLOAD_KINDS,
+        )
+        .await?;
         if page.is_empty() {
-            break;
+            return Ok(reduction);
         }
         cursor = page.last().map_or(cursor, |envelope| envelope.seq);
         for envelope in page {
-            if envelope.run_id.as_ref() == Some(current_run) {
-                continue;
-            }
-            let Ok(EventPayload::Usage(usage)) =
-                serde_json::from_value::<EventPayload>(envelope.payload)
-            else {
-                continue;
-            };
-            let Some(previous) = usage.scope else {
-                continue;
-            };
-            if previous.request_kind == UsageRequestKind::MainTurn
-                && previous.provider == scope.provider
-                && previous.model == scope.model
-                && previous.account_scope == scope.account_scope
-                && previous.auth_scope == scope.auth_scope
-            {
-                latest = Some(latest.map_or(envelope.committed_at_ms, |timestamp| {
-                    timestamp.max(envelope.committed_at_ms)
-                }));
-            }
+            reduction.observe_envelope(envelope)?;
         }
     }
-    let Some(latest) = latest.filter(|timestamp| *timestamp > 0) else {
-        return Ok(None);
-    };
-    let Some(now) = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
-    else {
-        return Ok(None);
-    };
-    Ok(Some(now.saturating_sub(latest)))
 }
 
 /// E2 — every autonomously accepted `plan` proposal body on this branch. The
@@ -6517,6 +6937,7 @@ async fn prepare_compaction_messages(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn active_turn(
     run_id: RunId,
     branch_id: Option<BranchId>,
@@ -6524,6 +6945,7 @@ fn active_turn(
     actor: JoinHandle<()>,
     dispatcher: Option<Arc<dyn ToolDispatcher>>,
     handle: TurnHandle,
+    effect_dispatched: Arc<AtomicBool>,
     anthropic_web_tools: bool,
 ) -> ActiveTurn {
     let cancel = handle.cancel_token();
@@ -6535,6 +6957,7 @@ fn active_turn(
         harness,
         dispatcher,
         actor: Some(actor),
+        effect_dispatched,
         anthropic_web_tools,
     }
 }
@@ -6724,6 +7147,7 @@ async fn append_shell_payloads(
 /// prior unchanged non-empty fact remains the proof for later turns; an empty
 /// fact is emitted when files disappear so recovery does not inherit stale
 /// policy. Recovered work uses the latest exact same-run fact first.
+#[allow(clippy::too_many_arguments)]
 async fn journal_project_instructions_if_changed(
     store: &HubStoreHandle,
     device_id: &DeviceId,
@@ -6732,10 +7156,14 @@ async fn journal_project_instructions_if_changed(
     agent_id: Option<&AgentId>,
     event_ids: &EventIdGenerator,
     loaded: Option<&LoadedProjectInstructions>,
+    reduction: &mut TurnSetupReduction,
 ) -> Result<(), HaiderError> {
     let current = loaded.map_or_else(ProjectInstructionsLoaded::default, |loaded| loaded.fact());
-    let (latest, same_run) = project_instruction_fact_history(store, run_id, branch_id).await?;
-    let previous = same_run.as_ref().or(latest.as_ref());
+    let previous = reduction
+        .same_run_instruction_fact
+        .as_ref()
+        .or(reduction.latest_instruction_fact.as_ref());
+    let had_previous = previous.is_some();
     let changed = previous.map_or(!current.files.is_empty(), |previous| previous != &current);
     if !changed {
         return Ok(());
@@ -6770,8 +7198,9 @@ async fn journal_project_instructions_if_changed(
         payload,
     }];
     StoreHandle::append(store, &mut envelope).await?;
-    if previous.is_some() {
-        let previous_scope = latest_main_usage_scope(store).await?;
+    reduction.record_instruction_fact(current.clone());
+    if had_previous {
+        let previous_scope = reduction.latest_main_usage_scope.clone();
         let stable = previous_scope
             .as_ref()
             .map_or(0, |scope| scope.stable_prefix_tokens);
@@ -6829,73 +7258,9 @@ async fn journal_project_instructions_if_changed(
             ],
         )
         .await?;
+        reduction.record_cache_transition(&transition);
     }
     Ok(())
-}
-
-async fn project_instruction_fact_history(
-    store: &HubStoreHandle,
-    run_id: &RunId,
-    branch_id: Option<&BranchId>,
-) -> Result<
-    (
-        Option<ProjectInstructionsLoaded>,
-        Option<ProjectInstructionsLoaded>,
-    ),
-    HaiderError,
-> {
-    let mut latest = None;
-    let mut same_run = None;
-    let mut cursor = 0;
-    loop {
-        let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
-        if page.is_empty() {
-            break;
-        }
-        cursor = page.last().map_or(cursor, |envelope| envelope.seq);
-        for envelope in page {
-            let Some(fact) = ProjectInstructionsLoaded::from_payload_value(&envelope.payload)
-            else {
-                continue;
-            };
-            if envelope.run_id.as_ref() == Some(run_id) {
-                if envelope.branch_id.as_ref() != branch_id {
-                    continue;
-                }
-                same_run = Some(fact.clone());
-            }
-            latest = Some(fact);
-        }
-    }
-    Ok((latest, same_run))
-}
-
-async fn latest_main_usage_scope(
-    store: &HubStoreHandle,
-) -> Result<Option<UsageScope>, HaiderError> {
-    let mut latest = None;
-    let mut cursor = 0;
-    loop {
-        let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
-        if page.is_empty() {
-            break;
-        }
-        cursor = page.last().map_or(cursor, |envelope| envelope.seq);
-        for envelope in page {
-            let Ok(EventPayload::Usage(usage)) =
-                serde_json::from_value::<EventPayload>(envelope.payload)
-            else {
-                continue;
-            };
-            let Some(scope) = usage.scope else {
-                continue;
-            };
-            if scope.request_kind == UsageRequestKind::MainTurn && scope.agent.is_none() {
-                latest = Some(scope);
-            }
-        }
-    }
-    Ok(latest)
 }
 
 async fn prior_cache_request_context(
@@ -7005,34 +7370,6 @@ async fn prior_cache_request_context(
     Ok((previous_request, previous_provider_view, pending))
 }
 
-async fn cache_transition_was_emitted(
-    store: &HubStoreHandle,
-    transition: &CacheEpochTransitionV1,
-) -> Result<bool, HaiderError> {
-    let mut cursor = 0;
-    loop {
-        let page = StoreHandle::read(store, store.session_id(), cursor, 256).await?;
-        if page.is_empty() {
-            return Ok(false);
-        }
-        cursor = page.last().map_or(cursor, |envelope| envelope.seq);
-        let found = page.into_iter().any(|envelope| {
-            let Ok(EventPayload::Item(ItemEvent::Completed { item, .. })) =
-                serde_json::from_value::<EventPayload>(envelope.payload)
-            else {
-                return false;
-            };
-            CacheEpochTransitionV1::from_extension_item(&item).is_some_and(|existing| {
-                existing.reason == transition.reason
-                    && existing.transition_id == transition.transition_id
-            })
-        });
-        if found {
-            return Ok(true);
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn journal_cache_transition_if_new(
     store: &HubStoreHandle,
@@ -7041,8 +7378,9 @@ async fn journal_cache_transition_if_new(
     branch_id: Option<&BranchId>,
     event_ids: &EventIdGenerator,
     transition: CacheEpochTransitionV1,
+    reduction: &mut TurnSetupReduction,
 ) -> Result<(), HaiderError> {
-    if cache_transition_was_emitted(store, &transition).await? {
+    if reduction.cache_transition_was_emitted(&transition) {
         return Ok(());
     }
     let item = transition.extension_item().map_err(|error| {
@@ -7073,7 +7411,9 @@ async fn journal_cache_transition_if_new(
             EventPayload::Item(ItemEvent::Completed { item_id, item }),
         ],
     )
-    .await
+    .await?;
+    reduction.record_cache_transition(&transition);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7085,8 +7425,9 @@ async fn surface_request_cache_transitions(
     event_ids: &EventIdGenerator,
     metadata: &SessionMetadataV1,
     current: &UsageScope,
+    reduction: &mut TurnSetupReduction,
 ) -> Result<(), HaiderError> {
-    let previous = latest_main_usage_scope(store).await?;
+    let previous = reduction.latest_main_usage_scope.clone();
     let Some(previous) = previous else {
         return Ok(());
     };
@@ -7160,6 +7501,7 @@ async fn surface_request_cache_transitions(
                     "reasoning": current_reasoning,
                 }),
             ),
+            reduction,
         )
         .await?;
     }
@@ -7182,6 +7524,7 @@ async fn surface_request_cache_transitions(
                 vec!["system_version".into()],
                 serde_json::json!(SystemPromptBuilder::VERSION),
             ),
+            reduction,
         )
         .await?;
     }
@@ -7198,6 +7541,7 @@ async fn surface_request_cache_transitions(
                     vec!["tools".into()],
                     serde_json::json!(&current.tool_pack),
                 ),
+                reduction,
             )
             .await?;
         }
@@ -7213,6 +7557,7 @@ async fn surface_request_cache_transitions(
                     vec!["web_tools".into()],
                     serde_json::json!(&current.web_tools),
                 ),
+                reduction,
             )
             .await?;
         }
@@ -7425,7 +7770,7 @@ impl BrokerToolFactory {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum RegisteredToolRoute {
     RequestInput,
     Plan,
@@ -7456,6 +7801,49 @@ pub(crate) struct RegisteredTool {
     pub(crate) manifest: ToolManifest,
     pub(crate) default: ToolPermissionDefault,
     pub(crate) route: RegisteredToolRoute,
+}
+
+struct RegisteredToolCatalog {
+    tools: Arc<[RegisteredTool]>,
+    provider_definitions: Arc<[ToolDefinition]>,
+    provider_definition_pack: Arc<ToolDefinitionPack>,
+    routes: HashMap<String, RegisteredToolRoute>,
+    tool_indices: HashMap<String, usize>,
+    filtered_packs: StdMutex<FilteredToolPackCache>,
+}
+
+struct ToolDefinitionPack {
+    definitions: Arc<[ToolDefinition]>,
+    digest: String,
+}
+
+const FILTERED_TOOL_PACK_CACHE_CAPACITY: usize = 128;
+
+struct FilteredToolPackCache {
+    packs: HashMap<Vec<usize>, Arc<ToolDefinitionPack>>,
+    insertion_order: VecDeque<Vec<usize>>,
+}
+
+impl FilteredToolPackCache {
+    fn get(&self, retained: &[usize]) -> Option<Arc<ToolDefinitionPack>> {
+        self.packs.get(retained).map(Arc::clone)
+    }
+
+    fn insert(&mut self, retained: Vec<usize>, pack: Arc<ToolDefinitionPack>) {
+        if let Some(existing) = self.packs.get_mut(&retained) {
+            *existing = pack;
+            return;
+        }
+        while self.packs.len() >= FILTERED_TOOL_PACK_CACHE_CAPACITY {
+            let Some(evicted) = self.insertion_order.pop_front() else {
+                self.packs.clear();
+                break;
+            };
+            self.packs.remove(&evicted);
+        }
+        self.insertion_order.push_back(retained.clone());
+        self.packs.insert(retained, pack);
+    }
 }
 
 fn registered_tool(
@@ -7490,11 +7878,7 @@ fn registered_manifest(
     }
 }
 
-/// The single daemon-owned public tool registry. Provider definitions,
-/// dispatcher routes, policy defaults, and inventory reads all project from
-/// these entries. Legacy aliases intentionally live only in
-/// `registered_tool_route` and can never be advertised.
-pub(crate) fn registered_tools() -> Vec<RegisteredTool> {
+fn build_registered_tools() -> Vec<RegisteredTool> {
     vec![
         registered_tool(
             request_input_definition(),
@@ -7679,6 +8063,62 @@ pub(crate) fn registered_tools() -> Vec<RegisteredTool> {
             }
         },
     ]
+}
+
+/// The single daemon-owned public tool registry. Provider definitions,
+/// dispatcher routes, policy defaults, and inventory reads all project from
+/// this process-wide immutable catalog. Legacy aliases intentionally live only
+/// in `registered_tool_route` and can never be advertised.
+fn registered_tool_catalog() -> &'static RegisteredToolCatalog {
+    static CATALOG: OnceLock<RegisteredToolCatalog> = OnceLock::new();
+    CATALOG.get_or_init(|| {
+        let tools: Arc<[RegisteredTool]> = build_registered_tools().into();
+        let provider_definitions: Arc<[ToolDefinition]> = tools
+            .iter()
+            .map(|entry| provider_definition(&entry.manifest))
+            .collect::<Vec<_>>()
+            .into();
+        let provider_definition_pack = Arc::new(ToolDefinitionPack {
+            digest: canonical_tool_definitions_digest(&provider_definitions),
+            definitions: Arc::clone(&provider_definitions),
+        });
+        let routes = tools
+            .iter()
+            .map(|entry| (entry.manifest.name.clone(), entry.route))
+            .collect();
+        let tool_indices = tools
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.manifest.name.clone(), index))
+            .collect();
+        RegisteredToolCatalog {
+            tools,
+            provider_definitions,
+            provider_definition_pack,
+            routes,
+            tool_indices,
+            filtered_packs: StdMutex::new(FilteredToolPackCache {
+                packs: HashMap::new(),
+                insertion_order: VecDeque::new(),
+            }),
+        }
+    })
+}
+
+pub(crate) fn registered_tools() -> &'static [RegisteredTool] {
+    registered_tool_catalog().tools.as_ref()
+}
+
+fn registered_provider_definitions() -> Arc<[ToolDefinition]> {
+    Arc::clone(&registered_tool_catalog().provider_definitions)
+}
+
+fn registered_tool_by_name(name: &str) -> Option<&'static RegisteredTool> {
+    let catalog = registered_tool_catalog();
+    catalog
+        .tool_indices
+        .get(name)
+        .and_then(|index| catalog.tools.get(*index))
 }
 
 /// The broad child request before the durable parent ceiling is applied.
@@ -8118,7 +8558,6 @@ pub(crate) fn web_fetch_host_allowed(grant: &Grant, host: &str) -> bool {
 }
 
 pub(crate) fn intersect_grant(requested: Grant, ceiling: &Grant) -> Grant {
-    let registry = registered_tools();
     let mut effect_ceiling = Vec::new();
     for effect in requested.effect_ceiling {
         match effect {
@@ -8149,16 +8588,13 @@ pub(crate) fn intersect_grant(requested: Grant, ceiling: &Grant) -> Grant {
             .into_iter()
             .filter(|name| ceiling.tools.contains(name))
             .filter(|name| {
-                registry
-                    .iter()
-                    .find(|entry| entry.manifest.name == *name)
-                    .is_some_and(|entry| {
-                        grant_admits_tool_manifest(
-                            ceiling,
-                            &entry.manifest.name,
-                            &entry.manifest.effects,
-                        )
-                    })
+                registered_tool_by_name(name).is_some_and(|entry| {
+                    grant_admits_tool_manifest(
+                        ceiling,
+                        &entry.manifest.name,
+                        &entry.manifest.effects,
+                    )
+                })
             })
             .collect(),
         effect_ceiling,
@@ -8166,9 +8602,8 @@ pub(crate) fn intersect_grant(requested: Grant, ceiling: &Grant) -> Grant {
 }
 
 pub(crate) fn validate_grant(grant: &Grant) -> Result<(), HaiderError> {
-    let registry = registered_tools();
     for name in &grant.tools {
-        let Some(entry) = registry.iter().find(|entry| entry.manifest.name == *name) else {
+        let Some(entry) = registered_tool_by_name(name) else {
             return Err(grant_corrupt(format!(
                 "delegated manifest grants unknown tool `{name}`"
             )));
@@ -8197,9 +8632,7 @@ pub(crate) fn registered_tool_route(name: &str) -> Option<RegisteredToolRoute> {
     if name == "exec" {
         return Some(RegisteredToolRoute::ProcessExec);
     }
-    registered_tools()
-        .into_iter()
-        .find_map(|entry| (entry.manifest.name == name).then_some(entry.route))
+    registered_tool_catalog().routes.get(name).copied()
 }
 
 /// Bounds one web-search result for the tool result (W-B decision 3):
@@ -8392,7 +8825,7 @@ pub(crate) fn tool_manual(tools: &[ToolDefinition]) -> String {
     manual
 }
 
-fn provider_definition(manifest: ToolManifest) -> ToolDefinition {
+fn provider_definition(manifest: &ToolManifest) -> ToolDefinition {
     // Instruct pipe: the wire carries only a tool's NAME and a minimal stub
     // schema (structure + enums). Its human-readable description AND every
     // per-property description move into the single system-prompt tool manual,
@@ -8402,9 +8835,69 @@ fn provider_definition(manifest: ToolManifest) -> ToolDefinition {
     // is never read there), and the generic/Gemini path is covered by the
     // manual plus the daemon's own `ComputerOperation::from_tool_args` checks.
     ToolDefinition {
-        name: manifest.name,
+        name: manifest.name.clone(),
         description: String::new(),
         input_schema: stub_schema(&manifest.input_schema),
+    }
+}
+
+struct ToolDefinitionView {
+    definitions: Arc<[ToolDefinition]>,
+    retained: Vec<usize>,
+}
+
+impl ToolDefinitionView {
+    fn all(definitions: Arc<[ToolDefinition]>) -> Self {
+        let retained = (0..definitions.len()).collect();
+        Self {
+            definitions,
+            retained,
+        }
+    }
+
+    fn retain(&mut self, mut predicate: impl FnMut(&ToolDefinition) -> bool) {
+        let definitions = &self.definitions;
+        self.retained
+            .retain(|index| predicate(&definitions[*index]));
+    }
+
+    fn into_pack(self) -> Arc<ToolDefinitionPack> {
+        let catalog = registered_tool_catalog();
+        if Arc::ptr_eq(&self.definitions, &catalog.provider_definitions) {
+            if self.retained.len() == self.definitions.len() {
+                return Arc::clone(&catalog.provider_definition_pack);
+            }
+            let mut packs = catalog
+                .filtered_packs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(pack) = packs.get(&self.retained) {
+                return pack;
+            }
+            let definitions: Arc<[ToolDefinition]> = self
+                .retained
+                .iter()
+                .map(|index| self.definitions[*index].clone())
+                .collect::<Vec<_>>()
+                .into();
+            let pack = Arc::new(ToolDefinitionPack {
+                digest: canonical_tool_definitions_digest(definitions.as_ref()),
+                definitions,
+            });
+            packs.insert(self.retained, Arc::clone(&pack));
+            return pack;
+        }
+
+        let definitions: Arc<[ToolDefinition]> = self
+            .retained
+            .into_iter()
+            .map(|index| self.definitions[index].clone())
+            .collect::<Vec<_>>()
+            .into();
+        Arc::new(ToolDefinitionPack {
+            digest: canonical_tool_definitions_digest(definitions.as_ref()),
+            definitions,
+        })
     }
 }
 
@@ -8440,38 +8933,88 @@ fn advertised_tool_definitions_for_mobile_state(
     web_degrade: WebCapabilityDegrade,
     mobile_use_active: bool,
 ) -> Vec<ToolDefinition> {
-    let mut definitions = authorized_tool_definitions(tool_factory, grant, mobile_use_active);
+    advertised_tool_pack_for_mobile_state(
+        tool_factory,
+        grant,
+        provider_name,
+        web_degrade,
+        mobile_use_active,
+    )
+    .definitions
+    .as_ref()
+    .to_vec()
+}
+
+fn advertised_tool_pack_for_mobile_state(
+    tool_factory: &Arc<dyn TurnToolFactory>,
+    grant: Option<&Grant>,
+    provider_name: &str,
+    web_degrade: WebCapabilityDegrade,
+    mobile_use_active: bool,
+) -> Arc<ToolDefinitionPack> {
+    let mut definitions = authorized_tool_definition_view(tool_factory, grant, mobile_use_active);
     let (local_web_tool_names, _) = provider_web_tool_names(provider_name, web_degrade);
+    retain_selected_local_web_tools(&mut definitions, &local_web_tool_names);
+    definitions.into_pack()
+}
+
+fn tool_definition_pack_for_web_names(
+    tool_factory: &Arc<dyn TurnToolFactory>,
+    grant: Option<&Grant>,
+    mobile_use_active: bool,
+    local_web_tool_names: &[String],
+) -> Arc<ToolDefinitionPack> {
+    let mut definitions = authorized_tool_definition_view(tool_factory, grant, mobile_use_active);
+    retain_selected_local_web_tools(&mut definitions, local_web_tool_names);
+    definitions.into_pack()
+}
+
+fn retain_selected_local_web_tools(
+    definitions: &mut ToolDefinitionView,
+    local_web_tool_names: &[String],
+) {
     definitions.retain(|definition| {
         !is_local_web_tool(&definition.name)
             || local_web_tool_names
                 .iter()
                 .any(|name| name == &definition.name)
     });
-    definitions
 }
 
+fn authorized_tool_definition_pack(
+    tool_factory: &Arc<dyn TurnToolFactory>,
+    grant: Option<&Grant>,
+    mobile_use_active: bool,
+) -> Arc<ToolDefinitionPack> {
+    authorized_tool_definition_view(tool_factory, grant, mobile_use_active).into_pack()
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
 fn authorized_tool_definitions(
     tool_factory: &Arc<dyn TurnToolFactory>,
     grant: Option<&Grant>,
     mobile_use_active: bool,
 ) -> Vec<ToolDefinition> {
-    let mut definitions = tool_factory.definitions();
+    authorized_tool_definition_pack(tool_factory, grant, mobile_use_active)
+        .definitions
+        .as_ref()
+        .to_vec()
+}
+
+fn authorized_tool_definition_view(
+    tool_factory: &Arc<dyn TurnToolFactory>,
+    grant: Option<&Grant>,
+    mobile_use_active: bool,
+) -> ToolDefinitionView {
+    let mut definitions = ToolDefinitionView::all(tool_factory.shared_definitions());
     definitions.retain(|definition| mobile_use_active || definition.name != "mobile");
     if let Some(grant) = grant {
-        let registry = registered_tools();
         definitions.retain(|definition| {
             grant.tools.contains(&definition.name)
-                && registry
-                    .iter()
-                    .find(|entry| entry.manifest.name == definition.name)
-                    .is_some_and(|entry| {
-                        grant_admits_tool_manifest(
-                            grant,
-                            &entry.manifest.name,
-                            &entry.manifest.effects,
-                        )
-                    })
+                && registered_tool_by_name(&definition.name).is_some_and(|entry| {
+                    grant_admits_tool_manifest(grant, &entry.manifest.name, &entry.manifest.effects)
+                })
         });
     } else {
         definitions.retain(|definition| definition.name != "workflow_author");
@@ -8527,20 +9070,51 @@ pub(crate) fn provider_derived_request_state(
 #[async_trait]
 impl TurnToolFactory for BrokerToolFactory {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        registered_tools()
-            .into_iter()
-            .map(|entry| provider_definition(entry.manifest))
-            .collect()
+        registered_provider_definitions().as_ref().to_vec()
+    }
+
+    fn shared_definitions(&self) -> Arc<[ToolDefinition]> {
+        registered_provider_definitions()
     }
 
     async fn create(
         &self,
         context: WorkerToolContext,
     ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
+        let durable_tool_state =
+            durable_session_tool_state(&context.store, context.store.session_id()).await?;
+        let DurableToolState {
+            grants,
+            bindings,
+            freshness,
+            mobile_use_active: _,
+        } = durable_tool_state;
+        self.create_with_turn_snapshot(
+            context,
+            grants,
+            bindings,
+            freshness,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+    }
+
+    async fn create_with_turn_snapshot(
+        &self,
+        context: WorkerToolContext,
+        durable_grants: Vec<SessionGrant>,
+        durable_bindings: HashMap<MenuId, (EffectClass, String)>,
+        durable_freshness: HashMap<String, FileFreshness>,
+        effect_dispatched: Arc<AtomicBool>,
+    ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
         let redaction = haider_tools::configured_screenshot_redaction_policy()
             .map_err(|error| tool_error(ToolError::Computer(error)))?;
         create_broker_tool_dispatcher(
             context,
+            durable_grants,
+            durable_bindings,
+            durable_freshness,
+            effect_dispatched,
             haider_tools::platform_computer_backend(),
             crate::mobile_transport::platform_mobile_backend(),
             redaction,
@@ -8553,18 +9127,49 @@ impl TurnToolFactory for BrokerToolFactory {
 #[cfg(test)]
 impl TurnToolFactory for InjectedComputerBrokerToolFactory {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        registered_tools()
-            .into_iter()
-            .map(|entry| provider_definition(entry.manifest))
-            .collect()
+        registered_provider_definitions().as_ref().to_vec()
+    }
+
+    fn shared_definitions(&self) -> Arc<[ToolDefinition]> {
+        registered_provider_definitions()
     }
 
     async fn create(
         &self,
         context: WorkerToolContext,
     ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
+        let durable_tool_state =
+            durable_session_tool_state(&context.store, context.store.session_id()).await?;
+        let DurableToolState {
+            grants,
+            bindings,
+            freshness,
+            mobile_use_active: _,
+        } = durable_tool_state;
+        self.create_with_turn_snapshot(
+            context,
+            grants,
+            bindings,
+            freshness,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+    }
+
+    async fn create_with_turn_snapshot(
+        &self,
+        context: WorkerToolContext,
+        durable_grants: Vec<SessionGrant>,
+        durable_bindings: HashMap<MenuId, (EffectClass, String)>,
+        durable_freshness: HashMap<String, FileFreshness>,
+        effect_dispatched: Arc<AtomicBool>,
+    ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
         create_broker_tool_dispatcher(
             context,
+            durable_grants,
+            durable_bindings,
+            durable_freshness,
+            effect_dispatched,
             Arc::clone(&self.backend),
             haider_tools::platform_mobile_backend(),
             Arc::clone(&self.screenshot_redaction),
@@ -8577,18 +9182,49 @@ impl TurnToolFactory for InjectedComputerBrokerToolFactory {
 #[cfg(test)]
 impl TurnToolFactory for InjectedMobileBrokerToolFactory {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        registered_tools()
-            .into_iter()
-            .map(|entry| provider_definition(entry.manifest))
-            .collect()
+        registered_provider_definitions().as_ref().to_vec()
+    }
+
+    fn shared_definitions(&self) -> Arc<[ToolDefinition]> {
+        registered_provider_definitions()
     }
 
     async fn create(
         &self,
         context: WorkerToolContext,
     ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
+        let durable_tool_state =
+            durable_session_tool_state(&context.store, context.store.session_id()).await?;
+        let DurableToolState {
+            grants,
+            bindings,
+            freshness,
+            mobile_use_active: _,
+        } = durable_tool_state;
+        self.create_with_turn_snapshot(
+            context,
+            grants,
+            bindings,
+            freshness,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+    }
+
+    async fn create_with_turn_snapshot(
+        &self,
+        context: WorkerToolContext,
+        durable_grants: Vec<SessionGrant>,
+        durable_bindings: HashMap<MenuId, (EffectClass, String)>,
+        durable_freshness: HashMap<String, FileFreshness>,
+        effect_dispatched: Arc<AtomicBool>,
+    ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
         create_broker_tool_dispatcher(
             context,
+            durable_grants,
+            durable_bindings,
+            durable_freshness,
+            effect_dispatched,
             Arc::new(haider_tools::UnavailableComputerBackend::new("mobile-test")),
             Arc::clone(&self.backend),
             Arc::new(haider_tools::PassthroughScreenshotRedaction),
@@ -8597,17 +9233,20 @@ impl TurnToolFactory for InjectedMobileBrokerToolFactory {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_broker_tool_dispatcher(
     context: WorkerToolContext,
+    durable_grants: Vec<SessionGrant>,
+    durable_bindings: HashMap<MenuId, (EffectClass, String)>,
+    durable_freshness: HashMap<String, FileFreshness>,
+    effect_dispatched: Arc<AtomicBool>,
     computer: Arc<dyn ComputerBackend>,
     mobile: Arc<dyn MobileBackend>,
     screenshot_redaction: Arc<dyn ScreenshotRedactionPolicy>,
 ) -> Result<Option<Arc<dyn ToolDispatcher>>, HaiderError> {
-    let durable_permissions =
-        durable_session_tool_state(&context.store, context.store.session_id()).await?;
     let session_id = context.store.session_id().clone();
     let active_tool_name = Arc::new(StdMutex::new(None));
-    let journal = HubJournalSink::new(&context, Arc::clone(&active_tool_name));
+    let journal = HubJournalSink::new(&context, Arc::clone(&active_tool_name), effect_dispatched);
     let mut broker = EffectBroker::new(
         Box::new(journal),
         &context.metadata.cwd,
@@ -8616,7 +9255,7 @@ async fn create_broker_tool_dispatcher(
     )
     .map_err(tool_error)?;
     broker
-        .restore_freshness(durable_permissions.freshness.clone().into_values())
+        .restore_freshness(durable_freshness.into_values())
         .map_err(tool_error)?;
     let mut policy = PermissionPolicy::default();
     for (class, default) in effective_permission_defaults(&context.metadata) {
@@ -8636,7 +9275,7 @@ async fn create_broker_tool_dispatcher(
             ToolPermissionDefault::NotApplicable => {}
         }
     }
-    for grant in durable_permissions.grants {
+    for grant in durable_grants {
         policy.allow_session_grant(grant).map_err(tool_error)?;
     }
     let interaction_policy =
@@ -8665,6 +9304,7 @@ async fn create_broker_tool_dispatcher(
         active_computer_turn_cancel: StdMutex::new(None),
         os_permission_menus: Mutex::new(HashMap::new()),
         pending_computer_permissions: Mutex::new(HashMap::new()),
+        parsed_tool_operations: StdMutex::new(HashMap::new()),
         permission_pollers: StdMutex::new(HashMap::new()),
         policy: Mutex::new(policy),
         cas: Mutex::new(HubArtifactStore {
@@ -8674,7 +9314,7 @@ async fn create_broker_tool_dispatcher(
         session_id,
         branch_id: context.branch_id,
         output,
-        durable_permission_bindings: durable_permissions.bindings,
+        durable_permission_bindings: durable_bindings,
         metadata: context.metadata,
         session_context_tail: context.session_context_tail,
         parent_agent_id: context.agent_id,
@@ -8695,9 +9335,9 @@ pub(crate) fn effective_permission_defaults(
 ) -> Vec<(EffectClass, ToolPermissionDefault)> {
     let overrides = metadata.permission_overrides.unwrap_or_default();
     registered_tools()
-        .into_iter()
+        .iter()
         .flat_map(|entry| {
-            entry.manifest.effects.into_iter().map(move |class| {
+            entry.manifest.effects.iter().cloned().map(move |class| {
                 let base = if (overrides.allow_writes && class == EffectClass::FsWrite)
                     || (overrides.allow_exec && class == EffectClass::ProcessExec)
                     // W-B: the exec override is the honest auto-mode gate for
@@ -8751,6 +9391,7 @@ struct BrokerToolDispatcher {
     active_computer_turn_cancel: StdMutex<Option<CancelToken>>,
     os_permission_menus: Mutex<HashMap<MenuId, Menu>>,
     pending_computer_permissions: Mutex<HashMap<MenuId, PendingComputerPermission>>,
+    parsed_tool_operations: StdMutex<HashMap<ParsedToolOperationKey, Arc<ParsedToolOperation>>>,
     permission_pollers: StdMutex<HashMap<MenuId, JoinHandle<()>>>,
     policy: Mutex<PermissionPolicy>,
     cas: Mutex<HubArtifactStore>,
@@ -8773,6 +9414,93 @@ struct BrokerToolDispatcher {
     /// The journal sink reads this only while `broker` is held. Setting it
     /// after acquiring that mutex keeps concurrent tool calls correctly named.
     active_tool_name: Arc<StdMutex<Option<String>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ParsedToolOperationKey {
+    run_id: RunId,
+    item_id: ItemId,
+    call_id: String,
+    route: RegisteredToolRoute,
+}
+
+enum ParsedToolOperation {
+    FsRead(FsRead),
+    FsGlob(FsGlob),
+    FsSearch(FsSearch),
+    FsWrite(FsWrite),
+    FsEdit(FsEdit),
+    FsPath(FsPath),
+    ProcessExec {
+        operation: ProcessExec,
+        requested_cwd: Option<String>,
+        background: bool,
+        name: Option<String>,
+    },
+    SpawnSubagent(Box<SpawnSubagent>),
+    TaskKill(String),
+    WebFetch(WebFetch),
+    Computer(Box<ComputerOperation>),
+    Mobile(Box<MobileOperation>),
+}
+
+fn cache_parsed_operation<K, T, E>(
+    operations: &mut HashMap<K, Arc<T>>,
+    key: K,
+    parse: impl FnOnce() -> Result<T, E>,
+) -> Result<Arc<T>, E>
+where
+    K: Eq + std::hash::Hash,
+{
+    if let Some(operation) = operations.get(&key) {
+        return Ok(Arc::clone(operation));
+    }
+    let operation = Arc::new(parse()?);
+    operations.insert(key, Arc::clone(&operation));
+    Ok(operation)
+}
+
+fn cached_operation_route_mismatch(route: RegisteredToolRoute) -> HaiderError {
+    HaiderError::new(
+        ErrorCode::Internal,
+        format!("cached operation does not match tool route `{route:?}`"),
+        false,
+    )
+}
+
+struct ParsedToolOperationLease<'a> {
+    operations: &'a StdMutex<HashMap<ParsedToolOperationKey, Arc<ParsedToolOperation>>>,
+    key: ParsedToolOperationKey,
+    retained_for_approval: bool,
+}
+
+impl<'a> ParsedToolOperationLease<'a> {
+    fn new(
+        operations: &'a StdMutex<HashMap<ParsedToolOperationKey, Arc<ParsedToolOperation>>>,
+        key: ParsedToolOperationKey,
+    ) -> Self {
+        Self {
+            operations,
+            key,
+            retained_for_approval: false,
+        }
+    }
+
+    fn retain_for_approval(&mut self) {
+        self.retained_for_approval = true;
+    }
+}
+
+impl Drop for ParsedToolOperationLease<'_> {
+    fn drop(&mut self) {
+        if self.retained_for_approval {
+            return;
+        }
+        self.operations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.key);
+    }
 }
 
 struct ActiveToolName {
@@ -8856,159 +9584,8 @@ fn typed_workflow_coordinates_match(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
-mod typed_workflow_boundary_tests {
-    use super::{
-        TypedWorkflowExecutionBinding, default_child_grant, loom_provider_grant,
-        typed_workflow_coordinates_match, typed_workflow_node_grant, validate_grant,
-    };
-    use haider_protocol::agent::Grant;
-    use haider_protocol::effect::EffectClass;
-    use haider_protocol::graph::{GraphNodeName, GraphPhase};
-    use haider_protocol::ids::GraphId;
-    use haider_protocol::loom::LoomAgentType;
-
-    #[test]
-    fn typed_executor_binding_ends_when_node_or_attempt_advances() {
-        let graph_id = GraphId::new("typed-graph");
-        let node = GraphNodeName::new("RESEARCH").expect("node");
-        let binding = TypedWorkflowExecutionBinding {
-            graph_id: graph_id.clone(),
-            node: node.clone(),
-            attempt: 2,
-            agent_type_id: "researcher".into(),
-        };
-        assert!(typed_workflow_coordinates_match(
-            &binding,
-            &graph_id,
-            GraphPhase::Active,
-            Some(&node),
-            true,
-            Some(2),
-            false,
-        ));
-
-        let next_node = GraphNodeName::new("VERIFY").expect("next node");
-        assert!(!typed_workflow_coordinates_match(
-            &binding,
-            &graph_id,
-            GraphPhase::Active,
-            Some(&next_node),
-            true,
-            Some(2),
-            false,
-        ));
-        assert!(!typed_workflow_coordinates_match(
-            &binding,
-            &graph_id,
-            GraphPhase::Active,
-            Some(&node),
-            true,
-            Some(3),
-            false,
-        ));
-        assert!(!typed_workflow_coordinates_match(
-            &binding,
-            &GraphId::new("replacement-graph"),
-            GraphPhase::Active,
-            Some(&node),
-            true,
-            Some(2),
-            false,
-        ));
-
-        // Completion may clear the volatile graph brief, but no subsequent
-        // tool execution is allowed under the finished specialist binding.
-        assert!(typed_workflow_coordinates_match(
-            &binding,
-            &graph_id,
-            GraphPhase::Completed,
-            None,
-            false,
-            None,
-            true,
-        ));
-        assert!(!typed_workflow_coordinates_match(
-            &binding,
-            &graph_id,
-            GraphPhase::Completed,
-            None,
-            false,
-            None,
-            false,
-        ));
-    }
-
-    #[test]
-    fn native_typed_workflow_on_generic_child_fails_closed_without_graph_evidence() {
-        let record = LoomAgentType {
-            id: "researcher".into(),
-            name: "Researcher".into(),
-            job: "Research only the scoped node.".into(),
-            in_type: "Question".into(),
-            out_type: "Sources".into(),
-            clis: Vec::new(),
-            apis: Vec::new(),
-            skills: Vec::new(),
-            scripts: Vec::new(),
-            color: String::new(),
-            glyph: String::new(),
-            rev: 1,
-        };
-        let node = GraphNodeName::new("RESEARCH").expect("node");
-        let inherited = default_child_grant();
-        let error = typed_workflow_node_grant(&record, &node, Some(&inherited))
-            .expect_err("native pin must not widen a generic child's grant");
-        assert_eq!(
-            error.code,
-            haider_protocol::error::ErrorCode::PermissionDenied
-        );
-
-        let mut workflow_child = inherited;
-        workflow_child.tools.push("graph_evidence".into());
-        assert!(typed_workflow_node_grant(&record, &node, Some(&workflow_child)).is_ok());
-    }
-
-    #[test]
-    fn loom_static_provider_ceiling_excludes_actor_owned_and_delegation_tools() {
-        let grant = loom_provider_grant(None);
-        for denied in [
-            "request_input",
-            "plan",
-            "todo_write",
-            "spawn_subagent",
-            "message_subagent",
-            "workflow_author",
-        ] {
-            assert!(!grant.tools.iter().any(|tool| tool == denied), "{denied}");
-        }
-        for brokered in ["graph_evidence", "fs_read", "process_exec", "web_fetch"] {
-            assert!(
-                grant.tools.iter().any(|tool| tool == brokered),
-                "{brokered}"
-            );
-        }
-    }
-
-    #[test]
-    fn loom_provider_ceiling_preserves_inherited_network_host_scopes() {
-        let inherited = Grant {
-            tools: vec!["web_fetch".into(), "graph_evidence".into()],
-            effect_ceiling: vec![EffectClass::Network {
-                host: "api.example.test".into(),
-            }],
-        };
-        let grant = loom_provider_grant(Some(&inherited));
-        assert!(grant.tools.iter().any(|tool| tool == "web_fetch"));
-        assert_eq!(
-            grant.effect_ceiling,
-            vec![EffectClass::Network {
-                host: "api.example.test".into(),
-            }]
-        );
-        validate_grant(&grant).expect("host-scoped Loom provider grant remains coherent");
-    }
-}
+#[path = "worker_typed_workflow_boundary_tests.rs"]
+mod typed_workflow_boundary_tests;
 
 impl BrokerToolDispatcher {
     async fn typed_workflow_binding_is_current(
@@ -9663,7 +10240,242 @@ impl BrokerToolDispatcher {
         }
     }
 
+    fn parse_tool_operation(
+        route: RegisteredToolRoute,
+        call_id: &str,
+        args: &serde_json::Value,
+    ) -> Result<ParsedToolOperation, HaiderError> {
+        match route {
+            RegisteredToolRoute::FsRead => {
+                let path = required_string(args, "path")?;
+                let offset = optional_u64(args, "offset")?
+                    .map(usize::try_from)
+                    .transpose()
+                    .map_err(|_| {
+                        HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            "tool argument `offset` is too large",
+                            false,
+                        )
+                    })?;
+                let limit = optional_u64(args, "limit")?
+                    .map(usize::try_from)
+                    .transpose()
+                    .map_err(|_| {
+                        HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            "tool argument `limit` is too large",
+                            false,
+                        )
+                    })?;
+                Ok(ParsedToolOperation::FsRead(
+                    FsRead::new(path).with_line_range(offset, limit),
+                ))
+            }
+            RegisteredToolRoute::FsSearch => {
+                let root = optional_string(args, "path")?
+                    .or(optional_string(args, "root")?)
+                    .unwrap_or_else(|| ".".into());
+                let query = optional_string(args, "pattern")?
+                    .or(optional_string(args, "query")?)
+                    .ok_or_else(|| {
+                        HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            "tool argument `pattern` must be a non-empty string",
+                            false,
+                        )
+                    })?;
+                let glob = optional_string(args, "glob")?;
+                let case_mode = match optional_string(args, "case")?.as_deref() {
+                    None | Some("sensitive") => FsCaseMode::Sensitive,
+                    Some("insensitive") => FsCaseMode::Insensitive,
+                    Some("smart") => FsCaseMode::Smart,
+                    Some(value) => {
+                        return Err(HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            format!("unsupported fs_search case mode `{value}`"),
+                            false,
+                        ));
+                    }
+                };
+                let mode = match optional_string(args, "mode")?.as_deref() {
+                    None | Some("literal") => FsSearchMode::Literal,
+                    Some("simple") => FsSearchMode::Simple,
+                    Some(value) => {
+                        return Err(HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            format!("unsupported fs_search pattern mode `{value}`"),
+                            false,
+                        ));
+                    }
+                };
+                let mut operation = FsSearch::new(root, query)
+                    .with_case_mode(case_mode)
+                    .with_mode(mode);
+                if let Some(glob) = glob {
+                    operation = operation.with_glob(glob);
+                }
+                Ok(ParsedToolOperation::FsSearch(operation))
+            }
+            RegisteredToolRoute::FsGlob => {
+                let root = optional_string(args, "path")?.unwrap_or_else(|| ".".into());
+                let pattern = required_string(args, "pattern")?;
+                Ok(ParsedToolOperation::FsGlob(FsGlob::new(root, pattern)))
+            }
+            RegisteredToolRoute::ProcessExec => {
+                let command = required_string(args, "command")?;
+                let requested_cwd = optional_string(args, "cwd")?;
+                let background = optional_bool(args, "background")?.unwrap_or(false);
+                let name = if background {
+                    optional_string(args, "name")?
+                } else {
+                    None
+                };
+                let mut operation = ProcessExec::new(call_id, command);
+                if let Some(cwd) = requested_cwd.as_ref() {
+                    operation = operation.with_cwd(cwd);
+                }
+                Ok(ParsedToolOperation::ProcessExec {
+                    operation,
+                    requested_cwd,
+                    background,
+                    name,
+                })
+            }
+            RegisteredToolRoute::SpawnSubagent => SpawnSubagent::from_tool_args(args.clone())
+                .map(Box::new)
+                .map(ParsedToolOperation::SpawnSubagent)
+                .map_err(tool_error),
+            RegisteredToolRoute::TaskKill => Ok(ParsedToolOperation::TaskKill(required_string(
+                args, "task_id",
+            )?)),
+            RegisteredToolRoute::WebFetch => WebFetch::from_tool_args(args)
+                .map(ParsedToolOperation::WebFetch)
+                .map_err(tool_error),
+            RegisteredToolRoute::FsWrite => {
+                let path = required_string(args, "path")?;
+                let content = required_string_allow_empty(args, "content")?;
+                Ok(ParsedToolOperation::FsWrite(FsWrite::new(path, content)))
+            }
+            RegisteredToolRoute::FsEdit => {
+                let path = required_string(args, "path")?;
+                let requested_edits = args
+                    .get("edits")
+                    .and_then(serde_json::Value::as_array)
+                    .filter(|edits| !edits.is_empty())
+                    .ok_or_else(|| {
+                        HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            "tool argument `edits` must be a non-empty array",
+                            false,
+                        )
+                    })?;
+                let mut edits = Vec::with_capacity(requested_edits.len());
+                for edit in requested_edits {
+                    let old = required_string(edit, "old")?;
+                    let new = required_string_allow_empty(edit, "new")?;
+                    let replace_all = optional_bool(edit, "replace_all")?.unwrap_or(false);
+                    edits.push(FsEditChange::new(old, new).replace_all(replace_all));
+                }
+                Ok(ParsedToolOperation::FsEdit(FsEdit::many(path, edits)))
+            }
+            RegisteredToolRoute::FsPath => {
+                let source = required_string(args, "source")?;
+                let operation = match required_string(args, "operation")?.as_str() {
+                    "move" => FsPathOperation::Move,
+                    "delete" => FsPathOperation::Delete,
+                    "copy" => FsPathOperation::Copy,
+                    value => {
+                        return Err(HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            format!("unsupported fs_path operation `{value}`"),
+                            false,
+                        ));
+                    }
+                };
+                let destination = optional_string(args, "destination")?;
+                let overwrite = optional_bool(args, "overwrite")?.unwrap_or(false);
+                let mut operation = FsPath::new(operation, source).overwrite(overwrite);
+                if let Some(destination) = destination {
+                    operation = operation.with_destination(destination);
+                }
+                Ok(ParsedToolOperation::FsPath(operation))
+            }
+            _ => Err(HaiderError::new(
+                ErrorCode::Internal,
+                format!("tool route `{route:?}` has no cached operation"),
+                false,
+            )),
+        }
+    }
+
+    fn cached_tool_operation(
+        &self,
+        key: &ParsedToolOperationKey,
+        args: &serde_json::Value,
+    ) -> Result<Arc<ParsedToolOperation>, HaiderError> {
+        let mut operations = self
+            .parsed_tool_operations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache_parsed_operation(&mut operations, key.clone(), || {
+            Self::parse_tool_operation(key.route, &key.call_id, args)
+        })
+    }
+
+    fn cached_computer_operation(
+        &self,
+        key: &ParsedToolOperationKey,
+        args: &serde_json::Value,
+    ) -> Result<Arc<ParsedToolOperation>, ToolError> {
+        let mut operations = self
+            .parsed_tool_operations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache_parsed_operation(&mut operations, key.clone(), || {
+            ComputerOperation::from_tool_args(args.clone())
+                .map(Box::new)
+                .map(ParsedToolOperation::Computer)
+        })
+    }
+
+    fn cached_mobile_operation(
+        &self,
+        key: &ParsedToolOperationKey,
+        args: &serde_json::Value,
+    ) -> Result<Arc<ParsedToolOperation>, ToolError> {
+        let mut operations = self
+            .parsed_tool_operations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache_parsed_operation(&mut operations, key.clone(), || {
+            MobileOperation::from_tool_args(args.clone())
+                .map(Box::new)
+                .map(ParsedToolOperation::Mobile)
+        })
+    }
+
+    fn clear_cached_operation(&self, key: &ParsedToolOperationKey) {
+        self.parsed_tool_operations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(key);
+    }
+
+    fn clear_cached_call(&self, run_id: &RunId, item_id: &ItemId, call_id: &str) {
+        self.parsed_tool_operations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|key, _| {
+                &key.run_id != run_id || &key.item_id != item_id || key.call_id.as_str() != call_id
+            });
+    }
+
     async fn close_effects(&self, cancelled: bool) -> Result<(), HaiderError> {
+        self.parsed_tool_operations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         let pollers = self
             .permission_pollers
             .lock()
@@ -9776,7 +10588,22 @@ impl ToolDispatcher for BrokerToolDispatcher {
         args: serde_json::Value,
         cancel: &CancelToken,
     ) -> Result<ToolDispatchResult, HaiderError> {
+        self.execute_shared(run_id, item_id, call_id, name, Arc::new(args), cancel)
+            .await
+    }
+
+    #[allow(clippy::expect_used)]
+    async fn execute_shared(
+        &self,
+        run_id: &RunId,
+        item_id: &ItemId,
+        call_id: &str,
+        name: &str,
+        args: Arc<serde_json::Value>,
+        cancel: &CancelToken,
+    ) -> Result<ToolDispatchResult, HaiderError> {
         if cancel.is_cancelled() {
+            self.clear_cached_call(run_id, item_id, call_id);
             return Err(HaiderError::new(
                 ErrorCode::Internal,
                 "tool dispatch was cancelled before start",
@@ -9793,6 +10620,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 .typed_workflow_binding_is_current(&execution.binding)
                 .await?
         {
+            self.clear_cached_call(run_id, item_id, call_id);
             return Ok(ToolDispatchResult::Completed(
                 typed_workflow_boundary_result(&format!(
                     "typed executor @{} completed graph attempt {}:{}@{}; the next provider request will bind the next ready node",
@@ -9812,35 +10640,43 @@ impl ToolDispatcher for BrokerToolDispatcher {
             .map(|execution| &execution.cli_scope)
             .or(self.cli_scope.as_ref());
         if name == "mobile" && !self.mobile_use_active {
+            self.clear_cached_call(run_id, item_id, call_id);
             return Ok(ToolDispatchResult::Completed(
                 mobile_capability_denied_result(),
             ));
         }
         if let Some(grant) = effective_grant {
             let allowed = grant.tools.iter().any(|allowed| allowed == name)
-                && registered_tools()
-                    .into_iter()
-                    .find(|entry| entry.manifest.name == name)
-                    .is_some_and(|entry| {
-                        grant_admits_tool_manifest(
-                            grant,
-                            &entry.manifest.name,
-                            &entry.manifest.effects,
-                        )
-                    });
+                && registered_tool_by_name(name).is_some_and(|entry| {
+                    grant_admits_tool_manifest(grant, &entry.manifest.name, &entry.manifest.effects)
+                });
             if !allowed {
+                self.clear_cached_call(run_id, item_id, call_id);
                 return Ok(ToolDispatchResult::Completed(grant_ceiling_result(name)));
             }
         }
-        let route = registered_tool_route(name).ok_or_else(|| {
-            HaiderError::new(
-                ErrorCode::InvalidArgument,
-                format!("unsupported tool `{name}`"),
-                false,
-            )
-        })?;
+        let route = match registered_tool_route(name) {
+            Some(route) => route,
+            None => {
+                self.clear_cached_call(run_id, item_id, call_id);
+                return Err(HaiderError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("unsupported tool `{name}`"),
+                    false,
+                ));
+            }
+        };
+        let operation_key = ParsedToolOperationKey {
+            run_id: run_id.clone(),
+            item_id: item_id.clone(),
+            call_id: call_id.to_owned(),
+            route,
+        };
+        let mut operation_lease =
+            ParsedToolOperationLease::new(&self.parsed_tool_operations, operation_key.clone());
         if route == RegisteredToolRoute::Monitor {
-            let request = MonitorRequest::from_tool_args(args).map_err(tool_error)?;
+            let request =
+                MonitorRequest::from_tool_args(args.as_ref().clone()).map_err(tool_error)?;
             let result = self
                 .output
                 .store
@@ -9861,7 +10697,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
             return Ok(ToolDispatchResult::Completed(result));
         }
         if route == RegisteredToolRoute::GraphEvidence {
-            let mut request = match GraphEvidence::from_tool_args(args) {
+            let mut request = match GraphEvidence::from_tool_args(args.as_ref().clone()) {
                 Ok(request) => request,
                 Err(error) => {
                     return Ok(ToolDispatchResult::Completed(graph_evidence_rejection(
@@ -10007,7 +10843,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
             if !authorized {
                 return Ok(ToolDispatchResult::Completed(grant_ceiling_result(name)));
             }
-            let request = WorkflowAuthor::from_tool_args(args).map_err(tool_error)?;
+            let request =
+                WorkflowAuthor::from_tool_args(args.as_ref().clone()).map_err(tool_error)?;
             if request.template.nodes.iter().any(|node| {
                 matches!(
                     node.gate,
@@ -10113,11 +10950,17 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 if error.code == ErrorCode::InvalidArgument
                     && error.message == crate::delegation::RECURSION_LIMIT_MESSAGE
                 {
+                    self.clear_cached_call(run_id, item_id, call_id);
                     return Ok(ToolDispatchResult::Completed(recursion_limit_result()));
                 }
+                self.clear_cached_call(run_id, item_id, call_id);
                 return Err(error);
             }
-            let mut request = SpawnSubagent::from_tool_args(args).map_err(tool_error)?;
+            let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
+            let ParsedToolOperation::SpawnSubagent(operation) = operation.as_ref() else {
+                return Err(cached_operation_route_mismatch(route));
+            };
+            let mut request = operation.as_ref().clone();
             // C2: a TYPED child. Resolve the agent type from the Loom registry
             // BEFORE any durable spawn work: the type's Job becomes the
             // child's role framing and the display label carries `@type ·` so
@@ -10220,6 +11063,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             false,
                         )
                     })?;
+                    operation_lease.retain_for_approval();
                     return Ok(ToolDispatchResult::ApprovalRequired(menu));
                 }
                 Err(error) => return Err(tool_error(error)),
@@ -10293,7 +11137,8 @@ impl ToolDispatcher for BrokerToolDispatcher {
             return Ok(ToolDispatchResult::Deferred(established.ticket));
         }
         if route == RegisteredToolRoute::MessageSubagent {
-            let request = MessageSubagent::from_tool_args(args).map_err(tool_error)?;
+            let request =
+                MessageSubagent::from_tool_args(args.as_ref().clone()).map_err(tool_error)?;
             let agent = request.agent.clone();
             let receipt = match self
                 .delegation
@@ -10358,107 +11203,54 @@ impl ToolDispatcher for BrokerToolDispatcher {
             .map_or(0, |changes| changes.writes.len());
         let result = match route {
             RegisteredToolRoute::FsRead => {
-                let path = required_string(&args, "path")?;
-                let offset = optional_u64(&args, "offset")?
-                    .map(usize::try_from)
-                    .transpose()
-                    .map_err(|_| {
-                        HaiderError::new(
-                            ErrorCode::InvalidArgument,
-                            "tool argument `offset` is too large",
-                            false,
-                        )
-                    })?;
-                let limit = optional_u64(&args, "limit")?
-                    .map(usize::try_from)
-                    .transpose()
-                    .map_err(|_| {
-                        HaiderError::new(
-                            ErrorCode::InvalidArgument,
-                            "tool argument `limit` is too large",
-                            false,
-                        )
-                    })?;
+                let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
+                let ParsedToolOperation::FsRead(operation) = operation.as_ref() else {
+                    return Err(cached_operation_route_mismatch(route));
+                };
                 let mut cas = self.cas.lock().await;
                 broker
-                    .fs_read(
-                        &FsRead::new(path).with_line_range(offset, limit),
-                        &policy,
-                        &mut *cas,
-                        ResultBounds::default(),
-                    )
+                    .fs_read(operation, &policy, &mut *cas, ResultBounds::default())
                     .await
             }
             RegisteredToolRoute::FsSearch => {
-                let root = optional_string(&args, "path")?
-                    .or(optional_string(&args, "root")?)
-                    .unwrap_or_else(|| ".".into());
-                let query = optional_string(&args, "pattern")?
-                    .or(optional_string(&args, "query")?)
-                    .ok_or_else(|| {
-                        HaiderError::new(
-                            ErrorCode::InvalidArgument,
-                            "tool argument `pattern` must be a non-empty string",
-                            false,
-                        )
-                    })?;
-                let glob = optional_string(&args, "glob")?;
-                let case_mode = match optional_string(&args, "case")?.as_deref() {
-                    None | Some("sensitive") => FsCaseMode::Sensitive,
-                    Some("insensitive") => FsCaseMode::Insensitive,
-                    Some("smart") => FsCaseMode::Smart,
-                    Some(value) => {
-                        return Err(HaiderError::new(
-                            ErrorCode::InvalidArgument,
-                            format!("unsupported fs_search case mode `{value}`"),
-                            false,
-                        ));
-                    }
+                let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
+                let ParsedToolOperation::FsSearch(operation) = operation.as_ref() else {
+                    return Err(cached_operation_route_mismatch(route));
                 };
-                let mode = match optional_string(&args, "mode")?.as_deref() {
-                    None | Some("literal") => FsSearchMode::Literal,
-                    Some("simple") => FsSearchMode::Simple,
-                    Some(value) => {
-                        return Err(HaiderError::new(
-                            ErrorCode::InvalidArgument,
-                            format!("unsupported fs_search pattern mode `{value}`"),
-                            false,
-                        ));
-                    }
-                };
-                let mut operation = FsSearch::new(root, query)
-                    .with_case_mode(case_mode)
-                    .with_mode(mode);
-                if let Some(glob) = glob {
-                    operation = operation.with_glob(glob);
-                }
                 let mut cas = self.cas.lock().await;
                 broker
-                    .fs_search(&operation, &policy, &mut *cas, ResultBounds::default())
+                    .fs_search(operation, &policy, &mut *cas, ResultBounds::default())
                     .await
             }
             RegisteredToolRoute::FsGlob => {
-                let root = optional_string(&args, "path")?.unwrap_or_else(|| ".".into());
-                let pattern = required_string(&args, "pattern")?;
+                let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
+                let ParsedToolOperation::FsGlob(operation) = operation.as_ref() else {
+                    return Err(cached_operation_route_mismatch(route));
+                };
                 let mut cas = self.cas.lock().await;
                 broker
-                    .fs_glob(
-                        &FsGlob::new(root, pattern),
-                        &policy,
-                        &mut *cas,
-                        ResultBounds::default(),
-                    )
+                    .fs_glob(operation, &policy, &mut *cas, ResultBounds::default())
                     .await
             }
             RegisteredToolRoute::ProcessExec => {
-                let command = required_string(&args, "command")?;
+                let parsed = self.cached_tool_operation(&operation_key, args.as_ref())?;
+                let ParsedToolOperation::ProcessExec {
+                    operation,
+                    requested_cwd,
+                    background,
+                    name,
+                } = parsed.as_ref()
+                else {
+                    return Err(cached_operation_route_mismatch(route));
+                };
                 // B3 (review round 2) — the typed CLI fence: a leaf
                 // specialist runs its DECLARED CLIs, one program per call
                 // (foreground AND background). A refusal is a completed
                 // typed result the model can react to.
                 if let Some(scope) = effective_cli_scope
-                    && let Err(reason) = cli_scope_admits(scope, &command)
+                    && let Err(reason) = cli_scope_admits(scope, &operation.command)
                 {
+                    self.clear_cached_operation(&operation_key);
                     return Ok(ToolDispatchResult::Completed(BoundedResult {
                         preview: serde_json::json!({ "ok": false, "error": reason }).to_string(),
                         truncated: false,
@@ -10470,14 +11262,11 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         presentation: None,
                     }));
                 }
-                let cwd = optional_string(&args, "cwd")?;
-                let background = optional_bool(&args, "background")?.unwrap_or(false);
-                if background {
+                if *background {
                     // Image discovery is foreground-only: detached tasks have
                     // no completed bounded transcript at this dispatch seam.
                     // W-A: the detached shape returns IMMEDIATELY with the
                     // typed running receipt; supervision is session-scoped.
-                    let name = optional_string(&args, "name")?;
                     self.tasks
                         .spawn_background(
                             crate::tasks::TaskSpawnContext {
@@ -10487,19 +11276,16 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 agent_id: self.parent_agent_id.clone(),
                                 call_id: call_id.to_owned(),
                             },
-                            command,
-                            cwd,
-                            name,
+                            operation.command.clone(),
+                            requested_cwd.clone(),
+                            name.clone(),
                             broker,
                             &policy,
                         )
                         .await
                 } else {
-                    let effective_cwd = command_cwd(&self.metadata.cwd, cwd.as_deref());
-                    let mut operation = ProcessExec::new(call_id, command.clone());
-                    if let Some(cwd) = cwd {
-                        operation = operation.with_cwd(cwd);
-                    }
+                    let effective_cwd =
+                        command_cwd(&self.metadata.cwd, requested_cwd.as_deref());
                     let cas = self.cas.lock().await.clone();
                     let output = self.output.sink(
                         run_id.clone(),
@@ -10509,7 +11295,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     );
                     let started = SystemTime::now();
                     match broker
-                        .process_exec(&operation, &policy, cas, output, ProcessBounds::default())
+                        .process_exec(operation, &policy, cas, output, ProcessBounds::default())
                         .await
                     {
                         Ok(execution) => match execution.wait().await {
@@ -10525,13 +11311,14 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                                     run_id,
                                                     call_id,
                                                     tool: "process_exec",
-                                                    command: &command,
+                                                    command: &operation.command,
                                                     output_preview: &preview,
                                                     cwd: &effective_cwd,
                                                     started,
                                                 })
                                                 .await
                                             {
+                                                self.clear_cached_operation(&operation_key);
                                                 return Err(tool_error(error));
                                             }
                                         }
@@ -10677,9 +11464,12 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     .await
             }
             RegisteredToolRoute::TaskKill => {
-                let task_id = required_string(&args, "task_id")?;
+                let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
+                let ParsedToolOperation::TaskKill(task_id) = operation.as_ref() else {
+                    return Err(cached_operation_route_mismatch(route));
+                };
                 self.tasks
-                    .task_kill(&self.session_id, &task_id, broker, &policy)
+                    .task_kill(&self.session_id, task_id, broker, &policy)
                     .await
             }
             RegisteredToolRoute::WebFetch => {
@@ -10688,13 +11478,17 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 // HONEST terminal outcome either way. A failed fetch is a
                 // typed tool RESULT the model can react to, never a turn
                 // failure; only journal-append failures abort.
-                let operation = WebFetch::from_tool_args(&args).map_err(tool_error)?;
+                let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
+                let ParsedToolOperation::WebFetch(operation) = operation.as_ref() else {
+                    return Err(cached_operation_route_mismatch(route));
+                };
                 // B2 — the use-site host fence: a typed child's grant scopes
                 // the network to its DECLARED APIs; a fetch outside them is a
                 // completed refusal the model can react to.
                 if let Some(grant) = effective_grant
                     && !web_fetch_host_allowed(grant, operation.host())
                 {
+                    self.clear_cached_operation(&operation_key);
                     return Ok(ToolDispatchResult::Completed(BoundedResult {
                         preview: serde_json::json!({
                             "ok": false,
@@ -10713,7 +11507,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         presentation: None,
                     }));
                 }
-                match broker.begin_web_fetch(&operation, &policy).await {
+                match broker.begin_web_fetch(operation, &policy).await {
                     Ok(intent) => {
                         let execution = tokio::select! {
                             () = cancel.cancelled() => {
@@ -10721,6 +11515,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                     .journal_outcome(&intent, EffectOutcome::Cancelled)
                                     .await
                                     .map_err(tool_error)?;
+                                self.clear_cached_operation(&operation_key);
                                 return Err(HaiderError::new(
                                     ErrorCode::Internal,
                                     "web_fetch was cancelled mid-flight",
@@ -10818,17 +11613,14 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 }
             }
             RegisteredToolRoute::FsWrite => {
-                let path = required_string(&args, "path")?;
-                let content = required_string_allow_empty(&args, "content")?;
+                let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
+                let ParsedToolOperation::FsWrite(operation) = operation.as_ref() else {
+                    return Err(cached_operation_route_mismatch(route));
+                };
                 let attribution = TurnAttribution::new(self.session_id.clone(), run_id.clone());
                 let started = SystemTime::now();
                 let result = broker
-                    .fs_write(
-                        &FsWrite::new(path.clone(), content),
-                        &policy,
-                        &attribution,
-                        &self.ledger,
-                    )
+                    .fs_write(operation, &policy, &attribution, &self.ledger)
                     .await;
                 if result
                     .as_ref()
@@ -10841,70 +11633,36 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             // Verify round 2: the EXACT argument, quoted, so
                             // a path with spaces nominates whole instead of
                             // fragmenting into whitespace tokens.
-                            command: &format!("\"{path}\""),
+                            command: &format!("\"{}\"", operation.path.display()),
                             output_preview: "",
                             cwd: Path::new(&self.metadata.cwd),
                             started,
                         })
                         .await
                 {
+                    self.clear_cached_operation(&operation_key);
                     return Err(tool_error(error));
                 }
                 result
             }
             RegisteredToolRoute::FsEdit => {
-                let path = required_string(&args, "path")?;
-                let requested_edits = args
-                    .get("edits")
-                    .and_then(serde_json::Value::as_array)
-                    .filter(|edits| !edits.is_empty())
-                    .ok_or_else(|| {
-                        HaiderError::new(
-                            ErrorCode::InvalidArgument,
-                            "tool argument `edits` must be a non-empty array",
-                            false,
-                        )
-                    })?;
-                let mut edits = Vec::with_capacity(requested_edits.len());
-                for edit in requested_edits {
-                    let old = required_string(edit, "old")?;
-                    let new = required_string_allow_empty(edit, "new")?;
-                    let replace_all = optional_bool(edit, "replace_all")?.unwrap_or(false);
-                    edits.push(FsEditChange::new(old, new).replace_all(replace_all));
-                }
+                let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
+                let ParsedToolOperation::FsEdit(operation) = operation.as_ref() else {
+                    return Err(cached_operation_route_mismatch(route));
+                };
                 let attribution = TurnAttribution::new(self.session_id.clone(), run_id.clone());
                 broker
-                    .fs_edit(
-                        &FsEdit::many(path, edits),
-                        &policy,
-                        &attribution,
-                        &self.ledger,
-                    )
+                    .fs_edit(operation, &policy, &attribution, &self.ledger)
                     .await
             }
             RegisteredToolRoute::FsPath => {
-                let source = required_string(&args, "source")?;
-                let operation = match required_string(&args, "operation")?.as_str() {
-                    "move" => FsPathOperation::Move,
-                    "delete" => FsPathOperation::Delete,
-                    "copy" => FsPathOperation::Copy,
-                    value => {
-                        return Err(HaiderError::new(
-                            ErrorCode::InvalidArgument,
-                            format!("unsupported fs_path operation `{value}`"),
-                            false,
-                        ));
-                    }
+                let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
+                let ParsedToolOperation::FsPath(operation) = operation.as_ref() else {
+                    return Err(cached_operation_route_mismatch(route));
                 };
-                let destination = optional_string(&args, "destination")?;
-                let overwrite = optional_bool(&args, "overwrite")?.unwrap_or(false);
-                let mut operation = FsPath::new(operation, source).overwrite(overwrite);
-                if let Some(destination) = destination {
-                    operation = operation.with_destination(destination);
-                }
                 let attribution = TurnAttribution::new(self.session_id.clone(), run_id.clone());
                 broker
-                    .fs_path(&operation, &policy, &attribution, &self.ledger)
+                    .fs_path(operation, &policy, &attribution, &self.ledger)
                     .await
             }
             RegisteredToolRoute::WebSearch => {
@@ -10969,10 +11727,16 @@ impl ToolDispatcher for BrokerToolDispatcher {
             }
             RegisteredToolRoute::Computer => {
                 async {
-                    let operation = ComputerOperation::from_tool_args(args)?;
+                    let operation = self
+                        .cached_computer_operation(&operation_key, args.as_ref())?;
+                    let ParsedToolOperation::Computer(operation) = operation.as_ref() else {
+                        return Err(ToolError::Runtime {
+                            message: cached_operation_route_mismatch(route).message,
+                        });
+                    };
                     let action_cancel = ComputerCancelToken::new();
                     let intent = broker
-                        .authorize_computer(&operation, &policy)
+                        .authorize_computer(operation, &policy)
                         .await?;
                     match self
                         .computer
@@ -11253,14 +12017,20 @@ impl ToolDispatcher for BrokerToolDispatcher {
             }
             RegisteredToolRoute::Mobile => {
                 async {
-                    let operation = MobileOperation::from_tool_args(args)?;
+                    let operation = self
+                        .cached_mobile_operation(&operation_key, args.as_ref())?;
+                    let ParsedToolOperation::Mobile(operation) = operation.as_ref() else {
+                        return Err(ToolError::Runtime {
+                            message: cached_operation_route_mismatch(route).message,
+                        });
+                    };
                     if effective_grant.is_some_and(|grant| {
                         !effect_within_grant(grant, &operation.action().effect_class())
                     }) {
                         return Ok(grant_ceiling_result("mobile"));
                     }
                     let action_cancel = MobileCancelToken::new();
-                    let intent = broker.authorize_mobile(&operation, &policy).await?;
+                    let intent = broker.authorize_mobile(operation, &policy).await?;
                     self.mobile
                         .prepare(operation.action(), &action_cancel)
                         .await
@@ -11369,6 +12139,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
             }
             RegisteredToolRoute::RequestInput
             | RegisteredToolRoute::Plan
+            | RegisteredToolRoute::LoomRegister
             | RegisteredToolRoute::TodoWrite
             | RegisteredToolRoute::GraphEvidence
             | RegisteredToolRoute::WorkflowAuthor
@@ -11391,6 +12162,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
             match result {
                 Ok(mut result) => {
                     let Some(changes) = self.ledger.changes_for(&self.session_id, run_id) else {
+                        self.clear_cached_operation(&operation_key);
                         return Err(HaiderError::new(
                             ErrorCode::Internal,
                             "filesystem mutation committed without ledger provenance",
@@ -11398,6 +12170,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         ));
                     };
                     let Some(record) = changes.writes.get(fs_write_count) else {
+                        self.clear_cached_operation(&operation_key);
                         return Err(HaiderError::new(
                             ErrorCode::Internal,
                             "filesystem mutation committed without one new ledger record",
@@ -11405,16 +12178,26 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         ));
                     };
                     if changes.writes.len() != fs_write_count.saturating_add(1) {
+                        self.clear_cached_operation(&operation_key);
                         return Err(HaiderError::new(
                             ErrorCode::Internal,
                             "filesystem mutation produced ambiguous ledger provenance",
                             false,
                         ));
                     }
-                    let mutation =
-                        durable_workspace_mutation(&self.output.store, run_id, &record.effect)
-                            .await
-                            .map_err(tool_error)?;
+                    let mutation = match durable_workspace_mutation(
+                        &self.output.store,
+                        run_id,
+                        &record.effect,
+                    )
+                    .await
+                    {
+                        Ok(mutation) => mutation,
+                        Err(error) => {
+                            self.clear_cached_operation(&operation_key);
+                            return Err(tool_error(error));
+                        }
+                    };
                     let subject_digest = mutation.subject_digest.clone();
                     let workspace_revision = mutation.workspace_revision.clone();
                     result.preview = serde_json::json!({
@@ -11435,7 +12218,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
         } else {
             result
         };
-        match result {
+        let dispatch_result = match result {
             Ok(result) => Ok(ToolDispatchResult::Completed(result)),
             Err(haider_tools::ToolError::AuthorizationRequired { menu }) => {
                 let menu = match broker.permission_menu(&menu).cloned() {
@@ -11460,7 +12243,14 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 Some(result) => Ok(ToolDispatchResult::Completed(result)),
                 None => Err(tool_error(error)),
             },
+        };
+        if matches!(
+            &dispatch_result,
+            Ok(ToolDispatchResult::ApprovalRequired(_))
+        ) {
+            operation_lease.retain_for_approval();
         }
+        dispatch_result
     }
 
     async fn collect_deferred(
@@ -11557,6 +12347,90 @@ pub(crate) struct DurableToolState {
     pub(crate) mobile_use_active: bool,
 }
 
+#[derive(Default)]
+struct DurableToolStateReduction {
+    intents: HashMap<EffectId, EffectIntent>,
+    opened: HashMap<MenuId, Menu>,
+    grants: Vec<SessionGrant>,
+    bindings: HashMap<MenuId, (EffectClass, String)>,
+    freshness: HashMap<String, FileFreshness>,
+    explicit_computer_intent: bool,
+    mobile_use_active: bool,
+}
+
+impl DurableToolStateReduction {
+    fn observe(&mut self, agent_id: Option<&AgentId>, payload: &EventPayload) {
+        match payload {
+            EventPayload::Effect(EffectPhase::Intent(intent)) => {
+                self.intents.insert(intent.effect.clone(), intent.clone());
+            }
+            EventPayload::Effect(EffectPhase::Authorized {
+                effect,
+                verdict: AuthorizationVerdict::Ask { menu },
+            }) => {
+                let Some(intent) = self.intents.get(effect) else {
+                    return;
+                };
+                self.bindings.insert(
+                    menu.clone(),
+                    (intent.class.clone(), intent.args_digest.clone()),
+                );
+            }
+            EventPayload::Effect(EffectPhase::Outcome {
+                freshness: Some(record),
+                ..
+            }) => {
+                self.freshness.insert(record.path.clone(), record.clone());
+            }
+            EventPayload::MenuOpened(menu) if matches!(menu.kind, MenuKind::Permission { .. }) => {
+                self.opened.insert(menu.id.clone(), menu.clone());
+            }
+            EventPayload::MenuAnswered(answer) => {
+                let Some(menu) = self.opened.get(&answer.menu) else {
+                    return;
+                };
+                let Some(option) = selected_menu_option(menu, answer) else {
+                    return;
+                };
+                if option.decision != Some(DecisionKind::AllowAlways) {
+                    return;
+                }
+                let Some((class, args_digest)) = self.bindings.get(&menu.id) else {
+                    return;
+                };
+                let grant = SessionGrant::for_effect(class.clone(), args_digest.clone());
+                if !self.grants.contains(&grant) {
+                    self.grants.push(grant);
+                }
+            }
+            EventPayload::UserMessage { text, .. }
+                if agent_id.is_none() && explicit_computer_use_intent(text) =>
+            {
+                self.explicit_computer_intent = true;
+            }
+            EventPayload::UserMessage { text, .. }
+                if agent_id.is_none() && explicit_mobile_use_intent(text) =>
+            {
+                self.mobile_use_active = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn snapshot(&self) -> DurableToolState {
+        let mut grants = self.grants.clone();
+        if self.explicit_computer_intent && explicit_computer_auto_grant_enabled() {
+            add_explicit_computer_session_grants(&mut grants);
+        }
+        DurableToolState {
+            grants,
+            bindings: self.bindings.clone(),
+            freshness: self.freshness.clone(),
+            mobile_use_active: self.mobile_use_active,
+        }
+    }
+}
+
 /// Set to `0`, `false`, `no`, or `off` to keep every computer effect on the
 /// ordinary Ask path even after an explicit user computer-use command.
 pub const EXPLICIT_COMPUTER_AUTO_GRANT_ENV: &str = "HAIDER_EXPLICIT_COMPUTER_AUTO_GRANT";
@@ -11617,85 +12491,18 @@ pub(crate) async fn durable_session_tool_state(
     session_id: &SessionId,
 ) -> Result<DurableToolState, HaiderError> {
     let mut cursor = 0;
-    let mut intents = HashMap::<EffectId, EffectIntent>::new();
-    let mut opened = HashMap::<MenuId, Menu>::new();
-    let mut grants = Vec::new();
-    let mut bindings = HashMap::new();
-    let mut freshness = HashMap::new();
-    let mut explicit_computer_intent = false;
-    let mut mobile_use_active = false;
+    let mut reduction = DurableToolStateReduction::default();
     loop {
         let page = store.read(session_id, cursor, 256).await?;
         if page.is_empty() {
-            if explicit_computer_intent && explicit_computer_auto_grant_enabled() {
-                add_explicit_computer_session_grants(&mut grants);
-            }
-            return Ok(DurableToolState {
-                grants,
-                bindings,
-                freshness,
-                mobile_use_active,
-            });
+            return Ok(reduction.snapshot());
         }
         cursor = page.last().map_or(cursor, |envelope| envelope.seq);
         for envelope in page {
             let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
                 continue;
             };
-            match payload {
-                EventPayload::Effect(EffectPhase::Intent(intent)) => {
-                    intents.insert(intent.effect.clone(), intent);
-                }
-                EventPayload::Effect(EffectPhase::Authorized {
-                    effect,
-                    verdict: AuthorizationVerdict::Ask { menu },
-                }) => {
-                    let Some(intent) = intents.get(&effect) else {
-                        continue;
-                    };
-                    bindings.insert(menu, (intent.class.clone(), intent.args_digest.clone()));
-                }
-                EventPayload::Effect(EffectPhase::Outcome {
-                    freshness: Some(record),
-                    ..
-                }) => {
-                    freshness.insert(record.path.clone(), record);
-                }
-                EventPayload::MenuOpened(menu)
-                    if matches!(menu.kind, MenuKind::Permission { .. }) =>
-                {
-                    opened.insert(menu.id.clone(), menu);
-                }
-                EventPayload::MenuAnswered(answer) => {
-                    let Some(menu) = opened.get(&answer.menu) else {
-                        continue;
-                    };
-                    let Some(option) = selected_menu_option(menu, &answer) else {
-                        continue;
-                    };
-                    if option.decision != Some(DecisionKind::AllowAlways) {
-                        continue;
-                    }
-                    let Some((class, args_digest)) = bindings.get(&menu.id) else {
-                        continue;
-                    };
-                    let grant = SessionGrant::for_effect(class.clone(), args_digest.clone());
-                    if !grants.contains(&grant) {
-                        grants.push(grant);
-                    }
-                }
-                EventPayload::UserMessage { text, .. }
-                    if envelope.agent_id.is_none() && explicit_computer_use_intent(&text) =>
-                {
-                    explicit_computer_intent = true;
-                }
-                EventPayload::UserMessage { text, .. }
-                    if envelope.agent_id.is_none() && explicit_mobile_use_intent(&text) =>
-                {
-                    mobile_use_active = true;
-                }
-                _ => {}
-            }
+            reduction.observe(envelope.agent_id.as_ref(), &payload);
         }
     }
 }
@@ -11712,13 +12519,13 @@ pub(crate) async fn tool_inventory_snapshot(
     // in the general session inventory. Mirror that gate here so a root
     // session's inventory does not advertise it.
     let tools = registered_tools()
-        .into_iter()
+        .iter()
         .filter(|entry| {
             entry.manifest.name != "workflow_author"
                 && (mobile_use_active || entry.manifest.name != "mobile")
         })
         .map(|entry| ToolInventoryEntry {
-            manifest: entry.manifest,
+            manifest: entry.manifest.clone(),
             default: entry.default,
         })
         .collect();
@@ -12817,12 +13624,17 @@ struct HubJournalSink {
     diagnostics: Option<Arc<EffectDiagnostics>>,
     workspace_root_digest: String,
     active_tool_name: Arc<StdMutex<Option<String>>>,
+    effect_dispatched: Arc<AtomicBool>,
     intent_digests: HashMap<EffectId, String>,
     pending_breadcrumbs: HashMap<EffectId, EffectBreadcrumb>,
 }
 
 impl HubJournalSink {
-    fn new(context: &WorkerToolContext, active_tool_name: Arc<StdMutex<Option<String>>>) -> Self {
+    fn new(
+        context: &WorkerToolContext,
+        active_tool_name: Arc<StdMutex<Option<String>>>,
+        effect_dispatched: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             store: context.store.clone(),
             run_id: context.run_id.clone(),
@@ -12832,6 +13644,7 @@ impl HubJournalSink {
             diagnostics: context.diagnostics.clone(),
             workspace_root_digest: EffectDiagnostics::workspace_digest(&context.metadata.cwd),
             active_tool_name,
+            effect_dispatched,
             intent_digests: HashMap::new(),
             pending_breadcrumbs: HashMap::new(),
         }
@@ -12873,6 +13686,10 @@ impl JournalSink for HubJournalSink {
             self.intent_digests
                 .insert(intent.effect.clone(), intent.args_digest.clone());
         }
+        let effect_was_dispatched = matches!(
+            &payload,
+            EventPayload::Effect(EffectPhase::Dispatched { .. })
+        );
         let dispatched = match &payload {
             EventPayload::Effect(EffectPhase::Dispatched { effect })
                 if self.diagnostics.is_some() =>
@@ -12914,6 +13731,13 @@ impl JournalSink for HubJournalSink {
                 }
             })?,
         }];
+        if effect_was_dispatched {
+            // The store actor can commit after cancellation drops this append
+            // future while it awaits the acknowledgement. Mark conservatively
+            // before that cancellation point; an append failure merely keeps
+            // the completion safety scan enabled.
+            self.effect_dispatched.store(true, Ordering::Release);
+        }
         haider_core::StoreHandle::append(&self.store, &mut envelopes)
             .await
             .map_err(|error| haider_tools::ToolError::Runtime {

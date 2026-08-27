@@ -437,6 +437,18 @@ fn prepared_anthropic_wire_bytes_match_legacy_final_render() {
         .request_payload(&request)
         .expect("legacy cache-controlled Anthropic payload");
     let prepared = provider.prepare_turn(&request).expect("prepared turn");
+    let mut borrowed_request = request.clone();
+    let shared_tools = std::mem::take(&mut borrowed_request.tools);
+    let borrowed =
+        crate::Provider::prepare_turn_with_tools(&provider, &borrowed_request, &shared_tools)
+            .expect("borrowed-tools prepared turn");
+    assert_eq!(
+        serde_json::to_vec(&borrowed.wire.as_ref().expect("borrowed wire").payload)
+            .expect("borrowed bytes"),
+        serde_json::to_vec(&prepared.wire.as_ref().expect("prepared wire").payload)
+            .expect("prepared bytes"),
+        "Arc-backed preparation must preserve exact Anthropic wire bytes"
+    );
     assert_eq!(
         serde_json::to_vec(&prepared.wire.as_ref().expect("prepared wire").payload)
             .expect("prepared bytes"),

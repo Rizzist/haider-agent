@@ -1930,6 +1930,18 @@ fn prepared_openai_and_compatible_wire_bytes_match_legacy_final_render() {
     request.tools = vec![computer_tool_definition()];
     request.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
     let prepared = crate::Provider::prepare_turn(&openai, &request).expect("prepared OpenAI turn");
+    let mut borrowed_request = request.clone();
+    let shared_tools = std::mem::take(&mut borrowed_request.tools);
+    let borrowed =
+        crate::Provider::prepare_turn_with_tools(&openai, &borrowed_request, &shared_tools)
+            .expect("borrowed-tools prepared OpenAI turn");
+    assert_eq!(
+        serde_json::to_vec(&borrowed.wire.as_ref().expect("borrowed wire").payload)
+            .expect("borrowed OpenAI bytes"),
+        serde_json::to_vec(&prepared.wire.as_ref().expect("prepared wire").payload)
+            .expect("prepared OpenAI bytes"),
+        "Arc-backed preparation must preserve exact OpenAI wire bytes"
+    );
     let mut finalized = request.clone();
     finalized
         .cache_metadata
@@ -1961,6 +1973,33 @@ fn prepared_openai_and_compatible_wire_bytes_match_legacy_final_render() {
         Some(cm2_cache_metadata(OPENAI_COMPATIBLE_PROVIDER_NAME, 1));
     let compatible_prepared = crate::Provider::prepare_turn(&compatible, &compatible_request)
         .expect("prepared compatible turn");
+    let mut borrowed_compatible_request = compatible_request.clone();
+    let shared_compatible_tools = std::mem::take(&mut borrowed_compatible_request.tools);
+    let borrowed_compatible = crate::Provider::prepare_turn_with_tools(
+        &compatible,
+        &borrowed_compatible_request,
+        &shared_compatible_tools,
+    )
+    .expect("borrowed-tools prepared compatible turn");
+    assert_eq!(
+        serde_json::to_vec(
+            &borrowed_compatible
+                .wire
+                .as_ref()
+                .expect("borrowed compatible wire")
+                .payload,
+        )
+        .expect("borrowed compatible bytes"),
+        serde_json::to_vec(
+            &compatible_prepared
+                .wire
+                .as_ref()
+                .expect("prepared compatible wire")
+                .payload,
+        )
+        .expect("prepared compatible bytes"),
+        "Arc-backed preparation must preserve exact compatible wire bytes"
+    );
     let compatible_legacy = compatible
         .request_payload(&compatible_request)
         .expect("legacy compatible payload");

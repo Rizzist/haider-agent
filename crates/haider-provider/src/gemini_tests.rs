@@ -400,6 +400,18 @@ fn prepared_gemini_wire_bytes_match_legacy_final_render() {
         .request_payload(&request)
         .expect("legacy Gemini payload");
     let prepared = crate::Provider::prepare_turn(&provider, &request).expect("prepared Gemini");
+    let mut borrowed_request = request.clone();
+    let shared_tools = std::mem::take(&mut borrowed_request.tools);
+    let borrowed =
+        crate::Provider::prepare_turn_with_tools(&provider, &borrowed_request, &shared_tools)
+            .expect("borrowed-tools prepared Gemini");
+    assert_eq!(
+        serde_json::to_vec(&borrowed.wire.as_ref().expect("borrowed wire").payload)
+            .expect("borrowed Gemini bytes"),
+        serde_json::to_vec(&prepared.wire.as_ref().expect("prepared wire").payload)
+            .expect("prepared Gemini bytes"),
+        "Arc-backed preparation must preserve exact Gemini wire bytes"
+    );
     assert_eq!(
         serde_json::to_vec(&prepared.wire.as_ref().expect("prepared wire").payload)
             .expect("prepared Gemini bytes"),
