@@ -53,7 +53,7 @@ fn model_source(
 ) -> Arc<CachedProviderModelSource> {
     let source = Arc::new(CachedProviderModelSource::default());
     for (provider, models) in entries {
-        source.replace(provider.to_owned(), models);
+        source.replace(provider.to_owned(), models, None);
     }
     source
 }
@@ -1318,4 +1318,24 @@ fn enterprise_origin_reconfigure_is_shape_validated() {
             .is_err(),
         "an off-inventory default stays refused"
     );
+}
+
+#[tokio::test]
+async fn production_endpoint_validator_keeps_transport_failure_distinct_from_bad_origin() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve closed port");
+    let address = listener.local_addr().expect("closed port address");
+    drop(listener);
+    let error = ProductionProviderEndpointValidator
+        .validate(&format!("http://{address}"))
+        .await
+        .expect_err("closed loopback endpoint is unreachable");
+    assert_eq!(error.code, ErrorCode::ProviderError);
+    assert!(error.retryable);
+
+    let invalid = ProductionProviderEndpointValidator
+        .validate("http://203.0.113.7")
+        .await
+        .expect_err("public plain HTTP is invalid");
+    assert_eq!(invalid.code, ErrorCode::InvalidArgument);
+    assert!(!invalid.retryable);
 }

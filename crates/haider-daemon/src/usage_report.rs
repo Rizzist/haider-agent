@@ -988,6 +988,58 @@ fn add_agent_cache_reread_component(
     accumulator.prev_prefix_tokens = logical.saturating_add(billed_output);
 }
 
+fn scoped_chunk_cost_usd(
+    scope: Option<&UsageScope>,
+    model: &str,
+    input: u64,
+    output: u64,
+    reasoning: u64,
+    cached: u64,
+) -> Option<f64> {
+    scope
+        .map(|scope| scope.provider.as_str())
+        .filter(|provider| !provider.is_empty())
+        .map_or_else(
+            || haider_provider::estimate_chunk_cost_usd(model, input, output, reasoning, cached),
+            |provider| {
+                haider_provider::estimate_chunk_cost_usd_for(
+                    provider, model, input, output, reasoning, cached,
+                )
+            },
+        )
+}
+
+fn scoped_normalized_cost_usd(
+    scope: Option<&UsageScope>,
+    model: &str,
+    usage: &NormalizedUsage,
+) -> Option<f64> {
+    scope
+        .map(|scope| scope.provider.as_str())
+        .filter(|provider| !provider.is_empty())
+        .map_or_else(
+            || haider_provider::estimate_normalized_usage_cost_usd(model, usage),
+            |provider| {
+                haider_provider::estimate_normalized_usage_cost_usd_for(provider, model, usage)
+            },
+        )
+}
+
+fn scoped_cache_cost(
+    scope: Option<&UsageScope>,
+    model: &str,
+    usage: &NormalizedUsage,
+    persisted: Option<CacheCostEstimate>,
+) -> Option<CacheCostEstimate> {
+    match scope
+        .map(|scope| scope.provider.as_str())
+        .filter(|provider| !provider.is_empty())
+    {
+        Some(provider) => haider_provider::estimate_cache_input_costs_for(provider, model, usage),
+        None => persisted.or_else(|| haider_provider::estimate_cache_input_costs(model, usage)),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn add_agent_usage_component(
     accumulator: &mut AgentUsageAccumulator,
@@ -1019,8 +1071,8 @@ fn add_agent_usage_component(
         .filter(|model| !model.is_empty())
         .unwrap_or(fallback_model);
     let cost = normalized.map_or_else(
-        || haider_provider::estimate_chunk_cost_usd(model, input, output, reasoning, cached),
-        |usage| haider_provider::estimate_normalized_usage_cost_usd(model, usage),
+        || scoped_chunk_cost_usd(scope, model, input, output, reasoning, cached),
+        |usage| scoped_normalized_cost_usd(scope, model, usage),
     );
     let auth_method = scope.and_then(scope_auth_method);
     let metered = auth_method == Some(AuthMethod::ApiKey);
@@ -1499,16 +1551,17 @@ impl SessionFolder {
         for (usage, model, _) in self.chunks.into_values() {
             let model = model.as_str();
             if !usage.accounts.is_empty() {
+                let parent_scope = usage.scope.as_ref();
                 for subtotal in usage.accounts {
-                    let subtotal_model = subtotal
-                        .scope
-                        .as_ref()
+                    let subtotal_scope = subtotal.scope.as_ref().or(parent_scope);
+                    let subtotal_model = subtotal_scope
                         .map(|scope| scope.model.as_str())
                         .filter(|model| !model.is_empty())
                         .unwrap_or(model);
                     let cost = subtotal.normalized.as_ref().map_or_else(
                         || {
-                            haider_provider::estimate_chunk_cost_usd(
+                            scoped_chunk_cost_usd(
+                                subtotal_scope,
                                 subtotal_model,
                                 subtotal.input,
                                 subtotal.output,
@@ -1517,16 +1570,16 @@ impl SessionFolder {
                             )
                         },
                         |normalized| {
-                            haider_provider::estimate_normalized_usage_cost_usd(
-                                subtotal_model,
-                                normalized,
-                            )
+                            scoped_normalized_cost_usd(subtotal_scope, subtotal_model, normalized)
                         },
                     );
-                    let cache_cost = subtotal.cache_cost.or_else(|| {
-                        subtotal.normalized.as_ref().and_then(|normalized| {
-                            haider_provider::estimate_cache_input_costs(subtotal_model, normalized)
-                        })
+                    let cache_cost = subtotal.normalized.as_ref().and_then(|normalized| {
+                        scoped_cache_cost(
+                            subtotal_scope,
+                            subtotal_model,
+                            normalized,
+                            subtotal.cache_cost,
+                        )
                     });
                     stats.tokens.entry(subtotal.account).or_default().add(
                         subtotal.input,
@@ -1535,30 +1588,32 @@ impl SessionFolder {
                         subtotal.cached,
                         cost,
                         subtotal.normalized.as_ref(),
-                        subtotal.scope.as_ref(),
+                        subtotal_scope,
                         cache_cost,
                         None,
                     );
                 }
             } else if let Some(account) = usage.account {
-                let cache_cost = usage.cache_cost.or_else(|| {
-                    usage.normalized.as_ref().and_then(|normalized| {
-                        haider_provider::estimate_cache_input_costs(model, normalized)
-                    })
+                let scope = usage.scope.as_ref();
+                let scoped_model = scope
+                    .map(|scope| scope.model.as_str())
+                    .filter(|model| !model.is_empty())
+                    .unwrap_or(model);
+                let cache_cost = usage.normalized.as_ref().and_then(|normalized| {
+                    scoped_cache_cost(scope, scoped_model, normalized, usage.cache_cost)
                 });
                 let cost = usage.normalized.as_ref().map_or_else(
                     || {
-                        haider_provider::estimate_chunk_cost_usd(
-                            model,
+                        scoped_chunk_cost_usd(
+                            scope,
+                            scoped_model,
                             usage.input,
                             usage.output,
                             usage.reasoning,
                             usage.cached,
                         )
                     },
-                    |normalized| {
-                        haider_provider::estimate_normalized_usage_cost_usd(model, normalized)
-                    },
+                    |normalized| scoped_normalized_cost_usd(scope, scoped_model, normalized),
                 );
                 stats.tokens.entry(account).or_default().add(
                     usage.input,
@@ -1567,7 +1622,7 @@ impl SessionFolder {
                     usage.cached,
                     cost,
                     usage.normalized.as_ref(),
-                    usage.scope.as_ref(),
+                    scope,
                     cache_cost,
                     usage.request.as_ref(),
                 );

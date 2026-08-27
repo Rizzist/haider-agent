@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use haider_client::{ClientError, EnsureError, EnsureOptions, ProfileEnv, resolve_profile};
 use haider_protocol::credential::{CredentialDescriptor, CredentialStatus};
@@ -17,9 +18,16 @@ use super::run::{EX_IOERR, EX_PROTOCOL, EX_PROVIDER, EX_SOFTWARE, EX_UNAVAILABLE
 const MODELS_SCHEMA: &str = "haider.models.v1";
 const SNAPSHOT_ATTEMPTS: usize = 3;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ModelsOptions {
     pub(crate) json: bool,
+    pub(crate) refresh: Option<ModelsRefresh>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ModelsRefresh {
+    All,
+    Provider(String),
 }
 
 #[derive(Serialize)]
@@ -41,6 +49,10 @@ struct ProviderView {
     has_credential: bool,
     auth_methods: Vec<haider_protocol::credential::AuthMethod>,
     default_model: Option<String>,
+    #[serde(rename = "fetched_at")]
+    fetched_at_ms: Option<u64>,
+    #[serde(rename = "inventory_age")]
+    inventory_age_ms: Option<u64>,
     models: Vec<ModelView>,
 }
 
@@ -93,7 +105,7 @@ pub(crate) async fn models_command(rest: &[String]) -> ExitCode {
     let options = match parse_options(rest) {
         Ok(Some(options)) => options,
         Ok(None) => {
-            println!("usage: haider models [--json]");
+            println!("usage: haider models [--json] [--refresh [<alias>]]");
             return ExitCode::SUCCESS;
         }
         Err(message) => {
@@ -109,18 +121,24 @@ pub(crate) async fn models_command(rest: &[String]) -> ExitCode {
         }
     };
     let mut ensure = EnsureOptions::default();
-    ensure.required_features = BTreeSet::from([haider_rpc::FEATURE_MODELS_LIST_V1.to_owned()]);
+    ensure.required_features = BTreeSet::from([
+        haider_rpc::FEATURE_MODELS_LIST_V1.to_owned(),
+        haider_rpc::FEATURE_PROVIDER_MODELS_V1.to_owned(),
+    ]);
+    // A nominal read may discover a per-provider TTL expiry after connecting,
+    // so the one connection negotiates Control up front. It still performs
+    // no mutation unless a cached inventory is stale or refresh was explicit.
     ensure.client = haider_client::ClientConfig {
         client_name: "haider-models".into(),
         client_kind: ClientKind::Headless,
-        capabilities: CapabilitySet::from([Capability::View]),
+        capabilities: CapabilitySet::from([Capability::View, Capability::Control]),
         ..ensure.client
     };
     let ensured = match haider_client::ensure_daemon(&profile, ensure).await {
         Ok(ensured) => ensured,
         Err(error) => return failure(&ModelsError::Ensure(error)),
     };
-    let result = read_document(&ensured.client).await;
+    let result = read_document_with_refresh(&ensured.client, options.refresh.as_ref()).await;
     ensured.client.close();
     let document = match result {
         Ok(document) => document,
@@ -138,14 +156,58 @@ pub(crate) fn parse_options(rest: &[String]) -> Result<Option<ModelsOptions>, St
         return Ok(None);
     }
     let mut options = ModelsOptions::default();
-    for value in rest {
-        match value.as_str() {
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index].as_str() {
             "--json" if !options.json => options.json = true,
             "--json" => return Err("duplicate --json flag".into()),
-            _ => return Err("usage: haider models [--json]".into()),
+            "--refresh" if options.refresh.is_none() => {
+                let provider = rest
+                    .get(index + 1)
+                    .filter(|value| !value.is_empty() && !value.starts_with('-'))
+                    .cloned();
+                if provider.is_some() {
+                    index += 1;
+                }
+                options.refresh =
+                    Some(provider.map_or(ModelsRefresh::All, ModelsRefresh::Provider));
+            }
+            "--refresh" => return Err("duplicate --refresh flag".into()),
+            _ => {
+                return Err("usage: haider models [--json] [--refresh [<alias>]]".into());
+            }
         }
+        index += 1;
     }
     Ok(Some(options))
+}
+
+async fn read_document_with_refresh(
+    client: &haider_client::RpcClient,
+    requested: Option<&ModelsRefresh>,
+) -> Result<ModelsDocument, ModelsError> {
+    let document = read_document(client).await?;
+    let targets = refresh_targets(&document, requested);
+    if targets.is_empty() {
+        return Ok(document);
+    }
+    for provider in targets {
+        if let Err(error) = refresh_provider(client, provider).await {
+            if requested.is_none()
+                && matches!(
+                    &error,
+                    ModelsError::Rpc {
+                        retryable: true,
+                        ..
+                    }
+                )
+            {
+                continue;
+            }
+            return Err(error);
+        }
+    }
+    read_document(client).await
 }
 
 async fn read_document(client: &haider_client::RpcClient) -> Result<ModelsDocument, ModelsError> {
@@ -155,9 +217,10 @@ async fn read_document(client: &haider_client::RpcClient) -> Result<ModelsDocume
         if account_revision.is_some_and(|account_revision| account_revision != revision) {
             continue;
         }
+        let now_ms = unix_time_ms();
         let providers = providers
             .into_iter()
-            .map(|provider| provider_view(provider, &descriptors))
+            .map(|provider| provider_view(provider, &descriptors, now_ms))
             .collect();
         return Ok(ModelsDocument {
             schema: MODELS_SCHEMA,
@@ -166,6 +229,73 @@ async fn read_document(client: &haider_client::RpcClient) -> Result<ModelsDocume
         });
     }
     Err(ModelsError::SnapshotChanged)
+}
+
+fn refresh_targets(document: &ModelsDocument, requested: Option<&ModelsRefresh>) -> Vec<String> {
+    match requested {
+        Some(ModelsRefresh::Provider(provider)) => vec![provider.clone()],
+        Some(ModelsRefresh::All) => document
+            .providers
+            .iter()
+            .filter(|provider| provider_supports_live_discovery(provider))
+            .map(|provider| provider.provider.clone())
+            .collect(),
+        None => document
+            .providers
+            .iter()
+            .filter(|provider| {
+                provider
+                    .inventory_age_ms
+                    .is_some_and(|age| age >= haider_rpc::MODEL_INVENTORY_TTL_MS)
+            })
+            .map(|provider| provider.provider.clone())
+            .collect(),
+    }
+}
+
+fn provider_supports_live_discovery(provider: &ProviderView) -> bool {
+    if provider.fetched_at_ms.is_some() {
+        return true;
+    }
+    match provider.provider.as_str() {
+        "openai-oauth" | "anthropic-oauth" | "kimi-oauth" | "grok-oauth" | "deepseek"
+        | "haider-code" | "xai" | "gemini" => true,
+        "openai" | "anthropic" | "bedrock" | "vertex" | "fake" | "openai-compatible" => false,
+        _ => {
+            provider.endpoint.is_some()
+                && matches!(
+                    provider.api_family,
+                    ProviderApiFamilyWire::OpenAiChatCompletions
+                        | ProviderApiFamilyWire::AnthropicMessages
+                )
+        }
+    }
+}
+
+async fn refresh_provider(
+    client: &haider_client::RpcClient,
+    provider: String,
+) -> Result<(), ModelsError> {
+    match client
+        .request(RequestBody::ProviderModelsRefresh { provider })
+        .await
+        .map_err(ModelsError::Client)?
+    {
+        ResponseBody::ProviderModelsRefresh { .. } => Ok(()),
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            ..
+        } => Err(ModelsError::Rpc {
+            code,
+            message,
+            retryable,
+        }),
+        _ => Err(ModelsError::Protocol(
+            "provider.models_refresh response method mismatch",
+        )),
+    }
 }
 
 async fn account_snapshot(
@@ -235,6 +365,7 @@ async fn provider_snapshot(
 fn provider_view(
     provider: ProviderSummaryWire,
     descriptors: &[CredentialDescriptor],
+    now_ms: u64,
 ) -> ProviderView {
     let auth_state = auth_state(&provider, descriptors);
     let has_credential = descriptors
@@ -255,6 +386,7 @@ fn provider_view(
         })
         .collect::<Vec<_>>();
     models.extend(details.into_values().map(model_detail_view));
+    let fetched_at_ms = provider.inventory_fetched_at_ms;
     ProviderView {
         provider: provider.provider,
         api_family: provider.api_family,
@@ -266,6 +398,8 @@ fn provider_view(
         has_credential,
         auth_methods: provider.auth_methods,
         default_model: provider.default_model,
+        fetched_at_ms,
+        inventory_age_ms: fetched_at_ms.map(|fetched_at_ms| now_ms.saturating_sub(fetched_at_ms)),
         models,
     }
 }
@@ -346,12 +480,15 @@ fn write_human(document: &ModelsDocument) -> ExitCode {
     for provider in &document.providers {
         let credential = if provider.has_credential { "yes" } else { "no" };
         text.push_str(&format!(
-            "{}  availability={}  auth_state={}  credential={}  default={}\n",
+            "{}  availability={}  auth_state={}  credential={}  default={}  inventory_age_ms={}\n",
             provider.provider,
             provider.availability,
             provider.auth_state,
             credential,
-            provider.default_model.as_deref().unwrap_or("-")
+            provider.default_model.as_deref().unwrap_or("-"),
+            provider
+                .inventory_age_ms
+                .map_or_else(|| "n/a".to_owned(), |age| age.to_string())
         ));
         for model in &provider.models {
             let context = model
@@ -372,6 +509,18 @@ fn write_human(document: &ModelsDocument) -> ExitCode {
         ExitCode::SUCCESS
     }
 }
+
+fn unix_time_ms() -> u64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+#[path = "models_tests.rs"]
+mod tests;
 
 fn failure(error: &ModelsError) -> ExitCode {
     eprintln!("haider models: {error}");

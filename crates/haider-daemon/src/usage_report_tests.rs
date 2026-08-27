@@ -1585,6 +1585,56 @@ fn mv4_no_usage_is_none_and_unknown_or_mixed_price_is_unpriced() {
     assert_eq!(usage.api_equivalent_cost_microusd, None);
 }
 
+/// Q4 law: a scoped custom provider cannot inherit built-in pricing from a
+/// colliding model slug, including a stale model-only cache estimate already
+/// persisted by an older writer.
+///
+/// MUTATION CHECK: use the compatibility model-only estimators for scoped
+/// rows, or trust `Usage.cache_cost` before qualifying its provider; one of
+/// the cost assertions becomes present.
+#[test]
+fn custom_provider_model_collision_remains_unpriced_in_live_and_account_folds() {
+    let mut usage = metrics_usage(1_000_000, 100_000, "gpt-5", UsageRequestKind::MainTurn);
+    usage.cached = 800_000;
+    let normalized = usage.normalized.as_mut().expect("normalized usage");
+    normalized.uncached_input = 200_000;
+    normalized.cache_read_input = 800_000;
+    usage.scope.as_mut().expect("usage scope").provider = "router-lab".into();
+    usage.cache_cost = Some(CacheCostEstimate {
+        input_with_cache_usd: 0.1,
+        input_without_cache_usd: 1.0,
+        estimated_savings_usd: 0.9,
+        explicit_storage_usd: 0.0,
+    });
+
+    let mut folder = SessionFolder::new("gpt-5");
+    folder.push(&envelope(
+        1,
+        Some("metrics-run"),
+        Some("agent-a"),
+        1,
+        usage_payload(usage),
+    ));
+    let live = folder
+        .agent_snapshot(
+            &SessionId::new("s-custom-price"),
+            Some(&AgentId::new("agent-a")),
+            1,
+        )
+        .and_then(|snapshot| snapshot.usage)
+        .expect("live custom usage");
+    assert!(!live.all_lanes_priced);
+    assert_eq!(live.metered_cost_microusd, None);
+    assert_eq!(live.api_equivalent_cost_microusd, None);
+
+    let stats = folder.finish();
+    let account = &stats.tokens[&CredentialAlias::new("billing-key")];
+    assert_eq!(account.est_cost_usd, None);
+    assert_eq!(account.api_equivalent_est_cost_usd, None);
+    assert_eq!(account.cache.input_with_cache_usd, None);
+    assert_eq!(account.cache.api_equivalent_input_with_cache_usd, None);
+}
+
 /// LAW mv6 — a terminal committed state forces a settled snapshot through
 /// that exact sequence, while Error/Cancelled retain partial work.
 ///

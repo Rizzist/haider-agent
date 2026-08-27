@@ -310,6 +310,7 @@ fn provider_summary(provider: &str, models: Vec<String>) -> haider_rpc::Provider
         response_open_timeout_ms: None,
         model_details: Vec::new(),
         models,
+        inventory_fetched_at_ms: None,
         auth_methods: Vec::new(),
         availability: haider_rpc::ProviderAvailabilityWire::Available,
         availability_reason: None,

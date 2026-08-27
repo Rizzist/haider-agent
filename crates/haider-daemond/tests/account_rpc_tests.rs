@@ -261,6 +261,7 @@ fn login_body_for_provider(
         alias: alias.map(str::to_owned),
         vault_reference: reference.into(),
         validation_model: validation_model.map(str::to_owned),
+        replace_existing: false,
     }
 }
 
@@ -1148,6 +1149,7 @@ async fn committed_login_is_picked_up_by_the_next_fake_turn() {
                 alias: Some("e2e".into()),
                 vault_reference: reference,
                 validation_model: None,
+                replace_existing: false,
             },
         )
         .await,

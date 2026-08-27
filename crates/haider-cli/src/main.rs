@@ -256,7 +256,9 @@ async fn dispatch(args: &[String]) -> ExitCode {
                  session <id> seen, session <id> recover [--json] [--probe|--mark-done|--retry|--abandon], \
                  session <id> item <seq> --json [--masked] [--no-spawn], \
                  account list [--json], account remove <alias> --confirm, \
-                 models [--json], \
+                 account add <alias> --base-url <url> [--api-key <key>|--api-key-env <VAR>|--api-key-stdin|--no-auth] [--api-family openai|anthropic] [--response-open-timeout <dur>] [--json], \
+                 account probe <alias> [--json], account update <alias> [--base-url <url>] [--api-key <key>|--api-key-env <VAR>|--api-key-stdin] [--response-open-timeout <dur>] [--json], \
+                 models [--json] [--refresh [<alias>]], \
                  fleet [<session-id>] [--json] [--no-spawn], \
                  events [--follow] [--no-spawn], \
                  graph status <session-id> [--json], graph pin <session-id>, \

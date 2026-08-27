@@ -1243,6 +1243,7 @@ pub fn request_body_for_features(
             // `None` means the release-owned full model id in the resolved
             // profile — the client never invents a validation model.
             validation_model: None,
+            replace_existing: false,
         },
         LiveCommand::AccountList => RequestBody::AccountList { provider: None },
         // D2: the read carries nothing; the import carries ONLY the opaque
@@ -1374,12 +1375,13 @@ pub fn request_body_for_features(
             family,
             models,
             default_model,
+            probe_vault_reference,
             expected_revision,
         } => {
             // G4b: an explicit inventory echo (the enterprise cards) rides
             // as-is; the pre-G4b custom shape derives both fields from the
             // single served model, byte-for-byte.
-            let (models, default_model) = if models.is_empty() {
+            let (models, default_model) = if models.is_empty() && !model.is_empty() {
                 (vec![model.clone()], Some(model))
             } else {
                 (models, default_model)
@@ -1398,6 +1400,7 @@ pub fn request_body_for_features(
                 models,
                 default_model,
                 response_open_timeout_ms: None,
+                probe_vault_reference,
                 expected_revision,
             }
         }
@@ -2011,6 +2014,18 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             data,
         } => context.attach.clone().map_or_else(
             || {
+                if let Some(haider_rpc::ErrorData::ProviderProbeFailed { provider, failure }) =
+                    data.as_ref()
+                    && let Some(command_id) = context.command_id.clone()
+                {
+                    return vec![LiveReply::ProviderProbeFailed {
+                        command_id,
+                        provider: provider.clone(),
+                        failure: *failure,
+                        message: message.clone(),
+                        retryable,
+                    }];
+                }
                 // TUI6.4: a STAGE request's error is identity-tagged from
                 // this same context (stages carry no durable command id,
                 // so `command_id` is None exactly when `login` context

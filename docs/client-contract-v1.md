@@ -1028,13 +1028,17 @@ or metadata-only digest.
 | shell `cwd` | use the session workspace |
 | account login `alias` | daemon derives a globally unique alias |
 | account login `validation_model` | release-owned full validation model |
+| account login `replace_existing` | `false`: legacy add/re-login semantics. A key-update client sends `true`, making in-place replacement intent part of the durable command identity and forcing a fresh stage after ambiguous crash recovery |
 | account remove `expected_revision` | legacy unfenced request; clients with revision truth should supply it |
 | account label `label` | clear display label; alias identity does not change |
 | account/provider list `provider` | all providers |
 | provider configure `api_family`, `auth_requirement` | on update, leave create-only metadata unchanged; creation requires both fields |
 | provider configure `origin` | on update, leave the origin unchanged; custom providers may instead supply a replacement origin under `expected_revision` (fixed release-owned origins remain immutable except their explicit enterprise configuration surfaces) |
 | provider configure `default_model` | no declared default/clear according to mutation validation; never choose one client-side |
-| provider configure `response_open_timeout_ms` | on update, preserve the stored response-header budget; on create, select the documented 60,000 ms OpenAI-family default. A present value must be greater than zero |
+| provider configure `response_open_timeout_ms` | on update, preserve the stored response-header budget; on create, select the documented 60,000 ms compatible-transport default. A present value must be greater than zero |
+| provider configure `probe_vault_reference` | probe without a newly staged key; never substitute an empty key or a stored reference |
+| provider summary `inventory_fetched_at_ms` | the inventory has no known live-fetch time; never decode it as zero or fresh |
+| `ModelUnknown.inventory_age` | the consulted inventory has no known live-fetch time; never decode it as age zero |
 | menu answer `input` | option needs no free-form value |
 | menu answer `request_id` | no correlated response; errors arrive as uncorrelated `ProtocolError` |
 
@@ -2547,9 +2551,10 @@ authority and must not infer it from cache-hit telemetry.
 ### 15.5 Response-open timeout budget
 
 `provider.configure.response_open_timeout_ms` is an optional durable override
-for the time from request dispatch until the OpenAI-family provider returns
+for the time from request dispatch until an OpenAI-compatible or standard
+Anthropic-compatible provider returns
 response headers. A present value must be greater than zero. On provider
-creation, omission selects the documented 60,000 ms OpenAI-family default; on
+creation, omission selects the documented 60,000 ms compatible-transport default; on
 update, omission preserves the stored override. `provider.list` projects the
 stored override when one exists. The response-open budget is distinct from
 the 10-second connection budget and the 90-second streaming chunk-idle budget,
@@ -2565,6 +2570,102 @@ For an old/create payload it selects the adapter default; for an update it
 means “leave the stored value unchanged.” A client must not clear a stored
 override by omission, merge this budget with connect/chunk-idle timeouts, or
 assume the transport may outlive the enclosing run deadline.
+
+### 15.6 Custom OpenAI-compatible providers (local or web)
+
+A custom provider is a durable provider profile whose caller-chosen alias is
+its stable identity and model-id namespace. Haider does not route among
+upstreams: the configured server is the provider, so an external router is
+added and used exactly like any other endpoint. The CLI surface is:
+
+```text
+haider account add <alias> --base-url <url>
+  [--api-key <key> | --api-key-env <name> | --api-key-stdin | --no-auth]
+  [--api-family openai|anthropic]
+  [--response-open-timeout <duration>] [--json]
+haider account probe <alias> [--json]
+haider account update <alias> [mutable options] [--json]
+haider models --refresh [<alias>] [--json]
+```
+
+Clients should prefer `--api-key-env` or `--api-key-stdin`; a secret value is
+never part of a response, durable receipt, model document, error detail, log,
+or TUI frame. The live TUI exposes the same operation as **Add custom
+server**, with alias, base URL, authentication choice, masked key input, and
+API-family fields.
+
+`provider.configure` remains the single create-or-update door. A keyed create
+first stages its secret through `vault.stage`; the optional
+`probe_vault_reference` lets the daemon borrow that connection-local stage to
+authenticate `GET <canonical-base>/v1/models` without consuming it or adding
+it to the durable command identity/recovery JSON. After discovery and profile
+commit, `account.login_api` consumes the same reference and commits the vault
+credential. A no-auth create omits the reference and creates no credential
+descriptor. The create response and the following `provider.list` snapshot
+carry only public profile/model facts.
+
+`api_family` and `auth_requirement` are create-only identity. The alias,
+origin, enabled flag, configured/default model, credential, and
+`response_open_timeout_ms` follow the existing revision and field-specific
+mutation laws. An update may replace the origin, credential, or response-open
+timeout but never silently change provider identity. OpenAI family means
+standard Chat Completions; Anthropic family means standard Messages. Azure
+OpenAI origins retain their existing resource-host predicate, `api-key`
+header, and deployment handling instead of falling through to generic Bearer
+rules.
+
+A credential update sends `account.login_api.replace_existing=true`. That
+boolean is secret-free but belongs to the durable command identity: after a
+crash, the daemon cannot mistake the expected old descriptor for proof that
+the replacement committed. If no command-owned stage remains, it returns
+`restage_required` and waits for the same command with a fresh stage.
+
+Discovery is authoritative and bounded. It accepts the OpenAI list envelope
+`{"data":[{"id":"…"}]}`, rejects redirects and oversized bodies, and
+returns a secret-free `ProviderProbeFailed` detail with one of
+`unreachable`, `unauthorized`, `non_open_ai_compatible_body`, or `empty_list`.
+Successful CLI output reports the exact count and every usable
+`<alias>/<model>` id. `account probe` reuses the stored auth state and reports
+reachability, elapsed latency, model count, and whether authentication is
+keyed or absent.
+
+The durable provider-model cache records `inventory_fetched_at_ms` for each
+live inventory. `haider.models.v1` projects it as `fetched_at` plus an
+`inventory_age` calculated at the read; both are millisecond integers, and
+absence means seeded/configured or legacy inventory, never age zero. The
+documented freshness TTL is 15 minutes.
+An explicit `haider models --refresh [<alias>]` refreshes immediately. When an
+explicit `<alias>/<model>` is absent from a known cached inventory, the daemon
+refreshes that provider once before rejecting it; the typed `ModelUnknown`
+detail includes optional `inventory_age` for the inventory actually
+consulted.
+
+The origin matrix is shared by discovery and inference. HTTPS origins anywhere
+are accepted without a provider allowlist, subject to the existing
+special-use credential-target fence. Plain HTTP is accepted only for loopback,
+RFC1918, `.local`, or another host whose complete pinned resolution satisfies
+the trusted-LAN policy. The fence rejects link-local/metadata, multicast,
+unspecified, broadcast, IPv6 ULA or link-local targets on either scheme, plus
+public plain HTTP. Those checks run before credential bytes can leave; proxies
+and redirects are disabled, and DNS validation and the request use the same
+pinned addresses.
+
+OpenAI-compatible usage parsing recognizes
+`prompt_tokens_details.cached_tokens` and the paired DeepSeek counters
+`prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`. Missing, malformed, or
+non-reconciling cache fields remain unavailable; no zero or hit rate is
+fabricated. Unknown prices remain unknown. Custom OpenAI-family turns also
+use `haider.prompt-cache-cohort.v3`; the custom alias is the account scope,
+including no-auth profiles, and all provider/model/header/cohort isolation
+laws in §15.4 apply unchanged.
+
+**Absence law.** Missing `probe_vault_reference` means discovery has no newly
+staged key; it never means an empty key. Missing inventory timestamps/ages are
+unknown, not fresh. Missing cache counters are `n/a`, not zero. An old daemon
+without an additive field keeps the prior provider-management behavior.
+Missing `account.login_api.replace_existing` is false and must never be
+inferred merely because an alias currently exists. A client must not invent
+discovery, authentication, freshness, or telemetry facts to fill any gap.
 
 ## 16. Known absences and limits of this revision
 

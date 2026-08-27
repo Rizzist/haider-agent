@@ -1418,6 +1418,9 @@ fn push_custom_card_lines<'a>(
         // G4b: the enterprise kinds retitle the SAME card and relabel its
         // fields; Generic stays byte-for-byte.
         let title = match card.kind {
+            crate::app::CustomCardKind::Generic if card.discover_models => {
+                "add custom server — local or web"
+            }
             crate::app::CustomCardKind::Generic => "add a custom provider — OpenAI-compatible",
             crate::app::CustomCardKind::Azure => "add Azure OpenAI — v1 surface, api-key header",
             crate::app::CustomCardKind::Bedrock => {
@@ -1453,6 +1456,10 @@ fn push_custom_card_lines<'a>(
             use crate::app::CustomCardKind;
             // Per-kind field roster: (label, value, field).
             let fields: Vec<(&str, &String, crate::app::CustomField)> = match card.kind {
+                CustomCardKind::Generic if card.discover_models => vec![
+                    ("alias   ", &card.name, crate::app::CustomField::Name),
+                    ("base URL", &card.origin, crate::app::CustomField::Origin),
+                ],
                 CustomCardKind::Generic => vec![
                     ("name    ", &card.name, crate::app::CustomField::Name),
                     ("origin  ", &card.origin, crate::app::CustomField::Origin),
@@ -1508,8 +1515,83 @@ fn push_custom_card_lines<'a>(
                     field_style,
                 ));
             }
+            if card.kind == CustomCardKind::Generic && card.discover_models {
+                let auth = if card.keyless { "no auth" } else { "API key" };
+                let family = if matches!(
+                    card.family,
+                    haider_rpc::ProviderApiFamilyWire::AnthropicMessages
+                ) {
+                    "anthropic"
+                } else {
+                    "openai"
+                };
+                for (label, value, field) in [
+                    ("auth    ", auth, crate::app::CustomField::Auth),
+                    ("API     ", family, crate::app::CustomField::ApiFamily),
+                ] {
+                    let prefix = format!("  {label} ❯ ");
+                    if editing {
+                        rects_out.push((
+                            lines_out.len(),
+                            u16::try_from(prefix.chars().count()).unwrap_or(u16::MAX),
+                            u16::MAX,
+                            Hit::CustomProviderField {
+                                attempt: card.attempt,
+                                field,
+                            },
+                        ));
+                    }
+                    let marker = if editing && card.focus == field {
+                        "‹ "
+                    } else {
+                        ""
+                    };
+                    let end_marker = if editing && card.focus == field {
+                        " ›"
+                    } else {
+                        ""
+                    };
+                    lines_out.push(Line::styled(
+                        format!("{prefix}{marker}{value}{end_marker}"),
+                        theme.text_style(),
+                    ));
+                }
+                if !card.keyless {
+                    const MASK_CAP: usize = 32;
+                    let prefix = "  key      ❯ ";
+                    if editing {
+                        rects_out.push((
+                            lines_out.len(),
+                            u16::try_from(prefix.chars().count()).unwrap_or(u16::MAX),
+                            u16::MAX,
+                            Hit::CustomProviderField {
+                                attempt: card.attempt,
+                                field: crate::app::CustomField::Key,
+                            },
+                        ));
+                    }
+                    let shown = card.masked_key_len().min(MASK_CAP);
+                    let more = if card.masked_key_len() > MASK_CAP {
+                        "…"
+                    } else {
+                        ""
+                    };
+                    let caret = if editing && card.focus == crate::app::CustomField::Key {
+                        "▏"
+                    } else {
+                        ""
+                    };
+                    lines_out.push(Line::styled(
+                        format!("{prefix}{}{more}{caret}", "•".repeat(shown)),
+                        theme.text_style(),
+                    ));
+                }
+            }
             if editing {
                 let hint = match card.kind {
+                    CustomCardKind::Generic if card.discover_models => {
+                        "  probes /v1/models now · key is masked and never printed"
+                    }
                     CustomCardKind::Generic => {
                         if card.edit {
                             "  repoint the endpoint or change the model · name is the fixed id"
@@ -1529,7 +1611,9 @@ fn push_custom_card_lines<'a>(
                 };
                 lines_out.push(Line::styled(hint, theme.dim_style()));
                 lines_out.push(Line::styled(
-                    if card.edit {
+                    if card.discover_models {
+                        "  ⏎ add and discover · tab field · ←/→ changes choices · esc cancel"
+                    } else if card.edit {
                         "  ⏎ save · tab origin/model · esc cancel"
                     } else {
                         "  ⏎ create · tab field · esc cancel"
@@ -1603,10 +1687,7 @@ fn push_account_add_buttons<'a>(
             ("+ Bedrock (Claude)", crate::app::AccountAddKind::Bedrock),
             ("+ Vertex (Claude)", crate::app::AccountAddKind::Vertex),
         ],
-        &[(
-            "+ Custom (OpenAI-compatible)",
-            crate::app::AccountAddKind::Custom,
-        )],
+        &[("+ Add custom server", crate::app::AccountAddKind::Custom)],
     ];
     for chunk in rows {
         // One hit per BUTTON: per-button column rects, hover-aware (owner
@@ -2019,6 +2100,7 @@ fn render_providers(
         let keyless_local = matches!(
             summary.api_family,
             haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions
+                | haider_rpc::ProviderApiFamilyWire::AnthropicMessages
         ) && summary.endpoint.is_some()
             && summary.auth_methods.is_empty();
         let (dot, dot_style, health) = match summary.availability {

@@ -24,6 +24,7 @@ fn provider_summary(provider: &str) -> ProviderSummaryWire {
         response_open_timeout_ms: None,
         models: vec![],
         model_details: vec![],
+        inventory_fetched_at_ms: None,
         auth_methods: vec![],
         availability: ProviderAvailabilityWire::Available,
         availability_reason: None,

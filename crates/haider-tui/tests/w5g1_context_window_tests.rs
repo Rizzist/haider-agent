@@ -53,6 +53,7 @@ fn windowed_summary(
                 supports_thinking_type: None,
             })
             .collect(),
+        inventory_fetched_at_ms: None,
         auth_methods: vec![AuthMethod::OAuth],
         availability: haider_rpc::ProviderAvailabilityWire::Available,
         availability_reason: None,

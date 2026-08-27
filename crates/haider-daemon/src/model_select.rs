@@ -25,6 +25,7 @@
 
 use haider_rpc::{ProviderApiFamilyWire, ProviderAvailabilityWire, ProviderSummaryWire};
 use std::collections::BTreeSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 #[path = "model_select_tests.rs"]
@@ -93,7 +94,11 @@ pub(crate) enum SelectionRefusal {
     ProviderUnavailable { provider: String },
     /// The provider has a KNOWN discovered inventory and the model is not in
     /// it.
-    ModelUnknown { provider: String, model: String },
+    ModelUnknown {
+        provider: String,
+        model: String,
+        inventory_age_ms: Option<u64>,
+    },
     /// A bare model selector resolved to zero or several provider rows;
     /// `candidates` names every available row so the caller can retry with an
     /// explicit pair.
@@ -124,7 +129,9 @@ impl SelectionRefusal {
             Self::ProviderUnavailable { provider } => {
                 format!("this model row's provider `{provider}` is not available on this daemon")
             }
-            Self::ModelUnknown { provider, model } => {
+            Self::ModelUnknown {
+                provider, model, ..
+            } => {
                 format!("model `{model}` is not in provider `{provider}`'s discovered inventory")
             }
             Self::ModelNotResolvable { model, candidates } => {
@@ -154,10 +161,15 @@ impl SelectionRefusal {
                 "kind": self.kind(),
                 "provider": provider,
             }),
-            Self::ModelUnknown { provider, model } => serde_json::json!({
+            Self::ModelUnknown {
+                provider,
+                model,
+                inventory_age_ms,
+            } => serde_json::json!({
                 "kind": self.kind(),
                 "provider": provider,
                 "model": model,
+                "inventory_age": inventory_age_ms,
             }),
             Self::ModelNotResolvable { model, candidates } => serde_json::json!({
                 "kind": self.kind(),
@@ -184,7 +196,7 @@ impl ModelSelectionAuthority {
     }
 
     /// The `session.create` creatability rule: the installed static registry,
-    /// or an ENABLED custom chat-completions profile.
+    /// or an enabled custom OpenAI/Anthropic profile.
     fn provider_is_creatable(&self, provider: &str) -> bool {
         let static_creatable = self
             .creatable
@@ -197,6 +209,7 @@ impl ModelSelectionAuthority {
                     && matches!(
                         summary.api_family,
                         ProviderApiFamilyWire::OpenAiChatCompletions
+                            | ProviderApiFamilyWire::AnthropicMessages
                     )
             })
     }
@@ -209,6 +222,15 @@ impl ModelSelectionAuthority {
             .find(|summary| summary.provider == provider)
             .map(|summary| summary.models.as_slice())
             .filter(|models| !models.is_empty())
+    }
+
+    fn inventory_age_ms(&self, provider: &str) -> Option<u64> {
+        let fetched_at_ms = self
+            .summaries
+            .iter()
+            .find(|summary| summary.provider == provider)?
+            .inventory_fetched_at_ms?;
+        Some(unix_time_ms().saturating_sub(fetched_at_ms))
     }
 
     /// Validates one explicit selection for a session currently on
@@ -245,6 +267,7 @@ impl ModelSelectionAuthority {
             return Err(SelectionRefusal::ModelUnknown {
                 provider: provider.to_owned(),
                 model: model.to_owned(),
+                inventory_age_ms: self.inventory_age_ms(provider),
             });
         }
         Ok((provider.to_owned(), model.to_owned()))
@@ -409,4 +432,12 @@ impl ModelSelectionAuthority {
             }
         }
     }
+}
+
+fn unix_time_ms() -> u64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
 }

@@ -29,9 +29,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AF
 use serde::Deserialize;
 use tokio::sync::{OnceCell, mpsc};
 
-#[cfg(test)]
-use crate::origin::FixedDnsResolver;
-use crate::origin::{FixedOriginGuard, SystemFixedDnsResolver};
+use crate::origin::{FixedDnsResolver, FixedOriginGuard, SystemFixedDnsResolver};
 use crate::wire::provider_kind_name;
 use crate::{
     MessageRole, Provider, ProviderError, ProviderErrorKind, ProviderStream, ProviderStreamItem,
@@ -155,6 +153,15 @@ struct OpenAiCompatibleTransport {
     guard: Option<Arc<CompatibleOriginGuard>>,
 }
 
+/// Guarded transport coordinates shared by OpenAI-compatible inference and
+/// model discovery. Keeping construction here prevents `/v1/models` from
+/// growing a weaker DNS, proxy, redirect, or URL-normalization path than
+/// `/v1/chat/completions`.
+pub(crate) struct OpenAiCompatibleCatalogTransport {
+    pub(crate) client: reqwest::Client,
+    pub(crate) models_url: String,
+}
+
 fn build_openai_client(
     origin_guard: Option<Arc<CompatibleOriginGuard>>,
     fixed_origin_guard: Option<Arc<FixedOriginGuard>>,
@@ -211,11 +218,55 @@ fn compatible_transport(
             origin.port,
             origin.plain_http,
             policy,
-            Arc::new(SystemCompatibleDnsResolver),
+            Arc::new(SystemFixedDnsResolver),
         ))
     });
     let client = build_openai_client(guard.clone(), None, OPENAI_DEFAULT_TRANSPORT_CONFIG)?;
     Ok(OpenAiCompatibleTransport { client, guard })
+}
+
+pub(crate) async fn openai_compatible_catalog_transport(
+    base_url: &str,
+    policy: CompatibleOriginPolicy,
+    timeout: Duration,
+    resolver: Arc<dyn FixedDnsResolver>,
+) -> Result<OpenAiCompatibleCatalogTransport, ProviderError> {
+    let endpoints = compatible_endpoints(base_url, policy)?;
+    let guard = endpoints.origin.as_ref().map(|origin| {
+        Arc::new(CompatibleOriginGuard::new(
+            origin.host.clone(),
+            origin.port,
+            origin.plain_http,
+            policy,
+            resolver,
+        ))
+    });
+    if let Some(guard) = &guard {
+        connect_before_deadline(
+            OPENAI_DEFAULT_TRANSPORT_CONFIG.connect_timeout,
+            guard.validate(),
+        )
+        .await?;
+    }
+    let mut client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .connect_timeout(OPENAI_DEFAULT_TRANSPORT_CONFIG.connect_timeout)
+        .timeout(timeout);
+    if let Some(guard) = guard {
+        client = client.dns_resolver(guard);
+    }
+    let client = client.build().map_err(|error| {
+        ProviderError::new(
+            ProviderErrorKind::Internal,
+            format!("could not construct OpenAI-compatible catalog client: {error}"),
+        )
+    })?;
+    Ok(OpenAiCompatibleCatalogTransport {
+        client,
+        models_url: endpoints.models_url,
+    })
 }
 
 /// Process-lifetime construction counter used by performance regression
@@ -272,6 +323,7 @@ pub struct OpenAiCapture {
 enum OpenAiAuthHeaderMode {
     Bearer,
     AzureApiKey,
+    None,
 }
 
 #[derive(Debug)]
@@ -487,6 +539,7 @@ impl OpenAiHttp {
             OpenAiAuthHeaderMode::AzureApiKey => {
                 request.header("api-key", self.azure_api_key_header()?)
             }
+            OpenAiAuthHeaderMode::None => request,
         })
     }
 
@@ -1053,6 +1106,24 @@ impl OpenAiCompatibleProvider {
         )
     }
 
+    /// Constructs a custom profile that sends no authentication header.
+    /// The handle remains an internal construction token only; its bytes are
+    /// never placed on the wire.
+    pub fn new_custom_no_auth(
+        credential: SecretHandle,
+        model: impl Into<String>,
+        base_url: impl AsRef<str>,
+    ) -> Result<Self, ProviderError> {
+        let mut provider = Self::new_with_policy_shared(
+            credential,
+            model,
+            base_url,
+            CompatibleOriginPolicy::TrustedLan,
+        )?;
+        provider.http.auth_header_mode = OpenAiAuthHeaderMode::None;
+        Ok(provider)
+    }
+
     /// Constructs the Azure OpenAI v1 adapter (G4b, LZ1): the SAME Chat
     /// Completions wire under the STRICT origin fence (Azure endpoints are
     /// public HTTPS only), with the credential riding the bare `api-key`
@@ -1084,7 +1155,7 @@ impl OpenAiCompatibleProvider {
         credential: SecretHandle,
         model: impl Into<String>,
         base_url: impl AsRef<str>,
-        resolver: Arc<dyn CompatibleDnsResolver>,
+        resolver: Arc<dyn FixedDnsResolver>,
     ) -> Result<Self, ProviderError> {
         if !azure_openai_origin(base_url.as_ref()) {
             return Err(invalid_request(
@@ -1127,7 +1198,7 @@ impl OpenAiCompatibleProvider {
         credential: SecretHandle,
         model: impl Into<String>,
         base_url: impl AsRef<str>,
-        resolver: Arc<dyn CompatibleDnsResolver>,
+        resolver: Arc<dyn FixedDnsResolver>,
     ) -> Result<Self, ProviderError> {
         Self::new_with_policy_and_dns_resolver(
             credential,
@@ -1144,7 +1215,7 @@ impl OpenAiCompatibleProvider {
         model: impl Into<String>,
         base_url: impl AsRef<str>,
         policy: CompatibleOriginPolicy,
-        resolver: Arc<dyn CompatibleDnsResolver>,
+        resolver: Arc<dyn FixedDnsResolver>,
     ) -> Result<Self, ProviderError> {
         let endpoints = compatible_endpoints(base_url.as_ref(), policy)?;
         let origin_guard = endpoints.origin.map(|origin| {
@@ -1642,18 +1713,28 @@ impl OpenAiCompatibleProvider {
             Some(prepared) => prepared.payload,
             None => self.request_payload(request)?,
         };
-        if self.dialect == CompatibleDialect::KimiOAuth
-            && let Some(object) = payload.as_object_mut()
+        if matches!(
+            self.dialect,
+            CompatibleDialect::Generic | CompatibleDialect::KimiOAuth
+        ) && let Some(object) = payload.as_object_mut()
         {
-            let key = request.cache_metadata.as_ref().and_then(|metadata| {
-                if metadata.boundaries_valid(request.messages.len())
-                    && metadata.provider == KIMI_OAUTH_PROVIDER_NAME
-                {
-                    prompt_cache_cohort_key(request, metadata)
-                } else {
-                    None
-                }
-            });
+            let key = request
+                .cache_metadata
+                .as_ref()
+                .and_then(|metadata| match self.dialect {
+                    CompatibleDialect::Generic => custom_prompt_cache_key(request, metadata, None),
+                    CompatibleDialect::KimiOAuth
+                        if metadata.boundaries_valid(request.messages.len())
+                            && metadata.provider == KIMI_OAUTH_PROVIDER_NAME =>
+                    {
+                        prompt_cache_cohort_key(request, metadata)
+                    }
+                    CompatibleDialect::KimiOAuth
+                    | CompatibleDialect::DeepSeekApi
+                    | CompatibleDialect::HaiderCodeApi
+                    | CompatibleDialect::XaiApi
+                    | CompatibleDialect::GrokOAuth => None,
+                });
             if let Some(key) = key {
                 object.insert("prompt_cache_key".into(), serde_json::Value::String(key));
             } else {
@@ -1750,8 +1831,10 @@ impl Provider for OpenAiCompatibleProvider {
             .ok()?;
         // Kimi's cohort key is a routing overlay, not prompt content. Remove
         // it from the only render until M4's exact provider view is frozen.
-        if self.dialect == CompatibleDialect::KimiOAuth
-            && let Some(object) = full_payload.as_object_mut()
+        if matches!(
+            self.dialect,
+            CompatibleDialect::Generic | CompatibleDialect::KimiOAuth
+        ) && let Some(object) = full_payload.as_object_mut()
         {
             object.remove("prompt_cache_key");
         }
@@ -1805,12 +1888,30 @@ impl Provider for OpenAiCompatibleProvider {
             prefix_digests.system = crate::exact_optional_wire_digest::<serde_json::Value>(None);
         }
         let header_epoch = provider_view.ledger().header_epoch.as_str();
-        if self.dialect == CompatibleDialect::KimiOAuth
-            && let Some(object) = full_payload.as_object_mut()
+        if matches!(
+            self.dialect,
+            CompatibleDialect::Generic | CompatibleDialect::KimiOAuth
+        ) && let Some(object) = full_payload.as_object_mut()
         {
-            if let Some(key) = request.cache_metadata.as_ref().and_then(|metadata| {
-                prompt_cache_cohort_key_with_header(request, metadata, Some(header_epoch))
-            }) {
+            if let Some(key) =
+                request
+                    .cache_metadata
+                    .as_ref()
+                    .and_then(|metadata| match self.dialect {
+                        CompatibleDialect::Generic => {
+                            custom_prompt_cache_key(request, metadata, Some(header_epoch))
+                        }
+                        CompatibleDialect::KimiOAuth => prompt_cache_cohort_key_with_header(
+                            request,
+                            metadata,
+                            Some(header_epoch),
+                        ),
+                        CompatibleDialect::DeepSeekApi
+                        | CompatibleDialect::HaiderCodeApi
+                        | CompatibleDialect::XaiApi
+                        | CompatibleDialect::GrokOAuth => None,
+                    })
+            {
                 object.insert("prompt_cache_key".into(), serde_json::Value::String(key));
             } else {
                 object.remove("prompt_cache_key");
@@ -4717,8 +4818,27 @@ fn compatible_cache_control_observation(
 
     match dialect {
         CompatibleDialect::DeepSeekApi => CacheControlObservationV1::NotRequired,
-        CompatibleDialect::KimiOAuth if payload.get("prompt_cache_key").is_some() => {
+        CompatibleDialect::Generic | CompatibleDialect::KimiOAuth
+            if payload.get("prompt_cache_key").is_some() =>
+        {
             CacheControlObservationV1::Emitted { ttl_ms: None }
+        }
+        CompatibleDialect::Generic => {
+            let Some(metadata) = request.cache_metadata.as_ref() else {
+                return CacheControlObservationV1::NotEmitted {
+                    reason: CacheControlOmissionReasonV1::AdapterUnavailable,
+                };
+            };
+            let reason = if !metadata.boundaries_valid(request.messages.len()) {
+                CacheControlOmissionReasonV1::InvalidBoundaries
+            } else if metadata.account_scope.is_none() {
+                CacheControlOmissionReasonV1::MissingAccountScope
+            } else if crate::BUILTIN_PROVIDER_NAMES.contains(&metadata.provider.as_str()) {
+                CacheControlOmissionReasonV1::ProviderMismatch
+            } else {
+                CacheControlOmissionReasonV1::AdapterUnavailable
+            };
+            CacheControlObservationV1::NotEmitted { reason }
         }
         CompatibleDialect::KimiOAuth => {
             let Some(metadata) = request.cache_metadata.as_ref() else {
@@ -4759,9 +4879,9 @@ fn compatible_cache_control_observation(
             };
             CacheControlObservationV1::NotEmitted { reason }
         }
-        CompatibleDialect::Generic
-        | CompatibleDialect::HaiderCodeApi
-        | CompatibleDialect::GrokOAuth => CacheControlObservationV1::Unavailable,
+        CompatibleDialect::HaiderCodeApi | CompatibleDialect::GrokOAuth => {
+            CacheControlObservationV1::Unavailable
+        }
     }
 }
 
@@ -4773,6 +4893,24 @@ fn xai_prompt_cache_conversation_id(
 ) -> Option<String> {
     let metadata = request.cache_metadata.as_ref()?;
     if !metadata.boundaries_valid(request.messages.len()) || metadata.provider != XAI_PROVIDER_NAME
+    {
+        return None;
+    }
+    prompt_cache_cohort_key_with_header(request, metadata, header_epoch)
+}
+
+/// Custom OpenAI-compatible profiles use the same v3 routing cohort as the
+/// named OpenAI-family adapters. The provider name is intentionally not a
+/// constructor constant: custom aliases are daemon-owned metadata carried in
+/// the request, and the resolved account scope provides the hard isolation
+/// boundary (including the synthetic alias used by no-auth profiles).
+fn custom_prompt_cache_key(
+    request: &TurnRequest,
+    metadata: &crate::PromptCacheMetadata,
+    header_epoch: Option<&str>,
+) -> Option<String> {
+    if !metadata.boundaries_valid(request.messages.len())
+        || crate::BUILTIN_PROVIDER_NAMES.contains(&metadata.provider.as_str())
     {
         return None;
     }
@@ -5079,8 +5217,17 @@ fn chat_request_json_with_boundary(
         .as_object_mut()
         .ok_or_else(|| internal("Chat request payload was not an object"))?;
     match dialect {
-        CompatibleDialect::Generic
-        | CompatibleDialect::DeepSeekApi
+        CompatibleDialect::Generic => {
+            object.insert("max_tokens".into(), serde_json::json!(request.max_tokens));
+            if let Some(key) = request
+                .cache_metadata
+                .as_ref()
+                .and_then(|metadata| custom_prompt_cache_key(request, metadata, None))
+            {
+                object.insert("prompt_cache_key".into(), serde_json::Value::String(key));
+            }
+        }
+        CompatibleDialect::DeepSeekApi
         | CompatibleDialect::HaiderCodeApi
         | CompatibleDialect::XaiApi
         | CompatibleDialect::GrokOAuth => {
@@ -5251,10 +5398,10 @@ fn model_has_reasoning(model: &str) -> bool {
 }
 
 #[derive(Debug)]
-struct CompatibleEndpoints {
-    base_url: String,
+pub(crate) struct CompatibleEndpoints {
+    pub(crate) base_url: String,
     chat_url: String,
-    models_url: String,
+    pub(crate) models_url: String,
     origin: Option<CompatibleHostnameOrigin>,
 }
 
@@ -5265,7 +5412,7 @@ struct CompatibleHostnameOrigin {
     plain_http: bool,
 }
 
-fn compatible_endpoints(
+pub(crate) fn compatible_endpoints(
     base_url: &str,
     policy: CompatibleOriginPolicy,
 ) -> Result<CompatibleEndpoints, ProviderError> {
@@ -5330,17 +5477,21 @@ fn compatible_endpoints(
 /// configured-deployment availability fallback — so they can never disagree.
 #[must_use]
 pub fn azure_openai_origin(origin: &str) -> bool {
-    let Some(rest) = origin.trim().strip_prefix("https://") else {
+    let Ok(parsed) = reqwest::Url::parse(origin.trim()) else {
         return false;
     };
-    let host = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default()
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
     ["openai.azure.com", "services.ai.azure.com"]
         .iter()
         .any(|suffix| {
@@ -5377,7 +5528,7 @@ pub async fn validate_openai_compatible_endpoint(
             origin.port,
             origin.plain_http,
             policy,
-            Arc::new(SystemCompatibleDnsResolver),
+            Arc::new(SystemFixedDnsResolver),
         ))
     });
     if let Some(guard) = &guard {
@@ -5459,30 +5610,61 @@ fn plain_http_message(policy: CompatibleOriginPolicy) -> &'static str {
     }
 }
 
-#[async_trait]
-trait CompatibleDnsResolver: Send + Sync {
-    async fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>>;
-}
-
-#[derive(Debug)]
-struct SystemCompatibleDnsResolver;
-
-#[async_trait]
-impl CompatibleDnsResolver for SystemCompatibleDnsResolver {
-    async fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
-        Ok(tokio::net::lookup_host((host, port)).await?.collect())
-    }
-}
-
 struct CompatibleOriginGuard {
     host: String,
     port: u16,
     plain_http: bool,
     policy: CompatibleOriginPolicy,
-    resolver: Arc<dyn CompatibleDnsResolver>,
+    resolver: Arc<dyn FixedDnsResolver>,
     validated: OnceCell<Result<Arc<[SocketAddr]>, ProviderError>>,
     #[cfg(test)]
     connection_lookups: AtomicUsize,
+}
+
+/// Opaque custom-origin resolver shared with the custom Anthropic adapter.
+/// The underlying resolver and its injection seam remain private to this
+/// module, so no private trait leaks through a public(crate) signature.
+pub(crate) struct CustomCompatibleOriginGuard(CompatibleOriginGuard);
+
+impl CustomCompatibleOriginGuard {
+    pub(crate) fn for_base_url(base_url: &str) -> Result<(String, Arc<Self>), ProviderError> {
+        let endpoints = compatible_endpoints(base_url, CompatibleOriginPolicy::TrustedLan)?;
+        let parsed = reqwest::Url::parse(&endpoints.base_url)
+            .map_err(|_| invalid_request("OpenAI-compatible base_url is not a valid URL"))?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| invalid_request("OpenAI-compatible base_url must include a host"))?
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_owned();
+        let port = parsed
+            .port_or_known_default()
+            .ok_or_else(|| invalid_request("OpenAI-compatible base_url must include a port"))?;
+        let guard = Arc::new(Self(CompatibleOriginGuard::new(
+            host,
+            port,
+            parsed.scheme() == "http",
+            CompatibleOriginPolicy::TrustedLan,
+            Arc::new(SystemFixedDnsResolver),
+        )));
+        Ok((endpoints.base_url, guard))
+    }
+
+    pub(crate) async fn validate_endpoint(&self, endpoint: &str) -> Result<(), ProviderError> {
+        self.0.validate_endpoint(endpoint).await
+    }
+}
+
+impl fmt::Debug for CustomCompatibleOriginGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl reqwest::dns::Resolve for CustomCompatibleOriginGuard {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        self.0.resolve(name)
+    }
 }
 
 struct PinnedAddrs {
@@ -5506,7 +5688,7 @@ impl CompatibleOriginGuard {
         port: u16,
         plain_http: bool,
         policy: CompatibleOriginPolicy,
-        resolver: Arc<dyn CompatibleDnsResolver>,
+        resolver: Arc<dyn FixedDnsResolver>,
     ) -> Self {
         Self {
             host,
@@ -5522,6 +5704,27 @@ impl CompatibleOriginGuard {
 
     async fn validate(&self) -> Result<(), ProviderError> {
         self.validated_addresses().await.map(|_| ())
+    }
+
+    async fn validate_endpoint(&self, endpoint: &str) -> Result<(), ProviderError> {
+        let parsed = reqwest::Url::parse(endpoint).map_err(|_| {
+            invalid_request("credential-bearing compatible endpoint is not a valid URL")
+        })?;
+        let expected_scheme = if self.plain_http { "http" } else { "https" };
+        if parsed.scheme() != expected_scheme
+            || !parsed
+                .host_str()
+                .map(|host| host.trim_start_matches('[').trim_end_matches(']'))
+                .is_some_and(|host| host.eq_ignore_ascii_case(&self.host))
+            || parsed.port_or_known_default() != Some(self.port)
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return Err(invalid_request(
+                "credential-bearing compatible request left its pinned origin",
+            ));
+        }
+        self.validate().await
     }
 
     async fn validated_addresses(&self) -> Result<Arc<[SocketAddr]>, ProviderError> {

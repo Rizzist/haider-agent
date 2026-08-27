@@ -424,6 +424,7 @@ fn provider_summary_fixture(
         response_open_timeout_ms: None,
         models: models.iter().map(|model| (*model).into()).collect(),
         model_details: Vec::new(),
+        inventory_fetched_at_ms: None,
         auth_methods: vec![AuthMethod::OAuth],
         availability: ProviderAvailabilityWire::Available,
         availability_reason: None,

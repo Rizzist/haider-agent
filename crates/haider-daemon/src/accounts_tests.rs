@@ -116,6 +116,7 @@ fn test_provider_registry() -> ProviderRegistry<Box<dyn ProviderRegistryStoreLik
                     extensions: None,
                 })
                 .collect(),
+            None,
         );
     }
     ProviderRegistry::new(
@@ -140,6 +141,7 @@ fn identity_for(profile: &str, command: &str) -> LoginIdentity {
         resolved_model: "claude-test".into(),
         display_alias: Some("work".into()),
         physical_alias: physical_alias(profile, "anthropic", command),
+        replace_existing: false,
     }
 }
 
@@ -339,6 +341,7 @@ fn adapter_cache_profile(provider: &str, endpoint: &str) -> ProviderSummaryWire 
         response_open_timeout_ms: None,
         models: vec!["adapter-cache-model".to_owned()],
         model_details: Vec::new(),
+        inventory_fetched_at_ms: None,
         auth_methods: vec![AuthMethod::ApiKey],
         availability: haider_rpc::ProviderAvailabilityWire::Available,
         availability_reason: None,
@@ -660,6 +663,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
                 supports_thinking_type: None,
             },
         ],
+        inventory_fetched_at_ms: None,
         auth_methods: vec![AuthMethod::ApiKey],
         availability: haider_rpc::ProviderAvailabilityWire::Available,
         availability_reason: None,
@@ -757,6 +761,7 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
                 supports_thinking_type: None,
             },
         ],
+        inventory_fetched_at_ms: None,
         auth_methods: vec![AuthMethod::ApiKey],
         availability: haider_rpc::ProviderAvailabilityWire::Available,
         availability_reason: None,
@@ -870,6 +875,7 @@ fn keyless_summary(provider: &str, origin: &str) -> ProviderSummaryWire {
             supported_speeds: Vec::new(),
             supports_thinking_type: None,
         }],
+        inventory_fetched_at_ms: None,
         auth_methods: Vec::new(),
         availability: haider_rpc::ProviderAvailabilityWire::Available,
         availability_reason: None,
@@ -881,8 +887,7 @@ fn keyless_summary(provider: &str, origin: &str) -> ProviderSummaryWire {
 /// LAW (LK1 — keyless auth arm, G4a): an ENABLED custom chat-completions
 /// profile whose auth requirement is None resolves a turn provider WITHOUT
 /// any stored credential — the synthesized `{provider}-keyless` account with
-/// the placeholder bearer `ollama` (the compat-layer convention; LM Studio
-/// ignores it) built by the factory's keyless arm at the profile origin.
+/// an internal construction handle that never reaches the wire.
 /// When the user DOES store a key for the same profile, the stored key wins:
 /// resolution returns the vault-backed alias, never the synthesized one.
 ///
@@ -893,8 +898,8 @@ fn keyless_summary(provider: &str, origin: &str) -> ProviderSummaryWire {
 /// `build_account_provider`. Expected runtime failure: both resolutions
 /// below report "no account-backed adapter" (the key-requiring arm
 /// deliberately excludes empty-auth profiles).
-/// MUTATION CHECK: change `KEYLESS_PLACEHOLDER_BEARER`. Expected runtime
-/// failure: the placeholder equality below.
+/// MUTATION CHECK: remove `KEYLESS_CONSTRUCTION_TOKEN`. Expected runtime
+/// failure: the construction-handle equality below.
 #[tokio::test]
 async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
     let provider = "ollama";
@@ -916,11 +921,11 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
         agent_type: None,
     };
 
-    // The placeholder rides the same handle machinery as real secrets and
-    // carries exactly the compat convention bytes.
-    assert_eq!(KEYLESS_PLACEHOLDER_BEARER, b"ollama");
-    let placeholder = keyless_placeholder_credential().expect("placeholder credential");
-    assert_eq!(placeholder.expose_secret(), b"ollama");
+    // The construction token rides the same redacted handle machinery as a
+    // secret while the selected no-auth adapter keeps it off the wire.
+    assert_eq!(KEYLESS_CONSTRUCTION_TOKEN, b"no-auth");
+    let construction = keyless_construction_credential().expect("keyless construction credential");
+    assert_eq!(construction.expose_secret(), b"no-auth");
 
     // NO stored credential anywhere: resolution synthesizes the keyless
     // account instead of failing CredentialMissing.
@@ -938,7 +943,11 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
         .await
         .expect("keyless dispatch");
     assert_eq!(resolved.provider_name, provider);
-    assert_eq!(resolved.account_alias.as_deref(), Some("ollama-keyless"));
+    assert_eq!(
+        resolved.account_alias.as_deref(),
+        Some(provider),
+        "the custom alias is the keyless account/cache scope"
+    );
     assert!(resolved.initial_rotation.is_none());
 
     // A STORED KEY WINS: with an active vault-backed descriptor for the same
@@ -1104,7 +1113,7 @@ async fn lk2_keyless_preset_configure_persists_and_mock_discovery_flips_availabl
         .await
         .expect("credential-free mock discovery");
     server.await.expect("mock server served one request");
-    providers.replace_models("ollama".to_owned(), catalog.models);
+    providers.replace_models("ollama".to_owned(), catalog.models, Some(1));
 
     let after = providers
         .summary("ollama", &|_| false)
@@ -1315,6 +1324,7 @@ async fn reserved_alias_fences_login_and_oauth_add_until_remove_finalizes() {
             provider: "anthropic".into(),
             display_alias: Some("work".into()),
             validation_model: Some("claude-test".into()),
+            replace_existing: false,
             secret: Some(Zeroizing::new(b"sk-reserved".to_vec())),
             route: LoginRoute {
                 request_id: RequestId::new("reserved-login-request"),
@@ -2117,6 +2127,25 @@ fn staged_secrets_dedupe_by_stage_id_and_claims_are_single_use() {
     assert!(stages.claim("vaultref-doesnotexist").is_none());
 }
 
+#[test]
+fn staged_secret_probe_borrows_a_copy_before_the_consuming_claim() {
+    let mut stages = StagedSecrets::default();
+    let (reference, _) = stages
+        .stage(
+            "custom-provider-key",
+            StagePurpose::ApiKey,
+            b"probe-then-login",
+        )
+        .expect("stage custom-provider key");
+    let (probe_purpose, probe_secret) = stages.probe(&reference).expect("borrow probe copy");
+    assert_eq!(probe_purpose, StagePurpose::ApiKey);
+    assert_eq!(probe_secret.as_slice(), b"probe-then-login");
+    let (claim_purpose, claimed_secret) = stages.claim(&reference).expect("consume after probe");
+    assert_eq!(claim_purpose, StagePurpose::ApiKey);
+    assert_eq!(claimed_secret.as_slice(), b"probe-then-login");
+    assert!(stages.claim(&reference).is_none());
+}
+
 // MUTATION CHECK (R7 stage TTL): remove `sweep_expired` from `claim`.
 // Expected failure: the expired reference below still claims.
 #[tokio::test(start_paused = true)]
@@ -2153,6 +2182,302 @@ impl FrameSink for ChannelSink {
 fn channel_sink() -> (Arc<dyn FrameSink>, mpsc::UnboundedReceiver<WireFrame>) {
     let (sender, receiver) = mpsc::unbounded_channel();
     (Arc::new(ChannelSink(sender)), receiver)
+}
+
+fn mapped_probe_failure(error: CatalogError) -> (ProviderProbeFailureWire, bool) {
+    let (sink, mut frames) = channel_sink();
+    respond_provider_probe_error(
+        &LoginRoute {
+            request_id: RequestId::new("typed-provider-probe"),
+            sink,
+        },
+        "router",
+        error,
+    );
+    match frames.try_recv().expect("typed probe response") {
+        WireFrame::Response {
+            body:
+                ResponseBody::Error {
+                    retryable,
+                    data: Some(ErrorData::ProviderProbeFailed { provider, failure }),
+                    ..
+                },
+            ..
+        } => {
+            assert_eq!(provider, "router");
+            (failure, retryable)
+        }
+        other => panic!("unexpected typed probe response: {other:?}"),
+    }
+}
+
+/// Mutation pin for every public custom-provider probe failure class.
+#[test]
+fn provider_probe_failures_map_to_typed_secret_free_error_data() {
+    assert_eq!(
+        mapped_probe_failure(CatalogError::Transport {
+            reason: "fixture unreachable".into(),
+        }),
+        (ProviderProbeFailureWire::Unreachable, true)
+    );
+    assert_eq!(
+        mapped_probe_failure(CatalogError::Unauthorized),
+        (ProviderProbeFailureWire::Unauthorized, false)
+    );
+    assert_eq!(
+        mapped_probe_failure(CatalogError::InvalidBody {
+            reason: "fixture invalid body".into(),
+        }),
+        (ProviderProbeFailureWire::NonOpenAiCompatibleBody, false)
+    );
+    assert_eq!(
+        mapped_probe_failure(CatalogError::Empty),
+        (ProviderProbeFailureWire::EmptyList, false)
+    );
+}
+
+/// A newly configured no-auth provider is not committed until discovery has
+/// supplied its live inventory; the same inventory reaches the durable cache
+/// and the response summary.
+#[tokio::test]
+async fn custom_provider_configure_discovers_before_successful_commit() {
+    struct CanonicalEndpoint;
+
+    #[async_trait::async_trait]
+    impl ProviderEndpointValidator for CanonicalEndpoint {
+        async fn validate(&self, origin: &str) -> Result<String, HaiderError> {
+            Ok(origin.trim_end_matches('/').to_owned())
+        }
+    }
+
+    struct ImmediateDiscovery;
+
+    #[async_trait::async_trait]
+    impl ProviderModelDiscoverer for ImmediateDiscovery {
+        async fn discover(
+            &self,
+            source: CatalogSource,
+            access_token: Option<&str>,
+            etag: Option<&str>,
+        ) -> Result<DiscoveredCatalog, CatalogError> {
+            assert_eq!(
+                source,
+                CatalogSource::OpenAiCompatible {
+                    origin: "http://127.0.0.1:18080".into()
+                }
+            );
+            assert_eq!(access_token, None);
+            assert_eq!(etag, None);
+            Ok(DiscoveredCatalog {
+                models: vec![haider_provider::DiscoveredModel {
+                    slug: "live-model".into(),
+                    display_name: "Live Model".into(),
+                    context_window: None,
+                    description: None,
+                    default_effort: None,
+                    supported_efforts: Vec::new(),
+                    visible: true,
+                    priority: None,
+                    extensions: None,
+                }],
+                etag: Some("fixture-etag".into()),
+            })
+        }
+    }
+
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let accounts = memory_accounts();
+    let vault = MemoryVault::new();
+    let management = ManagementSnapshot::new(0, Vec::new(), Vec::new());
+    let mut providers = test_provider_registry();
+    let discoverer = ImmediateDiscovery;
+    let (sink, mut frames) = channel_sink();
+    handle_provider_configure(
+        ProviderConfigureContext {
+            store: &store,
+            accounts: &accounts,
+            vault: &vault,
+            management: Some(&management),
+            providers: &mut providers,
+            endpoint_validator: Arc::new(CanonicalEndpoint),
+            model_discoverer: &discoverer,
+        },
+        ProviderConfigureJob {
+            command_id: "configure-live-router".into(),
+            input: ProviderConfigureInput {
+                provider: "router".into(),
+                api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+                origin: Some("http://127.0.0.1:18080/".into()),
+                auth_requirement: Some(ProviderAuthRequirementWire::None),
+                enabled: true,
+                models: Vec::new(),
+                default_model: None,
+                response_open_timeout_ms: Some(45_000),
+            },
+            probe_secret: None,
+            expected_revision: 0,
+            route: LoginRoute {
+                request_id: RequestId::new("configure-live-router-request"),
+                sink,
+            },
+        },
+    )
+    .await;
+
+    match frames.try_recv().expect("configure response") {
+        WireFrame::Response {
+            body: ResponseBody::ProviderConfigure { provider, revision },
+            ..
+        } => {
+            assert_eq!(revision, 1);
+            assert_eq!(provider.provider, "router");
+            assert_eq!(provider.models, vec!["live-model".to_owned()]);
+            assert_eq!(provider.default_model.as_deref(), Some("live-model"));
+            assert!(provider.auth_methods.is_empty());
+        }
+        other => panic!("unexpected configure response: {other:?}"),
+    }
+    let cached = store
+        .provider_models("router".into())
+        .await
+        .expect("read provider cache")
+        .expect("provider cache row");
+    assert!(cached.models_json.contains("live-model"));
+    store.close().await.expect("close store");
+}
+
+#[tokio::test]
+async fn endpoint_transport_failure_is_a_typed_unreachable_probe_error() {
+    struct TransportFailureEndpoint;
+
+    #[async_trait::async_trait]
+    impl ProviderEndpointValidator for TransportFailureEndpoint {
+        async fn validate(&self, _origin: &str) -> Result<String, HaiderError> {
+            Err(HaiderError::new(
+                ErrorCode::ProviderError,
+                "fixture connection refused",
+                true,
+            ))
+        }
+    }
+
+    struct UnusedDiscovery;
+
+    #[async_trait::async_trait]
+    impl ProviderModelDiscoverer for UnusedDiscovery {
+        async fn discover(
+            &self,
+            _source: CatalogSource,
+            _access_token: Option<&str>,
+            _etag: Option<&str>,
+        ) -> Result<DiscoveredCatalog, CatalogError> {
+            panic!("endpoint failure must stop before discovery")
+        }
+    }
+
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let accounts = memory_accounts();
+    let vault = MemoryVault::new();
+    let mut providers = test_provider_registry();
+    let discoverer = UnusedDiscovery;
+    let (sink, mut frames) = channel_sink();
+    handle_provider_configure(
+        ProviderConfigureContext {
+            store: &store,
+            accounts: &accounts,
+            vault: &vault,
+            management: None,
+            providers: &mut providers,
+            endpoint_validator: Arc::new(TransportFailureEndpoint),
+            model_discoverer: &discoverer,
+        },
+        ProviderConfigureJob {
+            command_id: "configure-unreachable-router".into(),
+            input: ProviderConfigureInput {
+                provider: "router".into(),
+                api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+                origin: Some("http://127.0.0.1:9".into()),
+                auth_requirement: Some(ProviderAuthRequirementWire::None),
+                enabled: true,
+                models: Vec::new(),
+                default_model: None,
+                response_open_timeout_ms: None,
+            },
+            probe_secret: None,
+            expected_revision: 0,
+            route: LoginRoute {
+                request_id: RequestId::new("configure-unreachable-router-request"),
+                sink,
+            },
+        },
+    )
+    .await;
+    match frames.try_recv().expect("typed endpoint response") {
+        WireFrame::Response {
+            body:
+                ResponseBody::Error {
+                    retryable: true,
+                    data:
+                        Some(ErrorData::ProviderProbeFailed {
+                            provider,
+                            failure: ProviderProbeFailureWire::Unreachable,
+                        }),
+                    ..
+                },
+            ..
+        } => assert_eq!(provider, "router"),
+        other => panic!("unexpected endpoint failure response: {other:?}"),
+    }
+    store.close().await.expect("close store");
+}
+
+#[tokio::test]
+async fn custom_login_validation_authenticates_with_models_get_not_inference() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind custom login catalog");
+    let origin = format!("http://{}", listener.local_addr().expect("catalog address"));
+    let fixture = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept login validation");
+        let mut request = vec![0_u8; 8_192];
+        let read = socket
+            .read(&mut request)
+            .await
+            .expect("read login validation");
+        let request = String::from_utf8_lossy(&request[..read]);
+        assert!(request.starts_with("GET /v1/models HTTP/1.1"));
+        assert!(!request.contains("/chat/completions"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer custom-login-key\r\n")
+        );
+        let body = br#"{"data":[{"id":"router-model"}]}"#;
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        socket
+            .write_all(headers.as_bytes())
+            .await
+            .expect("write login catalog headers");
+        socket
+            .write_all(body)
+            .await
+            .expect("write login catalog body");
+    });
+    let validated = validate_custom_provider_key(
+        &origin,
+        "router",
+        ProviderApiFamilyWire::OpenAiChatCompletions,
+        b"custom-login-key",
+    )
+    .await
+    .expect("custom login validation");
+    assert_eq!(validated.identity, "router api key");
+    fixture.await.expect("login catalog fixture");
 }
 
 const OAUTH_IMPORT_ENV_CHILD: &str = "HAIDER_TEST_OAUTH_IMPORT_ENV_CHILD";
@@ -2680,6 +3005,7 @@ fn login_job(
         provider: "anthropic".into(),
         display_alias: Some("work".into()),
         validation_model: Some("claude-test".into()),
+        replace_existing: false,
         secret: secret.map(|bytes| Zeroizing::new(bytes.to_vec())),
         route: LoginRoute {
             request_id: RequestId::new(request_id),
@@ -3015,6 +3341,7 @@ async fn login_receipt_claims_replay_and_reject_like_every_r2_command() {
         resolved_model: "claude-other".into(),
         display_alias: None,
         physical_alias: identity.physical_alias.clone(),
+        replace_existing: false,
     };
     let other_json = other
         .canonical_json()
@@ -3252,6 +3579,29 @@ async fn reconciliation_closes_every_login_crash_boundary() {
         .await
         .unwrap_or_else(|error| panic!("{}", error.message));
 
+    // Boundary E — an in-place replacement starts with BOTH old facts
+    // present. Their presence is ambiguous, so startup must leave the
+    // replacement pending for a same-command fresh stage.
+    let mut identity_e = identity_for("profile-r", "command-e");
+    identity_e.replace_existing = true;
+    let json_e = identity_e
+        .canonical_json()
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    let digest_e = blake3::hash(json_e.as_bytes()).to_hex().to_string();
+    let _ = store
+        .login_claim_receipt("command-e".into(), digest_e, json_e)
+        .await
+        .unwrap_or_else(|error| panic!("{}", error.message));
+    let alias_e = CredentialAlias::new(identity_e.physical_alias.clone());
+    vault
+        .put(&alias_e, b"old-replacement-key")
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    let mut descriptor_e = descriptor_for(&identity_e, &alias_e, Some("old identity".into()));
+    descriptor_e.active = false;
+    accounts
+        .add(descriptor_e)
+        .unwrap_or_else(|error| panic!("{error:?}"));
+
     reconcile_login_receipts(&store, &mut accounts, &provision)
         .await
         .unwrap_or_else(|error| panic!("{}", error.message));
@@ -3271,6 +3621,7 @@ async fn reconciliation_closes_every_login_crash_boundary() {
     assert_eq!(state_of("command-b"), "committed");
     assert_eq!(state_of("command-c"), "committed");
     assert_eq!(state_of("command-d"), "committed");
+    assert_eq!(state_of("command-e"), "pending");
 
     // B and C produced descriptors; D self-healed WITHOUT stealing the
     // provider's active slot (C's earlier active survives).
@@ -3289,6 +3640,13 @@ async fn reconciliation_closes_every_login_crash_boundary() {
             .get(&CredentialAlias::new(identity_a.physical_alias.clone()))
             .is_none(),
         "boundary A must not fabricate a descriptor"
+    );
+    assert_eq!(
+        accounts
+            .get(&alias_e)
+            .expect("old replacement descriptor remains")
+            .identity,
+        "old identity"
     );
 
     store
@@ -3754,6 +4112,7 @@ async fn committed_remove_tombstone_beats_only_the_fenced_add_incarnation() {
         resolved_model: "claude-test".into(),
         display_alias: Some(alias.as_str().to_owned()),
         physical_alias: alias.as_str().to_owned(),
+        replace_existing: false,
     };
     let descriptor = |alias: &CredentialAlias, identity: &str, active: bool| CredentialDescriptor {
         alias: alias.clone(),
@@ -4671,6 +5030,7 @@ async fn omitted_api_alias_is_stable_command_derived_and_secret_free() {
             provider: "anthropic".into(),
             display_alias: None,
             validation_model: Some("claude-test".into()),
+            replace_existing: false,
             secret: Some(Zeroizing::new(
                 b"OMITTED_ALIAS_SECRET_SENTINEL_86b2".to_vec(),
             )),
@@ -4717,6 +5077,7 @@ async fn omitted_api_alias_is_stable_command_derived_and_secret_free() {
             provider: "anthropic".into(),
             display_alias: None,
             validation_model: Some("claude-test".into()),
+            replace_existing: false,
             secret: None,
             route: LoginRoute {
                 request_id: RequestId::new("omitted-alias-replay"),
@@ -4735,6 +5096,156 @@ async fn omitted_api_alias_is_stable_command_derived_and_secret_free() {
             ..
         }
     ));
+    actor.shutdown().await;
+}
+
+/// Q1 update law: a staged API key may re-authenticate the stable existing
+/// alias in place, including after one retryable validation failure. The
+/// actor-owned secret survives the stage-less retry; the descriptor remains
+/// singular/active, its operator label survives replacement, and the vault
+/// contains only the new bytes.
+///
+/// MUTATION CHECK: always call `AccountStore::add` after validation. The
+/// login returns a duplicate-alias error and the assertions below fail.
+#[tokio::test]
+async fn api_login_rekeys_an_existing_alias_in_place() {
+    #[derive(Default)]
+    struct RekeyValidator {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl CredentialValidator for RekeyValidator {
+        fn supports(&self, provider: &str) -> bool {
+            provider == "anthropic"
+        }
+
+        async fn validate(
+            &self,
+            _provider: &str,
+            _model: &str,
+            secret: &[u8],
+            _endpoint: Option<&str>,
+        ) -> Result<ValidatedIdentity, ValidationError> {
+            assert_eq!(secret, b"REPLACEMENT_API_KEY_SENTINEL_9d31");
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(ValidationError {
+                    kind: ValidationFailureKind::Unavailable,
+                    message: "scripted retryable probe failure".into(),
+                });
+            }
+            Ok(ValidatedIdentity {
+                identity: "replacement identity".into(),
+            })
+        }
+    }
+
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let alias = CredentialAlias::new("stable-api-alias");
+    let mut accounts = memory_accounts();
+    accounts
+        .add(CredentialDescriptor {
+            alias: alias.clone(),
+            provider: "anthropic".into(),
+            base_url: None,
+            auth_method: AuthMethod::ApiKey,
+            identity: "prior identity".into(),
+            status: CredentialStatus::Ok,
+            active: true,
+            label: Some("operator label".into()),
+        })
+        .expect("seed API descriptor");
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
+    let vault = Arc::new(MemoryVault::new());
+    vault.put(&alias, b"prior-key").expect("seed prior key");
+    let mut actor = start_account_actor(AccountActorConfig {
+        store,
+        accounts,
+        vault: vault.clone() as Arc<dyn Vault>,
+        validator: Arc::new(RekeyValidator::default()),
+        snapshot: Arc::clone(&snapshot),
+        management: None,
+        profile_id: "api-rekey".into(),
+        default_model: "claude-test".into(),
+        providers: test_provider_registry(),
+        provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+        reserved_aliases: HashSet::new(),
+        refresh_fences: RefreshFenceRegistry::default(),
+    });
+    let (sink, mut frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::Login(Box::new(LoginJob {
+            command_id: "api-rekey-command".into(),
+            provider: "anthropic".into(),
+            display_alias: Some(alias.as_str().into()),
+            validation_model: Some("claude-test".into()),
+            replace_existing: true,
+            secret: Some(Zeroizing::new(
+                b"REPLACEMENT_API_KEY_SENTINEL_9d31".to_vec(),
+            )),
+            route: LoginRoute {
+                request_id: RequestId::new("api-rekey-request"),
+                sink: Arc::clone(&sink),
+            },
+        })))
+        .await
+        .expect("send API re-key");
+
+    let (code, retryable) = expect_error(
+        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("first API re-key deadline")
+            .expect("first API re-key response"),
+    );
+    assert_eq!(code, ERROR_CODE_PROVIDER_ERROR);
+    assert!(retryable);
+
+    actor
+        .commands()
+        .send(AccountCommand::Login(Box::new(LoginJob {
+            command_id: "api-rekey-command".into(),
+            provider: "anthropic".into(),
+            display_alias: Some(alias.as_str().into()),
+            validation_model: Some("claude-test".into()),
+            replace_existing: true,
+            secret: None,
+            route: LoginRoute {
+                request_id: RequestId::new("api-rekey-retry"),
+                sink,
+            },
+        })))
+        .await
+        .expect("retry API re-key without another stage");
+
+    let descriptor = match tokio::time::timeout(Duration::from_secs(2), frames.recv())
+        .await
+        .expect("API re-key deadline")
+        .expect("API re-key response")
+    {
+        WireFrame::Response {
+            body: ResponseBody::AccountLoginApi { descriptor },
+            ..
+        } => descriptor,
+        other => panic!("unexpected API re-key response: {other:?}"),
+    };
+    assert_eq!(descriptor.alias, alias);
+    assert_eq!(descriptor.identity, "replacement identity");
+    assert_eq!(descriptor.label.as_deref(), Some("operator label"));
+    assert!(descriptor.active);
+    let published = snapshot.lock().expect("account snapshot");
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0], descriptor);
+    drop(published);
+    assert_eq!(
+        vault
+            .resolve(&alias)
+            .expect("replacement key")
+            .expose_secret(),
+        b"REPLACEMENT_API_KEY_SENTINEL_9d31"
+    );
+
     actor.shutdown().await;
 }
 
@@ -4791,6 +5302,7 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
         AccountCommand::ConfigureProvider(Box::new(ProviderConfigureJob {
             command_id: command_id.into(),
             input,
+            probe_secret: None,
             expected_revision,
             route: LoginRoute {
                 request_id: RequestId::new(request_id),
@@ -5061,6 +5573,7 @@ fn endpoint_edit_registry(
                 priority: None,
                 extensions: None,
             }],
+            None,
         );
     }
     let provider_store: Box<dyn ProviderRegistryStoreLike> = Box::new(provider_store);
@@ -5103,6 +5616,7 @@ fn endpoint_configure_command(
     AccountCommand::ConfigureProvider(Box::new(ProviderConfigureJob {
         command_id: command_id.to_owned(),
         input,
+        probe_secret: None,
         expected_revision,
         route: LoginRoute {
             request_id: RequestId::new(format!("{command_id}-request")),
@@ -5913,6 +6427,91 @@ async fn pre_v8_pending_provider_receipts_reconcile_without_a_discovered_cache()
     store.close().await.expect("close");
 }
 
+/// Q1 crash law: once discovery has authenticated and the configure receipt
+/// owns its public catalog, startup reconciliation restores both the profile
+/// and the live picker inventory without retaining or requesting a secret.
+///
+/// MUTATION CHECK: ignore `discovered_models` in
+/// `reconcile_provider_receipts`. The summary and durable cache assertions
+/// below become empty after the simulated crash boundary.
+#[tokio::test]
+async fn pending_custom_configure_reconciliation_restores_discovered_inventory() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let model_source = Arc::new(CachedProviderModelSource::default());
+    let mut providers = ProviderRegistry::new(
+        Box::new(TestProviderStore::default()),
+        Vec::new(),
+        model_source,
+    )
+    .expect("empty provider registry");
+    let input = ProviderConfigureInput {
+        provider: "recovered-router".into(),
+        api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+        origin: Some("https://router.example.invalid/v1".into()),
+        auth_requirement: Some(ProviderAuthRequirementWire::None),
+        enabled: true,
+        models: vec!["recovered-model".into()],
+        default_model: Some("recovered-model".into()),
+        response_open_timeout_ms: Some(45_000),
+    };
+    let identity = ProviderConfigureIdentity {
+        input: input.clone(),
+        expected_revision: 0,
+    };
+    let (request_json, request_digest) = command_json(&identity).expect("configure identity");
+    let recovery = ProviderConfigureRecovery {
+        input,
+        discovered_models: Some(vec![haider_provider::DiscoveredModel {
+            slug: "recovered-model".into(),
+            display_name: "Recovered Model".into(),
+            context_window: Some(128_000),
+            description: None,
+            default_effort: None,
+            supported_efforts: Vec::new(),
+            visible: true,
+            priority: None,
+            extensions: None,
+        }]),
+        discovered_etag: Some("recovered-etag".into()),
+        revision_unchanged: false,
+        revision_unchanged_response: None,
+    };
+    assert!(matches!(
+        store
+            .management_claim_receipt::<ProviderReceipt>(
+                "recovered-custom-configure".into(),
+                PROVIDER_CONFIGURE_METHOD.into(),
+                request_digest,
+                request_json,
+                Some(serde_json::to_string(&recovery).expect("recovery JSON")),
+                Some(0),
+            )
+            .await
+            .expect("claim pending configure"),
+        ManagementClaim::Fresh
+    ));
+
+    reconcile_provider_receipts(&store, &memory_accounts(), &mut providers)
+        .await
+        .expect("reconcile custom configure");
+    let summary = providers
+        .summary("recovered-router", &|_| false)
+        .expect("recovered summary");
+    assert_eq!(summary.models, vec!["recovered-model"]);
+    assert_eq!(summary.model_details[0].context_window, Some(128_000));
+    assert!(summary.inventory_fetched_at_ms.is_some());
+    let cached = store
+        .provider_models("recovered-router".into())
+        .await
+        .expect("read recovered cache")
+        .expect("recovered cache row");
+    assert_eq!(cached.etag.as_deref(), Some("recovered-etag"));
+    assert!(cached.models_json.contains("recovered-model"));
+    assert_eq!(store.management_revision().await.expect("revision"), 1);
+    store.close().await.expect("close");
+}
+
 struct UnusedIdentityVerifier;
 
 #[async_trait::async_trait]
@@ -6037,7 +6636,11 @@ async fn wh3_deepseek_catalog_source_populates_models_and_flips_available() {
             None,
         )]
     );
-    providers.replace_models(DEEPSEEK_PROVIDER_NAME.to_owned(), discovered.models);
+    providers.replace_models(
+        DEEPSEEK_PROVIDER_NAME.to_owned(),
+        discovered.models,
+        Some(1),
+    );
     let after = providers
         .summary(DEEPSEEK_PROVIDER_NAME, &|provider| {
             provider == DEEPSEEK_PROVIDER_NAME
@@ -6311,10 +6914,10 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
         .commands()
         .send(AccountCommand::RefreshProviderModels {
             provider: key_provider.to_owned(),
-            completed: LoginRoute {
+            completed: ProviderModelsRefreshCompletion::Wire(LoginRoute {
                 request_id: RequestId::new("custom-key-refresh"),
                 sink: key_sink,
-            },
+            }),
         })
         .await
         .expect("key refresh handoff");
@@ -6339,10 +6942,10 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
         .commands()
         .send(AccountCommand::RefreshProviderModels {
             provider: GEMINI_PROVIDER_NAME.to_owned(),
-            completed: LoginRoute {
+            completed: ProviderModelsRefreshCompletion::Wire(LoginRoute {
                 request_id: RequestId::new("gemini-key-refresh"),
                 sink: gemini_sink,
-            },
+            }),
         })
         .await
         .expect("Gemini refresh handoff");
@@ -6370,10 +6973,10 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
         .commands()
         .send(AccountCommand::RefreshProviderModels {
             provider: no_auth_provider.to_owned(),
-            completed: LoginRoute {
+            completed: ProviderModelsRefreshCompletion::Wire(LoginRoute {
                 request_id: RequestId::new("custom-none-refresh"),
                 sink: none_sink,
-            },
+            }),
         })
         .await
         .expect("no-auth refresh handoff");
@@ -6549,10 +7152,10 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         .commands()
         .send(AccountCommand::RefreshProviderModels {
             provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
-            completed: LoginRoute {
+            completed: ProviderModelsRefreshCompletion::Wire(LoginRoute {
                 request_id: RequestId::new("refresh-models"),
                 sink,
-            },
+            }),
         })
         .await
         .expect("refresh handoff");
@@ -6622,6 +7225,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         .find(|summary| summary.provider == OPENAI_OAUTH_PROVIDER_NAME)
         .expect("refreshed provider");
     assert_eq!(summary.models, vec!["frontier-refresh"]);
+    assert_eq!(summary.inventory_fetched_at_ms, Some(cached.fetched_at_ms));
 
     tokio::time::sleep(Duration::from_millis(2)).await;
     let (sink, mut not_modified_frames) = channel_sink();
@@ -6629,10 +7233,10 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         .commands()
         .send(AccountCommand::RefreshProviderModels {
             provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
-            completed: LoginRoute {
+            completed: ProviderModelsRefreshCompletion::Wire(LoginRoute {
                 request_id: RequestId::new("refresh-models-not-modified"),
                 sink,
-            },
+            }),
         })
         .await
         .expect("conditional refresh handoff");
@@ -6662,6 +7266,17 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         touched.fetched_at_ms > cached.fetched_at_ms,
         "304 refresh must touch only the fetch timestamp"
     );
+    let touched_view = management.read().expect("touched management view");
+    let touched_summary = touched_view
+        .providers
+        .iter()
+        .find(|summary| summary.provider == OPENAI_OAUTH_PROVIDER_NAME)
+        .expect("touched provider summary");
+    assert_eq!(
+        touched_summary.inventory_fetched_at_ms,
+        Some(touched.fetched_at_ms),
+        "304 refresh must republish the cache timestamp without a revision bump"
+    );
     assert_eq!(store.management_revision().await.expect("revision"), 1);
     let seen = discoverer.seen.lock().expect("seen lock").clone();
     assert_eq!(
@@ -6676,10 +7291,10 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         .commands()
         .send(AccountCommand::RefreshProviderModels {
             provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
-            completed: LoginRoute {
+            completed: ProviderModelsRefreshCompletion::Wire(LoginRoute {
                 request_id: RequestId::new("refresh-models-unavailable"),
                 sink,
-            },
+            }),
         })
         .await
         .expect("unavailable refresh handoff");
@@ -6725,10 +7340,10 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         .commands()
         .send(AccountCommand::RefreshProviderModels {
             provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
-            completed: LoginRoute {
+            completed: ProviderModelsRefreshCompletion::Wire(LoginRoute {
                 request_id: RequestId::new("refresh-models-panic"),
                 sink,
-            },
+            }),
         })
         .await
         .expect("panic refresh handoff");
@@ -6758,10 +7373,10 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         .commands()
         .send(AccountCommand::RefreshProviderModels {
             provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
-            completed: LoginRoute {
+            completed: ProviderModelsRefreshCompletion::Wire(LoginRoute {
                 request_id: RequestId::new("refresh-models-after-panic"),
                 sink,
-            },
+            }),
         })
         .await
         .expect("post-panic refresh handoff");
@@ -6785,10 +7400,10 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         .commands()
         .send(AccountCommand::RefreshProviderModels {
             provider: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
-            completed: LoginRoute {
+            completed: ProviderModelsRefreshCompletion::Wire(LoginRoute {
                 request_id: RequestId::new("refresh-models-during-drain"),
                 sink,
-            },
+            }),
         })
         .await
         .expect("draining refresh handoff");
@@ -8371,6 +8986,7 @@ async fn oauth_import_obeys_the_reserved_alias_fence() {
         resolved_model: "gpt-test".to_owned(),
         display_alias: Some(OPENAI_OAUTH_PROVIDER_NAME.to_owned()),
         physical_alias: OPENAI_OAUTH_PROVIDER_NAME.to_owned(),
+        replace_existing: false,
     };
     let login_json = login_identity.canonical_json().expect("login coordinates");
     let login_digest = blake3::hash(login_json.as_bytes()).to_hex().to_string();
@@ -8771,7 +9387,7 @@ async fn provider_remove_commits_replays_fences_and_beats_restart_resurrection()
     let mut initial = builtin_profiles.clone();
     initial.push(custom.clone());
     let source = Arc::new(CachedProviderModelSource::default());
-    source.replace("custom-lab".to_owned(), vec![model]);
+    source.replace("custom-lab".to_owned(), vec![model], None);
     let provider_store: Box<dyn ProviderRegistryStoreLike> =
         Box::new(JsonProviderRegistryStore::new(dir.path()));
     let providers = ProviderRegistry::new(provider_store, initial, source)
@@ -9093,6 +9709,7 @@ fn custom_login_targets_only_chat_completions_profiles() {
                 response_open_timeout_ms: None,
                 models: vec!["llama3.1:8b".to_owned()],
                 model_details: Vec::new(),
+                inventory_fetched_at_ms: None,
                 auth_methods: Vec::new(),
                 availability: haider_rpc::ProviderAvailabilityWire::Available,
                 availability_reason: None,
@@ -9106,6 +9723,7 @@ fn custom_login_targets_only_chat_completions_profiles() {
                 response_open_timeout_ms: None,
                 models: Vec::new(),
                 model_details: Vec::new(),
+                inventory_fetched_at_ms: None,
                 auth_methods: Vec::new(),
                 availability: haider_rpc::ProviderAvailabilityWire::Available,
                 availability_reason: None,
@@ -9122,6 +9740,7 @@ fn custom_login_targets_only_chat_completions_profiles() {
                     .map(|model| (*model).to_owned())
                     .collect(),
                 model_details: Vec::new(),
+                inventory_fetched_at_ms: None,
                 auth_methods: vec![AuthMethod::ApiKey],
                 availability: haider_rpc::ProviderAvailabilityWire::Unavailable,
                 availability_reason: Some("provider has no credential".to_owned()),
@@ -9797,6 +10416,7 @@ fn stale_effort_clamps_for_anthropic_and_drops_for_declared_openai_ladders() {
                 supports_thinking_type: None,
             },
         ],
+        inventory_fetched_at_ms: None,
         auth_methods: vec![AuthMethod::OAuth],
         availability: haider_rpc::ProviderAvailabilityWire::Available,
         availability_reason: None,
@@ -9857,6 +10477,7 @@ fn enterprise_summary(provider: &str, endpoint: Option<&str>) -> ProviderSummary
         response_open_timeout_ms: None,
         models: models.clone(),
         model_details: Vec::new(),
+        inventory_fetched_at_ms: None,
         auth_methods: vec![AuthMethod::ApiKey],
         availability: haider_rpc::ProviderAvailabilityWire::Available,
         availability_reason: None,
@@ -10224,6 +10845,7 @@ async fn enterprise_login_validates_at_the_profile_endpoint_with_its_default_mod
             provider: "bedrock".to_owned(),
             display_alias: Some("bedrock-main".to_owned()),
             validation_model: None,
+            replace_existing: false,
             secret: Some(Zeroizing::new(b"BEDROCK_LOGIN_SENTINEL".to_vec())),
             route: LoginRoute {
                 request_id: RequestId::new("bedrock-login-request"),
@@ -10758,6 +11380,7 @@ async fn each_turn_resolves_the_currently_active_account() {
             supported_speeds: Vec::new(),
             supports_thinking_type: None,
         }],
+        inventory_fetched_at_ms: None,
         auth_methods: vec![AuthMethod::ApiKey],
         availability: haider_rpc::ProviderAvailabilityWire::Available,
         availability_reason: None,

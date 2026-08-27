@@ -47,21 +47,21 @@ use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::CredentialAlias;
 use haider_provider::{
     ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, AnthropicProvider,
-    BEDROCK_PROVIDER_NAME, BUILTIN_PROVIDER_NAMES, CatalogError, CatalogSource, DEEPSEEK_BASE_URL,
-    DEEPSEEK_PROVIDER_NAME, DiscoveredCatalog, DiscoveredModel, GEMINI_PROVIDER_NAME,
-    GROK_OAUTH_PROVIDER_NAME, GeminiProvider, HAIDER_CODE_BASE_URL, HAIDER_CODE_PROVIDER_NAME,
-    KIMI_OAUTH_PROVIDER_NAME, Message, OPENAI_COMPATIBLE_PROVIDER_NAME, OPENAI_OAUTH_PROVIDER_NAME,
-    OPENAI_PROVIDER_NAME, OpenAiCompatibleProvider, OpenAiProvider, OpenAiTransportConfig,
-    Provider, ProviderErrorKind, TurnRequest, VERTEX_PROVIDER_NAME, XAI_BASE_URL,
-    XAI_PROVIDER_NAME, azure_openai_origin, discover_models,
+    AnthropicTransportConfig, BEDROCK_PROVIDER_NAME, BUILTIN_PROVIDER_NAMES, CatalogError,
+    CatalogSource, DEEPSEEK_BASE_URL, DEEPSEEK_PROVIDER_NAME, DiscoveredCatalog, DiscoveredModel,
+    GEMINI_PROVIDER_NAME, GROK_OAUTH_PROVIDER_NAME, GeminiProvider, HAIDER_CODE_BASE_URL,
+    HAIDER_CODE_PROVIDER_NAME, KIMI_OAUTH_PROVIDER_NAME, Message, OPENAI_COMPATIBLE_PROVIDER_NAME,
+    OPENAI_OAUTH_PROVIDER_NAME, OPENAI_PROVIDER_NAME, OpenAiCompatibleProvider, OpenAiProvider,
+    OpenAiTransportConfig, Provider, ProviderErrorKind, TurnRequest, VERTEX_PROVIDER_NAME,
+    XAI_BASE_URL, XAI_PROVIDER_NAME, azure_openai_origin, discover_models,
 };
 use haider_rpc::{
     ERROR_CODE_BUSY, ERROR_CODE_CREDENTIAL_MISSING, ERROR_CODE_INVALID_ARGUMENT,
-    ERROR_CODE_PERMISSION_DENIED, ERROR_CODE_PROVIDER_ERROR, ERROR_CODE_PROVIDER_REMOVE_REFUSED,
-    ERROR_CODE_RESTAGE_REQUIRED, ERROR_CODE_REVISION_CONFLICT, ERROR_CODE_UNAUTHORIZED, ErrorData,
-    ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
-    ProviderRemoveRefusalReasonWire, ProviderSummaryWire, RequestId, ResponseBody, StagePurpose,
-    WireFrame,
+    ERROR_CODE_PERMISSION_DENIED, ERROR_CODE_PROVIDER_ERROR, ERROR_CODE_PROVIDER_MODELS_UNKNOWN,
+    ERROR_CODE_PROVIDER_REMOVE_REFUSED, ERROR_CODE_RESTAGE_REQUIRED, ERROR_CODE_REVISION_CONFLICT,
+    ERROR_CODE_UNAUTHORIZED, ErrorData, ProviderApiFamilyWire, ProviderAuthRequirementWire,
+    ProviderAvailabilityWire, ProviderProbeFailureWire, ProviderRemoveRefusalReasonWire,
+    ProviderSummaryWire, RequestId, ResponseBody, StagePurpose, WireFrame,
 };
 use subtle::ConstantTimeEq as _;
 use tokio::sync::{mpsc, watch};
@@ -248,12 +248,15 @@ async fn validate_openai_compatible_catalog_key(
                 CatalogError::Unavailable { reason } if reason.contains("(401)") => {
                     ValidationFailureKind::Unauthorized
                 }
+                CatalogError::Unauthorized => ValidationFailureKind::Unauthorized,
                 CatalogError::Unavailable { reason } if reason.contains("(403)") => {
                     ValidationFailureKind::PermissionDenied
                 }
                 CatalogError::NotModified
                 | CatalogError::Unavailable { .. }
-                | CatalogError::Transport { .. } => ValidationFailureKind::Unavailable,
+                | CatalogError::Transport { .. }
+                | CatalogError::InvalidBody { .. }
+                | CatalogError::Empty => ValidationFailureKind::Unavailable,
             };
             ValidationError {
                 kind,
@@ -280,12 +283,15 @@ async fn validate_deepseek_api_key(secret: &[u8]) -> Result<ValidatedIdentity, V
                 CatalogError::Unavailable { reason } if reason.contains("(401)") => {
                     ValidationFailureKind::Unauthorized
                 }
+                CatalogError::Unauthorized => ValidationFailureKind::Unauthorized,
                 CatalogError::Unavailable { reason } if reason.contains("(403)") => {
                     ValidationFailureKind::PermissionDenied
                 }
                 CatalogError::NotModified
                 | CatalogError::Unavailable { .. }
-                | CatalogError::Transport { .. } => ValidationFailureKind::Unavailable,
+                | CatalogError::Transport { .. }
+                | CatalogError::InvalidBody { .. }
+                | CatalogError::Empty => ValidationFailureKind::Unavailable,
             };
             ValidationError {
                 kind,
@@ -370,13 +376,13 @@ async fn validate_provider_api_key(
     }
 }
 
-/// A CUSTOM chat-completions profile's login target: its stored origin
-/// and declared default model (W5g-5). `None` for every other provider —
-/// the fixed validator set keeps its authority there.
+/// A custom OpenAI-compatible or Anthropic Messages profile's login target:
+/// its stored origin, declared default model, and wire family. `None` for
+/// fixed providers whose validator retains authority.
 fn custom_login_target(
     management: Option<&ManagementSnapshot>,
     provider: &str,
-) -> Option<(String, Option<String>)> {
+) -> Option<(String, Option<String>, ProviderApiFamilyWire)> {
     if matches!(
         provider,
         DEEPSEEK_PROVIDER_NAME | HAIDER_CODE_PROVIDER_NAME | XAI_PROVIDER_NAME
@@ -390,7 +396,7 @@ fn custom_login_target(
         .find(|profile| profile.provider == provider)?;
     if !matches!(
         profile.api_family,
-        ProviderApiFamilyWire::OpenAiChatCompletions
+        ProviderApiFamilyWire::OpenAiChatCompletions | ProviderApiFamilyWire::AnthropicMessages
     ) {
         return None;
     }
@@ -398,7 +404,7 @@ fn custom_login_target(
     // compatible card, family + endpoint identifies custom rows without a
     // provenance field on the wire.
     let origin = profile.endpoint?;
-    Some((origin, profile.default_model))
+    Some((origin, profile.default_model, profile.api_family))
 }
 
 /// An enterprise builtin's login target (G4b): the bedrock/vertex profile's
@@ -423,56 +429,46 @@ fn enterprise_login_target(
     Some((origin, profile.default_model))
 }
 
-/// The same 1-token validation turn, driven through
-/// [`OpenAiCompatibleProvider`] at a custom profile's STORED origin
-/// (W5g-5). The key authenticates against the server it will actually
-/// serve from — never a vendor endpoint.
-async fn validate_openai_compatible_key(
+/// Authenticates a custom provider through its guarded model catalog. Login
+/// must not require an inference side effect: a valid compatible server may
+/// intentionally expose only discovery until an actual user turn arrives.
+async fn validate_custom_provider_key(
     origin: &str,
     provider: &str,
-    model: &str,
+    api_family: ProviderApiFamilyWire,
     secret: &[u8],
 ) -> Result<ValidatedIdentity, ValidationError> {
-    let staging = MemoryVault::default();
-    let alias = CredentialAlias::new("login-validation");
-    let handle = staging
-        .put(&alias, secret)
-        .and_then(|()| staging.resolve(&alias))
-        .map_err(|error| ValidationError {
-            kind: ValidationFailureKind::Unavailable,
-            message: format!("validation staging failed: {}", error.message),
-        })?;
-    // Custom-provenance origins only reach this validator (builtins keep the
-    // fixed validator set), so the G4a TrustedLan matrix applies: a stored
-    // key for a LAN Ollama/LM Studio box must validate against the origin it
-    // will actually serve from. G4b: an AZURE origin validates through the
-    // azure adapter — the key must ride the `api-key` header here exactly
-    // as it will at turn time, or validation would 401 a working key.
-    let adapter = if azure_openai_origin(origin) {
-        OpenAiCompatibleProvider::new_azure(handle, model, origin)
-    } else {
-        OpenAiCompatibleProvider::new_custom(handle, model, origin)
-    }
-    .map_err(map_provider_error)?;
-    let request = TurnRequest {
-        messages: vec![Message::user_text("ping")],
-        model: model.to_owned(),
-        max_tokens: 1,
-        system_prompt: None,
-        tools: Vec::new(),
-        attachments: Vec::new(),
-        cache_metadata: None,
+    let secret = std::str::from_utf8(secret).map_err(|_| ValidationError {
+        kind: ValidationFailureKind::Unauthorized,
+        message: "custom provider API key is not valid UTF-8".to_owned(),
+    })?;
+    let source = match api_family {
+        ProviderApiFamilyWire::OpenAiChatCompletions => CatalogSource::OpenAiCompatible {
+            origin: origin.to_owned(),
+        },
+        ProviderApiFamilyWire::AnthropicMessages => CatalogSource::AnthropicCompatible {
+            origin: origin.to_owned(),
+        },
+        _ => {
+            return Err(ValidationError {
+                kind: ValidationFailureKind::Unavailable,
+                message: "custom provider API family cannot validate an API key".to_owned(),
+            });
+        }
     };
-    let mut stream = adapter
-        .stream_turn(request)
+    discover_models(source, Some(secret), None)
         .await
-        .map_err(map_provider_error)?;
-    match stream.recv().await {
-        Some(Ok(_)) | None => Ok(ValidatedIdentity {
-            identity: format!("{provider} api key · {origin}"),
-        }),
-        Some(Err(error)) => Err(map_provider_error(error)),
-    }
+        .map_err(|error| ValidationError {
+            kind: if matches!(error, CatalogError::Unauthorized) {
+                ValidationFailureKind::Unauthorized
+            } else {
+                ValidationFailureKind::Unavailable
+            },
+            message: "custom provider credential validation could not read /v1/models".to_owned(),
+        })?;
+    Ok(ValidatedIdentity {
+        identity: format!("{provider} api key"),
+    })
 }
 
 fn map_provider_error(error: haider_provider::ProviderError) -> ValidationError {
@@ -650,6 +646,19 @@ impl StagedSecrets {
         Some((entry.purpose, entry.secret))
     }
 
+    /// Borrows a zeroizing copy for a preflight while retaining the original
+    /// stage for its single consuming operation. This is intentionally
+    /// narrower than `claim`: only `provider.configure` model discovery uses
+    /// it before `account.login_api` consumes the same reference.
+    pub(crate) fn probe(&mut self, reference: &str) -> Option<(StagePurpose, Zeroizing<Vec<u8>>)> {
+        self.sweep_expired();
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.reference == reference)?;
+        Some((entry.purpose, Zeroizing::new(entry.secret.to_vec())))
+    }
+
     fn sweep_expired(&mut self) {
         self.entries
             .retain(|entry| entry.staged_at.elapsed() < SECRET_TTL);
@@ -678,6 +687,8 @@ pub(crate) struct LoginIdentity {
     pub resolved_model: String,
     pub display_alias: Option<String>,
     pub physical_alias: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replace_existing: bool,
 }
 
 impl LoginIdentity {
@@ -867,6 +878,41 @@ pub(crate) struct AccountsFacade {
     pub vault: Option<Arc<dyn Vault>>,
 }
 
+impl AccountsFacade {
+    pub(crate) async fn refresh_provider_models(
+        &self,
+        provider: String,
+    ) -> Result<ProviderSummaryWire, ProviderModelsRefreshFailure> {
+        let Some(commands) = self.login.as_ref() else {
+            return Err(ProviderModelsRefreshFailure {
+                code: ERROR_CODE_PROVIDER_MODELS_UNKNOWN.to_owned(),
+                message: "provider model refresh is unavailable".to_owned(),
+                retryable: true,
+                data: None,
+            });
+        };
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        commands
+            .send(AccountCommand::RefreshProviderModels {
+                provider,
+                completed: ProviderModelsRefreshCompletion::internal(sender),
+            })
+            .await
+            .map_err(|_| ProviderModelsRefreshFailure {
+                code: ERROR_CODE_PROVIDER_MODELS_UNKNOWN.to_owned(),
+                message: "provider model refresh actor is unavailable".to_owned(),
+                retryable: true,
+                data: None,
+            })?;
+        receiver.await.map_err(|_| ProviderModelsRefreshFailure {
+            code: ERROR_CODE_PROVIDER_MODELS_UNKNOWN.to_owned(),
+            message: "provider model refresh did not complete".to_owned(),
+            retryable: true,
+            data: None,
+        })?
+    }
+}
+
 /// Correlated response route back to the requesting connection. Disconnect
 /// drops only this route, never the durable command.
 #[derive(Clone)]
@@ -875,12 +921,70 @@ pub(crate) struct LoginRoute {
     pub sink: Arc<dyn FrameSink>,
 }
 
+#[derive(Debug)]
+pub(crate) struct ProviderModelsRefreshFailure {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    pub data: Option<ErrorData>,
+}
+
+pub(crate) type InternalModelRefreshSender =
+    tokio::sync::oneshot::Sender<Result<ProviderSummaryWire, ProviderModelsRefreshFailure>>;
+
+#[derive(Clone)]
+pub(crate) enum ProviderModelsRefreshCompletion {
+    Wire(LoginRoute),
+    Internal(Arc<StdMutex<Option<InternalModelRefreshSender>>>),
+}
+
+impl ProviderModelsRefreshCompletion {
+    pub(crate) fn internal(sender: InternalModelRefreshSender) -> ProviderModelsRefreshCompletion {
+        Self::Internal(Arc::new(StdMutex::new(Some(sender))))
+    }
+
+    fn complete(&self, body: ResponseBody) {
+        match self {
+            Self::Wire(route) => respond(route, body),
+            Self::Internal(sender) => {
+                let result = match body {
+                    ResponseBody::ProviderModelsRefresh { provider, .. } => Ok(provider),
+                    ResponseBody::Error {
+                        code,
+                        message,
+                        retryable,
+                        data,
+                    } => Err(ProviderModelsRefreshFailure {
+                        code,
+                        message,
+                        retryable,
+                        data,
+                    }),
+                    _ => Err(ProviderModelsRefreshFailure {
+                        code: ERROR_CODE_PROVIDER_ERROR.to_owned(),
+                        message: "provider model refresh produced a mismatched response".to_owned(),
+                        retryable: false,
+                        data: None,
+                    }),
+                };
+                if let Ok(mut sender) = sender.lock()
+                    && let Some(sender) = sender.take()
+                {
+                    let _ = sender.send(result);
+                }
+            }
+        }
+    }
+}
+
 /// One handed-off login command.
 pub(crate) struct LoginJob {
     pub command_id: String,
     pub provider: String,
     pub display_alias: Option<String>,
     pub validation_model: Option<String>,
+    /// Explicit key-rotation recovery intent from the wire request.
+    pub replace_existing: bool,
     /// Freshly claimed staged secret; `None` on a retry whose stage is gone
     /// (the actor may still hold the pending command's secret).
     pub secret: Option<Zeroizing<Vec<u8>>>,
@@ -944,6 +1048,9 @@ pub(crate) struct SetDefaultModelJob {
 pub(crate) struct ProviderConfigureJob {
     pub command_id: String,
     pub input: ProviderConfigureInput,
+    /// Ephemeral model-probe credential. Excluded from every durable
+    /// identity, receipt, and recovery coordinate.
+    pub probe_secret: Option<Zeroizing<Vec<u8>>>,
     pub expected_revision: u64,
     pub route: LoginRoute,
 }
@@ -1005,13 +1112,13 @@ pub(crate) enum AccountCommand {
     RemoveProvider(Box<ProviderRemoveJob>),
     RefreshProviderModels {
         provider: String,
-        completed: LoginRoute,
+        completed: ProviderModelsRefreshCompletion,
     },
     ProviderModelsRefreshCompleted {
         provider: String,
         cached: Option<haider_core::CachedModels>,
         result: ProviderModelsRefreshResult,
-        completed: LoginRoute,
+        completed: ProviderModelsRefreshCompletion,
     },
     BeginOAuthRefresh {
         descriptor: CredentialDescriptor,
@@ -1314,11 +1421,12 @@ async fn run_account_actor(
                                 model_refresh_routes.remove(&task_id)
                             {
                                 refreshing_providers.remove(&provider);
-                                respond_error(
+                                respond_model_refresh_error(
                                     &route,
                                     ERROR_CODE_PROVIDER_ERROR,
                                     "provider model refresh worker failed",
                                     true,
+                                    None,
                                 );
                             }
                         }
@@ -1476,11 +1584,15 @@ async fn run_account_actor(
             }
             AccountCommand::ConfigureProvider(job) => {
                 handle_provider_configure(
-                    &store,
-                    &accounts,
-                    management.as_ref(),
-                    &mut providers,
-                    Arc::clone(&provider_endpoint_validator),
+                    ProviderConfigureContext {
+                        store: &store,
+                        accounts: &accounts,
+                        vault: vault.as_ref(),
+                        management: management.as_ref(),
+                        providers: &mut providers,
+                        endpoint_validator: Arc::clone(&provider_endpoint_validator),
+                        model_discoverer: model_discoverer.as_ref(),
+                    },
                     *job,
                 )
                 .await;
@@ -1502,11 +1614,12 @@ async fn run_account_actor(
                 completed,
             } => {
                 if draining {
-                    respond_error(
+                    respond_model_refresh_error(
                         &completed,
                         ERROR_CODE_BUSY,
                         "account actor is shutting down",
                         true,
+                        None,
                     );
                     continue;
                 }
@@ -1533,14 +1646,16 @@ async fn run_account_actor(
             } => {
                 refreshing_providers.remove(&provider);
                 finish_provider_models_refresh(
-                    &store,
-                    &accounts,
-                    management.as_ref(),
-                    &providers,
+                    ProviderModelsRefreshContext {
+                        store: &store,
+                        accounts: &accounts,
+                        management: management.as_ref(),
+                        providers: &providers,
+                        completed: &completed,
+                    },
                     provider,
                     cached,
                     result,
-                    &completed,
                 )
                 .await;
             }
@@ -1654,10 +1769,10 @@ async fn begin_provider_models_refresh(
     model_discoverer: &Arc<dyn ProviderModelDiscoverer>,
     commands: &mpsc::Sender<AccountCommand>,
     refresh_tasks: &mut JoinSet<()>,
-    refresh_routes: &mut HashMap<tokio::task::Id, (String, LoginRoute)>,
+    refresh_routes: &mut HashMap<tokio::task::Id, (String, ProviderModelsRefreshCompletion)>,
     refreshing_providers: &mut HashSet<String>,
     provider: String,
-    completed: LoginRoute,
+    completed: ProviderModelsRefreshCompletion,
 ) {
     let Some((source, auth_requirement)) = catalog_source(&provider, providers) else {
         respond_provider_models_unavailable(
@@ -1668,11 +1783,12 @@ async fn begin_provider_models_refresh(
         return;
     };
     if refreshing_providers.contains(&provider) {
-        respond_error(
+        respond_model_refresh_error(
             &completed,
             ERROR_CODE_BUSY,
             "a model refresh is already running for this provider",
             true,
+            None,
         );
         return;
     }
@@ -1699,11 +1815,12 @@ async fn begin_provider_models_refresh(
     };
     let descriptor = if let Some(expected_auth) = expected_auth {
         let Some(descriptor) = accounts.active_for_provider(&provider).cloned() else {
-            respond_error(
+            respond_model_refresh_error(
                 &completed,
                 ERROR_CODE_CREDENTIAL_MISSING,
                 "provider has no active credential",
                 false,
+                None,
             );
             return;
         };
@@ -1727,7 +1844,13 @@ async fn begin_provider_models_refresh(
             } else {
                 "credential broker is unavailable"
             };
-            respond_error(&completed, ERROR_CODE_CREDENTIAL_MISSING, message, true);
+            respond_model_refresh_error(
+                &completed,
+                ERROR_CODE_CREDENTIAL_MISSING,
+                message,
+                true,
+                None,
+            );
             return;
         };
         Some(broker)
@@ -1737,11 +1860,12 @@ async fn begin_provider_models_refresh(
     let cached = match store.provider_models(provider.clone()).await {
         Ok(cached) => cached,
         Err(error) => {
-            respond_error(
+            respond_model_refresh_error(
                 &completed,
                 ERROR_CODE_PROVIDER_ERROR,
                 &error.message,
                 error.retryable,
+                None,
             );
             return;
         }
@@ -1799,52 +1923,65 @@ async fn begin_provider_models_refresh(
     refresh_routes.insert(refresh_task.id(), (provider, completed));
 }
 
-#[allow(clippy::too_many_arguments)]
+struct ProviderModelsRefreshContext<'a> {
+    store: &'a SqliteStoreHandle,
+    accounts: &'a AccountStore<Box<dyn StoreLike>>,
+    management: Option<&'a ManagementSnapshot>,
+    providers: &'a ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    completed: &'a ProviderModelsRefreshCompletion,
+}
+
 async fn finish_provider_models_refresh(
-    store: &SqliteStoreHandle,
-    accounts: &AccountStore<Box<dyn StoreLike>>,
-    management: Option<&ManagementSnapshot>,
-    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    context: ProviderModelsRefreshContext<'_>,
     provider: String,
     cached: Option<haider_core::CachedModels>,
     result: ProviderModelsRefreshResult,
-    completed: &LoginRoute,
 ) {
+    let ProviderModelsRefreshContext {
+        store,
+        accounts,
+        management,
+        providers,
+        completed,
+    } = context;
     match result {
         ProviderModelsRefreshResult::Discovery(Ok(catalog)) => {
             let models_json = match serde_json::to_string(&catalog.models) {
                 Ok(models_json) => models_json,
                 Err(error) => {
-                    respond_error(
+                    respond_model_refresh_error(
                         completed,
                         ERROR_CODE_PROVIDER_ERROR,
                         &format!("could not encode provider model catalog: {error}"),
                         false,
+                        None,
                     );
                     return;
                 }
             };
+            let fetched_at_ms = unix_ms_after(Duration::ZERO);
             let revision = match store
                 .put_provider_models_and_advance_management_revision(
                     provider.clone(),
                     models_json,
                     catalog.etag,
-                    unix_ms_after(Duration::ZERO),
+                    fetched_at_ms,
                 )
                 .await
             {
                 Ok(revision) => revision,
                 Err(error) => {
-                    respond_error(
+                    respond_model_refresh_error(
                         completed,
                         ERROR_CODE_PROVIDER_ERROR,
                         &error.message,
                         error.retryable,
+                        None,
                     );
                     return;
                 }
             };
-            providers.replace_models(provider.clone(), catalog.models);
+            providers.replace_models(provider.clone(), catalog.models, Some(fetched_at_ms));
             let summaries = providers.summaries(&provider_has_credential(accounts));
             let Some(summary) = summaries
                 .iter()
@@ -1861,54 +1998,60 @@ async fn finish_provider_models_refresh(
             if let Some(management) = management {
                 management.publish(revision, accounts.list().to_vec(), summaries);
             }
-            respond(
-                completed,
-                ResponseBody::ProviderModelsRefresh {
-                    provider: summary,
-                    revision,
-                },
-            );
+            completed.complete(ResponseBody::ProviderModelsRefresh {
+                provider: summary,
+                revision,
+            });
         }
         ProviderModelsRefreshResult::Discovery(Err(CatalogError::NotModified)) => {
             let Some(cached) = cached else {
-                respond_error(
+                respond_model_refresh_error(
                     completed,
                     ERROR_CODE_PROVIDER_ERROR,
                     "provider returned not-modified without a cached catalog",
                     true,
+                    None,
                 );
                 return;
             };
+            let fetched_at_ms = unix_ms_after(Duration::ZERO);
             if let Err(error) = store
                 .put_provider_models(
                     provider.clone(),
                     cached.models_json,
                     cached.etag,
-                    unix_ms_after(Duration::ZERO),
+                    fetched_at_ms,
                 )
                 .await
             {
-                respond_error(
+                respond_model_refresh_error(
                     completed,
                     ERROR_CODE_PROVIDER_ERROR,
                     &error.message,
                     error.retryable,
+                    None,
                 );
                 return;
             }
+            providers.touch_models(&provider, fetched_at_ms);
             let revision = match store.management_revision().await {
                 Ok(revision) => revision,
                 Err(error) => {
-                    respond_error(
+                    respond_model_refresh_error(
                         completed,
                         ERROR_CODE_PROVIDER_ERROR,
                         &error.message,
                         error.retryable,
+                        None,
                     );
                     return;
                 }
             };
-            let Some(summary) = providers.summary(&provider, &provider_has_credential(accounts))
+            let summaries = providers.summaries(&provider_has_credential(accounts));
+            let Some(summary) = summaries
+                .iter()
+                .find(|summary| summary.provider == provider)
+                .cloned()
             else {
                 respond_provider_models_unavailable(
                     completed,
@@ -1917,29 +2060,112 @@ async fn finish_provider_models_refresh(
                 );
                 return;
             };
-            respond(
-                completed,
-                ResponseBody::ProviderModelsRefresh {
-                    provider: summary,
-                    revision,
-                },
-            );
+            if let Some(management) = management {
+                management.publish(revision, accounts.list().to_vec(), summaries);
+            }
+            completed.complete(ResponseBody::ProviderModelsRefresh {
+                provider: summary,
+                revision,
+            });
         }
         ProviderModelsRefreshResult::Discovery(Err(CatalogError::Unavailable { reason })) => {
-            respond_provider_models_unavailable(completed, &provider, &reason);
+            if let Some(data) =
+                custom_probe_error_data(providers, &provider, ProviderProbeFailureWire::Unavailable)
+            {
+                respond_model_refresh_error(
+                    completed,
+                    ERROR_CODE_PROVIDER_ERROR,
+                    &reason,
+                    false,
+                    Some(data),
+                );
+            } else {
+                respond_provider_models_unavailable(completed, &provider, &reason);
+            }
         }
         ProviderModelsRefreshResult::Discovery(Err(CatalogError::Transport { reason })) => {
-            respond_error(completed, ERROR_CODE_PROVIDER_ERROR, &reason, true);
+            respond_model_refresh_error(
+                completed,
+                ERROR_CODE_PROVIDER_ERROR,
+                &reason,
+                true,
+                custom_probe_error_data(
+                    providers,
+                    &provider,
+                    ProviderProbeFailureWire::Unreachable,
+                ),
+            );
+        }
+        ProviderModelsRefreshResult::Discovery(Err(CatalogError::Unauthorized)) => {
+            respond_model_refresh_error(
+                completed,
+                ERROR_CODE_UNAUTHORIZED,
+                "model catalog authentication failed",
+                false,
+                custom_probe_error_data(
+                    providers,
+                    &provider,
+                    ProviderProbeFailureWire::Unauthorized,
+                ),
+            );
+        }
+        ProviderModelsRefreshResult::Discovery(Err(CatalogError::InvalidBody { reason })) => {
+            if let Some(data) = custom_probe_error_data(
+                providers,
+                &provider,
+                ProviderProbeFailureWire::NonOpenAiCompatibleBody,
+            ) {
+                respond_model_refresh_error(
+                    completed,
+                    ERROR_CODE_PROVIDER_ERROR,
+                    &reason,
+                    false,
+                    Some(data),
+                );
+            } else {
+                respond_provider_models_unavailable(completed, &provider, &reason);
+            }
+        }
+        ProviderModelsRefreshResult::Discovery(Err(CatalogError::Empty)) => {
+            let reason = "provider returned an empty model list";
+            if let Some(data) =
+                custom_probe_error_data(providers, &provider, ProviderProbeFailureWire::EmptyList)
+            {
+                respond_model_refresh_error(
+                    completed,
+                    ERROR_CODE_PROVIDER_ERROR,
+                    reason,
+                    false,
+                    Some(data),
+                );
+            } else {
+                respond_provider_models_unavailable(completed, &provider, reason);
+            }
         }
         ProviderModelsRefreshResult::Credential(error) => {
-            respond_error(
+            respond_model_refresh_error(
                 completed,
                 ERROR_CODE_PROVIDER_ERROR,
                 &error.message,
                 error.retryable,
+                None,
             );
         }
     }
+}
+
+fn custom_probe_error_data(
+    providers: &ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+    provider: &str,
+    failure: ProviderProbeFailureWire,
+) -> Option<ErrorData> {
+    providers
+        .get(provider)
+        .is_some_and(|profile| matches!(profile.provenance, ProviderProvenance::Custom))
+        .then(|| ErrorData::ProviderProbeFailed {
+            provider: provider.to_owned(),
+            failure,
+        })
 }
 
 fn catalog_source(
@@ -1980,6 +2206,7 @@ fn catalog_source(
                 || !matches!(
                     profile.api_family,
                     ProviderApiFamilyWire::OpenAiChatCompletions
+                        | ProviderApiFamilyWire::AnthropicMessages
                 )
                 || !matches!(
                     profile.auth_requirement,
@@ -1988,29 +2215,51 @@ fn catalog_source(
             {
                 return None;
             }
-            Some((
-                CatalogSource::OpenAiCompatible {
-                    origin: profile.base_url.clone()?,
-                },
-                profile.auth_requirement,
-            ))
+            let origin = profile.base_url.clone()?;
+            let source = match profile.api_family {
+                ProviderApiFamilyWire::OpenAiChatCompletions => {
+                    CatalogSource::OpenAiCompatible { origin }
+                }
+                ProviderApiFamilyWire::AnthropicMessages => {
+                    CatalogSource::AnthropicCompatible { origin }
+                }
+                _ => return None,
+            };
+            Some((source, profile.auth_requirement))
         }
     }
 }
 
-fn respond_provider_models_unavailable(route: &LoginRoute, provider: &str, reason: &str) {
-    respond(
-        route,
-        ResponseBody::Error {
-            code: ERROR_CODE_PROVIDER_ERROR.into(),
-            message: reason.to_owned(),
-            retryable: false,
-            data: Some(ErrorData::ProviderModelsUnavailable {
-                provider: provider.to_owned(),
-                reason: reason.to_owned(),
-            }),
-        },
+fn respond_provider_models_unavailable(
+    completed: &ProviderModelsRefreshCompletion,
+    provider: &str,
+    reason: &str,
+) {
+    respond_model_refresh_error(
+        completed,
+        ERROR_CODE_PROVIDER_ERROR,
+        reason,
+        false,
+        Some(ErrorData::ProviderModelsUnavailable {
+            provider: provider.to_owned(),
+            reason: reason.to_owned(),
+        }),
     );
+}
+
+fn respond_model_refresh_error(
+    completed: &ProviderModelsRefreshCompletion,
+    code: &str,
+    message: &str,
+    retryable: bool,
+    data: Option<ErrorData>,
+) {
+    completed.complete(ResponseBody::Error {
+        code: code.to_owned(),
+        message: message.to_owned(),
+        retryable,
+        data,
+    });
 }
 
 struct AutomaticAlternate<'a> {
@@ -2684,6 +2933,13 @@ struct ProviderConfigureIdentity {
 struct ProviderConfigureRecovery {
     #[serde(flatten)]
     input: ProviderConfigureInput,
+    /// Public catalog facts already authenticated before the receipt claim.
+    /// Retaining them lets a crash-resume rebuild the durable cache without
+    /// persisting or reusing the ephemeral probe credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    discovered_models: Option<Vec<DiscoveredModel>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    discovered_etag: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     revision_unchanged: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3382,14 +3638,70 @@ async fn handle_set_default_model(
     );
 }
 
-async fn handle_provider_configure(
-    store: &SqliteStoreHandle,
-    accounts: &AccountStore<Box<dyn StoreLike>>,
-    management: Option<&ManagementSnapshot>,
-    providers: &mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
+struct ProviderConfigureContext<'a> {
+    store: &'a SqliteStoreHandle,
+    accounts: &'a AccountStore<Box<dyn StoreLike>>,
+    vault: &'a dyn Vault,
+    management: Option<&'a ManagementSnapshot>,
+    providers: &'a mut ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
     endpoint_validator: Arc<dyn ProviderEndpointValidator>,
+    model_discoverer: &'a dyn ProviderModelDiscoverer,
+}
+
+fn respond_provider_probe_error(route: &LoginRoute, provider: &str, error: CatalogError) {
+    let (failure, message, retryable) = match error {
+        CatalogError::Transport { reason } => (ProviderProbeFailureWire::Unreachable, reason, true),
+        CatalogError::Unauthorized => (
+            ProviderProbeFailureWire::Unauthorized,
+            "custom provider rejected the API key while listing models".to_owned(),
+            false,
+        ),
+        CatalogError::InvalidBody { reason } => (
+            ProviderProbeFailureWire::NonOpenAiCompatibleBody,
+            reason,
+            false,
+        ),
+        CatalogError::Empty => (
+            ProviderProbeFailureWire::EmptyList,
+            "custom provider returned an empty model list".to_owned(),
+            false,
+        ),
+        CatalogError::Unavailable { reason } => {
+            (ProviderProbeFailureWire::Unavailable, reason, false)
+        }
+        CatalogError::NotModified => (
+            ProviderProbeFailureWire::Unavailable,
+            "custom provider returned not-modified without a probe cache".to_owned(),
+            true,
+        ),
+    };
+    respond(
+        route,
+        ResponseBody::Error {
+            code: ERROR_CODE_PROVIDER_ERROR.into(),
+            message,
+            retryable,
+            data: Some(ErrorData::ProviderProbeFailed {
+                provider: provider.to_owned(),
+                failure,
+            }),
+        },
+    );
+}
+
+async fn handle_provider_configure(
+    context: ProviderConfigureContext<'_>,
     mut job: ProviderConfigureJob,
 ) {
+    let ProviderConfigureContext {
+        store,
+        accounts,
+        vault,
+        management,
+        providers,
+        endpoint_validator,
+        model_discoverer,
+    } = context;
     let identity = ProviderConfigureIdentity {
         input: job.input.clone(),
         expected_revision: job.expected_revision,
@@ -3417,6 +3729,7 @@ async fn handle_provider_configure(
         return;
     }
     let mut accepted_revision_unchanged = None;
+    let mut recovered_catalog = None;
     match preflight {
         Ok(Some(ManagementClaim::Committed { response, revision })) => {
             respond(
@@ -3433,6 +3746,12 @@ async fn handle_provider_configure(
         })) => match serde_json::from_str::<ProviderConfigureRecovery>(&recovery) {
             Ok(recovery) => {
                 job.input = recovery.input;
+                if let Some(models) = recovery.discovered_models {
+                    recovered_catalog = Some(DiscoveredCatalog {
+                        models,
+                        etag: recovery.discovered_etag,
+                    });
+                }
                 accepted_revision_unchanged = Some(recovery.revision_unchanged);
             }
             Err(error) => {
@@ -3453,10 +3772,6 @@ async fn handle_provider_configure(
             return;
         }
     }
-    if let Err(error) = providers.validate_configure(job.input.clone()) {
-        respond_management_error(&job.route, &error);
-        return;
-    }
     let endpoint_to_validate = match accepted_revision_unchanged {
         Some(_) => None,
         None => match providers.get(&job.input.provider) {
@@ -3475,6 +3790,16 @@ async fn handle_provider_configure(
             tokio::spawn(async move { endpoint_validator.validate(&origin).await }).await;
         match validation {
             Ok(Ok(canonical_origin)) => job.input.origin = Some(canonical_origin),
+            Ok(Err(error)) if error.code == ErrorCode::ProviderError => {
+                respond_provider_probe_error(
+                    &job.route,
+                    &job.input.provider,
+                    CatalogError::Transport {
+                        reason: error.message,
+                    },
+                );
+                return;
+            }
             Ok(Err(error)) => {
                 respond_management_error(&job.route, &error);
                 return;
@@ -3492,10 +3817,180 @@ async fn handle_provider_configure(
             }
         }
     }
+    let mut discovered_slugs = recovered_catalog.as_ref().map(|catalog| {
+        catalog
+            .models
+            .iter()
+            .map(|model| model.slug.clone())
+            .collect::<Vec<_>>()
+    });
+    let mut discovered_catalog = recovered_catalog;
+    if accepted_revision_unchanged.is_none() {
+        let existing = providers.get(&job.input.provider).cloned();
+        let origin = job.input.origin.as_deref().or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|profile| profile.base_url.as_deref())
+        });
+        let should_discover = job.probe_secret.is_some() || job.input.models.is_empty();
+        if should_discover {
+            let Some(origin) = origin else {
+                respond_error(
+                    &job.route,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    "custom provider model discovery requires a base URL",
+                    false,
+                );
+                return;
+            };
+            let family = job
+                .input
+                .api_family
+                .or_else(|| existing.as_ref().map(|profile| profile.api_family));
+            let source = match family {
+                Some(ProviderApiFamilyWire::OpenAiChatCompletions) => {
+                    CatalogSource::OpenAiCompatible {
+                        origin: origin.to_owned(),
+                    }
+                }
+                Some(ProviderApiFamilyWire::AnthropicMessages) => {
+                    CatalogSource::AnthropicCompatible {
+                        origin: origin.to_owned(),
+                    }
+                }
+                _ => {
+                    respond_error(
+                        &job.route,
+                        ERROR_CODE_INVALID_ARGUMENT,
+                        "custom provider model discovery requires the openai or anthropic API family",
+                        false,
+                    );
+                    return;
+                }
+            };
+            let auth_requirement = job
+                .input
+                .auth_requirement
+                .or_else(|| existing.as_ref().map(|profile| profile.auth_requirement));
+            let discovery = match auth_requirement {
+                Some(ProviderAuthRequirementWire::ApiKey) => {
+                    if let Some(secret) = job.probe_secret.as_ref() {
+                        match std::str::from_utf8(secret) {
+                            Ok(secret) => {
+                                model_discoverer.discover(source, Some(secret), None).await
+                            }
+                            Err(_) => {
+                                respond_error(
+                                    &job.route,
+                                    ERROR_CODE_INVALID_ARGUMENT,
+                                    "staged API key is not valid UTF-8",
+                                    false,
+                                );
+                                return;
+                            }
+                        }
+                    } else {
+                        let Some(descriptor) = accounts.active_for_provider(&job.input.provider)
+                        else {
+                            respond_error(
+                                &job.route,
+                                ERROR_CODE_CREDENTIAL_MISSING,
+                                "provider model discovery requires an API key",
+                                false,
+                            );
+                            return;
+                        };
+                        let credential = match vault.resolve(&descriptor.alias) {
+                            Ok(credential) => credential,
+                            Err(error) => {
+                                respond_error(
+                                    &job.route,
+                                    ERROR_CODE_CREDENTIAL_MISSING,
+                                    &error.message,
+                                    error.retryable,
+                                );
+                                return;
+                            }
+                        };
+                        let secret = match std::str::from_utf8(credential.expose_secret()) {
+                            Ok(secret) => secret,
+                            Err(_) => {
+                                respond_error(
+                                    &job.route,
+                                    ERROR_CODE_CREDENTIAL_MISSING,
+                                    "stored API key is not valid UTF-8",
+                                    false,
+                                );
+                                return;
+                            }
+                        };
+                        model_discoverer.discover(source, Some(secret), None).await
+                    }
+                }
+                Some(ProviderAuthRequirementWire::None) => {
+                    if job.probe_secret.is_some() {
+                        respond_error(
+                            &job.route,
+                            ERROR_CODE_INVALID_ARGUMENT,
+                            "a no-auth provider must not carry a probe credential",
+                            false,
+                        );
+                        return;
+                    }
+                    model_discoverer.discover(source, None, None).await
+                }
+                _ => {
+                    respond_error(
+                        &job.route,
+                        ERROR_CODE_INVALID_ARGUMENT,
+                        "custom provider model discovery requires api_key or no authentication",
+                        false,
+                    );
+                    return;
+                }
+            };
+            let catalog = match discovery {
+                Ok(catalog) => catalog,
+                Err(error) => {
+                    respond_provider_probe_error(&job.route, &job.input.provider, error);
+                    return;
+                }
+            };
+            let slugs = catalog
+                .models
+                .iter()
+                .map(|model| model.slug.clone())
+                .collect::<Vec<_>>();
+            let selected_default = job
+                .input
+                .default_model
+                .as_ref()
+                .filter(|model| slugs.contains(model))
+                .cloned()
+                .or_else(|| {
+                    existing
+                        .as_ref()
+                        .and_then(|profile| profile.default_model.as_ref())
+                        .filter(|model| slugs.contains(model))
+                        .cloned()
+                })
+                .or_else(|| slugs.first().cloned());
+            job.input.models = slugs.clone();
+            job.input.default_model = selected_default;
+            discovered_slugs = Some(slugs);
+            discovered_catalog = Some(catalog);
+        }
+    }
     let custom_repoint = providers.get(&job.input.provider).is_some_and(|profile| {
         matches!(profile.provenance, ProviderProvenance::Custom) && job.input.origin.is_some()
     });
-    let configuration_changed = match providers.validate_configure(job.input.clone()) {
+    let validate = match discovered_slugs.as_deref() {
+        Some(inventory) => {
+            providers.validate_configure_with_inventory(job.input.clone(), inventory)
+        }
+        None => providers.validate_configure(job.input.clone()),
+    };
+    let configuration_changed = match validate {
         Ok(changed) => changed,
         Err(error) => {
             respond_management_error(&job.route, &error);
@@ -3533,6 +4028,12 @@ async fn handle_provider_configure(
     };
     let recovery_json = match serde_json::to_string(&ProviderConfigureRecovery {
         input: job.input.clone(),
+        discovered_models: discovered_catalog
+            .as_ref()
+            .map(|catalog| catalog.models.clone()),
+        discovered_etag: discovered_catalog
+            .as_ref()
+            .and_then(|catalog| catalog.etag.clone()),
         revision_unchanged,
         revision_unchanged_response,
     }) {
@@ -3600,7 +4101,11 @@ async fn handle_provider_configure(
             }
         }
     } else {
-        match providers.configure(job.input) {
+        let configured = match discovered_slugs.as_deref() {
+            Some(inventory) => providers.configure_with_inventory(job.input, inventory),
+            None => providers.configure(job.input),
+        };
+        match configured {
             Ok(profile) => profile,
             Err(error) => {
                 respond_management_error(&job.route, &error);
@@ -3608,6 +4113,43 @@ async fn handle_provider_configure(
             }
         }
     };
+    if let Some(catalog) = discovered_catalog {
+        let models_json = match serde_json::to_string(&catalog.models) {
+            Ok(models_json) => models_json,
+            Err(error) => {
+                respond_error(
+                    &job.route,
+                    ERROR_CODE_PROVIDER_ERROR,
+                    &format!("could not encode provider model catalog: {error}"),
+                    false,
+                );
+                return;
+            }
+        };
+        let fetched_at_ms = unix_ms_after(Duration::ZERO);
+        if let Err(error) = store
+            .put_provider_models(
+                profile.provider_id.clone(),
+                models_json,
+                catalog.etag,
+                fetched_at_ms,
+            )
+            .await
+        {
+            respond_error(
+                &job.route,
+                ERROR_CODE_PROVIDER_ERROR,
+                &error.message,
+                error.retryable,
+            );
+            return;
+        }
+        providers.replace_models(
+            profile.provider_id.clone(),
+            catalog.models,
+            Some(fetched_at_ms),
+        );
+    }
     let Some(provider) =
         providers.summary(&profile.provider_id, &provider_has_credential(accounts))
     else {
@@ -3848,11 +4390,12 @@ async fn handle_login(
         provider,
         display_alias,
         validation_model,
+        replace_existing,
         secret,
         route,
     } = job;
-    // A CUSTOM chat-completions profile validates against its OWN stored
-    // origin (W5g-5); everything else keeps the fixed validator set.
+    // A custom profile validates against its OWN stored `/v1/models`
+    // catalog; everything else keeps the fixed validator set.
     let custom_target = custom_login_target(management, &provider);
     // G4b: the enterprise builtins validate at their PROFILE endpoint with
     // the profile's declared default model spelling.
@@ -3884,7 +4427,7 @@ async fn handle_login(
         resolved_model: validation_model.unwrap_or_else(|| {
             custom_target
                 .as_ref()
-                .and_then(|(_, default)| default.clone())
+                .and_then(|(_, default, _)| default.clone())
                 .or_else(|| {
                     enterprise_target
                         .as_ref()
@@ -3894,6 +4437,7 @@ async fn handle_login(
         }),
         display_alias: Some(selected_alias.clone()),
         physical_alias: selected_alias,
+        replace_existing,
     };
     let request_json = match identity.canonical_json() {
         Ok(json) => json,
@@ -3955,11 +4499,22 @@ async fn handle_login(
         );
         return;
     }
+    // Prefer a still-live command-owned secret over crash reconciliation.
+    // This matters for an in-place re-key: the old descriptor legitimately
+    // exists while a retryable validation is pending, so treating descriptor
+    // presence as proof of commit would finalize the old key instead of
+    // retrying the replacement.
+    let secret = secret.or_else(|| {
+        pending
+            .remove(&command_id)
+            .filter(|entry| entry.claimed_at.elapsed() < SECRET_TTL)
+            .map(|entry| entry.secret)
+    });
     if resume {
         // Crash-boundary reconciliation at command time (R10 step 10):
         // descriptor present -> finalize; vault-only -> resume descriptor
         // commit; neither -> continue with a fresh stage below.
-        if accounts.get(&alias).is_some() {
+        if accounts.get(&alias).is_some() && secret.is_none() && !replace_existing {
             drop(secret);
             pending.remove(&command_id);
             finalize_and_respond(
@@ -3975,7 +4530,7 @@ async fn handle_login(
             .await;
             return;
         }
-        if vault.resolve(&alias).is_ok() {
+        if !replace_existing && accounts.get(&alias).is_none() && vault.resolve(&alias).is_ok() {
             drop(secret);
             pending.remove(&command_id);
             let descriptor = descriptor_for(&identity, &alias, None);
@@ -4007,24 +4562,20 @@ async fn handle_login(
     // pending command's retained secret, or an explicit restage.
     let secret = match secret {
         Some(secret) => secret,
-        None => match pending.remove(&command_id) {
-            Some(entry) if entry.claimed_at.elapsed() < SECRET_TTL => entry.secret,
-            _ => {
-                respond_error(
-                    &route,
-                    ERROR_CODE_RESTAGE_REQUIRED,
-                    "staged secret is no longer available; stage the key again and retry",
-                    true,
-                );
-                return;
-            }
-        },
+        None => {
+            respond_error(
+                &route,
+                ERROR_CODE_RESTAGE_REQUIRED,
+                "staged secret is no longer available; stage the key again and retry",
+                true,
+            );
+            return;
+        }
     };
 
     let validation = match &custom_target {
-        Some((origin, _)) => {
-            validate_openai_compatible_key(origin, &provider, &identity.resolved_model, &secret)
-                .await
+        Some((origin, _, api_family)) => {
+            validate_custom_provider_key(origin, &provider, *api_family, &secret).await
         }
         None => {
             validator
@@ -4041,6 +4592,12 @@ async fn handle_login(
     };
     match validation {
         Ok(validated) => {
+            let replacing = replace_existing || accounts.get(&alias).is_some();
+            let prior_secret = if replacing {
+                vault.resolve(&alias).ok()
+            } else {
+                None
+            };
             // Keychain first (R10 step 9).
             if let Err(error) = vault.put(&alias, &secret) {
                 pending.insert(
@@ -4061,11 +4618,29 @@ async fn handle_login(
             drop(secret);
             pending.remove(&command_id);
             let descriptor = descriptor_for(&identity, &alias, Some(validated.identity));
-            if let Err(error) = accounts.add(descriptor) {
+            let descriptor_result = if replacing {
+                accounts.replace(descriptor)
+            } else {
+                accounts.add(descriptor)
+            };
+            if let Err(error) = descriptor_result {
                 // Synchronous descriptor-save failure deletes the
-                // just-written vault alias (R10 step 9); the receipt stays
-                // pending and a fresh stage retries.
-                let _ = vault.delete(&alias);
+                // just-written vault alias on add, or restores the prior
+                // bytes on an in-place re-key. The receipt stays pending and
+                // a fresh stage retries.
+                let rollback = match prior_secret {
+                    Some(previous) => vault.put(&alias, previous.expose_secret()),
+                    None => vault.delete(&alias),
+                };
+                if rollback.is_err() {
+                    respond_error(
+                        &route,
+                        ERROR_CODE_PROVIDER_ERROR,
+                        "descriptor save and vault rollback failed",
+                        true,
+                    );
+                    return;
+                }
                 respond_error(
                     &route,
                     ERROR_CODE_PROVIDER_ERROR,
@@ -6463,6 +7038,35 @@ fn build_account_provider(
     let anthropic_effort = anthropic_effort_for(tuning, model);
     let openai_effort = openai_effort_for(tuning, profile, model);
     let openai_transport = openai_transport_config(profile);
+    let anthropic_transport = anthropic_transport_config(profile);
+    if auth_method == AuthMethod::ApiKey
+        && let Some(profile) = profile.filter(|profile| {
+            matches!(profile.api_family, ProviderApiFamilyWire::AnthropicMessages)
+                && !haider_provider::BUILTIN_PROVIDER_NAMES.contains(&provider)
+        })
+    {
+        let base_url = profile.endpoint.as_deref().or(base_url).ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::InvalidArgument,
+                format!("provider {provider} profile is missing its base_url"),
+                false,
+            )
+        })?;
+        let adapter = if profile.auth_methods.is_empty() {
+            AnthropicProvider::new_custom_no_auth(credential, model, base_url)
+        } else {
+            AnthropicProvider::new_custom(credential, model, base_url)
+        };
+        return Ok(Arc::new(
+            adapter
+                .map_err(|error| adapter_construction_error(provider, error))?
+                .with_transport_config(anthropic_transport)
+                .map_err(|error| adapter_construction_error(provider, error))?
+                .with_account(alias.clone())
+                .with_effort(anthropic_effort.clone())
+                .with_fast(anthropic_fast),
+        ));
+    }
     let adapter: Arc<dyn Provider> = match (provider, auth_method) {
         // W-B: FIRST-PARTY Anthropic pairs declare the server web tools;
         // Bedrock/Vertex below deliberately never take the flag (the
@@ -6574,10 +7178,9 @@ fn build_account_provider(
         }
         // G4a KEYLESS ARM: a chat-completions profile whose registry auth
         // requirement is None (auth_methods is empty on the wire summary).
-        // Resolution supplies the placeholder bearer when no key is stored
-        // and the vault key when one exists — a stored key wins — and either
-        // way the custom adapter serves the profile origin under the
-        // TrustedLan matrix.
+        // Resolution supplies an internal construction handle when no key is
+        // stored. The no-auth constructor never emits those bytes; the custom
+        // adapter serves the profile origin under the TrustedLan matrix.
         (_, AuthMethod::ApiKey)
             if profile.is_some_and(|profile| {
                 matches!(
@@ -6594,7 +7197,8 @@ fn build_account_provider(
                 )
             })?;
             Arc::new(
-                custom_compatible_adapter(provider, credential, model, base_url)?
+                OpenAiCompatibleProvider::new_custom_no_auth(credential, model, base_url)
+                    .map_err(|error| adapter_construction_error(provider, error))?
                     .with_transport_config(openai_transport)
                     .map_err(|error| adapter_construction_error(provider, error))?
                     .with_account(alias.clone()),
@@ -6788,6 +7392,14 @@ fn openai_transport_config(profile: Option<&ProviderSummaryWire>) -> OpenAiTrans
     config
 }
 
+fn anthropic_transport_config(profile: Option<&ProviderSummaryWire>) -> AnthropicTransportConfig {
+    let mut transport = AnthropicProvider::transport_config();
+    if let Some(timeout_ms) = profile.and_then(|profile| profile.response_open_timeout_ms) {
+        transport.response_open_timeout = Duration::from_millis(timeout_ms);
+    }
+    transport
+}
+
 /// G3 fast gate at construction: fast is validated at TOGGLE time, but a
 /// later model switch can leave a stale flag on a pair outside the static
 /// gate — 4.7 hard-errors on `speed: "fast"` and 4.6 silently bills
@@ -6917,24 +7529,24 @@ fn custom_compatible_adapter(
     .map_err(|error| adapter_construction_error(provider, error))
 }
 
-/// The placeholder bearer for auth-None profiles (G4a): ollama's OpenAI
-/// compat layer wants a non-empty key — the community convention is the
-/// literal `ollama` — and LM Studio ignores the header when auth is off.
-pub(crate) const KEYLESS_PLACEHOLDER_BEARER: &[u8] = b"ollama";
+/// Internal construction token for auth-None profiles (G4a). Provider
+/// adapters require a `SecretHandle` by type, but their no-auth constructors
+/// never place these bytes in a request header or body.
+pub(crate) const KEYLESS_CONSTRUCTION_TOKEN: &[u8] = b"no-auth";
 
 /// Mints the placeholder credential through the same vault machinery every
 /// real secret uses, so the handle's redaction/zeroization laws hold.
-fn keyless_placeholder_credential() -> Result<haider_accounts::SecretHandle, HaiderError> {
+fn keyless_construction_credential() -> Result<haider_accounts::SecretHandle, HaiderError> {
     let staging = MemoryVault::default();
     let alias = CredentialAlias::new("keyless-placeholder");
     staging
-        .put(&alias, KEYLESS_PLACEHOLDER_BEARER)
+        .put(&alias, KEYLESS_CONSTRUCTION_TOKEN)
         .and_then(|()| staging.resolve(&alias))
         .map_err(|error| {
             HaiderError::new(
                 ErrorCode::Internal,
                 format!(
-                    "could not stage the keyless placeholder credential: {}",
+                    "could not stage the keyless construction credential: {}",
                     error.message
                 ),
                 false,
@@ -7242,9 +7854,13 @@ impl AccountsProviderFactory {
     /// G4a keyless resolution: an ENABLED custom chat-completions profile
     /// whose auth requirement is None (empty `auth_methods` on the wire
     /// summary) serves turns WITHOUT any stored credential — a synthesized
-    /// descriptor at the profile origin plus the placeholder bearer. This
-    /// runs only after account resolution reported `CredentialMissing`, so
-    /// a stored key always wins.
+    /// descriptor at the profile origin plus a headerless construction
+    /// handle. The
+    /// provider id is also the synthetic account alias: custom-provider
+    /// identity is the cache account scope even when no credential exists,
+    /// so the v3 prompt-cache cohort has the same isolation inputs as a keyed
+    /// custom provider. This runs only after account resolution reported
+    /// `CredentialMissing`, so a stored key always wins.
     fn keyless_account(
         &self,
         provider: &str,
@@ -7255,7 +7871,7 @@ impl AccountsProviderFactory {
         let profile = self.provider_profile(provider)?;
         if !matches!(
             profile.api_family,
-            ProviderApiFamilyWire::OpenAiChatCompletions
+            ProviderApiFamilyWire::OpenAiChatCompletions | ProviderApiFamilyWire::AnthropicMessages
         ) || !profile.auth_methods.is_empty()
             || !profile.enabled
         {
@@ -7263,7 +7879,7 @@ impl AccountsProviderFactory {
         }
         let base_url = profile.endpoint.clone()?;
         let descriptor = CredentialDescriptor {
-            alias: CredentialAlias::new(format!("{provider}-keyless")),
+            alias: CredentialAlias::new(provider),
             provider: provider.to_owned(),
             base_url: Some(base_url),
             auth_method: AuthMethod::ApiKey,
@@ -7272,7 +7888,7 @@ impl AccountsProviderFactory {
             active: true,
             label: None,
         };
-        let credential = keyless_placeholder_credential().ok()?;
+        let credential = keyless_construction_credential().ok()?;
         Some((
             ResolvedAccount {
                 descriptor,
@@ -8135,6 +8751,14 @@ pub(crate) async fn reconcile_login_receipts(
                 }
             }
             "pending" => {
+                if identity.replace_existing {
+                    // An old descriptor is expected to exist throughout an
+                    // in-place re-key, so neither descriptor nor vault
+                    // presence proves which side of validation/replace a
+                    // crash reached. Same-command retry with a fresh stage
+                    // is the only unambiguous recovery.
+                    continue;
+                }
                 if accounts.get(&alias).is_some() {
                     finalize_reconciled(store, accounts, &row.command_id, &alias).await?;
                     continue;
@@ -8471,7 +9095,7 @@ async fn reconcile_provider_receipts(
             }
             continue;
         }
-        let (profile, revision_unchanged) = match row.method.as_str() {
+        let (profile, revision_unchanged, recovered_catalog) = match row.method.as_str() {
             ACCOUNT_SET_DEFAULT_MODEL_METHOD => {
                 let identity: SetDefaultModelIdentity = serde_json::from_str(&row.request_json)
                     .map_err(|error| {
@@ -8484,6 +9108,7 @@ async fn reconcile_provider_receipts(
                 (
                     providers.reconcile_set_default_model(&identity.provider, &identity.model)?,
                     false,
+                    None,
                 )
             }
             PROVIDER_CONFIGURE_METHOD => {
@@ -8499,6 +9124,11 @@ async fn reconcile_provider_receipts(
                         )
                     })?;
                 let revision_unchanged = recovery.revision_unchanged;
+                let recovered_catalog =
+                    recovery.discovered_models.map(|models| DiscoveredCatalog {
+                        models,
+                        etag: recovery.discovered_etag,
+                    });
                 let profile = if revision_unchanged {
                     providers
                         .get(&recovery.input.provider)
@@ -8513,7 +9143,7 @@ async fn reconcile_provider_receipts(
                 } else {
                     providers.reconcile_configure(recovery.input)?
                 };
-                (profile, revision_unchanged)
+                (profile, revision_unchanged, recovered_catalog)
             }
             PROVIDER_REMOVE_METHOD => {
                 let identity: ProviderRemoveIdentity = serde_json::from_str(&row.request_json)
@@ -8557,6 +9187,29 @@ async fn reconcile_provider_receipts(
                 ));
             }
         };
+        if let Some(catalog) = recovered_catalog {
+            let models_json = serde_json::to_string(&catalog.models).map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    format!("recovered provider model catalog is invalid: {error}"),
+                    false,
+                )
+            })?;
+            let fetched_at_ms = unix_ms_after(Duration::ZERO);
+            store
+                .put_provider_models(
+                    profile.provider_id.clone(),
+                    models_json,
+                    catalog.etag,
+                    fetched_at_ms,
+                )
+                .await?;
+            providers.replace_models(
+                profile.provider_id.clone(),
+                catalog.models,
+                Some(fetched_at_ms),
+            );
+        }
         let summary = providers
             .summary(&profile.provider_id, &provider_has_credential(accounts))
             .ok_or_else(|| {
@@ -8726,7 +9379,7 @@ impl AccountsRuntime {
                         false,
                     )
                 })?;
-                model_source.replace(provider.clone(), models);
+                model_source.replace(provider.clone(), models, Some(cached.fetched_at_ms));
             }
         }
         // R10: every daemon vault consumer funnels through this ONE wrap.

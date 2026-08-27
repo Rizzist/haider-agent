@@ -273,17 +273,17 @@ fn openai_compatible_ids_are_models_without_invented_metadata() {
 
 /// MUTATION CHECK (W5g-5b): substitute a built-in model when the custom
 /// response has no `data` array. Expected runtime failure: this malformed
-/// payload returns models instead of the runtime `Unavailable` error.
+/// payload returns models instead of the typed invalid-body error.
 #[test]
-fn malformed_openai_compatible_catalog_is_unavailable_not_substituted() {
+fn malformed_openai_compatible_catalog_is_typed_and_not_substituted() {
     let error = parse_catalog(
         CatalogSource::OpenAiCompatible {
             origin: "https://models.example.invalid/v1".to_owned(),
         },
         &serde_json::json!({"object": "list", "models": [{"id": "wrong-shape"}]}),
     )
-    .expect_err("missing data array must be unavailable");
-    assert!(matches!(error, CatalogError::Unavailable { .. }));
+    .expect_err("missing data array must be invalid");
+    assert!(matches!(error, CatalogError::InvalidBody { .. }));
 }
 
 /// MUTATION CHECK (W5g-5b): remove the loopback-only HTTP check before

@@ -977,7 +977,11 @@ impl ContextCompactor for DaemonContextCompactor {
                     }
                     usage.scope = Some(scope.clone());
                     usage.cache_cost = usage.normalized.as_ref().and_then(|normalized| {
-                        haider_provider::estimate_cache_input_costs(&self.model, normalized)
+                        haider_provider::estimate_cache_input_costs_for(
+                            &self.usage_scope.provider,
+                            &self.model,
+                            normalized,
+                        )
                     });
                     if let Some(account) = &self.usage_account {
                         usage.accounts = vec![AccountUsage {
@@ -7668,10 +7672,23 @@ fn collect_budget_usage(
             .map(|scope| scope.model.as_str())
             .filter(|model| !model.is_empty())
             .unwrap_or(fallback_model);
-        let cost_usd = normalized.map_or_else(
-            || haider_provider::estimate_chunk_cost_usd(model, input, output, reasoning, cached),
-            |normalized| haider_provider::estimate_normalized_usage_cost_usd(model, normalized),
-        );
+        let provider = scope
+            .map(|scope| scope.provider.as_str())
+            .filter(|provider| !provider.is_empty());
+        let cost_usd = match (provider, normalized) {
+            (Some(provider), Some(normalized)) => {
+                haider_provider::estimate_normalized_usage_cost_usd_for(provider, model, normalized)
+            }
+            (Some(provider), None) => haider_provider::estimate_chunk_cost_usd_for(
+                provider, model, input, output, reasoning, cached,
+            ),
+            (None, Some(normalized)) => {
+                haider_provider::estimate_normalized_usage_cost_usd(model, normalized)
+            }
+            (None, None) => {
+                haider_provider::estimate_chunk_cost_usd(model, input, output, reasoning, cached)
+            }
+        };
         let run_coordinate = scope
             .and_then(|scope| scope.run.as_ref())
             .or(envelope_run.as_ref())

@@ -83,18 +83,6 @@ impl StubDnsResolver {
 }
 
 #[async_trait]
-impl CompatibleDnsResolver for StubDnsResolver {
-    async fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<SocketAddr>> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        self.answers
-            .lock()
-            .expect("resolver answer lock")
-            .pop_front()
-            .ok_or_else(|| std::io::Error::other("stub resolver was called more than expected"))
-    }
-}
-
-#[async_trait]
 impl FixedDnsResolver for StubDnsResolver {
     async fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<SocketAddr>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
@@ -1149,35 +1137,33 @@ async fn pinned_subscription_capabilities_use_cached_catalog_without_discovery()
     assert_eq!(grok_resolver.calls(), 0, "pinned Grok must not discover");
 }
 
-/// LAW (LK1 golden half — the placeholder Bearer is SENT): a custom adapter
-/// holding the daemon's keyless placeholder secret (`ollama`) emits exactly
-/// `Authorization: Bearer ollama` on both the models probe and the chat
-/// POST at a loopback literal origin — the header shape ollama's compat
-/// layer requires and LM Studio ignores.
+/// LAW (Q no-auth): a custom adapter configured without authentication emits
+/// no credential header on either model discovery or inference. The internal
+/// construction handle must never become an authentication header on wire.
 ///
-/// MUTATION CHECK: blank the credential bytes in `authorization_header` (or
-/// drop the secret concatenation). Expected RUNTIME failure: the exact
-/// header equality below.
+/// MUTATION CHECK: route `new_custom_no_auth` through the bearer mode or add
+/// either credential header. Expected RUNTIME failure: the absence assertions.
 #[tokio::test]
-async fn lk1_keyless_placeholder_bearer_reaches_the_wire_header() {
+async fn custom_no_auth_get_and_post_have_no_credential_headers() {
     let vault = MemoryVault::new();
     let alias = CredentialAlias::new("ollama-keyless");
     vault.put(&alias, b"ollama").expect("store placeholder");
     let credential = vault.resolve(&alias).expect("resolve placeholder");
-    let provider =
-        OpenAiCompatibleProvider::new_custom(credential, "llama3.1:8b", "http://127.0.0.1:11434")
-            .expect("custom loopback adapter")
-            .with_account(alias);
+    let provider = OpenAiCompatibleProvider::new_custom_no_auth(
+        credential,
+        "llama3.1:8b",
+        "http://127.0.0.1:11434",
+    )
+    .expect("custom loopback adapter")
+    .with_account(alias);
 
     let get = provider
         .http
         .get_request(&provider.models_url)
         .await
         .expect("models probe request");
-    assert_eq!(
-        get.headers().get(AUTHORIZATION).expect("bearer on GET"),
-        "Bearer ollama"
-    );
+    assert!(!get.headers().contains_key(AUTHORIZATION));
+    assert!(!get.headers().contains_key("api-key"));
 
     let post = provider
         .http
@@ -1187,10 +1173,8 @@ async fn lk1_keyless_placeholder_bearer_reaches_the_wire_header() {
         )
         .await
         .expect("chat POST request");
-    assert_eq!(
-        post.headers().get(AUTHORIZATION).expect("bearer on POST"),
-        "Bearer ollama"
-    );
+    assert!(!post.headers().contains_key(AUTHORIZATION));
+    assert!(!post.headers().contains_key("api-key"));
 }
 
 fn custom_provider_with_resolver(
@@ -1246,6 +1230,21 @@ async fn lk3_custom_lan_hostname_resolution_matrix_pins_both_directions() {
             .await
             .unwrap_or_else(|error| panic!("RFC1918 {lan} must be a valid custom origin: {error}"));
     }
+
+    // `.local` is an explicitly supported trusted-LAN spelling. It is not a
+    // suffix exemption: acceptance still depends on every pinned answer being
+    // loopback or RFC1918.
+    let resolver = Arc::new(StubDnsResolver::new([vec![SocketAddr::from((
+        [192, 168, 50, 9],
+        8080,
+    ))]]));
+    let provider =
+        custom_provider_with_resolver(b"local-secret", "http://router.local:8080", resolver);
+    provider
+        .http
+        .validate_compatible_origin()
+        .await
+        .expect("private-resolution router.local must be a valid custom origin");
 
     // REFUSED: link-local metadata, IPv6 ULA/link-local, and public plain
     // HTTP — the scoped loosening must not widen past RFC1918.
@@ -2211,6 +2210,60 @@ fn cm2d_openai_prompt_cache_key_is_stable_and_domain_sensitive() {
         prompt_cache_cohort_key(&request, &other_header).expect("other header key"),
         "stable-header ABI changes must select a new cache route"
     );
+}
+
+/// HAIDER963 Q5. MUTATION CHECK: keep the generic/custom dialect outside the
+/// v3 cohort overlay, accept a builtin provider name, or drop the account
+/// scope. The presence/absence assertions below fail in each direction.
+#[test]
+fn custom_openai_compatible_uses_v3_prompt_cache_cohort() {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("router-lab");
+    vault
+        .put(&alias, b"CUSTOM_CACHE_SENTINEL_963")
+        .expect("store custom key");
+    let provider = OpenAiCompatibleProvider::new_custom(
+        vault.resolve(&alias).expect("resolve custom key"),
+        "router-model",
+        "http://127.0.0.1:11434/v1",
+    )
+    .expect("custom provider")
+    .with_account(alias);
+    let mut request = probe_request("router-model");
+    request.cache_metadata = Some(cm2_cache_metadata("router-lab", 1));
+    request
+        .cache_metadata
+        .as_mut()
+        .expect("custom metadata")
+        .account_scope = Some("router-lab".into());
+
+    let routed = provider.request_payload(&request).expect("custom payload");
+    assert!(routed.get("prompt_cache_key").is_some());
+
+    request
+        .cache_metadata
+        .as_mut()
+        .expect("custom metadata")
+        .account_scope = None;
+    let unscoped = provider
+        .request_payload(&request)
+        .expect("unscoped payload");
+    assert!(unscoped.get("prompt_cache_key").is_none());
+
+    request
+        .cache_metadata
+        .as_mut()
+        .expect("custom metadata")
+        .account_scope = Some("router-lab".into());
+    request
+        .cache_metadata
+        .as_mut()
+        .expect("custom metadata")
+        .provider = OPENAI_PROVIDER_NAME.into();
+    let builtin = provider
+        .request_payload(&request)
+        .expect("mismatched payload");
+    assert!(builtin.get("prompt_cache_key").is_none());
 }
 
 /// CACHE ITEM 962. Provider adapters place the shared system base in three
@@ -3504,6 +3557,74 @@ fn xai_cached_prompt_details_map_to_normalized_usage() {
     assert_eq!(normalized.cache_read_input, 40);
 }
 
+/// A user-added compatible server runs the generic dialect. Its standard
+/// nested OpenAI cache counter must reach normalized usage unchanged.
+///
+/// MUTATION CHECK: gate nested `cached_tokens` on a built-in dialect. The
+/// exact 60/40 split and Present status then fail for custom providers.
+#[test]
+fn generic_compatible_reads_nested_openai_cache_usage() {
+    let usage = chat_usage(
+        &serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 7,
+            "prompt_tokens_details": {"cached_tokens": 40}
+        }),
+        None,
+        CompatibleDialect::Generic,
+    )
+    .expect("generic compatible usage");
+    let normalized = usage.normalized.expect("normalized generic usage");
+    assert_eq!(normalized.uncached_input, 60);
+    assert_eq!(normalized.cache_read_input, 40);
+    assert_eq!(normalized.cache_status, CacheStatAvailability::Present);
+}
+
+/// DeepSeek-shaped counters are selected by the fields that arrived, even
+/// through an arbitrary compatible router.
+///
+/// MUTATION CHECK: restrict hit/miss parsing to the named DeepSeek adapter;
+/// the generic route changes from 23/71 to 94/0.
+#[test]
+fn generic_compatible_reads_deepseek_hit_and_miss_usage() {
+    let usage = chat_usage(
+        &serde_json::json!({
+            "prompt_tokens": 94,
+            "completion_tokens": 13,
+            "prompt_cache_miss_tokens": 23,
+            "prompt_cache_hit_tokens": 71
+        }),
+        None,
+        CompatibleDialect::Generic,
+    )
+    .expect("generic DeepSeek-shaped usage");
+    let normalized = usage.normalized.expect("normalized generic usage");
+    assert_eq!((usage.input, usage.cached), (23, 71));
+    assert_eq!(normalized.cache_status, CacheStatAvailability::Present);
+}
+
+/// An OpenAI-compatible response without a recognized cache field reports
+/// unavailable telemetry; zero remains reserved for an observed zero.
+///
+/// MUTATION CHECK: default absent `cached_tokens` to zero. The status changes
+/// from Unavailable to Present and fabricates a cache hit rate.
+#[test]
+fn generic_compatible_keeps_absent_cache_telemetry_absent() {
+    let usage = chat_usage(
+        &serde_json::json!({
+            "prompt_tokens": 94,
+            "completion_tokens": 13
+        }),
+        None,
+        CompatibleDialect::Generic,
+    )
+    .expect("generic usage without cache telemetry");
+    let normalized = usage.normalized.expect("normalized generic usage");
+    assert_eq!(normalized.cache_status, CacheStatAvailability::Unavailable);
+    assert_eq!(normalized.cache_telemetry_input, 0);
+    assert_eq!(normalized.cache_read_input, 0);
+}
+
 /// MUTATION CHECK: skip the normal OpenAI cached-token normalization for the
 /// Haider Code dialect. Expected runtime failure: uncached input remains 100
 /// or cache-read input becomes zero instead of the exact 60/40 split, and the
@@ -4097,7 +4218,7 @@ async fn lz1_azure_request_rides_api_key_header_and_deployment_model() {
     vault
         .put(&alias, b"AZURE_API_KEY_SENTINEL_5c1e")
         .expect("store azure key");
-    let resolver: Arc<dyn CompatibleDnsResolver> = Arc::new(StubDnsResolver::new([
+    let resolver: Arc<dyn FixedDnsResolver> = Arc::new(StubDnsResolver::new([
         vec![SocketAddr::from(([192, 0, 2, 1], 443))],
         vec![SocketAddr::from(([192, 0, 2, 1], 443))],
     ]));
@@ -4169,6 +4290,7 @@ fn azure_origin_predicate_and_constructor_agree_both_directions() {
         "https://contoso.openai.azure.com/openai/v1",
         "https://acme-ai.services.ai.azure.com/openai/v1/",
         "https://Contoso.openai.azure.com",
+        "HTTPS://contoso.openai.azure.com/openai/v1",
     ] {
         assert!(azure_openai_origin(accepted), "azure origin `{accepted}`");
     }

@@ -2,16 +2,19 @@
 
 use std::collections::BTreeSet;
 use std::future::Future;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use haider_client::{ClientError, EnsureError, EnsureOptions, ProfileEnv, resolve_profile};
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor};
 use haider_rpc::{
-    Capability, CapabilitySet, ClientKind, CommandId, RequestBody, ResponseBody,
-    SnapshotAvailabilityWire,
+    Capability, CapabilitySet, ClientKind, CommandId, ErrorData, ProviderApiFamilyWire,
+    ProviderAuthRequirementWire, ProviderProbeFailureWire, ProviderSummaryWire, RequestBody,
+    ResponseBody, SecretWire, SnapshotAvailabilityWire, StagePurpose,
 };
 use serde::Serialize;
+use zeroize::Zeroizing;
 
 use super::run::{EX_IOERR, EX_PROTOCOL, EX_SOFTWARE, EX_UNAVAILABLE, EX_USAGE};
 
@@ -21,6 +24,41 @@ const ACCOUNTS_SCHEMA: &str = "haider.accounts.v1";
 pub(crate) enum AccountCommand {
     List { json: bool },
     Remove { alias: String, confirm: bool },
+    Add(CustomAccountOptions),
+    Probe { alias: String, json: bool },
+    Update(CustomAccountOptions),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum SecretInput {
+    // Use the transport's redacted, zeroize-on-drop wrapper immediately
+    // after parsing. The original process argv cannot be made secret, but
+    // the CLI must not retain an additional ordinary `String` copy.
+    Direct(SecretWire),
+    Environment(String),
+    Stdin,
+    NoAuth,
+}
+
+impl std::fmt::Debug for SecretInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Direct(_) => formatter.write_str("Direct([REDACTED])"),
+            Self::Environment(name) => formatter.debug_tuple("Environment").field(name).finish(),
+            Self::Stdin => formatter.write_str("Stdin"),
+            Self::NoAuth => formatter.write_str("NoAuth"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CustomAccountOptions {
+    alias: String,
+    base_url: Option<String>,
+    secret: Option<SecretInput>,
+    api_family: Option<ProviderApiFamilyWire>,
+    response_open_timeout_ms: Option<u64>,
+    json: bool,
 }
 
 #[derive(Serialize)]
@@ -41,6 +79,30 @@ struct AccountView {
     created: Option<u64>,
 }
 
+#[derive(Serialize)]
+struct CustomAccountDocument {
+    schema: &'static str,
+    operation: &'static str,
+    alias: String,
+    base_url: Option<String>,
+    api_family: &'static str,
+    auth_state: &'static str,
+    reachable: bool,
+    latency_ms: u64,
+    model_count: usize,
+    models: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct AccountErrorDocument<'a> {
+    schema: &'static str,
+    code: &'a str,
+    message: String,
+    retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure: Option<&'static str>,
+}
+
 #[derive(Debug)]
 enum AccountError {
     Ensure(EnsureError),
@@ -49,10 +111,12 @@ enum AccountError {
         code: String,
         message: String,
         retryable: bool,
+        data: Option<ErrorData>,
     },
     Protocol(&'static str),
     SnapshotUnavailable(String),
     MissingAlias(String),
+    SecretInput(String),
 }
 
 trait AccountClient {
@@ -80,10 +144,17 @@ impl std::fmt::Display for AccountError {
                 code,
                 message,
                 retryable,
-            } => write!(
-                formatter,
-                "daemon rejected account command ({code}, retryable={retryable}): {message}"
-            ),
+                data,
+            } => {
+                write!(
+                    formatter,
+                    "daemon rejected account command ({code}, retryable={retryable}"
+                )?;
+                if let Some(failure) = provider_probe_failure(data.as_ref()) {
+                    write!(formatter, ", failure={failure}")?;
+                }
+                write!(formatter, "): {message}")
+            }
             Self::Protocol(message) => write!(formatter, "{message}"),
             Self::SnapshotUnavailable(reason) => {
                 write!(formatter, "account inventory is unavailable: {reason}")
@@ -91,6 +162,7 @@ impl std::fmt::Display for AccountError {
             Self::MissingAlias(alias) => {
                 write!(formatter, "account alias `{alias}` does not exist")
             }
+            Self::SecretInput(message) => write!(formatter, "{message}"),
         }
     }
 }
@@ -118,9 +190,154 @@ pub(crate) fn parse_account_command(rest: &[String]) -> Result<AccountCommand, S
                 confirm: true,
             })
         }
-        [] => Err("expected list [--json] or remove <alias> --confirm".into()),
-        _ => Err("expected list [--json] or remove <alias> --confirm".into()),
+        [command, alias, options @ ..]
+            if matches!(command.as_str(), "add" | "update")
+                && !alias.is_empty()
+                && !alias.starts_with('-') =>
+        {
+            let options = parse_custom_options(alias, options, command == "add")?;
+            if command == "add" {
+                Ok(AccountCommand::Add(options))
+            } else {
+                Ok(AccountCommand::Update(options))
+            }
+        }
+        [command, alias] if command == "probe" && !alias.is_empty() && !alias.starts_with('-') => {
+            Ok(AccountCommand::Probe {
+                alias: alias.clone(),
+                json: false,
+            })
+        }
+        [command, alias, flag]
+            if command == "probe"
+                && !alias.is_empty()
+                && !alias.starts_with('-')
+                && flag == "--json" =>
+        {
+            Ok(AccountCommand::Probe {
+                alias: alias.clone(),
+                json: true,
+            })
+        }
+        [] => Err(account_usage()),
+        _ => Err(account_usage()),
     }
+}
+
+fn account_usage() -> String {
+    "expected list [--json], remove <alias> --confirm, add <alias> --base-url <url> [--api-key <key> | --api-key-env <VAR> | --api-key-stdin | --no-auth] [--api-family openai|anthropic] [--response-open-timeout <duration>] [--json], probe <alias> [--json], or update <alias> [mutable options] [--json]".into()
+}
+
+fn parse_custom_options(
+    alias: &str,
+    rest: &[String],
+    create: bool,
+) -> Result<CustomAccountOptions, String> {
+    let mut base_url = None;
+    let mut secret = None;
+    let mut api_family = None;
+    let mut response_open_timeout_ms = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < rest.len() {
+        let flag = rest[index].as_str();
+        let value = |index: &mut usize, name: &str| -> Result<&String, String> {
+            *index += 1;
+            rest.get(*index)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| format!("{name} requires a value"))
+        };
+        match flag {
+            "--base-url" if base_url.is_none() => base_url = Some(value(&mut index, flag)?.clone()),
+            "--api-key" if secret.is_none() => {
+                secret = Some(SecretInput::Direct(SecretWire::new(
+                    value(&mut index, flag)?.clone(),
+                )));
+            }
+            "--api-key-env" if secret.is_none() => {
+                let name = value(&mut index, flag)?;
+                if name.contains('=') || name.chars().any(char::is_control) {
+                    return Err("--api-key-env requires an environment variable name".into());
+                }
+                secret = Some(SecretInput::Environment(name.clone()));
+            }
+            "--api-key-stdin" if secret.is_none() => secret = Some(SecretInput::Stdin),
+            "--no-auth" if secret.is_none() => secret = Some(SecretInput::NoAuth),
+            "--api-family" if api_family.is_none() => {
+                api_family = Some(match value(&mut index, flag)?.as_str() {
+                    "openai" => ProviderApiFamilyWire::OpenAiChatCompletions,
+                    "anthropic" => ProviderApiFamilyWire::AnthropicMessages,
+                    _ => return Err("--api-family requires openai or anthropic".into()),
+                });
+            }
+            "--response-open-timeout" if response_open_timeout_ms.is_none() => {
+                response_open_timeout_ms = Some(parse_duration_ms(value(&mut index, flag)?)?);
+            }
+            "--json" if !json => json = true,
+            _ if matches!(
+                flag,
+                "--api-key" | "--api-key-env" | "--api-key-stdin" | "--no-auth"
+            ) =>
+            {
+                return Err("choose exactly one API-key source or --no-auth".into());
+            }
+            _ => return Err(format!("unknown or repeated account option `{flag}`")),
+        }
+        index += 1;
+    }
+    if create && base_url.is_none() {
+        return Err("account add requires --base-url".into());
+    }
+    if create && secret.is_none() {
+        return Err("account add requires an API-key source or --no-auth".into());
+    }
+    if !create && base_url.is_none() && secret.is_none() && response_open_timeout_ms.is_none() {
+        return Err(
+            "account update requires --base-url, a key option, or --response-open-timeout".into(),
+        );
+    }
+    if !create && matches!(secret, Some(SecretInput::NoAuth)) {
+        return Err("account update does not change authentication mode; remove and re-add the provider to use --no-auth".into());
+    }
+    if !create && api_family.is_some() {
+        return Err(
+            "account update does not change --api-family; remove and re-add the provider".into(),
+        );
+    }
+    Ok(CustomAccountOptions {
+        alias: alias.to_owned(),
+        base_url,
+        secret,
+        api_family: api_family.or(create.then_some(ProviderApiFamilyWire::OpenAiChatCompletions)),
+        response_open_timeout_ms,
+        json,
+    })
+}
+
+fn parse_duration_ms(value: &str) -> Result<u64, String> {
+    let (digits, multiplier) = if let Some(value) = value.strip_suffix("ms") {
+        (value, 1_u64)
+    } else if let Some(value) = value.strip_suffix('s') {
+        (value, 1_000)
+    } else if let Some(value) = value.strip_suffix('m') {
+        (value, 60_000)
+    } else if let Some(value) = value.strip_suffix('h') {
+        (value, 3_600_000)
+    } else {
+        return Err(
+            "--response-open-timeout requires an integer followed by ms, s, m, or h".into(),
+        );
+    };
+    let amount = digits
+        .parse::<u64>()
+        .map_err(|_| "--response-open-timeout requires a positive integer duration".to_owned())?;
+    let millis = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| "--response-open-timeout is too large".to_owned())?;
+    if millis == 0 {
+        return Err("--response-open-timeout must be greater than zero".into());
+    }
+    Ok(millis)
 }
 
 pub(crate) async fn account_command(rest: &[String]) -> ExitCode {
@@ -141,6 +358,13 @@ pub(crate) async fn account_command(rest: &[String]) -> ExitCode {
         eprintln!("haider account: would remove account `{alias}`; pass --confirm to proceed");
         return ExitCode::from(EX_USAGE);
     }
+    let json_errors = matches!(
+        &command,
+        AccountCommand::List { json: true }
+            | AccountCommand::Add(CustomAccountOptions { json: true, .. })
+            | AccountCommand::Probe { json: true, .. }
+            | AccountCommand::Update(CustomAccountOptions { json: true, .. })
+    );
 
     let profile = match resolve_profile(&ProfileEnv::capture()) {
         Ok(profile) => profile,
@@ -151,12 +375,35 @@ pub(crate) async fn account_command(rest: &[String]) -> ExitCode {
     };
     let capabilities = match &command {
         AccountCommand::List { .. } => CapabilitySet::from([Capability::View]),
-        AccountCommand::Remove { .. } => {
-            CapabilitySet::from([Capability::View, Capability::Control])
-        }
+        AccountCommand::Remove { .. }
+        | AccountCommand::Add(_)
+        | AccountCommand::Probe { .. }
+        | AccountCommand::Update(_) => CapabilitySet::from([Capability::View, Capability::Control]),
     };
+    let mut required_features =
+        BTreeSet::from([haider_rpc::FEATURE_ACCOUNT_MANAGEMENT_V1.to_owned()]);
+    if matches!(&command, AccountCommand::Add(_) | AccountCommand::Update(_)) {
+        required_features.insert(haider_rpc::FEATURE_PROVIDER_CONFIGURE_V1.to_owned());
+        required_features.insert(haider_rpc::FEATURE_PROVIDER_MODELS_V1.to_owned());
+    }
+    if matches!(&command, AccountCommand::Probe { .. }) {
+        required_features.insert(haider_rpc::FEATURE_PROVIDER_MODELS_V1.to_owned());
+    }
+    if matches!(
+        &command,
+        AccountCommand::Add(CustomAccountOptions {
+            secret: Some(secret),
+            ..
+        }) | AccountCommand::Update(CustomAccountOptions {
+            secret: Some(secret),
+            ..
+        }) if !matches!(secret, SecretInput::NoAuth)
+    ) {
+        required_features.insert(haider_rpc::FEATURE_VAULT_STAGE_V1.to_owned());
+        required_features.insert(haider_rpc::FEATURE_ACCOUNT_LOGIN_API_V1.to_owned());
+    }
     let ensure = EnsureOptions {
-        required_features: BTreeSet::from([haider_rpc::FEATURE_ACCOUNT_MANAGEMENT_V1.to_owned()]),
+        required_features,
         client: haider_client::ClientConfig {
             client_name: "haider-account".into(),
             client_kind: ClientKind::Headless,
@@ -167,13 +414,13 @@ pub(crate) async fn account_command(rest: &[String]) -> ExitCode {
     };
     let ensured = match haider_client::ensure_daemon(&profile, ensure).await {
         Ok(ensured) => ensured,
-        Err(error) => return failure(&AccountError::Ensure(error)),
+        Err(error) => return failure(&AccountError::Ensure(error), json_errors),
     };
     let result = execute(&ensured.client, command).await;
     ensured.client.close();
     match result {
         Ok(output) => output,
-        Err(error) => failure(&error),
+        Err(error) => failure(&error, json_errors),
     }
 }
 
@@ -212,7 +459,7 @@ async fn execute(
             }
             match client
                 .request(RequestBody::AccountRemove {
-                    command_id: CommandId::new(command_id()),
+                    command_id: CommandId::new(command_id("account-remove")),
                     alias: alias.clone(),
                     expected_revision: Some(revision),
                 })
@@ -232,11 +479,12 @@ async fn execute(
                     code,
                     message,
                     retryable,
-                    ..
+                    data,
                 } => Err(AccountError::Rpc {
                     code,
                     message,
                     retryable,
+                    data,
                 }),
                 _ => Err(AccountError::Protocol(
                     "account.remove response method mismatch",
@@ -246,6 +494,337 @@ async fn execute(
         AccountCommand::Remove { confirm: false, .. } => {
             unreachable!("unconfirmed removal is gated before daemon startup")
         }
+        AccountCommand::Add(options) => execute_custom(client, options, true).await,
+        AccountCommand::Update(options) => execute_custom(client, options, false).await,
+        AccountCommand::Probe { alias, json } => execute_probe(client, alias, json).await,
+    }
+}
+
+async fn execute_custom(
+    client: &impl AccountClient,
+    options: CustomAccountOptions,
+    create: bool,
+) -> Result<ExitCode, AccountError> {
+    let (providers, revision) = provider_snapshot(client).await?;
+    let existing = providers
+        .iter()
+        .find(|provider| provider.provider == options.alias)
+        .cloned();
+    if create && existing.is_some() {
+        return Err(AccountError::Protocol(
+            "account add alias already names a provider; use account update",
+        ));
+    }
+    if !create && existing.is_none() {
+        return Err(AccountError::MissingAlias(options.alias));
+    }
+    let existing = existing.as_ref();
+    let api_family = options
+        .api_family
+        .or_else(|| existing.map(|provider| provider.api_family))
+        .ok_or(AccountError::Protocol("provider has no API family"))?;
+    let auth_requirement = if create {
+        Some(
+            if matches!(options.secret.as_ref(), Some(SecretInput::NoAuth)) {
+                ProviderAuthRequirementWire::None
+            } else {
+                ProviderAuthRequirementWire::ApiKey
+            },
+        )
+    } else {
+        None
+    };
+    let secret = match options.secret.as_ref() {
+        Some(SecretInput::NoAuth) | None => None,
+        Some(input) => Some(resolve_secret(input)?),
+    };
+    let vault_reference = if let Some(secret) = secret {
+        Some(stage_secret(client, secret).await?)
+    } else {
+        None
+    };
+    let began = Instant::now();
+    let response = client
+        .request(RequestBody::ProviderConfigure {
+            command_id: CommandId::new(command_id("provider-configure")),
+            provider: options.alias.clone(),
+            api_family: create.then_some(api_family),
+            origin: options.base_url.clone(),
+            auth_requirement,
+            enabled: existing.is_none_or(|provider| provider.enabled),
+            // Empty means "discover now" at this door. Every add/update
+            // success therefore proves current reachability and returns the
+            // live inventory instead of relabelling stale cached rows.
+            models: Vec::new(),
+            default_model: existing.and_then(|provider| provider.default_model.clone()),
+            response_open_timeout_ms: options.response_open_timeout_ms,
+            probe_vault_reference: vault_reference.clone(),
+            expected_revision: revision,
+        })
+        .await
+        .map_err(AccountError::Client)?;
+    let configured = match response {
+        ResponseBody::ProviderConfigure { provider, .. } => provider,
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            data,
+        } => {
+            return Err(AccountError::Rpc {
+                code,
+                message,
+                retryable,
+                data,
+            });
+        }
+        _ => {
+            return Err(AccountError::Protocol(
+                "provider.configure response method mismatch",
+            ));
+        }
+    };
+    if let Some(vault_reference) = vault_reference {
+        match client
+            .request(RequestBody::AccountLoginApi {
+                command_id: CommandId::new(command_id("account-login-api")),
+                provider: options.alias.clone(),
+                alias: Some(options.alias.clone()),
+                vault_reference,
+                validation_model: configured.default_model.clone(),
+                replace_existing: !create,
+            })
+            .await
+            .map_err(AccountError::Client)?
+        {
+            ResponseBody::AccountLoginApi { .. } => {}
+            ResponseBody::Error {
+                code,
+                message,
+                retryable,
+                data,
+            } => {
+                return Err(AccountError::Rpc {
+                    code,
+                    message,
+                    retryable,
+                    data,
+                });
+            }
+            _ => {
+                return Err(AccountError::Protocol(
+                    "account.login_api response method mismatch",
+                ));
+            }
+        }
+    }
+    let document = custom_document(
+        if create { "add" } else { "update" },
+        &options.alias,
+        configured,
+        began.elapsed(),
+    );
+    Ok(write_custom(&document, options.json))
+}
+
+async fn execute_probe(
+    client: &impl AccountClient,
+    alias: String,
+    json: bool,
+) -> Result<ExitCode, AccountError> {
+    let began = Instant::now();
+    let provider = match client
+        .request(RequestBody::ProviderModelsRefresh {
+            provider: alias.clone(),
+        })
+        .await
+        .map_err(AccountError::Client)?
+    {
+        ResponseBody::ProviderModelsRefresh { provider, .. } => provider,
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            data,
+        } => {
+            return Err(AccountError::Rpc {
+                code,
+                message,
+                retryable,
+                data,
+            });
+        }
+        _ => {
+            return Err(AccountError::Protocol(
+                "provider.models_refresh response method mismatch",
+            ));
+        }
+    };
+    let document = custom_document("probe", &alias, provider, began.elapsed());
+    Ok(write_custom(&document, json))
+}
+
+fn custom_document(
+    operation: &'static str,
+    alias: &str,
+    provider: ProviderSummaryWire,
+    latency: Duration,
+) -> CustomAccountDocument {
+    let api_family = match provider.api_family {
+        ProviderApiFamilyWire::AnthropicMessages => "anthropic",
+        ProviderApiFamilyWire::OpenAiChatCompletions => "openai",
+        _ => "unknown",
+    };
+    let auth_state = if provider.auth_methods.is_empty() {
+        "no_auth"
+    } else {
+        "authenticated"
+    };
+    let models = provider
+        .models
+        .iter()
+        .map(|model| format!("{alias}/{model}"))
+        .collect::<Vec<_>>();
+    CustomAccountDocument {
+        schema: "haider.account.custom.v1",
+        operation,
+        alias: alias.to_owned(),
+        base_url: provider.endpoint,
+        api_family,
+        auth_state,
+        reachable: true,
+        latency_ms: u64::try_from(latency.as_millis()).unwrap_or(u64::MAX),
+        model_count: models.len(),
+        models,
+    }
+}
+
+fn write_custom(document: &CustomAccountDocument, json: bool) -> ExitCode {
+    if json {
+        write_json(document)
+    } else {
+        println!(
+            "{}: reachable={} latency_ms={} auth={} models={}",
+            document.alias,
+            document.reachable,
+            document.latency_ms,
+            document.auth_state,
+            document.model_count
+        );
+        for model in &document.models {
+            println!("{model}");
+        }
+        ExitCode::SUCCESS
+    }
+}
+
+async fn stage_secret(
+    client: &impl AccountClient,
+    secret: SecretWire,
+) -> Result<String, AccountError> {
+    match client
+        .request(RequestBody::VaultStage {
+            stage_id: command_id("account-key-stage"),
+            purpose: StagePurpose::ApiKey,
+            secret,
+        })
+        .await
+        .map_err(AccountError::Client)?
+    {
+        ResponseBody::VaultStage {
+            vault_reference, ..
+        } => Ok(vault_reference),
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            data,
+        } => Err(AccountError::Rpc {
+            code,
+            message,
+            retryable,
+            data,
+        }),
+        _ => Err(AccountError::Protocol(
+            "vault.stage response method mismatch",
+        )),
+    }
+}
+
+fn resolve_secret(input: &SecretInput) -> Result<SecretWire, AccountError> {
+    const MAX_SECRET_BYTES: u64 = 4_096;
+    if let SecretInput::Direct(value) = input {
+        if value.is_empty() || value.expose_secret().chars().any(char::is_control) {
+            return Err(AccountError::SecretInput(
+                "API key is empty or invalid".into(),
+            ));
+        }
+        return Ok(value.clone());
+    }
+    let mut value = match input {
+        SecretInput::Environment(name) => Zeroizing::new(std::env::var(name).map_err(|_| {
+            AccountError::SecretInput(format!("environment variable `{name}` is not set"))
+        })?),
+        SecretInput::Stdin => {
+            let mut value = Zeroizing::new(String::new());
+            io::stdin()
+                .take(MAX_SECRET_BYTES + 1)
+                .read_to_string(&mut value)
+                .map_err(|error| {
+                    AccountError::SecretInput(format!("could not read API key from stdin: {error}"))
+                })?;
+            if u64::try_from(value.len()).unwrap_or(u64::MAX) > MAX_SECRET_BYTES {
+                return Err(AccountError::SecretInput(
+                    "API key from stdin is too large".into(),
+                ));
+            }
+            while matches!(value.as_bytes().last(), Some(b'\r' | b'\n')) {
+                value.pop();
+            }
+            value
+        }
+        SecretInput::NoAuth => {
+            return Err(AccountError::Protocol(
+                "internal no-auth input reached secret staging",
+            ));
+        }
+        SecretInput::Direct(_) => unreachable!("direct secret returned before string resolution"),
+    };
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err(AccountError::SecretInput(
+            "API key is empty or invalid".into(),
+        ));
+    }
+    Ok(SecretWire::new(std::mem::take(&mut *value)))
+}
+
+async fn provider_snapshot(
+    client: &impl AccountClient,
+) -> Result<(Vec<ProviderSummaryWire>, u64), AccountError> {
+    match client
+        .request(RequestBody::ProviderList { provider: None })
+        .await
+        .map_err(AccountError::Client)?
+    {
+        ResponseBody::ProviderList {
+            providers,
+            revision,
+            ..
+        } => Ok((providers, revision)),
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            data,
+        } => Err(AccountError::Rpc {
+            code,
+            message,
+            retryable,
+            data,
+        }),
+        _ => Err(AccountError::Protocol(
+            "provider.list response method mismatch",
+        )),
     }
 }
 
@@ -275,11 +854,12 @@ async fn account_snapshot(
             code,
             message,
             retryable,
-            ..
+            data,
         } => Err(AccountError::Rpc {
             code,
             message,
             retryable,
+            data,
         }),
         _ => Err(AccountError::Protocol(
             "account.list response method mismatch",
@@ -299,7 +879,7 @@ fn account_view(descriptor: CredentialDescriptor) -> AccountView {
     }
 }
 
-fn write_json(document: &AccountsDocument) -> ExitCode {
+fn write_json(document: &impl Serialize) -> ExitCode {
     let stdout = io::stdout();
     let mut output = stdout.lock();
     if let Err(error) = serde_json::to_writer(&mut output, document)
@@ -340,9 +920,9 @@ fn write_human(document: &AccountsDocument) -> ExitCode {
     }
 }
 
-fn command_id() -> String {
+fn command_id(operation: &str) -> String {
     format!(
-        "account-remove-{}-{}",
+        "{operation}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -350,8 +930,51 @@ fn command_id() -> String {
     )
 }
 
-fn failure(error: &AccountError) -> ExitCode {
-    eprintln!("haider account: {error}");
+fn provider_probe_failure(data: Option<&ErrorData>) -> Option<&'static str> {
+    let Some(ErrorData::ProviderProbeFailed { failure, .. }) = data else {
+        return None;
+    };
+    Some(match failure {
+        ProviderProbeFailureWire::Unreachable => "unreachable",
+        ProviderProbeFailureWire::Unauthorized => "unauthorized",
+        ProviderProbeFailureWire::NonOpenAiCompatibleBody => "non_open_ai_compatible_body",
+        ProviderProbeFailureWire::EmptyList => "empty_list",
+        ProviderProbeFailureWire::Unavailable => "unavailable",
+        ProviderProbeFailureWire::Unknown => "unknown",
+        _ => "unknown",
+    })
+}
+
+fn failure(error: &AccountError, json: bool) -> ExitCode {
+    if json {
+        let (code, retryable, failure) = match error {
+            AccountError::Rpc {
+                code,
+                retryable,
+                data,
+                ..
+            } => (
+                code.as_str(),
+                *retryable,
+                provider_probe_failure(data.as_ref()),
+            ),
+            AccountError::Ensure(_) => ("daemon_unavailable", true, None),
+            AccountError::Client(_) => ("client_error", true, None),
+            AccountError::Protocol(_) => ("protocol_error", false, None),
+            AccountError::SnapshotUnavailable(_) => ("snapshot_unavailable", true, None),
+            AccountError::MissingAlias(_) => ("not_found", false, None),
+            AccountError::SecretInput(_) => ("invalid_secret_input", false, None),
+        };
+        let _ = write_json(&AccountErrorDocument {
+            schema: "haider.account.error.v1",
+            code,
+            message: error.to_string(),
+            retryable,
+            failure,
+        });
+    } else {
+        eprintln!("haider account: {error}");
+    }
     let code = match error {
         AccountError::Ensure(
             EnsureError::ProtocolMismatch(_)
@@ -363,137 +986,16 @@ fn failure(error: &AccountError) -> ExitCode {
         AccountError::Client(ClientError::Disconnected(_)) => EX_IOERR,
         AccountError::Client(ClientError::Encode(_))
         | AccountError::Rpc { .. }
-        | AccountError::MissingAlias(_) => EX_SOFTWARE,
+        | AccountError::MissingAlias(_)
+        | AccountError::SecretInput(_) => EX_SOFTWARE,
     };
     ExitCode::from(code)
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)] // fake-client assertions may panic on a broken fixture
-mod tests {
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
+#[path = "account_tests.rs"]
+mod tests;
 
-    use haider_protocol::credential::CredentialStatus;
-    use haider_protocol::ids::CredentialAlias;
-
-    use super::*;
-
-    struct FakeAccountClient {
-        requests: Mutex<Vec<RequestBody>>,
-        responses: Mutex<VecDeque<ResponseBody>>,
-    }
-
-    impl FakeAccountClient {
-        fn new(responses: impl IntoIterator<Item = ResponseBody>) -> Self {
-            Self {
-                requests: Mutex::new(Vec::new()),
-                responses: Mutex::new(responses.into_iter().collect()),
-            }
-        }
-
-        fn requests(&self) -> Vec<RequestBody> {
-            self.requests.lock().expect("request lock").clone()
-        }
-    }
-
-    impl AccountClient for FakeAccountClient {
-        fn request(
-            &self,
-            request: RequestBody,
-        ) -> impl Future<Output = Result<ResponseBody, ClientError>> + Send {
-            self.requests.lock().expect("request lock").push(request);
-            let response = self
-                .responses
-                .lock()
-                .expect("response lock")
-                .pop_front()
-                .expect("fake response");
-            std::future::ready(Ok(response))
-        }
-    }
-
-    fn descriptor(alias: &str) -> CredentialDescriptor {
-        CredentialDescriptor {
-            alias: CredentialAlias::new(alias),
-            provider: "anthropic".into(),
-            base_url: None,
-            auth_method: AuthMethod::ApiKey,
-            identity: "fixture".into(),
-            status: CredentialStatus::Ok,
-            active: true,
-            label: None,
-        }
-    }
-
-    fn list_response(alias: &str, revision: Option<u64>) -> ResponseBody {
-        ResponseBody::AccountList {
-            descriptors: vec![descriptor(alias)],
-            revision,
-            provider_active: Vec::new(),
-            provider_defaults: Vec::new(),
-            availability: Some(SnapshotAvailabilityWire::Available),
-        }
-    }
-
-    /// MUTATION CHECK: remove the account.list preflight or stop propagating
-    /// its revision. Expected RUNTIME failure: request count/order or the
-    /// exact `expected_revision` assertion changes.
-    #[tokio::test]
-    async fn confirmed_remove_is_list_first_and_revision_fenced() {
-        let client = FakeAccountClient::new([
-            list_response("probe", Some(41)),
-            ResponseBody::AccountRemove {
-                removed_alias: CredentialAlias::new("probe"),
-                replacement_active_alias: None,
-                revision: 42,
-            },
-        ]);
-        let result = execute(
-            &client,
-            AccountCommand::Remove {
-                alias: "probe".into(),
-                confirm: true,
-            },
-        )
-        .await;
-        assert!(matches!(result, Ok(code) if code == ExitCode::SUCCESS));
-        let requests = client.requests();
-        assert_eq!(requests.len(), 2);
-        assert!(matches!(
-            &requests[0],
-            RequestBody::AccountList { provider: None }
-        ));
-        assert!(matches!(
-            &requests[1],
-            RequestBody::AccountRemove {
-                alias,
-                expected_revision: Some(41),
-                ..
-            } if alias == "probe"
-        ));
-    }
-
-    #[tokio::test]
-    async fn confirmed_remove_refuses_to_mutate_without_a_snapshot_revision() {
-        let client = FakeAccountClient::new([list_response("probe", None)]);
-        let result = execute(
-            &client,
-            AccountCommand::Remove {
-                alias: "probe".into(),
-                confirm: true,
-            },
-        )
-        .await;
-        assert!(matches!(
-            result,
-            Err(AccountError::Protocol(
-                "account.list omitted the revision required for removal"
-            ))
-        ));
-        assert!(matches!(
-            client.requests().as_slice(),
-            [RequestBody::AccountList { provider: None }]
-        ));
-    }
-}
+#[cfg(test)]
+#[path = "account_custom_tests.rs"]
+mod account_custom_tests;

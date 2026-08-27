@@ -53,6 +53,7 @@ fn provider_summary_model_details_round_trip_names_and_windows() {
                 supports_thinking_type: None,
             },
         ],
+        inventory_fetched_at_ms: None,
         auth_methods: vec![AuthMethod::ApiKey],
         availability: ProviderAvailabilityWire::Available,
         availability_reason: None,
@@ -103,4 +104,30 @@ fn provider_summary_response_open_timeout_preserves_typed_absence() {
             .response_open_timeout_ms,
         Some(75_000)
     );
+}
+
+/// MUTATION CHECK: dropping or renaming the additive fetch timestamp loses
+/// the cache-age authority; older bytes must still decode it as unknown.
+#[test]
+fn provider_summary_inventory_fetch_time_is_additive_and_pinned() {
+    let mut summary: ProviderSummaryWire = serde_json::from_value(serde_json::json!({
+        "provider": "custom-router",
+        "api_family": "openai_chat_completions",
+        "endpoint": "https://router.example/v1",
+        "models": ["model-a"],
+        "auth_methods": ["api_key"],
+        "availability": "available",
+        "enabled": true
+    }))
+    .expect("legacy provider summary");
+    assert_eq!(summary.inventory_fetched_at_ms, None);
+    summary.inventory_fetched_at_ms = Some(1_753_500_000_000);
+    let encoded = serde_json::to_value(&summary).expect("encode fetch timestamp");
+    assert_eq!(
+        encoded["inventory_fetched_at_ms"],
+        serde_json::json!(1_753_500_000_000_u64)
+    );
+    summary.inventory_fetched_at_ms = None;
+    let encoded = serde_json::to_value(&summary).expect("encode absent fetch timestamp");
+    assert!(encoded.get("inventory_fetched_at_ms").is_none());
 }
