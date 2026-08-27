@@ -3781,12 +3781,16 @@ fn responses_request_json(
     effort: Option<&str>,
     hosted_web_search: bool,
 ) -> Result<serde_json::Value, ProviderError> {
+    let cacheable_history_end = request.cache_metadata.as_ref().map_or(
+        request.messages.len(),
+        crate::PromptCacheMetadata::cacheable_history_end,
+    );
     responses_request_json_with_boundary(
         request,
         codex_responses_lite,
         effort,
         hosted_web_search,
-        request.messages.len(),
+        cacheable_history_end,
     )
     .map(|(payload, _, _)| payload)
 }

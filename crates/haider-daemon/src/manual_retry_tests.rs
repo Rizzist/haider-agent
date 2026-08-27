@@ -20,7 +20,7 @@ use haider_protocol::{
     EventPayload,
     provider::{Block, FinishReason},
 };
-use haider_provider::{FakeProvider, FakeStep, Message, ProviderErrorKind};
+use haider_provider::{FakeProvider, FakeStep, Message, MessageRole, ProviderErrorKind};
 use haider_rpc::{
     AttachMode, Capability, CommandId, RequestBody, RequestId, ResponseBody, SubmitDisposition,
     WireFrame,
@@ -75,18 +75,28 @@ struct RetryWorld {
 
 fn assert_retry_provider_messages(messages: &[Message]) {
     assert_eq!(
-        messages.first(),
-        Some(&Message::user_text("retry this exact user turn")),
-        "the fresh run compiles the failed run's committed user ancestry"
-    );
-    assert_eq!(
         messages.len(),
         2,
-        "the immutable user ancestry is followed only by daemon session context"
+        "daemon session context and the immutable user ancestry are the complete prompt"
     );
-    assert!(messages[1].blocks.iter().any(|block| {
-        matches!(block, Block::Text { text } if text.starts_with("[DAEMON-BOUND SESSION CONTEXT]"))
-    }));
+    let session_context = messages
+        .iter()
+        .position(|message| {
+            message.role == MessageRole::User
+                && matches!(message.blocks.as_slice(), [Block::Text { text }] if text.starts_with("[DAEMON-BOUND SESSION CONTEXT]"))
+        })
+        .expect("daemon session context is provider-visible");
+    let user_turn = messages
+        .iter()
+        .position(|message| {
+            message.role == MessageRole::User
+                && matches!(message.blocks.as_slice(), [Block::Text { text }] if text == "retry this exact user turn")
+        })
+        .expect("the fresh run compiles the failed run's committed user ancestry");
+    assert!(
+        session_context < user_turn,
+        "the frozen daemon context precedes the accepted user turn"
+    );
 }
 
 impl RetryWorld {

@@ -1729,6 +1729,7 @@ mod oauth_cache_tests {
                 account_scope: Some("account-a".into()),
                 expected_later_reads: 2,
                 reuse_gap_ms: Some(30_000),
+                stable_prefix_tokens: 4_096,
                 ..PromptCacheMetadata::default()
             }),
         }

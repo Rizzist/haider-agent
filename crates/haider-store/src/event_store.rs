@@ -20014,7 +20014,7 @@ mod run_head_projection_tests {
         transaction.commit().expect("commit retry-only head");
         assert!(!has_nonterminal_run(&connection, &session_id).expect("query retry-only head"));
 
-        let mut stateful = [state(0, "run-user-only", None, RunState::Queued)];
+        let mut stateful = [state(2, "run-user-only", None, RunState::Queued)];
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .expect("begin stateful append");

@@ -3695,6 +3695,13 @@ async fn warm_compaction_epoch_invalidation_is_timeline_scoped() {
     let mut main_suffix = vec![
         envelope(
             &session_id,
+            &main_warm,
+            "warm-main-current-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        envelope(
+            &session_id,
             &main_next,
             "warm-main-next-message",
             EventPayload::UserMessage {

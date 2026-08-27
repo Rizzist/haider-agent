@@ -27,7 +27,7 @@ use haider_protocol::provider::{Block, FinishReason};
 use haider_protocol::session::SessionMetadataV1;
 use haider_protocol::state::RunState;
 use haider_protocol::tool::{DispatchMode, ToolPermissionDefault};
-use haider_provider::{FakeProvider, FakeStep, Provider, TurnRequest};
+use haider_provider::{FakeProvider, FakeStep, MessageRole, Provider, TurnRequest};
 use std::sync::Arc;
 use tokio::time::{Duration, timeout};
 
@@ -422,21 +422,50 @@ async fn graph_evidence_tool_dispatches_to_daemon_gate_authority() {
     assert_eq!(status.attempt, 1);
     let requests = provider.requests();
     assert_eq!(requests.len(), 3);
-    assert!(requests[0].messages.last().is_some_and(|message| {
-        matches!(message.blocks.as_slice(), [Block::Text { text }] if text.starts_with("GraphBrief: BUILD attempt 1/8;"))
-    }));
-    assert!(requests[1].messages.last().is_some_and(|message| {
-        matches!(message.blocks.as_slice(), [Block::Text { text }] if text.starts_with("GraphBrief: VERIFY attempt 1/8;"))
-    }));
-    assert!(
-        requests[1]
+    for (round, request) in requests.iter().enumerate() {
+        let user_turn = request
             .messages
             .iter()
-            .filter(|message| matches!(message.blocks.as_slice(), [Block::Text { text }] if text.starts_with("GraphBrief:")))
-            .count()
-            == 1,
-        "same-turn continuation replaces the volatile graph tail"
-    );
+            .position(|message| {
+                message.role == MessageRole::User
+                    && matches!(message.blocks.as_slice(), [Block::Text { text }] if text == "build and record evidence")
+            })
+            .expect("accepted user turn is provider-visible");
+        let graph_briefs = request
+            .messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| {
+                if message.role != MessageRole::User {
+                    return None;
+                }
+                match message.blocks.as_slice() {
+                    [Block::Text { text }] if text.starts_with("GraphBrief:") => {
+                        Some((index, text.as_str()))
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            graph_briefs.len(),
+            1,
+            "request round {} contains exactly one frozen graph snapshot",
+            round + 1
+        );
+        assert!(
+            graph_briefs[0]
+                .1
+                .starts_with("GraphBrief: BUILD attempt 1/8;"),
+            "request round {} retains the turn-opening BUILD snapshot",
+            round + 1
+        );
+        assert!(
+            graph_briefs[0].0 < user_turn,
+            "request round {} places the frozen graph snapshot before the accepted user",
+            round + 1
+        );
+    }
     let payloads = world.typed_payloads().await;
     assert!(payloads.iter().any(|(payload, _)| {
         matches!(

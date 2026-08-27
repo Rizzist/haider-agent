@@ -2315,14 +2315,16 @@ fn openai_prompt_cache_key_is_omitted_without_account_scope() {
     }
 }
 
-/// GPT-5.6 gets explicit breakpoints plus the stable cache key. The volatile
-/// current-user suffix is deliberately beyond the final marker.
+/// GPT-5.6 gets explicit breakpoints plus the stable cache key. C1's frozen
+/// snapshot is part of the immutable prefix, while the current user remains
+/// deliberately beyond the final marker.
 #[test]
 fn cm2d_gpt56_uses_explicit_breakpoints_before_the_volatile_suffix() {
     let mut request = TurnRequest {
         messages: vec![
             Message::user_text("summary"),
             Message::user_text("stable history"),
+            Message::user_text("frozen daemon context"),
             Message::user_text("volatile current turn"),
         ],
         model: "gpt-5.6".into(),
@@ -2330,13 +2332,13 @@ fn cm2d_gpt56_uses_explicit_breakpoints_before_the_volatile_suffix() {
         system_prompt: Some("stable system".into()),
         tools: Vec::new(),
         attachments: Vec::new(),
-        cache_metadata: Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 2)),
+        cache_metadata: Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 3)),
     };
     request
         .cache_metadata
         .as_mut()
         .expect("metadata")
-        .current_user_start = 2;
+        .current_user_start = 3;
     let payload = responses_request_json(&request, false, None, false).expect("GPT-5.6 wire");
     assert!(payload.get("prompt_cache_key").is_some());
     assert_eq!(
@@ -2348,11 +2350,17 @@ fn cm2d_gpt56_uses_explicit_breakpoints_before_the_volatile_suffix() {
         serde_json::json!({"mode": "explicit"})
     );
     assert_eq!(
-        payload["input"][1]["content"][0]["prompt_cache_breakpoint"],
+        payload["input"][2]["content"][0]["prompt_cache_breakpoint"],
         serde_json::json!({"mode": "explicit"})
     );
     assert!(
-        payload["input"][2]["content"][0]
+        payload["input"][1]["content"][0]
+            .get("prompt_cache_breakpoint")
+            .is_none(),
+        "the middle stable block does not consume the second marker: {payload}"
+    );
+    assert!(
+        payload["input"][3]["content"][0]
             .get("prompt_cache_breakpoint")
             .is_none(),
         "volatile suffix must not be explicitly written: {payload}"
