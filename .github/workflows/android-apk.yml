@@ -2,10 +2,7 @@ name: android-apk
 
 on:
   push:
-    branches: [main]
-    paths:
-      - 'android/**'
-      - '.github/workflows/android-apk.yml'
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
@@ -32,13 +29,109 @@ jobs:
         with:
           gradle-version: '8.11.1'
 
-      - name: assemble debug APK
-        working-directory: android
-        run: gradle :app:assembleDebug --no-daemon --stacktrace
+      - name: resolve release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$({
+            awk '
+              /^\[workspace\.package\]$/ { in_workspace_package = 1; next }
+              /^\[/ { in_workspace_package = 0 }
+              in_workspace_package && /^version[[:space:]]*=/ {
+                value = $0
+                sub(/^[^=]*=[[:space:]]*"/, "", value)
+                sub(/".*/, "", value)
+                print value
+                exit
+              }
+            ' Cargo.toml
+          })"
+          test -n "$VERSION"
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            test "${GITHUB_REF_NAME#v}" = "$VERSION" || {
+              echo "tag $GITHUB_REF_NAME does not match workspace version $VERSION" >&2
+              exit 1
+            }
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: upload APK
+      - name: test and assemble release APK
+        id: assemble
+        working-directory: android
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYSTORE="$RUNNER_TEMP/haider-release.jks"
+          cleanup() { rm -f "$KEYSTORE"; }
+          trap cleanup EXIT INT TERM
+
+          SIGNING_READY=false
+          if [ -n "${ANDROID_KEYSTORE_B64:-}" ] && \
+             [ -n "${ANDROID_KEYSTORE_PASSWORD:-}" ] && \
+             [ -n "${ANDROID_KEY_ALIAS:-}" ] && \
+             [ -n "${ANDROID_KEY_PASSWORD:-}" ]; then
+            umask 077
+            printf '%s' "$ANDROID_KEYSTORE_B64" | base64 --decode > "$KEYSTORE"
+            SIGNING_READY=true
+          else
+            echo "::notice::signing skipped: secrets absent"
+          fi
+          unset ANDROID_KEYSTORE_B64
+
+          export ANDROID_KEYSTORE_PATH="$KEYSTORE"
+          gradle -p buildSrc test --no-daemon --stacktrace
+          gradle :app:testReleaseUnitTest :app:assembleRelease \
+            -PhaiderVersion="${{ steps.version.outputs.version }}" \
+            --no-daemon --stacktrace
+
+          if [ "$SIGNING_READY" = true ]; then
+            mapfile -t APKS < <(find app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print)
+            test "${#APKS[@]}" -eq 1
+            APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+            test -x "$APKSIGNER" || {
+              echo "Android build-tools 35.0.0 apksigner is unavailable" >&2
+              exit 1
+            }
+            VERIFY="$("$APKSIGNER" verify --verbose "${APKS[0]}")"
+            printf '%s\n' "$VERIFY"
+            for scheme in v1 v2 v3; do
+              grep -Eq "Verified using $scheme scheme.*: true" <<< "$VERIFY" || {
+                echo "release APK is missing required $scheme signing" >&2
+                exit 1
+              }
+            done
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::unsigned release build completed; APK artifact upload skipped"
+          fi
+
+      - name: stage APK and checksum
+        if: steps.assemble.outputs.signed == 'true'
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mapfile -t APKS < <(find android/app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print)
+          test "${#APKS[@]}" -eq 1 || {
+            echo "expected exactly one release APK, found ${#APKS[@]}" >&2
+            exit 1
+          }
+          mkdir -p dist-android
+          APK_NAME="haider-v${VERSION}-android.apk"
+          cp "${APKS[0]}" "dist-android/$APK_NAME"
+          (cd dist-android && sha256sum "$APK_NAME" > "$APK_NAME.sha256")
+
+      - name: upload release APK and checksum
+        if: steps.assemble.outputs.signed == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: haider-debug-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          name: haider-android-release
+          path: dist-android/*
           if-no-files-found: error

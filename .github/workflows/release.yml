@@ -5,6 +5,7 @@ on:
   workflow_dispatch: {}   # manual build-only run (no release published)
 
 permissions:
+  actions: read
   contents: write
 
 env:
@@ -239,6 +240,70 @@ jobs:
           pattern: distribution-*
           path: dist
           merge-multiple: true
+      - name: download Android APK artifact when available
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          RUN_ID=""
+          MISSING_ATTEMPTS=0
+          RUNNING_ATTEMPTS=0
+          while [ "$RUNNING_ATTEMPTS" -lt 120 ]; do
+            RUNS="$(gh api \
+              "/repos/$GITHUB_REPOSITORY/actions/workflows/android-apk.yml/runs?event=push&head_sha=$GITHUB_SHA&per_page=20" \
+              2>/dev/null || true)"
+            RUN_ID="$(jq -r --arg ref "$GITHUB_REF_NAME" '
+              [.workflow_runs[]?] as $all
+              | ([$all[] | select(.head_branch == $ref)] | if length > 0 then . else $all end)
+              | sort_by(.run_number) | last | .id // empty
+            ' <<< "$RUNS" 2>/dev/null || true)"
+            if [ -n "$RUN_ID" ]; then
+              MISSING_ATTEMPTS=0
+              RUNNING_ATTEMPTS=$((RUNNING_ATTEMPTS + 1))
+              STATUS="$(jq -r --argjson id "$RUN_ID" \
+                '.workflow_runs[] | select(.id == $id) | .status' <<< "$RUNS")"
+              CONCLUSION="$(jq -r --argjson id "$RUN_ID" \
+                '.workflow_runs[] | select(.id == $id) | .conclusion // empty' <<< "$RUNS")"
+              if [ "$STATUS" = "completed" ]; then
+                if [ "$CONCLUSION" = "success" ]; then
+                  APK_STAGE="$RUNNER_TEMP/haider-android-artifact"
+                  mkdir -p "$APK_STAGE"
+                  if gh run download "$RUN_ID" \
+                    --name haider-android-release \
+                    --dir "$APK_STAGE"; then
+                    VERSION="${GITHUB_REF_NAME#v}"
+                    APK_NAME="haider-v${VERSION}-android.apk"
+                    if [ -f "$APK_STAGE/$APK_NAME" ] && \
+                       [ -f "$APK_STAGE/$APK_NAME.sha256" ] && \
+                       (cd "$APK_STAGE" && sha256sum --check "$APK_NAME.sha256"); then
+                      if mv "$APK_STAGE/$APK_NAME" "$APK_STAGE/$APK_NAME.sha256" dist/; then
+                        echo "Downloaded Android release artifact from workflow run $RUN_ID"
+                      else
+                        rm -f "dist/$APK_NAME" "dist/$APK_NAME.sha256"
+                        echo "::warning::Android artifact could not be moved into the release directory"
+                      fi
+                    else
+                      echo "::warning::Android artifact was incomplete or failed checksum verification"
+                    fi
+                  else
+                    echo "::warning::Android workflow succeeded, but its APK artifact was unavailable"
+                  fi
+                else
+                  echo "::warning::Android APK workflow concluded '$CONCLUSION'; publishing native assets only"
+                fi
+                exit 0
+              fi
+            else
+              MISSING_ATTEMPTS=$((MISSING_ATTEMPTS + 1))
+              if [ "$MISSING_ATTEMPTS" -ge 8 ]; then
+                echo "::warning::Android APK workflow run was absent; publishing native assets only"
+                exit 0
+              fi
+            fi
+            sleep 15
+          done
+          echo "::warning::Android APK workflow was still running after 30 minutes; publishing native assets only"
       - name: create or update release (prerelease until v0.1.0)
         env:
           GH_TOKEN: ${{ github.token }}

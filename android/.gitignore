@@ -6,5 +6,6 @@ build/
 .cxx/
 *.apk
 *.keystore
+*.jks
 !debug.keystore
 .idea/

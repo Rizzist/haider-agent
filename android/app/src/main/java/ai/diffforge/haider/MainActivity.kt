@@ -7,10 +7,13 @@ import ai.diffforge.haider.ui.chat.Composer
 import ai.diffforge.haider.ui.chat.ConnectionState
 import ai.diffforge.haider.ui.chat.ModelPicker
 import ai.diffforge.haider.ui.chat.Transcript
+import ai.diffforge.haider.ui.chat.UpdateBanner
 import ai.diffforge.haider.ui.onboarding.OnboardingScreen
 import ai.diffforge.haider.ui.theme.Forge
 import ai.diffforge.haider.ui.theme.ForgeShapes
 import ai.diffforge.haider.ui.theme.ForgeTheme
+import ai.diffforge.haider.update.ApkUpdateCoordinator
+import ai.diffforge.haider.update.UpdateUiState
 import android.os.Bundle
 import android.app.Activity
 import android.content.Context
@@ -46,6 +49,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.SideEffect
@@ -69,7 +73,18 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         DaemonConnection.start(applicationContext)
+        ApkUpdateCoordinator.start(applicationContext)
         setContent { AppRoot() }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        ApkUpdateCoordinator.onActivityResumed(this)
+    }
+
+    override fun onPause() {
+        ApkUpdateCoordinator.onActivityPaused(this)
+        super.onPause()
     }
 }
 
@@ -80,6 +95,7 @@ private fun AppRoot() {
     var dark by rememberSaveable { mutableStateOf(preferences.getBoolean(DARK_THEME_KEY, true)) }
     var showOnboarding by rememberSaveable { mutableStateOf(false) }
     val vm: ChatViewModel = viewModel()
+    val updateState by ApkUpdateCoordinator.state.collectAsState()
     val view = LocalView.current
 
     if (!view.isInEditMode) {
@@ -98,6 +114,8 @@ private fun AppRoot() {
         } else {
             SessionDeckScreen(
                 vm = vm,
+                updateState = updateState,
+                onUpdate = { ApkUpdateCoordinator.onAffordanceTapped(context) },
                 dark = dark,
                 onToggleTheme = {
                     dark = !dark
@@ -112,6 +130,8 @@ private fun AppRoot() {
 @Composable
 private fun SessionDeckScreen(
     vm: ChatViewModel,
+    updateState: UpdateUiState,
+    onUpdate: () -> Unit,
     dark: Boolean,
     onToggleTheme: () -> Unit,
     onOpenSetup: () -> Unit,
@@ -134,6 +154,7 @@ private fun SessionDeckScreen(
             onToggleTheme = onToggleTheme,
             onOpenSetup = onOpenSetup,
         )
+        UpdateBanner(state = updateState, onClick = onUpdate)
         Box(modifier = Modifier.fillMaxWidth().weight(1f)) {
             if (vm.messages.isEmpty()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
