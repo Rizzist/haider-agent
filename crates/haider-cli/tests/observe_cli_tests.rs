@@ -292,6 +292,7 @@ fn observe_json_schemas_are_goldened_and_secret_free() {
         }),
         session_count: 2,
         profile_path: "/tmp/haider-profile".into(),
+        runtime_dir: "/tmp/haider-runtime/profile-a".into(),
         adoption_available: Vec::new(),
     };
     let permission = digest(
@@ -560,6 +561,7 @@ fn no_daemon_no_spawn_paths_are_typed_69_and_do_not_start_a_daemon() {
         profile_dir: Some(profile_dir.clone()),
         home: None,
         model: None,
+        runtime_dir: None,
         xdg_runtime_dir: None,
     })
     .expect("resolve inspected profile");

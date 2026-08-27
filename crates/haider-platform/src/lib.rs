@@ -31,8 +31,8 @@ pub use fs::{
 };
 pub use ipc::{
     BoundEndpoint, Endpoint, EndpointAddress, EndpointError, IpcReadHalf, IpcStream, IpcWriteHalf,
-    PeerCredentials, connect, peer_credentials, peer_credentials_are_owner, peer_is_owner, split,
-    sweep_stale_endpoints, write_immediate,
+    PeerCredentials, connect, peer_credentials, peer_credentials_are_owner, peer_is_owner,
+    prepare_runtime_directory, split, sweep_stale_endpoints, write_immediate,
 };
 pub use process::program_on_path;
 pub use process::{
@@ -46,10 +46,12 @@ pub use process::{
 pub use process::{windows_command_interpreter, windows_powershell};
 pub use shutdown::{ShutdownInstallError, ShutdownSignal, ShutdownSignals, shutdown_signal};
 pub use spawn::{
-    DAEMON_LOG_DIRECTORY, DAEMON_LOG_FILE, DAEMON_LOG_PATH_ENV, DAEMON_LOG_RETENTION,
-    DAEMON_READINESS_ARG, DaemonReadiness, DaemonReadyNotifier, DaemonSpawn, DaemonSpawnError,
-    SpawnedDaemon, allocate_daemon_log_path, publish_active_daemon_log, spawn_daemon,
+    DAEMON_LIVENESS_ARG, DAEMON_LOG_DIRECTORY, DAEMON_LOG_FILE, DAEMON_LOG_PATH_ENV,
+    DAEMON_LOG_RETENTION, DAEMON_READINESS_ARG, DaemonLivenessGuard, DaemonLivenessWatcher,
+    DaemonReadiness, DaemonReadyNotifier, DaemonSpawn, DaemonSpawnError, SpawnedDaemon,
+    allocate_daemon_log_path, publish_active_daemon_log, spawn_daemon,
     spawn_daemon_with_piped_stderr, spawn_daemon_with_readiness,
+    spawn_daemon_with_readiness_and_liveness,
 };
 pub use system::local_device_name;
 pub use user::{effective_user_id, is_owner_private_directory};

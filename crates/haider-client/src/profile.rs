@@ -9,11 +9,10 @@
 //! - The store directory is made absolute, created if absent, then
 //!   canonicalized; `profile_id` is the lowercase BLAKE3 hex digest of a
 //!   version tag plus the canonical store-path bytes.
-//! - The runtime directory is NEVER directly environment-overridable
-//!   (`HAIDER_RUNTIME_DIR` is deliberately not read — D1's short
-//!   private-directory rule). A verified owner-private `XDG_RUNTIME_DIR` on
-//!   Linux, `TMPDIR`, or `$PREFIX/tmp` supplies the base when available;
-//!   otherwise the short per-UID `/tmp` fallback is retained.
+//! - Every profile receives a distinct runtime directory. `HAIDER_RUNTIME_DIR`
+//!   selects the containing root for gates/CI; otherwise a verified
+//!   owner-private `XDG_RUNTIME_DIR` on Linux, `TMPDIR`, or `$PREFIX/tmp`
+//!   supplies the base, with the short per-UID `/tmp` fallback retained.
 //! - The default model is a release-owned FULL Anthropic model ID: profile
 //!   config (`config.json`) or `HAIDER_MODEL` may override the packaged
 //!   value; the TUI's short product labels never enter this seam.
@@ -22,6 +21,9 @@ use std::path::{Path, PathBuf};
 
 /// Environment variable naming the profile store directory.
 pub const PROFILE_DIR_ENV: &str = "HAIDER_PROFILE_DIR";
+/// Environment variable overriding the root that contains per-profile
+/// runtime directories.
+pub const RUNTIME_DIR_ENV: &str = "HAIDER_RUNTIME_DIR";
 /// Environment variable overriding the default full model ID.
 pub const MODEL_ENV: &str = "HAIDER_MODEL";
 /// Optional per-profile configuration file inside the store directory.
@@ -37,6 +39,7 @@ pub const PACKAGED_DEFAULT_MODEL: &str = "claude-opus-5";
 
 /// Domain-separation tag hashed ahead of the canonical store path.
 const PROFILE_ID_TAG: &[u8] = b"haider-profile-id-v1\n";
+const RUNTIME_PROFILE_ID_CHARS: usize = 20;
 
 /// Captured environment inputs to profile resolution.
 ///
@@ -51,6 +54,9 @@ pub struct ProfileEnv {
     pub home: Option<PathBuf>,
     /// `HAIDER_MODEL`.
     pub model: Option<String>,
+    /// `HAIDER_RUNTIME_DIR`, interpreted as a root; the resolver always adds
+    /// a profile-derived child so two profiles cannot share runtime files.
+    pub runtime_dir: Option<PathBuf>,
     /// `XDG_RUNTIME_DIR` (consulted on Linux only).
     pub xdg_runtime_dir: Option<PathBuf>,
 }
@@ -64,14 +70,14 @@ impl ProfileEnv {
             model: std::env::var(MODEL_ENV)
                 .ok()
                 .filter(|m| !m.trim().is_empty()),
+            runtime_dir: std::env::var_os(RUNTIME_DIR_ENV).map(PathBuf::from),
             xdg_runtime_dir: std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
         }
     }
 }
 
-/// Platform temp inputs captured separately so the public `ProfileEnv` shape
-/// remains compatible while tests can exercise resolution without mutating
-/// process-global environment variables.
+/// Platform temp inputs captured separately so tests can exercise base
+/// selection without mutating process-global environment variables.
 #[derive(Debug, Clone, Default)]
 struct RuntimeEnv {
     #[cfg(unix)]
@@ -201,7 +207,7 @@ pub fn resolve_profile(env: &ProfileEnv) -> Result<ResolvedProfile, ProfileError
     hasher.update(store_text.as_bytes());
     let profile_id = hasher.finalize().to_hex().to_string();
 
-    let runtime_dir = runtime_dir(env, &RuntimeEnv::capture());
+    let runtime_dir = runtime_dir(env, &RuntimeEnv::capture(), &profile_id);
     let endpoint_path = endpoint_path_for(&runtime_dir, &profile_id);
     let default_model = resolve_default_model(&store_dir, env)?;
 
@@ -220,16 +226,29 @@ pub fn resolve_profile(env: &ProfileEnv) -> Result<ResolvedProfile, ProfileError
 ///
 /// This derivation is the wire-level rendezvous law: `haider-daemon`'s
 /// `DaemonConfig::endpoint_path` delegates here, so client and daemon can
-/// never derive different socket names for the same profile. The digest keeps
-/// the name a constant 32 hex chars regardless of profile-id length, which
-/// protects the tight OS limit on Unix socket path length (`sun_path`,
-/// ~104 bytes on macOS).
+/// never derive different socket names for the same profile. The containing
+/// directory carries the profile scope, allowing a short fixed-size basename
+/// under the tight Unix socket path limit (`sun_path`, ~104 bytes on macOS).
 pub fn endpoint_path_for(runtime_dir: &Path, profile_id: &str) -> PathBuf {
     haider_platform::Endpoint::new(runtime_dir, profile_id).into_address()
 }
 
 /// Resolves the runtime directory from verified platform temp bases.
-fn runtime_dir(env: &ProfileEnv, runtime_env: &RuntimeEnv) -> PathBuf {
+fn runtime_dir(env: &ProfileEnv, runtime_env: &RuntimeEnv, profile_id: &str) -> PathBuf {
+    let root = runtime_root(env, runtime_env);
+    let scope = profile_id
+        .chars()
+        .take(RUNTIME_PROFILE_ID_CHARS)
+        .collect::<String>();
+    root.join(scope)
+}
+
+fn runtime_root(env: &ProfileEnv, runtime_env: &RuntimeEnv) -> PathBuf {
+    if let Some(override_root) = &env.runtime_dir
+        && !override_root.as_os_str().is_empty()
+    {
+        return override_root.clone();
+    }
     #[cfg(target_os = "linux")]
     if let Some(xdg) = &env.xdg_runtime_dir
         && verified_owner_private(xdg)

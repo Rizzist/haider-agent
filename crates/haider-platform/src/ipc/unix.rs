@@ -9,6 +9,7 @@ use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
 use std::fs;
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
@@ -298,17 +299,86 @@ fn rename_no_replace(directory: &OwnedFd, from: &str, to: &str) -> Result<(), Er
 }
 
 fn prepare_runtime_dir(runtime_dir: &Path) -> Result<(OwnedFd, u32), EndpointError> {
-    fs::create_dir_all(runtime_dir)
-        .map_err(|error| EndpointError::io("create runtime directory", runtime_dir, error))?;
-    let directory = rustix::fs::open(
-        runtime_dir,
+    let root_path = runtime_dir
+        .parent()
+        .ok_or_else(|| EndpointError::Endpoint {
+            message: format!(
+                "profile runtime directory {} has no containing root",
+                runtime_dir.display()
+            ),
+        })?;
+    let mut root_builder = fs::DirBuilder::new();
+    root_builder.mode(0o700);
+    let root_created = match root_builder.create(root_path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => {
+            return Err(EndpointError::io(
+                "create private runtime root",
+                root_path,
+                error,
+            ));
+        }
+    };
+    let root = rustix::fs::open(
+        root_path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| EndpointError::io("open private runtime root", root_path, error.into()))?;
+    let root_stat = rustix::fs::fstat(&root).map_err(|error| {
+        EndpointError::io("fstat private runtime root", root_path, error.into())
+    })?;
+    let expected_uid = rustix::process::geteuid().as_raw();
+    if FileType::from_raw_mode(root_stat.st_mode) != FileType::Directory
+        || root_stat.st_uid != expected_uid
+    {
+        return Err(EndpointError::Endpoint {
+            message: format!(
+                "runtime root {} is not an owner-private directory",
+                root_path.display()
+            ),
+        });
+    }
+    if root_created {
+        rustix::fs::fchmod(&root, Mode::from_bits_truncate(0o700)).map_err(|error| {
+            EndpointError::io("chmod private runtime root", root_path, error.into())
+        })?;
+    } else if root_stat.st_mode & 0o077 != 0 {
+        return Err(EndpointError::Endpoint {
+            message: format!(
+                "runtime root {} is not an owner-private directory",
+                root_path.display()
+            ),
+        });
+    }
+    let name = runtime_dir
+        .file_name()
+        .ok_or_else(|| EndpointError::Endpoint {
+            message: format!(
+                "profile runtime directory {} has no basename",
+                runtime_dir.display()
+            ),
+        })?;
+    match rustix::fs::mkdirat(&root, name, Mode::from_bits_truncate(0o700)) {
+        Ok(()) | Err(Errno::EXIST) => {}
+        Err(error) => {
+            return Err(EndpointError::io(
+                "create profile runtime directory",
+                runtime_dir,
+                error.into(),
+            ));
+        }
+    }
+    let directory = rustix::fs::openat(
+        &root,
+        name,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(|error| EndpointError::io("open runtime directory", runtime_dir, error.into()))?;
     let stat = rustix::fs::fstat(&directory)
         .map_err(|error| EndpointError::io("fstat runtime directory", runtime_dir, error.into()))?;
-    let expected_uid = rustix::process::geteuid().as_raw();
     if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
         return Err(EndpointError::Endpoint {
             message: format!(
@@ -329,7 +399,47 @@ fn prepare_runtime_dir(runtime_dir: &Path) -> Result<(OwnedFd, u32), EndpointErr
     }
     rustix::fs::fchmod(&directory, Mode::from_bits_truncate(0o700))
         .map_err(|error| EndpointError::io("chmod runtime directory", runtime_dir, error.into()))?;
+    let temp_path = runtime_dir.join("tmp");
+    match rustix::fs::mkdirat(&directory, "tmp", Mode::from_bits_truncate(0o700)) {
+        Ok(()) | Err(Errno::EXIST) => {}
+        Err(error) => {
+            return Err(EndpointError::io(
+                "create daemon temporary directory",
+                &temp_path,
+                error.into(),
+            ));
+        }
+    }
+    let temp = rustix::fs::openat(
+        &directory,
+        "tmp",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        EndpointError::io("open daemon temporary directory", &temp_path, error.into())
+    })?;
+    let temp_stat = rustix::fs::fstat(&temp).map_err(|error| {
+        EndpointError::io("fstat daemon temporary directory", &temp_path, error.into())
+    })?;
+    if FileType::from_raw_mode(temp_stat.st_mode) != FileType::Directory
+        || temp_stat.st_uid != expected_uid
+    {
+        return Err(EndpointError::Endpoint {
+            message: format!(
+                "daemon temporary path {} is not an owner-private directory",
+                temp_path.display()
+            ),
+        });
+    }
+    rustix::fs::fchmod(&temp, Mode::from_bits_truncate(0o700)).map_err(|error| {
+        EndpointError::io("chmod daemon temporary directory", &temp_path, error.into())
+    })?;
     Ok((directory, expected_uid))
+}
+
+pub(super) fn prepare_runtime_directory(runtime_dir: &Path) -> Result<(), EndpointError> {
+    prepare_runtime_dir(runtime_dir).map(|_| ())
 }
 
 async fn preflight(
@@ -490,10 +600,9 @@ fn platform_probe_failure(
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Endpoint names this module owns: `haider-<32 hex>.sock` (see
+/// The one endpoint name this profile-scoped module owns (see
 /// [`super::Endpoint::new`]). The sweep only ever considers these.
-const ENDPOINT_PREFIX: &str = "haider-";
-const ENDPOINT_SUFFIX: &str = ".sock";
+const ENDPOINT_NAME: &str = "h.sock";
 /// Upper bound on endpoints examined per sweep, so a runtime directory that
 /// has accumulated thousands of nodes cannot stall daemon startup. The sweep
 /// is opportunistic hygiene, never a correctness requirement.
@@ -529,7 +638,7 @@ pub async fn sweep_stale_endpoints(runtime_dir: &Path, keep: Option<&Path>) -> u
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            if name.starts_with(ENDPOINT_PREFIX) && name.ends_with(ENDPOINT_SUFFIX) {
+            if name == ENDPOINT_NAME {
                 names.push(name);
             }
         }

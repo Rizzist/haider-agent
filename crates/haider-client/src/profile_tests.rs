@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! Unit tests for the shared profile resolver (workspace rule: tests
 //! live in `*_tests.rs` files, never inline).
 
@@ -8,6 +10,7 @@ fn env_for(dir: &Path) -> ProfileEnv {
         profile_dir: Some(dir.to_path_buf()),
         home: None,
         model: None,
+        runtime_dir: None,
         xdg_runtime_dir: None,
     }
 }
@@ -34,9 +37,11 @@ fn profile_id_is_deterministic_and_path_scoped() {
     );
     // The store directory was created and canonicalized.
     assert!(a1.store_dir.is_dir());
-    // Same runtime dir, distinct sockets per profile.
-    assert_eq!(a1.runtime_dir, b.runtime_dir);
+    // Every profile owns a distinct runtime directory and endpoint.
+    assert_ne!(a1.runtime_dir, b.runtime_dir);
     assert_ne!(a1.endpoint_path, b.endpoint_path);
+    assert!(a1.endpoint_path.starts_with(&a1.runtime_dir));
+    assert!(b.endpoint_path.starts_with(&b.runtime_dir));
 }
 
 #[test]
@@ -46,6 +51,7 @@ fn default_home_store_dir_is_preserved() {
         profile_dir: None,
         home: Some(root.path().to_path_buf()),
         model: None,
+        runtime_dir: None,
         xdg_runtime_dir: None,
     };
     let profile = resolve_profile(&env).unwrap_or_else(|error| panic!("{error}"));
@@ -105,9 +111,7 @@ fn endpoint_stays_inside_the_resolved_runtime_directory() {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or_default();
-        assert!(name.starts_with("haider-") && name.ends_with(".sock"));
-        // Fixed-length socket name: "haider-" + 32 hex + ".sock".
-        assert_eq!(name.len(), "haider-".len() + 32 + ".sock".len());
+        assert_eq!(name, "h.sock");
     }
     #[cfg(windows)]
     {
@@ -137,8 +141,8 @@ fn runtime_dir_honors_a_verified_private_tmpdir() {
     };
 
     assert_eq!(
-        runtime_dir(&env_for(root.path()), &runtime_env),
-        tmpdir.join("haider")
+        runtime_dir(&env_for(root.path()), &runtime_env, "profile-123"),
+        tmpdir.join("haider").join("profile-123")
     );
 }
 
@@ -161,8 +165,10 @@ fn runtime_dir_refuses_a_non_private_tmpdir_and_falls_back() {
     };
 
     assert_eq!(
-        runtime_dir(&env_for(root.path()), &runtime_env),
-        PathBuf::from("/tmp").join(format!("haider-{}", effective_uid()))
+        runtime_dir(&env_for(root.path()), &runtime_env, "profile-123"),
+        PathBuf::from("/tmp")
+            .join(format!("haider-{}", effective_uid()))
+            .join("profile-123")
     );
 }
 
@@ -184,7 +190,32 @@ fn runtime_dir_uses_a_verified_prefix_tmp_when_tmpdir_is_unavailable() {
     };
 
     assert_eq!(
-        runtime_dir(&env_for(root.path()), &runtime_env),
-        prefix_tmp.join("haider")
+        runtime_dir(&env_for(root.path()), &runtime_env, "profile-123"),
+        prefix_tmp.join("haider").join("profile-123")
+    );
+}
+
+#[test]
+fn runtime_override_is_a_root_and_never_collapses_profiles() {
+    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let runtime_root = root.path().join("gate-runtime");
+    let mut first_env = env_for(&root.path().join("first"));
+    first_env.runtime_dir = Some(runtime_root.clone());
+    let mut second_env = env_for(&root.path().join("second"));
+    second_env.runtime_dir = Some(runtime_root.clone());
+
+    let first = resolve_profile(&first_env).unwrap_or_else(|error| panic!("{error}"));
+    let second = resolve_profile(&second_env).unwrap_or_else(|error| panic!("{error}"));
+
+    assert!(first.runtime_dir.starts_with(&runtime_root));
+    assert!(second.runtime_dir.starts_with(&runtime_root));
+    assert_ne!(first.runtime_dir, second.runtime_dir);
+    assert_eq!(
+        first
+            .runtime_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::len),
+        Some(RUNTIME_PROFILE_ID_CHARS)
     );
 }

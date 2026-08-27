@@ -15,7 +15,10 @@
 //! - The sibling executable next to `current_exe()` is the packaging
 //!   authority; `PATH` is diagnostic convenience only, never silently
 //!   executed.
-//! - Parent exit leaves the daemon running; nothing here implies shutdown.
+//! - Persistent parent exit leaves the daemon running. An
+//!   `EphemeralIfSpawned` launch carries a kernel liveness channel so the
+//!   daemon can shut itself down after the launcher vanishes and all other
+//!   clients disconnect.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -173,6 +176,7 @@ pub struct DaemonOwnershipToken {
     pub(crate) authenticated_pid: u32,
     pub(crate) instance_id: String,
     pub(crate) daemon_generation: u64,
+    pub(crate) _liveness: Option<haider_platform::DaemonLivenessGuard>,
 }
 
 /// Outcome of [`ensure_daemon`].
@@ -348,6 +352,7 @@ pub async fn ensure_daemon(
     let mut log_path = None;
     let mut child: Option<Child> = None;
     let mut readiness: Option<haider_platform::DaemonReadiness> = None;
+    let mut liveness: Option<haider_platform::DaemonLivenessGuard> = None;
     let mut readiness_channel_error = None;
     let mut spawned = false;
     let mut race_lost = false;
@@ -383,6 +388,7 @@ pub async fn ensure_daemon(
                                 child: active,
                                 instance_id: welcome.instance_id.clone(),
                                 daemon_generation: welcome.daemon_generation,
+                                _liveness: liveness.take(),
                             });
                         }
                         ReadyCandidate::CompetingLauncher { exit_code } => {
@@ -419,6 +425,7 @@ pub async fn ensure_daemon(
                     let candidate = spawn_daemon(profile, &options)?;
                     child = Some(candidate.child);
                     readiness = Some(candidate.readiness);
+                    liveness = candidate.liveness;
                     log_path = Some(candidate.log_path);
                     spawned = true;
                 } else if let Some(status) = child_status.take() {
@@ -568,6 +575,7 @@ fn daemon_binary(options: &EnsureOptions) -> Result<PathBuf, EnsureError> {
 struct SpawnedCandidate {
     child: Child,
     readiness: haider_platform::DaemonReadiness,
+    liveness: Option<haider_platform::DaemonLivenessGuard>,
     log_path: PathBuf,
 }
 
@@ -583,13 +591,19 @@ fn spawn_daemon(
                 message: format!("cannot allocate per-process daemon log: {error}"),
             }
         })?;
-    let spawned = haider_platform::spawn_daemon_with_readiness(haider_platform::DaemonSpawn {
+    let spec = haider_platform::DaemonSpawn {
         binary: &binary,
         profile_id: &profile.profile_id,
         store_dir: &profile.store_dir,
         runtime_dir: &profile.runtime_dir,
         log_path: &log_path,
-    })
+    };
+    let spawned = if options.daemon_lifetime == DaemonLifetime::EphemeralIfSpawned {
+        haider_platform::spawn_daemon_with_readiness_and_liveness(spec)
+            .map(|(spawned, liveness)| (spawned, Some(liveness)))
+    } else {
+        haider_platform::spawn_daemon_with_readiness(spec).map(|spawned| (spawned, None))
+    }
     .map_err(|error| {
         let message = match error {
             haider_platform::DaemonSpawnError::OpenLog(error) => {
@@ -605,9 +619,11 @@ fn spawn_daemon(
         };
         EnsureError::Spawn { binary, message }
     })?;
+    let (spawned, liveness) = spawned;
     Ok(SpawnedCandidate {
         child: spawned.child,
         readiness: spawned.readiness,
+        liveness,
         log_path,
     })
 }

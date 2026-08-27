@@ -425,17 +425,19 @@ fn close_inherited_descriptor_range(_first: std::os::raw::c_int) -> bool {
     false
 }
 
-/// Moves the daemon's one inherited readiness writer to descriptor 3.
+/// Moves the daemon's inherited startup descriptors to fixed coordinates.
 ///
 /// This runs after `fork` and before `exec`, so it uses only async-signal-safe
 /// libc calls. Descriptor 3 is then excluded from the background close sweep;
 /// the daemon restores `FD_CLOEXEC` as soon as it adopts the writer.
 #[cfg(unix)]
 #[allow(unsafe_code)]
-pub(crate) fn install_daemon_readiness_descriptor(
-    source: std::os::raw::c_int,
+pub(crate) fn install_daemon_spawn_descriptors(
+    readiness: Option<std::os::raw::c_int>,
+    liveness: Option<std::os::raw::c_int>,
 ) -> std::io::Result<()> {
     const DAEMON_READINESS_FD: std::os::raw::c_int = 3;
+    const DAEMON_LIVENESS_FD: std::os::raw::c_int = 4;
     const F_SETFD: std::os::raw::c_int = 2;
 
     unsafe extern "C" {
@@ -444,13 +446,26 @@ pub(crate) fn install_daemon_readiness_descriptor(
         -> std::os::raw::c_int;
     }
 
-    if source != DAEMON_READINESS_FD && unsafe { dup2(source, DAEMON_READINESS_FD) } == -1 {
-        return Err(std::io::Error::last_os_error());
+    for (source, target) in [
+        (readiness, DAEMON_READINESS_FD),
+        (liveness, DAEMON_LIVENESS_FD),
+    ] {
+        let Some(source) = source else {
+            continue;
+        };
+        if source != target && unsafe { dup2(source, target) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { fcntl(target, F_SETFD, 0) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
     }
-    if unsafe { fcntl(DAEMON_READINESS_FD, F_SETFD, 0) } == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-    close_inherited_descriptors_from(DAEMON_READINESS_FD + 1);
+    let last = if liveness.is_some() {
+        DAEMON_LIVENESS_FD
+    } else {
+        DAEMON_READINESS_FD
+    };
+    close_inherited_descriptors_from(last + 1);
     Ok(())
 }
 

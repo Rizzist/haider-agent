@@ -51,7 +51,7 @@ use crate::connection::{ConnectionContext, ConnectionExit, DrainNotice, reject_o
 use crate::diagnostics::EffectDiagnostics;
 use crate::endpoint;
 use crate::hooks::HookStartupHydrator;
-use crate::lifecycle::{ShutdownObserver, ShutdownRequest, StatePublisher};
+use crate::lifecycle::{ShutdownObserver, ShutdownReason, ShutdownRequest, StatePublisher};
 use crate::pipe_native::{PipeBootSession, PipeNativeWriter};
 use crate::turn_recovery::{
     RecoveredWork, StartupJournalVisitor, recover_interrupted_turns_report_with_visitor,
@@ -101,6 +101,76 @@ pub struct DaemonTask {
     crash: watch::Sender<bool>,
     task: JoinHandle<Result<ShutdownOutcome, DaemonError>>,
     diagnostics: DaemonTaskDiagnostics,
+}
+
+/// Lifecycle channels allocated before the owner task is scheduled.
+///
+/// The binary liveness path uses this split to arm the kernel watcher first,
+/// so an EOF/process signal already present at argument adoption is committed
+/// to the shutdown journal before startup can touch the profile.
+struct PreparedDaemonTask {
+    states: StatePublisher,
+    readiness: Readiness,
+    shutdown: ShutdownHandle,
+    shutdown_receiver: watch::Receiver<ShutdownRequest>,
+    shutdown_observer: ShutdownObserver,
+    crash: watch::Sender<bool>,
+    crash_receiver: watch::Receiver<bool>,
+    completion: Arc<DaemonTaskCompletion>,
+}
+
+impl PreparedDaemonTask {
+    fn new() -> Self {
+        let (states, readiness) = StatePublisher::channel();
+        let (shutdown, shutdown_receiver, shutdown_observer) = ShutdownHandle::channel();
+        let (crash, crash_receiver) = watch::channel(false);
+        Self {
+            states,
+            readiness,
+            shutdown,
+            shutdown_receiver,
+            shutdown_observer,
+            crash,
+            crash_receiver,
+            completion: Arc::new(DaemonTaskCompletion::default()),
+        }
+    }
+
+    fn shutdown_handle(&self) -> ShutdownHandle {
+        self.shutdown.clone()
+    }
+
+    fn spawn(self, config: DaemonConfig, dependencies: DaemonDependencies) -> DaemonTask {
+        let diagnostics = DaemonTaskDiagnostics {
+            readiness: self.readiness.clone(),
+            completion: Arc::clone(&self.completion),
+        };
+        let task_shutdown = self.shutdown.clone();
+        let completion_guard = DaemonTaskCompletionGuard {
+            completion: self.completion,
+        };
+        let task = tokio::spawn(async move {
+            let result = run_owner(
+                config,
+                dependencies,
+                self.states,
+                task_shutdown,
+                self.shutdown_receiver,
+                self.shutdown_observer,
+                self.crash_receiver,
+            )
+            .await;
+            completion_guard.record(format!("{result:?}"));
+            result
+        });
+        DaemonTask {
+            readiness: self.readiness,
+            shutdown: self.shutdown,
+            crash: self.crash,
+            task,
+            diagnostics,
+        }
+    }
 }
 
 /// Cloneable, read-only health probe for an in-process daemon task.
@@ -383,37 +453,7 @@ pub fn spawn_with_dependencies(
     config: DaemonConfig,
     dependencies: DaemonDependencies,
 ) -> DaemonTask {
-    let (states, readiness) = StatePublisher::channel();
-    let (shutdown, shutdown_receiver, shutdown_observer) = ShutdownHandle::channel();
-    let (crash, crash_receiver) = watch::channel(false);
-    let completion = Arc::new(DaemonTaskCompletion::default());
-    let diagnostics = DaemonTaskDiagnostics {
-        readiness: readiness.clone(),
-        completion: Arc::clone(&completion),
-    };
-    let task_shutdown = shutdown.clone();
-    let completion_guard = DaemonTaskCompletionGuard { completion };
-    let task = tokio::spawn(async move {
-        let result = run_owner(
-            config,
-            dependencies,
-            states,
-            task_shutdown,
-            shutdown_receiver,
-            shutdown_observer,
-            crash_receiver,
-        )
-        .await;
-        completion_guard.record(format!("{result:?}"));
-        result
-    });
-    DaemonTask {
-        readiness,
-        shutdown,
-        crash,
-        task,
-        diagnostics,
-    }
+    PreparedDaemonTask::new().spawn(config, dependencies)
 }
 
 /// Runs until Unix termination signals stop the daemon.
@@ -443,21 +483,73 @@ pub async fn run_with_signals_and_dependencies(
 pub async fn run_with_signals_and_dependencies_and_readiness(
     config: DaemonConfig,
     dependencies: DaemonDependencies,
+    launcher_readiness: Option<haider_platform::DaemonReadyNotifier>,
+) -> Result<ShutdownOutcome, DaemonError> {
+    run_with_signals_and_dependencies_and_readiness_and_liveness(
+        config,
+        dependencies,
+        launcher_readiness,
+        None,
+    )
+    .await
+}
+
+/// Runs the signal-owned daemon with optional startup readiness and ephemeral
+/// launcher-liveness channels.
+pub async fn run_with_signals_and_dependencies_and_readiness_and_liveness(
+    config: DaemonConfig,
+    dependencies: DaemonDependencies,
     mut launcher_readiness: Option<haider_platform::DaemonReadyNotifier>,
+    launcher_liveness: Option<haider_platform::DaemonLivenessWatcher>,
 ) -> Result<ShutdownOutcome, DaemonError> {
     let mut signals =
         haider_platform::ShutdownSignals::new().map_err(|error| DaemonError::Task {
             message: format!("cannot install {} handler: {error}", error.signal()),
         })?;
-    let task = spawn_with_dependencies(config, dependencies);
+    let prepared = PreparedDaemonTask::new();
+    let shutdown = prepared.shutdown_handle();
+    let (mut liveness_task, liveness_armed) = launcher_liveness.map_or_else(
+        || (None, None),
+        |watcher| {
+            let (armed_sender, armed_receiver) = tokio::sync::oneshot::channel();
+            let shutdown = shutdown.clone();
+            let task = tokio::spawn(async move {
+                let mut wait = Box::pin(watcher.wait());
+                let initial =
+                    std::future::poll_fn(|context| Poll::Ready(wait.as_mut().poll(context))).await;
+                match initial {
+                    Poll::Ready(outcome) => {
+                        record_launcher_liveness(outcome, &shutdown);
+                        let _ = armed_sender.send(());
+                    }
+                    Poll::Pending => {
+                        let _ = armed_sender.send(());
+                        record_launcher_liveness(wait.await, &shutdown);
+                    }
+                }
+            });
+            (Some(task), Some(armed_receiver))
+        },
+    );
+    if let Some(armed) = liveness_armed {
+        // The watcher has either observed an already-dead launcher or has
+        // registered its kernel wait before the owner task may start.
+        let _ = armed.await;
+    }
+    let task = prepared.spawn(config, dependencies);
     let mut readiness = task.readiness();
-    let shutdown = task.shutdown_handle();
     let mut joined: Pin<Box<dyn Future<Output = Result<ShutdownOutcome, DaemonError>> + Send>> =
         Box::pin(task.join());
     notify_launcher_if_ready(&readiness, &mut launcher_readiness);
     loop {
         tokio::select! {
-            result = &mut joined => return result,
+            result = &mut joined => {
+                if let Some(watcher) = liveness_task.take() {
+                    watcher.abort();
+                    let _ = watcher.await;
+                }
+                return result;
+            },
             state = readiness.changed(), if launcher_readiness.is_some() => {
                 match state {
                     Some(DaemonState::Ready) => {
@@ -475,6 +567,22 @@ pub async fn run_with_signals_and_dependencies_and_readiness(
                 }
             }
         }
+    }
+}
+
+fn record_launcher_liveness(outcome: std::io::Result<()>, shutdown: &ShutdownHandle) {
+    if let Err(error) = outcome {
+        // This watcher exists only for an ephemeral launch. Once its kernel
+        // proof becomes unusable, fail closed into the same idle barrier
+        // instead of risking an unsupervised daemon.
+        eprintln!("haiderd: launcher-liveness watch failed: {error}");
+        tracing::warn!(%error, "launcher-liveness watch failed");
+    }
+    if shutdown.request_when_idle(ShutdownReason::ClientVanished) {
+        tracing::info!(
+            reason = ?ShutdownReason::ClientVanished,
+            "ephemeral daemon observed launcher process exit"
+        );
     }
 }
 
@@ -558,6 +666,13 @@ async fn run_inner(
         drop(lease);
         return shutdown_without_store(config, states, request, &shutdown);
     }
+    let mut runtime_directory = endpoint::RuntimeDirectory::prepare(&config.runtime_dir)?;
+    if !matches!(*shutdown.borrow(), ShutdownRequest::None) {
+        let request = shutdown.borrow().clone();
+        runtime_directory.cleanup()?;
+        drop(lease);
+        return shutdown_without_store(config, states, request, &shutdown);
+    }
 
     // R16 ready gate: open store under the lock -> durable generation bump ->
     // reconcile every dispatched-without-terminal effect. Only after all of
@@ -617,7 +732,15 @@ async fn run_inner(
         }
         None => {
             let request = shutdown.borrow().clone();
-            return shutdown_before_listener(config, states, store, request, &mut shutdown).await;
+            return shutdown_before_listener(
+                config,
+                states,
+                store,
+                runtime_directory,
+                request,
+                &mut shutdown,
+            )
+            .await;
         }
     }
     tracing::trace!(
@@ -628,7 +751,15 @@ async fn run_inner(
     );
     if !matches!(*shutdown.borrow(), ShutdownRequest::None) {
         let request = shutdown.borrow().clone();
-        return shutdown_before_listener(config, states, store, request, &mut shutdown).await;
+        return shutdown_before_listener(
+            config,
+            states,
+            store,
+            runtime_directory,
+            request,
+            &mut shutdown,
+        )
+        .await;
     }
     let mut startup_hydration = match StartupHydration::prepare(&store).await {
         Ok(hydration) => hydration,
@@ -637,6 +768,17 @@ async fn run_inner(
             return Err(error.into());
         }
     };
+    if let Some(request) = startup_shutdown_request(&shutdown) {
+        return shutdown_before_listener(
+            config,
+            states,
+            store,
+            runtime_directory,
+            request,
+            &mut shutdown,
+        )
+        .await;
+    }
     let turn_recovery_started = Instant::now();
     let turn_recovery = match recover_interrupted_turns_report_with_visitor(
         &store,
@@ -659,6 +801,17 @@ async fn run_inner(
         operation_micros = turn_recovery_started.elapsed().as_micros(),
         "pre-ready recovery phase completed"
     );
+    if let Some(request) = startup_shutdown_request(&shutdown) {
+        return shutdown_before_listener(
+            config,
+            states,
+            store,
+            runtime_directory,
+            request,
+            &mut shutdown,
+        )
+        .await;
+    }
     // W3c2 R10 startup phase: load the descriptor store and reconcile
     // pending/committed LOGIN receipts against vault + descriptor truth
     // before anything can observe Ready (run_inner's receipt-reconciliation
@@ -815,10 +968,6 @@ async fn run_inner(
     let worker_handle = worker_manager.handle();
     hub.install_worker_manager(worker_handle.clone())
         .map_err(DaemonError::from)?;
-    // The monitor registry must finish durable boot adoption before any
-    // external source can publish. Otherwise an authenticated startup event
-    // could outrun an existing watch or its timeout fence.
-    hub.wait_for_monitor_ready().await;
     let crate::accounts::AccountsRuntime {
         facade: accounts_facade,
         actor: mut account_actor,
@@ -829,6 +978,50 @@ async fn run_inner(
     } = accounts_runtime;
     let oauth_coordinator = accounts_facade.oauth.clone();
     let account_management = accounts_facade.management.clone();
+    if let Some(request) = startup_shutdown_request(&shutdown) {
+        return shutdown_started_runtime_before_listener(
+            config,
+            states,
+            StartupShutdownResources {
+                store,
+                runtime_directory,
+                worker_manager,
+                credential_broker,
+                oauth_coordinator,
+                account_actor,
+                hook_engine,
+                hub,
+                mobile_server: None,
+            },
+            request,
+            &mut shutdown,
+        )
+        .await;
+    }
+    // The monitor registry must finish durable boot adoption before any
+    // external source can publish. Otherwise an authenticated startup event
+    // could outrun an existing watch or its timeout fence.
+    hub.wait_for_monitor_ready().await;
+    if let Some(request) = startup_shutdown_request(&shutdown) {
+        return shutdown_started_runtime_before_listener(
+            config,
+            states,
+            StartupShutdownResources {
+                store,
+                runtime_directory,
+                worker_manager,
+                credential_broker,
+                oauth_coordinator,
+                account_actor,
+                hook_engine,
+                hub,
+                mobile_server: None,
+            },
+            request,
+            &mut shutdown,
+        )
+        .await;
+    }
     hub.install_accounts(accounts_facade)
         .map_err(DaemonError::from)?;
     for work in recovered_work {
@@ -877,6 +1070,26 @@ async fn run_inner(
             let _ = store.close().await;
             return Err(error.into());
         }
+        if let Some(request) = startup_shutdown_request(&shutdown) {
+            return shutdown_started_runtime_before_listener(
+                config,
+                states,
+                StartupShutdownResources {
+                    store,
+                    runtime_directory,
+                    worker_manager,
+                    credential_broker,
+                    oauth_coordinator,
+                    account_actor,
+                    hook_engine,
+                    hub,
+                    mobile_server: None,
+                },
+                request,
+                &mut shutdown,
+            )
+            .await;
+        }
     }
     // Install both monitor seams before the accept task exists. From the
     // first authenticated APK frame onward, every valid SMS therefore has an
@@ -909,7 +1122,27 @@ async fn run_inner(
             return Err(error);
         }
     };
-    let mut endpoint = match endpoint::bind(config).await {
+    if let Some(request) = startup_shutdown_request(&shutdown) {
+        return shutdown_started_runtime_before_listener(
+            config,
+            states,
+            StartupShutdownResources {
+                store,
+                runtime_directory,
+                worker_manager,
+                credential_broker,
+                oauth_coordinator,
+                account_actor,
+                hook_engine,
+                hub,
+                mobile_server,
+            },
+            request,
+            &mut shutdown,
+        )
+        .await;
+    }
+    let mut endpoint = match endpoint::bind(config, runtime_directory).await {
         Ok(endpoint) => endpoint,
         Err(error) => {
             if let Some(server) = mobile_server.as_mut() {
@@ -1019,8 +1252,10 @@ async fn run_inner(
     // rotated value is durably restored or failed closed.
     endpoint.close_listener();
     let (reason, mut forced) = match request {
-        ShutdownRequest::Graceful { reason } => (reason, false),
-        ShutdownRequest::Forced { reason } => (reason, true),
+        ShutdownRequest::Graceful { reason } | ShutdownRequest::GracefulWhenIdle { reason } => {
+            (reason.to_string(), false)
+        }
+        ShutdownRequest::Forced { reason } => (reason.to_string(), true),
         // Unreachable: the loop above only breaks with a real request.
         ShutdownRequest::None => ("internal shutdown".into(), true),
     };
@@ -1182,6 +1417,74 @@ async fn run_inner(
     })
 }
 
+/// Runtime services that may already exist when launcher death arrives before
+/// the listener is published. They are stopped in the same dependency order
+/// as the ordinary drain before the store/runtime tail runs.
+struct StartupShutdownResources {
+    store: SqliteStoreHandle,
+    runtime_directory: endpoint::RuntimeDirectory,
+    worker_manager: WorkerManager,
+    credential_broker: Option<crate::oauth::CredentialBroker>,
+    oauth_coordinator: Option<crate::oauth::OAuthCoordinator>,
+    account_actor: Option<crate::accounts::AccountActorHandle>,
+    hook_engine: Option<crate::hooks::HookEngine>,
+    hub: SessionHub,
+    mobile_server: Option<crate::mobile_transport::MobileTransportServer>,
+}
+
+async fn shutdown_started_runtime_before_listener(
+    config: &DaemonConfig,
+    states: &StatePublisher,
+    resources: StartupShutdownResources,
+    request: ShutdownRequest,
+    shutdown: &mut watch::Receiver<ShutdownRequest>,
+) -> Result<ShutdownOutcome, DaemonError> {
+    let StartupShutdownResources {
+        store,
+        runtime_directory,
+        worker_manager,
+        credential_broker,
+        oauth_coordinator,
+        mut account_actor,
+        hook_engine,
+        hub,
+        mut mobile_server,
+    } = resources;
+    if let Some(server) = mobile_server.as_mut() {
+        server.shutdown().await;
+    }
+    worker_manager.handle().begin_draining();
+    hub.begin_draining();
+    let _ = worker_manager.shutdown().await;
+    if let Some(broker) = &credential_broker
+        && !broker.shutdown().await
+    {
+        broker.abort_and_join().await;
+    }
+    if let Some(oauth) = &oauth_coordinator
+        && !oauth.shutdown().await
+    {
+        oauth.abort_and_join().await;
+    }
+    if let Some(actor) = account_actor.as_mut() {
+        actor.shutdown().await;
+    }
+    if let Some(engine) = hook_engine {
+        engine.shutdown().await;
+    }
+    let _ = hub.shutdown().await;
+    shutdown_before_listener(config, states, store, runtime_directory, request, shutdown).await
+}
+
+fn startup_shutdown_request(
+    shutdown: &watch::Receiver<ShutdownRequest>,
+) -> Option<ShutdownRequest> {
+    match shutdown.borrow().clone() {
+        ShutdownRequest::None => None,
+        request => Some(request),
+    }
+}
+
 /// Phase 3 (R16 tail): run C4a reconciliation, interruptibly.
 ///
 /// A shutdown request during the scan abandons the pass — the next daemon
@@ -1256,6 +1559,7 @@ impl ConnectionRuntime {
         crash: &mut watch::Receiver<bool>,
     ) -> (RuntimeStop, Option<DaemonError>) {
         let mut listener_error = None;
+        let mut idle_wait_logged = false;
         let stop = loop {
             if *crash.borrow() {
                 break RuntimeStop::Crash;
@@ -1263,6 +1567,21 @@ impl ConnectionRuntime {
             match shutdown.borrow().clone() {
                 request @ (ShutdownRequest::Graceful { .. } | ShutdownRequest::Forced { .. }) => {
                     break RuntimeStop::Shutdown(request);
+                }
+                ShutdownRequest::GracefulWhenIdle { reason } => {
+                    if self.connections.is_empty() {
+                        break RuntimeStop::Shutdown(ShutdownRequest::Graceful { reason });
+                    }
+                    if !idle_wait_logged {
+                        idle_wait_logged = true;
+                        eprintln!(
+                            "haiderd: spawning client vanished; ephemeral daemon is waiting for live clients to disconnect"
+                        );
+                        tracing::info!(
+                            live_connections = self.connections.len(),
+                            "spawning client vanished; ephemeral daemon is waiting for live clients to disconnect"
+                        );
+                    }
                 }
                 ShutdownRequest::None => {}
             }
@@ -1448,9 +1767,9 @@ impl ConnectionRuntime {
     }
 }
 
-/// Phase 5b: flush, remove the exact owned socket, close the store (lock
-/// release) LAST. Every step runs under the same barrier discipline; the
-/// returned error is the first one worth reporting, in that order.
+/// Phase 5b: flush, remove the exact owned socket/pid/runtime, close the store
+/// (lock release) LAST. Every step runs under the same barrier discipline;
+/// the returned error is the first one worth reporting, in that order.
 async fn finalize(
     store: SqliteStoreHandle,
     endpoint: &mut endpoint::BoundEndpoint,
@@ -1476,6 +1795,14 @@ async fn finalize(
         forced,
     )
     .await;
+    let runtime_error = barrier_step(
+        std::future::ready(endpoint.cleanup_runtime()),
+        StepFailure::AlwaysReported,
+        deadline,
+        shutdown,
+        forced,
+    )
+    .await;
     let close_error = barrier_step(
         store.close(),
         StepFailure::SuppressedWhenForced,
@@ -1484,7 +1811,10 @@ async fn finalize(
         forced,
     )
     .await;
-    flush_error.or(cleanup_error).or(close_error)
+    flush_error
+        .or(cleanup_error)
+        .or(runtime_error)
+        .or(close_error)
 }
 
 /// What a barrier step's failure means once the barrier has been breached.
@@ -1615,19 +1945,22 @@ pub(crate) fn barrier_breached(
 
 /// Drain tail for shutdown observed after store open but before the listener
 /// bound: no socket or connections exist yet, so the barrier reduces to
-/// publish Draining -> flush -> close (lock release last). The same single
-/// deadline and second-signal escape bound this tail as bound the full
-/// barrier — a slow flush here must not hold the profile lock either.
+/// publish Draining -> flush -> remove runtime -> close (lock release last).
+/// The same single deadline and second-signal escape bound this tail as bound
+/// the full barrier — a slow flush here must not hold the profile lock either.
 async fn shutdown_before_listener(
     config: &DaemonConfig,
     states: &StatePublisher,
     store: SqliteStoreHandle,
+    mut runtime_directory: endpoint::RuntimeDirectory,
     request: ShutdownRequest,
     shutdown: &mut watch::Receiver<ShutdownRequest>,
 ) -> Result<ShutdownOutcome, DaemonError> {
     let (reason, mut forced) = match request {
-        ShutdownRequest::Graceful { reason } => (reason, false),
-        ShutdownRequest::Forced { reason } => (reason, true),
+        ShutdownRequest::Graceful { reason } | ShutdownRequest::GracefulWhenIdle { reason } => {
+            (reason.to_string(), false)
+        }
+        ShutdownRequest::Forced { reason } => (reason.to_string(), true),
         // `None` means the ShutdownHandle was dropped without a request
         // (watch channel closed mid-recovery); treat as forced.
         ShutdownRequest::None => ("startup shutdown controller dropped".into(), true),
@@ -1638,10 +1971,19 @@ async fn shutdown_before_listener(
         deadline_unix_ms: unix_time_ms().saturating_add(duration_ms(config.drain_timeout)),
     });
     // The same barrier steps the full drain runs, through the same helper:
-    // there is no socket and no connection here, so the tail is flush → close.
+    // there is no socket and no connection here, so the tail is
+    // flush → runtime cleanup → close.
     let flush_error = barrier_step(
         store.flush(),
         StepFailure::SuppressedWhenForced,
+        barrier_deadline,
+        shutdown,
+        &mut forced,
+    )
+    .await;
+    let runtime_error = barrier_step(
+        std::future::ready(runtime_directory.cleanup()),
+        StepFailure::AlwaysReported,
         barrier_deadline,
         shutdown,
         &mut forced,
@@ -1655,7 +1997,7 @@ async fn shutdown_before_listener(
         &mut forced,
     )
     .await;
-    if let Some(error) = flush_error.or(close_error) {
+    if let Some(error) = flush_error.or(runtime_error).or(close_error) {
         return Err(error);
     }
     states.publish(DaemonState::Stopped);
@@ -1676,8 +2018,10 @@ fn shutdown_without_store(
     shutdown: &watch::Receiver<ShutdownRequest>,
 ) -> Result<ShutdownOutcome, DaemonError> {
     let (reason, mut forced) = match request {
-        ShutdownRequest::Graceful { reason } => (reason, false),
-        ShutdownRequest::Forced { reason } => (reason, true),
+        ShutdownRequest::Graceful { reason } | ShutdownRequest::GracefulWhenIdle { reason } => {
+            (reason.to_string(), false)
+        }
+        ShutdownRequest::Forced { reason } => (reason.to_string(), true),
         ShutdownRequest::None => ("startup shutdown controller dropped".into(), true),
     };
     let barrier_deadline = tokio::time::Instant::now() + config.drain_timeout;

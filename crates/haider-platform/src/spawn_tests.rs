@@ -28,6 +28,22 @@ async fn readiness_eof_is_never_treated_as_ready() {
     assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
 }
 
+/// SIGKILL race pin: launcher death may close the writer before the daemon
+/// adopts or polls its inherited reader. EOF remains buffered kernel state and
+/// must be observed on the first later wait.
+#[cfg(unix)]
+#[tokio::test]
+async fn launcher_eof_before_liveness_wait_is_observed() {
+    let prepared = super::prepare_liveness().expect("prepare liveness pipe");
+    let super::PreparedLiveness { guard, reader, .. } = prepared;
+    drop(guard);
+
+    super::DaemonLivenessWatcher { reader }
+        .wait()
+        .await
+        .expect("observe launcher EOF buffered before wait");
+}
+
 #[cfg(unix)]
 #[test]
 fn readiness_descriptors_are_cloexec_and_writer_is_above_stdio() {
@@ -39,7 +55,21 @@ fn readiness_descriptors_are_cloexec_and_writer_is_above_stdio() {
 
     assert!(reader_flags.contains(rustix::io::FdFlags::CLOEXEC));
     assert!(writer_flags.contains(rustix::io::FdFlags::CLOEXEC));
-    assert!(prepared.writer.as_raw_fd() >= 3);
+    assert!(prepared.writer.as_raw_fd() >= 5);
+}
+
+#[cfg(unix)]
+#[test]
+fn liveness_descriptors_are_cloexec_and_reader_is_above_stdio() {
+    use std::os::fd::AsRawFd as _;
+
+    let prepared = super::prepare_liveness().expect("prepare liveness pipe");
+    let reader_flags = rustix::io::fcntl_getfd(&prepared.reader).expect("reader flags");
+    let writer_flags = rustix::io::fcntl_getfd(&prepared.guard._writer).expect("writer flags");
+
+    assert!(reader_flags.contains(rustix::io::FdFlags::CLOEXEC));
+    assert!(writer_flags.contains(rustix::io::FdFlags::CLOEXEC));
+    assert!(prepared.reader.as_raw_fd() >= 5);
 }
 
 #[cfg(windows)]

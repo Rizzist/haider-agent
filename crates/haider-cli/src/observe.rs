@@ -71,6 +71,7 @@ pub(crate) struct StatusDocument {
     pub account: Option<AccountView>,
     pub session_count: usize,
     pub profile_path: String,
+    pub runtime_dir: String,
     pub adoption_available: Vec<haider_rpc::AccountAdoptionAvailable>,
 }
 
@@ -210,6 +211,7 @@ impl ObserveJson for StatusDocument {
             })),
             "session_count": self.session_count,
             "profile_path": self.profile_path,
+            "runtime_dir": self.runtime_dir,
         });
         if !self.adoption_available.is_empty() {
             document["account_adoption_available"] = json!(self.adoption_available);
@@ -534,6 +536,7 @@ pub(crate) async fn status_command(rest: &[String]) -> ExitCode {
         account,
         session_count,
         profile_path: profile.store_dir.display().to_string(),
+        runtime_dir: profile.runtime_dir.display().to_string(),
         adoption_available,
     };
     if options.json {
@@ -1126,11 +1129,12 @@ fn write_status_human(document: &StatusDocument) -> ExitCode {
         |version| format!("available ({version})"),
     );
     let mut text = format!(
-        "daemon {} (generation {})\nupdate: {update}\naccount: {account}\nsessions: {}\nprofile: {}\nfeatures: {}\n",
+        "daemon {} (generation {})\nupdate: {update}\naccount: {account}\nsessions: {}\nprofile: {}\nruntime: {}\nfeatures: {}\n",
         document.daemon.version,
         document.daemon.generation,
         document.session_count,
         document.profile_path,
+        document.runtime_dir,
         document.features.join(", ")
     );
     for notice in &document.adoption_available {

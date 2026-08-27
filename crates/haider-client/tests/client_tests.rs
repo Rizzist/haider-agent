@@ -428,6 +428,7 @@ async fn live_but_old_daemon_is_diagnosed_and_never_killed() {
         profile_dir: Some(store),
         home: None,
         model: None,
+        runtime_dir: None,
         xdg_runtime_dir: None,
     };
     let mut profile = resolve_profile(&env).expect("resolve profile");
@@ -484,6 +485,7 @@ async fn no_wire_overlap_is_a_fatal_mismatch_and_never_spawns() {
         profile_dir: Some(store),
         home: None,
         model: None,
+        runtime_dir: None,
         xdg_runtime_dir: None,
     };
     let mut profile = resolve_profile(&env).expect("resolve profile");
@@ -531,6 +533,7 @@ async fn profile_mismatch_is_fatal() {
         profile_dir: Some(store),
         home: None,
         model: None,
+        runtime_dir: None,
         xdg_runtime_dir: None,
     };
     let mut profile = resolve_profile(&env).expect("resolve profile");
@@ -758,6 +761,7 @@ async fn racing_launcher_never_owns_the_other_launchers_winner() {
         profile_dir: Some(store),
         home: None,
         model: None,
+        runtime_dir: None,
         xdg_runtime_dir: None,
     };
     let mut profile = resolve_profile(&env).expect("resolve profile");
@@ -849,6 +853,7 @@ async fn closed_handshake_is_retried_only_after_a_spawnable_failure_authorizes_a
         profile_dir: Some(store),
         home: None,
         model: None,
+        runtime_dir: None,
         xdg_runtime_dir: None,
     };
     let mut profile = resolve_profile(&env).expect("resolve profile");
@@ -976,6 +981,7 @@ fn spawned_daemon_inherits_no_descriptors_beyond_stdio() {
         profile_dir: Some(store_dir),
         home: None,
         model: None,
+        runtime_dir: None,
         xdg_runtime_dir: None,
     };
     let profile = resolve_profile(&env).expect("resolve profile");

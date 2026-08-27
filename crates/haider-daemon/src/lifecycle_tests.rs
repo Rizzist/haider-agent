@@ -1,9 +1,9 @@
+#![allow(clippy::expect_used)]
+
 //! Unit tests for the phase publisher itself.
 //!
 //! `tests/state_machine_tests.rs` pins the transition RELATION; these pin what
 //! the publisher DOES with it, which is only reachable from inside the crate.
-
-#![allow(clippy::expect_used)]
 
 use super::*;
 
@@ -54,4 +54,16 @@ fn publish_refuses_a_self_transition_and_every_edge_out_of_a_terminal_state() {
         },
         "Failed is terminal: nothing may publish past it"
     );
+}
+
+#[test]
+fn launcher_death_is_retained_as_typed_idle_shutdown_reason() {
+    let (shutdown, receiver, _) = ShutdownHandle::channel();
+    assert!(shutdown.request_when_idle(ShutdownReason::ClientVanished));
+    assert!(matches!(
+        &*receiver.borrow(),
+        ShutdownRequest::GracefulWhenIdle {
+            reason: ShutdownReason::ClientVanished
+        }
+    ));
 }
