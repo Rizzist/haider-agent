@@ -7,7 +7,7 @@
 use haider_daemon::{
     BUILD_UUID, BUILD_VERSION, DaemonConfig, DaemonDependencies, ProviderFactory,
     ProviderFactoryConfig, ResolvedTurnProvider, ShutdownOutcome, process_started_unix_ms,
-    run_with_signals_and_dependencies,
+    run_with_signals_and_dependencies_and_readiness,
 };
 use haider_protocol::error::HaiderError;
 use haider_protocol::session::SessionMetadataV1;
@@ -131,8 +131,8 @@ async fn dispatch() -> ExitCode {
         println!("haiderd {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
-    let config = match parse_args(args.into_iter()) {
-        Ok(config) => config,
+    let parsed = match parse_args(args.into_iter()) {
+        Ok(parsed) => parsed,
         Err(message) => {
             eprintln!("haiderd: {message}");
             return ExitCode::from(64);
@@ -145,7 +145,13 @@ async fn dispatch() -> ExitCode {
             return ExitCode::from(64);
         }
     };
-    match run_with_signals_and_dependencies(config, dependencies).await {
+    match run_with_signals_and_dependencies_and_readiness(
+        parsed.config,
+        dependencies,
+        parsed.readiness,
+    )
+    .await
+    {
         Ok(ShutdownOutcome::Graceful) => ExitCode::SUCCESS,
         Ok(ShutdownOutcome::Forced) => ExitCode::from(130),
         Err(error) => {
@@ -239,10 +245,16 @@ impl ProviderFactory for FakeFactory {
 /// set is refused — mixing resolved and explicit identity could bind a
 /// socket for one profile against another profile's store. Every other knob
 /// keeps its `DaemonConfig` default.
-fn parse_args(args: impl Iterator<Item = String>) -> Result<DaemonConfig, String> {
+struct ParsedArgs {
+    config: DaemonConfig,
+    readiness: Option<haider_platform::DaemonReadyNotifier>,
+}
+
+fn parse_args(args: impl Iterator<Item = String>) -> Result<ParsedArgs, String> {
     let mut profile = None;
     let mut store_dir = None;
     let mut runtime_dir = None;
+    let mut readiness = None;
     let mut args = args;
     while let Some(argument) = args.next() {
         let value = args
@@ -252,6 +264,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<DaemonConfig, String
             "--profile" => profile = Some(value),
             "--store-dir" => store_dir = Some(PathBuf::from(value)),
             "--runtime-dir" => runtime_dir = Some(PathBuf::from(value)),
+            haider_platform::DAEMON_READINESS_ARG => readiness = Some(value),
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -294,7 +307,11 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<DaemonConfig, String
     if std::env::var_os("HAIDER_DISCOVERY_DISABLED").is_some_and(|value| value != "0") {
         config.discovery_disabled = true;
     }
-    Ok(config)
+    let readiness = readiness
+        .map(|token| haider_platform::DaemonReadyNotifier::from_spawn_token(&token))
+        .transpose()
+        .map_err(|error| format!("invalid startup readiness coordinate: {error}"))?;
+    Ok(ParsedArgs { config, readiness })
 }
 
 #[cfg(test)]

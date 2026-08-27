@@ -3,10 +3,25 @@ use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+#[path = "spawn_tests.rs"]
+mod readiness_tests;
+
+#[cfg(unix)]
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+
 pub const DAEMON_LOG_DIRECTORY: &str = "daemon-logs";
 pub const DAEMON_LOG_FILE: &str = "daemon.log";
 pub const DAEMON_LOG_RETENTION: usize = 32;
 pub const DAEMON_LOG_PATH_ENV: &str = "HAIDER_DAEMON_PROCESS_LOG";
+pub const DAEMON_READINESS_ARG: &str = "--startup-ready";
+#[cfg(unix)]
+const DAEMON_READINESS_TOKEN: &str = "3";
+#[cfg(windows)]
+const DAEMON_READINESS_TOKEN: &str = "stdin";
 static LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Fully resolved inputs for launching the packaged sibling daemon.
@@ -23,7 +38,151 @@ pub struct DaemonSpawn<'a> {
 pub enum DaemonSpawnError {
     OpenLog(std::io::Error),
     CloneLog(std::io::Error),
+    Readiness(std::io::Error),
     Spawn(std::io::Error),
+}
+
+/// A spawned daemon together with the one-shot readiness receiver owned by
+/// its launcher.
+pub struct SpawnedDaemon {
+    pub child: Child,
+    pub readiness: DaemonReadiness,
+}
+
+/// The launcher side of a one-byte daemon readiness notification.
+pub struct DaemonReadiness {
+    #[cfg(unix)]
+    reader: OwnedFd,
+    #[cfg(windows)]
+    server: NamedPipeServer,
+}
+
+/// The daemon side of a one-byte readiness notification.
+pub struct DaemonReadyNotifier {
+    #[cfg(unix)]
+    writer: OwnedFd,
+    #[cfg(windows)]
+    pipe: std::fs::File,
+}
+
+impl DaemonReadiness {
+    /// Waits until the spawned daemon explicitly reports that its listener and
+    /// lifecycle state are both ready. EOF is a typed I/O failure, not Ready.
+    pub async fn wait(self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            let reader = tokio::io::unix::AsyncFd::new(self.reader)?;
+            let mut byte = [0_u8; 1];
+            let read = reader
+                .async_io(tokio::io::Interest::READABLE, |reader| {
+                    rustix::io::read(reader, &mut byte).map_err(std::io::Error::from)
+                })
+                .await?;
+            if read == 1 && byte == [1] {
+                return Ok(());
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "daemon readiness channel closed without a notification",
+            ));
+        }
+        #[cfg(windows)]
+        {
+            use tokio::io::AsyncReadExt as _;
+
+            let mut server = self.server;
+            server.connect().await?;
+            let mut byte = [0_u8; 1];
+            server.read_exact(&mut byte).await?;
+            if byte == [1] {
+                return Ok(());
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "daemon readiness channel carried an invalid notification",
+            ))
+        }
+    }
+}
+
+impl DaemonReadyNotifier {
+    /// Adopts the readiness coordinate passed in the daemon's private argv.
+    /// The daemon immediately disables further inheritance so pre-Ready
+    /// subprocesses cannot retain the writer if it exits before publishing
+    /// Ready.
+    #[allow(unsafe_code)]
+    pub fn from_spawn_token(token: &str) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            if token != DAEMON_READINESS_TOKEN {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid daemon readiness descriptor",
+                ));
+            }
+            // SAFETY: the launcher moves its owned pipe writer to descriptor 3
+            // in `pre_exec` and passes exactly that descriptor in argv. This is
+            // the daemon's first and only adoption of it.
+            let writer = unsafe { OwnedFd::from_raw_fd(3) };
+            rustix::io::fcntl_setfd(&writer, rustix::io::FdFlags::CLOEXEC)
+                .map_err(std::io::Error::from)?;
+            Ok(Self { writer })
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+            use windows_sys::Win32::Foundation::{
+                HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+            };
+            use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
+
+            if token != DAEMON_READINESS_TOKEN {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid daemon readiness pipe coordinate",
+                ));
+            }
+            let raw = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+            if raw.is_null() || raw == INVALID_HANDLE_VALUE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "daemon readiness pipe is missing from standard input",
+                ));
+            }
+            // SAFETY: the launcher supplies its named-pipe writer as this
+            // child's stdin through Command's protected stdio inheritance
+            // path. No daemon code reads stdin, and this is its only adoption.
+            let pipe = unsafe { std::fs::File::from_raw_handle(raw) };
+            if unsafe { SetHandleInformation(pipe.as_raw_handle().cast(), HANDLE_FLAG_INHERIT, 0) }
+                == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(Self { pipe })
+        }
+    }
+
+    /// Emits the single buffered Ready byte and closes the notification side.
+    pub fn notify(self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            let written = rustix::io::write(&self.writer, &[1]).map_err(std::io::Error::from)?;
+            if written == 1 {
+                return Ok(());
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "daemon readiness notification was not written",
+            ))
+        }
+        #[cfg(windows)]
+        {
+            use std::io::Write as _;
+
+            let mut pipe = self.pipe;
+            pipe.write_all(&[1])
+        }
+    }
 }
 
 /// Allocates a collision-resistant, per-launch log path.
@@ -142,6 +301,9 @@ impl std::fmt::Display for DaemonSpawnError {
         match self {
             Self::OpenLog(error) => write!(formatter, "cannot open daemon log: {error}"),
             Self::CloneLog(error) => write!(formatter, "cannot clone daemon log handle: {error}"),
+            Self::Readiness(error) => {
+                write!(formatter, "cannot create daemon readiness channel: {error}")
+            }
             Self::Spawn(error) => error.fmt(formatter),
         }
     }
@@ -150,7 +312,10 @@ impl std::fmt::Display for DaemonSpawnError {
 impl std::error::Error for DaemonSpawnError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::OpenLog(error) | Self::CloneLog(error) | Self::Spawn(error) => Some(error),
+            Self::OpenLog(error)
+            | Self::CloneLog(error)
+            | Self::Readiness(error)
+            | Self::Spawn(error) => Some(error),
         }
     }
 }
@@ -158,7 +323,23 @@ impl std::error::Error for DaemonSpawnError {
 /// Spawns the sibling daemon with its fixed argv/stdout/stderr contract and
 /// the platform's detach + inheritance hygiene.
 pub fn spawn_daemon(spec: DaemonSpawn<'_>) -> Result<Child, DaemonSpawnError> {
-    spawn_daemon_with_stderr(spec, false)
+    spawn_daemon_with_stderr(spec, false, None)
+}
+
+/// Spawns a daemon with a private one-shot readiness notification.
+pub fn spawn_daemon_with_readiness(
+    spec: DaemonSpawn<'_>,
+) -> Result<SpawnedDaemon, DaemonSpawnError> {
+    let prepared = prepare_readiness().map_err(DaemonSpawnError::Readiness)?;
+    let token = prepared.token().to_owned();
+    let coordinate = prepared
+        .child_coordinate()
+        .map_err(DaemonSpawnError::Readiness)?;
+    let child = spawn_daemon_with_stderr(spec, false, Some((&token, coordinate)))?;
+    Ok(SpawnedDaemon {
+        child,
+        readiness: prepared.into_receiver(),
+    })
 }
 
 /// Test/diagnostic variant of [`spawn_daemon`] that leaves the child's stderr
@@ -169,12 +350,13 @@ pub fn spawn_daemon(spec: DaemonSpawn<'_>) -> Result<Child, DaemonSpawnError> {
 /// cannot block on a full pipe.
 #[doc(hidden)]
 pub fn spawn_daemon_with_piped_stderr(spec: DaemonSpawn<'_>) -> Result<Child, DaemonSpawnError> {
-    spawn_daemon_with_stderr(spec, true)
+    spawn_daemon_with_stderr(spec, true, None)
 }
 
 fn spawn_daemon_with_stderr(
     spec: DaemonSpawn<'_>,
     pipe_stderr: bool,
+    readiness: Option<(&str, ReadinessChildCoordinate)>,
 ) -> Result<Child, DaemonSpawnError> {
     let mut log_options = std::fs::OpenOptions::new();
     log_options.create(true).append(true);
@@ -199,28 +381,179 @@ fn spawn_daemon_with_stderr(
         .arg(spec.store_dir)
         .arg("--runtime-dir")
         .arg(spec.runtime_dir)
-        .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(stderr);
     command.env(DAEMON_LOG_PATH_ENV, spec.log_path);
+    if let Some((token, _)) = readiness.as_ref() {
+        command.arg(DAEMON_READINESS_ARG).arg(*token);
+    }
 
     #[cfg(unix)]
-    configure_daemon(&mut command);
+    {
+        command.stdin(Stdio::null());
+        configure_daemon(&mut command, readiness.map(|(_, coordinate)| coordinate));
+        command.spawn().map_err(DaemonSpawnError::Spawn)
+    }
     #[cfg(windows)]
-    configure_daemon(&mut command).map_err(DaemonSpawnError::Spawn)?;
-    command.spawn().map_err(DaemonSpawnError::Spawn)
+    {
+        let stdin = readiness.map_or_else(Stdio::null, |(_, writer)| Stdio::from(writer));
+        command.stdin(stdin);
+        configure_daemon(&mut command).map_err(DaemonSpawnError::Spawn)?;
+        command.spawn().map_err(DaemonSpawnError::Spawn)
+    }
 }
 
 #[cfg(unix)]
-fn configure_daemon(command: &mut std::process::Command) {
+type ReadinessChildCoordinate = std::os::raw::c_int;
+
+#[cfg(windows)]
+type ReadinessChildCoordinate = std::fs::File;
+
+struct PreparedReadiness {
+    token: String,
+    receiver: DaemonReadiness,
+    #[cfg(unix)]
+    writer: OwnedFd,
+    #[cfg(windows)]
+    writer: std::fs::File,
+}
+
+impl PreparedReadiness {
+    fn token(&self) -> &str {
+        &self.token
+    }
+
+    fn child_coordinate(&self) -> std::io::Result<ReadinessChildCoordinate> {
+        #[cfg(unix)]
+        return Ok(self.writer.as_raw_fd());
+        #[cfg(windows)]
+        {
+            self.writer.try_clone()
+        }
+    }
+
+    fn into_receiver(self) -> DaemonReadiness {
+        self.receiver
+    }
+}
+
+#[cfg(unix)]
+fn prepare_readiness() -> std::io::Result<PreparedReadiness> {
+    let (reader, writer) = readiness_pipe()?;
+    // Command may fill closed standard descriptors before pre_exec. Move the
+    // writer above 0..=2 now so setup cannot overwrite the coordinate.
+    // F_DUPFD_CLOEXEC performs the move without opening an inheritance gap.
+    let writer = readiness_writer_above_stdio(&writer)?;
+    Ok(PreparedReadiness {
+        token: DAEMON_READINESS_TOKEN.to_owned(),
+        receiver: DaemonReadiness { reader },
+        writer,
+    })
+}
+
+#[cfg(all(unix, not(target_os = "espidf")))]
+fn readiness_writer_above_stdio(writer: &OwnedFd) -> std::io::Result<OwnedFd> {
+    rustix::io::fcntl_dupfd_cloexec(writer, 3).map_err(std::io::Error::from)
+}
+
+#[cfg(all(unix, target_os = "espidf"))]
+fn readiness_writer_above_stdio(writer: &OwnedFd) -> std::io::Result<OwnedFd> {
+    // ESP-IDF lacks F_DUPFD_CLOEXEC. Duplicate above stdio, then apply the
+    // same immediate CLOEXEC fallback used by its pipe creation path.
+    let duplicated = rustix::io::fcntl_dupfd(writer, 3).map_err(std::io::Error::from)?;
+    rustix::io::fcntl_setfd(&duplicated, rustix::io::FdFlags::CLOEXEC)
+        .map_err(std::io::Error::from)?;
+    Ok(duplicated)
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_vendor = "apple",
+        target_os = "aix",
+        target_os = "espidf",
+        target_os = "haiku",
+        target_os = "horizon",
+        target_os = "nto"
+    ))
+))]
+fn readiness_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK)
+        .map_err(std::io::Error::from)
+}
+
+#[cfg(all(
+    unix,
+    any(
+        target_vendor = "apple",
+        target_os = "aix",
+        target_os = "espidf",
+        target_os = "haiku",
+        target_os = "horizon",
+        target_os = "nto"
+    )
+))]
+fn readiness_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    // These targets expose pipe(2), but not atomic pipe2 flags. Apply CLOEXEC
+    // immediately, then NONBLOCK to the launcher reader. This is the narrow
+    // unavoidable fallback; supported pipe2 targets use the atomic path.
+    let (reader, writer) = rustix::pipe::pipe().map_err(std::io::Error::from)?;
+    rustix::io::fcntl_setfd(&reader, rustix::io::FdFlags::CLOEXEC).map_err(std::io::Error::from)?;
+    rustix::io::fcntl_setfd(&writer, rustix::io::FdFlags::CLOEXEC).map_err(std::io::Error::from)?;
+    let flags = rustix::fs::fcntl_getfl(&reader).map_err(std::io::Error::from)?;
+    rustix::fs::fcntl_setfl(&reader, flags | rustix::fs::OFlags::NONBLOCK)
+        .map_err(std::io::Error::from)?;
+    Ok((reader, writer))
+}
+
+#[cfg(windows)]
+fn prepare_readiness() -> std::io::Result<PreparedReadiness> {
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random).map_err(std::io::Error::other)?;
+    let token = format!(
+        r"\\.\pipe\haider-readiness-{}-{}",
+        std::process::id(),
+        random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    let server = ServerOptions::new()
+        .access_inbound(true)
+        .access_outbound(false)
+        .first_pipe_instance(true)
+        .max_instances(1)
+        .in_buffer_size(1)
+        .create(&token)?;
+    // Connect in the launcher, then carry the writer through Command's
+    // internally locked stdin-inheritance path. The child therefore owns the
+    // pipe from CreateProcess onward: even a failure before Rust argument
+    // parsing closes the last writer and wakes the readiness wait.
+    let writer = std::fs::OpenOptions::new().write(true).open(&token)?;
+    Ok(PreparedReadiness {
+        token: DAEMON_READINESS_TOKEN.to_owned(),
+        receiver: DaemonReadiness { server },
+        writer,
+    })
+}
+
+#[cfg(unix)]
+fn configure_daemon(
+    command: &mut std::process::Command,
+    readiness: Option<ReadinessChildCoordinate>,
+) {
     use std::os::unix::process::CommandExt as _;
     command.process_group(0);
     // SAFETY: the hook runs between fork and exec and calls only the
     // async-signal-safe close(2); no allocation or runtime state is touched.
     #[allow(unsafe_code)]
     unsafe {
-        command.pre_exec(|| {
-            crate::process::close_inherited_descriptors();
+        command.pre_exec(move || {
+            if let Some(readiness) = readiness {
+                crate::process::install_daemon_readiness_descriptor(readiness)?;
+            } else {
+                crate::process::close_inherited_descriptors();
+            }
             Ok(())
         });
     }

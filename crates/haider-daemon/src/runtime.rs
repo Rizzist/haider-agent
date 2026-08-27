@@ -435,23 +435,60 @@ pub async fn run_with_signals_and_dependencies(
     config: DaemonConfig,
     dependencies: DaemonDependencies,
 ) -> Result<ShutdownOutcome, DaemonError> {
+    run_with_signals_and_dependencies_and_readiness(config, dependencies, None).await
+}
+
+/// Runs the signal-owned daemon and emits an optional launcher notification
+/// on the same lifecycle edge exposed by [`DaemonTask::readiness`].
+pub async fn run_with_signals_and_dependencies_and_readiness(
+    config: DaemonConfig,
+    dependencies: DaemonDependencies,
+    mut launcher_readiness: Option<haider_platform::DaemonReadyNotifier>,
+) -> Result<ShutdownOutcome, DaemonError> {
     let mut signals =
         haider_platform::ShutdownSignals::new().map_err(|error| DaemonError::Task {
             message: format!("cannot install {} handler: {error}", error.signal()),
         })?;
     let task = spawn_with_dependencies(config, dependencies);
+    let mut readiness = task.readiness();
     let shutdown = task.shutdown_handle();
     let mut joined: Pin<Box<dyn Future<Output = Result<ShutdownOutcome, DaemonError>> + Send>> =
         Box::pin(task.join());
+    notify_launcher_if_ready(&readiness, &mut launcher_readiness);
     loop {
         tokio::select! {
             result = &mut joined => return result,
+            state = readiness.changed(), if launcher_readiness.is_some() => {
+                match state {
+                    Some(DaemonState::Ready) => {
+                        notify_launcher_if_ready(&readiness, &mut launcher_readiness);
+                    }
+                    Some(DaemonState::Failed { .. } | DaemonState::Stopped) | None => {
+                        launcher_readiness = None;
+                    }
+                    Some(_) => {}
+                }
+            }
             signal = haider_platform::shutdown_signal(&mut signals) => {
                 if let Some(signal) = signal {
                     shutdown.request(signal.reason());
                 }
             }
         }
+    }
+}
+
+fn notify_launcher_if_ready(
+    readiness: &Readiness,
+    launcher_readiness: &mut Option<haider_platform::DaemonReadyNotifier>,
+) {
+    if !matches!(readiness.current(), DaemonState::Ready) {
+        return;
+    }
+    if let Some(notification) = launcher_readiness.take()
+        && let Err(error) = notification.notify()
+    {
+        tracing::warn!(%error, "could not notify daemon launcher that the listener is ready");
     }
 }
 
