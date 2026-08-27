@@ -37,6 +37,16 @@ export HAIDER_TEST_SIBLINGS_PREBUILT=1
 
 # Per-crate execution cap (15 min — generous for RUNNING tests).
 T="$(command -v timeout || command -v gtimeout || true)"
+windows_runner=false
+case "${RUNNER_OS:-}" in
+  Windows) windows_runner=true ;;
+esac
+case "${OS:-}" in
+  Windows_NT) windows_runner=true ;;
+esac
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) windows_runner=true ;;
+esac
 
 fail=0
 for crate in $crates; do
@@ -46,10 +56,16 @@ for crate in $crates; do
       ${T:+"$T" 900} cargo test -p "$crate" --locked -- --test-threads=4 || { echo "FAIL: $crate"; fail=$((fail+1)); }
       ;;
     haider-daemond)
-      # Stream this crate's explicit test/phase diagnostics. Libtest's default
-      # capture loses a still-running test's stderr when the outer timeout
-      # kills the process, which is why Gate 19 named only the crate.
-      ${T:+"$T" 900} cargo test -p "$crate" --locked -- --test-threads=4 --nocapture || { echo "FAIL: $crate"; fail=$((fail+1)); }
+      if [ "$windows_runner" = true ]; then
+        # Stream only the Windows process-tree test whose phase diagnostics
+        # identify the former hang, then keep capture for every other test.
+        # The skip prevents a duplicate run; the in-binary gate still
+        # serializes all five real-process tests in ordinary Windows runs.
+        ${T:+"$T" 900} cargo test -p "$crate" --locked --test live_turn_rpc_tests w4a2_cancelled_exec_child_process_group_dies -- --exact --test-threads=1 --nocapture || { echo "FAIL: $crate (streamed Windows process-tree test)"; fail=$((fail+1)); }
+        ${T:+"$T" 900} cargo test -p "$crate" --locked -- --test-threads=4 --skip w4a2_cancelled_exec_child_process_group_dies || { echo "FAIL: $crate"; fail=$((fail+1)); }
+      else
+        ${T:+"$T" 900} cargo test -p "$crate" --locked -- --test-threads=4 || { echo "FAIL: $crate"; fail=$((fail+1)); }
+      fi
       ;;
     *)
       ${T:+"$T" 900} cargo test -p "$crate" --locked || { echo "FAIL: $crate"; fail=$((fail+1)); }

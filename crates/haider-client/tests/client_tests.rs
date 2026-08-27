@@ -829,6 +829,136 @@ async fn racing_launcher_never_owns_the_other_launchers_winner() {
     ensured.client.close();
 }
 
+/// A closed handshake is not itself permission to spawn. Once a prior
+/// missing/refused endpoint has authorized one candidate, however, the stale
+/// Unix socket may disappear between connect and Hello and yield EOF while
+/// that candidate claims the endpoint. The launcher must keep polling the
+/// same candidate within its existing startup deadline.
+///
+/// MUTATION CHECK: make every closed handshake fatal in `ensure_daemon`.
+/// Expected runtime failure: the first post-spawn EOF escapes instead of the
+/// second handshake attaching to the winner. Making EOF spawnable also fails
+/// the pre-spawn half by trying the impossible candidate.
+#[tokio::test]
+async fn closed_handshake_is_retried_only_after_a_spawnable_failure_authorizes_a_candidate() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = short_dir();
+    let store = dir.path().join("store");
+    let env = ProfileEnv {
+        profile_dir: Some(store),
+        home: None,
+        model: None,
+        xdg_runtime_dir: None,
+    };
+    let mut profile = resolve_profile(&env).expect("resolve profile");
+    profile.endpoint_path = dir.path().join("closed-then-ready.sock");
+
+    let listener = UnixListener::bind(&profile.endpoint_path).expect("bind closing incumbent");
+    let closing_incumbent = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept initial handshake");
+        let mut decoder = uds_codec::Decoder::new(LIMIT);
+        assert!(matches!(
+            read_frames(&mut stream, &mut decoder).await.first(),
+            Some(WireFrame::Hello(_))
+        ));
+        drop(stream);
+    });
+    let error = match ensure_daemon(
+        &profile,
+        EnsureOptions {
+            daemon_binary: Some(PathBuf::from("/nonexistent/haiderd-must-not-run")),
+            ..EnsureOptions::default()
+        },
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("pre-spawn closed handshake must remain fatal"),
+    };
+    assert!(matches!(
+        error,
+        EnsureError::Connect(ConnectError::ClosedDuringHandshake)
+    ));
+    closing_incumbent.await.expect("closing incumbent joins");
+    std::fs::remove_file(&profile.endpoint_path).expect("remove closing incumbent socket");
+
+    let marker = dir.path().join("candidate-started");
+    let candidate = dir.path().join("losing-haiderd");
+    std::fs::write(
+        &candidate,
+        format!(
+            "#!/bin/sh\n: > '{}'\nsleep 0.4\nexit {}\n",
+            marker.display(),
+            haider_client::RACE_LOSER_EXIT_CODE
+        ),
+    )
+    .expect("write losing candidate");
+    let mut permissions = std::fs::metadata(&candidate)
+        .expect("candidate metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&candidate, permissions).expect("candidate executable");
+
+    let endpoint = profile.endpoint_path.clone();
+    let profile_id = profile.profile_id.clone();
+    let winner = tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !marker.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "candidate start marker deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let listener = UnixListener::bind(&endpoint).expect("bind eventual winner");
+
+        let (mut first, _) = listener.accept().await.expect("accept transient handshake");
+        let mut first_decoder = uds_codec::Decoder::new(LIMIT);
+        assert!(matches!(
+            read_frames(&mut first, &mut first_decoder).await.first(),
+            Some(WireFrame::Hello(_))
+        ));
+        drop(first);
+
+        let (mut second, _) = listener.accept().await.expect("accept retried handshake");
+        let mut second_decoder = uds_codec::Decoder::new(LIMIT);
+        assert!(matches!(
+            read_frames(&mut second, &mut second_decoder).await.first(),
+            Some(WireFrame::Hello(_))
+        ));
+        write_frame(
+            &mut second,
+            &WireFrame::Welcome(welcome(
+                &profile_id,
+                haider_client::required_live_features(),
+            )),
+        )
+        .await;
+        echo_serve(second, second_decoder).await;
+    });
+
+    let ensured = ensure_daemon(
+        &profile,
+        EnsureOptions {
+            startup_deadline: Duration::from_secs(5),
+            daemon_binary: Some(candidate),
+            ..EnsureOptions::default()
+        },
+    )
+    .await
+    .expect("post-spawn closed handshake is retried");
+    assert!(ensured.spawned);
+    assert!(ensured.race_lost);
+    assert!(ensured.ownership.is_none());
+    ensured.client.close();
+    drop(ensured);
+    tokio::time::timeout(Duration::from_secs(2), winner)
+        .await
+        .expect("winner join deadline")
+        .expect("winner joins after client closes");
+}
+
 /// MUTATION CHECK: remove the `pre_exec` descriptor sweep from
 /// `spawn_daemon`. Expected RUNTIME failure: a non-CLOEXEC socket end
 /// planted at a high descriptor (the macOS `pipe()`+`fcntl` race shape)

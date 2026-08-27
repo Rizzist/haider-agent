@@ -396,7 +396,18 @@ pub async fn ensure_daemon(
                     ownership,
                 });
             }
-            Attach::Fatal(error) => return Err(*error),
+            Attach::Fatal(error) => match *error {
+                // After a missing/refused endpoint has authorized exactly one
+                // spawn, a stale Unix socket can disappear between connect
+                // and Hello and surface EOF instead of another refusal. Keep
+                // polling the already-authorized candidate; the same error
+                // remains fatal before spawning, so it can never authorize a
+                // competitor against an incumbent.
+                EnsureError::Connect(ConnectError::ClosedDuringHandshake) if spawned => {
+                    last_error = Some(ConnectError::ClosedDuringHandshake);
+                }
+                error => return Err(error),
+            },
             Attach::Spawnable(error) => {
                 last_error = Some(error);
                 if !spawned {
