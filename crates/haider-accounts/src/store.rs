@@ -13,8 +13,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use haider_protocol::credential::{CredentialDescriptor, CredentialStatus};
+use haider_protocol::credential::{AccountIdentity, CredentialDescriptor, CredentialStatus};
 use haider_protocol::error::ErrorCode;
 use haider_protocol::ids::CredentialAlias;
 
@@ -203,6 +204,28 @@ impl<S: StoreLike> AccountStore<S> {
         if !provider_exists {
             descriptor.active = true;
         }
+        if descriptor.created_at_ms.is_none() {
+            descriptor.created_at_ms = Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|_| {
+                        accounts_error(
+                            ErrorCode::Internal,
+                            "cannot timestamp account creation",
+                            true,
+                        )
+                    })?
+                    .as_millis()
+                    .try_into()
+                    .map_err(|_| {
+                        accounts_error(
+                            ErrorCode::Internal,
+                            "account creation timestamp is out of range",
+                            false,
+                        )
+                    })?,
+            );
+        }
 
         let mut next = self.descriptors.clone();
         if descriptor.active {
@@ -235,6 +258,49 @@ impl<S: StoreLike> AccountStore<S> {
             .ok_or_else(|| missing_alias(alias))?;
         let mut next = self.descriptors.clone();
         next[index].label = label;
+        let updated = next[index].clone();
+        self.store.save(&next)?;
+        self.descriptors = next;
+        Ok(updated)
+    }
+
+    /// Persists an informational identity only when the pre-964 row has none.
+    /// The creation timestamp is intentionally untouched: migration must not
+    /// invent when an older account was added.
+    pub fn backfill_identity(
+        &mut self,
+        alias: &CredentialAlias,
+        identity: AccountIdentity,
+    ) -> AccountsResult<bool> {
+        let index = self
+            .descriptors
+            .iter()
+            .position(|existing| &existing.alias == alias)
+            .ok_or_else(|| missing_alias(alias))?;
+        if self.descriptors[index].account_identity.is_some() {
+            return Ok(false);
+        }
+        let mut next = self.descriptors.clone();
+        next[index].account_identity = Some(identity);
+        self.store.save(&next)?;
+        self.descriptors = next;
+        Ok(true)
+    }
+
+    /// Replaces only the informational identity for an existing account.
+    /// Credential coordinates and the original creation time remain fixed.
+    pub fn set_identity(
+        &mut self,
+        alias: &CredentialAlias,
+        identity: Option<AccountIdentity>,
+    ) -> AccountsResult<CredentialDescriptor> {
+        let index = self
+            .descriptors
+            .iter()
+            .position(|existing| &existing.alias == alias)
+            .ok_or_else(|| missing_alias(alias))?;
+        let mut next = self.descriptors.clone();
+        next[index].account_identity = identity;
         let updated = next[index].clone();
         self.store.save(&next)?;
         self.descriptors = next;
@@ -286,6 +352,9 @@ impl<S: StoreLike> AccountStore<S> {
         if descriptor.label.is_none() {
             descriptor.label = previous.label.clone();
         }
+        // Creation is the first Haider commit, not the latest refresh or
+        // re-login. Pre-964 rows deliberately keep their unknown timestamp.
+        descriptor.created_at_ms = previous.created_at_ms;
         let mut next = self.descriptors.clone();
         next[index] = descriptor;
         self.commit(next)

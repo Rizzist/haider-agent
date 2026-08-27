@@ -292,6 +292,7 @@ fn observe_json_schemas_are_goldened_and_secret_free() {
         }),
         session_count: 2,
         profile_path: "/tmp/haider-profile".into(),
+        adoption_available: Vec::new(),
     };
     let permission = digest(
         "session-permission",

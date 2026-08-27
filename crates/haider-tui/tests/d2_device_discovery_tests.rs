@@ -1,6 +1,5 @@
-//! Device discovery is daemon policy now. The TUI only triggers the
-//! discovery/auto-adopt cadence and then refreshes roster truth; it never
-//! renders candidates or offers manual import controls.
+//! Device discovery is metadata-only. The TUI shows one adoption notice and
+//! dispatches the opaque candidate only after an explicit yes.
 #![allow(clippy::expect_used)]
 
 use haider_tui::app::{AppModel, AppRequest, RuntimeMode, Screen};
@@ -10,9 +9,10 @@ use haider_tui::render::render;
 use haider_tui::runtime::live_pass;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::crossterm::event::KeyCode;
 
 mod common;
-use common::{launcher_model, run_slash};
+use common::{key, launcher_model, run_slash};
 
 fn live_model(features: &[&str]) -> AppModel {
     let mut model = launcher_model();
@@ -44,7 +44,7 @@ fn draw(model: &AppModel) -> String {
 }
 
 #[test]
-fn accounts_refresh_triggers_daemon_auto_adopt_but_has_no_device_section() {
+fn accounts_refresh_triggers_metadata_only_device_discovery() {
     let mut model = live_model(&[haider_rpc::FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1]);
     let mut driver = LiveDriver::new("test");
     run_slash(&mut model, "/accounts");
@@ -63,14 +63,64 @@ fn discovery_completion_refreshes_roster_truth_not_candidate_chrome() {
         LiveReply::DeviceCandidates {
             discovery_disabled: false,
             candidates: Vec::new(),
+            adoption_available: Vec::new(),
         },
     );
-    assert_eq!(
-        followups,
-        vec![LiveCommand::AccountList, LiveCommand::ProviderList],
-        "the daemon may have auto-adopted rows; materialize both rosters"
+    assert!(
+        followups.is_empty(),
+        "discovery is read-only until confirmation"
     );
     assert!(!draw(&model).contains("found on this device"));
+}
+
+#[test]
+fn adoption_offer_requires_yes_before_receipted_import() {
+    let mut model = live_model(&[haider_rpc::FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1]);
+    let mut driver = LiveDriver::new("test");
+    run_slash(&mut model, "/accounts");
+    model.requests.clear();
+    let identity = haider_protocol::credential::AccountIdentity {
+        email: Some("owner@example.invalid".into()),
+        display_name: None,
+        account_id: Some("acct-964".into()),
+        plan: Some("pro".into()),
+        issuer: Some("https://auth.openai.com".into()),
+        captured_at: 964,
+        verified: false,
+    };
+    let candidate_id = format!("dc1_{}", "0".repeat(64));
+    let commands = driver.apply(
+        &mut model,
+        LiveReply::DeviceCandidates {
+            discovery_disabled: false,
+            candidates: vec![haider_rpc::DeviceCredentialCandidateWire {
+                candidate: candidate_id.clone(),
+                source: "codex".into(),
+                provider: "openai-oauth".into(),
+                source_label: "Codex".into(),
+                account_label: Some("owner@example.invalid".into()),
+                identity: Some(identity),
+                freshness: "fresh".into(),
+                expires_at_ms: None,
+                path: "/home/test/.codex/auth.json".into(),
+                import_supported: true,
+                unsupported_reason: None,
+            }],
+            adoption_available: vec![haider_rpc::AccountAdoptionAvailable {
+                source: "codex".into(),
+                email: Some("owner@example.invalid".into()),
+            }],
+        },
+    );
+    assert!(commands.is_empty(), "notice alone cannot import");
+    assert!(draw(&model).contains("haider account import codex --confirm"));
+
+    model.handle(key(KeyCode::Char('y')));
+    let issued = live_pass(&mut driver, &mut model, None, std::time::Instant::now()).commands;
+    assert!(matches!(
+        issued.as_slice(),
+        [LiveCommand::DeviceImport { candidate, .. }] if candidate == &candidate_id
+    ));
 }
 
 #[test]

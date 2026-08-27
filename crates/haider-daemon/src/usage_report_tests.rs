@@ -1,7 +1,8 @@
+#![allow(clippy::expect_used)] // tests may expect; the lint guards src/ only
+
 //! Runtime laws for the U1 `usage.report` service: meter routing, the
 //! cache/poll floor, typed unavailability, JWT identity enrichment, and the
 //! journal fold's attribution arithmetic.
-#![allow(clippy::expect_used)] // tests may expect; the lint guards src/ only
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -46,6 +47,8 @@ fn descriptor(provider: &str, alias: &str, auth_method: AuthMethod) -> Credentia
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     }
 }
 

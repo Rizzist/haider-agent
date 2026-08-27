@@ -1354,10 +1354,9 @@ pub fn transcript() -> Vec<WireFrame> {
             },
         },
         // D1 append-only device credential discovery + import. Every earlier
-        // frame stays byte-for-byte frozen; there is deliberately NO
-        // `account.refresh` frame — refresh-now was cut by owner decision and
-        // never became wire surface. Candidates are metadata-only: no field
-        // of the candidate wire can carry token bytes.
+        // frame stays byte-for-byte frozen. The v0.0.964 `account.refresh`
+        // pair lives in the focused method fixture rather than rewriting this
+        // historical transcript. Candidates carry metadata only.
         WireFrame::Welcome(Welcome {
             protocol: 1,
             instance_id: "instance-device-discovery".into(),
@@ -1379,12 +1378,15 @@ pub fn transcript() -> Vec<WireFrame> {
             request_id: RequestId::new("request-device-candidates"),
             body: ResponseBody::AccountDeviceCandidates {
                 discovery_disabled: false,
+                adoption_available: Vec::new(),
                 candidates: vec![
                     DeviceCredentialCandidateWire {
                         candidate: format!("dc1_{}", "0123456789abcdef".repeat(4)),
+                        source: "codex".into(),
                         provider: "openai-oauth".into(),
                         source_label: "Codex".into(),
                         account_label: Some("person@example.invalid".into()),
+                        identity: None,
                         freshness: "fresh".into(),
                         expires_at_ms: Some(1_753_503_600_000),
                         path: "/home/golden/.codex/auth.json".into(),
@@ -1393,9 +1395,11 @@ pub fn transcript() -> Vec<WireFrame> {
                     },
                     DeviceCredentialCandidateWire {
                         candidate: format!("dc1_{}", "fedcba9876543210".repeat(4)),
+                        source: "gemini-cli".into(),
                         provider: "gemini".into(),
                         source_label: "Gemini CLI".into(),
                         account_label: None,
+                        identity: None,
                         freshness: "unknown".into(),
                         expires_at_ms: None,
                         path: "/home/golden/.gemini/oauth_creds.json".into(),
@@ -1414,6 +1418,7 @@ pub fn transcript() -> Vec<WireFrame> {
             body: ResponseBody::AccountDeviceCandidates {
                 discovery_disabled: true,
                 candidates: Vec::new(),
+                adoption_available: Vec::new(),
             },
         },
         WireFrame::Request {
@@ -1942,6 +1947,8 @@ pub fn golden_descriptor() -> CredentialDescriptor {
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     }
 }
 
@@ -1955,5 +1962,7 @@ pub fn golden_oauth_descriptor() -> CredentialDescriptor {
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     }
 }

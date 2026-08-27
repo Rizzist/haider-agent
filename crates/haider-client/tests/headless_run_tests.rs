@@ -362,6 +362,8 @@ fn active_account(provider: &str) -> CredentialDescriptor {
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     }
 }
 

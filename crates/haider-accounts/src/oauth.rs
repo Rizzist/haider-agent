@@ -7,6 +7,7 @@
 
 use std::fmt;
 
+use haider_protocol::credential::AccountIdentity;
 use haider_protocol::error::ErrorCode;
 use zeroize::Zeroizing;
 
@@ -16,6 +17,7 @@ const MAGIC: &[u8] = b"HAIDER_OAUTH_BUNDLE\x01";
 const REFRESH_ON_FIRST_USE_MARKER: &[u8] = b"HAIDER_IMPORT_REFRESH\x01";
 const LIFECYCLE_EXTENSION_MARKER: &[u8] = b"HAIDER_OAUTH_LIFECYCLE\x01";
 const IMPORT_SOURCE_FINGERPRINT_MARKER: &[u8] = b"HAIDER_OAUTH_IMPORT_SOURCE\x01";
+const ACCOUNT_IDENTITY_EXTENSION_MARKER: &[u8] = b"HAIDER_ACCOUNT_IDENTITY\x01";
 const MAX_BUNDLE_BYTES: usize = 256 * 1024;
 const MAX_FIELD_BYTES: usize = 64 * 1024;
 const MAX_SCOPES: usize = 128;
@@ -30,8 +32,9 @@ pub struct OAuthIdentityV1 {
 
 /// Opaque version-one OAuth credential stored as one vault payload.
 ///
-/// `Debug` never prints either token. ID tokens are intentionally absent:
-/// only [`OAuthIdentityV1`] survives verification.
+/// `Debug` never prints any token. An optional ID token is retained only in
+/// this vault payload so a no-network startup backfill can re-derive public
+/// informational identity after a descriptor migration.
 pub struct OAuthTokenBundleV1 {
     pub provider_id: String,
     pub issuer: String,
@@ -40,10 +43,12 @@ pub struct OAuthTokenBundleV1 {
     pub token_type: String,
     access_token: Zeroizing<Vec<u8>>,
     refresh_token: Option<Zeroizing<Vec<u8>>>,
+    id_token: Option<Zeroizing<Vec<u8>>>,
     pub expires_at_unix_ms: u64,
     pub refresh_expires_at_unix_ms: Option<u64>,
     pub granted_scopes: Vec<String>,
     pub identity: OAuthIdentityV1,
+    pub account_identity: Option<AccountIdentity>,
     pub generation: u64,
     /// Provider-computed turn-boundary threshold for proactive refresh.
     /// `None` preserves the legacy fixed-skew policy.
@@ -69,6 +74,7 @@ impl fmt::Debug for OAuthTokenBundleV1 {
                 "refresh_token",
                 &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
             )
+            .field("id_token", &self.id_token.as_ref().map(|_| "[REDACTED]"))
             .field("expires_at_unix_ms", &self.expires_at_unix_ms)
             .field(
                 "refresh_expires_at_unix_ms",
@@ -76,6 +82,7 @@ impl fmt::Debug for OAuthTokenBundleV1 {
             )
             .field("granted_scopes", &self.granted_scopes)
             .field("identity", &self.identity)
+            .field("account_identity", &self.account_identity)
             .field("generation", &self.generation)
             .field("refresh_after_unix_ms", &self.refresh_after_unix_ms)
             .field(
@@ -114,10 +121,12 @@ impl OAuthTokenBundleV1 {
             token_type,
             access_token,
             refresh_token,
+            id_token: None,
             expires_at_unix_ms,
             refresh_expires_at_unix_ms,
             granted_scopes,
             identity,
+            account_identity: None,
             generation,
             refresh_after_unix_ms: None,
             refresh_rejected_until_unix_ms: None,
@@ -183,6 +192,29 @@ impl OAuthTokenBundleV1 {
         if let Some(fingerprint) = self.import_source_access_fingerprint {
             out.extend_from_slice(IMPORT_SOURCE_FINGERPRINT_MARKER);
             out.extend_from_slice(&fingerprint);
+        }
+        if self.account_identity.is_some() || self.id_token.is_some() {
+            out.extend_from_slice(ACCOUNT_IDENTITY_EXTENSION_MARKER);
+            match &self.account_identity {
+                Some(identity) => {
+                    out.push(1);
+                    push_optional_string(&mut out, identity.email.as_deref())?;
+                    push_optional_string(&mut out, identity.display_name.as_deref())?;
+                    push_optional_string(&mut out, identity.account_id.as_deref())?;
+                    push_optional_string(&mut out, identity.plan.as_deref())?;
+                    push_optional_string(&mut out, identity.issuer.as_deref())?;
+                    push_u64(&mut out, identity.captured_at);
+                    out.push(u8::from(identity.verified));
+                }
+                None => out.push(0),
+            }
+            match &self.id_token {
+                Some(token) => {
+                    out.push(1);
+                    push_bytes(&mut out, token.as_slice())?;
+                }
+                None => out.push(0),
+            }
         }
         if out.len() > MAX_BUNDLE_BYTES {
             return Err(invalid_bundle("OAuth token bundle is oversized"));
@@ -257,6 +289,41 @@ impl OAuthTokenBundleV1 {
         } else {
             None
         };
+        let (account_identity, id_token) = if reader
+            .remaining
+            .starts_with(ACCOUNT_IDENTITY_EXTENSION_MARKER)
+        {
+            reader.take(ACCOUNT_IDENTITY_EXTENSION_MARKER.len())?;
+            let identity = match reader.byte()? {
+                0 => None,
+                1 => Some(AccountIdentity {
+                    email: reader.optional_public_string()?,
+                    display_name: reader.optional_public_string()?,
+                    account_id: reader.optional_public_string()?,
+                    plan: reader.optional_public_string()?,
+                    issuer: reader.optional_public_string()?,
+                    captured_at: reader.u64()?,
+                    verified: match reader.byte()? {
+                        0 => false,
+                        1 => true,
+                        _ => {
+                            return Err(invalid_bundle(
+                                "OAuth identity verification flag is invalid",
+                            ));
+                        }
+                    },
+                }),
+                _ => return Err(invalid_bundle("OAuth account identity marker is invalid")),
+            };
+            let id_token = match reader.byte()? {
+                0 => None,
+                1 => Some(reader.secret()?),
+                _ => return Err(invalid_bundle("OAuth ID-token marker is invalid")),
+            };
+            (identity, id_token)
+        } else {
+            (None, None)
+        };
         if !reader.is_empty() {
             return Err(invalid_bundle("OAuth token bundle has trailing bytes"));
         }
@@ -281,6 +348,8 @@ impl OAuthTokenBundleV1 {
         bundle.refresh_after_unix_ms = refresh_after_unix_ms;
         bundle.refresh_rejected_until_unix_ms = refresh_rejected_until_unix_ms;
         bundle.import_source_access_fingerprint = import_source_access_fingerprint;
+        bundle.account_identity = account_identity;
+        bundle.id_token = id_token;
         Ok(bundle)
     }
 
@@ -299,6 +368,25 @@ impl OAuthTokenBundleV1 {
     #[must_use]
     pub fn access_token(&self) -> &[u8] {
         self.access_token.as_slice()
+    }
+
+    #[must_use]
+    pub fn id_token(&self) -> Option<&[u8]> {
+        self.id_token.as_ref().map(|token| token.as_slice())
+    }
+
+    /// Retains an ID token inside the vault payload. It never enters a
+    /// descriptor, receipt, log, or wire response.
+    #[must_use]
+    pub fn with_id_token(mut self, id_token: Zeroizing<Vec<u8>>) -> Self {
+        self.id_token = Some(id_token);
+        self
+    }
+
+    #[must_use]
+    pub fn with_account_identity(mut self, identity: AccountIdentity) -> Self {
+        self.account_identity = Some(identity);
+        self
     }
 
     /// Marks an imported fallback bundle for one eager broker refresh.
@@ -381,6 +469,19 @@ fn push_optional_u64(out: &mut Vec<u8>, value: Option<u64>) {
     }
 }
 
+fn push_optional_string(out: &mut Vec<u8>, value: Option<&str>) -> AccountsResult<()> {
+    match value {
+        Some(value) => {
+            out.push(1);
+            push_bytes(out, value.as_bytes())
+        }
+        None => {
+            out.push(0);
+            Ok(())
+        }
+    }
+}
+
 fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> AccountsResult<()> {
     if bytes.len() > MAX_FIELD_BYTES {
         return Err(invalid_bundle("OAuth token bundle field is oversized"));
@@ -446,6 +547,14 @@ impl<'a> Reader<'a> {
         }
     }
 
+    fn optional_public_string(&mut self) -> AccountsResult<Option<String>> {
+        match self.byte()? {
+            0 => Ok(None),
+            1 => self.public_string().map(Some),
+            _ => Err(invalid_bundle("OAuth optional-string marker is invalid")),
+        }
+    }
+
     fn length_prefixed(&mut self) -> AccountsResult<&'a [u8]> {
         let length = usize::try_from(self.u32()?)
             .map_err(|_| invalid_bundle("OAuth field length is invalid"))?;
@@ -498,7 +607,17 @@ mod tests {
 
     #[test]
     fn token_bundle_round_trip_is_versioned_and_access_only_handle() {
-        let bundle = bundle();
+        let bundle = bundle()
+            .with_account_identity(AccountIdentity {
+                email: Some("owner@example.invalid".into()),
+                display_name: None,
+                account_id: Some("acct-964".into()),
+                plan: Some("pro".into()),
+                issuer: Some("https://issuer.invalid".into()),
+                captured_at: 964,
+                verified: false,
+            })
+            .with_id_token(Zeroizing::new(b"ID_TOKEN_SENTINEL_42".to_vec()));
         let encoded = bundle.encode().expect("encode");
         assert!(encoded.starts_with(MAGIC));
         let decoded = OAuthTokenBundleV1::decode(&encoded).expect("decode");
@@ -514,14 +633,26 @@ mod tests {
             decoded.refresh_token(),
             Some(b"REFRESH_SENTINEL_42".as_slice())
         );
+        assert_eq!(decoded.id_token(), Some(b"ID_TOKEN_SENTINEL_42".as_slice()));
+        assert_eq!(
+            decoded
+                .account_identity
+                .as_ref()
+                .and_then(|identity| identity.plan.as_deref()),
+            Some("pro")
+        );
     }
 
     #[test]
     fn token_bundle_debug_redacts_both_tokens() {
-        let debug = format!("{:?}", bundle());
+        let debug = format!(
+            "{:?}",
+            bundle().with_id_token(Zeroizing::new(b"ID_TOKEN_SENTINEL_42".to_vec()))
+        );
         assert!(!debug.contains("ACCESS_SENTINEL_42"));
         assert!(!debug.contains("REFRESH_SENTINEL_42"));
-        assert!(debug.matches("[REDACTED]").count() >= 2);
+        assert!(!debug.contains("ID_TOKEN_SENTINEL_42"));
+        assert!(debug.matches("[REDACTED]").count() >= 3);
     }
 
     #[test]

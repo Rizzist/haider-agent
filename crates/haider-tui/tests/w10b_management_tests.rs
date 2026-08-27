@@ -36,6 +36,8 @@ fn account_row(alias: &str, selected: bool) -> AccountRow {
         provider: "anthropic".into(),
         method: haider_protocol::credential::AuthMethod::ApiKey,
         identity: "id".into(),
+        account_identity: None,
+        created_at_ms: None,
         status: haider_protocol::credential::CredentialStatus::Ok,
         selected,
         base_url: None,

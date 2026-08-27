@@ -54,6 +54,185 @@ fn memory_accounts() -> AccountStore<Box<dyn StoreLike>> {
     AccountStore::new(store).unwrap_or_else(|error| panic!("accounts: {error:?}"))
 }
 
+#[test]
+fn chatgpt_model_rejection_names_the_resolved_account_only_once() {
+    let error = ProviderError::new(
+        haider_provider::ProviderErrorKind::Authentication,
+        "model x is not supported with a ChatGPT account",
+    );
+    let annotated = annotate_model_rejection(error, "owner@example.test · pro");
+    assert_eq!(
+        annotated.message,
+        "model x is not supported with a ChatGPT account (account used: owner@example.test · pro)"
+    );
+    let annotated_again = annotate_model_rejection(annotated, "other@example.test");
+    assert_eq!(
+        annotated_again.message,
+        "model x is not supported with a ChatGPT account (account used: owner@example.test · pro)"
+    );
+}
+
+#[test]
+fn confirmed_device_import_is_bound_to_the_reviewed_source_snapshot() {
+    let reviewed = [7_u8; 32];
+    assert!(confirmed_source_matches(None, [9_u8; 32]));
+    assert!(confirmed_source_matches(Some(reviewed), reviewed));
+    assert!(!confirmed_source_matches(Some(reviewed), [8_u8; 32]));
+}
+
+#[test]
+fn provider_normalized_subscription_identity_suppresses_repeat_adoption() {
+    let candidate = AccountIdentity {
+        email: None,
+        display_name: Some("Claude Pro subscription".into()),
+        account_id: None,
+        plan: Some("pro".into()),
+        issuer: Some("https://claude.ai".into()),
+        captured_at: 964,
+        verified: false,
+    };
+    let mut existing = candidate.clone();
+    existing.captured_at = 965;
+    assert!(account_identities_match(&candidate, &existing));
+    existing.plan = Some("max".into());
+    assert!(!account_identities_match(&candidate, &existing));
+}
+
+#[test]
+fn api_key_fingerprint_strips_controls_before_becoming_public() {
+    let identity = api_key_identity("openai", b"secret-a\x1bcd");
+    let summary = identity.summary();
+    assert_eq!(summary, "openai API key …-acd");
+    assert!(!summary.chars().any(char::is_control));
+    assert!(!summary.contains("secret"));
+}
+
+#[tokio::test]
+async fn account_refresh_rederives_api_key_fingerprint_without_exposing_the_key() {
+    let store_dir = test_store_dir();
+    let store = open_store(store_dir.path()).await;
+    let mut accounts = memory_accounts();
+    let alias = CredentialAlias::new("refresh-api");
+    accounts
+        .add(CredentialDescriptor {
+            alias: alias.clone(),
+            provider: "openai".into(),
+            base_url: None,
+            auth_method: AuthMethod::ApiKey,
+            identity: "validated account".into(),
+            status: CredentialStatus::Ok,
+            active: true,
+            label: None,
+            account_identity: None,
+            created_at_ms: None,
+        })
+        .expect("seed descriptor");
+    let created = accounts.get(&alias).and_then(|row| row.created_at_ms);
+    let vault = MemoryVault::new();
+    vault
+        .put(&alias, b"API_KEY_REFRESH_SENTINEL_abcd")
+        .expect("seed key");
+    let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
+    let management = ManagementSnapshot::new(0, accounts.list().to_vec(), Vec::new());
+    let (sink, mut frames) = channel_sink();
+
+    handle_refresh_identity(
+        &store,
+        &mut accounts,
+        &vault,
+        &snapshot,
+        Some(&management),
+        RefreshIdentityJob {
+            alias: alias.as_str().to_owned(),
+            route: LoginRoute {
+                request_id: RequestId::new("refresh-api-request"),
+                sink,
+            },
+        },
+    )
+    .await;
+
+    let WireFrame::Response {
+        body:
+            ResponseBody::AccountRefresh {
+                descriptor,
+                revision: 1,
+            },
+        ..
+    } = frames.try_recv().expect("refresh response")
+    else {
+        panic!("expected account.refresh response");
+    };
+    let identity = descriptor.account_identity.expect("refreshed identity");
+    assert_eq!(
+        identity.display_name.as_deref(),
+        Some("openai API key …abcd")
+    );
+    assert_eq!(descriptor.created_at_ms, created);
+    let encoded = serde_json::to_string(&identity).expect("identity JSON");
+    assert!(!encoded.contains("API_KEY_REFRESH_SENTINEL"));
+
+    store.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn startup_backfill_decodes_only_the_vaulted_id_token_without_network() {
+    let mut accounts = memory_accounts();
+    let alias = CredentialAlias::new(OPENAI_OAUTH_PROVIDER_NAME);
+    accounts
+        .add(CredentialDescriptor {
+            alias: alias.clone(),
+            provider: OPENAI_OAUTH_PROVIDER_NAME.into(),
+            base_url: None,
+            auth_method: AuthMethod::OAuth,
+            identity: "legacy OpenAI account".into(),
+            status: CredentialStatus::Ok,
+            active: true,
+            label: None,
+            account_identity: None,
+            created_at_ms: None,
+        })
+        .expect("seed descriptor");
+    let id_token = b"fake-id-token-header.eyJlbWFpbCI6ImZha2UtcGVyc29uQGV4YW1wbGUuaW52YWxpZCIsImh0dHBzOi8vYXBpLm9wZW5haS5jb20vYXV0aCI6eyJjaGF0Z3B0X2FjY291bnRfaWQiOiJmYWtlLWFjY291bnQtaWQtMSJ9fQ.fake-id-token-signature";
+    let bundle = haider_accounts::OAuthTokenBundleV1::new(
+        OPENAI_OAUTH_PROVIDER_NAME.into(),
+        "https://auth.openai.com".into(),
+        "codex-client".into(),
+        None,
+        "Bearer".into(),
+        Zeroizing::new(b"VAULTED_BACKFILL_ACCESS_SENTINEL".to_vec()),
+        Some(Zeroizing::new(
+            b"VAULTED_BACKFILL_REFRESH_SENTINEL".to_vec(),
+        )),
+        u64::MAX,
+        None,
+        vec!["openid".into()],
+        haider_accounts::OAuthIdentityV1 {
+            subject_hash: "legacy-subject".into(),
+            display_identity: "legacy OpenAI account".into(),
+        },
+        1,
+    )
+    .expect("bundle")
+    .with_id_token(Zeroizing::new(id_token.to_vec()));
+    let vault = MemoryVault::new();
+    vault
+        .put(&alias, &bundle.encode().expect("encode bundle"))
+        .expect("vault bundle");
+
+    assert!(backfill_oauth_identities(&mut accounts, &vault).await);
+    let identity = accounts
+        .get(&alias)
+        .and_then(|descriptor| descriptor.account_identity.as_ref())
+        .expect("backfilled identity");
+    assert_eq!(
+        identity.email.as_deref(),
+        Some("fake-person@example.invalid")
+    );
+    assert_eq!(identity.account_id.as_deref(), Some("fake-account-id-1"));
+    assert!(!identity.verified);
+}
+
 #[derive(Default)]
 struct TestProviderStore(StdMutex<Vec<ProviderProfileV1>>);
 
@@ -219,6 +398,8 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
             status: CredentialStatus::Ok,
             active: true,
             label: None,
+            account_identity: None,
+            created_at_ms: None,
         },
         CredentialDescriptor {
             alias: openai_alias.clone(),
@@ -229,6 +410,8 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
             status: CredentialStatus::Ok,
             active: true,
             label: None,
+            account_identity: None,
+            created_at_ms: None,
         },
         CredentialDescriptor {
             alias: gemini_alias.clone(),
@@ -239,6 +422,8 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
             status: CredentialStatus::Ok,
             active: true,
             label: None,
+            account_identity: None,
+            created_at_ms: None,
         },
         CredentialDescriptor {
             alias: compatible_alias.clone(),
@@ -249,6 +434,8 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
             status: CredentialStatus::Ok,
             active: true,
             label: None,
+            account_identity: None,
+            created_at_ms: None,
         },
     ]));
     let factory = AccountsProviderFactory::new(
@@ -361,6 +548,8 @@ fn adapter_cache_descriptor(provider: &str, alias: &str) -> CredentialDescriptor
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     }
 }
 
@@ -639,6 +828,8 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
     let summary = ProviderSummaryWire {
         provider: provider.to_owned(),
@@ -820,6 +1011,8 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
     let vault = Arc::new(MemoryVault::default());
     vault.put(&alias, b"promotion-secret").expect("seed key");
@@ -970,6 +1163,8 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
     let snapshot = Arc::new(StdMutex::new(vec![descriptor.clone()]));
     let management = ManagementSnapshot::new(0, vec![descriptor], vec![summary]);
@@ -1191,6 +1386,8 @@ async fn stale_oauth_fences_cannot_overwrite_or_expire_a_replaced_bundle() {
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
     let mut accounts = memory_accounts();
     accounts.add(descriptor.clone()).expect("descriptor");
@@ -1439,6 +1636,8 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
         status: CredentialStatus::Ok,
         active,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
     let descriptors = vec![
         descriptor(primary_alias.clone(), true),
@@ -1533,6 +1732,8 @@ fn fallback_chain_resolver_fixture() -> (AccountsAttemptResolver, CredentialAlia
             status: CredentialStatus::Ok,
             active: true,
             label: None,
+            account_identity: None,
+            created_at_ms: None,
         },
         CredentialDescriptor {
             alias: target.clone(),
@@ -1543,6 +1744,8 @@ fn fallback_chain_resolver_fixture() -> (AccountsAttemptResolver, CredentialAlia
             status: CredentialStatus::Ok,
             active: true,
             label: None,
+            account_identity: None,
+            created_at_ms: None,
         },
     ];
     let snapshot = Arc::new(StdMutex::new(descriptors));
@@ -1683,6 +1886,8 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
             status: CredentialStatus::Limited { until_ms: u64::MAX },
             active: true,
             label: None,
+            account_identity: None,
+            created_at_ms: None,
         })
         .expect("limited descriptor");
     accounts
@@ -1695,6 +1900,8 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
             status: CredentialStatus::Ok,
             active: false,
             label: None,
+            account_identity: None,
+            created_at_ms: None,
         })
         .expect("alternate descriptor");
     accounts
@@ -1707,6 +1914,8 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
             status: CredentialStatus::Ok,
             active: true,
             label: None,
+            account_identity: None,
+            created_at_ms: None,
         })
         .expect("refresh-failed descriptor");
     accounts
@@ -1719,6 +1928,8 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
             status: CredentialStatus::Ok,
             active: false,
             label: None,
+            account_identity: None,
+            created_at_ms: None,
         })
         .expect("refresh backup descriptor");
     let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
@@ -1851,6 +2062,8 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
     let openai_descriptor = descriptor(openai_alias.clone(), OPENAI_OAUTH_PROVIDER_NAME);
     let anthropic_descriptor = descriptor(anthropic_alias.clone(), ANTHROPIC_OAUTH_PROVIDER_NAME);
@@ -3375,6 +3588,8 @@ async fn login_receipt_claims_replay_and_reject_like_every_r2_command() {
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
     store
         .finalize_login_receipt(
@@ -3462,7 +3677,12 @@ async fn login_reconciliation_advances_a_missing_revision_exactly_once() {
     let alias = CredentialAlias::new(identity.physical_alias.clone());
     let mut accounts = memory_accounts();
     accounts
-        .add(descriptor_for(&identity, &alias, Some("reconciled".into())))
+        .add(descriptor_for(
+            &identity,
+            &alias,
+            Some("reconciled".into()),
+            None,
+        ))
         .expect("persist descriptor");
     let vault = VaultProvision::Available(Arc::new(MemoryVault::new()) as Arc<dyn Vault>);
 
@@ -3548,6 +3768,7 @@ async fn reconciliation_closes_every_login_crash_boundary() {
             &identity_c,
             &CredentialAlias::new(identity_c.physical_alias.clone()),
             None,
+            None,
         ))
         .unwrap_or_else(|error| panic!("{error:?}"));
 
@@ -3572,6 +3793,8 @@ async fn reconciliation_closes_every_login_crash_boundary() {
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
     store
         .finalize_login_receipt(
@@ -3600,7 +3823,7 @@ async fn reconciliation_closes_every_login_crash_boundary() {
     vault
         .put(&alias_e, b"old-replacement-key")
         .unwrap_or_else(|error| panic!("{error:?}"));
-    let mut descriptor_e = descriptor_for(&identity_e, &alias_e, Some("old identity".into()));
+    let mut descriptor_e = descriptor_for(&identity_e, &alias_e, Some("old identity".into()), None);
     descriptor_e.active = false;
     accounts
         .add(descriptor_e)
@@ -4127,6 +4350,8 @@ async fn committed_remove_tombstone_beats_only_the_fenced_add_incarnation() {
         status: CredentialStatus::Ok,
         active,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
 
     for (command, alias, identity, active) in [
@@ -4270,6 +4495,8 @@ async fn committed_remove_tombstone_beats_only_the_fenced_add_incarnation() {
                         status: CredentialStatus::Ok,
                         active: true,
                         label: None,
+                        account_identity: None,
+                        created_at_ms: None,
                     },
                 },
             )
@@ -4365,6 +4592,8 @@ async fn refresh_cas_ignores_benign_status_and_selection_changes() {
             status: CredentialStatus::Ok,
             active: false,
             label: None,
+            account_identity: None,
+            created_at_ms: None,
         })
         .expect("add other descriptor");
     accounts
@@ -4754,6 +4983,8 @@ async fn durable_remove_fences_late_refresh_across_same_alias_readd() {
         status: CredentialStatus::Ok,
         active,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
     let mut accounts = memory_accounts();
     accounts
@@ -5158,6 +5389,8 @@ async fn api_login_rekeys_an_existing_alias_in_place() {
             status: CredentialStatus::Ok,
             active: true,
             label: Some("operator label".into()),
+            account_identity: None,
+            created_at_ms: None,
         })
         .expect("seed API descriptor");
     let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
@@ -5237,6 +5470,14 @@ async fn api_login_rekeys_an_existing_alias_in_place() {
     assert_eq!(descriptor.alias, alias);
     assert_eq!(descriptor.identity, "replacement identity");
     assert_eq!(descriptor.label.as_deref(), Some("operator label"));
+    assert_eq!(
+        descriptor
+            .account_identity
+            .as_ref()
+            .and_then(|identity| identity.display_name.as_deref()),
+        Some("anthropic API key …9d31")
+    );
+    assert!(descriptor.created_at_ms.is_some());
     assert!(descriptor.active);
     {
         let published = snapshot.lock().expect("account snapshot");
@@ -5655,6 +5896,8 @@ async fn custom_provider_origin_repoint_updates_stored_origin_and_revision() {
             status: CredentialStatus::Ok,
             active: true,
             label: None,
+            account_identity: None,
+            created_at_ms: None,
         })
         .expect("custom descriptor");
     let vault = Arc::new(MemoryVault::new());
@@ -6215,6 +6458,8 @@ async fn pending_remove_reconciliation_retries_orphan_deletion_before_release() 
             status: CredentialStatus::Ok,
             active: true,
             label: None,
+            account_identity: None,
+            created_at_ms: None,
         })
         .expect("descriptor");
     let vault = Arc::new(DeleteGateVault {
@@ -6805,6 +7050,8 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
     let gemini_alias = CredentialAlias::new("gemini-refresh-key");
     let gemini_descriptor = CredentialDescriptor {
@@ -6816,6 +7063,8 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
     let mut accounts = memory_accounts();
     accounts.add(descriptor).expect("custom descriptor");
@@ -7075,6 +7324,8 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
     let mut accounts = memory_accounts();
     accounts.add(descriptor.clone()).expect("descriptor");
@@ -7778,7 +8029,6 @@ async fn locked_store_waits_for_cached_expiry_then_significant_refresh_self_heal
     ) {
         return;
     }
-
     let store_dir = test_store_dir();
     let store = open_store(store_dir.path()).await;
     let vault = Arc::new(MemoryVault::new());
@@ -7863,29 +8113,34 @@ async fn locked_store_waits_for_cached_expiry_then_significant_refresh_self_heal
             ..
         }
     ));
-    let current = snapshot.lock().expect("self-healed snapshot")[0].clone();
-    assert_eq!(current.status, CredentialStatus::Ok);
+    let current = snapshot.lock().expect("unchanged snapshot")[0].clone();
+    assert_eq!(
+        current.status,
+        CredentialStatus::NeedsAttention {
+            reason: CredentialAttentionReason::KeychainLocked,
+        },
+        "metadata discovery is read-only; explicit import performs recovery"
+    );
     assert!(current.active);
     let stored = vault
         .resolve(&descriptor.alias)
         .and_then(|secret| haider_accounts::OAuthTokenBundleV1::decode(secret.expose_secret()))
-        .expect("self-healed snapshot persisted");
-    assert_eq!(stored.access_token(), b"fake-claude-live-access-token-2");
+        .expect("cached snapshot remains persisted");
+    assert_eq!(stored.access_token(), b"fake-claude-access-token-1");
 
     assert!(broker.shutdown().await);
     actor.shutdown().await;
     store.close().await.expect("close");
 }
 
-/// LAW D4: denial is actionable rather than terminal. Once a significant
-/// refresh can read the owner again, automatic re-adoption clears the typed
-/// status and restores the account without a manual import.
+/// Device discovery remains read-only even when it can see a healed owner
+/// store. Explicit import is the only operation allowed to copy credentials.
 #[tokio::test(flavor = "current_thread")]
-async fn success_after_denied_auto_adopt_self_heals_to_active() {
+async fn success_after_denied_discovery_still_requires_explicit_import() {
     let fixture_home = test_store_dir();
     let missing_file = fixture_home.path().join("missing-claude-credentials.json");
     if run_oauth_import_env_child(
-        "accounts::accounts_tests::success_after_denied_auto_adopt_self_heals_to_active",
+        "accounts::accounts_tests::success_after_denied_discovery_still_requires_explicit_import",
         &[
             ("HOME", fixture_home.path()),
             ("HAIDER_CLAUDE_CREDS_PATH", &missing_file),
@@ -7950,10 +8205,15 @@ async fn success_after_denied_auto_adopt_self_heals_to_active() {
     assert_eq!(
         native.reads(),
         reads_before_recovery + 1,
-        "the successful discovery bytes are handed to auto-adopt"
+        "the successful discovery performs exactly one metadata read"
     );
-    let current = snapshot.lock().expect("self-healed snapshot")[0].clone();
-    assert_eq!(current.status, CredentialStatus::Ok);
+    let current = snapshot.lock().expect("unchanged snapshot")[0].clone();
+    assert_eq!(
+        current.status,
+        CredentialStatus::NeedsAttention {
+            reason: CredentialAttentionReason::KeychainDenied,
+        }
+    );
     assert!(current.active);
 
     assert!(broker.shutdown().await);
@@ -8036,6 +8296,8 @@ async fn file_only_claude_import_uses_independent_refresh_grant_fallback() {
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
     let bundle = haider_accounts::OAuthTokenBundleV1::new(
         ANTHROPIC_OAUTH_PROVIDER_NAME.to_owned(),
@@ -8296,7 +8558,7 @@ async fn failed_import_healing_names_the_import_recovery_command() {
     assert_eq!(error.code, ErrorCode::Unauthorized);
     assert_eq!(
         error.message,
-        "credential expired — re-run `haider import codex` or sign in again"
+        "credential expired — re-run `haider account import codex --confirm` or sign in again"
     );
     assert_eq!(oauth_import_read_count(), 1);
     // The MARK may record an UNCERTAIN refresh (forced shutdown
@@ -8450,11 +8712,11 @@ async fn oauth_import_source_ownership_tracks_the_latest_alias_incarnation() {
     store.close().await.expect("close");
 }
 
-/// LAW A3: probe aliases are never considered source-owned adoption targets.
-/// A discovery refresh may create the ordinary default row, but it can never
+/// LAW A3: probe aliases are never considered source-owned import targets.
+/// An explicit import may create the ordinary default row, but it can never
 /// replace a `probeN-api` credential or inherit its receipt provenance.
 #[tokio::test]
-async fn auto_adopt_alias_selection_never_reuses_probe_accounts() {
+async fn explicit_import_alias_selection_never_reuses_probe_accounts() {
     let store_dir = test_store_dir();
     let store = open_store(store_dir.path()).await;
     let mut accounts = memory_accounts();
@@ -8540,6 +8802,8 @@ async fn claude_device_candidate_resurfaces_and_re_adopts_existing_expired_accou
         status: CredentialStatus::Expired,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
     accounts.add(expired.clone()).expect("seed expired account");
     let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(vec![expired]));
@@ -8619,6 +8883,8 @@ async fn oauth_import_repairs_an_expired_default_alias_in_place() {
         status: CredentialStatus::Expired,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
     accounts
         .add(descriptor)
@@ -8654,6 +8920,10 @@ async fn codex_import_commits_refreshable_bundle_and_secret_free_receipt() {
     ) {
         return;
     }
+    let source_path = std::path::PathBuf::from(
+        std::env::var_os("HAIDER_CODEX_AUTH_PATH").expect("isolated Codex path"),
+    );
+    let source_before = std::fs::read(&source_path).expect("read source before import");
 
     let store_dir = test_store_dir();
     let store = open_store(store_dir.path()).await;
@@ -8687,6 +8957,7 @@ async fn codex_import_commits_refreshable_bundle_and_secret_free_receipt() {
     assert_eq!(descriptor.alias.as_str(), OPENAI_OAUTH_PROVIDER_NAME);
     assert_eq!(descriptor.provider, OPENAI_OAUTH_PROVIDER_NAME);
     assert_eq!(descriptor.identity, "fake-account-1 · Codex");
+    assert!(descriptor.created_at_ms.is_some());
     assert!(descriptor.active);
     {
         let current = snapshot.lock().expect("snapshot");
@@ -8755,6 +9026,11 @@ async fn codex_import_commits_refreshable_bundle_and_secret_free_receipt() {
     ] {
         assert!(!durable.contains(secret), "receipt leaked {secret}");
     }
+    assert_eq!(
+        std::fs::read(&source_path).expect("read source after import"),
+        source_before,
+        "import must copy without modifying the Codex credential store"
+    );
 
     actor.shutdown().await;
     store.close().await.expect("close");
@@ -9589,6 +9865,8 @@ async fn provider_remove_refuses_release_owned_and_account_referenced_profiles()
                 status: CredentialStatus::Ok,
                 active,
                 label: None,
+                account_identity: None,
+                created_at_ms: None,
             })
             .expect("blocking descriptor");
     }
@@ -9882,19 +10160,17 @@ const GEMINI_DISCOVERY_FIXTURE: &[u8] = br#"{
   "expiry_date": 4102444800123
 }"#;
 
-/// LAW A1/A2: production actor startup performs the discovery policy before
-/// servicing commands. The discovered Codex credential becomes roster truth
-/// without a TUI import action, and later discovery-cadence refreshes are
-/// revision/alias/receipt idempotent.
+/// Startup and repeated discovery detect Codex without ever copying it.
+/// Only account.import_device may create roster/vault/receipt truth.
 #[tokio::test(flavor = "current_thread")]
-async fn startup_auto_adopts_codex_once_and_refresh_is_idempotent() {
+async fn startup_detects_codex_but_never_auto_imports() {
     let fixture_dir = test_store_dir();
     let codex_path = fixture_dir.path().join("codex-auth.json");
     std::fs::write(&codex_path, CODEX_IMPORT_FIXTURE_1).expect("write Codex fixture");
     let empty_home = fixture_dir.path().join("empty-home");
     std::fs::create_dir_all(&empty_home).expect("mkdir empty home");
     if run_oauth_import_env_child(
-        "accounts::accounts_tests::startup_auto_adopts_codex_once_and_refresh_is_idempotent",
+        "accounts::accounts_tests::startup_detects_codex_but_never_auto_imports",
         &[
             ("HAIDER_CODEX_AUTH_PATH", &codex_path),
             ("HOME", &empty_home),
@@ -9923,7 +10199,7 @@ async fn startup_auto_adopts_codex_once_and_refresh_is_idempotent() {
             validator: Arc::new(ProviderCredentialValidator),
             snapshot: Arc::clone(&snapshot),
             management: Some(management.clone()),
-            profile_id: "auto-adopt-test".to_owned(),
+            profile_id: "adoption-detection-test".to_owned(),
             default_model: "unused".to_owned(),
             providers,
             provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
@@ -9944,31 +10220,12 @@ async fn startup_auto_adopts_codex_once_and_refresh_is_idempotent() {
         native.clone(),
         Some(false),
     )
-    .expect("auto-adopt actor");
+    .expect("discovery actor");
 
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if management.read().is_some_and(|view| view.revision == 1) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("startup auto-adopt deadline");
+    tokio::task::yield_now().await;
     let initial = management.read().expect("startup roster");
-    assert_eq!(initial.descriptors.len(), 1);
-    assert_eq!(
-        initial.descriptors[0].alias.as_str(),
-        OPENAI_OAUTH_PROVIDER_NAME
-    );
-    assert!(initial.descriptors[0].identity.ends_with(" · Codex"));
-    assert_eq!(
-        native.events(),
-        [ClaudeNativeReadEvent::AutoAdoptDiscovery],
-        "startup discovery must use the no-UI auto-adopt intent"
-    );
-
+    assert!(initial.descriptors.is_empty());
+    assert_eq!(initial.revision, 0);
     for ordinal in 1..=2 {
         let (sink, mut frames) = channel_sink();
         actor
@@ -9982,32 +10239,41 @@ async fn startup_auto_adopts_codex_once_and_refresh_is_idempotent() {
             })
             .await
             .expect("refresh cadence command");
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(2), frames.recv())
-                .await
-                .expect("refresh response deadline")
-                .expect("refresh response"),
-            WireFrame::Response {
-                body: ResponseBody::AccountDeviceCandidates { .. },
-                ..
-            }
-        ));
+        let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("refresh response deadline")
+            .expect("refresh response");
+        let WireFrame::Response {
+            body:
+                ResponseBody::AccountDeviceCandidates {
+                    adoption_available, ..
+                },
+            ..
+        } = frame
+        else {
+            panic!("expected device candidates response");
+        };
+        assert_eq!(adoption_available.len(), 1);
+        assert_eq!(adoption_available[0].source, "codex");
     }
-    let after = management.read().expect("idempotent roster");
-    assert_eq!(after.revision, 1);
+    let after = management.read().expect("unchanged roster");
+    assert_eq!(after.revision, 0);
     assert_eq!(after.descriptors, initial.descriptors);
-    assert_eq!(
-        store.account_add_receipts().await.expect("receipts").len(),
-        1
+    assert!(
+        store
+            .account_add_receipts()
+            .await
+            .expect("receipts")
+            .is_empty()
     );
     assert_eq!(
         native.events(),
         [
-            ClaudeNativeReadEvent::AutoAdoptDiscovery,
-            ClaudeNativeReadEvent::AutoAdoptDiscovery,
-            ClaudeNativeReadEvent::AutoAdoptDiscovery,
+            ClaudeNativeReadEvent::AdoptionDiscovery,
+            ClaudeNativeReadEvent::AdoptionDiscovery,
+            ClaudeNativeReadEvent::AdoptionDiscovery,
         ],
-        "startup and every DeviceCandidates refresh stay on the no-UI intent"
+        "startup and every discovery remain metadata-only"
     );
 
     assert!(broker.shutdown().await);
@@ -10628,6 +10894,8 @@ async fn g4b_factory_builds_bedrock_and_vertex_adapters_with_their_surfaces() {
             status: CredentialStatus::Ok,
             active: true,
             label: None,
+            account_identity: None,
+            created_at_ms: None,
         };
         let snapshot = Arc::new(StdMutex::new(vec![descriptor.clone()]));
         let management = ManagementSnapshot::new(0, vec![descriptor], vec![summary]);
@@ -10763,6 +11031,8 @@ async fn lv2_gcloud_refresh_source_refreshes_vault_and_surfaces_failure() {
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
     let refreshed = broker
         .refresh_after_auth_failure(&descriptor, None)
@@ -10805,6 +11075,8 @@ async fn lv2_gcloud_refresh_source_refreshes_vault_and_surfaces_failure() {
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
     let refused = broker
         .refresh_after_auth_failure(&plain, None)
@@ -11289,6 +11561,8 @@ async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs
             status: CredentialStatus::Ok,
             active: true,
             label: None,
+            account_identity: None,
+            created_at_ms: None,
         },
         CredentialDescriptor {
             alias: openai_alias,
@@ -11299,6 +11573,8 @@ async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs
             status: CredentialStatus::Ok,
             active: true,
             label: None,
+            account_identity: None,
+            created_at_ms: None,
         },
     ]));
     let builder = TuningRecordingBuilder::new();
@@ -11451,6 +11727,8 @@ async fn each_turn_resolves_the_currently_active_account() {
         status: CredentialStatus::Ok,
         active,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
 
     let vault = Arc::new(MemoryVault::default());

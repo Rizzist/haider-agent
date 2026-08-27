@@ -158,6 +158,8 @@ fn oauth_receipts_mask_the_identity_always() {
             status: CredentialStatus::Ok,
             active: true,
             label: None,
+            account_identity: None,
+            created_at_ms: None,
         },
     );
     let message = model.accounts.message.as_deref().expect("receipt named");
@@ -194,6 +196,8 @@ fn launcher_header_carries_the_alias_never_the_identity() {
             status: CredentialStatus::Ok,
             active: true,
             label: None,
+            account_identity: None,
+            created_at_ms: None,
         },
         1,
     );

@@ -297,6 +297,8 @@ pub fn seed_account_rows() -> Vec<crate::app::AccountRow> {
         provider: provider.to_owned(),
         method,
         identity: identity.to_owned(),
+        account_identity: None,
+        created_at_ms: None,
         status: CredentialStatus::Ok,
         selected,
         base_url: base_url.map(str::to_owned),

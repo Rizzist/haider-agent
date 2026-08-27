@@ -203,7 +203,7 @@ An operation not listed here is part of the v1 base surface. “Field” means t
 client may use that field only when it is present; the named token permits an
 affordance before the response exists.
 
-The ordinary v0.0.963 `welcome_features()` set contains all 94 tokens below.
+The ordinary v0.0.964 `welcome_features()` set contains all 95 tokens below.
 The re-verification anchors are
 `crates/haider-daemon/src/connection.rs:1871-1968` for the assembled set and
 `crates/haider-rpc/src/frame.rs:249-527` for the exact string constants. The
@@ -250,6 +250,7 @@ one peer-specific withholding exception is §4.1.
 | `account_rotation_v1` | live same-provider active-account rotation behavior |
 | `account_list_watch_v1` | `account.list_watch`, `AccountsChanged` |
 | `account_label_v1` | `account.set_label`, descriptor `label` |
+| `account_identity_v1` | additive descriptor `account_identity` and `created_at_ms`, `account.refresh`, and typed local-login adoption notices |
 | `provider_management_v1` | `provider.list` |
 | `provider_configure_v1` | `provider.configure` |
 | `provider_remove_v1` | `provider.remove` |
@@ -440,6 +441,7 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | `account.login_api`, `account.oauth_import`, `account.import_device`, `account.add`, `account.set_active`, `account.remove`, `account.set_default_model` | same-named response | durable account mutation |
 | `account.oauth_start`, `account.oauth_status`, `account.oauth_cancel`, `account.oauth_import_sources`, `account.device_candidates` | same-named response | connection-bound flow/catalog reads/actions |
 | `account.set_label` | `AccountSetLabel` | control mutation; alias remains identity |
+| `account.refresh` | `AccountRefresh` | re-derives informational identity from the vault-held credential; no secret field exists |
 | `provider.models_refresh` | `ProviderModelsRefresh` | provider snapshot refresh |
 | `provider.configure`, `provider.remove` | same-named response | durable provider mutation |
 | `transcription.secret_get`, `transcription.secret_set` | same-named response | same-UID UDS-only secret read/write, not a command receipt |
@@ -447,10 +449,46 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 The golden matrix at
 `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`, combined
 with the historical `wire_transcript.json`, pins a request and successful
-response for every one of the 99 v1 request methods. `menu.answer` and resident
+response for every one of the 100 v1 request methods. `menu.answer` and resident
 binding are top-level frames, not `RequestBody` methods.
 
-### 5.3 Advertised runtime with no client method
+### 5.3 Account identity and local-login adoption
+
+When `account_identity_v1` is advertised, each `CredentialDescriptor` may
+carry `account_identity { email, display_name, account_id, plan, issuer,
+captured_at, verified }` and `created_at_ms`. Both fields are additive. An
+older daemon omits them; a missing identity means unknown, and a missing
+creation time means “added before 0.0.964.” Clients MUST NOT synthesize either
+field from the legacy display string.
+
+JWT payload decoding is informational and therefore publishes
+`verified: false`. Only identity returned by an independently authenticated
+provider response may be marked verified. Neither the JWT nor any access or
+refresh token is representable in a descriptor, adoption notice, error, or
+client JSON document.
+
+All release OAuth registrations use the same provider-owned identity source.
+OpenAI/Codex reads `email` plus `chatgpt_plan_type` and
+`chatgpt_account_id` from the ID-token claims; Grok reads standard claims when
+an ID token is present. Claude's current token response has no ID token or
+stable account identifier (Claude Code adoption can still publish its local
+subscription plan), and Kimi Code returns no profile identity; those adapters
+therefore return an explicit unavailable result instead of inventing facts.
+
+`account.refresh { alias }` re-derives metadata from the stored credential
+through the provider's OAuth identity adapter (or the API-key fingerprint
+projection). It does not return or rotate the credential. Local Codex and
+Claude Code discovery is a read-only `account.device_candidates` operation;
+`AccountAdoptionAvailable { source, email }` is informational. Copying the
+source login requires the separate Control operation `account.import_device`
+and an explicit surface confirmation. Haider never moves or modifies the
+source credential store. Codex discovery uses the platform home directory's
+`.codex/auth.json`. Claude Code uses Keychain on macOS, Credential Manager on
+Windows, and `.claude/.credentials.json` on Linux; the file path is also the
+fallback on macOS and Windows. Platform paths are resolved by the daemon's
+existing home/platform helpers, not by string-concatenating Unix-only paths.
+
+### 5.4 Advertised runtime with no client method
 
 `monitor_v1` negotiates the daemon-owned, durable, session-scoped `monitor`
 **model tool** and the source/delivery runtime that can wake a session from a
@@ -2412,8 +2450,8 @@ The machine-checkable contract lives in these fixtures/tests:
   receipts; the appended monitor and Loom registry delta/caught-up entries pin
   both dedicated non-chat streams. The exact current transcript count is 133.
 - `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`: the
-  59 methods added after the historical matrix, completing its 40 with golden
-  request and successful response coverage for all 99 request methods and all
+  60 methods added after the historical matrix, completing its 40 with golden
+  request and successful response coverage for all 100 request methods and all
   five command dynamic slots.
 - `crates/haider-rpc/tests/fixtures/snapshot_availability_compat_v1.json`:
   old and new account/provider/usage response bytes.
@@ -2634,7 +2672,8 @@ The durable provider-model cache records `inventory_fetched_at_ms` for each
 live inventory. `haider.models.v1` projects it as `fetched_at` plus an
 `inventory_age` calculated at the read; both are millisecond integers, and
 absence means seeded/configured or legacy inventory, never age zero. The
-documented freshness TTL is 15 minutes.
+documented freshness TTL is 15 minutes. The TUI model picker shows the same
+per-provider age and refreshes a stale selected-provider inventory on entry.
 An explicit `haider models --refresh [<alias>]` refreshes immediately. When an
 explicit `<alias>/<model>` is absent from a known cached inventory, the daemon
 refreshes that provider once. Built-in provider inventories are authoritative:

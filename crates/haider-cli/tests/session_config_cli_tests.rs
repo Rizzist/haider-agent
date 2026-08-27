@@ -164,6 +164,8 @@ fn models_json_vocabulary_is_stable() {
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
     assert_eq!(
         auth_state(&provider, std::slice::from_ref(&active)),

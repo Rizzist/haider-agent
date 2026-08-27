@@ -287,8 +287,7 @@ pub const FEATURE_ACCOUNT_OAUTH_IMPORT_V1: &str = "account_oauth_import_v1";
 /// point-in-time credential-store availability.
 pub const FEATURE_ACCOUNT_OAUTH_IMPORT_SOURCES_V1: &str = "account_oauth_import_sources_v1";
 /// Daemon implements metadata-only device credential discovery and receipted
-/// candidate import. There is no wire refresh action: same-alias re-login or
-/// re-import replaces tokens, and broker-internal refresh stays daemon-owned.
+/// candidate import. Discovery is read-only; explicit import owns copying.
 pub const FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1: &str = "account_device_discovery_v1";
 /// Daemon implements durable `account.add` for an OAuth-ready reference.
 pub const FEATURE_ACCOUNT_MANAGEMENT_V1: &str = "account_management_v1";
@@ -300,6 +299,8 @@ pub const FEATURE_ACCOUNT_LIST_WATCH_V1: &str = "account_list_watch_v1";
 /// descriptors, so a surface can show an operator-chosen name instead of an
 /// alias or a provider identity string.
 pub const FEATURE_ACCOUNT_LABEL_V1: &str = "account_label_v1";
+/// Account descriptors carry optional rich identity and creation metadata.
+pub const FEATURE_ACCOUNT_IDENTITY_V1: &str = "account_identity_v1";
 /// Daemon implements provider management reads.
 pub const FEATURE_PROVIDER_MANAGEMENT_V1: &str = "provider_management_v1";
 /// Daemon implements durable `provider.configure`.
@@ -1185,6 +1186,9 @@ pub struct ProviderDefaultWire {
 pub struct DeviceCredentialCandidateWire {
     /// Opaque daemon-derived identifier consumed by account.import_device.
     pub candidate: String,
+    /// Stable daemon-owned import source key (for example `codex`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
     /// Haider provider this credential would serve.
     pub provider: String,
     /// Human-facing first-party source name.
@@ -1192,6 +1196,10 @@ pub struct DeviceCredentialCandidateWire {
     /// Account email/label only when the probed store itself carries one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_label: Option<String>,
+    /// Typed, informational identity derived without authenticating the
+    /// external CLI store. Never contains token material.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<haider_protocol::credential::AccountIdentity>,
     /// Coarse fresh | expiring | expired | unknown access-token hint.
     pub freshness: String,
     /// Provider access-token expiry, when the store states one.
@@ -1204,6 +1212,15 @@ pub struct DeviceCredentialCandidateWire {
     /// Honest, actionable explanation paired with an unsupported candidate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unsupported_reason: Option<String>,
+}
+
+/// Typed, secret-free notice that a first-party CLI login can be copied into
+/// Haider after explicit confirmation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountAdoptionAvailable {
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
 }
 
 /// Public-only flow progress. No variant can carry callback/token secrets or
@@ -3478,6 +3495,10 @@ pub enum RequestBody {
     /// Attach a connection-scoped registry baseline + durable delta stream.
     #[serde(rename = "loom.watch")]
     LoomWatch { after_cursor: u64 },
+    /// Re-derives public identity metadata from the credential already held
+    /// by the daemon. Secret material never crosses this method.
+    #[serde(rename = "account.refresh")]
+    AccountRefresh { alias: String },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline). W3b answers it with a protocol error, not a panic.
     #[serde(other)]
@@ -3966,6 +3987,8 @@ pub enum ResponseBody {
         discovery_disabled: bool,
         #[serde(default)]
         candidates: Vec<DeviceCredentialCandidateWire>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        adoption_available: Vec<AccountAdoptionAvailable>,
     },
     #[serde(rename = "account.import_device")]
     AccountImportDevice {
@@ -4218,6 +4241,11 @@ pub enum ResponseBody {
         watch_id: String,
         requested_after_cursor: u64,
         baseline: haider_protocol::loom::LoomRegistrySnapshot,
+    },
+    #[serde(rename = "account.refresh")]
+    AccountRefresh {
+        descriptor: haider_protocol::credential::CredentialDescriptor,
+        revision: u64,
     },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline).

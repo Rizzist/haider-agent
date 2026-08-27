@@ -1820,9 +1820,11 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         ResponseBody::AccountDeviceCandidates {
             discovery_disabled,
             candidates,
+            adoption_available,
         } => vec![LiveReply::DeviceCandidates {
             discovery_disabled,
             candidates,
+            adoption_available,
         }],
         ResponseBody::AccountImportDevice {
             descriptor,

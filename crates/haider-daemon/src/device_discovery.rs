@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use haider_protocol::credential::AccountIdentity;
 use haider_rpc::DeviceCredentialCandidateWire;
 use serde::de::{IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -18,8 +19,8 @@ use zeroize::Zeroizing;
 
 use crate::oauth::{
     ClaudeNativeCredentialStore, ClaudeNativeReadEvent, PlatformClaudeNativeCredentialStore,
-    SecretJson, load_claude_credential_input, oauth_home_dir, oauth_import_path,
-    parse_claude_credential_metadata,
+    SecretJson, claude_subscription_identity, load_claude_credential_input, oauth_home_dir,
+    oauth_import_path, parse_claude_credential_metadata,
 };
 
 const DISCOVERY_FILE_LIMIT: u64 = 256 * 1024;
@@ -35,6 +36,9 @@ const CLAUDE_UNVERIFIED_REASON: &str = "Claude OAuth path exists, but its creden
 pub(crate) struct DeviceCandidate {
     pub wire: DeviceCredentialCandidateWire,
     pub import_source: Option<&'static str>,
+    /// Exact external-store snapshot bound into `wire.candidate`. This stays
+    /// daemon-local and is rechecked against the material read for import.
+    pub content_fingerprint: Option<[u8; 32]>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -160,30 +164,61 @@ fn discover_codex() -> Option<DeviceCandidate> {
         return None;
     }
     let access = decode_jwt::<CodexClaims>(&parsed.tokens.access_token.0).unwrap_or_default();
-    let identity = parsed
+    let legacy_identity = parsed
         .tokens
         .id_token
         .as_ref()
         .and_then(|token| decode_jwt::<CodexClaims>(&token.0))
         .unwrap_or_default();
-    let account_label = identity
-        .email
+    let email = legacy_identity.email.and_then(nonempty);
+    let account_id = legacy_identity
+        .chatgpt_account_id
         .and_then(nonempty)
-        .or_else(|| identity.chatgpt_account_id.and_then(nonempty))
         .or_else(|| {
-            identity
+            legacy_identity
                 .openai_auth
                 .and_then(|claims| claims.chatgpt_account_id.and_then(nonempty))
         })
-        .or_else(|| parsed.tokens.account_id.and_then(nonempty));
+        .or_else(|| parsed.tokens.account_id.clone().and_then(nonempty));
+    let account_label = email.clone().or_else(|| account_id.clone());
+    let captured_at = now_ms()?;
+    let rich_identity = haider_provider::oauth_identity_source("openai-oauth")
+        .and_then(|source| {
+            source
+                .identity_from_tokens(&haider_provider::OAuthTokens {
+                    access_token: parsed.tokens.access_token.0.as_slice(),
+                    refresh_token: Some(parsed.tokens.refresh_token.0.as_slice()),
+                    id_token: parsed
+                        .tokens
+                        .id_token
+                        .as_ref()
+                        .map(|token| token.0.as_slice()),
+                    captured_at,
+                })
+                .ok()
+                .flatten()
+        })
+        .or_else(|| {
+            (email.is_some() || account_id.is_some()).then(|| AccountIdentity {
+                email,
+                display_name: None,
+                account_id,
+                plan: None,
+                issuer: Some("https://auth.openai.com".to_owned()),
+                captured_at,
+                verified: false,
+            })
+        });
     let expires_at_ms = access.exp.and_then(|seconds| seconds.checked_mul(1000));
     Some(candidate(
         "codex",
         "openai-oauth",
         "Codex",
         account_label,
+        rich_identity,
         expires_at_ms,
         path,
+        Some(*blake3::hash(&bytes).as_bytes()),
         true,
         None,
     ))
@@ -220,13 +255,25 @@ fn discover_claude_at_event(
     if !parsed.has_inference_scope {
         return None;
     }
+    let content_fingerprint = *blake3::hash(&input.bytes).as_bytes();
+    let (display_name, plan) = claude_subscription_identity(parsed.subscription_type.as_deref());
     Some(candidate(
         "claude-code",
         "anthropic-oauth",
         source_label,
         None,
+        Some(AccountIdentity {
+            email: None,
+            display_name: Some(display_name.to_owned()),
+            account_id: None,
+            plan: plan.map(str::to_owned),
+            issuer: Some("https://claude.ai".to_owned()),
+            captured_at: now_ms()?,
+            verified: false,
+        }),
         Some(parsed.expires_at_ms),
         input.location,
+        Some(content_fingerprint),
         !parsed.custom_client,
         parsed
             .custom_client
@@ -244,7 +291,9 @@ fn discover_claude_unverified_path() -> Option<DeviceCandidate> {
         "Claude OAuth (unverified path)",
         None,
         None,
+        None,
         path,
+        None,
         false,
         Some(CLAUDE_UNVERIFIED_REASON.to_owned()),
     ))
@@ -279,8 +328,10 @@ fn discover_kimi() -> Option<DeviceCandidate> {
         "kimi-oauth",
         "Kimi Code",
         None,
+        None,
         Some(expires_at_ms),
         path,
+        None,
         device_id_ok,
         (!device_id_ok).then(|| KIMI_DEVICE_REASON.to_owned()),
     ))
@@ -338,8 +389,10 @@ fn discover_grok() -> Option<DeviceCandidate> {
         haider_provider::GROK_OAUTH_PROVIDER_NAME,
         "Grok CLI",
         None,
+        None,
         expires_at_ms,
         path,
+        None,
         true,
         None,
     ))
@@ -375,8 +428,10 @@ fn discover_gemini() -> Option<DeviceCandidate> {
         "gemini",
         "Gemini CLI",
         None,
+        None,
         parsed.expiry_date.filter(|expiry| *expiry != 0),
         path,
+        None,
         false,
         Some(GEMINI_UNSUPPORTED_REASON.to_owned()),
     ))
@@ -411,7 +466,9 @@ fn discover_gcloud() -> Option<DeviceCandidate> {
         "Google Cloud (gcloud ADC)",
         None,
         None,
+        None,
         path,
+        None,
         true,
         None,
     ))
@@ -423,19 +480,23 @@ fn candidate(
     provider: &str,
     source_label: &str,
     account_label: Option<String>,
+    identity: Option<haider_protocol::credential::AccountIdentity>,
     expires_at_ms: Option<u64>,
     path: PathBuf,
+    content_fingerprint: Option<[u8; 32]>,
     import_supported: bool,
     unsupported_reason: Option<String>,
 ) -> DeviceCandidate {
     let path_display = path.to_string_lossy().into_owned();
-    let candidate = opaque_candidate_id(source, &path_display);
+    let candidate = opaque_candidate_id(source, &path_display, content_fingerprint);
     DeviceCandidate {
         wire: DeviceCredentialCandidateWire {
             candidate,
+            source: source.to_owned(),
             provider: provider.to_owned(),
             source_label: source_label.to_owned(),
             account_label,
+            identity,
             freshness: freshness(expires_at_ms),
             expires_at_ms,
             path: path_display,
@@ -443,15 +504,20 @@ fn candidate(
             unsupported_reason,
         },
         import_source: import_supported.then_some(source),
+        content_fingerprint,
     }
 }
 
-fn opaque_candidate_id(source: &str, path: &str) -> String {
+fn opaque_candidate_id(source: &str, path: &str, content_fingerprint: Option<[u8; 32]>) -> String {
     let mut input = Vec::with_capacity(source.len() + path.len() + 32);
     input.extend_from_slice(b"haider-device-candidate-v1\0");
     input.extend_from_slice(source.as_bytes());
     input.push(0);
     input.extend_from_slice(path.as_bytes());
+    if let Some(fingerprint) = content_fingerprint {
+        input.push(0);
+        input.extend_from_slice(&fingerprint);
+    }
     format!("dc1_{}", blake3::hash(&input).to_hex())
 }
 
@@ -549,7 +615,7 @@ fn decode_jwt<T: serde::de::DeserializeOwned>(token: &[u8]) -> Option<T> {
 }
 
 fn nonempty(value: String) -> Option<String> {
-    (!value.trim().is_empty()).then_some(value)
+    AccountIdentity::sanitized_field(&value)
 }
 
 fn now_ms() -> Option<u64> {

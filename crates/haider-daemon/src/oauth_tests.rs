@@ -14,7 +14,7 @@ use crate::session_hub::{FrameSendError, FrameSink};
 fn macos_keychain_ui_is_reserved_for_explicit_import_intent() {
     for event in [
         ClaudeNativeReadEvent::Ordinary,
-        ClaudeNativeReadEvent::AutoAdoptDiscovery,
+        ClaudeNativeReadEvent::AdoptionDiscovery,
         ClaudeNativeReadEvent::Significant,
     ] {
         let plan = event.macos_keychain_query_plan();
@@ -31,7 +31,7 @@ fn macos_keychain_ui_is_reserved_for_explicit_import_intent() {
         haider_core::InteractionResolution::FailClosed
     );
     assert_eq!(
-        ClaudeNativeReadEvent::AutoAdoptDiscovery.credential_interaction_resolution(),
+        ClaudeNativeReadEvent::AdoptionDiscovery.credential_interaction_resolution(),
         haider_core::InteractionResolution::FailClosed
     );
     assert_eq!(
@@ -221,23 +221,21 @@ impl ClaudeNativeCredentialStore for SuccessfulClaudeNative {
     }
 }
 
-/// LAW A4/D1: the significant discovery read hands its authorized bytes to
-/// the immediate importer exactly once. This is the hermetic equivalent of a
-/// macOS "Allow Once" consent: auto-adopt does not issue a second store query,
-/// while later ordinary reads still reach the live owner.
+/// LAW A4/D1: one metadata discovery read hands its bytes to the immediate
+/// candidate lookup exactly once; later ordinary reads still reach the owner.
 #[test]
-fn significant_native_read_is_handed_to_auto_adopt_without_a_second_store_call() {
+fn adoption_discovery_is_handed_to_candidate_lookup_without_a_second_store_call() {
     let raw = Arc::new(SuccessfulClaudeNative {
         reads: AtomicUsize::new(0),
     });
     let access = ClaudeNativeCredentialAccess::new(raw.clone());
 
     access
-        .read(ClaudeNativeReadEvent::AutoAdoptDiscovery)
+        .read(ClaudeNativeReadEvent::AdoptionDiscovery)
         .expect("discovery reads the native owner");
     access
         .read(ClaudeNativeReadEvent::Ordinary)
-        .expect("auto-adopt receives the one-shot handoff");
+        .expect("candidate lookup receives the one-shot handoff");
     assert_eq!(raw.reads.load(Ordering::SeqCst), 1);
 
     access
@@ -1622,6 +1620,8 @@ async fn codex_fallback_refresh_is_one_use_and_import_scoped_at_the_broker_call_
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
     let vault = Arc::new(MemoryVault::new());
     vault
@@ -1712,6 +1712,8 @@ async fn codex_fallback_refresh_is_one_use_and_import_scoped_at_the_broker_call_
         status: CredentialStatus::Ok,
         active: false,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
     let now = now_ms().expect("clock");
     let pkce_bundle = OAuthTokenBundleV1::new(
@@ -1784,6 +1786,20 @@ fn codex_import_leniently_reads_fake_jwt_claims() {
         bundle.identity.subject_hash,
         blake3::hash(b"fake-account-id-1").to_hex().to_string()
     );
+    let account_identity = bundle
+        .account_identity
+        .as_ref()
+        .expect("provider-generic account identity");
+    assert_eq!(
+        account_identity.email.as_deref(),
+        Some("fake-person@example.invalid")
+    );
+    assert_eq!(
+        account_identity.account_id.as_deref(),
+        Some("fake-account-id-1")
+    );
+    assert!(!account_identity.verified);
+    assert!(bundle.id_token().is_some(), "ID token remains vault-only");
 }
 
 /// MUTATION CHECK: remove either untagged Grok CLI auth.json arm, lose the
@@ -3255,6 +3271,8 @@ fn oauth_descriptor_for_test() -> CredentialDescriptor {
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     }
 }
 
@@ -4094,7 +4112,7 @@ async fn imported_ambiguous_transport_never_replays_uncertain_token() {
         assert!(!error.retryable);
         assert_eq!(
             error.message,
-            "credential expired — re-run `haider import codex` or sign in again"
+            "credential expired — re-run `haider account import codex --confirm` or sign in again"
         );
         assert_eq!(
             error
@@ -4154,7 +4172,7 @@ async fn terminal_invalid_grant_names_reimport_remedy_typed() {
         assert!(!error.retryable);
         assert_eq!(
             error.message,
-            "credential expired — re-run `haider import codex` or sign in again"
+            "credential expired — re-run `haider account import codex --confirm` or sign in again"
         );
         assert_eq!(
             error
@@ -5402,6 +5420,8 @@ async fn auth_aware_broker_keeps_api_keys_raw_and_never_treats_bundle_as_bearer(
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
     vault
         .put(&descriptor.alias, b"API_KEY_BROKER_SENTINEL_20ac")
@@ -5576,6 +5596,8 @@ async fn late_refresh_failure_after_remove_readd_cannot_expire_the_replacement()
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     };
     *snapshot.lock().expect("snapshot") = vec![replacement.clone()];
     vault

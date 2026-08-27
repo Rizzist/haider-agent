@@ -786,7 +786,7 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
                     HeadlessFailureCode::Run(ErrorCode::CredentialMissing)
                 ) {
                     eprintln!(
-                        "haider: set HAIDER_ANTHROPIC_API_KEY, run `haider import codex`, or sign in from the TUI"
+                        "haider: set HAIDER_ANTHROPIC_API_KEY, run `haider account import codex --confirm`, or sign in from the TUI"
                     );
                 }
             }

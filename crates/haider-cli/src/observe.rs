@@ -71,6 +71,7 @@ pub(crate) struct StatusDocument {
     pub account: Option<AccountView>,
     pub session_count: usize,
     pub profile_path: String,
+    pub adoption_available: Vec<haider_rpc::AccountAdoptionAvailable>,
 }
 
 pub(crate) struct DaemonView {
@@ -185,7 +186,7 @@ pub(crate) trait ObserveJson {
 
 impl ObserveJson for StatusDocument {
     fn json(&self) -> Value {
-        json!({
+        let mut document = json!({
             "schema": self.schema,
             "kind": self.kind,
             "daemon": {
@@ -209,7 +210,11 @@ impl ObserveJson for StatusDocument {
             })),
             "session_count": self.session_count,
             "profile_path": self.profile_path,
-        })
+        });
+        if !self.adoption_available.is_empty() {
+            document["account_adoption_available"] = json!(self.adoption_available);
+        }
+        document
     }
 }
 
@@ -507,6 +512,13 @@ pub(crate) async fn status_command(rest: &[String]) -> ExitCode {
             return observe_failure("status", &error);
         }
     };
+    let adoption_available = match observer.account_adoption_available().await {
+        Ok(notices) => notices,
+        Err(error) => {
+            observer.close();
+            return observe_failure("status", &error);
+        }
+    };
     let welcome = observer.welcome().clone();
     observer.close();
     let update = stamp_update_view(&profile.store_dir);
@@ -522,6 +534,7 @@ pub(crate) async fn status_command(rest: &[String]) -> ExitCode {
         account,
         session_count,
         profile_path: profile.store_dir.display().to_string(),
+        adoption_available,
     };
     if options.json {
         write_document(&document)
@@ -1112,14 +1125,22 @@ fn write_status_human(document: &StatusDocument) -> ExitCode {
         || document.update.status.to_owned(),
         |version| format!("available ({version})"),
     );
-    write_human(format!(
+    let mut text = format!(
         "daemon {} (generation {})\nupdate: {update}\naccount: {account}\nsessions: {}\nprofile: {}\nfeatures: {}\n",
         document.daemon.version,
         document.daemon.generation,
         document.session_count,
         document.profile_path,
         document.features.join(", ")
-    ))
+    );
+    for notice in &document.adoption_available {
+        let email = notice.email.as_deref().unwrap_or("unknown account");
+        text.push_str(&format!(
+            "account adoption available: {} ({email}) — haider account import {} --confirm\n",
+            notice.source, notice.source
+        ));
+    }
+    write_human(text)
 }
 
 fn write_sessions_human(document: &SessionsDocument) -> ExitCode {

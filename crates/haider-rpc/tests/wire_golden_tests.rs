@@ -261,6 +261,7 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "account.oauth_import_sources",
         "account.oauth_start",
         "account.oauth_status",
+        "account.refresh",
         "account.remove",
         "account.set_active",
         "account.set_default_model",
@@ -357,8 +358,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         expected_methods.len(),
-        99,
-        "the v1 contract covers all 86 prior and 13 v0.0.963 request methods"
+        100,
+        "the v1 contract covers all 99 prior and one v0.0.964 request method"
     );
     assert_eq!(
         request_methods_declared_in_source(),
@@ -2679,14 +2680,14 @@ fn provider_models_unavailable_reason_is_typed_and_golden() {
 /// surface's decode behavior for skewed peers. Tolerance is re-proved in both
 /// directions: a current client decodes future-shaped D1 frames (extra
 /// fields) into the typed variants, absent optional fields default, and the
-/// CUT `account.refresh` method — which never became wire surface — decodes
-/// as Unknown exactly like any other future method.
+/// additive v0.0.964 `account.refresh` method decodes without exposing any
+/// credential material.
 ///
 /// MUTATION CHECK: make `account_label` non-optional, stop skipping absent
 /// optionals during encode, add a token-bearing field to the candidate wire,
-/// or resurrect an `account.refresh` request variant. Expected runtime
-/// failure: the matching assertion below (defaulted decode, key-absence
-/// scan, no-token-field scan, or Unknown-method decode) breaks.
+/// or add a secret-shaped field to `account.refresh`. Expected runtime
+/// failure: the matching assertion below (defaulted decode, key-absence,
+/// no-token-field, or typed refresh decode) breaks.
 #[test]
 fn device_discovery_goldens_are_additive_and_tolerance_re_proved() {
     use haider_rpc::{DeviceCredentialCandidateWire, FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1};
@@ -2747,6 +2748,7 @@ fn device_discovery_goldens_are_additive_and_tolerance_re_proved() {
             ResponseBody::AccountDeviceCandidates {
                 discovery_disabled: false,
                 candidates,
+                ..
             },
         ..
     } = decoded
@@ -2754,6 +2756,7 @@ fn device_discovery_goldens_are_additive_and_tolerance_re_proved() {
         panic!("expected a typed device-candidates response");
     };
     assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].source, "", "pre-964 source defaults absent");
     assert_eq!(
         candidates[0].account_label, None,
         "absent optional defaults"
@@ -2771,6 +2774,7 @@ fn device_discovery_goldens_are_additive_and_tolerance_re_proved() {
             body: ResponseBody::AccountDeviceCandidates {
                 discovery_disabled: true,
                 ref candidates,
+                ..
             },
             ..
         } if candidates.is_empty()
@@ -2780,9 +2784,11 @@ fn device_discovery_goldens_are_additive_and_tolerance_re_proved() {
     // discipline), and no serialized key can carry token material.
     let bare = DeviceCredentialCandidateWire {
         candidate: format!("dc1_{}", "0".repeat(64)),
+        source: "codex".into(),
         provider: "openai-oauth".into(),
         source_label: "Codex".into(),
         account_label: None,
+        identity: None,
         freshness: "unknown".into(),
         expires_at_ms: None,
         path: "/home/golden/.codex/auth.json".into(),
@@ -2804,6 +2810,7 @@ fn device_discovery_goldens_are_additive_and_tolerance_re_proved() {
             "import_supported",
             "path",
             "provider",
+            "source",
             "source_label"
         ],
         "absent optionals must be omitted and no secret-bearing key may exist"
@@ -2815,15 +2822,17 @@ fn device_discovery_goldens_are_additive_and_tolerance_re_proved() {
         );
     }
 
-    // The cut refresh-now method never became surface: to every peer it is
-    // just another unknown future method, tolerated as Unknown.
+    // v0.0.964 promotes refresh-now without placing credential material on
+    // the wire; unknown future fields stay tolerated.
     let refresh_request = r#"{"v":1,"kind":"request","request_id":"request-refresh-cut","body":{"method":"account.refresh","alias":"openai-oauth"}}"#;
     let decoded: WireFrame = serde_json::from_str(refresh_request).expect("tolerant decode");
     assert_eq!(
         decoded,
         WireFrame::Request {
             request_id: haider_rpc::RequestId::new("request-refresh-cut"),
-            body: RequestBody::Unknown,
+            body: RequestBody::AccountRefresh {
+                alias: "openai-oauth".to_owned(),
+            },
         }
     );
 }

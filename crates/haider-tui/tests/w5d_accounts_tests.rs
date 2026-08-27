@@ -70,6 +70,8 @@ fn descriptor(alias: &str, provider: &str, method: AuthMethod) -> CredentialDesc
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     }
 }
 

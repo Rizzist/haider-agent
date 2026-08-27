@@ -29,7 +29,7 @@ mod vault;
 pub use env_bridge::import_env;
 pub use file_vault::FileVault;
 pub use haider_protocol::credential::{
-    AuthMethod, CredentialDescriptor, CredentialStatus, RotationEvent,
+    AccountIdentity, AuthMethod, CredentialDescriptor, CredentialStatus, RotationEvent,
 };
 pub use haider_protocol::error::{ErrorCode, HaiderError};
 pub use haider_protocol::ids::CredentialAlias;

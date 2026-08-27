@@ -1825,8 +1825,9 @@ impl DemoDriver {
             | AppRequest::AttachUpload { .. }
             // W10b live-only mutations: the demo reducer removes locally.
             | AppRequest::AccountRemove { .. }
+            | AppRequest::AccountImportDevice { .. }
             | AppRequest::ProviderRemove { .. }
-            // Device auto-adoption refresh is live-only; demo has no host
+            // Device credential discovery is live-only; demo has no host
             // credential stores and the reducer gate never pushes it.
             | AppRequest::DeviceCandidatesRefresh
             // T2 live-only vocabulary: `/talk` refuses honestly upstream
@@ -1953,6 +1954,8 @@ impl DemoDriver {
                     status: row.status,
                     active: true,
                     label: None,
+                    account_identity: None,
+                    created_at_ms: None,
                 };
                 let revision = model.accounts.revision.map_or(1, |current| current + 1);
                 model.apply_account_selected(&descriptor, revision);

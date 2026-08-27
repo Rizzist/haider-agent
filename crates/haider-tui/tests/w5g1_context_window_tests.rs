@@ -28,6 +28,8 @@ fn oauth_descriptor(provider: &str, alias: &str) -> CredentialDescriptor {
         status: CredentialStatus::Ok,
         active: true,
         label: None,
+        account_identity: None,
+        created_at_ms: None,
     }
 }
 
