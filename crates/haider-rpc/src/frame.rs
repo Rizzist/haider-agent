@@ -1071,6 +1071,10 @@ pub struct ProviderSummaryWire {
     pub api_family: ProviderApiFamilyWire,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// OpenAI-family response-header wait for this profile. Absent selects
+    /// the daemon's documented 60-second default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_open_timeout_ms: Option<u64>,
     #[serde(default)]
     pub models: Vec<String>,
     #[serde(default)]
@@ -3120,6 +3124,10 @@ pub enum RequestBody {
         models: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         default_model: Option<String>,
+        /// OpenAI-family response-header wait. Omission preserves the stored
+        /// value on update and selects the 60-second default on create.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_open_timeout_ms: Option<u64>,
         expected_revision: u64,
     },
     /// Durably removes one custom provider. Release-owned providers and

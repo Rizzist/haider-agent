@@ -122,6 +122,7 @@ use haider_protocol::provider::{
 use haider_protocol::queue::QueueChange;
 use haider_protocol::retry::RunRetryEventPayload;
 use haider_protocol::session::SessionMetadataV1;
+use haider_protocol::session_fork::{ForkCacheSegmentV1, ForkContextEpoch, SessionForked};
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::tool::{
     BoundedResult, DispatchMode, ImageBlockRef, RememberedGrantScope, RememberedSessionGrant,
@@ -342,6 +343,7 @@ struct DaemonContextCompactor {
     reasoning_settings: String,
     cache_expected_later_reads: u32,
     cache_reuse_gap_ms: Option<u64>,
+    cache_cohort: Option<String>,
     device_id: DeviceId,
     event_ids: Arc<EventIdGenerator>,
     agent_id: Option<AgentId>,
@@ -512,6 +514,7 @@ impl DaemonContextCompactor {
             compaction_epoch,
             provider: self.usage_scope.provider.clone(),
             session_scope: self.store.session_id().as_str().to_owned(),
+            cache_cohort: self.cache_cohort.clone(),
             account_scope: self
                 .usage_account
                 .as_ref()
@@ -1457,7 +1460,8 @@ impl SystemPromptBuilder {
 
     /// Daemon-authored per-session context. The worker emits this after the
     /// shared system/tool base as a volatile message, so different sessions
-    /// cannot perturb the provider-cache prefix shared by trusted siblings.
+    /// cannot perturb those byte-stable prefix bytes. OpenAI routing still
+    /// isolates unrelated sessions with the separate cache cohort.
     pub(crate) fn session_context_with_handoff(
         metadata: &SessionMetadataV1,
         instructions: &[(&str, &str)],
@@ -4941,6 +4945,20 @@ async fn perform_manual_compaction(
     };
     drop(workflow_selection);
     let cache_expected_later_reads = u32::from(!post_compaction_tools.is_empty()) * 2;
+    let cache_cohort = reduce_turn_setup_journal(
+        lease,
+        TurnSetupReductionSelector {
+            run_id: run_id.clone(),
+            branch_id: branch_id.clone(),
+            agent_id: agent_id.clone(),
+            provider: usage_scope.provider.clone(),
+            model: resolved.model.clone(),
+            account_scope: usage_account.clone(),
+            auth_scope: auth_scope.clone(),
+        },
+    )
+    .await?
+    .cache_cohort();
     let compactor = DaemonContextCompactor {
         store: lease.clone(),
         provider: resolved.provider,
@@ -4956,6 +4974,7 @@ async fn perform_manual_compaction(
         reasoning_settings,
         cache_expected_later_reads,
         cache_reuse_gap_ms: None,
+        cache_cohort,
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
         agent_id,
@@ -6088,7 +6107,9 @@ async fn start_turn(
     // Cache prefix law: common policy + the manual for the exact advertised
     // schema pack are the complete system prompt. Session/task/identity state
     // follows as a volatile user message, after providers have rendered the
-    // tool schemas, so trusted sibling sessions share a byte-identical base.
+    // tool schemas. Sibling sessions may retain a byte-identical base, while
+    // the provider cache route remains session-isolated unless C3 proves an
+    // active inherited fork segment.
     config.system_prompt = Some(SystemPromptBuilder::shared_immutable_base(
         config.tool_definitions(),
         &provider_grant_scope,
@@ -6149,6 +6170,7 @@ async fn start_turn(
     config.cache_previous_provider_view = previous_provider_view;
     config.cache_initial_rewarm = cache_initial_rewarm;
     config.cache_reuse_gap_ms = setup_reduction.prior_cache_domain_gap_ms();
+    config.cache_cohort = setup_reduction.cache_cohort();
     config.cache_stable_history_end = Some(compiled_stable_history_end);
     config.cache_current_user_start = Some(compiled_current_user_start);
     config.cache_compaction_summary_end = compiled_compaction_summary_end;
@@ -6186,6 +6208,7 @@ async fn start_turn(
         reasoning_settings: config.reasoning_settings.clone(),
         cache_expected_later_reads: config.cache_expected_later_reads,
         cache_reuse_gap_ms: config.cache_reuse_gap_ms,
+        cache_cohort: config.cache_cohort.clone(),
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
         agent_id: config.agent_id.clone(),
@@ -6485,6 +6508,7 @@ const TURN_SETUP_REDUCTION_PAYLOAD_KINDS: &[&str] = &[
     "usage",
     "node_committed",
     "item",
+    "session_forked",
 ];
 
 struct TurnSetupReductionSelector {
@@ -6512,6 +6536,9 @@ struct TurnSetupReduction {
     previous_provider_view: Option<ProviderViewLedgerV1>,
     latest_deliberate_boundary: Option<(u64, CacheRewarmReasonV1)>,
     latest_cache_domain_request_ms: Option<u64>,
+    inherited_cache_segment: Option<ForkCacheSegmentV1>,
+    fork_cache_boundary_seq: Option<u64>,
+    previous_provider_view_seq: Option<u64>,
     emitted_cache_transitions: HashSet<(CacheEpochTransitionReason, String)>,
     latest_seq: u64,
 }
@@ -6529,6 +6556,9 @@ impl TurnSetupReduction {
             previous_provider_view: None,
             latest_deliberate_boundary: None,
             latest_cache_domain_request_ms: None,
+            inherited_cache_segment: None,
+            fork_cache_boundary_seq: None,
+            previous_provider_view_seq: None,
             emitted_cache_transitions: HashSet::new(),
             latest_seq: 0,
         }
@@ -6548,6 +6578,12 @@ impl TurnSetupReduction {
                     fact,
                 );
             }
+            return Ok(());
+        }
+        if payload_kind == Some("session_forked") {
+            self.fork_cache_boundary_seq = Some(envelope.seq);
+            self.inherited_cache_segment = SessionForked::from_payload_value(&envelope.payload)
+                .and_then(inherited_fork_cache_segment);
             return Ok(());
         }
         if !matches!(
@@ -6591,7 +6627,9 @@ impl TurnSetupReduction {
                     Some((seq, CacheRewarmReasonV1::PlannedCompaction));
             }
             EventPayload::Item(ItemEvent::Completed { item, .. }) => {
-                self.observe_provider_view(branch_id.as_ref(), agent_id.as_ref(), item)?;
+                if self.observe_provider_view(branch_id.as_ref(), agent_id.as_ref(), item)? {
+                    self.previous_provider_view_seq = Some(seq);
+                }
                 if let Some(transition) = CacheEpochTransitionV1::from_extension_item(item) {
                     self.observe_cache_transition(seq, &transition);
                 }
@@ -6673,11 +6711,11 @@ impl TurnSetupReduction {
         branch_id: Option<&BranchId>,
         agent_id: Option<&AgentId>,
         item: &TurnItem,
-    ) -> Result<(), HaiderError> {
+    ) -> Result<bool, HaiderError> {
         if branch_id != self.selector.branch_id.as_ref()
             || agent_id != self.selector.agent_id.as_ref()
         {
-            return Ok(());
+            return Ok(false);
         }
         match ProviderViewAttemptV1::try_from_extension_item(item) {
             Ok(Some(attempt))
@@ -6691,17 +6729,15 @@ impl TurnSetupReduction {
                             .map(haider_protocol::ids::CredentialAlias::as_str) =>
             {
                 self.previous_provider_view = Some(attempt.view);
+                Ok(true)
             }
-            Ok(Some(_)) | Ok(None) => {}
-            Err(error) => {
-                return Err(HaiderError::new(
-                    ErrorCode::Internal,
-                    format!("durable provider-view ledger is malformed: {error}"),
-                    false,
-                ));
-            }
+            Ok(Some(_)) | Ok(None) => Ok(false),
+            Err(error) => Err(HaiderError::new(
+                ErrorCode::Internal,
+                format!("durable provider-view ledger is malformed: {error}"),
+                false,
+            )),
         }
-        Ok(())
     }
 
     fn observe_cache_transition(&mut self, seq: u64, transition: &CacheEpochTransitionV1) {
@@ -6728,6 +6764,33 @@ impl TurnSetupReduction {
 
     fn durable_tool_state(&self) -> DurableToolState {
         self.durable_tools.snapshot()
+    }
+
+    fn cache_cohort(&self) -> Option<String> {
+        let segment = self.inherited_cache_segment.as_ref()?;
+        if segment.provider != self.selector.provider
+            || segment.model != self.selector.model
+            || self
+                .selector
+                .account_scope
+                .as_ref()
+                .map(haider_protocol::ids::CredentialAlias::as_str)
+                != Some(segment.account_scope.as_str())
+        {
+            return None;
+        }
+        let boundary_seq = self.fork_cache_boundary_seq?;
+        if self
+            .previous_provider_view_seq
+            .is_some_and(|view_seq| view_seq > boundary_seq)
+            && !self
+                .previous_provider_view
+                .as_ref()
+                .is_some_and(|view| provider_view_matches_fork_segment(view, segment))
+        {
+            return None;
+        }
+        Some(segment.cache_route.clone())
     }
 
     fn prior_cache_request_context(
@@ -6793,6 +6856,30 @@ async fn reduce_turn_setup_journal(
             reduction.observe_envelope(envelope)?;
         }
     }
+}
+
+fn inherited_fork_cache_segment(record: SessionForked) -> Option<ForkCacheSegmentV1> {
+    if record.context_epoch != ForkContextEpoch::Inherited {
+        return None;
+    }
+    record
+        .inherited_cache_segment
+        .filter(|segment| !segment.cache_route.is_empty())
+}
+
+fn provider_view_matches_fork_segment(
+    view: &ProviderViewLedgerV1,
+    segment: &ForkCacheSegmentV1,
+) -> bool {
+    view.provider == segment.provider
+        && view.model == segment.model
+        && view.account_scope.as_deref() == Some(segment.account_scope.as_str())
+        && view.cache_epoch == segment.cache_epoch
+        && view.stable_history_end == segment.stable_history_end
+        && view
+            .prefix_digest()
+            .ok()
+            .is_some_and(|digest| digest == segment.prefix_digest)
 }
 
 /// E2 — every autonomously accepted `plan` proposal body on this branch. The

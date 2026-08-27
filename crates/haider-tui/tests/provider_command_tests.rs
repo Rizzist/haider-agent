@@ -17,6 +17,7 @@ fn provider_summary(
         provider: provider.to_owned(),
         api_family: haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: None,
+        response_open_timeout_ms: None,
         model_details: Vec::new(),
         models,
         auth_methods: Vec::new(),

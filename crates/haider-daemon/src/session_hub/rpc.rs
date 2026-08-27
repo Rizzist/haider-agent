@@ -3698,6 +3698,7 @@ impl HubConnection {
                 enabled,
                 models,
                 default_model,
+                response_open_timeout_ms,
                 expected_revision,
             } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
@@ -3720,6 +3721,7 @@ impl HubConnection {
                         enabled,
                         models,
                         default_model,
+                        response_open_timeout_ms,
                     },
                     expected_revision,
                 )

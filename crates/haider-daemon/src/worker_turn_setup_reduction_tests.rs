@@ -455,3 +455,138 @@ fn fused_turn_setup_reduction_rejects_malformed_matching_provider_view() {
     assert_eq!(error.code, ErrorCode::Internal);
     assert!(error.message.contains("provider-view ledger is malformed"));
 }
+
+/// HAIDER963 C3. MUTATION CHECK: ignore the fork audit, use the child session,
+/// treat `fresh` as inherited, or retain the inherited root after the exact
+/// segment diverges. The root/fresh/divergence pins fail.
+#[test]
+fn turn_setup_cache_cohort_tracks_the_active_inherited_fork_segment() {
+    let selector = || TurnSetupReductionSelector {
+        run_id: RunId::new("setup-current"),
+        branch_id: None,
+        agent_id: None,
+        provider: "openai".into(),
+        model: "gpt-5.6".into(),
+        account_scope: Some(haider_protocol::ids::CredentialAlias::new("account-a")),
+        auth_scope: "api_key".into(),
+    };
+    let block = haider_protocol::cache::ProviderViewBlockRefV1::for_bytes(b"fork-view");
+    let inherited_view = ProviderViewLedgerV1 {
+        provider: "openai".into(),
+        model: "gpt-5.6".into(),
+        dialect: "openai_responses".into(),
+        serialization_version: "haider.provider-view.json.v1".into(),
+        header_epoch: "header-epoch".into(),
+        cache_epoch: "cache-epoch".into(),
+        compaction_epoch: "root".into(),
+        reasoning_retention: "append-only".into(),
+        account_scope: Some("account-a".into()),
+        stable_history_end: 4,
+        current_user_start: 4,
+        latest_compaction_summary_end: None,
+        trim_sentinel: "root".into(),
+        boundaries: Vec::new(),
+        system_block: block.clone(),
+        tool_schema_block: block,
+        history_blocks: Vec::new(),
+        storage: None,
+    };
+    let inherited_segment = haider_protocol::session_fork::ForkCacheSegmentV1 {
+        provider: "openai".into(),
+        model: "gpt-5.6".into(),
+        account_scope: "account-a".into(),
+        cache_route: "fork-cohort-root".into(),
+        cache_epoch: "cache-epoch".into(),
+        prefix_digest: inherited_view
+            .prefix_digest()
+            .expect("inherited provider-view digest"),
+        stable_history_end: 4,
+        source_provider_view_seq: 9,
+        source_provider_view_event_id: EventId::new("source-view"),
+    };
+    let audit = |context_epoch, inherited_cache_segment| SessionForked {
+        source_session_id: SessionId::new("fork-parent"),
+        source_branch_id: None,
+        fork_node_id: NodeId::new("fork-node"),
+        fork_seq: 10,
+        mode: haider_protocol::session_fork::SessionForkMode::Fork,
+        description: None,
+        accepted_proposal_digest: None,
+        omissions: Vec::new(),
+        context_epoch,
+        inherited_cache_segment,
+    };
+
+    let mut inherited = TurnSetupReduction::new(selector());
+    inherited
+        .observe_envelope(setup_reduction_envelope(
+            1,
+            None,
+            None,
+            None,
+            1,
+            audit(ForkContextEpoch::Inherited, Some(inherited_segment.clone()))
+                .to_payload_value()
+                .expect("inherited fork payload"),
+        ))
+        .expect("reduce inherited fork");
+    assert_eq!(
+        inherited.cache_cohort().as_deref(),
+        Some("fork-cohort-root")
+    );
+
+    let provider_view_envelope = |seq, view: ProviderViewLedgerV1| {
+        let item = ProviderViewAttemptV1 { ordinal: 1, view }
+            .extension_item()
+            .expect("provider-view item");
+        setup_reduction_envelope(
+            seq,
+            Some(RunId::new(format!("fork-view-{seq}"))),
+            None,
+            None,
+            seq,
+            serde_json::to_value(EventPayload::Item(ItemEvent::Completed {
+                item_id: ItemId::new(format!("fork-view-{seq}")),
+                item,
+            }))
+            .expect("provider-view payload"),
+        )
+    };
+    inherited
+        .observe_envelope(provider_view_envelope(2, inherited_view.clone()))
+        .expect("reduce still-inherited provider view");
+    assert_eq!(
+        inherited.cache_cohort().as_deref(),
+        Some("fork-cohort-root"),
+        "an exact active inherited segment keeps the parent root"
+    );
+
+    let mut divergent_view = inherited_view;
+    divergent_view.stable_history_end = 5;
+    divergent_view.current_user_start = 5;
+    inherited
+        .observe_envelope(provider_view_envelope(3, divergent_view))
+        .expect("reduce divergent child provider view");
+    assert_eq!(
+        inherited.cache_cohort(),
+        None,
+        "the first divergent provider view starts the child's own cohort"
+    );
+
+    let mut fresh = TurnSetupReduction::new(selector());
+    fresh
+        .observe_envelope(setup_reduction_envelope(
+            1,
+            None,
+            None,
+            None,
+            1,
+            // Fail closed even if a malformed/future payload attaches a
+            // descriptor to an explicitly fresh epoch.
+            audit(ForkContextEpoch::Fresh, Some(inherited_segment))
+                .to_payload_value()
+                .expect("fresh fork payload"),
+        ))
+        .expect("reduce fresh fork");
+    assert_eq!(fresh.cache_cohort(), None);
+}

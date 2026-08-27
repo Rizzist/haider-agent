@@ -31,6 +31,7 @@ fn provider_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
         provider: provider.to_owned(),
         api_family: haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some("http://127.0.0.1:9999/v1".to_owned()),
+        response_open_timeout_ms: None,
         model_details: Vec::new(),
         models: vec!["model-a".to_owned()],
         auth_methods: Vec::new(),

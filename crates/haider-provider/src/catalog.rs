@@ -34,7 +34,14 @@ use reqwest::header::HeaderValue;
 /// Hard cap on a discovery response body. The codex payload embeds
 /// per-model base instructions, so this is generous but still bounded.
 const MAX_CATALOG_BYTES: usize = 1024 * 1024;
-const CATALOG_TIMEOUT: Duration = Duration::from_secs(15);
+/// Discovery is not inference, but OpenAI-family `/models` endpoints share
+/// the same slow-to-open gateway class. Keep the total request bound at the
+/// OpenAI response-open default so a 20-second header wait is admitted.
+const CATALOG_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
 /// Value for the codex model endpoint's required `client_version` query
 /// param. The backend only checks PRESENCE and well-formedness — it does
 /// not gate the returned catalog on the value — so a stable recent codex
@@ -339,18 +346,25 @@ pub async fn discover_models_with_resolver(
             );
             // The SSRF gate runs BEFORE the token can leave: resolve, validate
             // the exact endpoint, pin the addresses.
-            guard.validate_endpoint(&endpoint).await.map_err(|error| {
-                CatalogError::Unavailable {
+            let connect_timeout = crate::OPENAI_DEFAULT_TRANSPORT_CONFIG.connect_timeout;
+            let connect_budget_ms = duration_ms(connect_timeout);
+            tokio::time::timeout(connect_timeout, guard.validate_endpoint(&endpoint))
+                .await
+                .map_err(|_| CatalogError::Transport {
+                    reason: format!(
+                        "model catalog DNS preflight timed out; opened_within_ms={connect_budget_ms} budget_ms={connect_budget_ms}"
+                    ),
+                })?
+                .map_err(|error| CatalogError::Unavailable {
                     reason: format!("model catalog endpoint refused: {}", error.message),
-                }
-            })?;
+                })?;
             (endpoint, Some(guard))
         }
     };
     let mut client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(5))
+        .connect_timeout(crate::OPENAI_DEFAULT_TRANSPORT_CONFIG.connect_timeout)
         .timeout(CATALOG_TIMEOUT);
     if let Some(guard) = &guard {
         client = client.dns_resolver(Arc::clone(guard));
@@ -378,11 +392,24 @@ pub async fn discover_models_with_resolver(
             .header("anthropic-version", "2023-06-01");
     }
 
+    let catalog_budget_ms = duration_ms(CATALOG_TIMEOUT);
     let response = request
         .send()
         .await
         .map_err(|error| CatalogError::Transport {
-            reason: format!("model catalog request failed: {error}"),
+            reason: if error.is_timeout() && error.is_connect() {
+                let connect_budget_ms =
+                    duration_ms(crate::OPENAI_DEFAULT_TRANSPORT_CONFIG.connect_timeout);
+                format!(
+                    "model catalog connection did not open within its configured connect budget; opened_within_ms={connect_budget_ms} budget_ms={connect_budget_ms}"
+                )
+            } else if error.is_timeout() {
+                format!(
+                    "model catalog response did not open within its configured budget; opened_within_ms={catalog_budget_ms} budget_ms={catalog_budget_ms}"
+                )
+            } else {
+                format!("model catalog request failed: {error}")
+            },
         })?;
     if response.status() == reqwest::StatusCode::NOT_MODIFIED {
         return Err(CatalogError::NotModified);

@@ -119,6 +119,12 @@ pub struct ErrorPresentation {
     /// Absolute Unix reset time derived from the provider delay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_at_ms: Option<u64>,
+    /// Elapsed wait when a local provider transport budget fired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_within_ms: Option<u64>,
+    /// Exact local provider transport-phase budget selected for the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_ms: Option<u64>,
     pub scope: ErrorScope,
     pub allowed_actions: Vec<ErrorAction>,
 }
@@ -168,6 +174,8 @@ impl ErrorPresentation {
             provider_request_id: None,
             retry_after_ms: None,
             reset_at_ms: None,
+            opened_within_ms: None,
+            budget_ms: None,
             scope,
             allowed_actions,
         }
@@ -191,6 +199,13 @@ impl ErrorPresentation {
     pub fn with_retry_after(mut self, retry_after_ms: Option<u64>, now_ms: u64) -> Self {
         self.retry_after_ms = retry_after_ms;
         self.reset_at_ms = retry_after_ms.and_then(|delay| now_ms.checked_add(delay));
+        self
+    }
+
+    #[must_use]
+    pub fn with_timeout_budget(mut self, opened_within_ms: u64, budget_ms: u64) -> Self {
+        self.opened_within_ms = Some(opened_within_ms);
+        self.budget_ms = Some(budget_ms);
         self
     }
 }
@@ -229,6 +244,10 @@ struct RawErrorPresentation {
     #[serde(default)]
     reset_at_ms: Option<u64>,
     #[serde(default)]
+    opened_within_ms: Option<u64>,
+    #[serde(default)]
+    budget_ms: Option<u64>,
+    #[serde(default)]
     scope: Option<ErrorScope>,
     #[serde(default)]
     allowed_actions: Vec<ErrorAction>,
@@ -254,6 +273,8 @@ impl<'de> Deserialize<'de> for ErrorPresentation {
             .filter(|value| !value.is_empty());
         presentation.retry_after_ms = raw.retry_after_ms;
         presentation.reset_at_ms = raw.reset_at_ms;
+        presentation.opened_within_ms = raw.opened_within_ms;
+        presentation.budget_ms = raw.budget_ms;
         Ok(presentation)
     }
 }
@@ -484,6 +505,25 @@ mod tests {
         assert!(!presentation.title.trim().is_empty());
         assert!(!presentation.detail.trim().is_empty());
         assert_eq!(presentation.allowed_actions, vec![ErrorAction::None]);
+    }
+
+    #[test]
+    fn provider_timeout_budget_survives_the_durable_presentation_wire() {
+        let presentation = ErrorPresentation::new(
+            "provider-timeout",
+            "Provider request timed out",
+            "The response did not open.",
+            ErrorScope::Turn,
+            [ErrorAction::Retry],
+        )
+        .with_timeout_budget(60_000, 60_000);
+        let encoded = serde_json::to_value(&presentation).expect("serialize timeout telemetry");
+        assert_eq!(encoded["opened_within_ms"], 60_000);
+        assert_eq!(encoded["budget_ms"], 60_000);
+        let decoded: ErrorPresentation =
+            serde_json::from_value(encoded).expect("deserialize timeout telemetry");
+        assert_eq!(decoded.opened_within_ms, Some(60_000));
+        assert_eq!(decoded.budget_ms, Some(60_000));
     }
 
     #[test]

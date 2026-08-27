@@ -354,6 +354,7 @@ fn gemini_cache_request(model: &str) -> TurnRequest {
             compaction_epoch: "compaction-a".into(),
             provider: GEMINI_PROVIDER_NAME.into(),
             session_scope: "session-a".into(),
+            cache_cohort: None,
             account_scope: Some("account-a".into()),
             stable_prefix_tokens: 2_048,
             expected_later_reads: 2,

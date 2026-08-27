@@ -134,7 +134,7 @@ Important current distinctions:
 - Older model generations generally use automatic longest-prefix matching and have no write surcharge.
 - GPT-5.6 adds 1.25× cache writes, explicit `prompt_cache_breakpoint`, request-level `prompt_cache_options`, and a reported `cache_write_tokens`.
 - `prompt_cache_options.mode: "explicit"` avoids writing the volatile implicit suffix; current documented explicit TTL is `30m`.
-- `prompt_cache_key` should be stable for a session/cache domain, not regenerated per turn. Derive it from provider, model, account scope, system digest, tool digest, and compaction epoch.
+- `prompt_cache_key` is stable for one session, not regenerated per turn. The shipped domain is provider + model + account scope + finalized provider-view header epoch + cohort, where cohort defaults to the session identity. A byte-identical C3 inherited fork uses the durable fork-root route only while its recorded inherited provider-view segment remains active; after provider-view divergence it falls back to its own session identity. Unrelated same-account sessions never share a key.
 - Cached-read rates are model-specific, not universally 0.25–0.5×: current GPT-5.x models are commonly 0.1×; GPT-4.1/o3/o4-mini are commonly 0.25×; GPT-4o/o1/o3-mini commonly 0.5×. Use the model-price registry. See [OpenAI pricing](https://developers.openai.com/api/docs/pricing).
 
 For GPT-5.6, mirror the Anthropic boundary allocation with explicit breakpoints and exclude the live tail from writes. For older models, preserve the exact automatic prefix and provide a stable `prompt_cache_key`/supported retention option.

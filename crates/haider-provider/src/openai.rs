@@ -133,15 +133,14 @@ const STREAM_CAPACITY: usize = 32;
 const MODELS_BODY_LIMIT: usize = 1024 * 1024;
 #[cfg(test)]
 const ERROR_BODY_LIMIT: usize = crate::HTTP_ERROR_BODY_LIMIT;
-const TRANSPORT_CONFIG: OpenAiTransportConfig = OpenAiTransportConfig {
+/// Default OpenAI-family transport budgets. Connect and response-open are
+/// deliberately separate: reasoning/MoE gateways may accept a TCP connection
+/// promptly while taking substantially longer to produce response headers.
+pub const OPENAI_DEFAULT_TRANSPORT_CONFIG: OpenAiTransportConfig = OpenAiTransportConfig {
     retry_policy: OpenAiRetryPolicy::Never,
-    // `haider run` must fail under its own control before common 15-second
-    // process supervisors intervene. Request-open and idle waits are separate:
-    // an active stream may run indefinitely as long as it keeps producing
-    // chunks, but either silent phase is bounded well below that deadline.
-    connect_timeout: Duration::from_secs(5),
-    response_open_timeout: Duration::from_secs(5),
-    chunk_idle_timeout: Duration::from_secs(5),
+    connect_timeout: Duration::from_secs(10),
+    response_open_timeout: Duration::from_secs(60),
+    chunk_idle_timeout: Duration::from_secs(90),
 };
 
 static OPENAI_CLIENT_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -159,9 +158,9 @@ struct OpenAiCompatibleTransport {
 fn build_openai_client(
     origin_guard: Option<Arc<CompatibleOriginGuard>>,
     fixed_origin_guard: Option<Arc<FixedOriginGuard>>,
+    transport: OpenAiTransportConfig,
 ) -> Result<reqwest::Client, ProviderError> {
     OPENAI_CLIENT_BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
-    let transport = TRANSPORT_CONFIG;
     let mut client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -194,7 +193,11 @@ fn openai_fixed_transport(
         trusted_host,
         Arc::new(SystemFixedDnsResolver),
     )?);
-    let client = build_openai_client(None, Some(Arc::clone(&guard)))?;
+    let client = build_openai_client(
+        None,
+        Some(Arc::clone(&guard)),
+        OPENAI_DEFAULT_TRANSPORT_CONFIG,
+    )?;
     Ok(OpenAiFixedTransport { client, guard })
 }
 
@@ -211,7 +214,7 @@ fn compatible_transport(
             Arc::new(SystemCompatibleDnsResolver),
         ))
     });
-    let client = build_openai_client(guard.clone(), None)?;
+    let client = build_openai_client(guard.clone(), None, OPENAI_DEFAULT_TRANSPORT_CONFIG)?;
     Ok(OpenAiCompatibleTransport { client, guard })
 }
 
@@ -231,13 +234,26 @@ pub enum OpenAiRetryPolicy {
     Never,
 }
 
-/// Inspectable transport invariants shared by native and compatible adapters.
+/// Typed per-profile transport budgets shared by native and compatible
+/// adapters. [`OpenAiProvider::with_transport_config`] and
+/// [`OpenAiCompatibleProvider::with_transport_config`] apply one resolved
+/// profile override to every request path owned by that adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenAiTransportConfig {
     pub retry_policy: OpenAiRetryPolicy,
+    /// TCP/TLS connection establishment budget (10 seconds by default).
     pub connect_timeout: Duration,
+    /// Time from request execution to response headers (60 seconds by
+    /// default). The caller's run deadline remains the outer bound.
     pub response_open_timeout: Duration,
+    /// Maximum silence between response-body chunks (90 seconds by default).
     pub chunk_idle_timeout: Duration,
+}
+
+impl Default for OpenAiTransportConfig {
+    fn default() -> Self {
+        OPENAI_DEFAULT_TRANSPORT_CONFIG
+    }
 }
 
 /// Raw response returned only to explicit fixture-promotion harnesses.
@@ -269,6 +285,7 @@ struct OpenAiHttp {
     codex_responses_lite: bool,
     auth_header_mode: OpenAiAuthHeaderMode,
     grok_subscription_headers: bool,
+    transport_config: OpenAiTransportConfig,
 }
 
 impl OpenAiHttp {
@@ -300,6 +317,7 @@ impl OpenAiHttp {
             codex_responses_lite: false,
             auth_header_mode: OpenAiAuthHeaderMode::Bearer,
             grok_subscription_headers: false,
+            transport_config: OPENAI_DEFAULT_TRANSPORT_CONFIG,
         }
     }
 
@@ -381,6 +399,7 @@ impl OpenAiHttp {
             codex_responses_lite,
             auth_header_mode: OpenAiAuthHeaderMode::Bearer,
             grok_subscription_headers: false,
+            transport_config: OPENAI_DEFAULT_TRANSPORT_CONFIG,
         })
     }
 
@@ -392,9 +411,13 @@ impl OpenAiHttp {
         codex_responses_lite: bool,
     ) -> Result<Self, ProviderError> {
         let client = if origin_guard.is_none() && fixed_origin_guard.is_none() {
-            build_openai_client(None, None)?
+            build_openai_client(None, None, OPENAI_DEFAULT_TRANSPORT_CONFIG)?
         } else {
-            build_openai_client(origin_guard.clone(), fixed_origin_guard.clone())?
+            build_openai_client(
+                origin_guard.clone(),
+                fixed_origin_guard.clone(),
+                OPENAI_DEFAULT_TRANSPORT_CONFIG,
+            )?
         };
         Ok(Self {
             client,
@@ -406,6 +429,7 @@ impl OpenAiHttp {
             codex_responses_lite,
             auth_header_mode: OpenAiAuthHeaderMode::Bearer,
             grok_subscription_headers: false,
+            transport_config: OPENAI_DEFAULT_TRANSPORT_CONFIG,
         })
     }
 
@@ -471,11 +495,18 @@ impl OpenAiHttp {
         url: &str,
         body: Vec<u8>,
     ) -> Result<reqwest::Response, ProviderError> {
+        let request = connect_before_deadline(
+            self.transport_config.connect_timeout,
+            self.post_json_body_request(url, body),
+        )
+        .await?;
         let opening = async {
-            let request = self.post_json_body_request(url, body).await?;
-            self.client.execute(request).await.map_err(transport_error)
+            self.client
+                .execute(request)
+                .await
+                .map_err(|error| transport_error_with_config(error, self.transport_config))
         };
-        response_before_deadline(TRANSPORT_CONFIG.response_open_timeout, opening).await
+        response_before_deadline(self.transport_config.response_open_timeout, opening).await
     }
 
     async fn post_json_body_request(
@@ -508,11 +539,16 @@ impl OpenAiHttp {
     }
 
     async fn get(&self, url: &str) -> Result<reqwest::Response, ProviderError> {
+        let request =
+            connect_before_deadline(self.transport_config.connect_timeout, self.get_request(url))
+                .await?;
         let opening = async {
-            let request = self.get_request(url).await?;
-            self.client.execute(request).await.map_err(transport_error)
+            self.client
+                .execute(request)
+                .await
+                .map_err(|error| transport_error_with_config(error, self.transport_config))
         };
-        response_before_deadline(TRANSPORT_CONFIG.response_open_timeout, opening).await
+        response_before_deadline(self.transport_config.response_open_timeout, opening).await
     }
 
     async fn get_request(&self, url: &str) -> Result<reqwest::Request, ProviderError> {
@@ -534,6 +570,23 @@ impl OpenAiHttp {
         if let Some(guard) = &self.fixed_origin_guard {
             guard.validate_endpoint(url).await?;
         }
+        Ok(())
+    }
+
+    fn set_transport_config(
+        &mut self,
+        transport_config: OpenAiTransportConfig,
+    ) -> Result<(), ProviderError> {
+        validate_transport_config(transport_config)?;
+        if self.transport_config == transport_config {
+            return Ok(());
+        }
+        self.client = build_openai_client(
+            self.origin_guard.clone(),
+            self.fixed_origin_guard.clone(),
+            transport_config,
+        )?;
+        self.transport_config = transport_config;
         Ok(())
     }
 
@@ -648,7 +701,17 @@ impl OpenAiProvider {
 
     #[must_use]
     pub const fn transport_config() -> OpenAiTransportConfig {
-        TRANSPORT_CONFIG
+        OPENAI_DEFAULT_TRANSPORT_CONFIG
+    }
+
+    /// Overrides transport budgets for this resolved provider profile. The
+    /// caller's run deadline remains the outer bound and may cancel sooner.
+    pub fn with_transport_config(
+        mut self,
+        transport_config: OpenAiTransportConfig,
+    ) -> Result<Self, ProviderError> {
+        self.http.set_transport_config(transport_config)?;
+        Ok(self)
     }
 
     #[must_use]
@@ -723,6 +786,7 @@ impl OpenAiProvider {
         checked_stream(
             response,
             self.http.account.clone(),
+            self.http.transport_config.chunk_idle_timeout,
             DecoderKind::Responses(computer_kind),
         )
         .await
@@ -1454,7 +1518,17 @@ impl OpenAiCompatibleProvider {
 
     #[must_use]
     pub const fn transport_config() -> OpenAiTransportConfig {
-        TRANSPORT_CONFIG
+        OPENAI_DEFAULT_TRANSPORT_CONFIG
+    }
+
+    /// Overrides transport budgets for this resolved provider profile. The
+    /// same typed field applies to every compatible dialect and endpoint.
+    pub fn with_transport_config(
+        mut self,
+        transport_config: OpenAiTransportConfig,
+    ) -> Result<Self, ProviderError> {
+        self.http.set_transport_config(transport_config)?;
+        Ok(self)
     }
 
     #[must_use]
@@ -1545,15 +1619,19 @@ impl OpenAiCompatibleProvider {
         &self,
         request: &TurnRequest,
     ) -> Result<reqwest::Response, ProviderError> {
+        let outbound = connect_before_deadline(
+            self.http.transport_config.connect_timeout,
+            self.inference_request(request),
+        )
+        .await?;
         let opening = async {
-            let outbound = self.inference_request(request).await?;
             self.http
                 .client
                 .execute(outbound)
                 .await
-                .map_err(transport_error)
+                .map_err(|error| transport_error_with_config(error, self.http.transport_config))
         };
-        response_before_deadline(TRANSPORT_CONFIG.response_open_timeout, opening).await
+        response_before_deadline(self.http.transport_config.response_open_timeout, opening).await
     }
 
     async fn inference_request(
@@ -1608,6 +1686,7 @@ impl OpenAiCompatibleProvider {
         checked_stream(
             response,
             self.http.account.clone(),
+            self.http.transport_config.chunk_idle_timeout,
             DecoderKind::Chat(self.dialect),
         )
         .await
@@ -1832,6 +1911,7 @@ async fn capture(response: reqwest::Response) -> Result<OpenAiCapture, ProviderE
 async fn checked_stream(
     response: reqwest::Response,
     account: Option<CredentialAlias>,
+    chunk_idle_timeout: Duration,
     decoder: DecoderKind,
 ) -> Result<ProviderStream, ProviderError> {
     if !response.status().is_success() {
@@ -1846,14 +1926,7 @@ async fn checked_stream(
     }
     let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
     let producer = tokio::spawn(async move {
-        stream_response(
-            response,
-            account,
-            sender,
-            TRANSPORT_CONFIG.chunk_idle_timeout,
-            decoder,
-        )
-        .await;
+        stream_response(response, account, sender, chunk_idle_timeout, decoder).await;
     });
     Ok(ProviderStream::owned(receiver, producer))
 }
@@ -4473,10 +4546,10 @@ fn openai_automatic_cache_key_supported(model: &str) -> bool {
 /// shard-routed, and fast agentic rounds always outran its async warm-up
 /// (observed 0%-cached rounds on live sessions, 2026-08-21). codex 0.145
 /// sends a stable routing key. Prefix bytes still decide whether a cached
-/// entry matches; the key keeps trusted sibling sessions with the same base
-/// on one provider route without crossing an account boundary. The base is
-/// the exact provider-view header epoch, so there is no second competing
-/// system/tool digest path.
+/// entry matches; the key keeps one session, plus only a fork whose exact C3
+/// inherited segment is still active, on one provider route without crossing
+/// an account boundary. The base is the exact provider-view header epoch, so
+/// there is no second competing system/tool digest path.
 fn openai_prompt_cache_key(request: &TurnRequest) -> Option<String> {
     openai_prompt_cache_key_with_header(request, None)
 }
@@ -4707,14 +4780,14 @@ fn xai_prompt_cache_conversation_id(
 }
 
 /// Cache-cohort isolation law: a route exists only for a daemon-resolved
-/// account, and its identity is the provider/account/model plus the adapter's
-/// provider-view header epoch. That epoch content-addresses the exact rendered
-/// system and tool-schema bytes (including the effective-grant marker), the
-/// provider dialect, and serialization version. Session IDs, history, and
-/// compaction epochs never enter. Therefore trusted siblings share a route iff
-/// their provider-visible immutable bases match; differing accounts, models,
-/// effective grants, or rendered schema packs cannot collide. The provider
-/// still validates matching prefix bytes before a hit.
+/// account and a non-empty session/cohort identity. Unrelated sessions default
+/// to their own `session_scope`; only C3 forks whose exact inherited
+/// provider-view segment is still active carry the fork-root route in
+/// `cache_cohort`.
+/// Provider/account/model and the finalized provider-view header epoch remain
+/// hard domain boundaries. History and compaction epochs never enter, so one
+/// legitimate lineage stays stable across append-only turns without exposing
+/// the account to cache-key contention from unrelated traffic.
 fn prompt_cache_cohort_key(
     request: &TurnRequest,
     metadata: &crate::PromptCacheMetadata,
@@ -4736,12 +4809,20 @@ fn prompt_cache_cohort_key_with_header(
         .or_else(|| {
             (!metadata.header_epoch.is_empty()).then_some(metadata.header_epoch.as_str())
         })?;
+    let cohort = metadata
+        .cache_cohort
+        .as_deref()
+        .filter(|cohort| !cohort.is_empty())
+        .or_else(|| {
+            (!metadata.session_scope.is_empty()).then_some(metadata.session_scope.as_str())
+        })?;
     let domain = serde_json::json!({
-        "schema": "haider.prompt-cache-cohort.v2",
+        "schema": "haider.prompt-cache-cohort.v3",
         "provider": metadata.provider,
         "model": request.model,
         "account_scope": account_scope,
         "header_epoch": header_epoch,
+        "cohort": cohort,
     });
     serde_json::to_vec(&domain)
         .ok()
@@ -5289,7 +5370,7 @@ pub async fn validate_openai_compatible_endpoint(
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
-        .connect_timeout(TRANSPORT_CONFIG.connect_timeout);
+        .connect_timeout(OPENAI_DEFAULT_TRANSPORT_CONFIG.connect_timeout);
     let guard = endpoints.origin.map(|origin| {
         Arc::new(CompatibleOriginGuard::new(
             origin.host,
@@ -5300,7 +5381,11 @@ pub async fn validate_openai_compatible_endpoint(
         ))
     });
     if let Some(guard) = &guard {
-        guard.validate().await?;
+        connect_before_deadline(
+            OPENAI_DEFAULT_TRANSPORT_CONFIG.connect_timeout,
+            guard.validate(),
+        )
+        .await?;
         client = client.dns_resolver(Arc::clone(guard));
     }
     let client = client.build().map_err(|error| {
@@ -5313,9 +5398,14 @@ pub async fn validate_openai_compatible_endpoint(
         .get(&endpoints.models_url)
         .header(ACCEPT, "application/json")
         .send();
-    let response = response_before_deadline(TRANSPORT_CONFIG.response_open_timeout, async {
-        opening.await.map_err(transport_error)
-    })
+    let response = response_before_deadline(
+        OPENAI_DEFAULT_TRANSPORT_CONFIG.response_open_timeout,
+        async {
+            opening.await.map_err(|error| {
+                transport_error_with_config(error, OPENAI_DEFAULT_TRANSPORT_CONFIG)
+            })
+        },
+    )
     .await?;
     if response.status().is_redirection() {
         return Err(invalid_request(
@@ -5890,42 +5980,95 @@ fn transport_error(error: reqwest::Error) -> ProviderError {
     crate::reqwest_transport_error("OpenAI", error)
 }
 
+fn transport_error_with_config(
+    error: reqwest::Error,
+    transport_config: OpenAiTransportConfig,
+) -> ProviderError {
+    let connect_timeout_fired = error.is_timeout() && error.is_connect();
+    let mut error = transport_error(error);
+    if connect_timeout_fired {
+        let budget_ms = duration_ms(transport_config.connect_timeout);
+        error.message = format!(
+            "OpenAI connection did not open within the configured connect budget; opened_within_ms={budget_ms} budget_ms={budget_ms}"
+        );
+        error.presentation = provider_timeout_presentation();
+        error = error.with_timeout_budget(budget_ms, budget_ms);
+    }
+    error
+}
+
+fn validate_transport_config(config: OpenAiTransportConfig) -> Result<(), ProviderError> {
+    if config.connect_timeout.is_zero()
+        || config.response_open_timeout.is_zero()
+        || config.chunk_idle_timeout.is_zero()
+    {
+        return Err(invalid_request(
+            "OpenAI transport timeout budgets must be greater than zero",
+        ));
+    }
+    Ok(())
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 async fn response_before_deadline<T>(
     timeout: Duration,
     opening: impl Future<Output = Result<T, ProviderError>>,
 ) -> Result<T, ProviderError> {
-    tokio::time::timeout(timeout, opening)
-        .await
-        .map_err(|_| response_open_timeout_error(timeout))?
+    let started = tokio::time::Instant::now();
+    match tokio::time::timeout(timeout, opening).await {
+        Ok(result) => result,
+        Err(_) => Err(response_open_timeout_error(timeout, started.elapsed())),
+    }
 }
 
-fn response_open_timeout_error(timeout: Duration) -> ProviderError {
-    let mut error = ProviderError::new(
+async fn connect_before_deadline<T>(
+    timeout: Duration,
+    connecting: impl Future<Output = Result<T, ProviderError>>,
+) -> Result<T, ProviderError> {
+    match tokio::time::timeout(timeout, connecting).await {
+        Ok(result) => result,
+        Err(_) => Err(connect_timeout_error(timeout)),
+    }
+}
+
+fn connect_timeout_error(timeout: Duration) -> ProviderError {
+    let budget_ms = duration_ms(timeout);
+    ProviderError::new(
         ProviderErrorKind::Transport,
         format!(
-            "OpenAI response did not open within {} seconds",
-            timeout.as_secs()
+            "OpenAI connection preflight did not finish within the configured connect budget; opened_within_ms={budget_ms} budget_ms={budget_ms}"
         ),
     )
-    .with_presentation(provider_timeout_presentation());
-    // A local deadline is already the bounded recovery policy. Retrying ten
-    // identical silent requests would outlive the CLI/process deadline and
-    // convert a typed failure into an external SIGKILL.
-    error.retryable = false;
-    error
+    .with_presentation(provider_timeout_presentation())
+    .with_timeout_budget(budget_ms, budget_ms)
+}
+
+fn response_open_timeout_error(timeout: Duration, elapsed: Duration) -> ProviderError {
+    let opened_within_ms = duration_ms(elapsed.min(timeout));
+    let budget_ms = duration_ms(timeout);
+    ProviderError::new(
+        ProviderErrorKind::Transport,
+        format!(
+            "OpenAI response did not open within the configured response-open budget; opened_within_ms={opened_within_ms} budget_ms={budget_ms}"
+        ),
+    )
+    .with_presentation(provider_timeout_presentation())
+    .with_timeout_budget(opened_within_ms, budget_ms)
 }
 
 fn stream_idle_error(timeout: Duration) -> ProviderError {
-    let mut error = ProviderError::new(
+    let budget_ms = duration_ms(timeout);
+    ProviderError::new(
         ProviderErrorKind::Transport,
         format!(
-            "OpenAI SSE stream received no data for {} seconds",
-            timeout.as_secs()
+            "OpenAI SSE stream received no data within the configured idle budget; opened_within_ms={budget_ms} budget_ms={budget_ms}"
         ),
     )
-    .with_presentation(provider_timeout_presentation());
-    error.retryable = false;
-    error
+    .with_presentation(provider_timeout_presentation())
+    .with_timeout_budget(budget_ms, budget_ms)
 }
 
 fn provider_timeout_presentation() -> ErrorPresentation {

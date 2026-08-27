@@ -1322,6 +1322,7 @@ pub fn request_body_for_features(
                 enabled: true,
                 models,
                 default_model,
+                response_open_timeout_ms: None,
                 expected_revision,
             }
         }

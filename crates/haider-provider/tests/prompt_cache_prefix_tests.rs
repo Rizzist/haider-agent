@@ -118,6 +118,7 @@ fn cache_metadata(
         compaction_epoch: "compaction-epoch-a".into(),
         provider: provider.into(),
         session_scope: "prefix-session".into(),
+        cache_cohort: None,
         account_scope: Some("prefix-account".into()),
         stable_prefix_tokens: 4_096,
         expected_later_reads: 2,

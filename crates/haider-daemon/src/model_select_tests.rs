@@ -19,6 +19,7 @@ fn summary(
         provider: provider.to_owned(),
         api_family: ProviderApiFamilyWire::OpenAiResponses,
         endpoint: None,
+        response_open_timeout_ms: None,
         models: models.iter().map(|model| (*model).to_owned()).collect(),
         model_details: Vec::new(),
         auth_methods: Vec::new(),

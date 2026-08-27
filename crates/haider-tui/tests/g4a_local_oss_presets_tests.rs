@@ -38,6 +38,7 @@ fn keyless_summary(provider: &str, models: Vec<String>) -> haider_rpc::ProviderS
         provider: provider.to_owned(),
         api_family: haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some("http://127.0.0.1:11434/v1".to_owned()),
+        response_open_timeout_ms: None,
         model_details: Vec::new(),
         models,
         auth_methods: Vec::new(),

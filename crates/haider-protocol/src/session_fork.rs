@@ -96,12 +96,14 @@ pub enum SessionForkMode {
 #[serde(rename_all = "snake_case")]
 pub enum ForkContextEpoch {
     /// The child remains keyed by the actual C2 cohort key (provider, account,
-    /// model, and provider-view header epoch) but starts an independent C3
-    /// segment at zero; no parent segment bytes are inherited.
+    /// model, provider-view header epoch, and its own session identity) and
+    /// starts an independent C3 segment at zero; no parent route is inherited.
     Fresh,
     /// The child continues the exact provider-visible cache prefix recorded
-    /// by [`SessionForked::inherited_cache_segment`]. The first appended byte
-    /// after that prefix begins the child's independent lineage.
+    /// by [`SessionForked::inherited_cache_segment`]. The inherited fork-root
+    /// cohort applies only while that exact segment remains the active
+    /// provider view; the first divergent provider view uses the child's own
+    /// session cohort.
     Inherited,
     #[serde(other)]
     Unknown,

@@ -257,6 +257,10 @@ pub struct HarnessConfig {
     pub cache_stable_history_end: Option<usize>,
     /// Compiler-provided current-user start for adapter cache metadata.
     pub cache_current_user_start: Option<usize>,
+    /// Active C3 fork-cohort root. `None` isolates routing to `session_id`;
+    /// only a byte-identical inherited provider-view segment sets this, and
+    /// provider-view divergence clears it on the next turn setup.
+    pub cache_cohort: Option<String>,
     /// Exclusive end of the latest active compaction-summary message.
     pub cache_compaction_summary_end: Option<usize>,
     /// Conservative future-read expectation for explicit cache resources.
@@ -377,6 +381,7 @@ impl HarnessConfig {
             usage_scope: UsageScope::default(),
             cache_stable_history_end: None,
             cache_current_user_start: None,
+            cache_cohort: None,
             cache_compaction_summary_end: None,
             cache_expected_later_reads: 0,
             cache_reuse_gap_ms: None,
@@ -4931,6 +4936,8 @@ impl HarnessActor {
                 ),
                 retryable: true,
                 retry_after_ms: error.retry_after_ms,
+                opened_within_ms: error.opened_within_ms,
+                budget_ms: error.budget_ms,
                 presentation: error.presentation.clone(),
             };
             return Err(DriveError::Provider(capped));
@@ -8239,6 +8246,8 @@ fn provider_error_to_haider(provider_error: ProviderError) -> HaiderError {
     error.details = Some(serde_json::json!({
         "provider_error_kind": format!("{:?}", provider_error.kind),
         "retry_after_ms": provider_error.retry_after_ms,
+        "opened_within_ms": provider_error.opened_within_ms,
+        "budget_ms": provider_error.budget_ms,
     }));
     error.presentation = Some(provider_error.presentation);
     error
@@ -8390,6 +8399,8 @@ fn copy_provider_metadata(target: &mut ErrorPresentation, source: &ErrorPresenta
         .clone_from(&source.provider_request_id);
     target.retry_after_ms = source.retry_after_ms;
     target.reset_at_ms = source.reset_at_ms;
+    target.opened_within_ms = source.opened_within_ms;
+    target.budget_ms = source.budget_ms;
 }
 
 fn recovery_card_kind(presentation: &ErrorPresentation) -> Option<ErrorRecoveryCardKind> {
@@ -8873,6 +8884,7 @@ fn prompt_cache_metadata(
         compaction_epoch,
         provider: config.usage_scope.provider.clone(),
         session_scope: config.session_id.as_str().to_owned(),
+        cache_cohort: config.cache_cohort.clone(),
         account_scope: account_scope.map(|scope| scope.as_str().to_owned()),
         stable_prefix_tokens,
         expected_later_reads: config.cache_expected_later_reads,
@@ -10073,9 +10085,28 @@ mod cu1_actor_tests {
                 "The local deadline expired.",
                 ErrorScope::Turn,
                 [ErrorAction::Retry],
-            ));
+            ))
+            .with_timeout_budget(60_000, 60_000);
         let error = provider_error_to_haider(provider_error);
         assert_eq!(error.code, ErrorCode::ProviderTimeout);
+        assert!(error.retryable);
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|value| value["opened_within_ms"].as_u64()),
+            Some(60_000)
+        );
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|value| value["budget_ms"].as_u64()),
+            Some(60_000)
+        );
+        let presentation = error.presentation.expect("provider presentation");
+        assert_eq!(presentation.opened_within_ms, Some(60_000));
+        assert_eq!(presentation.budget_ms, Some(60_000));
     }
 
     #[tokio::test]

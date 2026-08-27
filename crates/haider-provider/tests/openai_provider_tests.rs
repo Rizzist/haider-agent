@@ -382,9 +382,9 @@ fn transport_config_disables_reqwest_retries_and_bounds_stream_waits() {
 
     assert_eq!(native, compatible);
     assert_eq!(native.retry_policy, OpenAiRetryPolicy::Never);
-    assert_eq!(native.connect_timeout, Duration::from_secs(5));
-    assert_eq!(native.response_open_timeout, Duration::from_secs(5));
-    assert_eq!(native.chunk_idle_timeout, Duration::from_secs(5));
+    assert_eq!(native.connect_timeout, Duration::from_secs(10));
+    assert_eq!(native.response_open_timeout, Duration::from_secs(60));
+    assert_eq!(native.chunk_idle_timeout, Duration::from_secs(90));
 }
 
 #[test]
@@ -437,8 +437,9 @@ fn codex_https_lite_request_omits_prompt_cache_retention() {
 
 /// MUTATION PIN (b): remove `prompt_cache_key` from the HTTPS lite body.
 /// Expected runtime failure: the required stable routing key is absent.
-/// C2 derives that key from provider/account/model plus the finalized
-/// provider-view header epoch stand-in supplied by the shape fixture below.
+/// C2 derives that key from provider/account/model, the finalized
+/// provider-view header epoch stand-in, and the session/fork cohort supplied
+/// by the shape fixture below.
 #[test]
 fn codex_https_lite_request_keeps_prompt_cache_key() {
     let payload = codex_lite_payload(true);
@@ -1055,6 +1056,7 @@ fn openai_shape_request(with_cache_metadata: bool) -> TurnRequest {
             compaction_epoch: "compaction-shape-pin".into(),
             provider: OPENAI_OAUTH_PROVIDER_NAME.into(),
             session_scope: "session-shape-pin".into(),
+            cache_cohort: None,
             account_scope: Some("account-shape-pin".into()),
             stable_prefix_tokens: 8_192,
             expected_later_reads: 2,
