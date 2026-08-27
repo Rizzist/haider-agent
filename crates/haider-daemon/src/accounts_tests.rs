@@ -5841,10 +5841,11 @@ async fn stale_expected_revision_refuses_origin_only_repoint() {
     store.close().await.expect("close store");
 }
 
-/// MUTATION-CHECK: remove the changed-custom-origin arm from
-/// `handle_provider_configure`. Expected RUNTIME failure: the link-local
-/// repoint bypasses `ProductionProviderEndpointValidator`, succeeds, and
-/// advances the revision instead of surfacing typed `invalid_argument`.
+/// MUTATION-CHECK: remove the changed-custom-origin arm or its local origin-
+/// claim preflight from `handle_provider_configure`. Expected RUNTIME failure:
+/// the link-local repoint bypasses `ProductionProviderEndpointValidator`, or
+/// the already-claimed HTTPS origin reaches the live `.invalid` probe and
+/// surfaces `provider_error` instead of the typed local `invalid_argument`.
 #[tokio::test]
 async fn custom_provider_origin_repoint_rejects_invalid_origin() {
     let old_origin = "https://old-models.example.invalid/v1";
@@ -9690,12 +9691,14 @@ async fn provider_remove_refuses_release_owned_and_account_referenced_profiles()
     store.close().await.expect("close store");
 }
 
-/// MUTATION CHECK (W5g-5 live fix): make `custom_login_target` ignore the
-/// API family (return a target for any profile with an endpoint). Expected
-/// runtime failure: the builtin-responses row below yields a target, so a
-/// vendor login would validate against the wrong origin.
+/// MUTATION CHECK (Q custom-login routing): remove the builtin-name guard,
+/// special-case Azure as fixed, narrow the accepted families back to OpenAI
+/// only, or ignore the API family. Expected runtime failure: a release-owned
+/// Anthropic/Bedrock/Vertex login targets `/v1/models`, an Azure or custom
+/// Anthropic row disappears, or the builtin Responses row becomes a custom
+/// credential target.
 #[test]
-fn custom_login_targets_only_chat_completions_profiles() {
+fn custom_login_targets_only_custom_compatible_profiles() {
     let management = ManagementSnapshot::new(
         1,
         Vec::new(),
@@ -9729,6 +9732,58 @@ fn custom_login_targets_only_chat_completions_profiles() {
                 enabled: true,
             },
             ProviderSummaryWire {
+                provider: "custom-claude".to_owned(),
+                api_family: ProviderApiFamilyWire::AnthropicMessages,
+                endpoint: Some("https://claude-gateway.example.invalid/v1".to_owned()),
+                response_open_timeout_ms: None,
+                models: vec!["claude-private".to_owned()],
+                model_details: Vec::new(),
+                inventory_fetched_at_ms: None,
+                auth_methods: vec![AuthMethod::ApiKey],
+                availability: haider_rpc::ProviderAvailabilityWire::Available,
+                availability_reason: None,
+                default_model: Some("claude-private".to_owned()),
+                enabled: true,
+            },
+            ProviderSummaryWire {
+                provider: "azure".to_owned(),
+                api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
+                endpoint: Some("https://contoso.openai.azure.com/openai/v1".to_owned()),
+                response_open_timeout_ms: None,
+                models: vec!["my-gpt-deployment".to_owned()],
+                model_details: Vec::new(),
+                inventory_fetched_at_ms: None,
+                auth_methods: vec![AuthMethod::ApiKey],
+                availability: haider_rpc::ProviderAvailabilityWire::Available,
+                availability_reason: None,
+                default_model: Some("my-gpt-deployment".to_owned()),
+                enabled: true,
+            },
+            ProviderSummaryWire {
+                provider: ANTHROPIC_PROVIDER_NAME.to_owned(),
+                api_family: ProviderApiFamilyWire::AnthropicMessages,
+                endpoint: Some("https://api.anthropic.com/v1".to_owned()),
+                response_open_timeout_ms: None,
+                models: vec!["claude-fable-5".to_owned()],
+                model_details: Vec::new(),
+                inventory_fetched_at_ms: None,
+                auth_methods: vec![AuthMethod::ApiKey],
+                availability: haider_rpc::ProviderAvailabilityWire::Available,
+                availability_reason: None,
+                default_model: Some("claude-fable-5".to_owned()),
+                enabled: true,
+            },
+            enterprise_summary(
+                BEDROCK_PROVIDER_NAME,
+                Some("https://bedrock-mantle.us-east-1.api.aws/anthropic"),
+            ),
+            enterprise_summary(
+                VERTEX_PROVIDER_NAME,
+                Some(
+                    "https://aiplatform.googleapis.com/v1/projects/acme-ai/locations/global/publishers/anthropic/models",
+                ),
+            ),
+            ProviderSummaryWire {
                 provider: DEEPSEEK_PROVIDER_NAME.to_owned(),
                 api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
                 endpoint: Some(DEEPSEEK_BASE_URL.to_owned()),
@@ -9751,9 +9806,41 @@ fn custom_login_targets_only_chat_completions_profiles() {
         .expect("chat-completions profile is a login target");
     assert_eq!(target.0, "http://127.0.0.1:18123/v1");
     assert_eq!(target.1.as_deref(), Some("llama3.1:8b"));
+    assert_eq!(target.2, ProviderApiFamilyWire::OpenAiChatCompletions);
+    let anthropic_target = custom_login_target(Some(&management), "custom-claude")
+        .expect("custom Anthropic profile is a login target");
+    assert_eq!(
+        anthropic_target,
+        (
+            "https://claude-gateway.example.invalid/v1".to_owned(),
+            Some("claude-private".to_owned()),
+            ProviderApiFamilyWire::AnthropicMessages,
+        )
+    );
+    assert_eq!(
+        custom_login_target(Some(&management), "azure"),
+        Some((
+            "https://contoso.openai.azure.com/openai/v1".to_owned(),
+            Some("my-gpt-deployment".to_owned()),
+            ProviderApiFamilyWire::OpenAiChatCompletions,
+        )),
+        "Azure is a named custom compatible profile, not a fixed builtin"
+    );
     assert!(
         custom_login_target(Some(&management), "openai").is_none(),
         "a vendor-family profile NEVER validates against a stored origin"
+    );
+    assert!(
+        custom_login_target(Some(&management), ANTHROPIC_PROVIDER_NAME).is_none(),
+        "the Anthropic builtin keeps the fixed credential validator"
+    );
+    assert!(
+        custom_login_target(Some(&management), BEDROCK_PROVIDER_NAME).is_none(),
+        "the Bedrock builtin keeps its profile-endpoint credential validator"
+    );
+    assert!(
+        custom_login_target(Some(&management), VERTEX_PROVIDER_NAME).is_none(),
+        "the Vertex builtin keeps its profile-endpoint credential validator"
     );
     assert!(
         custom_login_target(Some(&management), DEEPSEEK_PROVIDER_NAME).is_none(),
@@ -10775,8 +10862,9 @@ async fn la_env_bridge_imports_aws_bearer_token_bedrock() {
 /// global vendor default — and commits the descriptor under the provider.
 ///
 /// MUTATION CHECK: drop the `enterprise_login_target` endpoint from the
-/// validator call in `handle_login`. Expected RUNTIME failure: the recorded
-/// endpoint below is `None`.
+/// validator call or route an Anthropic-family builtin through custom catalog
+/// validation. Expected RUNTIME failure: the recorded endpoint is `None`, or
+/// no committed response/recorded validator call arrives.
 #[tokio::test]
 async fn enterprise_login_validates_at_the_profile_endpoint_with_its_default_model() {
     #[derive(Default)]

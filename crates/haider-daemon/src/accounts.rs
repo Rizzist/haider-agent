@@ -383,10 +383,7 @@ fn custom_login_target(
     management: Option<&ManagementSnapshot>,
     provider: &str,
 ) -> Option<(String, Option<String>, ProviderApiFamilyWire)> {
-    if matches!(
-        provider,
-        DEEPSEEK_PROVIDER_NAME | HAIDER_CODE_PROVIDER_NAME | XAI_PROVIDER_NAME
-    ) {
+    if BUILTIN_PROVIDER_NAMES.contains(&provider) {
         return None;
     }
     let view = management?.read()?;
@@ -3774,19 +3771,27 @@ async fn handle_provider_configure(
             return;
         }
     }
-    let endpoint_to_validate = match accepted_revision_unchanged {
-        Some(_) => None,
+    let (endpoint_to_validate, validate_repoint_claim) = match accepted_revision_unchanged {
+        Some(_) => (None, false),
         None => match providers.get(&job.input.provider) {
-            None => job.input.origin.as_deref(),
-            Some(profile) if matches!(profile.provenance, ProviderProvenance::Custom) => job
-                .input
-                .origin
-                .as_deref()
-                .filter(|origin| Some(*origin) != profile.base_url.as_deref()),
-            Some(_) => None,
+            None => (job.input.origin.as_deref(), false),
+            Some(profile) if matches!(profile.provenance, ProviderProvenance::Custom) => (
+                job.input
+                    .origin
+                    .as_deref()
+                    .filter(|origin| Some(*origin) != profile.base_url.as_deref()),
+                true,
+            ),
+            Some(_) => (None, false),
         },
     };
     if let Some(origin) = endpoint_to_validate {
+        if validate_repoint_claim
+            && let Err(error) = providers.validate_repoint_origin_claim(&job.input.provider, origin)
+        {
+            respond_management_error(&job.route, &error);
+            return;
+        }
         let origin = origin.to_owned();
         let validation =
             tokio::spawn(async move { endpoint_validator.validate(&origin).await }).await;

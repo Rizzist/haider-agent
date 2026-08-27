@@ -139,6 +139,10 @@ fn normal_aliases_containing_probe_are_not_hidden() {
 /// Sim hierarchy 1:1: head · provider groups (base URL on the group header,
 /// tui.js:3596-3599) · ●/○ rows with AUTH_LABEL/identity/status/"in use" ·
 /// ONE global add row after ALL groups · hints (tui.js:3684-3686).
+///
+/// MUTATION CHECK (Q custom caption): restore/omit the retired custom label or
+/// move the shared add rows ahead of the account groups. Expected runtime
+/// failure: the exact `+ Add custom server` assertion or ordering law fails.
 #[test]
 fn accounts_screen_renders_the_sim_hierarchy() {
     let model = accounts_model();
@@ -171,7 +175,7 @@ fn accounts_screen_renders_the_sim_hierarchy() {
         .expect("last account row present");
     let add = frame.find("[+ OpenAI (OAuth)]").expect("add row");
     assert!(add > last_row, "the add row renders AFTER all groups");
-    assert!(frame.contains("[+ Custom (OpenAI-compatible)]"));
+    assert!(frame.contains("[+ Add custom server]"));
     // Hints line.
     assert!(frame.contains("click an account to make it active"));
 }

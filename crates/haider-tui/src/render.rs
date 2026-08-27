@@ -1990,7 +1990,7 @@ fn render_accounts(
         }
         footer_lines.push(Line::raw(""));
     }
-    // The `+ Custom (OpenAI-compatible)` card (W5g-4; sim MenuBox
+    // The `+ Add custom server` card (W5g-4; sim MenuBox
     // tui.js:3629-3682). Demo = the sim's verbatim fabrication card; live
     // = the editable name/origin fields (the provider.configure front
     // door).

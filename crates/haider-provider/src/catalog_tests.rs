@@ -62,9 +62,10 @@ fn request(source: &CatalogSource, credential: Option<&str>) -> reqwest::Request
         .expect("catalog request builds")
 }
 
-/// MUTATION CHECK: apply the new Gemini header mode globally or change any
-/// existing source's bearer bytes. The old-source assertions pin the exact
-/// pre-B6a behavior while the Gemini assertion pins the additive branch.
+/// MUTATION CHECK: apply the Gemini/Azure/Anthropic header modes globally,
+/// route Azure login discovery back through Bearer, or change an existing
+/// source's bearer bytes. The assertions pin each credential family and the
+/// absence of an `Authorization` header on API-key-specific routes.
 #[test]
 fn catalog_auth_mode_is_source_specific_and_existing_sources_are_identical() {
     for source in [
@@ -115,6 +116,20 @@ fn catalog_auth_mode_is_source_specific_and_existing_sources_are_identical() {
     assert_eq!(key, "ANTHROPIC_CATALOG_KEY_SENTINEL_8ee4");
     assert!(key.is_sensitive());
     assert!(!anthropic.headers().contains_key(AUTHORIZATION));
+
+    let azure = request(
+        &CatalogSource::OpenAiCompatible {
+            origin: "https://contoso.openai.azure.com/openai/v1".into(),
+        },
+        Some("AZURE_CATALOG_KEY_SENTINEL_1d8f"),
+    );
+    let key = azure
+        .headers()
+        .get("api-key")
+        .expect("Azure catalog API key");
+    assert_eq!(key, "AZURE_CATALOG_KEY_SENTINEL_1d8f");
+    assert!(key.is_sensitive());
+    assert!(!azure.headers().contains_key(AUTHORIZATION));
 }
 
 #[test]

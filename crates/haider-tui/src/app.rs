@@ -702,7 +702,7 @@ pub enum CustomCardKind {
     Vertex,
 }
 
-/// Where the `+ Custom (OpenAI-compatible)` card is in its flow.
+/// Where the `+ Add custom server` card is in its flow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CustomPhase {
     /// Typing name/origin (also the retype state after a failure — the
@@ -712,7 +712,7 @@ pub enum CustomPhase {
     Submitting,
 }
 
-/// The `+ Custom (OpenAI-compatible)` card (sim tui.js:3629-3682).
+/// The `+ Add custom server` card (sim tui.js:3629-3682).
 ///
 /// The DEMO card is the sim's verbatim MenuBox — info lines and a fixed
 /// `[1] add http://127.0.0.1:8000/v1 (demo)`. The EDITABLE name/origin
@@ -9804,7 +9804,7 @@ impl AppModel {
         self.dirty = true;
     }
 
-    /// Opens the `+ Custom (OpenAI-compatible)` card. The name prefills
+    /// Opens the `+ Add custom server` card. The name prefills
     /// with the smallest free `custom[-N]` against the provider registry;
     /// the origin with the sim's demo URL (a real vLLM default).
     fn open_custom_add(&mut self) {

@@ -349,6 +349,10 @@ fn vertex_card_collects_project_and_location() {
 /// add rows offer the three buttons (Custom still last), and `e` on a
 /// bedrock row opens the REGION card (never the generic edit card, whose
 /// identity family would be refused).
+///
+/// MUTATION CHECK (G4b/Q footer): remove/reorder an enterprise or custom
+/// button, restore the retired custom caption, or retag its hit. Expected
+/// runtime failure: the label order or value-carrying hit assertions fail.
 #[test]
 fn enterprise_footer_buttons_and_edit_routing() {
     let mut model = live_model();
@@ -373,13 +377,14 @@ fn enterprise_footer_buttons_and_edit_routing() {
         AccountAddKind::AzureOpenAi,
         AccountAddKind::Bedrock,
         AccountAddKind::Vertex,
+        AccountAddKind::Custom,
     ] {
         assert!(
             hits.contains(&Hit::AccountAdd(kind)),
             "button hit for {kind:?}"
         );
     }
-    let custom_index = text.find("+ Custom (OpenAI-compatible)").expect("custom");
+    let custom_index = text.find("+ Add custom server").expect("custom");
     let vertex_index = text.find("+ Vertex (Claude)").expect("vertex");
     assert!(
         vertex_index < custom_index,

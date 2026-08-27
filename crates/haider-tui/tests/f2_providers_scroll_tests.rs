@@ -150,9 +150,10 @@ fn cursor_walk_keeps_the_selected_provider_visible() {
 /// scrolling even when the roster overflows, wearing the same
 /// value-carrying AccountAdd hits as before.
 ///
-/// MUTATION CHECK (F2b): flow the buttons back into the scroll body.
-/// Expected runtime failure: with the roster overflowing, no rendered
-/// row carries `+ OpenAI (OAuth)` and the visibility law fails.
+/// MUTATION CHECK (F2b/Q): flow the buttons back into the scroll body, omit
+/// the custom-server row, or retag that row with a different `AccountAddKind`.
+/// Expected runtime failure: the overflowing roster hides a pinned label, or
+/// the label-to-action assertion loses the custom add flow.
 #[test]
 fn add_login_buttons_pin_at_the_bottom() {
     let model = long_roster_model();
@@ -162,16 +163,41 @@ fn add_login_buttons_pin_at_the_bottom() {
         !text.contains("synth-11"),
         "the roster overflows (precondition)"
     );
-    for button in [
-        "+ OpenAI (OAuth)",
-        "+ Kimi (OAuth)",
-        "+ Custom (OpenAI-compatible)",
+    for (button, kind) in [
+        ("+ OpenAI (OAuth)", AccountAddKind::OpenAiOAuth),
+        ("+ Kimi (OAuth)", AccountAddKind::KimiOAuth),
+        ("+ Add custom server", AccountAddKind::Custom),
     ] {
         assert!(
             text.contains(button),
             "{button:?} must be visible without scrolling"
         );
+        assert!(
+            hits.iter()
+                .any(|(_, hit)| matches!(hit, Hit::AccountAdd(candidate) if *candidate == kind)),
+            "the pinned {button:?} button keeps its add flow"
+        );
     }
+    let custom_row = rows
+        .iter()
+        .position(|row| row.contains("+ Add custom server"))
+        .expect("custom button row");
+    let custom_column = rows[custom_row]
+        .find("+ Add custom server")
+        .expect("custom button column");
+    let custom_hit = hits
+        .iter()
+        .find_map(|(rect, hit)| {
+            matches!(hit, Hit::AccountAdd(AccountAddKind::Custom)).then_some(rect)
+        })
+        .expect("custom button hit rectangle");
+    assert!(
+        custom_row >= usize::from(custom_hit.y)
+            && custom_row < usize::from(custom_hit.y + custom_hit.height)
+            && custom_column >= usize::from(custom_hit.x)
+            && custom_column < usize::from(custom_hit.x + custom_hit.width),
+        "the custom caption must lie inside its Custom hit rectangle"
+    );
     // The buttons sit in the BOTTOM footer rows.
     let oauth_row = rows
         .iter()
@@ -188,19 +214,15 @@ fn add_login_buttons_pin_at_the_bottom() {
         oauth_row >= rows.len() - 11,
         "buttons pin at the bottom band (footer + status bar), not mid-page (row {oauth_row})"
     );
-    // Same flows: the hits still carry the AccountAdd kinds.
-    assert!(
-        hits.iter()
-            .any(|(_, hit)| matches!(hit, Hit::AccountAdd(AccountAddKind::OpenAiOAuth))),
-        "the pinned button keeps its add flow"
-    );
     // Scrolling the roster leaves the footer put.
     let mut model = model;
     model.handle(key(KeyCode::End));
     let (rows, _) = draw(&model, 100, 24);
     assert!(
-        rows.iter().any(|row| row.contains("+ OpenAI (OAuth)")),
-        "the footer survives scrolling to the end"
+        rows.iter().any(|row| row.contains("+ OpenAI (OAuth)"))
+            && rows.iter().any(|row| row.contains("+ Kimi (OAuth)"))
+            && rows.iter().any(|row| row.contains("+ Add custom server")),
+        "the complete footer survives scrolling to the end"
     );
 }
 

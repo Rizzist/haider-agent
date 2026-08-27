@@ -540,6 +540,19 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             .map(|(next, _)| next != self.profiles)
     }
 
+    /// Refuses a custom provider repoint to an origin already owned by another
+    /// provider before any live endpoint probe. The repoint configure branch
+    /// repeats this check after canonicalization; this preflight preserves the
+    /// typed local rejection for an exact duplicate without touching the
+    /// claimed remote endpoint.
+    pub(crate) fn validate_repoint_origin_claim(
+        &self,
+        provider_id: &str,
+        origin: &str,
+    ) -> Result<(), HaiderError> {
+        require_unique_repoint_origin(&self.profiles, provider_id, origin)
+    }
+
     pub(crate) fn remove_custom(&mut self, provider: &str) -> Result<(), HaiderError> {
         let profile = self
             .get(provider)
