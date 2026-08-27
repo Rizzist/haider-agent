@@ -16,7 +16,7 @@
 
 *One Rust binary that is a TUI, a headless runtime, and a per-device daemon — where every piece of interior state is a typed, evented, queryable contract.*
 
-![Version](https://img.shields.io/github/v/release/Rizzist/haider-agent?label=Haider&color=8b0000) ![Rust](https://img.shields.io/badge/Rust-100%25-orange?logo=rust) ![macOS](https://img.shields.io/badge/macOS-✓-black?logo=apple) ![Windows](https://img.shields.io/badge/Windows-✓-0078D4) ![Linux](https://img.shields.io/badge/Linux-✓-FCC624?logo=linux&logoColor=black)
+![Version](https://img.shields.io/github/v/release/Rizzist/haider-agent?label=Haider&color=8b0000) ![Rust](https://img.shields.io/badge/Rust-100%25-orange?logo=rust) ![macOS](https://img.shields.io/badge/macOS-✓-black?logo=apple) ![Windows](https://img.shields.io/badge/Windows-✓-0078D4) ![Linux](https://img.shields.io/badge/Linux-✓-FCC624?logo=linux&logoColor=black) ![Android](https://img.shields.io/badge/Android-APK-3DDC84?logo=android&logoColor=white)
 
 </div>
 
@@ -24,135 +24,140 @@
 
 ## ⬇️ Download
 
-Grab the [**latest release**](https://github.com/Rizzist/haider-agent/releases/latest) and pick the archive for your platform:
+Open the [latest release](https://github.com/Rizzist/haider-agent/releases/latest) and choose the exact asset for your platform.
 
-| Platform | Asset |
+| Platform | Release asset |
 |---|---|
-| 🍎 macOS (Apple Silicon) | `haider-v<version>-aarch64-apple-darwin.tar.xz` |
-| 🍎 macOS (Intel) | `haider-v<version>-x86_64-apple-darwin.tar.xz` |
-| 🐧 Linux (x86_64 / arm64) | `haider-v<version>-<arch>-unknown-linux-gnu.tar.xz` |
-| 🪟 Windows | `haider-v<version>-x86_64-pc-windows-msvc.zip` |
+| macOS arm64 (signed · notarized) | `haider-v<version>-aarch64-apple-darwin.tar.xz` |
+| macOS x86_64 (signed · notarized) | `haider-v<version>-x86_64-apple-darwin.tar.xz` |
+| Linux x86_64 | `haider-v<version>-x86_64-unknown-linux-gnu.tar.xz` |
+| Linux arm64 | `haider-v<version>-aarch64-unknown-linux-gnu.tar.xz` |
+| Windows x86_64 | `haider-v<version>-x86_64-pc-windows-msvc.zip` |
+| Android (APK, sideloadable) | `haider-v<version>-android.apk` |
 
-Every asset ships with a `.sha256`. Extract, put `haider` and `haiderd` on your `PATH`, and run:
+Every binary asset has a `.sha256` beside it. Download both files, then verify before extracting or installing. The current macOS/Linux manifests record the archive under `dist/`, so preserve that path when checking them:
 
+```console
+$ mkdir -p dist
+$ mv haider-v<version>-<target>.tar.xz dist/
+$ shasum -a 256 -c haider-v<version>-<target>.tar.xz.sha256
+dist/haider-v<version>-<target>.tar.xz: OK
 ```
-haider --version
-haider
+
+Windows and Android manifests use the bare filename and can be checked directly with the matching `.zip.sha256` or `.apk.sha256` file:
+
+```console
+$ shasum -a 256 -c haider-v<version>-android.apk.sha256
+haider-v<version>-android.apk: OK
 ```
 
-> **First launch:** builds are not yet OS-signed. On macOS, clear quarantine (`xattr -c haider haiderd`) or right-click → Open. `/update` inside the TUI checks for new releases from then on.
+The [native release workflow](.github/workflows/release.yml) produces the five target archives, signs and notarizes both macOS builds, and verifies the Android checksum before admitting an APK to a release.
+
+For Android, allow **Install unknown apps** for the browser or file manager that opens the download, then install the APK. A published release APK has been signed with the configured release key and passed v1/v2/v3 signature verification. The app's updater reads GitHub Releases, downloads the matching checksum, verifies SHA-256 after download and again before handing the file to Android's package installer. See the [Android release workflow](.github/workflows/android-apk.yml), [update checker](android/app/src/main/java/ai/diffforge/haider/update/UpdateChecker.kt), and [installer boundary](android/app/src/main/java/ai/diffforge/haider/update/PackageInstallerLauncher.kt).
+
+The APK is a separately gated companion build. If that job fails, the native release can still publish without Android; the release page is the authority for which assets are actually present.
+
+Extract the native archive, put `haider` and `haiderd` on your `PATH`, and run:
+
+```console
+$ haider --version
+$ haider
+```
 
 ---
 
 ## ⚔️ What is Haider?
 
-Haider is a coding-agent harness: the layer that turns a language model into a working software agent. You talk to it in a terminal; underneath, a per-device daemon owns every session, drives the model through a registry of typed tools, enforces permissions per effect, and journals everything that happens as durable, replayable events.
+Haider is a local coding-agent harness built around one durable, per-device daemon. The daemon owns sessions, provider state, permissions, and the append-only event journal; the CLI, TUI, headless runner, Android app, and other clients attach to it through typed contracts. A surface may render daemon truth, replay it, or submit a command, but it does not become a second source of truth.
 
-Most harnesses are a chat loop with tools bolted on. Haider is built the other way around: the **contract comes first**. Every fact an agent produces — a tool call, a subagent spawn, a permission grant, a compaction, an image it generated — is a typed event in an append-only journal, and every surface (the TUI, headless runs, a future ADE) is a pure projection of that log. The daemon is the single source of truth; clients render it, they never invent it.
+## 01 / Speed + memory
 
-It runs your model however you pay for it: twelve builtin providers — Anthropic and Claude subscription OAuth, OpenAI and codex subscription OAuth, Gemini, DeepSeek, xAI Grok API and SuperGrok subscription OAuth, Kimi coding-plan OAuth, Bedrock, Vertex, and any OpenAI-compatible endpoint you point it at — with live model catalogs, subscription quota meters, and credential imports from the official CLIs you already logged into.
+**Measured, not asserted.** These results were [measured on haider-agent v0.0.960 by the haidercode 21-case adapter conformance gate](https://haidercode.ai/benchmark):
 
-> 🏛️ Sessions, subagents, typed workflows, permissions, voice, computer use, and usage metering are all wired into one evented core — not added on as plugins.
-
-## ⚡ At a glance
-
-**Codex, Claude Code, and opencode are agents in a terminal. Haider is the harness underneath** — the daemon owns sessions, accounts, and state; every surface is a view of it. Nothing is inferred, everything is declared.
-
-| | |
+| Measurement | Result |
 |---|---|
-| 🌳 **Sessions** | History is a tree — branch, fork, replay; attach from anywhere; kill anything, resume everything |
-| 📡 **The Pipe** | Every session is a live, seekable event stream — the ADE folds it, `grep` reads it |
-| 🔥 **Cachemaxxing** | Byte-stable prefixes + cache-riding compaction, with the live hit-rate on screen |
-| 🧵 **Loom** | Agents with type signatures — capabilities declared, least-privilege by construction |
-| 🕸️ **Convergence Graph** | Long work runs on a typed DAG with evidence-graded gates, not hope |
-| 🤖 **Fleet** | Subagents are scheduled, leased citizens of the daemon — not orphaned child processes |
-| 🔑 **Every model, your accounts** | Twelve provider lanes — subscription OAuth + API keys, harness-owned; switch without losing the session |
-| 🪝 **Transparent Hooks** | Any editor, ADE, or script builds on the typed surface — no PTY scraping, ever |
-| 🛰️ **LionWire** | One typed protocol under every encoding — TUI, JSON, RPC, msgpack wire; built for slow links |
-| 🎙️ **Talk** | Push-to-transcribe on every surface |
-| 🏠 **Local-first** | The daemon runs on your machine; code, transcripts, and credentials need nobody's cloud |
-| 🔜 **Aura · Peers** | Voice orchestration; place agents on any enrolled device — leased, recovered, migrated |
+| Conformance | 19 of 21 · zero failures · the two non-passes are Linux-only procfs platform skips |
+| Peak RSS | haider 59.4 MiB · pi 254.5 MiB · 4.3× lighter, vs pi only |
+| Suite wall time | haider 8.9 s · pi 20.7 s · 2.3× faster, vs pi only |
+| Work-time per case | haider 187 ms · pi 666 ms · rick 43.5 ms |
 
-## 🧭 Philosophy
+rick records 54.6 MiB peak RSS on 9 of 21. The method uses the same deepseek-v4-flash model, the same machine, and pinned builds. It tests protocol behavior, telemetry, retries, isolation, and patch collection — not coding quality. An unknown stays “unknown,” never zero.
 
-- **Typed events over vibes.** Interior state is never a string soup. Protocol contracts are golden-fixture tested, schema changes are versioned migrations, and old daemons and new clients degrade honestly instead of guessing.
-- **The daemon is the truth.** Labels, grants, catalogs, and graph state come from the daemon, spoof-stripped and validated. A client renders what is provable; a stale or foreign fact renders as *unavailable*, never as a lie.
-- **Prompt-cache discipline is architecture, not optimization.** The append-only log plus a pure projection means every request is the previous request plus a suffix — the whole prefix rides the provider cache. Even compaction replays the conversation byte-for-byte plus one instruction so the summary itself rides the warm cache. CI asserts byte-prefix stability so a regression is a red build, not a bigger bill.
-- **Least privilege by construction.** Tools declare effects; permissions gate effects; typed subagents get grants scoped to their declared capabilities — exec fenced to exact declared programs, network fenced per host on every redirect hop.
-- **Humans gate the irreversible.** Registrations, risky effects, and full plans flow through durable review menus. An accepted plan *is* the authorization — auditable, replayable, honest.
-- **Ship-verdict development.** Every wave runs a clean-code plan → implement → adversarial multi-round review → optimize → ship loop, with mutation-checked test pins and a CI that fails any patch reducing the workspace test count.
+## 02 / Five targets + APK
 
-## 🧰 The toolset
+The release matrix builds five native target triples: macOS arm64 and x86_64, Linux x86_64 and arm64, and Windows x86_64. Both macOS builds package Developer ID-signed, Apple-notarized binaries; every release archive has an adjacent SHA-256 file. Android is produced by a separate release-key-signed APK workflow and joins the release only after its checksum verifies.
 
-**🖥️ The TUI.** A fast terminal client on the daemon's live event stream: session chips with a subagent tree, steering mid-turn, branching and fork/backtrack, a slash palette with custom commands, `!` shell escapes, themes, and a fleet view across sessions. Attachments ride a bounded ladder — paste text or images, attach files and PDFs — and when an agent *produces* an image, the transcript shows a durable 🖼 event you can click to reveal the file in your OS file manager.
+The exact filenames and verification steps are in the Download table above. The source of truth is the [native release matrix](.github/workflows/release.yml) plus the [Android companion workflow](.github/workflows/android-apk.yml).
 
-**🤖 Providers and accounts.** Twelve builtin lanes plus custom endpoints. Subscription OAuth for Claude, codex, Kimi, and SuperGrok/X Premium — with device-code logins, credential import from the official CLIs (`~/.codex`, `~/.grok`, Kimi), proactive token refresh, and per-lane quota meters in `/usage` (weekly windows, reset countdowns, plan tiers). Model libraries come from each provider's live catalog, never from hardcoded lists. Credentials live in an encrypted file vault; account rotation survives quota errors mid-turn.
+## 03 / Any provider, or none
 
-**🕸️ Convergence Graph.** Long work runs on a typed DAG, not hope: nodes with command/ship/human/all-of-N gates, evidence tallies with daemon-verified provenance, durable attempts, and a full-screen `/graph` view of exactly where a run stands. Todos dispatch into it; subagents report into it.
+**The model is a lane.** The current provider crate exports [13 built-in provider classes](crates/haider-provider/src/lib.rs): API-key and OAuth lanes for the supported hosted services, Haider Code, and OpenAI-compatible transport. The daemon also accepts custom OpenAI-compatible profiles with an API key or no authentication, including validated trusted-LAN endpoints for local servers.
 
-**🧵 Loom.** Typed workflows and capability-scoped agent types. A `pipe/v1` source like `clip: SourceURL -> VideoFile` plus node lines compiles onto the graph runtime — registered workflows run by name with zero new machinery. Agent types declare a job, typed I/O, and capability grants (CLIs, API hosts, skills); typed subagents spawn with least-privilege grants and render as accent-colored chips. Agents can author new types and workflows mid-session, but registration only lands through a human-accepted `plan` — the generic full-screen review-before-commit tool. Browse it all in `/loom`.
+Catalog availability is daemon-owned: unavailable stays unavailable, never an invented default. `session.select_model` is a receipted mutation; the next turn resolves through the newly selected provider/model pair while the durable session and transcript remain in place. See the [provider registry](crates/haider-daemon/src/provider_registry.rs), [pair-switch tests](crates/haider-daemon/src/pair_switch_runtime_tests.rs), and the [client contract](docs/client-contract-v1.md).
 
-**🛠️ The tool registry.** Nineteen typed tools — bounded filesystem read/write/edit/search/glob/path, one-shot and background process execution with task supervision, fenced web fetch and search, subagent spawn/message, todos, graph evidence, request-input, plan, and native computer use. Tool schemas ride the wire as minimal stubs with one compact manual in the cached system prompt (the instruct-pipe), cutting the advertised tool prefix by over a third.
+## 04 / Tokenomics
 
-**🖱️ Computer use.** Native screenshot-and-actuate backends for macOS, Linux (X11/Wayland), and Windows, adapted to both Anthropic and OpenAI computer-use models — with default-deny grants, an OS-permission repair flow (Screen Recording / Accessibility), configurable screenshot redaction, and daemon-verified observation evidence.
+**Byte-stable prefixes, explicit cache epochs.** Append-only Anthropic and OpenAI-compatible turns are tested to preserve the serialized provider-visible prefix. Content-addressed provider views reject an undeclared same-epoch mutation to system, tool-schema, or prior history bytes.
 
-**🎙️ Voice.** `/talk` push-to-talk dictation with local Whisper (offline) or Deepgram, bounded capture, and a model-download manager.
+Compaction, provider/model changes, and other header changes are declared cache-epoch boundaries; Haider does not mislabel them as warm continuation. The session usage fold tracks logical input, cache reads, cache writes, output, and telemetry coverage. It publishes a hit rate only when every logical input token has an authoritative cache split; otherwise the UI renders `n/a`.
 
-**🔐 Permissions.** Every tool effect is classed (fs read/write, exec, network-per-host, credentials, screen observe/control) and brokered: allow, ask, or deny, with durable one-shot grants through real menus, an opt-in auto-allow mode for unattended runs, and children that are pre-allowed only within their grant ceiling.
+Evidence: [wire-prefix tests](crates/haider-provider/tests/prompt_cache_prefix_tests.rs), [provider-view continuity](crates/haider-provider/src/cachemaxxing/provider_view.rs), and [session cache accounting](crates/haider-tui/src/cache_usage.rs).
 
-**📊 Usage and cost.** A local, exact token ledger per session and account — logical input, cache reads and writes, output — priced per provider where metered and quota-tracked where subscribed, with prefix-digest attribution that can tell you *why* a request missed the cache.
+## 05 / Sessions as a tree
+
+**Branch. Fork. Replay. Resume.** `branch.create` writes a durable named reference at exact fork and head coordinates. `session.fork` creates an independently durable child with source provenance; `session.metafork` binds reviewed prompt omissions to an accepted digest instead of deleting copied history.
+
+`session.attach` replays the journal and then follows the live tail. `haider resume` opens the daemon-owned session roster, while `haider resume <session-id>` attaches directly. The durable topology lives in [branch contracts](crates/haider-protocol/src/branch.rs) and [fork provenance](crates/haider-protocol/src/session_fork.rs); the public doors are specified in the [client contract](docs/client-contract-v1.md).
+
+## 06 / Loom + workflows
+
+**Delegation with a contract.** Loom's `pipe/v1` DSL defines typed inputs and outputs, explicit dependencies, forks, joins, bounded back-edges, and evidence gates, then lowers the workflow onto the Convergence Graph. A dependent node becomes ready only when its declared dependencies are green.
+
+Agent types declare job I/O plus CLI and API capabilities. At spawn, the daemon intersects the type grant with the default child grant and the durable parent ceiling; it validates the effective grant before work begins. Workflow state and evidence remain queryable through `graph.inspect`.
+
+Evidence: [Loom DSL and type contracts](crates/haider-protocol/src/loom.rs), [workflow design](docs/design/loom-pipe-v1.md), [delegation grant enforcement](crates/haider-daemon/src/delegation.rs), and [client graph surface](docs/client-contract-v1.md).
+
+## 07 / The Pipe + client SDK
+
+**The Pipe is seekable.** Every durable `RawEnvelope` carries the sole replay cursor for its session. `session.attach` replays exactly `(after_seq, replay_through_seq]`, emits `AttachCaughtUp`, and then continues with later live envelopes.
+
+Delivery is at least once, so clients advance their cursor only after fully applying a consecutive sequence. On a discontinuity they stop reduction and reattach from the last applied cursor; they never skip the hole. Native sidecar paths are daemon-published rather than guessed, and third-party clients can build on `haider-client` instead of scraping terminal output.
+
+Start with the authoritative [client contract v1](docs/client-contract-v1.md) and the [gap-recovery client tests](crates/haider-client/tests/observe_tests.rs).
+
+## 08 / Voice
+
+**Talk to the running session.** The shipped TUI voice path is `/talk`: toggle dictation with local Whisper or Deepgram, inspect the live ghost transcript, then commit it into the current daemon session. Cancelling leaves the ghost text out of the durable conversation.
+
+Local Whisper can run offline. The Deepgram key is stored through the daemon vault boundary, and downloaded Whisper models are SHA-256 verified before installation. The duplex `/voice` and Aura surfaces remain demo-only in live mode and are not claimed as shipped features here.
+
+Evidence: [`/talk` state machine](crates/haider-tui/src/talk.rs), [STT engine](crates/haider-stt/src), [live TUI wiring](crates/haider-tui/src/app.rs), and [implementation notes](docs/briefs/T2-talk-ux-notes.md).
 
 ## 🏗️ How it's built
 
-```text
-┌──────────────────────────────────────────────────────────────────┐
-│  ⚔️  haider (one binary)                                         │
-│                                                                  │
-│   TUI / headless CLI ───── typed RPC ───── haiderd (daemon)      │
-│   (pure projections         (versioned      sessions · tools     │
-│    of the event log,         frames,        permissions · graph  │
-│    zero invented state)      features)      loom · accounts      │
-│                                             journal + CAS        │
-└──────────────────────────────┬───────────────────────────────────┘
-                               │  provider adapters
-                ┌──────────────▼───────────────┐
-                │  Anthropic · OpenAI · Gemini │
-                │  DeepSeek · xAI · Kimi       │
-                │  Bedrock · Vertex · custom   │
-                │  (API keys + subscription    │
-                │   OAuth, live catalogs)      │
-                └──────────────────────────────┘
-```
-
 | Crate | Role |
 |---|---|
-| `haider-protocol` | Typed contracts + golden fixtures — events, items, graph, loom, permissions |
-| `haider-store` | Append-only journal, schema migrations, content-addressed artifact store |
-| `haider-core` | The harness runtime: turn loop, prompt projection, compaction, context policy |
-| `haider-provider` | Model adapters, wire builders, cache breakpoints, usage meters, catalogs |
-| `haider-tools` | The tool registry, effect broker, process/web/computer backends |
-| `haider-daemon` / `haider-daemond` | Session hub, permissions, subagents, OAuth, discovery — the truth |
-| `haider-rpc` / `haider-client` | Versioned client API + connection machinery |
-| `haider-tui` / `haider-cli` | The terminal client and the `haider` binary |
-| `haider-accounts` · `haider-stt` · `haider-pdf` · `haider-platform` · `haider-verify` | Vault, dictation, PDF ladder, OS glue, verification gate |
+| `haider-protocol` | Typed events and contracts for sessions, graph, Loom, providers, and permissions |
+| `haider-store` | Append-only journal, schema migrations, receipts, and content-addressed artifacts |
+| `haider-core` | Turn loop, prompt projection, context policy, and compaction |
+| `haider-provider` | Provider adapters, exact wire builders, catalogs, caching, and usage normalization |
+| `haider-tools` | Tool registry, effect broker, and process, web, and computer backends |
+| `haider-daemon` / `haider-daemond` | Durable session owner, workers, permissions, accounts, graphs, and client transport |
+| `haider-rpc` / `haider-client` | Versioned wire types, discovery, replay, and the client SDK |
+| `haider-tui` / `haider-cli` / `haider-stt` | Terminal surfaces, headless entry points, and dictation |
 
-Third-party clients should start with the authoritative
-[client contract v1](docs/client-contract-v1.md): discovery and framing,
-feature gates, snapshot/watch/replay laws, field-level precedence, absence
-semantics, native-pipe following, and compatibility fixtures are specified
-there. Do not infer the interface from terminal output.
+The [client contract v1](docs/client-contract-v1.md) is the integration boundary: discovery, framing, feature negotiation, replay laws, absence semantics, and projection precedence are specified there.
 
 ## 🚀 Development
 
 ```bash
-cargo build --release -p haider-cli -p haider-daemond
-cargo test --workspace          # ~2,600 tests
-cargo run -p xtask -- test-count   # the ledger CI enforces
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace
+cargo run -p xtask -- test-count
 ```
 
-Rules live in `CONVENTIONS.md`. Highlights: tests are mutation-checked pins (each documents the exact code deletion that must fail it); CI fails any patch that reduces the workspace test count; clippy runs `-D warnings` across the workspace; schema-affecting patches close all lanes until merged. Built by AI agents under the BUILDGUIDE discipline — every wave ends in an adversarial multi-round SHIP-verdict review, and the previous release dogfoods the next (N−1).
-
-Haider is a sibling of [**Diff Forge AI**](https://github.com/Rizzist/diffforge-client), the Agentic Development Environment — Haider is the harness layer an ADE like Diff Forge can drive, with the durable event contract designed for richer surfaces to render.
+Repository rules live in [CONVENTIONS.md](CONVENTIONS.md). CI enforces formatting, workspace-wide Clippy with warnings denied, and the checked-in workspace test-count floor.
 
 ## 📜 License
 
