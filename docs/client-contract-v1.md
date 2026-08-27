@@ -203,7 +203,7 @@ An operation not listed here is part of the v1 base surface. “Field” means t
 client may use that field only when it is present; the named token permits an
 affordance before the response exists.
 
-The ordinary v0.0.962 `welcome_features()` set contains all 85 tokens below.
+The ordinary v0.0.963 `welcome_features()` set contains all 87 tokens below.
 The re-verification anchors are
 `crates/haider-daemon/src/connection.rs:1868-1956` for the assembled set and
 `crates/haider-rpc/src/frame.rs:249-505` for the exact string constants. The
@@ -215,6 +215,8 @@ one peer-specific withholding exception is §4.1.
 | `session_permission_overrides_v1` | `session.create.permission_overrides` and metadata permission overrides |
 | `autonomous_interaction_v1` | `session.create.interaction_mode` and `SessionMetadataV1.interaction_mode` |
 | `turn_control_v1` | `turn.submit`, `turn.cancel` |
+| `headless_run_v1` | `headless.run.start`, `headless.run.status`, `headless.run.stop`, durable `HeadlessRunConfigured`, and typed replay divergence reports |
+| `run_budget_v1` | daemon-enforced token/cost/time limits and durable `RunBudgetExhausted` followed by `RunFailed { code: budget_exhausted }` and `Errored` |
 | `queue_control_v1` | `queue.list`, `queue.remove`, `queue.promote_steer`, and durable `QueueChanged` events on an attached session |
 | `run_retry_v1` | `run.retry` |
 | `context_compaction_v1` | `session.compact` |
@@ -387,6 +389,9 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | `session.fork` | `SessionFork` | durable receipt |
 | `session.metafork` | `SessionMetafork` | write-free review, then durable receipt after digest acceptance |
 | `turn.submit`, `turn.submit_from_cli`, `turn.submit_with_hook_trust` | `TurnSubmit` or `TurnSubmitOnBranch` | durable receipt |
+| `headless.run.start` | `HeadlessRunStart` | durable receipt with a run-scoped execution pin |
+| `headless.run.status` | `HeadlessRunStatus` | journal-derived lifecycle snapshot by run id |
+| `headless.run.stop` | `HeadlessRunStop` | idempotent durable cancellation by run id |
 | `turn.cancel` | `TurnCancel` | durable receipt |
 | `queue.remove` | `QueueRemove` | revision-fenced durable mutation |
 | `queue.promote_steer` | `QueuePromoteSteer` | revision-fenced durable mutation followed by Steer delivery |
@@ -425,7 +430,7 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 The golden matrix at
 `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`, combined
 with the historical `wire_transcript.json`, pins a request and successful
-response for every one of the 86 v1 request methods. `menu.answer` and resident
+response for every one of the 89 v1 request methods. `menu.answer` and resident
 binding are top-level frames, not `RequestBody` methods.
 
 ### 5.3 Advertised runtime with no client method
@@ -2051,12 +2056,14 @@ future event families without converting them to a lossy catch-all.
 Some direct nested enums shipped without an unknown arm and are frozen; adding
 a variant would break an old decoder, so expansion requires a new field/type or
 a raw additive event family. Others explicitly absorb unknown variants. The
-complete classification is normative in
-[Client contract v1 — wire enum audit](client-contract-v1-enum-audit.md).
+entries enumerated in
+[Client contract v1 — wire enum audit](client-contract-v1-enum-audit.md) are
+normative, but that appendix is not a refreshed census of every direct enum
+added by intervening feature work.
 
-That sibling audit's dated snapshot predates the direct enums documented by
-the v0.0.961 additions and this monitor surface. Until the appendix is
-refreshed in its own scoped change, `SessionInteractionModeV1`
+The sibling audit's method tags and v0.0.963 headless entries were checked on
+2026-08-27. Direct enums omitted from its tables are not implicitly assigned an
+expansion class. In particular, `SessionInteractionModeV1`
 (`"interactive" | "autonomous"`) and `TypedAgentInstallState`
 (`"queued" | "installing" | "verifying" | "succeeded" | "failed"`) are
 normatively **Frozen**: neither has `#[serde(other)]` or a custom unknown
@@ -2098,7 +2105,7 @@ The machine-checkable contract lives in these fixtures/tests:
   non-chat stream and its explicit truncation/dedupe fields.
 - `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`: the
   methods added after the historical matrix, completing golden request and
-  successful response coverage for all 86 request methods and all five
+  successful response coverage for all 89 request methods and all five
   command dynamic slots.
 - `crates/haider-rpc/tests/fixtures/snapshot_availability_compat_v1.json`:
   old and new account/provider/usage response bytes.
@@ -2125,12 +2132,13 @@ change. Months-old session payloads remain raw-decodable.
 
 ### 15.2 v0.0.962 integration lanes
 
-The integration lanes below do not add a client request method or a Welcome
-feature token. The exact totals therefore remain 86 request methods and 85
-feature tokens. They do not all preserve old event bytes: C3 additively exposes
-fork inheritance fields on `SessionForked`. The golden transcript recount
-remains 131 frames. Clients MUST NOT infer a new callable surface from these
-facts:
+The twelve integration lanes below did not add a client request method or a
+Welcome feature token in v0.0.962. The exact totals at that boundary therefore
+remained 86 request methods and 85 feature tokens. They did not all preserve
+old event bytes: C3 additively exposes fork inheritance fields on
+`SessionForked`. The golden transcript recount remained 131 frames. The
+v0.0.963 additions in §15.3 are separate. Clients MUST NOT infer a new callable
+surface from these implementation facts:
 
 | Lane | Client-contract effect |
 |---|---|
@@ -2151,6 +2159,63 @@ These lanes are deliberately absent from the feature-token table: performance,
 storage, cache-routing, and test-layout changes are not negotiable client
 capabilities. Any future client-visible field or method requires its own
 additive contract entry and golden frame.
+
+### 15.3 v0.0.963 headless run contract
+
+`haider run -p TEXT` and `haider run -` create an autonomous session and use
+the ordinary typed event stream; no TUI is initialized. `--json` emits one
+`haider.run.v1` object whose `events` array contains the correlated
+`RawEnvelope` values in sequence order. This is deliberately not a second
+turn/tool/usage schema: tool calls, bounded typed tool results, normalized
+usage, cache reads, cache writes, terminal causes, and unknown future event
+payloads retain their protocol shapes. Stable field order plus journal order
+makes repeated serialization of the same session byte-stable.
+
+`headless.run.start` commits `Queued`, the exact `UserMessage`, and
+`HeadlessRunConfigured` in the same receipt transaction. The configuration
+fact pins provider, model, maximum provider output, effort, speed, seed,
+workspace, permission overrides, hook trust, budgets, and an optional replay
+source. `--start` returns after that durable acceptance and uses a persistent
+daemon; disconnect does not cancel the run.
+`headless.run.status` and `headless.run.stop` resolve the run id daemon-side,
+so terminal runs remain addressable after the starting process exits. Stop is
+idempotent and distinguishes accepted cancellation from already-terminal.
+
+Token and cost accounting is last-snapshot-wins per physical request ordinal.
+All request kinds, including compaction/cache-lifecycle traffic, participate.
+Logical input already includes cache reads; cache read/write counters are
+reported separately but are never added a second time. Enforcement may
+overshoot a token or cost limit by one in-flight provider request. Time is
+measured from durable acceptance. Exhaustion commits `RunBudgetExhausted`
+before cancelling provider/tool work. The daemon's pre-`Done` finalization
+guard rechecks the last durable usage so a fast token/cost response cannot
+commit success first. After effect cleanup, terminalization commits
+`RunFailed(BudgetExhausted)` and `RunState::Errored`; restart recovery finds
+the durable exhaustion fact before starting another provider request.
+
+Replay reads the source's typed input and pin, reuses durable attachment refs,
+and submits a new run with `replay_of`. Its typed `ReplayDivergenceV1` compares
+final text, canonical tool calls/results, usage, and terminal outcome. The
+provider layer has no portable seed parameter in this revision: the requested
+seed is recorded, never injected into prompt text, and provider
+nondeterminism remains visible in the divergence report.
+
+Absence laws:
+
+- A missing `headless_run_v1`, or missing `run_budget_v1` when any limit is
+  present, fails feature negotiation before session creation or submission.
+- Omitted budget fields are unbounded; a present zero is invalid. `seed: 0`
+  remains present and is not treated as omission.
+- A run without a durable headless configuration fact is not silently treated
+  as a detached headless run. Unknown run ids return typed not-found.
+- Budget exhaustion is journal truth and survives reconnect; it is never
+  projected as ordinary user cancellation. Once its durable typed cause is
+  committed, a racing later stop cannot replace the budget terminal state.
+- Replay never reports equality by ignoring a provider/tool/usage/terminal
+  difference. Unknown future raw events remain in structured output.
+- Exit codes retain the existing headless mapping: provider failure `65`,
+  protocol/feature skew `76`, blocked or budget-exhausted `77`, and explicit
+  user cancellation `130`.
 
 ## 16. Known absences and limits of this revision
 

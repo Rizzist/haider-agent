@@ -1,6 +1,6 @@
 //! Manual `haider run` parser and daemon-backed output adapter.
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -9,9 +9,13 @@ use haider_client::{
     ConnectError, DaemonLifetime, ERROR_CODE_NO_ACTIVE_ACCOUNT, ERROR_CODE_NO_DEFAULT_MODEL,
     EnsureError, EnsureOptions, HeadlessEvent, HeadlessFailureCode, HeadlessOutcome,
     HeadlessRunError, HeadlessRunRequest, HeadlessRunResult, HeadlessSessionConfig, ProfileEnv,
-    load_attachment, resolve_profile, run_headless_with_session_config,
+    headless_run_events, headless_run_status, load_attachment, resolve_profile,
+    run_headless_with_session_config, stop_headless_run,
 };
+use haider_protocol::EventPayload;
 use haider_protocol::error::ErrorCode;
+use haider_protocol::headless::RunBudgetV1;
+use haider_protocol::ids::RunId;
 use haider_protocol::session::SessionPermissionOverridesV1;
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -52,6 +56,8 @@ impl ProviderSelection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunOptions {
     pub prompt: String,
+    pub prompt_stdin: bool,
+    pub action: RunAction,
     pub output: RunOutput,
     pub timeout: Option<Duration>,
     pub allow_writes: bool,
@@ -61,6 +67,17 @@ pub(crate) struct RunOptions {
     pub provider: Option<ProviderSelection>,
     pub model: Option<String>,
     pub attachments: Vec<PathBuf>,
+    pub budget: RunBudgetV1,
+    pub seed: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RunAction {
+    Execute,
+    Start,
+    Status(RunId),
+    Stop(RunId),
+    Replay(RunId),
 }
 
 #[allow(dead_code)]
@@ -76,6 +93,7 @@ struct ParsedRunOptions {
 fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, String> {
     let mut output = None;
     let mut legacy_jsonl = false;
+    let mut json = false;
     let mut timeout = None;
     let mut allow_writes = false;
     let mut allow_exec = false;
@@ -88,12 +106,86 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
     let mut account = None;
     let mut attachments = Vec::new();
     let mut prompt = None;
+    let mut prompt_stdin = false;
+    let mut action = RunAction::Execute;
+    let mut budget = RunBudgetV1::default();
+    let mut seed = None;
     let mut index = 0;
 
     while index < rest.len() {
         match rest[index].as_str() {
             "--jsonl" if !legacy_jsonl => legacy_jsonl = true,
             "--jsonl" => return Err("duplicate --jsonl flag".into()),
+            "--json" if !json => json = true,
+            "--json" => return Err("duplicate --json flag".into()),
+            "-p" if prompt.is_none() => {
+                index += 1;
+                let value = rest
+                    .get(index)
+                    .ok_or_else(|| "-p requires a prompt".to_owned())?;
+                if value.is_empty() {
+                    return Err("-p requires a non-empty prompt".into());
+                }
+                prompt = Some(value.clone());
+            }
+            "-p" => return Err("exactly one prompt source is required".into()),
+            "--start" if action == RunAction::Execute => action = RunAction::Start,
+            "--start" => return Err("only one lifecycle action may be requested".into()),
+            "--status" if action == RunAction::Execute => {
+                index += 1;
+                let value = rest
+                    .get(index)
+                    .ok_or_else(|| "--status requires a run id".to_owned())?;
+                action = RunAction::Status(parse_run_id(value, "--status")?);
+            }
+            "--status" => return Err("only one lifecycle action may be requested".into()),
+            "--stop" if action == RunAction::Execute => {
+                index += 1;
+                let value = rest
+                    .get(index)
+                    .ok_or_else(|| "--stop requires a run id".to_owned())?;
+                action = RunAction::Stop(parse_run_id(value, "--stop")?);
+            }
+            "--stop" => return Err("only one lifecycle action may be requested".into()),
+            "--replay" if action == RunAction::Execute => {
+                index += 1;
+                let value = rest
+                    .get(index)
+                    .ok_or_else(|| "--replay requires a run id".to_owned())?;
+                action = RunAction::Replay(parse_run_id(value, "--replay")?);
+            }
+            "--replay" => return Err("only one lifecycle action may be requested".into()),
+            "--max-tokens" if budget.max_tokens.is_none() => {
+                index += 1;
+                budget.max_tokens = Some(parse_positive_u64(rest.get(index), "--max-tokens")?);
+            }
+            "--max-tokens" => return Err("duplicate --max-tokens flag".into()),
+            "--max-cost" if budget.max_cost_microusd.is_none() => {
+                index += 1;
+                budget.max_cost_microusd = Some(parse_cost_microusd(rest.get(index))?);
+            }
+            "--max-cost" => return Err("duplicate --max-cost flag".into()),
+            "--max-time" if budget.max_time_ms.is_none() => {
+                index += 1;
+                let value = rest
+                    .get(index)
+                    .ok_or_else(|| "--max-time requires a duration".to_owned())?;
+                budget.max_time_ms =
+                    Some(u64::try_from(parse_timeout(value)?.as_millis()).unwrap_or(u64::MAX));
+            }
+            "--max-time" => return Err("duplicate --max-time flag".into()),
+            "--seed" if seed.is_none() => {
+                index += 1;
+                let value = rest
+                    .get(index)
+                    .ok_or_else(|| "--seed requires an unsigned integer".to_owned())?;
+                seed = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| "--seed requires an unsigned integer".to_owned())?,
+                );
+            }
+            "--seed" => return Err("duplicate --seed flag".into()),
             "--output" if output.is_none() => {
                 index += 1;
                 let value = rest
@@ -187,19 +279,54 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
                 attachments.push(PathBuf::from(value));
             }
             flag if flag.starts_with("--") => return Err(format!("unknown flag `{flag}`")),
+            "-" if prompt.is_none() => {
+                prompt = Some(String::new());
+                prompt_stdin = true;
+            }
             value if prompt.is_none() => prompt = Some(value.to_owned()),
             _ => return Err("exactly one prompt argument is required".into()),
         }
         index += 1;
     }
 
-    let output = match (legacy_jsonl, output) {
-        (true, Some(RunOutput::Jsonl) | None) => RunOutput::Jsonl,
-        (true, Some(_)) => return Err("--jsonl conflicts with a non-jsonl --output".into()),
-        (false, Some(output)) => output,
-        (false, None) => RunOutput::Print,
+    let output = match (legacy_jsonl, json, output) {
+        (true, false, Some(RunOutput::Jsonl) | None) => RunOutput::Jsonl,
+        (false, true, Some(RunOutput::Json) | None) => RunOutput::Json,
+        (false, false, Some(output)) => output,
+        (false, false, None) if matches!(action, RunAction::Replay(_)) => RunOutput::Json,
+        (false, false, None) => RunOutput::Print,
+        _ => return Err("--json/--jsonl conflicts with the selected --output".into()),
     };
-    let prompt = prompt.ok_or_else(|| "a prompt argument is required".to_owned())?;
+    if matches!(action, RunAction::Replay(_)) && output != RunOutput::Json {
+        return Err("replay requires --json output so divergence is never hidden".into());
+    }
+    let prompt_required = matches!(action, RunAction::Execute | RunAction::Start);
+    if prompt_required && prompt.is_none() {
+        return Err("a prompt source is required (-p TEXT, -, or one positional argument)".into());
+    }
+    if !prompt_required && prompt.is_some() {
+        return Err("status, stop, and replay do not accept a prompt".into());
+    }
+    if matches!(&action, RunAction::Status(_) | RunAction::Stop(_)) && timeout.is_some() {
+        return Err("status and stop do not accept --timeout".into());
+    }
+    if !prompt_required
+        && (provider.is_some()
+            || model.is_some()
+            || effort.is_some()
+            || fast.is_some()
+            || account.is_some()
+            || !attachments.is_empty()
+            || !budget.is_empty()
+            || seed.is_some()
+            || allow_writes
+            || allow_exec
+            || auto_allow
+            || trust_hooks)
+    {
+        return Err("status, stop, and replay use the run's pinned configuration".into());
+    }
+    let prompt = prompt.unwrap_or_default();
     let session_config = HeadlessSessionConfig {
         // `--model` is the session.create selection carried by
         // HeadlessRunRequest below. Re-applying it with session.select_model
@@ -213,6 +340,8 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
     Ok(ParsedRunOptions {
         options: RunOptions {
             prompt,
+            prompt_stdin,
+            action,
             output,
             timeout,
             allow_writes,
@@ -222,9 +351,58 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
             provider,
             model,
             attachments,
+            budget,
+            seed,
         },
         session_config,
     })
+}
+
+fn parse_positive_u64(value: Option<&String>, flag: &str) -> Result<u64, String> {
+    let value = value.ok_or_else(|| format!("{flag} requires a positive integer"))?;
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| format!("{flag} requires a positive integer"))?;
+    if parsed == 0 {
+        return Err(format!("{flag} must be greater than zero"));
+    }
+    Ok(parsed)
+}
+
+fn parse_run_id(value: &str, flag: &str) -> Result<RunId, String> {
+    if value.is_empty() || value.starts_with('-') {
+        return Err(format!("{flag} requires a run id, not another flag"));
+    }
+    Ok(RunId::new(value))
+}
+
+fn parse_cost_microusd(value: Option<&String>) -> Result<u64, String> {
+    let value = value.ok_or_else(|| "--max-cost requires a positive USD amount".to_owned())?;
+    let (dollars, fractional) = value.split_once('.').unwrap_or((value.as_str(), ""));
+    if dollars.is_empty()
+        || dollars.bytes().any(|byte| !byte.is_ascii_digit())
+        || fractional.len() > 6
+        || fractional.bytes().any(|byte| !byte.is_ascii_digit())
+    {
+        return Err("--max-cost requires USD with at most six decimal places".into());
+    }
+    let whole = dollars
+        .parse::<u64>()
+        .map_err(|_| "--max-cost is too large".to_owned())?
+        .checked_mul(1_000_000)
+        .ok_or_else(|| "--max-cost is too large".to_owned())?;
+    let mut padded = fractional.to_owned();
+    padded.resize(6, '0');
+    let micros = padded
+        .parse::<u64>()
+        .map_err(|_| "--max-cost requires a positive USD amount".to_owned())?;
+    let total = whole
+        .checked_add(micros)
+        .ok_or_else(|| "--max-cost is too large".to_owned())?;
+    if total == 0 {
+        return Err("--max-cost must be greater than zero".into());
+    }
+    Ok(total)
 }
 
 fn parse_timeout(value: &str) -> Result<Duration, String> {
@@ -256,14 +434,13 @@ fn parse_timeout(value: &str) -> Result<Duration, String> {
 }
 
 pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
-    let jsonl_requested = requests_jsonl_output(rest);
+    let machine_output = requested_machine_output(rest);
     let parsed = match parse_run_options_with_config(rest) {
         Ok(parsed) => parsed,
         Err(message) => {
             let failure = ClassifiedRunError::bootstrap("invalid_argument", message.clone());
-            if jsonl_requested
-                && let Err(error) =
-                    write_run_error(io::stdout().lock(), RunOutput::Jsonl, &failure, None, None)
+            if let Some(mode) = machine_output
+                && let Err(error) = write_run_error(io::stdout().lock(), mode, &failure, None, None)
             {
                 eprintln!("haider: stdout failed: {error}");
                 return ExitCode::from(EX_IOERR);
@@ -272,8 +449,39 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
             return ExitCode::from(EX_USAGE);
         }
     };
-    let options = parsed.options;
-    let session_config = parsed.session_config;
+    let mut options = parsed.options;
+    let mut session_config = parsed.session_config;
+    if options.prompt_stdin {
+        match tokio::task::spawn_blocking(read_stdin_prompt).await {
+            Ok(Ok(prompt)) => options.prompt = prompt,
+            Ok(Err(error)) => {
+                let failure = ClassifiedRunError::bootstrap("invalid_argument", error.to_string());
+                if let Err(io_error) =
+                    write_run_error(io::stdout().lock(), options.output, &failure, None, None)
+                {
+                    eprintln!("haider: stdout failed: {io_error}");
+                    return ExitCode::from(EX_IOERR);
+                }
+                eprintln!("haider run: stdin: {error}");
+                let code = match error.kind() {
+                    io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => EX_USAGE,
+                    _ => EX_IOERR,
+                };
+                return ExitCode::from(code);
+            }
+            Err(error) => {
+                let failure = ClassifiedRunError::bootstrap("internal", error.to_string());
+                if let Err(io_error) =
+                    write_run_error(io::stdout().lock(), options.output, &failure, None, None)
+                {
+                    eprintln!("haider: stdout failed: {io_error}");
+                    return ExitCode::from(EX_IOERR);
+                }
+                eprintln!("haider run: stdin reader failed: {error}");
+                return ExitCode::from(EX_SOFTWARE);
+            }
+        }
+    }
     let profile = match resolve_profile(&ProfileEnv::capture()) {
         Ok(profile) => profile,
         Err(error) => {
@@ -288,6 +496,126 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
             return ExitCode::from(EX_PROTOCOL);
         }
     };
+    let lifecycle_ensure = EnsureOptions {
+        daemon_lifetime: DaemonLifetime::Persistent,
+        ..EnsureOptions::default()
+    };
+    match options.action.clone() {
+        RunAction::Status(run_id) => {
+            return match headless_run_status(&profile, lifecycle_ensure.clone(), run_id).await {
+                Ok(status) => match write_lifecycle_value(
+                    io::stdout().lock(),
+                    options.output,
+                    "haider.run.status.v1",
+                    &status,
+                ) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => {
+                        eprintln!("haider: stdout failed: {error}");
+                        ExitCode::from(EX_IOERR)
+                    }
+                },
+                Err(error) => {
+                    report_lifecycle_error(options.output, "haider.run.status.v1", &error)
+                }
+            };
+        }
+        RunAction::Stop(run_id) => {
+            return match stop_headless_run(&profile, lifecycle_ensure.clone(), run_id).await {
+                Ok(stopped) => match write_lifecycle_value(
+                    io::stdout().lock(),
+                    options.output,
+                    "haider.run.stop.v1",
+                    &stopped,
+                ) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => {
+                        eprintln!("haider: stdout failed: {error}");
+                        ExitCode::from(EX_IOERR)
+                    }
+                },
+                Err(error) => report_lifecycle_error(options.output, "haider.run.stop.v1", &error),
+            };
+        }
+        RunAction::Execute | RunAction::Start | RunAction::Replay(_) => {}
+    }
+    let mut durable_attachments = Vec::new();
+    let mut replay_of = None;
+    let mut replay_source_events = None;
+    let mut replay_cwd = None;
+    let mut replay_permissions = None;
+    let mut request_max_tokens = profile.default_max_tokens;
+    if let RunAction::Replay(source_run_id) = options.action.clone() {
+        let replay_ensure = EnsureOptions {
+            daemon_lifetime: DaemonLifetime::EphemeralIfSpawned,
+            ..EnsureOptions::default()
+        };
+        let status =
+            match headless_run_status(&profile, replay_ensure.clone(), source_run_id.clone()).await
+            {
+                Ok(status) => status,
+                Err(error) => {
+                    return report_pre_run_error(options.output, &error, None, None);
+                }
+            };
+        if !status.state.is_terminal() || status.terminal_seq.is_none() {
+            let error = HeadlessRunError::Rpc {
+                stage: "headless replay",
+                code: "busy".into(),
+                message: "replay source is not terminal".into(),
+                retryable: true,
+            };
+            return report_pre_run_error(options.output, &error, None, None);
+        }
+        if status.spec.cwd.is_empty() {
+            let error = HeadlessRunError::Protocol {
+                stage: "headless replay",
+                message: "replay source predates the pinned workspace contract".into(),
+            };
+            return report_pre_run_error(options.output, &error, None, None);
+        }
+        let source_events = match headless_run_events(&profile, replay_ensure, &status).await {
+            Ok(events) => events,
+            Err(error) => {
+                return report_pre_run_error(options.output, &error, None, None);
+            }
+        };
+        let source_input = source_events.iter().find_map(|envelope| {
+            if envelope.run_id.as_ref() != Some(&source_run_id) {
+                return None;
+            }
+            match serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()? {
+                EventPayload::UserMessage {
+                    text, attachments, ..
+                } => Some((text, attachments)),
+                _ => None,
+            }
+        });
+        let Some((prompt, attachments)) = source_input else {
+            let error = HeadlessRunError::Protocol {
+                stage: "headless replay",
+                message: "replay source has no typed user input".into(),
+            };
+            return report_pre_run_error(options.output, &error, None, None);
+        };
+        options.prompt = prompt;
+        options.provider = Some(ProviderSelection(status.spec.provider.clone()));
+        options.model = Some(status.spec.model.clone());
+        options.budget = status.spec.budget.clone();
+        options.seed = status.spec.seed;
+        options.allow_writes = status.spec.permission_overrides.allow_writes;
+        options.allow_exec = status.spec.permission_overrides.allow_exec;
+        options.auto_allow = status.spec.permission_overrides.auto_allow;
+        replay_permissions = Some(status.spec.permission_overrides);
+        options.trust_hooks = status.spec.trust_hooks;
+        session_config.effort.clone_from(&status.spec.effort);
+        session_config.fast = Some(status.spec.fast);
+        request_max_tokens = status.spec.max_output_tokens;
+        durable_attachments = attachments;
+        replay_cwd = Some(status.spec.cwd.clone());
+        replay_of = Some(source_run_id);
+        replay_source_events = Some(source_events);
+    }
     let provider = options
         .provider
         .as_ref()
@@ -303,10 +631,11 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
                 .then(|| "fake-model".into())
         })
         .or_else(|| Some(profile.default_model.clone()));
-    let cwd = match std::env::current_dir()
-        .ok()
-        .and_then(|path| path.into_os_string().into_string().ok())
-    {
+    let cwd = match replay_cwd.or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .and_then(|path| path.into_os_string().into_string().ok())
+    }) {
         Some(cwd) => cwd,
         None => {
             let message = "current directory is unavailable or is not valid UTF-8";
@@ -353,15 +682,21 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
         cwd,
         prompt: options.prompt.clone(),
         attachments,
+        durable_attachments,
         provider: provider.clone(),
         model: model.clone(),
-        max_tokens: profile.default_max_tokens,
-        permission_overrides: SessionPermissionOverridesV1 {
-            allow_writes: options.allow_writes,
-            allow_exec: options.allow_exec,
-            allow_mobile: false,
-            auto_allow: options.auto_allow,
-        },
+        max_tokens: request_max_tokens,
+        budget: options.budget.clone(),
+        seed: options.seed,
+        replay_of,
+        journal_pin: true,
+        detached: options.action == RunAction::Start,
+        permission_overrides: execution_permission_overrides(
+            replay_permissions,
+            options.allow_writes,
+            options.allow_exec,
+            options.auto_allow,
+        ),
         trust_hooks: options.trust_hooks,
         timeout: options.timeout,
         terminal_grace: haider_client::DEFAULT_TERMINAL_GRACE,
@@ -371,7 +706,11 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
     let output_mode = options.output;
     let adapter = tokio::task::spawn_blocking(move || adapt_events(output_mode, receiver));
     let ensure = EnsureOptions {
-        daemon_lifetime: DaemonLifetime::EphemeralIfSpawned,
+        daemon_lifetime: if options.action == RunAction::Start {
+            DaemonLifetime::Persistent
+        } else {
+            DaemonLifetime::EphemeralIfSpawned
+        },
         ..EnsureOptions::default()
     };
     let result =
@@ -397,7 +736,10 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
     }
 
     match result {
-        Ok(result) => {
+        Ok(mut result) => {
+            if let Some(source_events) = replay_source_events.as_ref() {
+                result.replay = Some(replay_divergence(source_events, &result));
+            }
             if options.output != RunOutput::Jsonl
                 && let Err(error) = write_final(io::stdout().lock(), options.output, &result)
             {
@@ -471,11 +813,289 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
     }
 }
 
-fn requests_jsonl_output(rest: &[String]) -> bool {
-    rest.iter().any(|argument| argument == "--jsonl")
+const MAX_STDIN_PROMPT_BYTES: usize = 1024 * 1024;
+
+fn read_stdin_prompt() -> io::Result<String> {
+    read_stdin_prompt_from(io::stdin().lock())
+}
+
+fn execution_permission_overrides(
+    replay: Option<SessionPermissionOverridesV1>,
+    allow_writes: bool,
+    allow_exec: bool,
+    auto_allow: bool,
+) -> SessionPermissionOverridesV1 {
+    replay.unwrap_or(SessionPermissionOverridesV1 {
+        allow_writes,
+        allow_exec,
+        allow_mobile: false,
+        auto_allow,
+    })
+}
+
+pub(crate) fn read_stdin_prompt_from(mut input: impl Read) -> io::Result<String> {
+    let mut bytes = Vec::new();
+    input
+        .by_ref()
+        .take(u64::try_from(MAX_STDIN_PROMPT_BYTES).unwrap_or(u64::MAX) + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_STDIN_PROMPT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "prompt exceeds the 1 MiB stdin limit",
+        ));
+    }
+    let mut prompt = String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "prompt stdin is not valid UTF-8",
+        )
+    })?;
+    if prompt.ends_with('\n') {
+        prompt.pop();
+        if prompt.ends_with('\r') {
+            prompt.pop();
+        }
+    }
+    if prompt.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "prompt stdin is empty",
+        ));
+    }
+    Ok(prompt)
+}
+
+fn write_lifecycle_value(
+    mut output: impl Write,
+    mode: RunOutput,
+    schema: &str,
+    value: &impl Serialize,
+) -> io::Result<()> {
+    let value = serde_json::to_string(value).map_err(io::Error::other)?;
+    match mode {
+        RunOutput::Print => output.write_all(value.as_bytes())?,
+        RunOutput::Json | RunOutput::Jsonl => {
+            let schema = serde_json::to_string(schema).map_err(io::Error::other)?;
+            write!(output, "{{\"schema\":{schema},\"result\":{value}}}")?;
+        }
+    }
+    output.write_all(b"\n")?;
+    output.flush()
+}
+
+fn report_pre_run_error(
+    mode: RunOutput,
+    error: &HeadlessRunError,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> ExitCode {
+    let failure = classify_headless_error(error);
+    if let Err(io_error) = write_run_error(io::stdout().lock(), mode, &failure, provider, model) {
+        eprintln!("haider: stdout failed: {io_error}");
+        return ExitCode::from(EX_IOERR);
+    }
+    eprintln!("haider: {error}");
+    ExitCode::from(exit_code_for_error(error))
+}
+
+fn report_lifecycle_error(mode: RunOutput, schema: &str, error: &HeadlessRunError) -> ExitCode {
+    if mode != RunOutput::Print {
+        let failure = classify_headless_error(error);
+        let schema = serde_json::to_string(schema).unwrap_or_else(|_| "null".into());
+        let code = serde_json::to_string(&failure.code).unwrap_or_else(|_| "null".into());
+        let message = serde_json::to_string(&failure.message).unwrap_or_else(|_| "null".into());
+        let line = format!(
+            "{{\"schema\":{schema},\"result\":null,\"error\":{{\"code\":{code},\"message\":{message},\"retryable\":{}}}}}\n",
+            failure.retryable
+        );
+        let mut stdout = io::stdout().lock();
+        if let Err(io_error) = stdout
+            .write_all(line.as_bytes())
+            .and_then(|()| stdout.flush())
+        {
+            eprintln!("haider: stdout failed: {io_error}");
+            return ExitCode::from(EX_IOERR);
+        }
+    }
+    eprintln!("haider: {error}");
+    ExitCode::from(exit_code_for_error(error))
+}
+
+fn replay_final_text(events: &[haider_protocol::envelope::RawEnvelope]) -> Option<String> {
+    events
+        .iter()
+        .filter_map(|envelope| {
+            match serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()? {
+                EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
+                    item: haider_protocol::item::TurnItem::AgentMessage { text },
+                    ..
+                })
+                | EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
+                    item: haider_protocol::item::TurnItem::IncompleteAgentMessage { text, .. },
+                    ..
+                }) => Some(text),
+                _ => None,
+            }
+        })
+        .last()
+}
+
+fn replay_tool_trace(events: &[haider_protocol::envelope::RawEnvelope]) -> Vec<serde_json::Value> {
+    events
+        .iter()
+        .filter_map(|envelope| {
+            let payload = &envelope.payload;
+            match payload.get("type").and_then(serde_json::Value::as_str) {
+                Some("tool_result") => Some(serde_json::json!({
+                    "type": "tool_result",
+                    "call_id": payload.get("call_id"),
+                    "result": payload.get("result"),
+                })),
+                Some("item")
+                    if payload.get("event").and_then(serde_json::Value::as_str)
+                        == Some("completed")
+                        && payload
+                            .get("item")
+                            .and_then(|item| item.get("item"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some("tool_call") =>
+                {
+                    let item = payload.get("item")?;
+                    Some(serde_json::json!({
+                        "type": "tool_call",
+                        "call_id": item.get("call_id"),
+                        "name": item.get("name"),
+                        "args": item.get("args"),
+                        "status": item.get("status"),
+                    }))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn replay_usage_trace(events: &[haider_protocol::envelope::RawEnvelope]) -> Vec<serde_json::Value> {
+    events
+        .iter()
+        .filter_map(|envelope| {
+            let EventPayload::Usage(usage) =
+                serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?
+            else {
+                return None;
+            };
+            let mut value = serde_json::to_value(usage).ok()?;
+            normalize_replay_usage_coordinates(&mut value);
+            Some(value)
+        })
+        .collect()
+}
+
+fn normalize_replay_usage_coordinates(usage: &mut serde_json::Value) {
+    fn normalize_scope(scope: &mut serde_json::Value) {
+        let Some(scope) = scope.as_object_mut() else {
+            return;
+        };
+        if scope.contains_key("run") {
+            scope.insert("run".into(), serde_json::Value::String("<run>".into()));
+        }
+        if scope.contains_key("agent") {
+            scope.insert("agent".into(), serde_json::Value::String("<agent>".into()));
+        }
+    }
+
+    if let Some(scope) = usage.get_mut("scope") {
+        normalize_scope(scope);
+    }
+    if let Some(accounts) = usage
+        .get_mut("accounts")
+        .and_then(|value| value.as_array_mut())
+    {
+        for account in accounts {
+            if let Some(scope) = account.get_mut("scope") {
+                normalize_scope(scope);
+            }
+        }
+    }
+}
+
+fn replay_terminal(events: &[haider_protocol::envelope::RawEnvelope]) -> Vec<serde_json::Value> {
+    let budget = events.iter().rev().find_map(|envelope| {
+        (envelope
+            .payload
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            == Some("run_budget_exhausted"))
+        .then(|| envelope.payload.clone())
+    });
+    let failure = events.iter().rev().find_map(|envelope| {
+        (envelope
+            .payload
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            == Some("run_failed"))
+        .then(|| envelope.payload.clone())
+    });
+    let terminal = events.iter().rev().find_map(|envelope| {
+        let payload = &envelope.payload;
+        (payload.get("type").and_then(serde_json::Value::as_str) == Some("run_state")
+            && matches!(
+                payload.get("state").and_then(serde_json::Value::as_str),
+                Some("done" | "errored" | "cancelled")
+            ))
+        .then(|| payload.clone())
+    });
+    budget.into_iter().chain(failure).chain(terminal).collect()
+}
+
+fn replay_divergence(
+    source: &[haider_protocol::envelope::RawEnvelope],
+    replay: &HeadlessRunResult,
+) -> haider_protocol::headless::ReplayDivergenceV1 {
+    let source_run_id = source
+        .iter()
+        .find_map(|envelope| {
+            (envelope
+                .payload
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                == Some("headless_run_configured"))
+            .then(|| envelope.run_id.clone())
+            .flatten()
+        })
+        .unwrap_or_else(|| RunId::new("unknown"));
+    let final_text_matches = replay_final_text(source) == replay.response;
+    let tool_trace_matches = replay_tool_trace(source) == replay_tool_trace(&replay.events);
+    let usage_matches = replay_usage_trace(source) == replay_usage_trace(&replay.events);
+    let terminal_matches = replay_terminal(source) == replay_terminal(&replay.events);
+    haider_protocol::headless::ReplayDivergenceV1 {
+        source_run_id,
+        replay_run_id: replay.run_id.clone(),
+        final_text_matches,
+        tool_trace_matches,
+        usage_matches,
+        terminal_matches,
+        diverged: !(final_text_matches && tool_trace_matches && usage_matches && terminal_matches),
+    }
+}
+
+fn requested_machine_output(rest: &[String]) -> Option<RunOutput> {
+    if rest.iter().any(|argument| argument == "--jsonl")
         || rest
             .windows(2)
             .any(|arguments| arguments[0] == "--output" && arguments[1] == "jsonl")
+    {
+        Some(RunOutput::Jsonl)
+    } else if rest.iter().any(|argument| argument == "--json")
+        || rest
+            .windows(2)
+            .any(|arguments| arguments[0] == "--output" && arguments[1] == "json")
+    {
+        Some(RunOutput::Json)
+    } else {
+        None
+    }
 }
 
 struct ClassifiedRunError {
@@ -592,7 +1212,7 @@ fn write_error_json(
     let outcome = failure.outcome;
     let retryable = failure.retryable;
     let line = format!(
-        "{{\"schema\":\"haider.run.v1\",\"session_id\":null,\"run_id\":null,\"provider\":{provider},\"model\":{model},\"attachments\":{{\"count\":0,\"refs\":[]}},\"outcome\":\"{outcome}\",\"response\":null,\"usage\":null,\"permission_denials\":[],\"error\":{{\"code\":{code},\"message\":{message},\"retryable\":{retryable}}}}}"
+        "{{\"schema\":\"haider.run.v1\",\"session_id\":null,\"run_id\":null,\"provider\":{provider},\"model\":{model},\"attachments\":{{\"count\":0,\"refs\":[]}},\"outcome\":\"{outcome}\",\"response\":null,\"events\":[],\"usage\":null,\"budget_exhausted\":null,\"replay\":null,\"permission_denials\":[],\"background_tasks_running\":[],\"error\":{{\"code\":{code},\"message\":{message},\"retryable\":{retryable}}}}}"
     );
     output.write_all(line.as_bytes())?;
     output.write_all(b"\n")?;
@@ -687,7 +1307,10 @@ pub(crate) fn write_final(
 ) -> io::Result<()> {
     match mode {
         RunOutput::Print => {
-            if let Some(response) = &result.response {
+            if result.outcome == HeadlessOutcome::Started {
+                output.write_all(result.run_id.as_str().as_bytes())?;
+                output.write_all(b"\n")?;
+            } else if let Some(response) = &result.response {
                 output.write_all(response.as_bytes())?;
                 output.write_all(b"\n")?;
             }
@@ -716,6 +1339,10 @@ fn run_json(result: &HeadlessRunResult) -> io::Result<String> {
     let outcome = serde_json::to_string(&result.outcome).map_err(io::Error::other)?;
     let response = serde_json::to_string(&result.response).map_err(io::Error::other)?;
     let usage = serde_json::to_string(&result.usage).map_err(io::Error::other)?;
+    let events = serde_json::to_string(&result.events).map_err(io::Error::other)?;
+    let budget_exhausted =
+        serde_json::to_string(&result.budget_exhausted).map_err(io::Error::other)?;
+    let replay = serde_json::to_string(&result.replay).map_err(io::Error::other)?;
     let denials = serde_json::to_string(&result.permission_denials).map_err(io::Error::other)?;
     let error = match &result.failure {
         Some(failure) => {
@@ -750,7 +1377,7 @@ fn run_json(result: &HeadlessRunResult) -> io::Result<String> {
     )
     .map_err(io::Error::other)?;
     Ok(format!(
-        "{{\"schema\":\"haider.run.v1\",\"session_id\":{session_id},\"run_id\":{run_id},\"provider\":{provider},\"model\":{model},\"attachments\":{{\"count\":{attachment_count},\"refs\":{attachment_refs}}},\"outcome\":{outcome},\"response\":{response},\"usage\":{usage},\"permission_denials\":{denials},\"background_tasks_running\":{background_tasks},\"error\":{error}}}"
+        "{{\"schema\":\"haider.run.v1\",\"session_id\":{session_id},\"run_id\":{run_id},\"provider\":{provider},\"model\":{model},\"attachments\":{{\"count\":{attachment_count},\"refs\":{attachment_refs}}},\"outcome\":{outcome},\"response\":{response},\"events\":{events},\"usage\":{usage},\"budget_exhausted\":{budget_exhausted},\"replay\":{replay},\"permission_denials\":{denials},\"background_tasks_running\":{background_tasks},\"error\":{error}}}"
     ))
 }
 
@@ -765,7 +1392,7 @@ fn emit_headless_attention(result: &HeadlessRunResult) {
         HeadlessOutcome::Done => Attention::Done,
         HeadlessOutcome::Errored => Attention::Errored,
         HeadlessOutcome::InputRequired => Attention::Input,
-        HeadlessOutcome::Cancelled | HeadlessOutcome::Timeout => return,
+        HeadlessOutcome::Started | HeadlessOutcome::Cancelled | HeadlessOutcome::Timeout => return,
     };
     let is_tty = io::IsTerminal::is_terminal(&io::stderr());
     let line = notify::notification_line(attention, None);
@@ -777,7 +1404,7 @@ fn emit_headless_attention(result: &HeadlessRunResult) {
 
 pub(crate) fn exit_code_for_result(result: &HeadlessRunResult) -> u8 {
     match result.outcome {
-        HeadlessOutcome::Done => 0,
+        HeadlessOutcome::Started | HeadlessOutcome::Done => 0,
         HeadlessOutcome::Cancelled => EX_CANCELLED,
         HeadlessOutcome::Timeout => EX_TIMEOUT,
         HeadlessOutcome::InputRequired => EX_BLOCKED,
@@ -791,6 +1418,7 @@ pub(crate) fn exit_code_for_result(result: &HeadlessRunResult) -> u8 {
             Some(HeadlessFailureCode::Run(
                 ErrorCode::PermissionDenied
                 | ErrorCode::EffectUnknownOutcome
+                | ErrorCode::BudgetExhausted
                 | ErrorCode::WorkflowUnfinished,
             ))
             | Some(HeadlessFailureCode::Blocked(_)) => EX_BLOCKED,
@@ -925,6 +1553,108 @@ mod tests {
             assert_eq!(value["stage"], "bootstrap");
             assert_eq!(value["error"]["code"], expected_code);
         }
+    }
+
+    #[test]
+    fn replay_comparison_keeps_provider_call_ids_and_typed_failures() {
+        fn envelope(
+            seq: u64,
+            payload: serde_json::Value,
+        ) -> haider_protocol::envelope::RawEnvelope {
+            serde_json::from_value(serde_json::json!({
+                "schema_version": 1,
+                "event_id": format!("event-replay-{seq}"),
+                "seq": seq,
+                "session_id": "session-replay",
+                "run_id": "run-replay",
+                "device_id": "device-replay",
+                "authority_epoch": 1,
+                "worker_generation": 1,
+                "committed_at_ms": seq,
+                "render": {"ui": true, "durable": true, "prompt": "omit"},
+                "payload": payload,
+            }))
+            .expect("raw replay envelope")
+        }
+
+        let first_tool = vec![envelope(
+            1,
+            serde_json::json!({
+                "type": "tool_result",
+                "call_id": "provider-call-a",
+                "result": {"status": "completed", "preview": "ok", "truncated": false},
+            }),
+        )];
+        let second_tool = vec![envelope(
+            1,
+            serde_json::json!({
+                "type": "tool_result",
+                "call_id": "provider-call-b",
+                "result": {"status": "completed", "preview": "ok", "truncated": false},
+            }),
+        )];
+        assert_ne!(
+            replay_tool_trace(&first_tool),
+            replay_tool_trace(&second_tool)
+        );
+
+        let terminal = |message: &str| {
+            vec![
+                envelope(
+                    2,
+                    serde_json::json!({
+                        "type": "run_failed",
+                        "code": "provider_error",
+                        "message": message,
+                        "retryable": false,
+                    }),
+                ),
+                envelope(
+                    3,
+                    serde_json::json!({"type": "run_state", "state": "errored"}),
+                ),
+            ]
+        };
+        assert_ne!(
+            replay_terminal(&terminal("first failure")),
+            replay_terminal(&terminal("different failure"))
+        );
+
+        let budget = |tokens| {
+            vec![envelope(
+                4,
+                serde_json::json!({
+                    "type": "run_budget_exhausted",
+                    "dimension": "tokens",
+                    "limit": 10,
+                    "usage": {
+                        "logical_input_tokens": tokens,
+                        "billed_output_tokens": 0,
+                        "additional_reasoning_tokens": 0,
+                        "cache_read_tokens": 0,
+                        "cache_write_tokens": 0,
+                        "total_tokens": tokens,
+                        "estimated_cost_microusd": 0,
+                        "elapsed_ms": 1,
+                    },
+                }),
+            )]
+        };
+        assert_ne!(replay_terminal(&budget(10)), replay_terminal(&budget(11)));
+    }
+
+    #[test]
+    fn replay_preserves_the_complete_permission_pin() {
+        let pinned = SessionPermissionOverridesV1 {
+            allow_writes: false,
+            allow_exec: false,
+            allow_mobile: true,
+            auto_allow: false,
+        };
+        assert_eq!(
+            execution_permission_overrides(Some(pinned), true, true, true),
+            pinned
+        );
     }
 
     /// MUTATION CHECK: buffering the accepted event behind an envelope makes

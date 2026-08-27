@@ -267,6 +267,16 @@ struct AttachmentValidationFailure {
     data: Option<ErrorData>,
 }
 
+struct HeadlessRunLookup {
+    session_id: haider_protocol::ids::SessionId,
+    run_id: haider_protocol::ids::RunId,
+    state: RunState,
+    state_seq: u64,
+    head_seq: u64,
+    budget_exhausted: Option<haider_protocol::headless::RunBudgetExhaustedV1>,
+    spec: haider_protocol::headless::HeadlessRunSpecV1,
+}
+
 /// Compact direct-agent metrics from the same sealed journal head carried by
 /// `SessionSummary`. The live child path publishes the identical shape into
 /// the parent journal; this summary copy is the cold/reconnect and `/usage`
@@ -2580,6 +2590,7 @@ impl HubConnection {
                     attachments,
                     mode,
                     false,
+                    None,
                 )
                 .await
             }
@@ -2622,6 +2633,7 @@ impl HubConnection {
                     attachments,
                     mode,
                     false,
+                    None,
                 )
                 .await
             }
@@ -2665,6 +2677,7 @@ impl HubConnection {
                     attachments,
                     mode,
                     false,
+                    None,
                 )
                 .await
             }
@@ -2708,6 +2721,51 @@ impl HubConnection {
                     attachments,
                     mode,
                     true,
+                    None,
+                )
+                .await
+            }
+            RequestBody::HeadlessRunStart {
+                command_id,
+                session_id,
+                worker_generation,
+                text,
+                attachments,
+                spec,
+                trust_hooks,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "headless start requires a control attachment to this session",
+                        false,
+                        None,
+                    );
+                }
+                self.turn_submit(
+                    request_id,
+                    command_id,
+                    session_id,
+                    worker_generation,
+                    None,
+                    text,
+                    attachments,
+                    DeliveryMode::Queue,
+                    trust_hooks,
+                    Some(spec),
                 )
                 .await
             }
@@ -3896,6 +3954,30 @@ impl HubConnection {
                 }
                 self.loom_install_watch(request_id, job_id, after_cursor)
                     .await
+            }
+            RequestBody::HeadlessRunStatus { run_id } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.headless_run_status(request_id, run_id).await
+            }
+            RequestBody::HeadlessRunStop { command_id, run_id } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.headless_run_stop(request_id, command_id, run_id).await
             }
             // `Unknown` and any future method decode alike: a typed,
             // correlated rejection instead of a dropped request.
@@ -8513,6 +8595,7 @@ impl HubConnection {
         attachments: Vec<haider_protocol::tool::AttachmentBlock>,
         mode: haider_protocol::DeliveryMode,
         trust_hooks: bool,
+        headless_spec: Option<haider_protocol::headless::HeadlessRunSpecV1>,
     ) -> Result<(), SessionHubError> {
         if command_id.as_str().is_empty() || text.trim().is_empty() {
             return self.respond_error(
@@ -8538,6 +8621,44 @@ impl HubConnection {
                 ));
             };
             request.insert("trust_hooks".into(), serde_json::Value::Bool(true));
+        }
+        if let Some(spec) = headless_spec.as_ref() {
+            if spec.cwd.trim().is_empty()
+                || spec.provider.trim().is_empty()
+                || spec.model.trim().is_empty()
+                || spec.max_output_tokens == 0
+                || spec.budget.max_tokens == Some(0)
+                || spec.budget.max_cost_microusd == Some(0)
+                || spec.budget.max_time_ms == Some(0)
+            {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    "headless execution pins and present budget limits must be non-zero",
+                    false,
+                    None,
+                );
+            }
+            if spec.trust_hooks != trust_hooks {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    "headless hook-trust pin does not match the submitted policy",
+                    false,
+                    None,
+                );
+            }
+            let Some(request) = request_value.as_object_mut() else {
+                return Err(SessionHubError::Task(
+                    "turn-submit coordinates did not encode as an object".into(),
+                ));
+            };
+            request.insert(
+                "headless".into(),
+                serde_json::to_value(spec).map_err(|error| {
+                    SessionHubError::Task(format!("cannot encode headless run spec: {error}"))
+                })?,
+            );
         }
         let request_json = serde_json::to_string(&request_value).map_err(|error| {
             SessionHubError::Task(format!("cannot encode turn-submit coordinates: {error}"))
@@ -8577,13 +8698,48 @@ impl HubConnection {
                         return self.respond_turn_error(request_id, error);
                     }
                 }
-                return self.respond_turn_accepted(request_id, accepted);
+                return self.respond_turn_accepted(request_id, accepted, headless_spec.is_some());
             }
             Ok(None) => {}
             Err(SessionHubError::Store(error)) => {
                 return self.respond_turn_error(request_id, error);
             }
             Err(error) => return Err(error),
+        }
+        if let Some(spec) = headless_spec.as_ref() {
+            let metadata = match self.hub.session_metadata(&session_id).await {
+                Ok(Some(metadata)) => metadata,
+                Ok(None) => {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_INVALID_ARGUMENT,
+                        "headless start requires typed session metadata",
+                        false,
+                        None,
+                    );
+                }
+                Err(error) => return self.respond_turn_error(request_id, error),
+            };
+            let expected_permissions =
+                (!spec.permission_overrides.is_empty()).then_some(spec.permission_overrides);
+            if metadata.cwd != spec.cwd
+                || metadata.provider != spec.provider
+                || metadata.model != spec.model
+                || metadata.max_tokens != spec.max_output_tokens
+                || metadata.effort != spec.effort
+                || metadata.fast != spec.fast
+                || metadata.permission_overrides != expected_permissions
+                || metadata.interaction_mode
+                    != haider_protocol::session::SessionInteractionModeV1::Autonomous
+            {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    "headless execution pin does not match the resolved session configuration",
+                    false,
+                    None,
+                );
+            }
         }
         let pdf_delivery = if attachments.iter().any(|attachment| {
             matches!(
@@ -8682,7 +8838,7 @@ impl HubConnection {
         if let Err(error) = handoff {
             return self.respond_turn_error(request_id, error);
         }
-        self.respond_turn_accepted(request_id, accepted)
+        self.respond_turn_accepted(request_id, accepted, headless_spec.is_some())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9136,6 +9292,185 @@ impl HubConnection {
         })
     }
 
+    async fn find_headless_run(
+        &self,
+        run_id: &haider_protocol::ids::RunId,
+    ) -> Result<Option<HeadlessRunLookup>, SessionHubError> {
+        for session_id in self.hub.inner.store.session_ids().await? {
+            let mut cursor = 0_u64;
+            let mut state = None;
+            let mut spec = None;
+            let mut budget_exhausted = None;
+            loop {
+                let page = self.hub.inner.store.read(&session_id, cursor, 256).await?;
+                if page.is_empty() {
+                    break;
+                }
+                let page_len = page.len();
+                for envelope in page {
+                    cursor = envelope.seq;
+                    if envelope.run_id.as_ref() != Some(run_id) {
+                        continue;
+                    }
+                    match haider_protocol::headless::HeadlessRunEventPayload::from_payload_value(
+                        &envelope.payload,
+                    ) {
+                        Some(
+                            haider_protocol::headless::HeadlessRunEventPayload::HeadlessRunConfigured(
+                                configured,
+                            ),
+                        ) => spec = Some(configured),
+                        Some(
+                            haider_protocol::headless::HeadlessRunEventPayload::RunBudgetExhausted(
+                                exhausted,
+                            ),
+                        ) => budget_exhausted = Some(exhausted),
+                        None => {}
+                    }
+                    if let Ok(EventPayload::RunState(run_state)) =
+                        serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                    {
+                        state = Some((run_state, envelope.seq));
+                    }
+                }
+                if page_len < 256 {
+                    break;
+                }
+            }
+            if let (Some((state, state_seq)), Some(spec)) = (state, spec) {
+                return Ok(Some(HeadlessRunLookup {
+                    session_id,
+                    run_id: run_id.clone(),
+                    state,
+                    state_seq,
+                    head_seq: cursor,
+                    budget_exhausted,
+                    spec,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn headless_run_status(
+        &self,
+        request_id: RequestId,
+        run_id: haider_protocol::ids::RunId,
+    ) -> Result<(), SessionHubError> {
+        let Some(found) = self.find_headless_run(&run_id).await? else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "headless run was not found",
+                false,
+                None,
+            );
+        };
+        let terminal_seq = found.state.is_terminal().then_some(found.state_seq);
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::HeadlessRunStatus {
+                session_id: found.session_id,
+                run_id: found.run_id,
+                worker_generation: self.hub.worker_generation(),
+                state: found.state,
+                head_seq: found.head_seq,
+                terminal_seq,
+                budget_exhausted: found.budget_exhausted,
+                spec: found.spec,
+            },
+        })
+    }
+
+    async fn headless_run_stop(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        run_id: haider_protocol::ids::RunId,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "headless stop command id must not be empty",
+                false,
+                None,
+            );
+        }
+        let Some(found) = self.find_headless_run(&run_id).await? else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "headless run was not found",
+                false,
+                None,
+            );
+        };
+        if found.state.is_terminal() {
+            return self.send(WireFrame::Response {
+                request_id,
+                body: ResponseBody::HeadlessRunStop {
+                    session_id: found.session_id,
+                    run_id,
+                    status: CancelStatus::AlreadyTerminal,
+                    terminal_seq: Some(found.state_seq),
+                },
+            });
+        }
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": &found.session_id,
+            "worker_generation": self.hub.worker_generation(),
+            "run_id": &run_id,
+        }))
+        .map_err(|error| {
+            SessionHubError::Task(format!("cannot encode headless stop coordinates: {error}"))
+        })?;
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        let cancelled = match self
+            .hub
+            .turn_cancel_receipt(&command_id, &request_digest, &request_json)
+            .await
+        {
+            Ok(Some(cancelled)) => cancelled,
+            Ok(None) => {
+                let command = TurnCancelCommand {
+                    command_id: command_id.0,
+                    request_digest,
+                    request_json,
+                    session_id: found.session_id.clone(),
+                    worker_generation: self.hub.worker_generation(),
+                    run_id: run_id.clone(),
+                    cancelling_event_id: EventId::new(random_id("headless-cancelling")?),
+                    device_id: self.hub.inner.device_id.clone(),
+                };
+                match self.hub.cancel_turn(command).await {
+                    Ok(TurnCancelOutcome::Committed { cancelled, .. })
+                    | Ok(TurnCancelOutcome::IdempotentReplay { cancelled }) => cancelled,
+                    Err(SessionHubError::Store(error)) => {
+                        return self.respond_turn_error(request_id, error);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::HeadlessRunStop {
+                session_id: cancelled.session_id,
+                run_id: cancelled.run_id,
+                status: match cancelled.status {
+                    TurnCancellationStatus::Accepted => CancelStatus::Accepted,
+                    TurnCancellationStatus::AlreadyTerminal => CancelStatus::AlreadyTerminal,
+                },
+                terminal_seq: cancelled.terminal_seq,
+            },
+        })
+    }
+
     async fn run_retry(
         &self,
         request_id: RequestId,
@@ -9231,6 +9566,7 @@ impl HubConnection {
         &self,
         request_id: RequestId,
         accepted: AcceptedTurn,
+        headless: bool,
     ) -> Result<(), SessionHubError> {
         let disposition = match accepted.disposition {
             TurnAdmissionDisposition::Started => SubmitDisposition::Started,
@@ -9238,7 +9574,15 @@ impl HubConnection {
             TurnAdmissionDisposition::SteerPending => SubmitDisposition::SteerPending,
             TurnAdmissionDisposition::SubturnPending => SubmitDisposition::SubturnPending,
         };
-        let body = if let Some(branch_id) = accepted.branch_id {
+        let body = if headless {
+            ResponseBody::HeadlessRunStart {
+                session_id: accepted.session_id,
+                run_id: accepted.run_id,
+                accepted_seq: accepted.accepted_seq,
+                worker_generation: accepted.worker_generation,
+                disposition,
+            }
+        } else if let Some(branch_id) = accepted.branch_id {
             ResponseBody::TurnSubmitOnBranch {
                 session_id: accepted.session_id,
                 run_id: accepted.run_id,

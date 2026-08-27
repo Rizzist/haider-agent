@@ -22,6 +22,10 @@ use haider_rpc::haider_protocol::EventPayload;
 use haider_rpc::haider_protocol::effect::{AuthorizationVerdict, EffectPhase};
 use haider_rpc::haider_protocol::envelope::RawEnvelope;
 use haider_rpc::haider_protocol::error::{ErrorCode, ErrorPresentation};
+use haider_rpc::haider_protocol::headless::{
+    HeadlessRunEventPayload, HeadlessRunSpecV1, ReplayDivergenceV1, RunBudgetExhaustedV1,
+    RunBudgetV1,
+};
 use haider_rpc::haider_protocol::ids::{ArtifactRef, MenuId, RunId, SessionId};
 use haider_rpc::haider_protocol::item::{ItemEvent, TurnItem};
 use haider_rpc::haider_protocol::menu::{DecisionKind, MenuKind};
@@ -32,9 +36,9 @@ use haider_rpc::haider_protocol::session::{
 use haider_rpc::haider_protocol::state::RunState;
 use haider_rpc::haider_protocol::tool::AttachmentBlock;
 use haider_rpc::{
-    AttachMode, AttachmentId, Capability, CapabilitySet, ClientKind, CommandId,
+    AttachMode, AttachmentId, CancelStatus, Capability, CapabilitySet, ClientKind, CommandId,
     ERROR_CODE_ALREADY_RESOLVED, FEATURE_ARTIFACT_PUT_V1, FEATURE_AUTONOMOUS_INTERACTION_V1,
-    FEATURE_SESSION_PERMISSION_OVERRIDES_V1, RequestBody, ResponseBody, WireFrame,
+    FEATURE_SESSION_PERMISSION_OVERRIDES_V1, RequestBody, ResponseBody, SeqRange, WireFrame,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -376,11 +380,23 @@ pub struct HeadlessRunRequest {
     pub cwd: String,
     pub prompt: String,
     pub attachments: Vec<HeadlessAttachment>,
+    /// Already-durable attachment blocks reused by replay without copying
+    /// bytes through a second upload path.
+    pub durable_attachments: Vec<AttachmentBlock>,
     /// Explicit provider override. `None` follows the daemon's active account.
     pub provider: Option<String>,
     /// Explicit model override. `None` follows the selected provider summary.
     pub model: Option<String>,
     pub max_tokens: u64,
+    pub budget: RunBudgetV1,
+    pub seed: Option<u64>,
+    pub replay_of: Option<RunId>,
+    /// Record the resolved run inputs through the headless v1 journal
+    /// contract even when the caller waits for completion.
+    pub journal_pin: bool,
+    /// Return immediately after durable acceptance. The daemon and journal
+    /// remain the owners of the running turn.
+    pub detached: bool,
     pub permission_overrides: SessionPermissionOverridesV1,
     /// Trust discovered hooks for this run only. The daemon journals the
     /// grant in the same atomic acceptance transaction as the turn.
@@ -436,6 +452,7 @@ pub struct HeadlessPermissionDenial {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HeadlessOutcome {
+    Started,
     Done,
     Errored,
     Cancelled,
@@ -532,12 +549,40 @@ pub struct HeadlessRunResult {
     pub outcome: HeadlessOutcome,
     pub response: Option<String>,
     pub usage: Option<Usage>,
+    /// Lossless correlated journal stream. Event payloads are the shared
+    /// client contract, including typed tool results and normalized cache
+    /// read/write usage; unknown future payloads remain intact.
+    pub events: Vec<RawEnvelope>,
+    pub budget_exhausted: Option<RunBudgetExhaustedV1>,
+    pub replay: Option<ReplayDivergenceV1>,
     pub permission_denials: Vec<HeadlessPermissionDenial>,
     pub failure: Option<HeadlessRunFailure>,
     pub terminal_seq: Option<u64>,
     /// Background tasks with a durable started fact and no completed fact
     /// when the run's terminal was observed (W-A decision 8).
     pub background_tasks_running: Vec<HeadlessBackgroundTask>,
+}
+
+/// Durable lifecycle snapshot resolved by run id, independent of a live
+/// attachment or the process which originally started the run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeadlessRunStatus {
+    pub session_id: SessionId,
+    pub run_id: RunId,
+    pub worker_generation: u64,
+    pub state: RunState,
+    pub head_seq: u64,
+    pub terminal_seq: Option<u64>,
+    pub budget_exhausted: Option<RunBudgetExhaustedV1>,
+    pub spec: HeadlessRunSpecV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeadlessRunStopResult {
+    pub session_id: SessionId,
+    pub run_id: RunId,
+    pub status: CancelStatus,
+    pub terminal_seq: Option<u64>,
 }
 
 /// Failure before a correlated final result could be produced.
@@ -666,6 +711,36 @@ fn headless_submit_body(
     }
 }
 
+fn headless_submit_body_with_spec(
+    trust_hooks: bool,
+    command_id: CommandId,
+    session_id: SessionId,
+    worker_generation: u64,
+    text: String,
+    attachments: Vec<AttachmentBlock>,
+    spec: Option<HeadlessRunSpecV1>,
+) -> RequestBody {
+    match spec {
+        Some(spec) => RequestBody::HeadlessRunStart {
+            command_id,
+            session_id,
+            worker_generation,
+            text,
+            attachments,
+            spec,
+            trust_hooks,
+        },
+        None => headless_submit_body(
+            trust_hooks,
+            command_id,
+            session_id,
+            worker_generation,
+            text,
+            attachments,
+        ),
+    }
+}
+
 impl HeadlessConnection {
     /// Boxed on purpose: this future carries the whole `ensure_daemon` →
     /// `try_attach` spawn subtree, whose debug-build frames are large enough
@@ -772,6 +847,8 @@ struct HeadlessReducer {
     /// W-A: task id → (name, running) from the additive task facts, in
     /// deterministic id order for the run summary.
     background_tasks: BTreeMap<String, (String, bool)>,
+    events: Vec<RawEnvelope>,
+    budget_exhausted: Option<RunBudgetExhaustedV1>,
 }
 
 impl HeadlessReducer {
@@ -791,6 +868,8 @@ impl HeadlessReducer {
             cancel_observed: false,
             actions: VecDeque::new(),
             background_tasks: BTreeMap::new(),
+            events: Vec::new(),
+            budget_exhausted: None,
             output,
             output_closed: false,
         }
@@ -823,6 +902,9 @@ impl HeadlessReducer {
             .await;
         self.last_applied = envelope.seq;
         let correlated = self.is_correlated(&envelope);
+        if correlated {
+            self.events.push(envelope.clone());
+        }
         // W-A: background task facts are SESSION-scoped (they outlive turns
         // by design) and ride the additive union outside `EventPayload` —
         // track them regardless of run correlation so the run summary can
@@ -841,6 +923,12 @@ impl HeadlessReducer {
                         .insert(completed.task.as_str().to_owned(), (completed.name, false));
                 }
             }
+        }
+        if correlated
+            && let Some(HeadlessRunEventPayload::RunBudgetExhausted(exhausted)) =
+                HeadlessRunEventPayload::from_payload_value(&envelope.payload)
+        {
+            self.budget_exhausted = Some(exhausted);
         }
         let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
             return ApplyStatus::Applied;
@@ -1114,6 +1202,189 @@ pub async fn run_headless_with_session_config(
     }
 }
 
+fn normalize_lifecycle_options(options: &mut EnsureOptions) {
+    options.required_features.extend(required_live_features());
+    options
+        .required_features
+        .insert(haider_rpc::FEATURE_HEADLESS_RUN_V1.to_owned());
+    options.client = ClientConfig {
+        client_name: "haider-headless-lifecycle".into(),
+        client_instance_id: command_id("headless-lifecycle-client"),
+        client_kind: ClientKind::Headless,
+        capabilities: CapabilitySet::from([Capability::View, Capability::Control]),
+        ..options.client.clone()
+    };
+}
+
+async fn lifecycle_request(
+    profile: &ResolvedProfile,
+    mut ensure: EnsureOptions,
+    body: RequestBody,
+    stage: &'static str,
+) -> Result<ResponseBody, HeadlessRunError> {
+    normalize_lifecycle_options(&mut ensure);
+    let lifetime = ensure.daemon_lifetime;
+    let ownership = Arc::new(Mutex::new(None));
+    let connection =
+        HeadlessConnection::open(profile, ensure.clone(), Arc::clone(&ownership)).await?;
+    let response = connection
+        .client
+        .request(body)
+        .await
+        .map_err(|error| client_error_as_headless(stage, error));
+    drop(connection);
+    let teardown = if lifetime == DaemonLifetime::EphemeralIfSpawned {
+        teardown_owned_daemon(profile, &ensure, &ownership).await
+    } else {
+        Ok(())
+    };
+    match (response, teardown) {
+        (Ok(response), Ok(())) => Ok(response),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+/// Reads detached lifecycle state by the daemon-owned global run index seam.
+pub async fn headless_run_status(
+    profile: &ResolvedProfile,
+    ensure: EnsureOptions,
+    run_id: RunId,
+) -> Result<HeadlessRunStatus, HeadlessRunError> {
+    match lifecycle_request(
+        profile,
+        ensure,
+        RequestBody::HeadlessRunStatus { run_id },
+        "headless.run.status",
+    )
+    .await?
+    {
+        ResponseBody::HeadlessRunStatus {
+            session_id,
+            run_id,
+            worker_generation,
+            state,
+            head_seq,
+            terminal_seq,
+            budget_exhausted,
+            spec,
+        } => Ok(HeadlessRunStatus {
+            session_id,
+            run_id,
+            worker_generation,
+            state,
+            head_seq,
+            terminal_seq,
+            budget_exhausted,
+            spec,
+        }),
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            ..
+        } => Err(rpc_error("headless.run.status", code, message, retryable)),
+        _ => Err(protocol_error(
+            "headless.run.status",
+            "response method did not match request",
+        )),
+    }
+}
+
+/// Idempotently requests durable cancellation by run id.
+pub async fn stop_headless_run(
+    profile: &ResolvedProfile,
+    ensure: EnsureOptions,
+    run_id: RunId,
+) -> Result<HeadlessRunStopResult, HeadlessRunError> {
+    match lifecycle_request(
+        profile,
+        ensure,
+        RequestBody::HeadlessRunStop {
+            command_id: CommandId::new(command_id("headless-stop")),
+            run_id,
+        },
+        "headless.run.stop",
+    )
+    .await?
+    {
+        ResponseBody::HeadlessRunStop {
+            session_id,
+            run_id,
+            status,
+            terminal_seq,
+        } => Ok(HeadlessRunStopResult {
+            session_id,
+            run_id,
+            status,
+            terminal_seq,
+        }),
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            ..
+        } => Err(rpc_error("headless.run.stop", code, message, retryable)),
+        _ => Err(protocol_error(
+            "headless.run.stop",
+            "response method did not match request",
+        )),
+    }
+}
+
+/// Reads the exact typed source stream used to reconstruct replay inputs.
+pub async fn headless_run_events(
+    profile: &ResolvedProfile,
+    ensure: EnsureOptions,
+    status: &HeadlessRunStatus,
+) -> Result<Vec<RawEnvelope>, HeadlessRunError> {
+    let mut events = Vec::new();
+    let mut start_seq = 1_u64;
+    while start_seq <= status.head_seq {
+        let end_seq = start_seq.saturating_add(1023).min(status.head_seq);
+        let response = lifecycle_request(
+            profile,
+            ensure.clone(),
+            RequestBody::SessionRead {
+                session_id: status.session_id.clone(),
+                range: SeqRange { start_seq, end_seq },
+            },
+            "session.read for replay",
+        )
+        .await?;
+        match response {
+            ResponseBody::SessionRead { result } if result.session_id == status.session_id => {
+                events.extend(
+                    result
+                        .envelopes
+                        .into_iter()
+                        .filter(|envelope| envelope.run_id.as_ref() == Some(&status.run_id)),
+                );
+            }
+            ResponseBody::Error {
+                code,
+                message,
+                retryable,
+                ..
+            } => {
+                return Err(rpc_error(
+                    "session.read for replay",
+                    code,
+                    message,
+                    retryable,
+                ));
+            }
+            _ => {
+                return Err(protocol_error(
+                    "session.read for replay",
+                    "response method did not match request",
+                ));
+            }
+        }
+        start_seq = end_seq.saturating_add(1);
+    }
+    Ok(events)
+}
+
 async fn teardown_owned_daemon(
     profile: &ResolvedProfile,
     ensure: &EnsureOptions,
@@ -1320,6 +1591,21 @@ async fn run_headless_inner(
         !request.attachments.is_empty(),
         request.trust_hooks,
     );
+    let pinned_headless = request.journal_pin
+        || request.detached
+        || request.seed.is_some()
+        || request.replay_of.is_some()
+        || !request.budget.is_empty();
+    if pinned_headless {
+        ensure
+            .required_features
+            .insert(haider_rpc::FEATURE_HEADLESS_RUN_V1.to_owned());
+    }
+    if !request.budget.is_empty() {
+        ensure
+            .required_features
+            .insert(haider_rpc::FEATURE_RUN_BUDGET_V1.to_owned());
+    }
     normalize_session_config_features(&mut ensure, &session_config)?;
     let timeout_deadline = request.timeout.map(|timeout| Instant::now() + timeout);
     let submit_command_id = CommandId::new(command_id("headless-submit"));
@@ -1369,6 +1655,21 @@ async fn run_headless_inner(
         ),
     )
     .await?;
+    let mut submit_attachments = submit_attachments;
+    let mut attachment_refs = attachment_refs;
+    for attachment in &request.durable_attachments {
+        let artifact = match attachment {
+            AttachmentBlock::Image { artifact, .. }
+            | AttachmentBlock::PastedText { artifact, .. }
+            | AttachmentBlock::File { artifact, .. }
+            | AttachmentBlock::Pdf { artifact, .. } => Some(artifact.clone()),
+            AttachmentBlock::Skill { .. } => None,
+        };
+        if let Some(artifact) = artifact {
+            attachment_refs.push(artifact);
+        }
+    }
+    submit_attachments.extend(request.durable_attachments.clone());
     let create_body = RequestBody::SessionCreateWithPermissionOverrides {
         command_id: CommandId::new(command_id("headless-create")),
         cwd: request.cwd.clone(),
@@ -1381,7 +1682,7 @@ async fn run_headless_inner(
         interaction_mode: SessionInteractionModeV1::Autonomous,
     };
 
-    let (session_id, created_generation, created_seq) =
+    let (session_id, created_generation, created_seq, created_metadata) =
         before_acceptance_deadline(timeout_deadline, "session.create", async {
             loop {
                 match connection.client.request(create_body.clone()).await {
@@ -1408,7 +1709,7 @@ async fn run_headless_inner(
                                     .into(),
                             });
                         }
-                        break Ok((session_id, worker_generation, created_seq));
+                        break Ok((session_id, worker_generation, created_seq, metadata));
                     }
                     Ok(ResponseBody::Error {
                         code,
@@ -1480,13 +1781,27 @@ async fn run_headless_inner(
     // This body is immutable across response-loss retries. In particular, its
     // original generation remains part of the durable command identity even if
     // reconnecting observes a newer worker generation.
-    let submit_body = headless_submit_body(
+    let submit_spec = pinned_headless.then(|| HeadlessRunSpecV1 {
+        cwd: created_metadata.cwd.clone(),
+        provider: provider.clone(),
+        model: model.clone(),
+        max_output_tokens: request.max_tokens,
+        effort: session_config.effort.clone(),
+        fast: session_config.fast.unwrap_or(false),
+        seed: request.seed,
+        permission_overrides: created_metadata.permission_overrides.unwrap_or_default(),
+        trust_hooks: request.trust_hooks,
+        budget: request.budget.clone(),
+        replay_of: request.replay_of.clone(),
+    });
+    let submit_body = headless_submit_body_with_spec(
         request.trust_hooks,
         submit_command_id,
         session_id.clone(),
         connection.worker_generation,
         request.prompt,
         submit_attachments,
+        submit_spec,
     );
     let mut buffered = Vec::new();
     let mut submit_timeout_grace = None;
@@ -1539,13 +1854,22 @@ async fn run_headless_inner(
             }
         };
         match response {
-            Ok(ResponseBody::TurnSubmit {
-                session_id: accepted_session,
-                run_id,
-                accepted_seq,
-                worker_generation,
-                ..
-            }) if accepted_session == session_id => {
+            Ok(
+                ResponseBody::TurnSubmit {
+                    session_id: accepted_session,
+                    run_id,
+                    accepted_seq,
+                    worker_generation,
+                    ..
+                }
+                | ResponseBody::HeadlessRunStart {
+                    session_id: accepted_session,
+                    run_id,
+                    accepted_seq,
+                    worker_generation,
+                    ..
+                },
+            ) if accepted_session == session_id => {
                 connection.worker_generation = worker_generation;
                 reducer
                     .emit(HeadlessEvent::Accepted {
@@ -1590,6 +1914,25 @@ async fn run_headless_inner(
         }
     };
     reducer.run_id = Some(run_id.clone());
+    if request.detached {
+        return Ok(HeadlessRunResult {
+            session_id,
+            run_id,
+            provider,
+            model,
+            attachments: attachment_refs,
+            outcome: HeadlessOutcome::Started,
+            response: None,
+            usage: None,
+            events: Vec::new(),
+            budget_exhausted: None,
+            replay: None,
+            permission_denials: Vec::new(),
+            failure: None,
+            terminal_seq: None,
+            background_tasks_running: Vec::new(),
+        });
+    }
 
     let mut forced = submit_timeout_grace.map(|_| ForcedOutcome::Timeout);
     let mut grace_deadline = submit_timeout_grace;
@@ -3232,6 +3575,8 @@ fn finalize(
         blocking_presentation,
         terminal,
         background_tasks,
+        events,
+        budget_exhausted,
         ..
     } = reducer;
     let (outcome, failure, terminal_seq) = match forced {
@@ -3294,6 +3639,9 @@ fn finalize(
         outcome,
         response,
         usage,
+        events,
+        budget_exhausted,
+        replay: None,
         permission_denials,
         failure,
         terminal_seq,

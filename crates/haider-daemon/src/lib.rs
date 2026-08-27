@@ -85,6 +85,10 @@ mod pipe_native;
 mod profile_vault;
 mod project_instructions;
 mod provider_registry;
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+#[path = "run_budget_tests.rs"]
+mod run_budget_tests;
 mod runtime;
 mod session_hub;
 #[cfg(test)]

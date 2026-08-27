@@ -207,6 +207,9 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "graph.run_set.open",
         "graph.status",
         "graph.switch",
+        "headless.run.start",
+        "headless.run.status",
+        "headless.run.stop",
         "hooks.list",
         "hooks.revoke",
         "hooks.trust",
@@ -273,8 +276,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         expected_methods.len(),
-        86,
-        "the v1 contract covers all 78 base and eight v0.0.962 request methods"
+        89,
+        "the v1 contract covers all 86 prior and three v0.0.963 headless methods"
     );
     assert_eq!(
         request_methods_declared_in_source(),

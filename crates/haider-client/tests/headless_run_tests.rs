@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::time::Duration;
 
 use haider_client::{
-    EnsureOptions, HeadlessBlockingReason, HeadlessEvent, HeadlessFailureCode,
+    EnsureError, EnsureOptions, HeadlessBlockingReason, HeadlessEvent, HeadlessFailureCode,
     HeadlessImageAttachment, HeadlessOutcome, HeadlessRunError, HeadlessRunRequest, ProfileEnv,
     ResolvedProfile, resolve_profile, run_headless,
 };
@@ -309,9 +309,15 @@ fn request(timeout: Option<Duration>) -> HeadlessRunRequest {
         cwd: "/tmp".into(),
         prompt: "hello".into(),
         attachments: Vec::new(),
+        durable_attachments: Vec::new(),
         provider: Some("fake".into()),
         model: Some("fake-model".into()),
         max_tokens: 4096,
+        budget: haider_rpc::haider_protocol::headless::RunBudgetV1::default(),
+        seed: None,
+        replay_of: None,
+        journal_pin: false,
+        detached: false,
         permission_overrides: SessionPermissionOverridesV1::default(),
         trust_hooks: false,
         timeout,
@@ -357,6 +363,53 @@ fn active_account(provider: &str) -> CredentialDescriptor {
         active: true,
         label: None,
     }
+}
+
+#[tokio::test]
+async fn headless_pin_feature_is_required_before_session_mutation() {
+    let (_root, profile) = profile();
+    let peer = spawn_peer(&profile, |mut peer| async move {
+        assert!(peer.try_next().await.is_none());
+    });
+    let mut run = request(None);
+    run.journal_pin = true;
+    let (sender, _receiver) = mpsc::channel(1);
+    let error = run_headless(&profile, EnsureOptions::default(), run, sender)
+        .await
+        .expect_err("missing headless feature");
+    assert!(matches!(
+        error,
+        HeadlessRunError::Ensure(EnsureError::MissingFeatures { ref missing, .. })
+            if missing.contains(haider_rpc::FEATURE_HEADLESS_RUN_V1)
+    ));
+    peer.await.expect("peer");
+}
+
+#[tokio::test]
+async fn budget_feature_is_required_before_session_mutation() {
+    let (_root, profile) = profile();
+    let listener = UnixListener::bind(&profile.endpoint_path).expect("bind budget peer");
+    let mut advertised = welcome(&profile);
+    advertised
+        .features
+        .insert(haider_rpc::FEATURE_HEADLESS_RUN_V1.to_owned());
+    let peer = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener, advertised).await;
+        assert!(peer.try_next().await.is_none());
+    });
+    let mut run = request(None);
+    run.journal_pin = true;
+    run.budget.max_tokens = Some(1);
+    let (sender, _receiver) = mpsc::channel(1);
+    let error = run_headless(&profile, EnsureOptions::default(), run, sender)
+        .await
+        .expect_err("missing budget feature");
+    assert!(matches!(
+        error,
+        HeadlessRunError::Ensure(EnsureError::MissingFeatures { ref missing, .. })
+            if missing.contains(haider_rpc::FEATURE_RUN_BUDGET_V1)
+    ));
+    peer.await.expect("peer");
 }
 
 fn provider_summary_fixture(
