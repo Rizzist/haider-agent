@@ -29,6 +29,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 // waits; only real failures pay the longer bound.
 pub const DEADLINE: Duration = Duration::from_secs(60);
 
+/// Active test peers ping well inside the daemon's 45-second read-idle
+/// deadline. Long scenario-specific waits may exceed both values; this cadence
+/// keeps their connections non-idle for the whole outer wait.
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
 pub fn test_root(prefix: &str) -> tempfile::TempDir {
     #[cfg(target_os = "macos")]
     const SHORT_TMP_ROOT: &str = "/private/tmp";
@@ -132,6 +137,39 @@ impl UdsClient {
         .await
     }
 
+    /// Windows-only long-wait handshake that reports an EOF instead of
+    /// panicking, while preserving the daemon's negotiated-peer keepalive.
+    #[cfg(windows)]
+    pub async fn try_connect_control_with_keepalive(
+        path: &Path,
+        frame_limit: usize,
+        client_name: &str,
+        client_instance_id: &str,
+        client_kind: ClientKind,
+    ) -> Option<Self> {
+        let mut client = Self::connect(path, frame_limit).await.ok()?;
+        let hello = WireFrame::Hello(Hello {
+            protocol_min: WIRE_PROTOCOL_VERSION,
+            protocol_max: WIRE_PROTOCOL_VERSION,
+            client_name: client_name.into(),
+            client_version: "test".into(),
+            client_instance_id: client_instance_id.into(),
+            client_kind,
+            capabilities_requested: CapabilitySet::from([Capability::View, Capability::Control]),
+            max_receive_frame: u32::try_from(frame_limit).expect("frame limit"),
+            encodings: Vec::new(),
+        });
+        if !client.try_send(&hello, frame_limit).await {
+            return None;
+        }
+        match client.try_next_with_keepalive(frame_limit).await {
+            Some(WireFrame::Welcome(_)) => Some(client),
+            Some(WireFrame::ProtocolError(_)) => None,
+            Some(other) => panic!("expected Welcome during reconnect, got {other:?}"),
+            None => None,
+        }
+    }
+
     pub async fn connect_with_capabilities(
         path: &Path,
         frame_limit: usize,
@@ -210,7 +248,7 @@ impl UdsClient {
     pub async fn next_with_keepalive(&mut self, limit: usize) -> WireFrame {
         tokio::time::timeout(DEADLINE, async {
             loop {
-                match tokio::time::timeout(Duration::from_secs(10), self.receive()).await {
+                match tokio::time::timeout(KEEPALIVE_INTERVAL, self.receive()).await {
                     Ok(frame) => return frame,
                     Err(_) => {
                         self.send(
@@ -226,6 +264,30 @@ impl UdsClient {
         })
         .await
         .expect("frame deadline")
+    }
+
+    /// EOF-aware Windows counterpart used inside an independently bounded
+    /// process-start wait. It deliberately has no second outer deadline.
+    #[cfg(windows)]
+    pub async fn try_next_with_keepalive(&mut self, limit: usize) -> Option<WireFrame> {
+        loop {
+            match tokio::time::timeout(KEEPALIVE_INTERVAL, self.try_receive()).await {
+                Ok(frame) => return frame,
+                Err(_) => {
+                    if !self
+                        .try_send(
+                            &WireFrame::Ping {
+                                nonce: u64::MAX - 1,
+                            },
+                            limit,
+                        )
+                        .await
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
     }
 
     /// Next frame, or `None` when the daemon closed the connection first.

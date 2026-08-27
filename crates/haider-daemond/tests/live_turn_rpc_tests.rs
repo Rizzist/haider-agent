@@ -632,7 +632,7 @@ async fn wait_for_direct_shell_process_tree(
     heartbeat: &std::path::Path,
 ) -> Result<(), tokio::time::error::Elapsed> {
     tokio::time::timeout(process_start_deadline(), async {
-        let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(10));
+        let mut keepalive = tokio::time::interval(support::KEEPALIVE_INTERVAL);
         keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             if fs::metadata(heartbeat).is_ok_and(|metadata| metadata.len() > 1) {
@@ -654,47 +654,159 @@ async fn wait_for_direct_shell_process_tree(
 async fn wait_for_exec_child_started(
     client: &mut UdsClient,
     config: &DaemonConfig,
+    _session_id: &SessionId,
     run_id: &RunId,
-) -> Result<(), tokio::time::error::Elapsed> {
+) -> Result<ProcessStartObservation, tokio::time::error::Elapsed> {
     tokio::time::timeout(process_start_deadline(), async {
+        #[cfg(windows)]
+        let mut reconnects = 0_u64;
         loop {
             #[cfg(not(windows))]
             let frame = client.next_with_keepalive(config.frame_limit).await;
             #[cfg(windows)]
             let frame = loop {
-                match tokio::time::timeout(std::time::Duration::from_secs(10), client.receive())
-                    .await
+                if let Some(frame) = client.try_next_with_keepalive(config.frame_limit).await {
+                    break frame;
+                }
+                // A loaded Windows runner can starve this observer past the
+                // server's read-idle window despite the 10s ping cadence.
+                // Reattach from the durable beginning so no terminal or start
+                // observation written before EOF is lost.
+                if let Some(observation) = reconnect_exec_start_observer(
+                    client,
+                    config,
+                    _session_id,
+                    run_id,
+                    "wait",
+                    &mut reconnects,
+                )
+                .await
                 {
-                    Ok(frame) => break frame,
-                    Err(_) => {
-                        client
-                            .send(
-                                &WireFrame::Ping {
-                                    nonce: u64::MAX - 1,
-                                },
-                                config.frame_limit,
-                            )
-                            .await;
-                    }
+                    return observation;
                 }
             };
-            if let WireFrame::Event { envelope, .. } = frame
-                && envelope.run_id.as_ref() == Some(run_id)
-                && let Ok(EventPayload::Item(ItemEvent::Delta {
-                    delta: ItemDelta::CommandOutput { chunk_b64, .. },
-                    ..
-                })) = serde_json::from_value::<EventPayload>(envelope.payload)
-                && BASE64
-                    .decode(chunk_b64)
-                    .expect("command output base64")
-                    .windows(b"started".len())
-                    .any(|window| window == b"started")
-            {
-                break;
+            if let WireFrame::Event { envelope, .. } = frame {
+                #[cfg(windows)]
+                if run_terminal(&envelope, run_id) {
+                    return ProcessStartObservation::Terminal;
+                }
+                if exec_child_started(&envelope, run_id) {
+                    return ProcessStartObservation::Started;
+                }
             }
         }
     })
     .await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessStartObservation {
+    Started,
+    #[cfg(windows)]
+    Terminal,
+}
+
+#[cfg(windows)]
+async fn reconnect_exec_start_observer(
+    client: &mut UdsClient,
+    config: &DaemonConfig,
+    session_id: &SessionId,
+    run_id: &RunId,
+    phase: &str,
+    reconnects: &mut u64,
+) -> Option<ProcessStartObservation> {
+    loop {
+        *reconnects += 1;
+        let instance_id = format!("exec-start-observer-{phase}-{run_id}-{reconnects}");
+        let Some(connected) = UdsClient::try_connect_control_with_keepalive(
+            &config.endpoint_path(),
+            config.frame_limit,
+            "w4a2-test",
+            &instance_id,
+            ClientKind::Headless,
+        )
+        .await
+        else {
+            tokio::task::yield_now().await;
+            continue;
+        };
+        *client = connected;
+        let request_id = format!("exec-start-observer-attach-{phase}-{run_id}-{reconnects}");
+        let attached = client
+            .try_send(
+                &WireFrame::Request {
+                    request_id: RequestId::new(request_id),
+                    body: RequestBody::SessionAttach {
+                        session_id: session_id.clone(),
+                        after_seq: 0,
+                        mode: AttachMode::Control,
+                        sealed_replay: false,
+                    },
+                },
+                config.frame_limit,
+            )
+            .await;
+        if !attached {
+            continue;
+        }
+
+        let mut response_seen = false;
+        let mut caught_up_seen = false;
+        let mut started_seen = false;
+        let mut terminal_seen = false;
+        loop {
+            let Some(frame) = client.try_next_with_keepalive(config.frame_limit).await else {
+                break;
+            };
+            match frame {
+                WireFrame::Response {
+                    body: ResponseBody::SessionAttach { .. },
+                    ..
+                } => response_seen = true,
+                WireFrame::AttachCaughtUp { .. } => caught_up_seen = true,
+                WireFrame::Event { envelope, .. } => {
+                    started_seen |= exec_child_started(&envelope, run_id);
+                    terminal_seen |= run_terminal(&envelope, run_id);
+                }
+                _ => {}
+            }
+            if response_seen && caught_up_seen {
+                return if terminal_seen {
+                    Some(ProcessStartObservation::Terminal)
+                } else if started_seen {
+                    Some(ProcessStartObservation::Started)
+                } else {
+                    None
+                };
+            }
+        }
+    }
+}
+
+fn exec_child_started(envelope: &RawEnvelope, run_id: &RunId) -> bool {
+    envelope.run_id.as_ref() == Some(run_id)
+        && serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(|payload| {
+            let EventPayload::Item(ItemEvent::Delta {
+                delta: ItemDelta::CommandOutput { chunk_b64, .. },
+                ..
+            }) = payload
+            else {
+                return false;
+            };
+            BASE64
+                .decode(chunk_b64)
+                .expect("command output base64")
+                .windows(b"started".len())
+                .any(|window| window == b"started")
+        })
+}
+
+#[cfg(windows)]
+fn run_terminal(envelope: &RawEnvelope, run_id: &RunId) -> bool {
+    envelope.run_id.as_ref() == Some(run_id)
+        && serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+            |payload| matches!(payload, EventPayload::RunState(state) if state.is_terminal()),
+        )
 }
 
 #[cfg(windows)]
@@ -720,27 +832,42 @@ async fn cancel_timed_out_process_start(
     )
     .await;
     tokio::time::timeout(support::DEADLINE, async {
-        let mut response_seen = false;
+        let mut cancellation_accepted = false;
         let mut terminal_seen = false;
         let mut interrupted_idle_seen = false;
-        while !(response_seen && terminal_seen && interrupted_idle_seen) {
+        while !(cancellation_accepted && terminal_seen && interrupted_idle_seen) {
             match client.next_with_keepalive(config.frame_limit).await {
                 WireFrame::Response {
                     body:
                         ResponseBody::TurnCancel {
                             run_id: cancelled,
                             status,
+                            terminal_seq,
                             ..
                         },
                     ..
                 } => {
                     assert_eq!(&cancelled, run_id);
-                    assert_eq!(
-                        status,
-                        CancelStatus::Accepted,
-                        "only an active, load-stalled process start may be retried"
-                    );
-                    response_seen = true;
+                    match status {
+                        CancelStatus::Accepted => {
+                            assert_eq!(terminal_seq, None);
+                            cancellation_accepted = true;
+                        }
+                        CancelStatus::AlreadyTerminal => {
+                            assert!(
+                                terminal_seq.is_some_and(|seq| seq > 0),
+                                "an already-terminal retry precondition carries its terminal sequence"
+                            );
+                            // The 240s start wait may consume the terminal and
+                            // Idle frames before it expires. The store's
+                            // already-terminal receipt is then the durable
+                            // teardown proof; there is nothing left to cancel.
+                            return;
+                        }
+                        other => panic!(
+                            "a timed-out process start may be retried only after active cancellation or authoritative terminal observation, got {other:?}"
+                        ),
+                    }
                 }
                 WireFrame::Event { envelope, .. } => {
                     let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload)
@@ -7342,12 +7469,31 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
         0,
     )
     .await;
-    let start = wait_for_exec_child_started(&mut client, &config, &run_id).await;
+    let start = wait_for_exec_child_started(&mut client, &config, &session_id, &run_id).await;
     #[cfg(not(windows))]
-    start.expect("exec child starts within the deadline");
+    assert_eq!(
+        start.expect("exec child starts within the deadline"),
+        ProcessStartObservation::Started
+    );
     #[cfg(windows)]
-    let (run_id, answerer, process_start_attempts) = if start.is_err() {
+    let retry_start = !matches!(start, Ok(ProcessStartObservation::Started));
+    #[cfg(windows)]
+    let (run_id, answerer, process_start_attempts) = if retry_start {
         drop(answerer);
+        let mut reconnects = 0;
+        let _ = tokio::time::timeout(
+            process_start_deadline(),
+            reconnect_exec_start_observer(
+                &mut client,
+                &config,
+                &session_id,
+                &run_id,
+                "cleanup",
+                &mut reconnects,
+            ),
+        )
+        .await
+        .expect("timed-out Windows process observer reconnects before cleanup");
         cancel_timed_out_process_start(
             &mut client,
             &config,
@@ -7403,14 +7549,23 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
             0,
         )
         .await;
-        wait_for_exec_child_started(&mut client, &config, &retry_run_id)
-            .await
-            .expect("exec child starts within the deadline on its single retry");
+        assert_eq!(
+            wait_for_exec_child_started(&mut client, &config, &session_id, &retry_run_id)
+                .await
+                .expect("exec child starts within the deadline on its single retry"),
+            ProcessStartObservation::Started,
+            "the single retry must start a live process tree"
+        );
         (retry_run_id, retry_answerer, 2_usize)
     } else {
         (run_id, answerer, 1_usize)
     };
     assert!(heartbeat.exists(), "real child started");
+    #[cfg(windows)]
+    assert!(
+        workspace.join("descendant-started.log").exists(),
+        "the descendant existed before cancellation"
+    );
     drop(answerer);
     send_request(
         &mut client,
@@ -7482,6 +7637,14 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
         stopped_size,
         "cancelled child or descendant kept running"
     );
+    #[cfg(windows)]
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+        assert!(
+            !workspace.join("descendant-survived.log").exists(),
+            "cancelled process left a surviving descendant"
+        );
+    }
     #[cfg(not(windows))]
     assert_eq!(fake.requests().len(), 1);
     #[cfg(windows)]

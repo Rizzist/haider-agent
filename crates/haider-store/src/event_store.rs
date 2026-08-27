@@ -19979,6 +19979,66 @@ mod run_head_projection_tests {
     }
 
     #[test]
+    fn terminal_failure_batch_matches_the_legacy_full_scan() {
+        let mut connection = Connection::open_in_memory().expect("open in-memory database");
+        migrations::migrate(&mut connection).expect("migrate database");
+        connection
+            .execute(
+                "INSERT INTO sessions(id, created_at_ms, meta_json) VALUES (?1, 1, '{}')",
+                ["run-head-session"],
+            )
+            .expect("insert terminal-test session");
+        let session_id = SessionId::new("run-head-session");
+        let run_id = RunId::new("load-stalled-run");
+
+        let mut active = vec![state(1, run_id.as_str(), None, RunState::Thinking)];
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin active append");
+        append_transaction_envelopes(&transaction, &session_id, 99, &mut active)
+            .expect("append active state");
+        transaction.commit().expect("commit active state");
+
+        let mut terminal = vec![
+            event(
+                2,
+                Some(run_id.as_str()),
+                None,
+                EventPayload::RunFailed {
+                    code: ErrorCode::ProviderError,
+                    message: "process start failed".into(),
+                    retryable: true,
+                    presentation: None,
+                },
+            ),
+            state(3, run_id.as_str(), None, RunState::Errored),
+            event(
+                4,
+                None,
+                None,
+                EventPayload::SessionState(SessionState::Idle { interrupted: false }),
+            ),
+        ];
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin terminal append");
+        append_transaction_envelopes(&transaction, &session_id, 100, &mut terminal)
+            .expect("append adjacent terminal facts");
+        transaction
+            .commit()
+            .expect("commit adjacent terminal facts");
+
+        let journal = active.into_iter().chain(terminal).collect::<Vec<_>>();
+        let legacy = legacy_run_states(&journal).expect("legacy full-scan state");
+        let projected = latest_run_state(&connection, &session_id, &run_id)
+            .expect("projected state query")
+            .expect("projected run exists");
+        assert_eq!(legacy.get(&run_id), Some(&projected));
+        assert_eq!(projected.0, RunState::Errored);
+        assert!(projected.0.is_terminal());
+    }
+
+    #[test]
     fn stateful_nonterminal_lookup_ignores_user_and_retry_only_heads() {
         let mut connection = Connection::open_in_memory().expect("open in-memory database");
         migrations::migrate(&mut connection).expect("migrate database");
