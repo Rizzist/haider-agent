@@ -294,6 +294,18 @@
       "response_method": "headless.run.stop",
       "request": {"method":"headless.run.stop","command_id":"command-headless-stop","run_id":"run-headless-1"},
       "response": {"method":"headless.run.stop","session_id":"session-1","run_id":"run-headless-1","status":"accepted"}
+    },
+    {
+      "request_method": "workflow.graph.state",
+      "response_method": "workflow.graph.state",
+      "request": {"method":"workflow.graph.state","session_id":"session-1"},
+      "response": {"method":"workflow.graph.state"}
+    },
+    {
+      "request_method": "workflow.graph.watch",
+      "response_method": "workflow.graph.watch",
+      "request": {"method":"workflow.graph.watch","session_id":"session-1","after_cursor":0,"limit":128},
+      "response": {"method":"workflow.graph.watch","page":{"requested_after_cursor":0,"replay_through_cursor":0,"next_cursor":0}}
     }
   ]
 }

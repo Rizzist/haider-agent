@@ -509,6 +509,8 @@ pub const FEATURE_PIPE_NATIVE_V2: &str = "pipe_native_v2";
 /// Native-pipe tool rows carry a typed, unknown-tolerant lifecycle status;
 /// clients never need to recover an outcome from presentation prose.
 pub const FEATURE_PIPE_TOOL_STATUS_V1: &str = "pipe_tool_status_v1";
+/// Event-sourced typed workflow activation state and cursor replay.
+pub const FEATURE_WORKFLOW_GRAPH_V1: &str = "workflow_graph_v1";
 
 /// Maximum UTF-8 bytes accepted for one mirrored input value or injected text.
 pub const SURFACE_INPUT_MAX_BYTES: usize = 64 * 1024;
@@ -3247,6 +3249,21 @@ pub enum RequestBody {
         command_id: CommandId,
         run_id: RunId,
     },
+    /// Indexed state of one typed workflow activation graph. Omission picks
+    /// the session's most recently changed activation graph.
+    #[serde(rename = "workflow.graph.state")]
+    WorkflowGraphState {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        graph_id: Option<GraphId>,
+    },
+    /// Replays durable activation facts strictly after the applied cursor.
+    #[serde(rename = "workflow.graph.watch")]
+    WorkflowGraphWatch {
+        session_id: SessionId,
+        after_cursor: u64,
+        limit: u32,
+    },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline). W3b answers it with a protocol error, not a panic.
     #[serde(other)]
@@ -3939,6 +3956,15 @@ pub enum ResponseBody {
         status: CancelStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         terminal_seq: Option<u64>,
+    },
+    #[serde(rename = "workflow.graph.state")]
+    WorkflowGraphState {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<haider_protocol::graph::WorkflowGraphState>,
+    },
+    #[serde(rename = "workflow.graph.watch")]
+    WorkflowGraphWatch {
+        page: haider_protocol::graph::WorkflowGraphWatchPage,
     },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline).

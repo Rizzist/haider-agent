@@ -1,9 +1,15 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use super::*;
-use haider_protocol::graph::{GraphEvidenceTally, GraphGateKind, GraphNodeStatus};
-use haider_protocol::ids::GraphId;
+use haider_protocol::graph::{
+    GraphEvidenceTally, GraphGateKind, GraphNodeStatus, WorkflowActivationCause,
+    WorkflowGraphJournalEvent, WorkflowGraphStarted, WorkflowGraphState, WorkflowNodeActivated,
+    WorkflowNodeInput, workflow_activation_ast_digest, workflow_activation_ast_from_loom,
+    workflow_input_ledger_digest,
+};
+use haider_protocol::ids::{ArtifactRef, GraphId};
 use haider_protocol::loom::{LoomTypeSig, compile_pipe, parse_pipe};
+use haider_protocol::pipe::InstructEvidenceRef;
 use haider_protocol::typed_agent::{TypedAgentInstallProgress, TypedAgentInstallState};
 
 fn record(clis: Vec<String>) -> LoomAgentType {
@@ -42,6 +48,65 @@ fn job(record: &LoomAgentType, state: TypedAgentInstallState) -> TypedAgentInsta
         created_at_ms: 1,
         updated_at_ms: 2,
     }
+}
+
+fn activated_graph(workflow: &LoomWorkflow, graph_id: &GraphId) -> WorkflowGraphState {
+    let ast = workflow_activation_ast_from_loom(workflow).expect("activation AST");
+    let seed = InstructEvidenceRef::new(
+        ArtifactRef::new(format!("blake3:{}", "a".repeat(64))),
+        ast.input_type.clone(),
+        1,
+        Vec::new(),
+    );
+    let mut state = WorkflowGraphState::from_started(
+        1,
+        WorkflowGraphStarted {
+            graph_id: graph_id.clone(),
+            ast_digest: workflow_activation_ast_digest(&ast),
+            ast,
+            seed: Some(seed.clone()),
+        },
+    )
+    .expect("started activation graph");
+    let node = workflow.meta[0].node.clone();
+    let edge_id = state.ast.nodes[0].join.initial_all[0];
+    let inputs = vec![WorkflowNodeInput {
+        edge_id,
+        evidence: seed,
+    }];
+    state
+        .apply(
+            2,
+            &WorkflowGraphJournalEvent::WorkflowNodeActivated(WorkflowNodeActivated {
+                graph_id: graph_id.clone(),
+                node,
+                iteration: 1,
+                activation_order: 1,
+                cause: WorkflowActivationCause::ForwardJoin,
+                input_ledger_digest: workflow_input_ledger_digest(&inputs),
+                inputs,
+            }),
+        )
+        .expect("node activation");
+    state
+}
+
+fn activation_input_payloads(state: &WorkflowGraphState) -> Vec<TypedWorkflowInputPayload> {
+    let node = state
+        .nodes
+        .iter()
+        .find(|node| node.phase == haider_protocol::graph::WorkflowNodePhase::Activated)
+        .expect("activated node");
+    node.inputs
+        .iter()
+        .map(|input| TypedWorkflowInputPayload {
+            edge_id: input.edge_id,
+            artifact: input.evidence.artifact.clone(),
+            evidence_type: input.evidence.evidence_type.clone(),
+            ledger_digest: input.evidence.ledger_digest.clone(),
+            content: "{\"seed\":true}".into(),
+        })
+        .collect()
 }
 
 #[test]
@@ -115,11 +180,19 @@ fn pinned_open_node_selects_its_type_without_model_arguments() {
         pending_menus: Vec::new(),
         run_set: None,
     };
+    let activation = activated_graph(&workflow, &status.graph_id);
+    let activation_inputs = activation_input_payloads(&activation);
 
-    let selected =
-        prepare_typed_workflow_node_dispatch(&workflow, &status, selected_record.clone(), None)
-            .expect("daemon binding")
-            .expect("typed node");
+    let selected = prepare_typed_workflow_node_dispatch(
+        &workflow,
+        &status,
+        Some(&activation),
+        &activation_inputs,
+        selected_record.clone(),
+        None,
+    )
+    .expect("daemon binding")
+    .expect("typed node");
     assert_eq!(selected.node, node);
     assert_eq!(selected.dispatch.record.id, "researcher");
     assert!(
@@ -128,17 +201,53 @@ fn pinned_open_node_selects_its_type_without_model_arguments() {
             .prompt
             .contains("Daemon-selected Loom node")
     );
+    assert!(
+        selected.dispatch.prompt.contains("data={\"seed\":true}"),
+        "the executor receives the CAS-verified evidence body, not only its address"
+    );
+
+    for phase in [
+        haider_protocol::graph::WorkflowNodePhase::Waiting,
+        haider_protocol::graph::WorkflowNodePhase::Rejected,
+    ] {
+        let mut inactive = activation.clone();
+        inactive.nodes[0].phase = phase;
+        let refusal = prepare_typed_workflow_node_dispatch(
+            &workflow,
+            &status,
+            Some(&inactive),
+            &activation_inputs,
+            selected_record.clone(),
+            None,
+        )
+        .expect_err("a legacy-ready typed node cannot bypass its activation phase");
+        assert_eq!(refusal.code, "typed_workflow_node_not_activated");
+    }
 
     let mut impostor = record(Vec::new());
     impostor.id = "impostor".into();
-    let refusal = prepare_typed_workflow_node_dispatch(&workflow, &status, impostor, None)
-        .expect_err("workflow metadata rejects type substitution");
+    let refusal = prepare_typed_workflow_node_dispatch(
+        &workflow,
+        &status,
+        Some(&activation),
+        &activation_inputs,
+        impostor,
+        None,
+    )
+    .expect_err("workflow metadata rejects type substitution");
     assert_eq!(refusal.code, "typed_workflow_type_mismatch");
 
     let mut revised = selected_record;
     revised.rev = revised.rev.saturating_add(1);
     revised.job = "A newly revised role contract.".into();
-    let refusal = prepare_typed_workflow_node_dispatch(&workflow, &status, revised, None)
-        .expect_err("pinned node rejects a changed registry contract");
+    let refusal = prepare_typed_workflow_node_dispatch(
+        &workflow,
+        &status,
+        Some(&activation),
+        &activation_inputs,
+        revised,
+        None,
+    )
+    .expect_err("pinned node rejects a changed registry contract");
     assert_eq!(refusal.code, "typed_workflow_contract_stale");
 }
