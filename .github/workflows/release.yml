@@ -564,5 +564,13 @@ jobs:
               Write-Output "::warning::haider $Version already exists on Chocolatey; treating the push as an idempotent no-op"
               exit 0
             }
+            if ($PushText -match '(?i)(403|Forbidden)') {
+              Write-Output "::warning::Chocolatey rejected the CHOCO_API_KEY (403 Forbidden). Regenerate the key at https://community.chocolatey.org/account and update the repository secret CHOCO_API_KEY; the release itself is unaffected."
+              exit 0
+            }
+            if ($PushText -match '(?i)(401|Unauthorized)') {
+              Write-Output "::warning::Chocolatey rejected the CHOCO_API_KEY (401 Unauthorized). Regenerate the key at https://community.chocolatey.org/account and update the repository secret CHOCO_API_KEY; the release itself is unaffected."
+              exit 0
+            }
             exit $PushExit
           }
