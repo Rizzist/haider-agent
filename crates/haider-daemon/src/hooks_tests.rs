@@ -10,6 +10,7 @@ use super::{
     make_output, next_subscriber_backoff, prepare_hook_input, prune_terminal_run_trust,
     reduce_durable_state, run_command,
 };
+use crate::runtime::finish_hook_hydration_for_test;
 use crate::session_hub::{SessionHub, SessionHubConfig};
 #[cfg(windows)]
 use base64::Engine as _;
@@ -443,8 +444,7 @@ async fn structurally_inconsistent_hook_snapshot_replays_from_zero_cleanly() {
         .expect("corrupt snapshot is a cache miss");
     assert_eq!(hydration.scan_start(&session_id), 0);
     assert!(!hydration.state.sessions.contains_key(&session_id));
-    hydration
-        .catch_up_session(&store, &session_id)
+    hydration = finish_hook_hydration_for_test(&store, hydration)
         .await
         .expect("full hook fallback");
     assert_eq!(hydration.scan_start(&session_id), journal[0].seq);
@@ -502,8 +502,7 @@ async fn checksum_mismatched_hook_snapshot_replays_from_zero_cleanly() {
         .await
         .expect("checksum mismatch is a cache miss");
     assert_eq!(hydration.scan_start(&session_id), 0);
-    hydration
-        .catch_up_session(&store, &session_id)
+    hydration = finish_hook_hydration_for_test(&store, hydration)
         .await
         .expect("full checksum fallback");
     assert!(hydration.state.run_trust.contains(&(session_id, run_id)));
@@ -582,8 +581,7 @@ async fn valid_hook_snapshot_preserves_intent_until_ask_suffix_binds_it() {
         .await
         .expect("load valid intent snapshot");
     assert_eq!(hydration.scan_start(&session_id), prefix[0].seq);
-    hydration
-        .catch_up_session(&store, &session_id)
+    hydration = finish_hook_hydration_for_test(&store, hydration)
         .await
         .expect("fold ask suffix");
     let decision = hydration

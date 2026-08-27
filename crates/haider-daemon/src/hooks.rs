@@ -68,16 +68,6 @@ type DirectoryOpenError = std::io::Error;
 
 const HOOKS_FILE: &str = "hooks.json";
 const MAX_HOOK_CONFIG_BYTES: usize = 1024 * 1024;
-const HOOK_HYDRATION_PAGE_ENVELOPES: usize = 1_024;
-const HOOK_HYDRATION_PAGE_BYTES: usize = 4 * 1_024 * 1_024;
-pub(crate) const HOOK_HYDRATION_PAYLOAD_KINDS: &[&str] = &[
-    "effect",
-    "hook_run_trust",
-    "menu_opened",
-    "menu_answered",
-    "menu_closed",
-    "run_state",
-];
 const MAX_HOOK_ANCESTORS: usize = 256;
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 300_000;
@@ -677,8 +667,8 @@ impl HookEngine {
         store: haider_core::SqliteStoreHandle,
         hub: SessionHub,
     ) -> Result<(HookService, Self), haider_protocol::error::HaiderError> {
-        let mut hydration = HookStartupHydrator::prepare(&store).await?;
-        hydration.catch_up_all(&store).await?;
+        let hydration = HookStartupHydrator::prepare(&store).await?;
+        let hydration = crate::runtime::finish_hook_hydration_for_test(&store, hydration).await?;
         Self::start_with_state(profile_root, store, hub, hydration.into_state()).await
     }
 
@@ -944,11 +934,9 @@ struct HookEngineSnapshotFile {
 }
 
 /// Compact hook reducer state prepared before the shared startup scan.
-/// Runtime feeds it the same decoded pages as turn recovery; standalone hook
-/// tests use `catch_up_all`, which preserves the public start seam.
+/// Runtime feeds it the same decoded pages as turn recovery.
 pub(crate) struct HookStartupHydrator {
     state: EngineState,
-    session_ids: Vec<SessionId>,
 }
 
 impl HookStartupHydrator {
@@ -1041,7 +1029,7 @@ impl HookStartupHydrator {
                 clear_hook_session(&mut state, session_id);
             }
         }
-        Ok(Self { state, session_ids })
+        Ok(Self { state })
     }
 
     pub(crate) fn scan_start(&self, session_id: &SessionId) -> u64 {
@@ -1078,42 +1066,6 @@ impl HookStartupHydrator {
                 hook_boundary_event_id_digest(boundary_event_id),
             );
         }
-    }
-
-    pub(crate) async fn catch_up_session(
-        &mut self,
-        store: &haider_core::SqliteStoreHandle,
-        session_id: &SessionId,
-    ) -> Result<(), haider_protocol::error::HaiderError> {
-        loop {
-            let since_seq = self.scan_start(session_id);
-            let page = store
-                .read_reducer_page_with_boundary(
-                    session_id,
-                    since_seq,
-                    HOOK_HYDRATION_PAGE_ENVELOPES,
-                    HOOK_HYDRATION_PAGE_BYTES,
-                    HOOK_HYDRATION_PAYLOAD_KINDS,
-                )
-                .await?;
-            if page.envelopes.is_empty() {
-                if let Some((through_seq, boundary_event_id)) = page.observed_head {
-                    self.advance_through(session_id, through_seq, &boundary_event_id);
-                }
-                return Ok(());
-            }
-            self.fold_page(session_id, &page.envelopes);
-        }
-    }
-
-    async fn catch_up_all(
-        &mut self,
-        store: &haider_core::SqliteStoreHandle,
-    ) -> Result<(), haider_protocol::error::HaiderError> {
-        for session_id in self.session_ids.clone() {
-            self.catch_up_session(store, &session_id).await?;
-        }
-        Ok(())
     }
 
     fn into_state(self) -> EngineState {

@@ -112,17 +112,39 @@ struct StartupHydration {
 
 impl StartupHydration {
     async fn prepare(store: &SqliteStoreHandle) -> Result<Self, HaiderError> {
-        Ok(Self {
+        Ok(Self::with_hooks(
+            store,
+            HookStartupHydrator::prepare(store).await?,
+        ))
+    }
+
+    fn with_hooks(store: &SqliteStoreHandle, hooks: HookStartupHydrator) -> Self {
+        Self {
             store: store.clone(),
-            hooks: HookStartupHydrator::prepare(store).await?,
+            hooks,
             pipe_native: Arc::new(PipeNativeWriter::new(store.root())),
             pipe_session: None,
-        })
+        }
     }
 
     fn into_parts(self) -> (HookStartupHydrator, Arc<PipeNativeWriter>) {
         (self.hooks, self.pipe_native)
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn finish_hook_hydration_for_test(
+    store: &SqliteStoreHandle,
+    hooks: HookStartupHydrator,
+) -> Result<HookStartupHydrator, HaiderError> {
+    let mut startup = StartupHydration::with_hooks(store, hooks);
+    recover_interrupted_turns_report_with_visitor(
+        store,
+        &DeviceId::new("hook-test-shared-hydration"),
+        &mut startup,
+    )
+    .await?;
+    Ok(startup.into_parts().0)
 }
 
 #[async_trait::async_trait]
