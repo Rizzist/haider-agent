@@ -901,9 +901,25 @@ impl EffectBroker {
         #[cfg(windows)]
         set_anchored_current_dir(&mut command, &cwd_fd);
         haider_platform::configure_process_group(&mut command);
+        #[cfg(windows)]
+        let process_trace = windows_test_process_trace_enabled();
+        #[cfg(windows)]
+        if process_trace {
+            let configured = command.as_std();
+            eprintln!(
+                "haider-daemon windows-process phase=spawn-begin program={} args_len={} cwd={}",
+                configured.get_program().to_string_lossy(),
+                configured.get_args().count(),
+                operation.cwd.display(),
+            );
+        }
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
+                #[cfg(windows)]
+                if process_trace {
+                    eprintln!("haider-daemon windows-process phase=spawn-failed error={error}");
+                }
                 return self
                     .finish(
                         &intent,
@@ -926,7 +942,9 @@ impl EffectBroker {
         // The in-process daemon test harness streams stderr under --nocapture;
         // keep this after successful OS spawn so absence distinguishes a
         // pre-spawn stall from an unobserved child.
-        eprintln!("haider-daemon windows-process phase=daemon-spawned pid={raw_pid}");
+        if process_trace {
+            eprintln!("haider-daemon windows-process phase=daemon-spawned pid={raw_pid}");
+        }
         let platform_group = match haider_platform::register_process_group(raw_pid) {
             Ok(group) => group,
             Err(error) => {
@@ -1016,6 +1034,8 @@ impl EffectBroker {
                 cas: Box::new(cas),
                 output: Arc::new(output),
                 bounds,
+                #[cfg(windows)]
+                process_trace,
             })
             .await;
             if !process_result.leaked {
@@ -1127,6 +1147,8 @@ struct Supervisor {
     cas: Box<dyn CasSink>,
     output: Arc<dyn CommandOutputSink>,
     bounds: ProcessBounds,
+    #[cfg(windows)]
+    process_trace: bool,
 }
 
 struct SupervisorCompletion {
@@ -1211,6 +1233,8 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
         mut cas,
         output,
         bounds,
+        #[cfg(windows)]
+        process_trace,
     } = supervisor;
     let (captured_sender, mut captured) = mpsc::channel(1);
     tokio::spawn(read_output(
@@ -1249,6 +1273,8 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
     let mut wall_deadline = Box::pin(sleep(bounds.wall_timeout));
     let mut wall_deadline_open = true;
     let mut exit_observation = Box::pin(observe_process_leader_exit(pid));
+    #[cfg(windows)]
+    let mut first_output_traced = false;
 
     if cancelled {
         begin_group_termination(
@@ -1316,6 +1342,14 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
             maybe_chunk = captured.recv(), if output_open => {
                 match maybe_chunk {
                     Some(Captured::Chunk(stream, mut bytes)) => {
+                        #[cfg(windows)]
+                        if process_trace && !first_output_traced {
+                            first_output_traced = true;
+                            eprintln!(
+                                "haider-daemon windows-process phase=first-output bytes={}",
+                                bytes.len()
+                            );
+                        }
                         if cancelled || limit_reached.is_some() {
                             continue;
                         }
@@ -1481,6 +1515,12 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                         &mut lifecycle_events,
                     )
                     .await;
+                    #[cfg(windows)]
+                    if process_trace && let Some(status) = exit_status.as_ref() {
+                        eprintln!(
+                            "haider-daemon windows-process phase=child-exited status={status}"
+                        );
+                    }
                     leader_reaped = true;
                     if output_open {
                         pipe_drain_deadline = Some(Box::pin(sleep(bounds.kill_grace)));
@@ -1541,6 +1581,12 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                         &mut lifecycle_events,
                     )
                     .await;
+                    #[cfg(windows)]
+                    if process_trace && let Some(status) = exit_status.as_ref() {
+                        eprintln!(
+                            "haider-daemon windows-process phase=child-exited status={status}"
+                        );
+                    }
                     leader_reaped = true;
                     if output_open {
                         pipe_drain_deadline = Some(Box::pin(sleep(bounds.kill_grace)));
@@ -1644,6 +1690,11 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
         leaked: group_leaked,
         escalation_note,
     }
+}
+
+#[cfg(windows)]
+fn windows_test_process_trace_enabled() -> bool {
+    std::env::var("HAIDER_TEST_PROCESS_TRACE").is_ok_and(|value| value == "1")
 }
 
 pub(crate) async fn read_output<R>(

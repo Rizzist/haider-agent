@@ -647,6 +647,135 @@ fn process_start_deadline() -> std::time::Duration {
     }
 }
 
+#[cfg(windows)]
+const OBSERVED_FRAME_TRACE_LIMIT: usize = 200;
+
+#[cfg(windows)]
+struct WindowsProcessStartTrace {
+    test_name: &'static str,
+    started_at: tokio::time::Instant,
+    observed_frames: usize,
+}
+
+#[cfg(windows)]
+impl WindowsProcessStartTrace {
+    fn new(test_name: &'static str, run_id: &RunId, heartbeat: &std::path::Path) -> Self {
+        eprintln!(
+            "haider-daemond windows-process test={test_name} phase=first-start-wait-begin run_id={run_id} heartbeat={} exists={}",
+            heartbeat.display(),
+            heartbeat.exists(),
+        );
+        Self {
+            test_name,
+            started_at: tokio::time::Instant::now(),
+            observed_frames: 0,
+        }
+    }
+
+    fn heartbeat_started(&self, heartbeat: &std::path::Path) -> bool {
+        let bytes = fs::metadata(heartbeat).map_or(0, |metadata| metadata.len());
+        eprintln!(
+            "haider-daemond windows-process test={} phase=heartbeat-size bytes={bytes} elapsed_ms={}",
+            self.test_name,
+            self.started_at.elapsed().as_millis(),
+        );
+        bytes > 1
+    }
+
+    fn observed_frame(&mut self, frame: &WireFrame) {
+        if self.observed_frames < OBSERVED_FRAME_TRACE_LIMIT {
+            eprintln!(
+                "haider-daemond windows-process test={} phase=observed-frame kind={} elapsed_ms={}",
+                self.test_name,
+                observed_frame_kind(frame),
+                self.started_at.elapsed().as_millis(),
+            );
+        } else if self.observed_frames == OBSERVED_FRAME_TRACE_LIMIT {
+            eprintln!(
+                "haider-daemond windows-process test={} phase=observed-frame-cap elapsed_ms={}",
+                self.test_name,
+                self.started_at.elapsed().as_millis(),
+            );
+        }
+        self.observed_frames = self.observed_frames.saturating_add(1);
+    }
+}
+
+#[cfg(windows)]
+fn observed_frame_kind(frame: &WireFrame) -> String {
+    match frame {
+        WireFrame::Hello(_) => "Hello".into(),
+        WireFrame::Welcome(_) => "Welcome".into(),
+        WireFrame::Request { .. } => "Request".into(),
+        WireFrame::Response { .. } => "Response".into(),
+        WireFrame::Event { envelope, .. } => observed_event_kind(envelope),
+        WireFrame::AttachCaughtUp { .. } => "AttachCaughtUp".into(),
+        WireFrame::SessionRosterDelta { .. } => "SessionRosterDelta".into(),
+        WireFrame::AccountsChanged { .. } => "AccountsChanged".into(),
+        WireFrame::HaiderCodePlanStatus { .. } => "HaiderCodePlanStatus".into(),
+        WireFrame::ResidentSessionBinding { .. } => "ResidentSessionBinding".into(),
+        WireFrame::SessionSurfaceDelta { .. } => "SessionSurfaceDelta".into(),
+        WireFrame::SessionInputInjected { .. } => "SessionInputInjected".into(),
+        WireFrame::MenuAnswer { .. } => "MenuAnswer".into(),
+        WireFrame::Lagged { .. } => "Lagged".into(),
+        WireFrame::ServerDraining { .. } => "ServerDraining".into(),
+        WireFrame::Ping { .. } => "Ping".into(),
+        WireFrame::Pong { .. } => "Pong".into(),
+        WireFrame::ProtocolError(_) => "ProtocolError".into(),
+        WireFrame::SessionDescendantStream { .. } => "SessionDescendantStream".into(),
+        WireFrame::SessionDescendantRepairRequired { .. } => {
+            "SessionDescendantRepairRequired".into()
+        }
+        WireFrame::MonitorDelivery { .. } => "MonitorDelivery".into(),
+        WireFrame::MonitorDeliveryCaughtUp { .. } => "MonitorDeliveryCaughtUp".into(),
+        WireFrame::LoomRegistryDelta { .. } => "LoomRegistryDelta".into(),
+        WireFrame::LoomRegistryCaughtUp { .. } => "LoomRegistryCaughtUp".into(),
+        WireFrame::Unknown => "Unknown".into(),
+        _ => "Other".into(),
+    }
+}
+
+#[cfg(windows)]
+fn observed_event_kind(envelope: &RawEnvelope) -> String {
+    let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+        return "Event/Unparsed".into();
+    };
+    match payload {
+        EventPayload::RunState(state) => format!("Event/RunState/{state:?}"),
+        EventPayload::Item(ItemEvent::Started { item, .. }) => observed_item_kind("Started", &item),
+        EventPayload::Item(ItemEvent::Delta { delta, .. }) => match delta {
+            ItemDelta::Text { .. } => "Event/Item/Delta/Text".into(),
+            ItemDelta::Reasoning { .. } => "Event/Item/Delta/Reasoning".into(),
+            ItemDelta::ToolArgs { .. } => "Event/Item/Delta/ToolArgs".into(),
+            ItemDelta::CommandOutput { .. } => "Event/Item/Delta/CommandOutput".into(),
+        },
+        EventPayload::Item(ItemEvent::Completed { item, .. }) => {
+            observed_item_kind("Completed", &item)
+        }
+        _ => format!(
+            "Event/{}",
+            envelope
+                .payload
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("UnknownPayload")
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn observed_item_kind(event: &str, item: &TurnItem) -> String {
+    match item {
+        TurnItem::ToolCall { status, .. } => {
+            format!("Event/Item/{event}/ToolCall:{status:?}")
+        }
+        TurnItem::CommandExecution { status, .. } => {
+            format!("Event/Item/{event}/CommandExecution:{status:?}")
+        }
+        _ => format!("Event/Item/{event}"),
+    }
+}
+
 async fn wait_for_direct_shell_process_tree(
     client: &mut UdsClient,
     config: &DaemonConfig,
@@ -676,11 +805,16 @@ async fn wait_for_direct_shell_process_tree(
     }
     #[cfg(windows)]
     {
+        let mut trace = WindowsProcessStartTrace::new(
+            "w8a_shell_exec_cancel_kills_the_process_tree",
+            _run_id,
+            heartbeat,
+        );
         tokio::time::timeout(process_start_deadline(), async {
             let mut poll = tokio::time::interval(std::time::Duration::from_millis(10));
             poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                if fs::metadata(heartbeat).is_ok_and(|metadata| metadata.len() > 1) {
+                if trace.heartbeat_started(heartbeat) {
                     return ProcessStartObservation::Started;
                 }
                 tokio::select! {
@@ -692,6 +826,7 @@ async fn wait_for_direct_shell_process_tree(
                             );
                             panic!("direct-shell process-start observer reached EOF");
                         };
+                        trace.observed_frame(&frame);
                         if let WireFrame::Event { envelope, .. } = frame
                             && run_terminal(&envelope, _run_id)
                         {
@@ -712,13 +847,19 @@ async fn wait_for_exec_child_started(
     run_id: &RunId,
     _heartbeat: &std::path::Path,
 ) -> Result<ProcessStartObservation, tokio::time::error::Elapsed> {
+    #[cfg(windows)]
+    let mut trace = WindowsProcessStartTrace::new(
+        "w4a2_cancelled_exec_child_process_group_dies",
+        run_id,
+        _heartbeat,
+    );
     tokio::time::timeout(process_start_deadline(), async {
         #[cfg(windows)]
         let mut reconnects = 0_u64;
         let mut output_tail = Vec::new();
         loop {
             #[cfg(windows)]
-            if fs::metadata(_heartbeat).is_ok_and(|metadata| metadata.len() > 1) {
+            if trace.heartbeat_started(_heartbeat) {
                 return ProcessStartObservation::Started;
             }
             #[cfg(not(windows))]
@@ -726,6 +867,7 @@ async fn wait_for_exec_child_started(
             #[cfg(windows)]
             let frame = loop {
                 if let Some(frame) = client.try_next_with_keepalive(config.frame_limit).await {
+                    trace.observed_frame(&frame);
                     break frame;
                 }
                 // Reattach from the durable beginning so no terminal or start
@@ -738,6 +880,7 @@ async fn wait_for_exec_child_started(
                     _heartbeat,
                     "wait",
                     &mut reconnects,
+                    &mut trace,
                 )
                 .await
                 {
@@ -766,6 +909,7 @@ enum ProcessStartObservation {
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 async fn reconnect_exec_start_observer(
     client: &mut UdsClient,
     config: &DaemonConfig,
@@ -774,6 +918,7 @@ async fn reconnect_exec_start_observer(
     heartbeat: &std::path::Path,
     phase: &str,
     reconnects: &mut u64,
+    trace: &mut WindowsProcessStartTrace,
 ) -> Option<ProcessStartObservation> {
     loop {
         *reconnects += 1;
@@ -817,12 +962,13 @@ async fn reconnect_exec_start_observer(
         let mut terminal_seen = false;
         let mut output_tail = Vec::new();
         loop {
-            if fs::metadata(heartbeat).is_ok_and(|metadata| metadata.len() > 1) {
+            if trace.heartbeat_started(heartbeat) {
                 return Some(ProcessStartObservation::Started);
             }
             let Some(frame) = client.try_next_with_keepalive(config.frame_limit).await else {
                 break;
             };
+            trace.observed_frame(&frame);
             match frame {
                 WireFrame::Response {
                     body: ResponseBody::SessionAttach { .. },
@@ -905,6 +1051,7 @@ enum RetryPreconditionDisposition {
 }
 
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 async fn settle_process_start_attempt_before_retry(
     client: &mut UdsClient,
     config: &DaemonConfig,
@@ -7692,6 +7839,14 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
     #[cfg(windows)]
     let _windows_process_test =
         windows_real_process_test_guard("w4a2_cancelled_exec_child_process_group_dies").await;
+    #[cfg(windows)]
+    // SAFETY: Windows owns environment storage and permits process-wide
+    // mutation while other threads exist. This test-only key is set before the
+    // in-process daemon starts and is never consumed as application input.
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::set_var("HAIDER_TEST_PROCESS_TRACE", "1");
+    }
     let root = test_root("w4a2-exec-cancel-");
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).expect("workspace");

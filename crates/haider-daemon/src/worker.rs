@@ -161,6 +161,18 @@ const SUPERVISOR_CAPACITY: usize = 64;
 const COMPUTER_PERMISSION_POLL_TIMEOUT: Duration = Duration::from_secs(120);
 const COMPUTER_PERMISSION_MENU_ORIGIN: &str = "computer-os-permission";
 
+#[cfg(windows)]
+fn windows_test_process_trace_enabled() -> bool {
+    std::env::var("HAIDER_TEST_PROCESS_TRACE").is_ok_and(|value| value == "1")
+}
+
+#[cfg(windows)]
+fn trace_windows_process_publish(kind: &str, run_id: &RunId) {
+    if windows_test_process_trace_enabled() {
+        eprintln!("haider-daemon windows-process phase=publish kind={kind} run_id={run_id}");
+    }
+}
+
 /// A provider resolved and pinned for one logical turn (R6).
 pub struct ResolvedTurnProvider {
     pub provider: Arc<dyn Provider>,
@@ -7952,6 +7964,10 @@ async fn append_payloads(
     event_ids: &EventIdGenerator,
     payloads: Vec<EventPayload>,
 ) -> Result<(), HaiderError> {
+    #[cfg(windows)]
+    let publishes_terminal = payloads
+        .iter()
+        .any(|payload| matches!(payload, EventPayload::RunState(state) if state.is_terminal()));
     let mut envelopes = Vec::with_capacity(payloads.len());
     for payload in payloads {
         let payload_run_id =
@@ -7966,6 +7982,10 @@ async fn append_payloads(
         )?);
     }
     haider_core::StoreHandle::append(store, &mut envelopes).await?;
+    #[cfg(windows)]
+    if publishes_terminal {
+        trace_windows_process_publish("Terminal", run_id);
+    }
     Ok(())
 }
 
@@ -8072,6 +8092,10 @@ async fn append_shell_payloads(
     event_ids: &EventIdGenerator,
     payloads: Vec<EventPayload>,
 ) -> Result<(), HaiderError> {
+    #[cfg(windows)]
+    let publishes_terminal = payloads
+        .iter()
+        .any(|payload| matches!(payload, EventPayload::RunState(state) if state.is_terminal()));
     let mut envelopes = Vec::with_capacity(payloads.len());
     for payload in payloads {
         let prompt = matches!(
@@ -8097,6 +8121,10 @@ async fn append_shell_payloads(
         envelopes.push(envelope);
     }
     StoreHandle::append(store, &mut envelopes).await?;
+    #[cfg(windows)]
+    if publishes_terminal {
+        trace_windows_process_publish("Terminal", run_id);
+    }
     Ok(())
 }
 
@@ -12408,6 +12436,10 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     .await
             }
             RegisteredToolRoute::ProcessExec => {
+                #[cfg(windows)]
+                // Core durably commits RunningTool before dispatch enters this
+                // exec arm, so reaching this boundary confirms its publication.
+                trace_windows_process_publish("RunningTool", run_id);
                 let parsed = self.cached_tool_operation(&operation_key, args.as_ref())?;
                 let ParsedToolOperation::ProcessExec {
                     operation,
@@ -14827,6 +14859,8 @@ impl CommandOutputSink for HubCommandOutputSink {
             .map_err(|error| haider_tools::ToolError::Runtime {
                 message: error.message,
             })?;
+        #[cfg(windows)]
+        trace_windows_process_publish("CommandOutputDelta", &self.run_id);
         Ok(())
     }
 }
