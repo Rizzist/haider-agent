@@ -276,6 +276,24 @@
       "response_method": "monitor.watch",
       "request": {"method":"monitor.watch","session_id":"session-1","after_cursor":40},
       "response": {"method":"monitor.watch","receipt":{"session_id":"session-1","policy":{"list":"view","register":"control","register_requires_control_attachment":true,"remove":"control","remove_requires_control_attachment":true,"watch":"view"},"sources":[{"source":"sms","availability":{"state":"available"}},{"source":"process","availability":{"state":"unavailable","reason":"adapter_inactive"}},{"source":"file","availability":{"state":"unavailable","reason":"adapter_inactive"}},{"source":"poll","availability":{"state":"unavailable","reason":"adapter_inactive"}},{"source":"timer","availability":{"state":"unavailable","reason":"adapter_inactive"}}],"outcome":{"status":"watching","watch_id":"monitor-watch-1","requested_after_cursor":40,"replay_through_cursor":44}}}
+    },
+    {
+      "request_method": "headless.run.start",
+      "response_method": "headless.run.start",
+      "request": {"method":"headless.run.start","command_id":"command-headless-start","session_id":"session-1","worker_generation":7,"text":"ship it","attachments":[],"spec":{"cwd":"/workspace","provider":"fake","model":"fake-model","max_output_tokens":4096,"fast":false},"trust_hooks":false},
+      "response": {"method":"headless.run.start","session_id":"session-1","run_id":"run-headless-1","accepted_seq":8,"worker_generation":7,"disposition":"started"}
+    },
+    {
+      "request_method": "headless.run.status",
+      "response_method": "headless.run.status",
+      "request": {"method":"headless.run.status","run_id":"run-headless-1"},
+      "response": {"method":"headless.run.status","session_id":"session-1","run_id":"run-headless-1","worker_generation":7,"state":{"state":"queued"},"head_seq":8,"spec":{"cwd":"/workspace","provider":"fake","model":"fake-model","max_output_tokens":4096,"fast":false}}
+    },
+    {
+      "request_method": "headless.run.stop",
+      "response_method": "headless.run.stop",
+      "request": {"method":"headless.run.stop","command_id":"command-headless-stop","run_id":"run-headless-1"},
+      "response": {"method":"headless.run.stop","session_id":"session-1","run_id":"run-headless-1","status":"accepted"}
     }
   ]
 }

@@ -198,8 +198,8 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
         welcome_features().len(),
-        85,
-        "the ordinary Welcome advertises all 78 base and seven v0.0.962 feature tokens"
+        87,
+        "the ordinary Welcome advertises all 85 prior and two v0.0.963 headless feature tokens"
     );
     assert_eq!(
         welcome_features(),
@@ -228,6 +228,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_HOOKS_SERVER_V1.to_owned(),
             FEATURE_HOOKS_V1.to_owned(),
             haider_rpc::FEATURE_FALLBACK_CHAIN_V1.to_owned(),
+            haider_rpc::FEATURE_HEADLESS_RUN_V1.to_owned(),
             haider_rpc::FEATURE_HAIDER_CODE_PLAN_STATUS_V1.to_owned(),
             haider_rpc::FEATURE_LOOM_CLI_PRESENCE_V1.to_owned(),
             haider_rpc::FEATURE_TYPED_AGENT_INSTALL_V1.to_owned(),
@@ -254,6 +255,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_RESIDENT_SESSION_BINDING_V1.to_owned(),
             haider_rpc::FEATURE_RESIDENT_SESSION_BINDING_TOKEN_V1.to_owned(),
             haider_rpc::FEATURE_RUN_RETRY_V1.to_owned(),
+            haider_rpc::FEATURE_RUN_BUDGET_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_EFFORT_SELECT_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_FAST_SELECT_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_MODEL_SELECT_V1.to_owned(),

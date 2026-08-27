@@ -20,6 +20,7 @@ pub mod effect;
 pub mod envelope;
 pub mod error;
 pub mod graph;
+pub mod headless;
 pub mod history;
 pub mod hook;
 pub mod ids;

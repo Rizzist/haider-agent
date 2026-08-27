@@ -1,16 +1,17 @@
 # Client contract v1 — wire enum audit
 
-Status: normative appendix to [Haider client contract revision 1](client-contract-v1.md)  
-Audited source snapshot: 2026-08-24
+Status: normative appendix for the entries enumerated below
+Method-tag and headless additions checked against source: 2026-08-27
 
-This audit covers every serialized enum reachable from the v1 client frame
-surface in `haider-rpc` and `haider-protocol`, including typed decoders layered
-over `RawEnvelope.payload`. It also records the few serialized protocol IR
-enums that can be retained inside raw extension data. It excludes local-only
-Rust enums such as `WireEncoding`, codec errors, palette implementation values,
-and decoder state because they have no serialized client representation.
+This audit records the serialized enums enumerated below, including typed
+decoders layered over `RawEnvelope.payload`. Its method-tag spellings and
+v0.0.963 headless entries are current at the date above. It is not a refreshed
+census of every direct enum added by intervening feature work; §14 of the main
+contract supplies explicit supplemental classifications. Local-only Rust enums
+such as `WireEncoding`, codec errors, palette implementation values, and
+decoder state are outside the serialized client surface.
 
-Every enum has exactly one expansion class:
+Every enum listed here has exactly one expansion class:
 
 - **Extensible with Unknown**: the serialized type has `#[serde(other)]` or a
   custom unknown-string carrier. A new variant may use the same field/type; an
@@ -74,6 +75,7 @@ Provider-row health (`ProviderAvailabilityWire`) and whole-subsystem health
 | Module | Enums | Notes |
 |---|---|---|
 | `error` | `ErrorCode` | unknown code maps to `Unknown`; presentation remains available |
+| `headless` | `RunBudgetDimensionV1` | an unknown budget dimension remains terminal but non-actionable |
 | `provider` | `CacheBreakpointV1`, `CachePrefixMatchV1`, `CacheControlOmissionReasonV1`, `CacheControlObservationV1`, `CacheRewarmReasonV1`, `CacheMissClassificationV1`, `UsageRequestKind` | unknown cache evidence must not become a hit, miss, or available measurement |
 | `session_fork` | `SessionForkMode`, `ForkContextEpoch`, `SessionForkEventPayload` | each has a serde catch-all; unknown event remains non-actionable |
 | `usage` | `HaiderCodeAllowanceStateV1` | custom string decoder preserves the exact unknown provider string |
@@ -96,6 +98,7 @@ not know the new shape.
 | `credential` | `RotationCause` |
 | `effect` | `AuthorizationVerdict`, `AuthorizationSource`, `EffectPhase`, `EffectOutcome` |
 | `history` | `NodeKind`, `CompactionResume`, `AnnotationKind`, `TodoState` |
+| `headless` | `HeadlessRunEventPayload` |
 | `hook` | `HookInput`, `HookEventPayload`, `HookRuntimeKind`, `HookDecisionKind`, `HookSubscriptionState`, `HookVerdict`, `StartupGateKind` |
 | `item` | `CommandExecutionOrigin`, `TurnItem`, `ToolStatus`, `ItemEvent`, `ItemDelta`, `OutputStream` |
 | crate root | `EventPayload` |
@@ -252,7 +255,12 @@ appendix list every spelling in context.
 - `ErrorAction` (`crates/haider-protocol/src/error.rs:89`):
   `"retry"` | `"relogin"` | `"reimport"` | `"edit_key"` | `"switch_account"` | `"top_up"` | `"wait"` | `"choose_model"` | `"contact_admin"` | `"continue_partial"` | `"retry_fresh"` | `"none"`.
 - `ErrorCode` (`crates/haider-protocol/src/error.rs:301`):
-  `"invalid_argument"` | `"unknown_method"` | `"protocol_mismatch"` | `"unauthorized"` | `"credential_missing"` | `"credential_limited"` | `"session_not_found"` | `"run_not_active"` | `"menu_not_found"` | `"menu_already_answered"` | `"single_writer_violation"` | `"busy"` | `"revision_conflict"` | `"loop_limit"` | `"graph_already_active"` | `"graph_not_active"` | `"graph_wrong_node"` | `"provider_error"` | `"provider_timeout"` | `"vision_unsupported"` | `"store_corrupt"` | `"store_locked"` | `"store_full"` | `"store_read_only"` | `"store_unavailable"` | `"permission_denied"` | `"effect_unknown_outcome"` | `"internal"` | `"unknown"`; any other string → Rust `Unknown`.
+  `"invalid_argument"` | `"unknown_method"` | `"protocol_mismatch"` | `"unauthorized"` | `"credential_missing"` | `"credential_limited"` | `"session_not_found"` | `"run_not_active"` | `"menu_not_found"` | `"menu_already_answered"` | `"single_writer_violation"` | `"busy"` | `"revision_conflict"` | `"loop_limit"` | `"workflow_unfinished"` | `"graph_already_active"` | `"graph_not_active"` | `"graph_wrong_node"` | `"provider_error"` | `"provider_timeout"` | `"vision_unsupported"` | `"store_corrupt"` | `"store_locked"` | `"store_full"` | `"store_read_only"` | `"store_unavailable"` | `"permission_denied"` | `"effect_unknown_outcome"` | `"internal"` | `"budget_exhausted"` | `"unknown"`; any other string → Rust `Unknown`.
+
+### `crates/haider-protocol/src/headless.rs`
+
+- `HeadlessRunEventPayload` (`type` tag): `"headless_run_configured"` | `"run_budget_exhausted"`. Unknown headless event kinds remain preserved in `RawEnvelope.payload`; this focused typed decoder returns no value for them.
+- `RunBudgetDimensionV1`: `"tokens"` | `"cost"` | `"time"` | `"unknown"`; any other string → Rust `Unknown`.
 
 ### `crates/haider-protocol/src/graph.rs`
 
@@ -513,15 +521,15 @@ appendix list every spelling in context.
   `"queued"` | `"live"` | `"waiting"` | `"done"` | `"failed"` | `"cancelled"` | `"unknown"`; any other string → Rust `Unknown`.
 - `HookTrustStateWire` (`crates/haider-rpc/src/frame.rs:1565`):
   `"trusted"` | `"untrusted"` | `"revoked_by_edit"`.
-- `RequestBody` (`crates/haider-rpc/src/frame.rs:1578`; `method` tag):
-  `"command.list"` | `"command.invoke"` | `"artifact.put"` | `"session.create"` | `"session.list"` | `"session.list_watch"` | `"session.surface_publish"` | `"session.surface_watch"` | `"session.input_inject"` | `"session.pipe_path"` | `"session.read"` | `"session.observe"` | `"session.observe_batch"` | `"session.fleet"` | `"graph.pin"` | `"graph.run_set.open"` | `"graph.switch"` | `"graph.abandon"` | `"graph.status"` | `"loom.list"` | `"loom.register_agent_type"` | `"loom.register_workflow"` | `"graph.inspect"` | `"session.diagnostic"` | `"hooks.list"` | `"hooks.trust"` | `"hooks.revoke"` | `"session.attach"` | `"session.detach"` | `"branch.create"` | `"session.fork"` | `"session.metafork"` | `"agent.message"` | `"turn.submit"` | `"turn.submit_from_cli"` | `"turn.submit_with_hook_trust"` | `"turn.cancel"` | `"run.retry"` | `"session.compact"` | `"session.select_model"` | `"session.rename"` | `"session.seen"` | `"session.select_effort"` | `"session.select_agent_type"` | `"session.select_fast"` | `"shell.exec"` | `"tools.inventory"` | `"vault.stage"` | `"account.login_api"` | `"account.oauth_start"` | `"account.oauth_status"` | `"account.oauth_cancel"` | `"account.oauth_import_sources"` | `"account.oauth_import"` | `"account.device_candidates"` | `"account.import_device"` | `"account.add"` | `"account.set_active"` | `"account.remove"` | `"account.set_default_model"` | `"account.set_label"` | `"account.list_watch"` | `"account.list"` | `"provider.list"` | `"provider.models_refresh"` | `"provider.configure"` | `"provider.remove"` | `"transcription.secret_get"` | `"transcription.secret_set"` | `"usage.report"` | `"usage.history_day"` | `"usage.history_range"` | `"computer.permission_open_settings"` | `"workflow.instance"`; any other string → Rust `Unknown`.
-- `ResponseBody` (`crates/haider-rpc/src/frame.rs:2276`; `method` tag):
-  `"command.list"` | `"command.invoke"` | `"artifact.put"` | `"session.create"` | `"session.list"` | `"session.list_watch"` | `"session.surface_publish"` | `"session.surface_watch"` | `"session.input_inject"` | `"session.pipe_path"` | `"session.read"` | `"session.observe"` | `"session.observe_batch"` | `"session.fleet"` | `"graph.pin"` | `"graph.run_set.open"` | `"graph.switch"` | `"graph.abandon"` | `"graph.status"` | `"loom.list"` | `"loom.registered"` | `"graph.inspect"` | `"session.diagnostic"` | `"hooks.list"` | `"hooks.trust"` | `"hooks.revoke"` | `"session.attach"` | `"session.detach"` | `"branch.create"` | `"session.fork"` | `"session.metafork"` | `"agent.message"` | `"turn.submit"` | `"turn.submit.on_branch"` | `"turn.cancel"` | `"run.retry"` | `"session.compact"` | `"session.compact.on_branch"` | `"session.select_model"` | `"session.rename"` | `"session.seen"` | `"session.select_effort"` | `"session.select_agent_type"` | `"session.select_fast"` | `"shell.exec"` | `"tools.inventory"` | `"vault.stage"` | `"account.login_api"` | `"account.oauth_start"` | `"account.oauth_status"` | `"account.oauth_cancel"` | `"account.oauth_import_sources"` | `"account.oauth_import"` | `"account.device_candidates"` | `"account.import_device"` | `"account.add"` | `"account.set_active"` | `"account.remove"` | `"account.set_default_model"` | `"account.set_label"` | `"account.list_watch"` | `"account.list"` | `"provider.list"` | `"provider.models_refresh"` | `"provider.configure"` | `"provider.remove"` | `"transcription.secret_get"` | `"transcription.secret_set"` | `"usage.report"` | `"usage.history_day"` | `"usage.history_range"` | `"computer.permission_open_settings"` | `"menu.answer"` | `"workflow.instance"` | `"error"`; any other string → Rust `Unknown`.
-- `SubmitDisposition` (`crates/haider-rpc/src/frame.rs:2851`):
+- `RequestBody` (`crates/haider-rpc/src/frame.rs:2426`; `method` tag):
+  `"daemon.shutdown"` | `"command.list"` | `"command.invoke"` | `"artifact.put"` | `"session.create"` | `"session.list"` | `"session.list_watch"` | `"session.surface_publish"` | `"session.surface_watch"` | `"session.input_inject"` | `"session.pipe_path"` | `"session.read"` | `"session.observe"` | `"session.observe_batch"` | `"session.fleet"` | `"graph.pin"` | `"graph.run_set.open"` | `"graph.switch"` | `"graph.abandon"` | `"graph.status"` | `"loom.list"` | `"loom.register_agent_type"` | `"loom.install.status"` | `"loom.register_workflow"` | `"graph.inspect"` | `"session.diagnostic"` | `"hooks.list"` | `"hooks.trust"` | `"hooks.revoke"` | `"session.attach"` | `"session.detach"` | `"branch.create"` | `"session.fork"` | `"session.metafork"` | `"agent.message"` | `"turn.submit"` | `"turn.submit_from_cli"` | `"turn.submit_with_hook_trust"` | `"queue.list"` | `"queue.remove"` | `"queue.promote_steer"` | `"turn.cancel"` | `"run.retry"` | `"session.compact"` | `"session.select_model"` | `"session.rename"` | `"session.seen"` | `"session.select_effort"` | `"session.select_agent_type"` | `"session.select_fast"` | `"shell.exec"` | `"tools.inventory"` | `"vault.stage"` | `"account.login_api"` | `"account.oauth_start"` | `"account.oauth_status"` | `"account.oauth_cancel"` | `"account.oauth_import_sources"` | `"account.oauth_import"` | `"account.device_candidates"` | `"account.import_device"` | `"account.add"` | `"account.set_active"` | `"account.remove"` | `"account.set_default_model"` | `"account.set_label"` | `"account.list_watch"` | `"account.list"` | `"provider.list"` | `"provider.models_refresh"` | `"provider.configure"` | `"provider.remove"` | `"transcription.secret_get"` | `"transcription.secret_set"` | `"usage.report"` | `"usage.history_day"` | `"usage.history_range"` | `"computer.permission_open_settings"` | `"workflow.instance"` | `"session.descendants.attach"` | `"monitor.list"` | `"monitor.register"` | `"monitor.remove"` | `"monitor.watch"` | `"loom.install.retry"` | `"loom.install.watch"` | `"headless.run.start"` | `"headless.run.status"` | `"headless.run.stop"`; any other string → Rust `Unknown`.
+- `ResponseBody` (`crates/haider-rpc/src/frame.rs:3260`; `method` tag):
+  `"daemon.shutdown"` | `"command.list"` | `"command.invoke"` | `"artifact.put"` | `"session.create"` | `"session.list"` | `"session.list_watch"` | `"session.surface_publish"` | `"session.surface_watch"` | `"session.input_inject"` | `"session.pipe_path"` | `"session.read"` | `"session.observe"` | `"session.observe_batch"` | `"session.fleet"` | `"queue.list"` | `"queue.remove"` | `"queue.promote_steer"` | `"graph.pin"` | `"graph.run_set.open"` | `"graph.switch"` | `"graph.abandon"` | `"graph.status"` | `"loom.list"` | `"loom.registered"` | `"loom.install.status"` | `"graph.inspect"` | `"session.diagnostic"` | `"hooks.list"` | `"hooks.trust"` | `"hooks.revoke"` | `"session.attach"` | `"session.detach"` | `"branch.create"` | `"session.fork"` | `"session.metafork"` | `"agent.message"` | `"turn.submit"` | `"turn.submit.on_branch"` | `"turn.cancel"` | `"run.retry"` | `"session.compact"` | `"session.compact.on_branch"` | `"session.select_model"` | `"session.rename"` | `"session.seen"` | `"session.select_effort"` | `"session.select_agent_type"` | `"session.select_fast"` | `"shell.exec"` | `"tools.inventory"` | `"vault.stage"` | `"account.login_api"` | `"account.oauth_start"` | `"account.oauth_status"` | `"account.oauth_cancel"` | `"account.oauth_import_sources"` | `"account.oauth_import"` | `"account.device_candidates"` | `"account.import_device"` | `"account.add"` | `"account.set_active"` | `"account.remove"` | `"account.set_default_model"` | `"account.set_label"` | `"account.list_watch"` | `"account.list"` | `"provider.list"` | `"provider.models_refresh"` | `"provider.configure"` | `"provider.remove"` | `"transcription.secret_get"` | `"transcription.secret_set"` | `"usage.report"` | `"usage.history_day"` | `"usage.history_range"` | `"computer.permission_open_settings"` | `"menu.answer"` | `"error"` | `"workflow.instance"` | `"session.descendants.attach"` | `"monitor.list"` | `"monitor.register"` | `"monitor.remove"` | `"monitor.watch"` | `"loom.install.retry"` | `"loom.install.watch"` | `"headless.run.start"` | `"headless.run.status"` | `"headless.run.stop"`; any other string → Rust `Unknown`.
+- `SubmitDisposition` (`crates/haider-rpc/src/frame.rs:3953`):
   `"started"` | `"queued"` | `"steer_pending"` | `"subturn_pending"` | `"unknown"`; any other string → Rust `Unknown`.
-- `CancelStatus` (`crates/haider-rpc/src/frame.rs:2864`):
+- `CancelStatus` (`crates/haider-rpc/src/frame.rs:3966`):
   `"accepted"` | `"already_terminal"` | `"unknown"`; any other string → Rust `Unknown`.
-- `ErrorData` (`crates/haider-rpc/src/frame.rs:2879`; `kind` tag):
+- `ErrorData` (`crates/haider-rpc/src/frame.rs:3981`; `kind` tag):
   `"artifact_too_large"` | `"attachment_not_found"` | `"attachment_mime_unsupported"` | `"attachment_too_large"` | `"pdf_too_large"` | `"pdf_too_many_pages"` | `"pdf_malformed"` | `"too_many_attachments"` | `"attachments_too_large"` | `"vision_unsupported"` | `"cursor_ahead"` | `"already_resolved"` | `"revision_conflict"` | `"surface_text_too_large"` | `"provider_models_unavailable"` | `"provider_unavailable"` | `"model_unknown"` | `"effort_unsupported"` | `"fast_unsupported"` | `"cache_epoch_confirmation_required"` | `"provider_remove_refused"` | `"workflow_revision_conflict"` | `"unknown"`; any other string → Rust `Unknown`.
 - `ProviderRemoveRefusalReasonWire` (`crates/haider-rpc/src/frame.rs:3015`):
   `"not_found"` | `"release_owned"` | `"blocking_accounts"` | `"unknown"`; any other string → Rust `Unknown`.

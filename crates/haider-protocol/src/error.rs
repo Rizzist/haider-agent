@@ -344,6 +344,8 @@ pub enum ErrorCode {
     EffectUnknownOutcome,
     // internal
     Internal,
+    /// A daemon-enforced headless run budget reached its durable limit.
+    BudgetExhausted,
     /// Forward-compat catch-all: unknown codes from newer peers land here.
     #[serde(other)]
     Unknown,
@@ -383,6 +385,7 @@ impl ErrorCode {
             Self::PermissionDenied => "permission_denied",
             Self::EffectUnknownOutcome => "effect_unknown_outcome",
             Self::Internal => "internal",
+            Self::BudgetExhausted => "budget_exhausted",
             Self::Unknown => "unknown",
         }
     }
@@ -420,6 +423,7 @@ impl ErrorCode {
             Self::PermissionDenied => "permission-denied",
             Self::EffectUnknownOutcome => "effect-unknown-outcome",
             Self::Internal => "internal",
+            Self::BudgetExhausted => "budget-exhausted",
             Self::Unknown => "unknown",
         }
     }

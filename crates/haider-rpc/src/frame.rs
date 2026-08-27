@@ -9,6 +9,7 @@ use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::graph::{GraphInspectSnapshot, GraphStatus as ConvergenceGraphStatus};
+use haider_protocol::headless::HeadlessRunSpecV1;
 use haider_protocol::ids::{
     AgentId, ArtifactRef, BranchId, CredentialAlias, EventId, GraphId, GraphRunSetId, ItemId,
     MenuId, NodeId, RunId, SessionId,
@@ -249,6 +250,11 @@ pub const ERROR_CODE_GRAPH_WRONG_NODE: &str = "graph_wrong_node";
 pub const FEATURE_SESSION_MUTATION_V1: &str = "session_mutation_v1";
 /// Daemon implements durable submit/cancel turn control.
 pub const FEATURE_TURN_CONTROL_V1: &str = "turn_control_v1";
+/// Daemon implements durable detached headless start/status/stop and replay
+/// pins on the ordinary journal event stream.
+pub const FEATURE_HEADLESS_RUN_V1: &str = "headless_run_v1";
+/// Daemon enforces typed run-local token, cost, and wall-clock budgets.
+pub const FEATURE_RUN_BUDGET_V1: &str = "run_budget_v1";
 /// Daemon implements receipt-backed terminal-failure and backoff-wake retry
 /// (`run.retry`).
 pub const FEATURE_RUN_RETRY_V1: &str = "run_retry_v1";
@@ -3219,6 +3225,28 @@ pub enum RequestBody {
     /// Read durable progress snapshots strictly after the applied cursor.
     #[serde(rename = "loom.install.watch")]
     LoomInstallWatch { job_id: String, after_cursor: u64 },
+    /// Accepts a headless run with a fully resolved, durable execution pin.
+    #[serde(rename = "headless.run.start")]
+    HeadlessRunStart {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        text: String,
+        #[serde(default)]
+        attachments: Vec<AttachmentBlock>,
+        spec: HeadlessRunSpecV1,
+        #[serde(default)]
+        trust_hooks: bool,
+    },
+    /// Resolves durable lifecycle coordinates from a globally unique run id.
+    #[serde(rename = "headless.run.status")]
+    HeadlessRunStatus { run_id: RunId },
+    /// Idempotently stops a detached run after daemon-owned run lookup.
+    #[serde(rename = "headless.run.stop")]
+    HeadlessRunStop {
+        command_id: CommandId,
+        run_id: RunId,
+    },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline). W3b answers it with a protocol error, not a panic.
     #[serde(other)]
@@ -3882,6 +3910,35 @@ pub enum ResponseBody {
     #[serde(rename = "loom.install.watch")]
     LoomInstallWatch {
         receipt: TypedAgentInstallWatchReceiptWire,
+    },
+    #[serde(rename = "headless.run.start")]
+    HeadlessRunStart {
+        session_id: SessionId,
+        run_id: RunId,
+        accepted_seq: u64,
+        worker_generation: u64,
+        disposition: SubmitDisposition,
+    },
+    #[serde(rename = "headless.run.status")]
+    HeadlessRunStatus {
+        session_id: SessionId,
+        run_id: RunId,
+        worker_generation: u64,
+        state: haider_protocol::state::RunState,
+        head_seq: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budget_exhausted: Option<haider_protocol::headless::RunBudgetExhaustedV1>,
+        spec: HeadlessRunSpecV1,
+    },
+    #[serde(rename = "headless.run.stop")]
+    HeadlessRunStop {
+        session_id: SessionId,
+        run_id: RunId,
+        status: CancelStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_seq: Option<u64>,
     },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline).

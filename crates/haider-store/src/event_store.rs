@@ -53,6 +53,7 @@ use haider_protocol::graph::{
     process_signal_subject_digest, reduce_graphs, todo_child_graph_id, todo_run_set_id,
     validate_graph_template, workspace_mutation_subject_digest,
 };
+use haider_protocol::headless::HeadlessRunEventPayload;
 use haider_protocol::history::{COMPACTION_INTENT_EXTENSION_KIND, NodeKind, TodoItem, TreeNode};
 use haider_protocol::hook::HookEventPayload;
 use haider_protocol::ids::{
@@ -6278,7 +6279,9 @@ impl Store {
     ///
     /// This is the ONE authoritative live-worker transition site. Once a run
     /// is terminal no later run-scoped worker event may commit, and a durable
-    /// `Cancelling` may transition only to `Cancelled`.
+    /// `Cancelling` may transition only to `Cancelled`, except that a durable
+    /// headless budget cause may close through the matching typed budget-error
+    /// batch. The budget cause wins because it was journaled before the stop.
     pub fn append_worker(&self, envelopes: &mut [RawEnvelope]) -> StoreResult<CommittedSeqRange> {
         append_envelopes(self, envelopes, true)
     }
@@ -9070,6 +9073,40 @@ impl Store {
                             false,
                         )
                     })?,
+                PromptRender::Omit,
+            )?);
+        }
+        let headless_spec = serde_json::from_str::<serde_json::Value>(&command.request_json)
+            .ok()
+            .and_then(|request| request.get("headless").cloned())
+            .map(serde_json::from_value::<haider_protocol::headless::HeadlessRunSpecV1>)
+            .transpose()
+            .map_err(|error| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("cannot decode headless run spec: {error}"),
+                    false,
+                )
+            })?;
+        if let Some(spec) = headless_spec {
+            let payload =
+                haider_protocol::headless::HeadlessRunEventPayload::HeadlessRunConfigured(spec)
+                    .to_payload_value()
+                    .map_err(|error| {
+                        store_error(
+                            ErrorCode::InvalidArgument,
+                            format!("cannot serialize headless run fact: {error}"),
+                            false,
+                        )
+                    })?;
+            envelopes.push(unstamped_raw_command_envelope(
+                EventId::new(format!("headless-config-{}", command.queued_event_id)),
+                &command.session_id,
+                command.branch_id.clone(),
+                Some(command.run_id.clone()),
+                command.device_id.clone(),
+                self.worker_generation,
+                payload,
                 PromptRender::Omit,
             )?);
         }
@@ -16692,6 +16729,83 @@ fn graph_telemetry_event(payload: &serde_json::Value) -> bool {
     }
 }
 
+fn budget_terminal_runs(envelopes: &[RawEnvelope]) -> HashSet<RunId> {
+    envelopes
+        .windows(2)
+        .filter_map(|pair| {
+            let run_id = pair[0].run_id.as_ref()?;
+            if pair[1].run_id.as_ref() != Some(run_id) {
+                return None;
+            }
+            let budget_failure = matches!(
+                serde_json::from_value::<EventPayload>(pair[0].payload.clone()),
+                Ok(EventPayload::RunFailed {
+                    code: ErrorCode::BudgetExhausted,
+                    ..
+                })
+            );
+            let errored = matches!(
+                serde_json::from_value::<EventPayload>(pair[1].payload.clone()),
+                Ok(EventPayload::RunState(RunState::Errored))
+            );
+            (budget_failure && errored).then(|| run_id.clone())
+        })
+        .collect()
+}
+
+fn durable_headless_run_facts(
+    transaction: &Connection,
+    session_id: &SessionId,
+    run_id: &RunId,
+) -> StoreResult<(bool, bool)> {
+    let mut statement = transaction
+        .prepare_cached(
+            "SELECT seq, envelope_json, event_id, committed_at_ms
+             FROM events
+             WHERE session_id = ?1
+               AND payload_kind IN ('headless_run_configured', 'run_budget_exhausted')
+             ORDER BY seq ASC",
+        )
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query([session_id.as_str()])
+        .map_err(map_sqlite_error)?;
+    let mut configured = false;
+    let mut budget_exhausted = false;
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let stored_seq: i64 = row.get(0).map_err(map_sqlite_error)?;
+        let stored_event_id: String = row.get(2).map_err(map_sqlite_error)?;
+        let stored_committed_at_ms: i64 = row.get(3).map_err(map_sqlite_error)?;
+        let envelope = decode_envelope_column(row, 1).map_err(|error| {
+            corrupt(format!(
+                "invalid headless envelope for session {session_id}, seq {stored_seq}: {error}"
+            ))
+        })?;
+        validate_stored_envelope(
+            session_id,
+            stored_seq,
+            &stored_event_id,
+            stored_committed_at_ms,
+            &envelope,
+        )?;
+        if envelope.run_id.as_ref() != Some(run_id) || !envelope.render.durable {
+            continue;
+        }
+        match HeadlessRunEventPayload::from_payload_value(&envelope.payload) {
+            Some(HeadlessRunEventPayload::HeadlessRunConfigured(_)) => configured = true,
+            Some(HeadlessRunEventPayload::RunBudgetExhausted(_)) if configured => {
+                budget_exhausted = true;
+            }
+            Some(HeadlessRunEventPayload::RunBudgetExhausted(_)) => {}
+            None => {}
+        }
+        if configured && budget_exhausted {
+            break;
+        }
+    }
+    Ok((configured, budget_exhausted))
+}
+
 fn validate_worker_run_transitions(
     transaction: &Connection,
     session_id: &SessionId,
@@ -16730,6 +16844,7 @@ fn validate_worker_run_transitions(
             .then_some(run_id.clone())
         })
         .collect::<HashSet<_>>();
+    let budget_terminal_runs = budget_terminal_runs(envelopes);
     let commits_graph_guarded_done = envelopes.iter().any(|envelope| {
         matches!(
             serde_json::from_value::<EventPayload>(envelope.payload.clone()),
@@ -16765,8 +16880,15 @@ fn validate_worker_run_transitions(
             ProjectInstructionsLoaded::from_payload_value(&envelope.payload).is_some();
         let supplemental_computer_permission =
             PermissionEventPayload::from_payload_value(envelope.payload.clone()).is_ok();
+        let supplemental_run_budget = matches!(
+            HeadlessRunEventPayload::from_payload_value(&envelope.payload),
+            Some(HeadlessRunEventPayload::RunBudgetExhausted(_))
+        );
         let Some(run_id) = envelope.run_id.as_ref() else {
-            if supplemental_project_instructions || supplemental_computer_permission {
+            if supplemental_project_instructions
+                || supplemental_computer_permission
+                || supplemental_run_budget
+            {
                 return Err(store_error(
                     ErrorCode::InvalidArgument,
                     "supplemental worker fact has no logical-turn run id",
@@ -16775,7 +16897,9 @@ fn validate_worker_run_transitions(
             }
             continue;
         };
-        if (supplemental_project_instructions || supplemental_computer_permission)
+        if (supplemental_project_instructions
+            || supplemental_computer_permission
+            || supplemental_run_budget)
             && (!envelope.render.durable || envelope.render.prompt != PromptRender::Omit)
         {
             return Err(store_error(
@@ -16784,9 +16908,24 @@ fn validate_worker_run_transitions(
                 false,
             ));
         }
+        if supplemental_run_budget
+            && !durable_headless_run_facts(transaction, session_id, run_id)?.0
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                format!("worker run {run_id} has no durable headless configuration"),
+                false,
+            ));
+        }
         let payload = match serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
             Ok(payload) => Some(payload),
-            Err(_) if supplemental_project_instructions || supplemental_computer_permission => None,
+            Err(_)
+                if supplemental_project_instructions
+                    || supplemental_computer_permission
+                    || supplemental_run_budget =>
+            {
+                None
+            }
             Err(error) => {
                 return Err(store_error(
                     ErrorCode::InvalidArgument,
@@ -16836,7 +16975,20 @@ fn validate_worker_run_transitions(
             ));
         }
         if let Some(EventPayload::RunState(next)) = payload {
-            if durable == RunState::Cancelling && next != RunState::Cancelled {
+            let budget_terminal_wins = if durable == RunState::Cancelling
+                && next == RunState::Errored
+                && budget_terminal_runs.contains(run_id)
+            {
+                let (configured, budget_exhausted) =
+                    durable_headless_run_facts(transaction, session_id, run_id)?;
+                configured && budget_exhausted
+            } else {
+                false
+            };
+            if durable == RunState::Cancelling
+                && next != RunState::Cancelled
+                && !budget_terminal_wins
+            {
                 return Err(store_error(
                     ErrorCode::RunNotActive,
                     format!("worker run {run_id} is durably cancelling; only Cancelled may follow"),

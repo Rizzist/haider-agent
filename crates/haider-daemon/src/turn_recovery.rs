@@ -44,6 +44,7 @@ use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
+use haider_protocol::headless::{HeadlessRunEventPayload, RunBudgetExhaustedV1};
 use haider_protocol::ids::{
     AgentId, BranchId, DeviceId, EventId, ItemId, MenuId, RunId, SessionId,
 };
@@ -60,6 +61,7 @@ const RUN_STATE_PAYLOAD_KINDS: &[&str] = &["run_state"];
 pub(crate) const STARTUP_HYDRATION_PAYLOAD_KINDS: &[&str] = &[
     "agent_report",
     "effect",
+    "headless_run_configured",
     "hook_run_trust",
     "item",
     "item_tool_call",
@@ -67,6 +69,7 @@ pub(crate) const STARTUP_HYDRATION_PAYLOAD_KINDS: &[&str] = &[
     "menu_closed",
     "menu_opened",
     "node_committed",
+    "run_budget_exhausted",
     "run_failed",
     "run_retried",
     "run_state",
@@ -76,7 +79,7 @@ pub(crate) const STARTUP_HYDRATION_PAYLOAD_KINDS: &[&str] = &[
 const CHECKPOINT_PROJECTION: &str = "startup_turn_recovery";
 const CHECKPOINT_TIMELINE: &str = "session";
 const CHECKPOINT_SHAPE_VERSION: u32 = 1;
-const CHECKPOINT_REDUCER_VERSION: &str = "startup-turn-recovery-v1";
+const CHECKPOINT_REDUCER_VERSION: &str = "startup-turn-recovery-v2";
 
 pub(crate) enum RecoveredWork {
     Queued(AcceptedTurn),
@@ -120,6 +123,10 @@ struct RunReduction {
     tool_calls: HashMap<String, RecoveredToolCall>,
     agent_reports: HashSet<AgentId>,
     child_results: HashSet<AgentId>,
+    #[serde(default)]
+    headless_configured: bool,
+    #[serde(default)]
+    budget_exhausted: Option<RunBudgetExhaustedV1>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -652,7 +659,8 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
     };
     let payload = serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok();
     let retry_payload = RunRetryEventPayload::from_payload_value(envelope.payload.clone()).ok();
-    if payload.is_none() && retry_payload.is_none() {
+    let headless_payload = HeadlessRunEventPayload::from_payload_value(&envelope.payload);
+    if payload.is_none() && retry_payload.is_none() && headless_payload.is_none() {
         return;
     }
     // SessionState is session-global even when it names the run that caused
@@ -662,6 +670,13 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
         return;
     }
     let recovery_relevant = retry_payload.is_some()
+        || matches!(
+            headless_payload.as_ref(),
+            Some(
+                HeadlessRunEventPayload::HeadlessRunConfigured(_)
+                    | HeadlessRunEventPayload::RunBudgetExhausted(_)
+            )
+        )
         || matches!(
             payload.as_ref(),
             Some(
@@ -693,6 +708,23 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
     {
         reduction.retry_source = Some((failed_run_id, prompt_run_id, user_seq, envelope.seq));
         return;
+    }
+    match headless_payload {
+        Some(HeadlessRunEventPayload::HeadlessRunConfigured(_)) if envelope.render.durable => {
+            reduction.headless_configured = true;
+            return;
+        }
+        Some(HeadlessRunEventPayload::RunBudgetExhausted(exhausted))
+            if envelope.render.durable && reduction.headless_configured =>
+        {
+            reduction.budget_exhausted = Some(exhausted);
+            return;
+        }
+        Some(
+            HeadlessRunEventPayload::HeadlessRunConfigured(_)
+            | HeadlessRunEventPayload::RunBudgetExhausted(_),
+        ) => return,
+        None => {}
     }
     let Some(payload) = payload else {
         return;
@@ -967,13 +999,8 @@ async fn terminalize_interrupted(
     reduction: RunReduction,
     cancelling: bool,
 ) -> Result<(), HaiderError> {
-    let payloads = interrupted_terminal_payloads(
-        reduction,
-        cancelling,
-        ErrorCode::Internal,
-        "run was interrupted by daemon restart".into(),
-        true,
-    );
+    let (cancelling, code, message, retryable) = interrupted_restart_cause(&reduction, cancelling);
+    let payloads = interrupted_terminal_payloads(reduction, cancelling, code, message, retryable);
     let mut envelopes = recovery_envelopes(
         store.worker_generation(),
         device_id,
@@ -984,6 +1011,45 @@ async fn terminalize_interrupted(
     )?;
     store.append(&mut envelopes).await?;
     Ok(())
+}
+
+fn interrupted_restart_cause(
+    reduction: &RunReduction,
+    cancelling: bool,
+) -> (bool, ErrorCode, String, bool) {
+    match reduction.budget_exhausted.as_ref() {
+        Some(exhausted) => (
+            false,
+            ErrorCode::BudgetExhausted,
+            format!(
+                "headless {:?} budget exhausted at limit {}",
+                exhausted.dimension, exhausted.limit
+            ),
+            false,
+        ),
+        None => (
+            cancelling,
+            ErrorCode::Internal,
+            "run was interrupted by daemon restart".into(),
+            true,
+        ),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) fn interrupted_recovery_payloads_for_test(
+    run_id: &RunId,
+    envelopes: &[RawEnvelope],
+    cancelling: bool,
+) -> Vec<EventPayload> {
+    let mut reductions = HashMap::new();
+    for envelope in envelopes {
+        reduce(&mut reductions, envelope);
+    }
+    let reduction = reductions.remove(run_id).unwrap_or_default();
+    let (cancelling, code, message, retryable) = interrupted_restart_cause(&reduction, cancelling);
+    interrupted_terminal_payloads(reduction, cancelling, code, message, retryable)
 }
 
 pub(crate) async fn failed_resumption_payloads(
@@ -1030,7 +1096,7 @@ async fn resumption_terminal_payloads(
             }
         }
     }
-    let (cancelling, failure_code, failure_message, retryable) = match error {
+    let (mut cancelling, mut failure_code, mut failure_message, mut retryable) = match error {
         Some(error) => (
             false,
             error.code,
@@ -1055,6 +1121,15 @@ async fn resumption_terminal_payloads(
         Some(RunState::EffectOutcomeUnknown)
     ) {
         return Ok(Vec::new());
+    }
+    if let Some(exhausted) = reduction.budget_exhausted.as_ref() {
+        cancelling = false;
+        failure_code = ErrorCode::BudgetExhausted;
+        failure_message = format!(
+            "headless {:?} budget exhausted at limit {}",
+            exhausted.dimension, exhausted.limit
+        );
+        retryable = false;
     }
     Ok(interrupted_terminal_payloads(
         reduction,

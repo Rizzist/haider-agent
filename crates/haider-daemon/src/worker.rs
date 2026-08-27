@@ -84,6 +84,10 @@ use haider_protocol::graph::{
     ComputerObservationKind, GraphGateKind, GraphNodeName, GraphPhase, ProcessSignalRecorded,
     ProcessSignalRef, WorkspaceMutationRef, process_signal_subject_digest,
 };
+use haider_protocol::headless::{
+    HeadlessRunEventPayload, HeadlessRunSpecV1, HeadlessRunUsageV1, RunBudgetDimensionV1,
+    RunBudgetExhaustedV1, RunBudgetV1,
+};
 use haider_protocol::history::{
     COMPACTION_INTENT_EXTENSION_KIND, CompactionIntent, CompactionResume, NodeKind, TreeNode,
 };
@@ -134,7 +138,7 @@ use haider_tools::{
     ProcessResult, ResultBounds, ScreenshotRedactionPolicy, SessionGrant, SessionGrantScope,
     ShellSession, SpawnSubagent, ToolError, ToolResult, TurnAttribution, WebFetch, WorkflowAuthor,
 };
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -513,6 +517,8 @@ struct DaemonGraphFinalizationGuard {
     store: HubStoreHandle,
     branch_id: Option<BranchId>,
     device_id: DeviceId,
+    event_ids: Arc<EventIdGenerator>,
+    budget_check: Option<BudgetCheckContext>,
 }
 
 impl std::fmt::Debug for DaemonGraphFinalizationGuard {
@@ -524,9 +530,31 @@ impl std::fmt::Debug for DaemonGraphFinalizationGuard {
     }
 }
 
+impl DaemonGraphFinalizationGuard {
+    async fn reject_exhausted_budget(&self, run_id: &RunId) -> Result<(), HaiderError> {
+        if let Some(check) = self.budget_check.as_ref()
+            && let Some(exhausted) =
+                check_run_budget(&check.store, run_id, &check.spec, check.accepted_at_ms).await?
+        {
+            persist_headless_budget_fact(
+                check,
+                &self.device_id,
+                run_id,
+                self.branch_id.as_ref(),
+                &self.event_ids,
+                &exhausted,
+            )
+            .await?;
+            return Err(budget_exhausted_error(&exhausted));
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl FinalizationGuard for DaemonGraphFinalizationGuard {
     async fn before_done(&self, run_id: &RunId) -> Result<FinalizationGuardDecision, HaiderError> {
+        self.reject_exhausted_budget(run_id).await?;
         let outcome = self
             .store
             .hub()
@@ -540,7 +568,13 @@ impl FinalizationGuard for DaemonGraphFinalizationGuard {
             .await
             .map_err(hub_error)?;
         Ok(match outcome {
-            GraphFinalizationOutcome::AllowDone => FinalizationGuardDecision::AllowDone,
+            GraphFinalizationOutcome::AllowDone => {
+                // Graph finalization may itself await durable work. The
+                // acceptance-based wall clock therefore gets the final word
+                // immediately before core is allowed to append `Done`.
+                self.reject_exhausted_budget(run_id).await?;
+                FinalizationGuardDecision::AllowDone
+            }
             GraphFinalizationOutcome::Deferred {
                 graph_id,
                 emit_reminder,
@@ -2631,12 +2665,20 @@ struct ActiveTurn {
     /// W-B: whether this turn declared the anthropic SERVER web tools —
     /// the precondition for the invalid-request degrade latch.
     anthropic_web_tools: bool,
+    budget: Option<oneshot::Receiver<RunBudgetExhaustedV1>>,
+    budget_task: Option<JoinHandle<()>>,
+    budget_check: Option<BudgetCheckContext>,
+    budget_exhausted: Option<RunBudgetExhaustedV1>,
+    budget_fact_persisted: bool,
 }
 
 impl Drop for ActiveTurn {
     fn drop(&mut self) {
         if let Some(actor) = &self.actor {
             actor.abort();
+        }
+        if let Some(task) = &self.budget_task {
+            task.abort();
         }
     }
 }
@@ -2809,15 +2851,39 @@ async fn run_supervisor(
                 // honestly instead of silently pinning the spawn snapshot.
                 let turn_result = match fresh_turn_metadata(&lease).await {
                     Ok(fresh) => {
-                        start_turn(
+                        let startup_budget = wait_for_startup_headless_budget(
+                            lease.clone(),
+                            run_id.clone(),
+                            branch_id.clone(),
+                        );
+                        let start = start_turn(
                             &dependencies,
                             &fresh,
                             &lease,
                             &device_id,
                             Arc::clone(&event_ids),
                             pending,
-                        )
-                        .await
+                        );
+                        tokio::pin!(startup_budget);
+                        tokio::pin!(start);
+                        tokio::select! {
+                            biased;
+                            result = &mut start => result,
+                            expiry = &mut startup_budget => match expiry {
+                                Ok(expiry) => {
+                                    match persist_headless_budget_expiry(
+                                        &lease,
+                                        &device_id,
+                                        &event_ids,
+                                        &expiry,
+                                    ).await {
+                                        Ok(()) => Err(budget_exhausted_error(&expiry.exhausted)),
+                                        Err(error) => Err(error),
+                                    }
+                                }
+                                Err(error) => Err(error),
+                            },
+                        }
                     }
                     Err(error) => Err(error),
                 };
@@ -2938,6 +3004,60 @@ async fn run_supervisor(
             let active_run = turn.run_id.clone();
             let active_cancel = turn.cancel.clone();
             tokio::select! {
+                biased;
+                exhausted = wait_for_budget(&mut turn.budget) => {
+                    let persisted = match turn.budget_check.as_ref() {
+                        Some(check) => persist_headless_budget_fact(
+                            check,
+                            &device_id,
+                            &active_run,
+                            turn.branch_id.as_ref(),
+                            &event_ids,
+                            &exhausted,
+                        ).await,
+                        None => Err(HaiderError::new(
+                            ErrorCode::Internal,
+                            "budget monitor lost its enforcement context",
+                            false,
+                        )),
+                    };
+                    match persisted {
+                        Ok(()) => {
+                            turn.budget_exhausted = Some(exhausted);
+                            turn.budget_fact_persisted = true;
+                            active_cancel.cancel();
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                run_id = %active_run,
+                                ?error,
+                                "budget exhaustion could not be made durable"
+                            );
+                            turn.budget_exhausted = Some(exhausted);
+                            active_cancel.cancel();
+                        }
+                    }
+                }
+                queued_expiry = wait_for_queued_headless_budget(lease.clone(), active_run.clone()) => {
+                    let terminalized = match queued_expiry {
+                        Ok(expiry) => terminalize_queued_budget_expiry(
+                            &mut queue,
+                            &lease,
+                            &device_id,
+                            &event_ids,
+                            expiry,
+                        ).await,
+                        Err(error) => Err(error),
+                    };
+                    match terminalized {
+                        Ok(()) => {}
+                        Err(error) => {
+                            tracing::error!(?error, "queued headless budget could not be terminalized");
+                            let _ = lease.unregister_worker().await;
+                            return false;
+                        }
+                    }
+                }
                 command = commands.recv() => {
                     match command {
                         Some(SupervisorCommand::Submit(pending)) => {
@@ -3057,10 +3177,28 @@ async fn run_supervisor(
                 }
                 outcome = turn.outcome.as_mut() => {
                     if let Some(mut finished) = active.take() {
-                        let (outcome_state, outcome_error, drive_error) = match outcome {
+                        let (outcome_state, outcome_error, mut drive_error) = match outcome {
                             Ok(outcome) => (Some(outcome.state), outcome.error, None),
                             Err(error) => (None, None, Some(error)),
                         };
+                        let core_budget_terminal = outcome_error
+                            .as_ref()
+                            .is_some_and(|error| error.code == ErrorCode::BudgetExhausted);
+                        if core_budget_terminal {
+                            // The finalization guard committed the typed fact
+                            // before core committed RunFailed/Errored. A
+                            // simultaneously-ready polling result must not
+                            // make the supervisor append a second terminal.
+                            finished.budget_exhausted = None;
+                            finished.budget_fact_persisted = true;
+                        }
+                        if finished.budget_exhausted.is_some() {
+                            // Cancellation is the enforcement mechanism. If
+                            // the harness reports that cancellation through
+                            // its error channel, the durable budget fact still
+                            // owns the terminal cause.
+                            drive_error = None;
+                        }
                         // The core actor performs the normal exact refusal
                         // fallback in this SAME turn. This latch is only the
                         // terminal safety net if that exact typed refusal
@@ -3077,8 +3215,9 @@ async fn run_supervisor(
                         let cancellation_requested = matches!(
                             outcome_state.as_ref(),
                             Some(RunState::Cancelled)
-                        ) || durable_run_state(&lease, &finished.run_id).await
-                            == Some(RunState::Cancelling);
+                        ) || finished.budget_exhausted.is_some()
+                            || durable_run_state(&lease, &finished.run_id).await
+                                == Some(RunState::Cancelling);
                         if let Some(dispatcher) = finished.dispatcher.take()
                             && let Err(error) = if cancellation_requested {
                                 dispatcher.cancel().await
@@ -3210,6 +3349,69 @@ async fn run_supervisor(
                         if durable == Some(RunState::EffectOutcomeUnknown) {
                             let _ = lease.unregister_worker().await;
                             return true;
+                        }
+                        if let Some(exhausted) = finished.budget_exhausted.take() {
+                            if !finished.budget_fact_persisted {
+                                let persisted = match finished.budget_check.as_ref() {
+                                    Some(check) => persist_headless_budget_fact(
+                                        check,
+                                        &device_id,
+                                        &finished.run_id,
+                                        finished.branch_id.as_ref(),
+                                        &event_ids,
+                                        &exhausted,
+                                    )
+                                    .await
+                                    .is_ok(),
+                                    None => false,
+                                };
+                                if !persisted {
+                                    tracing::error!(
+                                        run_id = %finished.run_id,
+                                        "budget terminal remained fenced because its typed cause could not be committed"
+                                    );
+                                    let _ = lease.unregister_worker().await;
+                                    return false;
+                                }
+                            }
+                            let message = format!(
+                                "headless {:?} budget exhausted at limit {}",
+                                exhausted.dimension, exhausted.limit
+                            );
+                            let error = HaiderError::new(
+                                ErrorCode::BudgetExhausted,
+                                message.clone(),
+                                false,
+                            );
+                            let payloads = vec![
+                                EventPayload::RunFailed {
+                                    code: ErrorCode::BudgetExhausted,
+                                    message: sanitized_failure_message(&message),
+                                    retryable: false,
+                                    presentation: Some(presentation_for_haider_error(&error)),
+                                },
+                                EventPayload::RunState(RunState::Errored),
+                            ];
+                            let appended = append_payloads(
+                                &lease,
+                                &device_id,
+                                &finished.run_id,
+                                finished.branch_id.as_ref(),
+                                &event_ids,
+                                payloads,
+                            )
+                            .await
+                            .is_ok();
+                            if appended {
+                                let _ = append_session_idle(
+                                    &lease,
+                                    &device_id,
+                                    &event_ids,
+                                    true,
+                                )
+                                .await;
+                            }
+                            continue;
                         }
                         let cancelled =
                             idle_interrupted_after_outcome(outcome_state.as_ref(), durable.as_ref());
@@ -5261,6 +5463,50 @@ async fn start_turn(
         recovery_ready: _,
         recovering: _,
     } = pending;
+    let headless = headless_run_context(lease, &accepted.run_id).await?;
+    let mut pinned_metadata = metadata.clone();
+    if let Some(context) = headless.as_ref() {
+        let spec = &context.spec;
+        pinned_metadata.provider.clone_from(&spec.provider);
+        pinned_metadata.model.clone_from(&spec.model);
+        pinned_metadata.max_tokens = spec.max_output_tokens;
+        pinned_metadata.effort.clone_from(&spec.effort);
+        pinned_metadata.fast = spec.fast;
+        let exhaustion = match context.exhausted.clone() {
+            Some(exhausted) => Some(exhausted),
+            None => check_run_budget(lease, &accepted.run_id, spec, context.accepted_at_ms).await?,
+        };
+        if let Some(exhausted) = exhaustion {
+            if context.exhausted.is_none() {
+                append_headless_budget_fact(
+                    lease,
+                    device_id,
+                    &accepted.run_id,
+                    accepted.branch_id.as_ref(),
+                    &event_ids,
+                    &exhausted,
+                )
+                .await?;
+            }
+            return Err(HaiderError::new(
+                ErrorCode::BudgetExhausted,
+                format!(
+                    "headless {:?} budget exhausted at limit {}",
+                    exhausted.dimension, exhausted.limit
+                ),
+                false,
+            ));
+        }
+    }
+    let budget_check = headless.as_ref().and_then(|context| {
+        (!context.spec.budget.is_empty()).then(|| BudgetCheckContext {
+            store: lease.clone(),
+            spec: context.spec.clone(),
+            accepted_at_ms: context.accepted_at_ms,
+            fact_persisted: Arc::new(Mutex::new(false)),
+        })
+    });
+    let metadata = &pinned_metadata;
     // W-B (decision 8): the session's web-capability degrades ride into
     // pair resolution (native declarations) AND the tool pack below — ONE
     // per-turn derivation from the resolved pair.
@@ -5765,6 +6011,8 @@ async fn start_turn(
         store: lease.clone(),
         branch_id: accepted.branch_id.clone(),
         device_id: device_id.clone(),
+        event_ids: Arc::clone(&event_ids),
+        budget_check: budget_check.clone(),
     }));
     config.rotation_budget_consumed = resolved.rotation_budget_consumed;
     config.initial_rotation = resolved.initial_rotation;
@@ -5776,6 +6024,29 @@ async fn start_turn(
         event_ids: Arc::clone(&event_ids),
     }));
     config.supervisor_commits_cancelled = true;
+    if let Some(check) = budget_check.as_ref()
+        && let Some(exhausted) = check_run_budget(
+            &check.store,
+            &accepted.run_id,
+            &check.spec,
+            check.accepted_at_ms,
+        )
+        .await?
+    {
+        persist_headless_budget_fact(
+            check,
+            device_id,
+            &accepted.run_id,
+            accepted.branch_id.as_ref(),
+            &event_ids,
+            &exhausted,
+        )
+        .await?;
+        if let Some(dispatcher) = dispatcher.as_ref() {
+            let _ = dispatcher.close().await;
+        }
+        return Err(budget_exhausted_error(&exhausted));
+    }
     // Last uncancellable startup boundary: provider/tool resolution is done,
     // but the harness actor has not been spawned or submitted. A cancellation
     // committed while either factory was awaited aborts here. The worker
@@ -5901,6 +6172,7 @@ async fn start_turn(
         dispatcher,
         handle,
         anthropic_web_tools,
+        budget_check,
     ))
 }
 
@@ -6525,8 +6797,22 @@ fn active_turn(
     dispatcher: Option<Arc<dyn ToolDispatcher>>,
     handle: TurnHandle,
     anthropic_web_tools: bool,
+    budget_check: Option<BudgetCheckContext>,
 ) -> ActiveTurn {
     let cancel = handle.cancel_token();
+    let (budget, budget_task) = budget_check
+        .as_ref()
+        .map(|check| {
+            let (sender, receiver) = oneshot::channel();
+            let check = check.clone();
+            let monitor_run_id = run_id.clone();
+            let task = tokio::spawn(async move {
+                let exhausted = monitor_run_budget(check, monitor_run_id).await;
+                let _ = sender.send(exhausted);
+            });
+            (Some(receiver), Some(task))
+        })
+        .unwrap_or((None, None));
     ActiveTurn {
         run_id,
         branch_id,
@@ -6536,7 +6822,456 @@ fn active_turn(
         dispatcher,
         actor: Some(actor),
         anthropic_web_tools,
+        budget,
+        budget_task,
+        budget_check,
+        budget_exhausted: None,
+        budget_fact_persisted: false,
     }
+}
+
+#[derive(Clone)]
+struct BudgetCheckContext {
+    store: HubStoreHandle,
+    spec: HeadlessRunSpecV1,
+    accepted_at_ms: u64,
+    fact_persisted: Arc<Mutex<bool>>,
+}
+
+async fn headless_run_context(
+    store: &HubStoreHandle,
+    run_id: &RunId,
+) -> Result<Option<DurableHeadlessRunContext>, HaiderError> {
+    let mut cursor = 0_u64;
+    let mut accepted_at_ms = None;
+    let mut spec = None;
+    let mut exhausted = None;
+    loop {
+        let page = store.read(store.session_id(), cursor, 256).await?;
+        if page.is_empty() {
+            break;
+        }
+        let page_len = page.len();
+        for envelope in page {
+            cursor = envelope.seq;
+            if envelope.run_id.as_ref() != Some(run_id) {
+                continue;
+            }
+            accepted_at_ms.get_or_insert(envelope.committed_at_ms);
+            match HeadlessRunEventPayload::from_payload_value(&envelope.payload) {
+                Some(HeadlessRunEventPayload::HeadlessRunConfigured(configured)) => {
+                    spec = Some(configured);
+                }
+                Some(HeadlessRunEventPayload::RunBudgetExhausted(fact)) => {
+                    exhausted = Some(fact);
+                }
+                None => {}
+            }
+        }
+        if page_len < 256 {
+            break;
+        }
+    }
+    Ok(spec.map(|spec| DurableHeadlessRunContext {
+        spec,
+        accepted_at_ms: accepted_at_ms.unwrap_or(0),
+        exhausted,
+    }))
+}
+
+struct DurableHeadlessRunContext {
+    spec: HeadlessRunSpecV1,
+    accepted_at_ms: u64,
+    exhausted: Option<RunBudgetExhaustedV1>,
+}
+
+struct HeadlessBudgetExpiry {
+    run_id: RunId,
+    branch_id: Option<BranchId>,
+    exhausted: RunBudgetExhaustedV1,
+    fact_persisted: bool,
+}
+
+async fn wait_for_startup_headless_budget(
+    store: HubStoreHandle,
+    run_id: RunId,
+    branch_id: Option<BranchId>,
+) -> Result<HeadlessBudgetExpiry, HaiderError> {
+    loop {
+        let Some(context) = headless_run_context(&store, &run_id).await? else {
+            return std::future::pending().await;
+        };
+        if let Some(exhausted) = context.exhausted {
+            return Ok(HeadlessBudgetExpiry {
+                run_id,
+                branch_id,
+                exhausted,
+                fact_persisted: true,
+            });
+        }
+        let Some(limit) = context.spec.budget.max_time_ms else {
+            return std::future::pending().await;
+        };
+        let deadline_ms = context.accepted_at_ms.saturating_add(limit);
+        tokio::time::sleep(Duration::from_millis(
+            deadline_ms.saturating_sub(unix_time_ms()),
+        ))
+        .await;
+        if let Some(exhausted) =
+            check_run_budget(&store, &run_id, &context.spec, context.accepted_at_ms).await?
+        {
+            return Ok(HeadlessBudgetExpiry {
+                run_id,
+                branch_id,
+                exhausted,
+                fact_persisted: false,
+            });
+        }
+    }
+}
+
+async fn wait_for_queued_headless_budget(
+    store: HubStoreHandle,
+    active_run: RunId,
+) -> Result<HeadlessBudgetExpiry, HaiderError> {
+    loop {
+        let mut earliest = None;
+        for (run_id, state, _, branch_id, _) in durable_runs(&store).await? {
+            if run_id == active_run || state != RunState::Queued {
+                continue;
+            }
+            let Some(context) = headless_run_context(&store, &run_id).await? else {
+                continue;
+            };
+            if let Some(exhausted) = context.exhausted {
+                return Ok(HeadlessBudgetExpiry {
+                    run_id,
+                    branch_id,
+                    exhausted,
+                    fact_persisted: true,
+                });
+            }
+            let Some(limit) = context.spec.budget.max_time_ms else {
+                continue;
+            };
+            let deadline_ms = context.accepted_at_ms.saturating_add(limit);
+            let replace = earliest
+                .as_ref()
+                .is_none_or(|(current, _, _, _)| deadline_ms < *current);
+            if replace {
+                earliest = Some((deadline_ms, run_id, branch_id, context));
+            }
+        }
+        let Some((deadline_ms, run_id, branch_id, context)) = earliest else {
+            return std::future::pending().await;
+        };
+        tokio::time::sleep(Duration::from_millis(
+            deadline_ms.saturating_sub(unix_time_ms()),
+        ))
+        .await;
+        if let Some(exhausted) =
+            check_run_budget(&store, &run_id, &context.spec, context.accepted_at_ms).await?
+        {
+            return Ok(HeadlessBudgetExpiry {
+                run_id,
+                branch_id,
+                exhausted,
+                fact_persisted: false,
+            });
+        }
+    }
+}
+
+async fn persist_headless_budget_expiry(
+    store: &HubStoreHandle,
+    device_id: &DeviceId,
+    event_ids: &EventIdGenerator,
+    expiry: &HeadlessBudgetExpiry,
+) -> Result<(), HaiderError> {
+    if !expiry.fact_persisted {
+        append_headless_budget_fact(
+            store,
+            device_id,
+            &expiry.run_id,
+            expiry.branch_id.as_ref(),
+            event_ids,
+            &expiry.exhausted,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn terminalize_queued_budget_expiry(
+    queue: &mut VecDeque<PendingTurn>,
+    store: &HubStoreHandle,
+    device_id: &DeviceId,
+    event_ids: &EventIdGenerator,
+    expiry: HeadlessBudgetExpiry,
+) -> Result<(), HaiderError> {
+    // The typed cause owns the crash boundary before either the durable queue
+    // row or the in-memory handoff is removed.
+    persist_headless_budget_expiry(store, device_id, event_ids, &expiry).await?;
+    let _ = store
+        .consume_queued_turn(expiry.run_id.clone(), event_ids.next(), device_id.clone())
+        .await?;
+    queue.retain(|pending| pending.accepted.run_id != expiry.run_id);
+    append_failure(
+        store,
+        device_id,
+        &expiry.run_id,
+        expiry.branch_id.as_ref(),
+        event_ids,
+        budget_exhausted_error(&expiry.exhausted),
+    )
+    .await
+}
+
+struct BudgetUsageComponent {
+    input: u64,
+    output: u64,
+    reasoning: u64,
+    cache_read: u64,
+    cache_write: u64,
+    cost_usd: Option<f64>,
+}
+
+async fn run_budget_usage(
+    store: &HubStoreHandle,
+    run_id: &RunId,
+    fallback_model: &str,
+    elapsed_ms: u64,
+) -> Result<HeadlessRunUsageV1, HaiderError> {
+    let mut cursor = 0_u64;
+    let mut envelopes = Vec::new();
+    loop {
+        let page = store.read(store.session_id(), cursor, 256).await?;
+        if page.is_empty() {
+            break;
+        }
+        let page_len = page.len();
+        cursor = page.last().map_or(cursor, |envelope| envelope.seq);
+        envelopes.extend(page);
+        if page_len < 256 {
+            break;
+        }
+    }
+    Ok(budget_usage_from_envelopes(
+        store.session_id(),
+        run_id,
+        fallback_model,
+        elapsed_ms,
+        envelopes,
+    ))
+}
+
+fn budget_usage_from_envelopes(
+    session_id: &SessionId,
+    run_id: &RunId,
+    fallback_model: &str,
+    elapsed_ms: u64,
+    envelopes: impl IntoIterator<Item = haider_protocol::envelope::RawEnvelope>,
+) -> HeadlessRunUsageV1 {
+    let mut chunks = BTreeMap::<String, BudgetUsageComponent>::new();
+    for envelope in envelopes {
+        let envelope_run = envelope.run_id.clone();
+        let envelope_agent = envelope.agent_id.clone();
+        let Ok(EventPayload::Usage(usage)) =
+            serde_json::from_value::<EventPayload>(envelope.payload)
+        else {
+            continue;
+        };
+        let scoped_run = usage.scope.as_ref().and_then(|scope| scope.run.as_ref());
+        if envelope_run.as_ref() != Some(run_id) && scoped_run != Some(run_id) {
+            continue;
+        }
+        let scope = usage.scope.as_ref();
+        let request = usage.request.as_ref();
+        let input = request.map_or(usage.input, |request| request.input);
+        let output = request.map_or(usage.output, |request| request.output);
+        let reasoning = request.map_or(usage.reasoning, |request| request.reasoning.unwrap_or(0));
+        let cached = request.map_or(usage.cached, |request| request.cached.unwrap_or(0));
+        let normalized = match request {
+            Some(request) => request.normalized.as_ref(),
+            None => usage.normalized.as_ref(),
+        };
+        let logical = normalized.map_or(input, |normalized| normalized.logical_input);
+        let billed_output = normalized.map_or(output, |normalized| normalized.billed_output);
+        let additional_reasoning = normalized.map_or(0, |normalized| {
+            u64::from(
+                normalized.reasoning_accounting
+                    == haider_protocol::provider::ReasoningAccounting::AdditionalToOutput,
+            ) * normalized.reasoning_detail
+        });
+        let cache_read = normalized.map_or(cached, |normalized| normalized.cache_read_input);
+        let cache_write = normalized.map_or(0, |normalized| normalized.cache_write_input);
+        let model = scope
+            .map(|scope| scope.model.as_str())
+            .filter(|model| !model.is_empty())
+            .unwrap_or(fallback_model);
+        let cost_usd = normalized.map_or_else(
+            || haider_provider::estimate_chunk_cost_usd(model, input, output, reasoning, cached),
+            |normalized| haider_provider::estimate_normalized_usage_cost_usd(model, normalized),
+        );
+        let run_coordinate = scope
+            .and_then(|scope| scope.run.as_ref())
+            .or(envelope_run.as_ref())
+            .map_or("", |run| run.as_str());
+        let agent_coordinate = scope
+            .and_then(|scope| scope.agent.as_ref())
+            .or(envelope_agent.as_ref())
+            .map_or("", |agent| agent.as_str());
+        let account_coordinate = request
+            .and_then(|request| request.account.as_ref())
+            .or(usage.account.as_ref())
+            .map_or("", |account| account.as_str());
+        let key = format!(
+            "{session_id}\u{0}{run_coordinate}\u{0}{agent_coordinate}\u{0}{}\u{0}{model}\u{0}{}\u{0}{:?}\u{0}{:?}\u{0}{account_coordinate}",
+            scope.map_or("", |scope| scope.provider.as_str()),
+            scope.map_or("", |scope| scope.cache_epoch.as_str()),
+            scope.map_or(UsageRequestKind::MainTurn, |scope| scope.request_kind),
+            request.map(|request| request.ordinal),
+        );
+        chunks.insert(
+            key,
+            BudgetUsageComponent {
+                input: logical,
+                output: billed_output,
+                reasoning: additional_reasoning,
+                cache_read,
+                cache_write,
+                cost_usd,
+            },
+        );
+    }
+    let mut result = HeadlessRunUsageV1 {
+        elapsed_ms,
+        estimated_cost_microusd: Some(0),
+        ..HeadlessRunUsageV1::default()
+    };
+    let mut cost_usd = 0.0_f64;
+    for component in chunks.values() {
+        result.logical_input_tokens = result.logical_input_tokens.saturating_add(component.input);
+        result.billed_output_tokens = result.billed_output_tokens.saturating_add(component.output);
+        result.additional_reasoning_tokens = result
+            .additional_reasoning_tokens
+            .saturating_add(component.reasoning);
+        result.cache_read_tokens = result
+            .cache_read_tokens
+            .saturating_add(component.cache_read);
+        result.cache_write_tokens = result
+            .cache_write_tokens
+            .saturating_add(component.cache_write);
+        if let Some(component_cost) = component.cost_usd {
+            cost_usd += component_cost;
+        } else {
+            result.estimated_cost_microusd = None;
+        }
+    }
+    result.total_tokens = result
+        .logical_input_tokens
+        .saturating_add(result.billed_output_tokens)
+        .saturating_add(result.additional_reasoning_tokens);
+    if result.estimated_cost_microusd.is_some() {
+        result.estimated_cost_microusd = Some(if cost_usd <= 0.0 || !cost_usd.is_finite() {
+            0
+        } else {
+            ((cost_usd * 1_000_000.0).round() as u64).max(1)
+        });
+    }
+    result
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) fn budget_usage_from_envelopes_for_test(
+    session_id: &SessionId,
+    run_id: &RunId,
+    fallback_model: &str,
+    envelopes: Vec<haider_protocol::envelope::RawEnvelope>,
+) -> HeadlessRunUsageV1 {
+    budget_usage_from_envelopes(session_id, run_id, fallback_model, 0, envelopes)
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+async fn monitor_run_budget(check: BudgetCheckContext, run_id: RunId) -> RunBudgetExhaustedV1 {
+    loop {
+        if let Ok(Some(exhausted)) =
+            check_run_budget(&check.store, &run_id, &check.spec, check.accepted_at_ms).await
+        {
+            return exhausted;
+        }
+        let elapsed_ms = unix_time_ms().saturating_sub(check.accepted_at_ms);
+        let delay_ms = check
+            .spec
+            .budget
+            .max_time_ms
+            .map(|limit| limit.saturating_sub(elapsed_ms).min(25))
+            .unwrap_or(25);
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    }
+}
+
+async fn check_run_budget(
+    store: &HubStoreHandle,
+    run_id: &RunId,
+    spec: &HeadlessRunSpecV1,
+    accepted_at_ms: u64,
+) -> Result<Option<RunBudgetExhaustedV1>, HaiderError> {
+    let elapsed_ms = unix_time_ms().saturating_sub(accepted_at_ms);
+    let usage = run_budget_usage(store, run_id, &spec.model, elapsed_ms).await?;
+    Ok(exhausted_budget(&spec.budget, usage))
+}
+
+pub(crate) fn exhausted_budget(
+    budget: &RunBudgetV1,
+    usage: HeadlessRunUsageV1,
+) -> Option<RunBudgetExhaustedV1> {
+    let exhausted = budget
+        .max_time_ms
+        .filter(|limit| usage.elapsed_ms >= *limit)
+        .map(|limit| (RunBudgetDimensionV1::Time, limit))
+        .or_else(|| {
+            budget
+                .max_tokens
+                .filter(|limit| usage.total_tokens >= *limit)
+                .map(|limit| (RunBudgetDimensionV1::Tokens, limit))
+        })
+        .or_else(|| {
+            budget.max_cost_microusd.and_then(|limit| {
+                match usage.estimated_cost_microusd {
+                    Some(cost) if cost >= limit => Some((RunBudgetDimensionV1::Cost, limit)),
+                    // A configured cost ceiling must fail closed once
+                    // provider work is visible; unavailable pricing is never
+                    // silently interpreted as zero cost.
+                    None if usage.total_tokens > 0 => Some((RunBudgetDimensionV1::Cost, limit)),
+                    _ => None,
+                }
+            })
+        });
+    exhausted.map(|(dimension, limit)| RunBudgetExhaustedV1 {
+        dimension,
+        limit,
+        usage,
+    })
+}
+
+async fn wait_for_budget(
+    receiver: &mut Option<oneshot::Receiver<RunBudgetExhaustedV1>>,
+) -> RunBudgetExhaustedV1 {
+    if let Some(receiver) = receiver.take()
+        && let Ok(exhausted) = receiver.await
+    {
+        return exhausted;
+    }
+    std::future::pending().await
 }
 
 struct AbortOnDropTask(Option<JoinHandle<()>>);
@@ -6652,6 +7387,71 @@ async fn append_payloads(
     }
     haider_core::StoreHandle::append(store, &mut envelopes).await?;
     Ok(())
+}
+
+async fn append_headless_budget_fact(
+    store: &HubStoreHandle,
+    device_id: &DeviceId,
+    run_id: &RunId,
+    branch_id: Option<&BranchId>,
+    event_ids: &EventIdGenerator,
+    exhausted: &RunBudgetExhaustedV1,
+) -> Result<(), HaiderError> {
+    let payload = HeadlessRunEventPayload::RunBudgetExhausted(exhausted.clone())
+        .to_payload_value()
+        .map_err(|error| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                format!("cannot serialize budget-exhaustion fact: {error}"),
+                false,
+            )
+        })?;
+    let mut envelopes = [supervisor_raw_envelope(
+        store,
+        device_id,
+        branch_id.cloned(),
+        Some(run_id.clone()),
+        event_ids.next(),
+        payload,
+    )];
+    haider_core::StoreHandle::append(store, &mut envelopes).await?;
+    Ok(())
+}
+
+async fn persist_headless_budget_fact(
+    check: &BudgetCheckContext,
+    device_id: &DeviceId,
+    run_id: &RunId,
+    branch_id: Option<&BranchId>,
+    event_ids: &EventIdGenerator,
+    exhausted: &RunBudgetExhaustedV1,
+) -> Result<(), HaiderError> {
+    let mut persisted = check.fact_persisted.lock().await;
+    if *persisted {
+        return Ok(());
+    }
+    append_headless_budget_fact(
+        &check.store,
+        device_id,
+        run_id,
+        branch_id,
+        event_ids,
+        exhausted,
+    )
+    .await?;
+    *persisted = true;
+    Ok(())
+}
+
+fn budget_exhausted_error(exhausted: &RunBudgetExhaustedV1) -> HaiderError {
+    HaiderError::new(
+        ErrorCode::BudgetExhausted,
+        format!(
+            "headless {:?} budget exhausted at limit {}",
+            exhausted.dimension, exhausted.limit
+        ),
+        false,
+    )
 }
 
 /// Commits the terminal direct-command item as prompt-visible immediately
@@ -7228,16 +8028,37 @@ fn supervisor_envelope(
     event_id: EventId,
     payload: EventPayload,
 ) -> Result<haider_protocol::envelope::RawEnvelope, HaiderError> {
-    Ok(EventEnvelope {
+    let branch_id = if matches!(payload, EventPayload::SessionState(_)) {
+        None
+    } else {
+        branch_id
+    };
+    let payload = serde_json::to_value(payload).map_err(|error| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            format!("cannot serialize supervisor event: {error}"),
+            false,
+        )
+    })?;
+    Ok(supervisor_raw_envelope(
+        store, device_id, branch_id, run_id, event_id, payload,
+    ))
+}
+
+fn supervisor_raw_envelope(
+    store: &HubStoreHandle,
+    device_id: &DeviceId,
+    branch_id: Option<BranchId>,
+    run_id: Option<RunId>,
+    event_id: EventId,
+    payload: serde_json::Value,
+) -> haider_protocol::envelope::RawEnvelope {
+    EventEnvelope {
         schema_version: SCHEMA_VERSION,
         event_id,
         seq: 0,
         session_id: store.session_id().clone(),
-        branch_id: if matches!(payload, EventPayload::SessionState(_)) {
-            None
-        } else {
-            branch_id
-        },
+        branch_id,
         run_id,
         agent_id: None,
         device_id: device_id.clone(),
@@ -7251,14 +8072,8 @@ fn supervisor_envelope(
             durable: true,
             prompt: PromptRender::Omit,
         },
-        payload: serde_json::to_value(payload).map_err(|error| {
-            HaiderError::new(
-                ErrorCode::Internal,
-                format!("cannot serialize supervisor event: {error}"),
-                false,
-            )
-        })?,
-    })
+        payload,
+    }
 }
 
 fn manager_stopped() -> HaiderError {
