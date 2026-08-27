@@ -83,18 +83,12 @@ use haider_protocol::tool::{
 };
 use haider_protocol::verify::VerifyVerdict;
 use haider_provider::{
-<<<<<<< HEAD
     Message, PROVIDER_DEADLINE_SAFETY_MARGIN, PromptCacheMetadata, Provider, ProviderError,
-    ProviderErrorKind, ResolvedAttachment, ToolDefinition, TurnRequest,
-    apply_tool_result_image_budget, before_provider_request_deadline, canonical_tool_definitions,
-    canonical_tool_definitions_digest, degrade_tool_result_images_to_placeholders,
-    effective_request_budget, validate_provider_view_prefix,
-=======
-    Message, PromptCacheMetadata, Provider, ProviderError, ProviderErrorKind, ProviderStream,
-    ProviderStreamItem, ResolvedAttachment, ToolDefinition, TurnRequest,
-    apply_tool_result_image_budget, canonical_tool_definitions, canonical_tool_definitions_digest,
-    degrade_tool_result_images_to_placeholders, validate_provider_view_prefix,
->>>>>>> wave-964-o3
+    ProviderErrorKind, ProviderStream, ProviderStreamItem, ResolvedAttachment, ToolDefinition,
+    TurnRequest, apply_tool_result_image_budget, before_provider_request_deadline,
+    canonical_tool_definitions, canonical_tool_definitions_digest,
+    degrade_tool_result_images_to_placeholders, effective_request_budget,
+    validate_provider_view_prefix,
 };
 use haider_tools::{Plan, RequestInput, TodoWrite};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -8018,7 +8012,7 @@ impl HarnessActor {
                 false,
             ));
         }
-        let pending_usage = pending_usage.as_ref().ok_or_else(|| {
+        let usage_commit = pending_usage.as_ref().ok_or_else(|| {
             HaiderError::new(
                 ErrorCode::Internal,
                 "post-stream batch has no usage fact",
@@ -8035,8 +8029,8 @@ impl HarnessActor {
         let message_parent = self.tree_head.clone();
         let mut envelopes = self.uncommitted_usage_envelopes(
             run_id,
-            pending_usage.footprint.as_ref(),
-            pending_usage.usage.clone(),
+            usage_commit.footprint.as_ref(),
+            usage_commit.usage.clone(),
         )?;
 
         let message_node = if let Some(active) = message.as_ref() {

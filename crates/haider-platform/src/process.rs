@@ -365,16 +365,15 @@ pub(crate) fn close_inherited_descriptors_from(first: std::os::raw::c_int) {
         return;
     }
 
-    // Fallback for an older Linux kernel or a Unix without a bulk-close API.
-    // `getrlimit(2)` and `close(2)` are raw, async-signal-safe libc calls; the
-    // pre-exec child must not enter an allocator or a libc wrapper which may
-    // hold a parent-thread lock. EBADF is expected for unused slots. Do not use
-    // rustix::io::close here: its contract requires an open fd, and the Linux
-    // debug backend panics on EBADF. A panic after fork is converted into
-    // SIGABRT by Command's pre-exec guard.
+    // Fallback for an older Linux kernel or a Unix without a bulk CLOEXEC API.
+    // Mark rather than close: std::process creates a private CLOEXEC pipe
+    // before fork so the child can report pre-exec/exec errors to its parent.
+    // Closing that unknown descriptor here would turn ENOENT/EACCES into a
+    // false successful spawn. `getrlimit(2)` and `fcntl(2)` are raw,
+    // async-signal-safe libc calls; EBADF is expected for unused slots.
     let upper_bound = inherited_descriptor_upper_bound();
     for fd in first..upper_bound {
-        let _ = unsafe { libc::close(fd) };
+        let _ = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
     }
 }
 
@@ -410,33 +409,36 @@ fn inherited_descriptor_upper_bound() -> std::os::raw::c_int {
     65_536
 }
 
-/// Runtime probe for Linux's 5.9+ `close_range(2)`. A kernel without the
-/// syscall returns `ENOSYS`; seccomp and other runtime refusals also fall back
-/// to the conservative individual-close loop.
+/// Runtime probe for Linux's 5.11+ `CLOSE_RANGE_CLOEXEC`. A kernel without the
+/// flag returns an error; seccomp and other runtime refusals also fall back to
+/// the conservative individual-fcntl loop.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[allow(unsafe_code)]
 fn close_inherited_descriptor_range(first: std::os::raw::c_int) -> bool {
+    // Linux UAPI value shared by Android kernels. libc does not expose the
+    // named constant on every Android target supported by this workspace.
+    const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+
     unsafe {
         libc::syscall(
             libc::SYS_close_range,
             first as libc::c_uint,
             libc::c_uint::MAX,
-            0_u32,
+            CLOSE_RANGE_CLOEXEC,
         ) == 0
     }
 }
 
-/// The BSD libc implementations provide `closefrom(2)` as one bulk close.
+/// BSD `closefrom(2)` cannot preserve std::process's private exec-error pipe,
+/// so use the bounded CLOEXEC loop on these targets as well.
 #[cfg(any(
     target_os = "dragonfly",
     target_os = "freebsd",
     target_os = "netbsd",
     target_os = "openbsd"
 ))]
-#[allow(unsafe_code)]
-fn close_inherited_descriptor_range(first: std::os::raw::c_int) -> bool {
-    let _ = unsafe { libc::closefrom(first) };
-    true
+fn close_inherited_descriptor_range(_first: std::os::raw::c_int) -> bool {
+    false
 }
 
 /// macOS and other Unix targets use the loop when their deployed libc exposes
@@ -459,8 +461,8 @@ fn close_inherited_descriptor_range(_first: std::os::raw::c_int) -> bool {
 /// Moves the daemon's inherited startup descriptors to fixed coordinates.
 ///
 /// This runs after `fork` and before `exec`, so it uses only async-signal-safe
-/// libc calls. Descriptor 3 is then excluded from the background close sweep;
-/// the daemon restores `FD_CLOEXEC` as soon as it adopts the writer.
+/// libc calls. Descriptors 3 and 4 are then excluded from the background close
+/// sweep; the daemon restores `FD_CLOEXEC` as soon as it adopts each endpoint.
 #[cfg(unix)]
 #[allow(unsafe_code)]
 pub(crate) fn install_daemon_spawn_descriptors(
@@ -490,6 +492,11 @@ pub(crate) fn install_daemon_spawn_descriptors(
         if unsafe { fcntl(target, F_SETFD, 0) } == -1 {
             return Err(std::io::Error::last_os_error());
         }
+    }
+    // A liveness-only caller still reserves fd 4. Mark the unused fd 3 for
+    // exec closure without consuming std::process's private error reporter.
+    if readiness.is_none() && liveness.is_some() {
+        let _ = unsafe { libc::fcntl(DAEMON_READINESS_FD, libc::F_SETFD, libc::FD_CLOEXEC) };
     }
     let last = if liveness.is_some() {
         DAEMON_LIVENESS_FD

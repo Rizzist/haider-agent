@@ -1192,9 +1192,6 @@ pub struct ProviderDefaultWire {
 pub struct DeviceCredentialCandidateWire {
     /// Opaque daemon-derived identifier consumed by account.import_device.
     pub candidate: String,
-    /// Stable daemon-owned import source key (for example `codex`).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub source: String,
     /// Haider provider this credential would serve.
     pub provider: String,
     /// Human-facing first-party source name.
@@ -1202,10 +1199,6 @@ pub struct DeviceCredentialCandidateWire {
     /// Account email/label only when the probed store itself carries one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_label: Option<String>,
-    /// Typed, informational identity derived without authenticating the
-    /// external CLI store. Never contains token material.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity: Option<haider_protocol::credential::AccountIdentity>,
     /// Coarse fresh | expiring | expired | unknown access-token hint.
     pub freshness: String,
     /// Provider access-token expiry, when the store states one.
@@ -1218,6 +1211,15 @@ pub struct DeviceCredentialCandidateWire {
     /// Honest, actionable explanation paired with an unsupported candidate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unsupported_reason: Option<String>,
+    /// Stable daemon-owned import source key (for example `codex`). This
+    /// v0.0.964 field stays at the serialization tail for additive wire skew.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    /// Typed, informational identity derived without authenticating the
+    /// external CLI store. Never contains token material. Tail-added beside
+    /// `source` so older candidate bytes retain their historical prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<haider_protocol::credential::AccountIdentity>,
 }
 
 /// Typed, secret-free notice that a first-party CLI login can be copied into

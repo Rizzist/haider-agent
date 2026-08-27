@@ -105,14 +105,6 @@ impl ProviderViewStore {
             ));
         }
 
-        // Queue potential CAS orphans and publish their index references in
-        // one SQLite transaction. The filesystem writes remain between those
-        // SQL phases, preserving the former operation order while removing a
-        // standalone WAL commit.
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sqlite_write_error)?;
-        self.queue_gc(&transaction, &expected)?;
         let mut persisted = HashSet::new();
         for blob in blobs {
             if persisted.insert(blob.block.clone()) {
@@ -127,6 +119,14 @@ impl ProviderViewStore {
         // Every blob is plain-fsynced before this one full flush and the index transaction.
         self.cas.finish_batched_puts()?;
 
+        // Queue potential CAS orphans and publish their index references in
+        // one SQLite transaction. The trailing Full above is the durability
+        // fence before any index write begins; queue_gc remains folded into
+        // this single transaction rather than owning a standalone WAL commit.
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_write_error)?;
+        self.queue_gc(&transaction, &expected)?;
         transaction
             .execute(
                 "INSERT OR IGNORE INTO provider_view_session_cursors(

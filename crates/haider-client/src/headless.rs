@@ -2437,7 +2437,7 @@ async fn run_headless_inner(
     let mut connection = before_acceptance_deadline(
         timeout_deadline,
         "connect",
-        HeadlessConnection::open(profile, ensure.clone(), daemon_ownership),
+        HeadlessConnection::open(profile, ensure.clone(), Arc::clone(&daemon_ownership)),
     )
     .await?;
     let (explicit_provider, explicit_model, selected_provider) = before_acceptance_deadline(

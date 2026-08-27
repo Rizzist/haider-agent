@@ -307,6 +307,20 @@ fn prepare_runtime_dir(runtime_dir: &Path) -> Result<(OwnedFd, u32), EndpointErr
                 runtime_dir.display()
             ),
         })?;
+    // An explicit HAIDER_RUNTIME_DIR may name a nested root whose parents do
+    // not exist yet. Create only that ancestor chain recursively; the final
+    // root remains a separate mkdir/open/fstat sequence below so we can tell
+    // a newly created private root from an existing path that must already be
+    // owner-private.
+    if let Some(root_parent) = root_path.parent()
+        && !root_parent.as_os_str().is_empty()
+    {
+        let mut parent_builder = fs::DirBuilder::new();
+        parent_builder.recursive(true).mode(0o700);
+        parent_builder.create(root_parent).map_err(|error| {
+            EndpointError::io("create private runtime root ancestors", root_parent, error)
+        })?;
+    }
     let mut root_builder = fs::DirBuilder::new();
     root_builder.mode(0o700);
     let root_created = match root_builder.create(root_path) {
@@ -335,8 +349,11 @@ fn prepare_runtime_dir(runtime_dir: &Path) -> Result<(OwnedFd, u32), EndpointErr
     {
         return Err(EndpointError::Endpoint {
             message: format!(
-                "runtime root {} is not an owner-private directory",
-                root_path.display()
+                "runtime root {} is not an owner directory (uid {}, expected {}; mode {:04o})",
+                root_path.display(),
+                root_stat.st_uid,
+                expected_uid,
+                root_stat.st_mode & 0o7777,
             ),
         });
     }
@@ -347,8 +364,9 @@ fn prepare_runtime_dir(runtime_dir: &Path) -> Result<(OwnedFd, u32), EndpointErr
     } else if root_stat.st_mode & 0o077 != 0 {
         return Err(EndpointError::Endpoint {
             message: format!(
-                "runtime root {} is not an owner-private directory",
-                root_path.display()
+                "runtime root {} is not owner-private (mode {:04o}; expected no group/other bits)",
+                root_path.display(),
+                root_stat.st_mode & 0o7777,
             ),
         });
     }

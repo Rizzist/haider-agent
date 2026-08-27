@@ -78,6 +78,10 @@ fn haider_command(store: &Path) -> Command {
         // daemon binds there while the test watches the fallback path — the
         // round-4 daemon.log finally named this split.
         .env_remove("XDG_RUNTIME_DIR")
+        // `resolved_for` deliberately supplies no runtime override, so an
+        // ambient harness override must not make the child resolve a
+        // different root from the parent-side expected profile.
+        .env_remove("HAIDER_RUNTIME_DIR")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -363,12 +367,13 @@ fn stale_owner_socket_is_recovered_by_the_winning_daemon() {
 
     // Plant a dead same-owner socket node at the endpoint: bind, then drop
     // the listener. Connecting to the node now yields ConnectionRefused.
-    std::fs::create_dir_all(&profile.runtime_dir).expect("create runtime dir");
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ =
-            std::fs::set_permissions(&profile.runtime_dir, std::fs::Permissions::from_mode(0o700));
-    }
+    // Use the production creator for the whole shared-root/profile/tmp tree.
+    // A plain create_dir_all here creates the shared `<TMPDIR>/haider` parent
+    // through the test process's umask (normally 0755); chmodding only the
+    // profile child then poisons every concurrently starting daemon because
+    // production correctly refuses a non-private shared root.
+    haider_platform::prepare_runtime_directory(&profile.runtime_dir)
+        .expect("create owner-private runtime tree");
     let _ = std::fs::remove_file(&profile.endpoint_path);
     let stale =
         std::os::unix::net::UnixListener::bind(&profile.endpoint_path).expect("bind stale socket");

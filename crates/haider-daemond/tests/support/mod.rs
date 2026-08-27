@@ -291,10 +291,17 @@ pub fn test_root(prefix: &str) -> tempfile::TempDir {
     const SHORT_TMP_ROOT: &str = "/tmp";
 
     #[cfg(unix)]
-    return tempfile::Builder::new()
-        .prefix(prefix)
-        .tempdir_in(SHORT_TMP_ROOT)
-        .expect("short temporary root");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(SHORT_TMP_ROOT)
+            .expect("short temporary root");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("owner-private temporary root");
+        root
+    }
     #[cfg(windows)]
     {
         // Hosted runners commonly expose TEMP through an 8.3 alias such as

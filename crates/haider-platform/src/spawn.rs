@@ -284,16 +284,36 @@ impl DaemonLivenessWatcher {
         }
         #[cfg(windows)]
         {
-            use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0};
+            use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
             use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
 
             let (sender, receiver) = tokio::sync::oneshot::channel();
+            // Rendezvous after a zero-time kernel probe. Once it reports
+            // alive, process-handle signaling is sticky, so a launcher exit
+            // between this handshake and the infinite wait cannot be lost.
+            // This makes the outer runtime's first-poll "armed" fence real.
+            let (armed_sender, armed_receiver) = std::sync::mpsc::sync_channel(0);
             std::thread::Builder::new()
                 .name("haider-launcher-liveness".into())
                 .spawn(move || {
-                    let result = unsafe {
-                        WaitForSingleObject(self.launcher.as_raw_handle().cast(), INFINITE)
-                    };
+                    let handle = self.launcher.as_raw_handle().cast();
+                    let initial = unsafe { WaitForSingleObject(handle, 0) };
+                    if initial != WAIT_TIMEOUT {
+                        let outcome = match initial {
+                            WAIT_OBJECT_0 => Ok(()),
+                            WAIT_FAILED => Err(std::io::Error::last_os_error()),
+                            other => Err(std::io::Error::other(format!(
+                                "launcher process wait returned unexpected status {other}"
+                            ))),
+                        };
+                        let _ = sender.send(outcome);
+                        let _ = armed_sender.send(());
+                        return;
+                    }
+                    if armed_sender.send(()).is_err() {
+                        return;
+                    }
+                    let result = unsafe { WaitForSingleObject(handle, INFINITE) };
                     let outcome = match result {
                         WAIT_OBJECT_0 => Ok(()),
                         WAIT_FAILED => Err(std::io::Error::last_os_error()),
@@ -309,6 +329,11 @@ impl DaemonLivenessWatcher {
                         format!("could not start launcher-liveness thread: {error}"),
                     )
                 })?;
+            armed_receiver.recv().map_err(|error| {
+                std::io::Error::other(format!(
+                    "launcher-liveness thread did not arm its kernel wait: {error}"
+                ))
+            })?;
             receiver.await.map_err(|error| {
                 std::io::Error::other(format!("launcher-liveness thread failed: {error}"))
             })?
@@ -800,8 +825,9 @@ fn configure_daemon(
 ) {
     use std::os::unix::process::CommandExt as _;
     command.process_group(0);
-    // SAFETY: the hook runs between fork and exec and calls only the
-    // async-signal-safe close(2); no allocation or runtime state is touched.
+    // SAFETY: the hook runs between fork and exec and uses only raw,
+    // async-signal-safe descriptor syscalls; no allocation or runtime state
+    // is touched.
     #[allow(unsafe_code)]
     unsafe {
         command.pre_exec(move || {

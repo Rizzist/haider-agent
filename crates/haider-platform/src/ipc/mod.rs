@@ -174,6 +174,32 @@ mod tests {
     use super::Endpoint;
     use std::path::Path;
 
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn runtime_directory_creation_is_recursive_private_and_idempotent() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = tempfile::tempdir().expect("temporary base");
+        let root = base.path().join("missing").join("runtime-root");
+        let runtime = root.join("profile");
+
+        super::prepare_runtime_directory(&runtime).expect("prepare nested runtime directory");
+        super::prepare_runtime_directory(&runtime).expect("prepare runtime directory again");
+
+        let temp = runtime.join("tmp");
+        for path in [&root, &runtime, &temp] {
+            let metadata = std::fs::symlink_metadata(path).expect("runtime metadata");
+            assert!(metadata.is_dir(), "{} must be a directory", path.display());
+            assert_eq!(
+                metadata.permissions().mode() & 0o777,
+                0o700,
+                "{} must be owner-private",
+                path.display()
+            );
+        }
+    }
+
     #[test]
     #[cfg(unix)]
     fn unix_endpoint_uses_the_short_profile_scoped_name() {

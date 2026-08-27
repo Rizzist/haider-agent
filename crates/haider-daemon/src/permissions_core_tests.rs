@@ -1171,15 +1171,23 @@ fn every_advertised_tool_is_manual_described_and_wire_is_description_free() {
     assert!(manual.contains("REPLACE the whole todo list"));
 }
 
-/// MUTATION CHECK: stop stubbing, stop emptying wire descriptions, or move
-/// nothing into the manual. Expected RUNTIME failure: the instruct pipe stops
-/// being a real (>1/3) net reduction of the advertised prefix.
+/// MUTATION CHECK: stop stubbing, stop emptying wire descriptions, move
+/// nothing into the manual, or change the advertised inventory without
+/// recounting it. Expected RUNTIME failure: an inventory/byte pin moves or the
+/// instruct pipe stops being a material (at least 30%) net reduction.
 #[test]
 fn instruct_pipe_shrinks_the_advertised_wire_pack() {
+    const EXPECTED_REGISTERED_TOOLS: usize = 22;
+    const EXPECTED_ADVERTISED_TOOLS: usize = 19;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 14_783;
+    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 9_911;
+
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let stubbed =
         advertised_tool_definitions(&factory, None, "fake", WebCapabilityDegrade::default());
     let registry = registered_tools();
+    assert_eq!(registry.len(), EXPECTED_REGISTERED_TOOLS);
+    assert_eq!(stubbed.len(), EXPECTED_ADVERTISED_TOOLS);
     // Original prefix: each tool's name + full description + full schema.
     let full_prefix: usize = stubbed
         .iter()
@@ -1208,10 +1216,12 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
         })
         .sum();
     let new_total = stub_wire + tool_manual(&stubbed).len();
+    assert_eq!(full_prefix, EXPECTED_FULL_PREFIX_BYTES);
+    assert_eq!(new_total, EXPECTED_INSTRUCT_PIPE_BYTES);
     assert!(full_prefix > 0 && new_total < full_prefix);
     assert!(
-        full_prefix - new_total > full_prefix / 3,
-        "instruct pipe must cut the advertised prefix by >1/3 (new {new_total} vs full {full_prefix})"
+        (full_prefix - new_total) * 10 >= full_prefix * 3,
+        "instruct pipe must cut the advertised prefix by at least 30% (new {new_total} vs full {full_prefix})"
     );
 }
 

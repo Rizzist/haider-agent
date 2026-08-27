@@ -1070,7 +1070,9 @@ impl HookStartupHydrator {
             if envelope.seq <= since_seq {
                 continue;
             }
-            reduce_durable_state(&mut self.state, envelope);
+            let payload = decode_committed_payload(&envelope.payload);
+            advance_durable_cursor(&mut self.state, envelope);
+            reduce_decoded_durable_state(&mut self.state, envelope, &payload);
             since_seq = envelope.seq;
         }
     }
@@ -1238,17 +1240,16 @@ async fn persist_service_snapshot(
     persist_engine_snapshot(&service.inner.store, state).await
 }
 
-fn reduce_durable_state(
+fn reduce_decoded_durable_state(
     state: &mut EngineState,
     envelope: &RawEnvelope,
+    payload: &DecodedCommittedPayload,
 ) -> Option<DecisionContext> {
-    advance_durable_cursor(state, envelope);
-    if let Ok(HookEventPayload::HookRunTrust { enabled }) =
-        HookEventPayload::from_payload_value(envelope.payload.clone())
+    if let DecodedCommittedPayload::Hook(HookEventPayload::HookRunTrust { enabled }) = payload
         && let Some(run_id) = envelope.run_id.clone()
     {
         let key = (envelope.session_id.clone(), run_id);
-        if enabled {
+        if *enabled {
             state.run_trust.insert(key.clone());
         } else {
             state.run_trust.remove(&key);
@@ -1256,8 +1257,7 @@ fn reduce_durable_state(
         }
         return None;
     }
-    if let Ok(EventPayload::RunState(run_state)) =
-        serde_json::from_value::<EventPayload>(envelope.payload.clone())
+    if let DecodedCommittedPayload::Core(EventPayload::RunState(run_state)) = payload
         && run_state.is_terminal()
         && let Some(run_id) = envelope.run_id.clone()
     {
@@ -1266,7 +1266,20 @@ fn reduce_durable_state(
             state.terminal_run_trust.insert(key);
         }
     }
-    absorb_decision_fact(state, envelope)
+    let DecodedCommittedPayload::Core(payload) = payload else {
+        return None;
+    };
+    absorb_decision_fact(state, envelope, payload)
+}
+
+#[cfg(test)]
+fn reduce_durable_state(
+    state: &mut EngineState,
+    envelope: &RawEnvelope,
+) -> Option<DecisionContext> {
+    let payload = decode_committed_payload(&envelope.payload);
+    advance_durable_cursor(state, envelope);
+    reduce_decoded_durable_state(state, envelope, &payload)
 }
 
 fn prune_terminal_run_trust(state: &mut EngineState) {
@@ -1430,8 +1443,6 @@ async fn run_engine(
                             let mut aborted = false;
                             let mut batch_terminal = false;
                             for envelope in envelopes {
-                                let terminal_scope = terminal_run_scope(&envelope);
-                                batch_terminal |= terminal_scope.is_some();
                                 // Run-scoped trust must remain replayable until
                                 // every earlier row in that run is acknowledged.
                                 // Handle those server hooks synchronously so
@@ -1441,7 +1452,7 @@ async fn run_engine(
                                     state.run_trust.contains(&scope).then_some(scope)
                                 });
                                 let ack_count = acks.len();
-                                if !handle_and_complete(
+                                let outcome = handle_and_complete(
                                     &service,
                                     &mut state,
                                     &mut jobs,
@@ -1450,8 +1461,9 @@ async fn run_engine(
                                     &mut acks,
                                     &mut batch_discoveries,
                                 )
-                                .await
-                                {
+                                .await;
+                                batch_terminal |= outcome.terminal_scope.is_some();
+                                if !outcome.completed {
                                     if let Some(scope) = ordered_run_scope {
                                         blocked_run_acks.insert(scope);
                                     }
@@ -1464,7 +1476,7 @@ async fn run_engine(
                                     ordered_ack_scopes.insert(scope.clone());
                                 }
                                 if acks.len() > ack_count
-                                    && let Some(scope) = terminal_scope
+                                    && let Some(scope) = outcome.terminal_scope
                                     && state.terminal_run_trust.contains(&scope)
                                     && !blocked_run_acks.contains(&scope)
                                 {
@@ -1576,9 +1588,13 @@ async fn run_engine(
     }
 }
 
-fn terminal_run_scope(envelope: &RawEnvelope) -> Option<(SessionId, RunId)> {
-    let terminal = serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
-        |payload| matches!(payload, EventPayload::RunState(state) if state.is_terminal()),
+fn terminal_run_scope(
+    envelope: &RawEnvelope,
+    payload: &DecodedCommittedPayload,
+) -> Option<(SessionId, RunId)> {
+    let terminal = matches!(
+        payload,
+        DecodedCommittedPayload::Core(EventPayload::RunState(state)) if state.is_terminal()
     );
     if !terminal {
         return None;
@@ -1636,6 +1652,7 @@ async fn replay_pending_dispatches(
                 &mut batch_discoveries,
             )
             .await
+            .completed
             {
                 // Rows handled before the failure are still acknowledged so
                 // a restart replays exactly the unhandled remainder.
@@ -1649,6 +1666,11 @@ async fn replay_pending_dispatches(
     }
 }
 
+struct HandleOutcome {
+    terminal_scope: Option<(SessionId, RunId)>,
+    completed: bool,
+}
+
 async fn handle_and_complete(
     service: &HookService,
     state: &mut EngineState,
@@ -1657,28 +1679,37 @@ async fn handle_and_complete(
     defer_servers: bool,
     acks: &mut Vec<(SessionId, u64)>,
     batch_discoveries: &mut BatchDiscoveryCache,
-) -> bool {
+) -> HandleOutcome {
+    let payload = decode_committed_payload(&envelope.payload);
+    let terminal_scope = terminal_run_scope(&envelope, &payload);
+    let committed = DecodedCommittedEnvelope {
+        envelope: envelope.clone(),
+        payload,
+    };
     advance_durable_cursor(state, &envelope);
     let mut pending = Vec::new();
-    let mut terminal_scope = None;
+    let mut terminal_server_scope = None;
     if !handle_committed(
         service,
         state,
         jobs,
-        envelope.clone(),
+        committed,
         &mut pending,
-        &mut terminal_scope,
+        &mut terminal_server_scope,
         batch_discoveries,
     )
     .await
     {
-        return false;
+        return HandleOutcome {
+            terminal_scope,
+            completed: false,
+        };
     }
     if defer_servers && !pending.is_empty() {
         let service = service.clone();
         jobs.spawn(async move {
             let handled = complete_server_fires(&service, pending).await;
-            if let Some(scope) = &terminal_scope {
+            if let Some(scope) = &terminal_server_scope {
                 service.inner.servers.kill_scope(scope);
             }
             if handled {
@@ -1695,18 +1726,27 @@ async fn handle_and_complete(
                 }
             }
         });
-        return true;
+        return HandleOutcome {
+            terminal_scope,
+            completed: true,
+        };
     }
     if !complete_server_fires(service, pending).await {
-        return false;
+        return HandleOutcome {
+            terminal_scope,
+            completed: false,
+        };
     }
-    if let Some(scope) = terminal_scope {
+    if let Some(scope) = terminal_server_scope {
         service.inner.servers.kill_scope(&scope);
     }
     // Delete-after-handled is preserved: the caller's cycle flush runs
     // strictly after this handler returns, in one durable transaction.
     acks.push((envelope.session_id, envelope.seq));
-    true
+    HandleOutcome {
+        terminal_scope,
+        completed: true,
+    }
 }
 
 async fn complete_server_fires(service: &HookService, pending: Vec<PendingServerFire>) -> bool {
@@ -1722,20 +1762,19 @@ async fn handle_committed(
     service: &HookService,
     state: &mut EngineState,
     jobs: &mut JoinSet<()>,
-    envelope: RawEnvelope,
+    committed: DecodedCommittedEnvelope,
     pending_servers: &mut Vec<PendingServerFire>,
     terminal_server_scope: &mut Option<(SessionId, RunId)>,
     batch_discoveries: &mut BatchDiscoveryCache,
 ) -> bool {
+    let DecodedCommittedEnvelope { envelope, payload } = committed;
     if HookEventPayload::is_engine_fact(&envelope.payload) {
         return true;
     }
 
-    let decision = reduce_durable_state(state, &envelope);
-    if let Ok(HookEventPayload::HookRunTrust { enabled }) =
-        HookEventPayload::from_payload_value(envelope.payload.clone())
-    {
-        if !enabled && let Some(run_id) = envelope.run_id.clone() {
+    let decision = reduce_decoded_durable_state(state, &envelope, &payload);
+    if let DecodedCommittedPayload::Hook(HookEventPayload::HookRunTrust { enabled }) = &payload {
+        if !*enabled && let Some(run_id) = envelope.run_id.clone() {
             service
                 .inner
                 .servers
@@ -1743,7 +1782,7 @@ async fn handle_committed(
         }
         return true;
     }
-    let Some(facts) = classify(&envelope) else {
+    let Some(facts) = classify_payload(&payload) else {
         return true;
     };
     let context = if let Some(context) = batch_discoveries.get(&envelope.session_id).cloned() {
@@ -2158,55 +2197,59 @@ async fn journal_notice_once(
 fn absorb_decision_fact(
     state: &mut EngineState,
     envelope: &RawEnvelope,
+    payload: &EventPayload,
 ) -> Option<DecisionContext> {
     let session = state
         .sessions
         .entry(envelope.session_id.clone())
         .or_default();
-    let payload = serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?;
     match payload {
         EventPayload::Effect(EffectPhase::Intent(intent)) => {
-            session.intents.insert(intent.effect.clone(), intent);
+            session
+                .intents
+                .insert(intent.effect.clone(), intent.clone());
         }
         EventPayload::Effect(EffectPhase::Authorized {
             effect,
             verdict: AuthorizationVerdict::Ask { menu },
         }) => {
-            if let Some(intent) = session.intents.get(&effect).cloned() {
-                session.bindings.insert(menu, intent);
+            if let Some(intent) = session.intents.get(effect).cloned() {
+                session.bindings.insert(menu.clone(), intent);
             }
         }
         EventPayload::Effect(EffectPhase::Authorized { effect, .. })
         | EventPayload::Effect(EffectPhase::Outcome { effect, .. }) => {
-            session.intents.remove(&effect);
-            session.bindings.retain(|_, intent| intent.effect != effect);
+            session.intents.remove(effect);
+            session
+                .bindings
+                .retain(|_, intent| &intent.effect != effect);
         }
-        EventPayload::MenuOpened(menu) if matches!(menu.kind, MenuKind::Permission { .. }) => {
+        EventPayload::MenuOpened(menu) if matches!(&menu.kind, MenuKind::Permission { .. }) => {
             session.menus.insert(
                 menu.id.clone(),
                 OpenPermission {
-                    menu,
+                    menu: menu.clone(),
                     opening: envelope.clone(),
                 },
             );
         }
         EventPayload::RunState(RunState::PermissionRequired { menu }) => {
-            let intent = session.bindings.get(&menu)?.clone();
-            let permission = session.menus.get(&menu)?.clone();
+            let intent = session.bindings.get(menu)?.clone();
+            let permission = session.menus.get(menu)?.clone();
             return Some(DecisionContext { intent, permission });
         }
         EventPayload::MenuAnswered(answer) => {
-            let menu = answer.menu;
-            if let Some(intent) = session.bindings.remove(&menu) {
+            let menu = &answer.menu;
+            if let Some(intent) = session.bindings.remove(menu) {
                 session.intents.remove(&intent.effect);
             }
-            session.menus.remove(&menu);
+            session.menus.remove(menu);
         }
         EventPayload::MenuClosed { menu, .. } => {
-            if let Some(intent) = session.bindings.remove(&menu) {
+            if let Some(intent) = session.bindings.remove(menu) {
                 session.intents.remove(&intent.effect);
             }
-            session.menus.remove(&menu);
+            session.menus.remove(menu);
         }
         _ => {}
     }
@@ -2223,124 +2266,169 @@ struct MatchFacts {
     has_attachments: Option<bool>,
 }
 
-fn classify(envelope: &RawEnvelope) -> Option<MatchFacts> {
-    if let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) {
-        let facts = match payload {
-            EventPayload::SessionState(SessionState::Created) => MatchFacts {
-                event: MatchEvent::SessionCreated,
-                outcome: None,
-                parked_kind: None,
-                provider: None,
-                mode: None,
-                has_attachments: None,
-            },
-            EventPayload::UserMessage {
-                attachments, mode, ..
-            } => MatchFacts {
-                event: MatchEvent::UserMessage,
-                outcome: None,
-                parked_kind: None,
-                provider: None,
-                mode: Some(mode),
-                has_attachments: Some(!attachments.is_empty()),
-            },
-            EventPayload::RunState(RunState::Thinking) => MatchFacts {
-                event: MatchEvent::RunStarted,
-                outcome: None,
-                parked_kind: None,
-                provider: None,
-                mode: None,
-                has_attachments: None,
-            },
-            EventPayload::RunState(RunState::PermissionRequired { .. }) => MatchFacts {
-                event: MatchEvent::RunParked,
-                outcome: None,
-                parked_kind: Some("permission"),
-                provider: None,
-                mode: None,
-                has_attachments: None,
-            },
-            EventPayload::RunState(RunState::InputRequired { .. }) => MatchFacts {
-                event: MatchEvent::RunParked,
-                outcome: None,
-                parked_kind: Some("input"),
-                provider: None,
-                mode: None,
-                has_attachments: None,
-            },
-            EventPayload::RunState(RunState::Done) => MatchFacts {
-                event: MatchEvent::RunFinished,
-                outcome: Some("done"),
-                parked_kind: None,
-                provider: None,
-                mode: None,
-                has_attachments: None,
-            },
-            EventPayload::RunState(RunState::Errored) => MatchFacts {
-                event: MatchEvent::RunFinished,
-                outcome: Some("errored"),
-                parked_kind: None,
-                provider: None,
-                mode: None,
-                has_attachments: None,
-            },
-            EventPayload::RunState(RunState::Cancelled) => MatchFacts {
-                event: MatchEvent::RunFinished,
-                outcome: Some("cancelled"),
-                parked_kind: None,
-                provider: None,
-                mode: None,
-                has_attachments: None,
-            },
-            EventPayload::AgentSpawned(_) => MatchFacts {
-                event: MatchEvent::SubagentSpawned,
-                outcome: None,
-                parked_kind: None,
-                provider: None,
-                mode: None,
-                has_attachments: None,
-            },
-            EventPayload::AgentReport(_) => MatchFacts {
-                event: MatchEvent::SubagentReported,
-                outcome: None,
-                parked_kind: None,
-                provider: None,
-                mode: None,
-                has_attachments: None,
-            },
-            EventPayload::Item(ItemEvent::Completed {
-                item: TurnItem::ContextCompaction { .. },
-                ..
-            }) => MatchFacts {
-                event: MatchEvent::CompactionCompleted,
-                outcome: None,
-                parked_kind: None,
-                provider: None,
-                mode: None,
-                has_attachments: None,
-            },
-            _ => return None,
-        };
-        return Some(facts);
+enum DecodedCommittedPayload {
+    Core(EventPayload),
+    Hook(HookEventPayload),
+    Unknown,
+}
+
+struct DecodedCommittedEnvelope {
+    envelope: RawEnvelope,
+    payload: DecodedCommittedPayload,
+}
+
+fn decode_committed_payload(payload: &serde_json::Value) -> DecodedCommittedPayload {
+    let kind = payload.get("type").and_then(serde_json::Value::as_str);
+    if matches!(
+        kind,
+        Some(
+            "hook_notice"
+                | "hook_fired"
+                | "hook_subscription"
+                | "update_available"
+                | "account_expired"
+                | "hook_run_trust"
+                | "hook_trust_changed"
+        )
+    ) {
+        return HookEventPayload::from_payload_value(payload.clone()).map_or(
+            DecodedCommittedPayload::Unknown,
+            DecodedCommittedPayload::Hook,
+        );
     }
-    match HookEventPayload::from_payload_value(envelope.payload.clone()).ok()? {
-        HookEventPayload::UpdateAvailable { .. } => Some(MatchFacts {
-            event: MatchEvent::UpdateAvailable,
-            outcome: None,
-            parked_kind: None,
-            provider: None,
-            mode: None,
-            has_attachments: None,
-        }),
-        HookEventPayload::AccountExpired { provider, .. } => Some(MatchFacts {
-            event: MatchEvent::AccountExpired,
-            outcome: None,
-            parked_kind: None,
-            provider: Some(provider),
-            mode: None,
-            has_attachments: None,
-        }),
-        _ => None,
+    serde_json::from_value(payload.clone()).map_or(
+        DecodedCommittedPayload::Unknown,
+        DecodedCommittedPayload::Core,
+    )
+}
+
+#[cfg(test)]
+fn classify(envelope: &RawEnvelope) -> Option<MatchFacts> {
+    classify_payload(&decode_committed_payload(&envelope.payload))
+}
+
+fn classify_payload(payload: &DecodedCommittedPayload) -> Option<MatchFacts> {
+    match payload {
+        DecodedCommittedPayload::Core(payload) => {
+            let facts = match payload {
+                EventPayload::SessionState(SessionState::Created) => MatchFacts {
+                    event: MatchEvent::SessionCreated,
+                    outcome: None,
+                    parked_kind: None,
+                    provider: None,
+                    mode: None,
+                    has_attachments: None,
+                },
+                EventPayload::UserMessage {
+                    attachments, mode, ..
+                } => MatchFacts {
+                    event: MatchEvent::UserMessage,
+                    outcome: None,
+                    parked_kind: None,
+                    provider: None,
+                    mode: Some(*mode),
+                    has_attachments: Some(!attachments.is_empty()),
+                },
+                EventPayload::RunState(RunState::Thinking) => MatchFacts {
+                    event: MatchEvent::RunStarted,
+                    outcome: None,
+                    parked_kind: None,
+                    provider: None,
+                    mode: None,
+                    has_attachments: None,
+                },
+                EventPayload::RunState(RunState::PermissionRequired { .. }) => MatchFacts {
+                    event: MatchEvent::RunParked,
+                    outcome: None,
+                    parked_kind: Some("permission"),
+                    provider: None,
+                    mode: None,
+                    has_attachments: None,
+                },
+                EventPayload::RunState(RunState::InputRequired { .. }) => MatchFacts {
+                    event: MatchEvent::RunParked,
+                    outcome: None,
+                    parked_kind: Some("input"),
+                    provider: None,
+                    mode: None,
+                    has_attachments: None,
+                },
+                EventPayload::RunState(RunState::Done) => MatchFacts {
+                    event: MatchEvent::RunFinished,
+                    outcome: Some("done"),
+                    parked_kind: None,
+                    provider: None,
+                    mode: None,
+                    has_attachments: None,
+                },
+                EventPayload::RunState(RunState::Errored) => MatchFacts {
+                    event: MatchEvent::RunFinished,
+                    outcome: Some("errored"),
+                    parked_kind: None,
+                    provider: None,
+                    mode: None,
+                    has_attachments: None,
+                },
+                EventPayload::RunState(RunState::Cancelled) => MatchFacts {
+                    event: MatchEvent::RunFinished,
+                    outcome: Some("cancelled"),
+                    parked_kind: None,
+                    provider: None,
+                    mode: None,
+                    has_attachments: None,
+                },
+                EventPayload::AgentSpawned(_) => MatchFacts {
+                    event: MatchEvent::SubagentSpawned,
+                    outcome: None,
+                    parked_kind: None,
+                    provider: None,
+                    mode: None,
+                    has_attachments: None,
+                },
+                EventPayload::AgentReport(_) => MatchFacts {
+                    event: MatchEvent::SubagentReported,
+                    outcome: None,
+                    parked_kind: None,
+                    provider: None,
+                    mode: None,
+                    has_attachments: None,
+                },
+                EventPayload::Item(ItemEvent::Completed {
+                    item: TurnItem::ContextCompaction { .. },
+                    ..
+                }) => MatchFacts {
+                    event: MatchEvent::CompactionCompleted,
+                    outcome: None,
+                    parked_kind: None,
+                    provider: None,
+                    mode: None,
+                    has_attachments: None,
+                },
+                _ => return None,
+            };
+            Some(facts)
+        }
+        DecodedCommittedPayload::Hook(HookEventPayload::UpdateAvailable { .. }) => {
+            Some(MatchFacts {
+                event: MatchEvent::UpdateAvailable,
+                outcome: None,
+                parked_kind: None,
+                provider: None,
+                mode: None,
+                has_attachments: None,
+            })
+        }
+        DecodedCommittedPayload::Hook(HookEventPayload::AccountExpired { provider, .. }) => {
+            Some(MatchFacts {
+                event: MatchEvent::AccountExpired,
+                outcome: None,
+                parked_kind: None,
+                provider: Some(provider.clone()),
+                mode: None,
+                has_attachments: None,
+            })
+        }
+        DecodedCommittedPayload::Hook(_) | DecodedCommittedPayload::Unknown => None,
     }
 }
 

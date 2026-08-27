@@ -2820,7 +2820,7 @@ impl UserCommandOutput {
         self.retained_bytes = self.retained_bytes.saturating_add(retained);
     }
 
-    fn finish(self) -> (String, bool, bool, u64) {
+    fn finish(self, failed: bool) -> (String, bool, bool, u64) {
         let mut preview = String::new();
         let mut truncated = self.total_bytes > self.retained_bytes as u64;
         let mut lossy_utf8 = false;
@@ -2836,7 +2836,12 @@ impl UserCommandOutput {
             lossy_utf8 |= matches!(decoded, std::borrow::Cow::Owned(_));
             truncated |= !append_bounded_utf8(&mut preview, &decoded);
         }
-        (preview, truncated, lossy_utf8, self.total_bytes)
+        // E4 content law: the journal remains the raw command transcript.
+        // Deterministic output adapters apply only while constructing the
+        // provider-facing record from those raw bytes.
+        let reduced = haider_tools::reduce_tool_output("shell_exec", &preview, failed);
+        truncated |= reduced.text != preview;
+        (reduced.text, truncated, lossy_utf8, self.total_bytes)
     }
 }
 
@@ -3253,12 +3258,12 @@ fn render_journal_with_facts(
         if !ordinary_visible {
             continue;
         }
-        if envelope.render.prompt == PromptRender::Omit {
-            continue;
-        }
         let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
             continue;
         };
+        // Direct-shell chunks are raw durable/UI facts with prompt=omit. The
+        // completed command item below is the sole prompt record, and adapts
+        // this accumulated raw transcript exactly once for the model.
         if let EventPayload::Item(ItemEvent::Delta {
             item_id,
             delta: ItemDelta::CommandOutput { stream, chunk_b64 },
@@ -3274,6 +3279,9 @@ fn render_journal_with_facts(
                 .entry(item_id.clone())
                 .or_default()
                 .push(*stream, &bytes);
+            continue;
+        }
+        if envelope.render.prompt == PromptRender::Omit {
             continue;
         }
         match payload {
@@ -3312,8 +3320,9 @@ fn render_journal_with_facts(
                     .is_some_and(|origin| origin.call_id == call_id) =>
                 {
                     let output = user_command_outputs.remove(&item_id).unwrap_or_default();
+                    let failed = status != haider_protocol::item::ToolStatus::Completed;
                     let (output_preview, output_truncated, output_lossy_utf8, output_bytes) =
-                        output.finish();
+                        output.finish(failed);
                     messages.push(Message::user_command(UserCommandRecord {
                         call_id,
                         command,

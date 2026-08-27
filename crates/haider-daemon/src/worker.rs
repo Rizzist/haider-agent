@@ -3343,16 +3343,16 @@ async fn run_supervisor(
                     }
                 }
                 changed = cancellation_wakes.changed() => {
-                    if changed.is_ok() {
-                        if reconcile_durable_cancellations(
+                    if changed.is_ok()
+                        && reconcile_durable_cancellations(
                             &mut queue,
                             &lease,
                             &device_id,
                             &event_ids,
                             Some((&active_run, &active_cancel)),
-                        ).await {
-                            signal_queued_budget_change(&mut queue_epoch, &queue_changed);
-                        }
+                        ).await
+                    {
+                        signal_queued_budget_change(&mut queue_epoch, &queue_changed);
                     }
                 }
                 outcome = turn.outcome.as_mut() => {
@@ -3748,16 +3748,16 @@ async fn run_supervisor(
                     }
                 },
                 changed = cancellation_wakes.changed() => {
-                    if changed.is_ok() {
-                        if reconcile_durable_cancellations(
+                    if changed.is_ok()
+                        && reconcile_durable_cancellations(
                             &mut queue,
                             &lease,
                             &device_id,
                             &event_ids,
                             None,
-                        ).await {
-                            signal_queued_budget_change(&mut queue_epoch, &queue_changed);
-                        }
+                        ).await
+                    {
+                        signal_queued_budget_change(&mut queue_epoch, &queue_changed);
                     }
                 }
             }

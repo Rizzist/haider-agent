@@ -1,13 +1,6 @@
 #![allow(clippy::expect_used)]
 
-<<<<<<< HEAD
 use haider_protocol::DeliveryMode;
-=======
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
-
->>>>>>> wave-964-o2
 use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorCode, HaiderError};
@@ -30,16 +23,12 @@ use crate::turn_recovery::{
     STARTUP_HYDRATION_PAYLOAD_KINDS, interrupted_recovery_payloads_for_test,
 };
 use crate::worker::{
-<<<<<<< HEAD
-    BrokerToolFactory, ProviderFactory, ResolvedTurnProvider, WorkerDependencies, WorkerManager,
-    budget_usage_from_envelopes_for_test, exhausted_budget,
+    BrokerToolFactory, ProviderFactory, QueuedBudgetArm, QueuedBudgetWake, ResolvedTurnProvider,
+    WorkerDependencies, WorkerManager, budget_usage_from_envelopes_for_test, exhausted_budget,
+    signal_queued_budget_change, wait_for_queued_budget_deadline_or_change,
 };
 use haider_core::{SessionCreateCommand, SqliteStoreHandle, StoreHandle, TurnAcceptCommand};
 use haider_protocol::session::SessionMetadataV1;
-=======
-    QueuedBudgetArm, QueuedBudgetWake, budget_usage_from_envelopes_for_test, exhausted_budget,
-    signal_queued_budget_change, wait_for_queued_budget_deadline_or_change,
-};
 
 #[tokio::test(start_paused = true)]
 async fn queued_budget_arm_survives_select_reentry_and_rearms_after_queue_change() {
@@ -98,7 +87,6 @@ async fn queued_budget_arm_survives_select_reentry_and_rearms_after_queue_change
     budget.future_mut().await;
     assert_eq!(scans.load(Ordering::SeqCst), 2);
 }
->>>>>>> wave-964-o2
 
 fn envelope(seq: u64, run_id: &RunId, payload: serde_json::Value) -> RawEnvelope {
     serde_json::from_value(serde_json::json!({

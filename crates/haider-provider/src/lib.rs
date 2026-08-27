@@ -1216,11 +1216,12 @@ pub struct ProviderError {
     /// Exact local transport-phase budget selected for the request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_ms: Option<u64>,
-    /// Why a deadline-derived provider timeout fired.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_reason: Option<ProviderTimeoutReason>,
     #[serde(default)]
     pub presentation: ErrorPresentation,
+    /// Why a deadline-derived provider timeout fired. Tail-added so an error
+    /// carrying the new reason retains every pre-v0.0.964 field prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_reason: Option<ProviderTimeoutReason>,
 }
 
 impl ProviderError {
@@ -1240,8 +1241,8 @@ impl ProviderError {
             retry_after_ms: None,
             opened_within_ms: None,
             budget_ms: None,
-            timeout_reason: None,
             presentation,
+            timeout_reason: None,
         }
     }
 

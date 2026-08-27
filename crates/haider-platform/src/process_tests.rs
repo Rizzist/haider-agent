@@ -78,31 +78,60 @@ fn spawned_child_leaks_none_of_twenty_parent_descriptors() {
     );
 }
 
+/// MUTATION CHECK: close inherited descriptors in pre-exec instead of marking
+/// them CLOEXEC. That consumes std::process's private exec-error pipe, so this
+/// nonexistent executable incorrectly returns `Ok(Child)` instead of ENOENT.
+#[cfg(all(unix, not(target_os = "espidf")))]
+#[test]
+fn background_descriptor_sweep_preserves_synchronous_exec_errors() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build exec-error fixture runtime");
+    let error = runtime.block_on(async {
+        let mut command =
+            tokio::process::Command::new("/haider-fixture-this-executable-must-not-exist-wave-964");
+        super::configure_background_process(&mut command);
+        command
+            .spawn()
+            .expect_err("missing executable must fail spawn")
+    });
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+}
+
 #[cfg(all(unix, not(target_os = "espidf")))]
 #[test]
 #[allow(unsafe_code)]
-fn spawned_daemon_readiness_descriptor_survives_the_bounded_sweep() {
+fn spawned_daemon_startup_descriptors_survive_the_bounded_sweep() {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::process::CommandExt as _;
 
     const CHILD_MARKER: &str = "HAIDER_READINESS_SWEEP_CHILD";
     if std::env::var_os(CHILD_MARKER).is_some() {
-        // SAFETY: descriptor 3 is only borrowed for an open-descriptor probe.
-        let readiness = unsafe { std::os::fd::BorrowedFd::borrow_raw(3) };
-        rustix::io::fcntl_getfd(readiness)
-            .expect("readiness descriptor must survive the inherited-fd sweep");
+        for (fd, name) in [(3, "readiness"), (4, "liveness")] {
+            // SAFETY: each fixed descriptor is only borrowed for an
+            // open-descriptor probe in the spawned child.
+            let descriptor = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+            rustix::io::fcntl_getfd(descriptor).unwrap_or_else(|_| {
+                panic!("{name} descriptor must survive the inherited-fd sweep")
+            });
+        }
         return;
     }
 
-    let source = std::fs::File::open("/dev/null").expect("open readiness source");
-    let source_fd = source.as_raw_fd();
+    let readiness = std::fs::File::open("/dev/null").expect("open readiness source");
+    let liveness = std::fs::File::open("/dev/null").expect("open liveness source");
+    let readiness_fd = readiness.as_raw_fd();
+    let liveness_fd = liveness.as_raw_fd();
     let executable = std::env::current_exe().expect("locate platform test binary");
     let output = unsafe {
         std::process::Command::new(executable)
-            .arg("spawned_daemon_readiness_descriptor_survives_the_bounded_sweep")
+            .arg("spawned_daemon_startup_descriptors_survive_the_bounded_sweep")
             .arg("--nocapture")
             .env(CHILD_MARKER, "1")
-            .pre_exec(move || super::install_daemon_readiness_descriptor(source_fd))
+            .pre_exec(move || {
+                super::install_daemon_spawn_descriptors(Some(readiness_fd), Some(liveness_fd))
+            })
             .output()
     }
     .expect("spawn readiness-sweep child");
