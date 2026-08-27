@@ -35,20 +35,11 @@ Open the [latest release](https://github.com/Rizzist/haider-agent/releases/lates
 | Windows x86_64 | `haider-v<version>-x86_64-pc-windows-msvc.zip` |
 | Android (APK, sideloadable) | `haider-v<version>-android.apk` |
 
-Every binary asset has a `.sha256` beside it. Download both files, then verify before extracting or installing. The current macOS/Linux manifests record the archive under `dist/`, so preserve that path when checking them:
+Every binary asset has a `.sha256` beside it. Download both files into the same directory, then verify before extracting or installing. The same command works for every `.tar.xz`, `.zip`, and `.apk` asset; replace `<asset>` with the full asset filename from the table above:
 
 ```console
-$ mkdir -p dist
-$ mv haider-v<version>-<target>.tar.xz dist/
-$ shasum -a 256 -c haider-v<version>-<target>.tar.xz.sha256
-dist/haider-v<version>-<target>.tar.xz: OK
-```
-
-Windows and Android manifests use the bare filename and can be checked directly with the matching `.zip.sha256` or `.apk.sha256` file:
-
-```console
-$ shasum -a 256 -c haider-v<version>-android.apk.sha256
-haider-v<version>-android.apk: OK
+$ shasum -a 256 -c <asset>.sha256
+<asset>: OK
 ```
 
 The [native release workflow](.github/workflows/release.yml) produces the five target archives, signs and notarizes both macOS builds, and verifies the Android checksum before admitting an APK to a release.

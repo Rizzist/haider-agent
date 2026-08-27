@@ -208,7 +208,7 @@ jobs:
             (cd dist && sha256sum "$NAME.zip" > "$NAME.zip.sha256")
           else
             tar -C dist -cJf dist/$NAME.tar.xz $NAME
-            shasum -a 256 dist/$NAME.tar.xz > dist/$NAME.tar.xz.sha256
+            (cd dist && shasum -a 256 "$NAME.tar.xz" > "$NAME.tar.xz.sha256")
           fi
       - name: upload distribution archives
         uses: actions/upload-artifact@v4
