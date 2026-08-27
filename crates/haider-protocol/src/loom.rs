@@ -287,14 +287,44 @@ pub struct LoomRegistryEntryRef {
 
 /// Full typed record carried by a baseline or delta. The tag prevents agent
 /// lineage records from being collapsed into workflow graph records.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", content = "record", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum LoomRegistryRecord {
     AgentType(LoomAgentType),
     Workflow(LoomWorkflow),
-    #[serde(other)]
     Unknown,
+}
+
+impl<'de> Deserialize<'de> for LoomRegistryRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // `#[serde(other)]` on the adjacent representation above treats the
+        // catch-all as a unit variant and then rejects an unknown variant's
+        // `record` map. Decode the same wire shape internally tagged instead:
+        // known records stay typed, while an unknown tag consumes and ignores
+        // any future payload without making it actionable.
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum RegistryRecordWire {
+            AgentType {
+                record: LoomAgentType,
+            },
+            Workflow {
+                record: LoomWorkflow,
+            },
+            #[serde(other)]
+            Unknown,
+        }
+
+        Ok(match RegistryRecordWire::deserialize(deserializer)? {
+            RegistryRecordWire::AgentType { record } => Self::AgentType(record),
+            RegistryRecordWire::Workflow { record } => Self::Workflow(record),
+            RegistryRecordWire::Unknown => Self::Unknown,
+        })
+    }
 }
 
 impl LoomRegistryRecord {
@@ -539,43 +569,18 @@ pub fn validate_loom_author_text(
             None,
         )]);
     }
-    let parsed = serde_json::from_str::<LoomAuthorSpec>(text).map_err(|error| {
-        let message = error.to_string();
-        let missing = json_error_field(&message, "missing field");
-        let duplicate = json_error_field(&message, "duplicate field");
-        let unknown = json_error_field(&message, "unknown field");
-        let code = if missing.is_some() {
-            LoomAuthorValidationCode::MissingField
-        } else if duplicate.is_some() {
-            LoomAuthorValidationCode::DuplicateValue
-        } else if matches!(
-            error.classify(),
-            serde_json::error::Category::Syntax | serde_json::error::Category::Eof
-        ) {
-            LoomAuthorValidationCode::Syntax
-        } else {
-            LoomAuthorValidationCode::InvalidField
-        };
-        let leaf = missing.or(duplicate).or(unknown);
-        let field = if code == LoomAuthorValidationCode::Syntax {
-            "$".to_owned()
-        } else {
-            json_error_path(text, error.line(), error.column(), code, leaf)
-        };
-        vec![LoomAuthorValidationError {
-            code,
-            message,
-            location: LoomAuthorLocation {
-                line: u32::try_from(error.line()).unwrap_or(u32::MAX).max(1),
-                column: u32::try_from(error.column()).unwrap_or(u32::MAX).max(1),
-                field,
-            },
-        }]
-    })?;
-    let actual_kind = match &parsed {
-        LoomAuthorSpec::AgentType(_) => LoomAuthorKind::AgentType,
-        LoomAuthorSpec::Workflow(_) => LoomAuthorKind::Workflow,
-    };
+    #[derive(Deserialize)]
+    struct KindEnvelope {
+        kind: LoomAuthorKind,
+    }
+
+    // Deserialize the tag without buffering the tagged enum's payload.
+    // serde's internally-tagged enum path loses nested data coordinates
+    // (`line = column = 0`) after buffering, which collapses an edited leaf
+    // such as `nodes[0].evidence.required_green` back to `$`.
+    let actual_kind = serde_json::from_str::<KindEnvelope>(text)
+        .map_err(|error| loom_author_decode_errors(text, error))?
+        .kind;
     if actual_kind != expected_kind {
         return Err(vec![author_error(
             text,
@@ -585,10 +590,67 @@ pub fn validate_loom_author_text(
             None,
         )]);
     }
-    match parsed {
-        LoomAuthorSpec::AgentType(spec) => validate_author_agent_type(text, spec),
-        LoomAuthorSpec::Workflow(spec) => validate_author_workflow(text, spec, lookup),
+    // Decode the known payload as its strict struct directly. Blanking the
+    // top-level tag keeps every byte coordinate stable while avoiding the
+    // internally-tagged enum's coordinate-erasing buffer.
+    let payload = json_without_top_level_field(text, "kind").ok_or_else(|| {
+        vec![author_error(
+            text,
+            LoomAuthorValidationCode::MissingField,
+            "authoring text is missing its kind tag",
+            "kind",
+            None,
+        )]
+    })?;
+    match actual_kind {
+        LoomAuthorKind::AgentType => {
+            let spec = serde_json::from_str::<LoomAuthorAgentTypeSpec>(&payload)
+                .map_err(|error| loom_author_decode_errors(text, error))?;
+            validate_author_agent_type(text, spec)
+        }
+        LoomAuthorKind::Workflow => {
+            let spec = serde_json::from_str::<LoomAuthorWorkflowSpec>(&payload)
+                .map_err(|error| loom_author_decode_errors(text, error))?;
+            validate_author_workflow(text, spec, lookup)
+        }
     }
+}
+
+fn loom_author_decode_errors(
+    text: &str,
+    error: serde_json::Error,
+) -> Vec<LoomAuthorValidationError> {
+    let message = error.to_string();
+    let missing = json_error_field(&message, "missing field");
+    let duplicate = json_error_field(&message, "duplicate field");
+    let unknown = json_error_field(&message, "unknown field");
+    let code = if missing.is_some() {
+        LoomAuthorValidationCode::MissingField
+    } else if duplicate.is_some() {
+        LoomAuthorValidationCode::DuplicateValue
+    } else if matches!(
+        error.classify(),
+        serde_json::error::Category::Syntax | serde_json::error::Category::Eof
+    ) {
+        LoomAuthorValidationCode::Syntax
+    } else {
+        LoomAuthorValidationCode::InvalidField
+    };
+    let leaf = missing.or(duplicate).or(unknown);
+    let field = if code == LoomAuthorValidationCode::Syntax {
+        "$".to_owned()
+    } else {
+        json_error_path(text, error.line(), error.column(), code, leaf)
+    };
+    vec![LoomAuthorValidationError {
+        code,
+        message,
+        location: LoomAuthorLocation {
+            line: u32::try_from(error.line()).unwrap_or(u32::MAX).max(1),
+            column: u32::try_from(error.column()).unwrap_or(u32::MAX).max(1),
+            field,
+        },
+    }]
 }
 
 fn json_error_field<'a>(message: &'a str, class: &str) -> Option<&'a str> {
@@ -828,6 +890,42 @@ fn json_error_path(
         return leaf.map_or_else(|| parent.to_owned(), |field| json_child_path(parent, field));
     }
     enclosing.map_or_else(|| leaf.unwrap_or("$").to_owned(), |span| span.path.clone())
+}
+
+fn json_without_top_level_field(text: &str, field: &str) -> Option<String> {
+    let spans = JsonPathScanner::new(text).scan();
+    let key = spans
+        .iter()
+        .find(|span| span.path == field && span.key.as_deref() == Some(field))?;
+    let value = spans
+        .iter()
+        .filter(|span| span.path == field && span.key.is_none() && span.start >= key.end)
+        .min_by_key(|span| span.start)?;
+    let source = text.as_bytes();
+    let mut start = key.start;
+    let mut end = value.end;
+    let mut after = end;
+    while source.get(after).is_some_and(u8::is_ascii_whitespace) {
+        after += 1;
+    }
+    if source.get(after) == Some(&b',') {
+        end = after + 1;
+    } else {
+        let mut before = start;
+        while before > 0 && source[before - 1].is_ascii_whitespace() {
+            before -= 1;
+        }
+        if before > 0 && source[before - 1] == b',' {
+            start = before - 1;
+        }
+    }
+    let mut payload = source.to_vec();
+    for byte in &mut payload[start..end] {
+        if !matches!(*byte, b'\n' | b'\r') {
+            *byte = b' ';
+        }
+    }
+    String::from_utf8(payload).ok()
 }
 
 fn validate_author_agent_type(

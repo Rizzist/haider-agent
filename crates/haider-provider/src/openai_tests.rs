@@ -388,13 +388,17 @@ fn response_open_budget_is_a_typed_per_provider_override() {
     assert_eq!(compatible.http.transport_config, override_config);
 }
 
-#[tokio::test(start_paused = true)]
+/// MUTATION CHECK: change the expected status or body below. Expected runtime
+/// failure: the delayed response is still captured byte-exact under budget.
+#[tokio::test]
 async fn response_open_budget_accepts_a_mock_upstream_that_opens_at_twenty_seconds() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind slow-open fixture");
     let origin = format!("http://{}", listener.local_addr().expect("fixture address"));
     let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let (start_delay_tx, start_delay_rx) = tokio::sync::oneshot::channel();
+    let (delay_armed_tx, delay_armed_rx) = tokio::sync::oneshot::channel();
     let fixture = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.expect("accept inference request");
         let mut request = [0_u8; 8192];
@@ -404,7 +408,11 @@ async fn response_open_budget_accepts_a_mock_upstream_that_opens_at_twenty_secon
             .expect("read inference request");
         assert!(read > 0, "fixture received an HTTP request");
         accepted_tx.send(()).expect("signal accepted request");
-        tokio::time::sleep(Duration::from_secs(20)).await;
+        start_delay_rx.await.expect("start delayed first byte");
+        let delay = tokio::time::sleep(Duration::from_secs(20));
+        tokio::pin!(delay);
+        delay_armed_tx.send(()).expect("signal armed delay");
+        delay.await;
         socket
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
@@ -428,26 +436,37 @@ async fn response_open_budget_accepts_a_mock_upstream_that_opens_at_twenty_secon
             .capture_response(&probe_request("slow-open-model"))
             .await
     });
+    // Real loopback I/O must complete before virtual time is paused. Starting
+    // paused lets Tokio auto-advance the 60-second transport timer while a
+    // loaded macOS runner is still scheduling connect/read readiness.
     accepted_rx.await.expect("request reached slow upstream");
+    tokio::time::pause();
+    start_delay_tx.send(()).expect("release delayed first byte");
+    delay_armed_rx.await.expect("delayed first byte is armed");
     tokio::time::advance(Duration::from_secs(19)).await;
     assert!(!opening.is_finished());
     tokio::time::advance(Duration::from_secs(1)).await;
+    fixture.await.expect("slow-open fixture exits");
     let capture = opening
         .await
         .expect("open task exits")
         .expect("20-second response opens under the default budget");
     assert_eq!(capture.status, 200);
     assert_eq!(capture.body, b"{}");
-    fixture.await.expect("slow-open fixture exits");
 }
 
-#[tokio::test(start_paused = true)]
+/// MUTATION CHECK: change any expected `60_000` telemetry value below.
+/// Expected runtime failure: the fired response-open budget remains exact in
+/// both the typed error and its presentation.
+#[tokio::test]
 async fn response_open_budget_fails_typed_after_sixty_one_seconds() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind over-budget fixture");
     let origin = format!("http://{}", listener.local_addr().expect("fixture address"));
     let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let (start_delay_tx, start_delay_rx) = tokio::sync::oneshot::channel();
+    let (delay_armed_tx, delay_armed_rx) = tokio::sync::oneshot::channel();
     let fixture = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.expect("accept inference request");
         let mut request = [0_u8; 8192];
@@ -457,7 +476,11 @@ async fn response_open_budget_fails_typed_after_sixty_one_seconds() {
             .expect("read inference request");
         assert!(read > 0, "fixture received an HTTP request");
         accepted_tx.send(()).expect("signal accepted request");
-        tokio::time::sleep(Duration::from_secs(61)).await;
+        start_delay_rx.await.expect("start delayed first byte");
+        let delay = tokio::time::sleep(Duration::from_secs(61));
+        tokio::pin!(delay);
+        delay_armed_tx.send(()).expect("signal armed delay");
+        delay.await;
         let _ = socket
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
@@ -481,9 +504,10 @@ async fn response_open_budget_fails_typed_after_sixty_one_seconds() {
             .await
     });
     accepted_rx.await.expect("request reached slow upstream");
-    tokio::time::advance(Duration::from_secs(59)).await;
-    assert!(!opening.is_finished());
-    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::time::pause();
+    start_delay_tx.send(()).expect("release delayed first byte");
+    delay_armed_rx.await.expect("delayed first byte is armed");
+    tokio::time::advance(Duration::from_secs(60)).await;
     let error = opening
         .await
         .expect("timeout task exits")
@@ -496,6 +520,7 @@ async fn response_open_budget_fails_typed_after_sixty_one_seconds() {
     assert_eq!(error.presentation.budget_ms, Some(60_000));
     assert!(error.message.contains("opened_within_ms=60000"));
     assert!(error.message.contains("budget_ms=60000"));
+    tokio::time::advance(Duration::from_secs(1)).await;
     fixture.await.expect("over-budget fixture exits");
 }
 

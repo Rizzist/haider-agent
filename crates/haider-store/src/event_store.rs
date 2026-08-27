@@ -22851,6 +22851,9 @@ mod run_head_projection_tests {
         );
     }
 
+    /// MUTATION CHECK: remove one projected run from `expected` or change its
+    /// state. Expected runtime failure on both passes: exact equality proves
+    /// v23's run-head backfill remains untouched through v26 and reopen.
     #[test]
     fn store_open_migrates_and_backfills_a_v22_journal_idempotently() {
         let root = tempfile::tempdir().expect("profile");
@@ -22866,7 +22869,13 @@ mod run_head_projection_tests {
         }
         let raw = Connection::open(&database_path).expect("open raw v22 fixture");
         raw.execute_batch(
-            "DROP TABLE workflow_node_states;
+            "DROP TABLE loom_registry_events;
+             DROP TABLE loom_agent_type_revisions;
+             ALTER TABLE loom_agent_types DROP COLUMN archived;
+             ALTER TABLE loom_workflows DROP COLUMN archived;
+             ALTER TABLE loom_cli_install_jobs DROP COLUMN cancelled;
+             ALTER TABLE loom_cli_install_events DROP COLUMN cancelled;
+             DROP TABLE workflow_node_states;
              DROP TABLE workflow_graph_instances;
              ALTER TABLE profile_meta DROP COLUMN workflow_graph_backfill_version;
              DROP TABLE provider_view_gc;

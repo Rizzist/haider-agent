@@ -9,7 +9,7 @@ use haider_protocol::headless::{
 };
 use haider_protocol::ids::{RunId, SessionId};
 use haider_protocol::session::SessionPermissionOverridesV1;
-use haider_protocol::state::RunState;
+use haider_protocol::state::{RunState, SessionState};
 use haider_store::{EventStore, Store};
 
 use crate::turn_recovery::{
@@ -230,6 +230,9 @@ fn journal_usage_fold_replaces_snapshots_and_keeps_cache_lifecycle_requests() {
     assert!(folded.estimated_cost_microusd.is_some_and(|cost| cost > 0));
 }
 
+/// MUTATION CHECK: swap the terminal tail or change `Errored` to
+/// `Cancelled`. Expected runtime failure: the durable budget cause no longer
+/// precedes the session-idle fact in the one transactional recovery batch.
 #[test]
 fn restart_recovery_keeps_a_durable_budget_cause_ahead_of_cancellation() {
     assert!(
@@ -275,13 +278,16 @@ fn restart_recovery_keeps_a_durable_budget_cause_ahead_of_cancellation() {
             ..
         }
     )));
-    assert_eq!(
-        payloads.last(),
-        Some(&EventPayload::RunState(RunState::Errored))
-    );
+    assert!(payloads.ends_with(&[
+        EventPayload::RunState(RunState::Errored),
+        EventPayload::SessionState(SessionState::Idle { interrupted: true }),
+    ]));
     assert!(!payloads.contains(&EventPayload::RunState(RunState::Cancelled)));
 }
 
+/// MUTATION CHECK: change the terminal tail to `Errored` or move it after
+/// session idle. Expected runtime failure: an unconfigured budget fact is
+/// promoted or the single-batch run/session ordering is no longer proved.
 #[test]
 fn restart_recovery_does_not_promote_a_budget_fact_without_headless_configuration() {
     let run_id = RunId::new("ordinary-budget-recovery-run");
@@ -308,10 +314,10 @@ fn restart_recovery_does_not_promote_a_budget_fact_without_headless_configuratio
         ),
     ];
     let payloads = interrupted_recovery_payloads_for_test(&run_id, &envelopes, true);
-    assert_eq!(
-        payloads.last(),
-        Some(&EventPayload::RunState(RunState::Cancelled))
-    );
+    assert!(payloads.ends_with(&[
+        EventPayload::RunState(RunState::Cancelled),
+        EventPayload::SessionState(SessionState::Idle { interrupted: true }),
+    ]));
     assert!(!payloads.iter().any(|payload| matches!(
         payload,
         EventPayload::RunFailed {

@@ -20,8 +20,7 @@ use haider_rpc::{
     WorkflowCatalogEntryV1,
 };
 use haider_tui::app::{
-    AppEvent, AppModel, AppRequest, DraftKey, Hit, LauncherRow, LoomPane, RuntimeMode, Screen,
-    WorkflowRow,
+    AppEvent, AppModel, AppRequest, DraftKey, Hit, LoomPane, RuntimeMode, Screen, WorkflowRow,
 };
 use haider_tui::composer::Composer;
 use haider_tui::fleet;
@@ -897,6 +896,9 @@ fn open_authoring_owns_empty_revision_and_blocks_hidden_registry_actions() {
     ));
 }
 
+/// MUTATION CHECK: change revision 7, any byte of `expected_text`, or the
+/// rev-zero absent-record CAS fence. Expected runtime failure: Ctrl-S no
+/// longer proves the exact validated authoring revision and registry intent.
 #[test]
 fn drafted_text_is_editable_and_ctrl_s_confirms_the_exact_revision() {
     let mut model = live_bound_model();
@@ -907,7 +909,27 @@ fn drafted_text_is_editable_and_ctrl_s_confirms_the_exact_revision() {
     authoring.authoring_id = Some("author-1".into());
     authoring.revision = Some(7);
     authoring.validated = true;
-    model.composer.set_text("{\"kind\":\"workflow\"}");
+    let expected_text = serde_json::json!({
+        "kind": "workflow",
+        "id": "ctrl-s-flow",
+        "in_type": "Brief",
+        "out_type": "Brief",
+        "nodes": [{
+            "id": "execute",
+            "task": "confirm the exact editor revision",
+            "in_type": "Brief",
+            "out_type": "Brief",
+            "gate": "command",
+            "depends_on": [],
+            "evidence": {
+                "protocol": "instruct_pipe_v1",
+                "tool": "graph_evidence",
+                "required_green": 1
+            }
+        }]
+    })
+    .to_string();
+    model.composer.set_text(&expected_text);
     model.requests.clear();
 
     model.handle(ctrl(KeyCode::Char('s')));
@@ -916,11 +938,15 @@ fn drafted_text_is_editable_and_ctrl_s_confirms_the_exact_revision() {
         Some(AppRequest::LoomAuthorConfirm {
             authoring_id,
             expected_revision,
-            text,
+            text: sent,
+            expected_rev,
+            expected_digest,
             ..
         }) if authoring_id == "author-1"
             && expected_revision == 7
-            && text == "{\"kind\":\"workflow\"}"
+            && sent == expected_text
+            && expected_rev == 0
+            && expected_digest.is_none()
     ));
 }
 
@@ -1143,12 +1169,19 @@ fn correlated_authoring_replies_update_the_parked_editor_offscreen() {
     assert!(!model.loom_authoring.as_ref().expect("authoring").pending);
 }
 
+/// MUTATION CHECK: remove the parked session text or bypass the Loom-to-graph
+/// surface swap. Expected runtime failure: either the restored live composer
+/// or the parked Loom draft assertion changes.
 #[test]
 fn graph_strip_parks_nonpending_loom_text_and_restores_the_session_draft() {
     let mut model = live_bound_model();
-    model.composer.set_text("unfinished session prompt");
-    model.handle(ctrl(KeyCode::Char('c')));
-    model.handle_hit(Hit::ExtraRow(LauncherRow::Loom));
+    model.graph = Some(active_graph());
+    let session_key = DraftKey::Session(model.ui_generation());
+    run_slash(&mut model, "/loom");
+    assert_eq!(model.screen, Screen::Loom);
+    let mut session_draft = Composer::new();
+    session_draft.set_text("unfinished session prompt");
+    model.drafts.insert(session_key, session_draft);
     model.handle(ctrl(KeyCode::Char('n')));
     model.composer.set_text("loom typed text");
 
