@@ -15,6 +15,7 @@ fn record(clis: Vec<String>) -> LoomAgentType {
         out_type: "Sources".into(),
         clis,
         apis: Vec::new(),
+        denials: Vec::new(),
         skills: Vec::new(),
         scripts: Vec::new(),
         color: String::new(),

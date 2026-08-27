@@ -423,6 +423,9 @@ pub const FEATURE_WORKFLOW_CATALOG_V1: &str = "workflow_catalog_v1";
 /// The Loom pipe compiler accepts the v0.0.961 dependency-DAG grammar:
 /// explicit forks, multi-input joins, and conditional self/back edges.
 pub const FEATURE_LOOM_PIPE_DAG_V1: &str = "loom_pipe_dag_v1";
+/// Daemon supports prose-to-draft Loom authoring, typed text revision, and
+/// confirmation into an immutable daemon-issued execution digest.
+pub const FEATURE_LOOM_AUTHORING_V1: &str = "loom_authoring_v1";
 /// Daemon exposes immutable built-in/user workflow-instance descriptors and
 /// accepts template-digest fences on `graph.pin` and `graph.switch`.
 pub const FEATURE_WORKFLOW_INSTANCE_V1: &str = "workflow_instance_v1";
@@ -3219,6 +3222,31 @@ pub enum RequestBody {
     /// Read durable progress snapshots strictly after the applied cursor.
     #[serde(rename = "loom.install.watch")]
     LoomInstallWatch { job_id: String, after_cursor: u64 },
+    /// Start a Loom authoring session from user prose.
+    #[serde(rename = "loom.author.draft")]
+    LoomAuthorDraft {
+        /// Supplies the provider/model selection used for the AI draft. The
+        /// authoring exchange does not append to this session's journal.
+        session_id: SessionId,
+        kind: haider_protocol::loom::LoomAuthorKind,
+        prose: String,
+    },
+    /// Re-parse and re-validate the user's exact edited text.
+    #[serde(rename = "loom.author.revise")]
+    LoomAuthorRevise {
+        authoring_id: String,
+        expected_revision: u64,
+        kind: haider_protocol::loom::LoomAuthorKind,
+        text: String,
+    },
+    /// Confirm one validated revision and register its immutable hash.
+    #[serde(rename = "loom.author.confirm")]
+    LoomAuthorConfirm {
+        authoring_id: String,
+        expected_revision: u64,
+        kind: haider_protocol::loom::LoomAuthorKind,
+        text: String,
+    },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline). W3b answers it with a protocol error, not a panic.
     #[serde(other)]
@@ -3882,6 +3910,21 @@ pub enum ResponseBody {
     #[serde(rename = "loom.install.watch")]
     LoomInstallWatch {
         receipt: TypedAgentInstallWatchReceiptWire,
+    },
+    #[serde(rename = "loom.author.draft")]
+    LoomAuthorDraft {
+        draft: haider_protocol::loom::LoomAuthorDraft,
+    },
+    #[serde(rename = "loom.author.revise")]
+    LoomAuthorRevise {
+        draft: haider_protocol::loom::LoomAuthorDraft,
+    },
+    #[serde(rename = "loom.author.confirm")]
+    LoomAuthorConfirm {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confirmed: Option<haider_protocol::loom::LoomAuthorConfirmed>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        errors: Vec<haider_protocol::loom::LoomAuthorValidationError>,
     },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline).

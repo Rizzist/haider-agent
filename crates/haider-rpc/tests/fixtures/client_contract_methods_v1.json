@@ -276,6 +276,24 @@
       "response_method": "monitor.watch",
       "request": {"method":"monitor.watch","session_id":"session-1","after_cursor":40},
       "response": {"method":"monitor.watch","receipt":{"session_id":"session-1","policy":{"list":"view","register":"control","register_requires_control_attachment":true,"remove":"control","remove_requires_control_attachment":true,"watch":"view"},"sources":[{"source":"sms","availability":{"state":"available"}},{"source":"process","availability":{"state":"unavailable","reason":"adapter_inactive"}},{"source":"file","availability":{"state":"unavailable","reason":"adapter_inactive"}},{"source":"poll","availability":{"state":"unavailable","reason":"adapter_inactive"}},{"source":"timer","availability":{"state":"unavailable","reason":"adapter_inactive"}}],"outcome":{"status":"watching","watch_id":"monitor-watch-1","requested_after_cursor":40,"replay_through_cursor":44}}}
+    },
+    {
+      "request_method": "loom.author.draft",
+      "response_method": "loom.author.draft",
+      "request": {"method":"loom.author.draft","session_id":"session-1","kind":"workflow","prose":"Research, review, then publish"},
+      "response": {"method":"loom.author.draft","draft":{"authoring_id":"loom-author-1","revision":1,"kind":"workflow","text":"{\n  \"kind\": \"workflow\",\n  \"id\": \"research-review-publish\",\n  \"in_type\": \"Artifact\",\n  \"out_type\": \"Artifact\",\n  \"nodes\": [{\"id\":\"publish\",\"agent_type\":null,\"task\":\"publish\",\"in_type\":\"Artifact\",\"out_type\":\"Artifact\",\"gate\":\"command\",\"depends_on\":[],\"back_edge\":null,\"evidence\":{\"protocol\":\"instruct_pipe_v1\",\"tool\":\"graph_evidence\",\"required_green\":1}}]\n}"}}
+    },
+    {
+      "request_method": "loom.author.revise",
+      "response_method": "loom.author.revise",
+      "request": {"method":"loom.author.revise","authoring_id":"loom-author-1","expected_revision":1,"kind":"workflow","text":"{\n  \"kind\": \"workflow\",\n  \"id\": \"research-review-publish\",\n  \"in_type\": \"Artifact\",\n  \"out_type\": \"Artifact\",\n  \"nodes\": [{\"id\":\"publish\",\"agent_type\":null,\"task\":\"publish\",\"in_type\":\"Artifact\",\"out_type\":\"Artifact\",\"gate\":\"command\",\"depends_on\":[],\"back_edge\":null,\"evidence\":{\"protocol\":\"instruct_pipe_v1\",\"tool\":\"graph_evidence\",\"required_green\":1}}]\n}"},
+      "response": {"method":"loom.author.revise","draft":{"authoring_id":"loom-author-1","revision":2,"kind":"workflow","text":"{\n  \"kind\": \"workflow\",\n  \"id\": \"research-review-publish\",\n  \"in_type\": \"Artifact\",\n  \"out_type\": \"Artifact\",\n  \"nodes\": [{\"id\":\"publish\",\"agent_type\":null,\"task\":\"publish\",\"in_type\":\"Artifact\",\"out_type\":\"Artifact\",\"gate\":\"command\",\"depends_on\":[],\"back_edge\":null,\"evidence\":{\"protocol\":\"instruct_pipe_v1\",\"tool\":\"graph_evidence\",\"required_green\":1}}]\n}"}}
+    },
+    {
+      "request_method": "loom.author.confirm",
+      "response_method": "loom.author.confirm",
+      "request": {"method":"loom.author.confirm","authoring_id":"loom-author-1","expected_revision":2,"kind":"workflow","text":"{\n  \"kind\": \"workflow\",\n  \"id\": \"research-review-publish\",\n  \"in_type\": \"Artifact\",\n  \"out_type\": \"Artifact\",\n  \"nodes\": [{\"id\":\"publish\",\"agent_type\":null,\"task\":\"publish\",\"in_type\":\"Artifact\",\"out_type\":\"Artifact\",\"gate\":\"command\",\"depends_on\":[],\"back_edge\":null,\"evidence\":{\"protocol\":\"instruct_pipe_v1\",\"tool\":\"graph_evidence\",\"required_green\":1}}]\n}"},
+      "response": {"method":"loom.author.confirm","confirmed":{"authoring_id":"loom-author-1","kind":"workflow","canonical_text":"{\n  \"kind\": \"workflow\",\n  \"id\": \"research-review-publish\",\n  \"in_type\": \"Artifact\",\n  \"out_type\": \"Artifact\",\n  \"nodes\": [\n    {\n      \"id\": \"publish\",\n      \"task\": \"publish\",\n      \"in_type\": \"Artifact\",\n      \"out_type\": \"Artifact\",\n      \"gate\": \"command\",\n      \"depends_on\": [],\n      \"evidence\": {\n        \"protocol\": \"instruct_pipe_v1\",\n        \"tool\": \"graph_evidence\",\n        \"required_green\": 1\n      }\n    }\n  ]\n}","registration":{"id":"research-review-publish","rev":1,"digest":"0123456789abcdef0123456789abcdef","updated":true},"execution_digest":"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"}}
     }
   ]
 }

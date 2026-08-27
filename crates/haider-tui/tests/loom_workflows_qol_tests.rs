@@ -1,9 +1,8 @@
 //! W-flow — the Loom/Workflows QOL wave: the /workflows pane's fixed-head
 //! row space (`∅ none` first and undeletable, then the built-in catalog
 //! entries, then the REGISTERED section), ⌃P pin-by-name to the bound
-//! session, the ⌃N composer seed (authoring is a conversation held IN the
-//! tab, ⌥m picks the drafting model), the fleet's typed-agent accent, and
-//! the pane-entry snapshot re-request.
+//! session, the ⌃N typed authoring editor, ⌥m drafting-model selection, the
+//! fleet's typed-agent accent, and the pane-entry snapshot re-request.
 //!
 //! The registry actions sit on ⌃ rather than on bare letters because the
 //! owner's ruling (2026-08-22) keeps a LIVE COMPOSER on both loom panes:
@@ -16,12 +15,16 @@ use haider_protocol::ids::{GraphId, SessionId};
 use haider_protocol::loom::{LoomAgentType, LoomTypeSig, compile_pipe, parse_pipe};
 use haider_rpc::{
     FLEET_MAX_DEPTH, FLEET_MAX_NODES, FleetAgentStateWire, FleetMetricsTotalsWire, FleetNodeWire,
-    FleetRollupWire, FleetStateCountsWire, RequestBody, SessionFleetSnapshot,
+    FleetRollupWire, FleetStateCountsWire, RequestBody, ResponseBody, SessionFleetSnapshot,
     WorkflowCatalogEntryV1,
 };
-use haider_tui::app::{AppModel, AppRequest, LoomPane, RuntimeMode, Screen, WorkflowRow};
+use haider_tui::app::{
+    AppEvent, AppModel, AppRequest, DraftKey, Hit, LauncherRow, LoomPane, RuntimeMode, Screen,
+    WorkflowRow,
+};
+use haider_tui::composer::Composer;
 use haider_tui::fleet;
-use haider_tui::link::request_body;
+use haider_tui::link::{CommandContext, map_response, request_body};
 use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};
 use haider_tui::render::render;
 use ratatui::Terminal;
@@ -35,6 +38,24 @@ fn sid() -> SessionId {
     SessionId::new("s-loomflow")
 }
 
+fn author_confirmation(
+    kind: haider_protocol::loom::LoomAuthorKind,
+) -> haider_protocol::loom::LoomAuthorConfirmed {
+    haider_protocol::loom::LoomAuthorConfirmed {
+        authoring_id: "author-confirmed".into(),
+        kind,
+        canonical_text: "confirmed bytes".into(),
+        registration: haider_protocol::loom::LoomRegistration {
+            id: "reviewer".into(),
+            rev: 1,
+            digest: "confirmed-digest".into(),
+            updated: true,
+        },
+        execution_digest: "confirmed-execution-digest".into(),
+        install_job_id: None,
+    }
+}
+
 /// A live model with the Loom + Convergence Graph features served and one
 /// bound session — the ground every pin/authoring law stands on.
 fn live_bound_model() -> AppModel {
@@ -42,6 +63,7 @@ fn live_bound_model() -> AppModel {
     model.mode = RuntimeMode::Live;
     model.daemon_features = [
         haider_rpc::FEATURE_LOOM_V1.to_owned(),
+        haider_rpc::FEATURE_LOOM_AUTHORING_V1.to_owned(),
         haider_rpc::FEATURE_WORKFLOW_CATALOG_V1.to_owned(),
         haider_rpc::FEATURE_LOOM_PIPE_DAG_V1.to_owned(),
         haider_rpc::FEATURE_CONVERGENCE_GRAPH_V1.to_owned(),
@@ -89,6 +111,7 @@ fn researcher() -> LoomAgentType {
         out_type: "Transcript".into(),
         clis: vec!["yt-dlp".into()],
         apis: Vec::new(),
+        denials: Vec::new(),
         skills: Vec::new(),
         scripts: Vec::new(),
         color: "#c2701c".into(),
@@ -703,162 +726,626 @@ fn bare_letters_type_into_the_composer_and_never_fire_registry_actions() {
     }
 }
 
-// ---- item 3: ⌃N composer-seeded authoring -------------------------------
+// ---- item 3: typed draft/revise/confirm authoring ------------------------
 
-/// ⌃N seeds the tab's COMPOSER with the authoring opener and leaves you in
-/// the tab, so the draft, your refinements and the registry stay in view at
-/// once (owner 2026-08-22). It deliberately does NOT open a modal field or
-/// hop to the session screen — authoring a workflow is a conversation, and
-/// the registry you are describing has to remain readable while you have it.
-///
-/// MUTATION CHECK: make the seed overwrite a non-empty composer, or drop
-/// the pane split. Expected RUNTIME failure: the preserved-draft assertion,
-/// or the Types-pane opener assertion.
 #[test]
-fn ctrl_n_seeds_the_composer_per_pane_and_stays_in_the_tab() {
+fn ctrl_n_opens_typed_authoring_per_pane_and_enter_sends_prose_to_draft() {
     let mut model = live_bound_model();
     model.screen = Screen::Loom;
     model.loom_pane = LoomPane::Workflows;
     model.requests.clear();
 
     model.handle(ctrl(KeyCode::Char('n')));
+    assert!(model.composer.text().is_empty());
     assert_eq!(
-        model.composer.text(),
-        "New workflow: ",
-        "⌃N seeds the workflows opener"
+        model.loom_authoring.as_ref().map(|state| state.kind),
+        Some(haider_protocol::loom::LoomAuthorKind::Workflow)
     );
     assert_eq!(model.screen, Screen::Loom, "authoring stays in the tab");
-    assert!(
-        model.requests.is_empty(),
-        "seeding is local — nothing reaches the wire until ⏎"
-    );
+    assert!(model.requests.is_empty());
 
-    // Finishing the sentence is ordinary typing, and ⏎ sends it as one turn
-    // WITHOUT leaving the tab.
     for c in "spin and pin".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
-    assert_eq!(model.composer.text(), "New workflow: spin and pin");
+    model.handle(key(KeyCode::Enter));
+    assert!(matches!(
+        model.requests.pop(),
+        Some(AppRequest::LoomAuthorDraft {
+            session,
+            kind: haider_protocol::loom::LoomAuthorKind::Workflow,
+            prose,
+            ..
+        }) if session == sid() && prose == "spin and pin"
+    ));
 
-    // The TYPES pane seeds its own opener.
     let mut model = live_bound_model();
     model.screen = Screen::Loom;
     model.loom_pane = LoomPane::Types;
     model.handle(ctrl(KeyCode::Char('n')));
-    assert_eq!(model.composer.text(), "New agent type: ");
-
-    // A draft already in progress is NEVER clobbered — the seed is an
-    // affordance, not a reset.
-    let mut model = live_bound_model();
-    model.screen = Screen::Loom;
-    model.loom_pane = LoomPane::Workflows;
-    model.composer.set_text("half a thought");
-    model.handle(ctrl(KeyCode::Char('n')));
     assert_eq!(
-        model.composer.text(),
-        "half a thought",
-        "⌃N must not overwrite work in progress"
+        model.loom_authoring.as_ref().map(|state| state.kind),
+        Some(haider_protocol::loom::LoomAuthorKind::AgentType)
     );
 }
 
-/// `workflow_catalog_v1` and `loom_pipe_dag_v1` are independent. A client
-/// may browse a published catalog while talking to a daemon that only knows
-/// the legacy sequential grammar; its authoring turn must preserve that
-/// typed absence instead of prompting the model to invent DAG syntax.
-///
-/// MUTATION CHECK: remove the grammar feature branch from `submit_loom_turn`.
-/// Expected RUNTIME failure: the legacy-law assertion below.
 #[test]
-fn authoring_without_pipe_dag_feature_requests_only_legacy_grammar() {
+fn authoring_feature_absence_never_calls_or_falls_back_to_chat() {
     let mut model = live_bound_model();
     model
         .daemon_features
-        .remove(haider_rpc::FEATURE_LOOM_PIPE_DAG_V1);
+        .remove(haider_rpc::FEATURE_LOOM_AUTHORING_V1);
     model.screen = Screen::Loom;
     model.loom_pane = LoomPane::Workflows;
-    model.composer.set_text("New workflow: sequential review");
     model.requests.clear();
 
-    model.handle(key(KeyCode::Enter));
-
-    let AppRequest::SubmitText { text, .. } = model.requests.pop().expect("submit request") else {
-        panic!("workflow authoring should submit an ordinary text turn");
-    };
+    model.handle(ctrl(KeyCode::Char('n')));
+    assert!(model.loom_authoring.is_none());
+    assert!(model.requests.is_empty());
+    assert!(model.composer.text().is_empty());
     assert!(
-        text.contains("Use only the legacy loom_v1 sequential pipe grammar"),
-        "the absent feature is carried into the authoring request: {text}"
-    );
-    assert!(
-        !text.contains("supports the v0.0.961 explicit fork"),
-        "the absent DAG grammar must not be fabricated: {text}"
+        model
+            .flash
+            .as_deref()
+            .is_some_and(|text| text.contains("newer daemon"))
     );
 }
 
-/// MUTATION CHECK: let an unbound ⌃N seed anyway. Expected RUNTIME failure:
-/// the untouched-composer assertion or the honest flash naming the fix.
 #[test]
-fn ctrl_n_without_a_bound_session_flashes_honestly() {
+fn authoring_without_a_bound_session_never_chooses_a_model_implicitly() {
     let mut model = launcher_model();
     model.mode = RuntimeMode::Live;
-    model.daemon_features = [haider_rpc::FEATURE_LOOM_V1.to_owned()]
-        .into_iter()
-        .collect();
+    model.daemon_features = [
+        haider_rpc::FEATURE_LOOM_V1.to_owned(),
+        haider_rpc::FEATURE_LOOM_AUTHORING_V1.to_owned(),
+    ]
+    .into_iter()
+    .collect();
     model.loom_loaded = true;
     model.screen = Screen::Loom;
     model.loom_pane = LoomPane::Types;
     model.requests.clear();
 
     model.handle(ctrl(KeyCode::Char('n')));
+    assert!(model.loom_authoring.is_none());
+    assert!(model.requests.is_empty());
     assert!(
-        model.composer.text().is_empty(),
-        "no bound session — nothing to author into"
-    );
-    assert_eq!(
-        model.flash.as_deref(),
-        Some("· no bound session — open a session first"),
-        "the flash names the fix"
+        model
+            .flash
+            .as_deref()
+            .is_some_and(|flash| flash.contains("open one"))
     );
     assert_eq!(model.screen, Screen::Loom, "the tab stays put");
 }
 
-/// ⌥m picks the model that will DRAFT the workflow — the owner's "we can
-/// choose model type in the workflow we want". It must beat the composer's
-/// bare-Char arm, or it would simply type an `m`.
-///
-/// MUTATION CHECK: drop the ⌥m arm from the loom dispatch (or move it after
-/// the Char arm). Expected RUNTIME failure: the picker-open assertion, or
-/// the composer-untouched assertion — the `m` would land in the draft.
 #[test]
-fn alt_m_opens_the_model_picker_over_the_loom_tab_and_returns() {
+fn alt_m_still_selects_the_session_model_used_for_ai_drafting() {
     let mut model = live_bound_model();
     model.screen = Screen::Loom;
     model.loom_pane = LoomPane::Workflows;
     model.handle(ctrl(KeyCode::Char('n')));
-    for c in "flow".chars() {
-        model.handle(key(KeyCode::Char(c)));
-    }
-    let draft = model.composer.text().to_owned();
-    assert_eq!(draft, "New workflow: flow");
 
-    model.handle(haider_tui::app::AppEvent::Key(KeyEvent::new(
+    model.handle(AppEvent::Key(KeyEvent::new(
         KeyCode::Char('m'),
         KeyModifiers::ALT,
     )));
-    assert!(
-        model.model_picker.is_some(),
-        "⌥m opens the model picker over the loom tab"
-    );
-    assert_eq!(model.composer.text(), draft, "⌥m never lands in the draft");
+    assert!(model.model_picker.is_some());
+    assert!(model.loom_authoring.is_some());
+    assert!(model.composer.text().is_empty());
+}
 
-    // Esc closes the picker and the draft is still there.
-    model.handle(key(KeyCode::Esc));
-    assert!(model.model_picker.is_none(), "esc closes the picker");
-    assert_eq!(model.screen, Screen::Loom, "back on the loom tab");
-    assert_eq!(
-        model.composer.text(),
-        draft,
-        "the draft survives the picker round trip"
+#[test]
+fn loom_paste_and_seed_preserve_exact_pretyped_prose() {
+    let mut model = live_bound_model();
+    model.screen = Screen::Loom;
+    model.loom_pane = LoomPane::Workflows;
+    let prose = "describe a typed review workflow ".repeat(16);
+    model.handle(AppEvent::Paste(prose.clone().into()));
+    assert!(model.loom_authoring.is_none());
+    assert_eq!(model.composer.text(), prose);
+    assert!(!model.composer.text().contains("[Pasted text #"));
+
+    model.handle(ctrl(KeyCode::Char('n')));
+    assert_eq!(model.composer.text(), prose, "Ctrl-N preserves typed prose");
+    model.requests.clear();
+    model.handle(key(KeyCode::Enter));
+    assert!(matches!(
+        model.requests.pop(),
+        Some(AppRequest::LoomAuthorDraft { prose: sent, .. }) if sent == prose
+    ));
+}
+
+#[test]
+fn open_authoring_owns_empty_revision_and_blocks_hidden_registry_actions() {
+    let mut model = live_bound_model();
+    model.screen = Screen::Loom;
+    model.loom_pane = LoomPane::Workflows;
+    model.handle(ctrl(KeyCode::Char('n')));
+    let authoring = model.loom_authoring.as_mut().expect("authoring");
+    authoring.authoring_id = Some("author-empty".into());
+    authoring.revision = Some(3);
+    authoring.validated = true;
+    model.composer.clear();
+    model.requests.clear();
+
+    model.handle(ctrl(KeyCode::Char('p')));
+    assert!(
+        model.requests.is_empty(),
+        "hidden registry selection is locked"
     );
+    assert!(
+        model
+            .flash
+            .as_deref()
+            .is_some_and(|flash| flash.contains("close the Loom editor"))
+    );
+
+    model.handle(key(KeyCode::Enter));
+    assert!(matches!(
+        model.requests.pop(),
+        Some(AppRequest::LoomAuthorRevise {
+            authoring_id,
+            expected_revision: 3,
+            text,
+            ..
+        }) if authoring_id == "author-empty" && text.is_empty()
+    ));
+}
+
+#[test]
+fn drafted_text_is_editable_and_ctrl_s_confirms_the_exact_revision() {
+    let mut model = live_bound_model();
+    model.screen = Screen::Loom;
+    model.loom_pane = LoomPane::Workflows;
+    model.handle(ctrl(KeyCode::Char('n')));
+    let authoring = model.loom_authoring.as_mut().expect("authoring");
+    authoring.authoring_id = Some("author-1".into());
+    authoring.revision = Some(7);
+    authoring.validated = true;
+    model.composer.set_text("{\"kind\":\"workflow\"}");
+    model.requests.clear();
+
+    model.handle(ctrl(KeyCode::Char('s')));
+    assert!(matches!(
+        model.requests.pop(),
+        Some(AppRequest::LoomAuthorConfirm {
+            authoring_id,
+            expected_revision,
+            text,
+            ..
+        }) if authoring_id == "author-1"
+            && expected_revision == 7
+            && text == "{\"kind\":\"workflow\"}"
+    ));
+}
+
+#[test]
+fn draft_validation_locations_render_inline_and_transport_failure_releases_pending() {
+    let mut model = live_bound_model();
+    model.screen = Screen::Loom;
+    model.loom_pane = LoomPane::Workflows;
+    model.handle(ctrl(KeyCode::Char('n')));
+    let generation = model.loom_authoring.as_ref().expect("authoring").generation;
+    model.loom_authoring.as_mut().expect("authoring").pending = true;
+    let mut driver = LiveDriver::new("test");
+    driver.apply(
+        &mut model,
+        LiveReply::LoomAuthorDrafted {
+            generation,
+            epoch: 0,
+            draft: haider_protocol::loom::LoomAuthorDraft {
+                authoring_id: "author-inline".into(),
+                revision: 2,
+                kind: haider_protocol::loom::LoomAuthorKind::Workflow,
+                text: "{\n  \"kind\": \"workflow\"\n}".into(),
+                errors: vec![haider_protocol::loom::LoomAuthorValidationError {
+                    code: haider_protocol::loom::LoomAuthorValidationCode::InvalidField,
+                    message: "required_green must be positive".into(),
+                    location: haider_protocol::loom::LoomAuthorLocation {
+                        line: 12,
+                        column: 9,
+                        field: "nodes[1].evidence.required_green".into(),
+                    },
+                }],
+            },
+        },
+    );
+    assert_eq!(model.composer.text(), "{\n  \"kind\": \"workflow\"\n}");
+    assert!(!model.loom_authoring.as_ref().expect("authoring").pending);
+    let (rows, _) = draw(&model);
+    let all = rows.join("\n");
+    assert!(all.contains("12:9"), "coordinate missing:\n{all}");
+    assert!(
+        all.contains("nodes[1].evidence.required_green"),
+        "typed field missing:\n{all}"
+    );
+
+    model.requests.clear();
+    model.handle(key(KeyCode::Char(' ')));
+    let revised_text = model.composer.text().to_owned();
+    model.handle(key(KeyCode::Enter));
+    assert!(matches!(
+        model.requests.pop(),
+        Some(AppRequest::LoomAuthorRevise {
+            generation: request_generation,
+            authoring_id,
+            expected_revision: 2,
+            kind: haider_protocol::loom::LoomAuthorKind::Workflow,
+            text,
+        }) if request_generation == generation
+            && authoring_id == "author-inline"
+            && text == revised_text
+    ));
+    driver.apply(
+        &mut model,
+        LiveReply::LoomAuthorFailed {
+            generation,
+            epoch: 0,
+            message: "connection reset".into(),
+        },
+    );
+    assert!(!model.loom_authoring.as_ref().expect("authoring").pending);
+    assert!(
+        model
+            .flash
+            .as_deref()
+            .is_some_and(|flash| flash.contains("connection reset"))
+    );
+}
+
+#[test]
+fn authoring_wire_failure_is_routed_to_the_editor_without_a_command_id() {
+    let context = CommandContext::of(&LiveCommand::LoomAuthorDraft {
+        generation: 9,
+        epoch: 4,
+        session: sid(),
+        kind: haider_protocol::loom::LoomAuthorKind::Workflow,
+        prose: "draft it".into(),
+    });
+    assert_eq!(
+        map_response(
+            &context,
+            ResponseBody::Error {
+                code: "overloaded".into(),
+                message: "try again".into(),
+                retryable: true,
+                data: None,
+            },
+        ),
+        vec![LiveReply::LoomAuthorFailed {
+            generation: 9,
+            epoch: 4,
+            message: "try again".into(),
+        }]
+    );
+}
+
+#[test]
+fn loom_editor_has_a_dedicated_draft_surface() {
+    let mut model = live_bound_model();
+    let session_key = DraftKey::Session(model.ui_generation());
+    let mut chat = Composer::new();
+    chat.set_text("unfinished session prompt");
+    model.drafts.insert(session_key, chat);
+    model.screen = Screen::Loom;
+    model.loom_return = Some(Screen::Session);
+    model.composer.set_text("loom-only text");
+
+    model.handle(key(KeyCode::Esc));
+    assert_eq!(model.screen, Screen::Session);
+    assert_eq!(model.composer.text(), "unfinished session prompt");
+    assert_eq!(
+        model.drafts.get(&DraftKey::Loom).map(Composer::text),
+        Some("loom-only text")
+    );
+}
+
+#[test]
+fn pending_authoring_locks_edits_and_navigation() {
+    let mut model = live_bound_model();
+    model.screen = Screen::Loom;
+    model.loom_pane = LoomPane::Workflows;
+    model.handle(ctrl(KeyCode::Char('n')));
+    model.composer.set_text("submitted bytes");
+    model.loom_authoring.as_mut().expect("authoring").pending = true;
+
+    model.handle(key(KeyCode::Char('x')));
+    model.handle(AppEvent::Paste("replacement".to_owned().into()));
+    model.handle(ctrl(KeyCode::Char('c')));
+    model.handle_hit(Hit::GraphStrip);
+    assert_eq!(model.composer.text(), "submitted bytes");
+    assert_eq!(model.screen, Screen::Loom);
+    assert!(model.loom_authoring.as_ref().expect("authoring").pending);
+}
+
+#[test]
+fn correlated_authoring_replies_update_the_parked_editor_offscreen() {
+    let mut model = live_bound_model();
+    model.screen = Screen::Loom;
+    model.loom_pane = LoomPane::Workflows;
+    model.handle(ctrl(KeyCode::Char('n')));
+    let generation = model.loom_authoring.as_ref().expect("authoring").generation;
+    model.loom_authoring.as_mut().expect("authoring").pending = true;
+    model.composer.set_text("submitted prose");
+    model.handle(AppEvent::Envelope(Box::new(
+        haider_protocol::EventPayload::UserMessage {
+            text: "queued message".into(),
+            attachments: Vec::new(),
+            mode: haider_protocol::DeliveryMode::Steer,
+        },
+    )));
+    assert_eq!(model.screen, Screen::Session);
+
+    let mut driver = LiveDriver::new("test");
+    driver.apply(
+        &mut model,
+        LiveReply::LoomAuthorDrafted {
+            generation,
+            epoch: 0,
+            draft: haider_protocol::loom::LoomAuthorDraft {
+                authoring_id: "author-confirmed".into(),
+                revision: 1,
+                kind: haider_protocol::loom::LoomAuthorKind::Workflow,
+                text: "draft reply".into(),
+                errors: Vec::new(),
+            },
+        },
+    );
+    assert!(!model.loom_authoring.as_ref().expect("authoring").pending);
+    assert_eq!(
+        model.drafts.get(&DraftKey::Loom).map(Composer::text),
+        Some("draft reply")
+    );
+
+    model.loom_authoring.as_mut().expect("authoring").pending = true;
+    let commands = driver.apply(
+        &mut model,
+        LiveReply::LoomAuthorConfirmed {
+            generation,
+            epoch: 0,
+            confirmed: Some(author_confirmation(
+                haider_protocol::loom::LoomAuthorKind::Workflow,
+            )),
+            errors: Vec::new(),
+        },
+    );
+    assert!(matches!(
+        commands.as_slice(),
+        [LiveCommand::LoomList { .. }]
+    ));
+    assert!(
+        model
+            .loom_authoring
+            .as_ref()
+            .expect("authoring")
+            .confirmed
+            .is_some()
+    );
+    assert_eq!(
+        model.drafts.get(&DraftKey::Loom).map(Composer::text),
+        Some("confirmed bytes")
+    );
+
+    model.loom_authoring.as_mut().expect("authoring").pending = true;
+    driver.apply(
+        &mut model,
+        LiveReply::LoomAuthorFailed {
+            generation,
+            epoch: 0,
+            message: "late failure".into(),
+        },
+    );
+    assert!(!model.loom_authoring.as_ref().expect("authoring").pending);
+}
+
+#[test]
+fn graph_strip_parks_nonpending_loom_text_and_restores_the_session_draft() {
+    let mut model = live_bound_model();
+    model.composer.set_text("unfinished session prompt");
+    model.handle(ctrl(KeyCode::Char('c')));
+    model.handle_hit(Hit::ExtraRow(LauncherRow::Loom));
+    model.handle(ctrl(KeyCode::Char('n')));
+    model.composer.set_text("loom typed text");
+
+    model.handle_hit(Hit::GraphStrip);
+    assert_eq!(model.screen, Screen::Graph);
+    assert_eq!(model.composer.text(), "unfinished session prompt");
+    assert_eq!(
+        model.drafts.get(&DraftKey::Loom).map(Composer::text),
+        Some("loom typed text")
+    );
+}
+
+#[test]
+fn revise_reply_clears_prior_confirmation_and_cli_seed_cannot_overwrite_editor() {
+    let mut model = live_bound_model();
+    model.screen = Screen::Loom;
+    model.loom_pane = LoomPane::Types;
+    model.handle(ctrl(KeyCode::Char('n')));
+    let generation = model.loom_authoring.as_ref().expect("authoring").generation;
+    let confirmed = author_confirmation(haider_protocol::loom::LoomAuthorKind::AgentType);
+    let authoring = model.loom_authoring.as_mut().expect("authoring");
+    authoring.authoring_id = Some("author-confirmed".into());
+    authoring.revision = Some(1);
+    authoring.confirmed = Some(confirmed);
+    authoring.pending = true;
+    model.composer.set_text("submitted edit");
+
+    let mut driver = LiveDriver::new("test");
+    driver.apply(
+        &mut model,
+        LiveReply::LoomAuthorDrafted {
+            generation,
+            epoch: 0,
+            draft: haider_protocol::loom::LoomAuthorDraft {
+                authoring_id: "author-confirmed".into(),
+                revision: 2,
+                kind: haider_protocol::loom::LoomAuthorKind::AgentType,
+                text: "revised bytes".into(),
+                errors: Vec::new(),
+            },
+        },
+    );
+    assert!(
+        model
+            .loom_authoring
+            .as_ref()
+            .expect("authoring")
+            .confirmed
+            .is_none()
+    );
+    model.handle(ctrl(KeyCode::Char('i')));
+    assert_eq!(model.composer.text(), "revised bytes");
+    assert!(
+        model
+            .flash
+            .as_deref()
+            .is_some_and(|flash| flash.contains("close the Loom editor"))
+    );
+}
+
+#[test]
+fn closing_a_confirmed_editor_reports_that_registration_is_retained() {
+    let mut model = live_bound_model();
+    model.screen = Screen::Loom;
+    model.loom_pane = LoomPane::Workflows;
+    model.handle(ctrl(KeyCode::Char('n')));
+    model.loom_authoring.as_mut().expect("authoring").confirmed = Some(author_confirmation(
+        haider_protocol::loom::LoomAuthorKind::Workflow,
+    ));
+
+    model.handle(key(KeyCode::Esc));
+    assert!(model.loom_authoring.is_none());
+    assert!(
+        model
+            .flash
+            .as_deref()
+            .is_some_and(|flash| flash.contains("remains registered"))
+    );
+
+    let mut edited = live_bound_model();
+    edited.screen = Screen::Loom;
+    edited.loom_pane = LoomPane::Workflows;
+    edited.handle(ctrl(KeyCode::Char('n')));
+    edited.loom_authoring.as_mut().expect("authoring").confirmed = Some(author_confirmation(
+        haider_protocol::loom::LoomAuthorKind::Workflow,
+    ));
+    edited.handle(key(KeyCode::Char('x')));
+    assert!(
+        edited
+            .loom_authoring
+            .as_ref()
+            .expect("edited authoring")
+            .confirmed
+            .is_none()
+    );
+    edited.handle(key(KeyCode::Esc));
+    assert!(
+        edited
+            .flash
+            .as_deref()
+            .is_some_and(|flash| flash.contains("no new revision registered"))
+    );
+}
+
+#[test]
+fn late_reply_cannot_bind_to_a_reopened_editor() {
+    let mut model = live_bound_model();
+    model.screen = Screen::Loom;
+    model.loom_pane = LoomPane::Workflows;
+    model.handle(ctrl(KeyCode::Char('n')));
+    let old_generation = model
+        .loom_authoring
+        .as_ref()
+        .expect("old authoring")
+        .generation;
+    model
+        .loom_authoring
+        .as_mut()
+        .expect("old authoring")
+        .pending = false;
+    model.handle(key(KeyCode::Esc));
+    model.handle(ctrl(KeyCode::Char('n')));
+    let new_generation = model
+        .loom_authoring
+        .as_ref()
+        .expect("new authoring")
+        .generation;
+    assert_ne!(old_generation, new_generation);
+    model.composer.set_text("new prose");
+    model
+        .loom_authoring
+        .as_mut()
+        .expect("new authoring")
+        .pending = true;
+
+    let mut driver = LiveDriver::new("test");
+    driver.apply(
+        &mut model,
+        LiveReply::LoomAuthorDrafted {
+            generation: old_generation,
+            epoch: 0,
+            draft: haider_protocol::loom::LoomAuthorDraft {
+                authoring_id: "stale".into(),
+                revision: 1,
+                kind: haider_protocol::loom::LoomAuthorKind::Workflow,
+                text: "stale bytes".into(),
+                errors: Vec::new(),
+            },
+        },
+    );
+    assert_eq!(model.composer.text(), "new prose");
+    let authoring = model.loom_authoring.as_ref().expect("new authoring");
+    assert!(authoring.pending);
+    assert!(authoring.authoring_id.is_none());
+}
+
+#[test]
+fn disconnected_epoch_rejects_a_queued_old_authoring_reply() {
+    let mut model = live_bound_model();
+    model.screen = Screen::Loom;
+    model.loom_pane = LoomPane::Workflows;
+    model.handle(ctrl(KeyCode::Char('n')));
+    let generation = model.loom_authoring.as_ref().expect("authoring").generation;
+    model.loom_authoring.as_mut().expect("authoring").pending = true;
+    let mut driver = LiveDriver::new("test");
+    driver.apply(
+        &mut model,
+        LiveReply::Disconnected {
+            reason: "socket reset".into(),
+        },
+    );
+    model.composer.set_text("retry prose");
+    model.loom_authoring.as_mut().expect("authoring").pending = true;
+    driver.apply(
+        &mut model,
+        LiveReply::LoomAuthorDrafted {
+            generation,
+            epoch: 0,
+            draft: haider_protocol::loom::LoomAuthorDraft {
+                authoring_id: "old-connection".into(),
+                revision: 1,
+                kind: haider_protocol::loom::LoomAuthorKind::Workflow,
+                text: "old connection bytes".into(),
+                errors: Vec::new(),
+            },
+        },
+    );
+    assert_eq!(model.composer.text(), "retry prose");
+    assert!(model.loom_authoring.as_ref().expect("authoring").pending);
+}
+
+#[test]
+fn feature_loss_hides_confirm_affordance_for_an_open_editor() {
+    let mut model = live_bound_model();
+    model.screen = Screen::Loom;
+    model.handle(ctrl(KeyCode::Char('n')));
+    model
+        .daemon_features
+        .remove(haider_rpc::FEATURE_LOOM_AUTHORING_V1);
+    let (rows, _) = draw(&model);
+    let all = rows.join("\n");
+    assert!(all.contains("authoring unavailable"), "{all}");
+    assert!(!all.contains("confirm/register"), "{all}");
 }
 
 // ---- item 4: typed agents are colored in the fleet ----------------------

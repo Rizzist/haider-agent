@@ -6324,11 +6324,11 @@ fn wrap_plain(text: &str, width: usize) -> Vec<String> {
 /// W-flow: the workflows pane leads with the synthetic `∅ none` row and the
 /// daemon-published built-in catalog — `p` pins the selected row to the bound session,
 /// `n` opens the describe-it authoring input on both panes.
-/// The Loom/Workflows tab keeps the session COMPOSER live at its foot
-/// (owner 2026-08-22): authoring is a conversation, not a one-shot prompt,
-/// so the operator describes, sees the proposal, and refines WITHOUT leaving
-/// the registry they are editing. The list takes navigation keys; every
-/// printable character goes to the composer, which is why "new" is a
+/// The Loom/Workflows tab keeps its dedicated Loom editor live at its foot:
+/// authoring is a multi-step draft/revise/confirm session, so the operator
+/// describes, sees the proposal, and refines WITHOUT leaving the registry
+/// they are editing. The list takes navigation keys; every printable
+/// character goes to the editor, which is why "new" is a
 /// clickable row rather than a bare `n`.
 fn render_loom(
     model: &AppModel,
@@ -6377,6 +6377,90 @@ fn render_loom(
         ),
     ]));
     lines.push(Line::raw(""));
+    if let Some(authoring) = &model.loom_authoring {
+        let noun = match authoring.kind {
+            haider_protocol::loom::LoomAuthorKind::AgentType => "AGENT TYPE",
+            haider_protocol::loom::LoomAuthorKind::Workflow => "WORKFLOW",
+        };
+        lines.push(Line::from(vec![
+            Span::styled("AUTHORING — ", theme.gold_style()),
+            Span::styled(noun, theme.bright_style().add_modifier(Modifier::BOLD)),
+        ]));
+        lines.push(Line::raw(""));
+        if authoring.authoring_id.is_none() {
+            lines.push(Line::styled(
+                "Describe the agent type or workflow in prose below.",
+                theme.text_style(),
+            ));
+            lines.push(Line::styled(
+                "⏎ asks the daemon for an editable typed draft; nothing registers yet.",
+                theme.dim_style(),
+            ));
+        } else {
+            lines.push(Line::styled(
+                "The typed JSON below is the draft of record. Edit it directly.",
+                theme.text_style(),
+            ));
+            lines.push(Line::styled(
+                "workflow nodes expose types, fork/join dependencies, back_edge, and InstructPipe evidence",
+                theme.dim_style(),
+            ));
+        }
+        if authoring.pending {
+            lines.push(Line::styled(
+                "  validating with daemon…",
+                theme.gold_style(),
+            ));
+        } else if !authoring.errors.is_empty() {
+            lines.push(Line::raw(""));
+            lines.push(Line::styled("VALIDATION", theme.err_style()));
+            for error in &authoring.errors {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!(
+                            "  {}:{} {} — ",
+                            error.location.line, error.location.column, error.location.field
+                        ),
+                        theme.warn_style(),
+                    ),
+                    Span::styled(error.message.clone(), theme.text_style()),
+                ]));
+            }
+        } else if authoring.validated {
+            lines.push(Line::styled(
+                "  ✓ typed validation passed",
+                theme.ok_style(),
+            ));
+        }
+        if let Some(confirmed) = &authoring.confirmed {
+            lines.push(Line::raw(""));
+            lines.push(Line::from(vec![
+                Span::styled("CONFIRMED  ", theme.ok_style()),
+                Span::styled(
+                    format!(
+                        "{} rev {} · {}",
+                        confirmed.registration.id,
+                        confirmed.registration.rev,
+                        crate::graph::digest_short(&confirmed.execution_digest)
+                    ),
+                    theme.bright_style(),
+                ),
+            ]));
+            lines.push(Line::styled(
+                "changed content confirms as a new immutable revision and execution hash",
+                theme.dim_style(),
+            ));
+        }
+        lines.push(Line::raw(""));
+        let actions = if model.daemon_serves(haider_rpc::FEATURE_LOOM_AUTHORING_V1) {
+            "⇧⏎ newline · ⏎ validate · ⌃S confirm/register · ⌥m model · esc close draft"
+        } else {
+            "authoring unavailable on this connection · esc close draft"
+        };
+        lines.push(Line::styled(actions, theme.dim_style()));
+        frame.render_widget(Paragraph::new(Text::from(lines)), area);
+        return;
+    }
     // Owner 2026-08-22: a visible, CLICKABLE create affordance. Bare `n`
     // stopped being available the moment printable keys started reaching the
     // composer, and a button is what the operator was looking for anyway.
@@ -6531,6 +6615,18 @@ fn render_loom(
                     "  none — narrower privilege",
                     theme.faint_style(),
                 ));
+            }
+            if !record.denials.is_empty() {
+                lines.push(Line::styled(
+                    "DENIALS — explicitly withheld",
+                    theme.gold_style(),
+                ));
+                for denial in &record.denials {
+                    lines.push(Line::from(vec![
+                        Span::styled("  deny ", theme.dim_style()),
+                        Span::styled(denial.clone(), theme.warn_style()),
+                    ]));
+                }
             }
             lines.push(Line::raw(""));
             lines.push(Line::styled("KNOW-HOW", theme.gold_style()));

@@ -42,8 +42,20 @@ use haider_protocol::error::ErrorPresentation;
 use haider_protocol::ids::{MenuId, RunId, SessionId};
 use haider_rpc::{AttachmentId, CommandId, MenuInput, SessionSummary, SubmitDisposition};
 
-use crate::app::{AppModel, AppRequest, OutboundAnswer};
+use crate::app::{AppModel, AppRequest, DraftKey, OutboundAnswer};
 use crate::projection::RawOutcome;
+
+fn replace_loom_author_text(model: &mut AppModel, text: &str) {
+    if model.screen == crate::app::Screen::Loom {
+        model.composer.set_text(text);
+    } else {
+        model
+            .drafts
+            .entry(DraftKey::Loom)
+            .or_default()
+            .set_text(text);
+    }
+}
 
 fn recognized_payload(payload: &serde_json::Value) -> bool {
     serde_json::from_value::<haider_protocol::EventPayload>(payload.clone()).is_ok()
@@ -297,6 +309,29 @@ pub enum LiveCommand {
         /// Round 4: the connection epoch this read belongs to — a reply that
         /// crossed a reconnect installs nothing.
         epoch: u64,
+    },
+    LoomAuthorDraft {
+        generation: u64,
+        epoch: u64,
+        session: SessionId,
+        kind: haider_protocol::loom::LoomAuthorKind,
+        prose: String,
+    },
+    LoomAuthorRevise {
+        generation: u64,
+        epoch: u64,
+        authoring_id: String,
+        expected_revision: u64,
+        kind: haider_protocol::loom::LoomAuthorKind,
+        text: String,
+    },
+    LoomAuthorConfirm {
+        generation: u64,
+        epoch: u64,
+        authoring_id: String,
+        expected_revision: u64,
+        kind: haider_protocol::loom::LoomAuthorKind,
+        text: String,
     },
     /// `graph.inspect` (M2c) — a ONE-SHOT paged read of graph telemetry
     /// (template rollups, tool-selection stats, evidence provenance with real
@@ -856,6 +891,9 @@ impl LiveCommand {
             // The graph reduction is a read (see above).
             | Self::GraphStatus { .. }
             | Self::LoomList { .. }
+            | Self::LoomAuthorDraft { .. }
+            | Self::LoomAuthorRevise { .. }
+            | Self::LoomAuthorConfirm { .. }
             | Self::OpenPermissionSettings { .. }
             | Self::GraphInspect { .. }
             // A stage carries no durable identity BY DESIGN (see above).
@@ -908,6 +946,22 @@ pub enum LiveReply {
     /// request latch must release or /loom loads forever this connection.
     LoomListFailed {
         epoch: u64,
+    },
+    LoomAuthorDrafted {
+        generation: u64,
+        epoch: u64,
+        draft: haider_protocol::loom::LoomAuthorDraft,
+    },
+    LoomAuthorConfirmed {
+        generation: u64,
+        epoch: u64,
+        confirmed: Option<haider_protocol::loom::LoomAuthorConfirmed>,
+        errors: Vec<haider_protocol::loom::LoomAuthorValidationError>,
+    },
+    LoomAuthorFailed {
+        generation: u64,
+        epoch: u64,
+        message: String,
     },
     Listed {
         sessions: Vec<SessionSummary>,
@@ -2138,6 +2192,112 @@ impl LiveDriver {
                     // re-request; truth (`loom_loaded`) stays false, so
                     // /loom keeps reporting LOADING rather than lying.
                     model.loom_requested = false;
+                    model.dirty = true;
+                }
+                Vec::new()
+            }
+            LiveReply::LoomAuthorDrafted {
+                generation,
+                epoch,
+                draft,
+            } => {
+                let applies = model.loom_authoring.as_ref().is_some_and(|authoring| {
+                    authoring.generation == generation
+                        && epoch == self.connection_epoch
+                        && authoring.pending
+                        && authoring.kind == draft.kind
+                        && authoring
+                            .authoring_id
+                            .as_ref()
+                            .is_none_or(|id| id == &draft.authoring_id)
+                });
+                if applies {
+                    let validated = draft.errors.is_empty();
+                    let text = draft.text;
+                    let Some(authoring) = model.loom_authoring.as_mut() else {
+                        return Vec::new();
+                    };
+                    authoring.authoring_id = Some(draft.authoring_id);
+                    authoring.revision = Some(draft.revision);
+                    authoring.errors = draft.errors;
+                    // Draft and revise replies are editable, unconfirmed
+                    // revisions even when they follow a prior confirmation.
+                    authoring.confirmed = None;
+                    authoring.pending = false;
+                    authoring.validated = validated;
+                    replace_loom_author_text(model, &text);
+                    model.flash = Some(if validated {
+                        "· typed draft valid — edit freely; ⏎ validates, ⌃S confirms".to_owned()
+                    } else {
+                        "· draft needs edits — validation is shown inline".to_owned()
+                    });
+                    model.dirty = true;
+                }
+                Vec::new()
+            }
+            LiveReply::LoomAuthorConfirmed {
+                generation,
+                epoch,
+                confirmed,
+                errors,
+            } => {
+                let applies = model.loom_authoring.as_ref().is_some_and(|authoring| {
+                    authoring.generation == generation
+                        && epoch == self.connection_epoch
+                        && authoring.pending
+                });
+                if !applies {
+                    return Vec::new();
+                }
+                if let Some(confirmed) = confirmed
+                    && model
+                        .loom_authoring
+                        .as_ref()
+                        .and_then(|authoring| authoring.authoring_id.as_ref())
+                        .is_some_and(|id| id == &confirmed.authoring_id)
+                {
+                    let canonical_text = confirmed.canonical_text.clone();
+                    model.flash = Some(format!(
+                        "· confirmed {} rev {} · {}",
+                        confirmed.registration.id,
+                        confirmed.registration.rev,
+                        crate::graph::digest_short(&confirmed.execution_digest)
+                    ));
+                    let Some(authoring) = model.loom_authoring.as_mut() else {
+                        return Vec::new();
+                    };
+                    authoring.pending = false;
+                    authoring.errors.clear();
+                    authoring.validated = true;
+                    authoring.confirmed = Some(confirmed);
+                    replace_loom_author_text(model, &canonical_text);
+                    model.dirty = true;
+                    return vec![LiveCommand::LoomList {
+                        epoch: self.connection_epoch,
+                    }];
+                }
+                let Some(authoring) = model.loom_authoring.as_mut() else {
+                    return Vec::new();
+                };
+                authoring.pending = false;
+                authoring.errors = errors;
+                authoring.validated = false;
+                model.flash = Some("· confirm rejected — fix the typed errors inline".to_owned());
+                model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::LoomAuthorFailed {
+                generation,
+                epoch,
+                message,
+            } => {
+                if let Some(authoring) = &mut model.loom_authoring
+                    && authoring.generation == generation
+                    && epoch == self.connection_epoch
+                    && authoring.pending
+                {
+                    authoring.pending = false;
+                    model.flash = Some(format!("· Loom authoring failed — {message}"));
                     model.dirty = true;
                 }
                 Vec::new()
@@ -3674,6 +3834,17 @@ impl LiveDriver {
                 model.loom_types.clear();
                 model.workflow_catalog.clear();
                 model.loom_workflows.clear();
+                if let Some(authoring) = &mut model.loom_authoring {
+                    // Authoring ids are connection-scoped daemon state. Keep
+                    // the user's editor bytes, but require a fresh AI draft
+                    // before this text can be revised or confirmed again.
+                    authoring.authoring_id = None;
+                    authoring.revision = None;
+                    authoring.errors.clear();
+                    authoring.confirmed = None;
+                    authoring.pending = false;
+                    authoring.validated = false;
+                }
                 self.connection_epoch = self.connection_epoch.wrapping_add(1);
                 // Round 3: capability facts die with the socket as well; the
                 // reconnect handshake re-grounds them before work resumes.
@@ -4913,6 +5084,79 @@ impl LiveDriver {
                 // (no outbox), epoch-fenced exactly like the hydration read.
                 vec![LiveCommand::LoomList {
                     epoch: self.connection_epoch,
+                }]
+            }
+            AppRequest::LoomAuthorDraft {
+                generation,
+                session,
+                kind,
+                prose,
+            } => {
+                if !model.daemon_serves(haider_rpc::FEATURE_LOOM_AUTHORING_V1) {
+                    if let Some(authoring) = &mut model.loom_authoring
+                        && authoring.generation == generation
+                    {
+                        authoring.pending = false;
+                    }
+                    model.flash = Some(model.stale_daemon_note("Loom authoring"));
+                    return Vec::new();
+                }
+                vec![LiveCommand::LoomAuthorDraft {
+                    generation,
+                    epoch: self.connection_epoch,
+                    session,
+                    kind,
+                    prose,
+                }]
+            }
+            AppRequest::LoomAuthorRevise {
+                generation,
+                authoring_id,
+                expected_revision,
+                kind,
+                text,
+            } => {
+                if !model.daemon_serves(haider_rpc::FEATURE_LOOM_AUTHORING_V1) {
+                    if let Some(authoring) = &mut model.loom_authoring
+                        && authoring.generation == generation
+                    {
+                        authoring.pending = false;
+                    }
+                    model.flash = Some(model.stale_daemon_note("Loom authoring"));
+                    return Vec::new();
+                }
+                vec![LiveCommand::LoomAuthorRevise {
+                    generation,
+                    epoch: self.connection_epoch,
+                    authoring_id,
+                    expected_revision,
+                    kind,
+                    text,
+                }]
+            }
+            AppRequest::LoomAuthorConfirm {
+                generation,
+                authoring_id,
+                expected_revision,
+                kind,
+                text,
+            } => {
+                if !model.daemon_serves(haider_rpc::FEATURE_LOOM_AUTHORING_V1) {
+                    if let Some(authoring) = &mut model.loom_authoring
+                        && authoring.generation == generation
+                    {
+                        authoring.pending = false;
+                    }
+                    model.flash = Some(model.stale_daemon_note("Loom authoring"));
+                    return Vec::new();
+                }
+                vec![LiveCommand::LoomAuthorConfirm {
+                    generation,
+                    epoch: self.connection_epoch,
+                    authoring_id,
+                    expected_revision,
+                    kind,
+                    text,
                 }]
             }
             AppRequest::HooksTrust { digest, trusted } => {

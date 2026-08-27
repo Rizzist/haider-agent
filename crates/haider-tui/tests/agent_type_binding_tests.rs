@@ -36,6 +36,7 @@ fn scout() -> LoomAgentType {
         out_type: "Map".into(),
         clis: Vec::new(),
         apis: Vec::new(),
+        denials: Vec::new(),
         skills: Vec::new(),
         scripts: Vec::new(),
         color: "#7aa2f7".into(),

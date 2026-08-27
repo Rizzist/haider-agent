@@ -62,6 +62,7 @@ fn researcher_type() -> haider_protocol::loom::LoomAgentType {
         out_type: "Transcript".into(),
         clis: vec!["yt-dlp".into()],
         apis: Vec::new(),
+        denials: Vec::new(),
         skills: Vec::new(),
         scripts: Vec::new(),
         color: "#c2701c".into(),

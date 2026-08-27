@@ -21,6 +21,7 @@ fn agent_type(id: &str, in_type: &str, out_type: &str) -> LoomAgentType {
         out_type: out_type.into(),
         clis: vec!["yt-dlp".into()],
         apis: Vec::new(),
+        denials: Vec::new(),
         skills: vec!["transcript-clean".into()],
         scripts: Vec::new(),
         color: "#c2701c".into(),
@@ -64,11 +65,47 @@ fn agent_type_registration_owns_the_rev_law() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].rev, 2);
     assert_eq!(listed[0].apis, vec!["fal.ai".to_string()]);
+    let retained_first = store
+        .loom_agent_type_revision("researcher", created.rev, &created.digest)
+        .expect("read retained first revision")
+        .expect("first revision retained");
+    assert_eq!(retained_first.rev, 1);
+    assert!(retained_first.apis.is_empty());
+    let retained_second = store
+        .loom_agent_type_revision("researcher", revised.rev, &revised.digest)
+        .expect("read retained second revision")
+        .expect("second revision retained");
+    assert_eq!(retained_second, listed[0]);
+
+    drop(store);
+    let reopened = Store::open(root.path()).expect("reopen");
+    assert_eq!(
+        reopened
+            .loom_agent_type_revision("researcher", created.rev, &created.digest)
+            .expect("read retained revision after reopen"),
+        Some(retained_first),
+        "advancing current-by-id never mutates the old content hash"
+    );
+
+    // Returning to prior content creates a distinct retained registry
+    // revision even though its content-addressed execution digest repeats.
+    let reverted = reopened
+        .loom_register_agent_type(&first)
+        .expect("restore first content");
+    assert_eq!((reverted.rev, reverted.updated), (3, true));
+    assert_eq!(reverted.digest, created.digest);
+    let retained_third = reopened
+        .loom_agent_type_revision("researcher", reverted.rev, &reverted.digest)
+        .expect("read retained reverted revision")
+        .expect("reverted revision retained");
+    assert_eq!(retained_third.rev, 3);
+    assert!(retained_third.apis.is_empty());
+    assert_eq!(retained_third.digest(), retained_first.digest());
 
     // Bounds reject with typed errors.
     let mut bad = agent_type("bad id!", "A", "B");
     bad.id = "bad id!".into();
-    assert!(store.loom_register_agent_type(&bad).is_err());
+    assert!(reopened.loom_register_agent_type(&bad).is_err());
 }
 
 #[test]

@@ -92,12 +92,16 @@ use rusqlite::{
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const LOOM_AGENT_REVISIONS_DIR: &str = "loom-agent-revisions";
+static LOOM_AGENT_REVISION_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const REPLAY_PAGE_SIZE: usize = 1_024;
 const USAGE_REDUCER_PAYLOAD_KINDS: &[&str] =
     &["usage", "agent_spawned", "run_failed", "session_forked"];
@@ -2396,6 +2400,39 @@ impl Store {
         Ok(None)
     }
 
+    /// Reads the immutable workflow row named by a registration receipt.
+    /// Confirmation uses this exact address instead of rereading the mutable
+    /// current-by-name index after the registration transaction commits.
+    pub fn loom_workflow_registered_revision(
+        &self,
+        id: &str,
+        rev: u32,
+        digest: &str,
+    ) -> StoreResult<Option<LoomWorkflow>> {
+        validate_loom_revision_address(id, rev, digest)?;
+        let connection = self.connection()?;
+        let json = connection
+            .query_row(
+                "SELECT record_json FROM loom_workflow_revisions
+                 WHERE id = ?1 AND rev = ?2 AND digest = ?3",
+                params![id, i64::from(rev), digest],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?;
+        let Some(json) = json else {
+            return Ok(None);
+        };
+        let workflow: LoomWorkflow = serde_json::from_str(&json)
+            .map_err(|_| corrupt("Loom workflow revision is not decodable"))?;
+        if workflow.id != id || workflow.rev != rev || workflow.digest != digest {
+            return Err(corrupt(
+                "Loom workflow revision does not match its registration address",
+            ));
+        }
+        Ok(Some(workflow))
+    }
+
     /// C2 — one agent type by id (registry read used by typed spawns).
     pub fn loom_agent_type(&self, id: &str) -> StoreResult<Option<LoomAgentType>> {
         let connection = self.connection()?;
@@ -2413,6 +2450,125 @@ impl Store {
                     .map_err(|_| corrupt("loom agent type record is not decodable"))
             })
             .transpose()
+    }
+
+    /// Resolves one write-once agent-type revision by its registry revision
+    /// and execution digest.
+    /// The mutable current-by-id row remains the registry index; confirmed
+    /// content lives forever in this retained namespace so advancing that
+    /// index cannot destroy an older executable contract.
+    pub fn loom_agent_type_revision(
+        &self,
+        id: &str,
+        rev: u32,
+        digest: &str,
+    ) -> StoreResult<Option<LoomAgentType>> {
+        validate_loom_revision_address(id, rev, digest)?;
+        let path = self
+            .root
+            .join(LOOM_AGENT_REVISIONS_DIR)
+            .join(id)
+            .join(format!("{rev}-{digest}.json"));
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(loom_revision_io_error("read", &path, error)),
+        };
+        let record: LoomAgentType = serde_json::from_slice(&bytes)
+            .map_err(|_| corrupt("retained Loom agent-type revision is not decodable"))?;
+        if record.id != id || record.rev != rev || record.digest() != digest {
+            return Err(corrupt(
+                "retained Loom agent-type revision does not match its address",
+            ));
+        }
+        Ok(Some(record))
+    }
+
+    fn retain_loom_agent_type_revision(&self, record: &LoomAgentType) -> StoreResult<()> {
+        let digest = record.digest();
+        validate_loom_revision_address(&record.id, record.rev, &digest)?;
+        let revisions = self.root.join(LOOM_AGENT_REVISIONS_DIR);
+        let type_revisions = revisions.join(&record.id);
+        fs::create_dir_all(&revisions)
+            .map_err(|error| loom_revision_io_error("create directory", &revisions, error))?;
+        // Repeat parent synchronization even when an earlier attempt created
+        // the directory but failed before making that entry durable.
+        sync_loom_revision_directory(&self.root)?;
+        fs::create_dir_all(&type_revisions)
+            .map_err(|error| loom_revision_io_error("create directory", &type_revisions, error))?;
+        sync_loom_revision_directory(&revisions)?;
+        let path = type_revisions.join(format!("{}-{digest}.json", record.rev));
+        if path.exists() {
+            verify_retained_loom_agent_type(&path, record)?;
+            return sync_loom_revision_directory(&type_revisions);
+        }
+        let bytes = serde_json::to_vec(record)
+            .map_err(|_| corrupt("loom agent type revision is not encodable"))?;
+        let mut temporary_path = None;
+        let mut temporary = None;
+        for _ in 0..32 {
+            let counter = LOOM_AGENT_REVISION_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let candidate =
+                type_revisions.join(format!(".tmp-loom-agent-{}-{counter}", std::process::id()));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => {
+                    temporary_path = Some(candidate);
+                    temporary = Some(file);
+                    break;
+                }
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(loom_revision_io_error(
+                        "create temporary revision",
+                        &candidate,
+                        error,
+                    ));
+                }
+            }
+        }
+        let temporary_path = temporary_path.ok_or_else(|| {
+            store_error(
+                ErrorCode::Internal,
+                format!(
+                    "cannot allocate a temporary Loom revision in {}",
+                    type_revisions.display()
+                ),
+                true,
+            )
+        })?;
+        let mut temporary =
+            temporary.ok_or_else(|| corrupt("temporary Loom revision file was not opened"))?;
+        let write_result = temporary
+            .write_all(&bytes)
+            .and_then(|()| temporary.sync_all());
+        drop(temporary);
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temporary_path);
+            let _ = sync_loom_revision_directory(&type_revisions);
+            return Err(loom_revision_io_error(
+                "persist temporary revision",
+                &temporary_path,
+                error,
+            ));
+        }
+        let publish_result = match fs::hard_link(&temporary_path, &path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                verify_retained_loom_agent_type(&path, record)
+            }
+            Err(error) => Err(loom_revision_io_error("publish revision", &path, error)),
+        };
+        let remove_result = fs::remove_file(&temporary_path).map_err(|error| {
+            loom_revision_io_error("remove temporary revision", &temporary_path, error)
+        });
+        let sync_result = sync_loom_revision_directory(&type_revisions);
+        publish_result?;
+        remove_result?;
+        sync_result
     }
 
     /// B1 — register (or revise) one agent type. The registry rev law:
@@ -2444,30 +2600,46 @@ impl Store {
             .map_err(map_sqlite_error)?;
         let existing = transaction
             .query_row(
-                "SELECT rev, digest FROM loom_agent_types WHERE id = ?1",
+                "SELECT rev, digest, record_json FROM loom_agent_types WHERE id = ?1",
                 [record.id.as_str()],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()
             .map_err(map_sqlite_error)?;
+        let existing = existing
+            .map(|(rev, digest, json)| {
+                let stored: LoomAgentType = serde_json::from_str(&json)
+                    .map_err(|_| corrupt("loom agent type record is not decodable"))?;
+                let stored_rev = u32::try_from(rev)
+                    .map_err(|_| corrupt("loom agent type rev is out of range"))?;
+                if stored.rev != stored_rev || stored.id != record.id || stored.digest() != digest {
+                    return Err(corrupt("loom agent type row and record identities differ"));
+                }
+                Ok((stored_rev, digest, stored))
+            })
+            .transpose()?;
         let digest = record.digest();
         let now = now_ms()?;
         let is_new = existing.is_none();
         let (outcome, changed_record) = match &existing {
-            Some((rev, current)) if *current == digest => (
+            Some((rev, current, _)) if *current == digest => (
                 LoomRegistration {
                     id: record.id.clone(),
-                    rev: u32::try_from(*rev)
-                        .map_err(|_| corrupt("loom agent type rev is out of range"))?,
+                    rev: *rev,
                     digest: digest.clone(),
                     updated: false,
                 },
                 None,
             ),
-            Some((rev, _)) => {
-                let next = u32::try_from(*rev)
-                    .ok()
-                    .and_then(|rev| rev.checked_add(1))
+            Some((rev, _, _)) => {
+                let next = rev
+                    .checked_add(1)
                     .ok_or_else(|| corrupt("loom agent type rev is out of range"))?;
                 let mut stored = record.clone();
                 stored.rev = next;
@@ -2509,6 +2681,10 @@ impl Store {
             })?;
             let json = serde_json::to_string(&stored)
                 .map_err(|_| corrupt("loom agent type record is not encodable"))?;
+            if let Some((_, _, prior)) = &existing {
+                self.retain_loom_agent_type_revision(prior)?;
+            }
+            self.retain_loom_agent_type_revision(&stored)?;
             if is_new {
                 let inserted = transaction
                     .execute(
@@ -2554,6 +2730,11 @@ impl Store {
             // no-ops on both tables.
             let mut stored = record.clone();
             stored.rev = outcome.rev;
+            let retained = existing
+                .as_ref()
+                .map(|(_, _, stored)| stored)
+                .ok_or_else(|| corrupt("unchanged Loom agent type has no current record"))?;
+            self.retain_loom_agent_type_revision(retained)?;
             let contract = TypedAgentContract::from_loom_agent_type(&stored).map_err(|error| {
                 store_error(
                     ErrorCode::InvalidArgument,
@@ -19035,6 +19216,59 @@ fn typed_agent_install_conflict(message: impl Into<String>) -> HaiderError {
     store_error(ErrorCode::RevisionConflict, message, false)
 }
 
+fn validate_loom_revision_address(id: &str, rev: u32, digest: &str) -> StoreResult<()> {
+    let valid_id = !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+    let valid_digest = digest.len() == 32
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if valid_id && rev > 0 && valid_digest {
+        Ok(())
+    } else {
+        Err(store_error(
+            ErrorCode::InvalidArgument,
+            "invalid Loom revision address",
+            false,
+        ))
+    }
+}
+
+fn verify_retained_loom_agent_type(path: &Path, expected: &LoomAgentType) -> StoreResult<()> {
+    let bytes = fs::read(path)
+        .map_err(|error| loom_revision_io_error("read retained revision", path, error))?;
+    let retained: LoomAgentType = serde_json::from_slice(&bytes)
+        .map_err(|_| corrupt("retained Loom agent-type revision is not decodable"))?;
+    if retained == *expected {
+        Ok(())
+    } else {
+        Err(corrupt(
+            "retained Loom agent-type digest addresses different content",
+        ))
+    }
+}
+
+fn sync_loom_revision_directory(path: &Path) -> StoreResult<()> {
+    haider_platform::sync_directory(path)
+        .map_err(|error| loom_revision_io_error("sync directory", path, error))
+}
+
+fn loom_revision_io_error(action: &str, path: &Path, error: std::io::Error) -> HaiderError {
+    let code = match error.kind() {
+        ErrorKind::StorageFull => ErrorCode::StoreFull,
+        ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem => ErrorCode::StoreReadOnly,
+        _ => ErrorCode::Internal,
+    };
+    store_error(
+        code,
+        format!("cannot {action} {}: {error}", path.display()),
+        false,
+    )
+}
+
 /// Round 3 — canonical form BEFORE validation and digesting: typed I/O is
 /// trimmed, API hosts are lowercased. Comparisons downstream (grant hosts,
 /// tail joins) then never fight case or stray whitespace.
@@ -19047,6 +19281,12 @@ fn normalize_agent_type(record: &LoomAgentType) -> LoomAgentType {
     }
     for cli in &mut record.clis {
         *cli = cli.trim().to_owned();
+    }
+    for denial in &mut record.denials {
+        *denial = denial.trim().to_owned();
+        if let Some(host) = denial.strip_prefix("api:") {
+            *denial = format!("api:{}", host.to_ascii_lowercase());
+        }
     }
     record
 }
@@ -19127,7 +19367,13 @@ fn validate_agent_type(record: &LoomAgentType) -> StoreResult<()> {
              control/invisible/reordering characters",
         );
     }
-    for list in [&record.clis, &record.apis, &record.skills, &record.scripts] {
+    for list in [
+        &record.clis,
+        &record.apis,
+        &record.denials,
+        &record.skills,
+        &record.scripts,
+    ] {
         if list.len() > 32 {
             return reject("agent type capability lists are bounded to 32 entries");
         }
@@ -19190,6 +19436,31 @@ fn validate_agent_type(record: &LoomAgentType) -> StoreResult<()> {
         .any(|api| api.contains(['/', ':', '@', ' ', '\t']))
     {
         return reject("agent type API entries must be bare hosts (no scheme/port/path)");
+    }
+    let mut seen_denials = std::collections::HashSet::new();
+    for denial in &record.denials {
+        let denied_cli = denial.strip_prefix("cli:");
+        let denied_api = denial.strip_prefix("api:");
+        let valid = denied_cli.is_some_and(|value| {
+            !value.is_empty() && value.len() <= 128 && value.bytes().all(cli_byte_ok)
+        }) || denied_api.is_some_and(|value| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+        });
+        if !valid {
+            return reject("agent type denials must be cli:<program> or api:<host> keys");
+        }
+        if !seen_denials.insert(denial) {
+            return reject("agent type denials must be unique");
+        }
+        if denied_cli.is_some_and(|cli| record.clis.iter().any(|grant| grant == cli))
+            || denied_api.is_some_and(|api| record.apis.iter().any(|grant| grant == api))
+        {
+            return reject("agent type capability cannot be both granted and denied");
+        }
     }
     Ok(())
 }

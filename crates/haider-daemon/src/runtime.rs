@@ -626,6 +626,8 @@ async fn run_inner(
     };
     hub.install_creatable_providers(creatable_providers)
         .map_err(DaemonError::from)?;
+    hub.install_loom_author_provider(std::sync::Arc::clone(&provider_factory))
+        .map_err(DaemonError::from)?;
     // U1: the read-only `usage.report` service shares the account snapshot
     // and (when the vault runs) the SAME credential broker as provider
     // construction, so meter fetches ride the broker's refresh single-flight
