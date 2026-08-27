@@ -58,7 +58,7 @@ use haider_rpc::{
 use haider_store::{EventStore, Store};
 use haider_tools::{
     ChangeLedgerSink, EffectBroker, FsEdit, FsWriteRecord, JournalSink, PermissionPolicy,
-    ToolResult, TurnAttribution,
+    ToolError, ToolResult, TurnAttribution,
 };
 use std::fs;
 use std::future;

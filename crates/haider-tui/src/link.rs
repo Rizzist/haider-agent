@@ -635,6 +635,14 @@ pub fn command_required_features(command: &LiveCommand) -> &'static [&'static st
     }
 }
 
+/// Correlation retained for an in-flight checkpoint-list request.
+type CheckpointListContext = (
+    haider_protocol::ids::SessionId,
+    Option<haider_protocol::ids::BranchId>,
+    Option<String>,
+    Vec<haider_protocol::ids::RunId>,
+);
+
 /// What a response needs from its request to be interpretable (the wire
 /// deliberately does not echo, e.g., which session an attach was for).
 ///
@@ -656,12 +664,7 @@ pub struct CommandContext {
     /// id, so without this a failure cannot be correlated back to the
     /// session it wedged (review P1-5).
     attach: Option<haider_protocol::ids::SessionId>,
-    checkpoint_list: Option<(
-        haider_protocol::ids::SessionId,
-        Option<haider_protocol::ids::BranchId>,
-        Option<String>,
-        Vec<haider_protocol::ids::RunId>,
-    )>,
+    checkpoint_list: Option<CheckpointListContext>,
     /// The provider a `provider.models_refresh` was for — the request has
     /// no durable id, and its failure must land on the PROVIDER ROW, not
     /// the status-bar flash (owner bug: boot-time auto-refresh of a dead

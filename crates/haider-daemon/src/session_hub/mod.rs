@@ -5723,7 +5723,10 @@ impl HubStoreHandle {
             .map_err(|_| SessionHubError::Closed)
     }
 
-    pub(crate) async fn put_artifact(
+    /// Stores opaque artifact bytes through this worker lease's bounded CAS
+    /// surface. Public tool factories use this to back checkpoint journals
+    /// without gaining access to the hub's underlying cross-session store.
+    pub async fn put_artifact(
         &self,
         bytes: Vec<u8>,
     ) -> Result<haider_protocol::ids::ArtifactRef, HaiderError> {
