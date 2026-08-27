@@ -911,22 +911,26 @@ async fn settle_process_start_attempt_before_retry(
     session_id: &SessionId,
     generation: u64,
     run_id: &RunId,
+    deadline: tokio::time::Instant,
     request_id: &str,
     command_id: &str,
 ) -> RetryPreconditionDisposition {
-    send_request(
-        client,
-        config,
-        request_id,
-        RequestBody::TurnCancel {
-            command_id: CommandId::new(command_id),
-            session_id: session_id.clone(),
-            worker_generation: generation,
-            run_id: run_id.clone(),
-        },
-    )
-    .await;
-    tokio::time::timeout(support::DEADLINE, async {
+    tokio::time::timeout_at(deadline, async {
+        // The write belongs to the same continuous deadline as its reply and
+        // terminal observations. In particular, a wedged Windows named-pipe
+        // writer must not escape the retry-precondition bound.
+        send_request(
+            client,
+            config,
+            request_id,
+            RequestBody::TurnCancel {
+                command_id: CommandId::new(command_id),
+                session_id: session_id.clone(),
+                worker_generation: generation,
+                run_id: run_id.clone(),
+            },
+        )
+        .await;
         let mut cancellation_accepted = false;
         let mut terminal_seen = false;
         let mut interrupted_idle_seen = false;
@@ -3855,55 +3859,83 @@ async fn w8a_shell_exec_cancel_kills_the_process_tree() {
     let retry_start = !matches!(start, Ok(ProcessStartObservation::Started));
     #[cfg(windows)]
     let (run_id, item_id, process_start_attempts, shell_attempt_command_id) = if retry_start {
-        let _previous_attempt = settle_process_start_attempt_before_retry(
-            &mut client,
-            &config,
-            &session_id,
-            generation,
-            &run_id,
-            "shell-cancel-timeout-cleanup",
-            "shell-cancel-timeout-cleanup-command",
-        )
-        .await;
-        clean_timed_out_process_start_files(&workspace, &heartbeat).await;
-        send_request(
-            &mut client,
-            &config,
-            "shell-cancel-start-retry",
-            RequestBody::ShellExec {
-                command_id: CommandId::new("shell-cancel-command-retry"),
-                session_id: session_id.clone(),
-                worker_generation: generation,
-                command: cancellable_exec_command(),
-                cwd: None,
-            },
-        )
-        .await;
-        let retry_receipt = match next_response(&mut client).await {
-            WireFrame::Response {
-                body:
-                    ResponseBody::ShellExec {
-                        run_id: Some(run_id),
-                        item_id,
-                        ..
-                    },
-                ..
-            } => (run_id, item_id),
-            other => panic!("expected retry's cancellable shell receipt, got {other:?}"),
-        };
-        assert_eq!(
-            wait_for_direct_shell_process_tree(&mut client, &config, &retry_receipt.0, &heartbeat,)
+        let recovery_deadline = tokio::time::Instant::now() + support::DEADLINE;
+        tokio::time::timeout_at(recovery_deadline, async {
+            eprintln!(
+                "haider-daemond windows-process test=w8a_shell_exec_cancel_kills_the_process_tree phase=settling-first-attempt"
+            );
+            let _previous_attempt = settle_process_start_attempt_before_retry(
+                &mut client,
+                &config,
+                &session_id,
+                generation,
+                &run_id,
+                recovery_deadline,
+                "shell-cancel-timeout-cleanup",
+                "shell-cancel-timeout-cleanup-command",
+            )
+            .await;
+            eprintln!(
+                "haider-daemond windows-process test=w8a_shell_exec_cancel_kills_the_process_tree phase=cleaning-first-attempt"
+            );
+            clean_timed_out_process_start_files(&workspace, &heartbeat).await;
+            eprintln!(
+                "haider-daemond windows-process test=w8a_shell_exec_cancel_kills_the_process_tree phase=submitting-retry"
+            );
+            send_request(
+                &mut client,
+                &config,
+                "shell-cancel-start-retry",
+                RequestBody::ShellExec {
+                    command_id: CommandId::new("shell-cancel-command-retry"),
+                    session_id: session_id.clone(),
+                    worker_generation: generation,
+                    command: cancellable_exec_command(),
+                    cwd: None,
+                },
+            )
+            .await;
+            let retry_receipt = match next_response(&mut client).await {
+                WireFrame::Response {
+                    body:
+                        ResponseBody::ShellExec {
+                            run_id: Some(run_id),
+                            item_id,
+                            ..
+                        },
+                    ..
+                } => (run_id, item_id),
+                other => panic!("expected retry's cancellable shell receipt, got {other:?}"),
+            };
+            eprintln!(
+                "haider-daemond windows-process test=w8a_shell_exec_cancel_kills_the_process_tree phase=waiting-for-retry-start"
+            );
+            assert_eq!(
+                wait_for_direct_shell_process_tree(
+                    &mut client,
+                    &config,
+                    &retry_receipt.0,
+                    &heartbeat,
+                )
                 .await
                 .expect("direct shell process tree starts on its single retry"),
-            ProcessStartObservation::Started,
-            "the fresh retry must own the live process tree used by cancellation assertions"
-        );
-        (
-            retry_receipt.0,
-            retry_receipt.1,
-            2_usize,
-            "shell-cancel-command-retry",
-        )
+                ProcessStartObservation::Started,
+                "the fresh retry must own the live process tree used by cancellation assertions"
+            );
+            (
+                retry_receipt.0,
+                retry_receipt.1,
+                2_usize,
+                "shell-cancel-command-retry",
+            )
+        })
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!(
+                "haider-daemond windows-process test=w8a_shell_exec_cancel_kills_the_process_tree phase=failed-start-recovery-deadline result=Err({error:?})"
+            );
+            panic!("failed direct-shell start recovery exceeded one continuous deadline")
+        })
     } else {
         (run_id, item_id, 1_usize, "shell-cancel-command")
     };
@@ -7779,83 +7811,103 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
     let retry_start = !matches!(start, Ok(ProcessStartObservation::Started));
     #[cfg(windows)]
     let (run_id, answerer, process_start_attempts) = if retry_start {
-        eprintln!(
-            "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=settling-first-attempt"
-        );
-        drop(answerer);
-        let _previous_attempt = settle_process_start_attempt_before_retry(
-            &mut client,
-            &config,
-            &session_id,
-            generation,
-            &run_id,
-            "cancel-exec-timeout-cleanup",
-            "cancel-exec-timeout-cleanup-command",
-        )
-        .await;
-        clean_timed_out_process_start_files(&workspace, &heartbeat).await;
-        send_request(
-            &mut client,
-            &config,
-            "cancel-exec-submit-retry",
-            submit_body(
-                "cancel-exec-command-retry",
-                session_id.clone(),
-                generation,
-                "start then cancel the command",
-            ),
-        )
-        .await;
-        let (retry_run_id, _) = next_submit_response(&mut client).await;
-        let (retry_menu, retry_request_seq, retry_opening_generation) =
-            next_permission_menu(&mut client).await;
-        let mut retry_answerer = UdsClient::connect_control(
-            &config.endpoint_path(),
-            config.frame_limit,
-            "w4a2-test",
-            "exec-cancel-answerer-retry",
-            ClientKind::Headless,
-        )
-        .await;
-        failure_diagnostics.watch(&retry_answerer);
-        attach_existing(
-            &mut retry_answerer,
-            &config,
-            session_id.clone(),
-            retry_request_seq,
-            "exec-cancel-answerer-attach-retry",
-        )
-        .await;
-        answer_menu(
-            &mut retry_answerer,
-            &config,
-            "cancel-exec-answer-retry",
-            "cancel-exec-answer-command-retry",
-            session_id.clone(),
-            retry_menu.id,
-            retry_request_seq,
-            retry_opening_generation,
-            "approve_once",
-            0,
-        )
-        .await;
-        eprintln!(
-            "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=waiting-for-retry-start"
-        );
-        assert_eq!(
-            wait_for_exec_child_started(
+        // The first observer already spent the full long-start allowance.
+        // Cleanup, fresh submission, approval, and observation now share one
+        // ordinary RPC deadline instead of restarting a bound at every phase.
+        let recovery_deadline = tokio::time::Instant::now() + support::DEADLINE;
+        tokio::time::timeout_at(recovery_deadline, async {
+            eprintln!(
+                "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=settling-first-attempt"
+            );
+            drop(answerer);
+            let _previous_attempt = settle_process_start_attempt_before_retry(
                 &mut client,
                 &config,
                 &session_id,
-                &retry_run_id,
-                &heartbeat,
+                generation,
+                &run_id,
+                recovery_deadline,
+                "cancel-exec-timeout-cleanup",
+                "cancel-exec-timeout-cleanup-command",
             )
-            .await
-            .expect("exec child starts within the deadline on its single retry"),
-            ProcessStartObservation::Started,
-            "the single retry must start a live process tree"
-        );
-        (retry_run_id, retry_answerer, 2_usize)
+            .await;
+            eprintln!(
+                "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=cleaning-first-attempt"
+            );
+            clean_timed_out_process_start_files(&workspace, &heartbeat).await;
+            eprintln!(
+                "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=submitting-retry"
+            );
+            send_request(
+                &mut client,
+                &config,
+                "cancel-exec-submit-retry",
+                submit_body(
+                    "cancel-exec-command-retry",
+                    session_id.clone(),
+                    generation,
+                    "start then cancel the command",
+                ),
+            )
+            .await;
+            let (retry_run_id, _) = next_submit_response(&mut client).await;
+            let (retry_menu, retry_request_seq, retry_opening_generation) =
+                next_permission_menu(&mut client).await;
+            let mut retry_answerer = UdsClient::connect_control(
+                &config.endpoint_path(),
+                config.frame_limit,
+                "w4a2-test",
+                "exec-cancel-answerer-retry",
+                ClientKind::Headless,
+            )
+            .await;
+            failure_diagnostics.watch(&retry_answerer);
+            attach_existing(
+                &mut retry_answerer,
+                &config,
+                session_id.clone(),
+                retry_request_seq,
+                "exec-cancel-answerer-attach-retry",
+            )
+            .await;
+            answer_menu(
+                &mut retry_answerer,
+                &config,
+                "cancel-exec-answer-retry",
+                "cancel-exec-answer-command-retry",
+                session_id.clone(),
+                retry_menu.id,
+                retry_request_seq,
+                retry_opening_generation,
+                "approve_once",
+                0,
+            )
+            .await;
+            eprintln!(
+                "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=waiting-for-retry-start"
+            );
+            assert_eq!(
+                wait_for_exec_child_started(
+                    &mut client,
+                    &config,
+                    &session_id,
+                    &retry_run_id,
+                    &heartbeat,
+                )
+                .await
+                .expect("exec child starts within the deadline on its single retry"),
+                ProcessStartObservation::Started,
+                "the single retry must start a live process tree"
+            );
+            (retry_run_id, retry_answerer, 2_usize)
+        })
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!(
+                "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=failed-start-recovery-deadline result=Err({error:?})"
+            );
+            panic!("failed exec start recovery exceeded one continuous deadline")
+        })
     } else {
         (run_id, answerer, 1_usize)
     };

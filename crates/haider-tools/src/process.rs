@@ -922,6 +922,11 @@ impl EffectBroker {
                 )
                 .await;
         };
+        #[cfg(windows)]
+        // The in-process daemon test harness streams stderr under --nocapture;
+        // keep this after successful OS spawn so absence distinguishes a
+        // pre-spawn stall from an unobserved child.
+        eprintln!("haider-daemon windows-process phase=daemon-spawned pid={raw_pid}");
         let platform_group = match haider_platform::register_process_group(raw_pid) {
             Ok(group) => group,
             Err(error) => {
