@@ -170,7 +170,7 @@ fn valid_artifact_ref(artifact: &ArtifactRef) -> bool {
             digest.len() == 64
                 && digest
                     .bytes()
-                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         })
 }
 

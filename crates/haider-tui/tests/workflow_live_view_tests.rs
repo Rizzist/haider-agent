@@ -312,15 +312,13 @@ fn runtime_edges_do_not_invent_a_fork_for_unrelated_same_layer_nodes() {
 
 #[test]
 fn feature_downgrade_never_renders_a_retained_projection_as_live() {
-    let mut model = AppModel {
-        mode: RuntimeMode::Live,
-        screen: Screen::Loom,
-        loom_pane: LoomPane::Workflows,
-        loom_selection: 1,
-        loom_detail: true,
-        loom_loaded: true,
-        ..AppModel::default()
-    };
+    let mut model = AppModel::new();
+    model.mode = RuntimeMode::Live;
+    model.screen = Screen::Loom;
+    model.loom_pane = LoomPane::Workflows;
+    model.loom_selection = 1;
+    model.loom_detail = true;
+    model.loom_loaded = true;
     model.daemon_features.extend([
         haider_rpc::FEATURE_LOOM_V1.to_owned(),
         haider_rpc::FEATURE_WORKFLOW_CATALOG_V1.to_owned(),
@@ -376,14 +374,12 @@ fn feature_downgrade_never_renders_a_retained_projection_as_live() {
 #[test]
 fn tab_into_workflows_resumes_the_retained_runtime_cursor() {
     let session = SessionId::new("session-tab-workflow");
-    let mut model = AppModel {
-        mode: RuntimeMode::Live,
-        screen: Screen::Loom,
-        loom_pane: LoomPane::Types,
-        active_session: Some(session.clone()),
-        loom_loaded: true,
-        ..AppModel::default()
-    };
+    let mut model = AppModel::new();
+    model.mode = RuntimeMode::Live;
+    model.screen = Screen::Loom;
+    model.loom_pane = LoomPane::Types;
+    model.active_session = Some(session.clone());
+    model.loom_loaded = true;
     model.daemon_features.extend([
         haider_rpc::FEATURE_LOOM_V1.to_owned(),
         haider_rpc::FEATURE_WORKFLOW_CATALOG_V1.to_owned(),
@@ -466,15 +462,13 @@ fn enter_opens_a_rejects_exact_evidence_coordinate_for_inspection() {
         cursor: 84,
         evidence: Some(WorkflowEvidenceRef::new(evidence.clone())),
     });
-    let mut model = AppModel {
-        mode: RuntimeMode::Live,
-        screen: Screen::Loom,
-        loom_pane: LoomPane::Workflows,
-        loom_selection: 1,
-        loom_detail: true,
-        loom_loaded: true,
-        ..AppModel::default()
-    };
+    let mut model = AppModel::new();
+    model.mode = RuntimeMode::Live;
+    model.screen = Screen::Loom;
+    model.loom_pane = LoomPane::Workflows;
+    model.loom_selection = 1;
+    model.loom_detail = true;
+    model.loom_loaded = true;
     model.daemon_features.extend([
         haider_rpc::FEATURE_WORKFLOW_CATALOG_V1.to_owned(),
         haider_rpc::FEATURE_WORKFLOW_GRAPH_V1.to_owned(),
@@ -524,15 +518,13 @@ fn evidence_less_and_concurrent_rejects_are_each_inspectable() {
         cursor: 86,
         evidence: None,
     });
-    let mut model = AppModel {
-        mode: RuntimeMode::Live,
-        screen: Screen::Loom,
-        loom_pane: LoomPane::Workflows,
-        loom_selection: 1,
-        loom_detail: true,
-        loom_loaded: true,
-        ..AppModel::default()
-    };
+    let mut model = AppModel::new();
+    model.mode = RuntimeMode::Live;
+    model.screen = Screen::Loom;
+    model.loom_pane = LoomPane::Workflows;
+    model.loom_selection = 1;
+    model.loom_detail = true;
+    model.loom_loaded = true;
     model.daemon_features.extend([
         haider_rpc::FEATURE_WORKFLOW_CATALOG_V1.to_owned(),
         haider_rpc::FEATURE_WORKFLOW_GRAPH_V1.to_owned(),
@@ -636,11 +628,9 @@ fn state_and_cursor_watch_cross_the_link_as_typed_rpc_variants() {
 fn workflow_journal_facts_are_known_noops_in_active_and_background_sessions() {
     let active = SessionId::new("session-active-workflow");
     let background = SessionId::new("session-background-workflow");
-    let mut model = AppModel {
-        mode: RuntimeMode::Live,
-        active_session: Some(active.clone()),
-        ..AppModel::default()
-    };
+    let mut model = AppModel::new();
+    model.mode = RuntimeMode::Live;
+    model.active_session = Some(active.clone());
     model.upsert_live_session(&background);
 
     model.route_raw(&raw_workflow_started(active, 1));
@@ -660,13 +650,11 @@ fn workflow_journal_facts_are_known_noops_in_active_and_background_sessions() {
 fn stale_page_during_session_switch_resumes_the_new_sessions_retained_cursor() {
     let session_a = SessionId::new("session-a");
     let session_b = SessionId::new("session-b");
-    let mut model = AppModel {
-        mode: RuntimeMode::Live,
-        screen: Screen::Loom,
-        loom_pane: LoomPane::Workflows,
-        active_session: Some(session_a.clone()),
-        ..AppModel::default()
-    };
+    let mut model = AppModel::new();
+    model.mode = RuntimeMode::Live;
+    model.screen = Screen::Loom;
+    model.loom_pane = LoomPane::Workflows;
+    model.active_session = Some(session_a.clone());
     model
         .daemon_features
         .insert(haider_rpc::FEATURE_WORKFLOW_GRAPH_V1.to_owned());
@@ -714,13 +702,11 @@ fn stale_page_during_session_switch_resumes_the_new_sessions_retained_cursor() {
 #[test]
 fn reconnect_resumes_the_retained_workflow_cursor_and_empty_state_rebaselines() {
     let session = SessionId::new("session-reconnect-workflow");
-    let mut model = AppModel {
-        mode: RuntimeMode::Live,
-        screen: Screen::Loom,
-        loom_pane: LoomPane::Workflows,
-        active_session: Some(session.clone()),
-        ..AppModel::default()
-    };
+    let mut model = AppModel::new();
+    model.mode = RuntimeMode::Live;
+    model.screen = Screen::Loom;
+    model.loom_pane = LoomPane::Workflows;
+    model.active_session = Some(session.clone());
     model
         .daemon_features
         .insert(haider_rpc::FEATURE_WORKFLOW_GRAPH_V1.to_owned());
@@ -786,13 +772,11 @@ fn reconnect_resumes_the_retained_workflow_cursor_and_empty_state_rebaselines() 
     );
 
     let empty_session = SessionId::new("session-empty-workflow");
-    let mut empty = AppModel {
-        mode: RuntimeMode::Live,
-        screen: Screen::Loom,
-        loom_pane: LoomPane::Workflows,
-        active_session: Some(empty_session.clone()),
-        ..AppModel::default()
-    };
+    let mut empty = AppModel::new();
+    empty.mode = RuntimeMode::Live;
+    empty.screen = Screen::Loom;
+    empty.loom_pane = LoomPane::Workflows;
+    empty.active_session = Some(empty_session.clone());
     empty
         .daemon_features
         .insert(haider_rpc::FEATURE_WORKFLOW_GRAPH_V1.to_owned());
@@ -810,13 +794,11 @@ fn reconnect_resumes_the_retained_workflow_cursor_and_empty_state_rebaselines() 
 #[test]
 fn rejected_watch_cursor_rebaselines_without_discarding_last_good_view() {
     let session = SessionId::new("session-watch-repair");
-    let mut model = AppModel {
-        mode: RuntimeMode::Live,
-        screen: Screen::Loom,
-        loom_pane: LoomPane::Workflows,
-        active_session: Some(session.clone()),
-        ..AppModel::default()
-    };
+    let mut model = AppModel::new();
+    model.mode = RuntimeMode::Live;
+    model.screen = Screen::Loom;
+    model.loom_pane = LoomPane::Workflows;
+    model.active_session = Some(session.clone());
     model
         .daemon_features
         .insert(haider_rpc::FEATURE_WORKFLOW_GRAPH_V1.to_owned());

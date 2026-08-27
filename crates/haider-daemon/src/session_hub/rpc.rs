@@ -4271,7 +4271,7 @@ impl HubConnection {
         let normalized = command.trim().strip_prefix('/').unwrap_or(command.trim());
         let mut parts = normalized.splitn(2, char::is_whitespace);
         let name = parts.next().unwrap_or("").to_ascii_lowercase();
-        let argument = parts.next().map(str::trim).unwrap_or("");
+        let argument = parts.next().map_or("", str::trim);
         let Some(spec) = haider_rpc::command_spec(&name) else {
             return self.respond_command_outcome(
                 request_id,

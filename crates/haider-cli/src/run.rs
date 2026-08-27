@@ -941,7 +941,7 @@ fn replay_final_text(events: &[haider_protocol::envelope::RawEnvelope]) -> Optio
                 _ => None,
             }
         })
-        .last()
+        .next_back()
 }
 
 fn replay_tool_trace(events: &[haider_protocol::envelope::RawEnvelope]) -> Vec<serde_json::Value> {

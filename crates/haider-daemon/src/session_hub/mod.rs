@@ -2310,15 +2310,6 @@ impl SessionHub {
         ))
     }
 
-    /// E2 — plan-gated registration from the session agent's tool path.
-    #[cfg(test)]
-    pub(crate) async fn loom_register_workflow(
-        &self,
-        source: String,
-    ) -> Result<haider_protocol::loom::LoomRegistration, HaiderError> {
-        self.inner.store.loom_register_workflow(source).await
-    }
-
     pub(crate) async fn loom_register_workflow_cas(
         &self,
         source: String,

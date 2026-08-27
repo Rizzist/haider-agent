@@ -7273,19 +7273,16 @@ fn active_turn(init: ActiveTurnInit) -> ActiveTurn {
         budget_check,
     } = init;
     let cancel = handle.cancel_token();
-    let (budget, budget_task) = budget_check
-        .as_ref()
-        .map(|check| {
-            let (sender, receiver) = oneshot::channel();
-            let check = check.clone();
-            let monitor_run_id = run_id.clone();
-            let task = tokio::spawn(async move {
-                let exhausted = monitor_run_budget(check, monitor_run_id).await;
-                let _ = sender.send(exhausted);
-            });
-            (Some(receiver), Some(task))
-        })
-        .unwrap_or((None, None));
+    let (budget, budget_task) = budget_check.as_ref().map_or((None, None), |check| {
+        let (sender, receiver) = oneshot::channel();
+        let check = check.clone();
+        let monitor_run_id = run_id.clone();
+        let task = tokio::spawn(async move {
+            let exhausted = monitor_run_budget(check, monitor_run_id).await;
+            let _ = sender.send(exhausted);
+        });
+        (Some(receiver), Some(task))
+    });
     ActiveTurn {
         run_id,
         branch_id,
@@ -7693,8 +7690,7 @@ async fn monitor_run_budget(check: BudgetCheckContext, run_id: RunId) -> RunBudg
             .spec
             .budget
             .max_time_ms
-            .map(|limit| limit.saturating_sub(elapsed_ms).min(25))
-            .unwrap_or(25);
+            .map_or(25, |limit| limit.saturating_sub(elapsed_ms).min(25));
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
 }

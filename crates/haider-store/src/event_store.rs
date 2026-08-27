@@ -16721,16 +16721,13 @@ fn workflow_rejection<S: serde::Serialize + ?Sized>(
         .iter()
         .find(|candidate| candidate.node.eq(node))
         .ok_or_else(|| corrupt("workflow rejection node is absent from its AST"))?;
-    let parents = state
-        .node(node)
-        .map(|state| {
-            state
-                .inputs
-                .iter()
-                .map(|input| input.evidence.artifact.clone())
-                .collect()
-        })
-        .unwrap_or_default();
+    let parents = state.node(node).map_or_else(Vec::new, |state| {
+        state
+            .inputs
+            .iter()
+            .map(|input| input.evidence.artifact.clone())
+            .collect()
+    });
     let evidence = evidence_type
         .map(|evidence_type| cas_evidence(cas, evidence_type, source, parents))
         .transpose()?;

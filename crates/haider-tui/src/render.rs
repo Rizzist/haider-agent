@@ -6674,39 +6674,42 @@ fn render_loom(
                 theme.dim_style(),
             ));
             if let Some(job_id) = &confirmed.install_job_id {
-                if let Some(job) = authoring
+                match authoring
                     .install_job
                     .as_ref()
                     .filter(|job| &job.job_id == job_id)
                 {
-                    let state = if job.cancelled {
-                        "cancelled".to_owned()
-                    } else {
-                        format!("{:?}", job.state).to_ascii_lowercase()
-                    };
-                    lines.push(Line::styled(
-                        format!(
-                            "install job {job_id} · {state} · {}/{}{}",
-                            job.progress.completed,
-                            job.progress.total,
-                            job.progress
-                                .current_cli
-                                .as_ref()
-                                .map_or_else(String::new, |cli| format!(" · {cli}"))
-                        ),
-                        theme.gold_style(),
-                    ));
-                    if !job.state.is_terminal() {
+                    Some(job) => {
+                        let state = if job.cancelled {
+                            "cancelled".to_owned()
+                        } else {
+                            format!("{:?}", job.state).to_ascii_lowercase()
+                        };
                         lines.push(Line::styled(
-                            "⌃X cancel (registration remains retryable)",
-                            theme.dim_style(),
+                            format!(
+                                "install job {job_id} · {state} · {}/{}{}",
+                                job.progress.completed,
+                                job.progress.total,
+                                job.progress
+                                    .current_cli
+                                    .as_ref()
+                                    .map_or_else(String::new, |cli| format!(" · {cli}"))
+                            ),
+                            theme.gold_style(),
+                        ));
+                        if !job.state.is_terminal() {
+                            lines.push(Line::styled(
+                                "⌃X cancel (registration remains retryable)",
+                                theme.dim_style(),
+                            ));
+                        }
+                    }
+                    None => {
+                        lines.push(Line::styled(
+                            format!("install job {job_id} · status not reported"),
+                            theme.gold_style(),
                         ));
                     }
-                } else {
-                    lines.push(Line::styled(
-                        format!("install job {job_id} · status not reported"),
-                        theme.gold_style(),
-                    ));
                 }
             }
         }
