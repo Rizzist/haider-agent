@@ -70,6 +70,10 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(windows)]
+use std::sync::Mutex as StdMutex;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Semaphore, watch};
@@ -98,6 +102,101 @@ pub struct DaemonTask {
     shutdown: ShutdownHandle,
     crash: watch::Sender<bool>,
     task: JoinHandle<Result<ShutdownOutcome, DaemonError>>,
+    #[cfg(windows)]
+    diagnostics: DaemonTaskDiagnostics,
+}
+
+/// Cloneable, read-only health probe for an in-process daemon task.
+///
+/// Black-box integration tests use this instead of pretending the library
+/// daemon has a child-process exit status or separately capturable stdio.
+#[derive(Clone)]
+#[cfg(windows)]
+pub struct DaemonTaskDiagnostics {
+    readiness: Readiness,
+    completion: Arc<DaemonTaskCompletion>,
+}
+
+/// One non-blocking daemon-task health snapshot.
+#[derive(Debug, Clone)]
+#[cfg(windows)]
+pub struct DaemonTaskDiagnosticSnapshot {
+    /// Last lifecycle state published by the daemon owner.
+    pub state: DaemonState,
+    /// Whether the owner task returned, panicked, or was aborted.
+    pub finished: bool,
+    /// Bounded typed result, or the panic/abort marker installed by the guard.
+    pub outcome: Option<String>,
+}
+
+#[derive(Default)]
+#[cfg(windows)]
+struct DaemonTaskCompletion {
+    finished: AtomicBool,
+    outcome: StdMutex<Option<String>>,
+}
+
+#[cfg(windows)]
+struct DaemonTaskCompletionGuard {
+    completion: Arc<DaemonTaskCompletion>,
+}
+
+#[cfg(windows)]
+impl DaemonTaskCompletionGuard {
+    fn record(&self, mut outcome: String) {
+        const MAX_OUTCOME_BYTES: usize = 4 * 1024;
+        if outcome.len() > MAX_OUTCOME_BYTES {
+            let mut end = MAX_OUTCOME_BYTES.saturating_sub('…'.len_utf8());
+            while !outcome.is_char_boundary(end) {
+                end = end.saturating_sub(1);
+            }
+            outcome.truncate(end);
+            outcome.push('…');
+        }
+        let mut slot = self
+            .completion
+            .outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(outcome);
+    }
+}
+
+#[cfg(windows)]
+impl Drop for DaemonTaskCompletionGuard {
+    fn drop(&mut self) {
+        {
+            let mut slot = self
+                .completion
+                .outcome
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot.is_none() {
+                *slot =
+                    Some("daemon owner task panicked or was aborted before a typed outcome".into());
+            }
+        }
+        self.completion.finished.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(windows)]
+impl DaemonTaskDiagnostics {
+    #[must_use]
+    pub fn snapshot(&self) -> DaemonTaskDiagnosticSnapshot {
+        let finished = self.completion.finished.load(Ordering::Acquire);
+        let outcome = self
+            .completion
+            .outcome
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        DaemonTaskDiagnosticSnapshot {
+            state: self.readiness.current(),
+            finished,
+            outcome,
+        }
+    }
 }
 
 /// One-session-at-a-time fan-out for the pre-Ready journal scan. Pages feed
@@ -259,6 +358,13 @@ impl DaemonTask {
         self.shutdown.clone()
     }
 
+    /// Non-consuming task health used by failure diagnostics.
+    #[must_use]
+    #[cfg(windows)]
+    pub fn diagnostics(&self) -> DaemonTaskDiagnostics {
+        self.diagnostics.clone()
+    }
+
     /// Waits for the daemon to finish. `Err` values are the daemon's typed
     /// failures (including the loser-side `AlreadyRunning`).
     pub async fn join(self) -> Result<ShutdownOutcome, DaemonError> {
@@ -291,6 +397,7 @@ pub fn spawn_with_dependencies(
     let (states, readiness) = StatePublisher::channel();
     let (shutdown, shutdown_receiver, shutdown_observer) = ShutdownHandle::channel();
     let (crash, crash_receiver) = watch::channel(false);
+    #[cfg(not(windows))]
     let task = tokio::spawn(run_owner(
         config,
         dependencies,
@@ -300,11 +407,39 @@ pub fn spawn_with_dependencies(
         shutdown_observer,
         crash_receiver,
     ));
+    #[cfg(windows)]
+    let completion = Arc::new(DaemonTaskCompletion::default());
+    #[cfg(windows)]
+    let diagnostics = DaemonTaskDiagnostics {
+        readiness: readiness.clone(),
+        completion: Arc::clone(&completion),
+    };
+    #[cfg(windows)]
+    let task_shutdown = shutdown.clone();
+    #[cfg(windows)]
+    let completion_guard = DaemonTaskCompletionGuard { completion };
+    #[cfg(windows)]
+    let task = tokio::spawn(async move {
+        let result = run_owner(
+            config,
+            dependencies,
+            states,
+            task_shutdown,
+            shutdown_receiver,
+            shutdown_observer,
+            crash_receiver,
+        )
+        .await;
+        completion_guard.record(format!("{result:?}"));
+        result
+    });
     DaemonTask {
         readiness,
         shutdown,
         crash,
         task,
+        #[cfg(windows)]
+        diagnostics,
     }
 }
 
