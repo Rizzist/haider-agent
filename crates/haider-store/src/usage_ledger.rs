@@ -174,7 +174,8 @@ impl UsageLedgerWriter {
                 "sp": slot.subagents_spawned,
             }),
         )?;
-        file.sync_data()
+        // Closed usage slots retain their existing full-durability boundary.
+        haider_platform::fs::sync_file(&file, haider_platform::SyncPolicy::Full)
             .map_err(io_error("sync usage-history slot"))?;
         Ok(true)
     }
@@ -235,7 +236,8 @@ impl UsageLedgerWriter {
         insert_optional(object, "hold", sample.hold);
         insert_optional(object, "stale", sample.stale);
         append_json_line(&mut file, &value)?;
-        file.sync_data()
+        // Provider meter samples retain their existing full-durability boundary.
+        haider_platform::fs::sync_file(&file, haider_platform::SyncPolicy::Full)
             .map_err(io_error("sync usage-history meter sample"))
     }
 
@@ -260,7 +262,8 @@ impl UsageLedgerWriter {
                         .insert("backfilled".into(), Value::Bool(true));
                 }
                 append_json_line(&mut file, &header)?;
-                file.sync_all()
+                // The first day header is authoritative and remains fully durable.
+                haider_platform::fs::sync_file(&file, haider_platform::SyncPolicy::Full)
                     .map_err(io_error("sync usage-history day header"))?;
                 Ok(())
             }

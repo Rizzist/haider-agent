@@ -330,8 +330,10 @@ fn load_or_create_cache_diagnostic_key(
         match options.open(&path) {
             Ok(mut file) => {
                 file.write_all(&bytes)?;
-                file.sync_all()?;
-                haider_platform::sync_directory(root)?;
+                // A newly generated diagnostic key must retain full durability.
+                haider_platform::fs::sync_file(&file, haider_platform::SyncPolicy::Full)?;
+                // The key's new directory entry shares the same full-durability boundary.
+                haider_platform::fs::sync_directory(root, haider_platform::SyncPolicy::Full)?;
                 return Ok(CacheDiagnosticKey::from_bytes(bytes));
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -5731,6 +5733,13 @@ impl HubStoreHandle {
         bytes: Vec<u8>,
     ) -> Result<haider_protocol::ids::ArtifactRef, HaiderError> {
         self.hub.inner.store.put(bytes).await
+    }
+
+    pub(crate) async fn put_artifact_batch(
+        &self,
+        blobs: Vec<Vec<u8>>,
+    ) -> Result<Vec<haider_protocol::ids::ArtifactRef>, HaiderError> {
+        self.hub.inner.store.put_batch(blobs).await
     }
 
     pub(crate) async fn put_artifact_file(

@@ -6,7 +6,7 @@
 //! delivery preserve the pre-abstraction implementations exactly.
 
 mod directory;
-mod fs;
+pub mod fs;
 mod ipc;
 mod process;
 mod shutdown;
@@ -26,8 +26,8 @@ pub use directory::{
 #[cfg(windows)]
 pub use fs::replace_file_with_backup;
 pub use fs::{
-    configure_directory_mode, configure_file_mode, metadata_is_current_user, metadata_link_count,
-    metadata_mode, replace_file, set_mode, sync_directory,
+    SyncPolicy, configure_directory_mode, configure_file_mode, metadata_is_current_user,
+    metadata_link_count, metadata_mode, replace_file, set_mode, sync_file,
 };
 pub use ipc::{
     BoundEndpoint, Endpoint, EndpointAddress, EndpointError, IpcReadHalf, IpcStream, IpcWriteHalf,
@@ -55,6 +55,12 @@ pub use spawn::{
 };
 pub use system::local_device_name;
 pub use user::{effective_user_id, is_owner_private_directory};
+
+/// Compatibility boundary for unchanged callers; new side-file code should
+/// select its durability contract through [`fs::sync_directory`].
+pub fn sync_directory(path: &std::path::Path) -> std::io::Result<()> {
+    fs::sync_directory(path, SyncPolicy::Full)
+}
 
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-platform";

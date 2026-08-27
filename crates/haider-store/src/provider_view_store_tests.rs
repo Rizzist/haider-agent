@@ -4,6 +4,7 @@ use super::*;
 use crate::Store;
 use haider_protocol::cache::{ProviderViewBlobV1, ProviderViewBoundaryV1};
 use rusqlite::params;
+use std::sync::{Arc, Mutex};
 
 fn create_session(store: &Store, session_id: &SessionId) {
     let connection = Connection::open(store.database_path()).expect("open test database");
@@ -43,6 +44,90 @@ fn provider_view(seed: &str) -> (ProviderViewLedgerV1, Vec<ProviderViewBlobV1>) 
         storage: None,
     };
     (ledger, vec![system, tools, history])
+}
+
+/// MUTATION CHECK: restore per-blob full syncs, omit the trailing full sync,
+/// or move it below the SQLite transaction. Expected runtime failure: the
+/// count differs from one or the callback observes an indexed reference.
+#[test]
+fn provider_view_persist_uses_one_trailing_full_sync_before_indexing() {
+    for unique_blob_count in [1_usize, 3] {
+        let root = tempfile::tempdir().expect("profile");
+        let store = Store::open(root.path()).expect("store");
+        let session_id = SessionId::new(format!("provider-view-sync-{unique_blob_count}"));
+        create_session(&store, &session_id);
+        let (mut ledger, mut blobs) = provider_view(&format!("sync-{unique_blob_count}"));
+        if unique_blob_count == 1 {
+            let block = blobs[0].block.clone();
+            ledger.system_block = block.clone();
+            ledger.tool_schema_block = block.clone();
+            ledger.history_blocks = vec![block];
+            blobs.truncate(1);
+        }
+
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&observations);
+        let database_path = store.database_path().to_path_buf();
+        let persisted = crate::cas::with_cas_sync_test_hook(
+            move |_path, policy, target| {
+                observed
+                    .lock()
+                    .expect("CAS sync observation lock")
+                    .push((policy, target));
+                if policy == haider_platform::SyncPolicy::Full {
+                    let connection =
+                        Connection::open(&database_path).expect("observe provider-view index");
+                    connection
+                        .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+                        .expect("trailing full sync precedes the index write transaction");
+                    let indexed: i64 = connection
+                        .query_row("SELECT COUNT(*) FROM provider_view_requests", [], |row| {
+                            row.get(0)
+                        })
+                        .expect("count provider-view index rows");
+                    assert_eq!(indexed, 0, "blob durability precedes its index reference");
+                }
+            },
+            || {
+                store
+                    .persist_provider_view(&session_id, ledger, blobs)
+                    .expect("persist provider view")
+            },
+        );
+        assert!(persisted.storage.is_some());
+
+        let observations = observations.lock().expect("CAS sync observations");
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|(policy, _)| *policy == haider_platform::SyncPolicy::Full)
+                .count(),
+            1,
+            "one full sync closes every persist regardless of blob count"
+        );
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|(policy, target)| {
+                    *policy == haider_platform::SyncPolicy::Plain
+                        && *target == crate::cas::CasSyncTarget::File
+                })
+                .count(),
+            unique_blob_count,
+            "each new blob receives one plain file sync"
+        );
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|(policy, target)| {
+                    *policy == haider_platform::SyncPolicy::Plain
+                        && *target == crate::cas::CasSyncTarget::Directory
+                })
+                .count(),
+            unique_blob_count,
+            "each new blob publishes through one plain directory sync"
+        );
+    }
 }
 
 /// MUTATION CHECK: make the persist counter permanently due or forget to

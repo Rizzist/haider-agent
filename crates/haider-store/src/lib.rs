@@ -78,6 +78,13 @@ pub trait Cas: Send + Sync {
     /// Durably writes bytes and returns their BLAKE3 content address.
     fn put(&self, bytes: &[u8]) -> StoreResult<ArtifactRef>;
 
+    /// Durably writes one reference group. Implementations may coalesce the
+    /// final device-cache flush while preserving a plain file+directory sync
+    /// for every newly published object.
+    fn put_batch(&self, blobs: &[Vec<u8>]) -> StoreResult<Vec<ArtifactRef>> {
+        blobs.iter().map(|bytes| self.put(bytes)).collect()
+    }
+
     /// Durably streams a file into the CAS without loading it as one buffer.
     fn put_file(&self, path: &std::path::Path) -> StoreResult<ArtifactRef>;
 

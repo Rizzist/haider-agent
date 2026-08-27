@@ -1,5 +1,71 @@
-use std::fs::{DirBuilder, Metadata, OpenOptions};
+#[cfg(test)]
+#[path = "fs_tests.rs"]
+mod tests;
+
+use std::fs::{DirBuilder, File, Metadata, OpenOptions};
 use std::path::Path;
+
+/// Durability strength for an explicit filesystem synchronization boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncPolicy {
+    /// Flushes through volatile device caches on Apple and uses `fsync`
+    /// semantics on other platforms.
+    Full,
+    /// Orders prior writes at the device on Apple and uses `fsync` semantics
+    /// where `F_BARRIERFSYNC` is unavailable.
+    Barrier,
+    /// Uses plain `fsync` without Apple's whole-device cache flush.
+    Plain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncOperation {
+    #[cfg(target_vendor = "apple")]
+    FullFsync,
+    #[cfg(target_vendor = "apple")]
+    BarrierFsync,
+    #[cfg(unix)]
+    Fsync,
+    #[cfg(windows)]
+    SyncAll,
+    #[cfg(all(windows, test))]
+    Noop,
+}
+
+#[cfg(test)]
+type SyncTestHook = Box<dyn FnMut(SyncOperation)>;
+
+#[cfg(test)]
+std::thread_local! {
+    static SYNC_TEST_HOOK: std::cell::RefCell<Option<SyncTestHook>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn intercept_sync_for_test(operation: SyncOperation) -> bool {
+    SYNC_TEST_HOOK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(hook) = slot.as_mut() else {
+            return false;
+        };
+        hook(operation);
+        true
+    })
+}
+
+#[cfg(test)]
+fn with_sync_test_hook<T>(
+    hook: impl FnMut(SyncOperation) + 'static,
+    action: impl FnOnce() -> T,
+) -> T {
+    let previous = SYNC_TEST_HOOK.with(|slot| slot.replace(Some(Box::new(hook))));
+    let result = action();
+    SYNC_TEST_HOOK.with(|slot| {
+        slot.replace(previous);
+    });
+    result
+}
 
 #[cfg(unix)]
 pub fn configure_file_mode(options: &mut OpenOptions, mode: u32) {
@@ -77,14 +143,99 @@ pub fn metadata_link_count(_metadata: &Metadata) -> u64 {
     1
 }
 
+/// Synchronizes an open file according to `policy`.
+pub fn sync_file(file: &File, policy: SyncPolicy) -> std::io::Result<()> {
+    let operation = sync_operation(policy);
+    #[cfg(test)]
+    if intercept_sync_for_test(operation) {
+        return Ok(());
+    }
+    execute_file_sync(file, operation)
+}
+
+/// Synchronizes directory-entry mutations according to `policy`.
 #[cfg(unix)]
-pub fn sync_directory(path: &Path) -> std::io::Result<()> {
-    std::fs::File::open(path).and_then(|directory| directory.sync_all())
+pub fn sync_directory(path: &Path, policy: SyncPolicy) -> std::io::Result<()> {
+    File::open(path).and_then(|directory| sync_file(&directory, policy))
+}
+
+/// Windows has no portable directory flush handle in this seam. File syncs
+/// still use `File::sync_all`; directory synchronization remains a safe no-op.
+#[cfg(windows)]
+pub fn sync_directory(_path: &Path, _policy: SyncPolicy) -> std::io::Result<()> {
+    #[cfg(test)]
+    if intercept_sync_for_test(SyncOperation::Noop) {
+        return Ok(());
+    }
+    Ok(())
+}
+
+#[cfg(target_vendor = "apple")]
+fn sync_operation(policy: SyncPolicy) -> SyncOperation {
+    match policy {
+        SyncPolicy::Full => SyncOperation::FullFsync,
+        SyncPolicy::Barrier => SyncOperation::BarrierFsync,
+        SyncPolicy::Plain => SyncOperation::Fsync,
+    }
+}
+
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn sync_operation(_policy: SyncPolicy) -> SyncOperation {
+    SyncOperation::Fsync
 }
 
 #[cfg(windows)]
-pub fn sync_directory(_path: &Path) -> std::io::Result<()> {
-    Ok(())
+fn sync_operation(_policy: SyncPolicy) -> SyncOperation {
+    SyncOperation::SyncAll
+}
+
+#[cfg(target_vendor = "apple")]
+#[allow(unsafe_code)]
+fn execute_file_sync(file: &File, operation: SyncOperation) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    let result = match operation {
+        SyncOperation::FullFsync => unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) },
+        SyncOperation::BarrierFsync => unsafe {
+            libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC)
+        },
+        SyncOperation::Fsync => unsafe { libc::fsync(file.as_raw_fd()) },
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if operation == SyncOperation::BarrierFsync && barrier_is_unsupported(&error) {
+        if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+            return Ok(());
+        }
+        return Err(std::io::Error::last_os_error());
+    }
+    Err(error)
+}
+
+#[cfg(target_vendor = "apple")]
+fn barrier_is_unsupported(error: &std::io::Error) -> bool {
+    error
+        .raw_os_error()
+        .is_some_and(|code| code == libc::EINVAL || code == libc::ENOTSUP)
+}
+
+#[cfg(all(unix, not(target_vendor = "apple")))]
+#[allow(unsafe_code)]
+fn execute_file_sync(file: &File, _operation: SyncOperation) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn execute_file_sync(file: &File, _operation: SyncOperation) -> std::io::Result<()> {
+    file.sync_all()
 }
 
 /// Atomically publishes `source` at `target`, replacing an existing target.

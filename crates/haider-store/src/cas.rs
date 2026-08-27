@@ -33,6 +33,52 @@ mod cas_tests;
 /// Process-wide counter making temp-file names unique across threads.
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CasSyncTarget {
+    File,
+    Directory,
+}
+
+#[cfg(test)]
+type CasSyncTestHook = Box<dyn FnMut(&Path, haider_platform::SyncPolicy, CasSyncTarget)>;
+
+#[cfg(test)]
+std::thread_local! {
+    static CAS_SYNC_TEST_HOOK: std::cell::RefCell<Option<CasSyncTestHook>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn intercept_sync_for_test(
+    path: &Path,
+    policy: haider_platform::SyncPolicy,
+    target: CasSyncTarget,
+) -> bool {
+    CAS_SYNC_TEST_HOOK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(hook) = slot.as_mut() else {
+            return false;
+        };
+        hook(path, policy, target);
+        true
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn with_cas_sync_test_hook<T>(
+    hook: impl FnMut(&Path, haider_platform::SyncPolicy, CasSyncTarget) + 'static,
+    action: impl FnOnce() -> T,
+) -> T {
+    let previous = CAS_SYNC_TEST_HOOK.with(|slot| slot.replace(Some(Box::new(hook))));
+    let result = action();
+    CAS_SYNC_TEST_HOOK.with(|slot| {
+        slot.replace(previous);
+    });
+    result
+}
+
 /// Input bytes are bounded before format probing or decoding. The larger
 /// source allowance lets ordinary lossless screenshots be recompressed and
 /// downscaled into the existing 5 MiB artifact ceiling.
@@ -56,7 +102,7 @@ impl FileCas {
         fs::create_dir_all(&root).map_err(|error| io_error("create CAS root", &root, error))?;
         if created {
             // Persist the new `cas/` directory entry itself.
-            sync_directory(profile_root)?;
+            sync_directory(profile_root, haider_platform::SyncPolicy::Full)?;
         }
         Ok(Self { root })
     }
@@ -75,7 +121,8 @@ impl FileCas {
                         false,
                     )
                 })?;
-                sync_directory(parent)
+                // Garbage-collection unlink durability is unchanged.
+                sync_directory(parent, haider_platform::SyncPolicy::Full)
             }
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
             Err(error) => Err(io_error("remove CAS object", &path, error)),
@@ -125,9 +172,12 @@ impl FileCas {
                 // exactly the complete bytes eligible for publication.
                 hasher.update(&buffer[..read]);
             }
-            temporary.sync_all().map_err(|error| {
-                io_error("persist temporary CAS object", temporary_path.path(), error)
-            })?;
+            // Streaming CAS writes retain their independent full-durability boundary.
+            sync_file(
+                &temporary,
+                temporary_path.path(),
+                haider_platform::SyncPolicy::Full,
+            )?;
             Ok(ArtifactRef::new(format!(
                 "blake3:{}",
                 hasher.finalize().to_hex()
@@ -137,7 +187,11 @@ impl FileCas {
             Ok(artifact) => artifact,
             Err(error) => {
                 drop(temporary);
-                cleanup_temporary(&mut temporary_path, &self.root)?;
+                cleanup_temporary(
+                    &mut temporary_path,
+                    &self.root,
+                    haider_platform::SyncPolicy::Full,
+                )?;
                 return Err(error);
             }
         };
@@ -145,7 +199,11 @@ impl FileCas {
 
         let path = self.path_for(&artifact)?;
         if self.verify_existing(&artifact, &path)? {
-            cleanup_temporary(&mut temporary_path, &self.root)?;
+            cleanup_temporary(
+                &mut temporary_path,
+                &self.root,
+                haider_platform::SyncPolicy::Full,
+            )?;
             return Ok(artifact);
         }
         let parent = path.parent().ok_or_else(|| {
@@ -158,20 +216,30 @@ impl FileCas {
         let shard_created = !parent.exists();
         fs::create_dir_all(parent).map_err(|error| io_error("create CAS shard", parent, error))?;
         if shard_created {
-            sync_directory(&self.root)?;
+            // Independent streaming puts durably publish a newly created shard.
+            sync_directory(&self.root, haider_platform::SyncPolicy::Full)?;
         }
 
         match fs::hard_link(temporary_path.path(), &path) {
             Ok(()) => {
                 // Both directory mutations are durability boundaries: unlink
                 // the root staging name and persist the shard publication.
-                cleanup_temporary(&mut temporary_path, &self.root)?;
-                sync_directory(parent)?;
+                cleanup_temporary(
+                    &mut temporary_path,
+                    &self.root,
+                    haider_platform::SyncPolicy::Full,
+                )?;
+                // Independent streaming puts durably publish the object link.
+                sync_directory(parent, haider_platform::SyncPolicy::Full)?;
                 Ok(artifact)
             }
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                 let winner_is_valid = self.verify_existing(&artifact, &path);
-                cleanup_temporary(&mut temporary_path, &self.root)?;
+                cleanup_temporary(
+                    &mut temporary_path,
+                    &self.root,
+                    haider_platform::SyncPolicy::Full,
+                )?;
                 if winner_is_valid? {
                     Ok(artifact)
                 } else {
@@ -180,7 +248,89 @@ impl FileCas {
             }
             Err(error) => {
                 let publish_error = io_error("publish CAS object", &path, error);
-                cleanup_temporary(&mut temporary_path, &self.root)?;
+                cleanup_temporary(
+                    &mut temporary_path,
+                    &self.root,
+                    haider_platform::SyncPolicy::Full,
+                )?;
+                Err(publish_error)
+            }
+        }
+    }
+
+    /// Writes one member of a larger durability group. The caller must invoke
+    /// [`Self::finish_batched_puts`] before committing any durable reference.
+    pub(crate) fn put_batched(&self, bytes: &[u8]) -> StoreResult<ArtifactRef> {
+        self.put_bytes(bytes, haider_platform::SyncPolicy::Plain, true)
+    }
+
+    /// Closes a durability group after every member received its plain file
+    /// and directory sync, and before references enter SQLite or the journal.
+    pub(crate) fn finish_batched_puts(&self) -> StoreResult<()> {
+        // One full root flush closes the group and includes deferred shard creation.
+        sync_directory(&self.root, haider_platform::SyncPolicy::Full)
+    }
+
+    fn put_bytes(
+        &self,
+        bytes: &[u8],
+        policy: haider_platform::SyncPolicy,
+        defer_shard_sync: bool,
+    ) -> StoreResult<ArtifactRef> {
+        let artifact = artifact_for(bytes);
+        let path = self.path_for(&artifact)?;
+        if self.verify_existing(&artifact, &path)? {
+            return Ok(artifact);
+        }
+
+        let parent = path.parent().ok_or_else(|| {
+            store_error(
+                ErrorCode::Internal,
+                format!("CAS object has no parent directory: {}", path.display()),
+                false,
+            )
+        })?;
+        let shard_created = !parent.exists();
+        fs::create_dir_all(parent).map_err(|error| io_error("create CAS shard", parent, error))?;
+        if shard_created && !defer_shard_sync {
+            // Independent puts retain the existing shard-publication boundary.
+            sync_directory(&self.root, policy)?;
+        }
+        let (mut temporary_path, mut temporary) = create_temporary(parent)?;
+
+        let write_result = temporary
+            .write_all(bytes)
+            .map_err(|error| io_error("persist temporary CAS object", temporary_path.path(), error))
+            .and_then(|()| {
+                // Each object is flushed before its directory entry can become durable.
+                sync_file(&temporary, temporary_path.path(), policy)
+            });
+        if let Err(error) = write_result {
+            drop(temporary);
+            cleanup_temporary(&mut temporary_path, parent, policy)?;
+            return Err(error);
+        }
+        drop(temporary);
+
+        match fs::hard_link(temporary_path.path(), &path) {
+            Ok(()) => {
+                cleanup_temporary(&mut temporary_path, parent, policy)?;
+                Ok(artifact)
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                // A racing putter won publication without being overwritten.
+                // Verify its bytes before treating the content as deduplicated.
+                let winner_is_valid = self.verify_existing(&artifact, &path);
+                cleanup_temporary(&mut temporary_path, parent, policy)?;
+                if winner_is_valid? {
+                    Ok(artifact)
+                } else {
+                    Err(corrupt_object(&path))
+                }
+            }
+            Err(error) => {
+                let publish_error = io_error("publish CAS object", &path, error);
+                cleanup_temporary(&mut temporary_path, parent, policy)?;
                 Err(publish_error)
             }
         }
@@ -313,61 +463,18 @@ pub fn validate_image_block(bytes: &[u8], image: &ImageBlockRef) -> StoreResult<
 
 impl Cas for FileCas {
     fn put(&self, bytes: &[u8]) -> StoreResult<ArtifactRef> {
-        let artifact = artifact_for(bytes);
-        let path = self.path_for(&artifact)?;
-        if self.verify_existing(&artifact, &path)? {
-            return Ok(artifact);
-        }
+        self.put_bytes(bytes, haider_platform::SyncPolicy::Full, false)
+    }
 
-        let parent = path.parent().ok_or_else(|| {
-            store_error(
-                ErrorCode::Internal,
-                format!("CAS object has no parent directory: {}", path.display()),
-                false,
-            )
-        })?;
-        let shard_created = !parent.exists();
-        fs::create_dir_all(parent).map_err(|error| io_error("create CAS shard", parent, error))?;
-        if shard_created {
-            // Persist the new shard directory entry itself.
-            sync_directory(&self.root)?;
+    fn put_batch(&self, blobs: &[Vec<u8>]) -> StoreResult<Vec<ArtifactRef>> {
+        let artifacts = blobs
+            .iter()
+            .map(|bytes| self.put_batched(bytes))
+            .collect::<StoreResult<Vec<_>>>()?;
+        if !blobs.is_empty() {
+            self.finish_batched_puts()?;
         }
-        let (mut temporary_path, mut temporary) = create_temporary(parent)?;
-
-        let write_result = temporary
-            .write_all(bytes)
-            .and_then(|()| temporary.sync_all());
-        if let Err(error) = write_result {
-            drop(temporary);
-            let write_error =
-                io_error("persist temporary CAS object", temporary_path.path(), error);
-            cleanup_temporary(&mut temporary_path, parent)?;
-            return Err(write_error);
-        }
-        drop(temporary);
-
-        match fs::hard_link(temporary_path.path(), &path) {
-            Ok(()) => {
-                cleanup_temporary(&mut temporary_path, parent)?;
-                Ok(artifact)
-            }
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                // A racing putter won publication without being overwritten.
-                // Verify its bytes before treating the content as deduplicated.
-                let winner_is_valid = self.verify_existing(&artifact, &path);
-                cleanup_temporary(&mut temporary_path, parent)?;
-                if winner_is_valid? {
-                    Ok(artifact)
-                } else {
-                    Err(corrupt_object(&path))
-                }
-            }
-            Err(error) => {
-                let publish_error = io_error("publish CAS object", &path, error);
-                cleanup_temporary(&mut temporary_path, parent)?;
-                Err(publish_error)
-            }
-        }
+        Ok(artifacts)
     }
 
     fn put_file(&self, source_path: &Path) -> StoreResult<ArtifactRef> {
@@ -1001,9 +1108,14 @@ impl Drop for TemporaryPath {
 /// Removes a staged object and persists all directory mutations, including a
 /// successful final hard link. The directory sync is attempted even if temp
 /// removal fails, so a published object is still made durable.
-fn cleanup_temporary(temporary: &mut TemporaryPath, parent: &Path) -> StoreResult<()> {
+fn cleanup_temporary(
+    temporary: &mut TemporaryPath,
+    parent: &Path,
+    policy: haider_platform::SyncPolicy,
+) -> StoreResult<()> {
     let remove_result = temporary.remove();
-    let sync_result = sync_directory(parent);
+    // Temp unlink and final hard-link publication share this directory boundary.
+    let sync_result = sync_directory(parent, policy);
     remove_result?;
     sync_result
 }
@@ -1016,10 +1128,23 @@ fn corrupt_object(path: &Path) -> HaiderError {
     )
 }
 
+fn sync_file(file: &File, path: &Path, policy: haider_platform::SyncPolicy) -> StoreResult<()> {
+    #[cfg(test)]
+    if intercept_sync_for_test(path, policy, CasSyncTarget::File) {
+        return Ok(());
+    }
+    haider_platform::fs::sync_file(file, policy).map_err(|error| io_error("sync file", path, error))
+}
+
 /// Fsyncs a directory so its entries (hard links, new subdirectories) survive a
 /// crash.
-fn sync_directory(path: &Path) -> StoreResult<()> {
-    haider_platform::sync_directory(path).map_err(|error| io_error("sync directory", path, error))
+fn sync_directory(path: &Path, policy: haider_platform::SyncPolicy) -> StoreResult<()> {
+    #[cfg(test)]
+    if intercept_sync_for_test(path, policy, CasSyncTarget::Directory) {
+        return Ok(());
+    }
+    haider_platform::fs::sync_directory(path, policy)
+        .map_err(|error| io_error("sync directory", path, error))
 }
 
 fn io_error(action: &str, path: &Path, error: std::io::Error) -> HaiderError {

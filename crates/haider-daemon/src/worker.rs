@@ -14892,6 +14892,18 @@ impl CasSink for HubArtifactStore {
             })
     }
 
+    async fn put_batch(
+        &mut self,
+        blobs: &[Vec<u8>],
+    ) -> ToolResult<Vec<haider_protocol::ids::ArtifactRef>> {
+        self.store
+            .put_artifact_batch(blobs.to_vec())
+            .await
+            .map_err(|error| haider_tools::ToolError::Runtime {
+                message: error.message,
+            })
+    }
+
     async fn put_file(&mut self, path: &Path) -> ToolResult<haider_protocol::ids::ArtifactRef> {
         self.store
             .put_artifact_file(path.to_path_buf())
