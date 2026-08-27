@@ -494,6 +494,21 @@ async fn issue(
         return false;
     }
     let context = CommandContext::of(&command);
+    if let Some((generation, epoch)) = context.loom_authoring
+        && !client
+            .welcome()
+            .features
+            .contains(haider_rpc::FEATURE_LOOM_AUTHORING_V1)
+    {
+        let _ = replies
+            .send(LiveReply::LoomAuthorFailed {
+                generation,
+                epoch,
+                message: "connected daemon does not advertise loom_authoring_v1".to_owned(),
+            })
+            .await;
+        return false;
+    }
     let is_attach = context.attach.is_some();
     let body = request_body_for_features(command, &client.welcome().features);
     let pending = match client.begin_request(body).await {
@@ -513,6 +528,12 @@ async fn issue(
                     code: "encode_failed".to_owned(),
                     message: error.to_string(),
                     retryable: false,
+                }
+            } else if let Some((generation, epoch)) = context.loom_authoring {
+                LiveReply::LoomAuthorFailed {
+                    generation,
+                    epoch,
+                    message: error.to_string(),
                 }
             } else {
                 LiveReply::Failed {
@@ -534,13 +555,24 @@ async fn issue(
             Ok(response) => map_response(&context, response),
             // The disconnect edge is reported by the link itself.
             Err(ClientError::Disconnected(_)) => Vec::new(),
-            Err(error) => vec![LiveReply::Failed {
-                command_id: context.command_id.clone(),
-                code: "encode_failed".to_owned(),
-                message: error.to_string(),
-                retryable: false,
-                presentation: None,
-            }],
+            Err(error) => context.loom_authoring.map_or_else(
+                || {
+                    vec![LiveReply::Failed {
+                        command_id: context.command_id.clone(),
+                        code: "encode_failed".to_owned(),
+                        message: error.to_string(),
+                        retryable: false,
+                        presentation: None,
+                    }]
+                },
+                |(generation, epoch)| {
+                    vec![LiveReply::LoomAuthorFailed {
+                        generation,
+                        epoch,
+                        message: error.to_string(),
+                    }]
+                },
+            ),
         };
         if is_attach {
             // Even an EMPTY vector must be delivered: it is what retires
@@ -617,6 +649,10 @@ pub struct CommandContext {
     /// Round 4: the connection epoch a `loom.list` was issued under — the
     /// reply echoes it so a read that crossed a reconnect installs nothing.
     loom_epoch: Option<u64>,
+    /// This request belongs to the typed Loom authoring editor. These RPCs
+    /// deliberately carry no durable command id, so a wire failure must be
+    /// routed back to the editor to release its pending latch.
+    loom_authoring: Option<(u64, u64)>,
 }
 
 impl CommandContext {
@@ -699,6 +735,18 @@ impl CommandContext {
             },
             loom_epoch: match command {
                 LiveCommand::LoomList { epoch } => Some(*epoch),
+                _ => None,
+            },
+            loom_authoring: match command {
+                LiveCommand::LoomAuthorDraft {
+                    generation, epoch, ..
+                }
+                | LiveCommand::LoomAuthorRevise {
+                    generation, epoch, ..
+                }
+                | LiveCommand::LoomAuthorConfirm {
+                    generation, epoch, ..
+                } => Some((*generation, *epoch)),
                 _ => None,
             },
         }
@@ -987,6 +1035,40 @@ pub fn request_body_for_features(
             limit: crate::live::WORKFLOW_GRAPH_WATCH_PAGE,
         },
         LiveCommand::LoomList { .. } => RequestBody::LoomList {},
+        LiveCommand::LoomAuthorDraft {
+            session,
+            kind,
+            prose,
+            ..
+        } => RequestBody::LoomAuthorDraft {
+            session_id: session,
+            kind,
+            prose,
+        },
+        LiveCommand::LoomAuthorRevise {
+            authoring_id,
+            expected_revision,
+            kind,
+            text,
+            ..
+        } => RequestBody::LoomAuthorRevise {
+            authoring_id,
+            expected_revision,
+            kind,
+            text,
+        },
+        LiveCommand::LoomAuthorConfirm {
+            authoring_id,
+            expected_revision,
+            kind,
+            text,
+            ..
+        } => RequestBody::LoomAuthorConfirm {
+            authoring_id,
+            expected_revision,
+            kind,
+            text,
+        },
         LiveCommand::OpenPermissionSettings {
             session,
             request_id,
@@ -1477,6 +1559,27 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             cli_present,
             epoch: context.loom_epoch.unwrap_or(0),
         }],
+        ResponseBody::LoomAuthorDraft { draft } | ResponseBody::LoomAuthorRevise { draft } => {
+            context
+                .loom_authoring
+                .map_or_else(Vec::new, |(generation, epoch)| {
+                    vec![LiveReply::LoomAuthorDrafted {
+                        generation,
+                        epoch,
+                        draft,
+                    }]
+                })
+        }
+        ResponseBody::LoomAuthorConfirm { confirmed, errors } => context
+            .loom_authoring
+            .map_or_else(Vec::new, |(generation, epoch)| {
+                vec![LiveReply::LoomAuthorConfirmed {
+                    generation,
+                    epoch,
+                    confirmed,
+                    errors,
+                }]
+            }),
         ResponseBody::GraphStatus { status } => match context.graph.clone() {
             Some(session) => vec![LiveReply::Graph {
                 session,
@@ -1914,6 +2017,13 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 // latch instead of stranding /loom in a permanent LOADING.
                 if let Some(epoch) = context.loom_epoch {
                     return vec![LiveReply::LoomListFailed { epoch }];
+                }
+                if let Some((generation, epoch)) = context.loom_authoring {
+                    return vec![LiveReply::LoomAuthorFailed {
+                        generation,
+                        epoch,
+                        message: message.clone(),
+                    }];
                 }
                 vec![LiveReply::Failed {
                     command_id: context.command_id.clone(),

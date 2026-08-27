@@ -858,6 +858,7 @@ struct HubInner {
     device_id: DeviceId,
     cache_diagnostic_key: CacheDiagnosticKey,
     worker_manager: Mutex<Option<WorkerManagerHandle>>,
+    loom_author_provider: Mutex<Option<Arc<dyn crate::worker::ProviderFactory>>>,
     accounts: Mutex<Option<crate::accounts::AccountsFacade>>,
     creatable_providers: Mutex<Option<std::collections::BTreeSet<String>>>,
     hooks: Arc<Mutex<Option<crate::hooks::WeakHookService>>>,
@@ -1502,6 +1503,10 @@ pub struct HubConnection {
     /// Write-free metafork reviews awaiting an explicit acceptance on this
     /// connection. Shared with command-capture facades; dropped on disconnect.
     metafork_reviews: Arc<Mutex<HashMap<String, String>>>,
+    /// Ephemeral editable Loom drafts issued to this connection. Sharing the
+    /// map with response-capture facades preserves ownership while dropping
+    /// the connection discards every authoring session.
+    loom_author_sessions: Arc<Mutex<HashMap<String, crate::loom_author::LoomAuthorSession>>>,
     /// The transport-created identity lease. Response-capture facades share
     /// this lease, so they cannot independently own (and therefore cannot
     /// independently tear down) the caller's live identity.
@@ -1523,10 +1528,12 @@ struct MonitorWatchState {
 struct ConnectionIdentityLease {
     hub: SessionHub,
     connection_id: String,
+    loom_author_cancel: watch::Sender<bool>,
 }
 
 impl Drop for ConnectionIdentityLease {
     fn drop(&mut self) {
+        self.loom_author_cancel.send_replace(true);
         self.hub.clear_resident_binding(&self.connection_id);
         let Ok(attachments) = self
             .hub
@@ -1716,6 +1723,7 @@ impl SessionHub {
             device_id,
             cache_diagnostic_key,
             worker_manager: Mutex::new(None),
+            loom_author_provider: Mutex::new(None),
             accounts: Mutex::new(None),
             creatable_providers: Mutex::new(None),
             hooks,
@@ -1970,6 +1978,28 @@ impl SessionHub {
         Ok(())
     }
 
+    pub(crate) fn install_loom_author_provider(
+        &self,
+        provider: Arc<dyn crate::worker::ProviderFactory>,
+    ) -> Result<(), SessionHubError> {
+        let mut installed = lock(&self.inner.loom_author_provider)?;
+        if installed.is_some() {
+            return Err(SessionHubError::Task(
+                "Loom author provider is already installed".into(),
+            ));
+        }
+        *installed = Some(provider);
+        Ok(())
+    }
+
+    fn loom_author_provider(
+        &self,
+    ) -> Result<Arc<dyn crate::worker::ProviderFactory>, SessionHubError> {
+        lock(&self.inner.loom_author_provider)?
+            .clone()
+            .ok_or_else(|| SessionHubError::Task("Loom author provider is not installed".into()))
+    }
+
     pub(crate) fn install_hooks(
         &self,
         hooks: crate::hooks::HookService,
@@ -2186,6 +2216,62 @@ impl SessionHub {
         id: &str,
     ) -> Result<Option<haider_protocol::loom::LoomAgentType>, HaiderError> {
         self.inner.store.loom_agent_type(id.to_owned()).await
+    }
+
+    /// Exact retained lookup for a workflow node's frozen agent contract.
+    pub(crate) async fn loom_agent_type_revision(
+        &self,
+        id: &str,
+        rev: u32,
+        digest: &str,
+    ) -> Result<Option<haider_protocol::loom::LoomAgentType>, HaiderError> {
+        self.inner
+            .store
+            .loom_agent_type_revision(id.to_owned(), rev, digest.to_owned())
+            .await
+    }
+
+    /// Resolve exactly the agent contract frozen into workflow metadata.
+    /// Legacy/unbound metadata deliberately falls through to the current row
+    /// so the typed dispatcher can return its established contract-unbound
+    /// refusal instead of silently treating the node as a control node.
+    pub(crate) async fn pinned_loom_agent_type(
+        &self,
+        id: &str,
+        rev: Option<u32>,
+        digest: Option<&str>,
+    ) -> Result<Option<haider_protocol::loom::LoomAgentType>, HaiderError> {
+        let (Some(rev), Some(digest)) = (rev, digest) else {
+            return self.loom_agent_type(id).await;
+        };
+        if let Some(record) = self.loom_agent_type_revision(id, rev, digest).await? {
+            return Ok(Some(record));
+        }
+        let current = self.loom_agent_type(id).await?;
+        if let Some(record) = current.as_ref()
+            && record.rev == rev
+            && record.digest() == digest
+        {
+            // Upgrade compatibility: profiles created before retained agent
+            // revisions existed can still execute their unchanged current
+            // contract. The next registration retains it before advancing.
+            return Ok(current);
+        }
+        // A registration can publish history between the first miss and the
+        // current-row read. Retry once before diagnosing a missing revision.
+        if let Some(record) = self.loom_agent_type_revision(id, rev, digest).await? {
+            return Ok(Some(record));
+        }
+        if current.is_some() {
+            return Err(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                format!(
+                    "pinned Loom agent type `{id}` revision {rev} `{digest}` is missing from history"
+                ),
+                false,
+            ));
+        }
+        Ok(None)
     }
 
     /// E1 — the whole registry in one read (the volatile-tail inventory).
@@ -2694,9 +2780,11 @@ impl SessionHub {
         if let Some(fault) = self.inner.store.profile_fault() {
             let _ = sink.try_send(profile_store_fault_frame(&fault));
         }
+        let (loom_author_cancel, _) = watch::channel(false);
         let identity_lease = Arc::new(ConnectionIdentityLease {
             hub: self.clone(),
             connection_id: connection_id.clone(),
+            loom_author_cancel,
         });
         Ok(HubConnection {
             hub: self.clone(),
@@ -2710,6 +2798,7 @@ impl SessionHub {
             surface_watch: Mutex::new(None),
             monitor_watch: Mutex::new(None),
             metafork_reviews: Arc::new(Mutex::new(HashMap::new())),
+            loom_author_sessions: Arc::new(Mutex::new(HashMap::new())),
             identity_lease,
             closed: AtomicBool::new(false),
         })

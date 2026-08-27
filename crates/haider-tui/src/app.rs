@@ -241,7 +241,7 @@ pub enum Screen {
     Graph,
     /// D3 — the Loom registry browser (`/loom`): agent types (capability-
     /// scoped specialists) and pipe workflows, from the once-per-connection
-    /// loom.list snapshot. Read-only v1; creation rides the plan gate + RPC.
+    /// loom.list snapshot, plus the feature-gated typed authoring RPC flow.
     Loom,
 }
 
@@ -2788,11 +2788,36 @@ pub enum AppRequest {
     /// string.
     GraphAbandon { why: String },
     /// W-flow: re-read the Loom registry (`loom.list`). Pushed on every
-    /// loom-pane entry so a registration landed by the authoring turn is
+    /// loom-pane entry so a registration landed by authoring confirmation is
     /// visible on return — the once-per-connection Listed fetch stays the
     /// hydration path; this is the freshness path. Receipt-free read; the
     /// reply still rides the connection-epoch fence.
     LoomRefresh,
+    /// Start a feature-negotiated Loom authoring session from prose.
+    LoomAuthorDraft {
+        generation: u64,
+        session: SessionId,
+        kind: haider_protocol::loom::LoomAuthorKind,
+        prose: String,
+    },
+    /// Revalidate the exact edited typed document without mutating registry
+    /// state. Location-bearing errors return inline to the editor.
+    LoomAuthorRevise {
+        generation: u64,
+        authoring_id: String,
+        expected_revision: u64,
+        kind: haider_protocol::loom::LoomAuthorKind,
+        text: String,
+    },
+    /// Confirm and register one immutable revision. The daemon returns the
+    /// execution digest; the TUI never hashes locally.
+    LoomAuthorConfirm {
+        generation: u64,
+        authoring_id: String,
+        expected_revision: u64,
+        kind: haider_protocol::loom::LoomAuthorKind,
+        text: String,
+    },
     /// `account.set_default_model` under the expected-revision CAS. The
     /// default marker moves only on the correlated reply.
     SetDefaultModel {
@@ -3260,6 +3285,22 @@ pub enum LoomPane {
     Workflows,
 }
 
+/// Editable Loom authoring state. The composer owns `text`; this record owns
+/// validation/confirmation facts returned by the daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoomAuthoringState {
+    /// Monotonic local editor identity. It fences replies that outlive a
+    /// close/reopen cycle and is never sent to the daemon.
+    pub generation: u64,
+    pub kind: haider_protocol::loom::LoomAuthorKind,
+    pub authoring_id: Option<String>,
+    pub revision: Option<u64>,
+    pub errors: Vec<haider_protocol::loom::LoomAuthorValidationError>,
+    pub confirmed: Option<haider_protocol::loom::LoomAuthorConfirmed>,
+    pub pending: bool,
+    pub validated: bool,
+}
+
 /// One /workflows row (W-flow). The row space is FIXED-HEAD: the synthetic
 /// `none` row first (not a registry record — which is exactly what makes it
 /// undeletable), then the built-in MAIN-session catalog templates, then the
@@ -3328,10 +3369,10 @@ pub enum LauncherRow {
 
 /// A composer surface's identity (TUI5 item 9): the launcher, one session
 /// (by its LOCAL generation — the monotonic-identity law means a key can
-/// never be reworn), or the aura. The SUBAGENT screen shares its session's
-/// key (the amendment's key list is exactly launcher | session | aura), and
-/// the scratch surface (screen=Session, no session) shares the launcher's —
-/// documented: scratch is the launcher's envelope-driven lineage.
+/// never be reworn), the aura, or the dedicated Loom editor. The SUBAGENT
+/// screen shares its session's key, and the scratch surface (screen=Session,
+/// no session) shares the launcher's — documented: scratch is the launcher's
+/// envelope-driven lineage.
 ///
 /// W3c3: keyed by [`UiGeneration`], not [`SessionId`]. A draft key is a
 /// LOCAL SURFACE identity in the same family as the demo driver's arms and
@@ -3344,6 +3385,8 @@ pub enum DraftKey {
     Launcher,
     Session(UiGeneration),
     Aura,
+    /// Loom owns an editor distinct from every chat/session composer.
+    Loom,
 }
 
 /// Attachment bytes riding an [`AppRequest::AttachUpload`] /
@@ -3723,7 +3766,7 @@ pub struct AppModel {
         Vec<haider_protocol::hook::HookAttachmentMetadata>,
     )>,
     /// Parked composers for the surfaces NOT on screen (TUI5 item 9):
-    /// every surface — launcher, each session, aura — keeps its own draft
+    /// every surface — launcher, each session, aura, Loom — keeps its own draft
     /// (text AND cursor/selection/ring travel together, Claude Code's
     /// per-conversation drafts). Navigation swaps through here; nothing
     /// in it persists (item 8's DTO assertion covers it).
@@ -3880,10 +3923,12 @@ pub struct AppModel {
     pub loom_return: Option<Screen>,
     /// Which registry pane `Screen::Loom` shows (`/loom` vs `/workflows`).
     pub loom_pane: LoomPane,
-    /// W-flow authoring: the one-line `n` input on the loom screen —
-    /// `Some(buffer)` while open. The PANE decides what ⏎ asks the model to
-    /// draft (agent type vs workflow); the input itself registers nothing —
-    /// the plan gate + `loom_register` machinery does.
+    /// v963 L1 — prose/draft/revise/confirm state for the editable typed Loom
+    /// document. Registry mutation occurs only on a successful confirm RPC.
+    pub loom_authoring: Option<LoomAuthoringState>,
+    /// Allocator for reply-fenced Loom editor generations; zero is never
+    /// issued so default/missing request context cannot match live state.
+    next_loom_authoring_generation: u64,
     /// M2c: the last `graph.inspect` telemetry snapshot for the `/graph`
     /// screen (template rollups, tool-selection stats, evidence provenance with
     /// real workspace-revision provenance). A one-shot read, refetched on open.
@@ -4259,6 +4304,8 @@ impl Default for AppModel {
             loom_scroll_max: std::cell::Cell::new(0),
             loom_return: None,
             loom_pane: LoomPane::default(),
+            loom_authoring: None,
+            next_loom_authoring_generation: 1,
             graph_inspect: None,
             retry_inflight: false,
             graph_unsupported: false,
@@ -4394,6 +4441,7 @@ impl AppModel {
     pub fn surface_key(&self) -> DraftKey {
         match self.screen {
             Screen::Aura => DraftKey::Aura,
+            Screen::Loom => DraftKey::Loom,
             _ => self.session_draft_key(),
         }
     }
@@ -5373,6 +5421,23 @@ impl AppModel {
                 {
                     return;
                 }
+                if self.screen == Screen::Loom {
+                    if self
+                        .loom_authoring
+                        .as_ref()
+                        .is_some_and(|authoring| authoring.pending)
+                    {
+                        self.flash = Some(
+                            "· Loom editor is locked while validation is in flight".to_owned(),
+                        );
+                        return;
+                    }
+                    self.composer
+                        .insert_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+                    self.note_loom_author_edit();
+                    self.palette_dismissed = false;
+                    return;
+                }
                 // Sim thresholds measure the RAW clipboard — UTF-16 code
                 // units and raw newline count, BEFORE any normalization
                 // (tui.js:2298-2317). Big pastes become a pill token; small
@@ -5392,6 +5457,11 @@ impl AppModel {
                 self.palette_dismissed = false;
             }
             AppEvent::SurfaceInputReplace { text } => {
+                // The Loom editor is a dedicated local surface. A volatile
+                // session-input mirror must never replace its bytes.
+                if self.screen == Screen::Loom {
+                    return;
+                }
                 self.composer.set_text(text);
                 self.dirty = true;
             }
@@ -6057,6 +6127,16 @@ impl AppModel {
     }
 
     fn handle_key(&mut self, key: KeyEvent, now: std::time::Instant) {
+        if self.screen == Screen::Loom
+            && self
+                .loom_authoring
+                .as_ref()
+                .is_some_and(|authoring| authoring.pending)
+        {
+            self.flash = Some("· Loom editor is locked while validation is in flight".to_owned());
+            self.dirty = true;
+            return;
+        }
         if self.screen == Screen::Tools {
             if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
                 self.screen = Screen::Session;
@@ -6129,12 +6209,23 @@ impl AppModel {
                 // the tab grew a live composer (owner 2026-08-22) — and the
                 // global ⌃ block runs before the screen dispatch, so they
                 // have to be answered here or they never arrive.
-                KeyCode::Char('p') if self.screen == Screen::Loom => match self.loom_pane {
-                    LoomPane::Workflows => self.pin_selected_workflow(),
-                    LoomPane::Types => self.bind_selected_type(),
-                },
+                KeyCode::Char('p') if self.screen == Screen::Loom => {
+                    if self.loom_authoring.is_some() {
+                        self.flash = Some(
+                            "· close the Loom editor before changing registry selection".to_owned(),
+                        );
+                    } else {
+                        match self.loom_pane {
+                            LoomPane::Workflows => self.pin_selected_workflow(),
+                            LoomPane::Types => self.bind_selected_type(),
+                        }
+                    }
+                }
                 KeyCode::Char('n') if self.screen == Screen::Loom => {
                     self.seed_loom_authoring();
+                }
+                KeyCode::Char('s') if self.screen == Screen::Loom => {
+                    self.confirm_loom_authoring();
                 }
                 KeyCode::Char('i') if self.screen == Screen::Loom => {
                     self.seed_cli_provisioning();
@@ -6308,15 +6399,8 @@ impl AppModel {
         // D3 — /loom browser: ↑↓ move over types+workflows, ⏎ opens the
         // detail pane, esc backs out (detail → list → where you came from).
         if self.screen == Screen::Loom {
-            // W-flow authoring: ⌥m picks the model that will DRAFT the
-            // workflow or agent type. It must be matched before the bare
-            // Char arm below, which hands every printable key to the
-            // composer — otherwise the `m` would simply be typed.
-            //
-            // The choice routes to the bound session (see the live_session
-            // gate in `pick_model`), because authoring here IS an ordinary
-            // turn on that session: the model you pick is the one that
-            // drafts the plan the loom registry gate then accepts.
+            // The selected live-session model drafts the typed document.
+            // Match this before the printable-character arm below.
             if key.code == KeyCode::Char('m') && key.modifiers.contains(KeyModifiers::ALT) {
                 self.open_model_picker(String::new());
                 self.dirty = true;
@@ -6340,6 +6424,8 @@ impl AppModel {
             // ordinary Enter arm below still opens a catalog row initially;
             // Esc closes this subview before it closes the row detail.
             if key.code == KeyCode::Enter
+                && self.loom_authoring.is_none()
+                && !key.modifiers.contains(KeyModifiers::SHIFT)
                 && self.composer.text().trim().is_empty()
                 && self.open_selected_workflow_rejection_evidence()
             {
@@ -6364,9 +6450,41 @@ impl AppModel {
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     self.composer.insert_str(&c.to_string());
+                    self.note_loom_author_edit();
                 }
                 KeyCode::Backspace => {
                     self.composer.backspace();
+                    self.note_loom_author_edit();
+                }
+                KeyCode::Delete if self.loom_authoring.is_some() => {
+                    self.composer.delete_forward();
+                    self.note_loom_author_edit();
+                }
+                KeyCode::Left if self.loom_authoring.is_some() => {
+                    self.composer
+                        .move_left(key.modifiers.contains(KeyModifiers::SHIFT));
+                }
+                KeyCode::Right if self.loom_authoring.is_some() => {
+                    self.composer
+                        .move_right(key.modifiers.contains(KeyModifiers::SHIFT));
+                }
+                KeyCode::Home if self.loom_authoring.is_some() => {
+                    self.composer
+                        .line_home(key.modifiers.contains(KeyModifiers::SHIFT));
+                }
+                KeyCode::End if self.loom_authoring.is_some() => {
+                    self.composer
+                        .line_end_key(key.modifiers.contains(KeyModifiers::SHIFT));
+                }
+                KeyCode::Up if self.loom_authoring.is_some() => {
+                    let _ = self
+                        .composer
+                        .line_up(key.modifiers.contains(KeyModifiers::SHIFT));
+                }
+                KeyCode::Down if self.loom_authoring.is_some() => {
+                    let _ = self
+                        .composer
+                        .line_down(key.modifiers.contains(KeyModifiers::SHIFT));
                 }
                 // W-flow authoring: describe it, the model makes it.
                 KeyCode::Up if self.loom_detail => {
@@ -6381,9 +6499,17 @@ impl AppModel {
                 KeyCode::Down if total > 0 => {
                     self.loom_selection = (self.loom_selection + 1).min(total - 1);
                 }
-                // A composer with text owns ⏎ — that is the authoring turn.
-                // An EMPTY composer means the operator is browsing, so ⏎
-                // opens the selected row's detail. Unambiguous either way.
+                // An open editor owns ⏎ even when the user deleted every
+                // byte: the empty edit must reach typed validation. Without
+                // an editor, nonempty prose starts the draft RPC and an empty
+                // composer keeps the registry-detail action unambiguous.
+                KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.composer.insert_str("\n");
+                    self.note_loom_author_edit();
+                }
+                KeyCode::Enter if self.loom_authoring.is_some() => {
+                    self.submit_loom_turn();
+                }
                 KeyCode::Enter if !self.composer.text().trim().is_empty() => {
                     self.submit_loom_turn();
                 }
@@ -6397,6 +6523,12 @@ impl AppModel {
                     self.loom_scroll_max.set(u16::MAX);
                 }
                 KeyCode::Tab => {
+                    if self.loom_authoring.is_some() {
+                        self.composer.insert_str("  ");
+                        self.note_loom_author_edit();
+                        self.dirty = true;
+                        return;
+                    }
                     // ⇄ the sibling registry pane, selection reset — the
                     // sim's two surfaces, one keystroke apart.
                     if self.loom_pane == LoomPane::Types
@@ -6434,7 +6566,15 @@ impl AppModel {
                     }
                 }
                 KeyCode::Esc => {
-                    if self.workflow_evidence_inspection.take().is_some() {
+                    if let Some(authoring) = self.loom_authoring.take() {
+                        self.composer.clear();
+                        self.flash = Some(if authoring.confirmed.is_some() {
+                            "· Loom editor closed — confirmed revision remains registered"
+                                .to_owned()
+                        } else {
+                            "· Loom draft closed — no new revision registered".to_owned()
+                        });
+                    } else if self.workflow_evidence_inspection.take().is_some() {
                         self.loom_scroll = 0;
                     } else if self.loom_detail {
                         self.loom_detail = false;
@@ -6442,13 +6582,14 @@ impl AppModel {
                     } else {
                         // Round 3: esc returns to the screen /loom was
                         // OPENED from, not blindly to the session.
-                        self.screen = self.loom_return.take().unwrap_or({
+                        let target = self.loom_return.take().unwrap_or({
                             if self.active_session.is_some() {
                                 Screen::Session
                             } else {
                                 Screen::Launcher
                             }
                         });
+                        self.switch_surface(target);
                     }
                 }
                 _ => {}
@@ -6881,6 +7022,9 @@ impl AppModel {
         self.palette_scroll = 0;
         self.palette_dismissed = false;
         self.close_backtrack();
+        if self.screen == Screen::Loom {
+            self.note_loom_author_edit();
+        }
     }
 
     fn record_prompt(&mut self, text: String) {
@@ -10358,8 +10502,8 @@ impl AppModel {
         self.loom_detail = false;
         self.workflow_evidence_inspection = None;
         self.loom_scroll = 0;
-        // W-flow: EVERY pane entry re-reads the registry, so a
-        // `loom_register` landed by an authoring turn is visible on return.
+        // W-flow: EVERY pane entry re-reads the registry, so a registration
+        // landed by `loom.author.confirm` is visible on return.
         // The Listed-driven fetch stays the once-per-connection hydration
         // path; the reply still rides the connection-epoch fence.
         self.requests.push(AppRequest::LoomRefresh);
@@ -10378,7 +10522,7 @@ impl AppModel {
         if self.screen != Screen::Loom {
             self.loom_return = Some(self.screen);
         }
-        self.screen = Screen::Loom;
+        self.switch_surface(Screen::Loom);
     }
 
     /// W-flow — `p` on the /workflows pane: bind the SELECTED row to the
@@ -10456,6 +10600,10 @@ impl AppModel {
     /// lack. The operator still sees, and approves, the actual command.
     pub fn seed_cli_provisioning(&mut self) {
         self.dirty = true;
+        if self.loom_authoring.is_some() {
+            self.flash = Some("· close the Loom editor before preparing an install".to_owned());
+            return;
+        }
         if self.loom_pane != LoomPane::Types {
             self.flash = Some("· install — agent types carry the CLI grants".to_owned());
             return;
@@ -10532,61 +10680,107 @@ impl AppModel {
         }
     }
 
-    /// Submit the tab's composer as one ordinary turn WITHOUT leaving the
-    /// tab. The model's proposal, the operator's refinements, and the
-    /// registry being edited all stay on one screen — which is what makes
-    /// authoring iterative instead of one-shot (owner 2026-08-22).
+    /// Submit prose for a typed draft, or revalidate the current edited text.
+    /// Confirmation is separate (`⌃S`) so validation never mutates registry
+    /// state and the user always has an explicit final action.
     fn submit_loom_turn(&mut self) {
         if self.mode.fabricates_locally() {
+            self.flash = Some("· Loom authoring is daemon-owned".to_owned());
+            return;
+        }
+        if !self.daemon_serves(haider_rpc::FEATURE_LOOM_AUTHORING_V1) {
+            self.flash = Some(self.stale_daemon_note("Loom authoring"));
+            return;
+        }
+        if self
+            .loom_authoring
+            .as_ref()
+            .is_some_and(|authoring| authoring.pending)
+        {
+            self.flash = Some("· Loom authoring request already in flight".to_owned());
+            return;
+        }
+        let text = self.composer.text().to_owned();
+        let has_server_draft = self
+            .loom_authoring
+            .as_ref()
+            .and_then(|authoring| authoring.authoring_id.as_ref())
+            .is_some();
+        if text.trim().is_empty() && !has_server_draft {
+            return;
+        }
+        let drafting_session = self.active_session.clone();
+        if self
+            .loom_authoring
+            .as_ref()
+            .and_then(|authoring| authoring.authoring_id.as_ref())
+            .is_none()
+            && drafting_session.is_none()
+        {
             self.flash =
-                Some("· authoring runs live — the daemon's plan gate registers".to_owned());
+                Some("· no bound session — open one to choose the drafting model".to_owned());
             return;
         }
-        if self.active_session.is_none() {
-            self.flash = Some("· no bound session — open a session first".to_owned());
-            return;
+        if self.loom_authoring.is_none() {
+            let kind = match self.loom_pane {
+                LoomPane::Types => haider_protocol::loom::LoomAuthorKind::AgentType,
+                LoomPane::Workflows => haider_protocol::loom::LoomAuthorKind::Workflow,
+            };
+            let Some(generation) = self.allocate_loom_authoring_generation() else {
+                return;
+            };
+            self.loom_authoring = Some(LoomAuthoringState {
+                generation,
+                kind,
+                authoring_id: None,
+                revision: None,
+                errors: Vec::new(),
+                confirmed: None,
+                pending: false,
+                validated: false,
+            });
         }
-        let described = self.composer.take_for_submit();
-        if described.trim().is_empty() {
-            return;
-        }
-        // The pane decides what KIND of thing is being authored; the daemon's
-        // plan gate and `loom_register` still do the registering, so this
-        // stays an ordinary turn with no privileged path.
-        let text = match self.loom_pane {
-            LoomPane::Types => format!(
-                "{described}\n\nDraft this as a Loom AGENT TYPE. Propose it as a plan \
-                 (id, name, job, In -> Out types, color #rrggbb, glyph, and any \
-                 command-line tools it expects to have installed). After I accept \
-                 the plan, register it with loom_register."
-            ),
-            LoomPane::Workflows => {
-                let grammar = if self.daemon_serves(haider_rpc::FEATURE_LOOM_PIPE_DAG_V1) {
-                    "The daemon supports the v0.0.961 explicit fork, join, and back-edge \
-                     pipe-DAG grammar when the workflow needs it."
-                } else {
-                    "Use only the legacy loom_v1 sequential pipe grammar; do not use \
-                     explicit dependencies, forks, joins, or back edges."
-                };
-                format!(
-                    "{described}\n\nDraft this as a Loom WORKFLOW. Propose it as a plan \
-                     carrying the pipe DSL source (header `name: In -> Out`, one node per \
-                     line, using the registered agent types in your loom inventory) and \
-                     name the model each node should run on. {grammar} After I accept the \
-                     plan, register it with loom_register."
-                )
+        let kind = self.loom_authoring.as_ref().map_or_else(
+            || match self.loom_pane {
+                LoomPane::Types => haider_protocol::loom::LoomAuthorKind::AgentType,
+                LoomPane::Workflows => haider_protocol::loom::LoomAuthorKind::Workflow,
+            },
+            |authoring| authoring.kind,
+        );
+        let generation = self
+            .loom_authoring
+            .as_ref()
+            .map_or(0, |authoring| authoring.generation);
+        match self
+            .loom_authoring
+            .as_ref()
+            .and_then(|authoring| authoring.authoring_id.clone().zip(authoring.revision))
+        {
+            Some((authoring_id, expected_revision)) => {
+                self.requests.push(AppRequest::LoomAuthorRevise {
+                    generation,
+                    authoring_id,
+                    expected_revision,
+                    kind,
+                    text,
+                })
             }
-        };
-        let attachments = self.composer.take_ready_attachments();
-        self.turn_active = true;
-        self.requests.push(AppRequest::SubmitText {
-            text,
-            voice: false,
-            title: self.session_title.is_none(),
-            branch: self.branch_state.active().cloned(),
-            attachments,
-        });
-        self.flash = Some("· drafting — the plan gate will ask before it registers".to_owned());
+            None => {
+                let Some(session) = drafting_session else {
+                    return;
+                };
+                self.requests.push(AppRequest::LoomAuthorDraft {
+                    generation,
+                    session,
+                    kind,
+                    prose: text,
+                });
+            }
+        }
+        if let Some(authoring) = &mut self.loom_authoring {
+            authoring.pending = true;
+        }
+        self.flash = Some("· validating Loom draft…".to_owned());
     }
 
     /// Seed the tab's composer with the authoring opener for the current
@@ -10596,21 +10790,100 @@ impl AppModel {
     pub fn seed_loom_authoring(&mut self) {
         self.dirty = true;
         if self.mode.fabricates_locally() {
-            self.flash =
-                Some("· authoring runs live — the daemon's plan gate registers".to_owned());
+            self.flash = Some("· Loom authoring is daemon-owned".to_owned());
+            return;
+        }
+        if !self.daemon_serves(haider_rpc::FEATURE_LOOM_AUTHORING_V1) {
+            self.flash = Some(self.stale_daemon_note("Loom authoring"));
             return;
         }
         if self.active_session.is_none() {
-            self.flash = Some("· no bound session — open a session first".to_owned());
+            self.flash =
+                Some("· no bound session — open one to choose the drafting model".to_owned());
             return;
         }
-        let opener = match self.loom_pane {
-            LoomPane::Types => "New agent type: ",
-            LoomPane::Workflows => "New workflow: ",
-        };
-        if self.composer.text().trim().is_empty() {
-            self.composer.set_text(opener);
+        if self.loom_authoring.is_some() {
+            self.flash = Some("· close the current Loom draft before starting another".to_owned());
+            return;
         }
+        let kind = match self.loom_pane {
+            LoomPane::Types => haider_protocol::loom::LoomAuthorKind::AgentType,
+            LoomPane::Workflows => haider_protocol::loom::LoomAuthorKind::Workflow,
+        };
+        let Some(generation) = self.allocate_loom_authoring_generation() else {
+            return;
+        };
+        self.loom_authoring = Some(LoomAuthoringState {
+            generation,
+            kind,
+            authoring_id: None,
+            revision: None,
+            errors: Vec::new(),
+            confirmed: None,
+            pending: false,
+            validated: false,
+        });
+        self.flash = Some("· describe it in prose, then press ⏎ for a typed draft".to_owned());
+    }
+
+    fn allocate_loom_authoring_generation(&mut self) -> Option<u64> {
+        let generation = self.next_loom_authoring_generation;
+        let Some(next) = generation.checked_add(1) else {
+            self.flash = Some("· Loom editor identity space is exhausted".to_owned());
+            return None;
+        };
+        self.next_loom_authoring_generation = next;
+        Some(generation)
+    }
+
+    fn note_loom_author_edit(&mut self) {
+        if let Some(authoring) = &mut self.loom_authoring {
+            authoring.errors.clear();
+            authoring.validated = false;
+            authoring.confirmed = None;
+        }
+    }
+
+    fn confirm_loom_authoring(&mut self) {
+        self.dirty = true;
+        if !self.daemon_serves(haider_rpc::FEATURE_LOOM_AUTHORING_V1) {
+            self.flash = Some(self.stale_daemon_note("Loom authoring"));
+            return;
+        }
+        let Some(authoring) = &mut self.loom_authoring else {
+            self.flash = Some("· start a Loom draft first (⌃N)".to_owned());
+            return;
+        };
+        if authoring.pending {
+            self.flash = Some("· Loom authoring request already in flight".to_owned());
+            return;
+        }
+        let Some(authoring_id) = authoring.authoring_id.clone() else {
+            self.flash = Some("· press ⏎ to create the typed draft before confirming".to_owned());
+            return;
+        };
+        let Some(expected_revision) = authoring.revision else {
+            self.flash = Some("· validate the typed draft before confirming".to_owned());
+            return;
+        };
+        if !authoring.validated {
+            self.flash = Some("· press ⏎ to validate this edit before confirming".to_owned());
+            return;
+        }
+        let text = self.composer.text().to_owned();
+        if text.trim().is_empty() {
+            self.flash = Some("· an empty Loom draft cannot be confirmed".to_owned());
+            return;
+        }
+        authoring.pending = true;
+        self.requests.push(AppRequest::LoomAuthorConfirm {
+            generation: authoring.generation,
+            authoring_id,
+            expected_revision,
+            kind: authoring.kind,
+            text,
+        });
+        self.flash = Some("· confirming immutable Loom revision…".to_owned());
     }
 
     fn enter_graph(&mut self, arg: Option<&str>) {
@@ -13293,6 +13566,15 @@ impl AppModel {
         if self.login.is_some() {
             return;
         }
+        if self.screen == Screen::Loom
+            && self
+                .loom_authoring
+                .as_ref()
+                .is_some_and(|authoring| authoring.pending)
+        {
+            self.flash = Some("· Loom editor is locked while validation is in flight".to_owned());
+            return;
+        }
         match hit {
             // M2c: a click on the always-visible graph strip opens the
             // `/graph` telemetry screen — the same effect as the command
@@ -13310,7 +13592,11 @@ impl AppModel {
                 self.graph_unsupported = false;
                 self.requests.push(AppRequest::GraphRefresh);
                 self.requests.push(AppRequest::GraphInspectRefresh);
-                self.screen = Screen::Graph;
+                if self.screen == Screen::Loom {
+                    self.switch_surface(Screen::Graph);
+                } else {
+                    self.screen = Screen::Graph;
+                }
             }
             Hit::RevealPath(path) if matches!(self.screen, Screen::Session | Screen::Subagent) => {
                 self.requests.push(AppRequest::RevealPath { path });

@@ -5657,21 +5657,34 @@ async fn start_turn(
     }
     let typed_node_dispatch = match (graph_status.as_ref(), loom_workflow.as_ref()) {
         (Some(status), Some(workflow)) => {
-            let expected_type = (status.phase == GraphPhase::Active)
+            let expected_meta = (status.phase == GraphPhase::Active)
                 .then_some(())
                 .and(status.current_node.as_ref())
                 .filter(|node| status.node_is_ready(node))
-                .and_then(|node| workflow.meta.iter().find(|meta| &meta.node == node))
-                .and_then(|meta| meta.agent_type.as_deref());
-            match expected_type {
-                Some(type_id) => {
-                    let record = lease.hub().loom_agent_type(type_id).await?.ok_or_else(|| {
-                        HaiderError::new(
-                            ErrorCode::StoreCorrupt,
-                            format!("pinned Loom node references missing agent type `{type_id}`"),
-                            false,
-                        )
-                    })?;
+                .and_then(|node| workflow.meta.iter().find(|meta| &meta.node == node));
+            match expected_meta.and_then(|meta| {
+                meta.agent_type.as_deref().map(|type_id| {
+                    (
+                        type_id,
+                        meta.agent_type_rev,
+                        meta.agent_type_digest.as_deref(),
+                    )
+                })
+            }) {
+                Some((type_id, type_rev, type_digest)) => {
+                    let record = lease
+                        .hub()
+                        .pinned_loom_agent_type(type_id, type_rev, type_digest)
+                        .await?
+                        .ok_or_else(|| {
+                            HaiderError::new(
+                                ErrorCode::StoreCorrupt,
+                                format!(
+                                    "pinned Loom node references missing agent type `{type_id}`"
+                                ),
+                                false,
+                            )
+                        })?;
                     let install_job = lease
                         .hub()
                         .typed_agent_install_jobs(None, Some(type_id.to_owned()))
@@ -10690,13 +10703,20 @@ impl BrokerToolDispatcher {
         )
         .await?;
         let loom_tail = Some(loom_run_tail(&workflow));
-        let expected_type = (status.phase == GraphPhase::Active)
+        let expected_meta = (status.phase == GraphPhase::Active)
             .then_some(())
             .and(status.current_node.as_ref())
             .filter(|node| status.node_is_ready(node))
-            .and_then(|node| workflow.meta.iter().find(|meta| &meta.node == node))
-            .and_then(|meta| meta.agent_type.as_deref());
-        let Some(type_id) = expected_type else {
+            .and_then(|node| workflow.meta.iter().find(|meta| &meta.node == node));
+        let Some((type_id, type_rev, type_digest)) = expected_meta.and_then(|meta| {
+            meta.agent_type.as_deref().map(|type_id| {
+                (
+                    type_id,
+                    meta.agent_type_rev,
+                    meta.agent_type_digest.as_deref(),
+                )
+            })
+        }) else {
             let control = loom_control_execution_state(
                 &workflow,
                 &status,
@@ -10720,7 +10740,7 @@ impl BrokerToolDispatcher {
             .output
             .store
             .hub()
-            .loom_agent_type(type_id)
+            .pinned_loom_agent_type(type_id, type_rev, type_digest)
             .await?
             .ok_or_else(|| {
                 HaiderError::new(

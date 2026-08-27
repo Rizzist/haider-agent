@@ -30,6 +30,7 @@ fn typed(id: &str, clis: &[&str]) -> LoomAgentType {
         out_type: "Transcript".into(),
         clis: clis.iter().map(|cli| (*cli).to_owned()).collect(),
         apis: Vec::new(),
+        denials: Vec::new(),
         skills: Vec::new(),
         scripts: Vec::new(),
         color: "#c2701c".into(),

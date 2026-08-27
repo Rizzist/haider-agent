@@ -70,6 +70,10 @@ mod haider_code_plan_tests;
 mod hooks;
 mod image_events;
 mod lifecycle;
+mod loom_author;
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod loom_authoring_tests;
 mod loom_seed;
 #[cfg(test)]
 mod loom_seed_tests;

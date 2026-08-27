@@ -214,6 +214,9 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "hooks.revoke",
         "hooks.trust",
         "loom.list",
+        "loom.author.confirm",
+        "loom.author.draft",
+        "loom.author.revise",
         "loom.install.retry",
         "loom.install.status",
         "loom.install.watch",
@@ -278,8 +281,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         expected_methods.len(),
-        91,
-        "the v1 contract covers all 86 prior and five v0.0.963 request methods"
+        94,
+        "the v1 contract covers all 86 prior and eight v0.0.963 request methods"
     );
     assert_eq!(
         request_methods_declared_in_source(),

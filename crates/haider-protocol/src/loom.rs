@@ -1,8 +1,10 @@
 //! Loom pipe/v1 — the typed-workflow DSL and agent-type vocabulary.
 //!
-//! The authoring model emits **pipe source** (one terse line per node, spec:
-//! `docs/design/loom-pipe-v1.md`), never a JSON graph. [`parse_pipe`] turns
-//! source into an AST **totally** — errors are collected, never thrown — and
+//! The durable workflow format is **pipe source** (one terse line per node,
+//! spec: `docs/design/loom-pipe-v1.md`). Loom authoring exposes an editable,
+//! typed JSON document and validates it before lowering it to that retained
+//! pipe source. [`parse_pipe`] turns the lowered source into an AST
+//! **totally** — errors are collected, never thrown — and
 //! [`compile_pipe`] lowers the AST onto the existing Convergence-Graph
 //! vocabulary ([`GraphTemplateSpec`]/[`GraphNodeSpec`]/[`GraphGateKind`]) so
 //! pinning, reduction, advancement and the TUI status surfaces execute Loom
@@ -14,7 +16,8 @@
 
 use crate::graph::{
     GRAPH_MAX_ATTEMPTS, GRAPH_MAX_EVIDENCE_PER_ATTEMPT, GRAPH_TEMPLATE_VERSION, GraphExecutorShape,
-    GraphGateKind, GraphNodeName, GraphNodeSpec, GraphTemplateSpec, validate_graph_template,
+    GraphGateKind, GraphNodeName, GraphNodeSpec, GraphTemplateSpec, graph_template,
+    validate_graph_template,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -23,6 +26,8 @@ use std::collections::{HashMap, HashSet};
 pub const LOOM_PIPE_VERSION: &str = "pipe/v1";
 /// Pipe source above this size is rejected before parsing.
 pub const LOOM_SOURCE_MAX_BYTES: usize = 16 * 1024;
+/// Editable JSON has structural overhead beyond the lowered pipe source.
+pub const LOOM_AUTHOR_TEXT_MAX_BYTES: usize = 64 * 1024;
 /// A node's quoted task line is display material; keep it terse.
 pub const LOOM_TASK_MAX_BYTES: usize = 200;
 /// Non-human nodes retry within the node this many times before settling red.
@@ -46,6 +51,13 @@ pub struct LoomAgentType {
     pub clis: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub apis: Vec<String>,
+    /// Explicitly withheld capability keys (`cli:<program>` or
+    /// `api:<host>`). Runtime grants remain the positive `clis`/`apis`
+    /// lists; retaining denials makes the authored least-privilege decision
+    /// part of the immutable content digest instead of discarding it at
+    /// confirmation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denials: Vec<String>,
     /// Know-how: prose skills and frozen scripts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<String>,
@@ -88,6 +100,14 @@ impl LoomAgentType {
         for list in [&self.clis, &self.apis, &self.skills, &self.scripts] {
             part(&(list.len() as u64).to_le_bytes());
             for item in list {
+                part(item.as_bytes());
+            }
+        }
+        // Preserve every pre-authoring digest byte-for-byte when no explicit
+        // denial was authored. New denials are nevertheless content-bearing.
+        if !self.denials.is_empty() {
+            part(&(self.denials.len() as u64).to_le_bytes());
+            for item in &self.denials {
                 part(item.as_bytes());
             }
         }
@@ -218,6 +238,1505 @@ pub struct LoomRegistration {
     pub digest: String,
     /// False when the call was an idempotent same-content no-op.
     pub updated: bool,
+}
+
+/// The two typed documents accepted by the Loom authoring RPC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoomAuthorKind {
+    AgentType,
+    Workflow,
+}
+
+/// Stable classification for an authoring validation failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoomAuthorValidationCode {
+    Syntax,
+    InvalidField,
+    MissingField,
+    DuplicateValue,
+    CapabilityContradiction,
+    UnknownAgentType,
+    TypeMismatch,
+    InvalidGraph,
+}
+
+/// Source coordinates into the exact editable text returned by the RPC.
+/// Lines and columns are one-based; `field` is a stable dotted/indexed path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoomAuthorLocation {
+    pub line: u32,
+    pub column: u32,
+    pub field: String,
+}
+
+/// One typed, location-bearing authoring rejection. Callers branch on
+/// `code`/`location.field`; `message` is display prose only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoomAuthorValidationError {
+    pub code: LoomAuthorValidationCode,
+    pub message: String,
+    pub location: LoomAuthorLocation,
+}
+
+/// One editable authoring revision. A successful validation has no errors;
+/// the text remains editable and is not registry authority until confirmed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoomAuthorDraft {
+    pub authoring_id: String,
+    /// Monotonic daemon-owned edit fence for this authoring session.
+    pub revision: u64,
+    pub kind: LoomAuthorKind,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<LoomAuthorValidationError>,
+}
+
+/// Confirmation receipt. `execution_digest` is daemon-issued: a typed-agent
+/// content digest or the workflow template digest accepted by the existing
+/// `workflow_instance_v1` graph fence. Clients never compute either value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoomAuthorConfirmed {
+    pub authoring_id: String,
+    pub kind: LoomAuthorKind,
+    pub canonical_text: String,
+    pub registration: LoomRegistration,
+    pub execution_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_job_id: Option<String>,
+}
+
+/// A capability decision in authoring text. Every `capability_keys` entry is
+/// required to occur exactly once across `grants` and `denials`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoomAuthorAgentTypeSpec {
+    pub id: String,
+    pub name: String,
+    pub job: String,
+    pub in_type: String,
+    pub out_type: String,
+    #[serde(default)]
+    pub capability_keys: Vec<String>,
+    #[serde(default)]
+    pub grants: Vec<String>,
+    #[serde(default)]
+    pub denials: Vec<String>,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub scripts: Vec<String>,
+    #[serde(default)]
+    pub color: String,
+    #[serde(default)]
+    pub glyph: String,
+}
+
+/// The only evidence frame contract authored in v1. The fixed protocol/tool
+/// names make it a typed statement, while `required_green` lowers exactly to
+/// the existing command/all-of gate and therefore participates in the
+/// executable workflow digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoomAuthorEvidenceContract {
+    pub protocol: String,
+    pub tool: String,
+    pub required_green: u32,
+}
+
+/// One typed authoring node. Edges are explicit so forks, joins, and back
+/// edges remain visible/editable instead of being inferred from prose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoomAuthorNodeSpec {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    #[serde(default)]
+    pub task: String,
+    pub in_type: String,
+    pub out_type: String,
+    /// `command`, `review`, `human`, or `all_of`.
+    pub gate: String,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub back_edge: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<LoomAuthorEvidenceContract>,
+}
+
+/// Editable workflow document. Node order is deterministic topological order
+/// and is preserved in canonical text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoomAuthorWorkflowSpec {
+    pub id: String,
+    pub in_type: String,
+    pub out_type: String,
+    pub nodes: Vec<LoomAuthorNodeSpec>,
+}
+
+/// The tagged text format used by the editor and all authoring RPCs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LoomAuthorSpec {
+    AgentType(LoomAuthorAgentTypeSpec),
+    Workflow(LoomAuthorWorkflowSpec),
+}
+
+/// Validated lowering consumed by daemon confirmation. It is deliberately
+/// not serializable: only the daemon may turn editable text into a registry
+/// mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidatedLoomAuthorSpec {
+    AgentType {
+        record: LoomAgentType,
+        canonical_text: String,
+    },
+    Workflow {
+        source: String,
+        canonical_text: String,
+    },
+}
+
+impl ValidatedLoomAuthorSpec {
+    #[must_use]
+    pub const fn kind(&self) -> LoomAuthorKind {
+        match self {
+            Self::AgentType { .. } => LoomAuthorKind::AgentType,
+            Self::Workflow { .. } => LoomAuthorKind::Workflow,
+        }
+    }
+}
+
+/// Parse, normalize, and validate one editable authoring revision. Validation
+/// is total and returns every semantic problem it can identify with a source
+/// coordinate. The registry lookup is read-only and supplies exact typed node
+/// signatures; confirmation repeats this validation against the current
+/// registry immediately before mutation.
+pub fn validate_loom_author_text(
+    text: &str,
+    expected_kind: LoomAuthorKind,
+    lookup: impl Fn(&str) -> Option<LoomTypeSig>,
+) -> Result<ValidatedLoomAuthorSpec, Vec<LoomAuthorValidationError>> {
+    if text.len() > LOOM_AUTHOR_TEXT_MAX_BYTES {
+        return Err(vec![author_error(
+            text,
+            LoomAuthorValidationCode::InvalidField,
+            format!("authoring text exceeds {LOOM_AUTHOR_TEXT_MAX_BYTES} bytes"),
+            "$",
+            None,
+        )]);
+    }
+    let parsed = serde_json::from_str::<LoomAuthorSpec>(text).map_err(|error| {
+        let message = error.to_string();
+        let missing = json_error_field(&message, "missing field");
+        let duplicate = json_error_field(&message, "duplicate field");
+        let unknown = json_error_field(&message, "unknown field");
+        let code = if missing.is_some() {
+            LoomAuthorValidationCode::MissingField
+        } else if duplicate.is_some() {
+            LoomAuthorValidationCode::DuplicateValue
+        } else if matches!(
+            error.classify(),
+            serde_json::error::Category::Syntax | serde_json::error::Category::Eof
+        ) {
+            LoomAuthorValidationCode::Syntax
+        } else {
+            LoomAuthorValidationCode::InvalidField
+        };
+        let leaf = missing.or(duplicate).or(unknown);
+        let field = if code == LoomAuthorValidationCode::Syntax {
+            "$".to_owned()
+        } else {
+            json_error_path(text, error.line(), error.column(), code, leaf)
+        };
+        vec![LoomAuthorValidationError {
+            code,
+            message,
+            location: LoomAuthorLocation {
+                line: u32::try_from(error.line()).unwrap_or(u32::MAX).max(1),
+                column: u32::try_from(error.column()).unwrap_or(u32::MAX).max(1),
+                field,
+            },
+        }]
+    })?;
+    let actual_kind = match &parsed {
+        LoomAuthorSpec::AgentType(_) => LoomAuthorKind::AgentType,
+        LoomAuthorSpec::Workflow(_) => LoomAuthorKind::Workflow,
+    };
+    if actual_kind != expected_kind {
+        return Err(vec![author_error(
+            text,
+            LoomAuthorValidationCode::InvalidField,
+            "authoring kind does not match the session",
+            "kind",
+            None,
+        )]);
+    }
+    match parsed {
+        LoomAuthorSpec::AgentType(spec) => validate_author_agent_type(text, spec),
+        LoomAuthorSpec::Workflow(spec) => validate_author_workflow(text, spec, lookup),
+    }
+}
+
+fn json_error_field<'a>(message: &'a str, class: &str) -> Option<&'a str> {
+    let suffix = message.split_once(class)?.1;
+    let (_, suffix) = suffix.split_once('`')?;
+    suffix.split_once('`').map(|(field, _)| field)
+}
+
+#[derive(Debug)]
+struct JsonPathSpan {
+    start: usize,
+    end: usize,
+    path: String,
+    key: Option<String>,
+    container: bool,
+}
+
+struct JsonPathScanner<'a> {
+    text: &'a str,
+    bytes: &'a [u8],
+    cursor: usize,
+    spans: Vec<JsonPathSpan>,
+}
+
+impl<'a> JsonPathScanner<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            bytes: text.as_bytes(),
+            cursor: 0,
+            spans: Vec::new(),
+        }
+    }
+
+    fn scan(mut self) -> Vec<JsonPathSpan> {
+        let _ = self.value("$");
+        self.spans
+    }
+
+    fn value(&mut self, path: &str) -> Option<()> {
+        self.whitespace();
+        let start = self.cursor;
+        match self.bytes.get(self.cursor).copied()? {
+            b'{' => self.object(path, start),
+            b'[' => self.array(path, start),
+            b'"' => {
+                self.string()?;
+                self.spans.push(JsonPathSpan {
+                    start,
+                    end: self.cursor,
+                    path: path.to_owned(),
+                    key: None,
+                    container: false,
+                });
+                Some(())
+            }
+            _ => {
+                while self.cursor < self.bytes.len()
+                    && !matches!(
+                        self.bytes[self.cursor],
+                        b' ' | b'\n' | b'\r' | b'\t' | b',' | b']' | b'}'
+                    )
+                {
+                    self.cursor += 1;
+                }
+                self.spans.push(JsonPathSpan {
+                    start,
+                    end: self.cursor,
+                    path: path.to_owned(),
+                    key: None,
+                    container: false,
+                });
+                Some(())
+            }
+        }
+    }
+
+    fn object(&mut self, path: &str, start: usize) -> Option<()> {
+        self.cursor += 1;
+        self.whitespace();
+        while self.bytes.get(self.cursor).copied()? != b'}' {
+            let key_start = self.cursor;
+            let key = self.string()?;
+            let key_end = self.cursor;
+            let child_path = json_child_path(path, &key);
+            self.spans.push(JsonPathSpan {
+                start: key_start,
+                end: key_end,
+                path: child_path.clone(),
+                key: Some(key),
+                container: false,
+            });
+            self.whitespace();
+            if self.bytes.get(self.cursor).copied()? != b':' {
+                return None;
+            }
+            self.cursor += 1;
+            self.value(&child_path)?;
+            self.whitespace();
+            match self.bytes.get(self.cursor).copied()? {
+                b',' => {
+                    self.cursor += 1;
+                    self.whitespace();
+                }
+                b'}' => break,
+                _ => return None,
+            }
+        }
+        self.cursor += 1;
+        self.spans.push(JsonPathSpan {
+            start,
+            end: self.cursor,
+            path: path.to_owned(),
+            key: None,
+            container: true,
+        });
+        Some(())
+    }
+
+    fn array(&mut self, path: &str, start: usize) -> Option<()> {
+        self.cursor += 1;
+        self.whitespace();
+        let mut index = 0;
+        while self.bytes.get(self.cursor).copied()? != b']' {
+            let child_path = format!("{path}[{index}]");
+            self.value(&child_path)?;
+            index += 1;
+            self.whitespace();
+            match self.bytes.get(self.cursor).copied()? {
+                b',' => {
+                    self.cursor += 1;
+                    self.whitespace();
+                }
+                b']' => break,
+                _ => return None,
+            }
+        }
+        self.cursor += 1;
+        self.spans.push(JsonPathSpan {
+            start,
+            end: self.cursor,
+            path: path.to_owned(),
+            key: None,
+            container: true,
+        });
+        Some(())
+    }
+
+    fn string(&mut self) -> Option<String> {
+        let start = self.cursor;
+        if self.bytes.get(self.cursor).copied()? != b'"' {
+            return None;
+        }
+        self.cursor += 1;
+        while let Some(byte) = self.bytes.get(self.cursor).copied() {
+            match byte {
+                b'"' => {
+                    self.cursor += 1;
+                    return serde_json::from_str(&self.text[start..self.cursor]).ok();
+                }
+                b'\\' => {
+                    self.cursor += 2;
+                }
+                _ => self.cursor += 1,
+            }
+        }
+        None
+    }
+
+    fn whitespace(&mut self) {
+        while self
+            .bytes
+            .get(self.cursor)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            self.cursor += 1;
+        }
+    }
+}
+
+fn json_child_path(parent: &str, child: &str) -> String {
+    if parent == "$" {
+        child.to_owned()
+    } else {
+        format!("{parent}.{child}")
+    }
+}
+
+fn json_error_offset(text: &str, line: usize, column: usize) -> usize {
+    let line_start = text
+        .split_inclusive('\n')
+        .take(line.saturating_sub(1))
+        .map(str::len)
+        .sum::<usize>();
+    // serde_json reports a byte column, not a Unicode scalar column.
+    let line_text = text.get(line_start..).unwrap_or_default();
+    let line_bytes = line_text.find('\n').unwrap_or(line_text.len());
+    let column_offset = column.saturating_sub(1).min(line_bytes);
+    line_start.saturating_add(column_offset).min(text.len())
+}
+
+fn json_error_path(
+    text: &str,
+    line: usize,
+    column: usize,
+    code: LoomAuthorValidationCode,
+    leaf: Option<&str>,
+) -> String {
+    let offset = json_error_offset(text, line, column);
+    let spans = JsonPathScanner::new(text).scan();
+    if matches!(
+        code,
+        LoomAuthorValidationCode::DuplicateValue | LoomAuthorValidationCode::InvalidField
+    ) && let Some(leaf) = leaf
+    {
+        if let Some(span) = spans
+            .iter()
+            .filter(|span| span.key.as_deref() == Some(leaf) && span.start <= offset)
+            .min_by_key(|span| offset.saturating_sub(span.start))
+        {
+            return span.path.clone();
+        }
+    }
+    let probe = offset.saturating_sub(1);
+    let enclosing = spans
+        .iter()
+        .filter(|span| span.start <= offset && (offset <= span.end || probe <= span.end))
+        .max_by_key(|span| span.path.len());
+    if code == LoomAuthorValidationCode::MissingField {
+        let parent = enclosing
+            .filter(|span| span.container)
+            .or_else(|| {
+                spans
+                    .iter()
+                    .filter(|span| span.container && span.start <= offset && probe <= span.end)
+                    .max_by_key(|span| span.path.len())
+            })
+            .map_or("$", |span| span.path.as_str());
+        return leaf.map_or_else(|| parent.to_owned(), |field| json_child_path(parent, field));
+    }
+    enclosing.map_or_else(|| leaf.unwrap_or("$").to_owned(), |span| span.path.clone())
+}
+
+fn validate_author_agent_type(
+    text: &str,
+    mut spec: LoomAuthorAgentTypeSpec,
+) -> Result<ValidatedLoomAuthorSpec, Vec<LoomAuthorValidationError>> {
+    spec.in_type = spec.in_type.trim().to_owned();
+    spec.out_type = spec.out_type.trim().to_owned();
+    for key in spec
+        .capability_keys
+        .iter_mut()
+        .chain(spec.grants.iter_mut())
+        .chain(spec.denials.iter_mut())
+    {
+        *key = normalize_capability_key(key);
+    }
+    let mut errors = Vec::new();
+    if !is_ident(&spec.id) {
+        errors.push(author_error(
+            text,
+            LoomAuthorValidationCode::InvalidField,
+            "agent type id must be a 1..=64 byte identifier",
+            "id",
+            None,
+        ));
+    }
+    if spec.name.trim().is_empty()
+        || spec.name.len() > 120
+        || spec.name.chars().any(char::is_control)
+    {
+        errors.push(author_error(
+            text,
+            LoomAuthorValidationCode::InvalidField,
+            "agent type name must be 1..=120 bytes of safe text",
+            "name",
+            None,
+        ));
+    }
+    if spec.job.trim().is_empty()
+        || spec.job.len() > 4 * 1024
+        || spec
+            .job
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        errors.push(author_error(
+            text,
+            LoomAuthorValidationCode::InvalidField,
+            "agent type job must be 1..=4096 bytes of safe text",
+            "job",
+            None,
+        ));
+    }
+    for (field, type_expr) in [("in_type", &spec.in_type), ("out_type", &spec.out_type)] {
+        if !valid_type_expr(type_expr) {
+            errors.push(author_error(
+                text,
+                LoomAuthorValidationCode::InvalidField,
+                "type must be a bounded identifier or `A + B` expression",
+                field,
+                None,
+            ));
+        }
+    }
+    for (field, values) in [
+        ("capability_keys", &spec.capability_keys),
+        ("grants", &spec.grants),
+        ("denials", &spec.denials),
+    ] {
+        validate_capability_list(text, field, values, &mut errors);
+    }
+    let keys = spec.capability_keys.iter().collect::<HashSet<_>>();
+    let grants = spec.grants.iter().collect::<HashSet<_>>();
+    let denials = spec.denials.iter().collect::<HashSet<_>>();
+    let dispositions = grants.union(&denials).copied().collect::<HashSet<_>>();
+    for key in grants.intersection(&denials) {
+        errors.push(author_error(
+            text,
+            LoomAuthorValidationCode::CapabilityContradiction,
+            format!("capability `{key}` is both granted and denied"),
+            "denials",
+            Some(key),
+        ));
+    }
+    for key in keys.difference(&dispositions) {
+        errors.push(author_error(
+            text,
+            LoomAuthorValidationCode::MissingField,
+            format!("capability `{key}` has no grant or denial"),
+            "capability_keys",
+            Some(key),
+        ));
+    }
+    for key in grants.union(&denials) {
+        if !keys.contains(key) {
+            errors.push(author_error(
+                text,
+                LoomAuthorValidationCode::CapabilityContradiction,
+                format!("capability disposition `{key}` is not declared in capability_keys"),
+                if grants.contains(key) {
+                    "grants"
+                } else {
+                    "denials"
+                },
+                Some(key),
+            ));
+        }
+    }
+    for grant in &spec.grants {
+        let valid = grant.strip_prefix("cli:").map_or_else(
+            || {
+                grant
+                    .strip_prefix("api:")
+                    .is_some_and(valid_author_api_host)
+            },
+            valid_author_cli_grant,
+        );
+        if !valid {
+            errors.push(author_error(
+                text,
+                LoomAuthorValidationCode::InvalidField,
+                format!("capability `{grant}` cannot be granted by the typed-agent fence"),
+                "grants",
+                Some(grant),
+            ));
+        }
+    }
+    for (field, values) in [("skills", &spec.skills), ("scripts", &spec.scripts)] {
+        validate_bounded_list(text, field, values, &mut errors);
+    }
+    let color_ok = spec.color.is_empty()
+        || (spec.color.len() == 7
+            && spec.color.starts_with('#')
+            && spec
+                .color
+                .bytes()
+                .skip(1)
+                .all(|byte| byte.is_ascii_hexdigit()));
+    if !color_ok {
+        errors.push(author_error(
+            text,
+            LoomAuthorValidationCode::InvalidField,
+            "color must be empty or `#rrggbb`",
+            "color",
+            None,
+        ));
+    }
+    let leads_combining = spec.glyph.chars().next().is_some_and(|character| {
+        matches!(
+            character,
+            '\u{0300}'..='\u{036F}' | '\u{1AB0}'..='\u{1AFF}' | '\u{20D0}'..='\u{20FF}'
+        )
+    });
+    if spec.glyph.len() > 16
+        || leads_combining
+        || spec.glyph.chars().any(author_invisible_character)
+    {
+        errors.push(author_error(
+            text,
+            LoomAuthorValidationCode::InvalidField,
+            "glyph must be at most 16 bytes, lead with a base, and contain no invisible characters",
+            "glyph",
+            None,
+        ));
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    // Capability decisions are sets. Canonical authoring text and its
+    // lowered digest must not move merely because a user reordered JSON
+    // entries while editing.
+    spec.capability_keys.sort();
+    spec.grants.sort();
+    spec.denials.sort();
+    let mut clis = Vec::new();
+    let mut apis = Vec::new();
+    for grant in &spec.grants {
+        if let Some(value) = grant.strip_prefix("cli:") {
+            clis.push(value.to_owned());
+        } else if let Some(value) = grant.strip_prefix("api:") {
+            apis.push(value.to_owned());
+        }
+    }
+    let canonical_text = serde_json::to_string_pretty(&LoomAuthorSpec::AgentType(spec.clone()))
+        .map_err(|error| {
+            vec![author_error(
+                text,
+                LoomAuthorValidationCode::InvalidField,
+                format!("cannot canonicalize agent type: {error}"),
+                "$",
+                None,
+            )]
+        })?;
+    if canonical_text.len() > LOOM_AUTHOR_TEXT_MAX_BYTES {
+        return Err(vec![author_error(
+            text,
+            LoomAuthorValidationCode::InvalidField,
+            format!("canonical authoring text exceeds {LOOM_AUTHOR_TEXT_MAX_BYTES} bytes"),
+            "$",
+            None,
+        )]);
+    }
+    Ok(ValidatedLoomAuthorSpec::AgentType {
+        record: LoomAgentType {
+            id: spec.id,
+            name: spec.name,
+            job: spec.job,
+            in_type: spec.in_type,
+            out_type: spec.out_type,
+            clis,
+            apis,
+            denials: spec.denials,
+            skills: spec.skills,
+            scripts: spec.scripts,
+            color: spec.color,
+            glyph: spec.glyph,
+            rev: 0,
+        },
+        canonical_text,
+    })
+}
+
+fn validate_author_workflow(
+    text: &str,
+    mut spec: LoomAuthorWorkflowSpec,
+    lookup: impl Fn(&str) -> Option<LoomTypeSig>,
+) -> Result<ValidatedLoomAuthorSpec, Vec<LoomAuthorValidationError>> {
+    spec.in_type = spec.in_type.trim().to_owned();
+    spec.out_type = spec.out_type.trim().to_owned();
+    for node in &mut spec.nodes {
+        node.in_type = node.in_type.trim().to_owned();
+        node.out_type = node.out_type.trim().to_owned();
+    }
+    let mut errors = Vec::new();
+    if !is_ident(&spec.id) {
+        errors.push(author_error(
+            text,
+            LoomAuthorValidationCode::InvalidField,
+            "workflow id must be a 1..=64 byte identifier",
+            "id",
+            None,
+        ));
+    }
+    if graph_template(&spec.id).is_some() {
+        errors.push(author_error(
+            text,
+            LoomAuthorValidationCode::InvalidGraph,
+            "workflow id is reserved by a built-in graph template",
+            "id",
+            Some(&spec.id),
+        ));
+    }
+    for (field, type_expr) in [("in_type", &spec.in_type), ("out_type", &spec.out_type)] {
+        if !valid_type_expr(type_expr) {
+            errors.push(author_error(
+                text,
+                LoomAuthorValidationCode::InvalidField,
+                "type must be a bounded identifier or `A + B` expression",
+                field,
+                None,
+            ));
+        }
+    }
+    if spec.nodes.is_empty() {
+        errors.push(author_error(
+            text,
+            LoomAuthorValidationCode::MissingField,
+            "workflow must declare at least one node",
+            "nodes",
+            None,
+        ));
+    }
+    let mut seen = HashSet::new();
+    let mut seen_graph_nodes = HashSet::new();
+    let mut authored_outputs = HashMap::<&str, String>::new();
+    let mut authored_merged_outputs = HashSet::<&str>::new();
+    let mut source = format!("{}: {} -> {}", spec.id, spec.in_type, spec.out_type);
+    for (index, node) in spec.nodes.iter().enumerate() {
+        let base = format!("nodes[{index}]");
+        let graph_node_id = node.id.to_ascii_uppercase();
+        if GraphNodeName::new(graph_node_id.clone()).is_err() {
+            errors.push(author_node_error(
+                text,
+                &spec,
+                index,
+                LoomAuthorValidationCode::InvalidField,
+                "node id must begin with a letter and contain only letters, digits, `_`, or `-`",
+                "id",
+            ));
+        } else if !seen.insert(node.id.as_str()) || !seen_graph_nodes.insert(graph_node_id) {
+            errors.push(author_node_error(
+                text,
+                &spec,
+                index,
+                LoomAuthorValidationCode::DuplicateValue,
+                format!("node `{}` is duplicated", node.id),
+                "id",
+            ));
+        }
+        if node.task.len() > LOOM_TASK_MAX_BYTES
+            || node
+                .task
+                .chars()
+                .any(|character| character == '"' || character.is_control())
+        {
+            errors.push(author_node_error(
+                text,
+                &spec,
+                index,
+                LoomAuthorValidationCode::InvalidField,
+                format!(
+                    "node task must be one quote-free line of at most {LOOM_TASK_MAX_BYTES} bytes"
+                ),
+                "task",
+            ));
+        }
+        for (field, type_expr) in [
+            ("in_type", node.in_type.trim()),
+            ("out_type", node.out_type.trim()),
+        ] {
+            if !valid_type_expr(type_expr) {
+                errors.push(author_node_error(
+                    text,
+                    &spec,
+                    index,
+                    LoomAuthorValidationCode::InvalidField,
+                    format!("node {field} must be a bounded type expression"),
+                    field,
+                ));
+            }
+        }
+        if index == 0 && !node.depends_on.is_empty() {
+            errors.push(author_node_error(
+                text,
+                &spec,
+                index,
+                LoomAuthorValidationCode::InvalidGraph,
+                "the first node cannot depend on another node",
+                "depends_on",
+            ));
+        }
+        if index > 0 && node.depends_on.is_empty() {
+            errors.push(author_node_error(
+                text,
+                &spec,
+                index,
+                LoomAuthorValidationCode::MissingField,
+                "every non-root node must declare depends_on",
+                "depends_on",
+            ));
+        }
+        let signature = if let Some(agent_type) = node.agent_type.as_deref() {
+            match lookup(agent_type) {
+                Some(signature) => {
+                    if node.in_type.trim() != signature.in_type
+                        || node.out_type.trim() != signature.out_type
+                    {
+                        errors.push(author_node_error(
+                            text,
+                            &spec,
+                            index,
+                            LoomAuthorValidationCode::TypeMismatch,
+                            format!(
+                                "@{agent_type} is typed {} -> {}, not {} -> {}",
+                                signature.in_type,
+                                signature.out_type,
+                                node.in_type.trim(),
+                                node.out_type.trim()
+                            ),
+                            "agent_type",
+                        ));
+                    }
+                    Some(signature)
+                }
+                None => {
+                    errors.push(author_node_error(
+                        text,
+                        &spec,
+                        index,
+                        LoomAuthorValidationCode::UnknownAgentType,
+                        format!("agent type `@{agent_type}` is not registered"),
+                        "agent_type",
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let carries_merge = node.depends_on.len() > 1
+            || node
+                .depends_on
+                .iter()
+                .any(|dependency| authored_merged_outputs.contains(dependency.as_str()));
+        let incoming = if node.depends_on.is_empty() {
+            spec.in_type.clone()
+        } else {
+            merge_type_exprs(
+                &node
+                    .depends_on
+                    .iter()
+                    .filter_map(|dependency| authored_outputs.get(dependency.as_str()).cloned())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let accepts_incoming = if signature.is_none() {
+            node.in_type == incoming
+        } else if carries_merge {
+            same_type_operands(&node.in_type, &incoming)
+        } else {
+            accepts(&node.in_type, &incoming)
+        };
+        if !incoming.is_empty() && !accepts_incoming {
+            errors.push(author_node_error(
+                text,
+                &spec,
+                index,
+                LoomAuthorValidationCode::TypeMismatch,
+                format!(
+                    "node `{}` receives `{incoming}`, not authored type `{}`",
+                    node.id, node.in_type
+                ),
+                "in_type",
+            ));
+        }
+        let derived_output = signature
+            .as_ref()
+            .map_or_else(|| incoming.clone(), |signature| signature.out_type.clone());
+        if !derived_output.is_empty() && node.out_type != derived_output {
+            errors.push(author_node_error(
+                text,
+                &spec,
+                index,
+                LoomAuthorValidationCode::TypeMismatch,
+                format!(
+                    "node `{}` produces `{derived_output}`, not authored type `{}`",
+                    node.id, node.out_type
+                ),
+                "out_type",
+            ));
+        }
+        if signature.is_none() && carries_merge {
+            authored_merged_outputs.insert(node.id.as_str());
+        }
+        authored_outputs.insert(node.id.as_str(), derived_output);
+        validate_author_evidence(text, &spec, index, &mut errors);
+
+        source.push('\n');
+        source.push_str(&node.id);
+        if let Some(agent_type) = node.agent_type.as_deref() {
+            source.push_str(" @");
+            source.push_str(agent_type);
+        }
+        if !node.task.is_empty() {
+            source.push_str(" \"");
+            source.push_str(&node.task);
+            source.push('"');
+        }
+        match node.gate.as_str() {
+            "command" => {}
+            "review" => source.push_str(" :ship"),
+            "human" => source.push_str(" :human"),
+            "all_of" => {
+                if let Some(evidence) = &node.evidence {
+                    source.push_str(" :all-of-");
+                    source.push_str(&evidence.required_green.to_string());
+                }
+            }
+            _ => errors.push(author_error(
+                text,
+                LoomAuthorValidationCode::InvalidField,
+                "gate must be command, review, human, or all_of",
+                &format!("{base}.gate"),
+                Some(&node.gate),
+            )),
+        }
+        if index > 0 && !node.depends_on.is_empty() {
+            source.push_str(" <-");
+            source.push_str(&node.depends_on.join(","));
+        }
+        if let Some(back_edge) = node.back_edge.as_deref() {
+            source.push_str(" ↺");
+            source.push_str(back_edge);
+        }
+    }
+    if errors.is_empty() {
+        let ast = parse_pipe(&source);
+        match compile_pipe(&ast, |id| lookup(id)) {
+            Ok(workflow) => source = workflow.source,
+            Err(compile_errors) => {
+                for message in compile_errors {
+                    let node_index = spec
+                        .nodes
+                        .iter()
+                        .position(|node| compiler_error_names_node(&message, &node.id));
+                    if let Some(index) = node_index {
+                        errors.push(author_node_error(
+                            text,
+                            &spec,
+                            index,
+                            if message.contains("type mismatch") {
+                                LoomAuthorValidationCode::TypeMismatch
+                            } else {
+                                LoomAuthorValidationCode::InvalidGraph
+                            },
+                            message,
+                            if message.contains("type mismatch") {
+                                "in_type"
+                            } else if message.starts_with('↺')
+                                || message.starts_with("back target ")
+                            {
+                                "back_edge"
+                            } else {
+                                "depends_on"
+                            },
+                        ));
+                    } else {
+                        let output_mismatch = message.starts_with("pipe declares output ");
+                        errors.push(author_error(
+                            text,
+                            if output_mismatch {
+                                LoomAuthorValidationCode::TypeMismatch
+                            } else {
+                                LoomAuthorValidationCode::InvalidGraph
+                            },
+                            message,
+                            if output_mismatch { "out_type" } else { "nodes" },
+                            None,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    let canonical_text =
+        serde_json::to_string_pretty(&LoomAuthorSpec::Workflow(spec)).map_err(|error| {
+            vec![author_error(
+                text,
+                LoomAuthorValidationCode::InvalidField,
+                format!("cannot canonicalize workflow: {error}"),
+                "$",
+                None,
+            )]
+        })?;
+    if canonical_text.len() > LOOM_AUTHOR_TEXT_MAX_BYTES {
+        return Err(vec![author_error(
+            text,
+            LoomAuthorValidationCode::InvalidField,
+            format!("canonical authoring text exceeds {LOOM_AUTHOR_TEXT_MAX_BYTES} bytes"),
+            "$",
+            None,
+        )]);
+    }
+    Ok(ValidatedLoomAuthorSpec::Workflow {
+        source,
+        canonical_text,
+    })
+}
+
+fn compiler_error_names_node(message: &str, node_id: &str) -> bool {
+    message
+        .strip_prefix("node ")
+        .and_then(|tail| tail.split_once(':'))
+        .is_some_and(|(name, _)| name == node_id)
+        || message
+            .strip_prefix("type mismatch at ")
+            .and_then(|tail| tail.split_once(':'))
+            .is_some_and(|(name, _)| name == node_id)
+        || message.split_once(" on ").is_some_and(|(_, tail)| {
+            tail.strip_prefix(node_id).is_some_and(|suffix| {
+                suffix.is_empty() || suffix.starts_with(':') || suffix.starts_with(' ')
+            })
+        })
+}
+
+fn validate_author_evidence(
+    text: &str,
+    spec: &LoomAuthorWorkflowSpec,
+    index: usize,
+    errors: &mut Vec<LoomAuthorValidationError>,
+) {
+    let node = &spec.nodes[index];
+    if node.gate == "human" {
+        if node.evidence.is_some() {
+            errors.push(author_node_error(
+                text,
+                spec,
+                index,
+                LoomAuthorValidationCode::CapabilityContradiction,
+                "human gates do not consume InstructPipe evidence",
+                "evidence",
+            ));
+        }
+        return;
+    }
+    let Some(evidence) = &node.evidence else {
+        errors.push(author_node_error(
+            text,
+            spec,
+            index,
+            LoomAuthorValidationCode::MissingField,
+            "non-human gates require an InstructPipe evidence contract",
+            "evidence",
+        ));
+        return;
+    };
+    if evidence.protocol != "instruct_pipe_v1" {
+        errors.push(author_node_error(
+            text,
+            spec,
+            index,
+            LoomAuthorValidationCode::InvalidField,
+            "evidence protocol must be instruct_pipe_v1",
+            "evidence.protocol",
+        ));
+    }
+    if evidence.tool != "graph_evidence" {
+        errors.push(author_node_error(
+            text,
+            spec,
+            index,
+            LoomAuthorValidationCode::InvalidField,
+            "evidence tool must be graph_evidence",
+            "evidence.tool",
+        ));
+    }
+    let required_ok = match node.gate.as_str() {
+        "command" | "review" => evidence.required_green == 1,
+        "all_of" => {
+            evidence.required_green > 0 && evidence.required_green <= GRAPH_MAX_EVIDENCE_PER_ATTEMPT
+        }
+        _ => true,
+    };
+    if !required_ok {
+        errors.push(author_node_error(
+            text,
+            spec,
+            index,
+            LoomAuthorValidationCode::InvalidField,
+            format!(
+                "gate `{}` has an invalid required_green value {}",
+                node.gate, evidence.required_green
+            ),
+            "evidence.required_green",
+        ));
+    }
+}
+
+fn validate_capability_list(
+    text: &str,
+    field: &str,
+    values: &[String],
+    errors: &mut Vec<LoomAuthorValidationError>,
+) {
+    if values.len() > 32 {
+        errors.push(author_error(
+            text,
+            LoomAuthorValidationCode::InvalidField,
+            "capability lists are bounded to 32 entries",
+            field,
+            None,
+        ));
+    }
+    let mut seen = HashSet::new();
+    for value in values {
+        if !valid_capability_key(value) {
+            errors.push(author_error(
+                text,
+                LoomAuthorValidationCode::InvalidField,
+                format!("invalid capability key `{value}`; use cli:<program> or api:<host>"),
+                field,
+                Some(value),
+            ));
+        } else if !seen.insert(value) {
+            errors.push(author_error(
+                text,
+                LoomAuthorValidationCode::DuplicateValue,
+                format!("capability key `{value}` is duplicated"),
+                field,
+                Some(value),
+            ));
+        }
+    }
+}
+
+fn validate_bounded_list(
+    text: &str,
+    field: &str,
+    values: &[String],
+    errors: &mut Vec<LoomAuthorValidationError>,
+) {
+    if values.len() > 32
+        || values.iter().any(|value| {
+            value.is_empty() || value.len() > 128 || value.chars().any(char::is_control)
+        })
+    {
+        errors.push(author_error(
+            text,
+            LoomAuthorValidationCode::InvalidField,
+            "list must have at most 32 entries of 1..=128 bytes without control characters",
+            field,
+            None,
+        ));
+    }
+}
+
+fn normalize_capability_key(value: &str) -> String {
+    let value = value.trim();
+    value.strip_prefix("api:").map_or_else(
+        || value.to_owned(),
+        |host| format!("api:{}", host.to_ascii_lowercase()),
+    )
+}
+
+fn valid_capability_key(value: &str) -> bool {
+    value.strip_prefix("cli:").map_or_else(
+        || {
+            value
+                .strip_prefix("api:")
+                .is_some_and(valid_author_api_host)
+        },
+        |program| {
+            !program.is_empty()
+                && program.len() <= 128
+                && program.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+' | b'/')
+                })
+        },
+    )
+}
+
+fn valid_author_api_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 128
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+}
+
+fn valid_author_cli_grant(program: &str) -> bool {
+    const DISPATCHERS: [&str; 26] = [
+        ".", "source", "eval", "exec", "command", "builtin", "env", "xargs", "sh", "bash", "zsh",
+        "dash", "ksh", "csh", "tcsh", "fish", "nohup", "time", "nice", "sudo", "doas", "su",
+        "setsid", "stdbuf", "busybox", "toybox",
+    ];
+    !program.starts_with('-')
+        && !program.is_empty()
+        && program.len() <= 128
+        && program.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+' | b'/')
+        })
+        && (!program.contains('/') || program.starts_with('/'))
+        && !program.contains("//")
+        && !program
+            .split('/')
+            .any(|component| matches!(component, "." | ".."))
+        && program.bytes().any(|byte| byte.is_ascii_alphanumeric())
+        && program
+            .rsplit('/')
+            .next()
+            .is_some_and(|base| !DISPATCHERS.contains(&base))
+}
+
+fn author_invisible_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{00AD}'
+                | '\u{034F}'
+                | '\u{061C}'
+                | '\u{180B}'..='\u{180F}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{FE00}'..='\u{FE0F}'
+                | '\u{FEFF}'
+                | '\u{E0100}'..='\u{E01EF}'
+        )
+}
+
+fn author_node_error(
+    text: &str,
+    _spec: &LoomAuthorWorkflowSpec,
+    index: usize,
+    code: LoomAuthorValidationCode,
+    message: impl Into<String>,
+    field: &str,
+) -> LoomAuthorValidationError {
+    let path = format!("nodes[{index}].{field}");
+    author_error(text, code, message, &path, None)
+}
+
+fn author_error(
+    text: &str,
+    code: LoomAuthorValidationCode,
+    message: impl Into<String>,
+    field: &str,
+    needle: Option<&str>,
+) -> LoomAuthorValidationError {
+    let location = needle
+        .and_then(|needle| json_value_location(text, field, needle))
+        .or_else(|| json_field_location(text, field))
+        .or_else(|| json_parent_location(text, field))
+        .unwrap_or((1, 1));
+    LoomAuthorValidationError {
+        code,
+        message: message.into(),
+        location: LoomAuthorLocation {
+            line: location.0,
+            column: location.1,
+            field: field.to_owned(),
+        },
+    }
+}
+
+fn json_field_location(text: &str, target: &str) -> Option<(u32, u32)> {
+    json_location(text, target, None)
+}
+
+fn json_value_location(text: &str, target: &str, needle: &str) -> Option<(u32, u32)> {
+    json_location(text, target, Some(needle))
+}
+
+fn json_parent_location(text: &str, target: &str) -> Option<(u32, u32)> {
+    let mut parent = target;
+    while let Some((candidate, _)) = parent.rsplit_once('.') {
+        if let Some(location) = json_field_location(text, candidate) {
+            return Some(location);
+        }
+        parent = candidate;
+    }
+    None
+}
+
+fn json_location(text: &str, target: &str, needle: Option<&str>) -> Option<(u32, u32)> {
+    if target == "$" {
+        return Some((1, 1));
+    }
+    let mut scanner = JsonLocationScanner {
+        bytes: text.as_bytes(),
+        offset: 0,
+        line: 1,
+        column: 1,
+        target,
+        needle,
+        found: None,
+    };
+    scanner.scan_value("");
+    scanner.found
+}
+
+/// A total, allocation-bounded walk over already-valid authoring JSON. It
+/// records object-key coordinates by their dotted/indexed path; malformed
+/// input is rejected by serde before this helper is reached.
+struct JsonLocationScanner<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+    line: u32,
+    column: u32,
+    target: &'a str,
+    needle: Option<&'a str>,
+    found: Option<(u32, u32)>,
+}
+
+impl JsonLocationScanner<'_> {
+    fn scan_value(&mut self, path: &str) {
+        self.skip_whitespace();
+        let value_location = (self.line, self.column);
+        if self.found.is_none() && self.needle.is_none() && path == self.target {
+            self.found = Some(value_location);
+        }
+        match self.peek() {
+            Some(b'{') => self.scan_object(path),
+            Some(b'[') => self.scan_array(path),
+            Some(b'"') => {
+                if let Some(value) = self.scan_string()
+                    && self.found.is_none()
+                    && self.needle == Some(value.as_str())
+                    && json_value_path_matches(path, self.target)
+                {
+                    self.found = Some(value_location);
+                }
+            }
+            Some(_) => {
+                while self
+                    .peek()
+                    .is_some_and(|byte| !byte.is_ascii_whitespace() && !b",]}".contains(&byte))
+                {
+                    self.advance();
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn scan_object(&mut self, path: &str) {
+        self.advance();
+        loop {
+            self.skip_whitespace();
+            if self.peek() == Some(b'}') {
+                self.advance();
+                return;
+            }
+            let key_location = (self.line, self.column);
+            let Some(key) = self.scan_string() else {
+                return;
+            };
+            let child = if path.is_empty() {
+                key
+            } else {
+                format!("{path}.{key}")
+            };
+            if self.found.is_none() && self.needle.is_none() && child == self.target {
+                self.found = Some(key_location);
+            }
+            self.skip_whitespace();
+            if self.peek() != Some(b':') {
+                return;
+            }
+            self.advance();
+            self.scan_value(&child);
+            self.skip_whitespace();
+            match self.peek() {
+                Some(b',') => self.advance(),
+                Some(b'}') => {
+                    self.advance();
+                    return;
+                }
+                _ => return,
+            }
+        }
+    }
+
+    fn scan_array(&mut self, path: &str) {
+        self.advance();
+        let mut index = 0_usize;
+        loop {
+            self.skip_whitespace();
+            if self.peek() == Some(b']') {
+                self.advance();
+                return;
+            }
+            self.scan_value(&format!("{path}[{index}]"));
+            index = index.saturating_add(1);
+            self.skip_whitespace();
+            match self.peek() {
+                Some(b',') => self.advance(),
+                Some(b']') => {
+                    self.advance();
+                    return;
+                }
+                _ => return,
+            }
+        }
+    }
+
+    fn scan_string(&mut self) -> Option<String> {
+        if self.peek() != Some(b'"') {
+            return None;
+        }
+        let start = self.offset;
+        self.advance();
+        let mut escaped = false;
+        while let Some(byte) = self.peek() {
+            self.advance();
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                return serde_json::from_slice(&self.bytes[start..self.offset]).ok();
+            }
+        }
+        None
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self.peek().is_some_and(|byte| byte.is_ascii_whitespace()) {
+            self.advance();
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.offset).copied()
+    }
+
+    fn advance(&mut self) {
+        let Some(byte) = self.peek() else {
+            return;
+        };
+        self.offset = self.offset.saturating_add(1);
+        if byte == b'\n' {
+            self.line = self.line.saturating_add(1);
+            self.column = 1;
+        } else {
+            self.column = self.column.saturating_add(1);
+        }
+    }
+}
+
+fn json_value_path_matches(path: &str, target: &str) -> bool {
+    if path == target {
+        return true;
+    }
+    path.strip_prefix(target).is_some_and(|suffix| {
+        suffix.starts_with('[')
+            && suffix.ends_with(']')
+            && suffix[1..suffix.len().saturating_sub(1)]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+    })
 }
 
 /// Parse pipe source into an AST. Total: never panics, never throws — every
@@ -1205,6 +2724,7 @@ join @join "merge both" <-left,right"#;
             out_type: "Image".into(),
             clis: vec![],
             apis: vec!["fal.ai".into()],
+            denials: Vec::new(),
             skills: vec!["nanobanana-prompting".into()],
             scripts: vec![],
             color: "#c2557a".into(),

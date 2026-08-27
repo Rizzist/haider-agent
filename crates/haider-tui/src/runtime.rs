@@ -1806,6 +1806,9 @@ impl DemoDriver {
             // W-flow live-only read: the loom registry is daemon truth and
             // the demo reducer refuses /loom upstream.
             | AppRequest::LoomRefresh
+            | AppRequest::LoomAuthorDraft { .. }
+            | AppRequest::LoomAuthorRevise { .. }
+            | AppRequest::LoomAuthorConfirm { .. }
             // W-flow inline identity: the receipted agent-type binding is
             // daemon truth; the demo reducer refuses `p` upstream.
             | AppRequest::SelectAgentType { .. }

@@ -26,7 +26,7 @@ use haider_protocol::permission::{PermissionEventPayload, SystemPermission};
 use haider_protocol::state::RunState;
 use haider_tools::MessageSubagent;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::{MissedTickBehavior, interval_at};
 
 const MAX_ATTACHMENTS_PER_TURN: usize = 5;
@@ -4012,6 +4012,59 @@ impl HubConnection {
                 self.workflow_graph_watch(request_id, session_id, after_cursor, limit)
                     .await
             }
+            RequestBody::LoomAuthorDraft {
+                session_id,
+                kind,
+                prose,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.loom_author_draft(request_id, session_id, kind, prose)
+                    .await
+            }
+            RequestBody::LoomAuthorRevise {
+                authoring_id,
+                expected_revision,
+                kind,
+                text,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.loom_author_revise(request_id, authoring_id, expected_revision, kind, text)
+                    .await
+            }
+            RequestBody::LoomAuthorConfirm {
+                authoring_id,
+                expected_revision,
+                kind,
+                text,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.loom_author_confirm(request_id, authoring_id, expected_revision, kind, text)
+                    .await
+            }
             // `Unknown` and any future method decode alike: a typed,
             // correlated rejection instead of a dropped request.
             _ => self.respond_error(
@@ -4283,6 +4336,7 @@ impl HubConnection {
                 surface_watch: Mutex::new(None),
                 monitor_watch: Mutex::new(None),
                 metafork_reviews: Arc::clone(&self.metafork_reviews),
+                loom_author_sessions: Arc::clone(&self.loom_author_sessions),
                 identity_lease: Arc::clone(&self.identity_lease),
                 closed: AtomicBool::new(false),
             },
@@ -7472,6 +7526,582 @@ impl HubConnection {
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::WorkflowGraphWatch { page },
+        })
+    }
+
+    async fn loom_author_draft(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+        kind: haider_protocol::loom::LoomAuthorKind,
+        prose: String,
+    ) -> Result<(), SessionHubError> {
+        if let Err(error) = crate::loom_author::validate_prose(&prose) {
+            return self.respond_error(
+                request_id,
+                error.code.as_str(),
+                &error.message,
+                error.retryable,
+                None,
+            );
+        }
+        let metadata = match self.hub.session_metadata(&session_id).await {
+            Ok(Some(metadata)) => metadata,
+            Ok(None) => {
+                return self.respond_error(
+                    request_id,
+                    ErrorCode::SessionNotFound.as_str(),
+                    "AI Loom drafting session was not found",
+                    false,
+                    None,
+                );
+            }
+            Err(error) => {
+                return self.respond_error(
+                    request_id,
+                    error.code.as_str(),
+                    &error.message,
+                    error.retryable,
+                    None,
+                );
+            }
+        };
+        let agent_types = match self.hub.inner.store.loom_agent_types().await {
+            Ok(records) => records,
+            Err(error) => {
+                return self.respond_error(
+                    request_id,
+                    error.code.as_str(),
+                    &error.message,
+                    error.retryable,
+                    None,
+                );
+            }
+        };
+        let authoring_id = random_id("loom-author")?;
+        let provider = match self.hub.loom_author_provider() {
+            Ok(provider) => provider,
+            Err(error) => {
+                return self.respond_error(
+                    request_id,
+                    ErrorCode::Internal.as_str(),
+                    &error.to_string(),
+                    true,
+                    None,
+                );
+            }
+        };
+        {
+            let mut sessions = lock(&self.loom_author_sessions)?;
+            if sessions.len() >= crate::loom_author::LOOM_AUTHOR_SESSION_MAX {
+                let oldest = sessions
+                    .iter()
+                    .filter(|(_, session)| !session.confirming)
+                    .min_by_key(|(_, session)| session.updated_at)
+                    .map(|(id, _)| id.clone());
+                if let Some(oldest) = oldest {
+                    sessions.remove(&oldest);
+                }
+            }
+            if sessions.len() >= crate::loom_author::LOOM_AUTHOR_SESSION_MAX {
+                return self.respond_error(
+                    request_id,
+                    ErrorCode::Busy.as_str(),
+                    "too many Loom drafts are already in progress on this connection",
+                    true,
+                    None,
+                );
+            }
+            sessions.insert(
+                authoring_id.clone(),
+                crate::loom_author::LoomAuthorSession::pending(kind),
+            );
+        }
+        let sink = Arc::clone(&self.sink);
+        let sessions = Arc::clone(&self.loom_author_sessions);
+        let mut cancel = self.identity_lease.loom_author_cancel.subscribe();
+        let task = tokio::spawn(async move {
+            let result = tokio::select! {
+                biased;
+                closed = cancel.wait_for(|closed| *closed) => {
+                    let _ = closed;
+                    if let Ok(mut sessions) = sessions.lock() {
+                        sessions.remove(&authoring_id);
+                    }
+                    return;
+                }
+                result = tokio::time::timeout(
+                    Duration::from_secs(180),
+                    crate::loom_author::draft_from_prose(
+                        authoring_id.clone(),
+                        kind,
+                        &prose,
+                        &agent_types,
+                        &metadata,
+                        provider.as_ref(),
+                    ),
+                ) => match result {
+                    Ok(result) => result,
+                    Err(_) => Err(HaiderError::new(
+                        ErrorCode::Busy,
+                        "AI Loom drafting timed out",
+                        true,
+                    )),
+                },
+            };
+            let frame = match result {
+                Ok(draft) => match sessions.lock() {
+                    Ok(mut sessions) => {
+                        // `close` publishes cancellation before it locks and
+                        // clears this map. Recheck while holding the map lock
+                        // so a provider result can never recreate connection-
+                        // owned state after teardown won the race.
+                        if *cancel.borrow() {
+                            sessions.remove(&authoring_id);
+                            return;
+                        }
+                        sessions.insert(
+                            draft.authoring_id.clone(),
+                            crate::loom_author::LoomAuthorSession::from_draft(&draft),
+                        );
+                        WireFrame::Response {
+                            request_id,
+                            body: ResponseBody::LoomAuthorDraft { draft },
+                        }
+                    }
+                    Err(_) => WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::Error {
+                            code: ErrorCode::Internal.as_str().to_owned(),
+                            message: "Loom authoring session registry is unavailable".to_owned(),
+                            retryable: true,
+                            data: None,
+                        },
+                    },
+                },
+                Err(error) => {
+                    if let Ok(mut sessions) = sessions.lock() {
+                        sessions.remove(&authoring_id);
+                    }
+                    WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::Error {
+                            code: error.code.as_str().to_owned(),
+                            message: error.message,
+                            retryable: error.retryable,
+                            data: None,
+                        },
+                    }
+                }
+            };
+            if sink.try_send(frame).is_err() {
+                sink.close_after_required_delivery_failure();
+            }
+        });
+        // Dropping a Tokio join handle detaches the bounded task. It is
+        // connection-cancelled above and intentionally not added to the
+        // hub-wide actor registry, so a slow provider cannot delay shutdown.
+        drop(task);
+        Ok(())
+    }
+
+    async fn loom_author_revise(
+        &self,
+        request_id: RequestId,
+        authoring_id: String,
+        expected_revision: u64,
+        kind: haider_protocol::loom::LoomAuthorKind,
+        text: String,
+    ) -> Result<(), SessionHubError> {
+        if text.len() > haider_protocol::loom::LOOM_AUTHOR_TEXT_MAX_BYTES {
+            return self.respond_error(
+                request_id,
+                ErrorCode::InvalidArgument.as_str(),
+                "Loom authoring edit exceeds the 64 KiB limit",
+                false,
+                None,
+            );
+        }
+        {
+            let sessions = lock(&self.loom_author_sessions)?;
+            let Some(session) = sessions.get(&authoring_id) else {
+                return self.respond_error(
+                    request_id,
+                    ErrorCode::InvalidArgument.as_str(),
+                    "Loom authoring session was not issued by this daemon",
+                    false,
+                    None,
+                );
+            };
+            if session.kind != kind || session.revision != expected_revision || session.confirming {
+                return self.respond_error(
+                    request_id,
+                    ErrorCode::RevisionConflict.as_str(),
+                    "Loom authoring revision is stale or busy",
+                    false,
+                    None,
+                );
+            }
+        }
+        let agent_types = match self.hub.inner.store.loom_agent_types().await {
+            Ok(records) => records,
+            Err(error) => {
+                return self.respond_error(
+                    request_id,
+                    error.code.as_str(),
+                    &error.message,
+                    error.retryable,
+                    None,
+                );
+            }
+        };
+        let revision = {
+            let sessions = lock(&self.loom_author_sessions)?;
+            let Some(session) = sessions.get(&authoring_id) else {
+                return self.respond_error(
+                    request_id,
+                    ErrorCode::InvalidArgument.as_str(),
+                    "Loom authoring session was not issued by this daemon",
+                    false,
+                    None,
+                );
+            };
+            if session.kind != kind || session.revision != expected_revision || session.confirming {
+                return self.respond_error(
+                    request_id,
+                    ErrorCode::RevisionConflict.as_str(),
+                    "Loom authoring revision is stale or busy",
+                    false,
+                    None,
+                );
+            }
+            let Some(revision) = session.revision.checked_add(1) else {
+                return self.respond_error(
+                    request_id,
+                    ErrorCode::RevisionConflict.as_str(),
+                    "Loom authoring revision space is exhausted",
+                    false,
+                    None,
+                );
+            };
+            revision
+        };
+        let draft =
+            crate::loom_author::revise(authoring_id.clone(), revision, kind, text, &agent_types);
+        {
+            let mut sessions = lock(&self.loom_author_sessions)?;
+            let Some(session) = sessions.get_mut(&authoring_id) else {
+                return self.respond_error(
+                    request_id,
+                    ErrorCode::RevisionConflict.as_str(),
+                    "Loom authoring session disappeared",
+                    false,
+                    None,
+                );
+            };
+            if session.revision != expected_revision || session.kind != kind || session.confirming {
+                return self.respond_error(
+                    request_id,
+                    ErrorCode::RevisionConflict.as_str(),
+                    "Loom authoring revision changed while validating",
+                    false,
+                    None,
+                );
+            }
+            *session = crate::loom_author::LoomAuthorSession::from_draft(&draft);
+        }
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::LoomAuthorRevise { draft },
+        })
+    }
+
+    async fn loom_author_confirm(
+        &self,
+        request_id: RequestId,
+        authoring_id: String,
+        expected_revision: u64,
+        kind: haider_protocol::loom::LoomAuthorKind,
+        text: String,
+    ) -> Result<(), SessionHubError> {
+        if text.len() > haider_protocol::loom::LOOM_AUTHOR_TEXT_MAX_BYTES {
+            return self.respond_error(
+                request_id,
+                ErrorCode::InvalidArgument.as_str(),
+                "Loom authoring confirmation exceeds the 64 KiB limit",
+                false,
+                None,
+            );
+        }
+        {
+            let sessions = lock(&self.loom_author_sessions)?;
+            let Some(session) = sessions.get(&authoring_id) else {
+                return self.respond_error(
+                    request_id,
+                    ErrorCode::InvalidArgument.as_str(),
+                    "Loom authoring session was not issued by this daemon",
+                    false,
+                    None,
+                );
+            };
+            if session.kind != kind || session.revision != expected_revision {
+                return self.respond_error(
+                    request_id,
+                    ErrorCode::RevisionConflict.as_str(),
+                    "confirm requires the latest successfully revised Loom text",
+                    false,
+                    None,
+                );
+            }
+            if let Some(confirmed) = session.confirmed.clone() {
+                let exact_retry = session.text == text
+                    || session
+                        .confirmed_input_text
+                        .as_ref()
+                        .is_some_and(|submitted| submitted == &text);
+                if exact_retry {
+                    return self.send(WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::LoomAuthorConfirm {
+                            confirmed: Some(confirmed),
+                            errors: Vec::new(),
+                        },
+                    });
+                }
+                return self.respond_error(
+                    request_id,
+                    ErrorCode::RevisionConflict.as_str(),
+                    "a confirmed revision is immutable; revise to create a new revision",
+                    false,
+                    None,
+                );
+            }
+            if session.text != text {
+                return self.respond_error(
+                    request_id,
+                    ErrorCode::RevisionConflict.as_str(),
+                    "confirm requires the latest successfully revised Loom text",
+                    false,
+                    None,
+                );
+            }
+            if session.confirming {
+                return self.respond_error(
+                    request_id,
+                    ErrorCode::RevisionConflict.as_str(),
+                    "Loom authoring confirmation is already in progress",
+                    true,
+                    None,
+                );
+            }
+        }
+        let agent_types = match self.hub.inner.store.loom_agent_types().await {
+            Ok(records) => records,
+            Err(error) => {
+                return self.respond_error(
+                    request_id,
+                    error.code.as_str(),
+                    &error.message,
+                    error.retryable,
+                    None,
+                );
+            }
+        };
+        let validated = match crate::loom_author::validate(&text, kind, &agent_types) {
+            Ok(validated) => validated,
+            Err(errors) => {
+                return self.send(WireFrame::Response {
+                    request_id,
+                    body: ResponseBody::LoomAuthorConfirm {
+                        confirmed: None,
+                        errors,
+                    },
+                });
+            }
+        };
+        {
+            let mut sessions = lock(&self.loom_author_sessions)?;
+            let Some(session) = sessions.get_mut(&authoring_id) else {
+                return self.respond_error(
+                    request_id,
+                    ErrorCode::InvalidArgument.as_str(),
+                    "Loom authoring session was not issued by this daemon",
+                    false,
+                    None,
+                );
+            };
+            if session.kind != kind || session.revision != expected_revision {
+                return self.respond_error(
+                    request_id,
+                    ErrorCode::RevisionConflict.as_str(),
+                    "confirm requires the latest successfully revised Loom text",
+                    false,
+                    None,
+                );
+            }
+            if let Some(confirmed) = session.confirmed.clone() {
+                let exact_retry = session.text == text
+                    || session
+                        .confirmed_input_text
+                        .as_ref()
+                        .is_some_and(|submitted| submitted == &text);
+                if exact_retry {
+                    return self.send(WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::LoomAuthorConfirm {
+                            confirmed: Some(confirmed),
+                            errors: Vec::new(),
+                        },
+                    });
+                }
+                return self.respond_error(
+                    request_id,
+                    ErrorCode::RevisionConflict.as_str(),
+                    "a confirmed revision is immutable; revise to create a new revision",
+                    false,
+                    None,
+                );
+            }
+            if session.text != text || !session.valid {
+                return self.respond_error(
+                    request_id,
+                    ErrorCode::RevisionConflict.as_str(),
+                    "confirm requires the latest successfully revised Loom text",
+                    false,
+                    None,
+                );
+            }
+            if session.confirming {
+                return self.respond_error(
+                    request_id,
+                    ErrorCode::RevisionConflict.as_str(),
+                    "Loom authoring confirmation is already in progress",
+                    true,
+                    None,
+                );
+            }
+            session.confirming = true;
+        }
+        let confirmed = match validated {
+            haider_protocol::loom::ValidatedLoomAuthorSpec::AgentType {
+                record,
+                canonical_text,
+            } => match self.hub.loom_register_agent_type(record).await {
+                Ok(outcome) => haider_protocol::loom::LoomAuthorConfirmed {
+                    authoring_id: authoring_id.clone(),
+                    kind,
+                    canonical_text,
+                    execution_digest: outcome.registration.digest.clone(),
+                    registration: outcome.registration,
+                    install_job_id: outcome.install_job_id,
+                },
+                Err(error) => {
+                    if let Ok(mut sessions) = self.loom_author_sessions.lock()
+                        && let Some(session) = sessions.get_mut(&authoring_id)
+                    {
+                        session.confirming = false;
+                    }
+                    return self.respond_error(
+                        request_id,
+                        error.code.as_str(),
+                        &error.message,
+                        error.retryable,
+                        None,
+                    );
+                }
+            },
+            haider_protocol::loom::ValidatedLoomAuthorSpec::Workflow {
+                source,
+                canonical_text,
+            } => {
+                let registration = match self.hub.inner.store.loom_register_workflow(source).await {
+                    Ok(registration) => registration,
+                    Err(error) => {
+                        if let Ok(mut sessions) = self.loom_author_sessions.lock()
+                            && let Some(session) = sessions.get_mut(&authoring_id)
+                        {
+                            session.confirming = false;
+                        }
+                        return self.respond_error(
+                            request_id,
+                            error.code.as_str(),
+                            &error.message,
+                            error.retryable,
+                            None,
+                        );
+                    }
+                };
+                let registered = match self
+                    .hub
+                    .inner
+                    .store
+                    .loom_workflow_registered_revision(
+                        registration.id.clone(),
+                        registration.rev,
+                        registration.digest.clone(),
+                    )
+                    .await
+                {
+                    Ok(Some(workflow)) => workflow,
+                    Ok(None) => {
+                        if let Ok(mut sessions) = self.loom_author_sessions.lock()
+                            && let Some(session) = sessions.get_mut(&authoring_id)
+                        {
+                            session.confirming = false;
+                        }
+                        return self.respond_error(
+                            request_id,
+                            ErrorCode::StoreCorrupt.as_str(),
+                            "registered Loom workflow revision is missing",
+                            false,
+                            None,
+                        );
+                    }
+                    Err(error) => {
+                        if let Ok(mut sessions) = self.loom_author_sessions.lock()
+                            && let Some(session) = sessions.get_mut(&authoring_id)
+                        {
+                            session.confirming = false;
+                        }
+                        return self.respond_error(
+                            request_id,
+                            error.code.as_str(),
+                            &error.message,
+                            error.retryable,
+                            None,
+                        );
+                    }
+                };
+                let execution_digest =
+                    haider_protocol::graph::graph_template_digest(&registered.template);
+                haider_protocol::loom::LoomAuthorConfirmed {
+                    authoring_id: authoring_id.clone(),
+                    kind,
+                    canonical_text,
+                    registration,
+                    execution_digest,
+                    install_job_id: None,
+                }
+            }
+        };
+        {
+            let mut sessions = lock(&self.loom_author_sessions)?;
+            let session = sessions.get_mut(&authoring_id).ok_or_else(|| {
+                SessionHubError::Task("confirmed Loom authoring session disappeared".to_owned())
+            })?;
+            session.confirming = false;
+            session.confirmed_input_text = Some(text);
+            session.text.clone_from(&confirmed.canonical_text);
+            session.valid = true;
+            session.updated_at = std::time::Instant::now();
+            session.confirmed = Some(confirmed.clone());
+        }
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::LoomAuthorConfirm {
+                confirmed: Some(confirmed),
+                errors: Vec::new(),
+            },
         })
     }
 
@@ -11789,6 +12419,10 @@ impl HubConnection {
     pub async fn close(&self) -> Result<(), SessionHubError> {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
+        }
+        self.identity_lease.loom_author_cancel.send_replace(true);
+        if let Ok(mut sessions) = self.loom_author_sessions.lock() {
+            sessions.clear();
         }
         if let Ok(mut stages) = self.stages.lock() {
             *stages = crate::accounts::StagedSecrets::default();

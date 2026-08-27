@@ -40,6 +40,7 @@ fn agent_with_clis(id: &str, job: &str, clis: &[&str]) -> LoomAgentType {
         out_type: "Output".into(),
         clis: clis.iter().map(|cli| (*cli).to_owned()).collect(),
         apis: Vec::new(),
+        denials: Vec::new(),
         skills: Vec::new(),
         scripts: Vec::new(),
         color: String::new(),

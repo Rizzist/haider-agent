@@ -14,6 +14,7 @@ fn loom_type() -> LoomAgentType {
         out_type: "Evidence".into(),
         clis: vec!["rg".into(), "jq".into(), "rg".into()],
         apis: Vec::new(),
+        denials: Vec::new(),
         skills: Vec::new(),
         scripts: Vec::new(),
         color: "#c2701c".into(),

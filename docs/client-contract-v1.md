@@ -203,10 +203,10 @@ An operation not listed here is part of the v1 base surface. “Field” means t
 client may use that field only when it is present; the named token permits an
 affordance before the response exists.
 
-The ordinary v0.0.963 `welcome_features()` set contains all 87 tokens below.
+The ordinary v0.0.963 `welcome_features()` set contains all 89 tokens below.
 The re-verification anchors are
-`crates/haider-daemon/src/connection.rs:1868-1956` for the assembled set and
-`crates/haider-rpc/src/frame.rs:249-505` for the exact string constants. The
+`crates/haider-daemon/src/connection.rs:1870-1961` for the assembled set and
+`crates/haider-rpc/src/frame.rs:249-513` for the exact string constants. The
 one peer-specific withholding exception is §4.1.
 
 | Feature token | Methods, frames, or fields it publishes |
@@ -282,8 +282,10 @@ one peer-specific withholding exception is §4.1.
 | `convergence_graph_v3` | `graph.inspect` |
 | `convergence_graph_v4` | `graph.run_set.open` and todo child-graph telemetry |
 | `loom_v1` | `loom.list/register_agent_type/register_workflow` |
+| `loom_authoring_v1` | `loom.author.draft/revise/confirm` typed authoring sessions |
 | `loom_pipe_dag_v1` | v0.0.961 Loom pipe fork/join/back-edge DAG grammar |
 | `workflow_catalog_v1` | additive authoritative `workflow_catalog` section on `loom.list` |
+| `workflow_graph_v1` | indexed typed activation state from `workflow.graph.state` and bounded cursor replay from `workflow.graph.watch` |
 | `workflow_instance_v1` | immutable `workflow.instance` descriptors and optional `expected_digest` fences on `graph.pin`/`graph.switch` |
 | `loom_cli_presence_v1` | `loom.list.cli_present` |
 | `typed_agent_install_v1` | `loom.install.status` and the durable required-CLI install lifecycle started by agent-type registration |
@@ -417,8 +419,12 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | `graph.run_set.open`, `graph.abandon` | same-named response | durable receipts |
 | `graph.status`, `graph.inspect` | same-named response | snapshots |
 | `loom.register_agent_type`, `loom.register_workflow` | `LoomRegistered` (`method: "loom.registered"`) | registry mutation/no-op receipt |
+| `loom.author.draft`, `loom.author.revise` | same-named response carrying `LoomAuthorDraft` | editable typed text plus location-bearing validation errors |
+| `loom.author.confirm` | same-named response carrying `confirmed` or typed `errors` | immutable registration and daemon-issued execution digest |
 | `loom.install.retry` | `LoomInstallRetry` | typed requeue receipt or structured rejection |
 | `loom.install.watch` | `LoomInstallWatch` | typed bounded replay page or structured rejection |
+| `workflow.graph.state` | `WorkflowGraphState` | indexed typed activation snapshot; optional `graph_id` selects an exact graph |
+| `workflow.graph.watch` | `WorkflowGraphWatch` | bounded durable activation-event replay strictly after the applied cursor |
 | `vault.stage` | `VaultStage` | connection-local ephemeral dedupe, deliberately not durable |
 | `account.login_api`, `account.oauth_import`, `account.import_device`, `account.add`, `account.set_active`, `account.remove`, `account.set_default_model` | same-named response | durable account mutation |
 | `account.oauth_start/status/cancel`, `account.oauth_import_sources`, `account.device_candidates` | same-named response | connection-bound flow/catalog reads/actions |
@@ -430,7 +436,7 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 The golden matrix at
 `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`, combined
 with the historical `wire_transcript.json`, pins a request and successful
-response for every one of the 89 v1 request methods. `menu.answer` and resident
+response for every one of the 94 v1 request methods. `menu.answer` and resident
 binding are top-level frames, not `RequestBody` methods.
 
 ### 5.3 Advertised runtime with no client method
@@ -1673,6 +1679,67 @@ time, not a permanent execution guarantee. Agent-type optional/empty
 capability lists mean none declared, and empty color/glyph means no declared
 accent. A client must not infer capabilities from the job prose.
 
+### 13.1.1 Typed Loom authoring
+
+`loom_authoring_v1` adds a three-step authoring door.
+`loom.author.draft { session_id, kind, prose }` turns prose into a
+`LoomAuthorDraft` whose `text` is editable typed JSON. `session_id` selects the
+provider/model for this AI call but the exchange does not append a chat turn.
+Drafting requires Control capability. `loom.author.revise { authoring_id,
+expected_revision, kind, text }` re-parses the user's exact edit and returns
+the same draft shape with zero or more `LoomAuthorValidationError` values.
+Revision requires View capability; confirmation requires Control capability.
+Each error carries a stable code and a one-based `{ line, column, field }`
+location; a client MUST branch on those typed coordinates, never parse the
+display message. `authoring_id` and its monotonic `revision` are scoped to the
+issuing connection; after reconnect, the client may preserve editor bytes but
+must start a new draft session before revising or confirming them.
+
+An `agent_type` document declares `capability_keys`, `grants`, and `denials`.
+Every key is exactly `cli:<program>` or `api:<host>` and must occur in exactly
+one disposition. Positive grants lower to the existing `clis`/`apis` runtime
+authority; explicit denials remain in the immutable registry content and never
+grant a tool or effect. A `workflow` document carries ordered typed nodes with
+explicit `depends_on` edges (one predecessor is a chain, shared predecessors
+form forks, multiple predecessors form joins), an optional self-or-earlier
+`back_edge`, and a typed InstructPipe evidence contract. In v1 the evidence
+protocol/tool are exactly `instruct_pipe_v1`/`graph_evidence`; its green count
+lowers to the existing command or bounded all-of gate. Human gates carry no
+evidence contract. The daemon resolves every `agent_type` reference against
+one registry snapshot and repeats validation at confirmation.
+
+`loom.author.confirm { authoring_id, expected_revision, kind, text }` has two
+successful response forms: `confirmed: LoomAuthorConfirmed` with an
+omitted/empty `errors`, or no `confirmed` with one or more typed errors.
+Validation rejection is therefore a successful typed authoring response and
+performs no registry mutation. Revise and confirm both compare the daemon-owned
+draft revision; stale edits receive `revision_conflict`. The confirmed receipt
+contains canonical text, the registry `LoomRegistration`, and
+`execution_digest`. For agent types the execution digest is the frozen
+typed-agent content digest. For workflows it is the daemon-issued template
+digest accepted by the existing `workflow_instance_v1` graph fence; clients
+MUST NOT substitute `LoomRegistration.digest` or hash canonical text locally.
+
+Confirmation never opens a mutable object. Reconfirming identical canonical
+content is the registry's idempotent no-op. Editing a confirmed document's
+content and confirming again appends a new registry revision with a new
+execution digest; a formatting-only edit may canonicalize to the existing
+idempotent content. Older agent-type content remains retained under its `(id,
+registry rev, content digest)` execution coordinates, and older workflow
+revisions remain addressable through the template-digest lookup. Including
+registry revision keeps repeated content (A→B→A) unambiguous even when the
+content digest repeats.
+The current-by-name registry row is only an index to the newest revision:
+advancing it never rewrites the bytes addressed by an older confirmed hash, so
+an already pinned execution continues on its exact hash.
+
+Absence law: without `loom_authoring_v1`, a client MUST NOT call any
+`loom.author.*` method, expose confirmation as available, send the prose as an
+ordinary chat turn, or fall back to `loom.register_*`. It may continue to show
+the independently negotiated read-only Loom registry. An old daemon's unknown
+method response is not a probe result and must not be reinterpreted as an empty
+or invalid draft.
+
 ### 13.2 Durable typed-agent installation
 
 `typed_agent_install_v1` negotiates the reconnectable required-CLI install
@@ -2105,7 +2172,7 @@ The machine-checkable contract lives in these fixtures/tests:
   non-chat stream and its explicit truncation/dedupe fields.
 - `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`: the
   methods added after the historical matrix, completing golden request and
-  successful response coverage for all 89 request methods and all five
+  successful response coverage for all 94 request methods and all five
   command dynamic slots.
 - `crates/haider-rpc/tests/fixtures/snapshot_availability_compat_v1.json`:
   old and new account/provider/usage response bytes.
