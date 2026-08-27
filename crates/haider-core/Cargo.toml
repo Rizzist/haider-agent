@@ -20,6 +20,7 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+haider-accounts = { path = "../haider-accounts" }
 tempfile.workspace = true
 
 [lints]

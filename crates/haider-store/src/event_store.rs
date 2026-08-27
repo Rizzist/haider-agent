@@ -1875,8 +1875,9 @@ impl Store {
         blobs: Vec<ProviderViewBlobV1>,
     ) -> StoreResult<ProviderViewLedgerV1> {
         let mut connection = self.connection()?;
-        self.provider_views
-            .sweep_expired(&mut connection, now_ms()?)?;
+        let _ = self
+            .provider_views
+            .sweep_expired_if_due(&mut connection, now_ms()?)?;
         self.provider_views.persist(
             &mut connection,
             session_id,
