@@ -931,7 +931,7 @@ fn command_id(operation: &str) -> String {
 }
 
 fn provider_probe_failure(data: Option<&ErrorData>) -> Option<&'static str> {
-    let Some(ErrorData::ProviderProbeFailed { failure, .. }) = data else {
+    let ErrorData::ProviderProbeFailed { failure, .. } = data? else {
         return None;
     };
     Some(match failure {

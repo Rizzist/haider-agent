@@ -10277,9 +10277,7 @@ impl AppModel {
     /// G4a: a KEYLESS card skips the key card entirely — there is no
     /// credential to add — and goes straight to model discovery.
     pub fn custom_add_committed(&mut self, attempt: u64, credential_staged: bool) -> Option<u64> {
-        let Some(card) = self.custom_add.take_if(|card| card.attempt == attempt) else {
-            return None;
-        };
+        let card = self.custom_add.take_if(|card| card.attempt == attempt)?;
         if card.keyless {
             self.providers.message = Some(if card.discover_models {
                 format!(

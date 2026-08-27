@@ -77,7 +77,7 @@ fn custom_server_key_is_masked_and_debug_redacted() {
     let backend = TestBackend::new(110, 32);
     let mut terminal = Terminal::new(backend).expect("terminal");
     terminal
-        .draw(|frame| crate::render::render(&model, frame))
+        .draw(|frame| drop(crate::render::render(&model, frame)))
         .expect("draw");
     let buffer = terminal.backend().buffer();
     let mut rendered = String::new();

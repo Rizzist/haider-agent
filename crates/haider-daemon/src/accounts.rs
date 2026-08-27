@@ -589,6 +589,7 @@ pub(crate) struct StagedSecrets {
 }
 
 /// Typed staging failure mapped by the rpc layer.
+#[derive(Debug)]
 pub(crate) enum StageError {
     /// Same `stage_id` with different bytes/purpose.
     Mismatch,
@@ -883,14 +884,15 @@ impl AccountsFacade {
         &self,
         provider: String,
     ) -> Result<ProviderSummaryWire, ProviderModelsRefreshFailure> {
-        let Some(commands) = self.login.as_ref() else {
-            return Err(ProviderModelsRefreshFailure {
+        let commands = self
+            .login
+            .as_ref()
+            .ok_or_else(|| ProviderModelsRefreshFailure {
                 code: ERROR_CODE_PROVIDER_MODELS_UNKNOWN.to_owned(),
                 message: "provider model refresh is unavailable".to_owned(),
                 retryable: true,
                 data: None,
-            });
-        };
+            })?;
         let (sender, receiver) = tokio::sync::oneshot::channel();
         commands
             .send(AccountCommand::RefreshProviderModels {

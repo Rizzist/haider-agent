@@ -6439,12 +6439,9 @@ async fn pending_custom_configure_reconciliation_restores_discovered_inventory()
     let dir = test_store_dir();
     let store = open_store(dir.path()).await;
     let model_source = Arc::new(CachedProviderModelSource::default());
-    let mut providers = ProviderRegistry::new(
-        Box::new(TestProviderStore::default()),
-        Vec::new(),
-        model_source,
-    )
-    .expect("empty provider registry");
+    let provider_store: Box<dyn ProviderRegistryStoreLike> = Box::new(TestProviderStore::default());
+    let mut providers = ProviderRegistry::new(provider_store, Vec::new(), model_source)
+        .expect("empty provider registry");
     let input = ProviderConfigureInput {
         provider: "recovered-router".into(),
         api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
