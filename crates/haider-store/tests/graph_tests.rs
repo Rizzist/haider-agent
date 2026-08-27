@@ -3316,7 +3316,7 @@ fn compiled_loom_red_targets_survive_registry_pin_and_converge_at_runtime() {
         &store,
         &session_id,
         30_018,
-        check,
+        check.clone(),
         EvidenceVerdict::Green,
         "check converged",
     );

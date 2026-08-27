@@ -6679,7 +6679,7 @@ mod tests {
             projection_mutation.next_activation_order.saturating_add(1);
         assert!(projection_mutation.validate_projection().is_err());
 
-        let mut mutation = journal.clone();
+        let mut mutation = journal;
         mutation[1].payload["activation_order"] = serde_json::json!(2);
         assert!(reduce_workflow_graphs(&mutation).is_err());
     }

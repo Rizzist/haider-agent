@@ -157,12 +157,16 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
             "--replay" => return Err("only one lifecycle action may be requested".into()),
             "--max-tokens" if budget.max_tokens.is_none() => {
                 index += 1;
-                budget.max_tokens = Some(parse_positive_u64(rest.get(index), "--max-tokens")?);
+                budget.max_tokens = Some(parse_positive_u64(
+                    rest.get(index).map(String::as_str),
+                    "--max-tokens",
+                )?);
             }
             "--max-tokens" => return Err("duplicate --max-tokens flag".into()),
             "--max-cost" if budget.max_cost_microusd.is_none() => {
                 index += 1;
-                budget.max_cost_microusd = Some(parse_cost_microusd(rest.get(index))?);
+                budget.max_cost_microusd =
+                    Some(parse_cost_microusd(rest.get(index).map(String::as_str))?);
             }
             "--max-cost" => return Err("duplicate --max-cost flag".into()),
             "--max-time" if budget.max_time_ms.is_none() => {
@@ -358,7 +362,7 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
     })
 }
 
-fn parse_positive_u64(value: Option<&String>, flag: &str) -> Result<u64, String> {
+fn parse_positive_u64(value: Option<&str>, flag: &str) -> Result<u64, String> {
     let value = value.ok_or_else(|| format!("{flag} requires a positive integer"))?;
     let parsed = value
         .parse::<u64>()
@@ -376,9 +380,9 @@ fn parse_run_id(value: &str, flag: &str) -> Result<RunId, String> {
     Ok(RunId::new(value))
 }
 
-fn parse_cost_microusd(value: Option<&String>) -> Result<u64, String> {
+fn parse_cost_microusd(value: Option<&str>) -> Result<u64, String> {
     let value = value.ok_or_else(|| "--max-cost requires a positive USD amount".to_owned())?;
-    let (dollars, fractional) = value.split_once('.').unwrap_or((value.as_str(), ""));
+    let (dollars, fractional) = value.split_once('.').unwrap_or((value, ""));
     if dollars.is_empty()
         || dollars.bytes().any(|byte| !byte.is_ascii_digit())
         || fractional.len() > 6

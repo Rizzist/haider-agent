@@ -10974,7 +10974,7 @@ impl AppModel {
             return;
         }
         let selected = if let Some(authoring) = &self.loom_authoring {
-            authoring.confirmed.as_ref().and_then(|confirmed| {
+            authoring.confirmed.as_ref().map(|confirmed| {
                 let kind = match confirmed.kind {
                     haider_protocol::loom::LoomAuthorKind::AgentType => {
                         haider_protocol::loom::LoomRegistryEntryKind::AgentType
@@ -10983,12 +10983,12 @@ impl AppModel {
                         haider_protocol::loom::LoomRegistryEntryKind::Workflow
                     }
                 };
-                Some((
+                (
                     kind,
                     confirmed.registration.id.clone(),
                     confirmed.registration.rev,
                     confirmed.registration.digest.clone(),
-                ))
+                )
             })
         } else {
             match self.loom_pane {

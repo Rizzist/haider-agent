@@ -14121,7 +14121,7 @@ fn loom_register_definition() -> ToolDefinition {
                 "kind": {"type": "string", "enum": ["workflow", "agent_type"]},
                 "source": {"type": "string", "minLength": 1, "maxLength": 16384},
                 "record": {"type": "object"},
-                "expected_rev": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                "expected_rev": {"type": "integer", "minimum": 0, "maximum": 4_294_967_295_u64},
                 "expected_digest": {"type": "string", "minLength": 1}
             },
             "required": ["kind", "expected_rev"],
@@ -14428,29 +14428,28 @@ fn process_result_with_signal(
     }
 }
 
-#[allow(clippy::expect_used)]
 fn process_failure_reason(result: &ProcessResult) -> Option<String> {
     match result.status {
-        haider_protocol::item::ToolStatus::Completed => None,
-        haider_protocol::item::ToolStatus::Cancelled => Some("process cancelled".into()),
-        _ if result.limit_reached.is_some() => Some(format!(
-            "process exceeded {:?}",
-            result.limit_reached.expect("checked")
-        )),
-        _ if result.exit_code.is_some() => Some(format!(
-            "process exited with code {}",
-            result.exit_code.expect("checked")
-        )),
-        _ if result.signal.is_some() => Some(format!(
-            "process ended by signal {}",
-            result.signal.expect("checked")
-        )),
-        _ => result
-            .escalation_note
-            .as_deref()
-            .map(bounded_failure_reason)
-            .or_else(|| Some("process failed".into())),
+        haider_protocol::item::ToolStatus::Completed => return None,
+        haider_protocol::item::ToolStatus::Cancelled => {
+            return Some("process cancelled".into());
+        }
+        _ => {}
     }
+    if let Some(limit) = result.limit_reached {
+        return Some(format!("process exceeded {limit:?}"));
+    }
+    if let Some(exit_code) = result.exit_code {
+        return Some(format!("process exited with code {exit_code}"));
+    }
+    if let Some(signal) = result.signal {
+        return Some(format!("process ended by signal {signal}"));
+    }
+    result
+        .escalation_note
+        .as_deref()
+        .map(bounded_failure_reason)
+        .or_else(|| Some("process failed".into()))
 }
 
 fn bounded_failure_reason(message: &str) -> String {
