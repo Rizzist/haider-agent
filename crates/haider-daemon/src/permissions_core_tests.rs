@@ -737,7 +737,7 @@ async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
     // projection is the registry MINUS that gated tool. This session holds an
     // FsWrite grant, not the workflow-author grant, so it must not surface.
     let registry: Vec<_> = registered_tools()
-        .into_iter()
+        .iter()
         .filter(|entry| !matches!(entry.manifest.name.as_str(), "workflow_author" | "mobile"))
         .collect();
     assert_eq!(snapshot.tools.len(), registry.len());

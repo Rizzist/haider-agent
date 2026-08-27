@@ -8919,32 +8919,10 @@ pub(crate) fn advertised_tool_definitions(
     provider_name: &str,
     web_degrade: WebCapabilityDegrade,
 ) -> Vec<ToolDefinition> {
-    advertised_tool_definitions_for_mobile_state(
-        tool_factory,
-        grant,
-        provider_name,
-        web_degrade,
-        false,
-    )
-}
-
-fn advertised_tool_definitions_for_mobile_state(
-    tool_factory: &Arc<dyn TurnToolFactory>,
-    grant: Option<&Grant>,
-    provider_name: &str,
-    web_degrade: WebCapabilityDegrade,
-    mobile_use_active: bool,
-) -> Vec<ToolDefinition> {
-    advertised_tool_pack_for_mobile_state(
-        tool_factory,
-        grant,
-        provider_name,
-        web_degrade,
-        mobile_use_active,
-    )
-    .definitions
-    .as_ref()
-    .to_vec()
+    advertised_tool_pack_for_mobile_state(tool_factory, grant, provider_name, web_degrade, false)
+        .definitions
+        .as_ref()
+        .to_vec()
 }
 
 fn advertised_tool_pack_for_mobile_state(
@@ -12141,7 +12119,6 @@ impl ToolDispatcher for BrokerToolDispatcher {
             }
             RegisteredToolRoute::RequestInput
             | RegisteredToolRoute::Plan
-            | RegisteredToolRoute::LoomRegister
             | RegisteredToolRoute::TodoWrite
             | RegisteredToolRoute::GraphEvidence
             | RegisteredToolRoute::WorkflowAuthor
