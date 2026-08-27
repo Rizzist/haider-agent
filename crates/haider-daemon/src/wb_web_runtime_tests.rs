@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! W-B daemon-boundary web laws: the LOCAL `web_fetch` tool end to end
 //! through a live daemon run (broker journal + typed refusal results, LW6/
 //! LW7 daemon halves), the lite-only CLIENT `web_search` tool and its

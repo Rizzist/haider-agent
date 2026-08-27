@@ -104,17 +104,21 @@ use rusqlite::{
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Write as _};
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const LOOM_AGENT_REVISIONS_DIR: &str = "loom-agent-revisions";
-static LOOM_AGENT_REVISION_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const REPLAY_PAGE_SIZE: usize = 1_024;
+/// A v25 upgrade may need old graph facts, but profile open must never retain
+/// an unbounded copy of the journal. `envelope_weight_bytes` conservatively
+/// charges the decoded heap representation, not just its compact SQLite bytes.
+const WORKFLOW_BACKFILL_MAX_RESIDENT_BYTES: usize = 32 * 1_024 * 1_024;
+/// A watch baseline is one frame, so retaining more registry state than this
+/// cannot be made useful by queueing it. The per-row charge below deliberately
+/// overestimates decoded strings, vectors, and allocator bookkeeping.
+const LOOM_REGISTRY_SNAPSHOT_MAX_RESIDENT_BYTES: usize = 16 * 1_024 * 1_024;
 const USAGE_REDUCER_PAYLOAD_KINDS: &[&str] =
     &["usage", "agent_spawned", "run_failed", "session_forked"];
 const QUEUE_REDUCER_PAYLOAD_KINDS: &[&str] = &["user_message", "queue_changed"];
@@ -2538,17 +2542,20 @@ impl Store {
         digest: &str,
     ) -> StoreResult<Option<LoomAgentType>> {
         validate_loom_revision_address(id, rev, digest)?;
-        let path = self
-            .root
-            .join(LOOM_AGENT_REVISIONS_DIR)
-            .join(id)
-            .join(format!("{rev}-{digest}.json"));
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(loom_revision_io_error("read", &path, error)),
+        let connection = self.connection()?;
+        let json = connection
+            .query_row(
+                "SELECT record_json FROM loom_agent_type_revisions
+                 WHERE id = ?1 AND rev = ?2 AND digest = ?3",
+                params![id, i64::from(rev), digest],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?;
+        let Some(json) = json else {
+            return Ok(None);
         };
-        let record: LoomAgentType = serde_json::from_slice(&bytes)
+        let record: LoomAgentType = serde_json::from_str(&json)
             .map_err(|_| corrupt("retained Loom agent-type revision is not decodable"))?;
         if record.id != id || record.rev != rev || record.digest() != digest {
             return Err(corrupt(
@@ -2558,91 +2565,46 @@ impl Store {
         Ok(Some(record))
     }
 
-    fn retain_loom_agent_type_revision(&self, record: &LoomAgentType) -> StoreResult<()> {
+    fn retain_loom_agent_type_revision(
+        connection: &Connection,
+        record: &LoomAgentType,
+    ) -> StoreResult<()> {
         let digest = record.digest();
         validate_loom_revision_address(&record.id, record.rev, &digest)?;
-        let revisions = self.root.join(LOOM_AGENT_REVISIONS_DIR);
-        let type_revisions = revisions.join(&record.id);
-        fs::create_dir_all(&revisions)
-            .map_err(|error| loom_revision_io_error("create directory", &revisions, error))?;
-        // Repeat parent synchronization even when an earlier attempt created
-        // the directory but failed before making that entry durable.
-        sync_loom_revision_directory(&self.root)?;
-        fs::create_dir_all(&type_revisions)
-            .map_err(|error| loom_revision_io_error("create directory", &type_revisions, error))?;
-        sync_loom_revision_directory(&revisions)?;
-        let path = type_revisions.join(format!("{}-{digest}.json", record.rev));
-        if path.exists() {
-            verify_retained_loom_agent_type(&path, record)?;
-            return sync_loom_revision_directory(&type_revisions);
-        }
-        let bytes = serde_json::to_vec(record)
+        let json = serde_json::to_string(record)
             .map_err(|_| corrupt("loom agent type revision is not encodable"))?;
-        let mut temporary_path = None;
-        let mut temporary = None;
-        for _ in 0..32 {
-            let counter = LOOM_AGENT_REVISION_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let candidate =
-                type_revisions.join(format!(".tmp-loom-agent-{}-{counter}", std::process::id()));
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&candidate)
-            {
-                Ok(file) => {
-                    temporary_path = Some(candidate);
-                    temporary = Some(file);
-                    break;
-                }
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-                Err(error) => {
-                    return Err(loom_revision_io_error(
-                        "create temporary revision",
-                        &candidate,
-                        error,
-                    ));
-                }
-            }
-        }
-        let temporary_path = temporary_path.ok_or_else(|| {
-            store_error(
-                ErrorCode::Internal,
-                format!(
-                    "cannot allocate a temporary Loom revision in {}",
-                    type_revisions.display()
-                ),
-                true,
+        let inserted = connection
+            .execute(
+                "INSERT INTO loom_agent_type_revisions(
+                     id, rev, digest, record_json)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(id, rev) DO NOTHING",
+                params![
+                    record.id.as_str(),
+                    i64::from(record.rev),
+                    digest.as_str(),
+                    json.as_str()
+                ],
             )
-        })?;
-        let mut temporary =
-            temporary.ok_or_else(|| corrupt("temporary Loom revision file was not opened"))?;
-        let write_result = temporary
-            .write_all(&bytes)
-            .and_then(|()| temporary.sync_all());
-        drop(temporary);
-        if let Err(error) = write_result {
-            let _ = fs::remove_file(&temporary_path);
-            let _ = sync_loom_revision_directory(&type_revisions);
-            return Err(loom_revision_io_error(
-                "persist temporary revision",
-                &temporary_path,
-                error,
-            ));
+            .map_err(map_sqlite_error)?;
+        if inserted == 1 {
+            return Ok(());
         }
-        let publish_result = match fs::hard_link(&temporary_path, &path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                verify_retained_loom_agent_type(&path, record)
-            }
-            Err(error) => Err(loom_revision_io_error("publish revision", &path, error)),
-        };
-        let remove_result = fs::remove_file(&temporary_path).map_err(|error| {
-            loom_revision_io_error("remove temporary revision", &temporary_path, error)
-        });
-        let sync_result = sync_loom_revision_directory(&type_revisions);
-        publish_result?;
-        remove_result?;
-        sync_result
+        let retained = connection
+            .query_row(
+                "SELECT digest, record_json FROM loom_agent_type_revisions
+                 WHERE id = ?1 AND rev = ?2",
+                params![record.id.as_str(), i64::from(record.rev)],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(map_sqlite_error)?;
+        if retained == (record.digest(), json) {
+            Ok(())
+        } else {
+            Err(corrupt(
+                "retained Loom agent-type revision address contains different content",
+            ))
+        }
     }
 
     /// Compatibility create/idempotency door for one agent type. A NEW id
@@ -2809,9 +2771,9 @@ impl Store {
             let json = serde_json::to_string(&stored)
                 .map_err(|_| corrupt("loom agent type record is not encodable"))?;
             if let Some((_, _, prior)) = &existing {
-                self.retain_loom_agent_type_revision(prior)?;
+                Self::retain_loom_agent_type_revision(&transaction, prior)?;
             }
-            self.retain_loom_agent_type_revision(&stored)?;
+            Self::retain_loom_agent_type_revision(&transaction, &stored)?;
             if is_new {
                 let inserted = transaction
                     .execute(
@@ -2861,7 +2823,7 @@ impl Store {
                 .as_ref()
                 .map(|(_, _, stored)| stored)
                 .ok_or_else(|| corrupt("unchanged Loom agent type has no current record"))?;
-            self.retain_loom_agent_type_revision(retained)?;
+            Self::retain_loom_agent_type_revision(&transaction, retained)?;
             let contract = TypedAgentContract::from_loom_agent_type(&stored).map_err(|error| {
                 store_error(
                     ErrorCode::InvalidArgument,
@@ -3667,7 +3629,7 @@ impl Store {
         if kind == LoomRegistryEntryKind::AgentType {
             let record: LoomAgentType = serde_json::from_str(&record_json)
                 .map_err(|_| corrupt("loom agent type record is not decodable"))?;
-            self.retain_loom_agent_type_revision(&record)?;
+            Self::retain_loom_agent_type_revision(&transaction, &record)?;
         }
         let update = format!("UPDATE {table} SET archived = ?2, updated_at_ms = ?3 WHERE id = ?1");
         let now = now_ms()?;
@@ -3695,35 +3657,22 @@ impl Store {
         let mut connection = self.connection()?;
         let transaction = connection.transaction().map_err(map_sqlite_error)?;
         let through_cursor = loom_registry_head_tx(&transaction)?;
-        let agent_types = loom_agent_type_rows_tx(&transaction, true)?;
-        let workflows = loom_workflow_rows_tx(&transaction, true)?;
-        let mut entries = Vec::with_capacity(agent_types.len().saturating_add(workflows.len()));
-        entries.extend(agent_types.into_iter().map(|(record, archived)| {
-            let entry = LoomRegistryEntryRef {
-                kind: LoomRegistryEntryKind::AgentType,
-                id: record.id.clone(),
-                rev: record.rev,
-                digest: record.digest(),
-                archived,
-            };
-            LoomRegistrySnapshotEntry {
-                entry,
-                record: LoomRegistryRecord::AgentType(record),
-            }
-        }));
-        entries.extend(workflows.into_iter().map(|(record, archived)| {
-            let entry = LoomRegistryEntryRef {
-                kind: LoomRegistryEntryKind::Workflow,
-                id: record.id.clone(),
-                rev: record.rev,
-                digest: record.digest.clone(),
-                archived,
-            };
-            LoomRegistrySnapshotEntry {
-                entry,
-                record: LoomRegistryRecord::Workflow(record),
-            }
-        }));
+        let mut entries = Vec::new();
+        let mut resident_bytes = 0_usize;
+        append_loom_registry_snapshot_rows(
+            &transaction,
+            LoomRegistryEntryKind::AgentType,
+            "loom_agent_types",
+            &mut entries,
+            &mut resident_bytes,
+        )?;
+        append_loom_registry_snapshot_rows(
+            &transaction,
+            LoomRegistryEntryKind::Workflow,
+            "loom_workflows",
+            &mut entries,
+            &mut resident_bytes,
+        )?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(LoomRegistrySnapshot {
             through_cursor,
@@ -3789,8 +3738,7 @@ impl Store {
         let mut deltas = Vec::with_capacity(raw.len());
         for (cursor, kind, id, change, rev, digest, archived) in raw {
             let kind = loom_registry_entry_kind(&kind)?;
-            let record =
-                loom_registry_record_tx(&self.root, &transaction, kind, &id, rev, &digest)?;
+            let record = loom_registry_record_tx(&transaction, kind, &id, rev, &digest)?;
             deltas.push(LoomRegistryDelta {
                 cursor,
                 change: loom_registry_delta_kind(&change)?,
@@ -12435,12 +12383,25 @@ fn load_workflow_backfill_envelopes(
         .query([session_id.as_str()])
         .map_err(map_sqlite_error)?;
     let mut envelopes = Vec::new();
+    let mut resident_bytes = 0_usize;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
-        envelopes.push(decode_envelope_column(row, 0).map_err(|error| {
+        let envelope = decode_envelope_column(row, 0).map_err(|error| {
             corrupt(format!(
                 "invalid workflow-backfill envelope in session {session_id}: {error}"
             ))
-        })?);
+        })?;
+        resident_bytes = resident_bytes.saturating_add(envelope_weight_bytes(&envelope));
+        if resident_bytes > WORKFLOW_BACKFILL_MAX_RESIDENT_BYTES {
+            return Err(store_error(
+                ErrorCode::StoreFull,
+                format!(
+                    "workflow activation backfill for session {session_id} exceeds the bounded \
+                     {WORKFLOW_BACKFILL_MAX_RESIDENT_BYTES}-byte resident budget"
+                ),
+                false,
+            ));
+        }
+        envelopes.push(envelope);
     }
     Ok(envelopes)
 }
@@ -16773,16 +16734,15 @@ fn augment_workflow_graph_envelopes(
     // ordered selection below compares the stable numeric attempt.
     let mut evidence = HashMap::<(GraphId, GraphNodeName, u32), EvidenceRecorded>::new();
     let mut planned = Vec::<(WorkflowGraphJournalEvent, EventId)>::new();
-    let base_payloads = envelopes
-        .iter()
-        .filter_map(|envelope| {
-            serde_json::from_value::<EventPayload>(envelope.payload.clone())
-                .ok()
-                .map(|payload| (envelope.event_id.clone(), payload))
-        })
-        .collect::<Vec<_>>();
-    for (causation_id, payload) in &base_payloads {
-        match payload {
+    // Decode one payload at a time. In particular, the profile-open backfill
+    // already owns its bounded envelope page and must not retain a second
+    // O(page bytes) vector of cloned payload trees.
+    for envelope in envelopes.iter() {
+        let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone()) else {
+            continue;
+        };
+        let causation_id = &envelope.event_id;
+        match &payload {
             EventPayload::TodoGraphAttached(attached) => {
                 todo_inputs.insert(attached.child_graph_id.clone(), attached.clone());
             }
@@ -17318,8 +17278,23 @@ fn backfill_workflow_graph_journals(
             .query_map([], |row| row.get::<_, String>(0))
             .map_err(map_sqlite_error)?;
         let mut session_ids = Vec::new();
+        let mut resident_bytes = 0_usize;
         for row in rows {
-            session_ids.push(SessionId::new(row.map_err(map_sqlite_error)?));
+            let session_id = row.map_err(map_sqlite_error)?;
+            resident_bytes = resident_bytes
+                .saturating_add(std::mem::size_of::<SessionId>())
+                .saturating_add(session_id.len());
+            if resident_bytes > WORKFLOW_BACKFILL_MAX_RESIDENT_BYTES {
+                return Err(store_error(
+                    ErrorCode::StoreFull,
+                    format!(
+                        "workflow activation backfill session index exceeds the bounded \
+                         {WORKFLOW_BACKFILL_MAX_RESIDENT_BYTES}-byte resident budget"
+                    ),
+                    false,
+                ));
+            }
+            session_ids.push(SessionId::new(session_id));
         }
         session_ids
     };
@@ -21481,6 +21456,73 @@ fn loom_registry_head_tx(connection: &Connection) -> StoreResult<u64> {
         })
 }
 
+fn append_loom_registry_snapshot_rows(
+    connection: &Connection,
+    kind: LoomRegistryEntryKind,
+    table: &str,
+    entries: &mut Vec<LoomRegistrySnapshotEntry>,
+    resident_bytes: &mut usize,
+) -> StoreResult<()> {
+    let sql = format!("SELECT id, rev, digest, archived, record_json FROM {table} ORDER BY id");
+    let mut statement = connection.prepare(&sql).map_err(map_sqlite_error)?;
+    let mut rows = statement.query([]).map_err(map_sqlite_error)?;
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let id: String = row.get(0).map_err(map_sqlite_error)?;
+        let rev = u32::try_from(row.get::<_, i64>(1).map_err(map_sqlite_error)?)
+            .map_err(|_| corrupt("Loom registry snapshot revision is out of range"))?;
+        let digest: String = row.get(2).map_err(map_sqlite_error)?;
+        let archived: bool = row.get(3).map_err(map_sqlite_error)?;
+        let record_json: String = row.get(4).map_err(map_sqlite_error)?;
+        // Four times the canonical JSON plus fixed/string storage is a
+        // conservative charge for the decoded record's Vec/String headers,
+        // allocator bookkeeping, and the snapshot entry itself. Direct
+        // registrations bound every individual record; this aggregate fence
+        // bounds registry cardinality without first materializing all rows.
+        let row_charge = record_json
+            .len()
+            .saturating_mul(4)
+            .saturating_add(std::mem::size_of::<LoomRegistrySnapshotEntry>())
+            .saturating_add(id.len())
+            .saturating_add(digest.len());
+        let next_resident_bytes = resident_bytes.saturating_add(row_charge);
+        if next_resident_bytes > LOOM_REGISTRY_SNAPSHOT_MAX_RESIDENT_BYTES {
+            return Err(store_error(
+                ErrorCode::StoreFull,
+                format!(
+                    "Loom registry snapshot exceeds the bounded \
+                     {LOOM_REGISTRY_SNAPSHOT_MAX_RESIDENT_BYTES}-byte resident budget"
+                ),
+                false,
+            ));
+        }
+        let record = match kind {
+            LoomRegistryEntryKind::AgentType => LoomRegistryRecord::AgentType(
+                serde_json::from_str(&record_json)
+                    .map_err(|_| corrupt("loom agent type record is not decodable"))?,
+            ),
+            LoomRegistryEntryKind::Workflow => LoomRegistryRecord::Workflow(
+                serde_json::from_str(&record_json)
+                    .map_err(|_| corrupt("loom workflow record is not decodable"))?,
+            ),
+            LoomRegistryEntryKind::Unknown => {
+                return Err(corrupt("unknown Loom registry snapshot kind"));
+            }
+        };
+        *resident_bytes = next_resident_bytes;
+        entries.push(LoomRegistrySnapshotEntry {
+            entry: LoomRegistryEntryRef {
+                kind,
+                id,
+                rev,
+                digest,
+                archived,
+            },
+            record,
+        });
+    }
+    Ok(())
+}
+
 fn loom_agent_type_rows_tx(
     connection: &Connection,
     include_archived: bool,
@@ -21567,7 +21609,6 @@ fn loom_archived_entries_tx(connection: &Connection) -> StoreResult<Vec<LoomRegi
 }
 
 fn loom_registry_record_tx(
-    store_root: &Path,
     connection: &Connection,
     kind: LoomRegistryEntryKind,
     id: &str,
@@ -21577,13 +21618,19 @@ fn loom_registry_record_tx(
     match kind {
         LoomRegistryEntryKind::AgentType => {
             validate_loom_revision_address(id, rev, digest)?;
-            let path = store_root
-                .join(LOOM_AGENT_REVISIONS_DIR)
-                .join(id)
-                .join(format!("{rev}-{digest}.json"));
-            let bytes =
-                fs::read(&path).map_err(|error| loom_revision_io_error("read", &path, error))?;
-            let record: LoomAgentType = serde_json::from_slice(&bytes)
+            let json = connection
+                .query_row(
+                    "SELECT record_json FROM loom_agent_type_revisions
+                     WHERE id = ?1 AND rev = ?2 AND digest = ?3",
+                    params![id, i64::from(rev), digest],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(map_sqlite_error)?
+                .ok_or_else(|| {
+                    corrupt("retained Loom agent-type revision for registry replay is missing")
+                })?;
+            let record: LoomAgentType = serde_json::from_str(&json)
                 .map_err(|_| corrupt("retained Loom agent-type revision is not decodable"))?;
             if record.id != id || record.rev != rev || record.digest() != digest {
                 return Err(corrupt(
@@ -21632,38 +21679,6 @@ fn validate_loom_revision_address(id: &str, rev: u32, digest: &str) -> StoreResu
             false,
         ))
     }
-}
-
-fn verify_retained_loom_agent_type(path: &Path, expected: &LoomAgentType) -> StoreResult<()> {
-    let bytes = fs::read(path)
-        .map_err(|error| loom_revision_io_error("read retained revision", path, error))?;
-    let retained: LoomAgentType = serde_json::from_slice(&bytes)
-        .map_err(|_| corrupt("retained Loom agent-type revision is not decodable"))?;
-    if retained == *expected {
-        Ok(())
-    } else {
-        Err(corrupt(
-            "retained Loom agent-type digest addresses different content",
-        ))
-    }
-}
-
-fn sync_loom_revision_directory(path: &Path) -> StoreResult<()> {
-    haider_platform::sync_directory(path)
-        .map_err(|error| loom_revision_io_error("sync directory", path, error))
-}
-
-fn loom_revision_io_error(action: &str, path: &Path, error: std::io::Error) -> HaiderError {
-    let code = match error.kind() {
-        ErrorKind::StorageFull => ErrorCode::StoreFull,
-        ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem => ErrorCode::StoreReadOnly,
-        _ => ErrorCode::Internal,
-    };
-    store_error(
-        code,
-        format!("cannot {action} {}: {error}", path.display()),
-        false,
-    )
 }
 
 /// Round 3 — canonical form BEFORE validation and digesting: typed I/O is

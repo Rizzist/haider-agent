@@ -337,6 +337,5 @@ pub(crate) fn prepare_typed_workflow_node_dispatch(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 #[path = "typed_agent_executor_tests.rs"]
 mod typed_agent_executor_tests;

@@ -1,7 +1,7 @@
+#![allow(clippy::expect_used)]
 //! Unit tests for the daemon account seam: physical-alias namespacing,
 //! staged-secret laws, the login receipt shape, and the R10 startup
 //! reconciliation over every crash boundary.
-#![allow(clippy::expect_used)]
 
 use super::*;
 use haider_core::SqliteStoreHandle;

@@ -1,6 +1,5 @@
-//! v0.0.963 L3 workflow runtime projection laws.
-
 #![allow(clippy::expect_used)]
+//! v0.0.963 L3 workflow runtime projection laws.
 
 use haider_client::{
     WorkflowEvidenceRef, WorkflowGraphChange, WorkflowGraphEdge, WorkflowGraphEdgeKind,

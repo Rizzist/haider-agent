@@ -1,6 +1,5 @@
-//! Convergence Graph M1 durability and reduction laws.
-
 #![allow(clippy::expect_used, clippy::panic)]
+//! Convergence Graph M1 durability and reduction laws.
 
 use std::collections::HashSet;
 

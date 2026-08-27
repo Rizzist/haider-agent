@@ -1,7 +1,7 @@
+#![allow(clippy::expect_used)]
 //! W-ROLL — the child workflow-run rollup projection: state vocabulary,
 //! node tallies, gate naming, and the materiality/dedup laws that keep a
 //! run of N nodes at O(N) published rollups.
-#![allow(clippy::expect_used)]
 
 use crate::delegation::{graph_rollup, rollup_is_material, same_rollup_transition};
 use haider_protocol::EventPayload;

@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! B1 — the durable Loom registry: agent types + pipe-source workflows.
 //! The store is the compiler authority (callers send SOURCE, the registry
 //! compiles inside the transaction) and owns the rev law: new id → rev 1,

@@ -652,6 +652,17 @@ const MIGRATIONS: &[Migration] = &[
 
             CREATE INDEX loom_registry_events_entry_cursor
             ON loom_registry_events(entry_kind, entry_id, cursor);
+
+            CREATE TABLE loom_agent_type_revisions (
+                id          TEXT NOT NULL,
+                rev         INTEGER NOT NULL CHECK (rev > 0),
+                digest      TEXT NOT NULL CHECK (length(digest) = 32),
+                record_json TEXT NOT NULL,
+                PRIMARY KEY (id, rev)
+            );
+
+            INSERT INTO loom_agent_type_revisions(id, rev, digest, record_json)
+            SELECT id, rev, digest, record_json FROM loom_agent_types;
         ",
     },
 ];

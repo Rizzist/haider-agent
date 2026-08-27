@@ -1,5 +1,5 @@
-//! Additive provider model-detail wire compatibility.
 #![allow(clippy::expect_used)]
+//! Additive provider model-detail wire compatibility.
 
 use haider_protocol::credential::AuthMethod;
 use haider_rpc::{
@@ -69,4 +69,38 @@ fn provider_summary_model_details_round_trip_names_and_windows() {
     assert_eq!(decoded.model_details[0].context_window, Some(200_000));
     assert_eq!(decoded.model_details[1].name, "frontier-b");
     assert_eq!(decoded.model_details[1].context_window, None);
+}
+
+/// MUTATION CHECK: require the additive response-open budget, omit a present
+/// override, or serialize the absent value. Expected runtime failure: the
+/// N-1 decode or exact presence/absence assertions below change.
+#[test]
+fn provider_summary_response_open_timeout_preserves_typed_absence() {
+    let old: ProviderSummaryWire = serde_json::from_value(serde_json::json!({
+        "provider": "openai",
+        "api_family": "openai_responses",
+        "models": [],
+        "auth_methods": [],
+        "availability": "available",
+        "enabled": true
+    }))
+    .expect("pre-timeout provider summary decodes");
+    assert_eq!(old.response_open_timeout_ms, None);
+    assert!(
+        serde_json::to_value(&old)
+            .expect("old summary encodes")
+            .get("response_open_timeout_ms")
+            .is_none()
+    );
+
+    let mut current = old;
+    current.response_open_timeout_ms = Some(75_000);
+    let value = serde_json::to_value(&current).expect("current summary encodes");
+    assert_eq!(value["response_open_timeout_ms"], 75_000);
+    assert_eq!(
+        serde_json::from_value::<ProviderSummaryWire>(value)
+            .expect("current summary decodes")
+            .response_open_timeout_ms,
+        Some(75_000)
+    );
 }

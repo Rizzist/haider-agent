@@ -1,7 +1,6 @@
+#![allow(clippy::expect_used)]
 //! CU-1 daemon round trip: tool -> bounded CAS ref -> durable result ->
 //! provider-neutral request with ephemeral resolved bytes. No network.
-
-#![allow(clippy::expect_used)]
 
 use crate::session_hub::{HubStoreHandle, SessionHub, SessionHubConfig};
 use crate::worker::{

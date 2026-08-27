@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! Explicitly gated network smoke and fixture-promotion harness.
 //!
 //! These tests are ignored by default. The C1 lane must not run them.

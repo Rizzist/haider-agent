@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! Unit tests for the drain barrier's arbitration helpers.
 //!
 //! These are crate-internal on purpose: `bounded_finalization` and

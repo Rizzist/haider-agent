@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! W-flow inline identity — the session agent-type binding in the TUI:
 //! the /loom Types pane's fixed-head `∅ none` row and `p` bind over the
 //! receipted `session.select_agent_type`, receipt/refusal flash grammar,

@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! G4a — the local OSS presets (Ollama, LM Studio): the SAME custom card
 //! the HF/Zen/Go presets open, prefilled with the servers' default loopback
 //! origins, but KEYLESS — the configure carries `auth_requirement: none`

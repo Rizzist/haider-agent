@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! G1 daemon-boundary laws for `todo_write`: registry advertisement and
 //! routing (L1), live-turn Plan fact flow (L3), the durable Todos node (L4),
 //! and the root-only tool pack (L5).

@@ -1,6 +1,5 @@
-//! Private session-hub accounting tests.
-
 #![allow(clippy::expect_used)]
+//! Private session-hub accounting tests.
 
 use super::*;
 use haider_protocol::EventPayload;

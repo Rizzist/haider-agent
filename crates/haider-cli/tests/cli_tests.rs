@@ -1,5 +1,5 @@
-//! Black-box tests for the `haider` binary surface.
 #![allow(clippy::expect_used)] // tests may expect; the lint guards src/ only
+//! Black-box tests for the `haider` binary surface.
 
 use haider_protocol::EventPayload;
 use haider_protocol::effect::{AuthorizationVerdict, EffectPhase};
@@ -35,8 +35,8 @@ use cli_main::run::{
 use cli_main::{ImportDispatch, ImportSource, parse_import_dispatch};
 use haider_client::{
     DisconnectReason, EnsureError, HeadlessBlockingReason, HeadlessFailureCode, HeadlessOutcome,
-    HeadlessPermissionDenial, HeadlessRunError, HeadlessRunFailure, HeadlessRunResult,
-    load_image_attachment,
+    HeadlessPermissionDenial, HeadlessRunError, HeadlessRunEvents, HeadlessRunFailure,
+    HeadlessRunResult, load_image_attachment,
 };
 
 const DEFAULT_FAKE_SCRIPT: &str = concat!(
@@ -772,8 +772,12 @@ fn run_prompt_flag_and_piped_stdin_are_process_parity() {
     }
 }
 
-#[test]
-fn detached_run_lifecycle_is_addressable_by_run_id() {
+enum DetachedLifecycleFailure {
+    AlreadyTerminal,
+    Other(String),
+}
+
+fn detached_run_lifecycle_attempt() -> Result<(), DetachedLifecycleFailure> {
     let mut starter = haider();
     starter
         .args([
@@ -787,14 +791,24 @@ fn detached_run_lifecycle_is_addressable_by_run_id() {
         ])
         .env("HAIDER_TEST_FAKE_PROVIDER", r#"[{"step":"hang"}]"#);
     let started = output_with_boot_retry(&mut starter);
-    assert!(
-        started.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&started.stderr)
-    );
-    let started: serde_json::Value = serde_json::from_slice(&started.stdout).expect("start JSON");
-    assert_eq!(started["outcome"], "started");
-    let run_id = started["run_id"].as_str().expect("run id").to_owned();
+    if !started.status.success() {
+        return Err(DetachedLifecycleFailure::Other(format!(
+            "start stderr: {}",
+            String::from_utf8_lossy(&started.stderr)
+        )));
+    }
+    let started: serde_json::Value = serde_json::from_slice(&started.stdout)
+        .map_err(|error| DetachedLifecycleFailure::Other(format!("start JSON: {error}")))?;
+    if started["outcome"] != "started" {
+        return Err(DetachedLifecycleFailure::Other(format!(
+            "unexpected start outcome: {}",
+            started["outcome"]
+        )));
+    }
+    let run_id = started["run_id"]
+        .as_str()
+        .ok_or_else(|| DetachedLifecycleFailure::Other("start omitted run id".into()))?
+        .to_owned();
 
     let invoke = |arguments: &[&str]| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_haider"));
@@ -806,27 +820,60 @@ fn detached_run_lifecycle_is_addressable_by_run_id() {
         bounded_output(&mut command, None)
     };
     let status = invoke(&["run", "--status", &run_id, "--json"]);
-    assert!(
-        status.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&status.stderr)
-    );
-    let status: serde_json::Value = serde_json::from_slice(&status.stdout).expect("status JSON");
-    assert_eq!(status["schema"], "haider.run.status.v1");
-    assert_eq!(status["result"]["run_id"], run_id);
+    if !status.status.success() {
+        return Err(DetachedLifecycleFailure::Other(format!(
+            "status stderr: {}",
+            String::from_utf8_lossy(&status.stderr)
+        )));
+    }
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout)
+        .map_err(|error| DetachedLifecycleFailure::Other(format!("status JSON: {error}")))?;
+    if status["schema"] != "haider.run.status.v1" || status["result"]["run_id"] != run_id {
+        return Err(DetachedLifecycleFailure::Other(format!(
+            "unexpected lifecycle status: {status}"
+        )));
+    }
 
     let stopped = invoke(&["run", "--stop", &run_id, "--json"]);
-    assert!(
-        stopped.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&stopped.stderr)
-    );
-    let stopped: serde_json::Value = serde_json::from_slice(&stopped.stdout).expect("stop JSON");
-    assert_eq!(stopped["schema"], "haider.run.stop.v1");
-    assert!(matches!(
-        stopped["result"]["status"].as_str(),
-        Some("accepted" | "already_terminal")
-    ));
+    if !stopped.status.success() {
+        return Err(DetachedLifecycleFailure::Other(format!(
+            "stop stderr: {}",
+            String::from_utf8_lossy(&stopped.stderr)
+        )));
+    }
+    let stopped: serde_json::Value = serde_json::from_slice(&stopped.stdout)
+        .map_err(|error| DetachedLifecycleFailure::Other(format!("stop JSON: {error}")))?;
+    if stopped["schema"] != "haider.run.stop.v1" {
+        return Err(DetachedLifecycleFailure::Other(format!(
+            "unexpected stop response: {stopped}"
+        )));
+    }
+    match stopped["result"]["status"].as_str() {
+        Some("accepted") => Ok(()),
+        Some("already_terminal") => Err(DetachedLifecycleFailure::AlreadyTerminal),
+        status => Err(DetachedLifecycleFailure::Other(format!(
+            "unexpected stop status: {status:?}"
+        ))),
+    }
+}
+
+#[test]
+fn detached_run_lifecycle_is_addressable_by_run_id() {
+    let result = detached_run_lifecycle_attempt();
+    #[cfg(windows)]
+    let result = match result {
+        // One bounded retry starts a wholly fresh profile, daemon, run, and
+        // command identity. AlreadyTerminal never counts as cancellation.
+        Err(DetachedLifecycleFailure::AlreadyTerminal) => detached_run_lifecycle_attempt(),
+        result => result,
+    };
+    match result {
+        Ok(()) => {}
+        Err(DetachedLifecycleFailure::AlreadyTerminal) => {
+            panic!("fresh hanging run became terminal before cancellation")
+        }
+        Err(DetachedLifecycleFailure::Other(message)) => panic!("{message}"),
+    }
 }
 
 #[test]
@@ -2043,7 +2090,7 @@ fn result(outcome: HeadlessOutcome, failure: Option<HeadlessRunFailure>) -> Head
         outcome,
         response: None,
         usage: None,
-        events: Vec::new(),
+        events: HeadlessRunEvents::empty(RunId::new("run-json")),
         budget_exhausted: None,
         replay: None,
         permission_denials: Vec::new(),
@@ -2491,34 +2538,38 @@ fn print_and_json_outputs_pin_bytes_schema_and_nulls() {
         .expect("fixed typed envelope")
     };
     let mut typed_stream = result(HeadlessOutcome::Done, None);
-    typed_stream.events = vec![
-        envelope(
-            7,
-            "event-tool",
-            serde_json::json!({
-                "type": "tool_result",
-                "call_id": "call-1",
-                "result": {"preview": "ok", "truncated": false, "status": "completed"},
-            }),
-        ),
-        envelope(
-            8,
-            "event-usage",
-            serde_json::json!({
-                "type": "usage",
-                "input": 10,
-                "output": 2,
-                "source": "provider_reported",
-                "normalized": {
-                    "logical_input": 10,
-                    "uncached_input": 6,
-                    "cache_read_input": 4,
-                    "cache_write_input": 3,
-                    "billed_output": 2
-                }
-            }),
-        ),
-    ];
+    typed_stream.events = HeadlessRunEvents::from_envelopes(
+        RunId::new("run-json"),
+        [
+            envelope(
+                7,
+                "event-tool",
+                serde_json::json!({
+                    "type": "tool_result",
+                    "call_id": "call-1",
+                    "result": {"preview": "ok", "truncated": false, "status": "completed"},
+                }),
+            ),
+            envelope(
+                8,
+                "event-usage",
+                serde_json::json!({
+                    "type": "usage",
+                    "input": 10,
+                    "output": 2,
+                    "source": "provider_reported",
+                    "normalized": {
+                        "logical_input": 10,
+                        "uncached_input": 6,
+                        "cache_read_input": 4,
+                        "cache_write_input": 3,
+                        "billed_output": 2
+                    }
+                }),
+            ),
+        ],
+    )
+    .expect("fixture event ledger");
     let mut first = Vec::new();
     let mut second = Vec::new();
     write_final(&mut first, RunOutput::Json, &typed_stream).expect("first stable stream");

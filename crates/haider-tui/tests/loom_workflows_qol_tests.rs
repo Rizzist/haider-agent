@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! W-flow — the Loom/Workflows QOL wave: the /workflows pane's fixed-head
 //! row space (`∅ none` first and undeletable, then the built-in catalog
 //! entries, then the REGISTERED section), ⌃P pin-by-name to the bound

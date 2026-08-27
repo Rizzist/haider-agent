@@ -1,6 +1,5 @@
-//! v0.0.963 L3 adapter laws over L2's exact RPC graph shapes.
-
 #![allow(clippy::expect_used)]
+//! v0.0.963 L3 adapter laws over L2's exact RPC graph shapes.
 
 use haider_client::{WorkflowGraphProjection, WorkflowGraphRpcAdapter, WorkflowNodeState};
 use haider_protocol::graph::{

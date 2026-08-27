@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! W5g-1 — the identity's context window comes from the DISCOVERED
 //! catalog (real limits, never guessed).
 //!

@@ -1,7 +1,7 @@
+#![allow(clippy::expect_used)]
 //! W5g-4 — the `+ Custom (OpenAI-compatible)` card: sim-verbatim demo
 //! fabrication, and the live `provider.configure` front door with
 //! editable name/origin fields that chains into the masked key card.
-#![allow(clippy::expect_used)]
 
 use haider_protocol::credential::AuthMethod;
 use haider_tui::app::{AppEvent, AppModel, CustomField, CustomPhase, Hit, LoginFocus, RuntimeMode};

@@ -1,6 +1,6 @@
+#![allow(clippy::expect_used)]
 //! W-CFG — the headless session-config door and model-library enumeration:
 //! flag vocabulary, feature preconditions, and the provider/model selector.
-#![allow(clippy::expect_used)]
 #![allow(dead_code)]
 
 #[path = "../src/main.rs"]

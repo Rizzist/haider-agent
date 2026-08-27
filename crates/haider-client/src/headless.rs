@@ -12,7 +12,7 @@ mod tests;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::future::{Future, pending};
-use std::io::{BufRead as _, BufReader, BufWriter, Read as _, Write as _};
+use std::io::{BufRead as _, BufReader, BufWriter, Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -41,6 +41,7 @@ use haider_rpc::{
     ERROR_CODE_ALREADY_RESOLVED, FEATURE_ARTIFACT_PUT_V1, FEATURE_AUTONOMOUS_INTERACTION_V1,
     FEATURE_SESSION_PERMISSION_OVERRIDES_V1, RequestBody, ResponseBody, SeqRange, WireFrame,
 };
+use serde::ser::{Error as _, SerializeSeq as _};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -457,12 +458,12 @@ pub struct HeadlessPermissionDenial {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HeadlessOutcome {
-    Started,
     Done,
     Errored,
     Cancelled,
     Timeout,
     InputRequired,
+    Started,
 }
 
 /// Why a non-interactive run could not honestly continue.
@@ -557,7 +558,7 @@ pub struct HeadlessRunResult {
     /// Lossless correlated journal stream. Event payloads are the shared
     /// client contract, including typed tool results and normalized cache
     /// read/write usage; unknown future payloads remain intact.
-    pub events: Vec<RawEnvelope>,
+    pub events: HeadlessRunEvents,
     pub budget_exhausted: Option<RunBudgetExhaustedV1>,
     pub replay: Option<ReplayDivergenceV1>,
     pub permission_denials: Vec<HeadlessPermissionDenial>,
@@ -566,6 +567,220 @@ pub struct HeadlessRunResult {
     /// Background tasks with a durable started fact and no completed fact
     /// when the run's terminal was observed (W-A decision 8).
     pub background_tasks_running: Vec<HeadlessBackgroundTask>,
+}
+
+/// Disk-backed, lossless correlated journal stream for a headless run.
+///
+/// Iteration decodes one envelope at a time, so retaining a run result is
+/// O(1) resident memory with respect to the total journal byte count. The
+/// private spool is deleted after the last clone is dropped.
+#[derive(Clone)]
+pub struct HeadlessRunEvents {
+    run_id: RunId,
+    len: usize,
+    spool: Option<Arc<HeadlessEventSpoolCleanup>>,
+}
+
+impl HeadlessRunEvents {
+    #[must_use]
+    pub fn empty(run_id: RunId) -> Self {
+        Self {
+            run_id,
+            len: 0,
+            spool: None,
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Opens an independent streaming reader at the start of the ledger.
+    pub fn iter(&self) -> std::io::Result<HeadlessRunEventReader> {
+        let file = self
+            .spool
+            .as_ref()
+            .map(|spool| File::open(&spool.path))
+            .transpose()?;
+        Ok(HeadlessRunEventReader {
+            file: file.map(BufReader::new),
+            run_id: self.run_id.clone(),
+            expected: self.len,
+            yielded: 0,
+            failed: false,
+        })
+    }
+
+    /// Visits every envelope without materializing the ledger.
+    pub fn try_for_each(
+        &self,
+        mut visit: impl FnMut(RawEnvelope) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        for envelope in self.iter()? {
+            visit(envelope?)?;
+        }
+        Ok(())
+    }
+
+    /// Builds a private disk ledger from an already bounded fixture batch.
+    pub fn from_envelopes(
+        run_id: RunId,
+        envelopes: impl IntoIterator<Item = RawEnvelope>,
+    ) -> Result<Self, HeadlessRunError> {
+        let spool = create_headless_event_spool()?;
+        let HeadlessEventSpool {
+            mut writer,
+            reader,
+            pending,
+            ..
+        } = spool;
+        drop(reader);
+        drop(pending);
+        let mut len = 0_usize;
+        for envelope in envelopes {
+            if envelope.run_id.as_ref() != Some(&run_id) {
+                return Err(protocol_error(
+                    "event spool",
+                    "fixture envelope does not match the ledger run id",
+                ));
+            }
+            writer.push(&HeadlessEvent::Envelope(Box::new(envelope)));
+            len = len.saturating_add(1);
+        }
+        writer.finish(run_id, len)
+    }
+}
+
+impl std::fmt::Debug for HeadlessRunEvents {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HeadlessRunEvents")
+            .field("run_id", &self.run_id)
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for HeadlessRunEvents {
+    fn eq(&self, other: &Self) -> bool {
+        if self.run_id != other.run_id || self.len != other.len {
+            return false;
+        }
+        let (Ok(mut left), Ok(mut right)) = (self.iter(), other.iter()) else {
+            return false;
+        };
+        loop {
+            match (left.next(), right.next()) {
+                (None, None) => return true,
+                (Some(Ok(left)), Some(Ok(right))) if left == right => {}
+                _ => return false,
+            }
+        }
+    }
+}
+
+impl Serialize for HeadlessRunEvents {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.len))?;
+        let events = self.iter().map_err(S::Error::custom)?;
+        for envelope in events {
+            sequence.serialize_element(&envelope.map_err(S::Error::custom)?)?;
+        }
+        sequence.end()
+    }
+}
+
+/// Streaming reader for [`HeadlessRunEvents`].
+pub struct HeadlessRunEventReader {
+    file: Option<BufReader<File>>,
+    run_id: RunId,
+    expected: usize,
+    yielded: usize,
+    failed: bool,
+}
+
+impl Iterator for HeadlessRunEventReader {
+    type Item = std::io::Result<RawEnvelope>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        loop {
+            let Some(file) = self.file.as_mut() else {
+                if self.yielded == self.expected {
+                    return None;
+                }
+                self.failed = true;
+                return Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "headless event ledger is absent",
+                )));
+            };
+            let mut record = Vec::new();
+            let read = match file.read_until(b'\n', &mut record) {
+                Ok(read) => read,
+                Err(error) => {
+                    self.failed = true;
+                    return Some(Err(error));
+                }
+            };
+            if read == 0 {
+                if self.yielded == self.expected {
+                    return None;
+                }
+                self.failed = true;
+                return Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "headless event ledger ended after {} of {} envelopes",
+                        self.yielded, self.expected
+                    ),
+                )));
+            }
+            if record.last() != Some(&b'\n') {
+                self.failed = true;
+                return Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "headless event ledger has a partial final record",
+                )));
+            }
+            let event = match serde_json::from_slice::<HeadlessEvent>(&record[..record.len() - 1]) {
+                Ok(event) => event,
+                Err(error) => {
+                    self.failed = true;
+                    return Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("cannot decode headless event ledger: {error}"),
+                    )));
+                }
+            };
+            let HeadlessEvent::Envelope(envelope) = event else {
+                continue;
+            };
+            if envelope.run_id.as_ref() != Some(&self.run_id) {
+                continue;
+            }
+            if self.yielded == self.expected {
+                self.failed = true;
+                return Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "headless event ledger contains more envelopes than recorded",
+                )));
+            }
+            self.yielded = self.yielded.saturating_add(1);
+            return Some(Ok(*envelope));
+        }
+    }
 }
 
 /// Durable lifecycle snapshot resolved by run id, independent of a live
@@ -858,6 +1073,144 @@ impl Drop for HeadlessEventSpoolCleanup {
     }
 }
 
+struct BufferedWireFrames {
+    file: BufWriter<File>,
+    len: usize,
+    cleanup: Arc<HeadlessEventSpoolCleanup>,
+}
+
+impl BufferedWireFrames {
+    fn create() -> Result<Self, HeadlessRunError> {
+        let path = std::env::temp_dir().join(format!("{}.jsonl", command_id("haider-replay")));
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options
+            .open(&path)
+            .map_err(|error| HeadlessRunError::Protocol {
+                stage: "submit replay spool",
+                message: format!("cannot create private replay spool: {error}"),
+            })?;
+        Ok(Self {
+            file: BufWriter::new(file),
+            len: 0,
+            cleanup: Arc::new(HeadlessEventSpoolCleanup { path }),
+        })
+    }
+
+    fn clear(&mut self) -> Result<(), HeadlessRunError> {
+        self.file
+            .flush()
+            .and_then(|()| self.file.get_mut().set_len(0))
+            .and_then(|()| self.file.get_mut().seek(std::io::SeekFrom::Start(0)))
+            .map_err(|error| HeadlessRunError::Protocol {
+                stage: "submit replay spool",
+                message: format!("cannot reset replay spool: {error}"),
+            })?;
+        self.len = 0;
+        Ok(())
+    }
+
+    fn push(&mut self, frame: &WireFrame) -> Result<(), HeadlessRunError> {
+        serde_json::to_writer(&mut self.file, frame)
+            .map_err(std::io::Error::other)
+            .and_then(|()| self.file.write_all(b"\n"))
+            .and_then(|()| self.file.flush())
+            .map_err(|error| HeadlessRunError::Protocol {
+                stage: "submit replay spool",
+                message: format!("cannot write replay spool: {error}"),
+            })?;
+        self.len = self.len.saturating_add(1);
+        Ok(())
+    }
+
+    fn reader(&mut self) -> Result<BufferedWireFrameReader, HeadlessRunError> {
+        self.file
+            .flush()
+            .map_err(|error| HeadlessRunError::Protocol {
+                stage: "submit replay spool",
+                message: format!("cannot flush replay spool: {error}"),
+            })?;
+        let file = File::open(&self.cleanup.path).map_err(|error| HeadlessRunError::Protocol {
+            stage: "submit replay spool",
+            message: format!("cannot open replay spool: {error}"),
+        })?;
+        Ok(BufferedWireFrameReader {
+            file: BufReader::new(file),
+            expected: self.len,
+            yielded: 0,
+            failed: false,
+            _cleanup: Arc::clone(&self.cleanup),
+        })
+    }
+}
+
+struct BufferedWireFrameReader {
+    file: BufReader<File>,
+    expected: usize,
+    yielded: usize,
+    failed: bool,
+    _cleanup: Arc<HeadlessEventSpoolCleanup>,
+}
+
+impl Iterator for BufferedWireFrameReader {
+    type Item = Result<WireFrame, HeadlessRunError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        let mut record = Vec::new();
+        let read = match self.file.read_until(b'\n', &mut record) {
+            Ok(read) => read,
+            Err(error) => {
+                self.failed = true;
+                return Some(Err(protocol_error(
+                    "submit replay spool",
+                    &format!("cannot read replay spool: {error}"),
+                )));
+            }
+        };
+        if read == 0 {
+            if self.yielded == self.expected {
+                return None;
+            }
+            self.failed = true;
+            return Some(Err(protocol_error(
+                "submit replay spool",
+                "replay spool ended before its recorded frame count",
+            )));
+        }
+        if record.last() != Some(&b'\n') {
+            self.failed = true;
+            return Some(Err(protocol_error(
+                "submit replay spool",
+                "replay spool has a partial final record",
+            )));
+        }
+        if self.yielded == self.expected {
+            self.failed = true;
+            return Some(Err(protocol_error(
+                "submit replay spool",
+                "replay spool contains more frames than recorded",
+            )));
+        }
+        let frame = serde_json::from_slice(&record[..record.len() - 1]).map_err(|error| {
+            protocol_error(
+                "submit replay spool",
+                &format!("cannot decode replay spool: {error}"),
+            )
+        });
+        if frame.is_err() {
+            self.failed = true;
+        } else {
+            self.yielded = self.yielded.saturating_add(1);
+        }
+        Some(frame)
+    }
+}
+
 struct HeadlessEventSpool {
     writer: HeadlessEventSpoolWriter,
     reader: HeadlessEventSpoolReader,
@@ -868,9 +1221,6 @@ struct HeadlessEventSpool {
 
 impl HeadlessEventSpoolWriter {
     fn push(&mut self, event: &HeadlessEvent) {
-        if !self.output_open.load(Ordering::Relaxed) {
-            return;
-        }
         let _io_guard = match self.io_gate.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -887,7 +1237,35 @@ impl HeadlessEventSpoolWriter {
             }
             return;
         }
-        let _ = self.ready.try_send(());
+        if self.output_open.load(Ordering::Relaxed) {
+            let _ = self.ready.try_send(());
+        }
+    }
+
+    fn finish(mut self, run_id: RunId, len: usize) -> Result<HeadlessRunEvents, HeadlessRunError> {
+        if let Err(error) = self.file.flush() {
+            return Err(HeadlessRunError::Protocol {
+                stage: "event spool",
+                message: format!("cannot flush event ledger: {error}"),
+            });
+        }
+        let error = match self.error.lock() {
+            Ok(mut error) => error.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(message) = error {
+            return Err(HeadlessRunError::Protocol {
+                stage: "event spool",
+                message,
+            });
+        }
+        let cleanup = Arc::clone(&self._cleanup);
+        drop(self);
+        Ok(HeadlessRunEvents {
+            run_id,
+            len,
+            spool: Some(cleanup),
+        })
     }
 }
 
@@ -1001,7 +1379,7 @@ struct HeadlessReducer {
     /// W-A: task id → (name, running) from the additive task facts, in
     /// deterministic id order for the run summary.
     background_tasks: BTreeMap<String, (String, bool)>,
-    events: Vec<RawEnvelope>,
+    event_count: usize,
     budget_exhausted: Option<RunBudgetExhaustedV1>,
 }
 
@@ -1022,7 +1400,7 @@ impl HeadlessReducer {
             cancel_observed: false,
             actions: VecDeque::new(),
             background_tasks: BTreeMap::new(),
-            events: Vec::new(),
+            event_count: 0,
             budget_exhausted: None,
             output,
         }
@@ -1053,7 +1431,7 @@ impl HeadlessReducer {
         self.last_applied = envelope.seq;
         let correlated = self.is_correlated(&envelope);
         if correlated {
-            self.events.push(envelope.clone());
+            self.event_count = self.event_count.saturating_add(1);
         }
         // W-A: background task facts are SESSION-scoped (they outlive turns
         // by design) and ride the additive union outside `EventPayload` —
@@ -1511,8 +1889,17 @@ pub async fn headless_run_events(
     profile: &ResolvedProfile,
     ensure: EnsureOptions,
     status: &HeadlessRunStatus,
-) -> Result<Vec<RawEnvelope>, HeadlessRunError> {
-    let mut events = Vec::new();
+) -> Result<HeadlessRunEvents, HeadlessRunError> {
+    let spool = create_headless_event_spool()?;
+    let HeadlessEventSpool {
+        mut writer,
+        reader,
+        pending,
+        ..
+    } = spool;
+    drop(reader);
+    drop(pending);
+    let mut event_count = 0_usize;
     let mut start_seq = 1_u64;
     while start_seq <= status.head_seq {
         let end_seq = start_seq.saturating_add(1023).min(status.head_seq);
@@ -1528,12 +1915,14 @@ pub async fn headless_run_events(
         .await?;
         match response {
             ResponseBody::SessionRead { result } if result.session_id == status.session_id => {
-                events.extend(
-                    result
-                        .envelopes
-                        .into_iter()
-                        .filter(|envelope| envelope.run_id.as_ref() == Some(&status.run_id)),
-                );
+                for envelope in result
+                    .envelopes
+                    .into_iter()
+                    .filter(|envelope| envelope.run_id.as_ref() == Some(&status.run_id))
+                {
+                    writer.push(&HeadlessEvent::Envelope(Box::new(envelope)));
+                    event_count = event_count.saturating_add(1);
+                }
             }
             ResponseBody::Error {
                 code,
@@ -1557,7 +1946,7 @@ pub async fn headless_run_events(
         }
         start_seq = end_seq.saturating_add(1);
     }
-    Ok(events)
+    writer.finish(status.run_id.clone(), event_count)
 }
 
 async fn teardown_owned_daemon(
@@ -1976,23 +2365,23 @@ async fn run_headless_inner(
         submit_attachments,
         submit_spec,
     );
-    let mut buffered = Vec::new();
+    let mut buffered = BufferedWireFrames::create()?;
     let mut submit_timeout_grace = None;
     let run_id = loop {
         let pending_response = match connection.client.begin_request(submit_body.clone()).await {
             Ok(pending_response) => pending_response,
             Err(error) => {
-                buffered.clear();
-                reconnect_for_submit(
+                buffered.clear()?;
+                reconnect_for_submit(SubmitReconnectInput {
                     profile,
-                    &ensure,
-                    &mut connection,
-                    &mut reducer,
-                    &mut reconnects,
-                    &mut buffered,
-                    "turn.submit",
+                    ensure: &ensure,
+                    connection: &mut connection,
+                    reducer: &mut reducer,
+                    reconnects: &mut reconnects,
+                    buffered: &mut buffered,
+                    stage: "turn.submit",
                     error,
-                )
+                })
                 .await?;
                 continue;
             }
@@ -2013,7 +2402,7 @@ async fn run_headless_inner(
                         break Err(ClientError::Disconnected(connection_reason(&connection.client)));
                     };
                     if frame_matches_attachment(&frame, connection.attachment_id.as_ref()) {
-                        buffered.push(frame);
+                        buffered.push(&frame)?;
                     }
                 }
                 () = wait_until(response_deadline) => {
@@ -2063,17 +2452,17 @@ async fn run_headless_inner(
                 ));
             }
             Err(error) => {
-                buffered.clear();
-                let reconnect = reconnect_for_submit(
+                buffered.clear()?;
+                let reconnect = reconnect_for_submit(SubmitReconnectInput {
                     profile,
-                    &ensure,
-                    &mut connection,
-                    &mut reducer,
-                    &mut reconnects,
-                    &mut buffered,
-                    "turn.submit",
+                    ensure: &ensure,
+                    connection: &mut connection,
+                    reducer: &mut reducer,
+                    reconnects: &mut reconnects,
+                    buffered: &mut buffered,
+                    stage: "turn.submit",
                     error,
-                );
+                });
                 if let Some(deadline) = submit_timeout_grace {
                     tokio::time::timeout_at(deadline, reconnect)
                         .await
@@ -2095,7 +2484,7 @@ async fn run_headless_inner(
             outcome: HeadlessOutcome::Started,
             response: None,
             usage: None,
-            events: Vec::new(),
+            events: HeadlessRunEvents::empty(run_id.clone()),
             budget_exhausted: None,
             replay: None,
             permission_denials: Vec::new(),
@@ -2125,7 +2514,8 @@ async fn run_headless_inner(
         )
         .await?;
     }
-    for frame in std::mem::take(&mut buffered) {
+    for frame in buffered.reader()? {
+        let frame = frame?;
         if process_frame(&connection, &mut reducer, frame).await {
             let recovered = attach_for_run_before_deadline(
                 profile,
@@ -2330,14 +2720,7 @@ async fn run_headless_inner(
         }
     }
 
-    Ok(finalize(
-        reducer,
-        run_id,
-        provider,
-        model,
-        attachment_refs,
-        forced,
-    ))
+    finalize(reducer, run_id, provider, model, attachment_refs, forced)
 }
 
 async fn upload_attachments(
@@ -2865,17 +3248,28 @@ async fn reconnect_attached(
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn reconnect_for_submit(
-    profile: &ResolvedProfile,
-    ensure: &EnsureOptions,
-    connection: &mut HeadlessConnection,
-    reducer: &mut HeadlessReducer,
-    reconnects: &mut ReconnectBudget,
-    buffered: &mut Vec<WireFrame>,
+struct SubmitReconnectInput<'a> {
+    profile: &'a ResolvedProfile,
+    ensure: &'a EnsureOptions,
+    connection: &'a mut HeadlessConnection,
+    reducer: &'a mut HeadlessReducer,
+    reconnects: &'a mut ReconnectBudget,
+    buffered: &'a mut BufferedWireFrames,
     stage: &'static str,
     error: ClientError,
-) -> Result<(), HeadlessRunError> {
+}
+
+async fn reconnect_for_submit(input: SubmitReconnectInput<'_>) -> Result<(), HeadlessRunError> {
+    let SubmitReconnectInput {
+        profile,
+        ensure,
+        connection,
+        reducer,
+        reconnects,
+        buffered,
+        stage,
+        error,
+    } = input;
     let reason = client_error(stage, error)?;
     reconnects.spend(stage, reason)?;
     reopen_headless_connection(profile, ensure, connection).await?;
@@ -2922,10 +3316,10 @@ async fn attach_buffered_with_recovery(
     connection: &mut HeadlessConnection,
     reducer: &HeadlessReducer,
     reconnects: &mut ReconnectBudget,
-    buffered: &mut Vec<WireFrame>,
+    buffered: &mut BufferedWireFrames,
 ) -> Result<(), HeadlessRunError> {
     loop {
-        buffered.clear();
+        buffered.clear()?;
         match attach_buffered_once(connection, reducer, buffered).await {
             Ok(true) => return Ok(()),
             Ok(false) => {}
@@ -2944,7 +3338,7 @@ async fn attach_buffered_with_recovery(
 async fn attach_buffered_once(
     connection: &mut HeadlessConnection,
     reducer: &HeadlessReducer,
-    buffered: &mut Vec<WireFrame>,
+    buffered: &mut BufferedWireFrames,
 ) -> Result<bool, HeadlessRunError> {
     detach_existing(connection, "session.detach before submit retry").await?;
     let attach_loss_baseline = connection.client.lost_events();
@@ -3023,7 +3417,7 @@ async fn attach_buffered_once(
                 session_id,
                 ..
             } if event_attachment == &attachment_id && session_id == &reducer.session_id => {
-                buffered.push(frame);
+                buffered.push(&frame)?;
             }
             WireFrame::Lagged {
                 attachment_id: lagged,
@@ -3737,7 +4131,7 @@ fn finalize(
     model: String,
     attachments: Vec<ArtifactRef>,
     forced: Option<ForcedOutcome>,
-) -> HeadlessRunResult {
+) -> Result<HeadlessRunResult, HeadlessRunError> {
     let HeadlessReducer {
         session_id,
         response,
@@ -3746,10 +4140,12 @@ fn finalize(
         blocking_presentation,
         terminal,
         background_tasks,
-        events,
+        event_count,
         budget_exhausted,
+        output,
         ..
     } = reducer;
+    let events = output.finish(run_id.clone(), event_count)?;
     let (outcome, failure, terminal_seq) = match forced {
         Some(ForcedOutcome::Timeout) => (
             HeadlessOutcome::Timeout,
@@ -3801,7 +4197,7 @@ fn finalize(
             name: name.clone(),
         })
         .collect();
-    HeadlessRunResult {
+    Ok(HeadlessRunResult {
         session_id,
         run_id,
         provider,
@@ -3817,7 +4213,7 @@ fn finalize(
         failure,
         terminal_seq,
         background_tasks_running,
-    }
+    })
 }
 
 fn client_error(

@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! `/provider <name>` ownership: client-owned at the launcher, DAEMON TRUTH
 //! in an attached session. The in-session arm used to assign
 //! `identity.provider` locally and flash success, so the TUI announced a

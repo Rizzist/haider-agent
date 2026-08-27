@@ -47,6 +47,15 @@ struct TurnSubmitInput {
     headless_spec: Option<haider_protocol::headless::HeadlessRunSpecV1>,
 }
 
+struct SessionSelectModelInput {
+    command_id: CommandId,
+    session_id: SessionId,
+    worker_generation: u64,
+    model: String,
+    provider: Option<String>,
+    confirm_new_epoch: bool,
+}
+
 /// Profile-vault alias holding the transcription secret (the Deepgram API
 /// key). Daemon-internal: clients only ever speak
 /// `transcription.secret_get`/`transcription.secret_set` — the alias never
@@ -3064,12 +3073,14 @@ impl HubConnection {
                 }
                 self.session_select_model(
                     request_id,
-                    command_id,
-                    session_id,
-                    worker_generation,
-                    model,
-                    provider,
-                    confirm_new_epoch,
+                    SessionSelectModelInput {
+                        command_id,
+                        session_id,
+                        worker_generation,
+                        model,
+                        provider,
+                        confirm_new_epoch,
+                    },
                 )
                 .await
             }
@@ -4575,12 +4586,14 @@ impl HubConnection {
                 connection
                     .session_select_model(
                         request_id.clone(),
-                        command_id,
-                        session_id,
-                        generation,
-                        model,
-                        None,
-                        confirm_new_epoch,
+                        SessionSelectModelInput {
+                            command_id,
+                            session_id,
+                            worker_generation: generation,
+                            model,
+                            provider: None,
+                            confirm_new_epoch,
+                        },
                     )
                     .await?;
             }
@@ -4614,12 +4627,14 @@ impl HubConnection {
                 connection
                     .session_select_model(
                         request_id.clone(),
-                        command_id,
-                        session_id,
-                        generation,
-                        model,
-                        Some(provider),
-                        confirm_new_epoch,
+                        SessionSelectModelInput {
+                            command_id,
+                            session_id,
+                            worker_generation: generation,
+                            model,
+                            provider: Some(provider),
+                            confirm_new_epoch,
+                        },
                     )
                     .await?;
             }
@@ -7035,17 +7050,19 @@ impl HubConnection {
     /// `crate::model_select`; the store owns durability; the next logical
     /// turn re-reads the committed metadata (R6 re-resolution), so commit
     /// here IS next-turn pickup.
-    #[allow(clippy::too_many_arguments)]
     async fn session_select_model(
         &self,
         request_id: RequestId,
-        command_id: CommandId,
-        session_id: SessionId,
-        worker_generation: u64,
-        model: String,
-        provider: Option<String>,
-        confirm_new_epoch: bool,
+        input: SessionSelectModelInput,
     ) -> Result<(), SessionHubError> {
+        let SessionSelectModelInput {
+            command_id,
+            session_id,
+            worker_generation,
+            model,
+            provider,
+            confirm_new_epoch,
+        } = input;
         if command_id.as_str().trim().is_empty() || model.trim().is_empty() {
             return self.respond_error(
                 request_id,
@@ -7779,6 +7796,7 @@ impl HubConnection {
             );
         }
         let watch_id = random_id("loom-watch")?;
+        let baseline_through_cursor = baseline.through_cursor;
         let previous = {
             let mut slot = lock(&self.loom_registry_watch)?;
             slot.take()
@@ -7799,7 +7817,7 @@ impl HubConnection {
             body: ResponseBody::LoomWatch {
                 watch_id: watch_id.clone(),
                 requested_after_cursor: after_cursor,
-                baseline: baseline.clone(),
+                baseline,
             },
         };
         let hub = self.hub.clone();
@@ -7861,7 +7879,7 @@ impl HubConnection {
             watch_id,
             LoomRegistryReplayWindow {
                 after_cursor,
-                through_cursor: baseline.through_cursor,
+                through_cursor: baseline_through_cursor,
             },
             publications,
             cancel_receiver,
@@ -13018,7 +13036,6 @@ fn published_workflow_catalog(
 mod workflow_catalog_tests;
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 #[path = "loom_registry_watch_tests.rs"]
 mod loom_registry_watch_tests;
 

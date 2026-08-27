@@ -1,7 +1,7 @@
+#![allow(clippy::expect_used)]
 //! Laws for the static effort/fast capability tables (G3). Lives in a
 //! `*_tests.rs` file per the workspace rule — inline `mod tests` modules are
 //! invisible to the xtask test-count ledger.
-#![allow(clippy::expect_used)]
 
 use super::effort::*;
 

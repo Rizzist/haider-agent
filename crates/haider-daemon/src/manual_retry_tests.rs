@@ -1,6 +1,5 @@
-//! End-to-end daemon laws for receipt-backed `run.retry`.
-
 #![allow(clippy::expect_used)]
+//! End-to-end daemon laws for receipt-backed `run.retry`.
 
 use crate::accounts::ConnectionTransport;
 use crate::session_hub::{FrameSendError, FrameSink, HubConnection, SessionHub, SessionHubConfig};

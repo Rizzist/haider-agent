@@ -107,25 +107,26 @@ async fn reconnect_replays_requested_suffix_then_follows_live_commits() {
     cancel.send_replace(true);
     task.await.expect("registry watch stops");
 
-    let frames = sink.0.lock().expect("registry frames");
-    let cursors = frames
-        .iter()
-        .filter_map(|frame| match frame {
-            WireFrame::LoomRegistryDelta { delta, .. } => Some(delta.cursor),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        cursors,
-        ((first_cursor + 1)..=live_head).collect::<Vec<_>>(),
-        "attach replays every requested durable cursor and live commits continue contiguously"
-    );
-    assert!(matches!(
-        frames.as_slice(),
-        [.., WireFrame::LoomRegistryCaughtUp { high_water_cursor, .. }] if *high_water_cursor == live_head
-    ));
+    {
+        let frames = sink.0.lock().expect("registry frames");
+        let cursors = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                WireFrame::LoomRegistryDelta { delta, .. } => Some(delta.cursor),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cursors,
+            ((first_cursor + 1)..=live_head).collect::<Vec<_>>(),
+            "attach replays every requested durable cursor and live commits continue contiguously"
+        );
+        assert!(matches!(
+            frames.as_slice(),
+            [.., WireFrame::LoomRegistryCaughtUp { high_water_cursor, .. }] if *high_water_cursor == live_head
+        ));
+    }
 
-    drop(frames);
     hub.shutdown().await.expect("hub stops");
     store.close().await.expect("store closes");
 }

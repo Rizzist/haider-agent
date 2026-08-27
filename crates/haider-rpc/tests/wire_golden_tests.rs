@@ -1,5 +1,5 @@
-//! Golden JSON shape and serde tolerance tests.
 #![allow(clippy::expect_used)]
+//! Golden JSON shape and serde tolerance tests.
 
 mod common;
 
@@ -287,7 +287,7 @@ fn every_request_method_has_a_golden_request_and_success_response() {
     assert_eq!(
         expected_methods.len(),
         99,
-        "the v1 contract covers all 94 prior and five L4 request methods"
+        "the v1 contract covers all 86 prior and 13 v0.0.963 request methods"
     );
     assert_eq!(
         request_methods_declared_in_source(),
@@ -356,12 +356,45 @@ fn every_request_method_has_a_golden_request_and_success_response() {
     assert_eq!(covered, expected_methods);
 }
 
-/// MUTATION CHECK: make a current conflict coordinate required, default a
-/// missing row to revision zero/digest empty, or remove the tolerant decode
-/// defaults from the three L1 save doors. Expected runtime failure: typed
-/// absence or an old v1 request stops matching below.
+/// MUTATION CHECK: make archived inventory or a current conflict coordinate
+/// required, default a missing row to revision zero/digest empty, or remove
+/// tolerant decode defaults from the L1/L4 doors. Expected runtime failure:
+/// typed absence or an old v1 request stops matching below.
 #[test]
 fn loom_registry_cas_fields_preserve_typed_absence() {
+    let old_list: RequestBody = serde_json::from_value(serde_json::json!({
+        "method": "loom.list"
+    }))
+    .expect("pre-archive v1 list request still decodes");
+    assert!(matches!(
+        old_list,
+        RequestBody::LoomList {
+            include_archived: false
+        }
+    ));
+
+    let old_agent_type: RequestBody = serde_json::from_value(serde_json::json!({
+        "method": "loom.register_agent_type",
+        "record": {
+            "id": "reviewer",
+            "name": "Reviewer",
+            "job": "Review changes",
+            "in_type": "Patch",
+            "out_type": "Verdict",
+            "clis": ["rg"],
+            "rev": 0
+        }
+    }))
+    .expect("pre-CAS v1 agent-type request still decodes");
+    assert!(matches!(
+        old_agent_type,
+        RequestBody::LoomRegisterAgentType {
+            expected_rev: None,
+            expected_digest: None,
+            ..
+        }
+    ));
+
     let old: RequestBody = serde_json::from_value(serde_json::json!({
         "method": "loom.register_workflow",
         "source": "review: A -> A\nstep \"review\" :cmd"

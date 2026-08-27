@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION, envelope_weight_bytes,
 };
@@ -615,6 +617,7 @@ fn migrations_apply_fresh_and_are_idempotent_on_reopen() {
         "loom_cli_install_jobs",
         "loom_cli_install_items",
         "loom_cli_install_events",
+        "loom_agent_type_revisions",
         "loom_workflow_revisions",
         "provider_view_session_cursors",
         "provider_view_requests",

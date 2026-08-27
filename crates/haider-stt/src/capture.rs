@@ -671,6 +671,7 @@ impl Drop for CaptureWorker {
 }
 
 #[cfg(all(test, not(target_os = "android")))]
+#[allow(clippy::expect_used)]
 mod capture_worker_compile_tests {
     use super::{CaptureEvent, CaptureWorker};
     use crate::SttError;

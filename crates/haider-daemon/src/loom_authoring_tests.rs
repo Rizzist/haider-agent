@@ -756,7 +756,7 @@ async fn ai_draft_requires_a_terminal_finish_event() {
 }
 
 #[tokio::test]
-async fn pinned_agent_resolution_uses_legacy_current_then_retained_revision() {
+async fn pinned_agent_resolution_uses_current_then_retained_revision() {
     let profile = tempfile::tempdir().expect("profile");
     let store = SqliteStoreHandle::open(profile.path())
         .await
@@ -767,18 +767,12 @@ async fn pinned_agent_resolution_uses_legacy_current_then_retained_revision() {
         .await
         .expect("register first agent")
         .registration;
-    let retained_path = profile
-        .path()
-        .join("loom-agent-revisions")
-        .join("writer")
-        .join(format!("{}-{}.json", first.rev, first.digest));
-    std::fs::remove_file(&retained_path).expect("simulate pre-retention profile");
-    let legacy = hub
+    let current = hub
         .pinned_loom_agent_type("writer", Some(first.rev), Some(&first.digest))
         .await
-        .expect("legacy exact-current fallback")
+        .expect("exact-current retained lookup")
         .expect("current agent");
-    assert_eq!(legacy.rev, 1);
+    assert_eq!(current.rev, 1);
 
     let mut changed = typed_agent("writer", "Brief", "Draft");
     changed.job = "A newer writer role.".into();
@@ -830,7 +824,7 @@ fn invalid_edit_is_typed_rejected_at_the_offending_field_and_line() {
         .enumerate()
         .filter(|(_, line)| line.contains("\"required_green\""))
         .map(|(line, _)| u32::try_from(line + 1).expect("bounded test line"))
-        .last()
+        .next_back()
         .expect("required_green line");
     let errors = validate(&invalid, LoomAuthorKind::Workflow, &[]).expect_err("zero green rejects");
     assert!(errors.iter().any(|error| {
@@ -948,7 +942,7 @@ fn semantic_graph_edits_report_the_edited_field_or_containing_node() {
         .enumerate()
         .filter(|(_, line)| line.trim() == "{")
         .map(|(line, _)| u32::try_from(line + 1).expect("bounded node line"))
-        .last()
+        .next_back()
         .expect("node object line");
     let errors = validate(&missing_text, LoomAuthorKind::Workflow, &[])
         .expect_err("missing semantic evidence rejects");
@@ -1024,7 +1018,7 @@ fn agent_capability_denials_are_content_bearing_and_never_grants() {
                     .enumerate()
                     .filter(|(_, line)| line.contains("api:example.invalid:443"))
                     .map(|(line, _)| u32::try_from(line + 1).expect("bounded test line"))
-                    .last()
+                    .next_back()
                     .expect("offending grant line")
     }));
 }

@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! Runtime laws for provider-agnostic model selection (F1): the committed
 //! pair is what the NEXT logical turn — and every child spawned from it —
 //! resolves through. Two recording fake providers make the landing provider

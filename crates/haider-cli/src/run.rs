@@ -8,9 +8,9 @@ use std::time::Duration;
 use haider_client::{
     ConnectError, DaemonLifetime, ERROR_CODE_NO_ACTIVE_ACCOUNT, ERROR_CODE_NO_DEFAULT_MODEL,
     EnsureError, EnsureOptions, HeadlessEvent, HeadlessFailureCode, HeadlessOutcome,
-    HeadlessRunError, HeadlessRunRequest, HeadlessRunResult, HeadlessSessionConfig, ProfileEnv,
-    headless_run_events, headless_run_status, load_attachment, resolve_profile,
-    run_headless_with_session_config, stop_headless_run,
+    HeadlessRunError, HeadlessRunEventReader, HeadlessRunEvents, HeadlessRunRequest,
+    HeadlessRunResult, HeadlessSessionConfig, ProfileEnv, headless_run_events, headless_run_status,
+    load_attachment, resolve_profile, run_headless_with_session_config, stop_headless_run,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::error::ErrorCode;
@@ -583,17 +583,24 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
                 return report_pre_run_error(options.output, &error, None, None);
             }
         };
-        let source_input = source_events.iter().find_map(|envelope| {
-            if envelope.run_id.as_ref() != Some(&source_run_id) {
-                return None;
-            }
-            match serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()? {
-                EventPayload::UserMessage {
+        let mut source_input = None;
+        if let Err(error) = source_events.try_for_each(|envelope| {
+            if source_input.is_none()
+                && envelope.run_id.as_ref() == Some(&source_run_id)
+                && let Ok(EventPayload::UserMessage {
                     text, attachments, ..
-                } => Some((text, attachments)),
-                _ => None,
+                }) = serde_json::from_value::<EventPayload>(envelope.payload)
+            {
+                source_input = Some((text, attachments));
             }
-        });
+            Ok(())
+        }) {
+            let error = HeadlessRunError::Protocol {
+                stage: "headless replay",
+                message: format!("cannot read replay source ledger: {error}"),
+            };
+            return report_pre_run_error(options.output, &error, None, None);
+        }
         let Some((prompt, attachments)) = source_input else {
             let error = HeadlessRunError::Protocol {
                 stage: "headless replay",
@@ -741,7 +748,13 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
     match result {
         Ok(mut result) => {
             if let Some(source_events) = replay_source_events.as_ref() {
-                result.replay = Some(replay_divergence(source_events, &result));
+                match replay_divergence(source_events, &result) {
+                    Ok(divergence) => result.replay = Some(divergence),
+                    Err(error) => {
+                        eprintln!("haider: cannot compare replay ledgers: {error}");
+                        return ExitCode::from(EX_IOERR);
+                    }
+                }
             }
             if options.output != RunOutput::Jsonl
                 && let Err(error) = write_final(io::stdout().lock(), options.output, &result)
@@ -925,74 +938,136 @@ fn report_lifecycle_error(mode: RunOutput, schema: &str, error: &HeadlessRunErro
     ExitCode::from(exit_code_for_error(error))
 }
 
-fn replay_final_text(events: &[haider_protocol::envelope::RawEnvelope]) -> Option<String> {
-    events
-        .iter()
-        .filter_map(|envelope| {
-            match serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()? {
-                EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
-                    item: haider_protocol::item::TurnItem::AgentMessage { text },
-                    ..
-                })
-                | EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
-                    item: haider_protocol::item::TurnItem::IncompleteAgentMessage { text, .. },
-                    ..
-                }) => Some(text),
-                _ => None,
-            }
-        })
-        .next_back()
+struct ReplaySignature {
+    source_run_id: Option<RunId>,
+    final_text: Option<String>,
+    budget: Option<serde_json::Value>,
+    failure: Option<serde_json::Value>,
+    terminal: Option<serde_json::Value>,
 }
 
-fn replay_tool_trace(events: &[haider_protocol::envelope::RawEnvelope]) -> Vec<serde_json::Value> {
-    events
-        .iter()
-        .filter_map(|envelope| {
-            let payload = &envelope.payload;
-            match payload.get("type").and_then(serde_json::Value::as_str) {
-                Some("tool_result") => Some(serde_json::json!({
-                    "type": "tool_result",
-                    "call_id": payload.get("call_id"),
-                    "result": payload.get("result"),
-                })),
-                Some("item")
-                    if payload.get("event").and_then(serde_json::Value::as_str)
-                        == Some("completed")
-                        && payload
-                            .get("item")
-                            .and_then(|item| item.get("item"))
-                            .and_then(serde_json::Value::as_str)
-                            == Some("tool_call") =>
-                {
-                    let item = payload.get("item")?;
-                    Some(serde_json::json!({
-                        "type": "tool_call",
-                        "call_id": item.get("call_id"),
-                        "name": item.get("name"),
-                        "args": item.get("args"),
-                        "status": item.get("status"),
-                    }))
+fn replay_signature(events: &HeadlessRunEvents) -> io::Result<ReplaySignature> {
+    let mut source_run_id = None;
+    let mut final_text = None;
+    let mut budget = None;
+    let mut failure = None;
+    let mut terminal = None;
+    events.try_for_each(|envelope| {
+        let payload = envelope.payload;
+        let kind = payload.get("type").and_then(serde_json::Value::as_str);
+        if source_run_id.is_none() && kind == Some("headless_run_configured") {
+            source_run_id.clone_from(&envelope.run_id);
+        }
+        match kind {
+            Some("run_budget_exhausted") => budget = Some(payload.clone()),
+            Some("run_failed") => failure = Some(payload.clone()),
+            Some("run_state")
+                if matches!(
+                    payload.get("state").and_then(serde_json::Value::as_str),
+                    Some("done" | "errored" | "cancelled")
+                ) =>
+            {
+                terminal = Some(payload.clone());
+            }
+            _ => {}
+        }
+        if let Ok(EventPayload::Item(haider_protocol::item::ItemEvent::Completed {
+            item:
+                haider_protocol::item::TurnItem::AgentMessage { text }
+                | haider_protocol::item::TurnItem::IncompleteAgentMessage { text, .. },
+            ..
+        })) = serde_json::from_value::<EventPayload>(payload)
+        {
+            final_text = Some(text);
+        }
+        Ok(())
+    })?;
+    Ok(ReplaySignature {
+        source_run_id,
+        final_text,
+        budget,
+        failure,
+        terminal,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum ReplayTraceKind {
+    Tool,
+    Usage,
+}
+
+fn next_replay_trace_value(
+    reader: &mut HeadlessRunEventReader,
+    kind: ReplayTraceKind,
+) -> io::Result<Option<serde_json::Value>> {
+    for envelope in reader.by_ref() {
+        let payload = envelope?.payload;
+        let projected = match kind {
+            ReplayTraceKind::Tool => {
+                match payload.get("type").and_then(serde_json::Value::as_str) {
+                    Some("tool_result") => Some(serde_json::json!({
+                        "type": "tool_result",
+                        "call_id": payload.get("call_id"),
+                        "result": payload.get("result"),
+                    })),
+                    Some("item")
+                        if payload.get("event").and_then(serde_json::Value::as_str)
+                            == Some("completed")
+                            && payload
+                                .get("item")
+                                .and_then(|item| item.get("item"))
+                                .and_then(serde_json::Value::as_str)
+                                == Some("tool_call") =>
+                    {
+                        payload.get("item").map(|item| {
+                            serde_json::json!({
+                                "type": "tool_call",
+                                "call_id": item.get("call_id"),
+                                "name": item.get("name"),
+                                "args": item.get("args"),
+                                "status": item.get("status"),
+                            })
+                        })
+                    }
+                    _ => None,
                 }
-                _ => None,
             }
-        })
-        .collect()
+            ReplayTraceKind::Usage => {
+                let Ok(EventPayload::Usage(usage)) =
+                    serde_json::from_value::<EventPayload>(payload)
+                else {
+                    continue;
+                };
+                let mut value = serde_json::to_value(usage).map_err(io::Error::other)?;
+                normalize_replay_usage_coordinates(&mut value);
+                Some(value)
+            }
+        };
+        if let Some(projected) = projected {
+            return Ok(Some(projected));
+        }
+    }
+    Ok(None)
 }
 
-fn replay_usage_trace(events: &[haider_protocol::envelope::RawEnvelope]) -> Vec<serde_json::Value> {
-    events
-        .iter()
-        .filter_map(|envelope| {
-            let EventPayload::Usage(usage) =
-                serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?
-            else {
-                return None;
-            };
-            let mut value = serde_json::to_value(usage).ok()?;
-            normalize_replay_usage_coordinates(&mut value);
-            Some(value)
-        })
-        .collect()
+fn replay_trace_matches(
+    source: &HeadlessRunEvents,
+    replay: &HeadlessRunEvents,
+    kind: ReplayTraceKind,
+) -> io::Result<bool> {
+    let mut source = source.iter()?;
+    let mut replay = replay.iter()?;
+    loop {
+        match (
+            next_replay_trace_value(&mut source, kind)?,
+            next_replay_trace_value(&mut replay, kind)?,
+        ) {
+            (None, None) => return Ok(true),
+            (Some(source), Some(replay)) if source == replay => {}
+            _ => return Ok(false),
+        }
+    }
 }
 
 fn normalize_replay_usage_coordinates(usage: &mut serde_json::Value) {
@@ -1023,56 +1098,24 @@ fn normalize_replay_usage_coordinates(usage: &mut serde_json::Value) {
     }
 }
 
-fn replay_terminal(events: &[haider_protocol::envelope::RawEnvelope]) -> Vec<serde_json::Value> {
-    let budget = events.iter().rev().find_map(|envelope| {
-        (envelope
-            .payload
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            == Some("run_budget_exhausted"))
-        .then(|| envelope.payload.clone())
-    });
-    let failure = events.iter().rev().find_map(|envelope| {
-        (envelope
-            .payload
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            == Some("run_failed"))
-        .then(|| envelope.payload.clone())
-    });
-    let terminal = events.iter().rev().find_map(|envelope| {
-        let payload = &envelope.payload;
-        (payload.get("type").and_then(serde_json::Value::as_str) == Some("run_state")
-            && matches!(
-                payload.get("state").and_then(serde_json::Value::as_str),
-                Some("done" | "errored" | "cancelled")
-            ))
-        .then(|| payload.clone())
-    });
-    budget.into_iter().chain(failure).chain(terminal).collect()
-}
-
 fn replay_divergence(
-    source: &[haider_protocol::envelope::RawEnvelope],
+    source_events: &HeadlessRunEvents,
     replay: &HeadlessRunResult,
-) -> haider_protocol::headless::ReplayDivergenceV1 {
+) -> io::Result<haider_protocol::headless::ReplayDivergenceV1> {
+    let source = replay_signature(source_events)?;
+    let replay_signature = replay_signature(&replay.events)?;
     let source_run_id = source
-        .iter()
-        .find_map(|envelope| {
-            (envelope
-                .payload
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                == Some("headless_run_configured"))
-            .then(|| envelope.run_id.clone())
-            .flatten()
-        })
+        .source_run_id
         .unwrap_or_else(|| RunId::new("unknown"));
-    let final_text_matches = replay_final_text(source) == replay.response;
-    let tool_trace_matches = replay_tool_trace(source) == replay_tool_trace(&replay.events);
-    let usage_matches = replay_usage_trace(source) == replay_usage_trace(&replay.events);
-    let terminal_matches = replay_terminal(source) == replay_terminal(&replay.events);
-    haider_protocol::headless::ReplayDivergenceV1 {
+    let final_text_matches = source.final_text == replay.response;
+    let tool_trace_matches =
+        replay_trace_matches(source_events, &replay.events, ReplayTraceKind::Tool)?;
+    let usage_matches =
+        replay_trace_matches(source_events, &replay.events, ReplayTraceKind::Usage)?;
+    let terminal_matches = source.budget == replay_signature.budget
+        && source.failure == replay_signature.failure
+        && source.terminal == replay_signature.terminal;
+    Ok(haider_protocol::headless::ReplayDivergenceV1 {
         source_run_id,
         replay_run_id: replay.run_id.clone(),
         final_text_matches,
@@ -1080,7 +1123,7 @@ fn replay_divergence(
         usage_matches,
         terminal_matches,
         diverged: !(final_text_matches && tool_trace_matches && usage_matches && terminal_matches),
-    }
+    })
 }
 
 fn requested_machine_output(rest: &[String]) -> Option<RunOutput> {
@@ -1319,7 +1362,7 @@ pub(crate) fn write_final(
             }
         }
         RunOutput::Json => {
-            output.write_all(run_json(result)?.as_bytes())?;
+            write_run_json(&mut output, result)?;
             output.write_all(b"\n")?;
         }
         RunOutput::Jsonl => {}
@@ -1327,61 +1370,90 @@ pub(crate) fn write_final(
     output.flush()
 }
 
-fn run_json(result: &HeadlessRunResult) -> io::Result<String> {
-    let session_id = serde_json::to_string(result.session_id.as_str()).map_err(io::Error::other)?;
-    let run_id = serde_json::to_string(result.run_id.as_str()).map_err(io::Error::other)?;
-    let provider = serde_json::to_string(&result.provider).map_err(io::Error::other)?;
-    let model = serde_json::to_string(&result.model).map_err(io::Error::other)?;
+#[derive(Serialize)]
+struct RunJsonAttachments<'a> {
+    count: usize,
+    refs: Vec<&'a str>,
+}
+
+#[derive(Serialize)]
+struct RunJsonBackgroundTask<'a> {
+    task_id: &'a str,
+    name: &'a str,
+}
+
+#[derive(Serialize)]
+struct RunJsonError<'a> {
+    code: &'a str,
+    message: &'a str,
+    retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presentation: Option<&'a haider_protocol::error::ErrorPresentation>,
+}
+
+#[derive(Serialize)]
+struct RunJson<'a> {
+    schema: &'static str,
+    session_id: &'a str,
+    run_id: &'a str,
+    provider: &'a str,
+    model: &'a str,
+    attachments: RunJsonAttachments<'a>,
+    outcome: HeadlessOutcome,
+    response: &'a Option<String>,
+    events: &'a HeadlessRunEvents,
+    usage: &'a Option<haider_protocol::provider::Usage>,
+    budget_exhausted: &'a Option<haider_protocol::headless::RunBudgetExhaustedV1>,
+    replay: &'a Option<haider_protocol::headless::ReplayDivergenceV1>,
+    permission_denials: &'a [haider_client::HeadlessPermissionDenial],
+    background_tasks_running: Vec<RunJsonBackgroundTask<'a>>,
+    error: Option<RunJsonError<'a>>,
+}
+
+fn write_run_json(mut output: impl Write, result: &HeadlessRunResult) -> io::Result<()> {
     let attachment_refs = result
         .attachments
         .iter()
         .map(haider_protocol::ids::ArtifactRef::as_str)
         .collect::<Vec<_>>();
-    let attachment_refs = serde_json::to_string(&attachment_refs).map_err(io::Error::other)?;
-    let attachment_count = result.attachments.len();
-    let outcome = serde_json::to_string(&result.outcome).map_err(io::Error::other)?;
-    let response = serde_json::to_string(&result.response).map_err(io::Error::other)?;
-    let usage = serde_json::to_string(&result.usage).map_err(io::Error::other)?;
-    let events = serde_json::to_string(&result.events).map_err(io::Error::other)?;
-    let budget_exhausted =
-        serde_json::to_string(&result.budget_exhausted).map_err(io::Error::other)?;
-    let replay = serde_json::to_string(&result.replay).map_err(io::Error::other)?;
-    let denials = serde_json::to_string(&result.permission_denials).map_err(io::Error::other)?;
-    let error = match &result.failure {
-        Some(failure) => {
-            let presentation = failure
-                .presentation
-                .as_ref()
-                .map(|presentation| {
-                    serde_json::to_string(presentation)
-                        .map(|value| format!(",\"presentation\":{value}"))
-                })
-                .transpose()
-                .map_err(io::Error::other)?
-                .unwrap_or_default();
-            format!(
-                "{{\"code\":{},\"message\":{},\"retryable\":{}{}}}",
-                serde_json::to_string(failure.code.as_str()).map_err(io::Error::other)?,
-                serde_json::to_string(&failure.message).map_err(io::Error::other)?,
-                failure.retryable,
-                presentation,
-            )
-        }
-        None => "null".into(),
-    };
-    // W-A decision 8 (additive to the v1 object): tasks the daemon still
-    // owns when the TURN completed — they die with the session, not the run.
-    let background_tasks = serde_json::to_string(
-        &result
-            .background_tasks_running
-            .iter()
-            .map(|task| serde_json::json!({"task_id": task.task_id, "name": task.name}))
-            .collect::<Vec<_>>(),
+    let background_tasks_running = result
+        .background_tasks_running
+        .iter()
+        .map(|task| RunJsonBackgroundTask {
+            task_id: &task.task_id,
+            name: &task.name,
+        })
+        .collect();
+    let error = result.failure.as_ref().map(|failure| RunJsonError {
+        code: failure.code.as_str(),
+        message: &failure.message,
+        retryable: failure.retryable,
+        presentation: failure.presentation.as_ref(),
+    });
+    serde_json::to_writer(
+        &mut output,
+        &RunJson {
+            schema: "haider.run.v1",
+            session_id: result.session_id.as_str(),
+            run_id: result.run_id.as_str(),
+            provider: &result.provider,
+            model: &result.model,
+            attachments: RunJsonAttachments {
+                count: result.attachments.len(),
+                refs: attachment_refs,
+            },
+            outcome: result.outcome,
+            response: &result.response,
+            events: &result.events,
+            usage: &result.usage,
+            budget_exhausted: &result.budget_exhausted,
+            replay: &result.replay,
+            permission_denials: &result.permission_denials,
+            background_tasks_running,
+            error,
+        },
     )
-    .map_err(io::Error::other)?;
-    Ok(format!(
-        "{{\"schema\":\"haider.run.v1\",\"session_id\":{session_id},\"run_id\":{run_id},\"provider\":{provider},\"model\":{model},\"attachments\":{{\"count\":{attachment_count},\"refs\":{attachment_refs}}},\"outcome\":{outcome},\"response\":{response},\"events\":{events},\"usage\":{usage},\"budget_exhausted\":{budget_exhausted},\"replay\":{replay},\"permission_denials\":{denials},\"background_tasks_running\":{background_tasks},\"error\":{error}}}"
-    ))
+    .map_err(io::Error::other)
 }
 
 /// W-C M2: emit the headless desktop-notification attention signal (OSC 9) to

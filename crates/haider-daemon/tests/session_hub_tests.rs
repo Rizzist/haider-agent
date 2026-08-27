@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! W3b2 session-hub semantic acceptance matrix.
 //!
 //! These are integration tests because the hub's public worker/connection

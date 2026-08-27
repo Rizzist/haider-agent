@@ -2272,9 +2272,9 @@ impl SessionHub {
             && record.rev == rev
             && record.digest() == digest
         {
-            // Upgrade compatibility: profiles created before retained agent
-            // revisions existed can still execute their unchanged current
-            // contract. The next registration retains it before advancing.
+            // Upgrade compatibility: migration backfills the current row into
+            // retained history, but an older store implementation can still
+            // race this read while the current contract remains unchanged.
             return Ok(current);
         }
         // A registration can publish history between the first miss and the

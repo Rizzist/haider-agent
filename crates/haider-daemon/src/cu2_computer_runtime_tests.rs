@@ -1,7 +1,6 @@
+#![allow(clippy::expect_used)]
 //! CU-2 fake-backend runtime coverage. Tests in this module never touch real
 //! screen or input APIs.
-
-#![allow(clippy::expect_used)]
 
 use crate::session_hub::{SessionHub, SessionHubConfig};
 use crate::turn_recovery::{RecoveredWork, recover_interrupted_turns};

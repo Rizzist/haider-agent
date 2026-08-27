@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, clippy::expect_used)]
 
 use std::collections::BTreeSet;
 
@@ -762,7 +762,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 enabled: true,
                 models: vec!["local-frontier-a".into()],
                 default_model: Some("local-frontier-a".into()),
-                response_open_timeout_ms: Some(75_000),
+                response_open_timeout_ms: None,
                 expected_revision: 10,
             },
         },
@@ -773,7 +773,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     provider: "local-lab".into(),
                     api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
                     endpoint: Some("http://127.0.0.1:11434".into()),
-                    response_open_timeout_ms: Some(75_000),
+                    response_open_timeout_ms: None,
                     models: vec!["local-frontier-a".into()],
                     model_details: vec![ModelDetailWire {
                         name: "local-frontier-a".into(),

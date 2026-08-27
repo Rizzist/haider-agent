@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! Laws for the ONE model-selection authority (F1).
 //!
 //! Sessions are provider-agnostic: every law here speaks model selection.

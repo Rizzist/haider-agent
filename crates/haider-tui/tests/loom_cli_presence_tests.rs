@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! W-flow — declared CLIs are a capability grant, not a promise the program
 //! is INSTALLED. `loom.list` now carries a device presence map, the type
 //! detail draws it, and ⌃I seeds a provisioning turn for exactly the missing

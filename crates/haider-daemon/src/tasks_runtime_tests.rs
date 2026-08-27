@@ -1,3 +1,4 @@
+#![allow(clippy::expect_used)]
 //! W-A daemon-level background task laws.
 //!
 //! LT1 (immediate return + foreground unchanged), LT2 daemon half (bounded
@@ -6,7 +7,6 @@
 //! asserted — the W6 vacuous-pin lesson), LT5 (brokered kill journaling +
 //! bounded cursor reads), LT6 (restart adoption via the injected liveness
 //! seam), LT7 (concurrency cap + session-close/shutdown fences).
-#![allow(clippy::expect_used)]
 
 use crate::session_hub::{SessionHub, SessionHubConfig};
 use crate::tasks::{TaskFacade, TaskLiveState};

@@ -1,6 +1,5 @@
-//! Host-only mobile capability, dispatch-fence, and mock fast-path coverage.
-
 #![allow(clippy::expect_used)]
+//! Host-only mobile capability, dispatch-fence, and mock fast-path coverage.
 
 use super::*;
 use crate::session_hub::{SessionHub, SessionHubConfig};

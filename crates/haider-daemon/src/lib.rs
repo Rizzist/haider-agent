@@ -72,6 +72,7 @@ mod image_events;
 mod lifecycle;
 mod loom_author;
 #[cfg(test)]
+#[path = "loom_authoring_tests.rs"]
 mod loom_authoring_tests;
 #[cfg(test)]
 #[path = "loom_registry_l4_tests.rs"]

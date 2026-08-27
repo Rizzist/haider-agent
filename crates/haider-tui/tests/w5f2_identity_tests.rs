@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! W5f-2 — the composer identity follows DAEMON TRUTH until the user pins
 //! a choice, and `session.create` requests an OUTPUT budget, not the
 //! context window.

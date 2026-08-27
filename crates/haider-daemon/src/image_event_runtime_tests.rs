@@ -1,6 +1,5 @@
-//! Durable image-created output-context regression pins.
-
 #![allow(clippy::expect_used)]
+//! Durable image-created output-context regression pins.
 
 use super::HubCommandOutputContext;
 use crate::session_hub::{SessionHub, SessionHubConfig};

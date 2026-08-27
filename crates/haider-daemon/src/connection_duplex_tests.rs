@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! Cross-platform, no-bind connection regressions.
 //!
 //! `tokio::io::duplex` reaches the production framing, writer, hub RPC, and

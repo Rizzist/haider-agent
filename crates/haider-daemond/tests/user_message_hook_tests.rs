@@ -1,5 +1,5 @@
-//! Black-box user-message hook parity across production submission surfaces.
 #![allow(clippy::expect_used)]
+//! Black-box user-message hook parity across production submission surfaces.
 
 mod support;
 

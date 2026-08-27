@@ -1,7 +1,7 @@
+#![allow(clippy::expect_used)]
 //! W-C M1 — custom slash commands: parse, namespacing, project-over-global
 //! precedence, argument substitution, malformed skip-with-warning, palette
 //! listing, and the model-override-reaches-the-turn law.
-#![allow(clippy::expect_used)]
 
 use haider_protocol::ids::SessionId;
 use haider_tui::app::{AppModel, AppRequest, RuntimeMode, Screen};

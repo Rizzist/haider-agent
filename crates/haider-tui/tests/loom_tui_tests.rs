@@ -1,7 +1,7 @@
+#![allow(clippy::expect_used)]
 //! D1-D2 — the Loom surfaces: a typed child's `@type ·` label paints in its
 //! registry accent, and the graph screen annotates a pinned Loom workflow's
 //! nodes with their specialists and tasks.
-#![allow(clippy::expect_used)]
 
 use haider_protocol::agent::{AgentManifest, AgentRole, Grant, Placement};
 use haider_protocol::graph::{

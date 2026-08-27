@@ -1,6 +1,5 @@
-//! v0.0.963 L3 live workflow DAG rendering.
-
 #![allow(clippy::expect_used)]
+//! v0.0.963 L3 live workflow DAG rendering.
 
 use haider_client::{
     WorkflowEvidenceRef, WorkflowGraphEdge, WorkflowGraphEdgeKind, WorkflowGraphProjection,

@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! W-UI — the Loom split surfaces reach the menus (palette entries, launcher
 //! rows, the `/workflows` pane) and the subagents tree speaks a child's
 //! pinned-workflow DAG (`agent_graph_rollup_v1` → the chip row, sim

@@ -204,7 +204,7 @@ fn welcome_features_pin_served_management_families() {
     assert_eq!(
         welcome_features().len(),
         94,
-        "the ordinary Welcome advertises all 89 prior and five L4 feature tokens"
+        "the ordinary Welcome advertises all 85 prior and nine v0.0.963 feature tokens"
     );
     assert_eq!(
         welcome_features(),

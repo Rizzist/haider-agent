@@ -1,5 +1,5 @@
-//! Shared WS/UDS codec conformance and UDS stream framing cases.
 #![allow(clippy::expect_used)]
+//! Shared WS/UDS codec conformance and UDS stream framing cases.
 
 mod common;
 

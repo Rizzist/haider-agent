@@ -1,7 +1,7 @@
+#![allow(clippy::expect_used)]
 //! W10b management-polish laws: account/provider removal flows (armed
 //! confirm → durable command → typed reply/refusal), the locked edit card,
 //! and the HuggingFace preset.
-#![allow(clippy::expect_used)]
 
 use haider_protocol::EventPayload;
 use haider_protocol::state::HarnessStatus;

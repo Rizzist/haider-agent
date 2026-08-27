@@ -1,8 +1,8 @@
 # Haider client contract — revision 1
 
 Status: authoritative for wire protocol `v = 1`  
-Source snapshot: package `0.0.963` \
-N-1 compatibility baseline: `0.0.962` \
+Source snapshot: package `0.0.962` \
+N-1 compatibility baseline: `0.0.961` \
 Contract revision date: 2026-08-27
 
 This document is the client-facing contract of `haider-rpc`,
@@ -1859,6 +1859,10 @@ regress the baseline projection while consuming them. Deltas beyond
 Each snapshot row is `{ entry, record }`: `entry` carries exact
 kind/id/rev/digest/archive coordinates, including an agent-type digest clients
 must not recompute, while `record` remains distinctly tagged by registry kind.
+The daemon builds this full-frame baseline under a conservative 16 MiB
+resident-memory charge. If the complete registry exceeds that bound, the RPC
+fails with `store_full` and installs no watch; it never publishes a truncated
+baseline as authoritative.
 
 Committed changes arrive as
 `LoomRegistryDelta { watch_id, delta: { cursor, change, entry, record } }`.
@@ -2515,6 +2519,52 @@ Absence laws:
 - Exit codes retain the existing headless mapping: provider failure `65`,
   protocol/feature skew `76`, blocked or budget-exhausted `77`, and explicit
   user cancellation `130`.
+
+### 15.4 Prompt-cache cohort key v3
+
+OpenAI-family prompt-cache routing uses the internal schema
+`haider.prompt-cache-cohort.v3`. The key binds the provider, model, active
+account scope, finalized provider-view header epoch, and cohort. A normal
+session uses its session identity as the cohort, so unrelated sessions on the
+same account do not share a provider route. A byte-identical fork may keep the
+parent cohort only while its durable context epoch is `inherited` and its
+recorded inherited cache segment still matches the exact provider-view
+coordinates and prefix digest. Once that segment diverges, the child uses its
+own session cohort.
+
+The resulting provider key is opaque implementation state. It is not a client
+request field, response field, feature token, journal fact, or value that a
+client may reproduce. Cache usage remains observable only through the typed
+usage authorities described in §9.1.
+
+**Absence law.** If account scope or a non-empty cohort cannot be established,
+the adapter omits the provider cache key; it never substitutes a global,
+account-wide, empty, or model-only cohort. A missing/invalid inherited segment
+means a fresh child cohort, not permission to reuse the parent route. Because
+this schema is not negotiated, clients must treat its absence as no routing
+authority and must not infer it from cache-hit telemetry.
+
+### 15.5 Response-open timeout budget
+
+`provider.configure.response_open_timeout_ms` is an optional durable override
+for the time from request dispatch until the OpenAI-family provider returns
+response headers. A present value must be greater than zero. On provider
+creation, omission selects the documented 60,000 ms OpenAI-family default; on
+update, omission preserves the stored override. `provider.list` projects the
+stored override when one exists. The response-open budget is distinct from
+the 10-second connection budget and the 90-second streaming chunk-idle budget,
+and every transport budget remains subordinate to the run deadline.
+
+Timeout telemetry reports the applied `budget_ms` and observed
+`opened_within_ms`; eligible transient failures continue through the existing
+bounded retry/backoff policy. Changing this field does not change request or
+journal ordering and does not create an unbounded wait.
+
+**Absence law.** A missing wire field is never decoded as zero or infinity.
+For an old/create payload it selects the adapter default; for an update it
+means “leave the stored value unchanged.” A client must not clear a stored
+override by omission, merge this budget with connect/chunk-idle timeouts, or
+assume the transport may outlive the enclosing run deadline.
 
 ## 16. Known absences and limits of this revision
 

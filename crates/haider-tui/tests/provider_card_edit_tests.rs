@@ -1,5 +1,5 @@
-//! HAIDER952PROVIDERUI — character-indexed custom-provider card editing.
 #![allow(clippy::expect_used)]
+//! HAIDER952PROVIDERUI — character-indexed custom-provider card editing.
 
 use haider_tui::app::{AppModel, CustomField, Hit, RuntimeMode, Screen};
 use haider_tui::render::render;

@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 //! G4b — the enterprise provider cards (Azure OpenAI, Bedrock mantle,
 //! Vertex): the SAME custom-card machinery reshaped per surface. Azure
 //! derives `{endpoint}/openai/v1` and chains the key card; bedrock/vertex

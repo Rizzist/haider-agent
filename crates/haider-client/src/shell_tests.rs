@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 use super::shell::{
     AcceptedShellExec, ShellExecError, ShellExecRequest, accepted_from_response,
     cancelled_from_response, required_user_command_features,

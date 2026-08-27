@@ -15365,6 +15365,7 @@ pub fn tools_card(seq: u64) -> Menu {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod e3_recovery_tests {
     use super::*;
     use haider_protocol::error::{ErrorPresentation, ErrorScope};
