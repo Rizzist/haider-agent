@@ -59,6 +59,7 @@ fn recognized_payload(payload: &serde_json::Value) -> bool {
             .is_ok()
         || haider_protocol::permission::PermissionEventPayload::from_payload_value(payload.clone())
             .is_ok()
+        || crate::session::is_workflow_graph_event(payload)
 }
 
 /// The daemon's per-connection attachment ceiling
@@ -78,6 +79,14 @@ pub const RESIDENT_BINDING_TOKEN_ENV: &str = "HAIDER_BINDING_TOKEN";
 
 /// One page size for the launcher's session listing.
 pub const LIST_PAGE: u32 = 64;
+/// One durable activation fact per view page preserves the visible
+/// ready→active→terminal transitions instead of collapsing a fast workflow
+/// into a single paint. The driver immediately drains while `has_more`.
+pub const WORKFLOW_GRAPH_WATCH_PAGE: u32 = 1;
+
+fn workflow_graph_view_open(model: &AppModel) -> bool {
+    model.screen == crate::app::Screen::Loom && model.loom_pane == crate::app::LoomPane::Workflows
+}
 
 /// One outbound operation the IO shell must perform.
 ///
@@ -289,6 +298,17 @@ pub enum LiveCommand {
     /// held reduction (the reconnect resume re-reads).
     GraphStatus {
         session: SessionId,
+    },
+    /// `workflow.graph.state` — complete typed baseline for the active
+    /// session's most recently changed activation graph.
+    WorkflowGraphState {
+        session: SessionId,
+    },
+    /// `workflow.graph.watch` — one bounded replay strictly after the
+    /// greatest page cursor the client projection fully applied.
+    WorkflowGraphWatch {
+        session: SessionId,
+        after_cursor: u64,
     },
     /// `loom.list` — a receipt-free READ of the Loom registry (agent types +
     /// compiled workflows). Fetched once per connection; colors the typed
@@ -855,6 +875,8 @@ impl LiveCommand {
             | Self::SessionFleet { .. }
             // The graph reduction is a read (see above).
             | Self::GraphStatus { .. }
+            | Self::WorkflowGraphState { .. }
+            | Self::WorkflowGraphWatch { .. }
             | Self::LoomList { .. }
             | Self::OpenPermissionSettings { .. }
             | Self::GraphInspect { .. }
@@ -1107,6 +1129,24 @@ pub enum LiveReply {
     Graph {
         session: SessionId,
         status: Box<Option<haider_protocol::graph::GraphStatus>>,
+    },
+    /// Complete `workflow.graph.state` baseline, tagged with the request's
+    /// session so a response crossing a checkout installs nothing.
+    WorkflowGraphState {
+        session: SessionId,
+        state: Box<Option<haider_protocol::graph::WorkflowGraphState>>,
+    },
+    /// One cursor-bearing `workflow.graph.watch` node update.
+    WorkflowGraphPage {
+        session: SessionId,
+        page: Box<haider_protocol::graph::WorkflowGraphWatchPage>,
+    },
+    /// A state/watch request failed. The last good projection stays visible;
+    /// the next workflow fact or explicit refresh re-establishes a baseline.
+    WorkflowGraphFailed {
+        session: SessionId,
+        operation: WorkflowGraphRead,
+        message: String,
     },
     /// `graph.inspect` reply (M2c): the paged telemetry snapshot. Session-
     /// tagged so a stale reply for a since-switched session installs nothing.
@@ -1378,6 +1418,15 @@ pub enum LiveReply {
         component: &'static str,
         reason: String,
     },
+}
+
+/// Which receipt-free workflow graph read failed. Watch failures repair from
+/// a state baseline; state failures wait for the next view/event/reconnect
+/// trigger instead of spinning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowGraphRead {
+    State,
+    Watch,
 }
 
 /// A durable mutation awaiting its response — the outbox.
@@ -1662,6 +1711,10 @@ pub struct LiveDriver {
     /// flight at a time; concurrent asks fold into one chase re-read.
     graph_inflight: bool,
     graph_chase: bool,
+    /// One workflow state/watch read at a time. Facts racing that read fold
+    /// into `workflow_graph_chase`, exactly like the descendant cursor seam.
+    workflow_graph_inflight: bool,
+    workflow_graph_chase: bool,
     /// M2c: single-flight for the one-shot `graph.inspect` fetch (no chase).
     graph_inspect_inflight: bool,
 }
@@ -1749,6 +1802,8 @@ impl LiveDriver {
             fleet_chase: false,
             graph_inflight: false,
             graph_chase: false,
+            workflow_graph_inflight: false,
+            workflow_graph_chase: false,
             graph_inspect_inflight: false,
         }
     }
@@ -2127,6 +2182,20 @@ impl LiveDriver {
                     }
                     if changed {
                         model.loom_detail = false;
+                        model.workflow_evidence_inspection = None;
+                    }
+                    if model.screen == crate::app::Screen::Loom
+                        && model.loom_pane == crate::app::LoomPane::Workflows
+                        && model.loom_selection == 0
+                        && model
+                            .daemon_features
+                            .contains(haider_rpc::FEATURE_WORKFLOW_GRAPH_V1)
+                        && let Some(index) = model
+                            .workflow_graph
+                            .workflow_id()
+                            .and_then(|workflow_id| model.workflow_row_index(workflow_id))
+                    {
+                        model.loom_selection = index;
                     }
                 }
                 model.dirty = true;
@@ -2446,6 +2515,52 @@ impl LiveDriver {
                     return self.graph_refresh(model);
                 }
                 Vec::new()
+            }
+            LiveReply::WorkflowGraphState { session, state } => {
+                self.workflow_graph_inflight = false;
+                model.apply_workflow_graph_state(&session, *state);
+                if std::mem::take(&mut self.workflow_graph_chase) {
+                    return self.workflow_graph_watch(model);
+                }
+                Vec::new()
+            }
+            LiveReply::WorkflowGraphPage { session, page } => {
+                self.workflow_graph_inflight = false;
+                match model.apply_workflow_graph_page(&session, *page) {
+                    crate::app::WorkflowGraphPageOutcome::Ignored
+                        if std::mem::take(&mut self.workflow_graph_chase) =>
+                    {
+                        self.workflow_graph_watch(model)
+                    }
+                    crate::app::WorkflowGraphPageOutcome::Ignored => Vec::new(),
+                    crate::app::WorkflowGraphPageOutcome::Applied { has_more }
+                        if has_more || std::mem::take(&mut self.workflow_graph_chase) =>
+                    {
+                        self.workflow_graph_watch(model)
+                    }
+                    crate::app::WorkflowGraphPageOutcome::Applied { .. } => Vec::new(),
+                    crate::app::WorkflowGraphPageOutcome::Rebaseline => {
+                        self.workflow_graph_chase = false;
+                        self.workflow_graph_refresh(model)
+                    }
+                }
+            }
+            LiveReply::WorkflowGraphFailed {
+                session,
+                operation,
+                message,
+            } => {
+                self.workflow_graph_inflight = false;
+                let chase = std::mem::take(&mut self.workflow_graph_chase);
+                if model.active_session.as_ref() == Some(&session) {
+                    model.workflow_graph_error = Some(message);
+                    model.dirty = true;
+                }
+                if operation == WorkflowGraphRead::Watch || chase {
+                    self.workflow_graph_refresh(model)
+                } else {
+                    Vec::new()
+                }
             }
             LiveReply::GraphFailed => {
                 self.graph_inflight = false;
@@ -3709,6 +3824,8 @@ impl LiveDriver {
                 // the held reduction stays and the reconnect resume re-reads.
                 self.graph_inflight = false;
                 self.graph_chase = false;
+                self.workflow_graph_inflight = false;
+                self.workflow_graph_chase = false;
                 // B4b: `artifact.put` is receipt-free — an in-flight
                 // upload's reply can never arrive and nothing resends it,
                 // so its chip dies HERE, named, instead of spinning
@@ -3727,6 +3844,12 @@ impl LiveDriver {
             LiveReply::Handshake { features, version } => {
                 model.daemon_features = features;
                 model.daemon_version = Some(version);
+                if !model
+                    .daemon_features
+                    .contains(haider_rpc::FEATURE_WORKFLOW_GRAPH_V1)
+                {
+                    model.workflow_evidence_inspection = None;
+                }
                 model.dirty = true;
                 Vec::new()
             }
@@ -3746,6 +3869,12 @@ impl LiveDriver {
                 // unconditional whenever we still hold graph state.
                 if model.graph.is_some() {
                     commands.extend(self.graph_refresh(model));
+                }
+                // A workflow view left open keeps its own replay cursor.
+                // Resume only that visible consumer; entering later issues the
+                // same cursor-exact suffix without background polling.
+                if workflow_graph_view_open(model) {
+                    commands.extend(self.workflow_graph_watch(model));
                 }
                 commands
             }
@@ -4041,6 +4170,55 @@ impl LiveDriver {
         vec![LiveCommand::GraphStatus { session }]
     }
 
+    /// Establish or repair the L2 workflow activation baseline. The optional
+    /// response honestly clears a session with no graph; it never fabricates
+    /// a catalog row into runtime state.
+    fn workflow_graph_refresh(&mut self, model: &AppModel) -> Vec<LiveCommand> {
+        if !workflow_graph_view_open(model)
+            || !model.daemon_serves(haider_rpc::FEATURE_WORKFLOW_GRAPH_V1)
+        {
+            return Vec::new();
+        }
+        let Some(session) = model.active_session.clone() else {
+            return Vec::new();
+        };
+        if self.workflow_graph_inflight {
+            self.workflow_graph_chase = true;
+            return Vec::new();
+        }
+        self.workflow_graph_inflight = true;
+        vec![LiveCommand::WorkflowGraphState { session }]
+    }
+
+    /// Read one bounded suffix after the projection's sole applied cursor.
+    /// Empty/current pages stop; journal facts provide the next wake-up, so
+    /// a quiet workflow costs no polling loop.
+    fn workflow_graph_watch(&mut self, model: &AppModel) -> Vec<LiveCommand> {
+        if !workflow_graph_view_open(model)
+            || !model.daemon_serves(haider_rpc::FEATURE_WORKFLOW_GRAPH_V1)
+        {
+            return Vec::new();
+        }
+        let Some(session) = model.active_session.clone() else {
+            return Vec::new();
+        };
+        if model.workflow_graph_error.is_some() {
+            return self.workflow_graph_refresh(model);
+        }
+        let Some(after_cursor) = model.workflow_graph.cursor() else {
+            return self.workflow_graph_refresh(model);
+        };
+        if self.workflow_graph_inflight {
+            self.workflow_graph_chase = true;
+            return Vec::new();
+        }
+        self.workflow_graph_inflight = true;
+        vec![LiveCommand::WorkflowGraphWatch {
+            session,
+            after_cursor,
+        }]
+    }
+
     /// M2c: issue a ONE-SHOT `graph.inspect` read for the telemetry screen.
     /// Feature-gated on convergence_graph_v3; single-flight (a second call
     /// while one is in flight is dropped — the screen refetches on next open).
@@ -4160,6 +4338,16 @@ impl LiveDriver {
                 .is_some_and(haider_protocol::graph::GraphStatus::is_unfinished);
             if model.active_session.as_ref() == Some(session) && (graph_live || payload_is_graph) {
                 commands.extend(self.graph_event_chase(model, session));
+            }
+            if workflow_graph_view_open(model)
+                && model.active_session.as_ref() == Some(session)
+                && crate::session::is_workflow_graph_event(&envelope.payload)
+            {
+                commands.extend(if model.workflow_graph.is_empty() {
+                    self.workflow_graph_refresh(model)
+                } else {
+                    self.workflow_graph_watch(model)
+                });
             }
             if model.screen == crate::app::Screen::Hooks
                 && model.active_session.as_ref() == Some(session)
@@ -4835,6 +5023,8 @@ impl LiveDriver {
             // fold lives in `fleet_refresh`).
             AppRequest::FleetRefresh => self.fleet_refresh(model),
             AppRequest::GraphRefresh => self.graph_refresh(model),
+            AppRequest::WorkflowGraphRefresh => self.workflow_graph_refresh(model),
+            AppRequest::WorkflowGraphResume => self.workflow_graph_watch(model),
             AppRequest::GraphInspectRefresh => self.graph_inspect_refresh(model),
             AppRequest::FleetMemberGraph { session } => {
                 // A one-shot, session-tagged graph read for the fleet

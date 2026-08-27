@@ -425,6 +425,80 @@ impl AppModel {
         (registered < self.loom_workflows.len()).then_some(WorkflowRow::Registered(registered))
     }
 
+    /// Row index for one catalog workflow id, excluding the synthetic `none`.
+    #[must_use]
+    pub fn workflow_row_index(&self, workflow_id: &str) -> Option<usize> {
+        if !self.daemon_serves(haider_rpc::FEATURE_WORKFLOW_CATALOG_V1) {
+            return None;
+        }
+        let builtins = self.builtin_workflow_templates();
+        if let Some(index) = builtins
+            .iter()
+            .position(|template| template.name == workflow_id)
+        {
+            return Some(index + 1);
+        }
+        self.loom_workflows
+            .iter()
+            .position(|workflow| workflow.id == workflow_id)
+            .map(|index| index + 1 + builtins.len())
+    }
+
+    /// Open the selected workflow's next rejected node. Repeated Enter cycles
+    /// stable runtime order, so every concurrent reject remains reachable.
+    /// Evidence-less rejects still open with their typed reason and journal
+    /// cursor; the inspector never guesses across a workflow id.
+    fn open_selected_workflow_rejection_evidence(&mut self) -> bool {
+        if self.loom_pane != LoomPane::Workflows || !self.loom_detail {
+            return false;
+        }
+        let selected_workflow_id = match self.workflow_row(self.loom_selection) {
+            Some(WorkflowRow::BuiltIn(template)) => Some(template.name),
+            Some(WorkflowRow::Registered(index)) => self
+                .loom_workflows
+                .get(index)
+                .map(|workflow| workflow.id.clone()),
+            Some(WorkflowRow::None) | None => None,
+        };
+        if self.workflow_graph.workflow_id() != selected_workflow_id.as_deref() {
+            return false;
+        }
+        let rejected = self
+            .workflow_graph
+            .nodes()
+            .filter_map(|node| {
+                self.workflow_graph
+                    .rejection(&node.node_id)
+                    .map(|rejection| (node.node_id.clone(), rejection.clone()))
+            })
+            .collect::<Vec<_>>();
+        if rejected.is_empty() {
+            return false;
+        }
+        let next = self
+            .workflow_evidence_inspection
+            .as_ref()
+            .and_then(|open| {
+                rejected
+                    .iter()
+                    .position(|(node_id, _)| node_id == &open.node_id)
+            })
+            .map_or(0, |index| (index + 1) % rejected.len());
+        let (node_id, rejection) = &rejected[next];
+        let inspection = WorkflowEvidenceInspection {
+            node_id: node_id.clone(),
+            code: rejection.code_label().to_owned(),
+            message: rejection.message.clone(),
+            cursor: rejection.cursor,
+            reference: rejection
+                .evidence
+                .as_ref()
+                .map(|reference| reference.as_str().to_owned()),
+        };
+        self.workflow_evidence_inspection = Some(inspection);
+        true
+    }
+
     /// W-flow inline identity — total /loom (Types) rows: `none` +
     /// registered. Never zero; the types pane lost its whole-pane empty
     /// state exactly as the workflows pane did.
@@ -2679,6 +2753,13 @@ pub enum AppRequest {
     /// session (single-flight in the driver). Emitted on session open and
     /// on `/graph`; ongoing freshness rides the event-cadence chase.
     GraphRefresh,
+    /// v963 L3: establish the typed activation baseline used by the
+    /// reconnectable `workflow.graph.watch` cursor.
+    WorkflowGraphRefresh,
+    /// v963 L3: continue the activation stream from the checked-out
+    /// projection's retained cursor, falling back to a baseline only when
+    /// that session has no runtime state yet.
+    WorkflowGraphResume,
     /// M2c: one-shot `graph.inspect` telemetry read (template rollups, tool-
     /// selection stats, evidence provenance) for the `/graph` screen.
     GraphInspectRefresh,
@@ -3194,6 +3275,28 @@ pub enum WorkflowRow {
     BuiltIn(haider_protocol::graph::GraphTemplateSpec),
     /// Index into [`AppModel::loom_workflows`].
     Registered(usize),
+}
+
+/// The reject-evidence coordinate currently opened from a live workflow
+/// detail. L2 deliberately exposes an opaque artifact reference, not artifact
+/// bytes, so inspection preserves and displays that coordinate verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowEvidenceInspection {
+    pub node_id: String,
+    pub code: String,
+    pub message: String,
+    pub cursor: u64,
+    pub reference: Option<String>,
+}
+
+/// Result of admitting one `workflow.graph.watch` page. The driver uses this
+/// to drain bounded pages or replace a discontinuous baseline; the renderer
+/// continues showing the last good projection throughout repair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowGraphPageOutcome {
+    Ignored,
+    Applied { has_more: bool },
+    Rebaseline,
 }
 
 /// One /loom (Types) row — the workflows pane's fixed-head law mirrored
@@ -3734,6 +3837,18 @@ pub struct AppModel {
     /// always-visible strip above the composer and the `/graph` status view;
     /// never fabricated — it is a read of durable daemon truth.
     pub graph: Option<haider_protocol::graph::GraphStatus>,
+    /// L3: the `workflow.graph.state` baseline reduced with its reconnectable
+    /// watch suffix for the attached session.
+    pub workflow_graph: haider_client::WorkflowGraphProjection,
+    /// L2's typed reducer state, isolated behind the client adapter. Rendering
+    /// never reads this engine-owned shape directly.
+    pub workflow_graph_rpc: haider_client::WorkflowGraphRpcAdapter,
+    /// Last typed projection/watch refusal. The last good graph remains
+    /// visible while the driver reconnects from `workflow_graph.cursor()`.
+    pub workflow_graph_error: Option<String>,
+    /// Explicit reject-evidence subview opened from the workflow detail.
+    /// This is screen-local and clears on detail/session/pane changes.
+    pub workflow_evidence_inspection: Option<WorkflowEvidenceInspection>,
     /// D1 — the Loom registry snapshot (types color the `@type ·` chips; the
     /// workflows annotate the graph screen with tasks + typed I/O).
     pub loom_types: Vec<haider_protocol::loom::LoomAgentType>,
@@ -4127,6 +4242,10 @@ impl Default for AppModel {
             subtree_collapsed: false,
             fleet: crate::fleet::FleetView::default(),
             graph: None,
+            workflow_graph: haider_client::WorkflowGraphProjection::default(),
+            workflow_graph_rpc: haider_client::WorkflowGraphRpcAdapter::default(),
+            workflow_graph_error: None,
+            workflow_evidence_inspection: None,
             loom_types: Vec::new(),
             workflow_catalog: Vec::new(),
             loom_workflows: Vec::new(),
@@ -5716,6 +5835,107 @@ impl AppModel {
         self.dirty = true;
     }
 
+    /// Install one complete `workflow.graph.state` baseline for the active
+    /// session. A reply crossing a session switch is ignored.
+    pub fn apply_workflow_graph_state(
+        &mut self,
+        session_id: &haider_protocol::ids::SessionId,
+        state: Option<haider_protocol::graph::WorkflowGraphState>,
+    ) {
+        if self.active_session.as_ref() != Some(session_id) {
+            return;
+        }
+        match state {
+            Some(state) => {
+                let mut adapter = self.workflow_graph_rpc.clone();
+                match adapter.replace(state) {
+                    Ok(projected) => match self.workflow_graph.replace(projected) {
+                        Ok(()) => {
+                            self.workflow_graph_rpc = adapter;
+                            self.workflow_graph_error = None;
+                            self.workflow_evidence_inspection = None;
+                        }
+                        Err(error) => self.workflow_graph_error = Some(error.to_string()),
+                    },
+                    Err(error) => self.workflow_graph_error = Some(error.to_string()),
+                }
+            }
+            None => {
+                self.workflow_graph.clear();
+                self.workflow_graph_rpc.clear();
+                self.workflow_graph_error = None;
+                self.workflow_evidence_inspection = None;
+            }
+        }
+        if self.screen == Screen::Loom
+            && self.loom_pane == LoomPane::Workflows
+            && self.loom_selection == 0
+            && let Some(index) = self
+                .workflow_graph
+                .workflow_id()
+                .and_then(|workflow_id| self.workflow_row_index(workflow_id))
+        {
+            self.loom_selection = index;
+        }
+        self.dirty = true;
+    }
+
+    /// Apply one cursor-bounded `workflow.graph.watch` page. A mismatch leaves
+    /// the cursor and last good view untouched so the driver can reconnect
+    /// from exactly the greatest applied cursor.
+    pub fn apply_workflow_graph_page(
+        &mut self,
+        session_id: &haider_protocol::ids::SessionId,
+        page: haider_protocol::graph::WorkflowGraphWatchPage,
+    ) -> WorkflowGraphPageOutcome {
+        if self.active_session.as_ref() != Some(session_id) {
+            return WorkflowGraphPageOutcome::Ignored;
+        }
+        let Some(cursor) = self.workflow_graph.cursor() else {
+            self.workflow_graph_error =
+                Some(haider_client::WorkflowGraphRpcAdapterError::BaselineRequired.to_string());
+            self.dirty = true;
+            return WorkflowGraphPageOutcome::Rebaseline;
+        };
+        let mut adapter = self.workflow_graph_rpc.clone();
+        match adapter.apply_page(cursor, page) {
+            Ok(page) => {
+                let has_more = page.next_cursor < page.replay_through_cursor;
+                match self.workflow_graph.apply_page(page) {
+                    Ok(changed) => {
+                        self.workflow_graph_rpc = adapter;
+                        self.workflow_graph_error = None;
+                        if changed
+                            && self.workflow_evidence_inspection.as_ref().is_some_and(
+                                |inspection| {
+                                    self.workflow_graph
+                                        .rejection(&inspection.node_id)
+                                        .is_none_or(|rejection| {
+                                            rejection.cursor != inspection.cursor
+                                        })
+                                },
+                            )
+                        {
+                            self.workflow_evidence_inspection = None;
+                        }
+                        self.dirty |= changed;
+                        WorkflowGraphPageOutcome::Applied { has_more }
+                    }
+                    Err(error) => {
+                        self.workflow_graph_error = Some(error.to_string());
+                        self.dirty = true;
+                        WorkflowGraphPageOutcome::Rebaseline
+                    }
+                }
+            }
+            Err(error) => {
+                self.workflow_graph_error = Some(error.to_string());
+                self.dirty = true;
+                WorkflowGraphPageOutcome::Rebaseline
+            }
+        }
+    }
+
     /// M2c: install the `graph.inspect` telemetry snapshot for the active
     /// session (rollups, tool-selection stats, evidence provenance). Ignores a
     /// stale reply for a since-switched session, like `apply_graph_status`.
@@ -6113,6 +6333,18 @@ impl AppModel {
             // leaves no subject — fold the pane so esc means one press.
             if total == 0 {
                 self.loom_detail = false;
+                self.workflow_evidence_inspection = None;
+            }
+            // In an open workflow detail, an empty-composer Enter opens the
+            // first rejected node's published evidence coordinate. The
+            // ordinary Enter arm below still opens a catalog row initially;
+            // Esc closes this subview before it closes the row detail.
+            if key.code == KeyCode::Enter
+                && self.composer.text().trim().is_empty()
+                && self.open_selected_workflow_rejection_evidence()
+            {
+                self.dirty = true;
+                return;
             }
             let ceiling = self.loom_scroll_max.get();
             match key.code {
@@ -6157,6 +6389,9 @@ impl AppModel {
                 }
                 KeyCode::Enter if total > 0 => {
                     self.loom_detail = !self.loom_detail;
+                    if !self.loom_detail {
+                        self.workflow_evidence_inspection = None;
+                    }
                     self.loom_scroll = 0;
                     // Unknown ceiling until the pane paints once.
                     self.loom_scroll_max.set(u16::MAX);
@@ -6174,12 +6409,34 @@ impl AppModel {
                         LoomPane::Types => LoomPane::Workflows,
                         LoomPane::Workflows => LoomPane::Types,
                     };
-                    self.loom_selection = 0;
+                    self.loom_selection = if self.loom_pane == LoomPane::Workflows
+                        && self.daemon_serves(haider_rpc::FEATURE_WORKFLOW_GRAPH_V1)
+                    {
+                        self.workflow_graph
+                            .workflow_id()
+                            .and_then(|workflow_id| self.workflow_row_index(workflow_id))
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
                     self.loom_detail = false;
+                    self.workflow_evidence_inspection = None;
                     self.loom_scroll = 0;
+                    if self.loom_pane == LoomPane::Workflows
+                        && self.daemon_serves(haider_rpc::FEATURE_WORKFLOW_GRAPH_V1)
+                        && self.active_session.is_some()
+                    {
+                        self.requests.push(if self.workflow_graph.is_empty() {
+                            AppRequest::WorkflowGraphRefresh
+                        } else {
+                            AppRequest::WorkflowGraphResume
+                        });
+                    }
                 }
                 KeyCode::Esc => {
-                    if self.loom_detail {
+                    if self.workflow_evidence_inspection.take().is_some() {
+                        self.loom_scroll = 0;
+                    } else if self.loom_detail {
                         self.loom_detail = false;
                         self.loom_scroll = 0;
                     } else {
@@ -10088,14 +10345,34 @@ impl AppModel {
             return;
         }
         self.loom_pane = pane;
-        self.loom_selection = 0;
+        self.loom_selection = if pane == LoomPane::Workflows
+            && self.daemon_serves(haider_rpc::FEATURE_WORKFLOW_GRAPH_V1)
+        {
+            self.workflow_graph
+                .workflow_id()
+                .and_then(|workflow_id| self.workflow_row_index(workflow_id))
+                .unwrap_or(0)
+        } else {
+            0
+        };
         self.loom_detail = false;
+        self.workflow_evidence_inspection = None;
         self.loom_scroll = 0;
         // W-flow: EVERY pane entry re-reads the registry, so a
         // `loom_register` landed by an authoring turn is visible on return.
         // The Listed-driven fetch stays the once-per-connection hydration
         // path; the reply still rides the connection-epoch fence.
         self.requests.push(AppRequest::LoomRefresh);
+        if pane == LoomPane::Workflows
+            && self.daemon_serves(haider_rpc::FEATURE_WORKFLOW_GRAPH_V1)
+            && self.active_session.is_some()
+        {
+            self.requests.push(if self.workflow_graph.is_empty() {
+                AppRequest::WorkflowGraphRefresh
+            } else {
+                AppRequest::WorkflowGraphResume
+            });
+        }
         // Re-entering from the browser itself (pane hop) must keep the
         // ORIGINAL return screen, not overwrite it with Screen::Loom.
         if self.screen != Screen::Loom {
@@ -11659,10 +11936,10 @@ impl AppModel {
                                 );
                             }
                         }
-                        // S3/W-A: the additive agent- and task-event unions
-                        // ride raw envelopes OUTSIDE `EventPayload` — try
-                        // them before counting the payload unknown (both
-                        // twins).
+                        // S3/W-A/L3: additive agent, task, and workflow graph
+                        // event unions ride raw envelopes OUTSIDE
+                        // `EventPayload` — try them before counting the
+                        // payload unknown (both twins).
                         Err(_) if admission == Admission::Apply => {
                             if !crate::session::route_agent_event(
                                 &mut self.branch_state,
@@ -11674,10 +11951,12 @@ impl AppModel {
                                 &mut self.branch_state,
                                 &mut self.projection,
                                 envelope,
-                            ) && !crate::session::route_permission_event(
-                                &mut self.projection,
-                                envelope,
-                            ) {
+                            ) && !crate::session::route_workflow_graph_event(envelope)
+                                && !crate::session::route_permission_event(
+                                    &mut self.projection,
+                                    envelope,
+                                )
+                            {
                                 self.projection.count_unknown_payload();
                             }
                         }
@@ -12524,6 +12803,10 @@ impl AppModel {
         // CG-M1: the graph reduction travels whole with the session so the
         // strip reflects the session it belongs to, never the last one seen.
         self.graph = slot.graph.take();
+        self.workflow_graph = std::mem::take(&mut slot.workflow_graph);
+        self.workflow_graph_rpc = std::mem::take(&mut slot.workflow_graph_rpc);
+        self.workflow_graph_error = None;
+        self.workflow_evidence_inspection = None;
         self.graph_unsupported = false;
         // W-A: the background task rows travel whole with the session.
         self.tasks = std::mem::take(&mut slot.tasks);
@@ -12605,6 +12888,10 @@ impl AppModel {
             slot.branch_state = std::mem::take(&mut self.branch_state);
             slot.hook_facts = std::mem::take(&mut self.hook_facts);
             slot.graph = self.graph.take();
+            slot.workflow_graph = std::mem::take(&mut self.workflow_graph);
+            slot.workflow_graph_rpc = std::mem::take(&mut self.workflow_graph_rpc);
+            self.workflow_graph_error = None;
+            self.workflow_evidence_inspection = None;
             slot.tasks = std::mem::take(&mut self.tasks);
             slot.msg_queue = std::mem::take(&mut self.msg_queue);
             slot.queue_mode = std::mem::take(&mut self.queue_mode);
