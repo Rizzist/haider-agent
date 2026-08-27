@@ -437,6 +437,8 @@ fn codex_https_lite_request_omits_prompt_cache_retention() {
 
 /// MUTATION PIN (b): remove `prompt_cache_key` from the HTTPS lite body.
 /// Expected runtime failure: the required stable routing key is absent.
+/// C2 derives that key from provider/account/model plus the finalized
+/// provider-view header epoch stand-in supplied by the shape fixture below.
 #[test]
 fn codex_https_lite_request_keeps_prompt_cache_key() {
     let payload = codex_lite_payload(true);
@@ -1049,7 +1051,7 @@ fn openai_shape_request(with_cache_metadata: bool) -> TurnRequest {
                 reasoning_settings: "reasoning-shape-pin".into(),
             },
             cache_epoch: "cache-shape-pin".into(),
-            header_epoch: String::new(),
+            header_epoch: "provider-view-header-shape-pin".into(),
             compaction_epoch: "compaction-shape-pin".into(),
             provider: OPENAI_OAUTH_PROVIDER_NAME.into(),
             session_scope: "session-shape-pin".into(),
