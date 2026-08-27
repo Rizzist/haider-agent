@@ -147,7 +147,6 @@ mod allocation_probe {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 pub(crate) use allocation_probe::measure_peak as measure_peak_test_allocation;
 
 pub use cachemaxxing::{

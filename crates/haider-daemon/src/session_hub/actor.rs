@@ -1139,27 +1139,26 @@ pub(super) async fn run_session_actor(
                     )));
                     continue;
                 }
+                // A compaction batch forks its node from the tree head
+                // captured at plan time. Session-config and Convergence
+                // Graph FACTS advance the journal without moving the
+                // conversation tree, so a delta made ONLY of those facts
+                // keeps the planned parent valid.
+                // Any other payload in the delta (run states, items,
+                // nodes, unknown kinds) still rejects: committing the
+                // summary would fork an obsolete tree parent.
                 if let Some(expected_head) = expected_head
                     && head != expected_head
+                    && !non_tree_fact_only_delta(&store, &session_id, expected_head, head).await
                 {
-                    // A compaction batch forks its node from the tree head
-                    // captured at plan time. Session-config and Convergence
-                    // Graph FACTS advance the journal without moving the
-                    // conversation tree, so a delta made ONLY of those facts
-                    // keeps the planned parent valid.
-                    // Any other payload in the delta (run states, items,
-                    // nodes, unknown kinds) still rejects: committing the
-                    // summary would fork an obsolete tree parent.
-                    if !non_tree_fact_only_delta(&store, &session_id, expected_head, head).await {
-                        let _ = completed.send(Err(HaiderError::new(
-                            ErrorCode::Busy,
-                            format!(
-                                "session history advanced from {expected_head} to {head} during compaction"
-                            ),
-                            true,
-                        )));
-                        continue;
-                    }
+                    let _ = completed.send(Err(HaiderError::new(
+                        ErrorCode::Busy,
+                        format!(
+                            "session history advanced from {expected_head} to {head} during compaction"
+                        ),
+                        true,
+                    )));
+                    continue;
                 }
                 // DURABLE TERMINAL TRUTH: lease identity is necessary but not
                 // sufficient. This worker-only store transaction validates the

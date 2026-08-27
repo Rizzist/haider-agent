@@ -2394,7 +2394,6 @@ impl HarnessActor {
             // the compatibility fallback instead of serializing P twice.
             let mut prefix_digests = usage_prefix_digests(&self.config, &[]);
             prefix_digests.immutable_history.clear();
-            let mut previous_prefix_digests = None;
             let request_attachments =
                 match self.resolve_tool_result_images(&mut request_messages).await {
                     Ok(attachments) => attachments,
@@ -2475,16 +2474,18 @@ impl HarnessActor {
                     .clone_from(&self.config.system_prompt);
                 provider_request.tools.clone_from(&self.config.tools);
             }
-            if let Some(rendered) = prepared.as_ref().map(|prepared| prepared.prefix_digests()) {
+            let previous_prefix_digests = if let Some(rendered) =
+                prepared.as_ref().map(|prepared| prepared.prefix_digests())
+            {
                 prefix_digests = rendered.clone();
-                previous_prefix_digests = prepared
+                prepared
                     .as_ref()
                     .and_then(|prepared| prepared.previous_immutable_history_digest())
                     .map(|history| {
                         let mut previous = rendered.clone();
                         previous.immutable_history = history.to_owned();
                         previous
-                    });
+                    })
             } else {
                 // Legacy/injected providers report normalized diagnostics
                 // over the canonical pre-projection history. Temporarily
@@ -2512,7 +2513,7 @@ impl HarnessActor {
                     request_cacheable_history_end.min(provider_request.messages.len());
                 prefix_digests =
                     usage_prefix_digests(&self.config, &provider_request.messages[..current_end]);
-                previous_prefix_digests = previous_stable_history_end
+                let previous_prefix_digests = previous_stable_history_end
                     .filter(|previous| *previous <= provider_request.messages.len())
                     .map(|previous| {
                         usage_prefix_digests(&self.config, &provider_request.messages[..previous])
@@ -2535,7 +2536,8 @@ impl HarnessActor {
                         std::mem::swap(request_images, images);
                     }
                 }
-            }
+                previous_prefix_digests
+            };
             cache_metadata = prompt_cache_metadata(
                 &self.config,
                 &provider_request.messages,
@@ -2554,20 +2556,18 @@ impl HarnessActor {
             if let Some(provider_view) = prepared
                 .as_ref()
                 .and_then(|prepared| prepared.provider_view())
+                && let Some(previous) = previous_provider_view.as_ref()
+                && let Err(error) = validate_provider_view_prefix(previous, provider_view)
             {
-                if let Some(previous) = previous_provider_view.as_ref() {
-                    if let Err(error) = validate_provider_view_prefix(previous, provider_view) {
-                        return self
-                            .errored_outcome_with_items(
-                                &run_id,
-                                &mut message,
-                                &mut reasoning,
-                                &mut tools,
-                                provider_view_invariant_error(error),
-                            )
-                            .await;
-                    }
-                }
+                return self
+                    .errored_outcome_with_items(
+                        &run_id,
+                        &mut message,
+                        &mut reasoning,
+                        &mut tools,
+                        provider_view_invariant_error(error),
+                    )
+                    .await;
             }
             if let Some(provider_view_ledger) = prepared
                 .as_ref()

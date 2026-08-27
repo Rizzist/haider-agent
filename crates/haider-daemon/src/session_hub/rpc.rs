@@ -9766,10 +9766,10 @@ impl HubConnection {
         let accepted = watch.as_ref().is_none_or(JoinHandle::is_finished);
         // Subscribe BEFORE acknowledging so a publication racing registration
         // is observed as a change rather than missed.
-        let receiver = match self.hub.accounts()? {
-            Some(facade) => Some(facade.management.subscribe()),
-            None => None,
-        };
+        let receiver = self
+            .hub
+            .accounts()?
+            .map(|facade| facade.management.subscribe());
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::AccountListWatch {

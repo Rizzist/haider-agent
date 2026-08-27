@@ -697,25 +697,23 @@ impl ContextCompactor for DaemonContextCompactor {
         if let Some(provider_view) = prepared
             .as_ref()
             .and_then(|prepared| prepared.provider_view())
+            && let Some(previous) = previous_provider_view.as_ref()
+            // A committed compaction intent deliberately summarizes a
+            // prefix shorter than the newest tool-loop marker. That cut
+            // is declared lifecycle work; the post-summary request gets
+            // a new compaction epoch and mandatory rewarm classification.
+            && usize::try_from(previous.stable_history_end)
+                .is_ok_and(|boundary| boundary <= covered_history_end)
         {
-            if let Some(previous) = previous_provider_view.as_ref()
-                // A committed compaction intent deliberately summarizes a
-                // prefix shorter than the newest tool-loop marker. That cut
-                // is declared lifecycle work; the post-summary request gets
-                // a new compaction epoch and mandatory rewarm classification.
-                && usize::try_from(previous.stable_history_end)
-                    .is_ok_and(|boundary| boundary <= covered_history_end)
-            {
-                haider_provider::validate_provider_view_prefix(previous, provider_view).map_err(
-                    |error| {
-                        HaiderError::new(
-                            ErrorCode::Internal,
-                            format!("context summarization blocked before send: {error}"),
-                            false,
-                        )
-                    },
-                )?;
-            }
+            haider_provider::validate_provider_view_prefix(previous, provider_view).map_err(
+                |error| {
+                    HaiderError::new(
+                        ErrorCode::Internal,
+                        format!("context summarization blocked before send: {error}"),
+                        false,
+                    )
+                },
+            )?;
         }
         if let Some(provider_view_ledger) = prepared
             .as_ref()
