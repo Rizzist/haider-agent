@@ -42,9 +42,10 @@ impl CheckpointKind {
 
 /// Why the checkpoint was produced. Undo, redo, and rollback remain ordinary
 /// append-only history entries and can themselves be undone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckpointOrigin {
+    #[default]
     Tool,
     Undo,
     Redo,
@@ -105,12 +106,6 @@ pub struct CheckpointRecorded {
     pub post_digest: String,
     /// Zero is a producer placeholder stamped from `committed_at_ms`.
     pub recorded_at_ms: u64,
-}
-
-impl Default for CheckpointOrigin {
-    fn default() -> Self {
-        Self::Tool
-    }
 }
 
 /// Opaque newest-first list cursor. It is the last emitted journal sequence;

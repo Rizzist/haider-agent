@@ -81,10 +81,10 @@ impl DaemonReadiness {
             if read == 1 && byte == [1] {
                 return Ok(());
             }
-            return Err(std::io::Error::new(
+            Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "daemon readiness channel closed without a notification",
-            ));
+            ))
         }
         #[cfg(windows)]
         {

@@ -3173,7 +3173,7 @@ fn collect_streamed_file_matches(
     let mut file = file;
     let sniff_limit = remaining.min(SEARCH_BINARY_SNIFF_BYTES);
     let mut sniff = Vec::with_capacity(sniff_limit);
-    file.by_ref()
+    Read::by_ref(&mut file)
         .take(sniff_limit as u64)
         .read_to_end(&mut sniff)
         .map_err(|error| ToolError::io("sniff search file", entry_path, error))?;

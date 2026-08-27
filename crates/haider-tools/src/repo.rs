@@ -318,7 +318,8 @@ fn load_ignore_rules(
     let repository_exclude = if let Some(repo_root) = repo_root {
         let metadata = repo_root.join(".git");
         if std::fs::symlink_metadata(&metadata).is_ok_and(|m| m.file_type().is_dir()) {
-            let relative = workspace_relative(workspace_root, &metadata.join("info/exclude"))?;
+            let exclude = metadata.join("info/exclude");
+            let relative = workspace_relative(workspace_root, &exclude)?;
             build_anchored_ignore(workspace_root, repo_root, relative)?
         } else {
             Gitignore::empty()

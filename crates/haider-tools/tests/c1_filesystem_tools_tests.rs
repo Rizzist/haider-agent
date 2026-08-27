@@ -283,11 +283,14 @@ async fn search_and_glob_are_root_confined_sorted_and_bounded() {
     assert!(glob.truncated);
     assert_eq!(glob.preview.lines().count(), 4);
     assert_eq!(glob.preview.lines().next(), Some("entry-000.rs"));
-    assert_eq!(glob.preview.lines().last(), Some("[… 497 more .rs files]"));
+    assert_eq!(
+        glob.preview.lines().next_back(),
+        Some("[… 497 more .rs files]")
+    );
     let raw_glob = String::from_utf8(cas.writes.last().expect("raw glob CAS").clone())
         .expect("UTF-8 glob CAS");
     assert_eq!(raw_glob.lines().count(), 500);
-    assert_eq!(raw_glob.lines().last(), Some("entry-499.rs"));
+    assert_eq!(raw_glob.lines().next_back(), Some("entry-499.rs"));
 
     let (mut refused, observer) = broker(&workspace, "refused", 2);
     let error = refused
