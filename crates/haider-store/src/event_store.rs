@@ -68,7 +68,10 @@ use haider_protocol::ids::{
 };
 use haider_protocol::item::{CommandExecutionOrigin, ItemEvent, TurnItem, UserCommandOriginV1};
 use haider_protocol::loom::{
-    LoomAgentType, LoomRegistration, LoomWorkflow, compile_pipe, parse_pipe,
+    LoomAgentType, LoomRegistration, LoomRegistryDelta, LoomRegistryDeltaKind,
+    LoomRegistryEntryKind, LoomRegistryEntryRef, LoomRegistryRecord, LoomRegistrySnapshot,
+    LoomRegistrySnapshotEntry, LoomRevisionConflict, LoomRevisionExpectation, LoomWorkflow,
+    compile_pipe, parse_pipe,
 };
 use haider_protocol::menu::{Menu, MenuAnswer, MenuCloseReason, MenuKind};
 use haider_protocol::permission::PermissionEventPayload;
@@ -90,7 +93,8 @@ use haider_protocol::tool::{AttachmentBlock, ImageBlockRef};
 use haider_protocol::typed_agent::{
     TYPED_AGENT_INSTALL_STATUS_MAX_JOBS, TYPED_AGENT_INSTALL_WATCH_PAGE_MAX_EVENTS,
     TypedAgentContract, TypedAgentContractError, TypedAgentInstallEvent, TypedAgentInstallItem,
-    TypedAgentInstallJob, TypedAgentInstallProgress, TypedAgentInstallState, TypedAgentRequiredCli,
+    TypedAgentInstallJob, TypedAgentInstallProgress, TypedAgentInstallState,
+    TypedAgentInstallTerminalStateV1, TypedAgentRequiredCli,
 };
 use haider_protocol::{DeliveryMode, EventPayload};
 use rusqlite::{
@@ -1478,6 +1482,30 @@ pub struct LoomAgentTypeRegistration {
     pub install_job_id: Option<String>,
 }
 
+/// Store result for a CAS-fenced registry mutation. The publication cursor is
+/// allocated in the same transaction as `value`; callers publish only after
+/// this result returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoomRegistryMutation<T> {
+    Applied {
+        value: T,
+        publication_cursor: Option<u64>,
+    },
+    Conflict(LoomRevisionConflict),
+}
+
+/// Archive/unarchive result before wire projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoomArchiveResult {
+    Changed {
+        entry: LoomRegistryEntryRef,
+        publication_cursor: u64,
+    },
+    Already(LoomRegistryEntryRef),
+    NotFound,
+    Conflict(LoomRevisionConflict),
+}
+
 /// Compare-and-swap coordinates for one optional per-program transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypedAgentInstallItemCas {
@@ -1510,6 +1538,24 @@ pub enum TypedAgentInstallRetryResult {
     JobNotFound,
     StateNotRetryable { state: TypedAgentInstallState },
     ContractNotCurrent,
+}
+
+/// Result of the explicit install cancellation door.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypedAgentInstallCancelResult {
+    Cancelled,
+    AlreadyTerminal {
+        state: TypedAgentInstallTerminalStateV1,
+    },
+    Unknown,
+}
+
+/// One bounded durable registry replay page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoomRegistryWatchPage {
+    pub replay_through_cursor: u64,
+    pub next_cursor: u64,
+    pub deltas: Vec<LoomRegistryDelta>,
 }
 
 /// One bounded, exact-job page from the durable progress history.
@@ -2306,7 +2352,7 @@ impl Store {
     pub fn loom_agent_types(&self) -> StoreResult<Vec<LoomAgentType>> {
         let connection = self.connection()?;
         let mut statement = connection
-            .prepare("SELECT record_json FROM loom_agent_types ORDER BY id")
+            .prepare("SELECT record_json FROM loom_agent_types WHERE archived = 0 ORDER BY id")
             .map_err(map_sqlite_error)?;
         let rows = statement
             .query_map([], |row| row.get::<_, String>(0))
@@ -2322,11 +2368,18 @@ impl Store {
         Ok(records)
     }
 
+    /// Explicit archive-aware inventory. Callers must opt in; ordinary
+    /// catalogs and selection continue to exclude archived rows.
+    pub fn loom_agent_types_including_archived(&self) -> StoreResult<Vec<LoomAgentType>> {
+        let connection = self.connection()?;
+        loom_agent_types_tx(&connection, true)
+    }
+
     /// B1 — every registered Loom workflow (compiled records), ordered by id.
     pub fn loom_workflows(&self) -> StoreResult<Vec<LoomWorkflow>> {
         let connection = self.connection()?;
         let mut statement = connection
-            .prepare("SELECT record_json FROM loom_workflows ORDER BY id")
+            .prepare("SELECT record_json FROM loom_workflows WHERE archived = 0 ORDER BY id")
             .map_err(map_sqlite_error)?;
         let rows = statement
             .query_map([], |row| row.get::<_, String>(0))
@@ -2342,12 +2395,23 @@ impl Store {
         Ok(records)
     }
 
+    pub fn loom_workflows_including_archived(&self) -> StoreResult<Vec<LoomWorkflow>> {
+        let connection = self.connection()?;
+        loom_workflows_tx(&connection, true)
+    }
+
+    /// Exact archive facts for entries returned by an include-archived list.
+    pub fn loom_archived_entries(&self) -> StoreResult<Vec<LoomRegistryEntryRef>> {
+        let connection = self.connection()?;
+        loom_archived_entries_tx(&connection)
+    }
+
     /// C1 — one workflow by id (registry read used by the worker's Loom tail).
     pub fn loom_workflow(&self, id: &str) -> StoreResult<Option<LoomWorkflow>> {
         let connection = self.connection()?;
         let record = connection
             .query_row(
-                "SELECT record_json FROM loom_workflows WHERE id = ?1",
+                "SELECT record_json FROM loom_workflows WHERE id = ?1 AND archived = 0",
                 [id],
                 |row| row.get::<_, String>(0),
             )
@@ -2447,7 +2511,7 @@ impl Store {
         let connection = self.connection()?;
         let record = connection
             .query_row(
-                "SELECT record_json FROM loom_agent_types WHERE id = ?1",
+                "SELECT record_json FROM loom_agent_types WHERE id = ?1 AND archived = 0",
                 [id],
                 |row| row.get::<_, String>(0),
             )
@@ -2580,10 +2644,10 @@ impl Store {
         sync_result
     }
 
-    /// B1 — register (or revise) one agent type. The registry rev law:
-    /// a NEW id lands at rev 1 regardless of the caller's counter; identical
-    /// CONTENT (digest) is an idempotent no-op; changed content advances the
-    /// rev by exactly one. Callers never pick revs — the registry does.
+    /// Compatibility create/idempotency door for one agent type. A NEW id
+    /// lands at rev 1 and identical content is a no-op. Changed content is
+    /// refused: revisions must use the explicit CAS door below, so this
+    /// legacy helper can never silently overwrite a concurrent writer.
     pub fn loom_register_agent_type(
         &self,
         record: &LoomAgentType,
@@ -2593,14 +2657,36 @@ impl Store {
             .registration)
     }
 
-    /// Register or revise one typed specialist and atomically enqueue the
-    /// required CLI installation for the exact stored rev/digest. The legacy
-    /// registration method delegates here and discards only the richer job
-    /// projection, preserving its public result and rev law.
+    /// Create/idempotently register one typed specialist and atomically
+    /// enqueue the required CLI installation for the exact stored rev/digest.
+    /// Changed content is accepted only by the explicit CAS variant.
     pub fn loom_register_agent_type_with_install(
         &self,
         record: &LoomAgentType,
     ) -> StoreResult<LoomAgentTypeRegistration> {
+        match self.loom_register_agent_type_with_install_inner(record, None)? {
+            LoomRegistryMutation::Applied { value, .. } => Ok(value),
+            LoomRegistryMutation::Conflict(_) => Err(corrupt(
+                "unfenced Loom registration reported a CAS conflict",
+            )),
+        }
+    }
+
+    /// Client-visible CAS door. `rev = 0` means the id must be absent; a
+    /// positive revision and optional digest must match the one current row.
+    pub fn loom_register_agent_type_with_install_cas(
+        &self,
+        record: &LoomAgentType,
+        expected: &LoomRevisionExpectation,
+    ) -> StoreResult<LoomRegistryMutation<LoomAgentTypeRegistration>> {
+        self.loom_register_agent_type_with_install_inner(record, Some(expected))
+    }
+
+    fn loom_register_agent_type_with_install_inner(
+        &self,
+        record: &LoomAgentType,
+        expected: Option<&LoomRevisionExpectation>,
+    ) -> StoreResult<LoomRegistryMutation<LoomAgentTypeRegistration>> {
         let record = &normalize_agent_type(record);
         validate_agent_type(record)?;
         let mut connection = self.connection()?;
@@ -2633,7 +2719,38 @@ impl Store {
                 Ok((stored_rev, digest, stored))
             })
             .transpose()?;
+        if let Some(expected) = expected
+            && !loom_expectation_matches(
+                expected,
+                existing
+                    .as_ref()
+                    .map(|(rev, digest, _)| (*rev, digest.as_str())),
+            )
+        {
+            let conflict = loom_revision_conflict(
+                expected,
+                existing
+                    .as_ref()
+                    .map(|(rev, digest, _)| (*rev, digest.as_str())),
+            );
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(LoomRegistryMutation::Conflict(conflict));
+        }
         let digest = record.digest();
+        if expected.is_none()
+            && existing
+                .as_ref()
+                .is_some_and(|(_, current, _)| current != &digest)
+        {
+            return Err(store_error(
+                ErrorCode::RevisionConflict,
+                format!(
+                    "unfenced Loom agent-type mutation for `{}` refuses changed content; use the CAS door",
+                    record.id
+                ),
+                false,
+            ));
+        }
         let now = now_ms()?;
         let is_new = existing.is_none();
         let (outcome, changed_record) = match &existing {
@@ -2776,11 +2893,32 @@ impl Store {
             )
             .optional()
             .map_err(map_sqlite_error)?;
+        let publication_cursor = if outcome.updated {
+            let archived = transaction
+                .query_row(
+                    "SELECT archived FROM loom_agent_types WHERE id = ?1",
+                    [outcome.id.as_str()],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(map_sqlite_error)?;
+            insert_loom_registry_upsert_events(
+                &transaction,
+                LoomRegistryEntryKind::AgentType,
+                &outcome,
+                archived,
+                now,
+            )?
+        } else {
+            None
+        };
         transaction.commit().map_err(map_sqlite_error)?;
-        Ok(LoomAgentTypeRegistration {
-            registration: outcome,
-            install_job,
-            install_job_id,
+        Ok(LoomRegistryMutation::Applied {
+            value: LoomAgentTypeRegistration {
+                registration: outcome,
+                install_job,
+                install_job_id,
+            },
+            publication_cursor,
         })
     }
 
@@ -2865,6 +3003,7 @@ impl Store {
             .fold(now_ms()?.max(actual.updated_at_ms), u64::max);
         let mut next = actual.clone();
         next.state = TypedAgentInstallState::Queued;
+        next.cancelled = false;
         next.progress.completed = 0;
         next.progress.current_cli = None;
         next.error = None;
@@ -2888,7 +3027,7 @@ impl Store {
             .execute(
                 "UPDATE loom_cli_install_jobs
                  SET state = 'queued', completed = 0, current_cli = NULL,
-                     error = NULL, updated_at_ms = ?2
+                     error = NULL, cancelled = 0, updated_at_ms = ?2
                  WHERE job_id = ?1 AND state = 'failed' AND updated_at_ms = ?3",
                 params![
                     job_id,
@@ -2919,6 +3058,67 @@ impl Store {
         insert_typed_agent_install_event(&transaction, &next)?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(TypedAgentInstallRetryResult::Requeued(next))
+    }
+
+    /// Atomically terminalize one queued/running install job. The registry row
+    /// and every install item remain intact so an explicit retry can requeue
+    /// the same immutable contract later.
+    pub fn typed_agent_install_cancel(
+        &self,
+        install_job_id: &str,
+    ) -> StoreResult<TypedAgentInstallCancelResult> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let Some(actual) = typed_agent_install_job_tx(&transaction, install_job_id)? else {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(TypedAgentInstallCancelResult::Unknown);
+        };
+        if actual.state.is_terminal() {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(TypedAgentInstallCancelResult::AlreadyTerminal {
+                state: if actual.cancelled {
+                    TypedAgentInstallTerminalStateV1::Cancelled
+                } else if actual.state == TypedAgentInstallState::Succeeded {
+                    TypedAgentInstallTerminalStateV1::Succeeded
+                } else {
+                    TypedAgentInstallTerminalStateV1::Failed
+                },
+            });
+        }
+        let mut cancelled = actual.clone();
+        cancelled.state = TypedAgentInstallState::Failed;
+        cancelled.cancelled = true;
+        cancelled.progress.current_cli = None;
+        cancelled.error = Some("typed-agent installation was cancelled".to_owned());
+        cancelled.updated_at_ms = now_ms()?.max(actual.updated_at_ms);
+        cancelled
+            .validate()
+            .map_err(typed_agent_install_validation_error)?;
+        let changed = transaction
+            .execute(
+                "UPDATE loom_cli_install_jobs
+                 SET state = 'failed', cancelled = 1, current_cli = NULL,
+                     error = ?2, updated_at_ms = ?3
+                 WHERE job_id = ?1 AND cancelled = 0 AND state = ?4 AND updated_at_ms = ?5",
+                params![
+                    install_job_id,
+                    cancelled.error.as_deref(),
+                    to_sqlite_integer(cancelled.updated_at_ms)?,
+                    typed_agent_install_state_str(actual.state),
+                    to_sqlite_integer(actual.updated_at_ms)?,
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+        if changed != 1 {
+            return Err(typed_agent_install_conflict(format!(
+                "typed-agent install job `{install_job_id}` lost its cancellation race"
+            )));
+        }
+        insert_typed_agent_install_event(&transaction, &cancelled)?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(TypedAgentInstallCancelResult::Cancelled)
     }
 
     /// Read one exact job's durable progress snapshots strictly after the
@@ -3041,8 +3241,9 @@ impl Store {
             .execute(
                 "UPDATE loom_cli_install_jobs
                  SET state = ?2, completed = ?3, current_cli = ?4, error = ?5,
-                     updated_at_ms = ?6
-                 WHERE job_id = ?1 AND state = ?7 AND updated_at_ms = ?8",
+                     updated_at_ms = ?6, cancelled = ?7
+                 WHERE job_id = ?1 AND state = ?8 AND updated_at_ms = ?9
+                   AND cancelled = ?10",
                 params![
                     update.next_job.job_id.as_str(),
                     typed_agent_install_state_str(update.next_job.state),
@@ -3050,8 +3251,10 @@ impl Store {
                     update.next_job.progress.current_cli.as_deref(),
                     update.next_job.error.as_deref(),
                     to_sqlite_integer(update.next_job.updated_at_ms)?,
+                    update.next_job.cancelled,
                     typed_agent_install_state_str(actual_job.state),
                     to_sqlite_integer(actual_job.updated_at_ms)?,
+                    actual_job.cancelled,
                 ],
             )
             .map_err(map_sqlite_error)?;
@@ -3092,11 +3295,31 @@ impl Store {
         Ok(update.next_job.clone())
     }
 
-    /// B1 — register (or revise) one workflow FROM PIPE SOURCE. The store is
-    /// the compiler authority: callers send source, the registry compiles it
-    /// against the CURRENT agent-type table inside this transaction, and a
-    /// rejected pipe never leaves a half-written record. Rev law as above.
+    /// Compatibility create/idempotency door for one workflow FROM PIPE
+    /// SOURCE. The store remains the compiler authority, but changed content
+    /// is refused unless the caller supplies an explicit CAS expectation.
     pub fn loom_register_workflow(&self, source: &str) -> StoreResult<LoomRegistration> {
+        match self.loom_register_workflow_inner(source, None)? {
+            LoomRegistryMutation::Applied { value, .. } => Ok(value),
+            LoomRegistryMutation::Conflict(_) => {
+                Err(corrupt("unfenced Loom workflow reported a CAS conflict"))
+            }
+        }
+    }
+
+    pub fn loom_register_workflow_cas(
+        &self,
+        source: &str,
+        expected: &LoomRevisionExpectation,
+    ) -> StoreResult<LoomRegistryMutation<LoomRegistration>> {
+        self.loom_register_workflow_inner(source, Some(expected))
+    }
+
+    fn loom_register_workflow_inner(
+        &self,
+        source: &str,
+        expected: Option<&LoomRevisionExpectation>,
+    ) -> StoreResult<LoomRegistryMutation<LoomRegistration>> {
         let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -3106,7 +3329,7 @@ impl Store {
         let mut agent_types = std::collections::HashMap::new();
         {
             let mut statement = transaction
-                .prepare("SELECT record_json FROM loom_agent_types")
+                .prepare("SELECT record_json FROM loom_agent_types WHERE archived = 0")
                 .map_err(map_sqlite_error)?;
             let rows = statement
                 .query_map([], |row| row.get::<_, String>(0))
@@ -3168,6 +3391,35 @@ impl Store {
             )
             .optional()
             .map_err(map_sqlite_error)?;
+        if let Some(expected) = expected {
+            let current = existing
+                .as_ref()
+                .map(|(rev, digest, _)| {
+                    u32::try_from(*rev)
+                        .map(|rev| (rev, digest.as_str()))
+                        .map_err(|_| corrupt("loom workflow rev is out of range"))
+                })
+                .transpose()?;
+            if !loom_expectation_matches(expected, current) {
+                let conflict = loom_revision_conflict(expected, current);
+                transaction.commit().map_err(map_sqlite_error)?;
+                return Ok(LoomRegistryMutation::Conflict(conflict));
+            }
+        }
+        if expected.is_none()
+            && existing
+                .as_ref()
+                .is_some_and(|(_, current, _)| current != &workflow.digest)
+        {
+            return Err(store_error(
+                ErrorCode::RevisionConflict,
+                format!(
+                    "unfenced Loom workflow mutation for `{}` refuses changed content; use the CAS door",
+                    workflow.id
+                ),
+                false,
+            ));
+        }
         let now = now_ms()?;
         let outcome = match existing {
             Some((rev, ref current, ref stored_json)) if *current == workflow.digest => {
@@ -3321,8 +3573,243 @@ impl Store {
                 }
             }
         };
+        let publication_cursor = if outcome.updated {
+            let archived = transaction
+                .query_row(
+                    "SELECT archived FROM loom_workflows WHERE id = ?1",
+                    [outcome.id.as_str()],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(map_sqlite_error)?;
+            insert_loom_registry_upsert_events(
+                &transaction,
+                LoomRegistryEntryKind::Workflow,
+                &outcome,
+                archived,
+                now,
+            )?
+        } else {
+            None
+        };
         transaction.commit().map_err(map_sqlite_error)?;
-        Ok(outcome)
+        Ok(LoomRegistryMutation::Applied {
+            value: outcome,
+            publication_cursor,
+        })
+    }
+
+    /// Atomically change only selection state. Content revision and digest do
+    /// not move; the archive transition receives its own durable cursor.
+    pub fn loom_set_archived(
+        &self,
+        kind: LoomRegistryEntryKind,
+        id: &str,
+        archived: bool,
+        expected: &LoomRevisionExpectation,
+    ) -> StoreResult<LoomArchiveResult> {
+        validate_loom_registry_id(id)?;
+        let table = match kind {
+            LoomRegistryEntryKind::AgentType => "loom_agent_types",
+            LoomRegistryEntryKind::Workflow => "loom_workflows",
+            _ => {
+                return Err(store_error(
+                    ErrorCode::InvalidArgument,
+                    "unknown Loom registry entry kind",
+                    false,
+                ));
+            }
+        };
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let sql = format!("SELECT rev, digest, archived, record_json FROM {table} WHERE id = ?1");
+        let current = transaction
+            .query_row(&sql, [id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .optional()
+            .map_err(map_sqlite_error)?;
+        let Some((rev, digest, was_archived, record_json)) = current else {
+            let outcome = if loom_expectation_matches(expected, None) {
+                LoomArchiveResult::NotFound
+            } else {
+                LoomArchiveResult::Conflict(loom_revision_conflict(expected, None))
+            };
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(outcome);
+        };
+        let rev =
+            u32::try_from(rev).map_err(|_| corrupt("Loom registry revision is out of range"))?;
+        let current = Some((rev, digest.as_str()));
+        if !loom_expectation_matches(expected, current) {
+            let conflict = loom_revision_conflict(expected, current);
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(LoomArchiveResult::Conflict(conflict));
+        }
+        let entry = LoomRegistryEntryRef {
+            kind,
+            id: id.to_owned(),
+            rev,
+            digest: digest.clone(),
+            archived,
+        };
+        if was_archived == archived {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(LoomArchiveResult::Already(entry));
+        }
+        if kind == LoomRegistryEntryKind::AgentType {
+            let record: LoomAgentType = serde_json::from_str(&record_json)
+                .map_err(|_| corrupt("loom agent type record is not decodable"))?;
+            self.retain_loom_agent_type_revision(&record)?;
+        }
+        let update = format!("UPDATE {table} SET archived = ?2, updated_at_ms = ?3 WHERE id = ?1");
+        let now = now_ms()?;
+        let changed = transaction
+            .execute(&update, params![id, archived, to_sqlite_integer(now)?])
+            .map_err(map_sqlite_error)?;
+        if changed != 1 {
+            return Err(corrupt("Loom archive transition affected no row"));
+        }
+        let change = if archived {
+            LoomRegistryDeltaKind::Archived
+        } else {
+            LoomRegistryDeltaKind::Unarchived
+        };
+        let cursor = insert_loom_registry_event(&transaction, change, &entry, now)?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(LoomArchiveResult::Changed {
+            entry,
+            publication_cursor: cursor,
+        })
+    }
+
+    /// Full archive-aware registry baseline from one SQLite snapshot.
+    pub fn loom_registry_snapshot(&self) -> StoreResult<LoomRegistrySnapshot> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(map_sqlite_error)?;
+        let through_cursor = loom_registry_head_tx(&transaction)?;
+        let agent_types = loom_agent_type_rows_tx(&transaction, true)?;
+        let workflows = loom_workflow_rows_tx(&transaction, true)?;
+        let mut entries = Vec::with_capacity(agent_types.len().saturating_add(workflows.len()));
+        entries.extend(agent_types.into_iter().map(|(record, archived)| {
+            let entry = LoomRegistryEntryRef {
+                kind: LoomRegistryEntryKind::AgentType,
+                id: record.id.clone(),
+                rev: record.rev,
+                digest: record.digest(),
+                archived,
+            };
+            LoomRegistrySnapshotEntry {
+                entry,
+                record: LoomRegistryRecord::AgentType(record),
+            }
+        }));
+        entries.extend(workflows.into_iter().map(|(record, archived)| {
+            let entry = LoomRegistryEntryRef {
+                kind: LoomRegistryEntryKind::Workflow,
+                id: record.id.clone(),
+                rev: record.rev,
+                digest: record.digest.clone(),
+                archived,
+            };
+            LoomRegistrySnapshotEntry {
+                entry,
+                record: LoomRegistryRecord::Workflow(record),
+            }
+        }));
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(LoomRegistrySnapshot {
+            through_cursor,
+            entries,
+        })
+    }
+
+    pub fn loom_registry_head(&self) -> StoreResult<u64> {
+        let connection = self.connection()?;
+        loom_registry_head_tx(&connection)
+    }
+
+    /// Replays exact immutable records for one sealed registry cursor range.
+    pub fn loom_registry_watch_page(
+        &self,
+        after_cursor: u64,
+        through_cursor: u64,
+    ) -> StoreResult<LoomRegistryWatchPage> {
+        if after_cursor > through_cursor {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "Loom registry watch cursor is beyond its replay seal",
+                false,
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(map_sqlite_error)?;
+        let head = loom_registry_head_tx(&transaction)?;
+        if through_cursor > head {
+            return Err(corrupt("Loom registry replay seal is beyond durable head"));
+        }
+        let mut statement = transaction
+            .prepare_cached(
+                "SELECT cursor, entry_kind, entry_id, change_kind, rev, digest, archived
+                 FROM loom_registry_events
+                 WHERE cursor > ?1 AND cursor <= ?2
+                 ORDER BY cursor
+                 LIMIT 128",
+            )
+            .map_err(map_sqlite_error)?;
+        let mut rows = statement
+            .query(params![
+                to_sqlite_integer(after_cursor)?,
+                to_sqlite_integer(through_cursor)?
+            ])
+            .map_err(map_sqlite_error)?;
+        let mut raw = Vec::new();
+        while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+            raw.push((
+                u64::try_from(row.get::<_, i64>(0).map_err(map_sqlite_error)?)
+                    .map_err(|_| corrupt("Loom registry event cursor is negative"))?,
+                row.get::<_, String>(1).map_err(map_sqlite_error)?,
+                row.get::<_, String>(2).map_err(map_sqlite_error)?,
+                row.get::<_, String>(3).map_err(map_sqlite_error)?,
+                u32::try_from(row.get::<_, i64>(4).map_err(map_sqlite_error)?)
+                    .map_err(|_| corrupt("Loom registry event revision is out of range"))?,
+                row.get::<_, String>(5).map_err(map_sqlite_error)?,
+                row.get::<_, bool>(6).map_err(map_sqlite_error)?,
+            ));
+        }
+        drop(rows);
+        drop(statement);
+        let mut deltas = Vec::with_capacity(raw.len());
+        for (cursor, kind, id, change, rev, digest, archived) in raw {
+            let kind = loom_registry_entry_kind(&kind)?;
+            let record =
+                loom_registry_record_tx(&self.root, &transaction, kind, &id, rev, &digest)?;
+            deltas.push(LoomRegistryDelta {
+                cursor,
+                change: loom_registry_delta_kind(&change)?,
+                entry: LoomRegistryEntryRef {
+                    kind,
+                    id,
+                    rev,
+                    digest,
+                    archived,
+                },
+                record,
+            });
+        }
+        let next_cursor = deltas.last().map_or(after_cursor, |delta| delta.cursor);
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(LoomRegistryWatchPage {
+            replay_through_cursor: through_cursor,
+            next_cursor,
+            deltas,
+        })
     }
 
     /// Reads a provider's last-known model catalog.
@@ -8307,6 +8794,7 @@ impl Store {
                 device_id: command.device_id.clone(),
             },
             fact,
+            |_| Ok(()),
             |metadata| metadata.effort = effort.clone(),
             move |selected_seq| SelectedEffort {
                 session_id,
@@ -8365,16 +8853,8 @@ impl Store {
                 false,
             ));
         }
-        if let Some(id) = command.agent_type.as_deref()
-            && self.loom_agent_type(id)?.is_none()
-        {
-            return Err(store_error(
-                ErrorCode::InvalidArgument,
-                format!("agent type `{id}` is not registered in the loom registry"),
-                false,
-            ));
-        }
         let agent_type = command.agent_type.clone();
+        let active_agent_type = agent_type.clone();
         let fact = haider_protocol::session::AgentTypeSelected {
             agent_type: agent_type.clone(),
         }
@@ -8401,6 +8881,30 @@ impl Store {
                 device_id: command.device_id.clone(),
             },
             fact,
+            move |transaction| {
+                let Some(id) = active_agent_type.as_deref() else {
+                    return Ok(());
+                };
+                let active = transaction
+                    .query_row(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM loom_agent_types
+                             WHERE id = ?1 AND archived = 0
+                         )",
+                        [id],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .map_err(map_sqlite_error)?;
+                if active {
+                    Ok(())
+                } else {
+                    Err(store_error(
+                        ErrorCode::InvalidArgument,
+                        format!("agent type `{id}` is not registered in the active Loom registry"),
+                        false,
+                    ))
+                }
+            },
             |metadata| metadata.agent_type = agent_type.clone(),
             move |selected_seq| SelectedAgentType {
                 session_id,
@@ -8472,6 +8976,7 @@ impl Store {
                 device_id: command.device_id.clone(),
             },
             fact,
+            |_| Ok(()),
             |metadata| metadata.fast = enabled,
             move |selected_seq| SelectedFast {
                 session_id,
@@ -8498,6 +9003,7 @@ impl Store {
         &self,
         selection: SessionConfigSelection<'_>,
         fact_payload: serde_json::Value,
+        validate: impl FnOnce(&Connection) -> StoreResult<()>,
         mutate: impl FnOnce(&mut SessionMetadataV1),
         respond: impl FnOnce(u64) -> R,
     ) -> StoreResult<SessionConfigOutcome<R>> {
@@ -8529,6 +9035,7 @@ impl Store {
             return Ok(SessionConfigOutcome::IdempotentReplay { selected });
         }
         require_typed_session(&transaction, selection.session_id)?;
+        validate(&transaction)?;
         let metadata_json: String = transaction
             .query_row(
                 "SELECT meta_json FROM sessions WHERE id = ?1",
@@ -20245,9 +20752,12 @@ fn resolve_graph_template_tx(
             template,
         }));
     }
+    // Current-by-name selection excludes archived rows. Already pinned runs
+    // resolve their immutable revision through the retained-revision path.
     let record = transaction
         .query_row(
-            "SELECT rev, record_json FROM loom_workflows WHERE id = ?1",
+            "SELECT rev, record_json FROM loom_workflows
+             WHERE id = ?1 AND archived = 0",
             [name],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
@@ -20347,8 +20857,8 @@ fn insert_typed_agent_install_event(
             "INSERT INTO loom_cli_install_events(
                  job_id, agent_type_id, agent_type_rev, agent_type_digest,
                  state, total, completed, current_cli, error,
-                 created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 created_at_ms, updated_at_ms, cancelled)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 job.job_id.as_str(),
                 job.agent_type_id.as_str(),
@@ -20361,6 +20871,7 @@ fn insert_typed_agent_install_event(
                 job.error.as_deref(),
                 to_sqlite_integer(job.created_at_ms)?,
                 to_sqlite_integer(job.updated_at_ms)?,
+                job.cancelled,
             ],
         )
         .map_err(map_sqlite_error)?;
@@ -20384,7 +20895,7 @@ fn typed_agent_install_events_tx(
         .prepare_cached(
             "SELECT cursor, job_id, agent_type_id, agent_type_rev,
                     agent_type_digest, state, total, completed, current_cli,
-                    error, created_at_ms, updated_at_ms
+                    error, created_at_ms, updated_at_ms, cancelled
              FROM loom_cli_install_events
              WHERE job_id = ?1 AND cursor > ?2
              ORDER BY cursor
@@ -20409,6 +20920,7 @@ fn typed_agent_install_events_tx(
         let updated_at_ms = u64::try_from(row.get::<_, i64>(11).map_err(map_sqlite_error)?)
             .map_err(|_| corrupt("typed-agent install event update timestamp is negative"))?;
         let state: String = row.get(5).map_err(map_sqlite_error)?;
+        let cancelled: bool = row.get(12).map_err(map_sqlite_error)?;
         let event = TypedAgentInstallEvent {
             cursor,
             job: TypedAgentInstallJob {
@@ -20416,7 +20928,8 @@ fn typed_agent_install_events_tx(
                 agent_type_id: row.get(2).map_err(map_sqlite_error)?,
                 agent_type_rev,
                 agent_type_digest: row.get(4).map_err(map_sqlite_error)?,
-                state: typed_agent_install_state(&state)?,
+                state: typed_agent_install_state(&state, cancelled)?,
+                cancelled,
                 progress: TypedAgentInstallProgress {
                     total,
                     completed,
@@ -20444,7 +20957,7 @@ fn typed_agent_install_jobs_tx(
         .prepare_cached(
             "SELECT job_id, agent_type_id, agent_type_rev, agent_type_digest,
                     state, total, completed, current_cli, error,
-                    created_at_ms, updated_at_ms
+                    created_at_ms, updated_at_ms, cancelled
              FROM loom_cli_install_jobs
              WHERE (?1 IS NULL OR job_id = ?1)
                AND (?2 IS NULL OR agent_type_id = ?2)
@@ -20473,7 +20986,7 @@ fn typed_agent_install_status_jobs_tx(
         .prepare_cached(
             "SELECT job_id, agent_type_id, agent_type_rev, agent_type_digest,
                     state, total, completed, current_cli, error,
-                    created_at_ms, updated_at_ms
+                    created_at_ms, updated_at_ms, cancelled
              FROM loom_cli_install_jobs
              WHERE (?1 IS NULL OR job_id = ?1)
                AND (?2 IS NULL OR agent_type_id = ?2)
@@ -20712,12 +21225,14 @@ fn typed_agent_install_job_row(row: &rusqlite::Row<'_>) -> StoreResult<TypedAgen
     let updated_at_ms = u64::try_from(row.get::<_, i64>(10).map_err(map_sqlite_error)?)
         .map_err(|_| corrupt("typed-agent install job update timestamp is negative"))?;
     let state: String = row.get(4).map_err(map_sqlite_error)?;
+    let cancelled: bool = row.get(11).map_err(map_sqlite_error)?;
     let job = TypedAgentInstallJob {
         job_id: row.get(0).map_err(map_sqlite_error)?,
         agent_type_id: row.get(1).map_err(map_sqlite_error)?,
         agent_type_rev,
         agent_type_digest: row.get(3).map_err(map_sqlite_error)?,
-        state: typed_agent_install_state(&state)?,
+        state: typed_agent_install_state(&state, cancelled)?,
+        cancelled,
         progress: TypedAgentInstallProgress {
             total,
             completed,
@@ -20750,7 +21265,7 @@ fn typed_agent_install_item_row(row: &rusqlite::Row<'_>) -> StoreResult<TypedAge
         required_cli: TypedAgentRequiredCli {
             program: row.get(2).map_err(map_sqlite_error)?,
         },
-        state: typed_agent_install_state(&state)?,
+        state: typed_agent_install_state(&state, false)?,
         error: row.get(4).map_err(map_sqlite_error)?,
         created_at_ms,
         updated_at_ms,
@@ -20764,7 +21279,15 @@ fn typed_agent_install_item_row(row: &rusqlite::Row<'_>) -> StoreResult<TypedAge
     Ok(item)
 }
 
-fn typed_agent_install_state(value: &str) -> StoreResult<TypedAgentInstallState> {
+fn typed_agent_install_state(value: &str, cancelled: bool) -> StoreResult<TypedAgentInstallState> {
+    if cancelled {
+        if value != "failed" {
+            return Err(corrupt(
+                "cancelled typed-agent install row is not stored as failed",
+            ));
+        }
+        return Ok(TypedAgentInstallState::Failed);
+    }
     match value {
         "queued" => Ok(TypedAgentInstallState::Queued),
         "installing" => Ok(TypedAgentInstallState::Installing),
@@ -20797,6 +21320,299 @@ fn typed_agent_install_validation_error(error: TypedAgentContractError) -> Haide
 
 fn typed_agent_install_conflict(message: impl Into<String>) -> HaiderError {
     store_error(ErrorCode::RevisionConflict, message, false)
+}
+
+fn loom_expectation_matches(
+    expected: &LoomRevisionExpectation,
+    current: Option<(u32, &str)>,
+) -> bool {
+    match current {
+        None => expected.rev == 0 && expected.digest.is_none(),
+        Some((rev, digest)) => {
+            expected.rev == rev
+                && expected
+                    .digest
+                    .as_deref()
+                    .is_none_or(|expected_digest| expected_digest == digest)
+        }
+    }
+}
+
+fn loom_revision_conflict(
+    expected: &LoomRevisionExpectation,
+    current: Option<(u32, &str)>,
+) -> LoomRevisionConflict {
+    LoomRevisionConflict {
+        expected: expected.clone(),
+        current_rev: current.map(|(rev, _)| rev),
+        current_digest: current.map(|(_, digest)| digest.to_owned()),
+    }
+}
+
+fn validate_loom_registry_id(id: &str) -> StoreResult<()> {
+    let valid = !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    if valid {
+        Ok(())
+    } else {
+        Err(store_error(
+            ErrorCode::InvalidArgument,
+            "Loom registry id must be a 1..=64 byte identifier",
+            false,
+        ))
+    }
+}
+
+fn loom_registry_entry_kind_str(kind: LoomRegistryEntryKind) -> StoreResult<&'static str> {
+    match kind {
+        LoomRegistryEntryKind::AgentType => Ok("agent_type"),
+        LoomRegistryEntryKind::Workflow => Ok("workflow"),
+        _ => Err(store_error(
+            ErrorCode::InvalidArgument,
+            "unknown Loom registry entry kind",
+            false,
+        )),
+    }
+}
+
+fn loom_registry_entry_kind(value: &str) -> StoreResult<LoomRegistryEntryKind> {
+    match value {
+        "agent_type" => Ok(LoomRegistryEntryKind::AgentType),
+        "workflow" => Ok(LoomRegistryEntryKind::Workflow),
+        _ => Err(corrupt(format!(
+            "Loom registry event entry kind `{value}` is unknown"
+        ))),
+    }
+}
+
+fn loom_registry_delta_kind_str(kind: LoomRegistryDeltaKind) -> StoreResult<&'static str> {
+    match kind {
+        LoomRegistryDeltaKind::Upserted => Ok("upserted"),
+        LoomRegistryDeltaKind::Archived => Ok("archived"),
+        LoomRegistryDeltaKind::Unarchived => Ok("unarchived"),
+        LoomRegistryDeltaKind::RevisionAdded => Ok("revision_added"),
+        _ => Err(store_error(
+            ErrorCode::InvalidArgument,
+            "unknown Loom registry delta kind",
+            false,
+        )),
+    }
+}
+
+fn loom_registry_delta_kind(value: &str) -> StoreResult<LoomRegistryDeltaKind> {
+    match value {
+        "upserted" => Ok(LoomRegistryDeltaKind::Upserted),
+        "archived" => Ok(LoomRegistryDeltaKind::Archived),
+        "unarchived" => Ok(LoomRegistryDeltaKind::Unarchived),
+        "revision_added" => Ok(LoomRegistryDeltaKind::RevisionAdded),
+        _ => Err(corrupt(format!(
+            "Loom registry event change kind `{value}` is unknown"
+        ))),
+    }
+}
+
+fn insert_loom_registry_event(
+    connection: &Connection,
+    change: LoomRegistryDeltaKind,
+    entry: &LoomRegistryEntryRef,
+    now: u64,
+) -> StoreResult<u64> {
+    let inserted = connection
+        .execute(
+            "INSERT INTO loom_registry_events(
+                 entry_kind, entry_id, change_kind, rev, digest, archived, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                loom_registry_entry_kind_str(entry.kind)?,
+                entry.id.as_str(),
+                loom_registry_delta_kind_str(change)?,
+                i64::from(entry.rev),
+                entry.digest.as_str(),
+                entry.archived,
+                to_sqlite_integer(now)?,
+            ],
+        )
+        .map_err(map_sqlite_error)?;
+    if inserted != 1 {
+        return Err(corrupt("Loom registry event insert affected no row"));
+    }
+    u64::try_from(connection.last_insert_rowid())
+        .map_err(|_| corrupt("Loom registry event cursor is negative"))
+}
+
+fn insert_loom_registry_upsert_events(
+    connection: &Connection,
+    kind: LoomRegistryEntryKind,
+    registration: &LoomRegistration,
+    archived: bool,
+    now: u64,
+) -> StoreResult<Option<u64>> {
+    if !registration.updated {
+        return Ok(None);
+    }
+    let entry = LoomRegistryEntryRef {
+        kind,
+        id: registration.id.clone(),
+        rev: registration.rev,
+        digest: registration.digest.clone(),
+        archived,
+    };
+    insert_loom_registry_event(connection, LoomRegistryDeltaKind::Upserted, &entry, now)?;
+    insert_loom_registry_event(
+        connection,
+        LoomRegistryDeltaKind::RevisionAdded,
+        &entry,
+        now,
+    )
+    .map(Some)
+}
+
+fn loom_registry_head_tx(connection: &Connection) -> StoreResult<u64> {
+    connection
+        .query_row(
+            "SELECT COALESCE(MAX(cursor), 0) FROM loom_registry_events",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(map_sqlite_error)
+        .and_then(|cursor| {
+            u64::try_from(cursor).map_err(|_| corrupt("Loom registry head cursor is negative"))
+        })
+}
+
+fn loom_agent_type_rows_tx(
+    connection: &Connection,
+    include_archived: bool,
+) -> StoreResult<Vec<(LoomAgentType, bool)>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT record_json, archived FROM loom_agent_types
+             WHERE (?1 OR archived = 0) ORDER BY id",
+        )
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query([include_archived])
+        .map_err(map_sqlite_error)?;
+    let mut records = Vec::new();
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let json: String = row.get(0).map_err(map_sqlite_error)?;
+        let record = serde_json::from_str(&json)
+            .map_err(|_| corrupt("loom agent type record is not decodable"))?;
+        records.push((record, row.get(1).map_err(map_sqlite_error)?));
+    }
+    Ok(records)
+}
+
+fn loom_workflow_rows_tx(
+    connection: &Connection,
+    include_archived: bool,
+) -> StoreResult<Vec<(LoomWorkflow, bool)>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT record_json, archived FROM loom_workflows
+             WHERE (?1 OR archived = 0) ORDER BY id",
+        )
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query([include_archived])
+        .map_err(map_sqlite_error)?;
+    let mut records = Vec::new();
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let json: String = row.get(0).map_err(map_sqlite_error)?;
+        let record = serde_json::from_str(&json)
+            .map_err(|_| corrupt("loom workflow record is not decodable"))?;
+        records.push((record, row.get(1).map_err(map_sqlite_error)?));
+    }
+    Ok(records)
+}
+
+fn loom_agent_types_tx(
+    connection: &Connection,
+    include_archived: bool,
+) -> StoreResult<Vec<LoomAgentType>> {
+    loom_agent_type_rows_tx(connection, include_archived)
+        .map(|rows| rows.into_iter().map(|(record, _)| record).collect())
+}
+
+fn loom_workflows_tx(
+    connection: &Connection,
+    include_archived: bool,
+) -> StoreResult<Vec<LoomWorkflow>> {
+    loom_workflow_rows_tx(connection, include_archived)
+        .map(|rows| rows.into_iter().map(|(record, _)| record).collect())
+}
+
+fn loom_archived_entries_tx(connection: &Connection) -> StoreResult<Vec<LoomRegistryEntryRef>> {
+    let mut entries = Vec::new();
+    for (kind, table) in [
+        (LoomRegistryEntryKind::AgentType, "loom_agent_types"),
+        (LoomRegistryEntryKind::Workflow, "loom_workflows"),
+    ] {
+        let sql = format!("SELECT id, rev, digest FROM {table} WHERE archived = 1 ORDER BY id");
+        let mut statement = connection.prepare(&sql).map_err(map_sqlite_error)?;
+        let mut rows = statement.query([]).map_err(map_sqlite_error)?;
+        while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+            entries.push(LoomRegistryEntryRef {
+                kind,
+                id: row.get(0).map_err(map_sqlite_error)?,
+                rev: u32::try_from(row.get::<_, i64>(1).map_err(map_sqlite_error)?)
+                    .map_err(|_| corrupt("archived Loom revision is out of range"))?,
+                digest: row.get(2).map_err(map_sqlite_error)?,
+                archived: true,
+            });
+        }
+    }
+    Ok(entries)
+}
+
+fn loom_registry_record_tx(
+    store_root: &Path,
+    connection: &Connection,
+    kind: LoomRegistryEntryKind,
+    id: &str,
+    rev: u32,
+    digest: &str,
+) -> StoreResult<LoomRegistryRecord> {
+    match kind {
+        LoomRegistryEntryKind::AgentType => {
+            validate_loom_revision_address(id, rev, digest)?;
+            let path = store_root
+                .join(LOOM_AGENT_REVISIONS_DIR)
+                .join(id)
+                .join(format!("{rev}-{digest}.json"));
+            let bytes =
+                fs::read(&path).map_err(|error| loom_revision_io_error("read", &path, error))?;
+            let record: LoomAgentType = serde_json::from_slice(&bytes)
+                .map_err(|_| corrupt("retained Loom agent-type revision is not decodable"))?;
+            if record.id != id || record.rev != rev || record.digest() != digest {
+                return Err(corrupt(
+                    "retained Loom agent-type revision does not match registry replay address",
+                ));
+            }
+            Ok(LoomRegistryRecord::AgentType(record))
+        }
+        LoomRegistryEntryKind::Workflow => {
+            let json = connection
+                .query_row(
+                    "SELECT record_json FROM loom_workflow_revisions
+                     WHERE id = ?1 AND rev = ?2 AND digest = ?3",
+                    params![id, i64::from(rev), digest],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(map_sqlite_error)?
+                .ok_or_else(|| corrupt("Loom workflow revision for registry replay is missing"))?;
+            let record: LoomWorkflow = serde_json::from_str(&json)
+                .map_err(|_| corrupt("Loom workflow revision is not decodable"))?;
+            Ok(LoomRegistryRecord::Workflow(record))
+        }
+        _ => Err(corrupt(
+            "unknown Loom registry entry kind reached durable replay",
+        )),
+    }
 }
 
 fn validate_loom_revision_address(id: &str, rev: u32, digest: &str) -> StoreResult<()> {
@@ -22050,7 +22866,7 @@ mod run_head_projection_tests {
 
         for pass in 0..2 {
             let store = Store::open(root.path()).expect("migrate v22 store");
-            assert_eq!(store.schema_version().expect("schema version"), 25);
+            assert_eq!(store.schema_version().expect("schema version"), 26);
             let connection = store.connection().expect("migrated journal connection");
             assert_eq!(
                 load_projected_run_heads(&connection, &SessionId::new("run-head-session"))

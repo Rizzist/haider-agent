@@ -1363,11 +1363,32 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.loom_agent_types())).await
     }
 
+    pub async fn loom_agent_types_including_archived(
+        &self,
+    ) -> Result<Vec<haider_protocol::loom::LoomAgentType>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(Store::loom_agent_types_including_archived)).await
+    }
+
     pub async fn loom_workflows(
         &self,
     ) -> Result<Vec<haider_protocol::loom::LoomWorkflow>, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.loom_workflows())).await
+    }
+
+    pub async fn loom_workflows_including_archived(
+        &self,
+    ) -> Result<Vec<haider_protocol::loom::LoomWorkflow>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(Store::loom_workflows_including_archived)).await
+    }
+
+    pub async fn loom_archived_entries(
+        &self,
+    ) -> Result<Vec<haider_protocol::loom::LoomRegistryEntryRef>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(Store::loom_archived_entries)).await
     }
 
     pub async fn loom_workflow(
@@ -1424,6 +1445,8 @@ impl SqliteStoreHandle {
         .await
     }
 
+    /// Compatibility create/idempotency helper. Existing changed content is
+    /// refused; revisions must use the CAS variant.
     pub async fn loom_register_agent_type(
         &self,
         record: haider_protocol::loom::LoomAgentType,
@@ -1433,6 +1456,8 @@ impl SqliteStoreHandle {
             .await
     }
 
+    /// Compatibility create/idempotency helper. Existing changed content is
+    /// refused; revisions must use the CAS variant.
     pub async fn loom_register_agent_type_with_install(
         &self,
         record: haider_protocol::loom::LoomAgentType,
@@ -1440,6 +1465,23 @@ impl SqliteStoreHandle {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || {
             owner.with_store(|store| store.loom_register_agent_type_with_install(&record))
+        })
+        .await
+    }
+
+    pub async fn loom_register_agent_type_with_install_cas(
+        &self,
+        record: haider_protocol::loom::LoomAgentType,
+        expected: haider_protocol::loom::LoomRevisionExpectation,
+    ) -> Result<
+        haider_store::LoomRegistryMutation<haider_store::LoomAgentTypeRegistration>,
+        HaiderError,
+    > {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.loom_register_agent_type_with_install_cas(&record, &expected)
+            })
         })
         .await
     }
@@ -1495,6 +1537,17 @@ impl SqliteStoreHandle {
             .await
     }
 
+    pub async fn typed_agent_install_cancel(
+        &self,
+        install_job_id: String,
+    ) -> Result<haider_store::TypedAgentInstallCancelResult, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.typed_agent_install_cancel(&install_job_id))
+        })
+        .await
+    }
+
     pub async fn typed_agent_install_watch(
         &self,
         job_id: String,
@@ -1518,12 +1571,67 @@ impl SqliteStoreHandle {
         .await
     }
 
+    /// Compatibility create/idempotency helper. Existing changed content is
+    /// refused; revisions must use the CAS variant.
     pub async fn loom_register_workflow(
         &self,
         source: String,
     ) -> Result<haider_protocol::loom::LoomRegistration, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.loom_register_workflow(&source))).await
+    }
+
+    pub async fn loom_register_workflow_cas(
+        &self,
+        source: String,
+        expected: haider_protocol::loom::LoomRevisionExpectation,
+    ) -> Result<
+        haider_store::LoomRegistryMutation<haider_protocol::loom::LoomRegistration>,
+        HaiderError,
+    > {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.loom_register_workflow_cas(&source, &expected))
+        })
+        .await
+    }
+
+    pub async fn loom_set_archived(
+        &self,
+        kind: haider_protocol::loom::LoomRegistryEntryKind,
+        id: String,
+        archived: bool,
+        expected: haider_protocol::loom::LoomRevisionExpectation,
+    ) -> Result<haider_store::LoomArchiveResult, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.loom_set_archived(kind, &id, archived, &expected))
+        })
+        .await
+    }
+
+    pub async fn loom_registry_snapshot(
+        &self,
+    ) -> Result<haider_protocol::loom::LoomRegistrySnapshot, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(Store::loom_registry_snapshot)).await
+    }
+
+    pub async fn loom_registry_head(&self) -> Result<u64, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(Store::loom_registry_head)).await
+    }
+
+    pub async fn loom_registry_watch_page(
+        &self,
+        after_cursor: u64,
+        through_cursor: u64,
+    ) -> Result<haider_store::LoomRegistryWatchPage, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.loom_registry_watch_page(after_cursor, through_cursor))
+        })
+        .await
     }
 
     pub async fn provider_models(

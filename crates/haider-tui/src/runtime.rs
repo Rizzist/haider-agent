@@ -1809,6 +1809,9 @@ impl DemoDriver {
             | AppRequest::LoomAuthorDraft { .. }
             | AppRequest::LoomAuthorRevise { .. }
             | AppRequest::LoomAuthorConfirm { .. }
+            | AppRequest::LoomValidate { .. }
+            | AppRequest::LoomArchive { .. }
+            | AppRequest::LoomInstallCancel { .. }
             // W-flow inline identity: the receipted agent-type binding is
             // daemon truth; the demo reducer refuses `p` upstream.
             | AppRequest::SelectAgentType { .. }

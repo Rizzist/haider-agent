@@ -61,7 +61,23 @@ fn seed_agent_types() -> Vec<LoomAgentType> {
 pub(crate) async fn seed_loom_registry(store: &SqliteStoreHandle) -> Result<(), HaiderError> {
     for record in seed_agent_types() {
         if store.loom_agent_type(record.id.clone()).await?.is_none() {
-            store.loom_register_agent_type(record).await?;
+            match store
+                .loom_register_agent_type_with_install_cas(
+                    record,
+                    haider_protocol::loom::LoomRevisionExpectation {
+                        rev: 0,
+                        digest: None,
+                    },
+                )
+                .await?
+            {
+                haider_core::LoomRegistryMutation::Applied { .. } => {}
+                haider_core::LoomRegistryMutation::Conflict(_) => {
+                    // Startup has no concurrent client door. A conflict here
+                    // can only mean another startup owner violated the
+                    // profile lock, so never overwrite the now-current row.
+                }
+            }
         }
     }
     Ok(())

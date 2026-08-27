@@ -12412,6 +12412,27 @@ impl ToolDispatcher for BrokerToolDispatcher {
             }
             RegisteredToolRoute::LoomRegister => {
                 let kind = required_string(&args, "kind")?;
+                let expected_rev = optional_u64(&args, "expected_rev")?
+                    .ok_or_else(|| {
+                        HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            "loom_register requires `expected_rev` (zero creates an absent id)",
+                            false,
+                        )
+                    })
+                    .and_then(|value| {
+                        u32::try_from(value).map_err(|_| {
+                            HaiderError::new(
+                                ErrorCode::InvalidArgument,
+                                "loom_register `expected_rev` exceeds u32",
+                                false,
+                            )
+                        })
+                    })?;
+                let expected = haider_protocol::loom::LoomRevisionExpectation {
+                    rev: expected_rev,
+                    digest: optional_string(&args, "expected_digest")?,
+                };
                 let completed = |value: serde_json::Value| BoundedResult {
                     preview: value.to_string(),
                     truncated: false,
@@ -12424,6 +12445,12 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 };
                 let refusal = |error: String| {
                     completed(serde_json::json!({ "ok": false, "error": error }))
+                };
+                let conflict = |conflict: haider_protocol::loom::LoomRevisionConflict| {
+                    completed(serde_json::json!({
+                        "ok": false,
+                        "conflict": conflict,
+                    }))
                 };
                 let receipt = |kind: &str,
                                registration: haider_protocol::loom::LoomRegistration,
@@ -12447,8 +12474,19 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     "workflow" => {
                         let source = required_string(&args, "source")?;
                         if plan_gate_admits(&bodies, &[source.trim()]) {
-                            match self.output.store.hub().loom_register_workflow(source).await {
-                                Ok(registration) => Ok(receipt("workflow", registration, None)),
+                            match self
+                                .output
+                                .store
+                                .hub()
+                                .loom_register_workflow_cas(source, expected)
+                                .await
+                            {
+                                Ok(haider_core::LoomRegistryMutation::Applied { value, .. }) => {
+                                    Ok(receipt("workflow", value, None))
+                                }
+                                Ok(haider_core::LoomRegistryMutation::Conflict(value)) => {
+                                    Ok(conflict(value))
+                                }
                                 Err(error) if error.code == ErrorCode::InvalidArgument => {
                                     Ok(refusal(format!(
                                         "registration rejected: {}",
@@ -12495,14 +12533,17 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 .output
                                 .store
                                 .hub()
-                                .loom_register_agent_type(record)
+                                .loom_register_agent_type_cas(record, expected)
                                 .await
                             {
-                                Ok(outcome) => Ok(receipt(
+                                Ok(haider_core::LoomRegistryMutation::Applied { value, .. }) => Ok(receipt(
                                     "agent_type",
-                                    outcome.registration,
-                                    outcome.install_job_id,
+                                    value.registration,
+                                    value.install_job_id,
                                 )),
+                                Ok(haider_core::LoomRegistryMutation::Conflict(value)) => {
+                                    Ok(conflict(value))
+                                }
                                 Err(error) if error.code == ErrorCode::InvalidArgument => {
                                     Ok(refusal(format!(
                                         "registration rejected: {}",
@@ -14079,9 +14120,11 @@ fn loom_register_definition() -> ToolDefinition {
             "properties": {
                 "kind": {"type": "string", "enum": ["workflow", "agent_type"]},
                 "source": {"type": "string", "minLength": 1, "maxLength": 16384},
-                "record": {"type": "object"}
+                "record": {"type": "object"},
+                "expected_rev": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+                "expected_digest": {"type": "string", "minLength": 1}
             },
-            "required": ["kind"],
+            "required": ["kind", "expected_rev"],
             "additionalProperties": false
         }),
     }

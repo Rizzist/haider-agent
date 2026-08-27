@@ -93,18 +93,25 @@ async fn startup_retires_stale_revision_and_runs_only_current_contract() {
     let store = SqliteStoreHandle::open(profile.path())
         .await
         .expect("store");
-    let stale = store
+    let stale_registration = store
         .loom_register_agent_type_with_install(agent("changing", "old job", "rg"))
         .await
-        .expect("old revision")
-        .install_job
-        .expect("old job");
+        .expect("old revision");
+    let stale = stale_registration.install_job.clone().expect("old job");
     let current = store
-        .loom_register_agent_type_with_install(agent("changing", "new job", "jq"))
+        .loom_register_agent_type_with_install_cas(
+            agent("changing", "new job", "jq"),
+            haider_protocol::loom::LoomRevisionExpectation {
+                rev: stale_registration.registration.rev,
+                digest: Some(stale_registration.registration.digest),
+            },
+        )
         .await
-        .expect("new revision")
-        .install_job
-        .expect("new job");
+        .expect("new revision");
+    let haider_core::LoomRegistryMutation::Applied { value: current, .. } = current else {
+        panic!("current agent expectation cannot conflict");
+    };
+    let current = current.install_job.expect("new job");
 
     let installer = FakeInstaller::default();
     resume_pending_installs_with(store.clone(), &installer).await;
@@ -290,11 +297,13 @@ async fn failed_install_retry_resets_reruns_and_replays_progress() {
             .expect("unknown retry rejection"),
         haider_core::TypedAgentInstallRetryResult::JobNotFound
     ));
-    let stale = store
+    let stale_registration = store
         .loom_register_agent_type_with_install(agent("stale-retry", "old", "rg"))
         .await
-        .expect("register stale retry type")
+        .expect("register stale retry type");
+    let stale = stale_registration
         .install_job
+        .clone()
         .expect("stale retry job");
     run_install_job_with(
         store.clone(),
@@ -307,7 +316,13 @@ async fn failed_install_retry_resets_reruns_and_replays_progress() {
     .await
     .expect("stale job failure");
     store
-        .loom_register_agent_type_with_install(agent("stale-retry", "new", "jq"))
+        .loom_register_agent_type_with_install_cas(
+            agent("stale-retry", "new", "jq"),
+            haider_protocol::loom::LoomRevisionExpectation {
+                rev: stale_registration.registration.rev,
+                digest: Some(stale_registration.registration.digest),
+            },
+        )
         .await
         .expect("supersede failed job");
     assert!(matches!(

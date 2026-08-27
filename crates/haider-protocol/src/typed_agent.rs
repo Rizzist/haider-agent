@@ -212,9 +212,9 @@ impl TypedAgentContract {
     }
 }
 
-/// Durable installation lifecycle. Succeeded and failed are terminal for the
-/// ordinary installer CAS. The separately negotiated install-control door may
-/// atomically reset a failed aggregate to queued for an explicit retry.
+/// Durable v0.0.962 installation lifecycle. This enum is frozen: the L4
+/// cancellation fact is the additive `TypedAgentInstallJob::cancelled` field,
+/// so older retry/watch clients keep decoding every state they negotiated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TypedAgentInstallState {
@@ -263,6 +263,20 @@ impl TypedAgentInstallState {
     }
 }
 
+/// Terminal fact returned by the separately negotiated cancellation door.
+/// It can distinguish cancellation without expanding the frozen v0.0.962
+/// lifecycle enum used by retry/watch jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum TypedAgentInstallTerminalStateV1 {
+    Succeeded,
+    Failed,
+    Cancelled,
+    #[serde(other)]
+    Unknown,
+}
+
 /// Bounded progress retained with one durable install job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypedAgentInstallProgress {
@@ -304,6 +318,11 @@ pub struct TypedAgentInstallJob {
     pub agent_type_rev: u32,
     pub agent_type_digest: String,
     pub state: TypedAgentInstallState,
+    /// Additive L4 terminal discriminator. When true the legacy `state` is
+    /// `failed` solely as a frozen-enum compatibility carrier; cancel-aware
+    /// clients MUST treat this fact as cancelled, not failed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cancelled: bool,
     pub progress: TypedAgentInstallProgress,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -331,6 +350,7 @@ impl TypedAgentInstallJob {
             agent_type_rev: contract.agent_type_rev,
             agent_type_digest: contract.agent_type_digest.clone(),
             state: TypedAgentInstallState::Queued,
+            cancelled: false,
             progress: TypedAgentInstallProgress {
                 total,
                 completed: 0,
@@ -369,6 +389,12 @@ impl TypedAgentInstallJob {
         self.progress.validate()?;
         validate_error(&self.error)?;
 
+        if self.cancelled && self.state != TypedAgentInstallState::Failed {
+            return Err(TypedAgentContractError::new(
+                TypedAgentContractErrorCode::InvalidInstallProgress,
+                "a cancelled typed-agent install uses the frozen failed carrier state",
+            ));
+        }
         let state_progress_is_valid = match self.state {
             TypedAgentInstallState::Queued => {
                 self.progress.completed == 0
@@ -387,6 +413,11 @@ impl TypedAgentInstallJob {
                 self.progress.completed == self.progress.total
                     && self.progress.current_cli.is_none()
                     && self.error.is_none()
+            }
+            TypedAgentInstallState::Failed if self.cancelled => {
+                // Preserve the frozen v0.0.962 failed-state invariant for
+                // older retry/watch clients that validate the aggregate.
+                self.progress.current_cli.is_none() && self.error.is_some()
             }
             TypedAgentInstallState::Failed => self.error.is_some(),
         };
@@ -422,6 +453,12 @@ impl TypedAgentInstallJob {
             return Err(TypedAgentContractError::new(
                 TypedAgentContractErrorCode::InvalidInstallProgress,
                 "typed-agent install progress and timestamps must be monotonic",
+            ));
+        }
+        if self.cancelled != next.cancelled {
+            return Err(TypedAgentContractError::new(
+                TypedAgentContractErrorCode::InvalidInstallProgress,
+                "only the negotiated cancel/retry doors may change cancellation",
             ));
         }
         self.state.validate_transition_to(next.state)
@@ -574,4 +611,8 @@ fn is_valid_required_program(program: &str) -> bool {
     !basename.is_empty()
         && !DISPATCHERS.contains(&basename)
         && basename.bytes().any(|byte| byte.is_ascii_alphanumeric())
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }

@@ -1871,6 +1871,44 @@ pub fn transcript() -> Vec<WireFrame> {
             session_id: SessionId::new("session-1"),
             high_water_cursor: 73,
         },
+        // L4 appends the durable registry delta + seal frames after every
+        // historical golden. The record remains fully typed: an agent
+        // lineage fact is never flattened into workflow-DAG metadata.
+        WireFrame::LoomRegistryDelta {
+            watch_id: "loom-watch-1".into(),
+            delta: haider_protocol::loom::LoomRegistryDelta {
+                cursor: 44,
+                change: haider_protocol::loom::LoomRegistryDeltaKind::Archived,
+                entry: haider_protocol::loom::LoomRegistryEntryRef {
+                    kind: haider_protocol::loom::LoomRegistryEntryKind::AgentType,
+                    id: "reviewer".into(),
+                    rev: 3,
+                    digest: "digest-reviewer-3".into(),
+                    archived: true,
+                },
+                record: haider_protocol::loom::LoomRegistryRecord::AgentType(
+                    haider_protocol::loom::LoomAgentType {
+                        id: "reviewer".into(),
+                        name: "Reviewer".into(),
+                        job: "Review changes".into(),
+                        in_type: "Patch".into(),
+                        out_type: "Verdict".into(),
+                        clis: vec!["rg".into()],
+                        apis: Vec::new(),
+                        denials: Vec::new(),
+                        skills: Vec::new(),
+                        scripts: Vec::new(),
+                        color: "#445566".into(),
+                        glyph: "R".into(),
+                        rev: 3,
+                    },
+                ),
+            },
+        },
+        WireFrame::LoomRegistryCaughtUp {
+            watch_id: "loom-watch-1".into(),
+            high_water_cursor: 44,
+        },
     ]
 }
 

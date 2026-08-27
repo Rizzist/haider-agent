@@ -240,6 +240,115 @@ pub struct LoomRegistration {
     pub updated: bool,
 }
 
+/// Registry namespace named by CAS, archive, validation, and watch surfaces.
+/// Agent-type lineage and workflow DAGs remain distinct records; this enum is
+/// only their shared registry coordinate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum LoomRegistryEntryKind {
+    AgentType,
+    Workflow,
+    #[serde(other)]
+    Unknown,
+}
+
+/// One client-observed registry head used as a compare-and-swap fence.
+/// Revision zero explicitly means "this id must not exist". Digest absence is
+/// a typed weaker fence, not permission to invent a digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoomRevisionExpectation {
+    pub rev: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+}
+
+/// Typed registry CAS loss. Current coordinates are optional because an
+/// expected existing row may have become absent; no sentinel revision or
+/// fabricated digest stands in for that absence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoomRevisionConflict {
+    pub expected: LoomRevisionExpectation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_rev: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_digest: Option<String>,
+}
+
+/// Exact current registry address and archive selection state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoomRegistryEntryRef {
+    pub kind: LoomRegistryEntryKind,
+    pub id: String,
+    pub rev: u32,
+    pub digest: String,
+    pub archived: bool,
+}
+
+/// Full typed record carried by a baseline or delta. The tag prevents agent
+/// lineage records from being collapsed into workflow graph records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "record", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum LoomRegistryRecord {
+    AgentType(LoomAgentType),
+    Workflow(LoomWorkflow),
+    #[serde(other)]
+    Unknown,
+}
+
+impl LoomRegistryRecord {
+    #[must_use]
+    pub const fn kind(&self) -> LoomRegistryEntryKind {
+        match self {
+            Self::AgentType(_) => LoomRegistryEntryKind::AgentType,
+            Self::Workflow(_) => LoomRegistryEntryKind::Workflow,
+            Self::Unknown => LoomRegistryEntryKind::Unknown,
+        }
+    }
+}
+
+/// Durable registry change vocabulary. A content mutation emits `upserted`
+/// and, when it minted an immutable revision, `revision_added`; archive state
+/// transitions remain separate facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum LoomRegistryDeltaKind {
+    Upserted,
+    Archived,
+    Unarchived,
+    RevisionAdded,
+    #[serde(other)]
+    Unknown,
+}
+
+/// One replayable, persist-before-publish registry event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoomRegistryDelta {
+    pub cursor: u64,
+    pub change: LoomRegistryDeltaKind,
+    pub entry: LoomRegistryEntryRef,
+    pub record: LoomRegistryRecord,
+}
+
+/// One full registry baseline sealed at `through_cursor`. Archived records are
+/// included so a baseline can repair any prior gap without client polling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoomRegistrySnapshot {
+    pub through_cursor: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<LoomRegistrySnapshotEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoomRegistrySnapshotEntry {
+    /// Exact daemon-owned coordinate. In particular, agent-type digests are
+    /// carried rather than left for clients to recompute from record fields.
+    pub entry: LoomRegistryEntryRef,
+    pub record: LoomRegistryRecord,
+}
+
 /// The two typed documents accepted by the Loom authoring RPC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

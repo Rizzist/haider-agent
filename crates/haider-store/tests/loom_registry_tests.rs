@@ -5,11 +5,11 @@
 #![allow(clippy::expect_used)]
 
 use haider_protocol::ids::{DeviceId, EventId, GraphId, SessionId};
-use haider_protocol::loom::LoomAgentType;
+use haider_protocol::loom::{LoomAgentType, LoomRegistration, LoomRevisionExpectation};
 use haider_protocol::typed_agent::{TYPED_AGENT_INSTALL_STATUS_MAX_JOBS, TypedAgentInstallState};
 use haider_store::{
-    ErrorCode, GraphPinCommand, GraphPinOutcome, GraphSwitchCommand, SessionCreateCommand, Store,
-    TypedAgentInstallCas, TypedAgentInstallItemCas,
+    ErrorCode, GraphPinCommand, GraphPinOutcome, GraphSwitchCommand, LoomRegistryMutation,
+    SessionCreateCommand, Store, TypedAgentInstallCas, TypedAgentInstallItemCas,
 };
 
 fn agent_type(id: &str, in_type: &str, out_type: &str) -> LoomAgentType {
@@ -32,6 +32,48 @@ fn agent_type(id: &str, in_type: &str, out_type: &str) -> LoomAgentType {
 
 const PIPE: &str =
     "clip-flow: SourceURL -> Transcript\nresearch @researcher \"pull and transcribe\" :cmd";
+
+fn revise_agent_type(
+    store: &Store,
+    record: &LoomAgentType,
+    expected_rev: u32,
+    expected_digest: &str,
+) -> LoomRegistration {
+    let outcome = store
+        .loom_register_agent_type_with_install_cas(
+            record,
+            &LoomRevisionExpectation {
+                rev: expected_rev,
+                digest: Some(expected_digest.into()),
+            },
+        )
+        .expect("agent-type CAS");
+    let LoomRegistryMutation::Applied { value, .. } = outcome else {
+        panic!("current agent-type expectation cannot conflict");
+    };
+    value.registration
+}
+
+fn revise_workflow(
+    store: &Store,
+    source: &str,
+    expected_rev: u32,
+    expected_digest: &str,
+) -> LoomRegistration {
+    let outcome = store
+        .loom_register_workflow_cas(
+            source,
+            &LoomRevisionExpectation {
+                rev: expected_rev,
+                digest: Some(expected_digest.into()),
+            },
+        )
+        .expect("workflow CAS");
+    let LoomRegistryMutation::Applied { value, .. } = outcome else {
+        panic!("current workflow expectation cannot conflict");
+    };
+    value
+}
 
 /// MUTATION CHECK: let callers pick revs, stop no-opping identical content,
 /// or skip the rev advance on changed content. Expected RUNTIME failure.
@@ -57,9 +99,7 @@ fn agent_type_registration_owns_the_rev_law() {
     // Changed content advances by exactly one and persists the new record.
     let mut regranted = first.clone();
     regranted.apis.push("fal.ai".into());
-    let revised = store
-        .loom_register_agent_type(&regranted)
-        .expect("revised registration");
+    let revised = revise_agent_type(&store, &regranted, created.rev, &created.digest);
     assert_eq!((revised.rev, revised.updated), (2, true));
     let listed = store.loom_agent_types().expect("list");
     assert_eq!(listed.len(), 1);
@@ -89,9 +129,7 @@ fn agent_type_registration_owns_the_rev_law() {
 
     // Returning to prior content creates a distinct retained registry
     // revision even though its content-addressed execution digest repeats.
-    let reverted = reopened
-        .loom_register_agent_type(&first)
-        .expect("restore first content");
+    let reverted = revise_agent_type(&reopened, &first, revised.rev, &revised.digest);
     assert_eq!((reverted.rev, reverted.updated), (3, true));
     assert_eq!(reverted.digest, created.digest);
     let retained_third = reopened
@@ -192,8 +230,17 @@ fn typed_agent_registration_atomically_enqueues_frozen_install_work() {
     let mut revised = first.clone();
     revised.clis.push("jq".into());
     let revised = store
-        .loom_register_agent_type_with_install(&revised)
+        .loom_register_agent_type_with_install_cas(
+            &revised,
+            &LoomRevisionExpectation {
+                rev: created.registration.rev,
+                digest: Some(created.registration.digest.clone()),
+            },
+        )
         .expect("changed typed registration");
+    let LoomRegistryMutation::Applied { value: revised, .. } = revised else {
+        panic!("current typed registration cannot conflict");
+    };
     let revised_job = revised.install_job.expect("changed type creates a job");
     assert_eq!(revised.registration.rev, 2);
     assert_eq!(revised_job.agent_type_rev, 2);
@@ -253,11 +300,22 @@ fn typed_agent_status_bounds_history_before_loading_items() {
     let root = tempfile::tempdir().expect("profile");
     let store = Store::open(root.path()).expect("open");
     let mut record = agent_type("bounded-installer", "Input", "Output");
+    let mut expected = LoomRevisionExpectation {
+        rev: 0,
+        digest: None,
+    };
     for revision in 1..=40 {
         record.job = format!("Scoped installer contract revision {revision}.");
-        store
-            .loom_register_agent_type_with_install(&record)
+        let outcome = store
+            .loom_register_agent_type_with_install_cas(&record, &expected)
             .expect("register revision");
+        let LoomRegistryMutation::Applied { value, .. } = outcome else {
+            panic!("serial revision expectation cannot conflict");
+        };
+        expected = LoomRevisionExpectation {
+            rev: value.registration.rev,
+            digest: Some(value.registration.digest),
+        };
     }
 
     let snapshot = store
@@ -432,7 +490,7 @@ fn workflow_registration_compiles_source_against_the_live_registry() {
     );
 
     // Register the type, then the same source compiles and lands at rev 1.
-    store
+    let agent_created = store
         .loom_register_agent_type(&agent_type("researcher", "SourceURL", "Transcript"))
         .expect("agent type");
     let created = store.loom_register_workflow(PIPE).expect("workflow");
@@ -466,10 +524,8 @@ fn workflow_registration_compiles_source_against_the_live_registry() {
     // resolved types, not just the text).
     let mut widened = agent_type("researcher", "SourceURL + PlaylistURL", "Transcript");
     widened.apis.push("elevenlabs".into());
-    store
-        .loom_register_agent_type(&widened)
-        .expect("widened type");
-    let recompiled = store.loom_register_workflow(PIPE).expect("recompiled");
+    revise_agent_type(&store, &widened, agent_created.rev, &agent_created.digest);
+    let recompiled = revise_workflow(&store, PIPE, created.rev, &created.digest);
     assert_eq!((recompiled.rev, recompiled.updated), (2, true));
 }
 
@@ -561,7 +617,7 @@ fn registered_workflow_is_pinnable_by_name() {
 fn pinned_workflow_revision_survives_registry_edit_and_stale_fences_name_current() {
     let root = tempfile::tempdir().expect("profile");
     let store = Store::open(root.path()).expect("open");
-    store
+    let first_registration = store
         .loom_register_workflow("retained: A -> A\nstep \"one\" :cmd")
         .expect("register rev 1");
     let first = store
@@ -610,9 +666,12 @@ fn pinned_workflow_revision_survives_registry_edit_and_stale_fences_name_current
         | GraphPinOutcome::IdempotentReplay { pinned } => pinned,
     };
 
-    let revised = store
-        .loom_register_workflow("retained: A -> A\nstep \"two\" :cmd")
-        .expect("register rev 2");
+    let revised = revise_workflow(
+        &store,
+        "retained: A -> A\nstep \"two\" :cmd",
+        first_registration.rev,
+        &first_registration.digest,
+    );
     assert_eq!(revised.rev, 2);
     let current = store
         .loom_workflow("retained")
@@ -702,9 +761,12 @@ fn pinned_workflow_revision_survives_registry_edit_and_stale_fences_name_current
         Some(current_template_digest.as_str())
     );
 
-    let reverted = store
-        .loom_register_workflow("retained: A -> A\nstep \"one\" :cmd")
-        .expect("register content reversion");
+    let reverted = revise_workflow(
+        &store,
+        "retained: A -> A\nstep \"one\" :cmd",
+        revised.rev,
+        &revised.digest,
+    );
     assert_eq!(reverted.rev, 3);
     let retained_after_reversion = store
         .loom_workflow_revision("retained", &pinned.digest)
@@ -726,12 +788,15 @@ fn migration_backfill_and_legacy_heal_preserve_the_pinned_digest() {
     let root = tempfile::tempdir().expect("profile");
     let (database_path, legacy_json) = {
         let store = Store::open(root.path()).expect("open");
-        store
+        let first = store
             .loom_register_workflow("legacy-retained: A -> A\nstep \"one\" :cmd")
             .expect("register rev 1");
-        let registration = store
-            .loom_register_workflow("legacy-retained: A -> A\nstep \"two\" :cmd")
-            .expect("register rev 2");
+        let registration = revise_workflow(
+            &store,
+            "legacy-retained: A -> A\nstep \"two\" :cmd",
+            first.rev,
+            &first.digest,
+        );
         assert_eq!(registration.rev, 2);
         let mut legacy = store
             .loom_workflow("legacy-retained")
@@ -772,7 +837,7 @@ fn migration_backfill_and_legacy_heal_preserve_the_pinned_digest() {
     drop(raw);
 
     let store = Store::open(root.path()).expect("migrate legacy database");
-    assert_eq!(store.schema_version().expect("schema version"), 25);
+    assert_eq!(store.schema_version().expect("schema version"), 26);
     let legacy = store
         .loom_workflow("legacy-retained")
         .expect("read migrated current")
@@ -868,9 +933,12 @@ fn revisions_move_the_template_digest_and_display_edits_are_real() {
 
     // A task-only change: the template SHAPE is identical, but the rev bump
     // stamps a new version, so the join key must move.
-    let second = store
-        .loom_register_workflow("wf: A -> A\nstep \"two\" :cmd")
-        .expect("re-registers");
+    let second = revise_workflow(
+        &store,
+        "wf: A -> A\nstep \"two\" :cmd",
+        registration.rev,
+        &registration.digest,
+    );
     assert_eq!(second.rev, 2);
     let second_record = store
         .loom_workflow("wf")
@@ -892,9 +960,11 @@ fn revisions_move_the_template_digest_and_display_edits_are_real() {
             .updated
     );
     record.color = "#00ff00".into();
-    let repaint = store
-        .loom_register_agent_type(&record)
-        .expect("re-registers");
+    let first_record = store
+        .loom_agent_type("painter")
+        .expect("painter read")
+        .expect("painter exists");
+    let repaint = revise_agent_type(&store, &record, first_record.rev, &first_record.digest());
     assert!(repaint.updated, "a color edit must persist");
     assert_eq!(repaint.rev, 2);
 }

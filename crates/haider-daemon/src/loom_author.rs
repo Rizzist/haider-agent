@@ -8,8 +8,8 @@
 use crate::worker::ProviderFactory;
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::loom::{
-    LoomAgentType, LoomAuthorDraft, LoomAuthorKind, ValidatedLoomAuthorSpec,
-    validate_loom_author_text,
+    LoomAgentType, LoomAuthorDraft, LoomAuthorKind, ValidatedLoomAuthorSpec, compile_pipe,
+    parse_pipe, validate_loom_author_text,
 };
 use haider_protocol::provider::StreamEvent;
 use haider_protocol::session::SessionMetadataV1;
@@ -241,6 +241,54 @@ pub(crate) fn validate(
         .map(|record| (record.id.as_str(), record.signature()))
         .collect::<HashMap<_, _>>();
     validate_loom_author_text(text, kind, |id| registry.get(id).cloned())
+}
+
+/// Digest preview for the exact validated document. This is deliberately
+/// pure: `loom.validate` shares the authoring validator above and computes
+/// the same content identity registration would compute without reserving a
+/// revision or touching registry state.
+pub(crate) fn canonical_digest(
+    validated: &ValidatedLoomAuthorSpec,
+    agent_types: &[LoomAgentType],
+) -> Result<String, HaiderError> {
+    match validated {
+        ValidatedLoomAuthorSpec::AgentType { record, .. } => Ok(record.digest()),
+        ValidatedLoomAuthorSpec::Workflow { source, .. } => {
+            let registry = agent_types
+                .iter()
+                .map(|record| (record.id.as_str(), record))
+                .collect::<HashMap<_, _>>();
+            let mut workflow = compile_pipe(&parse_pipe(source), |id| {
+                registry.get(id).map(|record| record.signature())
+            })
+            .map_err(|errors| {
+                HaiderError::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "validated Loom workflow stopped compiling: {}",
+                        errors.join("; ")
+                    ),
+                    false,
+                )
+            })?;
+            for meta in &mut workflow.meta {
+                let Some(type_id) = meta.agent_type.as_deref() else {
+                    continue;
+                };
+                let record = registry.get(type_id).ok_or_else(|| {
+                    HaiderError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("validated Loom workflow references absent agent type `{type_id}`"),
+                        false,
+                    )
+                })?;
+                meta.agent_type_rev = Some(record.rev);
+                meta.agent_type_digest = Some(record.digest());
+            }
+            workflow.refresh_digest();
+            Ok(workflow.digest)
+        }
+    }
 }
 
 fn provider_draft_error(error: haider_provider::ProviderError) -> HaiderError {

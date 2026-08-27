@@ -2247,7 +2247,7 @@ impl HubConnection {
                 self.workflow_instance(request_id, workflow_id, template_digest)
                     .await
             }
-            RequestBody::LoomList {} => {
+            RequestBody::LoomList { include_archived } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::View) {
                     return self.respond_error(
                         request_id,
@@ -2257,9 +2257,13 @@ impl HubConnection {
                         None,
                     );
                 }
-                self.loom_list(request_id).await
+                self.loom_list(request_id, include_archived).await
             }
-            RequestBody::LoomRegisterAgentType { record } => {
+            RequestBody::LoomRegisterAgentType {
+                record,
+                expected_rev,
+                expected_digest,
+            } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
                     return self.respond_error(
                         request_id,
@@ -2269,7 +2273,24 @@ impl HubConnection {
                         None,
                     );
                 }
-                self.loom_register_agent_type(request_id, record).await
+                let Some(expected_rev) = expected_rev else {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_INVALID_ARGUMENT,
+                        "loom.register_agent_type requires expected_rev under loom_registry_cas_v1",
+                        false,
+                        None,
+                    );
+                };
+                self.loom_register_agent_type(
+                    request_id,
+                    record,
+                    haider_protocol::loom::LoomRevisionExpectation {
+                        rev: expected_rev,
+                        digest: expected_digest,
+                    },
+                )
+                .await
             }
             RequestBody::LoomInstallStatus {
                 job_id,
@@ -2287,7 +2308,11 @@ impl HubConnection {
                 self.loom_install_status(request_id, job_id, agent_type_id)
                     .await
             }
-            RequestBody::LoomRegisterWorkflow { source } => {
+            RequestBody::LoomRegisterWorkflow {
+                source,
+                expected_rev,
+                expected_digest,
+            } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
                     return self.respond_error(
                         request_id,
@@ -2297,7 +2322,24 @@ impl HubConnection {
                         None,
                     );
                 }
-                self.loom_register_workflow(request_id, source).await
+                let Some(expected_rev) = expected_rev else {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_INVALID_ARGUMENT,
+                        "loom.register_workflow requires expected_rev under loom_registry_cas_v1",
+                        false,
+                        None,
+                    );
+                };
+                self.loom_register_workflow(
+                    request_id,
+                    source,
+                    haider_protocol::loom::LoomRevisionExpectation {
+                        rev: expected_rev,
+                        digest: expected_digest,
+                    },
+                )
+                .await
             }
             RequestBody::GraphInspect {
                 session_id,
@@ -4074,6 +4116,8 @@ impl HubConnection {
                 expected_revision,
                 kind,
                 text,
+                expected_rev,
+                expected_digest,
             } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
                     return self.respond_error(
@@ -4084,8 +4128,117 @@ impl HubConnection {
                         None,
                     );
                 }
-                self.loom_author_confirm(request_id, authoring_id, expected_revision, kind, text)
-                    .await
+                let Some(expected_rev) = expected_rev else {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_INVALID_ARGUMENT,
+                        "loom.author.confirm requires expected_rev under loom_registry_cas_v1",
+                        false,
+                        None,
+                    );
+                };
+                self.loom_author_confirm(
+                    request_id,
+                    authoring_id,
+                    expected_revision,
+                    kind,
+                    text,
+                    haider_protocol::loom::LoomRevisionExpectation {
+                        rev: expected_rev,
+                        digest: expected_digest,
+                    },
+                )
+                .await
+            }
+            RequestBody::LoomInstallCancel { install_job_id } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.loom_install_cancel(request_id, install_job_id).await
+            }
+            RequestBody::LoomArchive {
+                kind,
+                id,
+                expected_rev,
+                expected_digest,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.loom_archive(
+                    request_id,
+                    kind,
+                    id,
+                    true,
+                    haider_protocol::loom::LoomRevisionExpectation {
+                        rev: expected_rev,
+                        digest: expected_digest,
+                    },
+                )
+                .await
+            }
+            RequestBody::LoomUnarchive {
+                kind,
+                id,
+                expected_rev,
+                expected_digest,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.loom_archive(
+                    request_id,
+                    kind,
+                    id,
+                    false,
+                    haider_protocol::loom::LoomRevisionExpectation {
+                        rev: expected_rev,
+                        digest: expected_digest,
+                    },
+                )
+                .await
+            }
+            RequestBody::LoomValidate { kind, text } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.loom_validate(request_id, kind, text).await
+            }
+            RequestBody::LoomWatch { after_cursor } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.loom_watch(request_id, after_cursor).await
             }
             // `Unknown` and any future method decode alike: a typed,
             // correlated rejection instead of a dropped request.
@@ -4357,6 +4510,8 @@ impl HubConnection {
                 accounts_watch: Mutex::new(None),
                 surface_watch: Mutex::new(None),
                 monitor_watch: Mutex::new(None),
+                loom_registry_watch: Mutex::new(None),
+                loom_registry_watch_serial: tokio::sync::Mutex::new(()),
                 metafork_reviews: Arc::clone(&self.metafork_reviews),
                 loom_author_sessions: Arc::clone(&self.loom_author_sessions),
                 identity_lease: Arc::clone(&self.identity_lease),
@@ -7308,9 +7463,13 @@ impl HubConnection {
     }
 
     /// B1 — the Loom registry read.
-    async fn loom_list(&self, request_id: RequestId) -> Result<(), SessionHubError> {
-        let agent_types = match self.hub.inner.store.loom_agent_types().await {
-            Ok(records) => records,
+    async fn loom_list(
+        &self,
+        request_id: RequestId,
+        include_archived: bool,
+    ) -> Result<(), SessionHubError> {
+        let snapshot = match self.hub.inner.store.loom_registry_snapshot().await {
+            Ok(snapshot) => snapshot,
             Err(error) => {
                 return self.respond_error(
                     request_id,
@@ -7321,18 +7480,37 @@ impl HubConnection {
                 );
             }
         };
-        let workflows = match self.hub.inner.store.loom_workflows().await {
-            Ok(records) => records,
-            Err(error) => {
-                return self.respond_error(
-                    request_id,
-                    error.code.as_str(),
-                    &error.message,
-                    error.retryable,
-                    None,
-                );
+        let mut agent_types = Vec::new();
+        let mut workflows = Vec::new();
+        let mut archived_entries = Vec::new();
+        for entry in snapshot.entries {
+            if entry.entry.archived && !include_archived {
+                continue;
             }
-        };
+            match entry.record {
+                haider_protocol::loom::LoomRegistryRecord::AgentType(record) => {
+                    if entry.entry.archived {
+                        archived_entries.push(entry.entry);
+                    }
+                    agent_types.push(record);
+                }
+                haider_protocol::loom::LoomRegistryRecord::Workflow(record) => {
+                    if entry.entry.archived {
+                        archived_entries.push(entry.entry);
+                    }
+                    workflows.push(record);
+                }
+                _ => {
+                    return self.respond_error(
+                        request_id,
+                        ErrorCode::Internal.as_str(),
+                        "durable Loom registry contains an unknown record kind",
+                        false,
+                        None,
+                    );
+                }
+            }
+        }
         // W-flow — probe each DISTINCT declared CLI once and report device
         // presence alongside the registry, so a missing program is visible
         // before the bind instead of at the first failing turn.
@@ -7355,6 +7533,7 @@ impl HubConnection {
                 workflows,
                 cli_present,
                 workflow_catalog,
+                archived_entries,
             },
         })
     }
@@ -7364,15 +7543,25 @@ impl HubConnection {
         &self,
         request_id: RequestId,
         record: haider_protocol::loom::LoomAgentType,
+        expected: haider_protocol::loom::LoomRevisionExpectation,
     ) -> Result<(), SessionHubError> {
-        match self.hub.loom_register_agent_type(record).await {
-            Ok(outcome) => self.send(WireFrame::Response {
-                request_id,
-                body: ResponseBody::LoomRegistered {
-                    registration: outcome.registration,
-                    install_job_id: outcome.install_job_id,
-                },
-            }),
+        match self
+            .hub
+            .loom_register_agent_type_cas(record, expected)
+            .await
+        {
+            Ok(haider_core::LoomRegistryMutation::Applied { value, .. }) => {
+                self.send(WireFrame::Response {
+                    request_id,
+                    body: ResponseBody::LoomRegistered {
+                        registration: value.registration,
+                        install_job_id: value.install_job_id,
+                    },
+                })
+            }
+            Ok(haider_core::LoomRegistryMutation::Conflict(conflict)) => {
+                self.respond_loom_revision_conflict(request_id, conflict)
+            }
             Err(error) => self.respond_error(
                 request_id,
                 error.code.as_str(),
@@ -7412,6 +7601,270 @@ impl HubConnection {
                 items: snapshot.items,
             },
         })
+    }
+
+    async fn loom_install_cancel(
+        &self,
+        request_id: RequestId,
+        install_job_id: String,
+    ) -> Result<(), SessionHubError> {
+        let outcome = match self
+            .hub
+            .typed_agent_install_cancel(install_job_id.clone())
+            .await
+        {
+            Ok(haider_core::TypedAgentInstallCancelResult::Cancelled) => {
+                haider_rpc::TypedAgentInstallCancelOutcomeWire::Cancelled
+            }
+            Ok(haider_core::TypedAgentInstallCancelResult::AlreadyTerminal { state }) => {
+                haider_rpc::TypedAgentInstallCancelOutcomeWire::AlreadyTerminal { state }
+            }
+            Ok(haider_core::TypedAgentInstallCancelResult::Unknown) => {
+                haider_rpc::TypedAgentInstallCancelOutcomeWire::Unknown
+            }
+            Err(error) => {
+                return self.respond_error(
+                    request_id,
+                    error.code.as_str(),
+                    &error.message,
+                    error.retryable,
+                    None,
+                );
+            }
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::LoomInstallCancel {
+                receipt: haider_rpc::TypedAgentInstallCancelReceiptWire {
+                    install_job_id,
+                    outcome,
+                },
+            },
+        })
+    }
+
+    async fn loom_archive(
+        &self,
+        request_id: RequestId,
+        kind: haider_protocol::loom::LoomRegistryEntryKind,
+        id: String,
+        archived: bool,
+        expected: haider_protocol::loom::LoomRevisionExpectation,
+    ) -> Result<(), SessionHubError> {
+        let outcome = match self
+            .hub
+            .loom_set_archived(kind, id.clone(), archived, expected)
+            .await
+        {
+            Ok(haider_core::LoomArchiveResult::Changed { entry, .. }) => {
+                haider_rpc::LoomArchiveOutcomeWire::Changed { entry }
+            }
+            Ok(haider_core::LoomArchiveResult::Already(entry)) => {
+                haider_rpc::LoomArchiveOutcomeWire::Already { entry }
+            }
+            Ok(haider_core::LoomArchiveResult::NotFound) => {
+                haider_rpc::LoomArchiveOutcomeWire::NotFound
+            }
+            Ok(haider_core::LoomArchiveResult::Conflict(conflict)) => {
+                return self.respond_loom_revision_conflict(request_id, conflict);
+            }
+            Err(error) => {
+                return self.respond_error(
+                    request_id,
+                    error.code.as_str(),
+                    &error.message,
+                    error.retryable,
+                    None,
+                );
+            }
+        };
+        let receipt = haider_rpc::LoomArchiveReceiptWire { kind, id, outcome };
+        self.send(WireFrame::Response {
+            request_id,
+            body: if archived {
+                ResponseBody::LoomArchive { receipt }
+            } else {
+                ResponseBody::LoomUnarchive { receipt }
+            },
+        })
+    }
+
+    async fn loom_validate(
+        &self,
+        request_id: RequestId,
+        kind: haider_protocol::loom::LoomAuthorKind,
+        text: String,
+    ) -> Result<(), SessionHubError> {
+        if text.len() > haider_protocol::loom::LOOM_AUTHOR_TEXT_MAX_BYTES {
+            return self.respond_error(
+                request_id,
+                ErrorCode::InvalidArgument.as_str(),
+                "Loom validation exceeds the 64 KiB limit",
+                false,
+                None,
+            );
+        }
+        let agent_types = match self.hub.inner.store.loom_agent_types().await {
+            Ok(records) => records,
+            Err(error) => {
+                return self.respond_error(
+                    request_id,
+                    error.code.as_str(),
+                    &error.message,
+                    error.retryable,
+                    None,
+                );
+            }
+        };
+        let (errors, canonical_digest) =
+            match crate::loom_author::validate(&text, kind, &agent_types) {
+                Ok(validated) => {
+                    match crate::loom_author::canonical_digest(&validated, &agent_types) {
+                        Ok(digest) => (Vec::new(), Some(digest)),
+                        Err(error) => {
+                            return self.respond_error(
+                                request_id,
+                                error.code.as_str(),
+                                &error.message,
+                                error.retryable,
+                                None,
+                            );
+                        }
+                    }
+                }
+                Err(errors) => (errors, None),
+            };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::LoomValidate {
+                errors,
+                canonical_digest,
+            },
+        })
+    }
+
+    async fn loom_watch(
+        &self,
+        request_id: RequestId,
+        after_cursor: u64,
+    ) -> Result<(), SessionHubError> {
+        let _setup = self.loom_registry_watch_serial.lock().await;
+        // Subscribe before sealing the baseline. A racing commit is therefore
+        // either included in that SQLite snapshot or wakes the durable replay.
+        let publications = self.hub.inner.loom_registry_publications.subscribe();
+        let baseline = match self.hub.inner.store.loom_registry_snapshot().await {
+            Ok(baseline) => baseline,
+            Err(error) => {
+                return self.respond_error(
+                    request_id,
+                    error.code.as_str(),
+                    &error.message,
+                    error.retryable,
+                    None,
+                );
+            }
+        };
+        if after_cursor > baseline.through_cursor {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_CURSOR_AHEAD,
+                "loom.watch cursor is beyond the durable registry head",
+                false,
+                Some(ErrorData::CursorAhead {
+                    requested: after_cursor,
+                    head: baseline.through_cursor,
+                }),
+            );
+        }
+        let watch_id = random_id("loom-watch")?;
+        let previous = {
+            let mut slot = lock(&self.loom_registry_watch)?;
+            slot.take()
+        };
+        if let Some(previous) = previous {
+            previous.cancel.send_replace(true);
+            if let Some(task) = previous.task {
+                let _ = task.await;
+            }
+            // Do not purge this ordered lane: its correlated LoomWatch
+            // response may be admitted but not yet written. Old queued frames
+            // carry the old watch id and are harmless to a client that has
+            // replaced the watch, while deleting the response would orphan
+            // the completed RPC.
+        }
+        let response = WireFrame::Response {
+            request_id,
+            body: ResponseBody::LoomWatch {
+                watch_id: watch_id.clone(),
+                requested_after_cursor: after_cursor,
+                baseline: baseline.clone(),
+            },
+        };
+        let hub = self.hub.clone();
+        let sink = Arc::clone(&self.sink);
+        let (cancel, mut cancel_receiver) = watch::channel(false);
+        {
+            // Ownership precedes the potentially backpressured baseline
+            // delivery so close/drop can always cancel this wait.
+            let mut slot = lock(&self.loom_registry_watch)?;
+            *slot = Some(LoomRegistryWatchState {
+                watch_id: watch_id.clone(),
+                cancel: cancel.clone(),
+                task: None,
+            });
+        }
+        // The correlated baseline is the first record on this watch's FIFO
+        // lane. Merely enqueueing it on the shared reply lane before spawning
+        // the replay task would not order two independently scheduled lanes;
+        // a delta could then name a watch the client had not learned yet.
+        match super::replay::deliver_ordered_frame(
+            &sink,
+            &watch_id,
+            &response,
+            &mut cancel_receiver,
+        )
+        .await
+        {
+            super::replay::FrameDelivery::Delivered => {}
+            super::replay::FrameDelivery::Cancelled => {
+                if let Ok(mut slot) = self.loom_registry_watch.lock()
+                    && slot
+                        .as_ref()
+                        .is_some_and(|state| state.watch_id == watch_id)
+                {
+                    slot.take();
+                }
+                return Ok(());
+            }
+            super::replay::FrameDelivery::Stuck | super::replay::FrameDelivery::Refused => {
+                if let Ok(mut slot) = self.loom_registry_watch.lock()
+                    && slot
+                        .as_ref()
+                        .is_some_and(|state| state.watch_id == watch_id)
+                {
+                    slot.take();
+                }
+                sink.close_after_required_delivery_failure();
+                return Err(SessionHubError::Delivery);
+            }
+        }
+        let mut slot = lock(&self.loom_registry_watch)?;
+        let Some(state) = slot.as_mut().filter(|state| state.watch_id == watch_id) else {
+            cancel.send_replace(true);
+            return Ok(());
+        };
+        state.task = Some(tokio::spawn(run_loom_registry_watch(
+            hub,
+            sink,
+            watch_id,
+            LoomRegistryReplayWindow {
+                after_cursor,
+                through_cursor: baseline.through_cursor,
+            },
+            publications,
+            cancel_receiver,
+        )));
+        Ok(())
     }
 
     async fn loom_install_retry(
@@ -7845,6 +8298,7 @@ impl HubConnection {
         expected_revision: u64,
         kind: haider_protocol::loom::LoomAuthorKind,
         text: String,
+        expected: haider_protocol::loom::LoomRevisionExpectation,
     ) -> Result<(), SessionHubError> {
         if text.len() > haider_protocol::loom::LOOM_AUTHOR_TEXT_MAX_BYTES {
             return self.respond_error(
@@ -8008,15 +8462,29 @@ impl HubConnection {
             haider_protocol::loom::ValidatedLoomAuthorSpec::AgentType {
                 record,
                 canonical_text,
-            } => match self.hub.loom_register_agent_type(*record).await {
-                Ok(outcome) => haider_protocol::loom::LoomAuthorConfirmed {
-                    authoring_id: authoring_id.clone(),
-                    kind,
-                    canonical_text,
-                    execution_digest: outcome.registration.digest.clone(),
-                    registration: outcome.registration,
-                    install_job_id: outcome.install_job_id,
-                },
+            } => match self
+                .hub
+                .loom_register_agent_type_cas(*record, expected.clone())
+                .await
+            {
+                Ok(haider_core::LoomRegistryMutation::Applied { value, .. }) => {
+                    haider_protocol::loom::LoomAuthorConfirmed {
+                        authoring_id: authoring_id.clone(),
+                        kind,
+                        canonical_text,
+                        execution_digest: value.registration.digest.clone(),
+                        registration: value.registration,
+                        install_job_id: value.install_job_id,
+                    }
+                }
+                Ok(haider_core::LoomRegistryMutation::Conflict(conflict)) => {
+                    if let Ok(mut sessions) = self.loom_author_sessions.lock()
+                        && let Some(session) = sessions.get_mut(&authoring_id)
+                    {
+                        session.confirming = false;
+                    }
+                    return self.respond_loom_revision_conflict(request_id, conflict);
+                }
                 Err(error) => {
                     if let Ok(mut sessions) = self.loom_author_sessions.lock()
                         && let Some(session) = sessions.get_mut(&authoring_id)
@@ -8036,8 +8504,17 @@ impl HubConnection {
                 source,
                 canonical_text,
             } => {
-                let registration = match self.hub.inner.store.loom_register_workflow(source).await {
-                    Ok(registration) => registration,
+                let registration = match self.hub.loom_register_workflow_cas(source, expected).await
+                {
+                    Ok(haider_core::LoomRegistryMutation::Applied { value, .. }) => value,
+                    Ok(haider_core::LoomRegistryMutation::Conflict(conflict)) => {
+                        if let Ok(mut sessions) = self.loom_author_sessions.lock()
+                            && let Some(session) = sessions.get_mut(&authoring_id)
+                        {
+                            session.confirming = false;
+                        }
+                        return self.respond_loom_revision_conflict(request_id, conflict);
+                    }
                     Err(error) => {
                         if let Ok(mut sessions) = self.loom_author_sessions.lock()
                             && let Some(session) = sessions.get_mut(&authoring_id)
@@ -8132,15 +8609,21 @@ impl HubConnection {
         &self,
         request_id: RequestId,
         source: String,
+        expected: haider_protocol::loom::LoomRevisionExpectation,
     ) -> Result<(), SessionHubError> {
-        match self.hub.inner.store.loom_register_workflow(source).await {
-            Ok(registration) => self.send(WireFrame::Response {
-                request_id,
-                body: ResponseBody::LoomRegistered {
-                    registration,
-                    install_job_id: None,
-                },
-            }),
+        match self.hub.loom_register_workflow_cas(source, expected).await {
+            Ok(haider_core::LoomRegistryMutation::Applied { value, .. }) => {
+                self.send(WireFrame::Response {
+                    request_id,
+                    body: ResponseBody::LoomRegistered {
+                        registration: value,
+                        install_job_id: None,
+                    },
+                })
+            }
+            Ok(haider_core::LoomRegistryMutation::Conflict(conflict)) => {
+                self.respond_loom_revision_conflict(request_id, conflict)
+            }
             Err(error) => self.respond_error(
                 request_id,
                 error.code.as_str(),
@@ -12431,6 +12914,24 @@ impl HubConnection {
         })
     }
 
+    fn respond_loom_revision_conflict(
+        &self,
+        request_id: RequestId,
+        conflict: haider_protocol::loom::LoomRevisionConflict,
+    ) -> Result<(), SessionHubError> {
+        self.respond_error(
+            request_id,
+            ErrorCode::RevisionConflict.as_str(),
+            "Loom registry revision fence did not match durable truth",
+            false,
+            Some(ErrorData::LoomRevisionConflict {
+                expected: conflict.expected,
+                current_rev: conflict.current_rev,
+                current_digest: conflict.current_digest,
+            }),
+        )
+    }
+
     fn send(&self, frame: WireFrame) -> Result<(), SessionHubError> {
         self.sink
             .try_send(frame)
@@ -12466,6 +12967,11 @@ impl HubConnection {
         {
             watch.cancel.send_replace(true);
             self.sink.purge_ordered(&watch.stream_id);
+        }
+        if let Ok(mut watch) = self.loom_registry_watch.lock()
+            && let Some(watch) = watch.take()
+        {
+            watch.cancel.send_replace(true);
         }
         if let Ok(Some(facade)) = self.hub.accounts()
             && let Some(oauth) = facade.oauth
@@ -12508,6 +13014,11 @@ fn published_workflow_catalog(
 #[cfg(test)]
 #[path = "rpc_workflow_catalog_tests.rs"]
 mod workflow_catalog_tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+#[path = "loom_registry_watch_tests.rs"]
+mod loom_registry_watch_tests;
 
 async fn run_surface_watch(
     hub: SessionHub,
@@ -12710,6 +13221,113 @@ async fn replay_monitor_delivery_range(
         }
     }
     true
+}
+
+/// Required-delivery registry stream. Publications are only wakeups: every
+/// payload is rebuilt from the durable event log, and broadcast lag repairs
+/// from the last delivered cursor instead of dropping registry facts.
+struct LoomRegistryReplayWindow {
+    after_cursor: u64,
+    through_cursor: u64,
+}
+
+async fn run_loom_registry_watch(
+    hub: SessionHub,
+    sink: Arc<dyn FrameSink>,
+    watch_id: String,
+    replay: LoomRegistryReplayWindow,
+    mut publications: tokio::sync::broadcast::Receiver<u64>,
+    mut cancel: watch::Receiver<bool>,
+) {
+    // The snapshot repairs the client's projection at `initial_high_water`,
+    // while replay from the requested cursor preserves the complete durable
+    // transition history and cursor continuity. Seal even an empty initial
+    // suffix so every successful attach receives an explicit caught-up fact.
+    let mut cursor = replay.after_cursor;
+    let mut initial_high_water = Some(replay.through_cursor);
+    loop {
+        let (high_water, seal_empty) = if let Some(high_water) = initial_high_water.take() {
+            (high_water, true)
+        } else {
+            let high_water = tokio::select! {
+                changed = cancel.changed() => {
+                    if changed.is_err() || *cancel.borrow() {
+                        return;
+                    }
+                    continue;
+                },
+                received = publications.recv() => match received {
+                    Ok(cursor) => cursor,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        match hub.inner.store.loom_registry_head().await {
+                            Ok(head) => head,
+                            Err(_) => {
+                                sink.close_after_required_delivery_failure();
+                                return;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                },
+            };
+            (high_water, false)
+        };
+        if high_water < cursor || (high_water == cursor && !seal_empty) {
+            continue;
+        }
+        while cursor < high_water {
+            let page = match hub
+                .inner
+                .store
+                .loom_registry_watch_page(cursor, high_water)
+                .await
+            {
+                Ok(page) => page,
+                Err(_) => {
+                    sink.close_after_required_delivery_failure();
+                    return;
+                }
+            };
+            if page.replay_through_cursor != high_water || page.next_cursor <= cursor {
+                sink.close_after_required_delivery_failure();
+                return;
+            }
+            for delta in page.deltas {
+                if delta.cursor != cursor.saturating_add(1) {
+                    sink.close_after_required_delivery_failure();
+                    return;
+                }
+                let next = delta.cursor;
+                let frame = WireFrame::LoomRegistryDelta {
+                    watch_id: watch_id.clone(),
+                    delta,
+                };
+                match super::replay::deliver_ordered_frame(&sink, &watch_id, &frame, &mut cancel)
+                    .await
+                {
+                    super::replay::FrameDelivery::Delivered => cursor = next,
+                    super::replay::FrameDelivery::Cancelled => return,
+                    super::replay::FrameDelivery::Stuck | super::replay::FrameDelivery::Refused => {
+                        sink.close_after_required_delivery_failure();
+                        return;
+                    }
+                }
+            }
+        }
+        let caught_up = WireFrame::LoomRegistryCaughtUp {
+            watch_id: watch_id.clone(),
+            high_water_cursor: high_water,
+        };
+        match super::replay::deliver_ordered_frame(&sink, &watch_id, &caught_up, &mut cancel).await
+        {
+            super::replay::FrameDelivery::Delivered => {}
+            super::replay::FrameDelivery::Cancelled => return,
+            super::replay::FrameDelivery::Stuck | super::replay::FrameDelivery::Refused => {
+                sink.close_after_required_delivery_failure();
+                return;
+            }
+        }
+    }
 }
 
 pub(crate) async fn session_summaries(

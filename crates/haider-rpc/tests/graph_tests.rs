@@ -506,6 +506,7 @@ fn workflow_catalog_is_additive_verbatim_and_unknown_origin_tolerant() {
             main_session_eligible: true,
             template: template.clone(),
         }],
+        archived_entries: Vec::new(),
     };
     let new_value = serde_json::to_value(&new).expect("new loom.list encodes");
     assert_eq!(new_value["workflow_catalog"][0]["origin"], "built_in");
@@ -552,6 +553,7 @@ fn workflow_catalog_is_additive_verbatim_and_unknown_origin_tolerant() {
             workflows: Vec::new(),
             cli_present: std::collections::BTreeMap::new(),
             workflow_catalog,
+            archived_entries: Vec::new(),
         })
         .expect("empty catalog re-encodes"),
         serde_json::json!({"method": "loom.list"})

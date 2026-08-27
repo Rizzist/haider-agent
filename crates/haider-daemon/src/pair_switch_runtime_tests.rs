@@ -527,7 +527,7 @@ async fn pinned_loom_workflow_runs_its_next_turn_after_registry_edit() {
         Arc::new(FakeProvider::new(Vec::new())),
     )
     .await;
-    world
+    let first_registration = world
         .store
         .loom_register_workflow("runtime-retained: A -> A\nstep \"one\" :cmd".into())
         .await
@@ -583,9 +583,18 @@ async fn pinned_loom_workflow_runs_its_next_turn_after_registry_edit() {
 
     let revised = world
         .store
-        .loom_register_workflow("runtime-retained: A -> A\nstep \"two\" :cmd".into())
+        .loom_register_workflow_cas(
+            "runtime-retained: A -> A\nstep \"two\" :cmd".into(),
+            haider_protocol::loom::LoomRevisionExpectation {
+                rev: first_registration.rev,
+                digest: Some(first_registration.digest),
+            },
+        )
         .await
         .expect("register rev 2");
+    let haider_core::LoomRegistryMutation::Applied { value: revised, .. } = revised else {
+        panic!("current workflow expectation cannot conflict");
+    };
     assert_eq!(revised.rev, 2);
 
     world

@@ -64,6 +64,11 @@ fn live_bound_model() -> AppModel {
     model.daemon_features = [
         haider_rpc::FEATURE_LOOM_V1.to_owned(),
         haider_rpc::FEATURE_LOOM_AUTHORING_V1.to_owned(),
+        haider_rpc::FEATURE_LOOM_REGISTRY_CAS_V1.to_owned(),
+        haider_rpc::FEATURE_LOOM_REGISTRY_ARCHIVE_V1.to_owned(),
+        haider_rpc::FEATURE_LOOM_VALIDATION_V1.to_owned(),
+        haider_rpc::FEATURE_TYPED_AGENT_INSTALL_V1.to_owned(),
+        haider_rpc::FEATURE_TYPED_AGENT_INSTALL_CANCEL_V1.to_owned(),
         haider_rpc::FEATURE_WORKFLOW_CATALOG_V1.to_owned(),
         haider_rpc::FEATURE_LOOM_PIPE_DAG_V1.to_owned(),
         haider_rpc::FEATURE_CONVERGENCE_GRAPH_V1.to_owned(),
@@ -1484,5 +1489,117 @@ fn pane_entry_rerequests_the_loom_snapshot() {
             .iter()
             .any(|command| matches!(command, LiveCommand::LoomList { .. })),
         "LoomRefresh rides the loom.list wire: {commands:?}"
+    );
+}
+
+/// MUTATION CHECK: remove the editor's L4 hotkeys or drop their CAS/job
+/// coordinates. Expected runtime failure: one of the three exact requests
+/// below disappears or fabricates a default coordinate.
+#[test]
+fn editor_surfaces_validate_archive_and_install_cancel() {
+    let mut model = live_bound_model();
+    model.screen = Screen::Loom;
+    model.loom_pane = LoomPane::Types;
+    model.loom_types = vec![researcher()];
+    model.loom_selection = 1;
+    model.requests.clear();
+    model.handle(ctrl(KeyCode::Char('a')));
+    assert!(matches!(
+        model.requests.pop(),
+        Some(AppRequest::LoomArchive {
+            kind: haider_protocol::loom::LoomRegistryEntryKind::AgentType,
+            id,
+            expected_rev: 1,
+            expected_digest,
+        }) if id == "researcher" && expected_digest == researcher().digest()
+    ));
+
+    model.handle(ctrl(KeyCode::Char('n')));
+    let text = serde_json::json!({
+        "kind": "agent_type",
+        "id": "preview",
+        "name": "Preview",
+        "job": "Preview only",
+        "in_type": "Patch",
+        "out_type": "Verdict",
+        "capability_keys": [],
+        "grants": [],
+        "denials": [],
+        "skills": [],
+        "scripts": [],
+        "color": "",
+        "glyph": ""
+    })
+    .to_string();
+    model.composer.set_text(&text);
+    model.requests.clear();
+    model.handle(ctrl(KeyCode::Char('v')));
+    assert!(matches!(
+        model.requests.pop(),
+        Some(AppRequest::LoomValidate { text: sent, .. }) if sent == text
+    ));
+
+    let authoring = model.loom_authoring.as_mut().expect("editor");
+    authoring.pending = false;
+    let mut confirmed = author_confirmation(haider_protocol::loom::LoomAuthorKind::AgentType);
+    confirmed.install_job_id = Some("install:preview:1".into());
+    authoring.confirmed = Some(confirmed);
+    authoring.install_job = Some(haider_protocol::typed_agent::TypedAgentInstallJob {
+        job_id: "install:preview:1".into(),
+        agent_type_id: "preview".into(),
+        agent_type_rev: 1,
+        agent_type_digest: "0123456789abcdef0123456789abcdef".into(),
+        state: haider_protocol::typed_agent::TypedAgentInstallState::Queued,
+        cancelled: false,
+        progress: haider_protocol::typed_agent::TypedAgentInstallProgress {
+            total: 1,
+            completed: 0,
+            current_cli: None,
+        },
+        error: None,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+    });
+    let generation = authoring.generation;
+    model.requests.clear();
+    model.handle(ctrl(KeyCode::Char('a')));
+    assert!(matches!(
+        model.requests.pop(),
+        Some(AppRequest::LoomArchive {
+            kind: haider_protocol::loom::LoomRegistryEntryKind::AgentType,
+            id,
+            expected_rev: 1,
+            expected_digest,
+        }) if id == "reviewer" && expected_digest == "confirmed-digest"
+    ));
+
+    model.requests.clear();
+    model.handle(ctrl(KeyCode::Char('x')));
+    let Some(AppRequest::LoomInstallCancel {
+        generation: requested_generation,
+        job_id,
+    }) = model.requests.pop()
+    else {
+        panic!("cancel request missing");
+    };
+    assert_eq!(requested_generation, generation);
+    assert_eq!(job_id, "install:preview:1");
+
+    let mut driver = LiveDriver::new("test");
+    let command = driver
+        .handle_request(
+            &mut model,
+            AppRequest::LoomInstallCancel {
+                generation,
+                job_id: job_id.clone(),
+            },
+        )
+        .pop()
+        .expect("cancel command");
+    assert_eq!(
+        request_body(command),
+        RequestBody::LoomInstallCancel {
+            install_job_id: job_id
+        }
     );
 }

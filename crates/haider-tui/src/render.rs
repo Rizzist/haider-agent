@@ -6649,6 +6649,12 @@ fn render_loom(
                 theme.ok_style(),
             ));
         }
+        if let Some(digest) = &authoring.preview_digest {
+            lines.push(Line::styled(
+                format!("  save preview · {}", crate::graph::digest_short(digest)),
+                theme.dim_style(),
+            ));
+        }
         if let Some(confirmed) = &authoring.confirmed {
             lines.push(Line::raw(""));
             lines.push(Line::from(vec![
@@ -6667,10 +6673,46 @@ fn render_loom(
                 "changed content confirms as a new immutable revision and execution hash",
                 theme.dim_style(),
             ));
+            if let Some(job_id) = &confirmed.install_job_id {
+                if let Some(job) = authoring
+                    .install_job
+                    .as_ref()
+                    .filter(|job| &job.job_id == job_id)
+                {
+                    let state = if job.cancelled {
+                        "cancelled".to_owned()
+                    } else {
+                        format!("{:?}", job.state).to_ascii_lowercase()
+                    };
+                    lines.push(Line::styled(
+                        format!(
+                            "install job {job_id} · {state} · {}/{}{}",
+                            job.progress.completed,
+                            job.progress.total,
+                            job.progress
+                                .current_cli
+                                .as_ref()
+                                .map_or_else(String::new, |cli| format!(" · {cli}"))
+                        ),
+                        theme.gold_style(),
+                    ));
+                    if !job.state.is_terminal() {
+                        lines.push(Line::styled(
+                            "⌃X cancel (registration remains retryable)",
+                            theme.dim_style(),
+                        ));
+                    }
+                } else {
+                    lines.push(Line::styled(
+                        format!("install job {job_id} · status not reported"),
+                        theme.gold_style(),
+                    ));
+                }
+            }
         }
         lines.push(Line::raw(""));
         let actions = if model.daemon_serves(haider_rpc::FEATURE_LOOM_AUTHORING_V1) {
-            "⇧⏎ newline · ⏎ validate · ⌃S confirm/register · ⌥m model · esc close draft"
+            "⇧⏎ newline · ⏎ revise · ⌃V validate-only · ⌃S confirm/register · ⌃A archive confirmed · ⌃X cancel install · esc close"
         } else {
             "authoring unavailable on this connection · esc close draft"
         };
@@ -7165,7 +7207,7 @@ fn render_loom(
         }
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            "↑↓ select · ⏎ detail · ⌃P bind · ⌃N new · ⌃I install · ⌥m model · tab ⇄ workflows · esc back",
+            "↑↓ select · ⏎ detail · ⌃P bind · ⌃N new · ⌃A archive · ⌃I install · tab ⇄ workflows · esc back",
             theme.dim_style(),
         ));
     } else {
@@ -7283,7 +7325,7 @@ fn render_loom(
         }
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            "↑↓ select · ⏎ detail · ⌃P pin · ⌃N new · ⌥m model · tab ⇄ loom · esc back",
+            "↑↓ select · ⏎ detail · ⌃P pin · ⌃N new · ⌃A archive · tab ⇄ loom · esc back",
             theme.dim_style(),
         ));
     }

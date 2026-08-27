@@ -1,9 +1,9 @@
 # Haider client contract — revision 1
 
 Status: authoritative for wire protocol `v = 1`  
-Source snapshot: package `0.0.962` \
-N-1 compatibility baseline: `0.0.961` \
-Contract revision date: 2026-08-26
+Source snapshot: package `0.0.963` \
+N-1 compatibility baseline: `0.0.962` \
+Contract revision date: 2026-08-27
 
 This document is the client-facing contract of `haider-rpc`,
 `haider-client`, and the daemon producers behind them. Rust types and golden
@@ -203,10 +203,10 @@ An operation not listed here is part of the v1 base surface. “Field” means t
 client may use that field only when it is present; the named token permits an
 affordance before the response exists.
 
-The ordinary v0.0.963 `welcome_features()` set contains all 89 tokens below.
+The ordinary v0.0.963 `welcome_features()` set contains all 94 tokens below.
 The re-verification anchors are
-`crates/haider-daemon/src/connection.rs:1870-1961` for the assembled set and
-`crates/haider-rpc/src/frame.rs:249-513` for the exact string constants. The
+`crates/haider-daemon/src/connection.rs:1871-1968` for the assembled set and
+`crates/haider-rpc/src/frame.rs:249-527` for the exact string constants. The
 one peer-specific withholding exception is §4.1.
 
 | Feature token | Methods, frames, or fields it publishes |
@@ -290,6 +290,11 @@ one peer-specific withholding exception is §4.1.
 | `loom_cli_presence_v1` | `loom.list.cli_present` |
 | `typed_agent_install_v1` | `loom.install.status` and the durable required-CLI install lifecycle started by agent-type registration |
 | `typed_agent_install_control_v1` | additive `LoomRegistered.install_job_id`, `loom.install.retry`, and cursor-replayable `loom.install.watch` |
+| `typed_agent_install_cancel_v1` | `loom.install.cancel`; kept separate so the v0.0.962 control token retains exactly retry + watch semantics |
+| `loom_registry_cas_v1` | expected-revision/digest fences on every client/tool registry save door and typed `LoomRevisionConflict` |
+| `loom_registry_archive_v1` | archive/unarchive registry state, include-archived inventory, and retained pinned-revision resolution |
+| `loom_validation_v1` | non-mutating `loom.validate` with L1-located errors and canonical digest preview |
+| `loom_registry_watch_v1` | `loom.watch` archive-aware baseline plus durable registry-delta/caught-up stream |
 | `session_workflow_state_v1` | `SessionObserveDigest.workflow` on `session.observe` and `session.observe_batch` |
 | `store_health_v1` | unsolicited latched/replayed store-health `ProtocolError` transitions |
 | `resident_session_binding_v1` | bidirectional `ResidentSessionBinding` baseline/push frame and its generation fence; it does not by itself guarantee publisher-token echo |
@@ -377,6 +382,7 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | Exact workflow instance | `workflow.instance` | `WorkflowInstance` | snapshot | current registry/catalog instance by id, or an exact retained user revision by template digest |
 | Typed-agent install readiness | `loom.install.status` | `LoomInstallStatus` | reconnectable, bounded snapshot | durable install jobs and per-CLI items read from one store snapshot |
 | Typed-agent install progress | `loom.install.watch` | `LoomInstallWatch` | bounded cursor replay page | durable exact-job progress snapshots |
+| Loom registry baseline and deltas | `loom.watch` | `LoomWatch`, then `LoomRegistryDelta` / `LoomRegistryCaughtUp` | replayable required-delivery stream | full archive-aware baseline plus committed registry event log |
 | Monitor registry | `monitor.list` | `MonitorList` | typed snapshot receipt | durable session monitor facts |
 | Monitor deliveries | `monitor.watch` | `MonitorWatch`, then `MonitorDelivery` / `MonitorDeliveryCaughtUp` | required cursor replay/live stream | durable `MonitorReportPending` facts in the session journal |
 | Todos | raw `ItemEvent` envelopes (`TurnItem` with `item: "plan"`) | no independent snapshot response | attach replay/live lifecycle | durable item lifecycle; reducer in §12 |
@@ -424,6 +430,10 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | `loom.author.confirm` | same-named response carrying `confirmed` or typed `errors` | immutable registration and daemon-issued execution digest |
 | `loom.install.retry` | `LoomInstallRetry` | typed requeue receipt or structured rejection |
 | `loom.install.watch` | `LoomInstallWatch` | typed bounded replay page or structured rejection |
+| `loom.install.cancel` | `LoomInstallCancel` | `Cancelled`, `AlreadyTerminal { state }`, or `Unknown` receipt |
+| `loom.archive`, `loom.unarchive` | same-named response carrying `LoomArchiveReceiptWire` | changed/already/not-found typed archive fact |
+| `loom.validate` | `LoomValidate` | located validation errors and optional canonical digest preview |
+| `loom.watch` | `LoomWatch` then registry stream frames | archive-aware baseline and persist-before-publish delta suffix |
 | `workflow.graph.state` | `WorkflowGraphState` | indexed typed activation snapshot; optional `graph_id` selects an exact graph |
 | `workflow.graph.watch` | `WorkflowGraphWatch` | bounded durable activation-event replay strictly after the applied cursor |
 | `vault.stage` | `VaultStage` | connection-local ephemeral dedupe, deliberately not durable |
@@ -437,7 +447,7 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 The golden matrix at
 `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`, combined
 with the historical `wire_transcript.json`, pins a request and successful
-response for every one of the 94 v1 request methods. `menu.answer` and resident
+response for every one of the 99 v1 request methods. `menu.answer` and resident
 binding are top-level frames, not `RequestBody` methods.
 
 ### 5.3 Advertised runtime with no client method
@@ -1709,7 +1719,8 @@ lowers to the existing command or bounded all-of gate. Human gates carry no
 evidence contract. The daemon resolves every `agent_type` reference against
 one registry snapshot and repeats validation at confirmation.
 
-`loom.author.confirm { authoring_id, expected_revision, kind, text }` has two
+`loom.author.confirm { authoring_id, expected_revision, kind, text,
+expected_rev, expected_digest? }` has two
 successful response forms: `confirmed: LoomAuthorConfirmed` with an
 omitted/empty `errors`, or no `confirmed` with one or more typed errors.
 Validation rejection is therefore a successful typed authoring response and
@@ -1740,6 +1751,133 @@ ordinary chat turn, or fall back to `loom.register_*`. It may continue to show
 the independently negotiated read-only Loom registry. An old daemon's unknown
 method response is not a probe result and must not be reinterpreted as an empty
 or invalid draft.
+
+### 13.1.2 Registry compare-and-swap (`loom_registry_cas_v1`)
+
+Every client-visible registry save/upsert is fenced. This extends the existing
+`loom.register_agent_type`, `loom.register_workflow`, and
+`loom.author.confirm` doors; the model's plan-gated `loom_register` tool uses
+the same store transaction rather than a parallel registry.
+
+| Door | Required request fence | Conflict |
+|---|---|---|
+| `loom.register_agent_type` | `expected_rev: u32`, `expected_digest: Option<String>` | error `revision_conflict` + `ErrorData::LoomRevisionConflict` |
+| `loom.register_workflow` | `expected_rev: u32`, `expected_digest: Option<String>` | same |
+| `loom.author.confirm` | authoring `expected_revision` plus registry `expected_rev` and optional `expected_digest` | same |
+| model tool `loom_register` | `expected_rev` and optional `expected_digest` | typed `conflict` object in the tool result |
+
+Revision zero means “this id must be absent.” A positive revision must equal
+the current durable revision; a supplied digest must also match. Creating
+`reviewer` therefore sends `{"expected_rev":0}`; editing observed revision 3
+should send `{"expected_rev":3,"expected_digest":"<observed digest>"}`.
+The daemon checks the fence and writes the revision, retained-history row,
+install job, and registry events in one transaction. Nothing is acknowledged
+or published before commit, and a batch never partially applies.
+
+`LoomRevisionConflict { expected, current_rev, current_digest }` carries the
+request fence verbatim. Both current fields are optional because the row may
+now be absent. Their absence is not revision zero and is never replaced with a
+fabricated digest. Missing `expected_rev` remains wire-decodable for v1
+tolerance, but a daemon advertising this feature rejects the mutation as
+`invalid_argument`; it never silently falls back to last-writer-wins.
+The older Rust compatibility helpers below the wire are create/idempotency
+only: once an id exists, changed content returns `revision_conflict` and must
+be retried through the CAS helper. They are not an unfenced revision escape
+hatch.
+
+**Absence law.** Without `loom_registry_cas_v1`, a client MUST NOT assume any
+registry mutation is CAS-safe or expose concurrent overwrite semantics.
+Absence of `current_rev` or `current_digest` in a conflict is typed absence,
+not permission to retry with a default.
+
+### 13.1.3 Archive instead of delete (`loom_registry_archive_v1`)
+
+| Direction | Method/type | Fields |
+|---|---|---|
+| Request | `loom.archive` / `loom.unarchive` | `kind: agent_type \| workflow`, `id`, `expected_rev`, `expected_digest?` |
+| Success | same-named response | `LoomArchiveReceiptWire { kind, id, outcome }` |
+| Inventory opt-in | `loom.list` | additive `include_archived: bool`; inclusive response also carries `archived_entries` |
+
+The outcome is `Changed { entry }`, `Already { entry }`, or `NotFound`; a
+mismatched fence is the same typed `LoomRevisionConflict` error used by saves.
+`NotFound` is explicit absence; no empty entry or revision zero is invented.
+Against an absent row, only `{ expected_rev:0, expected_digest:None }` may
+return `NotFound`. Any positive revision or supplied digest conflicts and
+returns the request expectation verbatim with both current coordinates absent.
+Archive/unarchive changes selection state only: it retains content
+revision/digest and appends a durable history event. Ordinary `loom.list`,
+catalogs, workflow selection, and agent-type selection exclude archived rows.
+`include_archived:true` returns both record vectors plus exact
+`archived_entries`, so consumers label only rows the daemon marked.
+
+Archive is not delete. Exact retained agent-type `(id, rev, digest)` and
+workflow template-digest lookups continue resolving, so pinned runs remain on
+the immutable bytes they already named. An archived row is not silently
+unarchived by a content save; unarchive is its own CAS-fenced fact. For example,
+`loom.archive { kind:"workflow", id:"review", expected_rev:2,
+expected_digest:"…" }` returns revision 2 with `archived:true`; default
+catalogs then omit it while an already pinned revision continues resolving.
+
+**Absence law.** Without `loom_registry_archive_v1`, do not show archive,
+unarchive, or include-archived controls and do not infer archival from a row
+missing in the default catalog. Missing is not a delete fact.
+
+### 13.1.4 Non-mutating validation (`loom_validation_v1`)
+
+`loom.validate { kind, text }` requires View and returns
+`LoomValidate { errors, canonical_digest }`. It invokes the exact L1 authoring
+validator, so syntax/field/capability/agent/type/graph failures carry the same
+one-based located `LoomAuthorValidationError` values. It creates no authoring
+session, reserves no revision, writes no registry state, starts no install,
+and publishes no delta.
+
+When errors are nonempty, `canonical_digest` is absent. On success, errors are
+empty/omitted and the digest is the content identity the current registry
+snapshot would produce, including exact resolved agent-type revision/digest
+bindings for a workflow. This is a preview, not a commit receipt or revision
+reservation; a later save still supplies CAS and may conflict. Never replace
+an absent digest with an empty string or local hash.
+
+**Absence law.** Without `loom_validation_v1`, a client MUST NOT call
+`loom.validate` or claim a save preview. It may use `loom.author.revise` only
+when `loom_authoring_v1` is separately present.
+
+### 13.1.5 Registry watch (`loom_registry_watch_v1`)
+
+`loom.watch { after_cursor }` installs one connection-scoped required-delivery
+stream. Its correlated `LoomWatch` response carries `watch_id`, the requested
+cursor verbatim, and a full archive-aware
+`LoomRegistrySnapshot { through_cursor, entries }`. The baseline repairs any
+gap: reconnecting clients replace their registry projection from it. The
+daemon then replays the durable transition suffix
+`(requested_after_cursor, through_cursor]` for that watch and seals it with
+`LoomRegistryCaughtUp`; those historical deltas establish cursor continuity
+but are already reflected in the replacement baseline, so clients MUST NOT
+regress the baseline projection while consuming them. Deltas beyond
+`through_cursor` are live changes and apply normally.
+Each snapshot row is `{ entry, record }`: `entry` carries exact
+kind/id/rev/digest/archive coordinates, including an agent-type digest clients
+must not recompute, while `record` remains distinctly tagged by registry kind.
+
+Committed changes arrive as
+`LoomRegistryDelta { watch_id, delta: { cursor, change, entry, record } }`.
+`change` is `upserted`, `revision_added`, `archived`, or `unarchived`; `entry`
+carries kind/id/rev/digest/archive state and `record` stays distinctly tagged
+as agent type or workflow. `LoomRegistryCaughtUp { watch_id,
+high_water_cursor }` seals a replay suffix. Upserts that mint a revision append
+both facts atomically. Events are allocated in the mutation transaction,
+committed, then published; broadcast lag replays from the last delivered
+durable cursor. No client polling repairs the stream.
+
+A cursor beyond the baseline head returns `cursor_ahead` with typed
+`{requested, head}`. Cursors are positive opaque log positions, not revisions
+or timestamps. A successful advertised baseline may have cursor zero and no
+entries; only then is the empty registry authoritative.
+
+**Absence law.** Without `loom_registry_watch_v1`, clients MUST NOT call or
+render `loom.watch`, fabricate cursor zero as an attached stream, or treat a
+disconnect as an empty registry. An explicit `loom.list` refresh remains a
+separate snapshot read, not a delta stream.
 
 ### 13.2 Durable typed-agent installation
 
@@ -1784,16 +1922,24 @@ The direct response records are exactly:
 
 | Type | Fields |
 |---|---|
-| `TypedAgentInstallJob` | `job_id: String`, `agent_type_id: String`, `agent_type_rev: u32`, `agent_type_digest: String`, `state: TypedAgentInstallState`, `progress: TypedAgentInstallProgress`, `error: Option<String>`, `created_at_ms: u64`, `updated_at_ms: u64` |
+| `TypedAgentInstallJob` | `job_id: String`, `agent_type_id: String`, `agent_type_rev: u32`, `agent_type_digest: String`, `state: TypedAgentInstallState`, additive `cancelled: bool`, `progress: TypedAgentInstallProgress`, `error: Option<String>`, `created_at_ms: u64`, `updated_at_ms: u64` |
 | `TypedAgentInstallProgress` | `total: u16`, `completed: u16`, `current_cli: Option<String>` |
 | `TypedAgentInstallItem` | `job_id: String`, `ordinal: u16`, `required_cli: TypedAgentRequiredCli`, `state: TypedAgentInstallState`, `error: Option<String>`, `created_at_ms: u64`, `updated_at_ms: u64` |
 | `TypedAgentRequiredCli` | `program: String` |
 
-`TypedAgentInstallState` has the exact frozen wire strings `"queued"`,
-`"installing"`, `"verifying"`, `"succeeded"`, and `"failed"`; the record
+`TypedAgentInstallState` retains the exact frozen wire strings `"queued"`,
+`"installing"`, `"verifying"`, `"succeeded"`, and `"failed"`. L4 advertises
+cancellation through the additive `cancelled:true` job field and the separate
+unknown-tolerant receipt enum, so a v0.0.962 watch decoder never receives a
+sixth lifecycle literal. Omitted `cancelled` is the field's explicit additive
+compatibility encoding for `false`: it means this present job has no
+cancellation fact, not that the requested job or status is absent. The record
 definitions and transition/absence invariants are at
-`crates/haider-protocol/src/typed_agent.rs:115-457`. `error` is present for a
-failed job/item and absent otherwise. `current_cli` names current progress only
+`crates/haider-protocol/src/typed_agent.rs:115-500`. `error` is present for a
+failed job/item and absent otherwise. A cancelled job retains a compatibility
+error string because its frozen carrier is `failed`, but `cancelled:true` is
+the typed authority and MUST be checked first; it has no current CLI and is
+not semantically an install failure. `current_cli` names current progress only
 when supplied; its absence MUST NOT be rendered as completion. A present
 `completed: 0`, item `ordinal: 0`, or required timestamp value of zero is data,
 not absence; `total` is validated as `1..=32`, never zero.
@@ -1891,10 +2037,10 @@ one tagged `outcome`:
   "contract_not_current"` means the failed job belongs to a superseded agent
   type revision/digest. Clients MUST branch on these tags, not message prose.
 
-The ordinary installer CAS still treats success and failure as terminal. Only
-the negotiated retry transaction may reopen failure; success is never reset.
-The optional `loom.install.cancel` door is not published by this revision, so
-clients MUST NOT infer or call it from the word “control.”
+The ordinary installer CAS treats success, failure, and cancellation as
+terminal. Only the negotiated retry transaction may reopen failure or
+cancellation; success is never reset. Cancellation is separately advertised
+and is not implied by the v0.0.962 control token.
 
 `loom.install.watch` is the additive status door form of a replayable progress
 watch. Its typed `outcome` is either:
@@ -1910,7 +2056,8 @@ recorded in the same transaction as the job creation, installer CAS, or retry
 reset. Migration gives each pre-feature job one exact current-state baseline;
 it does not invent transitions that were never recorded. The watch therefore
 replays the exact available wire states (`queued`, `installing`, `verifying`,
-and terminal `succeeded`/`failed`); `installing` is the wire's running phase
+and terminal `succeeded`/`failed`, with `cancelled:true` distinguishing a
+cancelled failed-carrier record); `installing` is the wire's running phase
 and MUST NOT be renamed by a client. Cursors are positive, opaque,
 store-issued replay coordinates for this door—not timestamps or
 install/agent/workflow ids. A
@@ -1926,11 +2073,45 @@ one exact job id, so they neither scan nor synthesize a larger registry.
 **Absence law.** If Welcome omits `typed_agent_install_control_v1`, a client
 has only fire-and-forget `loom.register_agent_type` behavior for this control
 surface. It MUST treat `LoomRegistered.install_job_id` as unavailable, MUST NOT
-call retry, cancel, or watch, and MUST NOT fabricate a job id from the agent
+call retry or watch, and MUST NOT fabricate a job id from the agent
 type, revision, digest, `cli_present`, PATH, or any other local fact. A
 separately present `typed_agent_install_v1` still permits its documented status
 read, but `cli_present: true` never proves install readiness and never creates
 a retry coordinate.
+
+### 13.2.2 Typed-agent install cancellation
+
+`typed_agent_install_cancel_v1` is intentionally separate from
+`typed_agent_install_control_v1`: a v0.0.962 client that negotiated the older
+token continues to know exactly retry + watch, never an expanded meaning.
+
+| Direction | Method/type | Fields |
+|---|---|---|
+| Request | `loom.install.cancel` | `install_job_id: String` |
+| Success response | `LoomInstallCancel` | `TypedAgentInstallCancelReceiptWire { install_job_id, outcome }` |
+
+The tagged outcome is `Cancelled`, `AlreadyTerminal { state }`, or `Unknown`
+(`status:"unknown"`). The requested id is carried verbatim; `Unknown` is typed
+absence and does not create a placeholder. Queued, installing, or verifying
+work transitions atomically to durable `cancelled`. An installer already
+racing outside SQLite loses its next CAS and cannot overwrite that terminal
+fact. The cancellation event commits before the receipt and is visible through
+`loom.install.watch`.
+
+Cancellation neither removes nor archives the agent-type registration and
+does not erase its per-CLI rows. `loom.install.retry` accepts a cancelled
+current-contract job and atomically requeues it, so cancellation is neither
+failure nor deletion. An already succeeded/failed/cancelled job returns its
+exact state under `AlreadyTerminal`.
+
+Example: cancelling `install-job-7` can return
+`{"status":"already_terminal","state":"succeeded"}`. Render that terminal
+fact rather than claiming this request cancelled it.
+
+**Absence law.** Without `typed_agent_install_cancel_v1`, a client MUST NOT
+show or call cancel even when `typed_agent_install_control_v1` is present.
+Neither PATH presence, a local process state, nor a watch gap permits
+fabricating `Cancelled`, `Unknown`, or a job id.
 
 ### 13.3 Session workflow projection
 
@@ -2097,8 +2278,10 @@ the delegation/agent-lineage graph described above.
 ### 13.5 Workflow catalog and pipe-DAG grammar negotiation
 
 `workflow_catalog_v1` adds one optional section to the existing `loom.list`
-success response; it does not add a second registry method. The request remains
-`LoomList` (`method: "loom.list"`) with no fields. The response retains
+success response; it does not add a second registry method. The L4 request is
+`LoomList { include_archived: bool }` (`method: "loom.list"`); the additive
+flag defaults false and is omitted when false, preserving the old fieldless
+wire bytes. The response retains
 `agent_types`, `workflows`, and `cli_present` unchanged and additively carries
 `workflow_catalog: Vec<WorkflowCatalogEntryV1>`. The field has a serde default
 and is omitted when empty, so a pre-feature v1 response retains its exact wire
@@ -2177,7 +2360,12 @@ expansion class. In particular, `SessionInteractionModeV1`
 (`"interactive" | "autonomous"`) and `TypedAgentInstallState`
 (`"queued" | "installing" | "verifying" | "succeeded" | "failed"`) are
 normatively **Frozen**: neither has `#[serde(other)]` or a custom unknown
-carrier. The monitor direct enums `MonitorSourceKindWire`,
+carrier. L4 preserves that pin: cancellation is the additive
+`TypedAgentInstallJob.cancelled` field plus the new unknown-tolerant
+`TypedAgentInstallTerminalStateV1`, not a sixth lifecycle literal.
+`LoomRegistryEntryKind`, tagged `LoomRegistryRecord`, and
+`LoomRegistryDeltaKind` are likewise **Extensible**; an unknown value carries
+no selection, mutation, or cursor authority. The monitor direct enums `MonitorSourceKindWire`,
 `MonitorSourceWire`, `MonitorFilterFieldWire`, `MonitorFilterOperatorWire`,
 `MonitorOccurrenceWire`, `MonitorLifetimeWire`,
 `MonitorSourceUnavailableReasonWire`, `MonitorSourceAvailabilityStateWire`,
@@ -2211,12 +2399,12 @@ The machine-checkable contract lives in these fixtures/tests:
 - `crates/haider-rpc/tests/fixtures/wire_transcript.json`: historical compact
   WebSocket bodies and four-byte length-prefixed UDS bytes, including
   Hello/Welcome, raw replay, menu CAS, accounts/providers/usage, and mutation
-  receipts; the appended monitor delivery/caught-up entries pin the dedicated
-  non-chat stream and its explicit truncation/dedupe fields.
+  receipts; the appended monitor and Loom registry delta/caught-up entries pin
+  both dedicated non-chat streams. The exact current transcript count is 133.
 - `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`: the
-  methods added after the historical matrix, completing golden request and
-  successful response coverage for all 94 request methods and all five
-  command dynamic slots.
+  59 methods added after the historical matrix, completing its 40 with golden
+  request and successful response coverage for all 99 request methods and all
+  five command dynamic slots.
 - `crates/haider-rpc/tests/fixtures/snapshot_availability_compat_v1.json`:
   old and new account/provider/usage response bytes.
 - `snapshot_availability_is_compatible_in_both_n_minus_one_directions`:

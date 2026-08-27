@@ -1993,7 +1993,7 @@ async fn graph_pin_rpc_replays_its_receipt_before_control_attachment_validation(
 #[tokio::test]
 async fn workflow_instance_rpc_retains_pinned_revision_and_fences_pin_and_switch() {
     let (_root, store, hub) = open_hub(None, 16).await;
-    store
+    let first_registration = store
         .loom_register_workflow("rpc-retained: A -> A\nstep \"one\" :cmd".into())
         .await
         .expect("register rev 1");
@@ -2041,7 +2041,13 @@ async fn workflow_instance_rpc_retains_pinned_revision_and_fences_pin_and_switch
     assert_eq!(pinned_digest, first_digest);
 
     store
-        .loom_register_workflow("rpc-retained: A -> A\nstep \"two\" :cmd".into())
+        .loom_register_workflow_cas(
+            "rpc-retained: A -> A\nstep \"two\" :cmd".into(),
+            haider_protocol::loom::LoomRevisionExpectation {
+                rev: first_registration.rev,
+                digest: Some(first_registration.digest),
+            },
+        )
         .await
         .expect("register rev 2");
     let current = store

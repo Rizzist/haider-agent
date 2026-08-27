@@ -514,6 +514,17 @@ pub const FEATURE_PIPE_NATIVE_V2: &str = "pipe_native_v2";
 pub const FEATURE_PIPE_TOOL_STATUS_V1: &str = "pipe_tool_status_v1";
 /// Event-sourced typed workflow activation state and cursor replay.
 pub const FEATURE_WORKFLOW_GRAPH_V1: &str = "workflow_graph_v1";
+/// Explicit queued/running typed-install cancellation. Kept separate from the
+/// shipped retry/watch token so 962 negotiation retains its exact meaning.
+pub const FEATURE_TYPED_AGENT_INSTALL_CANCEL_V1: &str = "typed_agent_install_cancel_v1";
+/// Every client-visible Loom registry mutation carries a revision/digest CAS.
+pub const FEATURE_LOOM_REGISTRY_CAS_V1: &str = "loom_registry_cas_v1";
+/// Loom entries can be archived/unarchived without deleting retained content.
+pub const FEATURE_LOOM_REGISTRY_ARCHIVE_V1: &str = "loom_registry_archive_v1";
+/// Read-only author-document validation with the would-save canonical digest.
+pub const FEATURE_LOOM_VALIDATION_V1: &str = "loom_validation_v1";
+/// Replayable persist-before-publish Loom registry baselines and deltas.
+pub const FEATURE_LOOM_REGISTRY_WATCH_V1: &str = "loom_registry_watch_v1";
 
 /// Maximum UTF-8 bytes accepted for one mirrored input value or injected text.
 pub const SURFACE_INPUT_MAX_BYTES: usize = 64 * 1024;
@@ -2343,6 +2354,51 @@ pub struct TypedAgentInstallWatchReceiptWire {
     pub outcome: TypedAgentInstallWatchOutcomeWire,
 }
 
+/// Typed result of cancelling one exact durable install job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum TypedAgentInstallCancelOutcomeWire {
+    Cancelled,
+    AlreadyTerminal {
+        state: haider_protocol::typed_agent::TypedAgentInstallTerminalStateV1,
+    },
+    /// The exact requested durable job is absent. Future unrecognized status
+    /// spellings also fail closed here for older readers.
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypedAgentInstallCancelReceiptWire {
+    pub install_job_id: String,
+    pub outcome: TypedAgentInstallCancelOutcomeWire,
+}
+
+/// Typed archive/unarchive result. `Already` carries the exact current fact;
+/// `NotFound` is an explicit absence rather than a fabricated empty entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum LoomArchiveOutcomeWire {
+    Changed {
+        entry: haider_protocol::loom::LoomRegistryEntryRef,
+    },
+    Already {
+        entry: haider_protocol::loom::LoomRegistryEntryRef,
+    },
+    NotFound,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoomArchiveReceiptWire {
+    pub kind: haider_protocol::loom::LoomRegistryEntryKind,
+    pub id: String,
+    pub outcome: LoomArchiveOutcomeWire,
+}
+
 /// Report terminal/match status from the durable monitor subsystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2606,12 +2662,19 @@ pub enum RequestBody {
     GraphStatus { session_id: SessionId },
     /// B1 — read the Loom registry (agent types + compiled workflows).
     #[serde(rename = "loom.list")]
-    LoomList {},
+    LoomList {
+        #[serde(default, skip_serializing_if = "is_false")]
+        include_archived: bool,
+    },
     /// B1 — register/revise one agent type. The registry owns revs: identical
     /// content no-ops, changed content advances by one.
     #[serde(rename = "loom.register_agent_type")]
     LoomRegisterAgentType {
         record: haider_protocol::loom::LoomAgentType,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_rev: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_digest: Option<String>,
     },
     /// Durable required-CLI installation status. Both filters omitted lists
     /// the bounded newest retained jobs; either filter narrows that view.
@@ -2626,7 +2689,13 @@ pub enum RequestBody {
     /// compiles it against the current agent-type registry and rejects a bad
     /// pipe with the full error list.
     #[serde(rename = "loom.register_workflow")]
-    LoomRegisterWorkflow { source: String },
+    LoomRegisterWorkflow {
+        source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_rev: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_digest: Option<String>,
+    },
     #[serde(rename = "graph.inspect")]
     GraphInspect {
         session_id: SessionId,
@@ -3291,7 +3360,39 @@ pub enum RequestBody {
         expected_revision: u64,
         kind: haider_protocol::loom::LoomAuthorKind,
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_rev: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_digest: Option<String>,
     },
+    /// Cancel one queued/running durable required-CLI install job.
+    #[serde(rename = "loom.install.cancel")]
+    LoomInstallCancel { install_job_id: String },
+    #[serde(rename = "loom.archive")]
+    LoomArchive {
+        kind: haider_protocol::loom::LoomRegistryEntryKind,
+        id: String,
+        expected_rev: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_digest: Option<String>,
+    },
+    #[serde(rename = "loom.unarchive")]
+    LoomUnarchive {
+        kind: haider_protocol::loom::LoomRegistryEntryKind,
+        id: String,
+        expected_rev: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_digest: Option<String>,
+    },
+    /// Validate exact editor text without registering it.
+    #[serde(rename = "loom.validate")]
+    LoomValidate {
+        kind: haider_protocol::loom::LoomAuthorKind,
+        text: String,
+    },
+    /// Attach a connection-scoped registry baseline + durable delta stream.
+    #[serde(rename = "loom.watch")]
+    LoomWatch { after_cursor: u64 },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline). W3b answers it with a protocol error, not a panic.
     #[serde(other)]
@@ -3468,6 +3569,9 @@ pub enum ResponseBody {
         /// advertised; default + skip-empty preserves pre-feature v1 bytes.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         workflow_catalog: Vec<WorkflowCatalogEntryV1>,
+        /// Present only when the request explicitly included archived entries.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        archived_entries: Vec<haider_protocol::loom::LoomRegistryEntryRef>,
     },
     /// B1 — a committed (or no-op) registration.
     #[serde(rename = "loom.registered")]
@@ -4009,6 +4113,27 @@ pub enum ResponseBody {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         errors: Vec<haider_protocol::loom::LoomAuthorValidationError>,
     },
+    #[serde(rename = "loom.install.cancel")]
+    LoomInstallCancel {
+        receipt: TypedAgentInstallCancelReceiptWire,
+    },
+    #[serde(rename = "loom.archive")]
+    LoomArchive { receipt: LoomArchiveReceiptWire },
+    #[serde(rename = "loom.unarchive")]
+    LoomUnarchive { receipt: LoomArchiveReceiptWire },
+    #[serde(rename = "loom.validate")]
+    LoomValidate {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        errors: Vec<haider_protocol::loom::LoomAuthorValidationError>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        canonical_digest: Option<String>,
+    },
+    #[serde(rename = "loom.watch")]
+    LoomWatch {
+        watch_id: String,
+        requested_after_cursor: u64,
+        baseline: haider_protocol::loom::LoomRegistrySnapshot,
+    },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline).
     #[serde(other)]
@@ -4164,6 +4289,14 @@ pub enum ErrorData {
         expected_digest: String,
         current_digest: String,
         current_revision: u32,
+    },
+    /// A Loom registry save/archive fence did not match current durable truth.
+    LoomRevisionConflict {
+        expected: haider_protocol::loom::LoomRevisionExpectation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_rev: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_digest: Option<String>,
     },
     /// Decode artifact for a data kind this crate does not know (tolerance
     /// discipline).
@@ -4435,6 +4568,17 @@ pub enum WireFrame {
         session_id: SessionId,
         high_water_cursor: u64,
     },
+    /// One committed Loom registry delta on a connection-scoped watch lane.
+    LoomRegistryDelta {
+        watch_id: String,
+        delta: haider_protocol::loom::LoomRegistryDelta,
+    },
+    /// The registry watcher has replayed every durable delta through this
+    /// cursor. Clients persist it only after applying all preceding deltas.
+    LoomRegistryCaughtUp {
+        watch_id: String,
+        high_water_cursor: u64,
+    },
     /// Decode artifact for a frame kind this crate does not know (tolerance
     /// discipline). Never constructed for sending.
     Unknown,
@@ -4534,6 +4678,14 @@ enum WireFrameRef<'a> {
     MonitorDeliveryCaughtUp {
         watch_id: &'a str,
         session_id: &'a SessionId,
+        high_water_cursor: u64,
+    },
+    LoomRegistryDelta {
+        watch_id: &'a str,
+        delta: &'a haider_protocol::loom::LoomRegistryDelta,
+    },
+    LoomRegistryCaughtUp {
+        watch_id: &'a str,
         high_water_cursor: u64,
     },
     Unknown,
@@ -4637,6 +4789,14 @@ enum WireFrameOwned {
     MonitorDeliveryCaughtUp {
         watch_id: String,
         session_id: SessionId,
+        high_water_cursor: u64,
+    },
+    LoomRegistryDelta {
+        watch_id: String,
+        delta: haider_protocol::loom::LoomRegistryDelta,
+    },
+    LoomRegistryCaughtUp {
+        watch_id: String,
         high_water_cursor: u64,
     },
     #[serde(other)]
@@ -4812,6 +4972,16 @@ impl Serialize for WireFrame {
                 session_id,
                 high_water_cursor: *high_water_cursor,
             },
+            Self::LoomRegistryDelta { watch_id, delta } => {
+                WireFrameRef::LoomRegistryDelta { watch_id, delta }
+            }
+            Self::LoomRegistryCaughtUp {
+                watch_id,
+                high_water_cursor,
+            } => WireFrameRef::LoomRegistryCaughtUp {
+                watch_id,
+                high_water_cursor: *high_water_cursor,
+            },
             Self::Unknown => WireFrameRef::Unknown,
         };
         VersionedFrameRef {
@@ -4955,6 +5125,16 @@ impl<'de> Deserialize<'de> for WireFrame {
             } => Self::MonitorDeliveryCaughtUp {
                 watch_id,
                 session_id,
+                high_water_cursor,
+            },
+            WireFrameOwned::LoomRegistryDelta { watch_id, delta } => {
+                Self::LoomRegistryDelta { watch_id, delta }
+            }
+            WireFrameOwned::LoomRegistryCaughtUp {
+                watch_id,
+                high_water_cursor,
+            } => Self::LoomRegistryCaughtUp {
+                watch_id,
                 high_water_cursor,
             },
             WireFrameOwned::Unknown => Self::Unknown,

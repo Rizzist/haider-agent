@@ -213,15 +213,20 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "hooks.list",
         "hooks.revoke",
         "hooks.trust",
+        "loom.archive",
         "loom.list",
         "loom.author.confirm",
         "loom.author.draft",
         "loom.author.revise",
+        "loom.install.cancel",
         "loom.install.retry",
         "loom.install.status",
         "loom.install.watch",
         "loom.register_agent_type",
         "loom.register_workflow",
+        "loom.unarchive",
+        "loom.validate",
+        "loom.watch",
         "monitor.list",
         "monitor.register",
         "monitor.remove",
@@ -281,8 +286,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         expected_methods.len(),
-        94,
-        "the v1 contract covers all 86 prior and eight v0.0.963 request methods"
+        99,
+        "the v1 contract covers all 94 prior and five L4 request methods"
     );
     assert_eq!(
         request_methods_declared_in_source(),
@@ -349,6 +354,48 @@ fn every_request_method_has_a_golden_request_and_success_response() {
     }
 
     assert_eq!(covered, expected_methods);
+}
+
+/// MUTATION CHECK: make a current conflict coordinate required, default a
+/// missing row to revision zero/digest empty, or remove the tolerant decode
+/// defaults from the three L1 save doors. Expected runtime failure: typed
+/// absence or an old v1 request stops matching below.
+#[test]
+fn loom_registry_cas_fields_preserve_typed_absence() {
+    let old: RequestBody = serde_json::from_value(serde_json::json!({
+        "method": "loom.register_workflow",
+        "source": "review: A -> A\nstep \"review\" :cmd"
+    }))
+    .expect("pre-CAS v1 request still decodes");
+    assert!(matches!(
+        old,
+        RequestBody::LoomRegisterWorkflow {
+            expected_rev: None,
+            expected_digest: None,
+            ..
+        }
+    ));
+
+    let body = ResponseBody::Error {
+        code: "revision_conflict".into(),
+        message: "stale".into(),
+        retryable: false,
+        data: Some(ErrorData::LoomRevisionConflict {
+            expected: haider_protocol::loom::LoomRevisionExpectation {
+                rev: 7,
+                digest: Some("expected-digest".into()),
+            },
+            current_rev: None,
+            current_digest: None,
+        }),
+    };
+    let value = serde_json::to_value(body).expect("typed conflict JSON");
+    assert_eq!(value["data"]["expected"]["rev"], 7);
+    assert_eq!(value["data"]["expected"]["digest"], "expected-digest");
+    assert!(
+        value["data"].get("current_rev").is_none() && value["data"].get("current_digest").is_none(),
+        "an absent current row stays absent"
+    );
 }
 
 /// MUTATION CHECK: make `install_job_id` required, rename an existing
@@ -683,7 +730,7 @@ fn compact_ws_bodies_and_length_prefixed_uds_streams_are_golden() {
 #[test]
 fn monitor_delivery_stream_is_additive_replayable_and_explicitly_bounded() {
     let frames = transcript();
-    assert_eq!(frames.len(), 131);
+    assert_eq!(frames.len(), 133);
     let WireFrame::MonitorDelivery { watch_id, report } = &frames[129] else {
         panic!("monitor delivery must be the first appended stream frame");
     };
@@ -707,6 +754,40 @@ fn monitor_delivery_stream_is_additive_replayable_and_explicitly_bounded() {
             session_id,
             high_water_cursor: 73,
         } if watch_id == "monitor-watch-1" && session_id.as_str() == "session-1"
+    ));
+}
+
+/// MUTATION CHECK: remove/retype any registry stream coordinate or insert the
+/// new frames ahead of the historical tail. Expected runtime failure: the
+/// exact delta/seal indices or typed field assertions below change.
+#[test]
+fn loom_registry_stream_is_tail_appended_and_exactly_addressed() {
+    let frames = transcript();
+    assert_eq!(frames.len(), 133);
+    let WireFrame::LoomRegistryDelta { watch_id, delta } = &frames[131] else {
+        panic!("Loom registry delta must follow every prior golden frame");
+    };
+    assert_eq!(watch_id, "loom-watch-1");
+    assert_eq!(delta.cursor, 44);
+    assert_eq!(
+        delta.change,
+        haider_protocol::loom::LoomRegistryDeltaKind::Archived
+    );
+    assert_eq!(delta.entry.id, "reviewer");
+    assert_eq!(delta.entry.rev, 3);
+    assert_eq!(delta.entry.digest, "digest-reviewer-3");
+    assert!(delta.entry.archived);
+    assert!(matches!(
+        &delta.record,
+        haider_protocol::loom::LoomRegistryRecord::AgentType(record)
+            if record.id == "reviewer" && record.rev == 3
+    ));
+    assert!(matches!(
+        &frames[132],
+        WireFrame::LoomRegistryCaughtUp {
+            watch_id,
+            high_water_cursor: 44,
+        } if watch_id == "loom-watch-1"
     ));
 }
 
