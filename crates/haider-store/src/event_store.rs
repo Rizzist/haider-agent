@@ -16382,20 +16382,23 @@ fn augment_workflow_graph_envelopes(
                     causation_id.clone(),
                 )?;
             }
-            EventPayload::EvidenceRecorded(recorded) => {
+            EventPayload::EvidenceRecorded(recorded)
                 if states.contains_key(&recorded.graph_id)
-                    || load_workflow_graph_state(transaction, session_id, Some(&recorded.graph_id))?
-                        .is_some()
-                {
-                    evidence.insert(
-                        (
-                            recorded.graph_id.clone(),
-                            recorded.node.clone(),
-                            recorded.attempt,
-                        ),
-                        recorded.clone(),
-                    );
-                }
+                    || load_workflow_graph_state(
+                        transaction,
+                        session_id,
+                        Some(&recorded.graph_id),
+                    )?
+                    .is_some() =>
+            {
+                evidence.insert(
+                    (
+                        recorded.graph_id.clone(),
+                        recorded.node.clone(),
+                        recorded.attempt,
+                    ),
+                    recorded.clone(),
+                );
             }
             EventPayload::GraphGateSatisfied(satisfied) => {
                 if !states.contains_key(&satisfied.graph_id)

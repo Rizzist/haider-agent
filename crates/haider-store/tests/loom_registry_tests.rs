@@ -83,7 +83,7 @@ fn agent_type_registration_owns_the_rev_law() {
         reopened
             .loom_agent_type_revision("researcher", created.rev, &created.digest)
             .expect("read retained revision after reopen"),
-        Some(retained_first),
+        Some(retained_first.clone()),
         "advancing current-by-id never mutates the old content hash"
     );
 

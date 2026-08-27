@@ -391,8 +391,7 @@ fn parse_cost_microusd(value: Option<&String>) -> Result<u64, String> {
         .map_err(|_| "--max-cost is too large".to_owned())?
         .checked_mul(1_000_000)
         .ok_or_else(|| "--max-cost is too large".to_owned())?;
-    let mut padded = fractional.to_owned();
-    padded.resize(6, '0');
+    let padded = format!("{fractional:0<6}");
     let micros = padded
         .parse::<u64>()
         .map_err(|_| "--max-cost requires a positive USD amount".to_owned())?;

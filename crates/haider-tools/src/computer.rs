@@ -31,10 +31,7 @@ use async_trait::async_trait;
 use haider_protocol::computer::ComputerAction;
 use haider_protocol::effect::EffectClass;
 use haider_protocol::permission::SystemPermission;
-use haider_protocol::tool::{
-    DispatchMode, TOOL_RESULT_IMAGE_MAX_DECODE_ALLOC, TOOL_RESULT_IMAGE_MAX_SOURCE_BYTES,
-    TOOL_RESULT_IMAGE_MAX_SOURCE_PIXELS, ToolManifest,
-};
+use haider_protocol::tool::{DispatchMode, ToolManifest};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::borrow::Cow;
@@ -151,6 +148,10 @@ impl ExcludeRegionScreenshotRedaction {
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 impl ScreenshotRedactionPolicy for ExcludeRegionScreenshotRedaction {
     fn redact_png<'a>(&self, png: &'a [u8]) -> ComputerResult<Cow<'a, [u8]>> {
+        use haider_protocol::tool::{
+            TOOL_RESULT_IMAGE_MAX_DECODE_ALLOC, TOOL_RESULT_IMAGE_MAX_SOURCE_BYTES,
+            TOOL_RESULT_IMAGE_MAX_SOURCE_PIXELS,
+        };
         use image::{DynamicImage, ImageFormat, ImageReader, Limits};
         use std::io::Cursor;
 
@@ -791,7 +792,7 @@ mod tests {
             height: 1,
         }])
         .expect("region policy");
-        let oversized = vec![0_u8; TOOL_RESULT_IMAGE_MAX_SOURCE_BYTES + 1];
+        let oversized = vec![0_u8; haider_protocol::tool::TOOL_RESULT_IMAGE_MAX_SOURCE_BYTES + 1];
         let error = policy
             .redact_png(&oversized)
             .expect_err("oversized bytes fail before decode");
