@@ -23,6 +23,10 @@ use std::time::Duration;
 // or synchronization state; they are implementation details of that sole sink
 // value and are never used to box a second sink over the same journal.
 
+fn test_checkpoint_artifact(bytes: &[u8]) -> ArtifactRef {
+    ArtifactRef::new(format!("blake3:{}", blake3::hash(bytes).to_hex()))
+}
+
 #[derive(Debug, Default)]
 struct SharedJournalStorage {
     payloads: Mutex<Vec<EventPayload>>,
@@ -50,6 +54,26 @@ struct RecordingJournal {
 impl JournalSink for RecordingJournal {
     async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
         self.payloads.push(payload);
+        Ok(())
+    }
+
+    fn supports_checkpoint_batches(&self) -> bool {
+        true
+    }
+    fn supports_checkpoint_artifacts(&self) -> bool {
+        true
+    }
+
+    async fn put_checkpoint_artifact(&mut self, bytes: &[u8]) -> ToolResult<ArtifactRef> {
+        Ok(test_checkpoint_artifact(bytes))
+    }
+
+    async fn append_checkpointed(
+        &mut self,
+        outcome: EventPayload,
+        checkpoint: EventPayload,
+    ) -> ToolResult<()> {
+        self.payloads.extend([outcome, checkpoint]);
         Ok(())
     }
 }
@@ -99,6 +123,31 @@ impl JournalSink for SharedRecordingJournal {
             .push(payload);
         Ok(())
     }
+
+    fn supports_checkpoint_batches(&self) -> bool {
+        true
+    }
+    fn supports_checkpoint_artifacts(&self) -> bool {
+        true
+    }
+
+    async fn put_checkpoint_artifact(&mut self, bytes: &[u8]) -> ToolResult<ArtifactRef> {
+        Ok(test_checkpoint_artifact(bytes))
+    }
+
+    async fn append_checkpointed(
+        &mut self,
+        outcome: EventPayload,
+        checkpoint: EventPayload,
+    ) -> ToolResult<()> {
+        self.storage.claim_sole_sink(&mut self.claimed);
+        self.storage
+            .payloads
+            .lock()
+            .map_err(|_| ToolError::journal("shared recording journal lock is poisoned"))?
+            .extend([outcome, checkpoint]);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -140,6 +189,36 @@ impl JournalSink for TerminalGateJournal {
         }
         Ok(())
     }
+
+    fn supports_checkpoint_batches(&self) -> bool {
+        true
+    }
+    fn supports_checkpoint_artifacts(&self) -> bool {
+        true
+    }
+
+    async fn put_checkpoint_artifact(&mut self, bytes: &[u8]) -> ToolResult<ArtifactRef> {
+        Ok(test_checkpoint_artifact(bytes))
+    }
+
+    async fn append_checkpointed(
+        &mut self,
+        outcome: EventPayload,
+        checkpoint: EventPayload,
+    ) -> ToolResult<()> {
+        self.storage.claim_sole_sink(&mut self.claimed);
+        if self.terminal_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.reached.notify_one();
+            self.release.notified().await;
+        }
+        self.storage
+            .payloads
+            .lock()
+            .map_err(|_| ToolError::journal("terminal gate journal lock is poisoned"))?
+            .extend([outcome, checkpoint]);
+        self.terminal_completions.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
@@ -179,6 +258,36 @@ impl JournalSink for FailFirstTerminalJournal {
             .push(payload);
         Ok(())
     }
+
+    fn supports_checkpoint_batches(&self) -> bool {
+        true
+    }
+    fn supports_checkpoint_artifacts(&self) -> bool {
+        true
+    }
+
+    async fn put_checkpoint_artifact(&mut self, bytes: &[u8]) -> ToolResult<ArtifactRef> {
+        Ok(test_checkpoint_artifact(bytes))
+    }
+
+    async fn append_checkpointed(
+        &mut self,
+        outcome: EventPayload,
+        checkpoint: EventPayload,
+    ) -> ToolResult<()> {
+        self.storage.claim_sole_sink(&mut self.claimed);
+        if self.terminal_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(ToolError::journal(
+                "injected first terminal outcome append failure",
+            ));
+        }
+        self.storage
+            .payloads
+            .lock()
+            .map_err(|_| ToolError::journal("terminal recording journal lock is poisoned"))?
+            .extend([outcome, checkpoint]);
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
@@ -193,6 +302,25 @@ impl JournalSink for RejectOutcomeJournal {
             return Err(ToolError::journal("outcome append unavailable"));
         }
         Ok(())
+    }
+
+    fn supports_checkpoint_batches(&self) -> bool {
+        true
+    }
+    fn supports_checkpoint_artifacts(&self) -> bool {
+        true
+    }
+
+    async fn put_checkpoint_artifact(&mut self, bytes: &[u8]) -> ToolResult<ArtifactRef> {
+        Ok(test_checkpoint_artifact(bytes))
+    }
+
+    async fn append_checkpointed(
+        &mut self,
+        _outcome: EventPayload,
+        _checkpoint: EventPayload,
+    ) -> ToolResult<()> {
+        Err(ToolError::journal("outcome append unavailable"))
     }
 }
 
@@ -213,6 +341,25 @@ impl JournalSink for DispatchBarrierJournal {
             // This synchronization point precedes the conceptual commit.
             self.barrier.wait().await;
         }
+        Ok(())
+    }
+
+    fn supports_checkpoint_batches(&self) -> bool {
+        true
+    }
+    fn supports_checkpoint_artifacts(&self) -> bool {
+        true
+    }
+
+    async fn put_checkpoint_artifact(&mut self, bytes: &[u8]) -> ToolResult<ArtifactRef> {
+        Ok(test_checkpoint_artifact(bytes))
+    }
+
+    async fn append_checkpointed(
+        &mut self,
+        _outcome: EventPayload,
+        _checkpoint: EventPayload,
+    ) -> ToolResult<()> {
         Ok(())
     }
 }
@@ -236,6 +383,25 @@ impl JournalSink for DispatchGateJournal {
             self.reached.notify_one();
             self.release.notified().await;
         }
+        Ok(())
+    }
+
+    fn supports_checkpoint_batches(&self) -> bool {
+        true
+    }
+    fn supports_checkpoint_artifacts(&self) -> bool {
+        true
+    }
+
+    async fn put_checkpoint_artifact(&mut self, bytes: &[u8]) -> ToolResult<ArtifactRef> {
+        Ok(test_checkpoint_artifact(bytes))
+    }
+
+    async fn append_checkpointed(
+        &mut self,
+        _outcome: EventPayload,
+        _checkpoint: EventPayload,
+    ) -> ToolResult<()> {
         Ok(())
     }
 }

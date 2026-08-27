@@ -25,6 +25,9 @@ use crate::{Cas, StoreResult, now_ms, store_error, to_sqlite_integer, validate_i
 use haider_protocol::agent::{AgentManifest, ChildReport, ReportVerification};
 use haider_protocol::branch::{BranchCreated, BranchDescriptor};
 use haider_protocol::cache::{ProviderViewBlobV1, ProviderViewBlockRefV1, ProviderViewLedgerV1};
+use haider_protocol::checkpoint::{
+    CHECKPOINT_LIST_MAX_PAGE, CheckpointCursor, CheckpointListPage, CheckpointRecorded,
+};
 use haider_protocol::credential::CredentialDescriptor;
 use haider_protocol::effect::{
     AuthorizationVerdict, EffectClass, EffectOutcome, EffectPhase, WorkspaceMutation,
@@ -63,8 +66,8 @@ use haider_protocol::headless::HeadlessRunEventPayload;
 use haider_protocol::history::{COMPACTION_INTENT_EXTENSION_KIND, NodeKind, TodoItem, TreeNode};
 use haider_protocol::hook::HookEventPayload;
 use haider_protocol::ids::{
-    AgentId, ArtifactRef, BranchId, DeviceId, EffectId, EventId, GraphId, GraphRunSetId, ItemId,
-    MenuId, NodeId, RunId, SessionId, WorkspaceRevision,
+    AgentId, ArtifactRef, BranchId, CheckpointId, DeviceId, EffectId, EventId, GraphId,
+    GraphRunSetId, ItemId, MenuId, NodeId, RunId, SessionId, WorkspaceRevision,
 };
 use haider_protocol::item::{CommandExecutionOrigin, ItemEvent, TurnItem, UserCommandOriginV1};
 use haider_protocol::loom::{
@@ -292,6 +295,29 @@ pub enum GraphPinOutcome {
     },
     IdempotentReplay {
         pinned: PinnedGraph,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckpointCommitCommand {
+    pub command_id: String,
+    pub method: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub restored_checkpoint_ids: Vec<CheckpointId>,
+    pub envelopes: Vec<RawEnvelope>,
+}
+
+#[derive(Debug, Clone)]
+pub enum CheckpointCommitOutcome {
+    Committed {
+        receipt: haider_protocol::checkpoint::CheckpointMutationReceipt,
+        envelopes: Vec<RawEnvelope>,
+    },
+    IdempotentReplay {
+        receipt: haider_protocol::checkpoint::CheckpointMutationReceipt,
     },
 }
 
@@ -7747,12 +7773,16 @@ impl Store {
             &command.source_session_id,
             command.source_branch_id.as_ref(),
         )?;
-        let source_envelopes = load_fork_source_envelopes(
+        let mut source_envelopes = load_fork_source_envelopes(
             &transaction,
             &command.source_session_id,
             command.fork_seq,
             &scopes,
         )?;
+        // Checkpoints are session-owned workspace mutation facts. A session
+        // fork copies conversational history, but must not manufacture child
+        // ownership of a source session's restore coordinates or CAS roots.
+        source_envelopes.retain(|envelope| payload_kind(envelope) != "checkpoint_recorded");
         if source_envelopes.is_empty() || source_envelopes[0].seq != 1 {
             return Err(corrupt(
                 "fork source lineage does not contain its created envelope",
@@ -11293,6 +11323,287 @@ impl Store {
         &self.cas
     }
 
+    /// Reads the indexed checkpoint projection newest first. The journal is
+    /// authoritative; every decoded row is cross-checked against indexed
+    /// coordinates before it is returned.
+    pub fn list_checkpoints(
+        &self,
+        session_id: &SessionId,
+        branch_id: Option<&BranchId>,
+        cursor: Option<&CheckpointCursor>,
+        limit: u16,
+    ) -> StoreResult<CheckpointListPage> {
+        if limit == 0 || limit > CHECKPOINT_LIST_MAX_PAGE {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                format!("checkpoint list limit must be between 1 and {CHECKPOINT_LIST_MAX_PAGE}"),
+                false,
+            ));
+        }
+        let connection = self.connection()?;
+        let before_seq = cursor.map_or(i64::MAX as u64, |cursor| cursor.0);
+        let fetch_limit = u64::from(limit)
+            .checked_add(1)
+            .ok_or_else(|| corrupt("checkpoint page limit overflow"))?;
+        let mut statement = connection
+            .prepare_cached(
+                "SELECT seq, checkpoint_id, branch_id, run_id, effect_id,
+                        workspace_revision, record_json
+                 FROM checkpoints
+                 WHERE session_id = ?1 AND branch_id IS ?2 AND seq < ?3
+                 ORDER BY seq DESC LIMIT ?4",
+            )
+            .map_err(map_sqlite_error)?;
+        let mut rows = statement
+            .query(params![
+                session_id.as_str(),
+                branch_id.map(BranchId::as_str),
+                to_sqlite_integer(before_seq)?,
+                to_sqlite_integer(fetch_limit)?,
+            ])
+            .map_err(map_sqlite_error)?;
+        let page_capacity = usize::try_from(fetch_limit)
+            .map_err(|_| corrupt("checkpoint page limit does not fit this platform"))?;
+        let mut checkpoints = Vec::with_capacity(page_capacity);
+        while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+            let seq = sql_u64(row.get(0).map_err(map_sqlite_error)?).map_err(map_sqlite_error)?;
+            let checkpoint_id = row.get::<_, String>(1).map_err(map_sqlite_error)?;
+            let stored_branch = row.get::<_, Option<String>>(2).map_err(map_sqlite_error)?;
+            let run_id = row.get::<_, String>(3).map_err(map_sqlite_error)?;
+            let effect_id = row.get::<_, String>(4).map_err(map_sqlite_error)?;
+            let revision = row.get::<_, String>(5).map_err(map_sqlite_error)?;
+            let record_json = row.get::<_, String>(6).map_err(map_sqlite_error)?;
+            let checkpoint: CheckpointRecorded =
+                serde_json::from_str(&record_json).map_err(|error| {
+                    corrupt(format!(
+                        "checkpoint projection row {session_id}/{seq} is invalid: {error}"
+                    ))
+                })?;
+            if checkpoint.session_id != *session_id
+                || checkpoint.seq != seq
+                || checkpoint.checkpoint_id.as_str() != checkpoint_id
+                || checkpoint.branch_id.as_ref().map(BranchId::as_str) != stored_branch.as_deref()
+                || checkpoint.run_id.as_str() != run_id
+                || checkpoint.effect_id.as_str() != effect_id
+                || checkpoint
+                    .workspace_revision
+                    .as_ref()
+                    .map(WorkspaceRevision::as_str)
+                    != Some(revision.as_str())
+            {
+                return Err(corrupt(format!(
+                    "checkpoint projection row {session_id}/{seq} disagrees with its record"
+                )));
+            }
+            checkpoints.push(checkpoint);
+        }
+        let has_more = checkpoints.len() > usize::from(limit);
+        checkpoints.truncate(usize::from(limit));
+        let next_cursor = if has_more {
+            checkpoints
+                .last()
+                .map(|checkpoint| CheckpointCursor(checkpoint.seq))
+        } else {
+            None
+        };
+        Ok(CheckpointListPage {
+            checkpoints,
+            next_cursor,
+        })
+    }
+
+    pub fn checkpoint(
+        &self,
+        session_id: &SessionId,
+        checkpoint_id: &CheckpointId,
+    ) -> StoreResult<Option<CheckpointRecorded>> {
+        let connection = self.connection()?;
+        let record_json = connection
+            .query_row(
+                "SELECT record_json FROM checkpoints
+                 WHERE session_id = ?1 AND checkpoint_id = ?2",
+                params![session_id.as_str(), checkpoint_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_sqlite_error)?;
+        record_json
+            .map(|record_json| {
+                serde_json::from_str::<CheckpointRecorded>(&record_json).map_err(|error| {
+                    corrupt(format!(
+                        "checkpoint projection row {session_id}/{checkpoint_id} is invalid: {error}"
+                    ))
+                })
+            })
+            .transpose()
+    }
+
+    pub fn checkpoints_for_run(
+        &self,
+        session_id: &SessionId,
+        branch_id: Option<&BranchId>,
+        run_id: &RunId,
+    ) -> StoreResult<Vec<CheckpointRecorded>> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare_cached(
+                "SELECT record_json FROM checkpoints
+                 WHERE session_id = ?1 AND branch_id IS ?2 AND run_id = ?3
+                 ORDER BY seq DESC",
+            )
+            .map_err(map_sqlite_error)?;
+        statement
+            .query_map(
+                params![
+                    session_id.as_str(),
+                    branch_id.map(BranchId::as_str),
+                    run_id.as_str()
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(map_sqlite_error)?
+            .map(|row| {
+                let json = row.map_err(map_sqlite_error)?;
+                serde_json::from_str(&json).map_err(|error| {
+                    corrupt(format!("checkpoint projection row is invalid: {error}"))
+                })
+            })
+            .collect()
+    }
+
+    pub fn checkpoint_command_receipt(
+        &self,
+        command_id: &str,
+        method: &str,
+        request_digest: &str,
+        request_json: &str,
+    ) -> StoreResult<Option<haider_protocol::checkpoint::CheckpointMutationReceipt>> {
+        validate_checkpoint_method(method)?;
+        validate_command_identity(command_id, request_digest, request_json)?;
+        let connection = self.connection()?;
+        lookup_command_response(
+            &connection,
+            command_id,
+            method,
+            request_digest,
+            request_json,
+            "checkpoint",
+        )
+    }
+
+    /// Atomically commits the undo/redo effect batch, checkpoint projection,
+    /// and idempotent response receipt. Filesystem publication is performed
+    /// by the daemon only after a full freshness preflight.
+    pub fn commit_checkpoint_command(
+        &self,
+        mut command: CheckpointCommitCommand,
+    ) -> StoreResult<CheckpointCommitOutcome> {
+        validate_checkpoint_method(&command.method)?;
+        validate_command_identity(
+            &command.command_id,
+            &command.request_digest,
+            &command.request_json,
+        )?;
+        if command.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                command.worker_generation,
+                self.worker_generation,
+            ));
+        }
+        if command.envelopes.len() < 5
+            || command
+                .envelopes
+                .iter()
+                .any(|envelope| envelope.session_id != command.session_id)
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "checkpoint command must carry one same-session effect/checkpoint batch",
+                false,
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        if let Some(receipt) = lookup_command_response(
+            &transaction,
+            &command.command_id,
+            &command.method,
+            &command.request_digest,
+            &command.request_json,
+            "checkpoint",
+        )? {
+            transaction.commit().map_err(map_sqlite_error)?;
+            return Ok(CheckpointCommitOutcome::IdempotentReplay { receipt });
+        }
+        let committed_at_ms = now_ms()?;
+        claim_pending_receipt(
+            &transaction,
+            &command.command_id,
+            &command.method,
+            &command.request_digest,
+            &command.request_json,
+            committed_at_ms,
+        )?;
+        append_transaction_envelopes(
+            &transaction,
+            &command.session_id,
+            committed_at_ms,
+            &mut command.envelopes,
+        )?;
+        let checkpoint = command
+            .envelopes
+            .iter()
+            .rev()
+            .find_map(|envelope| {
+                serde_json::from_value::<EventPayload>(envelope.payload.clone())
+                    .ok()
+                    .and_then(|payload| match payload {
+                        EventPayload::CheckpointRecorded(checkpoint) => Some(checkpoint),
+                        _ => None,
+                    })
+            })
+            .ok_or_else(|| corrupt("checkpoint command batch committed no checkpoint fact"))?;
+        let receipt = haider_protocol::checkpoint::CheckpointMutationReceipt {
+            checkpoint,
+            restored_checkpoint_ids: command.restored_checkpoint_ids,
+            worker_generation: self.worker_generation,
+        };
+        let response_json = serde_json::to_string(&receipt).map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize checkpoint command receipt: {error}"),
+                false,
+            )
+        })?;
+        let updated = transaction
+            .execute(
+                "UPDATE command_receipts
+                 SET state = 'committed', session_id = ?2, accepted_seq = ?3,
+                     response_json = ?4, updated_at_ms = ?5
+                 WHERE command_id = ?1 AND state = 'pending'",
+                params![
+                    &command.command_id,
+                    command.session_id.as_str(),
+                    to_sqlite_integer(receipt.checkpoint.seq)?,
+                    response_json,
+                    to_sqlite_integer(committed_at_ms)?,
+                ],
+            )
+            .map_err(map_sqlite_error)?;
+        if updated != 1 {
+            return Err(corrupt(
+                "checkpoint command receipt was not pending at finalization",
+            ));
+        }
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(CheckpointCommitOutcome::Committed {
+            receipt,
+            envelopes: command.envelopes,
+        })
+    }
+
     /// Current supported and migrated SQLite schema version.
     pub fn schema_version(&self) -> StoreResult<u32> {
         let connection = self.connection()?;
@@ -11669,6 +11980,21 @@ fn validate_command_identity(
         )
     })?;
     Ok(())
+}
+
+fn validate_checkpoint_method(method: &str) -> StoreResult<()> {
+    if matches!(
+        method,
+        "checkpoint.undo" | "checkpoint.redo" | "checkpoint.rollback_turn"
+    ) {
+        Ok(())
+    } else {
+        Err(store_error(
+            ErrorCode::InvalidArgument,
+            "unsupported checkpoint command method",
+            false,
+        ))
+    }
 }
 
 fn validate_monitor_control_method(method: &str) -> StoreResult<()> {
@@ -17452,6 +17778,7 @@ fn append_transaction_envelopes(
         envelope.committed_at_ms = committed_at_ms;
         stamp_queue_delta(envelope)?;
         stamp_workspace_mutation(transaction, envelope)?;
+        stamp_checkpoint_record(transaction, envelope)?;
         let bytes = encode_envelope(envelope).map_err(|error| {
             store_error(
                 ErrorCode::InvalidArgument,
@@ -17470,6 +17797,7 @@ fn append_transaction_envelopes(
             ])
             .map_err(map_sqlite_error)?;
         enqueue_hook_dispatch(transaction, envelope)?;
+        project_checkpoint_record(transaction, envelope)?;
     }
     drop(insert);
     update_run_head_projection_after_append(transaction, session_id, envelopes)?;
@@ -18567,6 +18895,7 @@ fn append_envelopes_in_transaction(
             envelope.committed_at_ms = committed_at_ms;
             stamp_queue_delta(&mut envelope)?;
             stamp_workspace_mutation(transaction, &mut envelope)?;
+            stamp_checkpoint_record(transaction, &mut envelope)?;
             let envelope_bytes = encode_envelope(&envelope).map_err(|error| {
                 store_error(
                     ErrorCode::InvalidArgument,
@@ -18585,6 +18914,7 @@ fn append_envelopes_in_transaction(
                 ])
                 .map_err(map_sqlite_error)?;
             enqueue_hook_dispatch(transaction, &envelope)?;
+            project_checkpoint_record(transaction, &envelope)?;
             stamped.push(envelope);
         }
     }
@@ -18733,6 +19063,197 @@ fn stamp_workspace_mutation_fields(seq: u64, effect: &EffectId, mutation: &mut W
         workspace_mutation_subject_digest(effect, &mutation.mutation_digest, &revision);
     mutation.workspace_revision = Some(revision);
     mutation.subject_digest = Some(subject_digest);
+}
+
+/// Stamps one checkpoint from the already-inserted terminal effect outcome.
+/// The outcome and checkpoint may share a worker batch or arrive as adjacent
+/// appends; in both cases the query sees only durable transaction state.
+#[allow(clippy::result_large_err)]
+fn stamp_checkpoint_record(
+    transaction: &Connection,
+    envelope: &mut RawEnvelope,
+) -> StoreResult<()> {
+    let Ok(EventPayload::CheckpointRecorded(mut checkpoint)) =
+        serde_json::from_value::<EventPayload>(envelope.payload.clone())
+    else {
+        return Ok(());
+    };
+    if checkpoint.session_id != envelope.session_id
+        || checkpoint.branch_id != envelope.branch_id
+        || Some(&checkpoint.run_id) != envelope.run_id.as_ref()
+        || checkpoint.call_id.trim().is_empty()
+        || checkpoint.paths.is_empty()
+        || checkpoint.seq != 0
+        || checkpoint.workspace_revision.is_some()
+        || checkpoint.recorded_at_ms != 0
+    {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            "checkpoint producer coordinates do not match its envelope",
+            false,
+        ));
+    }
+    if checkpoint.paths.iter().any(|path| {
+        path.path.trim().is_empty()
+            || std::path::Path::new(&path.path).is_absolute()
+            || std::path::Path::new(&path.path)
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            || (path.pre_artifact.is_none()
+                && path.pre_digest.is_some()
+                && path.truncated_reason.is_none())
+            || (path.pre_artifact.is_some()
+                && (path.pre_digest.is_none() || path.truncated_reason.is_some()))
+    }) {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            "checkpoint paths must be relative and carry an unambiguous pre-image state",
+            false,
+        ));
+    }
+
+    let mut statement = transaction
+        .prepare_cached(
+            "SELECT envelope_json FROM events
+             WHERE session_id = ?1 AND seq < ?2 AND payload_kind = 'effect'
+             ORDER BY seq DESC",
+        )
+        .map_err(map_sqlite_error)?;
+    let mut rows = statement
+        .query(params![
+            envelope.session_id.as_str(),
+            to_sqlite_integer(envelope.seq)?
+        ])
+        .map_err(map_sqlite_error)?;
+    let mut revision = None;
+    while let Some(row) = rows.next().map_err(map_sqlite_error)? {
+        let candidate = decode_envelope_column(row, 0).map_err(|error| {
+            corrupt(format!(
+                "invalid effect envelope while stamping checkpoint {}: {error}",
+                checkpoint.checkpoint_id
+            ))
+        })?;
+        let Ok(EventPayload::Effect(EffectPhase::Outcome {
+            effect,
+            outcome: _,
+            workspace_mutation: Some(mutation),
+            ..
+        })) = serde_json::from_value::<EventPayload>(candidate.payload)
+        else {
+            continue;
+        };
+        if effect != checkpoint.effect_id {
+            continue;
+        }
+        if candidate.branch_id != envelope.branch_id || candidate.run_id != envelope.run_id {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "checkpoint effect outcome belongs to different branch or run coordinates",
+                false,
+            ));
+        }
+        if mutation.mutation_digest != checkpoint.post_digest {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "checkpoint post digest does not match its terminal mutation outcome",
+                false,
+            ));
+        }
+        revision = mutation.workspace_revision;
+        break;
+    }
+    let revision = revision.ok_or_else(|| {
+        store_error(
+            ErrorCode::InvalidArgument,
+            "checkpoint has no preceding workspace mutation outcome",
+            false,
+        )
+    })?;
+    checkpoint.seq = envelope.seq;
+    checkpoint.workspace_revision = Some(revision);
+    checkpoint.recorded_at_ms = envelope.committed_at_ms;
+    envelope.payload =
+        serde_json::to_value(EventPayload::CheckpointRecorded(checkpoint)).map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize stamped checkpoint: {error}"),
+                false,
+            )
+        })?;
+    Ok(())
+}
+
+fn project_checkpoint_record(transaction: &Connection, envelope: &RawEnvelope) -> StoreResult<()> {
+    let Ok(EventPayload::CheckpointRecorded(checkpoint)) =
+        serde_json::from_value::<EventPayload>(envelope.payload.clone())
+    else {
+        return Ok(());
+    };
+    let revision = checkpoint.workspace_revision.as_ref().ok_or_else(|| {
+        corrupt(format!(
+            "checkpoint {} reached projection without a workspace revision",
+            checkpoint.checkpoint_id
+        ))
+    })?;
+    if checkpoint.seq != envelope.seq || checkpoint.recorded_at_ms != envelope.committed_at_ms {
+        return Err(corrupt(format!(
+            "checkpoint {} stamp differs from its envelope",
+            checkpoint.checkpoint_id
+        )));
+    }
+    let record_json = serde_json::to_string(&checkpoint).map_err(|error| {
+        store_error(
+            ErrorCode::InvalidArgument,
+            format!("cannot serialize checkpoint projection row: {error}"),
+            false,
+        )
+    })?;
+    transaction
+        .execute(
+            "INSERT INTO checkpoints(
+                session_id, seq, checkpoint_id, branch_id, run_id, effect_id,
+                call_id, workspace_revision, kind, origin, post_digest,
+                recorded_at_ms, record_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                checkpoint.session_id.as_str(),
+                to_sqlite_integer(checkpoint.seq)?,
+                checkpoint.checkpoint_id.as_str(),
+                checkpoint.branch_id.as_ref().map(BranchId::as_str),
+                checkpoint.run_id.as_str(),
+                checkpoint.effect_id.as_str(),
+                &checkpoint.call_id,
+                revision.as_str(),
+                checkpoint_kind_name(checkpoint.kind),
+                checkpoint_origin_name(checkpoint.origin),
+                &checkpoint.post_digest,
+                to_sqlite_integer(checkpoint.recorded_at_ms)?,
+                record_json,
+            ],
+        )
+        .map_err(map_sqlite_error)?;
+    Ok(())
+}
+
+fn checkpoint_kind_name(kind: haider_protocol::checkpoint::CheckpointKind) -> &'static str {
+    use haider_protocol::checkpoint::CheckpointKind;
+    match kind {
+        CheckpointKind::Edit => "edit",
+        CheckpointKind::Write => "write",
+        CheckpointKind::Create => "create",
+        CheckpointKind::Delete => "delete",
+        CheckpointKind::Move => "move",
+    }
+}
+
+fn checkpoint_origin_name(origin: haider_protocol::checkpoint::CheckpointOrigin) -> &'static str {
+    use haider_protocol::checkpoint::CheckpointOrigin;
+    match origin {
+        CheckpointOrigin::Tool => "tool",
+        CheckpointOrigin::Undo => "undo",
+        CheckpointOrigin::Redo => "redo",
+        CheckpointOrigin::RollbackTurn => "rollback_turn",
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -22863,7 +23384,7 @@ mod run_head_projection_tests {
 
     /// MUTATION CHECK: remove one projected run from `expected` or change its
     /// state. Expected runtime failure on both passes: exact equality proves
-    /// v23's run-head backfill remains untouched through v26 and reopen.
+    /// v23's run-head backfill remains untouched through v27 and reopen.
     #[test]
     fn store_open_migrates_and_backfills_a_v22_journal_idempotently() {
         let root = tempfile::tempdir().expect("profile");
@@ -22879,7 +23400,8 @@ mod run_head_projection_tests {
         }
         let raw = Connection::open(&database_path).expect("open raw v22 fixture");
         raw.execute_batch(
-            "DROP TABLE loom_registry_events;
+            "DROP TABLE checkpoints;
+             DROP TABLE loom_registry_events;
              DROP TABLE loom_agent_type_revisions;
              ALTER TABLE loom_agent_types DROP COLUMN archived;
              ALTER TABLE loom_workflows DROP COLUMN archived;
@@ -22902,7 +23424,7 @@ mod run_head_projection_tests {
 
         for pass in 0..2 {
             let store = Store::open(root.path()).expect("migrate v22 store");
-            assert_eq!(store.schema_version().expect("schema version"), 26);
+            assert_eq!(store.schema_version().expect("schema version"), 27);
             let connection = store.connection().expect("migrated journal connection");
             assert_eq!(
                 load_projected_run_heads(&connection, &SessionId::new("run-head-session"))

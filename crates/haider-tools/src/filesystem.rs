@@ -63,12 +63,17 @@
 //!   userspace-check-to-rename gap remains an explicitly bounded limitation.
 
 use crate::broker::{EffectBroker, EffectOperation, PermissionPolicy};
+use crate::checkpoint::{
+    CheckpointCapture, CheckpointCapturePath, FreezeCheckpointInput, checkpoint_without_cas,
+    freeze_checkpoint,
+};
 use crate::ledger::{ChangeLedgerSink, FsWriteRecord};
 use crate::{FsEditAnchorMismatch, ToolError, ToolResult};
 use async_trait::async_trait;
 use haider_platform::WorkspaceDirectory as OwnedFd;
+use haider_protocol::checkpoint::{CheckpointKind, CheckpointOrigin};
 use haider_protocol::effect::{EffectClass, FileFreshness, WorkspaceMutation};
-use haider_protocol::ids::{ArtifactRef, RunId, SessionId};
+use haider_protocol::ids::{ArtifactRef, BranchId, RunId, SessionId};
 use haider_protocol::tool::{BoundedResult, DispatchMode, ToolManifest};
 #[cfg(unix)]
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
@@ -492,11 +497,24 @@ pub fn fs_path_manifest() -> ToolManifest {
 pub struct TurnAttribution {
     pub session: SessionId,
     pub turn: RunId,
+    pub branch: Option<BranchId>,
+    pub call_id: String,
 }
 
 impl TurnAttribution {
     pub fn new(session: SessionId, turn: RunId) -> Self {
-        Self { session, turn }
+        Self {
+            session,
+            turn,
+            branch: None,
+            call_id: "unknown-call".into(),
+        }
+    }
+
+    pub fn with_tool_call(mut self, branch: Option<BranchId>, call_id: impl Into<String>) -> Self {
+        self.branch = branch;
+        self.call_id = call_id.into();
+        self
     }
 }
 
@@ -1142,6 +1160,43 @@ impl EffectBroker {
     where
         L: ChangeLedgerSink,
     {
+        self.fs_write_with_checkpoint_cas(operation, policy, attribution, ledger, None)
+            .await
+    }
+
+    pub async fn fs_write_checkpointed<C, L>(
+        &mut self,
+        operation: &FsWrite,
+        policy: &PermissionPolicy,
+        attribution: &TurnAttribution,
+        ledger: &L,
+        cas: C,
+    ) -> ToolResult<BoundedResult>
+    where
+        C: CasSink + 'static,
+        L: ChangeLedgerSink,
+    {
+        self.fs_write_with_checkpoint_cas(
+            operation,
+            policy,
+            attribution,
+            ledger,
+            Some(Box::new(cas)),
+        )
+        .await
+    }
+
+    async fn fs_write_with_checkpoint_cas<L>(
+        &mut self,
+        operation: &FsWrite,
+        policy: &PermissionPolicy,
+        attribution: &TurnAttribution,
+        ledger: &L,
+        mut checkpoint_cas: Option<Box<dyn CasSink>>,
+    ) -> ToolResult<BoundedResult>
+    where
+        L: ChangeLedgerSink,
+    {
         let operation = FsWrite::new(
             resolve_workspace_path(
                 self.workspace_root(),
@@ -1151,6 +1206,12 @@ impl EffectBroker {
             operation.content.clone(),
         );
         let intent = self.begin(&operation, policy).await?;
+        if let Err(error) = self
+            .require_checkpoint_support(checkpoint_cas.is_some())
+            .await
+        {
+            return self.finish(&intent, Err(error)).await;
+        }
         // A dispatched workspace mutation may land even when its terminal
         // ledger/result path later fails. Evict before the mutation worker
         // starts so no reader can reuse a pre-mutation entry through that
@@ -1161,6 +1222,7 @@ impl EffectBroker {
         let owned_operation = operation.clone();
         let critical_ledger = ledger.clone();
         let attribution = attribution.clone();
+        let checkpoint_attribution = attribution.clone();
         let effect = intent.effect.clone();
         let summary = intent.summary.clone();
         let (relative, workspace_dir) = match (relative, workspace_dir) {
@@ -1191,7 +1253,7 @@ impl EffectBroker {
         let finish = self.effect_finish(&intent);
         let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
         let finalizer_id = self.register_finalizer(async move {
-            let (result, freshness, workspace_mutation) = match worker.await {
+            let (mut result, freshness, workspace_mutation, capture) = match worker.await {
                 Ok(outcome) => outcome.into_result_with_freshness(freshness_path),
                 Err(error) if error.is_cancelled() => return None,
                 Err(error) => (
@@ -1200,10 +1262,43 @@ impl EffectBroker {
                     }),
                     None,
                     None,
+                    None,
                 ),
             };
+            let checkpoint = match capture {
+                Some(capture) => {
+                    let input = checkpoint_freeze_input(&checkpoint_attribution, &intent.effect);
+                    match checkpoint_cas.as_deref_mut() {
+                        Some(cas) => match freeze_checkpoint(cas, input, capture.clone()).await {
+                            Ok(checkpoint) => Some(checkpoint),
+                            Err(error) => {
+                                let reason = error.to_string();
+                                let input = checkpoint_freeze_input(
+                                    &checkpoint_attribution,
+                                    &intent.effect,
+                                );
+                                result = Err(error);
+                                Some(checkpoint_without_cas(input, capture, &reason))
+                            }
+                        },
+                        None => match finish.freeze_checkpoint(input, capture.clone()).await {
+                            Ok(checkpoint) => Some(checkpoint),
+                            Err(error) => {
+                                let reason = error.to_string();
+                                let input = checkpoint_freeze_input(
+                                    &checkpoint_attribution,
+                                    &intent.effect,
+                                );
+                                result = Err(error);
+                                Some(checkpoint_without_cas(input, capture, &reason))
+                            }
+                        },
+                    }
+                }
+                None => None,
+            };
             let result = finish
-                .finish_with_workspace_mutation(result, freshness, workspace_mutation)
+                .finish_with_checkpoint(result, freshness, workspace_mutation, checkpoint)
                 .await;
             let error = result.as_ref().err().cloned();
             let _ = result_sender.send(result);
@@ -1231,6 +1326,43 @@ impl EffectBroker {
     where
         L: ChangeLedgerSink,
     {
+        self.fs_edit_with_checkpoint_cas(operation, policy, attribution, ledger, None)
+            .await
+    }
+
+    pub async fn fs_edit_checkpointed<C, L>(
+        &mut self,
+        operation: &FsEdit,
+        policy: &PermissionPolicy,
+        attribution: &TurnAttribution,
+        ledger: &L,
+        cas: C,
+    ) -> ToolResult<BoundedResult>
+    where
+        C: CasSink + 'static,
+        L: ChangeLedgerSink,
+    {
+        self.fs_edit_with_checkpoint_cas(
+            operation,
+            policy,
+            attribution,
+            ledger,
+            Some(Box::new(cas)),
+        )
+        .await
+    }
+
+    async fn fs_edit_with_checkpoint_cas<L>(
+        &mut self,
+        operation: &FsEdit,
+        policy: &PermissionPolicy,
+        attribution: &TurnAttribution,
+        ledger: &L,
+        mut checkpoint_cas: Option<Box<dyn CasSink>>,
+    ) -> ToolResult<BoundedResult>
+    where
+        L: ChangeLedgerSink,
+    {
         let operation = FsEdit {
             path: resolve_workspace_path(
                 self.workspace_root(),
@@ -1240,12 +1372,19 @@ impl EffectBroker {
             edits: operation.edits.clone(),
         };
         let intent = self.begin(&operation, policy).await?;
+        if let Err(error) = self
+            .require_checkpoint_support(checkpoint_cas.is_some())
+            .await
+        {
+            return self.finish(&intent, Err(error)).await;
+        }
         invalidate_read_memo(self.workspace_root());
         let relative = anchored_relative_path(self.workspace_root(), &operation.path);
         let workspace_dir = self.duplicate_workspace_dir();
         let owned_operation = operation.clone();
         let critical_ledger = ledger.clone();
         let attribution = attribution.clone();
+        let checkpoint_attribution = attribution.clone();
         let effect = intent.effect.clone();
         let summary = intent.summary.clone();
         let (relative, workspace_dir) = match (relative, workspace_dir) {
@@ -1276,7 +1415,7 @@ impl EffectBroker {
         let finish = self.effect_finish(&intent);
         let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
         let finalizer_id = self.register_finalizer(async move {
-            let (result, freshness, workspace_mutation) = match worker.await {
+            let (mut result, freshness, workspace_mutation, capture) = match worker.await {
                 Ok(outcome) => outcome.into_result_with_freshness(freshness_path),
                 Err(error) if error.is_cancelled() => return None,
                 Err(error) => (
@@ -1285,10 +1424,43 @@ impl EffectBroker {
                     }),
                     None,
                     None,
+                    None,
                 ),
             };
+            let checkpoint = match capture {
+                Some(capture) => {
+                    let input = checkpoint_freeze_input(&checkpoint_attribution, &intent.effect);
+                    match checkpoint_cas.as_deref_mut() {
+                        Some(cas) => match freeze_checkpoint(cas, input, capture.clone()).await {
+                            Ok(checkpoint) => Some(checkpoint),
+                            Err(error) => {
+                                let reason = error.to_string();
+                                let input = checkpoint_freeze_input(
+                                    &checkpoint_attribution,
+                                    &intent.effect,
+                                );
+                                result = Err(error);
+                                Some(checkpoint_without_cas(input, capture, &reason))
+                            }
+                        },
+                        None => match finish.freeze_checkpoint(input, capture.clone()).await {
+                            Ok(checkpoint) => Some(checkpoint),
+                            Err(error) => {
+                                let reason = error.to_string();
+                                let input = checkpoint_freeze_input(
+                                    &checkpoint_attribution,
+                                    &intent.effect,
+                                );
+                                result = Err(error);
+                                Some(checkpoint_without_cas(input, capture, &reason))
+                            }
+                        },
+                    }
+                }
+                None => None,
+            };
             let result = finish
-                .finish_with_workspace_mutation(result, freshness, workspace_mutation)
+                .finish_with_checkpoint(result, freshness, workspace_mutation, checkpoint)
                 .await;
             let error = result.as_ref().err().cloned();
             let _ = result_sender.send(result);
@@ -1316,6 +1488,43 @@ impl EffectBroker {
     where
         L: ChangeLedgerSink,
     {
+        self.fs_path_with_checkpoint_cas(operation, policy, attribution, ledger, None)
+            .await
+    }
+
+    pub async fn fs_path_checkpointed<C, L>(
+        &mut self,
+        operation: &FsPath,
+        policy: &PermissionPolicy,
+        attribution: &TurnAttribution,
+        ledger: &L,
+        cas: C,
+    ) -> ToolResult<BoundedResult>
+    where
+        C: CasSink + 'static,
+        L: ChangeLedgerSink,
+    {
+        self.fs_path_with_checkpoint_cas(
+            operation,
+            policy,
+            attribution,
+            ledger,
+            Some(Box::new(cas)),
+        )
+        .await
+    }
+
+    async fn fs_path_with_checkpoint_cas<L>(
+        &mut self,
+        operation: &FsPath,
+        policy: &PermissionPolicy,
+        attribution: &TurnAttribution,
+        ledger: &L,
+        mut checkpoint_cas: Option<Box<dyn CasSink>>,
+    ) -> ToolResult<BoundedResult>
+    where
+        L: ChangeLedgerSink,
+    {
         operation.validate_shape()?;
         let source = resolve_workspace_path(
             self.workspace_root(),
@@ -1336,6 +1545,12 @@ impl EffectBroker {
             overwrite: operation.overwrite,
         };
         let intent = self.begin(&operation, policy).await?;
+        if let Err(error) = self
+            .require_checkpoint_support(checkpoint_cas.is_some())
+            .await
+        {
+            return self.finish(&intent, Err(error)).await;
+        }
         invalidate_read_memo(self.workspace_root());
         let source_relative = anchored_relative_path(self.workspace_root(), &operation.source);
         let destination_relative = operation
@@ -1347,6 +1562,7 @@ impl EffectBroker {
         let owned_operation = operation.clone();
         let critical_ledger = ledger.clone();
         let attribution = attribution.clone();
+        let checkpoint_attribution = attribution.clone();
         let effect = intent.effect.clone();
         let summary = intent.summary.clone();
         let (source_relative, destination_relative, workspace_dir) =
@@ -1381,7 +1597,7 @@ impl EffectBroker {
         let finish = self.effect_finish(&intent);
         let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
         let finalizer_id = self.register_finalizer(async move {
-            let (result, workspace_mutation) = match worker.await {
+            let (mut result, workspace_mutation, capture) = match worker.await {
                 Ok(outcome) => outcome.into_result(),
                 Err(error) if error.is_cancelled() => return None,
                 Err(error) => (
@@ -1389,10 +1605,43 @@ impl EffectBroker {
                         message: format!("blocking filesystem worker failed: {error}"),
                     }),
                     None,
+                    None,
                 ),
             };
+            let checkpoint = match capture {
+                Some(capture) => {
+                    let input = checkpoint_freeze_input(&checkpoint_attribution, &intent.effect);
+                    match checkpoint_cas.as_deref_mut() {
+                        Some(cas) => match freeze_checkpoint(cas, input, capture.clone()).await {
+                            Ok(checkpoint) => Some(checkpoint),
+                            Err(error) => {
+                                let reason = error.to_string();
+                                let input = checkpoint_freeze_input(
+                                    &checkpoint_attribution,
+                                    &intent.effect,
+                                );
+                                result = Err(error);
+                                Some(checkpoint_without_cas(input, capture, &reason))
+                            }
+                        },
+                        None => match finish.freeze_checkpoint(input, capture.clone()).await {
+                            Ok(checkpoint) => Some(checkpoint),
+                            Err(error) => {
+                                let reason = error.to_string();
+                                let input = checkpoint_freeze_input(
+                                    &checkpoint_attribution,
+                                    &intent.effect,
+                                );
+                                result = Err(error);
+                                Some(checkpoint_without_cas(input, capture, &reason))
+                            }
+                        },
+                    }
+                }
+                None => None,
+            };
             let result = finish
-                .finish_with_workspace_mutation(result, None, workspace_mutation)
+                .finish_with_checkpoint(result, None, workspace_mutation, checkpoint)
                 .await;
             let error = result.as_ref().err().cloned();
             let _ = result_sender.send(result);
@@ -2275,6 +2524,29 @@ mod read_memo_tests {
         async fn append(&mut self, _payload: EventPayload) -> ToolResult<()> {
             Ok(())
         }
+
+        fn supports_checkpoint_batches(&self) -> bool {
+            true
+        }
+
+        fn supports_checkpoint_artifacts(&self) -> bool {
+            true
+        }
+
+        async fn put_checkpoint_artifact(&mut self, bytes: &[u8]) -> ToolResult<ArtifactRef> {
+            Ok(ArtifactRef::new(format!(
+                "blake3:{}",
+                blake3::hash(bytes).to_hex()
+            )))
+        }
+
+        async fn append_checkpointed(
+            &mut self,
+            _outcome: EventPayload,
+            _checkpoint: EventPayload,
+        ) -> ToolResult<()> {
+            Ok(())
+        }
     }
 
     struct WorkingCas;
@@ -2709,6 +2981,7 @@ struct AppliedMutation {
     result: BoundedResult,
     paths: Vec<PathBuf>,
     post_digest: String,
+    checkpoint: CheckpointCapture,
 }
 
 enum MutationWorkerOutcome {
@@ -2716,34 +2989,47 @@ enum MutationWorkerOutcome {
         result: BoundedResult,
         effect: haider_protocol::ids::EffectId,
         post_digest: String,
+        checkpoint: CheckpointCapture,
     },
     ApplyFailed(ToolError),
-    LedgerFailed {
+    PostApplyFailed {
         error: ToolError,
-        written: bool,
         effect: haider_protocol::ids::EffectId,
         post_digest: String,
+        checkpoint: CheckpointCapture,
     },
 }
 
 impl MutationWorkerOutcome {
-    fn into_result(self) -> (ToolResult<BoundedResult>, Option<WorkspaceMutation>) {
+    fn into_result(
+        self,
+    ) -> (
+        ToolResult<BoundedResult>,
+        Option<WorkspaceMutation>,
+        Option<CheckpointCapture>,
+    ) {
         match self {
             Self::Applied {
                 result,
                 effect,
                 post_digest,
-            } => (Ok(result), Some(workspace_mutation(effect, post_digest))),
-            Self::ApplyFailed(error) => (Err(error), None),
-            Self::LedgerFailed {
+                checkpoint,
+            } => (
+                Ok(result),
+                Some(workspace_mutation(effect, post_digest)),
+                Some(checkpoint),
+            ),
+            Self::ApplyFailed(error) => (Err(error), None, None),
+            Self::PostApplyFailed {
                 error,
-                written,
                 effect,
                 post_digest,
-            } => {
-                debug_assert!(written, "ledger failure must follow a successful rename");
-                (Err(error), Some(workspace_mutation(effect, post_digest)))
-            }
+                checkpoint,
+            } => (
+                Err(error),
+                Some(workspace_mutation(effect, post_digest)),
+                Some(checkpoint),
+            ),
         }
     }
 
@@ -2754,12 +3040,14 @@ impl MutationWorkerOutcome {
         ToolResult<BoundedResult>,
         Option<FileFreshness>,
         Option<WorkspaceMutation>,
+        Option<CheckpointCapture>,
     ) {
         match self {
             Self::Applied {
                 result,
                 effect,
                 post_digest,
+                checkpoint,
             } => {
                 let mutation = workspace_mutation(effect, post_digest.clone());
                 (
@@ -2769,16 +3057,16 @@ impl MutationWorkerOutcome {
                         digest: post_digest,
                     }),
                     Some(mutation),
+                    Some(checkpoint),
                 )
             }
-            Self::ApplyFailed(error) => (Err(error), None, None),
-            Self::LedgerFailed {
+            Self::ApplyFailed(error) => (Err(error), None, None, None),
+            Self::PostApplyFailed {
                 error,
-                written,
                 effect,
                 post_digest,
+                checkpoint,
             } => {
-                debug_assert!(written, "ledger failure must follow a successful rename");
                 let mutation = workspace_mutation(effect, post_digest.clone());
                 (
                     Err(error),
@@ -2787,6 +3075,7 @@ impl MutationWorkerOutcome {
                         digest: post_digest,
                     }),
                     Some(mutation),
+                    Some(checkpoint),
                 )
             }
         }
@@ -2811,6 +3100,338 @@ struct MutationRecordContext<'a, L> {
     attribution: TurnAttribution,
     effect: haider_protocol::ids::EffectId,
     summary: String,
+}
+
+fn sync_mutation_parents(paths: &[PathBuf]) -> ToolResult<()> {
+    let mut parents = paths
+        .iter()
+        .map(|path| {
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        })
+        .collect::<Vec<_>>();
+    parents.sort();
+    parents.dedup();
+    for parent in parents {
+        haider_platform::sync_directory(&parent)
+            .map_err(|error| ToolError::io("sync mutation parent", &parent, error))?;
+    }
+    Ok(())
+}
+
+/// Installs one checkpoint state through the same anchored, no-follow commit
+/// machinery as ordinary filesystem mutations. The relative name is resolved
+/// from an open workspace-directory handle, so a swapped parent cannot
+/// redirect the restore through a newly introduced symlink.
+#[cfg(unix)]
+pub(crate) fn install_checkpoint_state(
+    workspace_root: &Path,
+    relative: &Path,
+    expected_digest: Option<&str>,
+    bytes: Option<&[u8]>,
+) -> Result<(), crate::checkpoint::InstallStateError> {
+    use crate::checkpoint::InstallStateError;
+
+    let display_path = workspace_root.join(relative);
+    let workspace_dir = haider_platform::open_workspace_directory(workspace_root)
+        .map_err(|error| ToolError::io("open checkpoint workspace", workspace_root, error))?;
+    let traversal_root = rustix::io::dup(&workspace_dir)
+        .map_err(|error| ToolError::io("duplicate checkpoint workspace", workspace_root, error))?;
+    let (parent, leaf) = open_parent_at(traversal_root, relative, &display_path)?;
+    let mut current = match rustix::fs::statat(&parent, &leaf, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(_) => {
+            let (mut file, metadata) = open_locked_current_at(&parent, &leaf, &display_path)
+                .map_err(checkpoint_install_error)?;
+            let (current_bytes, _) = file_snapshot(&parent, &mut file, &display_path)
+                .map_err(checkpoint_install_error)?
+                .parts();
+            let current_digest = mutation_digest(&current_bytes);
+            match expected_digest {
+                Some(expected) if current_digest == expected => {}
+                _ => {
+                    return Err(InstallStateError::Conflict {
+                        current_digest: Some(current_digest),
+                    });
+                }
+            }
+            Some((file, metadata, blake3::hash(&current_bytes)))
+        }
+        Err(rustix::io::Errno::NOENT) if expected_digest.is_none() => None,
+        Err(rustix::io::Errno::NOENT) => {
+            return Err(InstallStateError::Conflict {
+                current_digest: None,
+            });
+        }
+        Err(error) => {
+            return Err(checkpoint_install_error(anchored_io_error(
+                "inspect checkpoint target",
+                &display_path,
+                error,
+            )));
+        }
+    };
+
+    let staged = match bytes {
+        Some(bytes) => {
+            let (name, fd) = create_patch_temporary(&parent, &display_path)?;
+            let mode = current
+                .as_ref()
+                .map_or(0o644, |(_, metadata, _)| metadata.st_mode);
+            if let Err(error) = write_patch_temporary(fd, mode, bytes, &display_path) {
+                remove_temporary(&parent, &name);
+                return Err(error.into());
+            }
+            Some(name)
+        }
+        None => None,
+    };
+    let commit_parent =
+        match revalidate_commit_parent(&workspace_dir, relative, &parent, &display_path) {
+            Ok(parent) => parent,
+            Err(error) => {
+                if let Some(name) = staged.as_deref() {
+                    remove_temporary(&parent, name);
+                }
+                return Err(checkpoint_install_error(error));
+            }
+        };
+    if let Some((file, _, source_hash)) = current.as_mut()
+        && let Err(error) = require_unchanged_content(&parent, file, *source_hash, &display_path)
+    {
+        if let Some(name) = staged.as_deref() {
+            remove_temporary(&parent, name);
+        }
+        return Err(checkpoint_install_error(error));
+    }
+    if let Err(error) = require_unchanged_target(
+        &commit_parent,
+        &leaf,
+        current.as_ref().map(|(_, metadata, _)| metadata),
+        &display_path,
+    ) {
+        if let Some(name) = staged.as_deref() {
+            remove_temporary(&parent, name);
+        }
+        return Err(checkpoint_install_error(error));
+    }
+
+    match (staged.as_deref(), current.is_some()) {
+        (Some(name), true) => {
+            if let Err(error) = replace_temporary_at_commit(
+                &commit_parent,
+                name,
+                &leaf,
+                &display_path,
+                "publish checkpoint restore",
+            ) {
+                remove_temporary(&parent, name);
+                return Err(checkpoint_install_error(error));
+            }
+        }
+        (Some(name), false) => {
+            if let Err(error) = rustix::fs::renameat_with(
+                &commit_parent,
+                name,
+                &commit_parent,
+                &leaf,
+                rustix::fs::RenameFlags::NOREPLACE,
+            ) {
+                remove_temporary(&parent, name);
+                return Err(if error == rustix::io::Errno::EXIST {
+                    InstallStateError::Conflict {
+                        current_digest: None,
+                    }
+                } else {
+                    checkpoint_install_error(anchored_io_error(
+                        "publish absent checkpoint restore",
+                        &display_path,
+                        error,
+                    ))
+                });
+            }
+        }
+        (None, true) => {
+            rustix::fs::unlinkat(&commit_parent, &leaf, AtFlags::empty()).map_err(|error| {
+                checkpoint_install_error(anchored_io_error(
+                    "remove checkpoint restore target",
+                    &display_path,
+                    error,
+                ))
+            })?
+        }
+        (None, false) => {}
+    }
+    sync_mutation_parents(&[display_path]).map_err(InstallStateError::Tool)
+}
+
+#[cfg(unix)]
+fn checkpoint_install_error(error: ToolError) -> crate::checkpoint::InstallStateError {
+    match error {
+        ToolError::PathChanged { .. } | ToolError::StaleRead { .. } => {
+            crate::checkpoint::InstallStateError::Conflict {
+                current_digest: None,
+            }
+        }
+        error => crate::checkpoint::InstallStateError::Tool(error),
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn install_checkpoint_state(
+    workspace_root: &Path,
+    relative: &Path,
+    expected_digest: Option<&str>,
+    bytes: Option<&[u8]>,
+) -> Result<(), crate::checkpoint::InstallStateError> {
+    use crate::checkpoint::InstallStateError;
+
+    let display_path = workspace_root.join(relative);
+    let workspace_dir = haider_platform::open_workspace_directory(workspace_root)
+        .map_err(|error| ToolError::io("open checkpoint workspace", workspace_root, error))?;
+    let (parent, target) = windows_mutation_target(&workspace_dir, relative, &display_path, false)?;
+    let mut current = match fs::symlink_metadata(&target) {
+        Ok(metadata) => {
+            require_windows_regular_file(&target, &display_path, &metadata)
+                .map_err(checkpoint_install_error)?;
+            let mut file = open_windows_locked_file(&target, &display_path)
+                .map_err(checkpoint_install_error)?;
+            let snapshot = windows_stable_snapshot(&mut file, &display_path)
+                .map_err(checkpoint_install_error)?;
+            let current_digest = mutation_digest(&snapshot.bytes);
+            match expected_digest {
+                Some(expected) if expected == current_digest => {}
+                _ => {
+                    return Err(InstallStateError::Conflict {
+                        current_digest: Some(current_digest),
+                    });
+                }
+            }
+            let permissions = file
+                .metadata()
+                .map_err(|error| {
+                    ToolError::io("inspect checkpoint permissions", &display_path, error)
+                })?
+                .permissions();
+            Some((
+                file,
+                snapshot.identity,
+                blake3::hash(&snapshot.bytes),
+                permissions,
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && expected_digest.is_none() => {
+            None
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(InstallStateError::Conflict {
+                current_digest: None,
+            });
+        }
+        Err(error) => {
+            return Err(ToolError::io("inspect checkpoint target", &display_path, error).into());
+        }
+    };
+    let staged = match bytes {
+        Some(bytes) => {
+            let staged = stage_windows_content(
+                parent.path(),
+                &display_path,
+                bytes,
+                current
+                    .as_ref()
+                    .map(|(_, _, _, permissions)| permissions.clone()),
+            )?;
+            if let Some((file, _, _, _)) = current.as_ref()
+                && let Err(error) = copy_windows_dacl(file, &staged.file, &display_path)
+            {
+                let _ = delete_windows_entry(staged.file, &display_path);
+                return Err(error.into());
+            }
+            Some(staged)
+        }
+        None => None,
+    };
+    let revalidated = match current.as_mut() {
+        Some((file, identity, hash, _)) => revalidate_windows_mutation(
+            &workspace_dir,
+            relative,
+            &parent,
+            &target,
+            &display_path,
+            Some((file, *identity, *hash)),
+        ),
+        None => revalidate_windows_mutation(
+            &workspace_dir,
+            relative,
+            &parent,
+            &target,
+            &display_path,
+            None,
+        ),
+    };
+    let revalidated = match revalidated {
+        Ok(value) => value,
+        Err(error) => {
+            if let Some(staged) = staged {
+                let _ = delete_windows_entry(staged.file, &display_path);
+            }
+            return Err(checkpoint_install_error(error));
+        }
+    };
+    match (staged, current.as_ref()) {
+        (Some(staged), current) => publish_windows_temporary(
+            staged,
+            &target,
+            current.is_some(),
+            blake3::hash(bytes.unwrap_or_default()),
+            &display_path,
+        )
+        .map_err(checkpoint_install_error)?,
+        (None, Some((_, expected_identity, _, _))) => {
+            let entry = open_windows_path_entry(&target, &display_path, true)
+                .map_err(checkpoint_install_error)?;
+            if entry.identity.file != *expected_identity {
+                return Err(InstallStateError::Conflict {
+                    current_digest: None,
+                });
+            }
+            remove_windows_entry_from_handle(&target, &display_path, entry)
+                .map_err(checkpoint_install_error)?;
+        }
+        (None, None) => {}
+    }
+    drop(revalidated);
+    drop(current);
+    sync_mutation_parents(&[display_path]).map_err(InstallStateError::Tool)
+}
+
+#[cfg(windows)]
+fn checkpoint_install_error(error: ToolError) -> crate::checkpoint::InstallStateError {
+    match error {
+        ToolError::PathChanged { .. } | ToolError::StaleRead { .. } => {
+            crate::checkpoint::InstallStateError::Conflict {
+                current_digest: None,
+            }
+        }
+        error => crate::checkpoint::InstallStateError::Tool(error),
+    }
+}
+
+fn checkpoint_freeze_input(
+    attribution: &TurnAttribution,
+    effect: &haider_protocol::ids::EffectId,
+) -> FreezeCheckpointInput {
+    FreezeCheckpointInput {
+        session_id: attribution.session.clone(),
+        branch_id: attribution.branch.clone(),
+        run_id: attribution.turn.clone(),
+        effect_id: effect.clone(),
+        call_id: attribution.call_id.clone(),
+        origin: CheckpointOrigin::Tool,
+        source_checkpoint_id: None,
+    }
 }
 
 #[cfg(windows)]
@@ -2861,8 +3482,17 @@ where
         result,
         paths,
         post_digest,
+        checkpoint,
     } = applied;
     let effect = context.effect.clone();
+    if let Err(error) = sync_mutation_parents(&paths) {
+        return MutationWorkerOutcome::PostApplyFailed {
+            error,
+            effect,
+            post_digest,
+            checkpoint,
+        };
+    }
     match context.ledger.record_fs_write(
         context.attribution.session,
         context.attribution.turn,
@@ -2877,12 +3507,13 @@ where
             result,
             effect,
             post_digest,
+            checkpoint,
         },
-        Err(error) => MutationWorkerOutcome::LedgerFailed {
+        Err(error) => MutationWorkerOutcome::PostApplyFailed {
             error,
-            written: true,
             effect,
             post_digest,
+            checkpoint,
         },
     }
 }
@@ -2919,6 +3550,7 @@ fn apply_windows_write(
                 _file: file,
                 identity: source.identity,
                 hash: blake3::hash(&source.bytes),
+                bytes: source.bytes,
             })
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -2974,7 +3606,13 @@ fn apply_windows_write(
         return Err(error);
     }
     drop(revalidated);
-    drop(existing.take());
+    let pre_bytes = existing.take().map(|source| source.bytes);
+    let checkpoint_kind = if pre_bytes.is_some() {
+        CheckpointKind::Write
+    } else {
+        CheckpointKind::Create
+    };
+    let post_digest = mutation_digest(bytes);
     Ok(AppliedMutation {
         result: BoundedResult {
             preview: format!(
@@ -2991,7 +3629,18 @@ fn apply_windows_write(
             presentation: None,
         },
         paths: vec![operation.path.clone()],
-        post_digest: mutation_digest(bytes),
+        post_digest: post_digest.clone(),
+        checkpoint: CheckpointCapture {
+            kind: checkpoint_kind,
+            paths: vec![CheckpointCapturePath {
+                path: relative_path_argument(relative)?.to_owned(),
+                pre_digest: pre_bytes.as_deref().map(mutation_digest),
+                pre_bytes,
+                post_digest: Some(post_digest.clone()),
+                truncated_reason: None,
+            }],
+            post_digest,
+        },
     })
 }
 
@@ -3030,6 +3679,7 @@ fn apply_windows_edit(
         });
     }
     let source_hash = blake3::hash(&source.bytes);
+    let pre_bytes = source.bytes.clone();
     let mut edited =
         String::from_utf8(source.bytes).map_err(|error| ToolError::InvalidArgument {
             message: format!("{} is not UTF-8 text: {error}", operation.path.display()),
@@ -3087,6 +3737,7 @@ fn apply_windows_edit(
     }
     drop(revalidated);
     drop(source_file);
+    let post_digest = mutation_digest(bytes);
     Ok(AppliedMutation {
         result: BoundedResult {
             preview: format!(
@@ -3104,7 +3755,18 @@ fn apply_windows_edit(
             presentation: None,
         },
         paths: vec![operation.path.clone()],
-        post_digest: mutation_digest(bytes),
+        post_digest: post_digest.clone(),
+        checkpoint: CheckpointCapture {
+            kind: CheckpointKind::Edit,
+            paths: vec![CheckpointCapturePath {
+                path: relative_path_argument(relative)?.to_owned(),
+                pre_digest: Some(mutation_digest(&pre_bytes)),
+                pre_bytes: Some(pre_bytes),
+                post_digest: Some(post_digest.clone()),
+                truncated_reason: None,
+            }],
+            post_digest,
+        },
     })
 }
 
@@ -3168,6 +3830,7 @@ struct WindowsSource {
     _file: fs::File,
     identity: haider_platform::WindowsFileIdentity,
     hash: blake3::Hash,
+    bytes: Vec<u8>,
 }
 
 #[cfg(windows)]
@@ -3695,12 +4358,20 @@ fn apply_windows_path(
     }
     let (source_parent, source) =
         windows_mutation_target(workspace_dir, source_relative, &operation.source, false)?;
-    let source_entry = open_windows_path_entry(
+    let mut source_entry = open_windows_path_entry(
         &source,
         &operation.source,
         operation.operation != FsPathOperation::Copy,
     )?;
     let source_identity = source_entry.identity;
+    let source_preimage =
+        capture_windows_entry_preimage(&mut source_entry, source_relative, &operation.source)?;
+    let source_post_digest = source_preimage.pre_digest.clone();
+    let mut checkpoint_kind = CheckpointKind::Delete;
+    let mut checkpoint_paths = vec![CheckpointCapturePath {
+        post_digest: None,
+        ..source_preimage.clone()
+    }];
     let mut structural = Vec::new();
     structural.extend_from_slice(operation.operation_name().as_bytes());
     structural.push(0);
@@ -3764,7 +4435,7 @@ fn apply_windows_path(
                     "fs_path destination cannot be inside the source directory",
                 ));
             }
-            let destination_entry = match fs::symlink_metadata(&destination_path) {
+            let mut destination_entry = match fs::symlink_metadata(&destination_path) {
                 Ok(_) => Some(open_windows_path_entry(
                     &destination_path,
                     destination,
@@ -3785,6 +4456,38 @@ fn apply_windows_path(
                     "fs_path destination already exists: {}",
                     destination.display()
                 )));
+            }
+            let mut destination_preimage = if let Some(entry) = destination_entry.as_mut() {
+                capture_windows_entry_preimage(entry, destination_relative, destination)?
+            } else {
+                absent_checkpoint_path(destination_relative)?
+            };
+            if source_post_digest.is_none() && source_preimage.truncated_reason.is_some() {
+                destination_preimage
+                    .truncated_reason
+                    .get_or_insert_with(|| {
+                        "directory post-images are not representable by checkpoint_v1".into()
+                    });
+            }
+            destination_preimage.post_digest = source_post_digest.clone();
+            match operation.operation {
+                FsPathOperation::Move => {
+                    checkpoint_kind = CheckpointKind::Move;
+                    checkpoint_paths.push(destination_preimage);
+                }
+                FsPathOperation::Copy => {
+                    checkpoint_kind = if destination_entry.is_some() {
+                        CheckpointKind::Write
+                    } else {
+                        CheckpointKind::Create
+                    };
+                    checkpoint_paths = vec![destination_preimage];
+                }
+                FsPathOperation::Delete => {
+                    return Err(ToolError::Runtime {
+                        message: "fs_path delete reached move/copy checkpoint planning".into(),
+                    });
+                }
             }
             if destination_identity.is_some_and(|identity| identity.file == source_identity.file) {
                 return Err(ToolError::invalid_argument(
@@ -3854,14 +4557,24 @@ fn apply_windows_path(
                         vec![destination.clone()],
                     )
                 }
-                FsPathOperation::Delete => unreachable!("covered above"),
+                FsPathOperation::Delete => {
+                    return Err(ToolError::Runtime {
+                        message: "fs_path delete reached move/copy dispatch".into(),
+                    });
+                }
             }
         }
     };
+    let post_digest = mutation_digest(&structural);
     Ok(AppliedMutation {
         result,
         paths,
-        post_digest: mutation_digest(&structural),
+        post_digest: post_digest.clone(),
+        checkpoint: CheckpointCapture {
+            kind: checkpoint_kind,
+            paths: checkpoint_paths,
+            post_digest,
+        },
     })
 }
 
@@ -4360,8 +5073,17 @@ where
         result,
         paths,
         post_digest,
+        checkpoint,
     } = applied;
     let effect = context.effect.clone();
+    if let Err(error) = sync_mutation_parents(&paths) {
+        return MutationWorkerOutcome::PostApplyFailed {
+            error,
+            effect,
+            post_digest,
+            checkpoint,
+        };
+    }
     match context.ledger.record_fs_write(
         context.attribution.session,
         context.attribution.turn,
@@ -4376,12 +5098,13 @@ where
             result,
             effect,
             post_digest,
+            checkpoint,
         },
-        Err(error) => MutationWorkerOutcome::LedgerFailed {
+        Err(error) => MutationWorkerOutcome::PostApplyFailed {
             error,
-            written: true,
             effect,
             post_digest,
+            checkpoint,
         },
     }
 }
@@ -4420,7 +5143,7 @@ fn apply_write_at(
                     current_digest,
                 });
             }
-            Some((source, metadata, blake3::hash(&source_bytes)))
+            Some((source, metadata, blake3::hash(&source_bytes), source_bytes))
         }
         Err(rustix::io::Errno::NOENT) => None,
         Err(error) => {
@@ -4436,7 +5159,7 @@ fn apply_write_at(
     let (temporary_name, temporary_fd) = create_patch_temporary(&parent, &operation.path)?;
     let mode = source
         .as_ref()
-        .map_or(0o644, |(_, metadata, _)| metadata.st_mode);
+        .map_or(0o644, |(_, metadata, _, _)| metadata.st_mode);
     if let Err(error) = write_patch_temporary(temporary_fd, mode, bytes, &operation.path) {
         remove_temporary(&parent, &temporary_name);
         return Err(error);
@@ -4444,7 +5167,7 @@ fn apply_write_at(
     if let Err(error) = require_unchanged_target(
         &parent,
         &leaf,
-        source.as_ref().map(|(_, metadata, _)| metadata),
+        source.as_ref().map(|(_, metadata, _, _)| metadata),
         &operation.path,
     ) {
         remove_temporary(&parent, &temporary_name);
@@ -4458,7 +5181,7 @@ fn apply_write_at(
                 return Err(error);
             }
         };
-    if let Some((source, _, source_hash)) = source.as_mut()
+    if let Some((source, _, source_hash, _)) = source.as_mut()
         && let Err(error) =
             require_unchanged_content(&parent, source, *source_hash, &operation.path)
     {
@@ -4468,7 +5191,7 @@ fn apply_write_at(
     if let Err(error) = require_unchanged_target(
         &commit_parent,
         &leaf,
-        source.as_ref().map(|(_, metadata, _)| metadata),
+        source.as_ref().map(|(_, metadata, _, _)| metadata),
         &operation.path,
     ) {
         remove_temporary(&parent, &temporary_name);
@@ -4484,7 +5207,12 @@ fn apply_write_at(
         remove_temporary(&parent, &temporary_name);
         return Err(error);
     }
-    drop(source);
+    let pre_bytes = source.take().map(|(_, _, _, bytes)| bytes);
+    let checkpoint_kind = if pre_bytes.is_some() {
+        CheckpointKind::Write
+    } else {
+        CheckpointKind::Create
+    };
     Ok(AppliedMutation {
         result: BoundedResult {
             preview: format!(
@@ -4501,7 +5229,18 @@ fn apply_write_at(
             presentation: None,
         },
         paths: vec![operation.path.clone()],
-        post_digest,
+        post_digest: post_digest.clone(),
+        checkpoint: CheckpointCapture {
+            kind: checkpoint_kind,
+            paths: vec![CheckpointCapturePath {
+                path: relative_path_argument(relative)?.to_owned(),
+                pre_digest: pre_bytes.as_deref().map(mutation_digest),
+                pre_bytes,
+                post_digest: Some(post_digest.clone()),
+                truncated_reason: None,
+            }],
+            post_digest,
+        },
     })
 }
 
@@ -4523,8 +5262,17 @@ where
         result,
         paths,
         post_digest,
+        checkpoint,
     } = applied;
     let effect = context.effect.clone();
+    if let Err(error) = sync_mutation_parents(&paths) {
+        return MutationWorkerOutcome::PostApplyFailed {
+            error,
+            effect,
+            post_digest,
+            checkpoint,
+        };
+    }
     match context.ledger.record_fs_write(
         context.attribution.session,
         context.attribution.turn,
@@ -4539,12 +5287,13 @@ where
             result,
             effect,
             post_digest,
+            checkpoint,
         },
-        Err(error) => MutationWorkerOutcome::LedgerFailed {
+        Err(error) => MutationWorkerOutcome::PostApplyFailed {
             error,
-            written: true,
             effect,
             post_digest,
+            checkpoint,
         },
     }
 }
@@ -4622,6 +5371,7 @@ fn apply_edit_at_with_commit_hooks(
         });
     }
     let source_hash = blake3::hash(&source_bytes);
+    let pre_bytes = source_bytes.clone();
     let mut edited =
         String::from_utf8(source_bytes).map_err(|error| ToolError::InvalidArgument {
             message: format!("{} is not UTF-8 text: {error}", operation.path.display()),
@@ -4714,7 +5464,18 @@ fn apply_edit_at_with_commit_hooks(
             presentation: None,
         },
         paths: vec![operation.path.clone()],
-        post_digest,
+        post_digest: post_digest.clone(),
+        checkpoint: CheckpointCapture {
+            kind: CheckpointKind::Edit,
+            paths: vec![CheckpointCapturePath {
+                path: relative_path_argument(relative)?.to_owned(),
+                pre_digest: Some(mutation_digest(&pre_bytes)),
+                pre_bytes: Some(pre_bytes),
+                post_digest: Some(post_digest.clone()),
+                truncated_reason: None,
+            }],
+            post_digest,
+        },
     })
 }
 
@@ -4742,8 +5503,17 @@ where
         result,
         paths,
         post_digest,
+        checkpoint,
     } = applied;
     let effect = context.effect.clone();
+    if let Err(error) = sync_mutation_parents(&paths) {
+        return MutationWorkerOutcome::PostApplyFailed {
+            error,
+            effect,
+            post_digest,
+            checkpoint,
+        };
+    }
     match context.ledger.record_fs_write(
         context.attribution.session,
         context.attribution.turn,
@@ -4758,12 +5528,13 @@ where
             result,
             effect,
             post_digest,
+            checkpoint,
         },
-        Err(error) => MutationWorkerOutcome::LedgerFailed {
+        Err(error) => MutationWorkerOutcome::PostApplyFailed {
             error,
-            written: true,
             effect,
             post_digest,
+            checkpoint,
         },
     }
 }
@@ -4823,6 +5594,19 @@ fn apply_path_at_with_commit_hook(
         rustix::fs::statat(&source_parent, &source_leaf, AtFlags::SYMLINK_NOFOLLOW).map_err(
             |error| anchored_io_error("inspect fs_path source", &operation.source, error),
         )?;
+    let source_preimage = capture_unix_entry_preimage(
+        &source_parent,
+        &source_leaf,
+        &source_metadata,
+        source_relative,
+        &operation.source,
+    )?;
+    let source_post_digest = source_preimage.pre_digest.clone();
+    let mut checkpoint_kind = CheckpointKind::Delete;
+    let mut checkpoint_paths = vec![CheckpointCapturePath {
+        post_digest: None,
+        ..source_preimage.clone()
+    }];
 
     let mut structural = Vec::new();
     structural.extend_from_slice(operation.operation_name().as_bytes());
@@ -4901,6 +5685,44 @@ fn apply_path_at_with_commit_hook(
                     "fs_path destination already exists: {}",
                     destination.display()
                 )));
+            }
+            let mut destination_preimage = if let Some(metadata) = destination_metadata.as_ref() {
+                capture_unix_entry_preimage(
+                    &destination_parent,
+                    &destination_leaf,
+                    metadata,
+                    destination_relative,
+                    destination,
+                )?
+            } else {
+                absent_checkpoint_path(destination_relative)?
+            };
+            if source_post_digest.is_none() && source_preimage.truncated_reason.is_some() {
+                destination_preimage
+                    .truncated_reason
+                    .get_or_insert_with(|| {
+                        "directory post-images are not representable by checkpoint_v1".into()
+                    });
+            }
+            destination_preimage.post_digest = source_post_digest.clone();
+            match operation.operation {
+                FsPathOperation::Move => {
+                    checkpoint_kind = CheckpointKind::Move;
+                    checkpoint_paths.push(destination_preimage);
+                }
+                FsPathOperation::Copy => {
+                    checkpoint_kind = if destination_metadata.is_some() {
+                        CheckpointKind::Write
+                    } else {
+                        CheckpointKind::Create
+                    };
+                    checkpoint_paths = vec![destination_preimage];
+                }
+                FsPathOperation::Delete => {
+                    return Err(ToolError::Runtime {
+                        message: "fs_path delete reached move/copy checkpoint planning".into(),
+                    });
+                }
             }
 
             match operation.operation {
@@ -5083,15 +5905,25 @@ fn apply_path_at_with_commit_hook(
                         vec![destination.clone()],
                     )
                 }
-                FsPathOperation::Delete => unreachable!("covered above"),
+                FsPathOperation::Delete => {
+                    return Err(ToolError::Runtime {
+                        message: "fs_path delete reached move/copy dispatch".into(),
+                    });
+                }
             }
         }
     };
 
+    let post_digest = mutation_digest(&structural);
     Ok(AppliedMutation {
         result,
         paths,
-        post_digest: mutation_digest(&structural),
+        post_digest: post_digest.clone(),
+        checkpoint: CheckpointCapture {
+            kind: checkpoint_kind,
+            paths: checkpoint_paths,
+            post_digest,
+        },
     })
 }
 
@@ -5380,6 +6212,9 @@ fn copy_entry_at(
                     structural,
                 )?;
             }
+            rustix::fs::fsync(&destination_directory).map_err(|error| {
+                anchored_io_error("sync staged copy directory", destination_path, error)
+            })?;
             Ok(())
         }
         FileType::Symlink => Err(ToolError::PathChanged {
@@ -5945,8 +6780,10 @@ fn open_parent_creating_at(
         .pop()
         .ok_or_else(|| ToolError::invalid_argument("filesystem path has no leaf name"))?;
     for component in components {
-        match rustix::fs::mkdirat(&directory, &component, Mode::from_raw_mode(0o755)) {
-            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+        let created = match rustix::fs::mkdirat(&directory, &component, Mode::from_raw_mode(0o755))
+        {
+            Ok(()) => true,
+            Err(rustix::io::Errno::EXIST) => false,
             Err(error) => {
                 return Err(anchored_io_error(
                     "create write parent",
@@ -5954,6 +6791,13 @@ fn open_parent_creating_at(
                     error,
                 ));
             }
+        };
+        if created {
+            // Publish each new link in a multi-component parent chain before
+            // descending. The final parent is synced after the file commit.
+            rustix::fs::fsync(&directory).map_err(|error| {
+                anchored_io_error("sync created write parent", display_path, error)
+            })?;
         }
         directory = openat_nofollow(
             &directory,
@@ -6175,6 +7019,256 @@ fn relative_path_argument(path: &Path) -> ToolResult<&str> {
 /// duplicating digest logic across mutation tools.
 fn mutation_digest(bytes: &[u8]) -> String {
     format!("blake3:{}", blake3::hash(bytes).to_hex())
+}
+
+#[cfg(unix)]
+fn capture_unix_entry_preimage(
+    parent: &OwnedFd,
+    leaf: &OsStr,
+    metadata: &rustix::fs::Stat,
+    relative_path: &Path,
+    display_path: &Path,
+) -> ToolResult<CheckpointCapturePath> {
+    if FileType::from_raw_mode(metadata.st_mode) == FileType::Directory {
+        return Ok(CheckpointCapturePath {
+            path: relative_path_argument(relative_path)?.to_owned(),
+            pre_bytes: None,
+            pre_digest: None,
+            post_digest: None,
+            truncated_reason: Some(
+                "directory tree pre-images are not representable by checkpoint_v1".into(),
+            ),
+        });
+    }
+    if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile {
+        return Err(ToolError::PathChanged {
+            path: display_path.to_path_buf(),
+            message: "checkpoint capture refuses a non-file pre-image".into(),
+        });
+    }
+    let source_fd = openat_nofollow(
+        parent,
+        leaf,
+        OFlags::RDONLY,
+        "open checkpoint pre-image",
+        display_path,
+    )?;
+    let mut source = fs::File::from(source_fd);
+    let opened = rustix::fs::fstat(&source)
+        .map_err(|error| ToolError::io("identify checkpoint pre-image", display_path, error))?;
+    if opened.st_dev != metadata.st_dev
+        || opened.st_ino != metadata.st_ino
+        || opened.st_size != metadata.st_size
+    {
+        return Err(ToolError::PathChanged {
+            path: display_path.to_path_buf(),
+            message: "checkpoint source identity or size changed before snapshotting".into(),
+        });
+    }
+    let preimage_len = u64::try_from(opened.st_size).map_err(|_| ToolError::PathChanged {
+        path: display_path.to_path_buf(),
+        message: "checkpoint source reported a negative size".into(),
+    })?;
+    if preimage_len > haider_protocol::checkpoint::CHECKPOINT_PREIMAGE_MAX_BYTES {
+        let mut hasher = blake3::Hasher::new();
+        let mut total = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = source
+                .read(&mut buffer)
+                .map_err(|error| ToolError::io("hash checkpoint pre-image", display_path, error))?;
+            if read == 0 {
+                break;
+            }
+            total = total
+                .checked_add(u64::try_from(read).map_err(|_| ToolError::PathChanged {
+                    path: display_path.to_path_buf(),
+                    message: "checkpoint read length does not fit u64".into(),
+                })?)
+                .ok_or_else(|| ToolError::PathChanged {
+                    path: display_path.to_path_buf(),
+                    message: "checkpoint pre-image size overflowed".into(),
+                })?;
+            hasher.update(&buffer[..read]);
+        }
+        let current =
+            rustix::fs::statat(parent, leaf, AtFlags::SYMLINK_NOFOLLOW).map_err(|error| {
+                anchored_io_error("recheck checkpoint pre-image", display_path, error)
+            })?;
+        let snapshot = rustix::fs::fstat(&source).map_err(|error| {
+            ToolError::io("reidentify checkpoint pre-image", display_path, error)
+        })?;
+        if total != preimage_len
+            || current.st_dev != metadata.st_dev
+            || current.st_ino != metadata.st_ino
+            || snapshot.st_dev != metadata.st_dev
+            || snapshot.st_ino != metadata.st_ino
+            || snapshot.st_size != metadata.st_size
+        {
+            return Err(ToolError::PathChanged {
+                path: display_path.to_path_buf(),
+                message: "checkpoint source changed while hashing an oversized pre-image".into(),
+            });
+        }
+        return Ok(CheckpointCapturePath {
+            path: relative_path_argument(relative_path)?.to_owned(),
+            pre_bytes: None,
+            pre_digest: Some(format!("blake3:{}", hasher.finalize().to_hex())),
+            post_digest: None,
+            truncated_reason: Some(format!(
+                "pre-image is {preimage_len} bytes; checkpoint limit is {} bytes",
+                haider_protocol::checkpoint::CHECKPOINT_PREIMAGE_MAX_BYTES
+            )),
+        });
+    }
+    let (bytes, _) = file_snapshot(parent, &mut source, display_path)?.parts();
+    let current = rustix::fs::statat(parent, leaf, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| anchored_io_error("recheck checkpoint pre-image", display_path, error))?;
+    let snapshot = rustix::fs::fstat(&source)
+        .map_err(|error| ToolError::io("reidentify checkpoint pre-image", display_path, error))?;
+    if current.st_dev != metadata.st_dev
+        || current.st_ino != metadata.st_ino
+        || snapshot.st_dev != metadata.st_dev
+        || snapshot.st_ino != metadata.st_ino
+    {
+        return Err(ToolError::PathChanged {
+            path: display_path.to_path_buf(),
+            message: "checkpoint source identity changed while snapshotting".into(),
+        });
+    }
+    Ok(CheckpointCapturePath {
+        path: relative_path_argument(relative_path)?.to_owned(),
+        pre_digest: Some(mutation_digest(&bytes)),
+        pre_bytes: Some(bytes),
+        post_digest: None,
+        truncated_reason: None,
+    })
+}
+
+#[cfg(windows)]
+fn capture_windows_entry_preimage(
+    entry: &mut WindowsPathEntry,
+    relative_path: &Path,
+    display_path: &Path,
+) -> ToolResult<CheckpointCapturePath> {
+    if entry.identity.directory {
+        return Ok(CheckpointCapturePath {
+            path: relative_path_argument(relative_path)?.to_owned(),
+            pre_bytes: None,
+            pre_digest: None,
+            post_digest: None,
+            truncated_reason: Some(
+                "directory tree pre-images are not representable by checkpoint_v1".into(),
+            ),
+        });
+    }
+    if entry.identity.size > haider_protocol::checkpoint::CHECKPOINT_PREIMAGE_MAX_BYTES {
+        let snapshot = windows_stable_digest(&mut entry.handle, display_path)?;
+        if snapshot.identity != entry.identity {
+            return Err(ToolError::PathChanged {
+                path: display_path.to_path_buf(),
+                message: "checkpoint source identity changed while hashing".into(),
+            });
+        }
+        return Ok(CheckpointCapturePath {
+            path: relative_path_argument(relative_path)?.to_owned(),
+            pre_bytes: None,
+            pre_digest: Some(snapshot.digest),
+            post_digest: None,
+            truncated_reason: Some(format!(
+                "pre-image is {} bytes; checkpoint limit is {} bytes",
+                entry.identity.size,
+                haider_protocol::checkpoint::CHECKPOINT_PREIMAGE_MAX_BYTES
+            )),
+        });
+    }
+    let snapshot = windows_stable_snapshot(&mut entry.handle, display_path)?;
+    if snapshot.identity != entry.identity {
+        return Err(ToolError::PathChanged {
+            path: display_path.to_path_buf(),
+            message: "checkpoint source identity changed while snapshotting".into(),
+        });
+    }
+    Ok(CheckpointCapturePath {
+        path: relative_path_argument(relative_path)?.to_owned(),
+        pre_digest: Some(mutation_digest(&snapshot.bytes)),
+        pre_bytes: Some(snapshot.bytes),
+        post_digest: None,
+        truncated_reason: None,
+    })
+}
+
+#[cfg(windows)]
+struct WindowsStableDigest {
+    digest: String,
+    identity: WindowsPathIdentity,
+}
+
+#[cfg(windows)]
+fn windows_stable_digest(
+    file: &mut fs::File,
+    display_path: &Path,
+) -> ToolResult<WindowsStableDigest> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    for _ in 0..SNAPSHOT_ATTEMPTS {
+        let before = file
+            .metadata()
+            .map_err(|error| ToolError::io("inspect checkpoint digest", display_path, error))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| ToolError::io("seek checkpoint digest", display_path, error))?;
+        let mut hasher = blake3::Hasher::new();
+        let mut total = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|error| ToolError::io("read checkpoint digest", display_path, error))?;
+            if read == 0 {
+                break;
+            }
+            total = total.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+            hasher.update(&buffer[..read]);
+        }
+        let after = file
+            .metadata()
+            .map_err(|error| ToolError::io("reinspect checkpoint digest", display_path, error))?;
+        if before.file_attributes() == after.file_attributes()
+            && before.creation_time() == after.creation_time()
+            && before.last_write_time() == after.last_write_time()
+            && before.file_size() == after.file_size()
+            && before.file_size() == total
+        {
+            let file_identity = haider_platform::windows_file_identity(file).map_err(|error| {
+                ToolError::io("identify checkpoint digest", display_path, error)
+            })?;
+            return Ok(WindowsStableDigest {
+                digest: format!("blake3:{}", hasher.finalize().to_hex()),
+                identity: WindowsPathIdentity {
+                    file: file_identity,
+                    attributes: after.file_attributes(),
+                    creation_time: after.creation_time(),
+                    last_write_time: after.last_write_time(),
+                    size: after.file_size(),
+                    directory: false,
+                },
+            });
+        }
+    }
+    Err(ToolError::PathChanged {
+        path: display_path.to_path_buf(),
+        message: "checkpoint source changed while hashing its oversized pre-image".into(),
+    })
+}
+
+fn absent_checkpoint_path(relative_path: &Path) -> ToolResult<CheckpointCapturePath> {
+    Ok(CheckpointCapturePath {
+        path: relative_path_argument(relative_path)?.to_owned(),
+        pre_bytes: None,
+        pre_digest: None,
+        post_digest: None,
+        truncated_reason: None,
+    })
 }
 
 fn case_mode_argument(mode: FsCaseMode) -> &'static str {

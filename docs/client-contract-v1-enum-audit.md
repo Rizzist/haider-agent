@@ -333,8 +333,13 @@ appendix list every spelling in context.
 ### `crates/haider-protocol/src/lib.rs`
 
 - `EventPayload` (`crates/haider-protocol/src/lib.rs:50`; `type` tag):
-  `"harness_status"` | `"session_state"` | `"run_state"` | `"run_failed"` | `"client_diagnostic"` | `"idle_decayed"` | `"menu_opened"` | `"menu_answered"` | `"menu_closed"` | `"user_message"` | `"item"` | `"effect"` | `"tool_result"` | `"node_committed"` | `"agent_spawned"` | `"agent_report"` | `"agent_chip_state"` | `"gate_report"` | `"graph_pinned"` | `"graph_attempt_opened"` | `"evidence_recorded"` | `"graph_gate_satisfied"` | `"graph_advanced"` | `"graph_node_readied"` | `"graph_blocked"` | `"graph_completed"` | `"graph_abandoned"` | `"graph_superseded"` | `"graph_finalization_deferred"` | `"process_signal_recorded"` | `"graph_run_set_opened"` | `"todo_graph_attached"` | `"child_graph_attached"` | `"child_template_observed"` | `"child_template_promoted"` | `"rotation"` | `"usage"`.
+  `"harness_status"` | `"session_state"` | `"run_state"` | `"run_failed"` | `"client_diagnostic"` | `"idle_decayed"` | `"menu_opened"` | `"menu_answered"` | `"menu_closed"` | `"user_message"` | `"item"` | `"effect"` | `"tool_result"` | `"node_committed"` | `"agent_spawned"` | `"agent_report"` | `"agent_chip_state"` | `"gate_report"` | `"graph_pinned"` | `"graph_attempt_opened"` | `"evidence_recorded"` | `"graph_gate_satisfied"` | `"graph_advanced"` | `"graph_node_readied"` | `"graph_blocked"` | `"graph_completed"` | `"graph_abandoned"` | `"graph_superseded"` | `"graph_finalization_deferred"` | `"process_signal_recorded"` | `"graph_run_set_opened"` | `"todo_graph_attached"` | `"child_graph_attached"` | `"child_template_observed"` | `"child_template_promoted"` | `"rotation"` | `"usage"` | `"checkpoint_recorded"`.
 - `DeliveryMode` (`crates/haider-protocol/src/lib.rs:134`): `"steer"` | `"queue"` | `"subturn"`.
+
+### `crates/haider-protocol/src/checkpoint.rs`
+
+- `CheckpointKind` is **Frozen**: `"edit"` | `"write"` | `"create"` | `"delete"` | `"move"`.
+- `CheckpointOrigin` is **Frozen**: `"tool"` | `"undo"` | `"redo"` | `"rollback_turn"`.
 
 ### `crates/haider-protocol/src/loom.rs`
 
@@ -548,15 +553,15 @@ appendix list every spelling in context.
 - `HookTrustStateWire` (`crates/haider-rpc/src/frame.rs:1565`):
   `"trusted"` | `"untrusted"` | `"revoked_by_edit"`.
 - `RequestBody` (`crates/haider-rpc/src/frame.rs`; `method` tag):
-  the 94 pre-L4 spellings remain in their original order; the additive tail is `"loom.install.cancel"` | `"loom.archive"` | `"loom.unarchive"` | `"loom.validate"` | `"loom.watch"` | unknown. The exhaustive 99-method spelling pin is `wire_golden_tests::every_request_method_has_a_golden_request_and_success_response`; any other string → Rust `Unknown`.
+  the pre-checkpoint spellings remain in their original order; the additive tail is `"checkpoint.list"` | `"checkpoint.undo"` | `"checkpoint.redo"` | `"checkpoint.rollback_turn"` | unknown. The exhaustive 103-method spelling pin is `wire_golden_tests::every_request_method_has_a_golden_request_and_success_response`; any other string → Rust `Unknown`.
 - `ResponseBody` (`crates/haider-rpc/src/frame.rs`; `method` tag):
-  the pre-L4 response spellings remain in their original order; the additive tail is `"loom.install.cancel"` | `"loom.archive"` | `"loom.unarchive"` | `"loom.validate"` | `"loom.watch"` | unknown. Any other string → Rust `Unknown`.
+  the pre-checkpoint response spellings remain in their original order; the additive tail is `"checkpoint.list"` | `"checkpoint.undo"` | `"checkpoint.redo"` | `"checkpoint.rollback_turn"` | unknown. Any other string → Rust `Unknown`.
 - `SubmitDisposition` (`crates/haider-rpc/src/frame.rs:3953`):
   `"started"` | `"queued"` | `"steer_pending"` | `"subturn_pending"` | `"unknown"`; any other string → Rust `Unknown`.
 - `CancelStatus` (`crates/haider-rpc/src/frame.rs:3966`):
   `"accepted"` | `"already_terminal"` | `"unknown"`; any other string → Rust `Unknown`.
 - `ErrorData` (`crates/haider-rpc/src/frame.rs`; `kind` tag):
-  its additive tail is `"loom_revision_conflict"` | `"unknown"`; any other string → Rust `Unknown`.
+  its additive tail is `"checkpoint_conflict"` | `"checkpoint_rollback_conflict"` | `"checkpoint_branch_mismatch"` | `"unknown"`; any other string → Rust `Unknown`.
 - `ProviderRemoveRefusalReasonWire` (`crates/haider-rpc/src/frame.rs:3015`):
   `"not_found"` | `"release_owned"` | `"blocking_accounts"` | `"unknown"`; any other string → Rust `Unknown`.
 - `MenuInput` (`crates/haider-rpc/src/frame.rs:3055`; `kind` tag): `"text"` | `"secret_vault_reference"`.

@@ -13,6 +13,7 @@
 pub mod agent;
 pub mod branch;
 pub mod cache;
+pub mod checkpoint;
 pub mod computer;
 pub mod context;
 pub mod credential;
@@ -135,6 +136,8 @@ pub enum EventPayload {
     Rotation(credential::RotationEvent),
     // token accounting
     Usage(provider::Usage),
+    // append-only workspace mutation history
+    CheckpointRecorded(checkpoint::CheckpointRecorded),
 }
 
 /// Mid-turn input delivery (§3): steer is the default.

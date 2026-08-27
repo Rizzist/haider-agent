@@ -2811,6 +2811,20 @@ pub enum AppRequest {
         fork_seq: u64,
         name: Option<String>,
     },
+    /// Durable checkpoint reads/mutations. Branch identity is captured at
+    /// issuance; the live driver supplies session/generation coordinates.
+    Checkpoints {
+        branch: Option<haider_protocol::ids::BranchId>,
+        rollback: Option<String>,
+    },
+    CheckpointUndo {
+        branch: Option<haider_protocol::ids::BranchId>,
+        target: String,
+    },
+    CheckpointRedo {
+        branch: Option<haider_protocol::ids::BranchId>,
+        target: String,
+    },
     /// A drag selection finished (owner item 9): the RUNTIME extracts the
     /// selected text from its last-drawn frame and copies it (pbcopy, then
     /// OSC 52 — see [`crate::clipboard`]). A request because the reducer
@@ -12011,6 +12025,14 @@ impl AppModel {
                 }
             }
             "branch" => self.branch_command(&remainder),
+            "checkpoints" => self.checkpoint_command(None),
+            "undo" => self.checkpoint_mutation_command(false, &remainder),
+            "redo" => self.checkpoint_mutation_command(true, &remainder),
+            "rollback" => self.checkpoint_command(Some(if remainder.trim().is_empty() {
+                "current".to_owned()
+            } else {
+                remainder.trim().to_owned()
+            })),
             "attach" => self.attach_command(&remainder),
             "rename" => self.rename_command(&remainder),
             "compact" => {
@@ -12281,6 +12303,61 @@ impl AppModel {
                 });
             }
         }
+    }
+
+    fn checkpoint_command(&mut self, rollback: Option<String>) {
+        self.dirty = true;
+        if self.screen != Screen::Session {
+            self.flash = Some("· checkpoint commands are session only".to_owned());
+            return;
+        }
+        if self.mode.fabricates_locally() {
+            self.flash =
+                Some("· checkpoints are live daemon history; demo mode fabricates none".to_owned());
+            return;
+        }
+        if !self.daemon_serves(haider_rpc::FEATURE_CHECKPOINT_V1) {
+            self.flash = Some(self.stale_daemon_note("workspace checkpoints"));
+            return;
+        }
+        self.requests.push(AppRequest::Checkpoints {
+            branch: self.branch_state.active().cloned(),
+            rollback,
+        });
+        self.flash = Some("· reading durable checkpoints…".to_owned());
+    }
+
+    fn checkpoint_mutation_command(&mut self, redo: bool, argument: &str) {
+        self.dirty = true;
+        if self.screen != Screen::Session {
+            self.flash = Some("· checkpoint commands are session only".to_owned());
+            return;
+        }
+        if self.mode.fabricates_locally() {
+            self.flash =
+                Some("· checkpoints are live daemon history; demo mode fabricates none".to_owned());
+            return;
+        }
+        if !self.daemon_serves(haider_rpc::FEATURE_CHECKPOINT_V1) {
+            self.flash = Some(self.stale_daemon_note("workspace checkpoints"));
+            return;
+        }
+        let target = if argument.trim().is_empty() {
+            "last".to_owned()
+        } else {
+            argument.trim().to_owned()
+        };
+        let branch = self.branch_state.active().cloned();
+        self.requests.push(if redo {
+            AppRequest::CheckpointRedo { branch, target }
+        } else {
+            AppRequest::CheckpointUndo { branch, target }
+        });
+        self.flash = Some(if redo {
+            "· redoing checkpoint…".to_owned()
+        } else {
+            "· undoing checkpoint…".to_owned()
+        });
     }
 
     /// The legacy `/peers` spelling remains decodable, but Haider has no

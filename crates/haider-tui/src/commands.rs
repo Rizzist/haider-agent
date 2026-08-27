@@ -22,6 +22,10 @@ pub const HELP_TEXT: &[&str] = &[
     "  /tree              session tree — every branch, ⏎ jump to a node / open a fork, f forks there",
     "  /fork              fork the session at the current point",
     "  /branch [new|name] branches — numbered picker · direct switch · new forks at the last committed node",
+    "  /undo [last|id]    undo one durable file checkpoint (freshness guarded)",
+    "  /redo [last|id]    redo an undone checkpoint exactly",
+    "  /checkpoints       list path · kind · age · run for this branch",
+    "  /rollback [current|previous|run-id] undo one turn atomically",
     "  /sessions          list + switch sessions",
     "  /aura              Aura Mode — a voice/orchestrator session (spawns sessions, never codes) — demo only",
     "  /peers             not supported — Haider runs local-only",
@@ -51,6 +55,7 @@ pub const HELP_TEXT: &[&str] = &[
 ];
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::theme::ThemeChoice;

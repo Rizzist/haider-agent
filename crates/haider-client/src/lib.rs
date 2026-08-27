@@ -20,6 +20,7 @@
 //!
 //! This crate owns no TUI, daemon lifecycle, or persistence.
 
+pub mod checkpoint;
 pub mod client;
 pub mod graph;
 pub mod headless;
@@ -33,6 +34,7 @@ pub mod transcription;
 pub mod workflow_graph;
 pub mod workflow_graph_rpc;
 
+pub use checkpoint::{CheckpointClientError, checkpoints, redo, rollback_turn, undo};
 pub use client::{
     ClientConfig, ClientError, ConnectError, Connected, ConnectionState, DisconnectReason,
     MenuAnswerRequest, PING_INTERVAL, PONG_DEADLINE, PeerCredentials, PendingResponse, RpcClient,

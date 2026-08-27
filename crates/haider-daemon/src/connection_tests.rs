@@ -204,7 +204,11 @@ fn welcome_features_pin_served_management_families() {
     assert_eq!(
         welcome_features().len(),
         95,
+<<<<<<< HEAD
         "the ordinary Welcome advertises all 94 prior and one v0.0.964 feature token"
+=======
+        "the ordinary Welcome advertises all 94 v0.0.963 tokens plus checkpoint_v1"
+>>>>>>> wave-964-c
     );
     assert_eq!(
         welcome_features(),
@@ -221,6 +225,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_ARTIFACT_PUT_V1.to_owned(),
             haider_rpc::FEATURE_EXPORT_SEQ_V1.to_owned(),
             haider_rpc::FEATURE_BRANCH_CREATE_V1.to_owned(),
+            haider_rpc::FEATURE_CHECKPOINT_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_FORK_V1.to_owned(),
             FEATURE_COMMAND_DOOR_V1.to_owned(),
             haider_rpc::FEATURE_COMPACTION_GUARD_V1.to_owned(),

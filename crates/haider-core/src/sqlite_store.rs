@@ -9,29 +9,32 @@ use async_trait::async_trait;
 use haider_protocol::agent::ChildReport;
 use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::cache::{ProviderViewBlobV1, ProviderViewBlockRefV1, ProviderViewLedgerV1};
+use haider_protocol::checkpoint::{CheckpointCursor, CheckpointListPage, CheckpointRecorded};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::{ErrorAction, ErrorCode, ErrorPresentation, ErrorScope, HaiderError};
-use haider_protocol::ids::{AgentId, ArtifactRef, BranchId, GraphId, RunId, SessionId};
+use haider_protocol::ids::{
+    AgentId, ArtifactRef, BranchId, CheckpointId, GraphId, RunId, SessionId,
+};
 use haider_protocol::session::SessionMetadataV1;
 use haider_store::{
     AcceptedRunRetry, AcceptedShellExec, AcceptedTurn, BranchCreateCommand, BranchCreateOutcome,
-    CancelledTurn, Cas, ChildGraphAttachCommand, ChildGraphAttachOutcome, ChildTemplateCacheEntry,
-    ChildTemplateObservation, ChildTemplateObservationCommand, ComputerEvidenceCommand,
-    ComputerEvidenceOutcome, ContextCompactionClaim, ContextCompactionReceiptResponse,
-    DelegationCreateOutcome, DelegationRecord, EventStore, GraphAbandonCommand,
-    GraphAbandonOutcome, GraphEvidenceCommand, GraphEvidenceOutcome, GraphFinalizationCommand,
-    GraphFinalizationOutcome, GraphInspectResult, GraphPinCommand, GraphPinOutcome,
-    GraphRunSetOpenCommand, GraphRunSetOpenOutcome, GraphSwitchCommand, GraphSwitchOutcome,
-    HookTrustChange, HookTrustCommand, JournalAppendBatch, MenuResolutionCommand,
-    MenuResolutionOutcome, MonitorControlClaim, ProcessSignalCommand, ProcessSignalOutcome,
-    ProfileLease, QueueConsumeCommand, QueueConsumeOutcome, QueuePromoteCommand,
-    QueuePromoteOutcome, QueuePromotePreview, QueueRemoveCommand, QueueRemoveOutcome,
-    QueueSnapshot, RunRetryCommand, RunRetryOutcome, SessionCreateCommand, SessionCreateOutcome,
-    SessionForkCommand, SessionForkOutcome, SessionProjectionCheckpoint, SessionRenameCommand,
-    SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome, SessionSelectModelCommand,
-    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, Store,
-    TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand, TurnCancelOutcome,
-    TypedAgentInstallCas,
+    CancelledTurn, Cas, CheckpointCommitCommand, CheckpointCommitOutcome, ChildGraphAttachCommand,
+    ChildGraphAttachOutcome, ChildTemplateCacheEntry, ChildTemplateObservation,
+    ChildTemplateObservationCommand, ComputerEvidenceCommand, ComputerEvidenceOutcome,
+    ContextCompactionClaim, ContextCompactionReceiptResponse, DelegationCreateOutcome,
+    DelegationRecord, EventStore, GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand,
+    GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome, GraphInspectResult,
+    GraphPinCommand, GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome,
+    GraphSwitchCommand, GraphSwitchOutcome, HookTrustChange, HookTrustCommand, JournalAppendBatch,
+    MenuResolutionCommand, MenuResolutionOutcome, MonitorControlClaim, ProcessSignalCommand,
+    ProcessSignalOutcome, ProfileLease, QueueConsumeCommand, QueueConsumeOutcome,
+    QueuePromoteCommand, QueuePromoteOutcome, QueuePromotePreview, QueueRemoveCommand,
+    QueueRemoveOutcome, QueueSnapshot, RunRetryCommand, RunRetryOutcome, SessionCreateCommand,
+    SessionCreateOutcome, SessionForkCommand, SessionForkOutcome, SessionProjectionCheckpoint,
+    SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome,
+    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
+    ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand,
+    TurnCancelOutcome, TypedAgentInstallCas,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::{Path, PathBuf};
@@ -2019,6 +2022,83 @@ impl SqliteStoreHandle {
         let owner = Arc::clone(&self.owner);
         let artifact = artifact.clone();
         run_blocking(move || owner.with_store(|store| Ok(store.verify(&artifact)))).await
+    }
+
+    pub async fn list_checkpoints(
+        &self,
+        session_id: SessionId,
+        branch_id: Option<BranchId>,
+        cursor: Option<CheckpointCursor>,
+        limit: u16,
+    ) -> Result<CheckpointListPage, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.list_checkpoints(&session_id, branch_id.as_ref(), cursor.as_ref(), limit)
+            })
+        })
+        .await
+    }
+
+    pub async fn checkpoint(
+        &self,
+        session_id: SessionId,
+        checkpoint_id: CheckpointId,
+    ) -> Result<Option<CheckpointRecorded>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.checkpoint(&session_id, &checkpoint_id))
+        })
+        .await
+    }
+
+    pub async fn checkpoints_for_run(
+        &self,
+        session_id: SessionId,
+        branch_id: Option<BranchId>,
+        run_id: RunId,
+    ) -> Result<Vec<CheckpointRecorded>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.checkpoints_for_run(&session_id, branch_id.as_ref(), &run_id)
+            })
+        })
+        .await
+    }
+
+    pub async fn checkpoint_command_receipt(
+        &self,
+        command_id: String,
+        method: String,
+        request_digest: String,
+        request_json: String,
+    ) -> Result<Option<haider_protocol::checkpoint::CheckpointMutationReceipt>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.checkpoint_command_receipt(
+                    &command_id,
+                    &method,
+                    &request_digest,
+                    &request_json,
+                )
+            })
+        })
+        .await
+    }
+
+    pub async fn commit_checkpoint_command(
+        &self,
+        command: CheckpointCommitCommand,
+    ) -> Result<CheckpointCommitOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store_write(vec![command.command_id.clone()], |store| {
+                store.commit_checkpoint_command(command)
+            })
+        })
+        .await
     }
 
     pub async fn persist_provider_view(

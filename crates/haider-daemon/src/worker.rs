@@ -12865,10 +12865,18 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 let ParsedToolOperation::FsWrite(operation) = operation.as_ref() else {
                     return Err(cached_operation_route_mismatch(route));
                 };
-                let attribution = TurnAttribution::new(self.session_id.clone(), run_id.clone());
+                let attribution = TurnAttribution::new(self.session_id.clone(), run_id.clone())
+                    .with_tool_call(self.branch_id.clone(), call_id);
+                let checkpoint_cas = self.cas.lock().await.clone();
                 let started = SystemTime::now();
                 let result = broker
-                    .fs_write(operation, &policy, &attribution, &self.ledger)
+                    .fs_write_checkpointed(
+                        operation,
+                        &policy,
+                        &attribution,
+                        &self.ledger,
+                        checkpoint_cas,
+                    )
                     .await;
                 if result
                     .as_ref()
@@ -12898,9 +12906,17 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 let ParsedToolOperation::FsEdit(operation) = operation.as_ref() else {
                     return Err(cached_operation_route_mismatch(route));
                 };
-                let attribution = TurnAttribution::new(self.session_id.clone(), run_id.clone());
+                let attribution = TurnAttribution::new(self.session_id.clone(), run_id.clone())
+                    .with_tool_call(self.branch_id.clone(), call_id);
+                let checkpoint_cas = self.cas.lock().await.clone();
                 broker
-                    .fs_edit(operation, &policy, &attribution, &self.ledger)
+                    .fs_edit_checkpointed(
+                        operation,
+                        &policy,
+                        &attribution,
+                        &self.ledger,
+                        checkpoint_cas,
+                    )
                     .await
             }
             RegisteredToolRoute::FsPath => {
@@ -12908,9 +12924,17 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 let ParsedToolOperation::FsPath(operation) = operation.as_ref() else {
                     return Err(cached_operation_route_mismatch(route));
                 };
-                let attribution = TurnAttribution::new(self.session_id.clone(), run_id.clone());
+                let attribution = TurnAttribution::new(self.session_id.clone(), run_id.clone())
+                    .with_tool_call(self.branch_id.clone(), call_id);
+                let checkpoint_cas = self.cas.lock().await.clone();
                 broker
-                    .fs_path(operation, &policy, &attribution, &self.ledger)
+                    .fs_path_checkpointed(
+                        operation,
+                        &policy,
+                        &attribution,
+                        &self.ledger,
+                        checkpoint_cas,
+                    )
                     .await
             }
             RegisteredToolRoute::WebSearch => {
@@ -14932,6 +14956,10 @@ impl HubJournalSink {
 #[async_trait]
 impl JournalSink for HubJournalSink {
     async fn append(&mut self, payload: EventPayload) -> ToolResult<()> {
+        let intent_effect = match &payload {
+            EventPayload::Effect(EffectPhase::Intent(intent)) => Some(intent.effect.clone()),
+            _ => None,
+        };
         if let EventPayload::Effect(EffectPhase::Intent(intent)) = &payload {
             self.intent_digests
                 .insert(intent.effect.clone(), intent.args_digest.clone());
@@ -14988,28 +15016,112 @@ impl JournalSink for HubJournalSink {
             // the completion safety scan enabled.
             self.effect_dispatched.store(true, Ordering::Release);
         }
-        haider_core::StoreHandle::append(&self.store, &mut envelopes)
+        if let Some(breadcrumb) = dispatched.as_ref() {
+            self.pending_breadcrumbs
+                .insert(breadcrumb.effect_id.clone(), breadcrumb.clone());
+        }
+        let appended = haider_core::StoreHandle::append(&self.store, &mut envelopes)
             .await
             .map_err(|error| haider_tools::ToolError::Runtime {
                 message: error.message,
-            })?;
+            });
+        if let Err(error) = appended {
+            if let Some(breadcrumb) = dispatched.as_ref() {
+                self.pending_breadcrumbs.remove(&breadcrumb.effect_id);
+            }
+            if let Some(effect) = intent_effect {
+                self.intent_digests.remove(&effect);
+            }
+            return Err(error);
+        }
         if let (Some(diagnostics), Some(breadcrumb)) = (&self.diagnostics, dispatched) {
-            diagnostics
-                .record_start(breadcrumb.clone())
-                .await
-                .map_err(|error| ToolError::Runtime {
-                    message: format!("cannot persist pre-dispatch diagnostic breadcrumb: {error}"),
-                })?;
-            self.pending_breadcrumbs
-                .insert(breadcrumb.effect_id.clone(), breadcrumb);
+            if let Err(error) = diagnostics.record_start(breadcrumb).await {
+                // Diagnostics are a best-effort crash breadcrumb, never part
+                // of the journal transaction's success value. Waiting here
+                // preserves Start-before-Complete ordering while swallowing
+                // failure preserves JournalSink's Err-means-no-commit law.
+                tracing::warn!(
+                    %error,
+                    "effect dispatch committed but start diagnostic update failed"
+                );
+            }
         }
         if let (Some(diagnostics), Some(breadcrumb)) = (&self.diagnostics, completed) {
-            diagnostics
-                .record_completion(breadcrumb.clone())
-                .await
-                .map_err(|error| ToolError::Runtime {
-                    message: format!("cannot persist completion diagnostic breadcrumb: {error}"),
-                })?;
+            let diagnostics = Arc::clone(diagnostics);
+            let diagnostic_breadcrumb = breadcrumb.clone();
+            tokio::spawn(async move {
+                if let Err(error) = diagnostics.record_completion(diagnostic_breadcrumb).await {
+                    tracing::warn!(
+                        %error,
+                        "checkpoint outcome committed but completion diagnostic update failed"
+                    );
+                }
+            });
+            self.pending_breadcrumbs.remove(&breadcrumb.effect_id);
+            self.intent_digests.remove(&breadcrumb.effect_id);
+        }
+        Ok(())
+    }
+
+    fn supports_checkpoint_batches(&self) -> bool {
+        true
+    }
+
+    async fn append_checkpointed(
+        &mut self,
+        outcome: EventPayload,
+        checkpoint: EventPayload,
+    ) -> ToolResult<()> {
+        let completed = match &outcome {
+            EventPayload::Effect(EffectPhase::Outcome { effect, .. })
+                if self.diagnostics.is_some() =>
+            {
+                self.pending_breadcrumbs.get(effect).cloned()
+            }
+            _ => None,
+        };
+        let mut envelopes = Vec::with_capacity(2);
+        for payload in [outcome, checkpoint] {
+            envelopes.push(EventEnvelope {
+                schema_version: SCHEMA_VERSION,
+                event_id: self.event_ids.next(),
+                seq: 0,
+                session_id: self.store.session_id().clone(),
+                branch_id: self.branch_id.clone(),
+                run_id: Some(self.run_id.clone()),
+                agent_id: None,
+                device_id: self.device_id.clone(),
+                authority_epoch: 0,
+                worker_generation: self.store.worker_generation(),
+                causation_id: None,
+                correlation_id: None,
+                committed_at_ms: 0,
+                render: RenderTargets {
+                    ui: true,
+                    durable: true,
+                    prompt: PromptRender::Omit,
+                },
+                payload: serde_json::to_value(payload).map_err(|error| ToolError::Runtime {
+                    message: format!("cannot serialize checkpointed effect envelope: {error}"),
+                })?,
+            });
+        }
+        haider_core::StoreHandle::append(&self.store, &mut envelopes)
+            .await
+            .map_err(|error| ToolError::Runtime {
+                message: error.message,
+            })?;
+        if let (Some(diagnostics), Some(breadcrumb)) = (&self.diagnostics, completed) {
+            let diagnostics = Arc::clone(diagnostics);
+            let diagnostic_breadcrumb = breadcrumb.clone();
+            tokio::spawn(async move {
+                if let Err(error) = diagnostics.record_completion(diagnostic_breadcrumb).await {
+                    tracing::warn!(
+                        %error,
+                        "checkpoint outcome committed but completion diagnostic update failed"
+                    );
+                }
+            });
             self.pending_breadcrumbs.remove(&breadcrumb.effect_id);
             self.intent_digests.remove(&breadcrumb.effect_id);
         }

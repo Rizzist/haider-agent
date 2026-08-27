@@ -787,6 +787,9 @@ impl SessionProjection {
             // M2e: child-template cache bookkeeping (observation → promotion) is
             // internal — quiet until a render surfaces the reusable badge.
             EventPayload::ChildTemplateObserved(_) | EventPayload::ChildTemplatePromoted(_) => {}
+            // Checkpoint facts power the explicit /checkpoints surface; raw
+            // replay must not fabricate an extra transcript row for them.
+            EventPayload::CheckpointRecorded(_) => {}
         }
     }
 

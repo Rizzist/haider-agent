@@ -1818,6 +1818,9 @@ impl DemoDriver {
             // B2b live-only vocabulary: `/branch new` in demo mode flashes
             // its honest stub upstream — branches are daemon truth.
             | AppRequest::BranchCreate { .. }
+            | AppRequest::Checkpoints { .. }
+            | AppRequest::CheckpointUndo { .. }
+            | AppRequest::CheckpointRedo { .. }
             // B4b live-only vocabulary: `/attach` and the real paste pill
             // refuse honestly upstream in demo mode — attachments are
             // daemon-CAS truth, and the read itself is shell-owned.
