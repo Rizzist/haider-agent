@@ -29,7 +29,9 @@ pub mod peer;
 pub mod permission;
 pub mod profile;
 pub mod shell;
+pub mod shell_registry;
 pub mod spawn;
+pub mod ssh_profiles;
 pub mod surface;
 pub mod transcription;
 pub mod workflow_graph;
@@ -84,10 +86,17 @@ pub use shell::{
     AcceptedShellExec, CancelledShellExec, ShellExecError, ShellExecRequest, cancel_shell_exec,
     required_user_command_features, shell_exec,
 };
+pub use shell_registry::{
+    ShellEvent, ShellEventSubscription, ShellRegistry, ShellRegistryClientError,
+    shell_event_from_frame, shell_registry, shell_registry_available,
+};
 pub use spawn::{
     DAEMON_LOG_FILE, DaemonLifetime, DaemonOwnershipToken, EnsureError, EnsureOptions,
     EnsuredDaemon, RACE_LOSER_EXIT_CODE, STARTUP_DEADLINE, ensure_daemon, required_live_features,
     signal_authenticated_peer, spawn_daemon_retained,
+};
+pub use ssh_profiles::{
+    SshProfiles, SshProfilesClientError, ssh_list_response, ssh_profiles, ssh_profiles_available,
 };
 pub use surface::{
     SurfaceClientError, SurfaceInjectAck, SurfaceInjectOp, SurfaceInputPublishWire,
@@ -109,4 +118,10 @@ pub const CRATE_NAME: &str = "haider-client";
 #[cfg(test)]
 mod peer_tests;
 #[cfg(test)]
+#[path = "shell_registry_tests.rs"]
+mod shell_registry_tests;
+#[cfg(test)]
 mod shell_tests;
+#[cfg(test)]
+#[path = "ssh_profiles_tests.rs"]
+mod ssh_profiles_tests;

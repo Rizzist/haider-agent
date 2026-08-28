@@ -360,6 +360,55 @@ pub enum LiveCommand {
         message: String,
         summary: Option<String>,
     },
+    SshList {
+        session: Option<SessionId>,
+    },
+    SshSetScope {
+        session: SessionId,
+        scope: haider_rpc::SshScopeWire,
+    },
+    SshTest {
+        profile: String,
+    },
+    SshRemove {
+        profile: String,
+    },
+    SshProfileStage {
+        stage_id: String,
+        purpose: haider_rpc::StagePurpose,
+        secret: haider_rpc::SecretWire,
+        mutation: crate::app::SshProfileMutation,
+    },
+    SshAdd {
+        profile: haider_rpc::SshProfileInputWire,
+    },
+    SshUpdate {
+        name: String,
+        changes: haider_rpc::SshProfileUpdateWire,
+    },
+    SshShellOpen {
+        profile: String,
+        session: Option<SessionId>,
+        size: haider_rpc::SshPtySizeWire,
+    },
+    SshShellInput {
+        id: String,
+        input: crate::app::SshTerminalInput,
+    },
+    SshShellResize {
+        id: String,
+        size: haider_rpc::SshPtySizeWire,
+    },
+    SshShellEof {
+        id: String,
+    },
+    ShellList,
+    ShellClose {
+        id: String,
+    },
+    MonitorList {
+        session: SessionId,
+    },
     /// `hooks.list` — a READ of the daemon's hook discovery for one
     /// workspace (H4 /hooks). No durable identity; the cwd was captured at
     /// issuance by the reducer.
@@ -1036,6 +1085,20 @@ impl LiveCommand {
             | Self::ToolsInventory { .. }
             | Self::PeerList
             | Self::PeerSend { .. }
+            | Self::SshList { .. }
+            | Self::SshSetScope { .. }
+            | Self::SshTest { .. }
+            | Self::SshRemove { .. }
+            | Self::SshProfileStage { .. }
+            | Self::SshAdd { .. }
+            | Self::SshUpdate { .. }
+            | Self::SshShellOpen { .. }
+            | Self::SshShellInput { .. }
+            | Self::SshShellResize { .. }
+            | Self::SshShellEof { .. }
+            | Self::ShellList
+            | Self::ShellClose { .. }
+            | Self::MonitorList { .. }
             | Self::HooksList { .. }
             // U2: the usage snapshot is a read (see above).
             | Self::UsageReport
@@ -1302,6 +1365,47 @@ pub enum LiveReply {
     },
     PeerDeliveryChanged {
         receipt: haider_protocol::peer::PeerReceipt,
+    },
+    SshListed {
+        profiles: Vec<haider_rpc::SshProfileWire>,
+    },
+    SshScopeSet {
+        scope: haider_rpc::SshScopeWire,
+    },
+    SshChanged,
+    SshProfileStaged {
+        vault_reference: String,
+        mutation: crate::app::SshProfileMutation,
+    },
+    SshProfileMutationFailed {
+        message: String,
+    },
+    SshTested {
+        result: haider_rpc::SshTestResultWire,
+    },
+    SshTestFailed {
+        code: String,
+        message: String,
+    },
+    SshShellOpened {
+        shell: haider_rpc::ShellWire,
+    },
+    SshShellOutput {
+        id: String,
+        chunk_b64: haider_rpc::TerminalOutputWire,
+    },
+    SshShellFailed {
+        code: String,
+        message: String,
+    },
+    ShellListed {
+        shells: Vec<haider_rpc::ShellWire>,
+    },
+    ShellChanged {
+        shell: haider_rpc::ShellWire,
+    },
+    MonitorListed {
+        receipt: haider_rpc::MonitorListReceiptWire,
     },
     /// `hooks.list` answered — discovery truth for /hooks (H4).
     Hooks {
@@ -2019,6 +2123,64 @@ pub struct LiveDriver {
 /// and ask for the key again rather than advertise "validating…" forever
 /// behind `accepts_input() == false`.
 pub const LOGIN_STAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn ssh_profile_command(
+    mutation: crate::app::SshProfileMutation,
+    vault_reference: Option<String>,
+) -> Option<LiveCommand> {
+    let crate::app::SshProfileMutation {
+        original,
+        name,
+        description,
+        host,
+        port,
+        user,
+        auth,
+        default_cwd,
+    } = mutation;
+    let auth = match auth {
+        crate::app::SshPendingAuth::Keep => None,
+        crate::app::SshPendingAuth::KeyFile { path } => {
+            Some(haider_rpc::SshAuthInputWire::KeyFile {
+                path,
+                passphrase_vault_reference: None,
+            })
+        }
+        crate::app::SshPendingAuth::Agent => Some(haider_rpc::SshAuthInputWire::Agent),
+        crate::app::SshPendingAuth::Password => Some(haider_rpc::SshAuthInputWire::Password {
+            vault_reference: vault_reference?,
+        }),
+        crate::app::SshPendingAuth::KeyMaterial => {
+            Some(haider_rpc::SshAuthInputWire::KeyMaterial {
+                vault_reference: vault_reference?,
+            })
+        }
+    };
+    match original {
+        Some(original) => Some(LiveCommand::SshUpdate {
+            name: original,
+            changes: haider_rpc::SshProfileUpdateWire {
+                description: Some(description),
+                host: Some(host),
+                port: Some(port),
+                user: Some(user),
+                auth,
+                default_cwd: Some(default_cwd),
+            },
+        }),
+        None => Some(LiveCommand::SshAdd {
+            profile: haider_rpc::SshProfileInputWire {
+                name,
+                description,
+                host,
+                port,
+                user,
+                auth: auth?,
+                default_cwd,
+            },
+        }),
+    }
+}
 
 /// Ceiling on the OUTPUT-token budget `session.create` requests (W5f-2).
 ///
@@ -2820,6 +2982,14 @@ impl LiveDriver {
                         session: session.clone(),
                     });
                 }
+                if model.daemon_serves(haider_rpc::FEATURE_MONITOR_CONTROL_V1) {
+                    queue_read.push(LiveCommand::MonitorList {
+                        session: session.clone(),
+                    });
+                }
+                if model.daemon_serves(haider_rpc::FEATURE_SHELL_REGISTRY_V1) {
+                    queue_read.push(LiveCommand::ShellList);
+                }
                 self.generations.insert(session.clone(), worker_generation);
                 self.routes.insert(attachment.clone(), session.clone());
                 self.attachments.insert(session.clone(), attachment);
@@ -2961,6 +3131,90 @@ impl LiveDriver {
                     peer_delivery_label(receipt.delivery)
                 ));
                 model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::SshListed { profiles } => {
+                model.apply_ssh_list(profiles);
+                Vec::new()
+            }
+            LiveReply::SshScopeSet { scope } => {
+                model.flash = Some(format!("· SSH scope set to {scope:?}"));
+                model.dirty = true;
+                vec![LiveCommand::SshList {
+                    session: model.active_session.clone(),
+                }]
+            }
+            LiveReply::SshChanged => vec![LiveCommand::SshList {
+                session: model.active_session.clone(),
+            }],
+            LiveReply::SshProfileStaged {
+                vault_reference,
+                mutation,
+            } => ssh_profile_command(mutation, Some(vault_reference))
+                .into_iter()
+                .collect(),
+            LiveReply::SshProfileMutationFailed { message } => {
+                model.flash = Some(format!("· SSH profile not saved — {message}"));
+                model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::SshTested { result } => {
+                let fingerprint = result
+                    .profile
+                    .host_key
+                    .as_ref()
+                    .map(|key| key.fingerprint.as_str())
+                    .unwrap_or("unavailable");
+                model.flash = Some(if result.host_key_pinned {
+                    format!("· TOFU accepted {fingerprint} for {}", result.profile.name)
+                } else {
+                    format!(
+                        "· {} connected · host key {fingerprint}",
+                        result.profile.name
+                    )
+                });
+                model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::SshTestFailed { code, message } => {
+                model.flash = Some(format!("· SSH test refused [{code}] — {message}"));
+                model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::SshShellOpened { shell } => {
+                model.apply_ssh_shell_opened(shell);
+                Vec::new()
+            }
+            LiveReply::SshShellOutput { id, chunk_b64 } => {
+                use base64::Engine as _;
+                match base64::engine::general_purpose::STANDARD.decode(chunk_b64.expose()) {
+                    Ok(bytes) => {
+                        let bytes = zeroize::Zeroizing::new(bytes);
+                        model.apply_ssh_shell_output(&id, bytes.as_slice());
+                    }
+                    Err(_) => {
+                        model.flash = Some("· invalid remote terminal output".into());
+                        model.dirty = true;
+                    }
+                }
+                Vec::new()
+            }
+            LiveReply::SshShellFailed { code, message } => {
+                model.ssh_terminal = None;
+                model.flash = Some(format!("· SSH terminal refused [{code}] — {message}"));
+                model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::ShellListed { shells } => {
+                model.apply_shell_list(shells);
+                Vec::new()
+            }
+            LiveReply::ShellChanged { shell } => {
+                model.apply_shell_event(shell);
+                Vec::new()
+            }
+            LiveReply::MonitorListed { receipt } => {
+                model.apply_monitor_list(receipt);
                 Vec::new()
             }
             LiveReply::Hooks {
@@ -5854,6 +6108,62 @@ impl LiveDriver {
                 message,
                 summary: None,
             }],
+            AppRequest::SshList => vec![LiveCommand::SshList {
+                session: model.active_session.clone(),
+            }],
+            AppRequest::SshSetScope { scope } => match model.active_session.clone() {
+                Some(session) => vec![LiveCommand::SshSetScope { session, scope }],
+                None => Vec::new(),
+            },
+            AppRequest::SshTest { profile } => vec![LiveCommand::SshTest { profile }],
+            AppRequest::SshRemove { profile } => vec![LiveCommand::SshRemove { profile }],
+            AppRequest::SshProfileSave {
+                mutation,
+                secret: Some(secret),
+            } => {
+                let purpose = match &mutation.auth {
+                    crate::app::SshPendingAuth::KeyMaterial => {
+                        haider_rpc::StagePurpose::SshKeyMaterial
+                    }
+                    crate::app::SshPendingAuth::Password => haider_rpc::StagePurpose::SshPassword,
+                    _ => {
+                        model.flash = Some("· SSH secret did not match authentication kind".into());
+                        model.dirty = true;
+                        return Vec::new();
+                    }
+                };
+                self.next_command += 1;
+                vec![LiveCommand::SshProfileStage {
+                    stage_id: format!("{}-ssh-stage-{}", self.instance, self.next_command),
+                    purpose,
+                    secret,
+                    mutation,
+                }]
+            }
+            AppRequest::SshProfileSave {
+                mutation,
+                secret: None,
+            } => ssh_profile_command(mutation, None).into_iter().collect(),
+            AppRequest::SshShellOpen { profile, size } => {
+                vec![LiveCommand::SshShellOpen {
+                    profile,
+                    session: model.active_session.clone(),
+                    size,
+                }]
+            }
+            AppRequest::SshShellInput { id, input } => {
+                vec![LiveCommand::SshShellInput { id, input }]
+            }
+            AppRequest::SshShellResize { id, size } => {
+                vec![LiveCommand::SshShellResize { id, size }]
+            }
+            AppRequest::SshShellEof { id } => vec![LiveCommand::SshShellEof { id }],
+            AppRequest::ShellList => vec![LiveCommand::ShellList],
+            AppRequest::ShellClose { id } => vec![LiveCommand::ShellClose { id }],
+            AppRequest::MonitorList => match model.active_session.clone() {
+                Some(session) => vec![LiveCommand::MonitorList { session }],
+                None => Vec::new(),
+            },
             AppRequest::HooksRefresh { cwd } => {
                 // A read — never outboxed; the cwd is remembered so a
                 // trust receipt can chain its refresh at the same
@@ -6407,6 +6717,8 @@ const fn command_session(command: &LiveCommand) -> Option<&SessionId> {
         | LiveCommand::AgentMessage { session, .. }
         | LiveCommand::ShellExec { session, .. }
         | LiveCommand::ToolsInventory { session }
+        | LiveCommand::SshSetScope { session, .. }
+        | LiveCommand::MonitorList { session }
         | LiveCommand::SelectModel { session, .. }
         | LiveCommand::Rename { session, .. }
         | LiveCommand::Seen { session, .. }

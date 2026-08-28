@@ -365,7 +365,10 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
         Layout::vertical([Constraint::Min(1), Constraint::Length(status_height)]).areas(area);
     // F2a: the full-screen /model picker COVERS the body while open —
     // it owns the keys, so it owns the pixels and the hit map too.
-    if model.model_picker.is_some() {
+    if model.ssh_terminal.is_some() {
+        render_ssh_terminal(model, theme, frame, body);
+        hits.clear();
+    } else if model.model_picker.is_some() {
         render_model_picker(model, theme, frame, body, &mut hits);
     } else {
         match model.screen {
@@ -389,6 +392,12 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
     if model.help_open {
         render_help(model, theme, frame, body);
         hits.clear();
+    } else if model.shells_open {
+        render_shells_overlay(model, theme, frame, body, &mut hits);
+    } else if model.ssh_open {
+        render_ssh_overlay(model, theme, frame, body, &mut hits);
+    } else if model.monitors_open {
+        render_monitors_overlay(model, theme, frame, body, &mut hits);
     }
     if status_height > 0 {
         render_status_bar(model, theme, frame, status, &mut hits);
@@ -10975,6 +10984,319 @@ fn render_help(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
     );
 }
 
+/// Floating terminal-registry details. This reuses the existing body overlay
+/// layer and status strip; it never allocates new top-level chrome.
+fn render_shells_overlay(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    hits.clear();
+    let mut close_offsets = Vec::new();
+    let mut lines = vec![Line::from(vec![
+        Span::styled("shells", theme.gold_style()),
+        Span::styled("  ↑↓ select · enter/close · esc", theme.faint_style()),
+    ])];
+    if model.shells.is_empty() {
+        lines.push(Line::styled("  no terminal sessions", theme.dim_style()));
+    } else {
+        for (index, shell) in model.shells.iter().enumerate() {
+            let marker = if index == model.shells_cursor {
+                "›"
+            } else {
+                " "
+            };
+            let kind = match &shell.kind {
+                haider_rpc::ShellKindWire::Local => "local".to_owned(),
+                haider_rpc::ShellKindWire::Ssh { profile } => format!("ssh:{profile}"),
+            };
+            let status = match &shell.status {
+                haider_rpc::ShellStatusWire::Starting => "starting".to_owned(),
+                haider_rpc::ShellStatusWire::Running => "running".to_owned(),
+                haider_rpc::ShellStatusWire::Exited { code } => {
+                    code.map_or_else(|| "exited".to_owned(), |code| format!("exit {code}"))
+                }
+                haider_rpc::ShellStatusWire::Closed => "closed".to_owned(),
+            };
+            let line = Line::from(vec![
+                Span::styled(format!("{marker} {kind} · {status} · "), theme.dim_style()),
+                Span::styled(shell.title.clone(), theme.text_style()),
+                Span::styled(format!(" · {}  ", shell.cwd_or_host), theme.dim_style()),
+                Span::styled("[close]", theme.maroon_style()),
+            ]);
+            close_offsets.push((
+                line.width().saturating_sub("[close]".len()),
+                shell.id.clone(),
+            ));
+            lines.push(line);
+        }
+    }
+    let height = u16::try_from(lines.len() + 1).unwrap_or(area.height);
+    let [_, panel] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(height.min(area.height)),
+    ])
+    .areas(area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).style(theme.text_style().bg(theme.bar_bg.into())),
+        panel,
+    );
+    for (index, (offset, shell_id)) in close_offsets.into_iter().enumerate() {
+        let y = panel
+            .y
+            .saturating_add(1 + u16::try_from(index).unwrap_or(u16::MAX));
+        let Ok(offset) = u16::try_from(offset) else {
+            continue;
+        };
+        let x = panel.x.saturating_add(offset);
+        let panel_end = panel.x.saturating_add(panel.width);
+        if y < panel.y.saturating_add(panel.height) && x < panel_end {
+            hits.push((
+                Rect::new(x, y, 7_u16.min(panel_end.saturating_sub(x)), 1),
+                Hit::ShellClose(shell_id),
+            ));
+        }
+    }
+}
+
+/// Saved profile list in the existing body-overlay layer. Only public target
+/// metadata is available here; authentication details cannot reach the TUI.
+fn render_ssh_overlay(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    hits.clear();
+    if let Some(form) = model.ssh_form.as_ref() {
+        render_ssh_form(form, theme, frame, area);
+        return;
+    }
+    let mut lines = vec![Line::from(vec![
+        Span::styled("ssh profiles", theme.gold_style()),
+        Span::styled(
+            "  ↑↓ select · enter shell · a add · e edit · t test · d,d remove · esc",
+            theme.faint_style(),
+        ),
+    ])];
+    if model.ssh_profiles.is_empty() {
+        lines.push(Line::styled("  no SSH profiles", theme.dim_style()));
+    } else {
+        for (index, profile) in model.ssh_profiles.iter().enumerate() {
+            let marker = if index == model.ssh_cursor {
+                "›"
+            } else {
+                " "
+            };
+            let description = profile.description.as_deref().unwrap_or("no description");
+            let last_used = profile
+                .last_used_ms
+                .map_or_else(|| "never".to_owned(), |used| used.to_string());
+            lines.push(Line::from(vec![
+                Span::styled(format!("{marker} {} · ", profile.name), theme.dim_style()),
+                Span::styled(
+                    format!("{}@{}:{}", profile.user, profile.host, profile.port),
+                    theme.text_style(),
+                ),
+                Span::styled(
+                    format!(
+                        " · {} · {description} · last {last_used} · multiplexing",
+                        if profile.in_scope {
+                            "in scope"
+                        } else {
+                            "out of scope"
+                        }
+                    ),
+                    theme.faint_style(),
+                ),
+            ]));
+        }
+    }
+    if let Some(profile) = model.ssh_remove_armed.as_deref() {
+        lines.push(Line::styled(
+            format!("  remove {profile}? press d again to confirm"),
+            Style::default().fg(theme.err.into()),
+        ));
+    }
+    let height = u16::try_from(lines.len() + 1).unwrap_or(area.height);
+    let [_, panel] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(height.min(area.height)),
+    ])
+    .areas(area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).style(theme.text_style().bg(theme.bar_bg.into())),
+        panel,
+    );
+}
+
+fn render_ssh_form(
+    form: &crate::app::SshProfileForm,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+) {
+    let marker = |index| if form.focus == index { "›" } else { " " };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            if form.original.is_some() {
+                "edit SSH profile"
+            } else {
+                "add SSH profile"
+            },
+            theme.gold_style(),
+        ),
+        Span::styled(
+            "  tab fields · ←→ auth · ⌃S save · esc",
+            theme.faint_style(),
+        ),
+    ])];
+    let fields = [
+        ("name", form.name.clone()),
+        ("description", form.description.clone()),
+        ("host", form.host.clone()),
+        ("user", form.user.clone()),
+        ("port", form.port.clone()),
+        ("auth", form.auth_label().to_owned()),
+        ("key path / secret", form.credential_display()),
+        ("cwd", form.cwd.clone()),
+    ];
+    for (index, (label, value)) in fields.into_iter().enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} {label:17} ", marker(index)), theme.dim_style()),
+            Span::styled(value, theme.text_style()),
+        ]));
+    }
+    lines.push(Line::styled(
+        "  key files stay outside the vault; pasted keys/passwords match API-key FileVault protection (Windows inherits the profile ACL); no Haider encryption",
+        theme.faint_style(),
+    ));
+    if let Some(error) = &form.error {
+        lines.push(Line::styled(
+            format!("  {error}"),
+            Style::default().fg(theme.err.into()),
+        ));
+    }
+    let height = u16::try_from(lines.len() + 1).unwrap_or(area.height);
+    let [_, panel] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(height.min(area.height)),
+    ])
+    .areas(area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).style(theme.text_style().bg(theme.bar_bg.into())),
+        panel,
+    );
+}
+
+fn render_ssh_terminal(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
+    let Some(terminal) = model.ssh_terminal.as_ref() else {
+        return;
+    };
+    let title = Line::from(vec![
+        Span::styled(format!("ssh {}", terminal.profile), theme.gold_style()),
+        Span::styled("  interactive PTY · ⌃] close", theme.faint_style()),
+    ]);
+    let body = sanitize_terminal_text(&terminal.display_text());
+    let [title_area, body_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    frame.render_widget(
+        Paragraph::new(title).style(theme.text_style().bg(theme.ground.into())),
+        title_area,
+    );
+    let lines = body.lines().map(Line::raw).collect::<Vec<_>>();
+    let scroll = u16::try_from(lines.len().saturating_sub(usize::from(body_area.height)))
+        .unwrap_or(u16::MAX);
+    let paragraph = Paragraph::new(Text::from(lines))
+        .style(theme.text_style().bg(theme.ground.into()))
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+    frame.render_widget(paragraph, body_area);
+}
+
+fn sanitize_terminal_text(input: &str) -> String {
+    enum Escape {
+        Ground,
+        Esc,
+        Csi,
+        Osc,
+    }
+    let mut state = Escape::Ground;
+    let mut output = String::with_capacity(input.len());
+    for character in input.chars() {
+        match state {
+            Escape::Ground => match character {
+                '\u{1b}' => state = Escape::Esc,
+                '\r' => {}
+                '\n' | '\t' => output.push(character),
+                value if !value.is_control() => output.push(value),
+                _ => {}
+            },
+            Escape::Esc => match character {
+                '[' => state = Escape::Csi,
+                ']' => state = Escape::Osc,
+                _ => state = Escape::Ground,
+            },
+            Escape::Csi => {
+                if ('@'..='~').contains(&character) {
+                    state = Escape::Ground;
+                }
+            }
+            Escape::Osc => {
+                if character == '\u{7}' {
+                    state = Escape::Ground;
+                } else if character == '\u{1b}' {
+                    state = Escape::Esc;
+                }
+            }
+        }
+    }
+    output
+}
+
+/// Read-only details for the existing monitor primitive. This is deliberately
+/// separate from the terminal registry and reuses the same body-overlay layer.
+fn render_monitors_overlay(
+    model: &AppModel,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    hits.clear();
+    let mut lines = vec![Line::from(vec![
+        Span::styled("monitors", theme.gold_style()),
+        Span::styled("  existing monitor details · esc", theme.faint_style()),
+    ])];
+    if model.monitors.is_empty() {
+        lines.push(Line::styled("  no active monitors", theme.dim_style()));
+    } else {
+        for monitor in &model.monitors {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} · ", monitor.monitor_id), theme.dim_style()),
+                Span::styled(format!("{:?}", monitor.source), theme.text_style()),
+                Span::styled(
+                    format!(" · created {}", monitor.created_at_ms),
+                    theme.faint_style(),
+                ),
+            ]));
+        }
+    }
+    let height = u16::try_from(lines.len() + 1).unwrap_or(area.height);
+    let [_, panel] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(height.min(area.height)),
+    ])
+    .areas(area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).style(theme.text_style().bg(theme.bar_bg.into())),
+        panel,
+    );
+}
+
 /// One text run of the status bar's bottom-left strip: the content and
 /// the tone the renderer styles it with. The TEXT is the shared truth
 /// (`status_segment_v1`); the tone is display-only.
@@ -10986,6 +11308,13 @@ pub struct StatusSegment {
     /// the one clients should render instead of parsing display text.
     pub state: Option<String>,
     pub detail: Option<String>,
+    action: Option<StatusSegmentAction>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusSegmentAction {
+    Shells,
+    Monitors,
 }
 
 /// The strip's style vocabulary — resolved to real styles only inside
@@ -11063,24 +11392,28 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
             tone: StatusSegmentTone::Text,
             state: None,
             detail: None,
+            action: None,
         },
         StatusSegment {
             text: "[ ".to_owned(),
             tone: StatusSegmentTone::BadgeChrome,
             state: None,
             detail: None,
+            action: None,
         },
         StatusSegment {
             text: badge.clone(),
             tone: StatusSegmentTone::Badge,
             state: Some(state),
             detail,
+            action: None,
         },
         StatusSegment {
             text: " ]".to_owned(),
             tone: StatusSegmentTone::BadgeChrome,
             state: None,
             detail: None,
+            action: None,
         },
     ];
     if let Some(progress) = model.provider_wait_progress()
@@ -11092,6 +11425,7 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
             tone: StatusSegmentTone::Dim,
             state: None,
             detail: None,
+            action: None,
         });
     }
     let meter_shown = badge_cells + 2 + meter.chars().count() <= width as usize;
@@ -11101,6 +11435,7 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
             tone: StatusSegmentTone::Dim,
             state: None,
             detail: None,
+            action: None,
         });
     }
     if meter_shown && !model.cache_usage.is_empty() {
@@ -11121,6 +11456,7 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
                 tone: StatusSegmentTone::Dim,
                 state: None,
                 detail: None,
+                action: None,
             });
         } else if medium.chars().count() + 2 <= available {
             segments.push(StatusSegment {
@@ -11128,6 +11464,7 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
                 tone: StatusSegmentTone::Dim,
                 state: None,
                 detail: None,
+                action: None,
             });
         }
     }
@@ -11147,6 +11484,42 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
             tone: StatusSegmentTone::Text,
             state: None,
             detail: None,
+            action: None,
+        });
+    }
+    let shell_count = model
+        .shells
+        .iter()
+        .filter(|shell| {
+            matches!(
+                &shell.status,
+                haider_rpc::ShellStatusWire::Starting | haider_rpc::ShellStatusWire::Running
+            )
+        })
+        .count();
+    if shell_count > 0 {
+        segments.push(StatusSegment {
+            text: format!(
+                "· {shell_count} shell{}  ",
+                if shell_count == 1 { "" } else { "s" }
+            ),
+            tone: StatusSegmentTone::Dim,
+            state: None,
+            detail: None,
+            action: Some(StatusSegmentAction::Shells),
+        });
+    }
+    if model.monitor_count > 0 {
+        segments.push(StatusSegment {
+            text: format!(
+                "· {} monitor{}  ",
+                model.monitor_count,
+                if model.monitor_count == 1 { "" } else { "s" }
+            ),
+            tone: StatusSegmentTone::Dim,
+            state: None,
+            detail: None,
+            action: Some(StatusSegmentAction::Monitors),
         });
     }
     // The voice/dictation chip moved to the TOP-RIGHT header (see
@@ -11166,18 +11539,21 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
             tone: StatusSegmentTone::HookChrome,
             state: None,
             detail: None,
+            action: None,
         });
         segments.push(StatusSegment {
             text: "⚙ hook·decided".to_owned(),
             tone: StatusSegmentTone::Hook,
             state: None,
             detail: None,
+            action: None,
         });
         segments.push(StatusSegment {
             text: " ]".to_owned(),
             tone: StatusSegmentTone::HookChrome,
             state: None,
             detail: None,
+            action: None,
         });
     }
     segments
@@ -11255,8 +11631,9 @@ fn render_status_bar(
     } else {
         (badge_chrome, theme.badge_style(tone))
     };
-    let left: Vec<Span<'_>> = status_left_segments(model, area.width)
-        .into_iter()
+    let left_segments = status_left_segments(model, area.width);
+    let left: Vec<Span<'_>> = left_segments
+        .iter()
         .map(|segment| {
             let style = match segment.tone {
                 StatusSegmentTone::Text => theme.text_style(),
@@ -11266,7 +11643,7 @@ fn render_status_bar(
                 StatusSegmentTone::HookChrome => theme.frame_style(),
                 StatusSegmentTone::Hook => theme.gold_style(),
             };
-            Span::styled(segment.text, style)
+            Span::styled(segment.text.clone(), style)
         })
         .collect();
 
@@ -11297,6 +11674,26 @@ fn render_status_bar(
     let right_width = u16::try_from(right.chars().count()).unwrap_or(0);
     let [left_area, right_area] =
         Layout::horizontal([Constraint::Min(1), Constraint::Length(right_width)]).areas(area);
+    let mut segment_x = left_area.x;
+    let left_end = left_area.x.saturating_add(left_area.width);
+    for segment in &left_segments {
+        let width = u16::try_from(segment.text.chars().count()).unwrap_or(u16::MAX);
+        let visible_width = width.min(left_end.saturating_sub(segment_x));
+        if visible_width > 0 {
+            let hit = match segment.action {
+                Some(StatusSegmentAction::Shells) => Some(Hit::ShellStatus),
+                Some(StatusSegmentAction::Monitors) => Some(Hit::MonitorStatus),
+                None => None,
+            };
+            if let Some(hit) = hit {
+                hits.push((Rect::new(segment_x, area.y, visible_width, 1), hit));
+            }
+        }
+        segment_x = segment_x.saturating_add(width);
+        if segment_x >= left_end {
+            break;
+        }
+    }
     // Sim StatusBar (tui.js:5492-5499): TRANSPARENT ground (its frame
     // border-top has no row budget here; the dim ink carries the bar) —
     // the owner's "tan band" was our former bar_bg tint. No tinted rows
@@ -11906,6 +12303,11 @@ fn item_lines<'a>(
         } => {
             // Sim ToolRow (tui.js:3901-3908): glyph (ok / warn-running /
             // err) · MAROON name · dim ellipsized desc from the args.
+            let remote_profile = if name == "ssh_shell" || name == "process_exec" {
+                args.get("profile").and_then(serde_json::Value::as_str)
+            } else {
+                None
+            };
             let mut spans = vec![
                 Span::raw("  "),
                 Span::styled(
@@ -11925,7 +12327,13 @@ fn item_lines<'a>(
                         haider_protocol::item::ToolStatus::Completed => theme.ok_style(),
                     },
                 ),
-                Span::styled(name.as_str(), theme.maroon_style()),
+                Span::styled(
+                    remote_profile.map_or_else(
+                        || name.clone(),
+                        |profile| format!("↗ remote · {profile} · {name}"),
+                    ),
+                    theme.maroon_style(),
+                ),
             ];
             let desc = tool_desc(args);
             let meta = tool_meta(args, *status);

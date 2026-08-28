@@ -904,6 +904,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
             },
             store: parent_lease,
             run_id: parent_run.clone(),
+            run_deadline: None,
             branch_id: None,
             device_id: DeviceId::new("message-idle-tool-device"),
             event_ids: Arc::new(EventIdGenerator::new("message-idle-tool-event")),

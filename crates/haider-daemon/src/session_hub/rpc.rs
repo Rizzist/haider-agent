@@ -2018,17 +2018,23 @@ async fn effect_probe_observation(
             "durable delegation probe found {} child record(s)",
             delegation_count.unwrap_or(0)
         ),
-        EffectClass::ProcessExec
-        | EffectClass::GitOp
-        | EffectClass::CredentialAccess
-        | EffectClass::GuiAct
-        | EffectClass::ScreenObserve
-        | EffectClass::ScreenControl
-        | EffectClass::MobileObserve
-        | EffectClass::MobileControl
-        | EffectClass::ReadSms => {
-            "inconclusive — no safe automatic probe exists for this effect class".into()
+        // Keep this catch-all future-safe: lane A is adding another effect
+        // class on the integration branch. Every remaining class is unsafe
+        // to probe automatically, including local/remote execution.
+        _ => "inconclusive — no safe automatic probe exists for this effect class".into(),
+    }
+}
+
+fn ssh_timeout(timeout_s: Option<u32>) -> Result<Option<Duration>, crate::ssh::SshError> {
+    match timeout_s {
+        Some(seconds) if (1..=86_400).contains(&seconds) => {
+            Ok(Some(Duration::from_secs(u64::from(seconds))))
         }
+        Some(_) => Err(crate::ssh::SshError::SshProfileInvalid {
+            field: "timeout_s",
+            message: "must be between 1 and 86400".into(),
+        }),
+        None => Ok(None),
     }
 }
 
@@ -2251,6 +2257,7 @@ impl HubConnection {
                 permission_overrides,
                 cache_policy,
                 interaction_mode,
+                ssh_scope,
             } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
                     return self.respond_error(
@@ -2271,6 +2278,7 @@ impl HubConnection {
                     permission_overrides,
                     cache_policy.unwrap_or_default(),
                     interaction_mode,
+                    ssh_scope,
                 )
                 .await
             }
@@ -2300,6 +2308,7 @@ impl HubConnection {
                     None,
                     Default::default(),
                     haider_protocol::session::SessionInteractionModeV1::Interactive,
+                    None,
                 )
                 .await
             }
@@ -4644,7 +4653,11 @@ impl HubConnection {
                 )
                 .await
             }
+<<<<<<< HEAD
             RequestBody::PeerList {} => {
+=======
+            RequestBody::SshList { session_id } => {
+>>>>>>> wave-965-c
                 if let Err(message) = authorize(&self.capabilities, Operation::View) {
                     return self.respond_error(
                         request_id,
@@ -4654,6 +4667,7 @@ impl HubConnection {
                         None,
                     );
                 }
+<<<<<<< HEAD
                 self.hub.enable_peer_events(&self.connection_id)?;
                 match self.hub.peer_service()?.list().await {
                     Ok(agents) => self.send(WireFrame::Response {
@@ -4667,6 +4681,255 @@ impl HubConnection {
                 to,
                 message,
                 summary,
+=======
+                let Some(ssh) = self.hub.ssh()? else {
+                    return self.respond_error(
+                        request_id,
+                        haider_rpc::ERROR_CODE_VAULT_UNSUPPORTED,
+                        "SSH profile secret storage is unavailable",
+                        false,
+                        None,
+                    );
+                };
+                let scope = match session_id {
+                    Some(session_id) => {
+                        if self.hub.session_metadata(&session_id).await?.is_none() {
+                            return self.respond_error(
+                                request_id,
+                                ERROR_CODE_NOT_FOUND,
+                                "session was not found",
+                                false,
+                                None,
+                            );
+                        }
+                        self.hub.ssh_scope(&session_id)?
+                    }
+                    None => crate::ssh::SshScope::All,
+                };
+                match ssh.store.list() {
+                    Ok(profiles) => self.send(WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::SshList {
+                            profiles: profiles
+                                .into_iter()
+                                .map(|profile| {
+                                    let in_scope = scope.allows(&profile.name);
+                                    profile.public_with_scope(in_scope)
+                                })
+                                .collect(),
+                        },
+                    }),
+                    Err(error) => self.respond_ssh_error(request_id, error),
+                }
+            }
+            RequestBody::SshAdd { profile } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                let Some(ssh) = self.hub.ssh()? else {
+                    return self.respond_error(
+                        request_id,
+                        haider_rpc::ERROR_CODE_VAULT_UNSUPPORTED,
+                        "SSH profile secret storage is unavailable",
+                        false,
+                        None,
+                    );
+                };
+                let Some(auth) =
+                    self.ssh_auth_from_wire(&request_id, &ssh.store, &profile.name, profile.auth)?
+                else {
+                    return Ok(());
+                };
+                let stored = crate::ssh::SshProfile {
+                    name: profile.name,
+                    description: profile.description,
+                    ssh: crate::ssh::SshTarget {
+                        host: profile.host,
+                        port: profile.port,
+                        user: profile.user,
+                        auth,
+                        default_cwd: profile.default_cwd,
+                        host_key: None,
+                    },
+                    last_used_ms: None,
+                };
+                match ssh.store.add(stored.clone()) {
+                    Ok(profile) => self.send(WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::SshAdd {
+                            profile: profile.public(),
+                        },
+                    }),
+                    Err(error) => {
+                        ssh.store.discard_auth_secret(&stored.ssh.auth);
+                        self.respond_ssh_error(request_id, error)
+                    }
+                }
+            }
+            RequestBody::SshUpdate { name, mut changes } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                let Some(ssh) = self.hub.ssh()? else {
+                    return self.respond_error(
+                        request_id,
+                        haider_rpc::ERROR_CODE_VAULT_UNSUPPORTED,
+                        "SSH profile secret storage is unavailable",
+                        false,
+                        None,
+                    );
+                };
+                let auth = match changes.auth.take() {
+                    Some(auth) => {
+                        let Some(auth) =
+                            self.ssh_auth_from_wire(&request_id, &ssh.store, &name, auth)?
+                        else {
+                            return Ok(());
+                        };
+                        Some(auth)
+                    }
+                    None => None,
+                };
+                match ssh.store.update_non_secret(&name, changes, auth.clone()) {
+                    Ok(profile) => {
+                        ssh.runtime.forget(&name).await;
+                        self.send(WireFrame::Response {
+                            request_id,
+                            body: ResponseBody::SshUpdate {
+                                profile: profile.public(),
+                            },
+                        })
+                    }
+                    Err(error) => {
+                        if let Some(auth) = &auth {
+                            ssh.store.discard_auth_secret(auth);
+                        }
+                        self.respond_ssh_error(request_id, error)
+                    }
+                }
+            }
+            RequestBody::SshRemove { name } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                let Some(ssh) = self.hub.ssh()? else {
+                    return self.respond_error(
+                        request_id,
+                        haider_rpc::ERROR_CODE_VAULT_UNSUPPORTED,
+                        "SSH profile secret storage is unavailable",
+                        false,
+                        None,
+                    );
+                };
+                match ssh.store.remove(&name) {
+                    Ok(()) => {
+                        ssh.runtime.forget(&name).await;
+                        self.send(WireFrame::Response {
+                            request_id,
+                            body: ResponseBody::SshRemove { removed: name },
+                        })
+                    }
+                    Err(error) => self.respond_ssh_error(request_id, error),
+                }
+            }
+            RequestBody::SshTest { name, timeout_s } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                let Some(ssh) = self.hub.ssh()? else {
+                    return self.respond_error(
+                        request_id,
+                        haider_rpc::ERROR_CODE_VAULT_UNSUPPORTED,
+                        "SSH profile secret storage is unavailable",
+                        false,
+                        None,
+                    );
+                };
+                let timeout = match ssh_timeout(timeout_s) {
+                    Ok(timeout) => timeout,
+                    Err(error) => return self.respond_ssh_error(request_id, error),
+                };
+                match ssh.runtime.test(&name, timeout).await {
+                    Ok(host_key_pinned) => match ssh.store.get(&name) {
+                        Ok(profile) => self.send(WireFrame::Response {
+                            request_id,
+                            body: ResponseBody::SshTest {
+                                result: haider_rpc::SshTestResultWire {
+                                    profile: profile.public(),
+                                    connected: true,
+                                    host_key_pinned,
+                                },
+                            },
+                        }),
+                        Err(error) => self.respond_ssh_error(request_id, error),
+                    },
+                    Err(error) => self.respond_ssh_error(request_id, error),
+                }
+            }
+            RequestBody::SessionSetSshScope { session_id, scope } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if self.hub.session_metadata(&session_id).await?.is_none() {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_NOT_FOUND,
+                        "session was not found",
+                        false,
+                        None,
+                    );
+                }
+                match crate::ssh::SshScope::from_wire(scope) {
+                    Ok(scope) => {
+                        let public = scope.to_wire();
+                        self.hub.set_ssh_scope(session_id.clone(), scope)?;
+                        self.send(WireFrame::Response {
+                            request_id,
+                            body: ResponseBody::SessionSetSshScope {
+                                session_id,
+                                scope: public,
+                            },
+                        })
+                    }
+                    Err(error) => self.respond_ssh_error(request_id, error),
+                }
+            }
+            RequestBody::SshShell {
+                name,
+                command,
+                cwd,
+                timeout_s,
+>>>>>>> wave-965-c
             } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
                     return self.respond_error(
@@ -4677,16 +4940,25 @@ impl HubConnection {
                         None,
                     );
                 }
+<<<<<<< HEAD
                 let sessions = self.hub.peer_control_sessions(&self.connection_id)?;
                 let [session_id] = sessions.as_slice() else {
                     return self.respond_error(
                         request_id,
                         ERROR_CODE_PEER_INVALID,
                         "peer.send requires exactly one control-attached sender session",
+=======
+                let Some(ssh) = self.hub.ssh()? else {
+                    return self.respond_error(
+                        request_id,
+                        haider_rpc::ERROR_CODE_VAULT_UNSUPPORTED,
+                        "SSH profile secret storage is unavailable",
+>>>>>>> wave-965-c
                         false,
                         None,
                     );
                 };
+<<<<<<< HEAD
                 self.hub.enable_peer_events(&self.connection_id)?;
                 match self
                     .hub
@@ -4699,6 +4971,292 @@ impl HubConnection {
                         body: ResponseBody::PeerSend { receipt },
                     }),
                     Err(error) => self.respond_peer_error(request_id, error),
+=======
+                let profile = match ssh.store.get(&name) {
+                    Ok(profile) => profile,
+                    Err(error) => return self.respond_ssh_error(request_id, error),
+                };
+                let timeout = match ssh_timeout(timeout_s) {
+                    Ok(timeout) => timeout,
+                    Err(error) => return self.respond_ssh_error(request_id, error),
+                };
+                let shell = self
+                    .hub
+                    .shell_registry()
+                    .open(
+                        haider_rpc::ShellKindWire::Ssh {
+                            profile: name.clone(),
+                        },
+                        format!("ssh {name}"),
+                        profile.ssh.host,
+                    )
+                    .map_err(|error| SessionHubError::Task(error.to_string()))?;
+                shell
+                    .running()
+                    .map_err(|error| SessionHubError::Task(error.to_string()))?;
+                let result = ssh
+                    .runtime
+                    .exec(crate::ssh::SshExecRequest {
+                        profile: name,
+                        command,
+                        cwd,
+                        timeout,
+                        close: Some(shell.close_receiver()),
+                        output: None,
+                    })
+                    .await;
+                match result {
+                    Ok(result) => {
+                        shell
+                            .add_output(result.stdout.len().saturating_add(result.stderr.len()))
+                            .map_err(|error| SessionHubError::Task(error.to_string()))?;
+                        shell
+                            .exited(result.exit_code)
+                            .map_err(|error| SessionHubError::Task(error.to_string()))?;
+                        self.send(WireFrame::Response {
+                            request_id,
+                            body: ResponseBody::SshShell { result },
+                        })
+                    }
+                    Err(error) => {
+                        shell.exited(None).map_err(|registry_error| {
+                            SessionHubError::Task(registry_error.to_string())
+                        })?;
+                        self.respond_ssh_error(request_id, error)
+                    }
+                }
+            }
+            RequestBody::SshShellOpen {
+                name,
+                session_id,
+                term,
+                size,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                let Some(ssh) = self.hub.ssh()? else {
+                    return self.respond_error(
+                        request_id,
+                        haider_rpc::ERROR_CODE_VAULT_UNSUPPORTED,
+                        "SSH profile secret storage is unavailable",
+                        false,
+                        None,
+                    );
+                };
+                if let Some(session_id) = session_id {
+                    if self.hub.session_metadata(&session_id).await?.is_none() {
+                        return self.respond_error(
+                            request_id,
+                            ERROR_CODE_NOT_FOUND,
+                            "session was not found",
+                            false,
+                            None,
+                        );
+                    }
+                    let scope = self.hub.ssh_scope(&session_id)?;
+                    if let Err(error) = crate::ssh::enforce_scope(&scope, &session_id, &name) {
+                        return self.respond_ssh_error(request_id, error);
+                    }
+                }
+                let profile = match ssh.store.get(&name) {
+                    Ok(profile) => profile,
+                    Err(error) => return self.respond_ssh_error(request_id, error),
+                };
+                let (shell, controls) = self
+                    .hub
+                    .shell_registry()
+                    .open_interactive(
+                        haider_rpc::ShellKindWire::Ssh {
+                            profile: name.clone(),
+                        },
+                        format!("ssh {name}"),
+                        profile.ssh.host,
+                        Some(self.connection_id.clone()),
+                    )
+                    .map_err(|error| SessionHubError::Task(error.to_string()))?;
+                let (activate, activation) = tokio::sync::oneshot::channel();
+                match ssh
+                    .runtime
+                    .start_pty(crate::ssh::SshPtyRequest {
+                        profile: name,
+                        term,
+                        size,
+                        shell,
+                        controls,
+                        activation: Some(activation),
+                    })
+                    .await
+                {
+                    Ok(shell) => {
+                        self.send(WireFrame::Response {
+                            request_id,
+                            body: ResponseBody::SshShellOpen { shell },
+                        })?;
+                        let _ = activate.send(());
+                        Ok(())
+                    }
+                    Err(error) => self.respond_ssh_error(request_id, error),
+                }
+            }
+            RequestBody::SshShellInput { id, data_b64 } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                let bytes = match base64::engine::general_purpose::STANDARD
+                    .decode(data_b64.expose_secret())
+                {
+                    Ok(bytes)
+                        if !bytes.is_empty()
+                            && bytes.len() <= haider_rpc::SSH_PTY_INPUT_MAX_BYTES =>
+                    {
+                        zeroize::Zeroizing::new(bytes)
+                    }
+                    Ok(_) => {
+                        return self.respond_error(
+                            request_id,
+                            ERROR_CODE_INVALID_ARGUMENT,
+                            "SSH terminal input must decode to 1..=65536 bytes",
+                            false,
+                            None,
+                        );
+                    }
+                    Err(_) => {
+                        return self.respond_error(
+                            request_id,
+                            ERROR_CODE_INVALID_ARGUMENT,
+                            "SSH terminal input is not padded standard base64",
+                            false,
+                            None,
+                        );
+                    }
+                };
+                match self.hub.shell_registry().control(
+                    &id,
+                    Some(&self.connection_id),
+                    crate::shell_registry::ShellControl::Input(bytes),
+                ) {
+                    Ok(shell) => self.send(WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::SshShellInput { shell },
+                    }),
+                    Err(error) => self.respond_shell_control_error(request_id, error),
+                }
+            }
+            RequestBody::SshShellResize { id, size } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if size.cols == 0 || size.rows == 0 {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_INVALID_ARGUMENT,
+                        "SSH terminal rows and columns must be greater than zero",
+                        false,
+                        None,
+                    );
+                }
+                match self.hub.shell_registry().control(
+                    &id,
+                    Some(&self.connection_id),
+                    crate::shell_registry::ShellControl::Resize(size),
+                ) {
+                    Ok(shell) => self.send(WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::SshShellResize { shell },
+                    }),
+                    Err(error) => self.respond_shell_control_error(request_id, error),
+                }
+            }
+            RequestBody::SshShellEof { id } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                match self.hub.shell_registry().control(
+                    &id,
+                    Some(&self.connection_id),
+                    crate::shell_registry::ShellControl::Eof,
+                ) {
+                    Ok(shell) => self.send(WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::SshShellEof { shell },
+                    }),
+                    Err(error) => self.respond_shell_control_error(request_id, error),
+                }
+            }
+            RequestBody::ShellList => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                let shells = self
+                    .hub
+                    .shell_registry()
+                    .list()
+                    .map_err(|error| SessionHubError::Task(error.to_string()))?;
+                self.send(WireFrame::Response {
+                    request_id,
+                    body: ResponseBody::ShellList { shells },
+                })
+            }
+            RequestBody::ShellClose { id } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                match self
+                    .hub
+                    .shell_registry()
+                    .close_control(&id, Some(&self.connection_id))
+                {
+                    Ok(shell) => self.send(WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::ShellClose { shell },
+                    }),
+                    Err(crate::shell_registry::ShellRegistryError::NotFound(_)) => self
+                        .respond_error(
+                            request_id,
+                            ERROR_CODE_NOT_FOUND,
+                            format!("shell `{id}` was not found"),
+                            false,
+                            None,
+                        ),
+                    Err(error) => self.respond_shell_control_error(request_id, error),
+>>>>>>> wave-965-c
                 }
             }
             // `Unknown` and any future method decode alike: a typed,
@@ -12134,6 +12692,7 @@ impl HubConnection {
         permission_overrides: Option<haider_protocol::session::SessionPermissionOverridesV1>,
         cache_policy: haider_protocol::cache::CachePolicySettingsV1,
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
+        ssh_scope: Option<haider_rpc::SshScopeWire>,
     ) -> Result<(), SessionHubError> {
         if command_id.as_str().is_empty() {
             return self.respond_error(
@@ -12150,6 +12709,19 @@ impl HubConnection {
             "model": &model,
             "max_tokens": max_tokens,
         });
+        let ssh_scope = match ssh_scope {
+            Some(scope) => match crate::ssh::SshScope::from_wire(scope) {
+                Ok(scope) => scope,
+                Err(error) => return self.respond_ssh_error(request_id, error),
+            },
+            None => crate::ssh::SshScope::All,
+        };
+        if !matches!(&ssh_scope, crate::ssh::SshScope::All) {
+            request_coordinates["ssh_scope"] =
+                serde_json::to_value(ssh_scope.to_wire()).map_err(|error| {
+                    SessionHubError::Task(format!("cannot encode session SSH scope: {error}"))
+                })?;
+        }
         if let Some(overrides) = permission_overrides {
             request_coordinates["permission_overrides"] =
                 serde_json::to_value(overrides).map_err(|error| {
@@ -12185,7 +12757,11 @@ impl HubConnection {
             .session_create_receipt(&command_id, &request_digest, &request_json)
             .await
         {
-            Ok(Some(created)) => return self.respond_created(request_id, created),
+            Ok(Some(created)) => {
+                self.hub
+                    .set_ssh_scope(created.session_id.clone(), ssh_scope)?;
+                return self.respond_created(request_id, created);
+            }
             Ok(None) => {}
             Err(SessionHubError::Store(error)) => {
                 return self.respond_error(
@@ -12294,11 +12870,12 @@ impl HubConnection {
                 );
             }
         };
+        let session_id = SessionId::new(random_id("session")?);
         let command = SessionCreateCommand {
             command_id: command_id.0,
             request_digest,
             request_json,
-            session_id: SessionId::new(random_id("session")?),
+            session_id: session_id.clone(),
             cwd: workspace.canonical,
             provider,
             model,
@@ -12314,6 +12891,11 @@ impl HubConnection {
         // Keep the opened directory descriptor alive until the transaction
         // returns. M3 transfers the same canonical identity into its broker.
         let _descriptor = workspace.descriptor;
+        // Scope must be durable before the session can become observable. A
+        // vault failure therefore leaves no committed session that defaults
+        // open to `All`. A concurrent idempotent creator stages the same
+        // requested scope under its winning session id before its commit.
+        self.hub.set_ssh_scope(session_id, ssh_scope.clone())?;
         match self
             .hub
             .create_session_with_interaction_mode(command, interaction_mode)
@@ -12321,6 +12903,8 @@ impl HubConnection {
         {
             Ok(SessionCreateOutcome::Committed { created, .. })
             | Ok(SessionCreateOutcome::IdempotentReplay { created }) => {
+                self.hub
+                    .set_ssh_scope(created.session_id.clone(), ssh_scope)?;
                 self.respond_created(request_id, created)
             }
             Err(SessionHubError::Store(error)) => self.respond_error(
@@ -14148,6 +14732,172 @@ impl HubConnection {
                 data,
             },
         })
+    }
+
+    fn respond_ssh_error(
+        &self,
+        request_id: RequestId,
+        error: crate::ssh::SshError,
+    ) -> Result<(), SessionHubError> {
+        let retryable = matches!(
+            &error,
+            crate::ssh::SshError::SshConnection { .. }
+                | crate::ssh::SshError::SshChannelQuota { .. }
+                | crate::ssh::SshError::Vault { .. }
+        );
+        self.respond_error(
+            request_id,
+            error.code(),
+            &error.to_string(),
+            retryable,
+            None,
+        )
+    }
+
+    fn respond_shell_control_error(
+        &self,
+        request_id: RequestId,
+        error: crate::shell_registry::ShellRegistryError,
+    ) -> Result<(), SessionHubError> {
+        let retryable = matches!(
+            &error,
+            crate::shell_registry::ShellRegistryError::ControlBusy(_)
+        );
+        let code = match &error {
+            crate::shell_registry::ShellRegistryError::NotFound(_) => ERROR_CODE_NOT_FOUND,
+            crate::shell_registry::ShellRegistryError::NotInteractive(_) => {
+                ERROR_CODE_INVALID_ARGUMENT
+            }
+            crate::shell_registry::ShellRegistryError::ControlDenied(_) => {
+                ERROR_CODE_CAPABILITY_DENIED
+            }
+            crate::shell_registry::ShellRegistryError::ControlBusy(_) => ERROR_CODE_OVERLOADED,
+            crate::shell_registry::ShellRegistryError::ControlClosed(_) => "ssh_channel_closed",
+            crate::shell_registry::ShellRegistryError::Poisoned
+            | crate::shell_registry::ShellRegistryError::IdGeneration(_) => {
+                return Err(SessionHubError::Task(error.to_string()));
+            }
+        };
+        self.respond_error(request_id, code, &error.to_string(), retryable, None)
+    }
+
+    fn ssh_auth_from_wire(
+        &self,
+        request_id: &RequestId,
+        store: &crate::ssh::SshProfileStore,
+        name: &str,
+        auth: haider_rpc::SshAuthInputWire,
+    ) -> Result<Option<crate::ssh::SshAuth>, SessionHubError> {
+        match auth {
+            haider_rpc::SshAuthInputWire::KeyFile {
+                path,
+                passphrase_vault_reference: None,
+            } => Ok(Some(crate::ssh::SshAuth::KeyFile {
+                path,
+                passphrase_vault_ref: None,
+            })),
+            haider_rpc::SshAuthInputWire::KeyFile {
+                path,
+                passphrase_vault_reference: Some(vault_reference),
+            } => self
+                .claim_ssh_secret_reference(
+                    request_id,
+                    store,
+                    name,
+                    vault_reference,
+                    haider_rpc::StagePurpose::SshPassword,
+                )
+                .map(|reference| {
+                    reference.map(|passphrase_vault_ref| crate::ssh::SshAuth::KeyFile {
+                        path,
+                        passphrase_vault_ref: Some(passphrase_vault_ref),
+                    })
+                }),
+            haider_rpc::SshAuthInputWire::Agent => Ok(Some(crate::ssh::SshAuth::Agent)),
+            haider_rpc::SshAuthInputWire::KeyMaterial { vault_reference } => self.claim_ssh_secret(
+                request_id,
+                store,
+                name,
+                vault_reference,
+                haider_rpc::StagePurpose::SshKeyMaterial,
+                true,
+            ),
+            haider_rpc::SshAuthInputWire::Password { vault_reference } => self.claim_ssh_secret(
+                request_id,
+                store,
+                name,
+                vault_reference,
+                haider_rpc::StagePurpose::SshPassword,
+                false,
+            ),
+        }
+    }
+
+    fn claim_ssh_secret(
+        &self,
+        request_id: &RequestId,
+        store: &crate::ssh::SshProfileStore,
+        name: &str,
+        vault_reference: String,
+        expected_purpose: haider_rpc::StagePurpose,
+        key_material: bool,
+    ) -> Result<Option<crate::ssh::SshAuth>, SessionHubError> {
+        let reference = self.claim_ssh_secret_reference(
+            request_id,
+            store,
+            name,
+            vault_reference,
+            expected_purpose,
+        )?;
+        Ok(reference.map(|vault_ref| {
+            if key_material {
+                crate::ssh::SshAuth::KeyMaterial { vault_ref }
+            } else {
+                crate::ssh::SshAuth::Password { vault_ref }
+            }
+        }))
+    }
+
+    fn claim_ssh_secret_reference(
+        &self,
+        request_id: &RequestId,
+        store: &crate::ssh::SshProfileStore,
+        name: &str,
+        vault_reference: String,
+        expected_purpose: haider_rpc::StagePurpose,
+    ) -> Result<Option<String>, SessionHubError> {
+        if self.secret_surface_facade(request_id)?.is_none() {
+            return Ok(None);
+        }
+        let claimed = lock(&self.stages)?.claim(&vault_reference);
+        let Some((purpose, secret)) = claimed else {
+            self.respond_error(
+                request_id.clone(),
+                ERROR_CODE_RESTAGE_REQUIRED,
+                "SSH credential stage is unknown, expired, or already consumed",
+                false,
+                None,
+            )?;
+            return Ok(None);
+        };
+        if purpose != expected_purpose {
+            self.respond_error(
+                request_id.clone(),
+                ERROR_CODE_INVALID_ARGUMENT,
+                "staged secret purpose does not match the SSH authentication method",
+                false,
+                None,
+            )?;
+            return Ok(None);
+        }
+        let vault_ref = match store.put_auth_secret(name, &secret) {
+            Ok(vault_ref) => vault_ref,
+            Err(error) => {
+                self.respond_ssh_error(request_id.clone(), error)?;
+                return Ok(None);
+            }
+        };
+        Ok(Some(vault_ref))
     }
 
     fn respond_loom_revision_conflict(

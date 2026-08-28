@@ -100,6 +100,7 @@ use crate::DaemonError;
 use crate::worker::WorkerManagerHandle;
 use actor::run_session_actor;
 use async_trait::async_trait;
+use base64::Engine as _;
 use descendant_stream::run_descendant_stream;
 use haider_core::{
     AbandonedGraph, AcceptedRunRetry, AcceptedShellExec, AcceptedTurn, AppendGroupBatch,
@@ -880,6 +881,13 @@ struct HubInner {
     peer_handoff_count: AtomicU64,
     loom_author_provider: Mutex<Option<Arc<dyn crate::worker::ProviderFactory>>>,
     accounts: Mutex<Option<crate::accounts::AccountsFacade>>,
+    /// Installed beside the profile-scoped, owner-only secret vault. SSH sessions are
+    /// process-local and shared by every Haider session in this profile.
+    ssh: Mutex<Option<crate::ssh::SshService>>,
+    /// Session launch/interactive scope. Absence means the v1 default: All.
+    ssh_scopes: Mutex<HashMap<SessionId, crate::ssh::SshScope>>,
+    /// One registry for all daemon-owned terminal channels.
+    shells: crate::shell_registry::ShellRegistry,
     creatable_providers: Mutex<Option<std::collections::BTreeSet<String>>>,
     hooks: Arc<Mutex<Option<crate::hooks::WeakHookService>>>,
     /// One post-commit fan-out shared by every session actor. The journal is
@@ -1573,6 +1581,7 @@ impl Drop for ConnectionIdentityLease {
     fn drop(&mut self) {
         self.loom_author_cancel.send_replace(true);
         self.hub.clear_resident_binding(&self.connection_id);
+        let _ = self.hub.inner.shells.close_owner(&self.connection_id);
         let Ok(attachments) = self
             .hub
             .detach_connection_registrations(&self.connection_id)
@@ -1785,6 +1794,9 @@ impl SessionHub {
             peer_handoff_count: AtomicU64::new(0),
             loom_author_provider: Mutex::new(None),
             accounts: Mutex::new(None),
+            ssh: Mutex::new(None),
+            ssh_scopes: Mutex::new(HashMap::new()),
+            shells: crate::shell_registry::ShellRegistry::default(),
             creatable_providers: Mutex::new(None),
             hooks,
             commit_projection,
@@ -1799,10 +1811,108 @@ impl SessionHub {
             prompt_history: PromptHistoryCache::default(),
         });
         let hub = Self { inner };
+        hub.spawn_shell_registry_events()?;
         hub.spawn_profile_fault_watcher();
         hub.spawn_usage_history_reconciler()?;
         hub.spawn_typed_install_resume()?;
         Ok(hub)
+    }
+
+    fn spawn_shell_registry_events(&self) -> Result<(), SessionHubError> {
+        let mut events = self.inner.shells.subscribe();
+        let weak = Arc::downgrade(&self.inner);
+        lock(&self.inner.actor_tasks)?.push(tokio::spawn(async move {
+            loop {
+                let event = match events.recv().await {
+                    Ok(event) => event,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let Some(inner) = weak.upgrade() else {
+                            break;
+                        };
+                        let connections = match inner.diagnostic_sinks.lock() {
+                            Ok(sinks) => sinks
+                                .iter()
+                                .map(|(owner, sink)| (owner.clone(), Arc::clone(sink)))
+                                .collect::<Vec<_>>(),
+                            Err(_) => break,
+                        };
+                        // Terminal bytes are ordered protocol data, never
+                        // best-effort diagnostics. If the bounded registry
+                        // fanout overruns, close every affected transport and
+                        // PTY instead of continuing with a corrupt terminal.
+                        for (owner, sink) in connections {
+                            sink.close_after_required_delivery_failure();
+                            let _ = inner.shells.close_owner(&owner);
+                        }
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
+                let Some(inner) = weak.upgrade() else {
+                    break;
+                };
+                let (frame, delivery_required) = match event {
+                    crate::shell_registry::ShellRegistryEvent::Opened(shell) => {
+                        (WireFrame::ShellOpened { shell }, false)
+                    }
+                    crate::shell_registry::ShellRegistryEvent::State(shell) => {
+                        let delivery_required = matches!(
+                            &shell.status,
+                            haider_rpc::ShellStatusWire::Exited { .. }
+                                | haider_rpc::ShellStatusWire::Closed
+                        );
+                        (WireFrame::ShellState { shell }, delivery_required)
+                    }
+                    crate::shell_registry::ShellRegistryEvent::Closed(shell) => {
+                        (WireFrame::ShellClosed { shell }, true)
+                    }
+                    crate::shell_registry::ShellRegistryEvent::Output {
+                        owner,
+                        id,
+                        stream,
+                        bytes,
+                    } => {
+                        let frame = WireFrame::ShellOutput {
+                            id,
+                            stream,
+                            chunk_b64: haider_rpc::TerminalOutputWire::new(
+                                base64::engine::general_purpose::STANDARD.encode(bytes.as_slice()),
+                            ),
+                        };
+                        let sinks = match inner.diagnostic_sinks.lock() {
+                            Ok(sinks) => match owner.as_deref() {
+                                Some(owner) => {
+                                    sinks.get(owner).cloned().into_iter().collect::<Vec<_>>()
+                                }
+                                None => sinks.values().cloned().collect::<Vec<_>>(),
+                            },
+                            Err(_) => break,
+                        };
+                        let mut refused = false;
+                        for sink in sinks {
+                            if sink.try_send_droppable(frame.clone()).is_err() {
+                                sink.close_after_required_delivery_failure();
+                                refused = true;
+                            }
+                        }
+                        if refused && let Some(owner) = owner {
+                            let _ = inner.shells.close_owner(&owner);
+                        }
+                        continue;
+                    }
+                };
+                let sinks = match inner.diagnostic_sinks.lock() {
+                    Ok(sinks) => sinks.values().cloned().collect::<Vec<_>>(),
+                    Err(_) => break,
+                };
+                for sink in sinks {
+                    if sink.try_send_droppable(frame.clone()).is_err() && delivery_required {
+                        sink.close_after_required_delivery_failure();
+                    }
+                }
+            }
+        }));
+        Ok(())
     }
 
     fn spawn_typed_install_resume(&self) -> Result<(), SessionHubError> {
@@ -2113,8 +2223,62 @@ impl SessionHub {
                 "account facade is already installed".into(),
             ));
         }
+        if let Some(vault) = facade.vault.clone() {
+            *lock(&self.inner.ssh)? = Some(crate::ssh::SshService::new(vault));
+        }
         *installed = Some(facade);
         Ok(())
+    }
+
+    pub(crate) fn ssh(&self) -> Result<Option<crate::ssh::SshService>, SessionHubError> {
+        Ok(lock(&self.inner.ssh)?.clone())
+    }
+
+    pub(crate) fn ssh_scope(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<crate::ssh::SshScope, SessionHubError> {
+        // Hold the cache lock through the durable read. This is deliberately
+        // synchronous: otherwise a concurrent narrowing can be overwritten by
+        // a cache-miss reader that loaded the older `All` value.
+        let mut scopes = lock(&self.inner.ssh_scopes)?;
+        if let Some(scope) = scopes.get(session_id).cloned() {
+            return Ok(scope);
+        }
+        let scope = lock(&self.inner.ssh)?
+            .as_ref()
+            .map_or_else(
+                || Ok(crate::ssh::SshScope::All),
+                |ssh| ssh.store.session_scope(session_id),
+            )
+            .map_err(|error| SessionHubError::Task(error.to_string()))?;
+        scopes.insert(session_id.clone(), scope.clone());
+        Ok(scope)
+    }
+
+    pub(crate) fn set_ssh_scope(
+        &self,
+        session_id: SessionId,
+        scope: crate::ssh::SshScope,
+    ) -> Result<(), SessionHubError> {
+        // Serialize persistence and cache publication with cache misses. A
+        // caller can therefore never observe `All` after narrowing started.
+        let mut scopes = lock(&self.inner.ssh_scopes)?;
+        if let Some(ssh) = lock(&self.inner.ssh)?.as_ref() {
+            ssh.store
+                .set_session_scope(&session_id, &scope)
+                .map_err(|error| SessionHubError::Task(error.to_string()))?;
+        } else if !matches!(scope, crate::ssh::SshScope::All) {
+            return Err(SessionHubError::Task(
+                "SSH scope secret storage is unavailable".into(),
+            ));
+        }
+        scopes.insert(session_id, scope);
+        Ok(())
+    }
+
+    pub(crate) fn shell_registry(&self) -> &crate::shell_registry::ShellRegistry {
+        &self.inner.shells
     }
 
     pub(crate) fn accounts(
@@ -5315,6 +5479,10 @@ impl SessionHub {
 
     async fn detach_connection(&self, connection_id: &str) -> Result<(), SessionHubError> {
         let attachments = self.detach_connection_registrations(connection_id)?;
+        self.inner
+            .shells
+            .close_owner(connection_id)
+            .map_err(|error| SessionHubError::Task(error.to_string()))?;
         for (attachment_id, owner) in attachments {
             Self::finish_detach(&attachment_id, owner).await;
         }

@@ -386,6 +386,7 @@
       "response": {"method":"checkpoint.rollback_turn","receipt":{"checkpoint":{"checkpoint_id":"checkpoint-rollback-1","session_id":"session-1","run_id":"checkpoint-command:command-checkpoint-rollback","effect_id":"checkpoint-effect:command-checkpoint-rollback","call_id":"command-checkpoint-rollback","seq":60,"workspace_revision":"workspace-revision-4","kind":"edit","origin":"rollback_turn","paths":[{"path":"src/lib.rs","pre_artifact":"blake3:1111111111111111111111111111111111111111111111111111111111111111","pre_digest":"blake3:1111111111111111111111111111111111111111111111111111111111111111","post_digest":"blake3:0000000000000000000000000000000000000000000000000000000000000000"}],"post_digest":"blake3:5555555555555555555555555555555555555555555555555555555555555555","recorded_at_ms":1720000003000},"restored_checkpoint_ids":["checkpoint-1"],"worker_generation":7}}
     },
     {
+<<<<<<< HEAD
       "request_method": "peer.list",
       "response_method": "peer.list",
       "request": {"method":"peer.list"},
@@ -396,6 +397,84 @@
       "response_method": "peer.send",
       "request": {"method":"peer.send","to":"workspace-a1b2c3","message":"Please inspect the failing boundary.","summary":"debug boundary"},
       "response": {"method":"peer.send","receipt":{"msg_id":"msg-peer-1","delivery":"queued"}}
+=======
+      "request_method": "ssh.list",
+      "response_method": "ssh.list",
+      "request": {"method":"ssh.list","session_id":"session-1"},
+      "response": {"method":"ssh.list","profiles":[{"name":"prod","description":"Production console","host":"prod.example.invalid","port":22,"user":"deploy","default_cwd":"/srv/app","last_used_ms":1720000004000,"multiplexing":true,"in_scope":true}]}
+    },
+    {
+      "request_method": "ssh.add",
+      "response_method": "ssh.add",
+      "request": {"method":"ssh.add","profile":{"name":"prod","description":"Production console","host":"prod.example.invalid","port":22,"user":"deploy","auth":{"kind":"key_material","vault_reference":"staged-ssh-key-1"},"default_cwd":"/srv/app"}},
+      "response": {"method":"ssh.add","profile":{"name":"prod","description":"Production console","host":"prod.example.invalid","port":22,"user":"deploy","default_cwd":"/srv/app","multiplexing":true,"in_scope":true}}
+    },
+    {
+      "request_method": "ssh.update",
+      "response_method": "ssh.update",
+      "request": {"method":"ssh.update","name":"prod","changes":{"description":"Primary production console","port":2222}},
+      "response": {"method":"ssh.update","profile":{"name":"prod","description":"Primary production console","host":"prod.example.invalid","port":2222,"user":"deploy","default_cwd":"/srv/app","multiplexing":true,"in_scope":true}}
+    },
+    {
+      "request_method": "ssh.remove",
+      "response_method": "ssh.remove",
+      "request": {"method":"ssh.remove","name":"prod"},
+      "response": {"method":"ssh.remove","removed":"prod"}
+    },
+    {
+      "request_method": "ssh.test",
+      "response_method": "ssh.test",
+      "request": {"method":"ssh.test","name":"prod","timeout_s":15},
+      "response": {"method":"ssh.test","result":{"profile":{"name":"prod","description":"Production console","host":"prod.example.invalid","port":22,"user":"deploy","default_cwd":"/srv/app","host_key":{"algorithm":"ssh-ed25519","fingerprint":"SHA256:golden-fingerprint","pinned_at_ms":1720000005000},"last_used_ms":1720000005001,"multiplexing":true,"in_scope":true},"connected":true,"host_key_pinned":true}}
+    },
+    {
+      "request_method": "session.set_ssh_scope",
+      "response_method": "session.set_ssh_scope",
+      "request": {"method":"session.set_ssh_scope","session_id":"session-1","scope":{"kind":"allow","names":["prod"]}},
+      "response": {"method":"session.set_ssh_scope","session_id":"session-1","scope":{"kind":"allow","names":["prod"]}}
+    },
+    {
+      "request_method": "ssh.shell",
+      "response_method": "ssh.shell",
+      "request": {"method":"ssh.shell","name":"prod","command":"uname -a","cwd":"/srv/app","timeout_s":30},
+      "response": {"method":"ssh.shell","result":{"profile":"prod","stdout":"Linux prod\\n","stderr":"","exit_code":0,"timed_out":false}}
+    },
+    {
+      "request_method": "ssh.shell_open",
+      "response_method": "ssh.shell_open",
+      "request": {"method":"ssh.shell_open","name":"prod","session_id":"session-1","term":"xterm-256color","size":{"cols":120,"rows":40,"pixel_width":960,"pixel_height":800}},
+      "response": {"method":"ssh.shell_open","shell":{"id":"sh-pty-0123456789","kind":{"kind":"ssh","profile":"prod"},"status":{"status":"running"},"title":"prod","cwd_or_host":"prod.example.invalid","created_at_ms":1720000006000,"last_activity_ms":1720000006001,"bytes_out":0}}
+    },
+    {
+      "request_method": "ssh.shell_input",
+      "response_method": "ssh.shell_input",
+      "request": {"method":"ssh.shell_input","id":"sh-pty-0123456789","data_b64":"d2hvYW1pXG4="},
+      "response": {"method":"ssh.shell_input","shell":{"id":"sh-pty-0123456789","kind":{"kind":"ssh","profile":"prod"},"status":{"status":"running"},"title":"prod","cwd_or_host":"prod.example.invalid","created_at_ms":1720000006000,"last_activity_ms":1720000006001,"bytes_out":0}}
+    },
+    {
+      "request_method": "ssh.shell_resize",
+      "response_method": "ssh.shell_resize",
+      "request": {"method":"ssh.shell_resize","id":"sh-pty-0123456789","size":{"cols":132,"rows":43,"pixel_width":1056,"pixel_height":860}},
+      "response": {"method":"ssh.shell_resize","shell":{"id":"sh-pty-0123456789","kind":{"kind":"ssh","profile":"prod"},"status":{"status":"running"},"title":"prod","cwd_or_host":"prod.example.invalid","created_at_ms":1720000006000,"last_activity_ms":1720000006001,"bytes_out":0}}
+    },
+    {
+      "request_method": "ssh.shell_eof",
+      "response_method": "ssh.shell_eof",
+      "request": {"method":"ssh.shell_eof","id":"sh-pty-0123456789"},
+      "response": {"method":"ssh.shell_eof","shell":{"id":"sh-pty-0123456789","kind":{"kind":"ssh","profile":"prod"},"status":{"status":"running"},"title":"prod","cwd_or_host":"prod.example.invalid","created_at_ms":1720000006000,"last_activity_ms":1720000006001,"bytes_out":0}}
+    },
+    {
+      "request_method": "shell.list",
+      "response_method": "shell.list",
+      "request": {"method":"shell.list"},
+      "response": {"method":"shell.list","shells":[{"id":"sh-0123456789abcdef0123","kind":{"kind":"ssh","profile":"prod"},"status":{"status":"running"},"title":"prod: uname -a","cwd_or_host":"prod.example.invalid","created_at_ms":1720000006000,"last_activity_ms":1720000006001,"bytes_out":11}]}
+    },
+    {
+      "request_method": "shell.close",
+      "response_method": "shell.close",
+      "request": {"method":"shell.close","id":"sh-0123456789abcdef0123"},
+      "response": {"method":"shell.close","shell":{"id":"sh-0123456789abcdef0123","kind":{"kind":"ssh","profile":"prod"},"status":{"status":"closed"},"title":"prod: uname -a","cwd_or_host":"prod.example.invalid","created_at_ms":1720000006000,"last_activity_ms":1720000007000,"bytes_out":11}}
+>>>>>>> wave-965-c
     }
   ]
 }

@@ -589,9 +589,22 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "session.select_effort",
         "session.select_fast",
         "session.select_model",
+        "session.set_ssh_scope",
         "session.surface_publish",
         "session.surface_watch",
+        "shell.close",
         "shell.exec",
+        "shell.list",
+        "ssh.add",
+        "ssh.list",
+        "ssh.remove",
+        "ssh.shell",
+        "ssh.shell_eof",
+        "ssh.shell_input",
+        "ssh.shell_open",
+        "ssh.shell_resize",
+        "ssh.test",
+        "ssh.update",
         "tools.inventory",
         "transcription.secret_get",
         "transcription.secret_set",
@@ -614,8 +627,13 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         expected_methods.len(),
+<<<<<<< HEAD
         106,
         "the v1 contract covers the 104 v0.0.964 methods plus peer.list and peer.send"
+=======
+        117,
+        "the v1 contract covers the prior 104 methods plus 13 SSH/shell-registry methods"
+>>>>>>> wave-965-c
     );
     assert_eq!(
         request_methods_declared_in_source(),
@@ -682,6 +700,107 @@ fn every_request_method_has_a_golden_request_and_success_response() {
     }
 
     assert_eq!(covered, expected_methods);
+}
+
+/// MUTATION CHECK: rename a shell event kind, split SSH shells into another
+/// event family, or omit a lifecycle field. Expected runtime failure: the
+/// exact additive event goldens below change.
+#[test]
+fn shell_registry_events_are_additive_and_golden() {
+    let base = haider_rpc::ShellWire {
+        id: "sh-0123456789abcdef0123".into(),
+        kind: haider_rpc::ShellKindWire::Ssh {
+            profile: "prod".into(),
+        },
+        status: haider_rpc::ShellStatusWire::Starting,
+        title: "prod: tests".into(),
+        cwd_or_host: "prod.example.invalid".into(),
+        created_at_ms: 10,
+        last_activity_ms: 11,
+        bytes_out: 12,
+    };
+    let frames = [
+        WireFrame::ShellOpened {
+            shell: base.clone(),
+        },
+        WireFrame::ShellState {
+            shell: haider_rpc::ShellWire {
+                status: haider_rpc::ShellStatusWire::Running,
+                ..base.clone()
+            },
+        },
+        WireFrame::ShellClosed {
+            shell: haider_rpc::ShellWire {
+                status: haider_rpc::ShellStatusWire::Closed,
+                ..base.clone()
+            },
+        },
+        WireFrame::ShellOutput {
+            id: base.id,
+            stream: haider_rpc::ShellOutputStreamWire::Stdout,
+            chunk_b64: haider_rpc::TerminalOutputWire::new("c2VjcmV0LWZyZWUtb3V0cHV0"),
+        },
+    ];
+    assert_eq!(
+        frames
+            .into_iter()
+            .map(|frame| serde_json::to_value(frame).expect("encode shell event"))
+            .collect::<Vec<_>>(),
+        [
+            serde_json::json!({"v":1,"kind":"shell.opened","shell":{"id":"sh-0123456789abcdef0123","kind":{"kind":"ssh","profile":"prod"},"status":{"status":"starting"},"title":"prod: tests","cwd_or_host":"prod.example.invalid","created_at_ms":10,"last_activity_ms":11,"bytes_out":12}}),
+            serde_json::json!({"v":1,"kind":"shell.state","shell":{"id":"sh-0123456789abcdef0123","kind":{"kind":"ssh","profile":"prod"},"status":{"status":"running"},"title":"prod: tests","cwd_or_host":"prod.example.invalid","created_at_ms":10,"last_activity_ms":11,"bytes_out":12}}),
+            serde_json::json!({"v":1,"kind":"shell.closed","shell":{"id":"sh-0123456789abcdef0123","kind":{"kind":"ssh","profile":"prod"},"status":{"status":"closed"},"title":"prod: tests","cwd_or_host":"prod.example.invalid","created_at_ms":10,"last_activity_ms":11,"bytes_out":12}}),
+            serde_json::json!({"v":1,"kind":"shell.output","id":"sh-0123456789abcdef0123","stream":"stdout","chunk_b64":"c2VjcmV0LWZyZWUtb3V0cHV0"}),
+        ]
+    );
+}
+
+/// Stage references are bearer capabilities and must remain absent from every
+/// diagnostic representation even though the request wire carries them to the
+/// daemon once.
+#[test]
+fn ssh_auth_debug_redacts_all_staged_capabilities() {
+    let sentinel = "stage-capability-never-debug";
+    for auth in [
+        haider_rpc::SshAuthInputWire::Password {
+            vault_reference: sentinel.into(),
+        },
+        haider_rpc::SshAuthInputWire::KeyMaterial {
+            vault_reference: sentinel.into(),
+        },
+        haider_rpc::SshAuthInputWire::KeyFile {
+            path: "/public/key/path".into(),
+            passphrase_vault_reference: Some(sentinel.into()),
+        },
+    ] {
+        assert!(!format!("{auth:?}").contains(sentinel));
+    }
+}
+
+#[test]
+fn ssh_terminal_input_debug_is_redacted_through_request_and_frame() {
+    let sentinel = "c3NoLXRlcm1pbmFsLXNlY3JldC1zZW50aW5lbA==";
+    let request = RequestBody::SshShellInput {
+        id: "sh-pty-redaction".into(),
+        data_b64: haider_rpc::SecretWire::new(sentinel),
+    };
+    assert!(!format!("{request:?}").contains(sentinel));
+    let frame = WireFrame::Request {
+        request_id: haider_rpc::RequestId::new("request-pty-redaction"),
+        body: request,
+    };
+    assert!(!format!("{frame:?}").contains(sentinel));
+}
+
+#[test]
+fn ssh_terminal_output_debug_is_redacted_through_frame() {
+    let sentinel = "c2Vuc2l0aXZlLXJlbW90ZS1vdXRwdXQ=";
+    let frame = WireFrame::ShellOutput {
+        id: "sh-pty-output-redaction".into(),
+        stream: haider_rpc::ShellOutputStreamWire::Stdout,
+        chunk_b64: haider_rpc::TerminalOutputWire::new(sentinel),
+    };
+    assert!(!format!("{frame:?}").contains(sentinel));
 }
 
 /// MUTATION CHECK: make archived inventory or a current conflict coordinate
@@ -1415,6 +1534,7 @@ fn legacy_session_create_defaults_permission_overrides_to_none() {
                 permission_overrides: None,
                 cache_policy: None,
                 interaction_mode: haider_protocol::session::SessionInteractionModeV1::Interactive,
+                ssh_scope: None,
             },
         }
     );

@@ -6749,6 +6749,7 @@ async fn session_create_permission_overrides_are_digest_bound_and_persisted() {
         permission_overrides: overrides,
         cache_policy: None,
         interaction_mode: haider_protocol::session::SessionInteractionModeV1::Interactive,
+        ssh_scope: None,
     };
 
     send_request(

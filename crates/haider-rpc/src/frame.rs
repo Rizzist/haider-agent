@@ -31,6 +31,10 @@ fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
 
+const fn default_true() -> bool {
+    true
+}
+
 fn is_default<T: Default + PartialEq>(value: &T) -> bool {
     value == &T::default()
 }
@@ -327,6 +331,11 @@ pub const FEATURE_MODELS_LIST_V1: &str = "models_list_v1";
 pub const FEATURE_ACCOUNT_ROTATION_V1: &str = "account_rotation_v1";
 /// Daemon implements receipt-backed direct user shell execution.
 pub const FEATURE_SHELL_EXEC_V1: &str = "shell_exec_v1";
+/// Daemon implements profile-scoped SSH profile management, session scope,
+/// and remote shell execution without exposing stored authentication data.
+pub const FEATURE_SSH_PROFILES_V1: &str = "ssh_profiles_v1";
+/// Daemon exposes one registry for local and SSH-backed terminal lifecycles.
+pub const FEATURE_SHELL_REGISTRY_V1: &str = "shell_registry_v1";
 /// Daemon commits direct shell provenance/output into later model context and
 /// returns an immediate synthetic-run cancellation coordinate.
 pub const FEATURE_USER_COMMAND_V1: &str = "user_command_v1";
@@ -779,12 +788,13 @@ pub struct Welcome {
     pub encoding: Option<String>,
 }
 
-/// A raw secret in transit on the sensitive same-UID UDS staging path (R7).
+/// Sensitive bytes in transit on authenticated, owner-scoped local IPC (R7).
 ///
 /// This type exists ONLY in the transport crate — domain `haider-protocol`
-/// stays secret-free — and only inside [`RequestBody::VaultStage`], which the
-/// daemon serves exclusively on an authenticated same-UID local UDS
-/// connection. Laws:
+/// stays secret-free. It is used by [`RequestBody::VaultStage`] and by opaque
+/// interactive-terminal input, both served exclusively on authenticated local
+/// transport (same-UID UDS on Unix and the owner-scoped equivalent elsewhere).
+/// Laws:
 ///
 /// - `Debug` is unconditionally redacted; ordinary frame formatting can
 ///   never reveal the value (test-pinned).
@@ -821,6 +831,42 @@ impl std::fmt::Debug for SecretWire {
 }
 
 impl Drop for SecretWire {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.0.zeroize();
+    }
+}
+
+/// Base64-encoded interactive terminal output that may echo sensitive input.
+///
+/// It remains serializable for transport and renderable by the opening
+/// terminal, but ordinary frame diagnostics redact it and the allocation is
+/// wiped on drop.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TerminalOutputWire(String);
+
+impl TerminalOutputWire {
+    /// Wraps base64-encoded bytes for transient terminal delivery.
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Borrows the base64 text at the terminal-render boundary.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for TerminalOutputWire {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TerminalOutputWire([REDACTED])")
+    }
+}
+
+impl Drop for TerminalOutputWire {
     fn drop(&mut self) {
         use zeroize::Zeroize;
         self.0.zeroize();
@@ -1287,10 +1333,230 @@ pub enum StagePurpose {
     ApiKey,
     /// A provider-requested menu secret (`MenuInput::SecretVaultReference`).
     MenuSecret,
+    /// Private-key material headed for an SSH profile. The staged bytes are
+    /// consumed once and persisted only in the profile vault.
+    SshKeyMaterial,
+    /// A password headed for an SSH profile. The staged bytes are consumed
+    /// once and persisted only in the profile vault.
+    SshPassword,
     /// Decode artifact for a purpose this crate does not know (tolerance
     /// discipline).
     #[serde(other)]
     Unknown,
+}
+
+/// Which saved SSH profiles one session may expose to its model tools.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SshScopeWire {
+    #[default]
+    All,
+    Allow {
+        names: Vec<String>,
+    },
+    None,
+}
+
+impl SshScopeWire {
+    #[must_use]
+    pub fn is_all(&self) -> bool {
+        matches!(self, Self::All)
+    }
+}
+
+/// Authentication input for add/update. Secret-bearing variants carry only a
+/// connection-scoped, single-use `vault.stage` reference.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SshAuthInputWire {
+    KeyFile {
+        path: String,
+        /// Optional single-use staged reference for an encrypted key file's
+        /// passphrase. Never a durable vault alias on the wire.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        passphrase_vault_reference: Option<String>,
+    },
+    KeyMaterial {
+        vault_reference: String,
+    },
+    Agent,
+    Password {
+        vault_reference: String,
+    },
+}
+
+impl std::fmt::Debug for SshAuthInputWire {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::KeyFile {
+                path,
+                passphrase_vault_reference,
+            } => formatter
+                .debug_struct("KeyFile")
+                .field("path", path)
+                .field(
+                    "passphrase_vault_reference",
+                    &passphrase_vault_reference.as_ref().map(|_| "<redacted>"),
+                )
+                .finish(),
+            Self::KeyMaterial { .. } => formatter
+                .debug_struct("KeyMaterial")
+                .field("vault_reference", &"<redacted>")
+                .finish(),
+            Self::Agent => formatter.write_str("Agent"),
+            Self::Password { .. } => formatter
+                .debug_struct("Password")
+                .field("vault_reference", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinnedHostKeyWire {
+    pub algorithm: String,
+    pub fingerprint: String,
+    pub pinned_at_ms: u64,
+}
+
+/// Complete non-secret SSH profile input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshProfileInputWire {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub host: String,
+    #[serde(default = "default_ssh_port")]
+    pub port: u16,
+    pub user: String,
+    pub auth: SshAuthInputWire,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_cwd: Option<String>,
+}
+
+/// Partial edit input. `description: Some(None)` clears the description;
+/// omission leaves it unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshProfileUpdateWire {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<SshAuthInputWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_cwd: Option<Option<String>>,
+}
+
+/// Public profile projection. It is intentionally unable to serialize auth
+/// paths, vault aliases/references, passwords, or private-key bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshProfileWire {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_key: Option<PinnedHostKeyWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_ms: Option<u64>,
+    pub multiplexing: bool,
+    /// Whether the queried session may use this profile. Administrative
+    /// unscoped reads and legacy payloads default to true.
+    #[serde(default = "default_true")]
+    pub in_scope: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshTestResultWire {
+    pub profile: SshProfileWire,
+    pub connected: bool,
+    pub host_key_pinned: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshShellResultWire {
+    pub profile: String,
+    pub stdout: String,
+    pub stderr: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stdout_truncated: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stderr_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+}
+
+/// Terminal dimensions carried by the interactive SSH control path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshPtySizeWire {
+    pub cols: u32,
+    pub rows: u32,
+    #[serde(default)]
+    pub pixel_width: u32,
+    #[serde(default)]
+    pub pixel_height: u32,
+}
+
+/// Maximum decoded bytes carried by one interactive-terminal input request.
+/// Clients split larger paste events into requests no larger than this bound.
+pub const SSH_PTY_INPUT_MAX_BYTES: usize = 64 * 1024;
+
+/// Stream identity for transient terminal output. Interactive input is never
+/// reflected through this type or retained by the shell registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellOutputStreamWire {
+    Stdout,
+    Stderr,
+}
+
+/// Execution backend for one daemon-tracked shell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ShellKindWire {
+    Local,
+    Ssh { profile: String },
+}
+
+/// Lifecycle state for a local or remote shell. `Closed` is an explicit
+/// operator action; `Exited` is the command/channel's terminal result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ShellStatusWire {
+    Starting,
+    Running,
+    Exited {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<i32>,
+    },
+    Closed,
+}
+
+/// Public, secret-free projection of one entry in the unified shell registry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellWire {
+    pub id: String,
+    pub kind: ShellKindWire,
+    pub status: ShellStatusWire,
+    pub title: String,
+    pub cwd_or_host: String,
+    pub created_at_ms: u64,
+    pub last_activity_ms: u64,
+    pub bytes_out: u64,
+}
+
+const fn default_ssh_port() -> u16 {
+    22
 }
 
 /// Inclusive sequence range for a non-subscribing session read.
@@ -2639,6 +2905,10 @@ pub enum RequestBody {
             skip_serializing_if = "haider_protocol::session::SessionInteractionModeV1::is_interactive"
         )]
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
+        /// SSH profile visibility for the new session. Omission preserves the
+        /// v1 default (`all`) and the exact bytes of older clients.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssh_scope: Option<SshScopeWire>,
     },
     /// Atomically creates typed session configuration, a `Created` event, and
     /// the durable command receipt that makes response-loss retries safe.
@@ -3555,6 +3825,7 @@ pub enum RequestBody {
         worker_generation: u64,
         run_id: RunId,
     },
+<<<<<<< HEAD
     /// Lists every currently live Haider session and registered external peer.
     #[serde(rename = "peer.list")]
     PeerList {},
@@ -3567,6 +3838,71 @@ pub enum RequestBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
     },
+=======
+    /// Lists saved SSH profiles. When `session_id` is present, each
+    /// administrative row carries that session's `in_scope` decision. The
+    /// model-facing tool separately omits false rows.
+    #[serde(rename = "ssh.list")]
+    SshList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<SessionId>,
+    },
+    #[serde(rename = "ssh.add")]
+    SshAdd { profile: SshProfileInputWire },
+    #[serde(rename = "ssh.update")]
+    SshUpdate {
+        name: String,
+        changes: SshProfileUpdateWire,
+    },
+    #[serde(rename = "ssh.remove")]
+    SshRemove { name: String },
+    #[serde(rename = "ssh.test")]
+    SshTest {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_s: Option<u32>,
+    },
+    #[serde(rename = "session.set_ssh_scope")]
+    SessionSetSshScope {
+        session_id: SessionId,
+        scope: SshScopeWire,
+    },
+    /// Remote one-shot execution used by `haider ssh shell -- command`.
+    /// Model calls use the separately permission-brokered `ssh_shell` tool
+    /// and never this Control-only RPC directly.
+    #[serde(rename = "ssh.shell")]
+    SshShell {
+        name: String,
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_s: Option<u32>,
+    },
+    /// Opens one interactive PTY channel on the reusable profile session.
+    #[serde(rename = "ssh.shell_open")]
+    SshShellOpen {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<SessionId>,
+        term: String,
+        size: SshPtySizeWire,
+    },
+    /// Sends opaque terminal bytes. The daemon never logs or journals them.
+    #[serde(rename = "ssh.shell_input")]
+    SshShellInput { id: String, data_b64: SecretWire },
+    #[serde(rename = "ssh.shell_resize")]
+    SshShellResize { id: String, size: SshPtySizeWire },
+    #[serde(rename = "ssh.shell_eof")]
+    SshShellEof { id: String },
+    /// Reads the unified local/SSH terminal registry.
+    #[serde(rename = "shell.list")]
+    ShellList,
+    /// Idempotently closes one local process or SSH channel. Closing an SSH
+    /// shell deliberately leaves its reusable authenticated profile session.
+    #[serde(rename = "shell.close")]
+    ShellClose { id: String },
+>>>>>>> wave-965-c
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline). W3b answers it with a protocol error, not a panic.
     #[serde(other)]
@@ -4331,10 +4667,42 @@ pub enum ResponseBody {
     CheckpointRollbackTurn {
         receipt: haider_protocol::checkpoint::CheckpointMutationReceipt,
     },
+<<<<<<< HEAD
     #[serde(rename = "peer.list")]
     PeerList { agents: Vec<PeerDescriptor> },
     #[serde(rename = "peer.send")]
     PeerSend { receipt: PeerReceipt },
+=======
+    #[serde(rename = "ssh.list")]
+    SshList { profiles: Vec<SshProfileWire> },
+    #[serde(rename = "ssh.add")]
+    SshAdd { profile: SshProfileWire },
+    #[serde(rename = "ssh.update")]
+    SshUpdate { profile: SshProfileWire },
+    #[serde(rename = "ssh.remove")]
+    SshRemove { removed: String },
+    #[serde(rename = "ssh.test")]
+    SshTest { result: SshTestResultWire },
+    #[serde(rename = "session.set_ssh_scope")]
+    SessionSetSshScope {
+        session_id: SessionId,
+        scope: SshScopeWire,
+    },
+    #[serde(rename = "ssh.shell")]
+    SshShell { result: SshShellResultWire },
+    #[serde(rename = "ssh.shell_open")]
+    SshShellOpen { shell: ShellWire },
+    #[serde(rename = "ssh.shell_input")]
+    SshShellInput { shell: ShellWire },
+    #[serde(rename = "ssh.shell_resize")]
+    SshShellResize { shell: ShellWire },
+    #[serde(rename = "ssh.shell_eof")]
+    SshShellEof { shell: ShellWire },
+    #[serde(rename = "shell.list")]
+    ShellList { shells: Vec<ShellWire> },
+    #[serde(rename = "shell.close")]
+    ShellClose { shell: ShellWire },
+>>>>>>> wave-965-c
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline).
     #[serde(other)]
@@ -4827,10 +5195,26 @@ pub enum WireFrame {
         watch_id: String,
         high_water_cursor: u64,
     },
+<<<<<<< HEAD
     /// A peer message crossed the durable target-session turn boundary.
     PeerMessageReceived { message: PeerMessage },
     /// A sender-visible transition after the initial `peer.send` receipt.
     PeerDeliveryChanged { receipt: PeerReceipt },
+=======
+    /// A local or SSH-backed terminal entered the unified registry.
+    ShellOpened { shell: ShellWire },
+    /// A tracked terminal changed lifecycle state or counters.
+    ShellState { shell: ShellWire },
+    /// A terminal was explicitly closed and released its process/channel.
+    ShellClosed { shell: ShellWire },
+    /// Transient output for an interactive shell. It is delivered only to the
+    /// opening connection and is never stored in a registry row or journal.
+    ShellOutput {
+        id: String,
+        stream: ShellOutputStreamWire,
+        chunk_b64: TerminalOutputWire,
+    },
+>>>>>>> wave-965-c
     /// Decode artifact for a frame kind this crate does not know (tolerance
     /// discipline). Never constructed for sending.
     Unknown,
@@ -4940,11 +5324,31 @@ enum WireFrameRef<'a> {
         watch_id: &'a str,
         high_water_cursor: u64,
     },
+<<<<<<< HEAD
     PeerMessageReceived {
         message: &'a PeerMessage,
     },
     PeerDeliveryChanged {
         receipt: &'a PeerReceipt,
+=======
+    #[serde(rename = "shell.opened")]
+    ShellOpened {
+        shell: &'a ShellWire,
+    },
+    #[serde(rename = "shell.state")]
+    ShellState {
+        shell: &'a ShellWire,
+    },
+    #[serde(rename = "shell.closed")]
+    ShellClosed {
+        shell: &'a ShellWire,
+    },
+    #[serde(rename = "shell.output")]
+    ShellOutput {
+        id: &'a str,
+        stream: ShellOutputStreamWire,
+        chunk_b64: &'a TerminalOutputWire,
+>>>>>>> wave-965-c
     },
     Unknown,
 }
@@ -5057,11 +5461,31 @@ enum WireFrameOwned {
         watch_id: String,
         high_water_cursor: u64,
     },
+<<<<<<< HEAD
     PeerMessageReceived {
         message: PeerMessage,
     },
     PeerDeliveryChanged {
         receipt: PeerReceipt,
+=======
+    #[serde(rename = "shell.opened")]
+    ShellOpened {
+        shell: ShellWire,
+    },
+    #[serde(rename = "shell.state")]
+    ShellState {
+        shell: ShellWire,
+    },
+    #[serde(rename = "shell.closed")]
+    ShellClosed {
+        shell: ShellWire,
+    },
+    #[serde(rename = "shell.output")]
+    ShellOutput {
+        id: String,
+        stream: ShellOutputStreamWire,
+        chunk_b64: TerminalOutputWire,
+>>>>>>> wave-965-c
     },
     #[serde(other)]
     Unknown,
@@ -5246,8 +5670,23 @@ impl Serialize for WireFrame {
                 watch_id,
                 high_water_cursor: *high_water_cursor,
             },
+<<<<<<< HEAD
             Self::PeerMessageReceived { message } => WireFrameRef::PeerMessageReceived { message },
             Self::PeerDeliveryChanged { receipt } => WireFrameRef::PeerDeliveryChanged { receipt },
+=======
+            Self::ShellOpened { shell } => WireFrameRef::ShellOpened { shell },
+            Self::ShellState { shell } => WireFrameRef::ShellState { shell },
+            Self::ShellClosed { shell } => WireFrameRef::ShellClosed { shell },
+            Self::ShellOutput {
+                id,
+                stream,
+                chunk_b64,
+            } => WireFrameRef::ShellOutput {
+                id,
+                stream: *stream,
+                chunk_b64,
+            },
+>>>>>>> wave-965-c
             Self::Unknown => WireFrameRef::Unknown,
         };
         VersionedFrameRef {
@@ -5403,12 +5842,27 @@ impl<'de> Deserialize<'de> for WireFrame {
                 watch_id,
                 high_water_cursor,
             },
+<<<<<<< HEAD
             WireFrameOwned::PeerMessageReceived { message } => {
                 Self::PeerMessageReceived { message }
             }
             WireFrameOwned::PeerDeliveryChanged { receipt } => {
                 Self::PeerDeliveryChanged { receipt }
             }
+=======
+            WireFrameOwned::ShellOpened { shell } => Self::ShellOpened { shell },
+            WireFrameOwned::ShellState { shell } => Self::ShellState { shell },
+            WireFrameOwned::ShellClosed { shell } => Self::ShellClosed { shell },
+            WireFrameOwned::ShellOutput {
+                id,
+                stream,
+                chunk_b64,
+            } => Self::ShellOutput {
+                id,
+                stream,
+                chunk_b64,
+            },
+>>>>>>> wave-965-c
             WireFrameOwned::Unknown => Self::Unknown,
         })
     }

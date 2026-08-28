@@ -118,23 +118,43 @@ pub fn append_peer_message_to_provider_tail(messages: &mut Vec<Message>, message
 /// Shapes a tool result only at the provider boundary.
 ///
 /// The durable [`BoundedResult`] remains the authority and is never rewritten.
-/// Peer inventories can be large, so their first-send and replay views use the
-/// same deterministic output diet while the journal retains the raw JSON.
+/// Peer/SSH inventories and remote command results can be large, so their
+/// first-send and replay views use the same deterministic byte cap while the
+/// journal retains the raw JSON.
 pub(crate) fn model_tool_result_preview(tool_name: &str, result: &BoundedResult) -> (String, bool) {
-    const PEER_LIST_MODEL_PREVIEW_MAX_BYTES: usize = 8 * 1024;
-    const PEER_LIST_COMPACTION_MARKER: &str =
-        "\n[… peer list compacted for model; raw result retained in journal …]";
-    if tool_name != "peer_list" || result.preview.len() <= PEER_LIST_MODEL_PREVIEW_MAX_BYTES {
+    const INVENTORY_MODEL_PREVIEW_MAX_BYTES: usize = 8 * 1024;
+    let marker = match tool_name {
+        "peer_list" => "\n[… peer list compacted for model; raw result retained in journal …]",
+        "ssh_list" => {
+            "\n[… SSH profile list compacted for model; raw result retained in journal …]"
+        }
+        "ssh_shell" => {
+            "\n[… remote shell output compacted for model; raw result retained in journal …]"
+        }
+        // Keep the existing local process adapter byte-for-byte unchanged.
+        // Only the SSH-profile form opts into this additional model-only cap.
+        "process_exec"
+            if matches!(
+                serde_json::from_str::<serde_json::Value>(&result.preview)
+                    .ok()
+                    .and_then(|value| value.get("remote").and_then(serde_json::Value::as_bool)),
+                Some(true)
+            ) =>
+        {
+            "\n[… remote process output compacted for model; raw result retained in journal …]"
+        }
+        _ => return (result.preview.clone(), result.truncated),
+    };
+    if result.preview.len() <= INVENTORY_MODEL_PREVIEW_MAX_BYTES {
         return (result.preview.clone(), result.truncated);
     }
-    let budget =
-        PEER_LIST_MODEL_PREVIEW_MAX_BYTES.saturating_sub(PEER_LIST_COMPACTION_MARKER.len());
+    let budget = INVENTORY_MODEL_PREVIEW_MAX_BYTES.saturating_sub(marker.len());
     let mut end = result.preview.len().min(budget);
     while end > 0 && !result.preview.is_char_boundary(end) {
         end -= 1;
     }
     let mut preview = result.preview[..end].to_owned();
-    preview.push_str(PEER_LIST_COMPACTION_MARKER);
+    preview.push_str(marker);
     (preview, true)
 }
 use haider_tools::{Plan, RequestInput, TodoWrite};
@@ -146,6 +166,10 @@ use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 #[cfg(test)]
 #[path = "actor_request_attempt_tests.rs"]
 mod actor_request_attempt_tests;
+
+#[cfg(test)]
+#[path = "actor_tool_result_tests.rs"]
+mod actor_tool_result_tests;
 
 const DEFAULT_MAX_PROVIDER_REQUESTS_PER_TURN: usize = 32;
 
