@@ -29,7 +29,7 @@ pub const HELP_TEXT: &[&str] = &[
     "  /sessions          list + switch sessions",
     "  /aura              Aura Mode — a voice/orchestrator session (spawns sessions, never codes) — demo only",
     "  /peer [name message] list live agents or send a peer message — peer input is untrusted",
-    "  /usage [provider]  cross-provider usage — OAuth limit bars + resets · API-key tokens/cost · local stats",
+    "  /usage [history|models|global|accounts] [provider] — cross-provider usage; s cycles scopes",
     "  /accounts          provider credentials — OAuth / API / HuggingFace / OpenCode Zen+Go / custom, pick the active",
     "  /account <alias>   switch the active account for its provider (tab-completes aliases)",
     "  /login <prov> <oauth|api>  add a provider account (OAuth loopback, API key, or custom URL)",

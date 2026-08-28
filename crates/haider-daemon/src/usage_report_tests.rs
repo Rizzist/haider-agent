@@ -13,7 +13,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use haider_accounts::{MemoryVault, SecretHandle, Vault};
 use haider_protocol::EventPayload;
 use haider_protocol::agent::AgentUsageMetrics;
-use haider_protocol::credential::{AuthMethod, CredentialDescriptor, CredentialStatus};
+use haider_protocol::credential::{
+    AccountIdentity, AuthMethod, CredentialDescriptor, CredentialStatus,
+};
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RawEnvelope, RenderTargets};
 use haider_protocol::ids::{AgentId, CredentialAlias, DeviceId, EventId, RunId, SessionId};
 use haider_protocol::provider::{
@@ -23,13 +25,13 @@ use haider_protocol::provider::{
 use haider_protocol::session::ModelSelected;
 use haider_protocol::usage::{
     AccountMeterStateV1, HaiderCodeAllowanceStateV1, HaiderCodePlanSnapshotV1,
-    HaiderCodeWeeklyAllowanceV1,
+    HaiderCodeWeeklyAllowanceV1, UsageHistoryModelTotalV1, UsageHistoryRangeDayV1,
 };
 use haider_provider::MeterUnavailable;
 
 use super::{
     MeterTokenSource, OpenAiTokenIdentity, SessionFolder, UsageMeterHttp, UsageReportService,
-    attribute_session, meter_for, openai_token_identity,
+    attribute_session, enrich_usage_history_costs, meter_for, openai_token_identity,
 };
 use crate::haider_code_plan::{PlanFetchOutcome, PlanMeterValues, classify_account_response};
 
@@ -50,6 +52,20 @@ fn descriptor(provider: &str, alias: &str, auth_method: AuthMethod) -> Credentia
         account_identity: None,
         created_at_ms: None,
     }
+}
+
+fn openai_descriptor(alias: &str, account_id: &str) -> CredentialDescriptor {
+    let mut descriptor = descriptor("openai-oauth", alias, AuthMethod::OAuth);
+    descriptor.account_identity = Some(AccountIdentity {
+        email: Some(format!("{alias}@example.invalid")),
+        display_name: None,
+        account_id: Some(account_id.to_owned()),
+        plan: Some("pro".into()),
+        issuer: Some("https://auth.openai.com".into()),
+        captured_at: 1,
+        verified: false,
+    });
+    descriptor
 }
 
 fn snapshot(descriptors: Vec<CredentialDescriptor>) -> crate::accounts::AccountsSnapshot {
@@ -91,9 +107,12 @@ impl MeterTokenSource for FailingTokens {
 }
 
 /// Counts calls and serves a fixed (status, body) per URL.
+type CapturedMeterRequest = (String, Vec<(&'static str, &'static str)>, Option<String>);
+
 struct StubHttp {
     calls: AtomicU64,
     responses: HashMap<String, (u16, Vec<u8>)>,
+    requests: std::sync::Mutex<Vec<CapturedMeterRequest>>,
 }
 
 impl StubHttp {
@@ -101,11 +120,16 @@ impl StubHttp {
         Self {
             calls: AtomicU64::new(0),
             responses: responses.into_iter().collect(),
+            requests: std::sync::Mutex::new(Vec::new()),
         }
     }
 
     fn calls(&self) -> u64 {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    fn requests(&self) -> Vec<CapturedMeterRequest> {
+        self.requests.lock().expect("request capture").clone()
     }
 }
 
@@ -115,9 +139,15 @@ impl UsageMeterHttp for StubHttp {
         &self,
         url: &str,
         _bearer: &SecretHandle,
-        _extra_headers: &[(&'static str, &'static str)],
+        extra_headers: &[(&'static str, &'static str)],
+        chatgpt_account_id: Option<&str>,
     ) -> Result<(u16, Vec<u8>), MeterUnavailable> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.requests.lock().expect("request capture").push((
+            url.to_owned(),
+            extra_headers.to_vec(),
+            chatgpt_account_id.map(str::to_owned),
+        ));
         self.responses
             .get(url)
             .cloned()
@@ -607,11 +637,7 @@ async fn openai_token_claims_supply_email_and_plan_with_meter_precedence() {
         (200, wham.to_vec()),
     )]));
     let service = service_with_clock(
-        vec![descriptor(
-            "openai-oauth",
-            "work-chatgpt",
-            AuthMethod::OAuth,
-        )],
+        vec![openai_descriptor("work-chatgpt", "chatgpt-account-123")],
         Some(Arc::new(StubTokens {
             bytes: jwt_with_claims(&serde_json::json!({
                 "email": "person@example.invalid",
@@ -627,6 +653,80 @@ async fn openai_token_claims_supply_email_and_plan_with_meter_precedence() {
     assert_eq!(entry.identity.as_deref(), Some("person@example.invalid"));
     assert_eq!(entry.plan.as_deref(), Some("plus"), "meter plan wins");
     assert!(matches!(entry.meter, AccountMeterStateV1::Metered { .. }));
+    let requests = http.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].2.as_deref(), Some("chatgpt-account-123"));
+    assert!(
+        requests[0]
+            .1
+            .contains(&("originator", haider_provider::OPENAI_OAUTH_USAGE_ORIGINATOR))
+    );
+}
+
+/// The WHAM request must never guess an OpenAI organization or omit the
+/// ID-token-derived ChatGPT account coordinate. Missing identity fails before
+/// HTTP and remains branchable in the report row.
+#[tokio::test]
+async fn openai_meter_requires_the_chatgpt_account_id_claim_before_http() {
+    let http = Arc::new(StubHttp::new([(
+        haider_provider::OPENAI_OAUTH_USAGE_URL.to_owned(),
+        (200, b"{}".to_vec()),
+    )]));
+    let service = service_with_clock(
+        vec![descriptor(
+            "openai-oauth",
+            "missing-account",
+            AuthMethod::OAuth,
+        )],
+        Some(Arc::new(StubTokens {
+            bytes: b"redacted-test-token".to_vec(),
+        })),
+        Arc::clone(&http) as Arc<dyn UsageMeterHttp>,
+        Arc::new(AtomicU64::new(9_000_000)),
+    );
+    let (_root, store) = empty_store().await;
+    let report = service.report(&store).await.expect("typed report");
+    assert_eq!(
+        report.accounts[0].meter,
+        AccountMeterStateV1::Unavailable {
+            reason: "credential_account_id_unavailable".into()
+        }
+    );
+    assert_eq!(
+        http.calls(),
+        0,
+        "missing account identity fails before HTTP"
+    );
+}
+
+#[test]
+fn attributed_history_costs_require_a_known_provider_model_pair() {
+    let row = |provider: &str| UsageHistoryModelTotalV1 {
+        model: "gpt-5.2".into(),
+        provider: provider.into(),
+        requests: 1,
+        input_tokens: 1_000_000,
+        output_tokens: 100_000,
+        cache_read_tokens: 100_000,
+        reasoning_tokens: 10_000,
+        est_cost_microusd: None,
+    };
+    let mut days = vec![UsageHistoryRangeDayV1 {
+        date: "2026-08-28".into(),
+        total: None,
+        models: vec![row("openai-oauth"), row("custom-openai-compatible")],
+    }];
+    enrich_usage_history_costs(&mut days);
+    assert!(
+        days[0].models[0]
+            .est_cost_microusd
+            .is_some_and(|cost| cost > 0),
+        "a registered provider/model pair is priced"
+    );
+    assert_eq!(
+        days[0].models[1].est_cost_microusd, None,
+        "a custom provider never inherits economics from the model slug"
+    );
 }
 
 fn envelope(

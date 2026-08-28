@@ -142,6 +142,23 @@ pub struct UsageHistoryDailyTotalV1 {
     pub subagents_spawned: u64,
 }
 
+/// One provider/model attribution folded from a day's lane rows. The ledger
+/// stores only counters; `est_cost_microusd` is an optional read-time
+/// enrichment and is absent when the provider/model price is unknown.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageHistoryModelTotalV1 {
+    pub model: String,
+    pub provider: String,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub est_cost_microusd: Option<u64>,
+}
+
 /// One dated heatmap cell. `total=None` is no local sample for that date;
 /// a present all-zero total is a measured zero day.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +166,11 @@ pub struct UsageHistoryRangeDayV1 {
     pub date: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total: Option<UsageHistoryDailyTotalV1>,
+    /// Additive attributed fold for Models scope. Older daemons omit it;
+    /// absence/empty means no attributed rows were published for this day,
+    /// never that the day's aggregate total was zero.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<UsageHistoryModelTotalV1>,
 }
 
 /// Provider-native allowance state from Haider Code's account endpoint.

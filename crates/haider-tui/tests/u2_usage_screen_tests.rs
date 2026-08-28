@@ -16,11 +16,12 @@ use haider_protocol::ids::CredentialAlias;
 use haider_protocol::usage::{
     AccountMeterStateV1, AccountUsageReportV1, LocalUsageStatsV1, UsageReportV1, UsageWindowV1,
 };
-use haider_tui::app::UsageScope;
 use haider_tui::app::{AppModel, AppRequest, Hit, RuntimeMode, Screen};
+use haider_tui::app::{UsageModelRange, UsageScope};
 use haider_tui::commands::{COMMANDS, has_arg_slots, offers_arg_completions, palette_items};
 use haider_tui::format::{
-    USAGE_BAR_CELLS, UsageTone, fmt_remaining, fmt_reset, mask_identity, remaining_bar, usage_tone,
+    USAGE_BAR_CELLS, UsageTone, fmt_meter_reason, fmt_remaining, fmt_reset, mask_identity,
+    remaining_bar, usage_tone,
 };
 use haider_tui::link::{CommandContext, map_response, request_body};
 use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};
@@ -29,6 +30,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::Rect;
+use ratatui::style::Modifier;
 
 mod common;
 use common::{key, launcher_model, run_slash};
@@ -58,6 +60,22 @@ fn draw(model: &AppModel, width: u16, height: u16) -> (Vec<String>, Vec<(Rect, H
 /// assertions bind to the usage report alone.
 fn body_text(rows: &[String]) -> String {
     rows[..rows.len().saturating_sub(1)].join("\n")
+}
+
+fn scope_strip_modifiers(model: &AppModel) -> Vec<(UsageScope, Modifier)> {
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    let mut hits = Vec::new();
+    terminal
+        .draw(|frame| hits = render(model, frame))
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    hits.into_iter()
+        .filter_map(|(rect, hit)| match hit {
+            Hit::UsageScope(scope) => Some((scope, buffer[(rect.x, rect.y)].modifier)),
+            _ => None,
+        })
+        .collect()
 }
 
 fn stats(sessions: u64, est_cost_usd: Option<f64>) -> LocalUsageStatsV1 {
@@ -131,7 +149,7 @@ fn report() -> UsageReportV1 {
                 plan: None,
                 auth_method: AuthMethod::OAuth,
                 meter: AccountMeterStateV1::Unavailable {
-                    reason: "http 401 — token expired".to_owned(),
+                    reason: "http_status_401".to_owned(),
                 },
                 local: idle_oauth_stats(),
             },
@@ -302,6 +320,17 @@ fn reset_times_format_by_tier() {
     );
 }
 
+#[test]
+fn meter_reason_compaction_preserves_the_typed_mapping() {
+    assert_eq!(fmt_meter_reason("http_status_401"), "http 401");
+    assert_eq!(fmt_meter_reason("transport_timeout"), "transport timeout");
+    assert_eq!(fmt_meter_reason("malformed_response"), "malformed response");
+    assert_eq!(
+        fmt_meter_reason("credential_unavailable"),
+        "credential unavailable"
+    );
+}
+
 /// THRESHOLD LAW: the bar's ink tone flips calm→warn at 0.70 and
 /// warn→err at 0.90 (theme slots only — the renderer maps tones).
 #[test]
@@ -427,99 +456,239 @@ fn s_cycles_scope_and_global_renders_compact_overview() {
     );
 }
 
-/// 954 Models scope: today's day folds by key and groups by MODEL across
-/// providers — one line per model even when two providers served it; root
-/// and subagent lanes fold separately; the daemon's honest "no file yet"
-/// answer renders as the fact it is.
-///
-/// MUTATION CHECK (executed): group by key id instead of model name in
-/// the fold — the cross-provider assertion fails (two gpt-5.6-sol lines).
 #[test]
-fn models_scope_groups_across_providers_and_splits_roles() {
+fn scope_strip_pins_every_active_scope_and_clicks_by_value() {
+    let mut model = usage_model();
+    for active in [
+        UsageScope::Accounts,
+        UsageScope::Global,
+        UsageScope::History,
+        UsageScope::Models,
+    ] {
+        model.usage.scope = active;
+        let (rows, hits) = draw(&model, 120, 30);
+        assert!(
+            rows.join("\n")
+                .contains("accounts · global · history · models    s next scope · ← → account"),
+            "the shared strip renders on {active:?}"
+        );
+        let styles = scope_strip_modifiers(&model);
+        assert_eq!(styles.len(), 4, "four scope labels are clickable");
+        for (scope, modifier) in styles {
+            assert_eq!(
+                modifier.contains(Modifier::BOLD),
+                scope == active,
+                "only {active:?} is highlighted; examined {scope:?}"
+            );
+        }
+        let history_hit = hits
+            .into_iter()
+            .find_map(|(_, hit)| matches!(hit, Hit::UsageScope(UsageScope::History)).then_some(hit))
+            .expect("history scope hit");
+        model.handle_hit(history_hit);
+        assert_eq!(model.usage.scope, UsageScope::History);
+    }
+}
+
+#[test]
+fn direct_usage_scope_arguments_land_and_keep_the_provider_filter() {
+    let mut model = usage_model();
+    model.handle(key(KeyCode::Esc));
+    run_slash(&mut model, "/usage history anthropic");
+    assert_eq!(model.usage.scope, UsageScope::History);
+    assert_eq!(model.usage.filter.as_deref(), Some("anthropic"));
+
+    for (command, expected) in [
+        ("/usage models", UsageScope::Models),
+        ("/usage global", UsageScope::Global),
+        ("/usage accounts", UsageScope::Accounts),
+    ] {
+        model.handle(key(KeyCode::Esc));
+        run_slash(&mut model, command);
+        assert_eq!(model.usage.scope, expected, "{command}");
+        assert_eq!(model.usage.filter, None, "{command} has no filter");
+    }
+}
+
+/// Models folds attributed daily rows over the selected range, keeps provider
+/// coordinates, sorts most-to-least, and cycles today/7d/30d/all-time with r.
+///
+/// MUTATION CHECK: reverse the token comparator; the first-row ordering pin
+/// fails. Drop the range suffix; the 7d aggregate remains 50k and fails.
+#[test]
+fn models_scope_orders_and_folds_selectable_ledger_ranges() {
     use haider_protocol::usage::{
-        UsageHistoryDayV1, UsageHistoryKeyV1, UsageHistoryRoleV1, UsageHistoryRowV1,
-        UsageHistorySlotV1,
+        UsageHistoryDailyTotalV1, UsageHistoryModelTotalV1, UsageHistoryRangeDayV1,
     };
     let mut model = usage_model();
     for _ in 0..3 {
         model.handle(key(KeyCode::Char('s')));
     }
     assert_eq!(model.usage.scope, UsageScope::Models);
+    let daily_total = UsageHistoryDailyTotalV1 {
+        sampled_slots: 1,
+        requests: 1,
+        input_tokens: 1,
+        ..UsageHistoryDailyTotalV1::default()
+    };
+    let attributed =
+        |date: &str, model: &str, provider: &str, input_tokens: u64, cost: Option<u64>| {
+            UsageHistoryRangeDayV1 {
+                date: date.into(),
+                total: Some(daily_total.clone()),
+                models: vec![UsageHistoryModelTotalV1 {
+                    model: model.into(),
+                    provider: provider.into(),
+                    requests: 2,
+                    input_tokens,
+                    output_tokens: input_tokens / 10,
+                    cache_read_tokens: input_tokens / 2,
+                    reasoning_tokens: 0,
+                    est_cost_microusd: cost,
+                }],
+            }
+        };
+    model.usage.apply_history(vec![
+        UsageHistoryRangeDayV1 {
+            date: "2026-08-20".into(),
+            total: Some(daily_total.clone()),
+            models: Vec::new(),
+        },
+        attributed(
+            "2026-08-21",
+            "gpt-5.6-sol",
+            "openai-oauth",
+            30_000,
+            Some(120_000),
+        ),
+        attributed(
+            "2026-08-27",
+            "claude-sonnet-5",
+            "anthropic-oauth",
+            10_000,
+            Some(30_000),
+        ),
+        attributed(
+            "2026-08-28",
+            "gpt-5.6-sol",
+            "openai-oauth",
+            50_000,
+            Some(200_000),
+        ),
+    ]);
 
-    // The honest no-file-yet FACT before any day is held.
-    model.usage.apply_today(None);
-    let (rows, _) = draw(&model, 110, 34);
+    let (rows, _) = draw(&model, 120, 34);
+    let text = rows.join("\n");
+    assert!(text.contains("today (UTC)"));
+    assert!(text.contains("model                    provider"));
+    assert!(text.contains("gpt-5.6-sol"));
     assert!(
-        rows.join("\n").contains("no ledger file for today yet"),
-        "the daemon's None answer renders as a fact"
+        !text.contains("claude-sonnet-5"),
+        "today excludes older rows"
     );
 
-    let hkey = |id: u32, provider: &str, role_model: &str| UsageHistoryKeyV1 {
-        id,
-        account: Some(format!("{provider}-acct")),
-        provider: Some(provider.into()),
-        model: Some(role_model.into()),
-        api_family: None,
-        effort: Some("xhigh".into()),
-        speed: None,
-    };
-    let row = |key_id: u32, role: UsageHistoryRoleV1, tokens: u64| UsageHistoryRowV1 {
-        key_id,
-        role,
-        requests: 2,
-        errors: 1,
-        input_tokens: tokens,
-        output_tokens: tokens / 10,
-        cache_read_tokens: 0,
-        cache_write_tokens: 0,
-        reasoning_tokens: 0,
-    };
-    let mut slots: Vec<Option<UsageHistorySlotV1>> = vec![None; 96];
-    slots[40] = Some(UsageHistorySlotV1 {
-        rows: vec![
-            row(1, UsageHistoryRoleV1::Root, 50_000),
-            row(2, UsageHistoryRoleV1::Subagent, 30_000),
-        ],
-        subagents_spawned: 1,
-    });
-    model.usage.apply_today(Some(UsageHistoryDayV1 {
-        date: "2026-08-25".into(),
-        device_id: "dev-test".into(),
-        backfilled: false,
-        keys: vec![
-            hkey(1, "openai-oauth", "gpt-5.6-sol"),
-            hkey(2, "haider-code", "gpt-5.6-sol"),
-        ],
-        slots,
-        meter_samples: vec![],
-        version_changes: vec![],
-    }));
+    model.handle(key(KeyCode::Char('r')));
+    assert_eq!(model.usage.model_range, UsageModelRange::SevenDays);
+    let (rows, _) = draw(&model, 120, 34);
+    let text = rows.join("\n");
+    assert!(text.contains("7d"));
+    let gpt = text.find("gpt-5.6-sol").expect("largest row");
+    let claude = text.find("claude-sonnet-5").expect("second row");
+    assert!(gpt < claude, "80k-ish GPT total sorts before Claude");
+    assert!(
+        text.contains("80k"),
+        "same model/provider folds across days"
+    );
+    assert!(text.contains("$0.32"), "daily known prices add exactly");
+
+    model.handle(key(KeyCode::Char('r')));
+    assert_eq!(model.usage.model_range, UsageModelRange::ThirtyDays);
+    model.handle(key(KeyCode::Char('r')));
+    assert_eq!(model.usage.model_range, UsageModelRange::AllTime);
+    model.handle(key(KeyCode::Char('r')));
+    assert_eq!(model.usage.model_range, UsageModelRange::Today);
+
+    // A typed failure never flattens the held range.
+    model.usage.history_failed("socket lost");
     let (rows, _) = draw(&model, 110, 34);
     let text = rows.join("\n");
-    assert_eq!(
-        text.matches("gpt-5.6-sol").count(),
-        1,
-        "ONE grouped line for the model served by two providers: {text}"
-    );
     assert!(
-        text.contains("haider-code, openai-oauth"),
-        "both providers annotate the grouped model"
+        text.contains("model history read failed"),
+        "the error is typed"
     );
-    assert!(text.contains("root — req 2"), "the root lane folds");
-    assert!(
-        text.contains("subs — req 2"),
-        "the subagent lane folds separately"
-    );
-
-    // A typed failure never flattens the held day.
-    model.usage.today_failed("socket lost");
-    let (rows, _) = draw(&model, 110, 34);
-    let text = rows.join("\n");
-    assert!(text.contains("day read failed"), "the error is typed");
     assert!(
         text.contains("gpt-5.6-sol"),
-        "the held day stays visible under the error"
+        "the held range stays visible under the error"
     );
+}
+
+#[test]
+fn models_scope_names_empty_attribution_and_scrolls_long_tables() {
+    use haider_protocol::usage::{
+        UsageHistoryDailyTotalV1, UsageHistoryModelTotalV1, UsageHistoryRangeDayV1,
+    };
+    let mut model = usage_model();
+    model.usage.scope = UsageScope::Models;
+    let total = UsageHistoryDailyTotalV1 {
+        sampled_slots: 1,
+        requests: 1,
+        ..UsageHistoryDailyTotalV1::default()
+    };
+    model.usage.apply_history(vec![
+        UsageHistoryRangeDayV1 {
+            date: "2026-08-27".into(),
+            total: Some(total.clone()),
+            models: vec![UsageHistoryModelTotalV1 {
+                model: "first-attributed".into(),
+                provider: "openai-oauth".into(),
+                requests: 1,
+                input_tokens: 10,
+                ..UsageHistoryModelTotalV1::default()
+            }],
+        },
+        UsageHistoryRangeDayV1 {
+            date: "2026-08-28".into(),
+            total: Some(total.clone()),
+            models: Vec::new(),
+        },
+    ]);
+    let (rows, _) = draw(&model, 110, 20);
+    assert!(
+        rows.join("\n")
+            .contains("no attributed rows in this range · first attributed date 2026-08-27")
+    );
+
+    let models = (0_u64..24)
+        .map(|index| UsageHistoryModelTotalV1 {
+            model: format!("model-{index:02}"),
+            provider: "openai-oauth".into(),
+            requests: 1,
+            input_tokens: 24_000 - index * 1_000,
+            ..UsageHistoryModelTotalV1::default()
+        })
+        .collect();
+    model.usage.apply_history(vec![UsageHistoryRangeDayV1 {
+        date: "2026-08-28".into(),
+        total: Some(total),
+        models,
+    }]);
+    let (rows, _) = draw(&model, 100, 14);
+    assert!(
+        rows.join("\n").contains("model-00"),
+        "largest row starts visible"
+    );
+    assert!(
+        model.usage.scroll_max.get() > 8,
+        "the table owns a real viewport"
+    );
+    model.handle(key(KeyCode::PageDown));
+    let (rows, _) = draw(&model, 100, 14);
+    assert_eq!(model.usage.scroll.get(), 8);
+    assert!(
+        !rows.join("\n").contains("model-00"),
+        "page-down moves the largest row above the viewport"
+    );
+    assert!(rows.join("\n").contains('⋮'), "the scroll gutter renders");
 }
 
 /// 954 heatmap laws on the History scope: an ABSENT day (`total: None`)
@@ -549,23 +718,31 @@ fn history_scope_renders_absence_zero_and_activity_distinctly() {
         UsageHistoryRangeDayV1 {
             date: "2026-08-20".into(),
             total: Some(total(120_000)),
+            models: Vec::new(),
         },
         UsageHistoryRangeDayV1 {
             date: "2026-08-21".into(),
             total: None,
+            models: Vec::new(),
         },
         UsageHistoryRangeDayV1 {
             date: "2026-08-22".into(),
             total: Some(total(0)),
+            models: Vec::new(),
         },
         UsageHistoryRangeDayV1 {
             date: "2026-08-23".into(),
             total: Some(total(40_000)),
+            models: Vec::new(),
         },
     ]);
     let (rows, _) = draw(&model, 110, 30);
     let text = rows.join("\n");
     assert!(text.contains("Token activity"), "the header renders");
+    assert!(
+        text.contains("daily · weekly · cumulative — next"),
+        "History keeps its own one-line legend beneath the shared scope strip"
+    );
     assert!(
         text.contains("lifetime 160k"),
         "lifetime folds only present days: {text}"
@@ -637,6 +814,27 @@ fn metered_accounts_render_bars_percent_and_resets() {
     assert!(text.contains("in 1.2M"), "token splits render");
 }
 
+#[test]
+fn weekly_only_meter_row_pins_percent_label_and_reset() {
+    let mut usage = report();
+    usage.accounts[0].meter = AccountMeterStateV1::Metered {
+        windows: vec![UsageWindowV1 {
+            window: "weekly".into(),
+            utilization: 0.08,
+            resets_at_ms: Some(GENERATED_AT_MS + (3 * 24 + 4) * 60 * 60 * 1_000),
+            label: None,
+        }],
+    };
+    usage.accounts.truncate(1);
+    let mut model = usage_model();
+    model.usage.apply_report(usage);
+    let (rows, _) = draw(&model, 110, 24);
+    assert!(
+        rows.join("\n")
+            .contains("92% left (weekly) · resets in 3d 4h")
+    );
+}
+
 /// An `unavailable` meter renders its typed reason and NEVER a bar — no
 /// meter glyph may appear anywhere in that account's block.
 ///
@@ -650,7 +848,7 @@ fn unavailable_meters_render_the_typed_reason_never_a_bar() {
     let (rows, _) = draw(&model, 110, 30);
     let text = body_text(&rows);
     assert!(
-        text.contains("meter unavailable — http 401 — token expired"),
+        text.contains("meter unavailable · http 401"),
         "the typed reason renders honestly"
     );
     // The anthropic block now shows NO bar; openai is local-only; so the
@@ -658,6 +856,13 @@ fn unavailable_meters_render_the_typed_reason_never_a_bar() {
     assert!(
         !text.contains('▰') && !text.contains('▱'),
         "an unavailable meter never fabricates a bar"
+    );
+
+    model.usage.scope = UsageScope::Global;
+    let (rows, _) = draw(&model, 110, 30);
+    assert!(
+        body_text(&rows).contains("meter unavailable · http 401"),
+        "the compact global row must not swallow the typed reason"
     );
 }
 
@@ -1070,6 +1275,48 @@ fn live_usage_entry_is_feature_gated_then_fetches() {
     model.requests.clear();
     model.handle(key(KeyCode::Char('r')));
     assert!(model.requests.is_empty(), "r reveals — it never fetches");
+}
+
+/// `f` is visible work in both ledger scopes: it refreshes the compact
+/// provider snapshot and reconciled range together, immediately renders the
+/// in-flight state, then leaves a typed reason if either read fails.
+#[test]
+fn history_and_models_f_refresh_has_immediate_feedback() {
+    for scope in [UsageScope::History, UsageScope::Models] {
+        let mut model = live_gated_model();
+        model
+            .daemon_features
+            .insert(haider_rpc::FEATURE_USAGE_HISTORY_V1.to_owned());
+        run_slash(&mut model, &format!("/usage {}", scope.name()));
+        model.requests.clear();
+        model.usage.fetching = false;
+        model.usage.history_fetching = false;
+
+        model.handle(key(KeyCode::Char('f')));
+        assert!(model.usage.fetching, "{scope:?} provider read starts");
+        assert!(model.usage.history_fetching, "{scope:?} ledger read starts");
+        assert!(
+            model
+                .requests
+                .iter()
+                .any(|request| matches!(request, AppRequest::UsageRefresh))
+        );
+        assert!(
+            model
+                .requests
+                .iter()
+                .any(|request| matches!(request, AppRequest::UsageHistoryRefresh))
+        );
+        let (rows, _) = draw(&model, 100, 24);
+        assert!(rows.join("\n").contains("fetching…"), "{scope:?}");
+
+        model.usage.read_failed("http 503");
+        model.usage.history_failed("ledger busy");
+        let (rows, _) = draw(&model, 100, 24);
+        let text = rows.join("\n");
+        assert!(text.contains("usage read failed — http 503"), "{scope:?}");
+        assert!(text.contains("read failed — ledger busy"), "{scope:?}");
+    }
 }
 
 /// The driver maps the read onto U1's wire and installs ONLY committed

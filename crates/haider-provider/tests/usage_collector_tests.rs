@@ -22,7 +22,8 @@
 use haider_protocol::provider::{CacheStatAvailability, NormalizedUsage, ReasoningAccounting};
 use haider_provider::{
     ANTHROPIC_OAUTH_USAGE_URL, CacheWriteTtl, KIMI_OAUTH_USAGE_URL, MeterUnavailable,
-    OPENAI_OAUTH_USAGE_URL, UsageMeterEndpoint, estimate_cache_input_costs,
+    OPENAI_OAUTH_ACCOUNT_ID_HEADER, OPENAI_OAUTH_USAGE_ORIGINATOR, OPENAI_OAUTH_USAGE_URL,
+    OPENAI_OAUTH_USAGE_USER_AGENT, UsageMeterEndpoint, estimate_cache_input_costs,
     estimate_cache_input_costs_for, estimate_cache_rewarm_cost_usd, estimate_chunk_cost_usd,
     estimate_chunk_cost_usd_for, estimate_normalized_usage_cost_usd_for, model_rate,
     normalize_utilization, parse_rfc3339_to_unix_ms,
@@ -37,7 +38,7 @@ fn fixture(name: &str) -> Vec<u8> {
 
 /// LAW (openai_wham_fixture_yields_primary_secondary_and_named_extra_windows):
 /// the codex meter parse maps `rate_limit.primary_window`/`secondary_window`
-/// to the `primary`/`secondary` windows (percent → 0–1 fraction, `reset_at`
+/// to human `5h`/`weekly` windows (percent → 0–1 fraction, `reset_at`
 /// seconds → ms), surfaces each `additional_rate_limits[]` entry under its
 /// `limit_name` label, and reports the subscription `plan_type` — while
 /// tolerating unknown siblings such as `code_review_rate_limit`.
@@ -48,14 +49,14 @@ fn openai_wham_fixture_yields_primary_secondary_and_named_extra_windows() {
         .expect("wham fixture parses");
     assert_eq!(reading.plan.as_deref(), Some("plus"));
     assert_eq!(reading.windows.len(), 4, "primary, secondary, two named");
-    assert_eq!(reading.windows[0].window, "primary");
+    assert_eq!(reading.windows[0].window, "5h");
     assert!((reading.windows[0].utilization - 0.06).abs() < 1e-9);
     assert_eq!(reading.windows[0].resets_at_ms, Some(1_738_300_000_000));
     assert_eq!(reading.windows[0].label, None);
-    assert_eq!(reading.windows[1].window, "secondary");
+    assert_eq!(reading.windows[1].window, "weekly");
     assert!((reading.windows[1].utilization - 0.24).abs() < 1e-9);
     assert_eq!(reading.windows[1].resets_at_ms, Some(1_738_900_000_000));
-    assert_eq!(reading.windows[2].window, "primary");
+    assert_eq!(reading.windows[2].window, "5h");
     assert_eq!(
         reading.windows[2].label.as_deref(),
         Some("GPT-5.3-Codex-Spark")
@@ -69,6 +70,58 @@ fn openai_wham_fixture_yields_primary_secondary_and_named_extra_windows() {
         Some("Sub-Percent-Lane")
     );
     assert!((reading.windows[3].utilization - 0.005).abs() < 1e-9);
+}
+
+/// LAW: OpenAI plans may publish either subscription window independently.
+/// Relative resets are anchored to the fetch instant, and an absent/null
+/// primary window never suppresses a valid weekly window.
+///
+/// MUTATION CHECK: require `primary_window` before examining secondary; the
+/// secondary-only case changes from one weekly window to an error.
+#[test]
+fn openai_optional_window_matrix_keeps_every_window_that_exists() {
+    const FETCHED_AT_MS: u64 = 1_800_000_000_000;
+    let secondary = UsageMeterEndpoint::OpenAiOauth
+        .parse_at(
+            200,
+            &fixture("openai_wham_secondary_only.json"),
+            FETCHED_AT_MS,
+        )
+        .expect("secondary-only fixture parses");
+    assert_eq!(secondary.windows.len(), 1);
+    assert_eq!(secondary.windows[0].window, "weekly");
+    assert!((secondary.windows[0].utilization - 0.08).abs() < 1e-9);
+    assert_eq!(
+        secondary.windows[0].resets_at_ms,
+        Some(FETCHED_AT_MS + 604_800_000)
+    );
+
+    let primary = UsageMeterEndpoint::OpenAiOauth
+        .parse_at(
+            200,
+            &fixture("openai_wham_primary_only.json"),
+            FETCHED_AT_MS,
+        )
+        .expect("primary-only fixture parses");
+    assert_eq!(primary.windows.len(), 1);
+    assert_eq!(primary.windows[0].window, "5h");
+    assert_eq!(
+        primary.windows[0].resets_at_ms,
+        Some(FETCHED_AT_MS + 7_200_000)
+    );
+
+    assert_eq!(
+        UsageMeterEndpoint::OpenAiOauth.parse(200, &fixture("openai_wham_empty.json")),
+        Err(MeterUnavailable::new("no_windows_reported"))
+    );
+    assert_eq!(
+        UsageMeterEndpoint::OpenAiOauth.parse(401, &fixture("openai_wham_401.json")),
+        Err(MeterUnavailable::new("http_status_401"))
+    );
+    assert_eq!(
+        UsageMeterEndpoint::OpenAiOauth.parse(200, &fixture("openai_wham_malformed.json")),
+        Err(MeterUnavailable::new("malformed_response"))
+    );
 }
 
 /// LAW (anthropic_live_fixture_normalizes_percent_scale_and_rfc3339_resets):
@@ -114,6 +167,16 @@ fn anthropic_fraction_fixture_reads_identically_to_the_percent_scale() {
     assert_eq!(reading.windows[3].window, "extra_usage");
     assert!((reading.windows[3].utilization - 0.25).abs() < 1e-9);
     assert_eq!(reading.windows[3].resets_at_ms, None);
+}
+
+#[test]
+fn anthropic_seven_day_only_is_a_valid_meter_reading() {
+    let reading = UsageMeterEndpoint::AnthropicOauth
+        .parse(200, &fixture("anthropic_oauth_seven_day_only.json"))
+        .expect("seven-day-only fixture parses");
+    assert_eq!(reading.windows.len(), 1);
+    assert_eq!(reading.windows[0].window, "seven_day");
+    assert!((reading.windows[0].utilization - 0.6).abs() < 1e-9);
 }
 
 /// LAW (kimi_fixture_reads_string_counters_and_names_rolling_windows): kimi
@@ -194,8 +257,9 @@ fn failures_are_typed_unavailable_never_a_fabricated_reading() {
 
 /// LAW (endpoint_coordinates_headers_and_poll_floors_are_pinned): the three
 /// meter URLs are the researched literals; anthropic carries the mandatory
-/// beta + Claude Code User-Agent headers while the others add none; and the
-/// cache floors honor the brief (codex ≥ 60 s, anthropic ≥ 180 s).
+/// beta + Claude Code User-Agent headers; OpenAI carries the same account-
+/// scoped client identity header set as Codex; and cache floors honor the
+/// brief (codex ≥ 60 s, anthropic ≥ 180 s).
 #[test]
 fn endpoint_coordinates_headers_and_poll_floors_are_pinned() {
     assert_eq!(
@@ -214,7 +278,17 @@ fn endpoint_coordinates_headers_and_poll_floors_are_pinned() {
         UsageMeterEndpoint::OpenAiOauth.url(),
         OPENAI_OAUTH_USAGE_URL
     );
-    assert!(UsageMeterEndpoint::OpenAiOauth.extra_headers().is_empty());
+    let openai_headers = UsageMeterEndpoint::OpenAiOauth.extra_headers();
+    assert_eq!(OPENAI_OAUTH_ACCOUNT_ID_HEADER, "chatgpt-account-id");
+    assert!(openai_headers.contains(&("accept", "application/json")));
+    assert!(openai_headers.contains(&("originator", OPENAI_OAUTH_USAGE_ORIGINATOR)));
+    assert!(openai_headers.contains(&("user-agent", OPENAI_OAUTH_USAGE_USER_AGENT)));
+    assert!(
+        !openai_headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("openai-beta")),
+        "WHAM is a JSON GET, not the experimental Responses request"
+    );
     assert!(UsageMeterEndpoint::KimiOauth.extra_headers().is_empty());
     let anthropic_headers = UsageMeterEndpoint::AnthropicOauth.extra_headers();
     assert_eq!(anthropic_headers[0], ("anthropic-beta", "oauth-2025-04-20"));
@@ -528,11 +602,13 @@ fn cm3b_registry_estimates_invalidated_prefix_rewarm_cost() {
 /// header pair is pinned by VALUE — `anthropic-beta: oauth-2025-04-20` and a
 /// `claude-code/` user-agent. The endpoint refuses requests without them,
 /// but only a gated live test would notice; this pin makes the contract
-/// CI-observable. openai/kimi meters ride Bearer alone.
+/// CI-observable. Kimi rides Bearer alone; OpenAI also carries its account
+/// id dynamically in the daemon plus the client identity headers below.
 ///
 /// MUTATION CHECK: corrupt either header value in
 /// `UsageMeterEndpoint::extra_headers`. Expected failure: the exact-value
-/// asserts below.
+/// asserts below. The OpenAI meter is pinned here too: dropping originator
+/// or User-Agent makes the companion exact-value assertions fail.
 #[test]
 fn anthropic_meter_request_carries_the_required_header_values() {
     let headers = UsageMeterEndpoint::AnthropicOauth.extra_headers();
@@ -547,6 +623,15 @@ fn anthropic_meter_request_carries_the_required_header_values() {
             .any(|(name, value)| *name == "user-agent" && value.starts_with("claude-code/")),
         "the endpoint requires a claude-code user-agent: {headers:?}"
     );
-    assert!(UsageMeterEndpoint::OpenAiOauth.extra_headers().is_empty());
+    let openai = UsageMeterEndpoint::OpenAiOauth.extra_headers();
+    assert_eq!(openai.len(), 3, "accept + originator + user-agent");
+    assert_eq!(
+        openai,
+        &[
+            ("accept", "application/json"),
+            ("originator", OPENAI_OAUTH_USAGE_ORIGINATOR),
+            ("user-agent", OPENAI_OAUTH_USAGE_USER_AGENT),
+        ]
+    );
     assert!(UsageMeterEndpoint::KimiOauth.extra_headers().is_empty());
 }

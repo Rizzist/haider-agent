@@ -155,6 +155,17 @@ pub fn fmt_reset(generated_at_ms: u64, resets_at_ms: u64) -> String {
     }
 }
 
+/// Compact one machine-readable meter failure for the operator-facing row.
+/// The wire remains branchable (`http_status_401`, `transport_timeout`);
+/// the TUI never discards it behind a generic "meter unavailable" label.
+#[must_use]
+pub fn fmt_meter_reason(reason: &str) -> String {
+    reason.strip_prefix("http_status_").map_or_else(
+        || reason.replace('_', " "),
+        |status| format!("http {status}"),
+    )
+}
+
 /// Formats short provider backoffs with second precision. Sub-second or
 /// elapsed delays say `resets soon`; unlike [`fmt_reset`], this must not
 /// floor short delays to minutes.
