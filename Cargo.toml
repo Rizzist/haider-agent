@@ -36,7 +36,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 hex = "0.4"
 bytes = "1"
 crc32fast = "1"
-getrandom = "0.3"
+getrandom = { version = "0.3", features = ["std"] }
 globset = "=0.4.20"
 httpdate = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
