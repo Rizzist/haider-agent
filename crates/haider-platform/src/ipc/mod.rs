@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 pub enum IpcShutdownOutcome {
     /// The peer was synchronously notified that this connection is closing.
     PeerNotified,
+    /// The peer had already closed its side, so there was nobody left to
+    /// notify and the connection is already effectively closed.
+    PeerAlreadyGone,
     /// The local async-stream slot was emptied, but peer visibility still
     /// depends on the owning Tokio runtime polling cancelled I/O.
     LocalSlotEmptiedOnly,

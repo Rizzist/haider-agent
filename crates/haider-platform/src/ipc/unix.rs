@@ -66,9 +66,29 @@ impl IpcShutdown {
         if unsafe { libc::shutdown(self.socket.as_raw_fd(), libc::SHUT_RDWR) } == 0 {
             Ok(IpcShutdownOutcome::PeerNotified)
         } else {
-            self.requested.store(false, Ordering::Release);
-            Err(std::io::Error::last_os_error())
+            match shutdown_error_outcome(std::io::Error::last_os_error()) {
+                Ok(outcome) => Ok(outcome),
+                Err(error) => {
+                    self.requested.store(false, Ordering::Release);
+                    Err(error)
+                }
+            }
         }
+    }
+}
+
+/// Maps only the POSIX error that proves there is no peer left to notify.
+///
+/// macOS/BSD returns `ENOTCONN` when `shutdown(2)` races with or follows peer
+/// closure, while Linux commonly returns success for that connected-then-
+/// closed socket state. On both platforms `ENOTCONN` has the same semantic
+/// meaning: shutdown is already effective. The other documented errors —
+/// `EBADF`, `EINVAL`, and `ENOTSOCK` — indicate a bad local descriptor or call
+/// and must remain visible to callers rather than being blanket-swallowed.
+fn shutdown_error_outcome(error: std::io::Error) -> std::io::Result<IpcShutdownOutcome> {
+    match error.raw_os_error() {
+        Some(libc::ENOTCONN) => Ok(IpcShutdownOutcome::PeerAlreadyGone),
+        _ => Err(error),
     }
 }
 
@@ -973,13 +993,61 @@ pub fn write_immediate(stream: &IpcStream, bytes: &[u8]) {
 mod tests {
     use super::{
         Endpoint, EndpointError, STAGING_BASENAME_BYTES, STAGING_PREFIX, UNIX_SOCKET_PATH_BYTES,
-        is_synthesized_probe_timeout, longest_staging_path, probe_failure, staging_name,
-        validate_endpoint_budget,
+        is_synthesized_probe_timeout, longest_staging_path, probe_failure, shutdown_error_outcome,
+        shutdown_handle, staging_name, validate_endpoint_budget,
     };
+    use crate::ipc::IpcShutdownOutcome;
     use rustix::io::Errno;
     use std::io::{Error, ErrorKind};
     use std::os::unix::ffi::OsStrExt as _;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn shutdown_error_mapping_accepts_only_not_connected() {
+        assert!(matches!(
+            shutdown_error_outcome(Error::from_raw_os_error(libc::ENOTCONN)),
+            Ok(IpcShutdownOutcome::PeerAlreadyGone)
+        ));
+
+        for code in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK] {
+            let error = match shutdown_error_outcome(Error::from_raw_os_error(code)) {
+                Ok(outcome) => panic!("errno {code} was hidden as {outcome:?}"),
+                Err(error) => error,
+            };
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_with_an_already_closed_peer_is_never_a_failure() {
+        let (stream, peer) = match std::os::unix::net::UnixStream::pair() {
+            Ok(pair) => pair,
+            Err(error) => panic!("create socket pair: {error}"),
+        };
+        if let Err(error) = stream.set_nonblocking(true) {
+            panic!("make socket nonblocking: {error}");
+        }
+        let stream = match tokio::net::UnixStream::from_std(stream) {
+            Ok(stream) => stream,
+            Err(error) => panic!("adopt socket pair: {error}"),
+        };
+        let shutdown = match shutdown_handle(&stream) {
+            Ok(shutdown) => shutdown,
+            Err(error) => panic!("retain shutdown handle: {error}"),
+        };
+        drop(peer);
+
+        let outcome = match shutdown.request() {
+            Ok(outcome) => outcome,
+            Err(error) => panic!("closed peer leaked a shutdown error: {error}"),
+        };
+        assert!(matches!(
+            outcome,
+            IpcShutdownOutcome::PeerNotified | IpcShutdownOutcome::PeerAlreadyGone
+        ));
+        #[cfg(target_vendor = "apple")]
+        assert_eq!(outcome, IpcShutdownOutcome::PeerAlreadyGone);
+    }
 
     #[test]
     fn staging_name_is_twenty_five_url_safe_bytes_with_ninety_six_random_bits() {

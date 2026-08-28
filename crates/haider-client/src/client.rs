@@ -198,7 +198,8 @@ pub enum ClientCloseOutcome {
     /// polled before the close becomes peer-visible. This is the Windows
     /// named-pipe outcome while cancelled IOCP operations are still pending.
     LocalSlotEmptiedOnly,
-    /// A prior close already consumed the transport shutdown authority.
+    /// The peer had already gone away, or a prior close already consumed the
+    /// transport shutdown authority.
     AlreadyClosed,
     /// The platform shutdown request itself failed.
     ShutdownFailed(std::io::Error),
@@ -694,6 +695,9 @@ impl RpcClient {
         let outcome = match self.shutdown.request() {
             Ok(haider_platform::IpcShutdownOutcome::PeerNotified) => {
                 ClientCloseOutcome::PeerNotified
+            }
+            Ok(haider_platform::IpcShutdownOutcome::PeerAlreadyGone) => {
+                ClientCloseOutcome::AlreadyClosed
             }
             Ok(haider_platform::IpcShutdownOutcome::LocalSlotEmptiedOnly) => {
                 ClientCloseOutcome::LocalSlotEmptiedOnly

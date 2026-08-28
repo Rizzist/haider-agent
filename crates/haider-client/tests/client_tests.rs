@@ -29,7 +29,9 @@ use tokio::net::{UnixListener, UnixStream};
 
 const LIMIT: usize = DEFAULT_FRAME_LIMIT;
 
-fn assert_peer_notified(outcome: ClientCloseOutcome) {
+/// These fixtures keep their serving loop alive until client EOF, so the peer
+/// is controlled and must still be present when close synchronously notifies it.
+fn assert_live_peer_notified(outcome: ClientCloseOutcome) {
     assert!(matches!(outcome, ClientCloseOutcome::PeerNotified));
 }
 
@@ -244,7 +246,7 @@ async fn user_command_feature_failure_sends_zero_rpc_requests() {
     assert!(matches!(error, ShellExecError::FeatureUnavailable { .. }));
     tokio::task::yield_now().await;
     assert_eq!(requests.load(Ordering::SeqCst), 0);
-    assert_peer_notified(connected.client.close());
+    assert_live_peer_notified(connected.client.close());
 }
 
 #[tokio::test]
@@ -348,7 +350,7 @@ async fn connect_retains_kernel_authenticated_peer_credentials() {
         connected.peer_credentials.uid,
         haider_client::effective_uid()
     );
-    assert_peer_notified(connected.client.close());
+    assert_live_peer_notified(connected.client.close());
 }
 
 // MUTATION CHECK: the R9 client heartbeat law — a ping unmatched for the
@@ -834,7 +836,7 @@ async fn racing_launcher_never_owns_the_other_launchers_winner() {
         ensured.ownership.is_none(),
         "a losing launcher must never own the authenticated winner"
     );
-    assert_peer_notified(ensured.client.close());
+    assert_live_peer_notified(ensured.client.close());
 }
 
 /// A closed handshake is not itself permission to spawn. Once a prior
@@ -960,7 +962,7 @@ async fn closed_handshake_is_retried_only_after_a_spawnable_failure_authorizes_a
     assert!(ensured.spawned);
     assert!(ensured.race_lost);
     assert!(ensured.ownership.is_none());
-    assert_peer_notified(ensured.client.close());
+    assert_live_peer_notified(ensured.client.close());
     drop(ensured);
     tokio::time::timeout(Duration::from_secs(2), winner)
         .await
