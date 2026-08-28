@@ -222,19 +222,25 @@ fn reduce_test_output(input: &str, failed: bool) -> String {
                     }
                 }
             }
-            for keep in retained.iter_mut().skip(lines.len().saturating_sub(20)) {
+            let final_tail_start = lines.len().saturating_sub(20).max(failure_start);
+            for keep in retained.iter_mut().skip(final_tail_start) {
                 *keep = true;
             }
-            let mut output = String::from("-- failures + final 20 lines (verbatim) --\n");
-            output.push_str(&join_output_lines(
+            let body = join_output_lines(
                 lines
                     .iter()
                     .zip(retained)
                     .filter(|(_, retain)| *retain)
                     .map(|(line, _)| (*line).to_owned())
                     .collect(),
-            ));
-            return output;
+            );
+            let marker = "-- failures + final 20 lines (verbatim) --\n";
+            if estimated_tokens(marker.len().saturating_add(body.len()))
+                < estimated_tokens(input.len())
+            {
+                return format!("{marker}{body}");
+            }
+            return body;
         }
     }
     join_output_lines(
@@ -368,8 +374,9 @@ fn reduce_package_output(input: &str) -> String {
         let lower = line.to_ascii_lowercase();
         let error =
             lower.contains("error") || lower.contains("failed") || lower.contains("failure");
-        let warning_with_anchor =
-            lower.contains("warning") && (line.contains(':') || lower.contains(" at "));
+        let warning =
+            lower.contains("warning") || lower.split_ascii_whitespace().any(|word| word == "warn");
+        let warning_with_anchor = warning && (line.contains(':') || lower.contains(" at "));
         if error || warning_with_anchor {
             kept.push(line.to_owned());
             error_tail = usize::from(error) * 8;

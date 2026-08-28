@@ -957,14 +957,12 @@ async fn successful_dispatch_has_strict_four_phase_order() {
     let mut policy = PermissionPolicy::default();
     policy.allow(EffectClass::FsRead);
     let mut broker = broker_at(RecordingJournal::default(), directory.path(), 1);
+    let bounds = ResultBounds::default();
+    assert_eq!(haider_tools::TOOL_RESULT_INLINE_MAX_BYTES, 8 * 1024);
+    assert_eq!(bounds.max_preview_bytes, 8 * 1024);
 
     let result = broker
-        .fs_read(
-            &FsRead::new(&path),
-            &policy,
-            &mut UnusedCas,
-            ResultBounds::default(),
-        )
+        .fs_read(&FsRead::new(&path), &policy, &mut UnusedCas, bounds)
         .await
         .expect("read succeeds");
     assert_eq!(result.preview, "small result");

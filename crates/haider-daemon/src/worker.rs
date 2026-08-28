@@ -66,13 +66,14 @@ use haider_core::{
     GraphEvidenceCommand, GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome,
     GraphSwitchCommand, GraphSwitchOutcome, HarnessActor, HarnessConfig, PartialStreamCheckpoint,
     PreviousCacheRequest, ProcessSignalCommand, ProcessSignalOutcome, PromptHistoryCompiler,
-    ProviderDerivedRequestState, ProviderPairSwitch, ProviderPairSwitchCommitter,
-    RequestInputCheckpoint, SessionSelectModelCommand, SessionSelectModelOutcome, SharedToolPacks,
-    StoreHandle, SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn,
-    SubmitPartialStreamTurn, ToolDispatchResult, ToolDispatcher, TurnHandle,
-    build_cache_request_diagnostic, classify_cache_request, context_soft_threshold_tokens,
-    effect_recovery_evidence, estimate_provider_request_input_tokens,
-    presentation_for_haider_error, sanitized_failure_message,
+    ProviderDeadlineGuard, ProviderDerivedRequestState, ProviderPairSwitch,
+    ProviderPairSwitchCommitter, RequestInputCheckpoint, SessionSelectModelCommand,
+    SessionSelectModelOutcome, SharedToolPacks, StoreHandle, SubmitCheckpointTurn,
+    SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn, ToolDispatchResult,
+    ToolDispatcher, TurnHandle, build_cache_request_diagnostic, classify_cache_request,
+    context_soft_threshold_tokens, effect_recovery_evidence,
+    estimate_provider_request_input_tokens, presentation_for_haider_error,
+    sanitized_failure_message,
 };
 use haider_protocol::agent::Grant;
 use haider_protocol::cache::{
@@ -136,7 +137,7 @@ use haider_provider::{
     apply_tool_result_image_budget, canonical_tool_definitions_digest,
     degrade_tool_result_images_to_placeholders,
 };
-use haider_provider::{Provider, ToolDefinition, TurnRequest};
+use haider_provider::{Provider, ProviderError, ToolDefinition, TurnRequest};
 use haider_store::{MenuResolutionCommand, MenuResolutionOutcome};
 use haider_tools::{
     CasSink, ChangeLedger, CommandOutputSink, ComputerBackend, ComputerCancelToken, ComputerError,
@@ -347,6 +348,7 @@ struct DaemonContextCompactor {
     model: String,
     max_tokens: u64,
     provider_deadline: Option<tokio::time::Instant>,
+    provider_deadline_guard: Option<Arc<DaemonGraphFinalizationGuard>>,
     context_window: Option<u64>,
     reserved_output_tokens: u64,
     post_compaction_system_prompt: Option<String>,
@@ -379,6 +381,38 @@ impl std::fmt::Debug for DaemonContextCompactor {
 }
 
 impl DaemonContextCompactor {
+    async fn provider_phase_error(
+        &self,
+        run_id: &RunId,
+        error: ProviderError,
+        message: &str,
+    ) -> HaiderError {
+        if error.timeout_reason == Some(haider_provider::ProviderTimeoutReason::DeadlineExhausted)
+            && let Some(guard) = self.provider_deadline_guard.as_ref()
+        {
+            match guard.map_budget_owned_provider_deadline(run_id).await {
+                Ok(Some(mapped)) | Err(mapped) => return mapped,
+                Ok(None) => {}
+            }
+        }
+        let code = if error.presentation.subcode.as_str() == "provider-timeout" {
+            ErrorCode::ProviderTimeout
+        } else {
+            ErrorCode::ProviderError
+        };
+        HaiderError::new(code, format!("{message}: {error}"), error.retryable)
+    }
+
+    async fn provider_open_error(&self, run_id: &RunId, error: ProviderError) -> HaiderError {
+        self.provider_phase_error(run_id, error, "context summarization could not start")
+            .await
+    }
+
+    async fn provider_stream_error(&self, run_id: &RunId, error: ProviderError) -> HaiderError {
+        self.provider_phase_error(run_id, error, "context summarization failed")
+            .await
+    }
+
     async fn record_provider_view_attempt(
         &self,
         run_id: &RunId,
@@ -576,6 +610,42 @@ impl DaemonGraphFinalizationGuard {
         }
         Ok(())
     }
+
+    async fn map_budget_owned_provider_deadline(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<HaiderError>, HaiderError> {
+        let Some(check) = self.budget_check.as_ref() else {
+            return Ok(None);
+        };
+        let Some(limit) = check.spec.budget.max_time_ms else {
+            return Ok(None);
+        };
+        let budget_deadline = check.accepted_at_ms.saturating_add(limit);
+        if check
+            .spec
+            .request_deadline_unix_ms
+            .is_some_and(|request_deadline| request_deadline < budget_deadline)
+        {
+            return Ok(None);
+        }
+
+        // Provider phases reserve a tiny terminalization margin, so their
+        // deadline error may arrive just before the wall-clock budget monitor.
+        // Wait on the same canonical budget reduction, then commit its typed
+        // fact before core is allowed to append RunFailed/Errored.
+        let exhausted = monitor_run_budget(check.clone(), run_id.clone()).await;
+        persist_headless_budget_fact(
+            check,
+            &self.device_id,
+            run_id,
+            self.branch_id.as_ref(),
+            &self.event_ids,
+            &exhausted,
+        )
+        .await?;
+        Ok(Some(budget_exhausted_error(&exhausted)))
+    }
 }
 
 #[async_trait]
@@ -621,6 +691,16 @@ impl FinalizationGuard for DaemonGraphFinalizationGuard {
                 state_digest,
             } => return Err(workflow_unfinished_error(&graph_id, &state_digest)),
         })
+    }
+}
+
+#[async_trait]
+impl ProviderDeadlineGuard for DaemonGraphFinalizationGuard {
+    async fn map_deadline_exhausted(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<HaiderError>, HaiderError> {
+        self.map_budget_owned_provider_deadline(run_id).await
     }
 }
 
@@ -874,11 +954,7 @@ impl ContextCompactor for DaemonContextCompactor {
                 ));
             }
             Err(error) if error.presentation.subcode.as_str() == "provider-timeout" => {
-                return Err(HaiderError::new(
-                    ErrorCode::ProviderTimeout,
-                    format!("context summarization could not start: {error}"),
-                    false,
-                ));
+                return Err(self.provider_open_error(run_id, error).await);
             }
             Err(_) => {
                 // Some provider families cannot replay durable multimodal
@@ -961,23 +1037,15 @@ impl ContextCompactor for DaemonContextCompactor {
                 );
                 self.record_cache_request_attempt(run_id, 2, &fallback_cache_diagnostic)
                     .await?;
-                let stream = haider_provider::before_provider_request_deadline(
+                let stream = match haider_provider::before_provider_request_deadline(
                     self.provider_deadline,
                     self.provider.stream_turn(fallback),
                 )
                 .await
-                .map_err(|error| {
-                    let code = if error.presentation.subcode.as_str() == "provider-timeout" {
-                        ErrorCode::ProviderTimeout
-                    } else {
-                        ErrorCode::ProviderError
-                    };
-                    HaiderError::new(
-                        code,
-                        format!("context summarization could not start: {error}"),
-                        error.retryable,
-                    )
-                })?;
+                {
+                    Ok(stream) => stream,
+                    Err(error) => return Err(self.provider_open_error(run_id, error).await),
+                };
                 (
                     stream,
                     request_messages,
@@ -990,14 +1058,20 @@ impl ContextCompactor for DaemonContextCompactor {
         let mut summary = String::new();
         let mut finished = false;
         let mut reported_usage: Option<Usage> = None;
-        while let Some(item) = stream.recv().await {
-            match item.map_err(|error| {
-                HaiderError::new(
-                    ErrorCode::ProviderError,
-                    format!("context summarization failed: {error}"),
-                    error.retryable,
-                )
-            })? {
+        loop {
+            let item = match haider_provider::before_provider_request_deadline(
+                self.provider_deadline,
+                async { Ok::<_, ProviderError>(stream.recv().await) },
+            )
+            .await
+            {
+                Ok(Some(Ok(item))) => item,
+                Ok(Some(Err(error))) | Err(error) => {
+                    return Err(self.provider_stream_error(run_id, error).await);
+                }
+                Ok(None) => break,
+            };
+            match item {
                 StreamEvent::TextDelta { text } => summary.push_str(&text),
                 StreamEvent::ReasoningDelta { .. } => {}
                 StreamEvent::UsageUpdate(mut usage) => {
@@ -5099,6 +5173,7 @@ async fn perform_manual_compaction(
         model: resolved.model,
         max_tokens: metadata.max_tokens,
         provider_deadline: None,
+        provider_deadline_guard: None,
         context_window: resolved.context_window,
         reserved_output_tokens: metadata.max_tokens,
         post_compaction_system_prompt: Some(post_compaction_system_prompt),
@@ -6325,6 +6400,13 @@ async fn start_turn(
     // decision into provider-specific behavior. G1: children do NOT retain
     // `todo_write` — the plan surface is root-only (L5).
     config.attachments = attachments;
+    let run_boundary_guard = Arc::new(DaemonGraphFinalizationGuard {
+        store: lease.clone(),
+        branch_id: accepted.branch_id.clone(),
+        device_id: device_id.clone(),
+        event_ids: Arc::clone(&event_ids),
+        budget_check: budget_check.clone(),
+    });
     // Round 5 (known, accepted): these lane facts FREEZE at turn setup.
     // Mid-turn account rotation or web-tool degradation can drift the live
     // lane away from them; the replay then simply misses the cache (and may
@@ -6336,6 +6418,7 @@ async fn start_turn(
         model: config.model.clone(),
         max_tokens: config.max_tokens,
         provider_deadline,
+        provider_deadline_guard: Some(Arc::clone(&run_boundary_guard)),
         context_window: config.context_window,
         reserved_output_tokens: config.reserved_output_tokens,
         post_compaction_system_prompt: config.system_prompt.clone(),
@@ -6357,13 +6440,8 @@ async fn start_turn(
         usage_scope: config.usage_scope.clone(),
         usage_account: config.usage_account.clone(),
     }));
-    config.finalization_guard = Some(Arc::new(DaemonGraphFinalizationGuard {
-        store: lease.clone(),
-        branch_id: accepted.branch_id.clone(),
-        device_id: device_id.clone(),
-        event_ids: Arc::clone(&event_ids),
-        budget_check: budget_check.clone(),
-    }));
+    config.finalization_guard = Some(run_boundary_guard.clone());
+    config.provider_deadline_guard = Some(run_boundary_guard);
     config.rotation_budget_consumed = resolved.rotation_budget_consumed;
     config.initial_rotation = resolved.initial_rotation;
     config.provider_attempt_resolver = resolved.attempt_resolver;

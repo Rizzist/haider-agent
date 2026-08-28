@@ -143,7 +143,7 @@ pub struct ResultBounds {
 impl Default for ResultBounds {
     fn default() -> Self {
         Self {
-            max_preview_bytes: 8 * 1024,
+            max_preview_bytes: crate::TOOL_RESULT_INLINE_MAX_BYTES,
         }
     }
 }
@@ -7929,8 +7929,8 @@ fn is_dot_entry(name: &CStr) -> bool {
 }
 
 /// Redacts exactly once at the fs_read preview boundary. Raw bytes never enter
-/// the preview, but a changed or oversized value is retained in CAS for the
-/// existing owner-authorized item-inspection door.
+/// the preview, and only a semantically or byte-truncated value is retained in
+/// CAS; presentation-only redaction does not spill an otherwise-inline result.
 async fn bounded_read<C>(
     contents: String,
     preview_contents: Option<String>,
@@ -7966,7 +7966,14 @@ where
         || presentation_reduced
         || contents.len() > bounds.max_preview_bytes
         || redacted.text.len() > bounds.max_preview_bytes;
-    let artifact = Some(cas.put(contents.as_bytes()).await?);
+    let artifact_required = semantic_truncated
+        || contents.len() > bounds.max_preview_bytes
+        || redacted.text.len() > bounds.max_preview_bytes;
+    let artifact = if artifact_required {
+        Some(cas.put(contents.as_bytes()).await?)
+    } else {
+        None
+    };
     Ok(BoundedResult {
         preview: utf8_prefix(&redacted.text, bounds.max_preview_bytes).to_owned(),
         truncated,
@@ -8002,7 +8009,11 @@ where
         } else {
             None
         });
-    let artifact = Some(cas.put_file(output.complete.path()).await?);
+    let artifact = if truncated {
+        Some(cas.put_file(output.complete.path()).await?)
+    } else {
+        None
+    };
     let mut result = BoundedResult {
         preview: output.preview,
         truncated,
@@ -8072,7 +8083,11 @@ where
     let truncated_reason = output
         .truncated_reason
         .or(byte_truncated.then_some(ToolTruncationReason::ResultBytes));
-    let artifact = Some(cas.put(output.contents.as_bytes()).await?);
+    let artifact = if truncated {
+        Some(cas.put(output.contents.as_bytes()).await?)
+    } else {
+        None
+    };
     Ok(BoundedResult {
         preview: utf8_prefix(&output.preview, bounds.max_preview_bytes).to_owned(),
         truncated,

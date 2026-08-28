@@ -1077,8 +1077,8 @@ async fn landed_write_with_ledger_failure_still_updates_freshness() {
     );
 }
 
-/// MUTATION CHECK: alter the legacy preview/flags or remove the E4 owner re-read
-/// handle. Expected RUNTIME failure: one of these exact assertions differs.
+/// MUTATION CHECK: alter the legacy preview/flags or spill an inline read to
+/// CAS. Expected RUNTIME failure: one of these exact assertions differs.
 #[tokio::test]
 async fn existing_read_and_create_write_results_remain_byte_exact() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -1095,7 +1095,7 @@ async fn existing_read_and_create_write_results_remain_byte_exact() {
         .expect("read");
     assert_eq!(read.preview, "exact\n");
     assert!(!read.truncated);
-    assert!(read.artifact.is_some());
+    assert!(read.artifact.is_none());
     assert!(read.cursor.is_none());
 
     let canonical = fs::canonicalize(directory.path())

@@ -84,11 +84,11 @@ use haider_protocol::tool::{
 use haider_protocol::verify::VerifyVerdict;
 use haider_provider::{
     Message, PROVIDER_DEADLINE_SAFETY_MARGIN, PromptCacheMetadata, Provider, ProviderError,
-    ProviderErrorKind, ProviderStream, ProviderStreamItem, ResolvedAttachment, ToolDefinition,
-    TurnRequest, apply_tool_result_image_budget, before_provider_request_deadline,
-    canonical_tool_definitions, canonical_tool_definitions_digest,
-    degrade_tool_result_images_to_placeholders, effective_request_budget,
-    validate_provider_view_prefix,
+    ProviderErrorKind, ProviderStream, ProviderStreamItem, ProviderTimeoutReason,
+    ResolvedAttachment, ToolDefinition, TurnRequest, apply_tool_result_image_budget,
+    before_provider_request_deadline, canonical_tool_definitions,
+    canonical_tool_definitions_digest, degrade_tool_result_images_to_placeholders,
+    effective_request_budget, validate_provider_view_prefix,
 };
 use haider_tools::{Plan, RequestInput, TodoWrite};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -314,6 +314,10 @@ pub struct HarnessConfig {
     /// Daemon-owned provider EndTurn guard. Standalone actors have no graph
     /// authority and therefore leave this unset.
     pub finalization_guard: Option<Arc<dyn FinalizationGuard>>,
+    /// Maps a provider-open deadline owned by the daemon's run budget back to
+    /// that typed budget terminal. A distinct client request deadline remains
+    /// a provider timeout, and standalone actors leave this unset.
+    pub provider_deadline_guard: Option<Arc<dyn ProviderDeadlineGuard>>,
     /// Typed human-availability policy derived from durable session metadata.
     pub interaction_policy: InteractionResolutionPolicy,
     pub command_capacity: usize,
@@ -409,6 +413,7 @@ impl HarnessConfig {
             retry_sleeper: Arc::new(RealRetrySleeper),
             context_compactor: None,
             finalization_guard: None,
+            provider_deadline_guard: None,
             interaction_policy: InteractionResolutionPolicy::default(),
             command_capacity: 8,
             broadcast_capacity: 128,
@@ -794,6 +799,19 @@ pub enum FinalizationGuardDecision {
 #[async_trait]
 pub trait FinalizationGuard: Send + Sync + std::fmt::Debug {
     async fn before_done(&self, run_id: &RunId) -> Result<FinalizationGuardDecision, HaiderError>;
+}
+
+/// Daemon-owned classifier for a provider-open wait that exhausted the
+/// absolute provider deadline. The daemon is the only layer that knows
+/// whether that deadline came from `budget.max_time_ms` or an earlier client
+/// request timeout, and it commits the typed budget fact before returning a
+/// replacement terminal error.
+#[async_trait]
+pub trait ProviderDeadlineGuard: Send + Sync + std::fmt::Debug {
+    async fn map_deadline_exhausted(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<HaiderError>, HaiderError>;
 }
 
 /// A provider/account replacement for the current logical turn.
@@ -7466,6 +7484,18 @@ impl HarnessActor {
         tools: &mut Vec<ToolAccumulator>,
         mut provider_error: ProviderError,
     ) -> TurnOutcome {
+        if provider_error.timeout_reason == Some(ProviderTimeoutReason::DeadlineExhausted)
+            && let Some(guard) = self.config.provider_deadline_guard.clone()
+        {
+            match guard.map_deadline_exhausted(run_id).await {
+                Ok(Some(error)) | Err(error) => {
+                    return self
+                        .errored_outcome_with_items(run_id, message, reasoning, tools, error)
+                        .await;
+                }
+                Ok(None) => {}
+            }
+        }
         specialize_provider_presentation(&self.config.usage_scope.auth_scope, &mut provider_error);
         if let Some(card) = recovery_card_kind(&provider_error.presentation) {
             let menu = recovery_menu(

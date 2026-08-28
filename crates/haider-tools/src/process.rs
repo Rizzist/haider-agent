@@ -455,7 +455,7 @@ pub struct ProcessBounds {
 impl Default for ProcessBounds {
     fn default() -> Self {
         Self {
-            max_inline_bytes: 8 * 1024,
+            max_inline_bytes: crate::TOOL_RESULT_INLINE_MAX_BYTES,
             max_output_bytes: 1024 * 1024,
             wall_timeout: Duration::from_secs(60),
             kill_grace: Duration::from_secs(2),
@@ -1659,21 +1659,13 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
 
     let artifact_result = if transcript_failed {
         Ok(None)
-    } else {
-        let file = if let Some(spill) = spill {
-            spill.finish()
-        } else {
-            TranscriptSpill::new().and_then(|mut created| {
-                for buffered in &transcript {
-                    created.append(buffered.stream, &buffered.bytes)?;
-                }
-                created.finish()
-            })
-        };
-        match file {
+    } else if let Some(spill) = spill {
+        match spill.finish() {
             Ok(file) => cas.put_file(file.path()).await.map(Some),
             Err(error) => Err(error),
         }
+    } else {
+        Ok(None)
     };
     // Cancellation is sticky through artifact ingestion: a request arriving
     // while put_file is blocked owns both its success and failure arms.

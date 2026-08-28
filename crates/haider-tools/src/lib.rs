@@ -30,6 +30,11 @@ mod todo_write;
 mod webfetch;
 mod workflow_author;
 
+/// Default byte ceiling for a complete tool result to remain inline. A result
+/// that crosses this boundary is frozen in CAS and represented by a bounded
+/// preview plus its artifact reference.
+pub const TOOL_RESULT_INLINE_MAX_BYTES: usize = 8 * 1024;
+
 pub use broker::{
     ALLOW_SCREEN_CONTROL_SESSION_GRANT, ALLOW_SCREEN_SESSION_GRANT, AlwaysAllowRule, EffectBroker,
     EffectBrokerCloseError, EffectBrokerCloseReport, EffectOperation, JournalSink,

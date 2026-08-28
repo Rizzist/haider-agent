@@ -619,7 +619,8 @@ type ReadinessChildCoordinate = std::fs::File;
 type LivenessChildCoordinate = std::os::raw::c_int;
 
 #[cfg(windows)]
-type LivenessChildCoordinate = ();
+#[derive(Clone, Copy)]
+struct LivenessChildCoordinate;
 
 struct PreparedReadiness {
     token: String,
@@ -650,7 +651,9 @@ impl PreparedLiveness {
             self.reader.as_raw_fd()
         }
         #[cfg(windows)]
-        {}
+        {
+            LivenessChildCoordinate
+        }
     }
 
     fn into_guard(self) -> DaemonLivenessGuard {

@@ -258,10 +258,11 @@ async fn overlong_lines_are_reported_instead_of_silently_omitted() {
     assert!(result.preview.is_empty());
 }
 
-/// MUTATION CHECK: expose a denied path, NUL file, or raw token in either the
-/// legacy preview or structured match. Expected failure: a literal secret is visible.
+/// MUTATION CHECK: expose a denied path or raw token in either the legacy
+/// preview or structured match, or spill a small redacted result to CAS.
+/// Expected failure: a literal secret is visible or the CAS remains nonempty.
 #[tokio::test]
-async fn search_and_read_redact_while_owner_cas_keeps_raw_bytes() {
+async fn search_and_read_redact_without_spilling_inline_results() {
     let root = tempfile::tempdir().expect("root");
     fs::create_dir(root.path().join(".git")).expect("git marker");
     fs::write(root.path().join(".env"), "PASSWORD=never-show\n").expect("env");
@@ -294,7 +295,7 @@ async fn search_and_read_redact_while_owner_cas_keeps_raw_bytes() {
         .expect("search");
     assert!(!result.preview.contains(token));
     assert!(result.preview.contains("[REDACTED:api_key]"));
-    assert!(result.artifact.is_some());
+    assert!(result.artifact.is_none());
     let Some(ToolResultData::FsSearch {
         matches,
         binary_files_skipped,
@@ -309,7 +310,7 @@ async fn search_and_read_redact_while_owner_cas_keeps_raw_bytes() {
     assert!(bytes_scanned >= b"needle\0secret".len());
     assert_eq!(skipped_sensitive, 2);
     assert!(!matches[0].text.contains(token));
-    assert!(String::from_utf8_lossy(cas.0.last().expect("search CAS")).contains(token));
+    assert!(cas.0.is_empty());
 
     let read = broker
         .fs_read(
@@ -321,11 +322,8 @@ async fn search_and_read_redact_while_owner_cas_keeps_raw_bytes() {
         .await
         .expect("read");
     assert!(!read.preview.contains(token));
-    assert!(read.artifact.is_some());
-    assert_eq!(
-        cas.0.last().expect("read CAS"),
-        format!("token={token}\n").as_bytes()
-    );
+    assert!(read.artifact.is_none());
+    assert!(cas.0.is_empty());
 
     let env = broker
         .fs_read(
@@ -337,7 +335,8 @@ async fn search_and_read_redact_while_owner_cas_keeps_raw_bytes() {
         .await
         .expect("sensitive read");
     assert_eq!(env.preview, "[REDACTED:sensitive_file]\n");
-    assert_eq!(cas.0.last().expect("env CAS"), b"PASSWORD=never-show\n");
+    assert!(env.artifact.is_none());
+    assert!(cas.0.is_empty());
 
     let plain = broker
         .fs_read(
@@ -349,8 +348,7 @@ async fn search_and_read_redact_while_owner_cas_keeps_raw_bytes() {
         .await
         .expect("3 KiB read");
     assert_eq!(plain.preview, three_kib);
-    assert!(plain.artifact.is_some());
-    assert_eq!(cas.0.last().expect("plain CAS"), three_kib.as_bytes());
+    assert!(plain.artifact.is_none());
 
     let ranged = broker
         .fs_read(
@@ -362,7 +360,8 @@ async fn search_and_read_redact_while_owner_cas_keeps_raw_bytes() {
         .await
         .expect("ranged key-body read");
     assert_eq!(ranged.preview, "2: [REDACTED:private_key]\n");
-    assert_eq!(cas.0.last().expect("ranged raw CAS"), b"2: AA==\n");
+    assert!(ranged.artifact.is_none());
+    assert!(cas.0.is_empty());
 
     let searched_key = broker
         .fs_search(
@@ -375,12 +374,14 @@ async fn search_and_read_redact_while_owner_cas_keeps_raw_bytes() {
         .expect("search embedded key body");
     assert!(searched_key.preview.contains("[REDACTED:private_key]"));
     assert!(!searched_key.preview.contains("AA=="));
+    assert!(searched_key.artifact.is_none());
+    assert!(cas.0.is_empty());
 }
 
 #[tokio::test]
 async fn repository_ignore_hidden_and_sensitive_glob_policies_are_stable() {
     let root = tempfile::tempdir().expect("root");
-    fs::create_dir(root.path().join(".git/info")).expect("git");
+    fs::create_dir_all(root.path().join(".git/info")).expect("git");
     fs::create_dir(root.path().join("src")).expect("src");
     fs::write(root.path().join(".gitignore"), "ignored.rs\n").expect("ignore");
     fs::write(root.path().join("src/.gitignore"), "drop.rs\n").expect("nested ignore");
