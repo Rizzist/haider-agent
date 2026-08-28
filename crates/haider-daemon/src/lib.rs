@@ -62,6 +62,9 @@ mod delegation_rollup_tests;
 mod device_discovery;
 mod diagnostics;
 mod endpoint;
+#[cfg(test)]
+#[path = "endpoint_tests.rs"]
+mod endpoint_tests;
 mod error;
 mod gcloud;
 mod haider_code_plan;

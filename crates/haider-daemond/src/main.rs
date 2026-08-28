@@ -150,13 +150,17 @@ fn prepare_dispatch() -> Result<Option<ParsedArgs>, ExitCode> {
             return Err(ExitCode::from(64));
         }
     };
-    configure_runtime_temp(&parsed.config.runtime_dir);
+    if let Err(message) = configure_runtime_temp(&parsed.config.runtime_dir) {
+        eprintln!("haiderd: {message}");
+        return Err(ExitCode::from(70));
+    }
     Ok(Some(parsed))
 }
 
 #[allow(unsafe_code)]
-fn configure_runtime_temp(runtime_dir: &std::path::Path) {
-    let temp = runtime_dir.join("tmp");
+fn configure_runtime_temp(runtime_dir: &std::path::Path) -> Result<(), String> {
+    let temp = haider_platform::daemon_temp_directory_path(runtime_dir)
+        .map_err(|error| format!("cannot choose private daemon temp path: {error}"))?;
     // SAFETY: process entry calls this before constructing Tokio or spawning
     // the Windows entry thread, so no other thread can read the environment
     // while these process-wide variables are updated.
@@ -169,6 +173,7 @@ fn configure_runtime_temp(runtime_dir: &std::path::Path) {
             std::env::set_var("TMP", &temp);
         }
     }
+    Ok(())
 }
 
 async fn dispatch(parsed: ParsedArgs) -> ExitCode {

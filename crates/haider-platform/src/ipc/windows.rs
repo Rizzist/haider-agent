@@ -1,4 +1,8 @@
-use super::{Endpoint, EndpointError, IpcShutdownOutcome, PeerCredentials, PeerExitReason};
+use super::{
+    Endpoint, EndpointError, IpcShutdownOutcome, OwnedDirectoryInspection, OwnedDirectoryPathState,
+    OwnedDirectoryReceipt, OwnedDirectoryRemoval, PeerCredentials, PeerExitReason,
+    PreparedRuntimeDirectory,
+};
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle as _, OwnedHandle as ProcessHandle};
 use std::path::Path;
@@ -70,7 +74,7 @@ impl Drop for IpcStream {
     fn drop(&mut self) {
         if take_pipe(&self.stream) == Some(PipeRole::Server) {
             eprintln!(
-                "haiderd: ephemeral-lifecycle event=windows_pipe_instance_close trigger=stream_drop outcome=closed close_order=connection_task_then_pipe_instance"
+                "haiderd: ephemeral-lifecycle event=windows_pipe_instance_close trigger=stream_drop outcome=local_slot_emptied kernel_close=deferred_until_iocp_poll close_order=connection_task_then_pipe_instance"
             );
         }
     }
@@ -119,8 +123,12 @@ impl PeerExitWatcher {
                     );
                     let closed = take_pipe(&self.stream).is_some();
                     eprintln!(
-                        "haiderd: ephemeral-lifecycle event=windows_pipe_instance_close trigger=process_exit outcome={}",
-                        if closed { "closed" } else { "already_closed" }
+                        "haiderd: ephemeral-lifecycle event=windows_pipe_instance_close trigger=process_exit outcome={} kernel_close=not_proven_until_iocp_poll",
+                        if closed {
+                            "local_slot_emptied"
+                        } else {
+                            "local_slot_already_empty"
+                        }
                     );
                     return Ok(PeerExitReason::ProcessExited);
                 }
@@ -153,16 +161,20 @@ impl PeerExitWatcher {
                 }
             };
             if !connected {
-                // Close the accepted server handle before the connection task
-                // returns. This cancels its split read/write operations and
-                // prevents a dead instance from surviving into runtime cleanup.
+                // Empty the accepted server slot before the connection task
+                // returns. This cancels its split read/write operations; mio
+                // may retain kernel-handle references until IOCP is polled.
                 eprintln!(
                     "haiderd: ephemeral-lifecycle event=windows_peer_wait result=connection_close close_order=probe_then_pipe_instance"
                 );
                 let closed = take_pipe(&self.stream).is_some();
                 eprintln!(
-                    "haiderd: ephemeral-lifecycle event=windows_pipe_instance_close trigger=connection_close outcome={}",
-                    if closed { "closed" } else { "already_closed" }
+                    "haiderd: ephemeral-lifecycle event=windows_pipe_instance_close trigger=connection_close outcome={} kernel_close=not_proven_until_iocp_poll",
+                    if closed {
+                        "local_slot_emptied"
+                    } else {
+                        "local_slot_already_empty"
+                    }
                 );
                 return Ok(PeerExitReason::ConnectionClosed);
             }
@@ -352,6 +364,12 @@ impl BoundEndpoint {
         Ok(())
     }
 
+    /// Windows named-pipe rendezvous names have no filesystem entry inside
+    /// the runtime directory.
+    pub fn owned_runtime_paths(&self) -> Result<Vec<std::path::PathBuf>, EndpointError> {
+        Ok(Vec::new())
+    }
+
     pub async fn accept(&self) -> io::Result<(IpcStream, EndpointAddress)> {
         // Borrow the pending instance across `connect` instead of taking it
         // out. The daemon awaits `accept` inside `tokio::select!`; cancellation
@@ -374,6 +392,592 @@ impl BoundEndpoint {
     pub fn close_listener(&mut self) {
         self.listener.get_mut().take();
     }
+}
+
+pub(super) fn prepare_runtime_directory(
+    runtime_dir: &Path,
+) -> Result<PreparedRuntimeDirectory, EndpointError> {
+    prepare_runtime_directory_inner(runtime_dir, None)
+}
+
+pub(super) fn prepare_runtime_directory_with_temp(
+    runtime_dir: &Path,
+    daemon_temp_dir: &Path,
+) -> Result<PreparedRuntimeDirectory, EndpointError> {
+    prepare_runtime_directory_inner(runtime_dir, Some(daemon_temp_dir))
+}
+
+fn prepare_runtime_directory_inner(
+    runtime_dir: &Path,
+    daemon_temp_dir: Option<&Path>,
+) -> Result<PreparedRuntimeDirectory, EndpointError> {
+    let parent = runtime_dir
+        .parent()
+        .ok_or_else(|| EndpointError::Endpoint {
+            message: format!(
+                "profile runtime directory {} has no containing root",
+                runtime_dir.display()
+            ),
+        })?;
+    std::fs::create_dir_all(parent).map_err(|error| {
+        EndpointError::io("create profile runtime root ancestors", parent, error)
+    })?;
+    let runtime_receipt = prepare_windows_directory(runtime_dir, "profile runtime directory")?;
+    let temp = runtime_dir.join("tmp");
+    let temp_receipt = match prepare_windows_directory(&temp, "daemon temporary directory") {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            if let Some(mut receipt) = runtime_receipt {
+                return match remove_owned_empty_directory(&mut receipt) {
+                    Ok(
+                        OwnedDirectoryRemoval::Removed
+                        | OwnedDirectoryRemoval::AlreadyAbsent
+                        | OwnedDirectoryRemoval::ReplacementPreserved,
+                    ) => Err(error),
+                    Ok(
+                        OwnedDirectoryRemoval::RemovalRequested
+                        | OwnedDirectoryRemoval::CoordinateLost
+                        | OwnedDirectoryRemoval::NotEmpty,
+                    )
+                    | Err(_) => Err(EndpointError::OwnedResidual {
+                        path: receipt.path().to_path_buf(),
+                        source: Box::new(error),
+                    }),
+                };
+            }
+            return Err(error);
+        }
+    };
+    let mut receipts = Vec::with_capacity(2);
+    if let Some(receipt) = runtime_receipt {
+        receipts.push(receipt);
+    }
+    if let Some(receipt) = temp_receipt {
+        receipts.push(receipt);
+    }
+    if let Some(daemon_temp_dir) = daemon_temp_dir {
+        if daemon_temp_dir.parent() != Some(temp.as_path()) {
+            return rollback_windows_directories(
+                receipts,
+                EndpointError::Endpoint {
+                    message: format!(
+                        "daemon temp directory {} is not a direct child of {}",
+                        daemon_temp_dir.display(),
+                        temp.display()
+                    ),
+                },
+            );
+        }
+        match prepare_windows_directory(daemon_temp_dir, "daemon-private temporary directory") {
+            Ok(Some(receipt)) => receipts.push(receipt),
+            Ok(None) => {
+                return rollback_windows_directories(
+                    receipts,
+                    EndpointError::Endpoint {
+                        message: format!(
+                            "daemon-private temp path unexpectedly pre-existed: {}",
+                            daemon_temp_dir.display()
+                        ),
+                    },
+                );
+            }
+            Err(error) => return rollback_windows_directories(receipts, error),
+        }
+    }
+    Ok(PreparedRuntimeDirectory::new(receipts))
+}
+
+fn rollback_windows_directories(
+    mut receipts: Vec<OwnedDirectoryReceipt>,
+    error: EndpointError,
+) -> Result<PreparedRuntimeDirectory, EndpointError> {
+    while let Some(mut receipt) = receipts.pop() {
+        match remove_owned_empty_directory(&mut receipt) {
+            Ok(
+                OwnedDirectoryRemoval::Removed
+                | OwnedDirectoryRemoval::AlreadyAbsent
+                | OwnedDirectoryRemoval::ReplacementPreserved,
+            ) => {}
+            Ok(OwnedDirectoryRemoval::RemovalRequested) => {
+                return Err(EndpointError::OwnedResidual {
+                    path: receipt.path().to_path_buf(),
+                    source: Box::new(error),
+                });
+            }
+            Ok(OwnedDirectoryRemoval::CoordinateLost | OwnedDirectoryRemoval::NotEmpty)
+            | Err(_) => {
+                return Err(EndpointError::OwnedResidual {
+                    path: receipt.path().to_path_buf(),
+                    source: Box::new(error),
+                });
+            }
+        }
+    }
+    Err(error)
+}
+
+fn prepare_windows_directory(
+    path: &Path,
+    description: &'static str,
+) -> Result<Option<OwnedDirectoryReceipt>, EndpointError> {
+    match open_removable_directory(path) {
+        Ok(anchor) => {
+            crate::set_mode(path, 0o700)
+                .map_err(|error| EndpointError::io("secure private directory", path, error))?;
+            drop(anchor);
+            return Ok(None);
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(EndpointError::io("open private directory", path, error));
+        }
+    }
+    loop {
+        let staging = owned_directory_claim_path(path)?;
+        match std::fs::create_dir(&staging) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(EndpointError::io(
+                    "create staged private directory",
+                    &staging,
+                    error,
+                ));
+            }
+        }
+        let anchor = match open_removable_directory(&staging) {
+            Ok(anchor) => anchor,
+            Err(error) => {
+                return Err(EndpointError::OwnedResidual {
+                    path: staging.clone(),
+                    source: Box::new(EndpointError::io(
+                        "open staged private directory",
+                        &staging,
+                        error,
+                    )),
+                });
+            }
+        };
+        if let Err(error) = crate::set_mode(&staging, 0o700) {
+            let mut receipt = OwnedDirectoryReceipt::new(staging.clone(), anchor);
+            return match remove_owned_empty_directory(&mut receipt) {
+                Ok(OwnedDirectoryRemoval::Removed | OwnedDirectoryRemoval::AlreadyAbsent) => Err(
+                    EndpointError::io("secure staged private directory", &staging, error),
+                ),
+                Ok(
+                    OwnedDirectoryRemoval::RemovalRequested
+                    | OwnedDirectoryRemoval::ReplacementPreserved
+                    | OwnedDirectoryRemoval::CoordinateLost
+                    | OwnedDirectoryRemoval::NotEmpty,
+                )
+                | Err(_) => Err(EndpointError::OwnedResidual {
+                    path: receipt.path().to_path_buf(),
+                    source: Box::new(EndpointError::io(
+                        "secure staged private directory",
+                        &staging,
+                        error,
+                    )),
+                }),
+            };
+        }
+        let mut receipt = OwnedDirectoryReceipt::new(staging, anchor);
+        match rename_directory_handle(&receipt, path) {
+            Ok(()) => {
+                receipt.path = path.to_path_buf();
+                return Ok(Some(receipt));
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                match remove_owned_empty_directory(&mut receipt) {
+                    Ok(OwnedDirectoryRemoval::Removed | OwnedDirectoryRemoval::AlreadyAbsent) => {}
+                    _ => {
+                        return Err(EndpointError::OwnedResidual {
+                            path: receipt.path().to_path_buf(),
+                            source: Box::new(EndpointError::Endpoint {
+                                message: format!(
+                                    "{description} appeared while its staging directory could not be retired: {}",
+                                    path.display()
+                                ),
+                            }),
+                        });
+                    }
+                }
+                let anchor = open_removable_directory(path).map_err(|open_error| {
+                    EndpointError::io(
+                        "open concurrently created private directory",
+                        path,
+                        open_error,
+                    )
+                })?;
+                crate::set_mode(path, 0o700).map_err(|mode_error| {
+                    EndpointError::io(
+                        "secure concurrently created private directory",
+                        path,
+                        mode_error,
+                    )
+                })?;
+                drop(anchor);
+                return Ok(None);
+            }
+            Err(error) => {
+                let remove_result = remove_owned_empty_directory(&mut receipt);
+                return match remove_result {
+                    Ok(OwnedDirectoryRemoval::Removed | OwnedDirectoryRemoval::AlreadyAbsent) => {
+                        Err(EndpointError::io("publish private directory", path, error))
+                    }
+                    Ok(
+                        OwnedDirectoryRemoval::RemovalRequested
+                        | OwnedDirectoryRemoval::ReplacementPreserved
+                        | OwnedDirectoryRemoval::CoordinateLost
+                        | OwnedDirectoryRemoval::NotEmpty,
+                    )
+                    | Err(_) => Err(EndpointError::OwnedResidual {
+                        path: receipt.path().to_path_buf(),
+                        source: Box::new(EndpointError::io(
+                            "publish private directory",
+                            path,
+                            error,
+                        )),
+                    }),
+                };
+            }
+        }
+    }
+}
+
+fn open_removable_directory(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::windows::fs::MetadataExt as _;
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_LIST_DIRECTORY: u32 = 0x0000_0001;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+    let file = std::fs::OpenOptions::new()
+        .access_mode(DELETE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::other(format!(
+            "{} is not a real directory",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+pub(super) fn remove_owned_empty_directory(
+    receipt: &mut OwnedDirectoryReceipt,
+) -> io::Result<OwnedDirectoryRemoval> {
+    let Some(_) = receipt.anchor.as_ref() else {
+        return match std::fs::symlink_metadata(&receipt.path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Ok(OwnedDirectoryRemoval::Removed)
+            }
+            Ok(_) => Err(io::Error::from_raw_os_error(303)),
+            Err(error) => Err(error),
+        };
+    };
+    let original = receipt.path.clone();
+    let claim = owned_directory_claim_path(&original)?;
+    match rename_directory_handle(receipt, &claim) {
+        Ok(()) => receipt.path = claim,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return match owned_directory_path_state(receipt)? {
+                OwnedDirectoryPathState::OwnedObjectUnlinked => {
+                    Ok(OwnedDirectoryRemoval::AlreadyAbsent)
+                }
+                _ => Ok(OwnedDirectoryRemoval::CoordinateLost),
+            };
+        }
+        Err(error) => return Err(error),
+    }
+    match request_directory_delete(receipt) {
+        Ok(()) => {
+            drop(receipt.anchor.take());
+            Ok(OwnedDirectoryRemoval::RemovalRequested)
+        }
+        Err(error) if error.raw_os_error() == Some(145) => {
+            rename_directory_handle(receipt, &original)?;
+            receipt.path = original;
+            Ok(OwnedDirectoryRemoval::NotEmpty)
+        }
+        Err(error) => match rename_directory_handle(receipt, &original) {
+            Ok(()) => {
+                receipt.path = original;
+                Err(error)
+            }
+            Err(restore_error) => Err(io::Error::other(format!(
+                "remove owned directory failed: {error}; restore failed: {}",
+                restore_error
+            ))),
+        },
+    }
+}
+
+pub(super) fn owned_directory_path_state(
+    receipt: &OwnedDirectoryReceipt,
+) -> io::Result<OwnedDirectoryPathState> {
+    let Some(anchor) = receipt.anchor.as_ref() else {
+        return match std::fs::symlink_metadata(&receipt.path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Ok(OwnedDirectoryPathState::OwnedObjectUnlinked)
+            }
+            Ok(_) => Ok(OwnedDirectoryPathState::ReplacementPreserved),
+            Err(error) => Err(error),
+        };
+    };
+    let expected = crate::windows_file_identity(anchor)?;
+    let linked = windows_handle_link_count(anchor)? > 0;
+    match open_removable_directory(&receipt.path) {
+        Ok(found) if crate::windows_file_identity(&found)? == expected => {
+            Ok(OwnedDirectoryPathState::Owned)
+        }
+        Ok(_) if linked => Ok(OwnedDirectoryPathState::CoordinateLost),
+        Ok(_) => Ok(OwnedDirectoryPathState::ReplacementPreserved),
+        Err(error) if error.kind() == io::ErrorKind::NotFound && linked => {
+            Ok(OwnedDirectoryPathState::CoordinateLost)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok(OwnedDirectoryPathState::OwnedObjectUnlinked)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[allow(unsafe_code)]
+pub(super) fn inspect_owned_directory(
+    receipt: &OwnedDirectoryReceipt,
+) -> io::Result<OwnedDirectoryInspection> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use windows_sys::Win32::Foundation::ERROR_NO_MORE_FILES;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_BOTH_DIR_INFO, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo,
+        GetFileInformationByHandleEx,
+    };
+
+    let Some(anchor) = receipt.anchor.as_ref() else {
+        return Ok(OwnedDirectoryInspection::OwnedObjectUnlinked);
+    };
+    if windows_handle_link_count(anchor)? == 0 {
+        return Ok(OwnedDirectoryInspection::OwnedObjectUnlinked);
+    }
+
+    const BUFFER_BYTES: usize = 64 * 1024;
+    let mut buffer = vec![0_usize; BUFFER_BYTES.div_ceil(std::mem::size_of::<usize>())];
+    let mut information_class = FileIdBothDirectoryRestartInfo;
+    let mut entries = Vec::new();
+    loop {
+        // SAFETY: `anchor` is a live directory handle opened with
+        // FILE_LIST_DIRECTORY. `buffer` is suitably aligned, writable for
+        // BUFFER_BYTES, and lives through this call.
+        let succeeded = unsafe {
+            GetFileInformationByHandleEx(
+                anchor.as_raw_handle().cast(),
+                information_class,
+                buffer.as_mut_ptr().cast(),
+                BUFFER_BYTES as u32,
+            )
+        };
+        if succeeded == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                break;
+            }
+            return Err(error);
+        }
+
+        let mut offset = 0_usize;
+        loop {
+            let header_bytes = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+            if offset % std::mem::align_of::<FILE_ID_BOTH_DIR_INFO>() != 0
+                || offset
+                    .checked_add(header_bytes)
+                    .is_none_or(|end| end > BUFFER_BYTES)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid Windows directory enumeration record offset",
+                ));
+            }
+            // SAFETY: the offset and fixed header were bounds- and
+            // alignment-checked above; the kernel initialized this record.
+            let information = unsafe {
+                &*buffer
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(offset)
+                    .cast::<FILE_ID_BOTH_DIR_INFO>()
+            };
+            let name_bytes = information.FileNameLength as usize;
+            let name_start = offset + header_bytes;
+            if name_bytes % std::mem::size_of::<u16>() != 0
+                || name_start
+                    .checked_add(name_bytes)
+                    .is_none_or(|end| end > BUFFER_BYTES)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid Windows directory enumeration filename length",
+                ));
+            }
+            // SAFETY: FileName is UTF-16 aligned within the checked record and
+            // the byte length was validated against the output buffer.
+            let name = unsafe {
+                std::slice::from_raw_parts(
+                    buffer.as_ptr().cast::<u8>().add(name_start).cast::<u16>(),
+                    name_bytes / std::mem::size_of::<u16>(),
+                )
+            };
+            let name = std::ffi::OsString::from_wide(name);
+            if name != "." && name != ".." {
+                entries.push(receipt.path.join(name));
+            }
+            let next = information.NextEntryOffset as usize;
+            if next == 0 {
+                break;
+            }
+            if next < header_bytes || offset.checked_add(next).is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid Windows directory enumeration next offset",
+                ));
+            }
+            offset += next;
+        }
+        information_class = FileIdBothDirectoryInfo;
+    }
+    entries.sort();
+    Ok(OwnedDirectoryInspection::Entries(entries))
+}
+
+#[allow(unsafe_code)]
+pub(super) fn windows_handle_link_count(file: &std::fs::File) -> io::Result<u32> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    // SAFETY: `file` owns a live handle and `information` is writable for the
+    // exact structure expected by GetFileInformationByHandle.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &raw mut information) } == 0
+    {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(information.nNumberOfLinks)
+    }
+}
+
+#[allow(unsafe_code)]
+fn rename_directory_handle(receipt: &OwnedDirectoryReceipt, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
+    };
+
+    let anchor = receipt
+        .anchor
+        .as_ref()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "owned directory handle closed"))?;
+    let mut destination = destination.as_os_str().encode_wide().collect::<Vec<_>>();
+    if destination.is_empty() || destination.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "directory rename destination is empty or contains NUL",
+        ));
+    }
+    let name_bytes = destination
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| io::Error::other("directory rename destination is too long"))?;
+    destination.push(0);
+    let buffer_bytes = std::mem::offset_of!(FILE_RENAME_INFO, FileName)
+        .checked_add(name_bytes)
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u16>()))
+        .ok_or_else(|| io::Error::other("directory rename buffer size overflow"))?;
+    let words = buffer_bytes.div_ceil(std::mem::size_of::<usize>());
+    let mut buffer = vec![0_usize; words];
+    let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    unsafe {
+        (*information).Anonymous.ReplaceIfExists = false;
+        (*information).RootDirectory = std::ptr::null_mut();
+        (*information).FileNameLength = u32::try_from(name_bytes)
+            .map_err(|_| io::Error::other("directory rename destination is too long"))?;
+        std::ptr::copy_nonoverlapping(
+            destination.as_ptr(),
+            std::ptr::addr_of_mut!((*information).FileName).cast::<u16>(),
+            destination.len(),
+        );
+    }
+    // SAFETY: `information` names a suitably aligned buffer of
+    // `buffer_bytes`; the live directory handle has DELETE access and the
+    // no-replace flag preserves any destination that appeared concurrently.
+    if unsafe {
+        SetFileInformationByHandle(
+            anchor.as_raw_handle().cast(),
+            FileRenameInfo,
+            information.cast(),
+            u32::try_from(buffer_bytes)
+                .map_err(|_| io::Error::other("directory rename buffer is too large"))?,
+        )
+    } == 0
+    {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[allow(unsafe_code)]
+fn request_directory_delete(receipt: &OwnedDirectoryReceipt) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+
+    let anchor = receipt
+        .anchor
+        .as_ref()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "owned directory handle closed"))?;
+    let information = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: the structure is initialized for this information class and the
+    // retained directory handle has DELETE access.
+    if unsafe {
+        SetFileInformationByHandle(
+            anchor.as_raw_handle().cast(),
+            FileDispositionInfo,
+            std::ptr::from_ref(&information).cast_mut().cast(),
+            u32::try_from(std::mem::size_of_val(&information))
+                .map_err(|_| io::Error::other("directory disposition size overflow"))?,
+        )
+    } == 0
+    {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn owned_directory_claim_path(path: &Path) -> Result<std::path::PathBuf, EndpointError> {
+    use std::fmt::Write as _;
+
+    let mut random = [0_u8; 12];
+    getrandom::fill(&mut random).map_err(|error| EndpointError::Task {
+        message: format!("cannot generate directory claim name: {error}"),
+    })?;
+    let mut basename = String::from(".haiderd-dir-");
+    for byte in random {
+        write!(&mut basename, "{byte:02x}").map_err(|error| EndpointError::Task {
+            message: format!("cannot format directory claim name: {error}"),
+        })?;
+    }
+    Ok(path.with_file_name(basename))
 }
 
 pub(super) fn validate_endpoint_budget(

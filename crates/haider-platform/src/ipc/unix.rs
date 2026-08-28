@@ -4,7 +4,11 @@
 //! directory-relative verification, unpredictable staging names, non-replacing
 //! publication/restoration, stale probing, and device/inode cleanup identity.
 
-use super::{Endpoint, EndpointError, IpcShutdownOutcome, PeerCredentials, PeerExitReason};
+use super::{
+    Endpoint, EndpointError, IpcShutdownOutcome, OwnedDirectoryInspection, OwnedDirectoryPathState,
+    OwnedDirectoryReceipt, OwnedDirectoryRemoval, PeerCredentials, PeerExitReason,
+    PreparedRuntimeDirectory,
+};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
 use std::fs;
@@ -116,15 +120,14 @@ impl BoundEndpoint {
     pub async fn bind(endpoint: &Endpoint, runtime_dir: &Path) -> Result<Self, EndpointError> {
         validate_endpoint_budget(endpoint, runtime_dir)?;
         let runtime_dir_owned = runtime_dir.to_path_buf();
-        let (directory, owner_uid) =
-            tokio::task::spawn_blocking(move || prepare_runtime_dir(&runtime_dir_owned))
+        let (directory, owner_uid, _) =
+            tokio::task::spawn_blocking(move || prepare_runtime_dir(&runtime_dir_owned, None))
                 .await
                 .map_err(|error| EndpointError::Task {
                     message: format!("runtime directory preparation task failed: {error}"),
                 })??;
         let socket_path = endpoint.address().to_path_buf();
         let name = endpoint_name(&socket_path)?;
-        sweep_staging(&directory, runtime_dir, owner_uid).await?;
         preflight(&directory, &socket_path, &name, owner_uid).await?;
 
         let staging = staging_name()?;
@@ -134,9 +137,15 @@ impl BoundEndpoint {
         let (identity, inode_anchor) =
             match stage_and_publish(&directory, &staging, &name, owner_uid) {
                 Ok(published) => published,
+                // The staging pathname can be replaced after bind. Without a
+                // retained identity receipt from the failed publication path,
+                // unlinking that name could delete a replacement. Preserve it
+                // as a typed owned-coordinate residual instead.
                 Err(error) => {
-                    let _ = rustix::fs::unlinkat(&directory, staging.as_str(), AtFlags::empty());
-                    return Err(error);
+                    return Err(EndpointError::OwnedResidual {
+                        path: staging_path,
+                        source: Box::new(error),
+                    });
                 }
             };
         Ok(Self {
@@ -146,6 +155,7 @@ impl BoundEndpoint {
                 name,
                 path: socket_path,
                 identity,
+                owned_path_candidates: vec![endpoint.address().to_path_buf()],
                 _inode_anchor: inode_anchor,
                 active: true,
             },
@@ -172,6 +182,14 @@ impl BoundEndpoint {
         self.cleanup.remove_owned()
     }
 
+    /// Filesystem paths that still name the exact socket inode this endpoint
+    /// created. Cleanup can temporarily move that inode under a random claim
+    /// name; retaining the generated path and checking its device/inode keeps
+    /// runtime-directory cleanup from guessing ownership from a basename.
+    pub fn owned_runtime_paths(&self) -> Result<Vec<PathBuf>, EndpointError> {
+        self.cleanup.owned_runtime_paths()
+    }
+
     pub async fn accept(&self) -> std::io::Result<(IpcStream, EndpointAddress)> {
         match &self.listener {
             Some(listener) => listener.accept().await,
@@ -192,6 +210,7 @@ struct SocketCleanup {
     name: String,
     path: PathBuf,
     identity: SocketIdentity,
+    owned_path_candidates: Vec<PathBuf>,
     // Linux can immediately recycle a Unix socket's inode after its pathname
     // is replaced. Keep the staged inode referenced so the device/inode
     // cleanup identity cannot suffer an ABA collision with its replacement.
@@ -204,15 +223,16 @@ impl SocketCleanup {
         if !self.active {
             return Ok(());
         }
-        self.active = false;
         match rustix::fs::statat(
             &self.directory,
             self.name.as_str(),
             AtFlags::SYMLINK_NOFOLLOW,
         ) {
-            Ok(stat) if identity_of(&stat) != self.identity => return Ok(()),
+            Ok(stat) if identity_of(&stat) != self.identity => {
+                return self.finish_if_owned_socket_unlinked();
+            }
             Ok(_) => {}
-            Err(Errno::NOENT) => return Ok(()),
+            Err(Errno::NOENT) => return self.finish_if_owned_socket_unlinked(),
             Err(error) => {
                 return Err(EndpointError::io(
                     "lstat owned socket",
@@ -222,14 +242,19 @@ impl SocketCleanup {
             }
         }
         let claim = staging_name()?;
-        match rustix::fs::renameat(
-            &self.directory,
-            self.name.as_str(),
-            &self.directory,
-            claim.as_str(),
-        ) {
+        self.owned_path_candidates
+            .push(self.path.with_file_name(&claim));
+        match rename_no_replace(&self.directory, self.name.as_str(), claim.as_str()) {
             Ok(()) => {}
-            Err(Errno::NOENT) => return Ok(()),
+            Err(Errno::NOENT) => return self.finish_if_owned_socket_unlinked(),
+            Err(Errno::EXIST) => {
+                return Err(EndpointError::Endpoint {
+                    message: format!(
+                        "cannot claim owned endpoint {} without replacing an existing node",
+                        self.path.display()
+                    ),
+                });
+            }
             Err(error) => {
                 return Err(EndpointError::io(
                     "claim owned socket",
@@ -241,7 +266,7 @@ impl SocketCleanup {
         let stat =
             match rustix::fs::statat(&self.directory, claim.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(stat) => stat,
-                Err(Errno::NOENT) => return Ok(()),
+                Err(Errno::NOENT) => return self.finish_if_owned_socket_unlinked(),
                 Err(error) => {
                     restore(&self.directory, &claim, &self.name)?;
                     return Err(EndpointError::io(
@@ -252,16 +277,99 @@ impl SocketCleanup {
                 }
             };
         if identity_of(&stat) != self.identity {
-            return restore(&self.directory, &claim, &self.name);
+            restore(&self.directory, &claim, &self.name)?;
+            return self.finish_if_owned_socket_unlinked();
         }
         match rustix::fs::unlinkat(&self.directory, claim.as_str(), AtFlags::empty()) {
-            Ok(()) | Err(Errno::NOENT) => Ok(()),
+            Ok(()) => {
+                self.active = false;
+                Ok(())
+            }
+            Err(Errno::NOENT) => self.finish_if_owned_socket_unlinked(),
             Err(error) => Err(EndpointError::io(
                 "remove owned socket",
                 &self.path,
                 error.into(),
             )),
         }
+    }
+
+    fn finish_if_owned_socket_unlinked(&mut self) -> Result<(), EndpointError> {
+        #[cfg(target_os = "linux")]
+        {
+            let stat = rustix::fs::fstat(&self._inode_anchor).map_err(|error| {
+                EndpointError::io("fstat retained socket inode", &self.path, error.into())
+            })?;
+            if stat.st_nlink == 0 {
+                self.active = false;
+                return Ok(());
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            Err(self.owned_socket_coordinate_lost())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Apple/BSD provide no O_PATH-equivalent anchor for a filesystem
+            // socket inode. A replacement at the public coordinate is still
+            // preserved; the listener owns the old socket object, and losing
+            // its directory entry is the expected controlled-handover case.
+            self.active = false;
+            Ok(())
+        }
+    }
+
+    fn owned_socket_coordinate_lost(&self) -> EndpointError {
+        EndpointError::OwnedResidual {
+            path: self.path.clone(),
+            source: Box::new(EndpointError::Endpoint {
+                message: format!(
+                    "daemon-owned endpoint remains linked outside its recorded coordinate: {}",
+                    self.path.display()
+                ),
+            }),
+        }
+    }
+
+    fn owned_runtime_paths(&self) -> Result<Vec<PathBuf>, EndpointError> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let mut owned_paths = Vec::new();
+        for path in &self.owned_path_candidates {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) => {
+                    let identity = SocketIdentity {
+                        device: metadata.dev(),
+                        inode: metadata.ino(),
+                    };
+                    if identity == self.identity {
+                        owned_paths.push(path.clone());
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(EndpointError::io(
+                        "inspect owned endpoint residual",
+                        path,
+                        error,
+                    ));
+                }
+            }
+        }
+        if owned_paths.is_empty() && self.active {
+            #[cfg(target_os = "linux")]
+            {
+                let stat = rustix::fs::fstat(&self._inode_anchor).map_err(|error| {
+                    EndpointError::io("fstat retained socket residual", &self.path, error.into())
+                })?;
+                if stat.st_nlink == 0 {
+                    return Ok(owned_paths);
+                }
+            }
+            return Err(self.owned_socket_coordinate_lost());
+        }
+        Ok(owned_paths)
     }
 }
 
@@ -372,7 +480,10 @@ fn rename_no_replace(directory: &OwnedFd, from: &str, to: &str) -> Result<(), Er
     rustix::fs::renameat(directory, from, directory, to)
 }
 
-fn prepare_runtime_dir(runtime_dir: &Path) -> Result<(OwnedFd, u32), EndpointError> {
+fn prepare_runtime_dir(
+    runtime_dir: &Path,
+    daemon_temp_dir: Option<&Path>,
+) -> Result<(OwnedFd, u32, Vec<OwnedDirectoryReceipt>), EndpointError> {
     let root_path = runtime_dir
         .parent()
         .ok_or_else(|| EndpointError::Endpoint {
@@ -442,86 +553,442 @@ fn prepare_runtime_dir(runtime_dir: &Path) -> Result<(OwnedFd, u32), EndpointErr
                 runtime_dir.display()
             ),
         })?;
-    match rustix::fs::mkdirat(&root, name, Mode::from_bits_truncate(0o700)) {
-        Ok(()) | Err(Errno::EXIST) => {}
+    let (directory, runtime_receipt) = prepare_child_directory(
+        &root,
+        name,
+        runtime_dir,
+        expected_uid,
+        "runtime directory",
+        true,
+    )?;
+    let temp_path = runtime_dir.join("tmp");
+    let (temp, temp_receipt) = match prepare_child_directory(
+        &directory,
+        std::ffi::OsStr::new("tmp"),
+        &temp_path,
+        expected_uid,
+        "daemon temporary directory",
+        true,
+    ) {
+        Ok(prepared) => prepared,
         Err(error) => {
-            return Err(EndpointError::io(
-                "create profile runtime directory",
-                runtime_dir,
-                error.into(),
-            ));
+            if let Some(mut receipt) = runtime_receipt {
+                return match remove_owned_empty_directory(&mut receipt) {
+                    Ok(
+                        OwnedDirectoryRemoval::Removed
+                        | OwnedDirectoryRemoval::RemovalRequested
+                        | OwnedDirectoryRemoval::AlreadyAbsent,
+                    ) => Err(error),
+                    Ok(OwnedDirectoryRemoval::ReplacementPreserved) => Err(error),
+                    Ok(OwnedDirectoryRemoval::CoordinateLost | OwnedDirectoryRemoval::NotEmpty)
+                    | Err(_) => Err(EndpointError::OwnedResidual {
+                        path: receipt.path().to_path_buf(),
+                        source: Box::new(error),
+                    }),
+                };
+            }
+            return Err(error);
+        }
+    };
+    let mut receipts = Vec::with_capacity(2);
+    if let Some(receipt) = runtime_receipt {
+        receipts.push(receipt);
+    }
+    if let Some(receipt) = temp_receipt {
+        receipts.push(receipt);
+    }
+    if let Some(daemon_temp_dir) = daemon_temp_dir {
+        if daemon_temp_dir.parent() != Some(temp_path.as_path()) {
+            return rollback_created_directories(
+                receipts,
+                EndpointError::Endpoint {
+                    message: format!(
+                        "daemon temp directory {} is not a direct child of {}",
+                        daemon_temp_dir.display(),
+                        temp_path.display()
+                    ),
+                },
+            );
+        }
+        let daemon_temp_name = match daemon_temp_dir.file_name() {
+            Some(name) => name,
+            None => {
+                return rollback_created_directories(
+                    receipts,
+                    EndpointError::Endpoint {
+                        message: format!(
+                            "daemon temp directory {} has no basename",
+                            daemon_temp_dir.display()
+                        ),
+                    },
+                );
+            }
+        };
+        match prepare_child_directory(
+            &temp,
+            daemon_temp_name,
+            daemon_temp_dir,
+            expected_uid,
+            "daemon-private temporary directory",
+            false,
+        ) {
+            Ok((_, Some(receipt))) => receipts.push(receipt),
+            Ok((_, None)) => {
+                return rollback_created_directories(
+                    receipts,
+                    EndpointError::Endpoint {
+                        message: format!(
+                            "daemon-private temp path unexpectedly pre-existed: {}",
+                            daemon_temp_dir.display()
+                        ),
+                    },
+                );
+            }
+            Err(error) => return rollback_created_directories(receipts, error),
         }
     }
+    Ok((directory, expected_uid, receipts))
+}
+
+pub(super) fn prepare_runtime_directory(
+    runtime_dir: &Path,
+    daemon_temp_dir: Option<&Path>,
+) -> Result<PreparedRuntimeDirectory, EndpointError> {
+    let (_, _, receipts) = prepare_runtime_dir(runtime_dir, daemon_temp_dir)?;
+    Ok(PreparedRuntimeDirectory::new(receipts))
+}
+
+fn prepare_child_directory(
+    parent: &OwnedFd,
+    name: &std::ffi::OsStr,
+    path: &Path,
+    expected_uid: u32,
+    description: &'static str,
+    allow_existing: bool,
+) -> Result<(OwnedFd, Option<OwnedDirectoryReceipt>), EndpointError> {
+    let name_string = name.to_str().ok_or_else(|| EndpointError::Endpoint {
+        message: format!("{description} basename is not UTF-8: {}", path.display()),
+    })?;
+    match open_validated_directory(parent, name, path, expected_uid, description) {
+        Ok(directory) if allow_existing => return Ok((directory, None)),
+        Ok(_) => {
+            return Err(EndpointError::Endpoint {
+                message: format!("{description} already exists: {}", path.display()),
+            });
+        }
+        Err(EndpointError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    loop {
+        let staging = staging_name()?;
+        match rustix::fs::mkdirat(parent, staging.as_str(), Mode::from_bits_truncate(0o700)) {
+            Ok(()) => {}
+            Err(Errno::EXIST) => continue,
+            Err(error) => {
+                return Err(EndpointError::io(
+                    "create staged private directory",
+                    path,
+                    error.into(),
+                ));
+            }
+        }
+        let staging_path = path.with_file_name(&staging);
+        let anchor = match open_validated_directory(
+            parent,
+            std::ffi::OsStr::new(&staging),
+            &staging_path,
+            expected_uid,
+            description,
+        ) {
+            Ok(anchor) => anchor,
+            Err(error) => {
+                // The staged name can be replaced after mkdir. Without the
+                // descriptor returned by successful validation there is no
+                // exact object we may safely unlink, so surface the residual.
+                return Err(EndpointError::OwnedResidual {
+                    path: staging_path,
+                    source: Box::new(error),
+                });
+            }
+        };
+        let mut receipt = OwnedDirectoryReceipt::new(staging_path, anchor);
+        let working = match rustix::io::dup(&receipt.anchor) {
+            Ok(working) => working,
+            Err(error) => {
+                let source = EndpointError::io(
+                    "duplicate staged private directory",
+                    receipt.path(),
+                    error.into(),
+                );
+                return match remove_owned_empty_directory(&mut receipt) {
+                    Ok(
+                        OwnedDirectoryRemoval::Removed
+                        | OwnedDirectoryRemoval::RemovalRequested
+                        | OwnedDirectoryRemoval::AlreadyAbsent,
+                    ) => Err(source),
+                    _ => Err(EndpointError::OwnedResidual {
+                        path: receipt.path().to_path_buf(),
+                        source: Box::new(source),
+                    }),
+                };
+            }
+        };
+        match rename_no_replace(parent, staging.as_str(), name_string) {
+            Ok(()) => {
+                receipt.path = path.to_path_buf();
+                return Ok((working, Some(receipt)));
+            }
+            Err(Errno::EXIST) => {
+                match remove_owned_empty_directory(&mut receipt) {
+                    Ok(
+                        OwnedDirectoryRemoval::Removed
+                        | OwnedDirectoryRemoval::RemovalRequested
+                        | OwnedDirectoryRemoval::AlreadyAbsent,
+                    ) => {}
+                    _ => {
+                        return Err(EndpointError::OwnedResidual {
+                            path: receipt.path().to_path_buf(),
+                            source: Box::new(EndpointError::Endpoint {
+                                message: format!(
+                                    "{description} appeared while its staging directory could not be retired: {}",
+                                    path.display()
+                                ),
+                            }),
+                        });
+                    }
+                }
+                if !allow_existing {
+                    return Err(EndpointError::Endpoint {
+                        message: format!("{description} appeared concurrently: {}", path.display()),
+                    });
+                }
+                return open_validated_directory(parent, name, path, expected_uid, description)
+                    .map(|directory| (directory, None));
+            }
+            Err(error) => {
+                let remove_result = remove_owned_empty_directory(&mut receipt);
+                return match remove_result {
+                    Ok(
+                        OwnedDirectoryRemoval::Removed
+                        | OwnedDirectoryRemoval::RemovalRequested
+                        | OwnedDirectoryRemoval::AlreadyAbsent,
+                    ) => Err(EndpointError::io(
+                        "publish private directory",
+                        path,
+                        error.into(),
+                    )),
+                    _ => Err(EndpointError::OwnedResidual {
+                        path: receipt.path().to_path_buf(),
+                        source: Box::new(EndpointError::io(
+                            "publish private directory",
+                            path,
+                            error.into(),
+                        )),
+                    }),
+                };
+            }
+        }
+    }
+}
+
+fn rollback_created_directories(
+    mut receipts: Vec<OwnedDirectoryReceipt>,
+    error: EndpointError,
+) -> Result<(OwnedFd, u32, Vec<OwnedDirectoryReceipt>), EndpointError> {
+    while let Some(mut receipt) = receipts.pop() {
+        match remove_owned_empty_directory(&mut receipt) {
+            Ok(
+                OwnedDirectoryRemoval::Removed
+                | OwnedDirectoryRemoval::RemovalRequested
+                | OwnedDirectoryRemoval::AlreadyAbsent
+                | OwnedDirectoryRemoval::ReplacementPreserved,
+            ) => {}
+            Ok(OwnedDirectoryRemoval::CoordinateLost | OwnedDirectoryRemoval::NotEmpty)
+            | Err(_) => {
+                return Err(EndpointError::OwnedResidual {
+                    path: receipt.path().to_path_buf(),
+                    source: Box::new(error),
+                });
+            }
+        }
+    }
+    Err(error)
+}
+
+fn open_validated_directory(
+    parent: &OwnedFd,
+    name: &std::ffi::OsStr,
+    path: &Path,
+    expected_uid: u32,
+    description: &'static str,
+) -> Result<OwnedFd, EndpointError> {
     let directory = rustix::fs::openat(
-        &root,
+        parent,
         name,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|error| EndpointError::io("open runtime directory", runtime_dir, error.into()))?;
+    .map_err(|error| EndpointError::io("open private directory", path, error.into()))?;
     let stat = rustix::fs::fstat(&directory)
-        .map_err(|error| EndpointError::io("fstat runtime directory", runtime_dir, error.into()))?;
-    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+        .map_err(|error| EndpointError::io("fstat private directory", path, error.into()))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory || stat.st_uid != expected_uid {
         return Err(EndpointError::Endpoint {
             message: format!(
-                "runtime path {} is not a real directory",
-                runtime_dir.display()
-            ),
-        });
-    }
-    if stat.st_uid != expected_uid {
-        return Err(EndpointError::Endpoint {
-            message: format!(
-                "runtime directory {} is owned by uid {}, expected {}",
-                runtime_dir.display(),
-                stat.st_uid,
-                expected_uid
+                "{description} {} is not an owner-private real directory",
+                path.display()
             ),
         });
     }
     rustix::fs::fchmod(&directory, Mode::from_bits_truncate(0o700))
-        .map_err(|error| EndpointError::io("chmod runtime directory", runtime_dir, error.into()))?;
-    let temp_path = runtime_dir.join("tmp");
-    match rustix::fs::mkdirat(&directory, "tmp", Mode::from_bits_truncate(0o700)) {
-        Ok(()) | Err(Errno::EXIST) => {}
-        Err(error) => {
-            return Err(EndpointError::io(
-                "create daemon temporary directory",
-                &temp_path,
-                error.into(),
-            ));
-        }
-    }
-    let temp = rustix::fs::openat(
-        &directory,
-        "tmp",
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|error| {
-        EndpointError::io("open daemon temporary directory", &temp_path, error.into())
-    })?;
-    let temp_stat = rustix::fs::fstat(&temp).map_err(|error| {
-        EndpointError::io("fstat daemon temporary directory", &temp_path, error.into())
-    })?;
-    if FileType::from_raw_mode(temp_stat.st_mode) != FileType::Directory
-        || temp_stat.st_uid != expected_uid
-    {
-        return Err(EndpointError::Endpoint {
-            message: format!(
-                "daemon temporary path {} is not an owner-private directory",
-                temp_path.display()
-            ),
-        });
-    }
-    rustix::fs::fchmod(&temp, Mode::from_bits_truncate(0o700)).map_err(|error| {
-        EndpointError::io("chmod daemon temporary directory", &temp_path, error.into())
-    })?;
-    Ok((directory, expected_uid))
+        .map_err(|error| EndpointError::io("chmod private directory", path, error.into()))?;
+    Ok(directory)
 }
 
-pub(super) fn prepare_runtime_directory(runtime_dir: &Path) -> Result<(), EndpointError> {
-    prepare_runtime_dir(runtime_dir).map(|_| ())
+pub(super) fn remove_owned_empty_directory(
+    receipt: &mut OwnedDirectoryReceipt,
+) -> std::io::Result<OwnedDirectoryRemoval> {
+    match owned_directory_path_state(receipt)? {
+        OwnedDirectoryPathState::Owned => {}
+        OwnedDirectoryPathState::OwnedObjectUnlinked => {
+            return Ok(OwnedDirectoryRemoval::AlreadyAbsent);
+        }
+        OwnedDirectoryPathState::ReplacementPreserved => {
+            return Ok(OwnedDirectoryRemoval::ReplacementPreserved);
+        }
+        OwnedDirectoryPathState::CoordinateLost => {
+            return Ok(OwnedDirectoryRemoval::CoordinateLost);
+        }
+    }
+    let expected = identity_of(&rustix::fs::fstat(&receipt.anchor)?);
+    let original = receipt.path.clone();
+    let claim = original.with_file_name(staging_name().map_err(endpoint_error_to_io)?);
+    match rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        &original,
+        rustix::fs::CWD,
+        &claim,
+        rustix::fs::RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => {}
+        Err(Errno::NOENT) => {
+            return match owned_directory_path_state(receipt)? {
+                OwnedDirectoryPathState::OwnedObjectUnlinked => {
+                    Ok(OwnedDirectoryRemoval::AlreadyAbsent)
+                }
+                _ => Ok(OwnedDirectoryRemoval::CoordinateLost),
+            };
+        }
+        Err(error) => return Err(error.into()),
+    }
+    receipt.path = claim.clone();
+    let claimed = match rustix::fs::statat(rustix::fs::CWD, &claim, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => identity_of(&stat),
+        Err(Errno::NOENT) => {
+            return match owned_directory_path_state(receipt)? {
+                OwnedDirectoryPathState::OwnedObjectUnlinked => {
+                    Ok(OwnedDirectoryRemoval::AlreadyAbsent)
+                }
+                _ => Ok(OwnedDirectoryRemoval::CoordinateLost),
+            };
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if claimed != expected {
+        // The public source was replaced between the coordinate check and
+        // rename. Put that unowned object back with NOREPLACE; never unlink it
+        // merely because it reached our unpredictable claim coordinate.
+        restore_owned_directory(receipt, &original)?;
+        return match owned_directory_path_state(receipt)? {
+            OwnedDirectoryPathState::OwnedObjectUnlinked
+            | OwnedDirectoryPathState::ReplacementPreserved => {
+                Ok(OwnedDirectoryRemoval::ReplacementPreserved)
+            }
+            OwnedDirectoryPathState::Owned | OwnedDirectoryPathState::CoordinateLost => {
+                Ok(OwnedDirectoryRemoval::CoordinateLost)
+            }
+        };
+    }
+    match rustix::fs::unlinkat(rustix::fs::CWD, &claim, AtFlags::REMOVEDIR) {
+        Ok(()) => Ok(OwnedDirectoryRemoval::Removed),
+        Err(Errno::NOENT) => match owned_directory_path_state(receipt)? {
+            OwnedDirectoryPathState::OwnedObjectUnlinked => Ok(OwnedDirectoryRemoval::Removed),
+            OwnedDirectoryPathState::Owned
+            | OwnedDirectoryPathState::ReplacementPreserved
+            | OwnedDirectoryPathState::CoordinateLost => Ok(OwnedDirectoryRemoval::CoordinateLost),
+        },
+        Err(Errno::NOTEMPTY) => {
+            restore_owned_directory(receipt, &original)?;
+            Ok(OwnedDirectoryRemoval::NotEmpty)
+        }
+        Err(error) => {
+            let restore_result = restore_owned_directory(receipt, &original);
+            match restore_result {
+                Ok(()) => Err(error.into()),
+                Err(restore_error) => Err(std::io::Error::other(format!(
+                    "remove owned directory failed: {error}; restore failed: {restore_error}"
+                ))),
+            }
+        }
+    }
+}
+
+pub(super) fn owned_directory_path_state(
+    receipt: &OwnedDirectoryReceipt,
+) -> std::io::Result<OwnedDirectoryPathState> {
+    let anchored = rustix::fs::fstat(&receipt.anchor)?;
+    let linked = anchored.st_nlink > 0;
+    match rustix::fs::statat(rustix::fs::CWD, &receipt.path, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(found) if identity_of(&found) == identity_of(&anchored) => {
+            Ok(OwnedDirectoryPathState::Owned)
+        }
+        Ok(_) if linked => Ok(OwnedDirectoryPathState::CoordinateLost),
+        Ok(_) => Ok(OwnedDirectoryPathState::ReplacementPreserved),
+        Err(Errno::NOENT) if linked => Ok(OwnedDirectoryPathState::CoordinateLost),
+        Err(Errno::NOENT) => Ok(OwnedDirectoryPathState::OwnedObjectUnlinked),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(super) fn inspect_owned_directory(
+    receipt: &OwnedDirectoryReceipt,
+) -> std::io::Result<OwnedDirectoryInspection> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    if rustix::fs::fstat(&receipt.anchor)?.st_nlink == 0 {
+        return Ok(OwnedDirectoryInspection::OwnedObjectUnlinked);
+    }
+    let mut directory = rustix::fs::Dir::read_from(&receipt.anchor)?;
+    let mut entries = Vec::new();
+    for entry in &mut directory {
+        let entry = entry?;
+        let name = entry.file_name().to_bytes();
+        if name != b"." && name != b".." {
+            entries.push(receipt.path.join(std::ffi::OsStr::from_bytes(name)));
+        }
+    }
+    entries.sort();
+    Ok(OwnedDirectoryInspection::Entries(entries))
+}
+
+fn restore_owned_directory(
+    receipt: &mut OwnedDirectoryReceipt,
+    original: &Path,
+) -> std::io::Result<()> {
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        &receipt.path,
+        rustix::fs::CWD,
+        original,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)?;
+    receipt.path = original.to_path_buf();
+    Ok(())
+}
+
+fn endpoint_error_to_io(error: EndpointError) -> std::io::Error {
+    std::io::Error::other(error.to_string())
 }
 
 async fn preflight(
@@ -571,9 +1038,17 @@ async fn remove_verified_stale(
     expected_uid: u32,
 ) -> Result<(), EndpointError> {
     let claim = staging_name()?;
-    match rustix::fs::renameat(directory, name, directory, claim.as_str()) {
+    match rename_no_replace(directory, name, claim.as_str()) {
         Ok(()) => {}
         Err(Errno::NOENT) => return Ok(()),
+        Err(Errno::EXIST) => {
+            return Err(EndpointError::Endpoint {
+                message: format!(
+                    "cannot claim stale endpoint {} without replacing an existing node",
+                    socket_path.display()
+                ),
+            });
+        }
         Err(error) => {
             return Err(EndpointError::io(
                 "claim stale Unix socket",
@@ -703,8 +1178,8 @@ const SWEEP_BUDGET: usize = 256;
 /// deliberately swallowed: hygiene must never fail a daemon start.
 pub async fn sweep_stale_endpoints(runtime_dir: &Path, keep: Option<&Path>) -> usize {
     let runtime_dir_owned = runtime_dir.to_path_buf();
-    let Ok(Ok((directory, owner_uid))) =
-        tokio::task::spawn_blocking(move || prepare_runtime_dir(&runtime_dir_owned)).await
+    let Ok(Ok((directory, owner_uid, _))) =
+        tokio::task::spawn_blocking(move || prepare_runtime_dir(&runtime_dir_owned, None)).await
     else {
         return 0;
     };
@@ -834,47 +1309,6 @@ pub(super) fn validate_endpoint_budget(
             limit: UNIX_SOCKET_PATH_BYTES,
             unit: "bytes",
         });
-    }
-    Ok(())
-}
-
-async fn sweep_staging(
-    directory: &OwnedFd,
-    runtime_dir: &Path,
-    expected_uid: u32,
-) -> Result<(), EndpointError> {
-    let entries = {
-        let mut directory = rustix::fs::Dir::read_from(directory).map_err(|error| {
-            EndpointError::io("read runtime directory", runtime_dir, error.into())
-        })?;
-        let mut names = Vec::new();
-        while let Some(entry) = directory.read() {
-            let entry = entry.map_err(|error| {
-                EndpointError::io("read runtime dir entry", runtime_dir, error.into())
-            })?;
-            if let Ok(name) = entry.file_name().to_str()
-                && name.starts_with(STAGING_PREFIX)
-            {
-                names.push(name.to_owned());
-            }
-        }
-        names
-    };
-    for name in entries {
-        let Ok(stat) = rustix::fs::statat(directory, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
-        else {
-            continue;
-        };
-        if FileType::from_raw_mode(stat.st_mode) != FileType::Socket || stat.st_uid != expected_uid
-        {
-            continue;
-        }
-        match probe(&runtime_dir.join(&name)).await {
-            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
-                let _ = rustix::fs::unlinkat(directory, name.as_str(), AtFlags::empty());
-            }
-            _ => {}
-        }
     }
     Ok(())
 }

@@ -22,7 +22,7 @@
 //! - node that goes live in the
 //!   probe → removal window        -> `stale_cleanup_never_removes_a_node_that_went_live`
 //! - staging leftovers swept,
-//!   live staging left alone       -> `stranded_staging_nodes_are_swept_but_live_ones_are_left`
+//!   unreceipted staging retained  -> `unreceipted_staging_nodes_are_left_intact`
 //! - live foreign endpoint         -> `live_foreign_endpoint_is_refused_and_left_intact`
 //!
 //! Connection layer and its bounds (R12, report §2.5):
@@ -96,7 +96,7 @@ use rustix::process::{Pid, Signal, kill_process};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::os::unix::net::UnixListener as StdUnixListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Barrier};
@@ -169,24 +169,6 @@ fn test_config(root: &tempfile::TempDir, profile: &str) -> DaemonConfig {
     // probe the developer machine's real credential stores (A2 auto-adopt).
     config.discovery_disabled = true;
     config
-}
-
-fn assert_runtime_directory_residual(
-    outcome: Result<ShutdownOutcome, DaemonError>,
-    runtime_dir: &Path,
-    mut expected: Vec<PathBuf>,
-) {
-    let DaemonError::RuntimeDirectoryNotEmpty {
-        path,
-        mut remaining_entries,
-    } = outcome.expect_err("foreign runtime entries must prevent a clean removal")
-    else {
-        panic!("shutdown returned the wrong typed residual");
-    };
-    expected.sort();
-    remaining_entries.sort();
-    assert_eq!(path, runtime_dir);
-    assert_eq!(remaining_entries, expected);
 }
 
 fn assert_racing_endpoint_shutdown(
@@ -617,10 +599,9 @@ async fn successor_socket_deletion_guard_preserves_replacement_identity() {
     let successor = StdUnixListener::bind(&socket_path).expect("bind successor node");
     let successor_metadata = fs::symlink_metadata(&socket_path).expect("successor metadata");
     task.shutdown_handle().request("controlled handover");
-    assert_runtime_directory_residual(
-        task.join().await,
-        &config.runtime_dir,
-        vec![socket_path.clone()],
+    assert_eq!(
+        task.join().await.expect("daemon joins"),
+        ShutdownOutcome::Graceful
     );
     let after = fs::symlink_metadata(&socket_path).expect("successor node remains");
     assert_eq!(
@@ -1549,10 +1530,9 @@ async fn endpoint_replacement_before_cleanup_is_never_deleted() {
     let replacement = StdUnixListener::bind(&socket_path).expect("bind replacement node");
     let replacement_metadata = fs::symlink_metadata(&socket_path).expect("replacement metadata");
     task.shutdown_handle().request("handover");
-    assert_runtime_directory_residual(
-        task.join().await,
-        &config.runtime_dir,
-        vec![socket_path.clone()],
+    assert_eq!(
+        task.join().await.expect("daemon joins"),
+        ShutdownOutcome::Graceful
     );
     let after = fs::symlink_metadata(&socket_path).expect("replacement node survives cleanup");
     assert_eq!(
@@ -1741,15 +1721,11 @@ async fn stale_cleanup_never_removes_a_node_that_went_live() {
     let _ = fs::remove_file(&socket_path);
 }
 
-/// A daemon that died between claim and restore leaves a staging node behind.
-/// The next start sweeps its own leftovers — and only those: a staging name
-/// that is still LIVE belongs to someone else's in-flight bind and is left.
-/// MUTATION CHECK: delete the `sweep_staging(..)` call in `endpoint::bind`.
-/// Expected failure: the stranded node is still there after the daemon reaches
-/// Ready ("a stale staging leftover must be swept at startup"). Verified
-/// 2026-07-27.
+/// A staging-shaped basename is not ownership proof. Without the receipt for
+/// the exact node created by this process, startup retains both stale and live
+/// nodes rather than guessing which filesystem object it may remove.
 #[tokio::test]
-async fn stranded_staging_nodes_are_swept_but_live_ones_are_left() {
+async fn unreceipted_staging_nodes_are_left_intact() {
     let root = test_root("w3b1-");
     let config = test_config(&root, "staging-sweep");
     fs::create_dir_all(&config.runtime_dir).expect("runtime directory");
@@ -1767,8 +1743,8 @@ async fn stranded_staging_nodes_are_swept_but_live_ones_are_left() {
     let task = spawn(config.clone());
     wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
     assert!(
-        !stranded.exists(),
-        "a stale staging leftover must be swept at startup"
+        stranded.exists(),
+        "an unreceipted stale-looking node must not be inferred owned from its basename"
     );
     assert!(
         live.exists(),
@@ -1781,11 +1757,12 @@ async fn stranded_staging_nodes_are_swept_but_live_ones_are_left() {
 
     drop(live_listener);
     task.shutdown_handle().request("test complete");
-    assert_runtime_directory_residual(
-        task.join().await,
-        &config.runtime_dir,
-        vec![live.clone(), unrelated.clone()],
+    assert_eq!(
+        task.join().await.expect("daemon joins"),
+        ShutdownOutcome::Graceful
     );
+    assert!(live.exists());
+    assert!(unrelated.exists());
 }
 
 /// The conservative half of R3: a LIVE endpoint owned by someone else is

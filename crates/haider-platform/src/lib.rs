@@ -31,10 +31,13 @@ pub use fs::{
 };
 pub use ipc::{
     BoundEndpoint, Endpoint, EndpointAddress, EndpointError, IpcReadHalf, IpcShutdown,
-    IpcShutdownOutcome, IpcStream, IpcWriteHalf, PeerCredentials, PeerExitReason, PeerExitWatcher,
-    connect, peer_credentials, peer_credentials_and_exit_watcher, peer_credentials_are_owner,
-    peer_is_owner, prepare_runtime_directory, shutdown_handle, split, sweep_stale_endpoints,
-    write_immediate,
+    IpcShutdownOutcome, IpcStream, IpcWriteHalf, OwnedDirectoryInspection, OwnedDirectoryPathState,
+    OwnedDirectoryReceipt, OwnedDirectoryRemoval, PeerCredentials, PeerExitReason, PeerExitWatcher,
+    PreparedRuntimeDirectory, connect, daemon_temp_directory_path, inspect_owned_directory,
+    owned_directory_path_state, peer_credentials, peer_credentials_and_exit_watcher,
+    peer_credentials_are_owner, peer_is_owner, prepare_runtime_directory,
+    prepare_runtime_directory_with_temp, remove_owned_empty_directory, retained_file_link_count,
+    shutdown_handle, split, sweep_stale_endpoints, write_immediate,
 };
 pub use process::program_on_path;
 pub use process::{
