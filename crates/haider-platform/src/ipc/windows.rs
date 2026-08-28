@@ -23,6 +23,7 @@ use windows_sys::Win32::System::Threading::{
 
 const BIND_RETRY_WINDOW: Duration = Duration::from_secs(3);
 const BIND_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+const PEER_LIVENESS_POLL: Duration = Duration::from_millis(250);
 const NAMED_PIPE_PATH_CODE_UNITS: usize = 256;
 
 pub type IpcReadHalf = tokio::io::ReadHalf<IpcStream>;
@@ -76,6 +77,95 @@ impl Drop for IpcStream {
 /// does not depend on a current-thread runtime polling aborted tasks again.
 pub struct IpcShutdown {
     stream: Arc<StdMutex<Option<PipeStream>>>,
+}
+
+/// Retains both the authenticated peer process and the accepted pipe instance.
+/// Process signaling covers abrupt termination; polling the pipe covers an
+/// explicit close by a client process that remains alive.
+pub struct PeerExitWatcher {
+    process: ProcessHandle,
+    stream: Arc<StdMutex<Option<PipeStream>>>,
+}
+
+impl PeerExitWatcher {
+    /// Waits until the peer process exits or its named-pipe instance disconnects.
+    #[allow(unsafe_code)]
+    pub async fn wait(self) -> io::Result<()> {
+        use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+        loop {
+            // SAFETY: `self.process` owns a live process handle with
+            // SYNCHRONIZE access for the full duration of this poll.
+            let status = unsafe { WaitForSingleObject(self.process.as_raw_handle().cast(), 0) };
+            match status {
+                WAIT_OBJECT_0 => {
+                    take_pipe(&self.stream);
+                    return Ok(());
+                }
+                WAIT_TIMEOUT => {}
+                WAIT_FAILED => return Err(io::Error::last_os_error()),
+                other => {
+                    return Err(io::Error::other(format!(
+                        "IPC peer process wait returned unexpected status {other}"
+                    )));
+                }
+            }
+            if !pipe_peer_is_connected(&self.stream)? {
+                // Close the accepted server handle before the connection task
+                // returns. This cancels its split read/write operations and
+                // prevents a dead instance from surviving into runtime cleanup.
+                take_pipe(&self.stream);
+                return Ok(());
+            }
+            tokio::time::sleep(PEER_LIVENESS_POLL).await;
+        }
+    }
+}
+
+#[allow(unsafe_code)]
+fn pipe_peer_is_connected(stream: &StdMutex<Option<PipeStream>>) -> io::Result<bool> {
+    use windows_sys::Win32::Foundation::{
+        ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED,
+    };
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    let stream = stream
+        .lock()
+        .map_err(|_| io::Error::other("Windows named-pipe state lock poisoned"))?;
+    let Some(pipe) = stream.as_ref() else {
+        return Ok(false);
+    };
+    let handle = match pipe {
+        PipeStream::Client(pipe) => pipe.as_raw_handle(),
+        PipeStream::Server(pipe) => pipe.as_raw_handle(),
+    };
+    // SAFETY: the locked stream owns this overlapped, read-capable pipe handle;
+    // null output pointers request a non-consuming connection-state probe.
+    if unsafe {
+        PeekNamedPipe(
+            handle.cast(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } != 0
+    {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(code)
+            if code == ERROR_BROKEN_PIPE.cast_signed()
+                || code == ERROR_NO_DATA.cast_signed()
+                || code == ERROR_PIPE_NOT_CONNECTED.cast_signed() =>
+        {
+            Ok(false)
+        }
+        _ => Err(error),
+    }
 }
 
 impl IpcShutdown {
@@ -313,9 +403,16 @@ pub fn peer_credentials(stream: &IpcStream) -> io::Result<PeerCredentials> {
 
 pub fn peer_credentials_and_exit_watcher(
     stream: &IpcStream,
-) -> io::Result<(PeerCredentials, Option<super::PeerExitWatcher>)> {
-    peer_credentials_and_process(stream)
-        .map(|(credentials, process)| (credentials, Some(super::PeerExitWatcher { process })))
+) -> io::Result<(PeerCredentials, Option<PeerExitWatcher>)> {
+    peer_credentials_and_process(stream).map(|(credentials, process)| {
+        (
+            credentials,
+            Some(PeerExitWatcher {
+                process,
+                stream: Arc::clone(&stream.stream),
+            }),
+        )
+    })
 }
 
 #[allow(unsafe_code)]
@@ -560,8 +657,8 @@ mod tests {
 
     use super::{
         BIND_RETRY_INTERVAL, BIND_RETRY_WINDOW, BoundEndpoint, bind_first_instance, connect,
-        peer_credentials, peer_is_owner, pipe_name, retryable_bind_error, sids_equal,
-        validate_endpoint_budget,
+        peer_credentials, peer_credentials_and_exit_watcher, peer_is_owner, pipe_name,
+        retryable_bind_error, sids_equal, validate_endpoint_budget,
     };
     use crate::ipc::{Endpoint, peer_credentials_are_owner};
     use std::path::Path;
@@ -700,6 +797,28 @@ mod tests {
             .expect("retained listener accepts");
         drop((client, server));
         bound.close_listener();
+    }
+
+    #[tokio::test]
+    async fn peer_watcher_observes_pipe_close_while_peer_process_remains_alive() {
+        let endpoint = unique_endpoint("peer-close");
+        let bound = BoundEndpoint::bind(&endpoint, Path::new("ignored"))
+            .await
+            .expect("bind named pipe");
+        let (client, accepted) = tokio::join!(connect(endpoint.address()), bound.accept());
+        let client = client.expect("connect same-process client");
+        let (server, ()) = accepted.expect("accept same-process client");
+        let (_, watcher) = peer_credentials_and_exit_watcher(&server)
+            .expect("authenticate peer and retain watcher");
+        let watcher = watcher.expect("Windows supplies a peer watcher");
+
+        drop(client);
+
+        tokio::time::timeout(Duration::from_secs(1), watcher.wait())
+            .await
+            .expect("peer watcher observes pipe close before deadline")
+            .expect("peer watcher accepts ordinary pipe close");
+        drop(server);
     }
 
     #[allow(unsafe_code)]

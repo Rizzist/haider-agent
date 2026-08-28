@@ -7,15 +7,15 @@ mod windows;
 
 #[cfg(unix)]
 pub use unix::{
-    BoundEndpoint, EndpointAddress, IpcReadHalf, IpcShutdown, IpcStream, IpcWriteHalf, connect,
-    peer_credentials, peer_credentials_and_exit_watcher, peer_is_owner, shutdown_handle, split,
-    sweep_stale_endpoints, write_immediate,
+    BoundEndpoint, EndpointAddress, IpcReadHalf, IpcShutdown, IpcStream, IpcWriteHalf,
+    PeerExitWatcher, connect, peer_credentials, peer_credentials_and_exit_watcher, peer_is_owner,
+    shutdown_handle, split, sweep_stale_endpoints, write_immediate,
 };
 #[cfg(windows)]
 pub use windows::{
-    BoundEndpoint, EndpointAddress, IpcReadHalf, IpcShutdown, IpcStream, IpcWriteHalf, connect,
-    peer_credentials, peer_credentials_and_exit_watcher, peer_is_owner, shutdown_handle, split,
-    sweep_stale_endpoints, write_immediate,
+    BoundEndpoint, EndpointAddress, IpcReadHalf, IpcShutdown, IpcStream, IpcWriteHalf,
+    PeerExitWatcher, connect, peer_credentials, peer_credentials_and_exit_watcher, peer_is_owner,
+    shutdown_handle, split, sweep_stale_endpoints, write_immediate,
 };
 
 /// Creates and validates one profile's private runtime and temporary
@@ -188,47 +188,6 @@ pub struct PeerCredentials {
     /// the authenticated equality result.
     #[cfg(windows)]
     pub(crate) same_user: bool,
-}
-
-/// A kernel-pinned IPC peer identity used to retire a Windows named-pipe
-/// connection promptly when its owning process exits. Unix sockets already
-/// report peer exit through EOF, so Unix never constructs this watcher.
-pub struct PeerExitWatcher {
-    #[cfg(windows)]
-    process: std::os::windows::io::OwnedHandle,
-}
-
-impl PeerExitWatcher {
-    /// Waits until the pinned peer process exits.
-    #[cfg(windows)]
-    #[allow(unsafe_code)]
-    pub async fn wait(self) -> std::io::Result<()> {
-        use std::os::windows::io::AsRawHandle as _;
-        use std::time::Duration;
-        use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
-        use windows_sys::Win32::System::Threading::WaitForSingleObject;
-
-        loop {
-            // SAFETY: `self.process` owns a live process handle with
-            // SYNCHRONIZE access for the full duration of this poll.
-            let status = unsafe { WaitForSingleObject(self.process.as_raw_handle().cast(), 0) };
-            match status {
-                WAIT_OBJECT_0 => return Ok(()),
-                WAIT_TIMEOUT => tokio::time::sleep(Duration::from_millis(250)).await,
-                WAIT_FAILED => return Err(std::io::Error::last_os_error()),
-                other => {
-                    return Err(std::io::Error::other(format!(
-                        "IPC peer process wait returned unexpected status {other}"
-                    )));
-                }
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    pub async fn wait(self) -> std::io::Result<()> {
-        std::future::pending().await
-    }
 }
 
 #[cfg(unix)]

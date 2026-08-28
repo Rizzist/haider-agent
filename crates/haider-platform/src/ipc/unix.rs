@@ -44,6 +44,16 @@ pub struct IpcShutdown {
     socket: OwnedFd,
 }
 
+/// Unix sockets report peer closure through their ordinary read path, so the
+/// daemon never constructs this platform-neutral watcher coordinate.
+pub struct PeerExitWatcher;
+
+impl PeerExitWatcher {
+    pub async fn wait(self) -> std::io::Result<()> {
+        std::future::pending().await
+    }
+}
+
 impl IpcShutdown {
     #[allow(unsafe_code)]
     pub fn request(&self) -> std::io::Result<()> {
@@ -891,7 +901,7 @@ pub fn peer_credentials(stream: &IpcStream) -> std::io::Result<PeerCredentials> 
 
 pub fn peer_credentials_and_exit_watcher(
     stream: &IpcStream,
-) -> std::io::Result<(PeerCredentials, Option<super::PeerExitWatcher>)> {
+) -> std::io::Result<(PeerCredentials, Option<PeerExitWatcher>)> {
     peer_credentials(stream).map(|credentials| (credentials, None))
 }
 
