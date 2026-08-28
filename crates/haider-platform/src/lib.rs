@@ -30,6 +30,7 @@ pub use fs::{
     metadata_link_count, metadata_mode, replace_file, set_mode, sync_file,
 };
 pub use ipc::{
+<<<<<<< HEAD
     BoundEndpoint, Endpoint, EndpointAddress, EndpointError, IpcReadHalf, IpcShutdown,
     IpcShutdownOutcome, IpcStream, IpcWriteHalf, OwnedDirectoryInspection, OwnedDirectoryPathState,
     OwnedDirectoryReceipt, OwnedDirectoryRemoval, PeerCredentials, PeerExitReason, PeerExitWatcher,
@@ -38,6 +39,13 @@ pub use ipc::{
     peer_credentials_are_owner, peer_is_owner, prepare_runtime_directory,
     prepare_runtime_directory_with_temp, remove_owned_empty_directory, retained_file_link_count,
     shutdown_handle, split, sweep_stale_endpoints, write_immediate,
+=======
+    BoundEndpoint, Endpoint, EndpointAddress, EndpointError, IpcReadHalf, IpcStream, IpcWriteHalf,
+    PeerCredentials, PeerEndpointKind, PeerEndpointPaths, RUNTIME_ARTIFACT_BASENAME_MAX_BYTES,
+    UNIX_SOCKET_PATH_MAX_BYTES, connect, peer_credentials, peer_credentials_are_owner,
+    peer_endpoint_paths, peer_is_owner, prepare_runtime_directory, split, sweep_stale_endpoints,
+    validate_runtime_artifact_basename, validate_unix_socket_path, write_immediate,
+>>>>>>> wave-965-a
 };
 pub use process::program_on_path;
 pub use process::{

@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+<<<<<<< HEAD
 /// A descriptor-backed receipt for one directory this process created.
 ///
 /// The retained descriptor/handle keeps the created filesystem identity live,
@@ -183,6 +184,110 @@ pub enum IpcShutdownOutcome {
     LocalSlotEmptiedOnly,
     /// A prior request had already consumed the shutdown authority.
     AlreadyRequested,
+=======
+/// Maximum portable basename for anything published in a profile runtime.
+/// Keeping this independent from the profile-directory digest prevents a new
+/// rendezvous family from consuming the Unix socket path budget by accident.
+pub const RUNTIME_ARTIFACT_BASENAME_MAX_BYTES: usize = 20;
+
+/// macOS exposes 104 bytes in `sockaddr_un.sun_path`, including the trailing
+/// NUL. A pathname must therefore fit in at most 103 bytes.
+pub const UNIX_SOCKET_PATH_MAX_BYTES: usize = 103;
+
+/// Which peer endpoint owns a short runtime-root artifact family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerEndpointKind {
+    Haider,
+    External,
+}
+
+/// Short, profile-scoped paths for one peer endpoint and its durable sidecars.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerEndpointPaths {
+    pub socket: PathBuf,
+    pub manifest: PathBuf,
+    pub mailbox: PathBuf,
+}
+
+/// Derives the only peer-artifact names allowed directly under a profile
+/// runtime. All three basenames are 17 bytes (`ph-<12-hex>.<s|j|q>` or the
+/// external `px-` family), and socket length is checked before any bind.
+pub fn peer_endpoint_paths(
+    runtime_dir: &Path,
+    stable_id: &str,
+    kind: PeerEndpointKind,
+) -> Result<PeerEndpointPaths, EndpointError> {
+    let prefix = match kind {
+        PeerEndpointKind::Haider => "ph",
+        PeerEndpointKind::External => "px",
+    };
+    let digest = blake3::hash(stable_id.as_bytes()).to_hex();
+    let short_digest = digest.as_str().chars().take(12).collect::<String>();
+    let stem = format!("{prefix}-{short_digest}");
+    let socket = runtime_dir.join(format!("{stem}.s"));
+    let manifest = runtime_dir.join(format!("{stem}.j"));
+    let mailbox = runtime_dir.join(format!("{stem}.q"));
+    for path in [&socket, &manifest, &mailbox] {
+        validate_runtime_artifact_basename(path)?;
+    }
+    validate_unix_socket_path(&socket)?;
+    Ok(PeerEndpointPaths {
+        socket,
+        manifest,
+        mailbox,
+    })
+}
+
+/// Fails before filesystem mutation when a runtime artifact name exceeds the
+/// owner law. The error carries both the observed length and its limit.
+pub fn validate_runtime_artifact_basename(path: &Path) -> Result<(), EndpointError> {
+    let Some(name) = path.file_name() else {
+        return Err(EndpointError::Endpoint {
+            message: format!("runtime artifact path {} has no basename", path.display()),
+        });
+    };
+    let length = basename_len(name);
+    if length > RUNTIME_ARTIFACT_BASENAME_MAX_BYTES {
+        return Err(EndpointError::PathTooLong {
+            path: path.to_path_buf(),
+            length,
+            limit: RUNTIME_ARTIFACT_BASENAME_MAX_BYTES,
+        });
+    }
+    Ok(())
+}
+
+/// Portable pre-bind socket-path budget check. Windows named pipes do not use
+/// `sockaddr_un`, so this is intentionally a no-op there.
+pub fn validate_unix_socket_path(path: &Path) -> Result<(), EndpointError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let length = path.as_os_str().as_bytes().len();
+        if length > UNIX_SOCKET_PATH_MAX_BYTES {
+            return Err(EndpointError::PathTooLong {
+                path: path.to_path_buf(),
+                length,
+                limit: UNIX_SOCKET_PATH_MAX_BYTES,
+            });
+        }
+    }
+    #[cfg(windows)]
+    let _ = path;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn basename_len(name: &std::ffi::OsStr) -> usize {
+    use std::os::unix::ffi::OsStrExt as _;
+    name.as_bytes().len()
+}
+
+#[cfg(windows)]
+fn basename_len(name: &std::ffi::OsStr) -> usize {
+    name.to_string_lossy().len()
+>>>>>>> wave-965-a
 }
 
 #[cfg(unix)]
@@ -330,12 +435,19 @@ pub enum EndpointError {
     Task {
         message: String,
     },
+<<<<<<< HEAD
     /// Endpoint setup created this exact filesystem artifact and then failed
     /// to remove it. The daemon uses the path as ownership evidence for its
     /// typed runtime-residual report.
     OwnedResidual {
         path: PathBuf,
         source: Box<EndpointError>,
+=======
+    PathTooLong {
+        path: PathBuf,
+        length: usize,
+        limit: usize,
+>>>>>>> wave-965-a
     },
 }
 
@@ -380,9 +492,19 @@ impl std::fmt::Display for EndpointError {
                 path.display()
             ),
             Self::Endpoint { message } | Self::Task { message } => formatter.write_str(message),
+<<<<<<< HEAD
             Self::OwnedResidual { path, source } => write!(
                 formatter,
                 "owned endpoint residual {} remained after setup failure: {source}",
+=======
+            Self::PathTooLong {
+                path,
+                length,
+                limit,
+            } => write!(
+                formatter,
+                "runtime path {} is {length} bytes; limit is {limit} bytes",
+>>>>>>> wave-965-a
                 path.display()
             ),
         }
@@ -431,6 +553,10 @@ pub fn peer_credentials_are_owner(credentials: &PeerCredentials, owner_uid: u32)
 pub fn peer_credentials_are_owner(credentials: &PeerCredentials, _owner_uid: u32) -> bool {
     credentials.same_user
 }
+
+#[cfg(test)]
+#[path = "../ipc_tests.rs"]
+mod ipc_tests;
 
 #[cfg(test)]
 mod tests {

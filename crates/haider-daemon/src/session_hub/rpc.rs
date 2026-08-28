@@ -4644,6 +4644,63 @@ impl HubConnection {
                 )
                 .await
             }
+            RequestBody::PeerList {} => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.hub.enable_peer_events(&self.connection_id)?;
+                match self.hub.peer_service()?.list().await {
+                    Ok(agents) => self.send(WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::PeerList { agents },
+                    }),
+                    Err(error) => self.respond_peer_error(request_id, error),
+                }
+            }
+            RequestBody::PeerSend {
+                to,
+                message,
+                summary,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                let sessions = self.hub.peer_control_sessions(&self.connection_id)?;
+                let [session_id] = sessions.as_slice() else {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_PEER_INVALID,
+                        "peer.send requires exactly one control-attached sender session",
+                        false,
+                        None,
+                    );
+                };
+                self.hub.enable_peer_events(&self.connection_id)?;
+                match self
+                    .hub
+                    .peer_service()?
+                    .send(session_id, to, message, summary)
+                    .await
+                {
+                    Ok(receipt) => self.send(WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::PeerSend { receipt },
+                    }),
+                    Err(error) => self.respond_peer_error(request_id, error),
+                }
+            }
             // `Unknown` and any future method decode alike: a typed,
             // correlated rejection instead of a dropped request.
             _ => self.respond_error(
@@ -4651,6 +4708,32 @@ impl HubConnection {
                 ERROR_CODE_INVALID_ARGUMENT,
                 "unknown session method",
                 false,
+                None,
+            ),
+        }
+    }
+
+    fn respond_peer_error(
+        &self,
+        request_id: RequestId,
+        error: crate::peer::PeerError,
+    ) -> Result<(), SessionHubError> {
+        match error {
+            crate::peer::PeerError::Ambiguous { candidates } => self.respond_error(
+                request_id,
+                ERROR_CODE_PEER_AMBIGUOUS,
+                "peer address is ambiguous; qualify it with an id prefix",
+                false,
+                Some(ErrorData::PeerAmbiguous { candidates }),
+            ),
+            crate::peer::PeerError::Invalid { message } => {
+                self.respond_error(request_id, ERROR_CODE_PEER_INVALID, message, false, None)
+            }
+            error => self.respond_error(
+                request_id,
+                ERROR_CODE_PEER_UNAVAILABLE,
+                error.to_string(),
+                true,
                 None,
             ),
         }

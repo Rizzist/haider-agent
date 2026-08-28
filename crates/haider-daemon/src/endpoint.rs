@@ -1270,7 +1270,20 @@ pub(crate) fn map_error(error: haider_platform::EndpointError) -> DaemonError {
         },
         haider_platform::EndpointError::Endpoint { message } => DaemonError::Endpoint { message },
         haider_platform::EndpointError::Task { message } => DaemonError::Task { message },
+<<<<<<< HEAD
         haider_platform::EndpointError::OwnedResidual { source, .. } => map_error(*source),
+=======
+        haider_platform::EndpointError::PathTooLong {
+            path,
+            length,
+            limit,
+        } => DaemonError::Endpoint {
+            message: format!(
+                "runtime path {} is {length} bytes; limit is {limit} bytes",
+                path.display()
+            ),
+        },
+>>>>>>> wave-965-a
     }
 }
 

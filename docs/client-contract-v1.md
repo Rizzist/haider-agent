@@ -1,9 +1,9 @@
 # Haider client contract — revision 1
 
 Status: authoritative for wire protocol `v = 1`  
-Source snapshot: package `0.0.962` \
-N-1 compatibility baseline: `0.0.961` \
-Contract revision date: 2026-08-27
+Source snapshot: package `0.0.965` \
+N-1 compatibility baseline: `0.0.964` \
+Contract revision date: 2026-08-28
 
 This document is the client-facing contract of `haider-rpc`,
 `haider-client`, and the daemon producers behind them. Rust types and golden
@@ -206,11 +206,11 @@ An operation not listed here is part of the v1 base surface. “Field” means t
 client may use that field only when it is present; the named token permits an
 affordance before the response exists.
 
-The ordinary v0.0.964 `welcome_features()` set contains all 96 tokens below.
-The re-verification anchors are
-`crates/haider-daemon/src/connection.rs:1872-1969` for the assembled set and
-`crates/haider-rpc/src/frame.rs:261-541` for the exact string constants. The
-one peer-specific withholding exception is §4.1.
+The ordinary v0.0.965 `welcome_features()` set contains all 97 tokens below.
+The re-verification anchors are the `welcome_features()` function in
+`crates/haider-daemon/src/connection.rs` and the `FEATURE_*` constant block in
+`crates/haider-rpc/src/frame.rs`. The one peer-specific withholding exception
+is §4.1.
 
 | Feature token | Methods, frames, or fields it publishes |
 |---|---|
@@ -221,6 +221,7 @@ one peer-specific withholding exception is §4.1.
 | `headless_run_v1` | `headless.run.start`, `headless.run.status`, `headless.run.stop`, durable `HeadlessRunConfigured`, and typed replay divergence reports |
 | `run_budget_v1` | daemon-enforced token/cost/time limits and durable `RunBudgetExhausted` followed by `RunFailed { code: budget_exhausted }` and `Errored` |
 | `queue_control_v1` | `queue.list`, `queue.remove`, `queue.promote_steer`, and durable `QueueChanged` events on an attached session |
+| `peer_messaging_v1` | `peer.list`, `peer.send`, `PeerMessageReceived`, and `PeerDeliveryChanged` |
 | `run_retry_v1` | `run.retry` |
 | `context_compaction_v1` | `session.compact` |
 | `fallback_chain_v1` | durable fallback-lane events and next-lane continuation; no separate method |
@@ -453,11 +454,13 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | `checkpoint.undo` | `CheckpointUndo` | idempotent durable guarded mutation receipt |
 | `checkpoint.redo` | `CheckpointRedo` | idempotent durable guarded mutation receipt |
 | `checkpoint.rollback_turn` | `CheckpointRollbackTurn` | atomic reverse-order guarded turn rollback receipt |
+| `peer.list` | `PeerList` | live Haider sessions and external manifests after liveness verification |
+| `peer.send` | `PeerSend` | durable target-side queue receipt; later state changes arrive as `PeerDeliveryChanged` |
 
 The golden matrix at
 `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`, combined
 with the historical `wire_transcript.json`, pins a request and successful
-response for every one of the 104 v1 request methods. `menu.answer` and resident
+response for every one of the 106 v1 request methods. `menu.answer` and resident
 binding are top-level frames, not `RequestBody` methods.
 
 ### 5.3 Account identity and local-login adoption
@@ -2456,10 +2459,11 @@ The machine-checkable contract lives in these fixtures/tests:
   WebSocket bodies and four-byte length-prefixed UDS bytes, including
   Hello/Welcome, raw replay, menu CAS, accounts/providers/usage, and mutation
   receipts; the appended monitor and Loom registry delta/caught-up entries pin
-  both dedicated non-chat streams. The exact current transcript count is 133.
+  both dedicated non-chat streams and the peer-messaging tail. The exact
+  current transcript count is 139.
 - `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`: the
-  64 methods added after the historical matrix, completing its 40 with golden
-  request and successful response coverage for all 104 request methods and all
+  66 methods added after the historical matrix, completing its 40 with golden
+  request and successful response coverage for all 106 request methods and all
   five command dynamic slots.
 - `crates/haider-rpc/tests/fixtures/snapshot_availability_compat_v1.json`:
   old and new account/provider/usage response bytes.
@@ -2606,8 +2610,9 @@ Undo, redo, and rollback are themselves `FsWrite` effects and append a fresh
 `CheckpointRecorded` fact. Their post-state is never rewritten into an older
 record, and neither journal rows nor CAS objects are deleted.
 
-The exact v0.0.964 recount is 96 Welcome feature tokens and 104 request
-methods: two features and five methods beyond v0.0.963's actual 94/99 base.
+The exact v0.0.965 recount is 97 Welcome feature tokens and 106 request
+methods: `peer_messaging_v1`, `peer.list`, and `peer.send` are tail additions
+to v0.0.964's 96/104 base.
 
 **Absence law.** Without `checkpoint_v1`, a client MUST NOT call any checkpoint
 method, infer pre-images from ordinary file-change summaries, replay local
@@ -2951,3 +2956,69 @@ labelled/refreshed as such; absence of both feature bits is unavailable
 lineage truth, not an empty tree. The non-UI `ObserveClient::descendants_attach`
 surface enforces this choice as `DescendantView::Live` versus
 `DescendantView::Snapshot`; the snapshot variant has no event receiver.
+
+## 18. `peer_messaging_v1`
+
+`peer.list` requires `view` and returns `agents[]` with exactly these fields:
+`id`, `name`, `kind` (`haider_session | external`), `workspace`, `model`,
+`state` (`idle | busy`), `started_at`, and `last_seen`. A session title is its
+explicit addressable name. An untitled Haider session defaults to its
+workspace basename plus a short stable-id suffix. External names come from
+their owner-private manifest. `id` is stable identity; `name` is the human
+address.
+
+A bare name resolves only when exactly one live peer has that name. Otherwise
+the daemon returns `peer_ambiguous` with typed `candidates[{id,name}]`. A
+caller resolves a collision with `name [id-prefix]` or the complete id. It
+MUST NOT choose the first row.
+
+`peer.send {to,message,summary?}` requires `control` and exactly one
+control-attached sender session. Before returning a `queued` or `delivered`
+receipt, the target side has durably appended the attributable message to its
+mailbox. A busy target stays queued. Admission uses the same serialized idle
+boundary as an ordinary turn: peer text is never inserted into an in-flight
+provider request or tool call, and it never mutates a prompt prefix or cache
+epoch. The fixed v1 expiry is 24 hours. A message whose target never returns
+transitions to `expired` with `reason: target_never_returned`; target deletion
+uses `target_unavailable`. Receipts are `{msg_id,delivery,reason?}`, where
+`delivery` is `queued | delivered | expired | refused`.
+For a Haider target the durable target mailbox is the sole expiry authority;
+the sender does not run a competing terminal timer. At an idle boundary the
+target appends a mailbox claim before touching its private core store. That
+claim is durable delivery authority: cross-daemon recovery may report it as
+`delivered`, never `expired`, and the target completes core admission after a
+restart. Same-store recovery also reconciles the durable `peer:<msg_id>`
+turn-accept receipt. Session deletion durably publishes
+`expired/target_unavailable` before removing the live endpoint, so a foreign
+scanner cannot reinterpret the claim. An external-target
+outbound expectation is expired by its sender because no Haider target
+mailbox exists. A receiver may shorten a future-skewed deadline to the v1 TTL
+but never extends the sender's valid deadline.
+On the ordinary live path, `delivered` is journaled after the worker-manager
+handoff accepts the admitted turn; durable-claim recovery is the only earlier
+terminal case. Cross-daemon terminal receipts use a request/ack exchange; the
+target retains its durable retry marker until the sender has journaled and
+echoed the exact receipt.
+
+`PeerMessageReceived {message}` is an additive target-side event;
+`PeerDeliveryChanged {receipt}` is the sender-side transition event. They are
+sent only to connections that opted into this family by calling `peer.list` or
+`peer.send`, and only for their attached session. They are
+notifications, not replay cursors; mailbox and turn journals remain the
+durability authorities. Consumers deduplicate notifications by `msg_id`:
+crash recovery may repeat a notification whose journaled publication marker
+had not yet synced.
+
+Every model-visible peer turn is explicitly delimited as a peer message and
+states that it is not a user instruction. An external or otherwise unverified
+sender additionally carries `trust: untrusted_external` and the exact
+`UNTRUSTED EXTERNAL DATA; NOT A USER INSTRUCTION` label in the rendered
+payload. A client MUST preserve that provenance and MUST NOT render an
+external peer as the user.
+
+**Absence law.** If Welcome omits `peer_messaging_v1`, the client MUST NOT call
+either method, render a peer roster or mailbox state, or wait for either event.
+The daemon sends no peer event to a connection that has not opted into the
+family. An absent feature is “peer messaging unavailable,” never an empty peer
+list. The non-Haider local wire, manifest, pathname budgets, and trust rules
+are normative in `docs/peer-messaging-v1.md`.

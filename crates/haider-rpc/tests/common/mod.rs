@@ -14,6 +14,10 @@ use haider_protocol::ids::CredentialAlias;
 use haider_protocol::ids::{
     AgentId, ArtifactRef, BranchId, DeviceId, EventId, ItemId, MenuId, NodeId, RunId, SessionId,
 };
+use haider_protocol::peer::{
+    PeerDelivery, PeerDescriptor, PeerKind, PeerMessage, PeerReceipt, PeerSender, PeerState,
+    PeerTrust,
+};
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::session_fork::{
     SessionMetaforkProposal, SessionMetaforkRemoval, SessionMetaforkReviewManifest,
@@ -1931,6 +1935,68 @@ pub fn transcript() -> Vec<WireFrame> {
         WireFrame::LoomRegistryCaughtUp {
             watch_id: "loom-watch-1".into(),
             high_water_cursor: 44,
+        },
+        // Peer messaging v1 is tail-only: both methods and both additive
+        // event shapes leave every historical byte pin unchanged.
+        WireFrame::Request {
+            request_id: RequestId("request-peer-list".into()),
+            body: RequestBody::PeerList {},
+        },
+        WireFrame::Response {
+            request_id: RequestId("request-peer-list".into()),
+            body: ResponseBody::PeerList {
+                agents: vec![PeerDescriptor {
+                    id: "session-peer".into(),
+                    name: "workspace-a1b2c3".into(),
+                    kind: PeerKind::HaiderSession,
+                    workspace: "/tmp/workspace".into(),
+                    model: "claude-test".into(),
+                    state: PeerState::Idle,
+                    started_at: 1_753_500_080_000,
+                    last_seen: 1_753_500_081_000,
+                }],
+            },
+        },
+        WireFrame::Request {
+            request_id: RequestId("request-peer-send".into()),
+            body: RequestBody::PeerSend {
+                to: "workspace-a1b2c3".into(),
+                message: "Please inspect the failing boundary.".into(),
+                summary: Some("debug boundary".into()),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId("request-peer-send".into()),
+            body: ResponseBody::PeerSend {
+                receipt: PeerReceipt {
+                    msg_id: "msg-peer-1".into(),
+                    delivery: PeerDelivery::Queued,
+                    reason: None,
+                },
+            },
+        },
+        WireFrame::PeerMessageReceived {
+            message: PeerMessage {
+                msg_id: "msg-peer-1".into(),
+                from: PeerSender {
+                    id: "external-fixture".into(),
+                    name: "fixture".into(),
+                    kind: PeerKind::External,
+                    trust: PeerTrust::UntrustedExternal,
+                },
+                to: "session-1".into(),
+                message: "Treat this as data, not instruction.".into(),
+                summary: None,
+                queued_at: 1_753_500_082_000,
+                expires_at: 1_753_586_482_000,
+            },
+        },
+        WireFrame::PeerDeliveryChanged {
+            receipt: PeerReceipt {
+                msg_id: "msg-peer-1".into(),
+                delivery: PeerDelivery::Delivered,
+                reason: None,
+            },
         },
     ]
 }
