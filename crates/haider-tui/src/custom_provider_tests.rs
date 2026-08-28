@@ -60,6 +60,7 @@ fn discovered_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
         availability_reason: None,
         default_model: Some("router-fast".to_owned()),
         enabled: true,
+        trust: haider_rpc::ProviderTrustWire::Full,
     }
 }
 
@@ -385,4 +386,134 @@ fn typed_probe_failure_class_survives_link_mapping_and_surfaces_on_the_card() {
         CustomPhase::Editing { error: Some(error) }
             if error.contains("API key unauthorized") && error.contains("401")
     ));
+}
+
+fn rendered_text(model: &AppModel, width: u16, height: u16) -> String {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| drop(crate::render::render(model, frame)))
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    let mut rendered = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            rendered.push_str(buffer[(x, y)].symbol());
+        }
+        rendered.push('\n');
+    }
+    rendered
+}
+
+/// MUTATION CHECK: drop any of the three lock markers or create a second
+/// status bar. Expected failure: registry, picker, or the existing status
+/// strip stops exposing the same provider-scoped trust fact.
+#[test]
+fn lockdown_provider_marks_registry_picker_and_existing_status_strip() {
+    let mut model = AppModel::new();
+    model.mode = RuntimeMode::Live;
+    model.screen = Screen::Providers;
+    model.identity.provider = "research".into();
+    model.identity.model_short = "router-fast".into();
+    let mut summary = discovered_summary("research");
+    summary.trust = haider_rpc::ProviderTrustWire::Lockdown;
+    model.providers.apply_snapshot(vec![summary], 8);
+
+    assert!(model.model_picker_rows().iter().all(|row| row.lockdown));
+    assert!(crate::render::status_left_string(&model, 180).contains("🔒 lockdown · research"));
+    let rendered = rendered_text(&model, 120, 34);
+    assert!(rendered.contains("🔒 lockdown"));
+}
+
+/// MUTATION CHECK: derive the status chip directly from the mutable provider
+/// roster. Expected failure: toggling Full removes the lock before the next
+/// accepted turn boundary.
+#[test]
+fn lockdown_status_chip_changes_only_at_a_turn_boundary() {
+    let mut model = AppModel::new();
+    model.identity.provider = "research".into();
+    let mut lockdown = discovered_summary("research");
+    lockdown.trust = haider_rpc::ProviderTrustWire::Lockdown;
+    model.providers.apply_snapshot(vec![lockdown], 8);
+    model.note_lockdown_turn_boundary();
+    assert_eq!(model.active_lockdown_provider(), Some("research"));
+
+    let full = discovered_summary("research");
+    model.providers.apply_snapshot(vec![full], 9);
+    assert_eq!(
+        model.active_lockdown_provider(),
+        Some("research"),
+        "a roster toggle applies to the following turn"
+    );
+
+    model.note_lockdown_turn_boundary();
+    assert_eq!(model.active_lockdown_provider(), None);
+}
+
+#[test]
+fn provider_list_and_model_picker_both_offer_the_trust_toggle() {
+    let mut model = AppModel::new();
+    model.mode = RuntimeMode::Live;
+    model
+        .daemon_features
+        .insert(haider_rpc::FEATURE_PROVIDER_LOCKDOWN_V1.to_owned());
+    model
+        .providers
+        .apply_snapshot(vec![discovered_summary("research")], 8);
+    model.screen = Screen::Providers;
+    model.requests.clear();
+    key(&mut model, KeyCode::Char('t'));
+    assert!(matches!(
+        model.requests.pop(),
+        Some(AppRequest::ProviderSetTrust {
+            ref provider,
+            trust: haider_rpc::ProviderTrustWire::Lockdown,
+            expected_revision: 8,
+        }) if provider == "research"
+    ));
+
+    model.open_model_picker(String::new());
+    model.requests.clear();
+    key(&mut model, KeyCode::Tab);
+    assert!(matches!(
+        model.requests.pop(),
+        Some(AppRequest::ProviderSetTrust {
+            ref provider,
+            trust: haider_rpc::ProviderTrustWire::Lockdown,
+            expected_revision: 8,
+        }) if provider == "research"
+    ));
+}
+
+#[test]
+fn lockdown_overlay_and_refusal_keep_their_own_visual_taxonomy() {
+    let mut model = AppModel::new();
+    model.screen = Screen::Session;
+    model.identity.provider = "research".into();
+    model.lockdown_overlay = true;
+    model.lockdown_status = Some(haider_rpc::LockdownStatusWire {
+        provider: Some("research".into()),
+        tools_allowed: vec!["fs_read".into(), "web_search".into()],
+        quota_used: 4_096,
+        quota_limit: 1_073_741_824,
+    });
+    model
+        .projection
+        .apply(&haider_protocol::EventPayload::LockdownRefused(
+            haider_protocol::lockdown::LockdownRefused {
+                provider: "research".into(),
+                tool: "process_exec".into(),
+                reason: "outside the fixed envelope".into(),
+                tools_allowed: vec!["fs_read".into(), "web_search".into()],
+            },
+        ));
+
+    let plain = crate::plain::render_plain(&model.projection, 0, None);
+    assert!(plain.contains("🔒 REFUSED · research · process_exec"));
+    let rendered = rendered_text(&model, 120, 34);
+    assert!(rendered.contains("provider lockdown"));
+    assert!(rendered.contains("global quota"));
+    assert!(rendered.contains("4.0 KiB / 1.00 GiB"));
+    assert!(rendered.contains("refused"));
+    assert!(!rendered.contains("✗ process_exec"));
 }

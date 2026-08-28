@@ -40,6 +40,9 @@ pub enum DaemonError {
     /// A daemon-owned task or process-level facility failed (spawn, join,
     /// signal handler, randomness).
     Task { message: String },
+    /// The global lockdown sandbox/quota could not be initialized before
+    /// Ready, so the daemon cannot honestly enforce the provider ceiling.
+    Lockdown { message: String },
 }
 
 impl DaemonError {
@@ -63,7 +66,7 @@ impl DaemonError {
             Self::AlreadyRunning { .. } => 75,
             Self::InvalidConfig { .. } => 64,
             Self::Store(_) | Self::Io { .. } | Self::Endpoint { .. } => 74,
-            Self::Protocol { .. } | Self::Task { .. } => 70,
+            Self::Protocol { .. } | Self::Task { .. } | Self::Lockdown { .. } => 70,
         }
     }
 }
@@ -103,6 +106,7 @@ impl std::fmt::Display for DaemonError {
             Self::Endpoint { message } => write!(formatter, "daemon endpoint error: {message}"),
             Self::Protocol { message } => write!(formatter, "daemon protocol error: {message}"),
             Self::Task { message } => write!(formatter, "daemon task error: {message}"),
+            Self::Lockdown { message } => write!(formatter, "daemon lockdown error: {message}"),
         }
     }
 }

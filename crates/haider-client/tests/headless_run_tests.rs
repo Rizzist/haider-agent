@@ -434,6 +434,7 @@ fn provider_summary_fixture(
         availability_reason: None,
         default_model: default_model.map(Into::into),
         enabled: true,
+        trust: haider_rpc::ProviderTrustWire::Full,
     }
 }
 

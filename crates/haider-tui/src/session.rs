@@ -119,6 +119,11 @@ pub struct SessionState {
     /// there means PLAIN (a clear propagates); an older daemon never sets
     /// it. The roster row joins the loom snapshot's color by this id.
     pub agent_type: Option<String>,
+    /// Provider ceiling frozen at this session's last accepted turn
+    /// boundary. `lockdown_boundary_known` distinguishes a Full boundary
+    /// from a session that has not submitted a turn in this UI process.
+    pub lockdown_provider: Option<String>,
+    pub lockdown_boundary_known: bool,
 }
 
 /// The additive `session.list` counts one roster row holds (launcher fix 2
@@ -180,6 +185,8 @@ impl SessionState {
             turns_offset: 0,
             summary_counts: None,
             agent_type: None,
+            lockdown_provider: None,
+            lockdown_boundary_known: false,
         }
     }
 

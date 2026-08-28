@@ -788,6 +788,12 @@ impl WeakSessionHub {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LockdownTurnBinding {
+    provider: String,
+    lockdown: bool,
+}
+
 struct HubInner {
     store: SqliteStoreHandle,
     append_committer: AppendCommitter,
@@ -895,6 +901,12 @@ struct HubInner {
     /// the client search). Deliberately IN-MEMORY: "for the session" is a
     /// runtime scope — a daemon restart retries the capability once.
     web_degrade: Mutex<HashMap<SessionId, crate::worker::WebCapabilityDegrade>>,
+    /// Daemon-authoritative provider ceiling frozen at the first observer of
+    /// a run boundary. Hooks can observe the committed acceptance before the
+    /// worker starts, so both paths race through one atomic map entry instead
+    /// of independently reading mutable provider trust. A trust toggle can
+    /// therefore change the next run, never an in-flight run.
+    lockdown_turns: Mutex<HashMap<(SessionId, RunId), LockdownTurnBinding>>,
     /// Ephemeral compiled-prompt acceleration. Journal bytes remain the
     /// authority; the cache is discarded with this daemon generation.
     prompt_history: PromptHistoryCache,
@@ -1778,6 +1790,7 @@ impl SessionHub {
             tasks: crate::tasks::TaskRegistry::default(),
             monitors: crate::monitor::MonitorService::default(),
             web_degrade: Mutex::new(HashMap::new()),
+            lockdown_turns: Mutex::new(HashMap::new()),
             prompt_history: PromptHistoryCache::default(),
         });
         let hub = Self { inner };
@@ -1948,6 +1961,171 @@ impl SessionHub {
             .get(session_id)
             .copied()
             .unwrap_or_default()
+    }
+
+    /// Returns the live provider policy used only when opening a new run
+    /// boundary. Missing account infrastructure is retained as Full for
+    /// isolated hub tests; once the account facade is installed, an unknown
+    /// provider fails closed as lockdown.
+    pub(crate) fn provider_lockdown_policy(&self, provider: &str) -> Result<bool, SessionHubError> {
+        let Some(accounts) = self.accounts()? else {
+            return Ok(false);
+        };
+        let view = accounts.management.read().ok_or_else(|| {
+            SessionHubError::Task("provider trust snapshot is unavailable".to_owned())
+        })?;
+        Ok(view
+            .providers
+            .iter()
+            .find(|summary| summary.provider == provider)
+            .map_or(true, |summary| {
+                !matches!(summary.trust, haider_rpc::ProviderTrustWire::Full)
+            }))
+    }
+
+    /// Atomically freezes one provider ceiling for a run. The hook engine and
+    /// worker can reach a newly committed acceptance in either order; the
+    /// first snapshot wins and later callers for the same run reuse it.
+    pub(crate) fn bind_lockdown_turn(
+        &self,
+        session_id: &SessionId,
+        run_id: &RunId,
+        provider: &str,
+        proposed_lockdown: bool,
+    ) -> Result<bool, SessionHubError> {
+        let durable = match crate::lockdown::global() {
+            Ok(manager) => {
+                let profile_id = self.inner.store.profile_installation_id()?;
+                Some(
+                    manager
+                        .bind_turn(
+                            &profile_id,
+                            session_id.as_str(),
+                            run_id.as_str(),
+                            provider,
+                            proposed_lockdown,
+                        )
+                        .map_err(|error| SessionHubError::Task(error.to_string()))?,
+                )
+            }
+            #[cfg(test)]
+            Err(_) => None,
+            #[cfg(not(test))]
+            Err(error) => return Err(SessionHubError::Task(error.to_string())),
+        };
+        let (provider, lockdown) =
+            durable.unwrap_or_else(|| (provider.to_owned(), proposed_lockdown));
+        let mut turns = lock(&self.inner.lockdown_turns)?;
+        let key = (session_id.clone(), run_id.clone());
+        if let Some(binding) = turns.get(&key) {
+            if binding.provider != provider {
+                return Err(SessionHubError::Task(format!(
+                    "lockdown turn binding conflict for {session_id}/{run_id}: stored provider `{}`, requested `{provider}`",
+                    binding.provider
+                )));
+            }
+            return Ok(binding.lockdown);
+        }
+        turns.insert(key, LockdownTurnBinding { provider, lockdown });
+        Ok(lockdown)
+    }
+
+    /// Returns a frozen run's provider and ceiling. Headless runs may pin a
+    /// provider different from the session metadata, so hook processing must
+    /// consult this coordinate before it considers the metadata fallback.
+    pub(crate) fn bound_lockdown_run(
+        &self,
+        session_id: &SessionId,
+        run_id: &RunId,
+    ) -> Result<Option<(String, bool)>, SessionHubError> {
+        let key = (session_id.clone(), run_id.clone());
+        if let Some(binding) = lock(&self.inner.lockdown_turns)?.get(&key).cloned() {
+            return Ok(Some((binding.provider, binding.lockdown)));
+        }
+        let binding = match crate::lockdown::global() {
+            Ok(manager) => {
+                let profile_id = self.inner.store.profile_installation_id()?;
+                manager
+                    .turn_binding(&profile_id, session_id.as_str(), run_id.as_str())
+                    .map_err(|error| SessionHubError::Task(error.to_string()))?
+            }
+            #[cfg(test)]
+            Err(_) => None,
+            #[cfg(not(test))]
+            Err(error) => return Err(SessionHubError::Task(error.to_string())),
+        };
+        if let Some((provider, lockdown)) = binding.as_ref() {
+            lock(&self.inner.lockdown_turns)?.insert(
+                key,
+                LockdownTurnBinding {
+                    provider: provider.clone(),
+                    lockdown: *lockdown,
+                },
+            );
+        }
+        Ok(binding)
+    }
+
+    /// Marks the run whose boundary is now executing as the direct-control
+    /// ceiling for this session. Durable per-run bindings remain available
+    /// for crash recovery, while the live map sheds older completed/queued
+    /// snapshots so a later Full boundary can restore Full direct controls.
+    pub(crate) fn activate_lockdown_turn(
+        &self,
+        session_id: &SessionId,
+        run_id: &RunId,
+    ) -> Result<(), SessionHubError> {
+        match crate::lockdown::global() {
+            Ok(manager) => {
+                let profile_id = self.inner.store.profile_installation_id()?;
+                manager
+                    .activate_turn(&profile_id, session_id.as_str(), run_id.as_str())
+                    .map_err(|error| SessionHubError::Task(error.to_string()))?;
+            }
+            #[cfg(test)]
+            Err(_) => {}
+            #[cfg(not(test))]
+            Err(error) => return Err(SessionHubError::Task(error.to_string())),
+        }
+        let key = (session_id.clone(), run_id.clone());
+        let mut turns = lock(&self.inner.lockdown_turns)?;
+        if !turns.contains_key(&key) {
+            return Err(SessionHubError::Task(format!(
+                "lockdown turn {session_id}/{run_id} was activated before it was bound"
+            )));
+        }
+        turns.retain(|candidate, _| candidate.0 != *session_id || candidate == &key);
+        Ok(())
+    }
+
+    /// Last provider ceiling that actually governed this session. Direct
+    /// mutation surfaces use it until the next run boundary, including for a
+    /// headless run whose provider differs from durable session metadata.
+    pub(crate) fn bound_session_lockdown(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<(String, bool)>, SessionHubError> {
+        match crate::lockdown::global() {
+            Ok(manager) => {
+                let profile_id = self.inner.store.profile_installation_id()?;
+                Ok(manager
+                    .active_session_binding(&profile_id, session_id.as_str())
+                    .map_err(|error| SessionHubError::Task(error.to_string()))?
+                    .map(|(_, provider, lockdown)| (provider, lockdown)))
+            }
+            // Isolated hub tests may omit the process-global manager. In that
+            // configuration `activate_lockdown_turn` prunes the local map to
+            // its one active binding, so the fallback retains test parity.
+            // Production must never inspect unactivated/queued bindings:
+            // doing so could apply a trust toggle before the next boundary.
+            #[cfg(test)]
+            Err(_) => Ok(lock(&self.inner.lockdown_turns)?
+                .iter()
+                .find(|((candidate, _), _)| candidate == session_id)
+                .map(|(_, binding)| (binding.provider.clone(), binding.lockdown))),
+            #[cfg(not(test))]
+            Err(error) => Err(SessionHubError::Task(error.to_string())),
+        }
     }
 
     /// W-B: latches "anthropic server web tools 400ed" for this session —
@@ -4157,6 +4335,15 @@ impl SessionHub {
             }
         }
         self.inner.observe_digests.remove(session_id);
+        lock(&self.inner.lockdown_turns)
+            .map_err(hub_error_as_store)?
+            .retain(|(candidate, _), _| candidate != session_id);
+        if let Ok(manager) = crate::lockdown::global() {
+            let profile_id = self.inner.store.profile_installation_id()?;
+            manager
+                .remove_session_bindings(&profile_id, session_id.as_str())
+                .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+        }
         if let Ok(Some(hooks)) = self.hooks() {
             hooks.session_deleted(session_id.clone());
         }

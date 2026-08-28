@@ -28,6 +28,7 @@ fn provider_summary(
         availability_reason: None,
         default_model,
         enabled: true,
+        trust: haider_rpc::ProviderTrustWire::Full,
     }
 }
 

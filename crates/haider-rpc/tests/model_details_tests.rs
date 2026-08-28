@@ -60,6 +60,7 @@ fn provider_summary_model_details_round_trip_names_and_windows() {
         availability_reason: None,
         default_model: Some("frontier-a".to_owned()),
         enabled: true,
+        trust: haider_rpc::ProviderTrustWire::Full,
     };
 
     let encoded = serde_json::to_value(&summary).expect("provider summary encodes");

@@ -33,6 +33,12 @@ pub(crate) fn redact_private_key_lines(input: &str) -> RedactedText {
     }
 }
 
+/// Forced secret redaction for the provider-lockdown sandbox. The returned
+/// text is the only form the restricted provider receives.
+pub fn redact_lockdown_text(input: &str) -> String {
+    redact_private_key_lines(input).text
+}
+
 pub(crate) fn redact_line_with_private_key_state(
     line: &str,
     private_key: &mut bool,
@@ -268,3 +274,7 @@ fn looks_high_entropy(value: &str) -> bool {
 #[cfg(test)]
 #[path = "redact/tests/redact_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "redact_lockdown_tests.rs"]
+mod lockdown_tests;

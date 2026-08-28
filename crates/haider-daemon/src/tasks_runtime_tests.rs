@@ -176,6 +176,7 @@ async fn task_dispatcher_with_grant(
     TurnToolFactory::create(
         &BrokerToolFactory,
         WorkerToolContext {
+            lockdown: None,
             diagnostics: None,
             metadata: task_metadata(cwd),
             store: lease,

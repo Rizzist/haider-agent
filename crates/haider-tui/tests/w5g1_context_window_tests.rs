@@ -62,6 +62,7 @@ fn windowed_summary(
         availability_reason: None,
         default_model: Some(default.to_owned()),
         enabled: true,
+        trust: haider_rpc::ProviderTrustWire::Full,
     }
 }
 

@@ -384,6 +384,24 @@
       "response_method": "checkpoint.rollback_turn",
       "request": {"method":"checkpoint.rollback_turn","command_id":"command-checkpoint-rollback","session_id":"session-1","worker_generation":7,"run_id":"run-1"},
       "response": {"method":"checkpoint.rollback_turn","receipt":{"checkpoint":{"checkpoint_id":"checkpoint-rollback-1","session_id":"session-1","run_id":"checkpoint-command:command-checkpoint-rollback","effect_id":"checkpoint-effect:command-checkpoint-rollback","call_id":"command-checkpoint-rollback","seq":60,"workspace_revision":"workspace-revision-4","kind":"edit","origin":"rollback_turn","paths":[{"path":"src/lib.rs","pre_artifact":"blake3:1111111111111111111111111111111111111111111111111111111111111111","pre_digest":"blake3:1111111111111111111111111111111111111111111111111111111111111111","post_digest":"blake3:0000000000000000000000000000000000000000000000000000000000000000"}],"post_digest":"blake3:5555555555555555555555555555555555555555555555555555555555555555","recorded_at_ms":1720000003000},"restored_checkpoint_ids":["checkpoint-1"],"worker_generation":7}}
+    },
+    {
+      "request_method": "provider.set_trust",
+      "response_method": "provider.set_trust",
+      "request": {"method":"provider.set_trust","command_id":"command-provider-trust","name":"research","trust":"lockdown","expected_revision":12},
+      "response": {"method":"provider.set_trust","provider":{"provider":"research","api_family":"openai_chat_completions","models":["search-1"],"model_details":[],"auth_methods":[],"availability":"available","enabled":true,"trust":"lockdown"},"revision":13}
+    },
+    {
+      "request_method": "lockdown.status",
+      "response_method": "lockdown.status",
+      "request": {"method":"lockdown.status","provider":"research"},
+      "response": {"method":"lockdown.status","status":{"provider":"research","tools_allowed":["fs_read","fs_search","web_search"],"quota_used":4096,"quota_limit":1073741824}}
+    },
+    {
+      "request_method": "lockdown.set_quota",
+      "response_method": "lockdown.set_quota",
+      "request": {"method":"lockdown.set_quota","command_id":"command-lockdown-quota","bytes":2147483648},
+      "response": {"method":"lockdown.set_quota","status":{"tools_allowed":["fs_read","fs_search","web_search"],"quota_used":4096,"quota_limit":2147483648}}
     }
   ]
 }

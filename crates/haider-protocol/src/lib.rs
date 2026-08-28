@@ -28,6 +28,7 @@ pub mod ids;
 pub mod image;
 pub mod interaction;
 pub mod item;
+pub mod lockdown;
 pub mod loom;
 pub mod menu;
 pub mod mobile;
@@ -138,6 +139,14 @@ pub enum EventPayload {
     Usage(provider::Usage),
     // append-only workspace mutation history
     CheckpointRecorded(checkpoint::CheckpointRecorded),
+    /// Raw daemon security facts. Prompt compaction may summarize these, but
+    /// durable/native-pipe records retain the complete payload.
+    #[serde(rename = "lockdown.refused")]
+    LockdownRefused(lockdown::LockdownRefused),
+    #[serde(rename = "lockdown.quota")]
+    LockdownQuota(lockdown::LockdownQuota),
+    #[serde(rename = "provider.trust_changed")]
+    ProviderTrustChanged(lockdown::ProviderTrustChanged),
 }
 
 /// Mid-turn input delivery (§3): steer is the default.

@@ -2175,6 +2175,62 @@ async fn matcher_fires_only_after_commit() {
     fixture.close().await;
 }
 
+/// MUTATION CHECK: consult mutable provider trust again while handling the
+/// committed event, or let trusted hooks bypass the provider ceiling.
+/// Expected failure: the marker is created, the typed refusal disappears, or
+/// changing the proposal widens the already-bound run.
+#[tokio::test]
+async fn lockdown_run_binding_suppresses_hooks_until_the_next_run() {
+    let marker_dir = tempfile::tempdir().expect("marker dir");
+    let marker = marker_dir.path().join("lockdown-hook-fired");
+    let command = write_command("forbidden", &marker);
+    let fixture = EngineFixture::start_user_message(&command).await;
+    assert!(
+        fixture
+            .hub
+            .bind_lockdown_turn(&fixture.session_id, &fixture.run_id, "fake", true)
+            .expect("bind lockdown turn")
+    );
+    assert!(
+        fixture
+            .hub
+            .bind_lockdown_turn(&fixture.session_id, &fixture.run_id, "fake", false)
+            .expect("reuse lockdown turn"),
+        "a trust toggle must not widen the in-flight run"
+    );
+    fixture
+        .accept_user_message(
+            "lockdown-hook",
+            "research only",
+            DeliveryMode::Steer,
+            Vec::new(),
+        )
+        .await;
+    wait_for_hook_outbox_drain(&fixture.store).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!marker.exists());
+    assert!(fixture.events().await.iter().any(|event| {
+        matches!(
+            serde_json::from_value::<EventPayload>(event.payload.clone()),
+            Ok(EventPayload::LockdownRefused(refusal))
+                if refusal.provider == "fake" && refusal.tool == "hooks"
+        )
+    }));
+    assert!(
+        !fixture
+            .hub
+            .bind_lockdown_turn(
+                &fixture.session_id,
+                &RunId::new("hooks-test-next-run"),
+                "fake",
+                false,
+            )
+            .expect("bind next Full turn"),
+        "the changed policy takes effect at the next run boundary"
+    );
+    fixture.close().await;
+}
+
 /// MUTATION CHECK: drop the drain-cycle acknowledgement flush, or flush a
 /// cycle's rows before handling them. Expected RUNTIME failure: live-handled
 /// rows stay pending below forever — or the markers appear while their rows

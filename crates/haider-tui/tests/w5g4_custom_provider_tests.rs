@@ -48,6 +48,7 @@ fn live_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
         availability_reason: Some("provider model inventory is unavailable".to_owned()),
         default_model: None,
         enabled: true,
+        trust: haider_rpc::ProviderTrustWire::Full,
     }
 }
 

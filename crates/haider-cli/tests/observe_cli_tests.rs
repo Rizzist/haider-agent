@@ -139,6 +139,9 @@ fn digest(
                     .as_str()
                     .expect("chip string")
                     .to_owned(),
+                provider: None,
+                lockdown_bound: None,
+                lockdown: None,
             },
             ObserveSubagentWire {
                 agent_id: AgentId::new("agent-without-callsign"),
@@ -149,8 +152,12 @@ fn digest(
                     .as_str()
                     .expect("chip string")
                     .to_owned(),
+                provider: None,
+                lockdown_bound: None,
+                lockdown: None,
             },
         ],
+        lockdown: None,
         updated_at_ms: 1_800_000_000_012,
         last_event_kinds: vec!["run_state".into(), "future_observe_kind_v9".into()],
         turn_count: None,

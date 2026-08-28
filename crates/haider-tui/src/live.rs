@@ -551,6 +551,15 @@ pub enum LiveCommand {
         provider: String,
         expected_revision: u64,
     },
+    ProviderSetTrust {
+        command_id: CommandId,
+        provider: String,
+        trust: haider_rpc::ProviderTrustWire,
+        expected_revision: u64,
+    },
+    LockdownStatus {
+        provider: Option<String>,
+    },
     /// Stage a raw secret in connection-scoped daemon memory (R7/R10).
     /// Deliberately NON-durable and NOT in the outbox: no command receipt
     /// may ever contain a secret, so a lost response is answered by
@@ -1002,6 +1011,7 @@ impl LiveCommand {
             | Self::ShellExec { command_id, .. }
             | Self::AccountRemove { command_id, .. }
             | Self::ProviderRemove { command_id, .. }
+            | Self::ProviderSetTrust { command_id, .. }
             | Self::Answer { command_id, .. } => Some(command_id),
             Self::HooksTrust { command_id, .. } => Some(command_id),
             Self::GraphPin { command_id, .. } | Self::GraphAbandon { command_id, .. } => {
@@ -1010,6 +1020,7 @@ impl LiveCommand {
             Self::SurfacePublish { .. }
             | Self::SurfaceWatch { .. }
             | Self::ResidentSessionBinding { .. } => None,
+            Self::LockdownStatus { .. } => None,
             Self::LoginApi { command_id, .. } => Some(command_id),
             Self::AccountSetActive { command_id, .. } => Some(command_id),
             Self::DeviceImport { command_id, .. } => Some(command_id),
@@ -1449,6 +1460,14 @@ pub enum LiveReply {
         command_id: CommandId,
         provider: String,
         revision: u64,
+    },
+    ProviderTrustSet {
+        command_id: CommandId,
+        provider: haider_rpc::ProviderSummaryWire,
+        revision: u64,
+    },
+    LockdownStatus {
+        status: haider_rpc::LockdownStatusWire,
     },
     /// One committed envelope for an attachment.
     Event {
@@ -2889,7 +2908,8 @@ impl LiveDriver {
             } => {
                 self.binding_worker_generation = Some(worker_generation);
                 self.retire(&command_id);
-                self.generations.insert(session, worker_generation);
+                self.generations.insert(session.clone(), worker_generation);
+                model.note_session_lockdown_turn_boundary(&session);
                 Vec::new()
             }
             LiveReply::ArtifactUploaded {
@@ -3240,6 +3260,32 @@ impl LiveDriver {
                 model.providers.message = Some(format!("removed `{provider}`"));
                 model.dirty = true;
                 vec![LiveCommand::ProviderList]
+            }
+            LiveReply::ProviderTrustSet {
+                command_id,
+                provider,
+                revision,
+            } => {
+                self.retire(&command_id);
+                let name = provider.provider.clone();
+                let trust = provider.trust;
+                model.providers.apply_models_refresh(provider, revision);
+                model.providers.message = Some(format!(
+                    "{name} trust → {}",
+                    match trust {
+                        haider_rpc::ProviderTrustWire::Full => "full",
+                        haider_rpc::ProviderTrustWire::Lockdown => "lockdown",
+                        haider_rpc::ProviderTrustWire::Unknown => "unknown",
+                        _ => "unknown",
+                    }
+                ));
+                model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::LockdownStatus { status } => {
+                model.lockdown_status = Some(status);
+                model.dirty = true;
+                Vec::new()
             }
             LiveReply::Answered { command_id }
             | LiveReply::Cancelled { command_id }
@@ -6126,6 +6172,22 @@ impl LiveDriver {
                     provider,
                     expected_revision,
                 })]
+            }
+            AppRequest::ProviderSetTrust {
+                provider,
+                trust,
+                expected_revision,
+            } => {
+                let command_id = self.mint();
+                vec![self.enqueue(LiveCommand::ProviderSetTrust {
+                    command_id,
+                    provider,
+                    trust,
+                    expected_revision,
+                })]
+            }
+            AppRequest::LockdownStatus { provider } => {
+                vec![LiveCommand::LockdownStatus { provider }]
             }
             AppRequest::Compact { branch } => {
                 // W7b: receipt-backed idle-only `session.compact`. The

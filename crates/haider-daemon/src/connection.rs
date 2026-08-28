@@ -1996,6 +1996,7 @@ fn welcome_features() -> BTreeSet<String> {
         FEATURE_HOOKS_V1.to_owned(),
         FEATURE_PROVIDER_CONFIGURE_V1.to_owned(),
         FEATURE_PROVIDER_MANAGEMENT_V1.to_owned(),
+        haider_rpc::FEATURE_PROVIDER_LOCKDOWN_V1.to_owned(),
         FEATURE_PROVIDER_MODELS_V1.to_owned(),
         FEATURE_MODELS_LIST_V1.to_owned(),
         FEATURE_PROVIDER_REMOVE_V1.to_owned(),

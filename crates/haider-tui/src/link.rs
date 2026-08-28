@@ -506,6 +506,7 @@ async fn issue(
                 | LiveCommand::CheckpointUndo { .. }
                 | LiveCommand::CheckpointRedo { .. }
                 | LiveCommand::CheckpointRollbackTurn { .. }
+                | LiveCommand::ProviderSetTrust { .. }
         ) {
             let _ = replies
                 .send(LiveReply::Failed {
@@ -633,6 +634,9 @@ pub fn command_required_features(command: &LiveCommand) -> &'static [&'static st
         | LiveCommand::CheckpointRollbackTurn { .. } => &[haider_rpc::FEATURE_CHECKPOINT_V1],
         LiveCommand::PeerList | LiveCommand::PeerSend { .. } => {
             &[haider_rpc::FEATURE_PEER_MESSAGING_V1]
+        }
+        LiveCommand::ProviderSetTrust { .. } | LiveCommand::LockdownStatus { .. } => {
+            &[haider_rpc::FEATURE_PROVIDER_LOCKDOWN_V1]
         }
         _ => &[],
     }
@@ -1335,6 +1339,18 @@ pub fn request_body_for_features(
             provider,
             expected_revision,
         },
+        LiveCommand::ProviderSetTrust {
+            command_id,
+            provider,
+            trust,
+            expected_revision,
+        } => RequestBody::ProviderSetTrust {
+            command_id,
+            name: provider,
+            trust,
+            expected_revision,
+        },
+        LiveCommand::LockdownStatus { provider } => RequestBody::LockdownStatus { provider },
         LiveCommand::Stage {
             stage_id, secret, ..
         } => RequestBody::VaultStage {
@@ -1515,6 +1531,7 @@ pub fn request_body_for_features(
                 default_model,
                 response_open_timeout_ms: None,
                 probe_vault_reference,
+                trust: None,
                 expected_revision,
             }
         }
@@ -1927,6 +1944,16 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 }]
             })
         }
+        ResponseBody::ProviderSetTrust { provider, revision } => {
+            context.command_id.clone().map_or_else(Vec::new, |id| {
+                vec![LiveReply::ProviderTrustSet {
+                    command_id: id,
+                    provider,
+                    revision,
+                }]
+            })
+        }
+        ResponseBody::LockdownStatus { status } => vec![LiveReply::LockdownStatus { status }],
         ResponseBody::VaultStage {
             vault_reference, ..
         } => context

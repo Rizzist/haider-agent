@@ -41,6 +41,7 @@ fn provider_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
         availability_reason: None,
         default_model: Some("model-a".to_owned()),
         enabled: true,
+        trust: haider_rpc::ProviderTrustWire::Full,
     }
 }
 

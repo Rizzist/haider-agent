@@ -70,6 +70,10 @@ mod haider_code_plan_tests;
 mod hooks;
 mod image_events;
 mod lifecycle;
+mod lockdown;
+#[cfg(test)]
+#[path = "lockdown_tests.rs"]
+mod lockdown_tests;
 mod loom_author;
 #[cfg(test)]
 #[path = "loom_authoring_tests.rs"]

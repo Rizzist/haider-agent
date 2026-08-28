@@ -283,6 +283,7 @@ pub(crate) struct WebSearchFailure {
 /// receipted transaction used by the public `session.select_model` RPC.
 struct DaemonProviderPairSwitchCommitter {
     store: HubStoreHandle,
+    branch_id: Option<BranchId>,
     device_id: DeviceId,
     event_ids: Arc<EventIdGenerator>,
 }
@@ -299,6 +300,69 @@ impl std::fmt::Debug for DaemonProviderPairSwitchCommitter {
 #[async_trait]
 impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
     async fn commit(&self, switch: &ProviderPairSwitch) -> Result<(), HaiderError> {
+        let source_lockdown = self
+            .store
+            .hub()
+            .bound_lockdown_run(self.store.session_id(), &switch.run_id)
+            .map_err(hub_error)?
+            .map_or_else(
+                || {
+                    self.store
+                        .hub()
+                        .provider_lockdown_policy(&switch.from_provider)
+                        .map_err(hub_error)
+                },
+                |(_, lockdown)| Ok(lockdown),
+            )?;
+        let target_lockdown = self
+            .store
+            .hub()
+            .provider_lockdown_policy(&switch.to_provider)
+            .map_err(hub_error)?;
+        if !lockdown_pair_switch_allowed(switch, source_lockdown, target_lockdown) {
+            let provider = if target_lockdown {
+                &switch.to_provider
+            } else {
+                &switch.from_provider
+            };
+            let reason = "an automatic cross-provider switch cannot replace a turn-scoped lockdown tool pack";
+            append_payloads(
+                &self.store,
+                &self.device_id,
+                &switch.run_id,
+                self.branch_id.as_ref(),
+                &self.event_ids,
+                vec![EventPayload::LockdownRefused(
+                    haider_protocol::lockdown::LockdownRefused {
+                        provider: provider.clone(),
+                        tool: "provider_pair_switch".to_owned(),
+                        reason: reason.to_owned(),
+                        tools_allowed: crate::lockdown::allowed_tool_names(),
+                    },
+                )],
+            )
+            .await?;
+            let mut error = HaiderError::new(
+                ErrorCode::PermissionDenied,
+                format!("RefusedByLockdown {{ tool: provider_pair_switch, reason: {reason} }}"),
+                false,
+            )
+            .with_presentation(ErrorPresentation::new(
+                "refused_by_lockdown",
+                "Provider switch refused by lockdown",
+                reason,
+                ErrorScope::Turn,
+                [ErrorAction::None],
+            ));
+            error.details = Some(serde_json::json!({
+                "kind": "refused_by_lockdown",
+                "provider": provider,
+                "tool": "provider_pair_switch",
+                "reason": reason,
+                "tools_allowed": crate::lockdown::allowed_tool_names(),
+            }));
+            return Err(error);
+        }
         let request_json = serde_json::json!({
             "automatic": true,
             "session_id": self.store.session_id(),
@@ -339,6 +403,14 @@ impl ProviderPairSwitchCommitter for DaemonProviderPairSwitchCommitter {
             Err(error) => Err(hub_error(error)),
         }
     }
+}
+
+fn lockdown_pair_switch_allowed(
+    switch: &ProviderPairSwitch,
+    source_lockdown: bool,
+    target_lockdown: bool,
+) -> bool {
+    switch.from_provider == switch.to_provider || (!source_lockdown && !target_lockdown)
 }
 
 struct DaemonContextCompactor {
@@ -1283,6 +1355,9 @@ pub struct WorkerToolContext {
     /// unavailable result).
     pub(crate) web_search: Option<Arc<dyn WebSearchExecutor>>,
     pub(crate) diagnostics: Option<Arc<EffectDiagnostics>>,
+    /// Provider trust is snapshotted once at the turn boundary. A concurrent
+    /// toggle therefore cannot widen or narrow an in-flight tool call.
+    pub(crate) lockdown: Option<crate::lockdown::LockdownTurn>,
 }
 
 /// Injectable tool/effect boundary (R4). Production uses the shipped broker;
@@ -4913,6 +4988,10 @@ async fn perform_manual_compaction(
             true,
         ));
     }
+    let boundary_run_id = existing.as_ref().map_or_else(
+        || RunId::new(format!("manual-compact-{command_id}")),
+        |receipt| receipt.run_id.clone(),
+    );
 
     let delegation = dependencies.delegation.clone().ok_or_else(|| {
         HaiderError::new(
@@ -4953,11 +5032,28 @@ async fn perform_manual_compaction(
             false,
         ));
     }
+    let lockdown = lockdown_turn_snapshot(
+        lease.hub(),
+        lease.session_id(),
+        &boundary_run_id,
+        &resolved.provider_name,
+    )?;
+    lease
+        .hub()
+        .activate_lockdown_turn(lease.session_id(), &boundary_run_id)
+        .map_err(hub_error)?;
     dependencies
         .provider_factory
         .reconcile_cache_scope(lease.session_id(), &resolved.provider_name)
         .await;
-    let instructions = project_instructions::load(&metadata.cwd).await;
+    // Project instruction discovery walks ancestor directories. Lockdown
+    // reads are workspace-scoped, so the daemon must not inject that implicit
+    // out-of-workspace read into a restricted provider prompt.
+    let instructions = if lockdown.is_some() {
+        None
+    } else {
+        project_instructions::load(&metadata.cwd).await
+    };
     let instruction_entries = instructions
         .as_ref()
         .map_or_else(Vec::new, LoadedProjectInstructions::prompt_entries);
@@ -4967,12 +5063,15 @@ async fn perform_manual_compaction(
     let mobile_use_active = durable_session_tool_state(lease, lease.session_id())
         .await?
         .mobile_use_active;
-    let post_compaction_tool_pack = advertised_tool_pack_for_mobile_state(
-        &dependencies.tool_factory,
-        grant,
-        &resolved.provider_name,
-        web_degrade,
-        mobile_use_active,
+    let post_compaction_tool_pack = lockdown_tool_definition_pack(
+        advertised_tool_pack_for_mobile_state(
+            &dependencies.tool_factory,
+            grant,
+            &resolved.provider_name,
+            web_degrade,
+            mobile_use_active,
+        ),
+        lockdown.is_some(),
     );
     let post_compaction_tools = Arc::clone(&post_compaction_tool_pack.definitions);
     let post_compaction_tool_digest = post_compaction_tool_pack.digest.clone();
@@ -5019,7 +5118,7 @@ async fn perform_manual_compaction(
     let (run_id, accepted_seq, intent) = if let Some(existing) = existing {
         (existing.run_id, existing.accepted_seq, existing.intent)
     } else {
-        let run_id = RunId::new(format!("manual-compact-{command_id}"));
+        let run_id = boundary_run_id;
         let intent = PromptHistoryCompiler::plan_idle_compaction(
             lease,
             lease.session_id(),
@@ -5933,6 +6032,21 @@ async fn start_turn(
             false,
         ));
     }
+    let lockdown = lockdown_turn_snapshot(
+        lease.hub(),
+        lease.session_id(),
+        &accepted.run_id,
+        &resolved.provider_name,
+    )?;
+    lease
+        .hub()
+        .activate_lockdown_turn(lease.session_id(), &accepted.run_id)
+        .map_err(hub_error)?;
+    if lockdown.is_some() {
+        // A task launched by an earlier Full turn must not remain a process
+        // escape after this provider's next Lockdown boundary.
+        lease.hub().fence_background_tasks(lease.session_id()).await;
+    }
     // Explicit Gemini resources are session-owned rather than provider-
     // instance-owned. Reconcile on every ordinary turn after resolving the
     // selected pair so switching away deletes the old paid resource before
@@ -5947,7 +6061,13 @@ async fn start_turn(
     let handoff_dir = delegation
         .handoff_dir_for_child_session(lease.session_id(), &metadata.cwd)
         .await?;
-    let instructions = project_instructions::load(&metadata.cwd).await;
+    // See the manual-compaction path above: ancestor instruction discovery
+    // is an implicit filesystem read and is therefore disabled in lockdown.
+    let instructions = if lockdown.is_some() {
+        None
+    } else {
+        project_instructions::load(&metadata.cwd).await
+    };
     let auth_scope = credential_surface_name(resolved.provider.credential_surface()).to_owned();
     let account_scope = resolved
         .account_alias
@@ -6130,6 +6250,7 @@ async fn start_turn(
                 loom_provider_fenced,
                 web_search: dependencies.web_search.clone(),
                 diagnostics: dependencies.diagnostics.clone(),
+                lockdown: lockdown.clone(),
             },
             durable_grants,
             durable_bindings,
@@ -6156,7 +6277,7 @@ async fn start_turn(
     config.model = resolved.model;
     config.context_window = resolved.context_window;
     config.agent_id = agent_id;
-    config.enforce_advertised_tool_ceiling = loom_provider_fenced;
+    config.enforce_advertised_tool_ceiling = loom_provider_fenced || lockdown.is_some();
     config.branch_id = accepted.branch_id.clone();
     config.max_tokens = metadata.max_tokens;
     config.interaction_policy =
@@ -6181,26 +6302,35 @@ async fn start_turn(
     }
     let provider_grant = loom_turn_grant.as_ref().or(delegation_grant.as_ref());
     let provider_grant_scope = cache_grant_scope_digest(provider_grant)?;
-    let provider_tool_base = authorized_tool_definition_pack(
-        &dependencies.tool_factory,
-        provider_grant,
-        mobile_use_active,
+    let provider_tool_base = lockdown_tool_definition_pack(
+        authorized_tool_definition_pack(
+            &dependencies.tool_factory,
+            provider_grant,
+            mobile_use_active,
+        ),
+        lockdown.is_some(),
     );
-    let provider_tools = tool_definition_pack_for_web_names(
-        &dependencies.tool_factory,
-        provider_grant,
-        mobile_use_active,
-        &provider_request_state.local_web_tool_names,
+    let provider_tools = lockdown_tool_definition_pack(
+        tool_definition_pack_for_web_names(
+            &dependencies.tool_factory,
+            provider_grant,
+            mobile_use_active,
+            &provider_request_state.local_web_tool_names,
+        ),
+        lockdown.is_some(),
     );
     let provider_fallback_tools = (!provider_request_state
         .provider_fallback_local_web_tool_names
         .is_empty())
     .then(|| {
-        let pack = tool_definition_pack_for_web_names(
-            &dependencies.tool_factory,
-            provider_grant,
-            mobile_use_active,
-            &provider_request_state.provider_fallback_local_web_tool_names,
+        let pack = lockdown_tool_definition_pack(
+            tool_definition_pack_for_web_names(
+                &dependencies.tool_factory,
+                provider_grant,
+                mobile_use_active,
+                &provider_request_state.provider_fallback_local_web_tool_names,
+            ),
+            lockdown.is_some(),
         );
         (Arc::clone(&pack.definitions), pack.digest.clone())
     });
@@ -6225,11 +6355,14 @@ async fn start_turn(
     let mut provider_tool_variants = HashMap::new();
     for mut names in name_variants {
         names.sort_unstable();
-        let pack = tool_definition_pack_for_web_names(
-            &dependencies.tool_factory,
-            provider_grant,
-            mobile_use_active,
-            &names,
+        let pack = lockdown_tool_definition_pack(
+            tool_definition_pack_for_web_names(
+                &dependencies.tool_factory,
+                provider_grant,
+                mobile_use_active,
+                &names,
+            ),
+            lockdown.is_some(),
         );
         provider_tool_variants.insert(names, (Arc::clone(&pack.definitions), pack.digest.clone()));
     }
@@ -6370,6 +6503,7 @@ async fn start_turn(
     config.compaction_promotion = resolved.compaction_promotion;
     config.provider_pair_switch_committer = Some(Arc::new(DaemonProviderPairSwitchCommitter {
         store: lease.clone(),
+        branch_id: accepted.branch_id.clone(),
         device_id: device_id.clone(),
         event_ids: Arc::clone(&event_ids),
     }));
@@ -10359,6 +10493,102 @@ fn authorized_tool_definition_pack(
     authorized_tool_definition_view(tool_factory, grant, mobile_use_active).into_pack()
 }
 
+fn lockdown_tool_definition_pack(
+    pack: Arc<ToolDefinitionPack>,
+    lockdown: bool,
+) -> Arc<ToolDefinitionPack> {
+    if !lockdown {
+        return pack;
+    }
+    let definitions: Arc<[ToolDefinition]> = pack
+        .definitions
+        .iter()
+        .filter(|definition| crate::lockdown::tool_allowed(&definition.name))
+        .cloned()
+        .collect::<Vec<_>>()
+        .into();
+    Arc::new(ToolDefinitionPack {
+        digest: canonical_tool_definitions_digest(&definitions),
+        definitions,
+    })
+}
+
+fn lockdown_turn_snapshot(
+    hub: &SessionHub,
+    session_id: &SessionId,
+    run_id: &RunId,
+    provider: &str,
+) -> Result<Option<crate::lockdown::LockdownTurn>, HaiderError> {
+    let proposed = hub.provider_lockdown_policy(provider).map_err(hub_error)?;
+    if !hub
+        .bind_lockdown_turn(session_id, run_id, provider, proposed)
+        .map_err(hub_error)?
+    {
+        return Ok(None);
+    }
+    crate::lockdown::global()
+        .and_then(|manager| manager.turn(provider))
+        .map(Some)
+        .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))
+}
+
+fn provider_lockdown_snapshot(
+    hub: &SessionHub,
+    provider: &str,
+) -> Result<Option<crate::lockdown::LockdownTurn>, HaiderError> {
+    if !hub.provider_lockdown_policy(provider).map_err(hub_error)? {
+        return Ok(None);
+    }
+    crate::lockdown::global()
+        .and_then(|manager| manager.turn(provider))
+        .map(Some)
+        .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))
+}
+
+const fn lockdown_child_provider_allowed(parent_lockdown: bool, child_lockdown: bool) -> bool {
+    !parent_lockdown || child_lockdown
+}
+
+/// Effect identity for the one lockdown mutation allowed outside the
+/// workspace. The ceiling validates the provider sandbox before this value is
+/// constructed; the broker still owns intent/authorization/dispatch/outcome.
+struct LockdownSandboxWriteEffect<'a> {
+    path: &'a Path,
+    content: &'a str,
+}
+
+impl EffectOperation for LockdownSandboxWriteEffect<'_> {
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::FsWrite
+    }
+
+    fn summary(&self) -> String {
+        format!("write lockdown sandbox {}", self.path.display())
+    }
+
+    fn arguments(&self) -> ToolResult<serde_json::Value> {
+        Ok(serde_json::json!({
+            "path": self.path.display().to_string(),
+            "content": self.content,
+        }))
+    }
+
+    fn approval_preview(&self) -> Vec<String> {
+        vec![
+            format!("Target: {}", self.path.display()),
+            format!("Content: {} UTF-8 bytes", self.content.len()),
+        ]
+    }
+}
+
+fn lockdown_write_relative<'a>(sandbox: &Path, requested: &'a Path) -> Result<&'a Path, ()> {
+    if requested.is_absolute() {
+        requested.strip_prefix(sandbox).map_err(|_| ())
+    } else {
+        Ok(requested)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 fn authorized_tool_definitions(
@@ -10658,6 +10888,27 @@ async fn create_broker_tool_dispatcher(
         policy
             .deny_unresolved_asks("no_human_available: autonomous mode cannot approve this effect");
     }
+    if context.lockdown.is_some() {
+        for class in [
+            EffectClass::ProcessExec,
+            EffectClass::GitOp,
+            EffectClass::CredentialAccess,
+            EffectClass::GuiAct,
+            EffectClass::ScreenObserve,
+            EffectClass::ScreenControl,
+            EffectClass::MobileObserve,
+            EffectClass::MobileControl,
+            EffectClass::ReadSms,
+            // Lane A supplies the core class consumed by lane B's peer
+            // surface; lockdown must remain below its Ask/Allow path.
+            EffectClass::PeerMessage,
+        ] {
+            policy.hard_deny(
+                class,
+                "provider capability ceiling: lockdown cannot be lifted by user approval",
+            );
+        }
+    }
     let output = HubCommandOutputContext {
         store: context.store.clone(),
         branch_id: context.branch_id.clone(),
@@ -10695,6 +10946,7 @@ async fn create_broker_tool_dispatcher(
         cli_scope: context.cli_scope,
         typed_workflow_execution: Mutex::new(context.typed_workflow_execution),
         loom_provider_fenced: context.loom_provider_fenced,
+        lockdown: context.lockdown,
         deferred: Mutex::new(HashMap::new()),
         active_tool_name,
     })))
@@ -10780,6 +11032,7 @@ struct BrokerToolDispatcher {
     cli_scope: Option<Vec<String>>,
     typed_workflow_execution: Mutex<Option<TypedWorkflowExecutionState>>,
     loom_provider_fenced: bool,
+    lockdown: Option<crate::lockdown::LockdownTurn>,
     deferred: Mutex<HashMap<AgentId, DeferredTicket>>,
     /// The journal sink reads this only while `broker` is held. Setting it
     /// after acquiring that mutex keeps concurrent tool calls correctly named.
@@ -12170,6 +12423,31 @@ impl ToolDispatcher for BrokerToolDispatcher {
             .as_ref()
             .map(|execution| &execution.cli_scope)
             .or(self.cli_scope.as_ref());
+        if let Some(lockdown) = self.lockdown.as_ref()
+            && !crate::lockdown::tool_allowed(name)
+        {
+            self.clear_cached_call(run_id, item_id, call_id);
+            let reason = "the fixed lockdown envelope does not advertise or dispatch this tool";
+            append_payloads(
+                &self.output.store,
+                &self.output.device_id,
+                run_id,
+                self.branch_id.as_ref(),
+                &self.output.event_ids,
+                vec![EventPayload::LockdownRefused(
+                    haider_protocol::lockdown::LockdownRefused {
+                        provider: lockdown.provider.clone(),
+                        tool: name.to_owned(),
+                        reason: reason.to_owned(),
+                        tools_allowed: lockdown.tools_allowed.clone(),
+                    },
+                )],
+            )
+            .await?;
+            return Ok(ToolDispatchResult::Completed(lockdown_refusal_result(
+                lockdown, name, reason,
+            )));
+        }
         if name == "mobile" && !self.mobile_use_active {
             self.clear_cached_call(run_id, item_id, call_id);
             return Ok(ToolDispatchResult::Completed(
@@ -12205,6 +12483,268 @@ impl ToolDispatcher for BrokerToolDispatcher {
         };
         let mut operation_lease =
             ParsedToolOperationLease::new(&self.parsed_tool_operations, operation_key.clone());
+        if let Some(lockdown) = self.lockdown.as_ref()
+            && matches!(
+                route,
+                RegisteredToolRoute::FsRead
+                    | RegisteredToolRoute::FsSearch
+                    | RegisteredToolRoute::FsGlob
+            )
+        {
+            let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
+            let requested = match operation.as_ref() {
+                ParsedToolOperation::FsRead(operation) => operation.path.as_path(),
+                ParsedToolOperation::FsSearch(operation) => operation.root.as_path(),
+                ParsedToolOperation::FsGlob(operation) => operation.root.as_path(),
+                _ => return Err(cached_operation_route_mismatch(route)),
+            };
+            if !crate::lockdown::read_path_allowed(
+                Path::new(&self.metadata.cwd),
+                &lockdown.sandbox,
+                requested,
+            ) {
+                let reason = "lockdown reads are limited to the workspace and provider sandbox; vault, profile, environment, and SSH paths are refused";
+                append_payloads(
+                    &self.output.store,
+                    &self.output.device_id,
+                    run_id,
+                    self.branch_id.as_ref(),
+                    &self.output.event_ids,
+                    vec![EventPayload::LockdownRefused(
+                        haider_protocol::lockdown::LockdownRefused {
+                            provider: lockdown.provider.clone(),
+                            tool: name.to_owned(),
+                            reason: reason.to_owned(),
+                            tools_allowed: lockdown.tools_allowed.clone(),
+                        },
+                    )],
+                )
+                .await?;
+                return Ok(ToolDispatchResult::Completed(lockdown_refusal_result(
+                    lockdown, name, reason,
+                )));
+            }
+        }
+        if let Some(lockdown) = self.lockdown.as_ref()
+            && route == RegisteredToolRoute::FsWrite
+        {
+            let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
+            let ParsedToolOperation::FsWrite(operation) = operation.as_ref() else {
+                return Err(cached_operation_route_mismatch(route));
+            };
+            let relative = match lockdown_write_relative(&lockdown.sandbox, &operation.path) {
+                Ok(path) => path,
+                Err(()) => {
+                    let reason = "writes are limited to the provider lockdown sandbox";
+                    append_payloads(
+                        &self.output.store,
+                        &self.output.device_id,
+                        run_id,
+                        self.branch_id.as_ref(),
+                        &self.output.event_ids,
+                        vec![EventPayload::LockdownRefused(
+                            haider_protocol::lockdown::LockdownRefused {
+                                provider: lockdown.provider.clone(),
+                                tool: name.to_owned(),
+                                reason: reason.to_owned(),
+                                tools_allowed: lockdown.tools_allowed.clone(),
+                            },
+                        )],
+                    )
+                    .await?;
+                    return Ok(ToolDispatchResult::Completed(lockdown_refusal_result(
+                        lockdown, name, reason,
+                    )));
+                }
+            };
+            let written_path = lockdown.sandbox.join(relative);
+            let effect = LockdownSandboxWriteEffect {
+                path: &written_path,
+                content: &operation.content,
+            };
+            let mut broker_guard = self.broker.lock().await;
+            let broker = broker_guard.as_mut().ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    "tool dispatcher is already closed",
+                    false,
+                )
+            })?;
+            let policy = self.policy.lock().await;
+            let intent = broker.normalize(&effect).await.map_err(tool_error)?;
+            match broker
+                .authorize(&intent, &policy)
+                .await
+                .map_err(tool_error)?
+            {
+                AuthorizationVerdict::Allow | AuthorizationVerdict::PreAuthorized { .. } => {
+                    broker
+                        .journal_dispatched(&intent)
+                        .await
+                        .map_err(tool_error)?;
+                }
+                AuthorizationVerdict::Ask { menu } => {
+                    let menu = broker.permission_menu(&menu).cloned().ok_or_else(|| {
+                        HaiderError::new(
+                            ErrorCode::Internal,
+                            "lockdown write permission menu disappeared before publication",
+                            false,
+                        )
+                    })?;
+                    operation_lease.retain_for_approval();
+                    return Ok(ToolDispatchResult::ApprovalRequired(menu));
+                }
+                AuthorizationVerdict::Deny { reason } => {
+                    return Err(tool_error(broker.denial_error(&policy, &intent, reason)));
+                }
+            }
+            let status = match crate::lockdown::global().and_then(|manager| {
+                manager.write(&lockdown.provider, relative, operation.content.as_bytes())
+            }) {
+                Ok(status) => status,
+                Err(crate::lockdown::LockdownError::LockdownQuotaExceeded { used, limit }) => {
+                    broker
+                        .journal_outcome(
+                            &intent,
+                            EffectOutcome::Failed {
+                                error: format!(
+                                    "LockdownQuotaExceeded {{ used: {used}, limit: {limit} }}"
+                                ),
+                            },
+                        )
+                        .await
+                        .map_err(tool_error)?;
+                    append_payloads(
+                        &self.output.store,
+                        &self.output.device_id,
+                        run_id,
+                        self.branch_id.as_ref(),
+                        &self.output.event_ids,
+                        vec![EventPayload::LockdownQuota(
+                            haider_protocol::lockdown::LockdownQuota {
+                                provider: Some(lockdown.provider.clone()),
+                                used,
+                                limit,
+                            },
+                        )],
+                    )
+                    .await?;
+                    return Ok(ToolDispatchResult::Completed(lockdown_quota_result(
+                        lockdown, name, used, limit,
+                    )));
+                }
+                Err(error) => {
+                    let reason = error.to_string();
+                    broker
+                        .journal_outcome(
+                            &intent,
+                            EffectOutcome::Failed {
+                                error: reason.clone(),
+                            },
+                        )
+                        .await
+                        .map_err(tool_error)?;
+                    append_payloads(
+                        &self.output.store,
+                        &self.output.device_id,
+                        run_id,
+                        self.branch_id.as_ref(),
+                        &self.output.event_ids,
+                        vec![EventPayload::LockdownRefused(
+                            haider_protocol::lockdown::LockdownRefused {
+                                provider: lockdown.provider.clone(),
+                                tool: name.to_owned(),
+                                reason: reason.clone(),
+                                tools_allowed: lockdown.tools_allowed.clone(),
+                            },
+                        )],
+                    )
+                    .await?;
+                    return Ok(ToolDispatchResult::Completed(lockdown_refusal_result(
+                        lockdown, name, &reason,
+                    )));
+                }
+            };
+            broker
+                .journal_outcome(&intent, EffectOutcome::Ok)
+                .await
+                .map_err(tool_error)?;
+            append_payloads(
+                &self.output.store,
+                &self.output.device_id,
+                run_id,
+                self.branch_id.as_ref(),
+                &self.output.event_ids,
+                vec![EventPayload::LockdownQuota(
+                    haider_protocol::lockdown::LockdownQuota {
+                        provider: Some(lockdown.provider.clone()),
+                        used: status.quota_used,
+                        limit: status.quota_limit,
+                    },
+                )],
+            )
+            .await?;
+            return Ok(ToolDispatchResult::Completed(lockdown_write_result(
+                &written_path,
+                operation.content.len(),
+                status.quota_used,
+                status.quota_limit,
+            )));
+        }
+        if let Some(lockdown) = self.lockdown.as_ref()
+            && route == RegisteredToolRoute::FsRead
+        {
+            let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
+            let ParsedToolOperation::FsRead(operation) = operation.as_ref() else {
+                return Err(cached_operation_route_mismatch(route));
+            };
+            if operation.path.is_absolute() && operation.path.starts_with(&lockdown.sandbox) {
+                let relative = operation
+                    .path
+                    .strip_prefix(&lockdown.sandbox)
+                    .map_err(|_| {
+                        HaiderError::new(
+                            ErrorCode::PermissionDenied,
+                            "lockdown sandbox read escaped its provider root",
+                            false,
+                        )
+                    })?;
+                let bytes = match crate::lockdown::global()
+                    .and_then(|manager| manager.read(&lockdown.provider, relative))
+                {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        let reason = error.to_string();
+                        append_payloads(
+                            &self.output.store,
+                            &self.output.device_id,
+                            run_id,
+                            self.branch_id.as_ref(),
+                            &self.output.event_ids,
+                            vec![EventPayload::LockdownRefused(
+                                haider_protocol::lockdown::LockdownRefused {
+                                    provider: lockdown.provider.clone(),
+                                    tool: name.to_owned(),
+                                    reason: reason.clone(),
+                                    tools_allowed: lockdown.tools_allowed.clone(),
+                                },
+                            )],
+                        )
+                        .await?;
+                        return Ok(ToolDispatchResult::Completed(lockdown_refusal_result(
+                            lockdown, name, &reason,
+                        )));
+                    }
+                };
+                let text = String::from_utf8_lossy(&bytes);
+                let redacted = haider_tools::redact_lockdown_text(&text);
+                return Ok(ToolDispatchResult::Completed(lockdown_read_result(
+                    &redacted,
+                    operation.offset,
+                    operation.limit,
+                )));
+            }
+        }
         if route == RegisteredToolRoute::Monitor {
             let request =
                 MonitorRequest::from_tool_args(args.as_ref().clone()).map_err(tool_error)?;
@@ -12593,6 +13133,37 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     )));
                 }
             };
+            let child_lockdown =
+                provider_lockdown_snapshot(self.output.store.hub(), &child_metadata.provider)?;
+            if !lockdown_child_provider_allowed(self.lockdown.is_some(), child_lockdown.is_some()) {
+                let Some(lockdown) = self.lockdown.as_ref() else {
+                    return Err(HaiderError::new(
+                        ErrorCode::Internal,
+                        "lockdown child ceiling lost its parent snapshot",
+                        false,
+                    ));
+                };
+                let reason = "a lockdown provider cannot spawn a child whose provider is Full";
+                append_payloads(
+                    &self.output.store,
+                    &self.output.device_id,
+                    run_id,
+                    self.branch_id.as_ref(),
+                    &self.output.event_ids,
+                    vec![EventPayload::LockdownRefused(
+                        haider_protocol::lockdown::LockdownRefused {
+                            provider: lockdown.provider.clone(),
+                            tool: name.to_owned(),
+                            reason: reason.to_owned(),
+                            tools_allowed: lockdown.tools_allowed.clone(),
+                        },
+                    )],
+                )
+                .await?;
+                return Ok(ToolDispatchResult::Completed(lockdown_refusal_result(
+                    lockdown, name, reason,
+                )));
+            }
             let intent = match broker.begin_agent_spawn(&request, &policy).await {
                 Ok(intent) => intent,
                 Err(ToolError::AuthorizationRequired { menu }) => {
@@ -12620,6 +13191,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         call_id: call_id.to_owned(),
                         metadata: child_metadata,
                         agent_type: typed_record,
+                        lockdown: child_lockdown.is_some(),
                     },
                     request,
                 )
@@ -12818,7 +13390,7 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     return Ok(ToolDispatchResult::ApprovalRequired(menu));
                 }
                 AuthorizationVerdict::Deny { reason } => {
-                    return Err(tool_error(ToolError::PermissionDenied { reason }));
+                    return Err(tool_error(broker.denial_error(&policy, &intent, reason)));
                 }
             }
             let delivery = match self.output.store.hub().peer_service() {
@@ -14023,10 +14595,32 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 };
                 Ok(ToolDispatchResult::ApprovalRequired(menu))
             }
-            Err(error) => match typed_tool_result(&error) {
-                Some(result) => Ok(ToolDispatchResult::Completed(result)),
-                None => Err(tool_error(error)),
-            },
+            Err(error) => {
+                if let (Some(lockdown), ToolError::RefusedByLockdown { tool, reason }) =
+                    (self.lockdown.as_ref(), &error)
+                {
+                    append_payloads(
+                        &self.output.store,
+                        &self.output.device_id,
+                        run_id,
+                        self.branch_id.as_ref(),
+                        &self.output.event_ids,
+                        vec![EventPayload::LockdownRefused(
+                            haider_protocol::lockdown::LockdownRefused {
+                                provider: lockdown.provider.clone(),
+                                tool: tool.clone(),
+                                reason: reason.clone(),
+                                tools_allowed: lockdown.tools_allowed.clone(),
+                            },
+                        )],
+                    )
+                    .await?;
+                }
+                match typed_tool_result(&error) {
+                    Some(result) => Ok(ToolDispatchResult::Completed(result)),
+                    None => Err(tool_error(error)),
+                }
+            }
         };
         if matches!(
             &dispatch_result,
@@ -14387,6 +14981,10 @@ pub(crate) fn typed_tool_result(error: &haider_tools::ToolError) -> Option<Bound
         ));
     }
     let (status, kind) = match error {
+        haider_tools::ToolError::RefusedByLockdown { .. } => ("rejected", "refused_by_lockdown"),
+        haider_tools::ToolError::LockdownQuotaExceeded { .. } => {
+            ("rejected", "lockdown_quota_exceeded")
+        }
         haider_tools::ToolError::PermissionDenied { .. } => ("denied", "permission_denied"),
         haider_tools::ToolError::WorkspaceBoundary { .. } => ("rejected", "workspace_boundary"),
         haider_tools::ToolError::PathChanged { .. } => ("rejected", "path_changed"),
@@ -14685,6 +15283,132 @@ fn grant_ceiling_result(name: &str) -> BoundedResult {
         cursor: None,
         status: ToolResultStatus::Rejected,
         reason: Some(reason),
+        presentation: None,
+    }
+}
+
+fn lockdown_refusal_result(
+    lockdown: &crate::lockdown::LockdownTurn,
+    tool: &str,
+    reason: &str,
+) -> BoundedResult {
+    let error = ToolError::RefusedByLockdown {
+        tool: tool.to_owned(),
+        reason: reason.to_owned(),
+    };
+    let allowed = lockdown.tools_allowed.join(", ");
+    let message = format!(
+        "provider {} is in lockdown mode; available tools: {allowed}",
+        lockdown.provider
+    );
+    BoundedResult {
+        preview: serde_json::json!({
+            "status": "refused",
+            "kind": "refused_by_lockdown",
+            "message": message,
+            "details": {
+                "provider": lockdown.provider,
+                "tool": tool,
+                "reason": reason,
+                "typed_error": error.to_string(),
+                "tools_allowed": lockdown.tools_allowed,
+            },
+        })
+        .to_string(),
+        truncated: false,
+        data: None,
+        artifact: None,
+        images: Vec::new(),
+        cursor: None,
+        status: ToolResultStatus::Rejected,
+        reason: Some(message),
+        presentation: None,
+    }
+}
+
+fn lockdown_write_result(
+    path: &Path,
+    bytes: usize,
+    quota_used: u64,
+    quota_limit: u64,
+) -> BoundedResult {
+    BoundedResult {
+        preview: serde_json::json!({
+            "status": "completed",
+            "path": path,
+            "bytes": bytes,
+            "quota_used": quota_used,
+            "quota_limit": quota_limit,
+        })
+        .to_string(),
+        truncated: false,
+        data: None,
+        artifact: None,
+        images: Vec::new(),
+        cursor: None,
+        status: ToolResultStatus::Completed,
+        reason: None,
+        presentation: None,
+    }
+}
+
+fn lockdown_quota_result(
+    lockdown: &crate::lockdown::LockdownTurn,
+    tool: &str,
+    used: u64,
+    limit: u64,
+) -> BoundedResult {
+    let error = ToolError::LockdownQuotaExceeded { used, limit };
+    let message = format!(
+        "provider {} is in lockdown mode; available tools: {}",
+        lockdown.provider,
+        lockdown.tools_allowed.join(", ")
+    );
+    BoundedResult {
+        preview: serde_json::json!({
+            "status": "refused",
+            "kind": "lockdown_quota_exceeded",
+            "message": message,
+            "details": {
+                "provider": lockdown.provider,
+                "tool": tool,
+                "used": used,
+                "limit": limit,
+                "typed_error": error.to_string(),
+                "tools_allowed": lockdown.tools_allowed,
+            },
+        })
+        .to_string(),
+        truncated: false,
+        data: None,
+        artifact: None,
+        images: Vec::new(),
+        cursor: None,
+        status: ToolResultStatus::Rejected,
+        reason: Some(message),
+        presentation: None,
+    }
+}
+
+fn lockdown_read_result(text: &str, offset: Option<usize>, limit: Option<usize>) -> BoundedResult {
+    let start = offset.unwrap_or(1).saturating_sub(1);
+    let selected = text
+        .lines()
+        .skip(start)
+        .take(limit.unwrap_or(usize::MAX))
+        .enumerate()
+        .map(|(index, line)| format!("{}\t{line}", start.saturating_add(index).saturating_add(1)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    BoundedResult {
+        preview: selected,
+        truncated: false,
+        data: None,
+        artifact: None,
+        images: Vec::new(),
+        cursor: None,
+        status: ToolResultStatus::Completed,
+        reason: Some("lockdown secret redaction forced on".to_owned()),
         presentation: None,
     }
 }

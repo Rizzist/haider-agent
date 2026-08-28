@@ -379,6 +379,7 @@ pub fn seed_provider_summaries() -> Vec<haider_rpc::ProviderSummaryWire> {
                    reason: Option<&str>,
                    default_model: Option<&str>,
                    enabled: bool| ProviderSummaryWire {
+        trust: haider_rpc::ProviderTrustWire::Full,
         provider: provider.to_owned(),
         api_family,
         endpoint: endpoint.map(str::to_owned),

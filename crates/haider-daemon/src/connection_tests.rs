@@ -203,8 +203,8 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
         welcome_features().len(),
-        96,
-        "the ordinary Welcome advertises all 94 v0.0.963 tokens plus account_identity_v1 and checkpoint_v1"
+        97,
+        "the ordinary Welcome advertises the 96 pre-lockdown tokens plus provider_lockdown_v1"
     );
     assert_eq!(
         welcome_features(),
@@ -262,6 +262,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_SESSION_LIST_WATCH_V1.to_owned(),
             FEATURE_PROVIDER_CONFIGURE_V1.to_owned(),
             FEATURE_PROVIDER_MANAGEMENT_V1.to_owned(),
+            haider_rpc::FEATURE_PROVIDER_LOCKDOWN_V1.to_owned(),
             FEATURE_PROVIDER_MODELS_V1.to_owned(),
             FEATURE_PROVIDER_REMOVE_V1.to_owned(),
             haider_rpc::FEATURE_RESIDENT_SESSION_BINDING_V1.to_owned(),
