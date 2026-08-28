@@ -9,7 +9,7 @@
   "architecture": {
     "64bit": {
       "url": "https://github.com/Rizzist/haider-agent/releases/download/v0.0.964/haider-v0.0.964-x86_64-pc-windows-msvc.zip",
-      "hash": "c96d21fbd74fb1e8ee1ce31c390f6b42ef19249d1dc1ef7db9229280c31efa61",
+      "hash": "dfd4818769c529c5518bec4b5067de6b6219b02aae72938c1b38a9a618a3a624",
       "extract_dir": "haider-v0.0.964-x86_64-pc-windows-msvc"
     }
   },
