@@ -198,17 +198,192 @@ pub fn build_stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
     archive
 }
 
-/// Writes an executable stub script and returns its path (unix test hosts).
-pub fn write_stub_script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, body).expect("write stub script");
+/// Cross-platform behavior for a spawned command fixture.
+pub enum StubBehavior {
+    Success,
+    Output {
+        stdout: String,
+    },
+    Failure {
+        stderr: Vec<String>,
+        exit_code: i32,
+    },
+    RecordArgs {
+        path: std::path::PathBuf,
+        stdout: String,
+        stderr: Vec<String>,
+    },
+    DelayedOutput {
+        delay_ms: u64,
+        stdout: String,
+    },
+    CounterOutput {
+        path: std::path::PathBuf,
+        prefix: String,
+    },
+}
+
+#[cfg(unix)]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(unix)]
+fn render_stub_script(behavior: &StubBehavior) -> String {
+    let mut script = String::from("#!/bin/sh\n");
+    match behavior {
+        StubBehavior::Success => script.push_str("exit 0\n"),
+        StubBehavior::Output { stdout } => {
+            script.push_str(&format!("printf '%s' {}\n", shell_quote(stdout)));
+        }
+        StubBehavior::Failure { stderr, exit_code } => {
+            for line in stderr {
+                script.push_str(&format!("printf '%s\\n' {} >&2\n", shell_quote(line)));
+            }
+            script.push_str(&format!("exit {exit_code}\n"));
+        }
+        StubBehavior::RecordArgs {
+            path,
+            stdout,
+            stderr,
+        } => {
+            script.push_str(&format!(
+                "printf '%s\\n' \"$@\" > {}\n",
+                shell_quote(&path.to_string_lossy())
+            ));
+            for line in stderr {
+                script.push_str(&format!("printf '%s\\n' {} >&2\n", shell_quote(line)));
+            }
+            script.push_str(&format!("printf '%s' {}\n", shell_quote(stdout)));
+        }
+        StubBehavior::DelayedOutput { delay_ms, stdout } => {
+            script.push_str(&format!("sleep {:.3}\n", *delay_ms as f64 / 1_000.0));
+            script.push_str(&format!("printf '%s' {}\n", shell_quote(stdout)));
+        }
+        StubBehavior::CounterOutput { path, prefix } => {
+            let path = shell_quote(&path.to_string_lossy());
+            script.push_str(&format!(
+                "n=$(cat {path} 2>/dev/null || printf '0')\nn=$((n+1))\nprintf '%s\\n' \"$n\" > {path}\nprintf '%s%s' {} \"$n\"\n",
+                shell_quote(prefix)
+            ));
+        }
+    }
+    script
+}
+
+#[cfg(windows)]
+fn push_fixture_blob(encoded: &mut Vec<u8>, bytes: &[u8]) {
+    encoded.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    encoded.extend_from_slice(bytes);
+}
+
+#[cfg(windows)]
+fn encode_stub_behavior(behavior: &StubBehavior) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    match behavior {
+        StubBehavior::Success => encoded.push(0),
+        StubBehavior::Output { stdout } => {
+            encoded.push(1);
+            push_fixture_blob(&mut encoded, stdout.as_bytes());
+        }
+        StubBehavior::Failure { stderr, exit_code } => {
+            encoded.push(2);
+            encoded.extend_from_slice(&exit_code.to_le_bytes());
+            encoded.extend_from_slice(&(stderr.len() as u32).to_le_bytes());
+            for line in stderr {
+                push_fixture_blob(&mut encoded, line.as_bytes());
+            }
+        }
+        StubBehavior::RecordArgs {
+            path,
+            stdout,
+            stderr,
+        } => {
+            encoded.push(3);
+            push_fixture_blob(&mut encoded, path.to_string_lossy().as_bytes());
+            push_fixture_blob(&mut encoded, stdout.as_bytes());
+            encoded.extend_from_slice(&(stderr.len() as u32).to_le_bytes());
+            for line in stderr {
+                push_fixture_blob(&mut encoded, line.as_bytes());
+            }
+        }
+        StubBehavior::DelayedOutput { delay_ms, stdout } => {
+            encoded.push(4);
+            encoded.extend_from_slice(&delay_ms.to_le_bytes());
+            push_fixture_blob(&mut encoded, stdout.as_bytes());
+        }
+        StubBehavior::CounterOutput { path, prefix } => {
+            encoded.push(5);
+            push_fixture_blob(&mut encoded, path.to_string_lossy().as_bytes());
+            push_fixture_blob(&mut encoded, prefix.as_bytes());
+        }
+    }
+    encoded
+}
+
+#[cfg(windows)]
+fn native_stub_driver() -> &'static std::path::Path {
+    static DRIVER: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DRIVER
+        .get_or_init(|| {
+            let build_dir =
+                std::env::temp_dir().join(format!("haider-stt-native-stub-{}", std::process::id()));
+            std::fs::create_dir_all(&build_dir).expect("create native stub build dir");
+            let executable = build_dir.join("haider-stt-native-stub.exe");
+            let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/windows_stub.rs");
+            let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+            let output = std::process::Command::new(rustc)
+                .args(["--edition", "2024"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&executable)
+                .output()
+                .expect("run rustc for native Windows stub");
+            assert!(
+                output.status.success(),
+                "native Windows stub failed to compile: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            executable
+        })
+        .as_path()
+}
+
+/// Writes a spawnable command fixture and returns its platform-correct path.
+///
+/// Unix uses a small shell script. Windows compiles one Rust fixture driver,
+/// copies that valid PE image under the requested `.exe` name, and writes its
+/// behavior to a sidecar file. No Windows spawn test relies on a Unix script.
+pub fn write_stub_command(
+    dir: &std::path::Path,
+    name: &str,
+    behavior: StubBehavior,
+) -> std::path::PathBuf {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
+
+        let path = dir.join(name);
+        std::fs::write(&path, render_stub_script(&behavior)).expect("write stub script");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .expect("make stub executable");
+        path
     }
-    path
+    #[cfg(windows)]
+    {
+        let requested = std::path::Path::new(name);
+        let executable_name = if requested.extension().is_some() {
+            requested.to_path_buf()
+        } else {
+            requested.with_extension("exe")
+        };
+        let path = dir.join(executable_name);
+        std::fs::copy(native_stub_driver(), &path).expect("copy native Windows stub");
+        std::fs::write(path.with_extension("stub"), encode_stub_behavior(&behavior))
+            .expect("write native Windows stub behavior");
+        path
+    }
 }
 
 /// The sha256 of a byte slice as lowercase hex (for fixture specs).

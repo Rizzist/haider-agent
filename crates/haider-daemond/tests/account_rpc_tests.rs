@@ -636,7 +636,15 @@ async fn committed_receipt_self_heals_a_missing_descriptor_on_restart() {
 async fn account_remove_survives_a_fresh_daemon_on_the_same_profile() {
     let root = test_root("hacR");
     let store_dir = root.path().join("store");
-    let config = DaemonConfig::new("profile-remove-restart", &store_dir, root.path());
+    // The runtime directory is daemon-owned and removable. Keeping it distinct
+    // from the fixture root prevents legitimate `store/` state from being
+    // diagnosed as a foreign runtime residual on Windows (Unix sticky-root
+    // owner scoping otherwise masks this malformed fixture layout).
+    let config = DaemonConfig::new(
+        "profile-remove-restart",
+        &store_dir,
+        root.path().join("runtime"),
+    );
     let validator = ScriptedValidator::new(Vec::new());
     let dependencies = DaemonDependencies {
         accounts: AccountsDependencies {

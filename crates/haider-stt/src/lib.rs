@@ -16,6 +16,11 @@
 //! discipline (`download`). Models are evictable at any moment — the ADE's
 //! uninstall deletes the whole dir — so "model missing" is a first-class
 //! typed state ([`SttError::ModelMissing`]), never a crash.
+//!
+//! Desktop platform matrix: local Whisper and Deepgram dictation are supported
+//! on macOS, Windows, and Linux. Windows local Whisper discovers native
+//! `whisper-cli.exe`/`main.exe`/`whisper.exe` runtimes and can install the
+//! pinned official x64 runtime archive into the shared managed directory.
 
 pub mod capture;
 pub mod catalog;

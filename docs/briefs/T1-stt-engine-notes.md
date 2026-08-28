@@ -39,8 +39,8 @@ card) is deliberately NOT here — no TUI file changed.
   `brew install whisper-cpp` (missing brew → honest hint outcome; non-zero
   exit → first output line only), Windows pinned v1.8.4 zip+sha256 through
   the same verify-before-rename install, entry names screened by an
-  explicit zip-slip guard BEFORE extraction (platform `tar` does the
-  unpack; bsdtar reads zip), Linux → PATH-only hint outcome.
+  explicit zip-slip guard BEFORE in-process ZIP extraction, Linux →
+  PATH-only hint outcome.
 - `capture.rs` — deterministic `CaptureState` (every transition takes an
   explicit `Instant`, so laws run without a microphone): ADE DSP ports
   (mono mix, rms/peak stats, dBFS, digital-zero detect, single-value
@@ -165,10 +165,9 @@ tolerance.
    a real input device. All behavior it delegates to `CaptureState` is
    law-covered; the glue is kept logic-free. Live-mic verification is the
    ship-gate probe after T2.
-4. Windows zip extraction shells the platform `tar` (bsdtar reads zip;
-   ships on Win10+); entry names are screened for zip-slip before any byte
-   is extracted. No zip crate was added (deps stayed cpal +
-   tokio-tungstenite + futures-util).
+4. Windows ZIP extraction is in-process and magic-byte-selected; entry names
+   are screened for zip-slip before any byte is extracted. This avoids making
+   platform `tar` behavior part of the runtime-install contract.
 5. Deepgram sessions emit per-message frames only (ADE parity); the
    assembled text is `finish()`'s result. Local sessions add one final
    cumulative frame when text exists (also ADE parity).

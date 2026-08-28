@@ -4,13 +4,17 @@
 
 mod common;
 
+#[cfg(windows)]
+use std::ffi::OsStr;
 use std::ffi::OsString;
 // Only the macOS well-known-paths test constructs PathBuf values.
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
 
-use common::{build_stored_zip, write_stub_script};
+use common::{StubBehavior, build_stored_zip, write_stub_command};
 use haider_stt::SttError;
+#[cfg(windows)]
+use haider_stt::runtime::find_on_path_with_pathext;
 #[cfg(target_os = "macos")]
 use haider_stt::runtime::well_known_runtime_paths;
 use haider_stt::runtime::{
@@ -33,9 +37,9 @@ fn discovery_order_is_managed_dir_then_path_then_well_known() {
     let known_dir = tempfile::tempdir().expect("well-known dir");
     let managed = runtime_directory(whisper.path()).join("bin");
     std::fs::create_dir_all(&managed).expect("managed dir");
-    let managed_cli = write_stub_script(&managed, "whisper-cli", "#!/bin/sh\nexit 0\n");
-    let path_cli = write_stub_script(path_dir.path(), "whisper-cli", "#!/bin/sh\nexit 0\n");
-    let known_cli = write_stub_script(known_dir.path(), "whisper-cli", "#!/bin/sh\nexit 0\n");
+    let managed_cli = write_stub_command(&managed, "whisper-cli", StubBehavior::Success);
+    let path_cli = write_stub_command(path_dir.path(), "whisper-cli", StubBehavior::Success);
+    let known_cli = write_stub_command(known_dir.path(), "whisper-cli", StubBehavior::Success);
     let path_value = OsString::from(path_dir.path().display().to_string());
     let well_known = vec![known_cli.clone()];
     // All three tiers present: the managed runtime wins (recursive walk).
@@ -62,23 +66,51 @@ fn discovery_order_is_managed_dir_then_path_then_well_known() {
 #[test]
 fn name_order_prefers_whisper_cli_then_main_then_whisper() {
     let dir = tempfile::tempdir().expect("dir");
-    let whisper = write_stub_script(dir.path(), "whisper", "#!/bin/sh\nexit 0\n");
+    let whisper = write_stub_command(dir.path(), "whisper", StubBehavior::Success);
     let path_value = OsString::from(dir.path().display().to_string());
     assert_eq!(
         find_on_path(runtime_executable_names(), Some(&path_value)),
         Some(whisper.clone())
     );
-    let main = write_stub_script(dir.path(), "main", "#!/bin/sh\nexit 0\n");
+    let main = write_stub_command(dir.path(), "main", StubBehavior::Success);
     assert_eq!(
         find_on_path(runtime_executable_names(), Some(&path_value)),
         Some(main)
     );
-    let cli = write_stub_script(dir.path(), "whisper-cli", "#!/bin/sh\nexit 0\n");
+    let cli = write_stub_command(dir.path(), "whisper-cli", StubBehavior::Success);
     assert_eq!(
         find_on_path(runtime_executable_names(), Some(&path_value)),
         Some(cli)
     );
     assert!(whisper.is_file(), "lower-precedence names stay in place");
+}
+
+/// Windows PATH lookup applies PATHEXT inside each canonical executable name,
+/// without disturbing PATH-directory or whisper/main name precedence.
+#[cfg(windows)]
+#[test]
+fn windows_path_resolution_honors_pathext_order() {
+    let dir = tempfile::tempdir().expect("dir");
+    let com = write_stub_command(dir.path(), "whisper-cli.com", StubBehavior::Success);
+    let exe = write_stub_command(dir.path(), "whisper-cli.exe", StubBehavior::Success);
+    let path_value = OsString::from(dir.path().display().to_string());
+
+    assert_eq!(
+        find_on_path_with_pathext(
+            &["whisper-cli"],
+            Some(&path_value),
+            Some(OsStr::new(".COM;.EXE")),
+        ),
+        Some(com)
+    );
+    assert_eq!(
+        find_on_path_with_pathext(
+            &["whisper-cli"],
+            Some(&path_value),
+            Some(OsStr::new(".EXE;.COM")),
+        ),
+        Some(exe)
+    );
 }
 
 /// The macOS well-known list is the ADE's literal list, in order.
@@ -107,14 +139,20 @@ fn macos_well_known_paths_are_the_ade_literals() {
 #[tokio::test]
 async fn homebrew_driver_maps_exit_status_and_first_output_line() {
     let dir = tempfile::tempdir().expect("dir");
-    let ok_brew = write_stub_script(dir.path(), "brew-ok", "#!/bin/sh\nexit 0\n");
+    let ok_brew = write_stub_command(dir.path(), "brew-ok", StubBehavior::Success);
     install_runtime_with_homebrew(&ok_brew)
         .await
         .expect("zero exit is success");
-    let failing = write_stub_script(
+    let failing = write_stub_command(
         dir.path(),
         "brew-fail",
-        "#!/bin/sh\necho 'Error: no bottle available' 1>&2\necho 'second line' 1>&2\nexit 1\n",
+        StubBehavior::Failure {
+            stderr: vec![
+                "Error: no bottle available".to_owned(),
+                "second line".to_owned(),
+            ],
+            exit_code: 1,
+        },
     );
     let error = install_runtime_with_homebrew(&failing)
         .await
@@ -158,8 +196,9 @@ fn zip_entry_guard_refuses_escaping_names() {
 #[tokio::test]
 async fn runtime_zip_extraction_is_screened_and_lands_in_runtime_dir() {
     let whisper = tempfile::tempdir().expect("whisper dir");
+    let runtime_entry = format!("Release/{}", runtime_executable_names()[0]);
     let good_zip = build_stored_zip(&[
-        ("Release/whisper-cli", b"#!/bin/sh\nexit 0\n".as_slice()),
+        (runtime_entry.as_str(), b"native runtime bytes".as_slice()),
         ("Release/README.txt", b"runtime".as_slice()),
     ]);
     let good_path = whisper.path().join("whisper-bin-x64.zip");
@@ -189,6 +228,9 @@ async fn runtime_zip_extraction_is_screened_and_lands_in_runtime_dir() {
         "no byte of an unsafe archive may be extracted"
     );
 
+    // This mutation subcase constructs a Unix filesystem symlink. The ZIP
+    // format, path-screening, and extraction assertions above remain enabled
+    // on Windows.
     #[cfg(unix)]
     {
         let linked_whisper = tempfile::tempdir().expect("linked whisper dir");
@@ -236,11 +278,12 @@ async fn archive_without_runtime_executable_is_typed_runtime_missing() {
 #[tokio::test]
 async fn runtime_archive_format_detection_is_magic_byte_driven() {
     let root = tempfile::tempdir().expect("archive root");
+    let runtime_entry = format!("Release/{}", runtime_executable_names()[0]);
 
     let zip_path = root.path().join("runtime.data");
     std::fs::write(
         &zip_path,
-        build_stored_zip(&[("Release/whisper-cli", b"zip bytes".as_slice())]),
+        build_stored_zip(&[(runtime_entry.as_str(), b"zip bytes".as_slice())]),
     )
     .expect("write extensionless zip");
     let zip_runtime = root.path().join("zip-runtime");
@@ -248,7 +291,7 @@ async fn runtime_archive_format_detection_is_magic_byte_driven() {
         .await
         .expect("ZIP magic is accepted without a zip extension");
     assert_eq!(
-        std::fs::read(zip_runtime.join("Release/whisper-cli")).expect("read ZIP payload"),
+        std::fs::read(zip_runtime.join(&runtime_entry)).expect("read ZIP payload"),
         b"zip bytes"
     );
 

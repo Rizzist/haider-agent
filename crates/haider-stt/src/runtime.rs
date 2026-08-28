@@ -3,8 +3,9 @@
 //! Discovery order (rust-diffforge `src-tauri/src/audio.rs:3769-3876`):
 //! managed `<whisper_dir>/runtime/` (recursive, per executable name) → PATH →
 //! well-known absolute paths. Executable names probed in order:
-//! `whisper-cli`, `main`, `whisper` (`.exe` on Windows). One runtime serves
-//! both products: Haider never installs a private copy when the ADE already
+//! `whisper-cli`, `main`, `whisper` (`.exe` in the managed Windows layout;
+//! Windows PATH lookup also follows `PATHEXT`). One runtime serves both
+//! products: Haider never installs a private copy when the ADE already
 //! installed one anywhere on this list.
 //!
 //! Install drivers:
@@ -57,6 +58,17 @@ pub fn runtime_executable_names() -> &'static [&'static str] {
     #[cfg(not(windows))]
     {
         &["whisper-cli", "main", "whisper"]
+    }
+}
+
+fn runtime_path_names() -> &'static [&'static str] {
+    #[cfg(windows)]
+    {
+        &["whisper-cli", "main", "whisper"]
+    }
+    #[cfg(not(windows))]
+    {
+        runtime_executable_names()
     }
 }
 
@@ -123,20 +135,90 @@ pub fn find_runtime_in_dir(directory: &Path) -> Option<PathBuf> {
         .find_map(|name| find_named_in_dir(directory, name))
 }
 
-/// Finds the first canonical executable across `path_value` entries (an
-/// injected `$PATH` snapshot, so discovery is deterministic under test).
+#[cfg(windows)]
+fn windows_path_extensions(pathext: Option<&OsStr>) -> Vec<String> {
+    const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
+    let value = pathext
+        .map(OsStr::to_string_lossy)
+        .unwrap_or_else(|| DEFAULT_PATHEXT.into());
+    let mut extensions = Vec::new();
+    for raw in value.split(';') {
+        let extension = raw.trim();
+        if extension.len() < 2
+            || !extension.starts_with('.')
+            || !extension[1..]
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric())
+            || extensions
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(extension))
+        {
+            continue;
+        }
+        extensions.push(extension.to_owned());
+    }
+    if !extensions
+        .iter()
+        .any(|extension| extension.eq_ignore_ascii_case(".EXE"))
+    {
+        // The managed/downloaded runtime contract is always an `.exe`, even
+        // when a caller has supplied an unusual PATHEXT without that default.
+        extensions.push(".EXE".to_owned());
+    }
+    extensions
+}
+
+fn path_candidates(directory: &Path, name: &str, pathext: Option<&OsStr>) -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        if Path::new(name).extension().is_some() {
+            vec![directory.join(name)]
+        } else {
+            windows_path_extensions(pathext)
+                .into_iter()
+                .map(|extension| directory.join(format!("{name}{extension}")))
+                .collect()
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pathext;
+        vec![directory.join(name)]
+    }
+}
+
+/// Finds the first canonical executable across `path_value` entries, using
+/// the injected Windows `PATHEXT` snapshot for extensionless names.
+///
+/// PATH directory order remains primary, then caller-supplied name order,
+/// then `PATHEXT` order. On non-Windows hosts `pathext` is ignored.
 #[must_use]
-pub fn find_on_path(names: &[&str], path_value: Option<&OsStr>) -> Option<PathBuf> {
+pub fn find_on_path_with_pathext(
+    names: &[&str],
+    path_value: Option<&OsStr>,
+    pathext: Option<&OsStr>,
+) -> Option<PathBuf> {
     let path_value = path_value?;
     for directory in std::env::split_paths(path_value) {
         for name in names {
-            let candidate = directory.join(name);
-            if candidate.is_file() {
-                return Some(candidate);
+            for candidate in path_candidates(&directory, name, pathext) {
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
             }
         }
     }
     None
+}
+
+/// Finds the first canonical executable across `path_value` entries.
+///
+/// The PATH snapshot is injected for deterministic discovery. Windows also
+/// reads the process `PATHEXT`; tests that need to pin it use
+/// [`find_on_path_with_pathext`].
+#[must_use]
+pub fn find_on_path(names: &[&str], path_value: Option<&OsStr>) -> Option<PathBuf> {
+    find_on_path_with_pathext(names, path_value, std::env::var_os("PATHEXT").as_deref())
 }
 
 /// Full discovery with every input injected: managed dir → PATH →
@@ -150,7 +232,7 @@ pub fn discover_runtime_with(
     if let Some(runtime) = find_runtime_in_dir(&runtime_directory(whisper_dir)) {
         return Some(runtime);
     }
-    if let Some(runtime) = find_on_path(runtime_executable_names(), path_value) {
+    if let Some(runtime) = find_on_path(runtime_path_names(), path_value) {
         return Some(runtime);
     }
     well_known

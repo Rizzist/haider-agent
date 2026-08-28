@@ -8,7 +8,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use common::write_stub_script;
+use common::{StubBehavior, write_stub_command};
 use haider_stt::local::{
     CancelToken, LocalWhisperEngine, MAX_AUDIO_BYTES, TRANSCRIBE_TIMEOUT_SECS, build_args,
     partial_thread_count, start_partial_session, thread_count,
@@ -99,13 +99,17 @@ fn thread_counts_clamp_to_ade_ranges() {
 async fn stub_cli_roundtrip_returns_stdout_and_receives_pinned_args() {
     let dir = tempfile::tempdir().expect("dir");
     let args_file = dir.path().join("seen-args.txt");
-    let cli = write_stub_script(
+    let cli = write_stub_command(
         dir.path(),
         "whisper-cli",
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\necho 'whisper_init_from_file: loading model' 1>&2\necho 'ggml_metal_init: found device' 1>&2\nprintf '  hello from stub  '\n",
-            args_file.display()
-        ),
+        StubBehavior::RecordArgs {
+            path: args_file.clone(),
+            stdout: "  hello from stub  ".to_owned(),
+            stderr: vec![
+                "whisper_init_from_file: loading model".to_owned(),
+                "ggml_metal_init: found device".to_owned(),
+            ],
+        },
     );
     let engine = engine_with(dir.path(), cli);
     let text = engine
@@ -138,10 +142,16 @@ async fn stub_cli_roundtrip_returns_stdout_and_receives_pinned_args() {
 #[tokio::test]
 async fn failing_cli_reports_filtered_stderr() {
     let dir = tempfile::tempdir().expect("dir");
-    let cli = write_stub_script(
+    let cli = write_stub_command(
         dir.path(),
         "whisper-cli",
-        "#!/bin/sh\necho 'whisper_init_from_file: loading model' 1>&2\necho 'error: failed to load model' 1>&2\nexit 3\n",
+        StubBehavior::Failure {
+            stderr: vec![
+                "whisper_init_from_file: loading model".to_owned(),
+                "error: failed to load model".to_owned(),
+            ],
+            exit_code: 3,
+        },
     );
     let engine = engine_with(dir.path(), cli);
     let error = engine
@@ -167,10 +177,12 @@ async fn failing_cli_reports_filtered_stderr() {
 #[tokio::test]
 async fn evicted_model_is_typed_model_missing_per_spawn() {
     let dir = tempfile::tempdir().expect("dir");
-    let cli = write_stub_script(
+    let cli = write_stub_command(
         dir.path(),
         "whisper-cli",
-        "#!/bin/sh\nprintf 'transcribed text'\n",
+        StubBehavior::Output {
+            stdout: "transcribed text".to_owned(),
+        },
     );
     let engine = engine_with(dir.path(), cli);
     // First spawn succeeds (model present, cache warmed).
@@ -196,7 +208,13 @@ async fn evicted_model_is_typed_model_missing_per_spawn() {
 #[tokio::test]
 async fn oversized_wav_is_refused_before_spawn() {
     let dir = tempfile::tempdir().expect("dir");
-    let cli = write_stub_script(dir.path(), "whisper-cli", "#!/bin/sh\nprintf 'x'\n");
+    let cli = write_stub_command(
+        dir.path(),
+        "whisper-cli",
+        StubBehavior::Output {
+            stdout: "x".to_owned(),
+        },
+    );
     let engine = engine_with(dir.path(), cli);
     let error = engine
         .transcribe_wav_bytes(
@@ -217,10 +235,13 @@ async fn oversized_wav_is_refused_before_spawn() {
 #[tokio::test]
 async fn cancel_kills_the_inflight_spawn() {
     let dir = tempfile::tempdir().expect("dir");
-    let cli = write_stub_script(
+    let cli = write_stub_command(
         dir.path(),
         "whisper-cli",
-        "#!/bin/sh\nsleep 5\nprintf 'late'\n",
+        StubBehavior::DelayedOutput {
+            delay_ms: 5_000,
+            stdout: "late".to_owned(),
+        },
     );
     let engine = engine_with(dir.path(), cli);
     let cancel = CancelToken::new();
@@ -252,13 +273,13 @@ async fn cancel_kills_the_inflight_spawn() {
 async fn partial_session_emits_cumulative_frames_and_assembles() {
     let dir = tempfile::tempdir().expect("dir");
     let count_file = dir.path().join("count");
-    let cli = write_stub_script(
+    let cli = write_stub_command(
         dir.path(),
         "whisper-cli",
-        &format!(
-            "#!/bin/sh\nn=$(cat {count} 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > {count}\nprintf 'chunk %s' $n\n",
-            count = count_file.display()
-        ),
+        StubBehavior::CounterOutput {
+            path: count_file,
+            prefix: "chunk ".to_owned(),
+        },
     );
     let engine = Arc::new(engine_with(dir.path(), cli));
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<TranscriptFrame>();
@@ -306,7 +327,13 @@ async fn partial_session_error_surfaces_only_without_assembled_text() {
     // Session A: no model at all → the only chunk errors → finish is the
     // typed ModelMissing.
     let dir = tempfile::tempdir().expect("dir");
-    let cli = write_stub_script(dir.path(), "whisper-cli", "#!/bin/sh\nprintf 'text'\n");
+    let cli = write_stub_command(
+        dir.path(),
+        "whisper-cli",
+        StubBehavior::Output {
+            stdout: "text".to_owned(),
+        },
+    );
     let engine = engine_with(dir.path(), cli);
     std::fs::remove_file(dir.path().join("ggml-base.en.bin")).expect("evict model");
     let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel::<TranscriptFrame>();

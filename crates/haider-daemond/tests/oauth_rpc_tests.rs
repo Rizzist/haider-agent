@@ -1074,7 +1074,14 @@ async fn blocking_refresh_shutdown_barrier(inject_worker_shutdown_error: bool) {
     } else {
         "oauth-barrier"
     };
-    let mut config = DaemonConfig::new(profile_id, root.path().join("store"), root.path());
+    // Runtime cleanup owns this directory; the durable store and test
+    // workspace are siblings, not runtime residuals. This distinction is
+    // observable on Windows, where no Unix sticky-root UID scope is derived.
+    let mut config = DaemonConfig::new(
+        profile_id,
+        root.path().join("store"),
+        root.path().join("runtime"),
+    );
     config.discovery_disabled = true; // hermetic: direct spawns bypass support::ready
     config.drain_timeout = Duration::from_millis(100);
     config.inject_worker_manager_shutdown_error = inject_worker_shutdown_error;
