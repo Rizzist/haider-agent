@@ -190,6 +190,14 @@ pub struct PeerCredentials {
     pub(crate) same_user: bool,
 }
 
+/// Kernel-observed reason a platform peer can no longer own its connection.
+/// No process identity or pipe name is retained in the diagnostic value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerExitReason {
+    ProcessExited,
+    ConnectionClosed,
+}
+
 #[cfg(unix)]
 #[must_use]
 pub fn peer_credentials_are_owner(credentials: &PeerCredentials, owner_uid: u32) -> bool {

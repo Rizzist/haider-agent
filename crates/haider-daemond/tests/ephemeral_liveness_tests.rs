@@ -3,9 +3,11 @@
 //! isolation. The helper is a real client process; `Child::kill` is SIGKILL on
 //! Unix and TerminateProcess on Windows.
 
+mod support;
+
 use haider_client::{
-    ClientConfig, DAEMON_LOG_FILE, DaemonLifetime, EnsureOptions, ProfileEnv, ResolvedProfile,
-    connect, ensure_daemon, resolve_profile,
+    ClientConfig, ConnectError, DAEMON_LOG_FILE, DaemonLifetime, EnsureOptions, ProfileEnv,
+    ResolvedProfile, connect, ensure_daemon, resolve_profile,
 };
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -22,6 +24,7 @@ const POLL: Duration = Duration::from_millis(20);
 struct ChildGuard {
     child: Child,
     reaped: bool,
+    exit_status: Option<ExitStatus>,
 }
 
 impl ChildGuard {
@@ -29,6 +32,7 @@ impl ChildGuard {
         Self {
             child,
             reaped: false,
+            exit_status: None,
         }
     }
 
@@ -40,7 +44,23 @@ impl ChildGuard {
         self.child.kill()?;
         let status = self.child.wait()?;
         self.reaped = true;
+        self.exit_status = Some(status);
         Ok(status)
+    }
+
+    fn diagnostic_status(&mut self) -> String {
+        if let Some(status) = self.exit_status {
+            return format!("exited({status})");
+        }
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                self.reaped = true;
+                self.exit_status = Some(status);
+                format!("exited({status})")
+            }
+            Ok(None) => "alive".into(),
+            Err(error) => format!("query_error({error})"),
+        }
     }
 }
 
@@ -100,24 +120,47 @@ fn pid_path(profile: &ResolvedProfile) -> PathBuf {
     profile.runtime_dir.join(haider_daemon::DAEMON_PID_FILE)
 }
 
-fn wait_until(mut predicate: impl FnMut() -> bool, boundary: &str) {
-    let deadline = Instant::now() + DEADLINE;
-    while !predicate() {
-        assert!(Instant::now() < deadline, "deadline waiting for {boundary}");
-        std::thread::sleep(POLL);
+fn boundary_context(profile: &ResolvedProfile) -> support::BoundaryContext<'_> {
+    support::BoundaryContext {
+        store_dir: &profile.store_dir,
+        runtime_dir: &profile.runtime_dir,
+        endpoint_path: &profile.endpoint_path,
+        captured_daemon_stderr: &[],
     }
 }
 
-fn wait_for_helper(marker: &Path, child: &mut ChildGuard, boundary: &str) {
-    wait_until(
-        || {
-            assert!(
-                child.child_mut().try_wait().expect("poll helper").is_none(),
-                "helper exited before {boundary}"
-            );
-            marker.exists()
-        },
+fn wait_until(
+    profile: &ResolvedProfile,
+    boundary: &str,
+    predicate: impl FnMut() -> bool,
+    snapshot: impl FnMut() -> support::BoundarySnapshot,
+) {
+    support::wait_until(
         boundary,
+        DEADLINE,
+        POLL,
+        &boundary_context(profile),
+        predicate,
+        snapshot,
+    );
+}
+
+fn wait_for_helper(
+    profile: &ResolvedProfile,
+    marker: &Path,
+    child: &mut ChildGuard,
+    boundary: &str,
+) {
+    wait_until(
+        profile,
+        boundary,
+        || marker.exists(),
+        || {
+            process_snapshot(profile, Some(child), None)
+                .observation("marker_exists", marker.exists())
+                .observation("pid_file_exists", pid_path(profile).exists())
+                .observation("runtime_dir_exists", profile.runtime_dir.exists())
+        },
     );
 }
 
@@ -160,18 +203,37 @@ fn kill_helper(child: &mut ChildGuard) {
     );
 }
 
-fn wait_for_cleanup(profile: &ResolvedProfile) {
+fn wait_for_cleanup(
+    profile: &ResolvedProfile,
+    mut child: Option<&mut ChildGuard>,
+    daemon_pid: Option<u32>,
+) {
     wait_until(
-        || !profile.runtime_dir.exists() && !pid_path(profile).exists(),
+        profile,
         "ephemeral daemon runtime cleanup",
+        || !profile.runtime_dir.exists() && !pid_path(profile).exists(),
+        || {
+            process_snapshot(profile, child.as_deref_mut(), daemon_pid)
+                .observation("runtime_dir_absent", !profile.runtime_dir.exists())
+                .observation("pid_file_absent", !pid_path(profile).exists())
+        },
     );
     let runtime = runtime();
-    assert!(
-        runtime
-            .block_on(connect(&profile.endpoint_path, ClientConfig::default()))
-            .is_err(),
-        "cleaned ephemeral endpoint must no longer serve"
-    );
+    let endpoint_probe_started = Instant::now();
+    if let Ok(stream) = runtime.block_on(connect(&profile.endpoint_path, ClientConfig::default())) {
+        drop(stream);
+        support::report_boundary_timeout(
+            "cleaned ephemeral endpoint no longer serves",
+            endpoint_probe_started.elapsed(),
+            Duration::ZERO,
+            &boundary_context(profile),
+            process_snapshot(profile, child, daemon_pid)
+                .observation("endpoint_unreachable", false)
+                .observation("runtime_dir_absent", !profile.runtime_dir.exists())
+                .observation("pid_file_absent", !pid_path(profile).exists()),
+        );
+        panic!("cleaned ephemeral endpoint still serves");
+    }
 }
 
 #[cfg(unix)]
@@ -185,6 +247,21 @@ fn process_has_exited(pid: u32) -> bool {
     }
 }
 
+#[cfg(unix)]
+fn process_diagnostic_status(pid: u32) -> String {
+    let Some(raw) = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    else {
+        return format!("invalid_pid({pid})");
+    };
+    match rustix::process::test_kill_process(raw) {
+        Ok(()) => format!("alive(pid={pid})"),
+        Err(error) if error == rustix::io::Errno::SRCH => format!("exited(pid={pid})"),
+        Err(error) => format!("query_error(pid={pid}, error={error})"),
+    }
+}
+
 #[cfg(windows)]
 fn process_has_exited(pid: u32) -> bool {
     let Some(pid) = haider_platform::process_id(Some(pid)) else {
@@ -194,6 +271,41 @@ fn process_has_exited(pid: u32) -> bool {
         Ok(exited) => exited,
         Err(error) if haider_platform::process_error_is_missing(&error) => true,
         Err(_) => false,
+    }
+}
+
+#[cfg(windows)]
+fn process_diagnostic_status(pid: u32) -> String {
+    let Some(process_id) = haider_platform::process_id(Some(pid)) else {
+        return format!("invalid_pid({pid})");
+    };
+    match haider_platform::process_leader_exited(process_id) {
+        Ok(true) => format!("exited(pid={pid})"),
+        Ok(false) => format!("alive(pid={pid})"),
+        Err(error) if haider_platform::process_error_is_missing(&error) => {
+            format!("exited(pid={pid}, process_missing=true)")
+        }
+        Err(error) => format!("query_error(pid={pid}, error={error})"),
+    }
+}
+
+fn process_snapshot(
+    profile: &ResolvedProfile,
+    child: Option<&mut ChildGuard>,
+    daemon_pid: Option<u32>,
+) -> support::BoundarySnapshot {
+    let mut snapshot = support::BoundarySnapshot::default();
+    if let Some(child) = child {
+        snapshot = snapshot.process("client_helper", child.diagnostic_status());
+    }
+    let daemon_pid = daemon_pid.or_else(|| {
+        std::fs::read_to_string(pid_path(profile))
+            .ok()
+            .and_then(|contents| contents.trim().parse().ok())
+    });
+    match daemon_pid {
+        Some(pid) => snapshot.process("daemon", process_diagnostic_status(pid)),
+        None => snapshot.process("daemon", "unknown(pid_file_unavailable)"),
     }
 }
 
@@ -214,17 +326,85 @@ fn spawn_persistent_daemon(profile: &ResolvedProfile) -> ChildGuard {
     ChildGuard::new(child)
 }
 
-async fn connect_until_ready(profile: &ResolvedProfile) -> haider_client::Connected {
-    tokio::time::timeout(DEADLINE, async {
-        loop {
-            if let Ok(connected) = connect(&profile.endpoint_path, ClientConfig::default()).await {
-                return connected;
+fn connect_until_ready(
+    runtime: &tokio::runtime::Runtime,
+    profile: &ResolvedProfile,
+    mut child: Option<&mut ChildGuard>,
+    daemon_pid: Option<u32>,
+) -> haider_client::Connected {
+    let started = Instant::now();
+    loop {
+        let remaining = DEADLINE.saturating_sub(started.elapsed());
+        match runtime.block_on(async {
+            tokio::time::timeout(
+                remaining,
+                connect(&profile.endpoint_path, ClientConfig::default()),
+            )
+            .await
+        }) {
+            Ok(Ok(connected)) => return connected,
+            Ok(Err(_error)) if started.elapsed() < DEADLINE => {
+                std::thread::sleep(POLL.min(DEADLINE.saturating_sub(started.elapsed())));
             }
-            tokio::time::sleep(POLL).await;
+            Ok(Err(error)) => {
+                report_readiness_timeout(
+                    profile,
+                    child.as_deref_mut(),
+                    daemon_pid,
+                    started.elapsed(),
+                    connect_error_class(&error),
+                    "completed_with_error",
+                );
+            }
+            Err(_) => {
+                report_readiness_timeout(
+                    profile,
+                    child.as_deref_mut(),
+                    daemon_pid,
+                    started.elapsed(),
+                    "attempt_deadline_elapsed",
+                    "cancelled_at_deadline",
+                );
+            }
         }
-    })
-    .await
-    .expect("daemon readiness deadline")
+    }
+}
+
+fn report_readiness_timeout(
+    profile: &ResolvedProfile,
+    child: Option<&mut ChildGuard>,
+    daemon_pid: Option<u32>,
+    elapsed: Duration,
+    error_class: &str,
+    final_attempt: &str,
+) -> ! {
+    support::report_boundary_timeout(
+        "daemon readiness",
+        elapsed,
+        DEADLINE,
+        &boundary_context(profile),
+        process_snapshot(profile, child, daemon_pid)
+            .observation("handshake_completed", false)
+            .observation("final_handshake_attempt", final_attempt)
+            .observation("handshake_error_class", error_class)
+            .observation("pid_file_exists", pid_path(profile).exists())
+            .observation("runtime_dir_exists", profile.runtime_dir.exists()),
+    );
+    panic!("deadline waiting for daemon readiness");
+}
+
+fn connect_error_class(error: &ConnectError) -> &'static str {
+    match error {
+        ConnectError::NotFound(_) => "not_found",
+        ConnectError::Refused(_) => "refused",
+        ConnectError::PermissionDenied(_) => "permission_denied",
+        ConnectError::Io(_) => "io",
+        ConnectError::Rejected(_) => "rejected",
+        ConnectError::ClosedDuringHandshake => "closed_during_handshake",
+        ConnectError::HandshakeTimeout => "handshake_timeout",
+        ConnectError::Frame(_) => "frame",
+        ConnectError::UnexpectedFrame => "unexpected_frame",
+    }
 }
 
 /// Runs only in the subprocess launched by `spawn_helper`. The retained
@@ -290,7 +470,12 @@ fn killed_spawning_client_reaps_ephemeral_daemon_and_runtime_files() {
     let profile = profile(&root.path().join("store"), &root.path().join("runtime"));
     let marker = root.path().join("client-ready");
     let mut helper = spawn_helper(&profile, &marker, true);
-    wait_for_helper(&marker, &mut helper, "daemon spawn before readiness read");
+    wait_for_helper(
+        &profile,
+        &marker,
+        &mut helper,
+        "daemon spawn before readiness read",
+    );
     let marker = std::fs::read_to_string(&marker).expect("read helper marker");
     let daemon_pid = marker
         .strip_prefix("daemon_pid=")
@@ -299,10 +484,17 @@ fn killed_spawning_client_reaps_ephemeral_daemon_and_runtime_files() {
 
     kill_helper(&mut helper);
     wait_until(
-        || process_has_exited(daemon_pid),
+        &profile,
         "ephemeral daemon exit after pre-readiness client kill",
+        || process_has_exited(daemon_pid),
+        || {
+            process_snapshot(&profile, Some(&mut helper), Some(daemon_pid))
+                .observation("daemon_process_exited", process_has_exited(daemon_pid))
+                .observation("pid_file_exists", pid_path(&profile).exists())
+                .observation("runtime_dir_exists", profile.runtime_dir.exists())
+        },
     );
-    wait_for_cleanup(&profile);
+    wait_for_cleanup(&profile, Some(&mut helper), Some(daemon_pid));
 }
 
 /// S3(a): once readiness has proved the endpoint and PID file existed, killing
@@ -314,7 +506,7 @@ fn killed_ready_spawning_client_reaps_ephemeral_daemon_and_runtime_files() {
     let profile = profile(&root.path().join("store"), &root.path().join("runtime"));
     let marker = root.path().join("client-ready");
     let mut helper = spawn_helper(&profile, &marker, false);
-    wait_for_helper(&marker, &mut helper, "ready ephemeral helper");
+    wait_for_helper(&profile, &marker, &mut helper, "ready ephemeral helper");
     assert_eq!(
         std::fs::read_to_string(&marker).expect("read helper marker"),
         "spawned=true\n"
@@ -326,16 +518,23 @@ fn killed_ready_spawning_client_reaps_ephemeral_daemon_and_runtime_files() {
         .parse::<u32>()
         .expect("PID file carries daemon process id");
     let runtime = runtime();
-    let probe = runtime.block_on(connect_until_ready(&profile));
+    let probe = connect_until_ready(&runtime, &profile, Some(&mut helper), Some(daemon_pid));
     probe.client.close();
     drop(probe);
 
     kill_helper(&mut helper);
     wait_until(
-        || process_has_exited(daemon_pid),
+        &profile,
         "ready ephemeral daemon exit after client kill",
+        || process_has_exited(daemon_pid),
+        || {
+            process_snapshot(&profile, Some(&mut helper), Some(daemon_pid))
+                .observation("daemon_process_exited", process_has_exited(daemon_pid))
+                .observation("pid_file_exists", pid_path(&profile).exists())
+                .observation("runtime_dir_exists", profile.runtime_dir.exists())
+        },
     );
-    wait_for_cleanup(&profile);
+    wait_for_cleanup(&profile, Some(&mut helper), Some(daemon_pid));
 }
 
 /// S3(b): an attaching client receives no liveness authority over a daemon it
@@ -347,20 +546,20 @@ fn killed_attached_client_does_not_stop_persistent_daemon() {
     let profile = profile(&root.path().join("store"), &root.path().join("runtime"));
     let mut daemon = spawn_persistent_daemon(&profile);
     let runtime = runtime();
-    let warmup = runtime.block_on(connect_until_ready(&profile));
+    let warmup = connect_until_ready(&runtime, &profile, None, None);
     warmup.client.close();
     drop(warmup);
 
     let marker = root.path().join("attached-ready");
     let mut helper = spawn_helper(&profile, &marker, false);
-    wait_for_helper(&marker, &mut helper, "attached helper readiness");
+    wait_for_helper(&profile, &marker, &mut helper, "attached helper readiness");
     assert_eq!(
         std::fs::read_to_string(&marker).expect("read helper marker"),
         "spawned=false\n"
     );
     kill_helper(&mut helper);
 
-    let still_serving = runtime.block_on(connect_until_ready(&profile));
+    let still_serving = connect_until_ready(&runtime, &profile, Some(&mut helper), None);
     assert!(
         daemon
             .child_mut()
@@ -385,13 +584,20 @@ fn second_client_holds_ephemeral_daemon_until_its_disconnect() {
     let profile = profile(&root.path().join("store"), &root.path().join("runtime"));
     let marker = root.path().join("client-ready");
     let mut helper = spawn_helper(&profile, &marker, false);
-    wait_for_helper(&marker, &mut helper, "ephemeral helper readiness");
+    wait_for_helper(&profile, &marker, &mut helper, "ephemeral helper readiness");
     let runtime = runtime();
-    let second = runtime.block_on(connect_until_ready(&profile));
+    let second = connect_until_ready(&runtime, &profile, Some(&mut helper), None);
+    let daemon_pid = std::fs::read_to_string(pid_path(&profile))
+        .expect("PID file existed while the second client was attached")
+        .trim()
+        .parse::<u32>()
+        .expect("PID file carries daemon process id");
 
     kill_helper(&mut helper);
     let daemon_log = profile.store_dir.join(DAEMON_LOG_FILE);
     wait_until(
+        &profile,
+        "launcher liveness observation with a second live client",
         || {
             std::fs::read_to_string(&daemon_log).is_ok_and(|contents| {
                 contents.contains(
@@ -399,19 +605,29 @@ fn second_client_holds_ephemeral_daemon_until_its_disconnect() {
                 )
             })
         },
-        "launcher liveness observation with a second live client",
+        || {
+            let observed = std::fs::read_to_string(&daemon_log).is_ok_and(|contents| {
+                contents.contains(
+                    "spawning client vanished; ephemeral daemon is waiting for live clients",
+                )
+            });
+            process_snapshot(&profile, Some(&mut helper), Some(daemon_pid))
+                .observation("launcher_liveness_logged", observed)
+                .observation("pid_file_exists", pid_path(&profile).exists())
+                .observation("runtime_dir_exists", profile.runtime_dir.exists())
+        },
     );
     assert!(
         pid_path(&profile).exists(),
         "second client keeps daemon alive"
     );
-    let probe = runtime.block_on(connect_until_ready(&profile));
+    let probe = connect_until_ready(&runtime, &profile, Some(&mut helper), Some(daemon_pid));
     probe.client.close();
     drop(probe);
 
     second.client.close();
     drop(second);
-    wait_for_cleanup(&profile);
+    wait_for_cleanup(&profile, Some(&mut helper), Some(daemon_pid));
 }
 
 /// S3(d): one runtime root may contain many profiles, but every writable
@@ -429,8 +645,14 @@ fn two_profiles_have_disjoint_runtime_trees_and_writes() {
     let second_marker = root.path().join("second-ready");
     let mut first_helper = spawn_helper(&first, &first_marker, false);
     let mut second_helper = spawn_helper(&second, &second_marker, false);
-    wait_for_helper(&first_marker, &mut first_helper, "first profile readiness");
     wait_for_helper(
+        &first,
+        &first_marker,
+        &mut first_helper,
+        "first profile readiness",
+    );
+    wait_for_helper(
+        &second,
         &second_marker,
         &mut second_helper,
         "second profile readiness",
@@ -466,8 +688,18 @@ fn two_profiles_have_disjoint_runtime_trees_and_writes() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(actual, expected, "runtime root has no shared writes");
 
+    let first_daemon_pid = std::fs::read_to_string(pid_path(&first))
+        .expect("first daemon PID file")
+        .trim()
+        .parse::<u32>()
+        .expect("first daemon PID");
+    let second_daemon_pid = std::fs::read_to_string(pid_path(&second))
+        .expect("second daemon PID file")
+        .trim()
+        .parse::<u32>()
+        .expect("second daemon PID");
     kill_helper(&mut first_helper);
     kill_helper(&mut second_helper);
-    wait_for_cleanup(&first);
-    wait_for_cleanup(&second);
+    wait_for_cleanup(&first, Some(&mut first_helper), Some(first_daemon_pid));
+    wait_for_cleanup(&second, Some(&mut second_helper), Some(second_daemon_pid));
 }

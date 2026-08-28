@@ -534,7 +534,23 @@ pub async fn run_with_signals_and_dependencies_and_readiness_and_liveness(
     if let Some(armed) = liveness_armed {
         // The watcher has either observed an already-dead launcher or has
         // registered its kernel wait before the owner task may start.
-        let _ = armed.await;
+        match armed.await {
+            Ok(()) => {
+                eprintln!(
+                    "haiderd: ephemeral-lifecycle event=guard_armed result=registered_or_already_signaled"
+                );
+                tracing::info!(
+                    result = "registered_or_already_signaled",
+                    "ephemeral launcher guard armed"
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "haiderd: ephemeral-lifecycle event=guard_armed result=failed error={error}"
+                );
+                tracing::warn!(%error, "ephemeral launcher guard failed to arm");
+            }
+        }
     }
     let task = prepared.spawn(config, dependencies);
     let mut readiness = task.readiness();
@@ -571,18 +587,36 @@ pub async fn run_with_signals_and_dependencies_and_readiness_and_liveness(
 }
 
 fn record_launcher_liveness(outcome: std::io::Result<()>, shutdown: &ShutdownHandle) {
-    if let Err(error) = outcome {
-        // This watcher exists only for an ephemeral launch. Once its kernel
-        // proof becomes unusable, fail closed into the same idle barrier
-        // instead of risking an unsupervised daemon.
-        eprintln!("haiderd: launcher-liveness watch failed: {error}");
-        tracing::warn!(%error, "launcher-liveness watch failed");
+    match outcome {
+        Ok(()) => {
+            eprintln!(
+                "haiderd: ephemeral-lifecycle event=launcher_liveness result=launcher_exited"
+            );
+            tracing::info!("ephemeral launcher liveness ended");
+        }
+        Err(error) => {
+            // This watcher exists only for an ephemeral launch. Once its kernel
+            // proof becomes unusable, fail closed into the same idle barrier
+            // instead of risking an unsupervised daemon.
+            eprintln!(
+                "haiderd: ephemeral-lifecycle event=launcher_liveness result=error error={error}"
+            );
+            tracing::warn!(%error, "launcher-liveness watch failed");
+        }
     }
     if shutdown.request_when_idle(ShutdownReason::ClientVanished) {
+        eprintln!(
+            "haiderd: ephemeral-lifecycle event=idle_shutdown_armed reason=launcher_vanished"
+        );
         tracing::info!(
             reason = ?ShutdownReason::ClientVanished,
             "ephemeral daemon observed launcher process exit"
         );
+    } else {
+        eprintln!(
+            "haiderd: ephemeral-lifecycle event=idle_shutdown_not_armed reason=shutdown_already_requested"
+        );
+        tracing::info!("ephemeral idle shutdown was already superseded");
     }
 }
 
@@ -1251,7 +1285,23 @@ async fn run_inner(
     // vault write is the sole fail-safe exception: after the deadline, Stopped
     // and lock release remain withheld until that write is joined and its
     // rotated value is durably restored or failed closed.
+    eprintln!(
+        "haiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=starting path={}",
+        endpoint.path().display()
+    );
+    #[cfg(windows)]
+    eprintln!(
+        "haiderd: ephemeral-lifecycle event=windows_pipe_close_order step=listener_instance before=connection_drain"
+    );
     endpoint.close_listener();
+    eprintln!(
+        "haiderd: ephemeral-lifecycle event=cleanup step=listener_close outcome=closed path={}",
+        endpoint.path().display()
+    );
+    tracing::info!(
+        path = %endpoint.path().display(),
+        "daemon listener closed before connection drain"
+    );
     let (reason, mut forced) = match request {
         ShutdownRequest::Graceful { reason } | ShutdownRequest::GracefulWhenIdle { reason } => {
             (reason.to_string(), false)
@@ -1560,7 +1610,11 @@ impl ConnectionRuntime {
         crash: &mut watch::Receiver<bool>,
     ) -> (RuntimeStop, Option<DaemonError>) {
         let mut listener_error = None;
-        let mut idle_wait_logged = false;
+        let mut idle_wait_logged = None;
+        #[cfg(unix)]
+        let accept_operation = "accept Unix connection";
+        #[cfg(windows)]
+        let accept_operation = "accept Windows named-pipe connection";
         let stop = loop {
             if *crash.borrow() {
                 break RuntimeStop::Crash;
@@ -1570,16 +1624,28 @@ impl ConnectionRuntime {
                     break RuntimeStop::Shutdown(request);
                 }
                 ShutdownRequest::GracefulWhenIdle { reason } => {
-                    if self.connections.is_empty() {
-                        break RuntimeStop::Shutdown(ShutdownRequest::Graceful { reason });
-                    }
-                    if !idle_wait_logged {
-                        idle_wait_logged = true;
+                    let attached_clients = self.connections.len();
+                    if attached_clients == 0 {
                         eprintln!(
-                            "haiderd: spawning client vanished; ephemeral daemon is waiting for live clients to disconnect"
+                            "haiderd: ephemeral-lifecycle event=shutdown_decision reason=launcher_vanished attached_clients=0 decision=shutdown"
                         );
                         tracing::info!(
-                            live_connections = self.connections.len(),
+                            attached_clients,
+                            reason = %reason,
+                            decision = "shutdown",
+                            "ephemeral daemon reached idle shutdown"
+                        );
+                        break RuntimeStop::Shutdown(ShutdownRequest::Graceful { reason });
+                    }
+                    if idle_wait_logged != Some(attached_clients) {
+                        idle_wait_logged = Some(attached_clients);
+                        eprintln!(
+                            "haiderd: spawning client vanished; ephemeral daemon is waiting for live clients to disconnect; ephemeral-lifecycle event=shutdown_decision attached_clients={attached_clients} decision=stay_alive"
+                        );
+                        tracing::info!(
+                            attached_clients,
+                            reason = %reason,
+                            decision = "stay_alive",
                             "spawning client vanished; ephemeral daemon is waiting for live clients to disconnect"
                         );
                     }
@@ -1613,6 +1679,14 @@ impl ConnectionRuntime {
                                         let _permit = permit;
                                         serve(stream, connection_context, connection_drain).await
                                     });
+                                    let attached_clients = self.connections.len();
+                                    eprintln!(
+                                        "haiderd: ephemeral-lifecycle event=connection_admitted attached_clients={attached_clients}"
+                                    );
+                                    tracing::info!(
+                                        attached_clients,
+                                        "daemon connection admitted"
+                                    );
                                 }
                                 // Over the cap: typed rejection, then close. No task
                                 // and no queue is created for this peer.
@@ -1621,7 +1695,7 @@ impl ConnectionRuntime {
                         }
                         Err(error) => {
                             listener_error = Some(DaemonError::io(
-                                "accept Unix connection",
+                                accept_operation,
                                 endpoint.path(),
                                 error,
                             ));
@@ -1640,18 +1714,8 @@ impl ConnectionRuntime {
                     }
                 }
                 completed = self.connections.join_next(), if !self.connections.is_empty() => {
-                    match completed {
-                        Some(Ok(Ok(exit))) => {
-                            tracing::debug!(?exit, "daemon connection closed");
-                        }
-                        Some(Ok(Err(error))) => {
-                            tracing::warn!(%error, "daemon connection failed");
-                        }
-                        Some(Err(error)) => {
-                            tracing::warn!(%error, "daemon connection task failed");
-                        }
-                        None => {}
-                    }
+                    let attached_clients = self.connections.len();
+                    journal_connection_exit(&completed, attached_clients);
                 }
             }
         };
@@ -1699,7 +1763,8 @@ impl ConnectionRuntime {
             while !self.connections.is_empty() {
                 tokio::select! {
                     completed = self.connections.join_next() => {
-                        note_connection_exit(&mut undelivered, completed);
+                        let attached_clients = self.connections.len();
+                        note_connection_exit(&mut undelivered, &completed, attached_clients);
                     }
                     changed = shutdown.changed() => {
                         if changed.is_err()
@@ -1730,7 +1795,8 @@ impl ConnectionRuntime {
             self.connections.abort_all();
         }
         while let Some(completed) = self.connections.join_next().await {
-            note_connection_exit(&mut undelivered, Some(completed));
+            let attached_clients = self.connections.len();
+            note_connection_exit(&mut undelivered, &Some(completed), attached_clients);
         }
         // RE-DRAIN. A connection accepted just before shutdown can register its
         // writer AFTER the collection above — its first poll may run on another
@@ -1768,6 +1834,26 @@ impl ConnectionRuntime {
     }
 }
 
+fn daemon_error_class(error: &DaemonError) -> &'static str {
+    match error {
+        DaemonError::AlreadyRunning { .. } => "already_running",
+        DaemonError::InvalidConfig { .. } => "invalid_config",
+        DaemonError::Store(_) => "store",
+        DaemonError::Io { .. } => "io",
+        DaemonError::EndpointAddressTooLong { .. } => "endpoint_address_too_long",
+        DaemonError::Endpoint { .. } => "endpoint",
+        DaemonError::Protocol { .. } => "protocol",
+        DaemonError::Task { .. } => "task",
+    }
+}
+
+fn daemon_error_raw_os_error(error: &DaemonError) -> Option<i32> {
+    match error {
+        DaemonError::Io { source, .. } => source.raw_os_error(),
+        _ => None,
+    }
+}
+
 /// Phase 5b: flush, remove the exact owned socket/pid/runtime, close the store
 /// (lock release) LAST. Every step runs under the same barrier discipline;
 /// the returned error is the first one worth reporting, in that order.
@@ -1780,6 +1866,7 @@ async fn finalize(
 ) -> Option<DaemonError> {
     let flush_error = barrier_step(
         store.flush(),
+        Some("store_flush"),
         StepFailure::SuppressedWhenForced,
         deadline,
         shutdown,
@@ -1790,6 +1877,7 @@ async fn finalize(
     // rendezvous node is worse than a large WAL.
     let cleanup_error = barrier_step(
         std::future::ready(endpoint.cleanup()),
+        None,
         StepFailure::AlwaysReported,
         deadline,
         shutdown,
@@ -1798,6 +1886,7 @@ async fn finalize(
     .await;
     let runtime_error = barrier_step(
         std::future::ready(endpoint.cleanup_runtime()),
+        None,
         StepFailure::AlwaysReported,
         deadline,
         shutdown,
@@ -1806,6 +1895,7 @@ async fn finalize(
     .await;
     let close_error = barrier_step(
         store.close(),
+        Some("store_close"),
         StepFailure::SuppressedWhenForced,
         deadline,
         shutdown,
@@ -1841,6 +1931,7 @@ enum StepFailure {
 /// gets the same arbitration.
 async fn barrier_step<T, E>(
     work: impl Future<Output = Result<T, E>>,
+    journal_step: Option<&'static str>,
     failure: StepFailure,
     deadline: tokio::time::Instant,
     shutdown: &mut watch::Receiver<ShutdownRequest>,
@@ -1849,6 +1940,9 @@ async fn barrier_step<T, E>(
 where
     DaemonError: From<E>,
 {
+    if let Some(step) = journal_step {
+        eprintln!("haiderd: ephemeral-lifecycle event=cleanup_step step={step} outcome=started");
+    }
     let outcome = bounded_finalization(work, deadline, shutdown).await;
     let overran = outcome.is_none();
     let error = outcome
@@ -1861,22 +1955,92 @@ where
     // this step, and must not swallow an unrelated store error.
     let breached = overran || barrier_breached(deadline, shutdown);
     *forced |= breached;
+    if let Some(step) = journal_step {
+        if overran {
+            eprintln!(
+                "haiderd: ephemeral-lifecycle event=cleanup_step step={step} outcome=barrier_overrun"
+            );
+        } else if let Some(error) = error.as_ref() {
+            eprintln!(
+                "haiderd: ephemeral-lifecycle event=cleanup_step step={step} outcome=failed error_class={} raw_os_error={:?}",
+                daemon_error_class(error),
+                daemon_error_raw_os_error(error)
+            );
+        } else {
+            eprintln!(
+                "haiderd: ephemeral-lifecycle event=cleanup_step step={step} outcome=completed barrier_breached={breached}"
+            );
+        }
+    }
     match failure {
         StepFailure::SuppressedWhenForced if breached => None,
         StepFailure::SuppressedWhenForced | StepFailure::AlwaysReported => error,
     }
 }
 
+type ConnectionCompletion =
+    Option<Result<Result<ConnectionExit, DaemonError>, tokio::task::JoinError>>;
+
+fn journal_connection_exit(completed: &ConnectionCompletion, attached_clients: usize) {
+    match completed {
+        Some(Ok(Ok(ConnectionExit::ClosedBeforeDrain { reason }))) => {
+            eprintln!(
+                "haiderd: ephemeral-lifecycle event=connection_retired reason={} attached_clients={attached_clients}",
+                reason.as_str()
+            );
+            tracing::info!(
+                reason = reason.as_str(),
+                attached_clients,
+                "daemon connection retired"
+            );
+        }
+        Some(Ok(Ok(
+            exit @ (ConnectionExit::NoticeDelivered | ConnectionExit::NoticeUndelivered),
+        ))) => {
+            eprintln!(
+                "haiderd: ephemeral-lifecycle event=connection_retired reason=daemon_shutdown attached_clients={attached_clients} drain_outcome={exit:?}"
+            );
+            tracing::info!(
+                ?exit,
+                reason = "daemon_shutdown",
+                attached_clients,
+                "daemon connection retired"
+            );
+        }
+        Some(Ok(Err(error))) => {
+            eprintln!(
+                "haiderd: ephemeral-lifecycle event=connection_retired reason=error attached_clients={attached_clients} error_class={} raw_os_error={:?}",
+                daemon_error_class(error),
+                daemon_error_raw_os_error(error)
+            );
+            tracing::warn!(%error, attached_clients, "daemon connection failed");
+        }
+        Some(Err(error)) => {
+            eprintln!(
+                "haiderd: ephemeral-lifecycle event=connection_retired reason=task_error attached_clients={attached_clients} task_cancelled={} task_panicked={}",
+                error.is_cancelled(),
+                error.is_panic()
+            );
+            tracing::warn!(%error, attached_clients, "daemon connection task failed");
+        }
+        None => {}
+    }
+}
+
 /// Counts connections whose last frame never made it out (R17 honesty). A
 /// connection that simply failed its socket is not counted: that is the peer's
-/// end going away, not the daemon skipping its notice.
+/// end going away, not the daemon skipping its notice. Every completion is
+/// journaled here as well because shutdown-drain retirements bypass the accept
+/// loop's normal completion branch.
 fn note_connection_exit(
     undelivered: &mut usize,
-    completed: Option<Result<Result<ConnectionExit, DaemonError>, tokio::task::JoinError>>,
+    completed: &ConnectionCompletion,
+    attached_clients: usize,
 ) {
     if let Some(Ok(Ok(ConnectionExit::NoticeUndelivered))) = completed {
         *undelivered = undelivered.saturating_add(1);
     }
+    journal_connection_exit(completed, attached_clients);
 }
 
 /// Runs one finalization step under the drain deadline and the second-signal
@@ -1976,6 +2140,7 @@ async fn shutdown_before_listener(
     // flush → runtime cleanup → close.
     let flush_error = barrier_step(
         store.flush(),
+        Some("store_flush"),
         StepFailure::SuppressedWhenForced,
         barrier_deadline,
         shutdown,
@@ -1984,6 +2149,7 @@ async fn shutdown_before_listener(
     .await;
     let runtime_error = barrier_step(
         std::future::ready(runtime_directory.cleanup()),
+        None,
         StepFailure::AlwaysReported,
         barrier_deadline,
         shutdown,
@@ -1992,6 +2158,7 @@ async fn shutdown_before_listener(
     .await;
     let close_error = barrier_step(
         store.close(),
+        Some("store_close"),
         StepFailure::SuppressedWhenForced,
         barrier_deadline,
         shutdown,

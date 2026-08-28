@@ -1392,7 +1392,9 @@ async fn msgpack_switches_after_json_welcome_on_paired_uds() {
             .await
             .expect("serve joins")
             .expect("serve result"),
-        ConnectionExit::ClosedBeforeDrain
+        ConnectionExit::ClosedBeforeDrain {
+            reason: ConnectionRetirementReason::Eof,
+        }
     );
     hub.shutdown().await.expect("hub shutdown");
 }
@@ -1816,7 +1818,12 @@ async fn silent_negotiated_peer_is_closed_at_the_read_idle_deadline() {
         .await
         .expect("serve joins")
         .expect("serve result");
-    assert_eq!(exit, ConnectionExit::ClosedBeforeDrain);
+    assert_eq!(
+        exit,
+        ConnectionExit::ClosedBeforeDrain {
+            reason: ConnectionRetirementReason::Error,
+        }
+    );
     let _ = hub.shutdown().await;
 }
 

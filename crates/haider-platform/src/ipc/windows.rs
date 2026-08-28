@@ -1,4 +1,4 @@
-use super::{Endpoint, EndpointError, PeerCredentials};
+use super::{Endpoint, EndpointError, PeerCredentials, PeerExitReason};
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle as _, OwnedHandle as ProcessHandle};
 use std::path::Path;
@@ -68,7 +68,11 @@ impl IpcStream {
 
 impl Drop for IpcStream {
     fn drop(&mut self) {
-        take_pipe(&self.stream);
+        if take_pipe(&self.stream) == Some(PipeRole::Server) {
+            eprintln!(
+                "haiderd: ephemeral-lifecycle event=windows_pipe_instance_close trigger=stream_drop outcome=closed close_order=connection_task_then_pipe_instance"
+            );
+        }
     }
 }
 
@@ -90,7 +94,7 @@ pub struct PeerExitWatcher {
 impl PeerExitWatcher {
     /// Waits until the peer process exits or its named-pipe instance disconnects.
     #[allow(unsafe_code)]
-    pub async fn wait(self) -> io::Result<()> {
+    pub async fn wait(self) -> io::Result<PeerExitReason> {
         use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
         use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
@@ -100,23 +104,57 @@ impl PeerExitWatcher {
             let status = unsafe { WaitForSingleObject(self.process.as_raw_handle().cast(), 0) };
             match status {
                 WAIT_OBJECT_0 => {
-                    take_pipe(&self.stream);
-                    return Ok(());
+                    eprintln!(
+                        "haiderd: ephemeral-lifecycle event=windows_peer_wait result=process_exit close_order=wait_then_pipe_instance"
+                    );
+                    let closed = take_pipe(&self.stream).is_some();
+                    eprintln!(
+                        "haiderd: ephemeral-lifecycle event=windows_pipe_instance_close trigger=process_exit outcome={}",
+                        if closed { "closed" } else { "already_closed" }
+                    );
+                    return Ok(PeerExitReason::ProcessExited);
                 }
                 WAIT_TIMEOUT => {}
-                WAIT_FAILED => return Err(io::Error::last_os_error()),
+                WAIT_FAILED => {
+                    let error = io::Error::last_os_error();
+                    eprintln!(
+                        "haiderd: ephemeral-lifecycle event=windows_peer_wait result=failed raw_os_error={:?}",
+                        error.raw_os_error()
+                    );
+                    return Err(error);
+                }
                 other => {
+                    eprintln!(
+                        "haiderd: ephemeral-lifecycle event=windows_peer_wait result=unexpected wait_status={other}"
+                    );
                     return Err(io::Error::other(format!(
                         "IPC peer process wait returned unexpected status {other}"
                     )));
                 }
             }
-            if !pipe_peer_is_connected(&self.stream)? {
+            let connected = match pipe_peer_is_connected(&self.stream) {
+                Ok(connected) => connected,
+                Err(error) => {
+                    eprintln!(
+                        "haiderd: ephemeral-lifecycle event=windows_peer_wait result=pipe_probe_failed raw_os_error={:?}",
+                        error.raw_os_error()
+                    );
+                    return Err(error);
+                }
+            };
+            if !connected {
                 // Close the accepted server handle before the connection task
                 // returns. This cancels its split read/write operations and
                 // prevents a dead instance from surviving into runtime cleanup.
-                take_pipe(&self.stream);
-                return Ok(());
+                eprintln!(
+                    "haiderd: ephemeral-lifecycle event=windows_peer_wait result=connection_close close_order=probe_then_pipe_instance"
+                );
+                let closed = take_pipe(&self.stream).is_some();
+                eprintln!(
+                    "haiderd: ephemeral-lifecycle event=windows_pipe_instance_close trigger=connection_close outcome={}",
+                    if closed { "closed" } else { "already_closed" }
+                );
+                return Ok(PeerExitReason::ConnectionClosed);
             }
             tokio::time::sleep(PEER_LIVENESS_POLL).await;
         }
@@ -170,17 +208,26 @@ fn pipe_peer_is_connected(stream: &StdMutex<Option<PipeStream>>) -> io::Result<b
 
 impl IpcShutdown {
     pub fn request(&self) -> io::Result<()> {
-        take_pipe(&self.stream);
+        let _ = take_pipe(&self.stream);
         Ok(())
     }
 }
 
-fn take_pipe(stream: &StdMutex<Option<PipeStream>>) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipeRole {
+    Client,
+    Server,
+}
+
+fn take_pipe(stream: &StdMutex<Option<PipeStream>>) -> Option<PipeRole> {
     let mut stream = match stream.lock() {
         Ok(stream) => stream,
         Err(poisoned) => poisoned.into_inner(),
     };
-    stream.take();
+    stream.take().map(|pipe| match pipe {
+        PipeStream::Client(_) => PipeRole::Client,
+        PipeStream::Server(_) => PipeRole::Server,
+    })
 }
 
 impl AsyncRead for IpcStream {

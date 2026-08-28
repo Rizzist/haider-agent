@@ -169,13 +169,34 @@ struct ReservedNotice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConnectionExit {
     /// The barrier never reached this connection; it closed on its own first.
-    ClosedBeforeDrain,
+    ClosedBeforeDrain { reason: ConnectionRetirementReason },
     /// `ServerDraining` was written and the socket was shut down cleanly.
     NoticeDelivered,
     /// The daemon could not deliver `ServerDraining`: the negotiated frame
     /// limit refused even a truncated notice, or the barrier deadline expired
     /// while this connection was still writing.
     NoticeUndelivered,
+}
+
+/// Secret-free reason the runtime journals when one attached client retires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectionRetirementReason {
+    PeerProcessExit,
+    ConnectionClose,
+    Eof,
+    Error,
+}
+
+impl ConnectionRetirementReason {
+    #[must_use]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::PeerProcessExit => "peer_process_exit",
+            Self::ConnectionClose => "connection_close",
+            Self::Eof => "eof",
+            Self::Error => "error",
+        }
+    }
 }
 
 /// What the handshake granted this connection.
@@ -1262,6 +1283,7 @@ where
     let mut outbound_limit = context.frame_limit;
     let mut encoding = WireEncoding::Json;
     let mut close = false;
+    let mut retirement_reason = ConnectionRetirementReason::ConnectionClose;
     let mut notice_reserved = false;
     let mut notice_refused = false;
     // A peer that never speaks must not hold its connection slot forever.
@@ -1274,6 +1296,14 @@ where
     let mut last_write_progress = Instant::now();
     let mut liveness = tokio::time::interval(LIVENESS_TICK);
     liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    #[cfg(unix)]
+    let read_operation = "read Unix connection";
+    #[cfg(windows)]
+    let read_operation = "read Windows named-pipe connection";
+    #[cfg(unix)]
+    let write_operation = "write Unix connection";
+    #[cfg(windows)]
+    let write_operation = "write Windows named-pipe connection";
     let peer_exit = async move {
         match peer_exit {
             Some(watcher) => watcher.wait().await,
@@ -1286,13 +1316,21 @@ where
         while !close {
             tokio::select! {
                 outcome = &mut peer_exit => {
-                    outcome.map_err(|error| {
+                    let reason = outcome.map_err(|error| {
                         DaemonError::io(
                             "wait for IPC peer process exit",
                             &context.endpoint_path,
                             error,
                         )
                     })?;
+                    retirement_reason = match reason {
+                        haider_platform::PeerExitReason::ProcessExited => {
+                            ConnectionRetirementReason::PeerProcessExit
+                        }
+                        haider_platform::PeerExitReason::ConnectionClosed => {
+                            ConnectionRetirementReason::ConnectionClose
+                        }
+                    };
                     break;
                 }
                 changed = drain.changed() => {
@@ -1323,6 +1361,7 @@ where
                         encoding,
                     );
                     close = true;
+                    retirement_reason = ConnectionRetirementReason::Error;
                 }
                 _ = liveness.tick(), if grant.is_some() => {
                     let now = Instant::now();
@@ -1344,13 +1383,15 @@ where
                             encoding,
                         );
                         close = true;
+                        retirement_reason = ConnectionRetirementReason::Error;
                     }
                 }
                 read = reader.read(&mut buffer) => {
                     let read = read.map_err(|error| {
-                        DaemonError::io("read Unix connection", &context.endpoint_path, error)
+                        DaemonError::io(read_operation, &context.endpoint_path, error)
                     })?;
                     if read == 0 {
+                        retirement_reason = ConnectionRetirementReason::Eof;
                         break;
                     }
                     last_read = Instant::now();
@@ -1370,6 +1411,9 @@ where
                                 &mut outbound_limit,
                                 &mut encoding,
                             ).await?;
+                            if close {
+                                retirement_reason = ConnectionRetirementReason::Error;
+                            }
                             // `push_one` stops at Prefix{filled:0}; the
                             // negotiated encoding therefore applies to an
                             // unread coalesced suffix, never a partial frame.
@@ -1400,6 +1444,7 @@ where
                             encoding,
                         );
                         close = true;
+                        retirement_reason = ConnectionRetirementReason::Error;
                     }
                 }
             }
@@ -1423,10 +1468,12 @@ where
     let written = writer_task
         .finish()
         .await
-        .map_err(|error| DaemonError::io("write Unix connection", &context.endpoint_path, error))?;
+        .map_err(|error| DaemonError::io(write_operation, &context.endpoint_path, error))?;
     processing?;
     Ok(match (notice_reserved || notice_refused, written) {
-        (false, _) => ConnectionExit::ClosedBeforeDrain,
+        (false, _) => ConnectionExit::ClosedBeforeDrain {
+            reason: retirement_reason,
+        },
         (true, true) => ConnectionExit::NoticeDelivered,
         (true, false) => ConnectionExit::NoticeUndelivered,
     })

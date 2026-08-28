@@ -619,6 +619,7 @@ async fn a_force_raised_elsewhere_does_not_swallow_a_store_error() {
                 ),
             )
         },
+        None,
         StepFailure::SuppressedWhenForced,
         deadline,
         &mut shutdown,
@@ -655,6 +656,7 @@ async fn a_step_that_ran_into_the_barrier_keeps_its_failure_to_itself() {
                 ),
             )
         },
+        None,
         StepFailure::SuppressedWhenForced,
         deadline,
         &mut shutdown,
@@ -678,6 +680,7 @@ async fn an_always_reported_step_survives_a_breached_barrier() {
         std::future::ready(Err::<(), DaemonError>(DaemonError::Endpoint {
             message: "socket still there".into(),
         })),
+        None,
         StepFailure::AlwaysReported,
         expired,
         &mut shutdown,

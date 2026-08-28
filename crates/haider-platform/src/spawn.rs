@@ -305,8 +305,20 @@ impl DaemonLivenessWatcher {
                     let initial = unsafe { WaitForSingleObject(handle, 0) };
                     if initial != WAIT_TIMEOUT {
                         let outcome = match initial {
-                            WAIT_OBJECT_0 => Ok(()),
-                            WAIT_FAILED => Err(std::io::Error::last_os_error()),
+                            WAIT_OBJECT_0 => {
+                                eprintln!(
+                                    "haiderd: ephemeral-lifecycle event=windows_launcher_liveness_wait phase=initial result=signaled"
+                                );
+                                Ok(())
+                            }
+                            WAIT_FAILED => {
+                                let error = std::io::Error::last_os_error();
+                                eprintln!(
+                                    "haiderd: ephemeral-lifecycle event=windows_launcher_liveness_wait phase=initial result=failed raw_os_error={:?}",
+                                    error.raw_os_error()
+                                );
+                                Err(error)
+                            }
                             other => Err(std::io::Error::other(format!(
                                 "launcher process wait returned unexpected status {other}"
                             ))),
@@ -321,8 +333,20 @@ impl DaemonLivenessWatcher {
                     // SAFETY: the same owned process handle remains live for this thread.
                     let result = unsafe { WaitForSingleObject(handle, INFINITE) };
                     let outcome = match result {
-                        WAIT_OBJECT_0 => Ok(()),
-                        WAIT_FAILED => Err(std::io::Error::last_os_error()),
+                        WAIT_OBJECT_0 => {
+                            eprintln!(
+                                "haiderd: ephemeral-lifecycle event=windows_launcher_liveness_wait phase=armed result=signaled"
+                            );
+                            Ok(())
+                        }
+                        WAIT_FAILED => {
+                            let error = std::io::Error::last_os_error();
+                            eprintln!(
+                                "haiderd: ephemeral-lifecycle event=windows_launcher_liveness_wait phase=armed result=failed raw_os_error={:?}",
+                                error.raw_os_error()
+                            );
+                            Err(error)
+                        }
                         other => Err(std::io::Error::other(format!(
                             "launcher process wait returned unexpected status {other}"
                         ))),

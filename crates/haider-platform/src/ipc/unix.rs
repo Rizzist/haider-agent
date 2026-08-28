@@ -4,7 +4,7 @@
 //! directory-relative verification, unpredictable staging names, non-replacing
 //! publication/restoration, stale probing, and device/inode cleanup identity.
 
-use super::{Endpoint, EndpointError, PeerCredentials};
+use super::{Endpoint, EndpointError, PeerCredentials, PeerExitReason};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
 use std::fs;
@@ -49,7 +49,7 @@ pub struct IpcShutdown {
 pub struct PeerExitWatcher;
 
 impl PeerExitWatcher {
-    pub async fn wait(self) -> std::io::Result<()> {
+    pub async fn wait(self) -> std::io::Result<PeerExitReason> {
         std::future::pending().await
     }
 }

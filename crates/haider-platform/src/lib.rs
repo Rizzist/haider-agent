@@ -31,7 +31,7 @@ pub use fs::{
 };
 pub use ipc::{
     BoundEndpoint, Endpoint, EndpointAddress, EndpointError, IpcReadHalf, IpcShutdown, IpcStream,
-    IpcWriteHalf, PeerCredentials, PeerExitWatcher, connect, peer_credentials,
+    IpcWriteHalf, PeerCredentials, PeerExitReason, PeerExitWatcher, connect, peer_credentials,
     peer_credentials_and_exit_watcher, peer_credentials_are_owner, peer_is_owner,
     prepare_runtime_directory, shutdown_handle, split, sweep_stale_endpoints, write_immediate,
 };

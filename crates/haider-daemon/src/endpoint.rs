@@ -16,6 +16,7 @@ pub(crate) struct BoundEndpoint {
     pid_path: PathBuf,
     pid_contents: String,
     pid_active: bool,
+    endpoint_active: bool,
 }
 
 /// Cleanup ownership starts as soon as the profile runtime is created, not
@@ -73,7 +74,35 @@ impl BoundEndpoint {
     }
 
     pub(crate) fn cleanup(&mut self) -> Result<(), haider_platform::EndpointError> {
-        let endpoint_error = self.inner.cleanup().err();
+        let endpoint_error = if self.endpoint_active {
+            // Platform cleanup is intentionally one-shot: on Unix its owned
+            // identity is retired before the fallible unlink attempt. Mirror
+            // that contract so Drop cannot report a false retry success.
+            self.endpoint_active = false;
+            let result = self.inner.cleanup();
+            match &result {
+                Ok(()) => {
+                    #[cfg(unix)]
+                    journal_cleanup_success(
+                        "endpoint_remove",
+                        self.inner.path(),
+                        "removed_or_already_absent",
+                    );
+                    #[cfg(windows)]
+                    journal_cleanup_success(
+                        "endpoint_remove",
+                        self.inner.path(),
+                        "kernel_pipe_instances_released",
+                    );
+                }
+                Err(error) => {
+                    journal_endpoint_failure("endpoint_remove", self.inner.path(), error);
+                }
+            }
+            result.err()
+        } else {
+            None
+        };
         let pid_error = self.remove_owned_pid().err();
         match endpoint_error.or(pid_error) {
             Some(error) => Err(error),
@@ -92,14 +121,17 @@ impl BoundEndpoint {
         match std::fs::read_to_string(&self.pid_path) {
             Ok(contents) if contents != self.pid_contents => {
                 self.pid_active = false;
+                journal_cleanup_success("pid_file_remove", &self.pid_path, "preserved_successor");
                 return Ok(());
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 self.pid_active = false;
+                journal_cleanup_success("pid_file_remove", &self.pid_path, "already_absent");
                 return Ok(());
             }
             Err(error) => {
+                journal_io_failure("pid_file_read", &self.pid_path, &error);
                 return Err(haider_platform::EndpointError::Io {
                     operation: "read owned daemon pid file",
                     path: self.pid_path.clone(),
@@ -110,17 +142,22 @@ impl BoundEndpoint {
         match std::fs::remove_file(&self.pid_path) {
             Ok(()) => {
                 self.pid_active = false;
+                journal_cleanup_success("pid_file_remove", &self.pid_path, "removed");
                 Ok(())
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 self.pid_active = false;
+                journal_cleanup_success("pid_file_remove", &self.pid_path, "already_absent");
                 Ok(())
             }
-            Err(error) => Err(haider_platform::EndpointError::Io {
-                operation: "remove owned daemon pid file",
-                path: self.pid_path.clone(),
-                source: error,
-            }),
+            Err(error) => {
+                journal_io_failure("pid_file_remove", &self.pid_path, &error);
+                Err(haider_platform::EndpointError::Io {
+                    operation: "remove owned daemon pid file",
+                    path: self.pid_path.clone(),
+                    source: error,
+                })
+            }
         }
     }
 }
@@ -165,6 +202,7 @@ pub(crate) async fn bind(
         pid_path,
         pid_contents,
         pid_active: true,
+        endpoint_active: true,
     })
 }
 
@@ -175,19 +213,71 @@ pub(crate) fn cleanup_runtime_dirs(runtime_dir: &Path) -> Result<(), DaemonError
         ("remove profile runtime directory", runtime_dir, true),
     ] {
         match std::fs::remove_dir(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(()) => journal_cleanup_success(operation, path, "removed"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                journal_cleanup_success(operation, path, "already_absent");
+            }
             Err(error)
                 if preserve_nonempty && error.kind() == std::io::ErrorKind::DirectoryNotEmpty =>
             {
                 // Exact socket/PID ownership cleanup may intentionally leave
                 // a successor or unrelated node behind. Preserve it; an
                 // empty ephemeral tree is still removed by the success path.
+                journal_cleanup_success(operation, path, "preserved_nonempty");
             }
-            Err(error) => return Err(DaemonError::io(operation, path, error)),
+            Err(error) => {
+                journal_io_failure(operation, path, &error);
+                return Err(DaemonError::io(operation, path, error));
+            }
         }
     }
     Ok(())
+}
+
+fn journal_cleanup_success(step: &str, path: &Path, outcome: &str) {
+    eprintln!(
+        "haiderd: ephemeral-lifecycle event=cleanup step={step} outcome={outcome} path={}",
+        path.display()
+    );
+    tracing::info!(
+        step,
+        outcome,
+        path = %path.display(),
+        "daemon runtime cleanup step completed"
+    );
+}
+
+fn journal_io_failure(step: &str, path: &Path, error: &std::io::Error) {
+    eprintln!(
+        "haiderd: ephemeral-lifecycle event=cleanup step={step} outcome=failed raw_os_error={:?} path={} error={error}",
+        error.raw_os_error(),
+        path.display()
+    );
+    tracing::warn!(
+        step,
+        path = %path.display(),
+        raw_os_error = ?error.raw_os_error(),
+        %error,
+        "daemon runtime cleanup step failed"
+    );
+}
+
+fn journal_endpoint_failure(step: &str, path: &Path, error: &haider_platform::EndpointError) {
+    let raw_os_error = match error {
+        haider_platform::EndpointError::Io { source, .. } => source.raw_os_error(),
+        _ => None,
+    };
+    eprintln!(
+        "haiderd: ephemeral-lifecycle event=cleanup step={step} outcome=failed raw_os_error={raw_os_error:?} path={} error={error}",
+        path.display()
+    );
+    tracing::warn!(
+        step,
+        path = %path.display(),
+        ?raw_os_error,
+        %error,
+        "daemon endpoint cleanup step failed"
+    );
 }
 
 fn publish_pid(runtime_dir: &Path) -> Result<(PathBuf, String), DaemonError> {

@@ -28,6 +28,30 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+// Boundary diagnostics must not replace the intended timeout panic if CI's
+// capture pipe is already closed. These local macros preserve the familiar
+// call sites while making every stdout write explicitly best effort.
+macro_rules! println {
+    () => {{
+        let _ = std::io::Write::write_all(&mut std::io::stdout().lock(), b"\n");
+    }};
+    ($($argument:tt)*) => {{
+        let _ = std::io::Write::write_fmt(
+            &mut std::io::stdout().lock(),
+            format_args!("{}\n", format_args!($($argument)*)),
+        );
+    }};
+}
+
+macro_rules! print {
+    ($($argument:tt)*) => {{
+        let _ = std::io::Write::write_fmt(
+            &mut std::io::stdout().lock(),
+            format_args!($($argument)*),
+        );
+    }};
+}
+
 // 60s, not 10 (W5f-3): the full per-crate gate runs this suite's daemons
 // under heavy compile/test contention, and the 10s ceiling flaked
 // `worker_aware_drain_terminalizes_durable_queued_turns_before_store_close`
@@ -40,6 +64,309 @@ pub const DEADLINE: Duration = Duration::from_secs(60);
 /// keeps their connections non-idle for the whole outer wait.
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEPALIVE_NONCE: u64 = u64::MAX - 1;
+
+/// Filesystem coordinates whose failure-only state explains a daemon boundary.
+///
+/// The successful polling path retains only these borrowed paths. Log reads,
+/// endpoint probes, directory walks, and process snapshots happen only after
+/// the deadline has elapsed.
+pub struct BoundaryContext<'a> {
+    pub store_dir: &'a Path,
+    pub runtime_dir: &'a Path,
+    pub endpoint_path: &'a Path,
+    /// Extra fixture-owned daemon stderr captures, if a suite pipes stderr
+    /// instead of using the ordinary per-process daemon log.
+    pub captured_daemon_stderr: &'a [PathBuf],
+}
+
+/// Named predicate state and process state gathered once, at timeout.
+#[derive(Default)]
+pub struct BoundarySnapshot {
+    observations: Vec<(String, String)>,
+    processes: Vec<(String, String)>,
+}
+
+impl BoundarySnapshot {
+    #[must_use]
+    pub fn observation(mut self, name: impl Into<String>, value: impl ToString) -> Self {
+        self.observations.push((name.into(), value.to_string()));
+        self
+    }
+
+    #[must_use]
+    pub fn process(mut self, role: impl Into<String>, status: impl Into<String>) -> Self {
+        self.processes.push((role.into(), status.into()));
+        self
+    }
+}
+
+/// Polls a synchronous boundary and prints a complete stdout post-mortem
+/// before failing it. `snapshot` is deliberately lazy: success does no I/O,
+/// tree walking, endpoint probing, allocation, or process inspection.
+pub fn wait_until(
+    boundary: &str,
+    deadline: Duration,
+    poll: Duration,
+    context: &BoundaryContext<'_>,
+    mut predicate: impl FnMut() -> bool,
+    mut snapshot: impl FnMut() -> BoundarySnapshot,
+) {
+    let started = std::time::Instant::now();
+    let deadline_at = started + deadline;
+    loop {
+        if predicate() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline_at {
+            report_boundary_timeout(boundary, started.elapsed(), deadline, context, snapshot());
+            panic!("deadline waiting for {boundary}");
+        }
+        std::thread::sleep(poll.min(deadline_at.saturating_duration_since(now)));
+    }
+}
+
+/// Failure-only reporter shared by synchronous polls and async timeout arms.
+/// Every fallible diagnostic operation is rendered as data; none can replace
+/// the boundary failure with a secondary filesystem or process panic.
+pub fn report_boundary_timeout(
+    boundary: &str,
+    elapsed: Duration,
+    deadline: Duration,
+    context: &BoundaryContext<'_>,
+    snapshot: BoundarySnapshot,
+) {
+    println!("===== haider boundary post-mortem =====");
+    println!("boundary={boundary}");
+    println!(
+        "timing elapsed_ms={} deadline_ms={}",
+        elapsed.as_millis(),
+        deadline.as_millis()
+    );
+    println!("----- predicate state (re-evaluated at timeout) -----");
+    if snapshot.observations.is_empty() {
+        println!("observation_state=unavailable");
+    } else {
+        for (name, value) in snapshot.observations {
+            println!("{name}={value}");
+        }
+    }
+    println!("----- process state -----");
+    if snapshot.processes.is_empty() {
+        println!("process_state=unavailable");
+    } else {
+        for (role, status) in snapshot.processes {
+            println!("process role={role} status={status}");
+        }
+    }
+    // Freeze existing evidence before the endpoint probe opens a real stream
+    // and can thereby create diagnostic admission/retirement journal lines.
+    print_daemon_logs(context.store_dir, context.captured_daemon_stderr);
+    print_runtime_tree(context.runtime_dir);
+    print_endpoint_state(context.endpoint_path);
+    println!("===== end haider boundary post-mortem =====");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
+fn print_endpoint_state(endpoint_path: &Path) {
+    println!("----- endpoint state -----");
+    println!("endpoint_path={}", endpoint_path.display());
+    #[cfg(unix)]
+    println!("unix_socket_path_exists={}", endpoint_path.exists());
+
+    let endpoint = endpoint_path.to_path_buf();
+    let probe = std::thread::Builder::new()
+        .name("haider-boundary-endpoint-probe".into())
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| (format!("runtime_error:{error}"), None))
+                .and_then(|runtime| {
+                    runtime
+                        .block_on(async {
+                            tokio::time::timeout(
+                                Duration::from_millis(500),
+                                haider_platform::connect(endpoint),
+                            )
+                            .await
+                        })
+                        .map_err(|_| ("probe_timeout".to_owned(), None))
+                        .and_then(|result| {
+                            result.map_err(|error| {
+                                let raw_os_error = error.raw_os_error();
+                                (format!("connect_error:{error}"), raw_os_error)
+                            })
+                        })
+                        .map(drop)
+                })
+        })
+        .map_err(|error| (format!("probe_thread_error:{error}"), None))
+        .and_then(|thread| {
+            thread
+                .join()
+                .map_err(|_| ("probe_thread_panicked".to_owned(), None))?
+        });
+    println!("endpoint_reachable={}", probe.is_ok());
+    if let Err((error, raw_os_error)) = &probe {
+        println!("endpoint_probe={error}");
+        println!("endpoint_probe_raw_os_error={raw_os_error:?}");
+    }
+    #[cfg(windows)]
+    {
+        // A successful open proves existence. ERROR_PIPE_BUSY (231) also
+        // proves a name exists even when every instance is occupied. Other
+        // errors remain explicit instead of manufacturing a false answer.
+        let exists = match &probe {
+            Ok(()) => "true".to_owned(),
+            Err((_, Some(231))) => "true (all instances busy)".into(),
+            Err((_, Some(5))) => "true (access denied)".into(),
+            Err((_, Some(2 | 3))) => "false".into(),
+            Err((error, _)) => format!("unknown ({error})"),
+        };
+        println!("named_pipe_exists={exists}");
+    }
+}
+
+fn print_runtime_tree(runtime_dir: &Path) {
+    println!("----- runtime directory tree -----");
+    match std::fs::symlink_metadata(runtime_dir) {
+        Ok(metadata) => {
+            print_tree_entry(runtime_dir, &metadata);
+            let mut pending = vec![runtime_dir.to_path_buf()];
+            while let Some(directory) = pending.pop() {
+                let entries = match std::fs::read_dir(&directory) {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        println!(
+                            "tree_error path={} operation=read_dir error={error}",
+                            directory.display()
+                        );
+                        continue;
+                    }
+                };
+                let mut paths = entries
+                    .filter_map(|entry| match entry {
+                        Ok(entry) => Some(entry.path()),
+                        Err(error) => {
+                            println!(
+                                "tree_error path={} operation=read_entry error={error}",
+                                directory.display()
+                            );
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                paths.sort();
+                for path in paths.into_iter().rev() {
+                    match std::fs::symlink_metadata(&path) {
+                        Ok(metadata) => {
+                            print_tree_entry(&path, &metadata);
+                            if metadata.is_dir() {
+                                pending.push(path);
+                            }
+                        }
+                        Err(error) => println!(
+                            "tree_error path={} operation=metadata error={error}",
+                            path.display()
+                        ),
+                    }
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!("runtime_dir_exists=false path={}", runtime_dir.display());
+        }
+        Err(error) => println!(
+            "tree_error path={} operation=root_metadata error={error}",
+            runtime_dir.display()
+        ),
+    }
+}
+
+fn print_tree_entry(path: &Path, metadata: &std::fs::Metadata) {
+    let kind = if metadata.is_dir() {
+        "directory"
+    } else if metadata.is_file() {
+        "file"
+    } else if metadata.file_type().is_symlink() {
+        "symlink"
+    } else {
+        "other"
+    };
+    println!(
+        "tree_entry path={} kind={kind} size_bytes={}",
+        path.display(),
+        metadata.len()
+    );
+}
+
+fn print_daemon_logs(store_dir: &Path, captured_stderr: &[PathBuf]) {
+    println!("----- daemon diagnostic logs (full contents) -----");
+    let directory = store_dir.join(haider_platform::DAEMON_LOG_DIRECTORY);
+    let mut logs = Vec::new();
+    match std::fs::read_dir(&directory) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(entry) => {
+                        let path = entry.path();
+                        if path.extension().is_some_and(|extension| extension == "log") {
+                            logs.push(path);
+                        }
+                    }
+                    Err(error) => println!(
+                        "log_error path={} operation=read_entry error={error}",
+                        directory.display()
+                    ),
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!(
+                "daemon_log_directory_exists=false path={}",
+                directory.display()
+            );
+        }
+        Err(error) => println!(
+            "log_error path={} operation=read_dir error={error}",
+            directory.display()
+        ),
+    }
+    let active = store_dir.join(haider_platform::DAEMON_LOG_FILE);
+    if active.exists() {
+        logs.push(active);
+    }
+    logs.sort();
+    logs.dedup();
+    for path in logs {
+        print_full_file("daemon_log", &path);
+    }
+    for path in captured_stderr {
+        print_full_file("captured_daemon_stderr", path);
+    }
+}
+
+fn print_full_file(kind: &str, path: &Path) {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            println!(
+                "{kind}_begin path={} size_bytes={}",
+                path.display(),
+                bytes.len()
+            );
+            print!("{}", String::from_utf8_lossy(&bytes));
+            if !bytes.ends_with(b"\n") {
+                println!();
+            }
+            println!("{kind}_end path={}", path.display());
+        }
+        Err(error) => println!(
+            "log_error path={} operation=read_file error={error}",
+            path.display()
+        ),
+    }
+}
 
 const DIAGNOSTIC_LINES: usize = 200;
 const DIAGNOSTIC_LINE_BYTES: usize = 4 * 1024;
