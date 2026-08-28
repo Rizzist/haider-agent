@@ -1,0 +1,57 @@
+name: ship-gate
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  # Static workflow name avoids sharing the caller's group when release.yml
+  # invokes this reusable workflow.
+  group: ship-gate-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  behaviour:
+    name: probe ladder (demo + live, CI profile)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-ship-behaviour-ci-profile
+      - name: probe ladder (demo + live)
+        run: |
+          # Journal rows are msgpack blobs since v0.0.931; without the module
+          # the reader skips every row.
+          python3 -m pip install --break-system-packages msgpack
+          cargo build --profile ci -p haider-cli -p haider-daemond --locked
+          NO_COLOR=1 CLICOLOR=0 HAIDER_TEST_DEVICE_NAME=test-mac \
+            scripts/tui-probes/ladder.sh \
+              "$GITHUB_WORKSPACE/target/ci/haider" \
+              "$GITHUB_WORKSPACE/target/ci/haiderd"
+
+  render-benchmark:
+    name: render benchmark (true release profile)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-ship-render-release-profile
+      # Ledger row 17 is a two-way performance gate: it rejects rendering that
+      # is too slow or implausibly fast. Its thresholds remain calibrated to
+      # the actual shipped profile, so this job deliberately stays --release.
+      - name: render benchmark (release — ledger row 17's two-way gate)
+        run: cargo test --release -p haider-tui --test w3c3_render_bench_tests --locked

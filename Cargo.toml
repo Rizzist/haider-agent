@@ -100,3 +100,13 @@ lto = "fat"
 debug = "line-tables-only"
 split-debuginfo = "packed"
 strip = "symbols"
+
+# Optimized enough for CI behaviour probes without paying the link-time cost
+# reserved for binaries that are actually shipped. Release-quality performance
+# gates and all distributable artifacts continue to use `profile.release`.
+[profile.ci]
+inherits = "release"
+codegen-units = 16
+lto = false
+debug = false
+incremental = false

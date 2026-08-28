@@ -1,26 +1,44 @@
 name: xplat-check
-# Fast cross-platform compile check — the iteration loop for the Windows
-# port. `cargo check --all-targets` surfaces type/cfg errors in minutes
-# without a full build; Windows has no local toolchain on the dev box, so
-# this workflow IS the Windows compiler.
 on:
   push:
-    branches: [main]
-  workflow_dispatch: {}
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
-  check:
+  rust:
+    name: ${{ matrix.phase }} (${{ matrix.target }})
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
+            phase: check
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            phase: clippy
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            phase: test
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            phase: check
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            phase: clippy
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            phase: test
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -30,21 +48,31 @@ jobs:
           targets: ${{ matrix.target }}
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: xplat-${{ matrix.phase }}-${{ matrix.target }}
       - name: install Linux system deps
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libglib2.0-dev pkg-config
-      - name: check (all targets — lib + bins + tests compile)
-        run: cargo check --workspace --all-targets --locked --target ${{ matrix.target }}
-      - name: clippy (all targets)
-        run: cargo clippy --workspace --all-targets --locked --target ${{ matrix.target }} -- -D warnings
-      # The cross-platform TEST loop (owner bar: tests green on every OS
-      # before the next release). Per-crate for the same load-isolation
-      # reasons as ci.yml; Git Bash serves this script on Windows.
-      - name: test (per-crate)
+      - name: check (all targets; report every reachable error)
+        if: matrix.phase == 'check'
+        run: cargo check --workspace --all-targets --locked --keep-going --target ${{ matrix.target }}
+      - name: clippy (all targets; report every reachable error)
+        if: matrix.phase == 'clippy'
+        run: cargo clippy --workspace --all-targets --locked --keep-going --target ${{ matrix.target }} -- -D warnings
+      - name: test (per-crate, collect all failures)
+        if: matrix.phase == 'test'
         shell: bash
-        # ci-test.sh gives every OS the production daemon's 8 MiB stack
-        # default while preserving a non-empty caller override.
+        # ci-test.sh preserves the 8 MiB stack, hermetic discovery/device env,
+        # sibling-binary compile phase, and the Windows-only streamed test.
         run: bash scripts/ci-test.sh
+      - name: upload failing test logs
+        if: failure() && matrix.phase == 'test'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-test-failures-${{ matrix.target }}
+          path: target/ci-test-logs/**
+          if-no-files-found: error
+          retention-days: 14
 
   android-build:
     runs-on: ubuntu-latest
@@ -72,6 +100,8 @@ jobs:
       - name: install Android Rust target
         run: rustup target add aarch64-linux-android
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: android-fast-build
       - uses: nttld/setup-ndk@v1
         id: setup-ndk
         with:

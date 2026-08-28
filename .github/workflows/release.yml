@@ -4,6 +4,10 @@ on:
     tags: ["v*"]
   workflow_dispatch: {}   # manual build-only run (no release published)
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
+
 permissions:
   actions: read
   contents: write
@@ -12,7 +16,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  ship-gate:
+    uses: ./.github/workflows/ship-gate.yml
+
   build:
+    needs: ship-gate
     strategy:
       fail-fast: false
       matrix:

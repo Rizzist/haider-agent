@@ -1,14 +1,36 @@
 name: ci
 on:
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
+  workflow_dispatch:
+
+# PIPELINE CONTRACT — capability may move, but it may not disappear.
+# FAST PATH (every branch push, every PR, and dispatch): this workflow runs
+# macOS fmt/clippy/repo guards/self-test, the full per-crate macOS tests, and
+# the Linux X11 computer-use E2E. xplat.yml concurrently runs check, clippy,
+# and the same full tests on Linux + Windows, plus the Android native/Kotlin
+# build. SHIP GATE: ship-gate.yml runs the complete demo+live PTY probe ladder
+# with profile.ci and the two-way render benchmark with the true release
+# profile. It runs automatically on main, is a required `needs` dependency of
+# release.yml for every v* tag/manual release build, and can be invoked before
+# tagging with `gh workflow run ship-gate.yml --ref <candidate-ref>`; the
+# pre-tag ritual is to wait for ci.yml, xplat.yml, and that manual ship gate on
+# the exact candidate SHA before creating the tag. release.yml and the Android
+# release workflows continue to build actual artifacts with release settings.
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
-  check:
+  lint:
+    name: lint + repository guards (macOS)
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -17,49 +39,43 @@ jobs:
           toolchain: 1.95.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-lint
       - name: fmt
         run: cargo fmt --all --check
-      - name: clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      # Per-crate, mirroring the local gate: one workspace invocation
-      # SIGABRTs/flakes under load (fd + socket pressure across many tokio
-      # test binaries — the documented haider-client/headless flake family).
-      - name: test (per-crate)
-        run: bash scripts/ci-test.sh
+      - name: clippy (all targets; report every reachable error)
+        run: cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
       - name: repo guards
         run: cargo run -p xtask -- check
       - name: self-test
         run: |
           cargo build -p haider-cli --locked
           ./target/debug/haider self-test | grep '"ok":true'
-      # The PTY ladder is the only gate that exercises the real terminal
-      # surface, and its live rows are the only proof that bare `haider`
-      # reaches live mode on a real daemon (the v0.0.12 keystone). The
-      # headless suite cannot see either, and the ladder has already caught
-      # three live-only bugs it could not: the display cwd sent to
-      # session.create, the first turn racing attach into capability_denied,
-      # and selection never attaching.
-      #
-      # What it does NOT do is replace reading the code. W3c3's six P1s were
-      # all found by an adversarial review (e39dc0f), with this ladder green
-      # through every one of them. It pins the surface cargo test cannot
-      # reach; a green ladder is not evidence that a change was reviewed.
-      - name: probe ladder (demo + live)
-        run: |
-          # Journal rows are msgpack blobs since v0.0.931; without the module
-          # the reader skips every row.
-          python3 -m pip install --break-system-packages msgpack
-          cargo build --release -p haider-cli -p haider-daemond --locked
-          NO_COLOR=1 CLICOLOR=0 HAIDER_TEST_DEVICE_NAME=test-mac scripts/tui-probes/ladder.sh
-      # Ledger row 17's threshold ("p95 render >8-10ms") describes the
-      # SHIPPED binary, so the debug `cargo test` above deliberately skips
-      # the measurement half and only checks that the ledger carries a
-      # recorded figure. THIS is where the row's two-way gate is actually
-      # enforced — without it the ledger and the measurement could drift
-      # apart and CI would never notice (review W3c3 P2-7). The release
-      # profile is already warm from the ladder build above.
-      - name: render benchmark (release — ledger row 17's two-way gate)
-        run: cargo test --release -p haider-tui --test w3c3_render_bench_tests --locked
+
+  test:
+    name: full tests (macOS, per crate)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-test
+      # One workspace test invocation SIGABRTs/flakes under combined fd/socket
+      # pressure. The script compiles once, then runs every crate with a 15m
+      # cap and Cargo --no-fail-fast so every test binary gets a turn.
+      - name: test (per-crate, collect all failures)
+        run: bash scripts/ci-test.sh
+      - name: upload failing test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-test-failures-macos
+          path: target/ci-test-logs/**
+          if-no-files-found: error
+          retention-days: 14
 
   computer-x11-e2e:
     name: computer use (Linux X11 + Xvfb)
@@ -70,6 +86,8 @@ jobs:
         with:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-computer-x11
       - name: install Xvfb and Wayland helper link dependencies
         run: sudo apt-get update && sudo apt-get install -y libglib2.0-dev xvfb xauth
       - name: real screenshot, pixel, pointer, click, type, and key round trip
