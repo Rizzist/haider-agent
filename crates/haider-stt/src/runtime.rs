@@ -187,6 +187,37 @@ fn path_candidates(directory: &Path, name: &str, pathext: Option<&OsStr>) -> Vec
     }
 }
 
+/// Returns an existing candidate with the basename spelling stored by its
+/// parent directory. On a case-insensitive filesystem, `Path::is_file` can
+/// accept a constructed spelling that no directory entry actually carries;
+/// diagnostics and child spawning must receive the real entry name instead.
+fn existing_file_with_real_name(candidate: PathBuf) -> Option<PathBuf> {
+    if !candidate.is_file() {
+        return None;
+    }
+    let candidate_name = candidate.file_name()?;
+    let parent = candidate.parent()?;
+    let lookup_parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let mut case_insensitive_match = None;
+    for entry in std::fs::read_dir(lookup_parent).ok()?.flatten() {
+        let entry_name = entry.file_name();
+        if entry_name == candidate_name && entry.path().is_file() {
+            return Some(candidate);
+        }
+        if case_insensitive_match.is_none()
+            && entry_name.eq_ignore_ascii_case(candidate_name)
+            && entry.path().is_file()
+        {
+            case_insensitive_match = Some(candidate.with_file_name(entry_name));
+        }
+    }
+    case_insensitive_match
+}
+
 /// Finds the first canonical executable across `path_value` entries, using
 /// the injected Windows `PATHEXT` snapshot for extensionless names.
 ///
@@ -202,7 +233,7 @@ pub fn find_on_path_with_pathext(
     for directory in std::env::split_paths(path_value) {
         for name in names {
             for candidate in path_candidates(&directory, name, pathext) {
-                if candidate.is_file() {
+                if let Some(candidate) = existing_file_with_real_name(candidate) {
                     return Some(candidate);
                 }
             }

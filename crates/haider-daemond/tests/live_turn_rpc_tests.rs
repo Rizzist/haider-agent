@@ -8721,8 +8721,13 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
         })
         .await
         .unwrap_or_else(|error| {
+            let heartbeat_bytes = fs::metadata(&heartbeat).map_or(0, |metadata| metadata.len());
             eprintln!(
-                "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=failed-start-recovery-deadline result=Err({error:?})"
+                "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=failed-start-recovery-deadline result=Err({error:?}) ps_alive={} heartbeat_bytes={heartbeat_bytes} workspace_entries={:?} first_attempt_requests={} retry_requests={}",
+                workspace.join("ps-alive.log").exists(),
+                workspace_listing(&workspace),
+                fake.first_attempt_request_count(),
+                fake.retry_request_count(),
             );
             panic!("failed exec start recovery exceeded one continuous deadline")
         })

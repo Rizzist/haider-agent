@@ -686,7 +686,7 @@ pub(super) fn remove_owned_empty_directory(
         };
     };
     let original = receipt.path.clone();
-    let claim = owned_directory_claim_path(&original)?;
+    let claim = owned_directory_claim_path(&original).map_err(io::Error::other)?;
     match rename_directory_handle(receipt, &claim) {
         Ok(()) => receipt.path = claim,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {

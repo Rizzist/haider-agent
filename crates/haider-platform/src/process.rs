@@ -227,38 +227,81 @@ fn resume_suspended_process(pid: u32) -> std::io::Result<()> {
         ..THREADENTRY32::default()
     };
     let mut found = unsafe { Thread32First(snapshot, &raw mut entry) } != 0;
-    let mut thread_id = None;
+    let mut thread_ids = Vec::new();
     while found {
         if entry.th32OwnerProcessID == pid {
-            thread_id = Some(entry.th32ThreadID);
-            break;
+            thread_ids.push(entry.th32ThreadID);
         }
         entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
         found = unsafe { Thread32Next(snapshot, &raw mut entry) } != 0;
     }
     unsafe { CloseHandle(snapshot) };
-    let thread_id = thread_id.ok_or_else(|| {
-        std::io::Error::new(
+    if thread_ids.is_empty() {
+        return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("primary thread for suspended process {pid} was not found"),
-        )
-    })?;
-    let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
-    if thread.is_null() {
-        return Err(std::io::Error::last_os_error());
+            format!("threads for suspended process {pid} were not found"),
+        ));
     }
-    let previous_count = unsafe { ResumeThread(thread) };
-    let error = if previous_count == u32::MAX {
-        Some(std::io::Error::last_os_error())
-    } else if previous_count != 1 {
-        Some(std::io::Error::other(format!(
-            "suspended process {pid} had unexpected thread suspend count {previous_count}"
-        )))
-    } else {
-        None
-    };
-    unsafe { CloseHandle(thread) };
-    error.map_or(Ok(()), Err)
+
+    // ToolHelp does not identify the primary thread and does not promise an
+    // ordering. Snapshot every thread before resuming any: a security product
+    // may have injected an auxiliary thread into the newly created process,
+    // and resuming only the first matching entry can leave the real primary
+    // thread suspended forever while falsely reporting a successful spawn.
+    let mut resumed = 0_usize;
+    let mut already_running = 0_usize;
+    let mut first_error = None;
+    let mut observations = Vec::with_capacity(thread_ids.len());
+    for thread_id in thread_ids {
+        let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
+        if thread.is_null() {
+            let error = std::io::Error::last_os_error();
+            observations.push((thread_id, None));
+            first_error.get_or_insert_with(|| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("open thread {thread_id} for suspended process {pid}: {error}"),
+                )
+            });
+            continue;
+        }
+        let previous_count = unsafe { ResumeThread(thread) };
+        let resume_error = (previous_count == u32::MAX).then(std::io::Error::last_os_error);
+        unsafe { CloseHandle(thread) };
+        observations.push((thread_id, Some(previous_count)));
+        if let Some(error) = resume_error {
+            first_error.get_or_insert_with(|| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("resume thread {thread_id} for suspended process {pid}: {error}"),
+                )
+            });
+        } else if previous_count == 0 {
+            already_running = already_running.saturating_add(1);
+        } else if previous_count == 1 {
+            resumed = resumed.saturating_add(1);
+        } else {
+            first_error.get_or_insert_with(|| {
+                std::io::Error::other(format!(
+                    "suspended process {pid} thread {thread_id} had unexpected suspend count {previous_count}"
+                ))
+            });
+        }
+    }
+    if std::env::var("HAIDER_TEST_PROCESS_TRACE").is_ok_and(|value| value == "1") {
+        eprintln!(
+            "haider-daemon windows-process phase=job-assigned-and-threads-resumed pid={pid} resumed={resumed} already_running={already_running} observations={observations:?}"
+        );
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    if resumed == 0 {
+        return Err(std::io::Error::other(format!(
+            "suspended process {pid} had no suspended thread to resume"
+        )));
+    }
+    Ok(())
 }
 
 #[must_use]
