@@ -578,10 +578,18 @@ impl PipeNativeWriter {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(session_id);
         let state = if let Some(mut state) = known {
+            let already_processed = committed
+                .last()
+                .is_none_or(|last| last.seq <= state.cursor.pending_seq);
             let directly_follows = committed
                 .first()
                 .is_some_and(|first| state.cursor.pending_seq.checked_add(1) == Some(first.seq));
-            if !directly_follows {
+            if already_processed {
+                // First-touch rebuild may have absorbed later queued commits.
+                // Their queue entries are acknowledgements, not cursor gaps,
+                // and must not append duplicate coverage watermarks.
+                state
+            } else if !directly_follows {
                 let latest_seq = self.journal_head(store, session_id).await?;
                 let cursor = state.cursor;
                 let generation = cursor.generation;

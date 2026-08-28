@@ -266,5 +266,5 @@ fn looks_high_entropy(value: &str) -> bool {
 }
 
 #[cfg(test)]
-#[path = "redact/tests/redact_tests.rs"]
-mod tests;
+#[path = "redact_tests.rs"]
+mod redact_tests;

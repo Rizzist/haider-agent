@@ -5,8 +5,8 @@
 //!   Dropping it — including by process death or kill — releases the lock;
 //!   there is no stale-lock state to clean up.
 //! - A second opener fails fast with retryable `StoreLocked`.
-//! - The lock file's bytes are never read or used for decisions; new files are
-//!   empty and legacy contents may remain untouched. Diagnostic readers use
+//! - The lock file's bytes are never read or used for decisions; clean release
+//!   truncates legacy contents. Diagnostic readers use
 //!   only the separate human-readable owner token (pid, timestamp), atomically
 //!   published at `<root>/lock.owner`; nothing ever reads it to make decisions.
 //!   Normal release removes it
@@ -37,6 +37,9 @@ impl Drop for ProfileLock {
         // ordering prevents a departing owner from deleting its successor's
         // freshly published token.
         let _ = fs::remove_file(&self.owner_path);
+        // Clearing legacy inline diagnostics is part of clean release. The
+        // advisory lock is authoritative, so this needs no durability sync.
+        let _ = self.file.set_len(0);
         // Make the release boundary synchronous and explicit. Relying only
         // on handle close can leave a just-closed profile briefly contended
         // on macOS and Windows, where recovery immediately reopens it.

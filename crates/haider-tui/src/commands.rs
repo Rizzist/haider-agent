@@ -9,10 +9,13 @@ pub use haider_rpc::{
     has_arg_slots, offers_arg_completions, palette_items,
 };
 
-/// The `/help` panel body — the sim's `HELP_TEXT` verbatim (tui.js:587-614),
-/// including the `menus —` and `keys —` explainers.
+/// The `/help` panel body — the sim's `HELP_TEXT` content (tui.js:587-614),
+/// with the `menus —` and `keys —` explainers kept in the initial viewport.
 pub const HELP_TEXT: &[&str] = &[
     "commands",
+    "menus — every card (permission · hook trust · recovery · voice · tools) is a typed menu:",
+    "  answer by typing [n] ⏎, clicking, by id over RPC (menu.answer), or from Diff Forge web",
+    "keys — ⏎ send · ⇧⏎ newline · esc interrupt / back · ⌃C launcher (quit from the launcher) · type / for the palette (↑↓ pick · tab complete · ⏎ run)",
     "  /model [name]      switch model — fable-5 · gpt-5.6 · gemini-3 · qwen3",
     "  /provider [name]   anthropic · openai · gemini · kimi · grok · xai · deepseek",
     "  /effort [level]    reasoning effort for the CURRENT pair — bare /effort opens the ladder picker · default reverts",
@@ -49,9 +52,6 @@ pub const HELP_TEXT: &[&str] = &[
     "  /update            check for and install production updates",
     "  /rename <name>     rename this session",
     "  /reset             reset the demo to the seed sessions",
-    "menus — every card (permission · hook trust · recovery · voice · tools) is a typed menu:",
-    "  answer by typing [n] ⏎, clicking, by id over RPC (menu.answer), or from Diff Forge web",
-    "keys — ⏎ send · ⇧⏎ newline · esc interrupt / back · ⌃C launcher (quit from the launcher) · type / for the palette (↑↓ pick · tab complete · ⏎ run)",
 ];
 
 #[cfg(test)]

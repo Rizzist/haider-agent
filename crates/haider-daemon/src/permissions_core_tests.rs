@@ -1179,7 +1179,17 @@ fn every_advertised_tool_is_manual_described_and_wire_is_description_free() {
 fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     const EXPECTED_REGISTERED_TOOLS: usize = 22;
     const EXPECTED_ADVERTISED_TOOLS: usize = 19;
+    // The full-prefix comparison deliberately includes the platform-specific
+    // computer manifest description. Linux documents X11/Wayland (+49 bytes
+    // over macOS), while Windows is two bytes longer than macOS.
+    #[cfg(target_os = "linux")]
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 14_832;
+    #[cfg(target_os = "macos")]
     const EXPECTED_FULL_PREFIX_BYTES: usize = 14_783;
+    #[cfg(target_os = "windows")]
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 14_785;
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 14_777;
     const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 9_911;
 
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);

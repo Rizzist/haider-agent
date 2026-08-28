@@ -55,7 +55,7 @@ pub use spawn::{
     spawn_daemon_with_readiness_and_liveness,
 };
 pub use system::local_device_name;
-pub use user::{effective_user_id, is_owner_private_directory};
+pub use user::{effective_user_id, is_owner_private_directory, owner_scoped_runtime_directory};
 
 /// Compatibility boundary for unchanged callers; new side-file code should
 /// select its durability contract through [`fs::sync_directory`].

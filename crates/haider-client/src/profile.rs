@@ -240,7 +240,7 @@ fn runtime_dir(env: &ProfileEnv, runtime_env: &RuntimeEnv, profile_id: &str) -> 
         .chars()
         .take(RUNTIME_PROFILE_ID_CHARS)
         .collect::<String>();
-    root.join(scope)
+    haider_platform::owner_scoped_runtime_directory(&root.join(scope))
 }
 
 fn runtime_root(env: &ProfileEnv, runtime_env: &RuntimeEnv) -> PathBuf {

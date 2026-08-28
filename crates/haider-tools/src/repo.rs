@@ -20,8 +20,10 @@ const IGNORE_CONTROL_MAX_BYTES: usize = 256 * 1024;
 pub(crate) struct WalkOptions {
     pub respect_gitignore: bool,
     pub include_hidden: bool,
-    /// Hard cap on all enumerated entries, including hidden, ignored, and
-    /// symlink entries. It is deliberately independent of retained results.
+    /// Hard cap on enumerated directories, visible files, ignore controls,
+    /// and symlinks. Hidden regular files directly under the requested root
+    /// are filtered before this cap; hidden directories and their descendants
+    /// still consume it so traversal remains bounded.
     pub max_files: usize,
     pub deadline: Option<Instant>,
 }
@@ -162,14 +164,34 @@ pub(crate) fn walk_files(
             }
             continue;
         }
-        entries_seen = entries_seen.saturating_add(1);
-        if entries_seen > options.max_files {
-            truncated = true;
-            break;
-        }
         let Some(file_type) = entry.file_type() else {
             continue;
         };
+        let relevant_gitignore = is_gitignore_name(entry.path())
+            && (entry.path().starts_with(search_root)
+                || entry
+                    .path()
+                    .parent()
+                    .is_some_and(|parent| search_root.starts_with(parent)));
+        if file_type.is_symlink() && relevant_gitignore {
+            // Preserve the control for the anchored NOFOLLOW reader below;
+            // silently discarding it would turn an unsafe control into an
+            // environment-dependent empty walk.
+            raw_files.push(entry.path().to_path_buf());
+        }
+        let root_hidden_regular_file = !options.include_hidden
+            && file_type.is_file()
+            && !relevant_gitignore
+            && entry.path().parent() == Some(search_root)
+            && workspace_relative(workspace_root, entry.path())
+                .is_ok_and(|relative| is_hidden_path(relative, entry.path()));
+        if !root_hidden_regular_file {
+            entries_seen = entries_seen.saturating_add(1);
+            if entries_seen > options.max_files {
+                truncated = true;
+                break;
+            }
+        }
         if file_type.is_symlink() || !entry.path().starts_with(search_root) {
             // Ancestor `.gitignore` files between repo root and search root are
             // retained separately even though ordinary ancestor files are not.
@@ -544,5 +566,5 @@ fn is_hidden_path(relative: &Path, _path: &Path) -> bool {
 }
 
 #[cfg(test)]
-#[path = "repo/tests/repo_tests.rs"]
-mod tests;
+#[path = "repo_tests.rs"]
+mod repo_tests;

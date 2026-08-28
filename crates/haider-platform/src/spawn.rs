@@ -167,6 +167,7 @@ impl DaemonReadyNotifier {
                     "invalid daemon readiness pipe coordinate",
                 ));
             }
+            // SAFETY: the documented standard-input selector requires no caller-owned pointer.
             let raw = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
             if raw.is_null() || raw == INVALID_HANDLE_VALUE {
                 return Err(std::io::Error::new(
@@ -178,6 +179,7 @@ impl DaemonReadyNotifier {
             // child's stdin through Command's protected stdio inheritance
             // path. No daemon code reads stdin, and this is its only adoption.
             let pipe = unsafe { std::fs::File::from_raw_handle(raw) };
+            // SAFETY: `pipe` owns this valid handle for the duration of the call.
             if unsafe { SetHandleInformation(pipe.as_raw_handle().cast(), HANDLE_FLAG_INHERIT, 0) }
                 == 0
             {
@@ -250,6 +252,7 @@ impl DaemonLivenessWatcher {
             // inheritable process handle copied into this daemon by
             // CreateProcess. This is the child's first and only adoption.
             let launcher = unsafe { OwnedHandle::from_raw_handle(raw) };
+            // SAFETY: `launcher` owns this valid process handle for the duration of the call.
             if unsafe {
                 SetHandleInformation(launcher.as_raw_handle().cast(), HANDLE_FLAG_INHERIT, 0)
             } == 0
@@ -263,6 +266,7 @@ impl DaemonLivenessWatcher {
     /// Waits for the launcher to disappear. No client cleanup code is needed:
     /// Unix reports EOF after the last writer closes, while Windows signals
     /// the inherited process handle for every exit path, including kill.
+    #[allow(unsafe_code)]
     pub async fn wait(self) -> std::io::Result<()> {
         #[cfg(unix)]
         {
@@ -297,6 +301,7 @@ impl DaemonLivenessWatcher {
                 .name("haider-launcher-liveness".into())
                 .spawn(move || {
                     let handle = self.launcher.as_raw_handle().cast();
+                    // SAFETY: `self.launcher` owns a live SYNCHRONIZE process handle for this thread.
                     let initial = unsafe { WaitForSingleObject(handle, 0) };
                     if initial != WAIT_TIMEOUT {
                         let outcome = match initial {
@@ -313,6 +318,7 @@ impl DaemonLivenessWatcher {
                     if armed_sender.send(()).is_err() {
                         return;
                     }
+                    // SAFETY: the same owned process handle remains live for this thread.
                     let result = unsafe { WaitForSingleObject(handle, INFINITE) };
                     let outcome = match result {
                         WAIT_OBJECT_0 => Ok(()),
@@ -794,12 +800,14 @@ fn prepare_liveness() -> std::io::Result<PreparedLiveness> {
     // moved the public module home of SYNCHRONIZE between supported releases.
     const SYNCHRONIZE: u32 = 0x0010_0000;
 
+    // SAFETY: the current PID and fixed access mask satisfy OpenProcess's value contract.
     let raw = unsafe { OpenProcess(SYNCHRONIZE, 1, GetCurrentProcessId()) };
     if raw.is_null() {
         return Err(std::io::Error::last_os_error());
     }
     // SAFETY: OpenProcess returned one newly owned real handle.
     let launcher = unsafe { OwnedHandle::from_raw_handle(raw.cast()) };
+    // SAFETY: `launcher` owns this valid process handle for the duration of the call.
     if unsafe {
         SetHandleInformation(
             launcher.as_raw_handle().cast(),
@@ -868,6 +876,7 @@ fn configure_daemon(command: &mut std::process::Command) -> std::io::Result<()> 
         (STD_OUTPUT_HANDLE, "stdout"),
         (STD_ERROR_HANDLE, "stderr"),
     ] {
+        // SAFETY: each documented standard-handle selector requires no caller-owned pointer.
         let handle = unsafe { GetStdHandle(kind) };
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             continue;
@@ -886,6 +895,7 @@ fn clear_handle_inheritance(
 ) -> std::io::Result<()> {
     use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
+    // SAFETY: the caller supplies a live standard handle and retains ownership.
     if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0 {
         return Ok(());
     }
@@ -1066,6 +1076,7 @@ mod windows_tests {
         ));
         let file = std::fs::File::create(&path).expect("create inheritance fixture");
         let handle = file.as_raw_handle().cast();
+        // SAFETY: `file` owns the live fixture handle for the duration of the call.
         assert_ne!(
             unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) },
             0,
@@ -1074,6 +1085,7 @@ mod windows_tests {
 
         clear_handle_inheritance(handle, "fixture").expect("clear fixture inheritance");
         let mut flags = 0;
+        // SAFETY: `file` still owns the live fixture handle and `flags` is writable.
         assert_ne!(
             unsafe { GetHandleInformation(handle, &mut flags) },
             0,

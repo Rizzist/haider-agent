@@ -346,9 +346,9 @@ fn prepare_runtime_dir(runtime_dir: &Path) -> Result<(OwnedFd, u32), EndpointErr
         })?;
     // An explicit HAIDER_RUNTIME_DIR may name a nested root whose parents do
     // not exist yet. Create only that ancestor chain recursively; the final
-    // root remains a separate mkdir/open/fstat sequence below so we can tell
-    // a newly created private root from an existing path that must already be
-    // owner-private.
+    // root remains a separate mkdir/open/fstat sequence below so ownership and
+    // file type are validated through a NOFOLLOW descriptor before an
+    // owner-controlled loose mode is tightened.
     if let Some(root_parent) = root_path.parent()
         && !root_parent.as_os_str().is_empty()
     {
@@ -360,9 +360,9 @@ fn prepare_runtime_dir(runtime_dir: &Path) -> Result<(OwnedFd, u32), EndpointErr
     }
     let mut root_builder = fs::DirBuilder::new();
     root_builder.mode(0o700);
-    let root_created = match root_builder.create(root_path) {
-        Ok(()) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+    match root_builder.create(root_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => {
             return Err(EndpointError::io(
                 "create private runtime root",
@@ -370,7 +370,7 @@ fn prepare_runtime_dir(runtime_dir: &Path) -> Result<(OwnedFd, u32), EndpointErr
                 error,
             ));
         }
-    };
+    }
     let root = rustix::fs::open(
         root_path,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
@@ -394,19 +394,9 @@ fn prepare_runtime_dir(runtime_dir: &Path) -> Result<(OwnedFd, u32), EndpointErr
             ),
         });
     }
-    if root_created {
-        rustix::fs::fchmod(&root, Mode::from_bits_truncate(0o700)).map_err(|error| {
-            EndpointError::io("chmod private runtime root", root_path, error.into())
-        })?;
-    } else if root_stat.st_mode & 0o077 != 0 {
-        return Err(EndpointError::Endpoint {
-            message: format!(
-                "runtime root {} is not owner-private (mode {:04o}; expected no group/other bits)",
-                root_path.display(),
-                root_stat.st_mode & 0o7777,
-            ),
-        });
-    }
+    rustix::fs::fchmod(&root, Mode::from_bits_truncate(0o700)).map_err(|error| {
+        EndpointError::io("chmod private runtime root", root_path, error.into())
+    })?;
     let name = runtime_dir
         .file_name()
         .ok_or_else(|| EndpointError::Endpoint {
@@ -1011,6 +1001,56 @@ mod tests {
             }
             other => panic!("expected typed endpoint budget error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shared_sticky_root_derivation_remains_inside_the_socket_budget() {
+        let requested = PathBuf::from("/tmp/profile-123");
+        let derived =
+            crate::user::owner_scoped_runtime_directory_for_metadata(&requested, 0, 0o1777, 501);
+        assert_eq!(derived, PathBuf::from("/tmp/haider-501/profile-123"));
+        assert!(validate_endpoint_budget(&Endpoint::new(&derived, "profile"), &derived).is_ok());
+
+        let base_root = PathBuf::from("/r");
+        let base_requested = base_root.join("p");
+        let base_derived = crate::user::owner_scoped_runtime_directory_for_metadata(
+            &base_requested,
+            0,
+            0o1777,
+            501,
+        );
+        let base_length = longest_staging_path(&base_derived)
+            .as_os_str()
+            .as_bytes()
+            .len();
+        let root = PathBuf::from(format!(
+            "/{}",
+            "r".repeat(UNIX_SOCKET_PATH_BYTES.saturating_sub(base_length) + 1)
+        ));
+        let at_limit_requested = root.join("p");
+        let at_limit = crate::user::owner_scoped_runtime_directory_for_metadata(
+            &at_limit_requested,
+            0,
+            0o1777,
+            501,
+        );
+        assert_eq!(
+            longest_staging_path(&at_limit).as_os_str().as_bytes().len(),
+            UNIX_SOCKET_PATH_BYTES
+        );
+        assert!(validate_endpoint_budget(&Endpoint::new(&at_limit, "profile"), &at_limit).is_ok());
+
+        let too_long_requested = root.join("rr").join("p");
+        let too_long = crate::user::owner_scoped_runtime_directory_for_metadata(
+            &too_long_requested,
+            0,
+            0o1777,
+            501,
+        );
+        assert!(matches!(
+            validate_endpoint_budget(&Endpoint::new(&too_long, "profile"), &too_long),
+            Err(EndpointError::AddressTooLong { .. })
+        ));
     }
 
     #[tokio::test]

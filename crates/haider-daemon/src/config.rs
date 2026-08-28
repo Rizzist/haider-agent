@@ -87,10 +87,13 @@ impl DaemonConfig {
         store_dir: impl Into<PathBuf>,
         runtime_dir: impl Into<PathBuf>,
     ) -> Self {
+        let runtime_dir = runtime_dir.into();
         Self {
             profile_id: profile_id.into(),
             store_dir: store_dir.into(),
-            runtime_dir: runtime_dir.into(),
+            // The client applies this same idempotent derivation before it
+            // computes the endpoint, preserving one launcher/daemon path.
+            runtime_dir: haider_platform::owner_scoped_runtime_directory(&runtime_dir),
             frame_limit: DEFAULT_FRAME_LIMIT,
             outbound_queue_capacity: 32,
             outbound_queued_bytes: DEFAULT_FRAME_LIMIT.saturating_mul(2),
