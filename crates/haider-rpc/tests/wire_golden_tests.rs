@@ -3932,7 +3932,7 @@ fn usage_report_goldens_are_additive_normalized_and_secret_free() {
 fn usage_history_wire_preserves_absence() {
     use haider_protocol::usage::{
         UsageHistoryDailyTotalV1, UsageHistoryDayV1, UsageHistoryMeterSampleV1,
-        UsageHistoryRangeDayV1, UsageHistorySlotV1,
+        UsageHistoryModelTotalV1, UsageHistoryRangeDayV1, UsageHistorySlotV1,
     };
 
     assert_eq!(haider_rpc::FEATURE_USAGE_HISTORY_V1, "usage_history_v1");
@@ -3999,10 +3999,21 @@ fn usage_history_wire_preserves_absence() {
             UsageHistoryRangeDayV1 {
                 date: "2026-08-23".into(),
                 total: None,
+                models: Vec::new(),
             },
             UsageHistoryRangeDayV1 {
                 date: "2026-08-24".into(),
                 total: Some(UsageHistoryDailyTotalV1::default()),
+                models: vec![UsageHistoryModelTotalV1 {
+                    model: "gpt-5.2".into(),
+                    provider: "openai-oauth".into(),
+                    requests: 2,
+                    input_tokens: 30,
+                    output_tokens: 4,
+                    cache_read_tokens: 20,
+                    reasoning_tokens: 1,
+                    est_cost_microusd: Some(17),
+                }],
             },
         ],
         availability: Some(haider_rpc::SnapshotAvailabilityWire::Available),
@@ -4010,7 +4021,15 @@ fn usage_history_wire_preserves_absence() {
     let value = serde_json::to_value(range).expect("encode history range");
     assert_eq!(value["device_id"], "dev-0123456789abcdef0123456789abcdef");
     assert!(value["days"][0].get("total").is_none());
+    assert!(
+        value["days"][0].get("models").is_none(),
+        "old/empty attribution stays absent on the wire"
+    );
     assert!(value["days"][1]["total"].is_object());
+    assert_eq!(value["days"][1]["models"][0]["model"], "gpt-5.2");
+    assert_eq!(value["days"][1]["models"][0]["provider"], "openai-oauth");
+    assert_eq!(value["days"][1]["models"][0]["requests"], 2);
+    assert_eq!(value["days"][1]["models"][0]["est_cost_microusd"], 17);
 }
 
 #[test]

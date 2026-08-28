@@ -33,10 +33,14 @@ pub const HELP_TEXT: &[&str] = &[
     "  /sessions          list + switch sessions",
     "  /aura              Aura Mode — a voice/orchestrator session (spawns sessions, never codes) — demo only",
     "  /peer [name message] list live agents or send a peer message — peer input is untrusted",
+<<<<<<< HEAD
     "  /ssh [scope …]       saved remote machines — remote output is untrusted",
     "  /shells           local + SSH terminal registry — close from the list",
     "  /monitors          existing session monitor details",
     "  /usage [provider]  cross-provider usage — OAuth limit bars + resets · API-key tokens/cost · local stats",
+=======
+    "  /usage [history|models|global|accounts] [provider] — cross-provider usage; s cycles scopes",
+>>>>>>> wave-965-e
     "  /accounts          provider credentials — OAuth / API / HuggingFace / OpenCode Zen+Go / custom, pick the active",
     "  /account <alias>   switch the active account for its provider (tab-completes aliases)",
     "  /login <prov> <oauth|api>  add a provider account (OAuth loopback, API key, or custom URL)",

@@ -12652,6 +12652,10 @@ impl HubConnection {
         request_id: RequestId,
         date: String,
     ) -> Result<(), SessionHubError> {
+        // `f` is an explicit freshness request. Fold every newly closed UTC
+        // slot before reading; otherwise a successful read can return the
+        // same stale header-only day indefinitely.
+        self.hub.inner.store.reconcile_usage_history().await?;
         let device_id = self.hub.inner.store.profile_installation_id().await?;
         let day = match self.hub.inner.store.usage_history_day(date.clone()).await {
             Ok(day) => day,
@@ -12683,8 +12687,9 @@ impl HubConnection {
         through_date: String,
         requested_days: u16,
     ) -> Result<(), SessionHubError> {
+        self.hub.inner.store.reconcile_usage_history().await?;
         let device_id = self.hub.inner.store.profile_installation_id().await?;
-        let days = match self
+        let mut days = match self
             .hub
             .inner
             .store
@@ -12703,6 +12708,7 @@ impl HubConnection {
             }
             Err(error) => return Err(error.into()),
         };
+        crate::usage_report::enrich_usage_history_costs(&mut days);
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::UsageHistoryRange {

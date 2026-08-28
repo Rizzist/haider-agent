@@ -1240,8 +1240,8 @@ pub struct UsageGroup {
 /// journal counters. Summing is legitimate ONLY for same-unit local
 /// facts — meters are never summed (different windows, different plans),
 /// and partially-priced cost sums say so instead of understating
-/// silently. `Models` (per-model across providers) arrives with the
-/// usage-history ledger RPC; no dead tab ships before its data source.
+/// silently. `Models` is a range-selectable provider/model fold over the
+/// same usage-history ledger RPC; no dead tab ships before its data source.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum UsageScope {
     #[default]
@@ -1250,12 +1250,32 @@ pub enum UsageScope {
     /// The usage-history heatmap (954 headline's UI): daily totals from
     /// the device-local ledger via `usage.history_range`.
     History,
-    /// Per-model across providers (954): today's UTC day read
-    /// (`usage.history_day`) folded by lane descriptor, grouped by model.
+    /// Per-model/provider rows folded over a selectable UTC ledger range.
     Models,
 }
 
 impl UsageScope {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Accounts => "accounts",
+            Self::Global => "global",
+            Self::History => "history",
+            Self::Models => "models",
+        }
+    }
+
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "accounts" => Some(Self::Accounts),
+            "global" => Some(Self::Global),
+            "history" => Some(Self::History),
+            "models" => Some(Self::Models),
+            _ => None,
+        }
+    }
+
     /// The `s` key cycles scopes; the ring grows as ledger scopes land.
     #[must_use]
     pub fn next(self) -> Self {
@@ -1268,18 +1288,62 @@ impl UsageScope {
     }
 }
 
+/// Ledger range folded by the Models scope. All-time is the complete
+/// returned attribution lifetime (the ledger is newer than the protocol's
+/// bounded history window).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum UsageModelRange {
+    #[default]
+    Today,
+    SevenDays,
+    ThirtyDays,
+    AllTime,
+}
+
+impl UsageModelRange {
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Today => Self::SevenDays,
+            Self::SevenDays => Self::ThirtyDays,
+            Self::ThirtyDays => Self::AllTime,
+            Self::AllTime => Self::Today,
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Today => "today (UTC)",
+            Self::SevenDays => "7d",
+            Self::ThirtyDays => "30d",
+            Self::AllTime => "all-time",
+        }
+    }
+
+    #[must_use]
+    pub const fn days(self) -> Option<usize> {
+        match self {
+            Self::Today => Some(1),
+            Self::SevenDays => Some(7),
+            Self::ThirtyDays => Some(30),
+            Self::AllTime => None,
+        }
+    }
+}
+
 /// The `/usage` screen state (U2). The report is U1's `usage.report`
 /// snapshot CONSUMED whole — meter windows, typed unavailability, local
 /// counters; nothing here re-derives or fabricates a reading.
 #[derive(Debug, Default)]
 pub struct UsageState {
-    /// The active viewing scope. Reset to `Accounts` on every screen
-    /// entry (the reveal-mask precedent: a screen opens predictably).
+    /// The active viewing scope. Bare `/usage` resets to `Accounts`; a
+    /// direct scope argument selects its named destination.
     pub scope: UsageScope,
     /// The last committed `usage.report` snapshot. `None` until the first
     /// reply lands (live) — the demo never fabricates one.
     pub report: Option<haider_protocol::usage::UsageReportV1>,
-    /// A read is in flight (screen entry / `r`).
+    /// A report read is in flight (screen entry / `f`).
     pub fetching: bool,
     /// The last read's typed failure — rendered on the screen, never a
     /// bare flash; a later good reply clears it.
@@ -1309,7 +1373,7 @@ pub struct UsageState {
     /// all-zero total is a measured zero day — the ledger's absence law,
     /// carried into the model verbatim.
     pub history: Option<Vec<haider_protocol::usage::UsageHistoryRangeDayV1>>,
-    /// A history read is in flight (History scope entry / `f`).
+    /// A history read is in flight (History/Models scope entry / `f`).
     pub history_fetching: bool,
     /// The last history read's typed failure — rendered in the History
     /// scope, never flattened into an empty heatmap (the consumer-boundary
@@ -1324,6 +1388,8 @@ pub struct UsageState {
     pub today_fetching: bool,
     /// Typed failure for the day read — never flattened into absence.
     pub today_error: Option<String>,
+    /// Models range; `r` cycles today → 7d → 30d → all-time.
+    pub model_range: UsageModelRange,
 }
 
 impl UsageState {
@@ -3817,6 +3883,9 @@ pub enum Hit {
         provider: String,
         index: usize,
     },
+    /// One `/usage` scope-strip label. Value-carrying so a stale hit map
+    /// can only select the scope that occupied the clicked cell.
+    UsageScope(UsageScope),
     BackChip,
     TalkChip,
     HelpHint,
@@ -9951,11 +10020,14 @@ impl AppModel {
     /// demo opens an honest empty state — usage is daemon truth and the
     /// demo fabricates no meter. Re-running `/usage` while the screen is
     /// up re-filters and (live) re-reads.
-    fn enter_usage(&mut self, filter: Option<&str>) {
+    fn enter_usage(&mut self, scope: UsageScope, filter: Option<&str>) {
         self.dirty = true;
-        // 954: like the reveal mask, the scope resets on entry — the
-        // screen always opens on the per-account detail.
-        self.usage.scope = UsageScope::default();
+        // Bare `/usage` still opens predictably on Accounts; direct scope
+        // arguments select their requested destination before any read is
+        // queued.
+        self.usage.scope = scope;
+        self.usage.model_range = UsageModelRange::default();
+        self.usage.scroll.set(0);
         let filter = filter
             .map(str::trim)
             .filter(|token| !token.is_empty())
@@ -9984,6 +10056,27 @@ impl AppModel {
         if !self.mode.fabricates_locally() {
             self.usage.fetching = true;
             self.requests.push(AppRequest::UsageRefresh);
+            self.refresh_usage_scope_if_needed();
+        }
+    }
+
+    fn refresh_usage_scope_if_needed(&mut self) {
+        if self.mode.fabricates_locally()
+            || !self.daemon_serves(haider_rpc::FEATURE_USAGE_HISTORY_V1)
+        {
+            return;
+        }
+        match self.usage.scope {
+            UsageScope::History | UsageScope::Models
+                if self.usage.history.is_none() && !self.usage.history_fetching =>
+            {
+                self.usage.history_fetching = true;
+                self.requests.push(AppRequest::UsageHistoryRefresh);
+            }
+            UsageScope::Accounts
+            | UsageScope::Global
+            | UsageScope::History
+            | UsageScope::Models => {}
         }
     }
 
@@ -10003,19 +10096,33 @@ impl AppModel {
         self.dirty = true;
     }
 
-    /// Keys on `/usage` (U2). KEY-OWNERSHIP: esc closes (never a ⏎
-    /// action — the screen is read-only), ↑/↓ move the provider-group
-    /// cursor (F2b follow), ←/→ (and tab/shift-tab) cycle the cursor
-    /// group's accounts wrapping, PageUp/PageDown/Home/End scroll against
-    /// the frame-written max, `r` toggles the identity reveal (owner
-    /// addendum — per-visit), `f` re-reads (live). Everything else is
-    /// swallowed.
+    /// Keys on `/usage` (U2). KEY-OWNERSHIP: esc closes (never a ⏎ action
+    /// — the screen is read-only); ↑/↓ select account groups or scroll the
+    /// Models table; ←/→ (and tab/shift-tab) cycle accounts; page/home/end
+    /// scroll; `r` reveals identities except on Models where it cycles the
+    /// range; `f` re-reads (live). Everything else is swallowed.
     fn handle_usage_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Esc => self.exit_usage(),
+            KeyCode::Up | KeyCode::Char('k') if self.usage.scope == UsageScope::Models => {
+                self.usage
+                    .scroll
+                    .set(self.usage.scroll.get().saturating_sub(1));
+                self.dirty = true;
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.usage.cursor = self.usage.cursor.saturating_sub(1);
                 self.usage.follow_cursor.set(true);
+                self.dirty = true;
+            }
+            KeyCode::Down | KeyCode::Char('j') if self.usage.scope == UsageScope::Models => {
+                self.usage.scroll.set(
+                    self.usage
+                        .scroll
+                        .get()
+                        .saturating_add(1)
+                        .min(self.usage.scroll_max.get()),
+                );
                 self.dirty = true;
             }
             KeyCode::Down | KeyCode::Char('j') => {
@@ -10046,6 +10153,11 @@ impl AppModel {
                 self.usage.follow_cursor.set(true);
                 self.dirty = true;
             }
+            KeyCode::Char('r') if self.usage.scope == UsageScope::Models => {
+                self.usage.model_range = self.usage.model_range.next();
+                self.usage.scroll.set(0);
+                self.dirty = true;
+            }
             KeyCode::Char('r') => {
                 // Owner addendum: `r` toggles the identity REVEAL for this
                 // visit only — the screen always opens masked and closing
@@ -10060,32 +10172,23 @@ impl AppModel {
                 // Entering History live with no held window: read it. The
                 // demo never fetches (usage is daemon truth) and a daemon
                 // without the feature gets the honest note at render.
-                if self.usage.scope == UsageScope::History
-                    && !self.mode.fabricates_locally()
-                    && self.daemon_serves(haider_rpc::FEATURE_USAGE_HISTORY_V1)
-                    && self.usage.history.is_none()
-                    && !self.usage.history_fetching
-                {
-                    self.usage.history_fetching = true;
-                    self.requests.push(AppRequest::UsageHistoryRefresh);
-                }
-                if self.usage.scope == UsageScope::Models
-                    && !self.mode.fabricates_locally()
-                    && self.daemon_serves(haider_rpc::FEATURE_USAGE_HISTORY_V1)
-                    && self.usage.today.is_none()
-                    && !self.usage.today_absent
-                    && !self.usage.today_fetching
-                {
-                    self.usage.today_fetching = true;
-                    self.requests.push(AppRequest::UsageTodayRefresh);
-                }
+                self.refresh_usage_scope_if_needed();
                 self.dirty = true;
             }
             // A manual re-read (live only — the demo has nothing to fetch
             // and the honest empty state already says so).
             KeyCode::Char('f') if !self.mode.fabricates_locally() => {
                 self.usage.fetching = true;
+                self.usage.error = None;
                 self.requests.push(AppRequest::UsageRefresh);
+                if matches!(self.usage.scope, UsageScope::History | UsageScope::Models)
+                    && self.daemon_serves(haider_rpc::FEATURE_USAGE_HISTORY_V1)
+                    && !self.usage.history_fetching
+                {
+                    self.usage.history_fetching = true;
+                    self.usage.history_error = None;
+                    self.requests.push(AppRequest::UsageHistoryRefresh);
+                }
                 self.dirty = true;
             }
             // F2b: page keys move the viewport and clamp at the true
@@ -12945,9 +13048,21 @@ impl AppModel {
             // Owner 2026-08-16: manual retry of the failed turn — the
             // keyboard path to the ambient retry row's click.
             "retry" => self.issue_run_retry(),
-            // U2: `/usage [provider]` — the cross-provider usage report;
-            // the optional first token is a provider prefix filter.
-            "usage" => self.enter_usage(arg.as_deref()),
+            // `/usage [history|models|global|accounts] [provider]`: a
+            // leading scope lands directly; otherwise the first token keeps
+            // the existing provider-prefix meaning.
+            "usage" => {
+                let mut usage_args = remainder.split_whitespace();
+                let first = usage_args.next();
+                let requested_scope = first.and_then(UsageScope::from_name);
+                let scope = requested_scope.unwrap_or_default();
+                let filter = if requested_scope.is_some() {
+                    usage_args.next()
+                } else {
+                    first
+                };
+                self.enter_usage(scope, filter);
+            }
             // W5e-3: choose from the DISCOVERED catalog. Both are
             // feature-gated BEFORE shipping this time (the W5e-1b lesson).
             "model" => {
@@ -15601,6 +15716,12 @@ impl AppModel {
                     self.usage.tabs.insert(provider, index);
                     self.dirty = true;
                 }
+            }
+            Hit::UsageScope(scope) if self.screen == Screen::Usage => {
+                self.usage.scope = scope;
+                self.usage.scroll.set(0);
+                self.refresh_usage_scope_if_needed();
+                self.dirty = true;
             }
             // Dismissed/replaced palettes drop the click.
             Hit::PaletteRow(item) if self.palette_open() => self.activate_palette_item(item),

@@ -48,7 +48,7 @@ use haider_protocol::session::ModelSelected;
 use haider_protocol::usage::{
     AccountMeterStateV1, AccountUsageReportV1, CacheUsageBreakdownV1, CacheUsageRequestScopeV1,
     CacheUsageRequestV1, CacheUsageStatsV1, HaiderCodePlanSnapshotV1, LocalUsageStatsV1,
-    UsageHistoryMeterSampleV1, UsageReportV1, UsageWindowV1,
+    UsageHistoryMeterSampleV1, UsageHistoryRangeDayV1, UsageReportV1, UsageWindowV1,
 };
 use haider_provider::{MeterReading, MeterUnavailable, UsageMeterEndpoint};
 use serde::Deserialize;
@@ -92,6 +92,7 @@ pub(crate) trait UsageMeterHttp: Send + Sync {
         url: &str,
         bearer: &SecretHandle,
         extra_headers: &[(&'static str, &'static str)],
+        chatgpt_account_id: Option<&str>,
     ) -> Result<(u16, Vec<u8>), MeterUnavailable>;
 }
 
@@ -122,6 +123,7 @@ impl UsageMeterHttp for ReqwestUsageMeterHttp {
         url: &str,
         bearer: &SecretHandle,
         extra_headers: &[(&'static str, &'static str)],
+        chatgpt_account_id: Option<&str>,
     ) -> Result<(u16, Vec<u8>), MeterUnavailable> {
         let Some(client) = &self.client else {
             return Err(MeterUnavailable::new("transport_unavailable"));
@@ -136,6 +138,12 @@ impl UsageMeterHttp for ReqwestUsageMeterHttp {
             .header(reqwest::header::AUTHORIZATION, authorization);
         for (name, value) in extra_headers {
             request = request.header(*name, *value);
+        }
+        if let Some(account_id) = chatgpt_account_id {
+            let mut account_id = reqwest::header::HeaderValue::from_str(account_id)
+                .map_err(|_| MeterUnavailable::new("credential_account_id_not_header_safe"))?;
+            account_id.set_sensitive(true);
+            request = request.header(haider_provider::OPENAI_OAUTH_ACCOUNT_ID_HEADER, account_id);
         }
         let response = request.send().await.map_err(|error| {
             if error.is_timeout() {
@@ -503,12 +511,40 @@ impl UsageReportService {
         } else {
             OpenAiTokenIdentity::default()
         };
+        // OpenAI's WHAM meter is account-scoped. This value is the
+        // `chatgpt_account_id` captured from the OAuth ID token by
+        // `OpenAiOAuthIdentitySource`; an OpenAI organization id is never a
+        // substitute. Refuse early instead of sending an ambiguous request
+        // that fails later as a bare 401/403.
+        let chatgpt_account_id = if endpoint == UsageMeterEndpoint::OpenAiOauth {
+            match descriptor
+                .account_identity
+                .as_ref()
+                .and_then(|identity| identity.account_id.as_deref())
+                .filter(|account_id| !account_id.is_empty())
+            {
+                Some(account_id) => Some(account_id),
+                None => {
+                    return (
+                        Err(MeterUnavailable::new("credential_account_id_unavailable")),
+                        token_identity,
+                    );
+                }
+            }
+        } else {
+            None
+        };
         let outcome = match self
             .http
-            .get(endpoint.url(), &token, endpoint.extra_headers())
+            .get(
+                endpoint.url(),
+                &token,
+                endpoint.extra_headers(),
+                chatgpt_account_id,
+            )
             .await
         {
-            Ok((status, body)) => endpoint.parse(status, &body),
+            Ok((status, body)) => endpoint.parse_at(status, &body, (self.clock)()),
             Err(unavailable) => Err(unavailable),
         };
         (outcome, token_identity)
@@ -528,6 +564,23 @@ fn haider_code_windows(snapshot: &HaiderCodePlanSnapshotV1) -> Vec<UsageWindowV1
         resets_at_ms: allowance.resets_at_ms,
         label: None,
     }]
+}
+
+/// Adds read-time price estimates to attributed ledger rows. Counters remain
+/// the raw day-fold truth; unknown provider/model pairs keep `None` and are
+/// never priced from a model slug alone.
+pub(crate) fn enrich_usage_history_costs(days: &mut [UsageHistoryRangeDayV1]) {
+    for row in days.iter_mut().flat_map(|day| day.models.iter_mut()) {
+        row.est_cost_microusd = haider_provider::estimate_chunk_cost_usd_for(
+            &row.provider,
+            &row.model,
+            row.input_tokens,
+            row.output_tokens,
+            row.reasoning_tokens,
+            row.cache_read_tokens,
+        )
+        .map(usd_to_microusd);
+    }
 }
 
 // --- local accounting -----------------------------------------------------

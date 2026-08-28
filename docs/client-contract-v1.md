@@ -1148,7 +1148,11 @@ For each account:
 - `identity` and `plan` absent mean unknown, not a fallback alias/tier.
 - meter `metered { windows: [] }` is a successful reading with no published
   windows. `local_only` means no server meter exists. `unavailable { reason }`
-  means the reading failed. These are not interchangeable.
+  means the reading failed. These are not interchangeable. The reason is a
+  bounded machine-readable coordinate such as `http_status_401`,
+  `transport_timeout`, `malformed_response`, or
+  `credential_account_id_unavailable`; clients may compact it for display
+  (`http 401`) but must not replace it with a generic unavailable label.
 - Haider Code is the API-key exception to the usual local-only rule: its
   meter provenance is a successfully held `HaiderCodePlanStatus` snapshot
   from the existing account-plan push/poll path, not a separate usage probe.
@@ -1157,7 +1161,11 @@ For each account:
   was published. A failed attempt with no new status does not fabricate a
   meter reading or a zero window.
 - window `utilization=0.0` is measured zero use; `resets_at_ms` and `label`
-  absent mean the provider did not publish them.
+  absent mean the provider did not publish them. Windows are independent:
+  OpenAI OAuth may publish `5h` and `weekly`, either one alone, or neither;
+  Anthropic OAuth may likewise publish `five_hour` and `seven_day`
+  independently. A missing shorter window never suppresses a present weekly
+  window.
 - local integer zeros are measured journal-derived zeros.
 - `est_cost_usd` absent means no priced metered model matched; it is not
   `$0`. `api_equivalent_est_cost_usd` absent means no complete equivalent
@@ -1217,6 +1225,15 @@ total means at least one slot was sampled and folded to zero. Hourly and daily
 views are folds on read over slot records; clients must not expect or create
 duplicate stored rollups.
 
+Each range element may also carry an additive `models` array, folded from the
+same day's attributed lane rows and sorted most-to-least by token total. Each
+row is keyed by the exact `(model, provider)` pair and contains request, input,
+output, cache-read, and reasoning counters. An omitted/empty `models` array
+means no attributed rows were published for that date; it does not erase or
+reinterpret a present daily `total`. `est_cost_microusd` is read-time
+enrichment from a provider-qualified price table. Its absence means the exact
+provider/model pair has no known price, never zero cost.
+
 Meter history freezes provider-published integer facts at arrival. Haider
 Code's weekly sample comes from the plan-status push described above; exact
 used basis points are computed only from a provider integer percent remaining,
@@ -1237,6 +1254,12 @@ older facts remain absent rather than being reconstructed. Backfill-created
 day headers carry `backfilled=true` because
 older journal facts may not contain all current descriptor dimensions. A
 backfill neither fills those dimensions nor turns missing slots into zeros.
+Modern usage facts also carry a physical request ordinal. Every distinct
+ordinal contributes one request-local lane row; repeated cumulative updates
+for the same ordinal replace rather than double-count. Historical facts that
+predate these attribution coordinates are not backfilled from current model
+selection, so clients should identify the first date with a nonempty `models`
+array instead of fabricating earlier per-model rows.
 
 Meter samples preserve the provider-adapter's published integer basis points
 without denominator arithmetic. Reset time, plan tier, and staleness remain

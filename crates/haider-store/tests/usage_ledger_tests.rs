@@ -133,6 +133,110 @@ fn dictionary_can_append_mid_file_and_roles_get_distinct_keys() {
     assert_ne!(root_id, subagent_id, "roles must not share a dictionary id");
 }
 
+/// Every physical request ordinal survives the journal reducer as one request
+/// in its attributed lane, and the range reader exposes provider/model rows
+/// ordered by descending token total.
+///
+/// MUTATION CHECK: remove `request_ordinal` from `ChunkKey`; the two updates
+/// replace one another and the exact requests/input pins fail.
+#[test]
+fn physical_requests_land_in_attributed_model_rows() {
+    let usage_event = |id: &str, ordinal: u64, input: u64, output: u64| EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new(id),
+        seq: ordinal,
+        session_id: SessionId::new("usage-request-rows"),
+        branch_id: None,
+        run_id: None,
+        agent_id: None,
+        device_id: DeviceId::new("journal-process-device"),
+        authority_epoch: 0,
+        worker_generation: 1,
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 1_777_075_200_000,
+        render: RenderTargets {
+            ui: false,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::json!({
+            "type": "usage",
+            "input": input,
+            "output": output,
+            "source": "provider_reported",
+            "account": "account-main",
+            "scope": {
+                "provider": "openai-oauth",
+                "model": "gpt-attributed",
+                "auth_scope": "oauth_subscription",
+                "cache_epoch": "epoch-rows"
+            },
+            "request": {
+                "ordinal": ordinal,
+                "input": input,
+                "output": output,
+                "cached": input / 2,
+                "source": "provider_reported",
+                "account": "account-main"
+            }
+        }),
+    };
+    let reduced = reduce_journal_usage(&[
+        usage_event("usage-request-one", 1, 12, 3),
+        usage_event("usage-request-two", 2, 20, 5),
+    ]);
+    let (address, reduced_slot) = reduced.iter().next().expect("one UTC slot");
+    let counters = reduced_slot.rows.values().next().expect("attributed lane");
+    assert_eq!(counters.requests, 2, "one row contribution per request");
+    assert_eq!(counters.input_tokens, 32);
+    assert_eq!(counters.output_tokens, 8);
+    assert_eq!(counters.cache_read_tokens, 16);
+
+    let root = tempfile::tempdir().expect("temp profile");
+    let writer =
+        UsageLedgerWriter::new(root.path(), "dev-abababababababababababababababab", "1.0.0");
+    let mut persisted_slot = reduced_slot.clone();
+    persisted_slot.rows.insert(
+        root_lane("claude-small"),
+        UsageLedgerCounters {
+            requests: 1,
+            input_tokens: 1,
+            ..UsageLedgerCounters::default()
+        },
+    );
+    writer
+        .append_slot(address, &persisted_slot, false)
+        .expect("append attributed requests");
+    let day = read_usage_day(root.path(), &address.date)
+        .expect("read attributed day")
+        .expect("attributed day exists");
+    let gpt_key = day
+        .keys
+        .iter()
+        .find(|key| {
+            key.model.as_deref() == Some("gpt-attributed")
+                && key.provider.as_deref() == Some("openai-oauth")
+        })
+        .expect("provider/model dictionary row");
+    let day_requests = day
+        .slots
+        .iter()
+        .flatten()
+        .flat_map(|slot| &slot.rows)
+        .filter(|row| row.key_id == gpt_key.id)
+        .map(|row| row.requests)
+        .sum::<u64>();
+    assert_eq!(day_requests, 2, "history_day preserves request rows");
+    let range = read_usage_range(root.path(), &address.date, 1).expect("read attributed range");
+    assert_eq!(range[0].models.len(), 2);
+    assert_eq!(range[0].models[0].model, "gpt-attributed");
+    assert_eq!(range[0].models[0].provider, "openai-oauth");
+    assert_eq!(range[0].models[0].requests, 2);
+    assert_eq!(range[0].models[0].input_tokens, 32);
+    assert_eq!(range[0].models[1].model, "claude-small");
+}
+
 #[test]
 fn meter_basis_points_are_written_verbatim() {
     let root = tempfile::tempdir().expect("temp profile");

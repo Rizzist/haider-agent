@@ -12,8 +12,9 @@ use haider_protocol::provider::{NormalizedUsage, UsageRequestKind, UsageScope};
 use haider_protocol::session_fork::SessionForkEventPayload;
 use haider_protocol::usage::{
     USAGE_HISTORY_MAX_RANGE_DAYS, USAGE_HISTORY_SLOTS_PER_DAY, UsageHistoryDailyTotalV1,
-    UsageHistoryDayV1, UsageHistoryKeyV1, UsageHistoryMeterSampleV1, UsageHistoryRangeDayV1,
-    UsageHistoryRoleV1, UsageHistoryRowV1, UsageHistorySlotV1, UsageHistoryVersionChangeV1,
+    UsageHistoryDayV1, UsageHistoryKeyV1, UsageHistoryMeterSampleV1, UsageHistoryModelTotalV1,
+    UsageHistoryRangeDayV1, UsageHistoryRoleV1, UsageHistoryRowV1, UsageHistorySlotV1,
+    UsageHistoryVersionChangeV1,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -464,9 +465,63 @@ fn read_usage_range_inner(
             )));
         }
         let total = day.as_ref().and_then(fold_daily_total);
-        range.push(UsageHistoryRangeDayV1 { date, total });
+        let models = day.as_ref().map_or_else(Vec::new, fold_model_totals);
+        range.push(UsageHistoryRangeDayV1 {
+            date,
+            total,
+            models,
+        });
     }
     Ok(range)
+}
+
+fn fold_model_totals(day: &UsageHistoryDayV1) -> Vec<UsageHistoryModelTotalV1> {
+    let keys = day
+        .keys
+        .iter()
+        .map(|key| (key.id, key))
+        .collect::<BTreeMap<_, _>>();
+    let mut totals = BTreeMap::<(String, String), UsageHistoryModelTotalV1>::new();
+    for row in day.slots.iter().flatten().flat_map(|slot| slot.rows.iter()) {
+        let Some(key) = keys.get(&row.key_id) else {
+            continue;
+        };
+        let Some(provider) = key.provider.as_deref().filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let Some(model) = key.model.as_deref().filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let total = totals
+            .entry((model.to_owned(), provider.to_owned()))
+            .or_insert_with(|| UsageHistoryModelTotalV1 {
+                model: model.to_owned(),
+                provider: provider.to_owned(),
+                ..UsageHistoryModelTotalV1::default()
+            });
+        total.requests = total.requests.saturating_add(row.requests);
+        total.input_tokens = total.input_tokens.saturating_add(row.input_tokens);
+        total.output_tokens = total.output_tokens.saturating_add(row.output_tokens);
+        total.cache_read_tokens = total
+            .cache_read_tokens
+            .saturating_add(row.cache_read_tokens);
+        total.reasoning_tokens = total.reasoning_tokens.saturating_add(row.reasoning_tokens);
+    }
+    let mut totals = totals.into_values().collect::<Vec<_>>();
+    totals.sort_by(|left, right| {
+        model_total_tokens(right)
+            .cmp(&model_total_tokens(left))
+            .then_with(|| left.model.cmp(&right.model))
+            .then_with(|| left.provider.cmp(&right.provider))
+    });
+    totals
+}
+
+fn model_total_tokens(total: &UsageHistoryModelTotalV1) -> u64 {
+    total
+        .input_tokens
+        .saturating_add(total.output_tokens)
+        .saturating_add(total.reasoning_tokens)
 }
 
 fn fold_daily_total(day: &UsageHistoryDayV1) -> Option<UsageHistoryDailyTotalV1> {

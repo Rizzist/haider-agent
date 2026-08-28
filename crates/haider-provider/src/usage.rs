@@ -106,6 +106,12 @@ pub enum UsageMeterEndpoint {
 pub const ANTHROPIC_OAUTH_USAGE_USER_AGENT: &str = "claude-code/2.0.19";
 /// codex/openai-oauth usage meter URL.
 pub const OPENAI_OAUTH_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+pub const OPENAI_OAUTH_ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
+/// Secret-free identity headers sent with the OpenAI subscription meter.
+/// `chatgpt-account-id` is account-specific and therefore supplied by the
+/// daemon from the descriptor's ID-token-derived identity.
+pub const OPENAI_OAUTH_USAGE_ORIGINATOR: &str = "haider";
+pub const OPENAI_OAUTH_USAGE_USER_AGENT: &str = concat!("haider/", env!("CARGO_PKG_VERSION"));
 /// anthropic-oauth usage meter URL.
 pub const ANTHROPIC_OAUTH_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 /// kimi-oauth usage meter URL.
@@ -128,7 +134,12 @@ impl UsageMeterEndpoint {
     /// Extra request headers beyond `Authorization: Bearer <token>`.
     pub fn extra_headers(self) -> &'static [(&'static str, &'static str)] {
         match self {
-            Self::OpenAiOauth | Self::KimiOauth => &[],
+            Self::OpenAiOauth => &[
+                ("accept", "application/json"),
+                ("originator", OPENAI_OAUTH_USAGE_ORIGINATOR),
+                ("user-agent", OPENAI_OAUTH_USAGE_USER_AGENT),
+            ],
+            Self::KimiOauth => &[],
             // The Grok proxy version-gates its clients; the meter sends the
             // same identity set as the inference lane, and the version
             // resolves through the SAME env-overridable seam
@@ -190,11 +201,23 @@ impl UsageMeterEndpoint {
 
     /// Parses one recorded response into a normalized reading.
     pub fn parse(self, status: u16, body: &[u8]) -> Result<MeterReading, MeterUnavailable> {
+        self.parse_at(status, body, 0)
+    }
+
+    /// Parses a response captured at `fetched_at_ms`. OpenAI may publish a
+    /// relative `reset_after_seconds` instead of an absolute `reset_at`; the
+    /// fetch instant is the only honest basis for converting that countdown.
+    pub fn parse_at(
+        self,
+        status: u16,
+        body: &[u8],
+        fetched_at_ms: u64,
+    ) -> Result<MeterReading, MeterUnavailable> {
         if !(200..300).contains(&status) {
             return Err(MeterUnavailable::new(format!("http_status_{status}")));
         }
         match self {
-            Self::OpenAiOauth => parse_openai_wham_usage(body),
+            Self::OpenAiOauth => parse_openai_wham_usage_at(body, fetched_at_ms),
             Self::AnthropicOauth => parse_anthropic_oauth_usage(body),
             Self::KimiOauth => parse_kimi_usages(body),
             Self::GrokOauth => parse_grok_billing(body),
@@ -246,10 +269,16 @@ struct WhamRateLimit {
 
 #[derive(Debug, Deserialize)]
 struct WhamWindow {
+    #[serde(alias = "usedPercent")]
     used_percent: Option<f64>,
+    #[serde(alias = "resetsAt")]
     reset_at: Option<u64>,
-    #[expect(dead_code, reason = "documented shape; window naming ignores it")]
+    #[serde(alias = "resetAfterSeconds")]
+    reset_after_seconds: Option<u64>,
+    #[serde(alias = "limitWindowSeconds")]
     limit_window_seconds: Option<u64>,
+    #[serde(alias = "windowDurationMins", alias = "window_minutes")]
+    window_duration_mins: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -258,14 +287,50 @@ struct WhamAdditionalRateLimit {
     rate_limit: Option<WhamRateLimit>,
 }
 
-fn wham_window(window: &WhamWindow, name: &str, label: Option<&str>) -> Option<UsageWindowV1> {
+fn wham_window_label(window: &WhamWindow, fallback: &str) -> String {
+    let seconds = window.limit_window_seconds.or_else(|| {
+        window
+            .window_duration_mins
+            .map(|minutes| minutes.saturating_mul(60))
+    });
+    match seconds {
+        Some(604_800) => "weekly".to_owned(),
+        Some(seconds) if seconds > 0 && seconds.is_multiple_of(86_400) => {
+            format!("{}d", seconds / 86_400)
+        }
+        Some(seconds) if seconds > 0 && seconds.is_multiple_of(3_600) => {
+            format!("{}h", seconds / 3_600)
+        }
+        Some(seconds) if seconds > 0 && seconds.is_multiple_of(60) => {
+            format!("{}m", seconds / 60)
+        }
+        _ if fallback == "primary" => "5h".to_owned(),
+        _ if fallback == "secondary" => "weekly".to_owned(),
+        _ => fallback.to_owned(),
+    }
+}
+
+fn wham_window(
+    window: &WhamWindow,
+    fallback: &str,
+    label: Option<&str>,
+    fetched_at_ms: u64,
+) -> Option<UsageWindowV1> {
     let used_percent = window.used_percent?;
     Some(UsageWindowV1 {
-        window: name.to_owned(),
+        window: wham_window_label(window, fallback),
         // `used_percent` is percent BY NAME — always divide, then clamp
         // through the shared normalizer for the defensive bounds.
         utilization: normalize_utilization(used_percent.clamp(0.0, 100.0) / 100.0),
-        resets_at_ms: window.reset_at.map(|seconds| seconds.saturating_mul(1000)),
+        resets_at_ms: window
+            .reset_at
+            .map(|seconds| seconds.saturating_mul(1000))
+            .or_else(|| {
+                window
+                    .reset_after_seconds
+                    .filter(|_| fetched_at_ms > 0)
+                    .map(|seconds| fetched_at_ms.saturating_add(seconds.saturating_mul(1000)))
+            }),
         label: label.map(str::to_owned),
     })
 }
@@ -274,6 +339,13 @@ fn wham_window(window: &WhamWindow, name: &str, label: Option<&str>) -> Option<U
 /// (5 h) + secondary (weekly) windows, named per-model
 /// `additional_rate_limits`, and the subscription `plan_type`.
 pub fn parse_openai_wham_usage(body: &[u8]) -> Result<MeterReading, MeterUnavailable> {
+    parse_openai_wham_usage_at(body, 0)
+}
+
+pub fn parse_openai_wham_usage_at(
+    body: &[u8],
+    fetched_at_ms: u64,
+) -> Result<MeterReading, MeterUnavailable> {
     let usage: WhamUsage =
         serde_json::from_slice(body).map_err(|_| MeterUnavailable::new("malformed_response"))?;
     let mut windows = Vec::new();
@@ -281,14 +353,14 @@ pub fn parse_openai_wham_usage(body: &[u8]) -> Result<MeterReading, MeterUnavail
         if let Some(window) = rate_limit
             .primary_window
             .as_ref()
-            .and_then(|window| wham_window(window, "primary", None))
+            .and_then(|window| wham_window(window, "primary", None, fetched_at_ms))
         {
             windows.push(window);
         }
         if let Some(window) = rate_limit
             .secondary_window
             .as_ref()
-            .and_then(|window| wham_window(window, "secondary", None))
+            .and_then(|window| wham_window(window, "secondary", None, fetched_at_ms))
         {
             windows.push(window);
         }
@@ -301,14 +373,14 @@ pub fn parse_openai_wham_usage(body: &[u8]) -> Result<MeterReading, MeterUnavail
         if let Some(window) = rate_limit
             .primary_window
             .as_ref()
-            .and_then(|window| wham_window(window, "primary", label))
+            .and_then(|window| wham_window(window, "primary", label, fetched_at_ms))
         {
             windows.push(window);
         }
         if let Some(window) = rate_limit
             .secondary_window
             .as_ref()
-            .and_then(|window| wham_window(window, "secondary", label))
+            .and_then(|window| wham_window(window, "secondary", label, fetched_at_ms))
         {
             windows.push(window);
         }
