@@ -89,6 +89,10 @@ pub(crate) struct SpawnCoordinates {
     /// B3 — the resolved Loom agent type of a TYPED spawn: the child's grant
     /// narrows to the type's capabilities (least privilege).
     pub(crate) agent_type: Option<haider_protocol::loom::LoomAgentType>,
+    /// Provider ceiling resolved by the parent dispatcher before any spawn
+    /// side effect. This exact bit is persisted and pins the child's first
+    /// run, closing a trust-toggle race between establishment and launch.
+    pub(crate) lockdown: bool,
 }
 
 pub(crate) struct MessageCoordinates {
@@ -183,9 +187,18 @@ impl DelegationHandle {
                 coordinates.parent_agent_id.as_ref(),
             )
             .await?;
-        let handoff_dir = self
-            .ensure_handoff_dir(&coordinates.metadata.cwd, &coordinates.parent_session_id)
-            .await?;
+        let handoff_dir = if coordinates.lockdown {
+            let relative =
+                Path::new("handoff").join(handoff_session_short(&coordinates.parent_session_id));
+            crate::lockdown::global()
+                .and_then(|manager| {
+                    manager.sandbox_location(&coordinates.metadata.provider, &relative)
+                })
+                .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?
+        } else {
+            self.ensure_handoff_dir(&coordinates.metadata.cwd, &coordinates.parent_session_id)
+                .await?
+        };
         let identity = stable_digest(&[
             coordinates.parent_session_id.as_str(),
             coordinates.parent_run_id.as_str(),
@@ -292,6 +305,7 @@ impl DelegationHandle {
                 attached.cache_hit = true;
             }
         }
+        let child_lockdown = coordinates.lockdown;
         let mut manifest_coordinates = serde_json::json!({
             "parent_session_id": coordinates.parent_session_id,
             "parent_run_id": coordinates.parent_run_id,
@@ -302,6 +316,10 @@ impl DelegationHandle {
             // S3: this exact coordinate is also the child prompt's
             // authority; clients never reproduce the private hash seam.
             "handoff_dir": handoff_dir.to_string_lossy(),
+            // Additive display coordinate. Older manifests omit it; the
+            // child session metadata remains the execution authority.
+            "provider": coordinates.metadata.provider,
+            "lockdown": child_lockdown,
         });
         if let Some(attached) = &workflow {
             manifest_coordinates["child_graph"] =
@@ -452,6 +470,27 @@ impl DelegationHandle {
             DelegationCreateOutcome::Committed(record)
             | DelegationCreateOutcome::IdempotentReplay(record) => record,
         };
+        let manifest = record.manifest.clone();
+        let persisted_lockdown = manifest
+            .coordinates
+            .as_ref()
+            .and_then(|coordinates| coordinates.get("lockdown"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        self.hub
+            .bind_lockdown_turn(
+                &record.child_session_id,
+                &record.child_run_id,
+                &coordinates.metadata.provider,
+                persisted_lockdown,
+            )
+            .map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("cannot bind child provider ceiling: {error}"),
+                    true,
+                )
+            })?;
         self.hub
             .notify_roster_session(record.child_session_id.clone());
         if let Some(attached) = workflow {
@@ -1545,7 +1584,7 @@ impl DelegationHandle {
         } else {
             None
         };
-        let (summary, verified, chip) = match state {
+        let (mut summary, verified, chip) = match state {
             RunState::Done => {
                 let verified = match workflow_graph.as_ref().map(|graph| graph.phase) {
                     Some(GraphPhase::Completed) => ReportVerification::Verified,
@@ -1574,6 +1613,23 @@ impl DelegationHandle {
             ),
             _ => unreachable!("terminal state match is exhaustive"),
         };
+        if record
+            .manifest
+            .coordinates
+            .as_ref()
+            .and_then(|coordinates| coordinates.get("lockdown"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            let provider = record
+                .manifest
+                .coordinates
+                .as_ref()
+                .and_then(|coordinates| coordinates.get("provider"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            summary = format!("[lockdown provider {provider}] {summary}");
+        }
         let (summary, truncated) = bounded_summary(summary);
         Ok(Some(DeferredToolResult {
             report: ChildReport {

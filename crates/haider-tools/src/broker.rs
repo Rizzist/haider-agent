@@ -291,6 +291,9 @@ struct DenyRule {
 /// always-allow, session/class allow, unresolved-ask fallback, ask.
 #[derive(Debug, Clone, Default)]
 pub struct PermissionPolicy {
+    /// Immutable daemon ceilings. User answers and session grants are
+    /// evaluated only after these rules, and `set` never removes them.
+    hard_denylist: Vec<DenyRule>,
     allowlist: Vec<EffectClass>,
     asklist: Vec<EffectClass>,
     denylist: Vec<DenyRule>,
@@ -343,6 +346,15 @@ impl PermissionPolicy {
                 reason: reason.into(),
             },
         );
+    }
+
+    /// Installs a daemon capability ceiling that no user Allow can lift.
+    pub fn hard_deny(&mut self, class: EffectClass, reason: impl Into<String>) {
+        self.hard_denylist.retain(|rule| rule.class != class);
+        self.hard_denylist.push(DenyRule {
+            class,
+            reason: reason.into(),
+        });
     }
 
     /// Denies only effects that would otherwise require a human answer.
@@ -431,6 +443,15 @@ impl PermissionPolicy {
 
     fn decision(&self, intent: &EffectIntent) -> PolicyDecision {
         if let Some(rule) = self
+            .hard_denylist
+            .iter()
+            .find(|rule| class_rule_matches(&rule.class, &intent.class))
+        {
+            return PolicyDecision::Deny {
+                reason: rule.reason.clone(),
+            };
+        }
+        if let Some(rule) = self
             .denylist
             .iter()
             .find(|rule| class_rule_matches(&rule.class, &intent.class))
@@ -457,6 +478,43 @@ impl PermissionPolicy {
             };
         }
         PolicyDecision::Ask
+    }
+
+    fn hard_denies(&self, intent: &EffectIntent) -> bool {
+        self.hard_denylist
+            .iter()
+            .any(|rule| class_rule_matches(&rule.class, &intent.class))
+    }
+}
+
+fn denied_effect_error(
+    policy: &PermissionPolicy,
+    intent: &EffectIntent,
+    reason: String,
+) -> ToolError {
+    if policy.hard_denies(intent) {
+        ToolError::RefusedByLockdown {
+            tool: match &intent.class {
+                EffectClass::FsRead => "fs_read",
+                EffectClass::FsWrite => "fs_write",
+                EffectClass::ProcessExec => "process_exec",
+                EffectClass::Network { .. } => "network",
+                EffectClass::GitOp => "git",
+                EffectClass::AgentSpawn => "spawn_subagent",
+                EffectClass::CredentialAccess => "credentials",
+                EffectClass::GuiAct => "gui",
+                EffectClass::ScreenObserve => "screen_observe",
+                EffectClass::ScreenControl => "screen_control",
+                EffectClass::MobileObserve => "mobile_observe",
+                EffectClass::MobileControl => "mobile_control",
+                EffectClass::ReadSms => "read_sms",
+                EffectClass::PeerMessage => "peer_send",
+            }
+            .to_owned(),
+            reason,
+        }
+    } else {
+        ToolError::PermissionDenied { reason }
     }
 }
 
@@ -1350,6 +1408,19 @@ impl EffectBroker {
         Ok(verdict)
     }
 
+    /// Converts a journaled deny verdict through the same hard-ceiling
+    /// classifier used by the broker's one-shot helpers. Dispatchers with a
+    /// custom authorize/dispatch sequence must not erase a lockdown denial
+    /// into an ordinary user-policy refusal.
+    pub fn denial_error(
+        &self,
+        policy: &PermissionPolicy,
+        intent: &EffectIntent,
+        reason: String,
+    ) -> ToolError {
+        denied_effect_error(policy, intent, reason)
+    }
+
     pub fn permission_menu(&self, menu: &MenuId) -> Option<&Menu> {
         self.pending_permissions
             .get(menu)
@@ -1552,7 +1623,9 @@ impl EffectBroker {
         match self.authorize(&intent, policy).await? {
             AuthorizationVerdict::Allow | AuthorizationVerdict::PreAuthorized { .. } => Ok(intent),
             AuthorizationVerdict::Ask { menu } => Err(ToolError::AuthorizationRequired { menu }),
-            AuthorizationVerdict::Deny { reason } => Err(ToolError::PermissionDenied { reason }),
+            AuthorizationVerdict::Deny { reason } => {
+                Err(denied_effect_error(policy, &intent, reason))
+            }
         }
     }
 
@@ -1596,7 +1669,9 @@ impl EffectBroker {
         match self.authorize(&intent, policy).await? {
             AuthorizationVerdict::Allow | AuthorizationVerdict::PreAuthorized { .. } => Ok(intent),
             AuthorizationVerdict::Ask { menu } => Err(ToolError::AuthorizationRequired { menu }),
-            AuthorizationVerdict::Deny { reason } => Err(ToolError::PermissionDenied { reason }),
+            AuthorizationVerdict::Deny { reason } => {
+                Err(denied_effect_error(policy, &intent, reason))
+            }
         }
     }
 
@@ -1652,7 +1727,9 @@ impl EffectBroker {
                 Ok(intent)
             }
             AuthorizationVerdict::Ask { menu } => Err(ToolError::AuthorizationRequired { menu }),
-            AuthorizationVerdict::Deny { reason } => Err(ToolError::PermissionDenied { reason }),
+            AuthorizationVerdict::Deny { reason } => {
+                Err(denied_effect_error(policy, &intent, reason))
+            }
         }
     }
 
@@ -1967,3 +2044,7 @@ fn canonicalize(value: Value) -> Value {
         scalar => scalar,
     }
 }
+
+#[cfg(test)]
+#[path = "broker_tests.rs"]
+mod broker_tests;

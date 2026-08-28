@@ -1446,6 +1446,8 @@ pub struct ChipModel {
     pub full: String,
     pub name: String,
     pub model: String,
+    /// Daemon-stamped provider ceiling for this child.
+    pub lockdown: bool,
     pub device: String,
     pub state: ChipDisplayState,
     pub tokens: u64,
@@ -1529,6 +1531,7 @@ impl ChipModel {
             full: seed.full,
             name: seed.name,
             model: seed.model,
+            lockdown: false,
             device: seed.device,
             state: seed.state,
             tokens: seed.tokens,
@@ -1582,6 +1585,12 @@ impl ChipModel {
             // display label (research W6b checklist item 4).
             name: manifest.task.clone(),
             model: manifest.model_profile.clone(),
+            lockdown: manifest
+                .coordinates
+                .as_ref()
+                .and_then(|coordinates| coordinates.get("lockdown"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
             device,
             state: ChipDisplayState::Idle,
             tokens: 0,
@@ -1769,6 +1778,11 @@ impl ChipModel {
                 format!("peer {sender}: {text}")
             }
             crate::projection::TranscriptEntry::Note { text } => text.clone(),
+            crate::projection::TranscriptEntry::Refusal {
+                provider,
+                tool,
+                reason,
+            } => format!("lockdown {provider} refused {tool}: {reason}"),
             crate::projection::TranscriptEntry::Error { text, .. } => format!("✗ {text}"),
             crate::projection::TranscriptEntry::Shell { cmd, .. } => format!("$ {cmd}"),
         });
@@ -3122,9 +3136,21 @@ pub enum AppRequest {
     /// W10b: durable custom-provider removal (`provider.remove`) — the
     /// daemon refuses builtins and account-referenced providers with
     /// typed reasons; the client never pre-judges.
+<<<<<<< HEAD
     ProviderRemove {
         provider: String,
     },
+=======
+    ProviderRemove { provider: String },
+    /// Toggle the selected provider's daemon-enforced trust ceiling.
+    ProviderSetTrust {
+        provider: String,
+        trust: haider_rpc::ProviderTrustWire,
+        expected_revision: u64,
+    },
+    /// Read the envelope/quota for the active provider explainer.
+    LockdownStatus { provider: Option<String> },
+>>>>>>> wave-965-d
     /// W8b: `/tools` live — read the daemon's canonical tool inventory.
     ToolsRefresh,
     /// `/peer` live — read the profile's advertised peer registry.
@@ -3782,6 +3808,8 @@ pub enum Hit {
         provider: String,
         model: String,
     },
+    /// Persistent provider-lockdown status segment.
+    LockdownStatus,
     /// One `/usage` account tab chip (U2). VALUE-CARRYING: the provider +
     /// the index WITHIN its group, so a stale hit map can never select a
     /// different account.
@@ -4318,6 +4346,7 @@ pub fn follow_viewport(top: usize, selection: usize, len: usize, window: usize) 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelPickerRow {
     pub provider: String,
+    pub lockdown: bool,
     /// The model slug; empty for a provider placeholder row.
     pub model: String,
     /// `oauth` / `api` — what a turn on this row meters.
@@ -4770,6 +4799,7 @@ pub struct AppModel {
     pub palette_dismissed: bool,
     /// The /help overlay (esc closes).
     pub help_open: bool,
+<<<<<<< HEAD
     /// `/shells` terminal-registry overlay; activity floats over the body.
     pub shells_open: bool,
     /// Selected shell row in the overlay's keyboard path.
@@ -4789,6 +4819,15 @@ pub struct AppModel {
     pub ssh_terminal: Option<SshTerminalPane>,
     /// Existing monitor details floated over the body from the status strip.
     pub monitors_open: bool,
+=======
+    /// Small status-line explainer overlay for the active lockdown provider.
+    pub lockdown_overlay: bool,
+    pub lockdown_status: Option<haider_rpc::LockdownStatusWire>,
+    /// Ceiling frozen at the active session's last accepted turn boundary.
+    /// Provider roster trust may already describe the following turn.
+    pub lockdown_provider: Option<String>,
+    pub lockdown_boundary_known: bool,
+>>>>>>> wave-965-d
     /// One-line transient notice shown in the status bar until the next
     /// keystroke (honest stubs: "/tree lands with the daemon").
     pub flash: Option<String>,
@@ -5100,6 +5139,7 @@ impl Default for AppModel {
             palette_scroll: 0,
             palette_dismissed: false,
             help_open: false,
+<<<<<<< HEAD
             shells_open: false,
             shells_cursor: 0,
             ssh_open: false,
@@ -5114,6 +5154,12 @@ impl Default for AppModel {
             },
             ssh_terminal: None,
             monitors_open: false,
+=======
+            lockdown_overlay: false,
+            lockdown_status: None,
+            lockdown_provider: None,
+            lockdown_boundary_known: false,
+>>>>>>> wave-965-d
             flash: None,
             update_available: None,
             profile_diagnostic: None,
@@ -6950,12 +6996,18 @@ impl AppModel {
     }
 
     fn handle_key(&mut self, key: KeyEvent, now: std::time::Instant) {
+<<<<<<< HEAD
         if self.ssh_terminal.is_some() {
             self.handle_ssh_terminal_key(key);
             return;
         }
         if self.ssh_form.is_some() {
             self.handle_ssh_form_key(key);
+=======
+        if self.lockdown_overlay {
+            self.lockdown_overlay = false;
+            self.dirty = true;
+>>>>>>> wave-965-d
             return;
         }
         if self.screen == Screen::Loom
@@ -10228,6 +10280,16 @@ impl AppModel {
                     self.requests
                         .push(AppRequest::ProviderModelsRefresh { provider });
                     self.dirty = true;
+                }
+            }
+            KeyCode::Char('t') => {
+                if let Some(provider) = self
+                    .providers
+                    .providers
+                    .get(self.providers.cursor)
+                    .map(|summary| summary.provider.clone())
+                {
+                    self.toggle_provider_trust(&provider);
                 }
             }
             KeyCode::Up => {
@@ -14565,6 +14627,10 @@ impl AppModel {
         self.session_title = None;
         self.session_name = None;
         self.session_workspace_cwd = None;
+        self.lockdown_provider = None;
+        self.lockdown_boundary_known = false;
+        self.lockdown_status = None;
+        self.lockdown_overlay = false;
         self.turn_active = false;
         self.msg_queue.clear();
         self.queue_mode = false;
@@ -14774,6 +14840,10 @@ impl AppModel {
         self.graph_unsupported = false;
         // W-A: the background task rows travel whole with the session.
         self.tasks = std::mem::take(&mut slot.tasks);
+        self.lockdown_provider = slot.lockdown_provider.take();
+        self.lockdown_boundary_known = slot.lockdown_boundary_known;
+        self.lockdown_status = None;
+        self.lockdown_overlay = false;
         self.msg_queue = std::mem::take(&mut slot.msg_queue);
         self.queue_mode = slot.queue_mode;
         self.subturn_mode = slot.subturn_mode;
@@ -14818,6 +14888,43 @@ impl AppModel {
         self.note_session_view();
     }
 
+    /// Returns the provider whose ceiling the status bar must display. Before
+    /// the first accepted turn the provider roster is the best available
+    /// truth; afterward the accepted boundary remains authoritative even if
+    /// an administrator has already toggled trust for the following turn.
+    pub(crate) fn active_lockdown_provider(&self) -> Option<&str> {
+        if self.lockdown_boundary_known {
+            return self.lockdown_provider.as_deref();
+        }
+        self.providers
+            .providers
+            .iter()
+            .find(|provider| provider.provider == self.identity.provider)
+            .filter(|provider| !matches!(provider.trust, haider_rpc::ProviderTrustWire::Full))
+            .map(|provider| provider.provider.as_str())
+    }
+
+    /// Freezes the UI chip at the same accepted-turn boundary used by the
+    /// daemon. A later roster update changes only the next boundary.
+    pub fn note_lockdown_turn_boundary(&mut self) {
+        self.lockdown_provider = self
+            .providers
+            .providers
+            .iter()
+            .find(|provider| provider.provider == self.identity.provider)
+            .filter(|provider| !matches!(provider.trust, haider_rpc::ProviderTrustWire::Full))
+            .map(|provider| provider.provider.clone());
+        self.lockdown_boundary_known = true;
+        self.lockdown_status = None;
+        self.dirty = true;
+    }
+
+    pub fn note_session_lockdown_turn_boundary(&mut self, session_id: &SessionId) {
+        if self.active_session.as_ref() == Some(session_id) {
+            self.note_lockdown_turn_boundary();
+        }
+    }
+
     /// A view/read acknowledgement is deliberately a request, not local
     /// unseen bookkeeping. The live driver debounces it and holds it until
     /// the control attachment is established; another surface then receives
@@ -14857,6 +14964,8 @@ impl AppModel {
             self.workflow_graph_error = None;
             self.workflow_evidence_inspection = None;
             slot.tasks = std::mem::take(&mut self.tasks);
+            slot.lockdown_provider = self.lockdown_provider.take();
+            slot.lockdown_boundary_known = std::mem::take(&mut self.lockdown_boundary_known);
             slot.msg_queue = std::mem::take(&mut self.msg_queue);
             slot.queue_mode = std::mem::take(&mut self.queue_mode);
             slot.subturn_mode = std::mem::take(&mut self.subturn_mode);
@@ -14874,6 +14983,8 @@ impl AppModel {
             slot.workspace_cwd = self.session_workspace_cwd.take();
         }
         self.last_detached = Some(active);
+        self.lockdown_status = None;
+        self.lockdown_overlay = false;
         self.msg_queue.clear();
         self.queue_mode = false;
         self.subturn_mode = false;
@@ -15246,6 +15357,7 @@ impl AppModel {
         if self.help_open {
             return;
         }
+<<<<<<< HEAD
         if self.shells_open && !matches!(hit, Hit::ShellClose(_) | Hit::ShellStatus) {
             return;
         }
@@ -15253,6 +15365,10 @@ impl AppModel {
             return;
         }
         if self.monitors_open && !matches!(hit, Hit::MonitorStatus) {
+=======
+        if self.lockdown_overlay {
+            self.lockdown_overlay = false;
+>>>>>>> wave-965-d
             return;
         }
         // TUI6.2b: the login card is MODAL against hits exactly as it is
@@ -15297,6 +15413,17 @@ impl AppModel {
                 } else {
                     self.screen = Screen::Graph;
                 }
+            }
+            Hit::LockdownStatus => {
+                self.lockdown_overlay = true;
+                self.lockdown_status = None;
+                self.requests.push(AppRequest::LockdownStatus {
+                    provider: Some(
+                        self.active_lockdown_provider()
+                            .unwrap_or(self.identity.provider.as_str())
+                            .to_owned(),
+                    ),
+                });
             }
             Hit::RevealPath(path) if matches!(self.screen, Screen::Session | Screen::Subagent) => {
                 self.requests.push(AppRequest::RevealPath { path });
@@ -16075,6 +16202,7 @@ impl AppModel {
             if summary.models.is_empty() {
                 rows.push(ModelPickerRow {
                     provider: summary.provider.clone(),
+                    lockdown: !matches!(summary.trust, haider_rpc::ProviderTrustWire::Full),
                     model: String::new(),
                     auth,
                     context_window: None,
@@ -16090,6 +16218,7 @@ impl AppModel {
             for model in &summary.models {
                 rows.push(ModelPickerRow {
                     provider: summary.provider.clone(),
+                    lockdown: !matches!(summary.trust, haider_rpc::ProviderTrustWire::Full),
                     model: model.clone(),
                     auth,
                     context_window: self.providers.declared_window(&summary.provider, model),
@@ -16119,6 +16248,7 @@ impl AppModel {
             {
                 rows.push(ModelPickerRow {
                     provider: summary.provider.clone(),
+                    lockdown: !matches!(summary.trust, haider_rpc::ProviderTrustWire::Full),
                     model: self.identity.model_short.clone(),
                     auth,
                     context_window: None,
@@ -16196,6 +16326,27 @@ impl AppModel {
                     self.select_model_row(&row);
                 }
             }
+            KeyCode::Tab => {
+                let Some((query, selection, pending)) = self.model_picker.as_ref().map(|picker| {
+                    (
+                        picker.query.clone(),
+                        picker.selection,
+                        picker.pending.is_some(),
+                    )
+                }) else {
+                    return;
+                };
+                if pending {
+                    return;
+                }
+                if let Some(provider) = self
+                    .model_picker_filtered(&query)
+                    .get(selection)
+                    .map(|row| row.provider.clone())
+                {
+                    self.toggle_provider_trust(&provider);
+                }
+            }
             KeyCode::Backspace => {
                 if let Some(picker) = self.model_picker.as_mut() {
                     picker.query.pop();
@@ -16214,6 +16365,46 @@ impl AppModel {
             }
             _ => {}
         }
+    }
+
+    fn toggle_provider_trust(&mut self, provider_name: &str) {
+        let Some(summary) = self
+            .providers
+            .providers
+            .iter()
+            .find(|summary| summary.provider == provider_name)
+            .cloned()
+        else {
+            return;
+        };
+        // An unknown future value is never interpreted as Full authority;
+        // the first toggle normalizes it to today's Lockdown value.
+        let trust = if matches!(summary.trust, haider_rpc::ProviderTrustWire::Lockdown) {
+            haider_rpc::ProviderTrustWire::Full
+        } else {
+            haider_rpc::ProviderTrustWire::Lockdown
+        };
+        if self.mode.fabricates_locally() {
+            if let Some(provider) = self
+                .providers
+                .providers
+                .iter_mut()
+                .find(|provider| provider.provider == summary.provider)
+            {
+                provider.trust = trust;
+            }
+            self.providers.message = Some(format!("{} trust toggled (demo)", summary.provider));
+        } else if self.daemon_serves(haider_rpc::FEATURE_PROVIDER_LOCKDOWN_V1) {
+            self.providers.message = Some(format!("changing {} trust…", summary.provider));
+            self.requests.push(AppRequest::ProviderSetTrust {
+                provider: summary.provider,
+                trust,
+                expected_revision: self.providers.revision.unwrap_or(0),
+            });
+        } else {
+            self.providers.message = Some(self.stale_daemon_note("provider lockdown"));
+        }
+        self.dirty = true;
     }
 
     /// Selecting one picker row. Unavailable / placeholder rows show

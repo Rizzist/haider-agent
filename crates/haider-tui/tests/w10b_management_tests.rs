@@ -59,6 +59,7 @@ fn provider_summary(name: &str) -> haider_rpc::ProviderSummaryWire {
         availability_reason: None,
         default_model: Some("m-1".into()),
         enabled: true,
+        trust: haider_rpc::ProviderTrustWire::Full,
     }
 }
 

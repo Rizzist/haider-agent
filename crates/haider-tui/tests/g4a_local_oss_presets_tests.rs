@@ -54,6 +54,7 @@ fn keyless_summary(provider: &str, models: Vec<String>) -> haider_rpc::ProviderS
             .then(|| "provider model inventory is unavailable".to_owned()),
         default_model: None,
         enabled: true,
+        trust: haider_rpc::ProviderTrustWire::Full,
     }
 }
 

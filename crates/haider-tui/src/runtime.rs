@@ -1846,6 +1846,8 @@ impl DemoDriver {
             | AppRequest::AccountRemove { .. }
             | AppRequest::AccountImportDevice { .. }
             | AppRequest::ProviderRemove { .. }
+            | AppRequest::ProviderSetTrust { .. }
+            | AppRequest::LockdownStatus { .. }
             // Device credential discovery is live-only; demo has no host
             // credential stores and the reducer gate never pushes it.
             | AppRequest::DeviceCandidatesRefresh

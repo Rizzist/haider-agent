@@ -117,6 +117,89 @@ fn checkpoint_error_codes_and_typed_coordinates_are_pinned() {
     );
 }
 
+/// MUTATION CHECK: rename any lockdown event tag or drop a self-sufficient
+/// coordinate. Expected failure: native Pipe/ADE consumers can no longer
+/// route these facts without parsing prose or joining provider state.
+#[test]
+fn provider_lockdown_pipe_event_shapes_are_exact() {
+    let refused = serde_json::to_value(haider_protocol::EventPayload::LockdownRefused(
+        haider_protocol::lockdown::LockdownRefused {
+            provider: "research".into(),
+            tool: "peer_send".into(),
+            reason: "outside the fixed envelope".into(),
+            tools_allowed: vec!["fs_read".into(), "web_search".into()],
+        },
+    ))
+    .expect("encode lockdown refusal");
+    assert_eq!(
+        refused,
+        serde_json::json!({
+            "type": "lockdown.refused",
+            "provider": "research",
+            "tool": "peer_send",
+            "reason": "outside the fixed envelope",
+            "tools_allowed": ["fs_read", "web_search"]
+        })
+    );
+
+    let quota = serde_json::to_value(haider_protocol::EventPayload::LockdownQuota(
+        haider_protocol::lockdown::LockdownQuota {
+            provider: Some("research".into()),
+            used: 4_096,
+            limit: 1_073_741_824,
+        },
+    ))
+    .expect("encode lockdown quota");
+    assert_eq!(quota["type"], "lockdown.quota");
+    assert_eq!(quota["provider"], "research");
+    assert_eq!(quota["used"], 4_096);
+    assert_eq!(quota["limit"], 1_073_741_824_u64);
+
+    let changed = serde_json::to_value(haider_protocol::EventPayload::ProviderTrustChanged(
+        haider_protocol::lockdown::ProviderTrustChanged {
+            provider: "research".into(),
+            previous: "full".into(),
+            trust: "lockdown".into(),
+            revision: 13,
+        },
+    ))
+    .expect("encode provider trust change");
+    assert_eq!(changed["type"], "provider.trust_changed");
+    assert_eq!(changed["previous"], "full");
+    assert_eq!(changed["trust"], "lockdown");
+    assert_eq!(changed["revision"], 13);
+
+    let typed_refusal = serde_json::to_value(haider_rpc::ErrorData::RefusedByLockdown {
+        provider: "research".into(),
+        tool: "shell.exec".into(),
+        reason: "outside the fixed envelope".into(),
+        tools_allowed: vec!["fs_read".into(), "web_search".into()],
+    })
+    .expect("encode typed refusal");
+    assert_eq!(
+        typed_refusal,
+        serde_json::json!({
+            "kind": "refused_by_lockdown",
+            "provider": "research",
+            "tool": "shell.exec",
+            "reason": "outside the fixed envelope",
+            "tools_allowed": ["fs_read", "web_search"]
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(haider_rpc::ErrorData::LockdownQuotaExceeded {
+            used: 4_096,
+            limit: 1_073_741_824,
+        })
+        .expect("encode typed quota refusal"),
+        serde_json::json!({
+            "kind": "lockdown_quota_exceeded",
+            "used": 4_096,
+            "limit": 1_073_741_824_u64,
+        })
+    );
+}
+
 /// MUTATION CHECK: remove or rename any optional checkpoint coordinate.
 /// Expected runtime failure: the complete list/checkpoint JSON no longer
 /// matches this additive v0.0.964 field pin.
@@ -314,12 +397,17 @@ fn custom_provider_probe_wire_fields_are_pinned() {
         default_model: None,
         response_open_timeout_ms: Some(45_000),
         probe_vault_reference: Some("opaque-stage-reference".into()),
+        trust: Some(haider_rpc::ProviderTrustWire::Lockdown),
         expected_revision: 7,
     };
     let encoded = serde_json::to_value(&request).expect("serialize provider.configure");
     assert_eq!(
         encoded.get("probe_vault_reference").and_then(Value::as_str),
         Some("opaque-stage-reference")
+    );
+    assert_eq!(
+        encoded.get("trust").and_then(Value::as_str),
+        Some("lockdown")
     );
     assert!(matches!(
         serde_json::from_value::<RequestBody>(encoded).expect("decode provider.configure"),
@@ -553,6 +641,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "loom.unarchive",
         "loom.validate",
         "loom.watch",
+        "lockdown.set_quota",
+        "lockdown.status",
         "monitor.list",
         "monitor.register",
         "monitor.remove",
@@ -563,6 +653,7 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "provider.list",
         "provider.models_refresh",
         "provider.remove",
+        "provider.set_trust",
         "queue.list",
         "queue.promote_steer",
         "queue.remove",
@@ -628,12 +719,17 @@ fn every_request_method_has_a_golden_request_and_success_response() {
     assert_eq!(
         expected_methods.len(),
 <<<<<<< HEAD
+<<<<<<< HEAD
         106,
         "the v1 contract covers the 104 v0.0.964 methods plus peer.list and peer.send"
 =======
         117,
         "the v1 contract covers the prior 104 methods plus 13 SSH/shell-registry methods"
 >>>>>>> wave-965-c
+=======
+        107,
+        "the v1 contract covers the 104 pre-lockdown methods plus provider.set_trust and two lockdown methods"
+>>>>>>> wave-965-d
     );
     assert_eq!(
         request_methods_declared_in_source(),

@@ -94,6 +94,7 @@ pub use process::{
     ProcessLifecycleEvent, ProcessLimit, ProcessOutputChunk, ProcessResult, ProcessSignal,
     workspace_state_digest,
 };
+pub use redact::redact_lockdown_text;
 pub use request_input::{RequestInput, RequestInputAnswer, RequestInputKind, RequestInputOption};
 pub use shell::{
     BuiltinResult, ComposerSubmission, EnvViewEntry, OutputAdapter, REDACTED_ENV_VALUE,

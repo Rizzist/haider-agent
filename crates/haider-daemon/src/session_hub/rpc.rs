@@ -906,6 +906,24 @@ pub(super) fn filter_provider_summaries(
         .collect()
 }
 
+fn lockdown_status_wire(status: crate::lockdown::LockdownStatus) -> haider_rpc::LockdownStatusWire {
+    haider_rpc::LockdownStatusWire {
+        provider: status.provider,
+        tools_allowed: status.tools_allowed,
+        quota_used: status.quota_used,
+        quota_limit: status.quota_limit,
+    }
+}
+
+fn lockdown_refusal_error_data(provider: &str, tool: &str, reason: &str) -> haider_rpc::ErrorData {
+    haider_rpc::ErrorData::RefusedByLockdown {
+        provider: provider.to_owned(),
+        tool: tool.to_owned(),
+        reason: reason.to_owned(),
+        tools_allowed: crate::lockdown::allowed_tool_names(),
+    }
+}
+
 #[derive(Debug)]
 struct ObservedRun {
     state: RunState,
@@ -1149,6 +1167,7 @@ impl ObserveFoldSnapshot {
             latest_context_footprint: self.footprint.clone(),
             pending_menus: self.pending_menus.clone(),
             subagents: self.subagents.clone(),
+            lockdown: None,
             updated_at_ms: self.updated_at_ms,
             last_event_kinds: self.event_kinds[event_start..].to_vec(),
             turn_count: include_summary.then_some(self.turns),
@@ -1393,6 +1412,7 @@ async fn session_observe_digest(
     metadata_only: bool,
 ) -> Result<Option<haider_rpc::SessionObserveDigest>, SessionHubError> {
     let metadata = hub.inner.store.session_metadata(&session_id).await?;
+    let active_provider = metadata.as_ref().map(|metadata| metadata.provider.clone());
     let initial_model = metadata
         .as_ref()
         .map_or("", |metadata| metadata.model.as_str());
@@ -1423,7 +1443,45 @@ async fn session_observe_digest(
         )
     };
     digest.workflow = workflow;
+    digest.lockdown = active_provider
+        .as_deref()
+        .map(|provider| observed_lockdown_status(hub, Some(&digest.session_id), provider))
+        .transpose()?
+        .flatten();
+    for subagent in &mut digest.subagents {
+        subagent.lockdown = match (subagent.provider.as_deref(), subagent.lockdown_bound) {
+            (Some(provider), Some(true)) => Some(lockdown_status_wire(
+                crate::lockdown::global()
+                    .and_then(|manager| manager.status(Some(provider)))
+                    .map_err(|error| SessionHubError::Task(error.to_string()))?,
+            )),
+            (_, Some(false)) => None,
+            (Some(provider), None) => observed_lockdown_status(hub, None, provider)?,
+            (None, _) => None,
+        };
+    }
     Ok(Some(digest))
+}
+
+fn observed_lockdown_status(
+    hub: &SessionHub,
+    session_id: Option<&SessionId>,
+    provider: &str,
+) -> Result<Option<haider_rpc::LockdownStatusWire>, SessionHubError> {
+    let (provider, lockdown) = match session_id {
+        Some(session_id) => hub
+            .bound_session_lockdown(session_id)?
+            .unwrap_or((provider.to_owned(), hub.provider_lockdown_policy(provider)?)),
+        None => (provider.to_owned(), hub.provider_lockdown_policy(provider)?),
+    };
+    if !lockdown {
+        return Ok(None);
+    }
+    crate::lockdown::global()
+        .and_then(|manager| manager.status(Some(&provider)))
+        .map(lockdown_status_wire)
+        .map(Some)
+        .map_err(|error| SessionHubError::Task(error.to_string()))
 }
 
 impl ObserveProjection {
@@ -1561,6 +1619,11 @@ impl ObserveProjection {
                 self.menus.remove(menu.as_str());
             }
             EventPayload::AgentSpawned(manifest) => {
+                let lockdown_bound = manifest
+                    .coordinates
+                    .as_ref()
+                    .and_then(|coordinates| coordinates.get("lockdown"))
+                    .and_then(serde_json::Value::as_bool);
                 self.subagents.insert(
                     manifest.agent.as_str().to_owned(),
                     haider_rpc::ObserveSubagentWire {
@@ -1568,6 +1631,14 @@ impl ObserveProjection {
                         callsign: manifest.callsign,
                         task: manifest.task,
                         state: "thinking".into(),
+                        provider: manifest
+                            .coordinates
+                            .as_ref()
+                            .and_then(|coordinates| coordinates.get("provider"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(ToOwned::to_owned),
+                        lockdown_bound,
+                        lockdown: None,
                     },
                 );
             }
@@ -1581,6 +1652,9 @@ impl ObserveProjection {
                         callsign: None,
                         task: String::new(),
                         state,
+                        provider: None,
+                        lockdown_bound: None,
+                        lockdown: None,
                     });
             }
             EventPayload::AgentReport(report) => {
@@ -1659,6 +1733,7 @@ impl ObserveProjection {
             latest_context_footprint: self.footprint,
             pending_menus,
             subagents: self.subagents.into_values().collect(),
+            lockdown: None,
             updated_at_ms: self.updated_at_ms,
             last_event_kinds: self.event_kinds.into_iter().collect(),
             // Roster-truth fields are stamped by the observe handler from the
@@ -3631,6 +3706,29 @@ impl HubConnection {
                         None,
                     );
                 }
+                if let Some(provider) = self.session_lockdown_provider(&session_id).await? {
+                    self.journal_session_lockdown_refusal(
+                        &session_id,
+                        command_id.as_str(),
+                        &provider,
+                        "shell.exec",
+                        "direct shell execution is outside the fixed lockdown envelope",
+                    )
+                    .await?;
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_PERMISSION_DENIED,
+                        format!(
+                            "RefusedByLockdown {{ tool: shell.exec, reason: provider {provider} is in lockdown mode }}"
+                        ),
+                        false,
+                        Some(lockdown_refusal_error_data(
+                            &provider,
+                            "shell.exec",
+                            "direct shell execution is outside the fixed lockdown envelope",
+                        )),
+                    );
+                }
                 self.shell_exec(
                     request_id,
                     command_id,
@@ -3669,6 +3767,29 @@ impl HubConnection {
                         "direct shell execution requires a control attachment to this session",
                         false,
                         None,
+                    );
+                }
+                if let Some(provider) = self.session_lockdown_provider(&session_id).await? {
+                    self.journal_session_lockdown_refusal(
+                        &session_id,
+                        command_id.as_str(),
+                        &provider,
+                        "shell.exec",
+                        "direct shell execution is outside the fixed lockdown envelope",
+                    )
+                    .await?;
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_PERMISSION_DENIED,
+                        format!(
+                            "RefusedByLockdown {{ tool: shell.exec, reason: provider {provider} is in lockdown mode }}"
+                        ),
+                        false,
+                        Some(lockdown_refusal_error_data(
+                            &provider,
+                            "shell.exec",
+                            "direct shell execution is outside the fixed lockdown envelope",
+                        )),
                     );
                 }
                 self.shell_exec(
@@ -4017,6 +4138,7 @@ impl HubConnection {
                 default_model,
                 response_open_timeout_ms,
                 probe_vault_reference,
+                trust,
                 expected_revision,
             } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
@@ -4072,6 +4194,7 @@ impl HubConnection {
                         models,
                         default_model,
                         response_open_timeout_ms,
+                        trust,
                     },
                     probe_secret,
                     expected_revision,
@@ -4092,6 +4215,47 @@ impl HubConnection {
                     );
                 }
                 self.provider_remove(request_id, command_id, provider, expected_revision)
+            }
+            RequestBody::ProviderSetTrust {
+                command_id,
+                name: provider,
+                trust,
+                expected_revision,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.provider_set_trust(request_id, command_id, provider, trust, expected_revision)
+            }
+            RequestBody::LockdownStatus { provider } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.lockdown_status(request_id, provider.as_deref())
+            }
+            RequestBody::LockdownSetQuota { command_id, bytes } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.lockdown_set_quota(request_id, command_id, bytes).await
             }
             RequestBody::UsageReport => {
                 if let Err(message) = authorize(&self.capabilities, Operation::View) {
@@ -4187,6 +4351,30 @@ impl HubConnection {
                         },
                     });
                 }
+                if let Some(provider) = self.session_lockdown_provider(&session_id).await? {
+                    let reason = "monitor registration is outside the fixed lockdown envelope";
+                    self.journal_session_lockdown_refusal(
+                        &session_id,
+                        command_id.as_str(),
+                        &provider,
+                        "monitor.register",
+                        reason,
+                    )
+                    .await?;
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_PERMISSION_DENIED,
+                        format!(
+                            "RefusedByLockdown {{ tool: monitor.register, reason: provider {provider} is in lockdown mode }}"
+                        ),
+                        false,
+                        Some(lockdown_refusal_error_data(
+                            &provider,
+                            "monitor.register",
+                            reason,
+                        )),
+                    );
+                }
                 self.monitor_register(
                     request_id,
                     crate::monitor::MonitorClientRegistrationRequest {
@@ -4238,6 +4426,30 @@ impl HubConnection {
                             ),
                         },
                     });
+                }
+                if let Some(provider) = self.session_lockdown_provider(&session_id).await? {
+                    let reason = "monitor mutation is outside the fixed lockdown envelope";
+                    self.journal_session_lockdown_refusal(
+                        &session_id,
+                        command_id.as_str(),
+                        &provider,
+                        "monitor.remove",
+                        reason,
+                    )
+                    .await?;
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_PERMISSION_DENIED,
+                        format!(
+                            "RefusedByLockdown {{ tool: monitor.remove, reason: provider {provider} is in lockdown mode }}"
+                        ),
+                        false,
+                        Some(lockdown_refusal_error_data(
+                            &provider,
+                            "monitor.remove",
+                            reason,
+                        )),
+                    );
                 }
                 self.monitor_remove(
                     request_id,
@@ -4292,6 +4504,30 @@ impl HubConnection {
                         "opening computer permission settings requires a control attachment",
                         false,
                         None,
+                    );
+                }
+                if let Some(provider) = self.session_lockdown_provider(&session_id).await? {
+                    let reason = "GUI permission settings are outside the fixed lockdown envelope";
+                    self.journal_session_lockdown_refusal(
+                        &session_id,
+                        &permission_request_id,
+                        &provider,
+                        "computer.permission_open_settings",
+                        reason,
+                    )
+                    .await?;
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_PERMISSION_DENIED,
+                        format!(
+                            "RefusedByLockdown {{ tool: computer.permission_open_settings, reason: provider {provider} is in lockdown mode }}"
+                        ),
+                        false,
+                        Some(lockdown_refusal_error_data(
+                            &provider,
+                            "computer.permission_open_settings",
+                            reason,
+                        )),
                     );
                 }
                 self.computer_permission_open_settings(
@@ -4585,6 +4821,29 @@ impl HubConnection {
                         None,
                     );
                 }
+                if let Some(provider) = self.session_lockdown_provider(&session_id).await? {
+                    self.journal_session_lockdown_refusal(
+                        &session_id,
+                        command_id.as_str(),
+                        &provider,
+                        "checkpoint.undo",
+                        "checkpoint application is outside the fixed lockdown envelope",
+                    )
+                    .await?;
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_PERMISSION_DENIED,
+                        format!(
+                            "RefusedByLockdown {{ tool: checkpoint.undo, reason: provider {provider} is in lockdown mode }}"
+                        ),
+                        false,
+                        Some(lockdown_refusal_error_data(
+                            &provider,
+                            "checkpoint.undo",
+                            "checkpoint application is outside the fixed lockdown envelope",
+                        )),
+                    );
+                }
                 self.checkpoint_mutate(
                     request_id,
                     CheckpointDoorInput {
@@ -4613,6 +4872,29 @@ impl HubConnection {
                         None,
                     );
                 }
+                if let Some(provider) = self.session_lockdown_provider(&session_id).await? {
+                    self.journal_session_lockdown_refusal(
+                        &session_id,
+                        command_id.as_str(),
+                        &provider,
+                        "checkpoint.redo",
+                        "checkpoint application is outside the fixed lockdown envelope",
+                    )
+                    .await?;
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_PERMISSION_DENIED,
+                        format!(
+                            "RefusedByLockdown {{ tool: checkpoint.redo, reason: provider {provider} is in lockdown mode }}"
+                        ),
+                        false,
+                        Some(lockdown_refusal_error_data(
+                            &provider,
+                            "checkpoint.redo",
+                            "checkpoint application is outside the fixed lockdown envelope",
+                        )),
+                    );
+                }
                 self.checkpoint_mutate(
                     request_id,
                     CheckpointDoorInput {
@@ -4639,6 +4921,29 @@ impl HubConnection {
                         message,
                         false,
                         None,
+                    );
+                }
+                if let Some(provider) = self.session_lockdown_provider(&session_id).await? {
+                    self.journal_session_lockdown_refusal(
+                        &session_id,
+                        command_id.as_str(),
+                        &provider,
+                        "checkpoint.rollback_turn",
+                        "checkpoint application is outside the fixed lockdown envelope",
+                    )
+                    .await?;
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_PERMISSION_DENIED,
+                        format!(
+                            "RefusedByLockdown {{ tool: checkpoint.rollback_turn, reason: provider {provider} is in lockdown mode }}"
+                        ),
+                        false,
+                        Some(lockdown_refusal_error_data(
+                            &provider,
+                            "checkpoint.rollback_turn",
+                            "checkpoint application is outside the fixed lockdown envelope",
+                        )),
                     );
                 }
                 self.checkpoint_mutate(
@@ -7299,6 +7604,306 @@ impl HubConnection {
                 },
             )),
         )
+    }
+
+    fn provider_set_trust(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        provider: String,
+        trust: haider_rpc::ProviderTrustWire,
+        expected_revision: u64,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().trim().is_empty()
+            || provider.trim().is_empty()
+            || matches!(trust, haider_rpc::ProviderTrustWire::Unknown)
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "provider-trust command id/provider must not be empty and trust must be full or lockdown",
+                false,
+                None,
+            );
+        }
+        self.send_management_command(
+            request_id.clone(),
+            crate::accounts::AccountCommand::SetProviderTrust(Box::new(
+                crate::accounts::ProviderSetTrustJob {
+                    command_id: command_id.0,
+                    provider,
+                    trust,
+                    expected_revision,
+                    route: crate::accounts::LoginRoute {
+                        request_id,
+                        sink: Arc::clone(&self.sink),
+                    },
+                },
+            )),
+        )
+    }
+
+    fn lockdown_status(
+        &self,
+        request_id: RequestId,
+        provider: Option<&str>,
+    ) -> Result<(), SessionHubError> {
+        match crate::lockdown::global().and_then(|manager| manager.status(provider)) {
+            Ok(status) => self.send(WireFrame::Response {
+                request_id,
+                body: ResponseBody::LockdownStatus {
+                    status: lockdown_status_wire(status),
+                },
+            }),
+            Err(error) => self.respond_error(
+                request_id,
+                haider_rpc::ERROR_CODE_PROVIDER_ERROR,
+                error.to_string(),
+                false,
+                None,
+            ),
+        }
+    }
+
+    async fn session_lockdown_provider(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<String>, SessionHubError> {
+        let Some(metadata) = self.hub.session_metadata(session_id).await? else {
+            return Ok(None);
+        };
+        let (provider, lockdown) = self.hub.bound_session_lockdown(session_id)?.unwrap_or((
+            metadata.provider.clone(),
+            self.hub.provider_lockdown_policy(&metadata.provider)?,
+        ));
+        Ok(lockdown.then_some(provider))
+    }
+
+    async fn journal_session_lockdown_refusal(
+        &self,
+        session_id: &SessionId,
+        command_id: &str,
+        provider: &str,
+        tool: &str,
+        reason: &str,
+    ) -> Result<(), SessionHubError> {
+        let payload = serde_json::to_value(EventPayload::LockdownRefused(
+            haider_protocol::lockdown::LockdownRefused {
+                provider: provider.to_owned(),
+                tool: tool.to_owned(),
+                reason: reason.to_owned(),
+                tools_allowed: crate::lockdown::ALLOWED_TOOLS
+                    .iter()
+                    .map(|tool| (*tool).to_owned())
+                    .collect(),
+            },
+        ))
+        .map_err(|error| SessionHubError::Task(error.to_string()))?;
+        let event_id = EventId::new(format!("lockdown-refusal-{command_id}-{tool}"));
+        let mut cursor = 0_u64;
+        loop {
+            let page =
+                haider_core::StoreHandle::read(&self.hub.inner.store, session_id, cursor, 512)
+                    .await?;
+            if page.is_empty() {
+                break;
+            }
+            if page
+                .iter()
+                .any(|envelope| envelope.event_id == event_id && envelope.payload == payload)
+            {
+                return Ok(());
+            }
+            let Some(next) = page.last().map(|envelope| envelope.seq) else {
+                break;
+            };
+            if next <= cursor {
+                return Err(SessionHubError::Task(
+                    "lockdown refusal journal scan did not advance".to_owned(),
+                ));
+            }
+            cursor = next;
+        }
+        let mut envelope = haider_protocol::envelope::EventEnvelope {
+            schema_version: haider_protocol::envelope::SCHEMA_VERSION,
+            event_id,
+            seq: 0,
+            session_id: session_id.clone(),
+            branch_id: None,
+            run_id: None,
+            agent_id: None,
+            device_id: DeviceId::new("lockdown-permission-broker"),
+            authority_epoch: 0,
+            worker_generation: self.hub.inner.store.worker_generation(),
+            causation_id: None,
+            correlation_id: None,
+            committed_at_ms: 0,
+            render: haider_protocol::envelope::RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: haider_protocol::envelope::PromptRender::Omit,
+            },
+            payload,
+        };
+        haider_core::StoreHandle::append(
+            &self.hub.inner.store,
+            std::slice::from_mut(&mut envelope),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn lockdown_set_quota(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        bytes: u64,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().trim().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "lockdown quota command id must not be empty",
+                false,
+                None,
+            );
+        }
+        match crate::lockdown::global()
+            .and_then(|manager| manager.set_quota_command(command_id.as_str(), bytes))
+        {
+            Ok(status) => {
+                self.journal_lockdown_quota(command_id.as_str(), &status)
+                    .await?;
+                self.send(WireFrame::Response {
+                    request_id,
+                    body: ResponseBody::LockdownSetQuota {
+                        status: lockdown_status_wire(status),
+                    },
+                })
+            }
+            Err(crate::lockdown::LockdownError::LockdownQuotaExceeded { used, limit }) => self
+                .respond_error(
+                    request_id,
+                    haider_rpc::ERROR_CODE_LOCKDOWN_QUOTA_EXCEEDED,
+                    format!("LockdownQuotaExceeded {{ used: {used}, limit: {limit} }}"),
+                    false,
+                    Some(haider_rpc::ErrorData::LockdownQuotaExceeded { used, limit }),
+                ),
+            Err(crate::lockdown::LockdownError::QuotaCommandConflict { command_id }) => self
+                .respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    format!(
+                        "lockdown quota command `{command_id}` was already used with different bytes"
+                    ),
+                    false,
+                    None,
+                ),
+            Err(error) => self.respond_error(
+                request_id,
+                haider_rpc::ERROR_CODE_PROVIDER_ERROR,
+                error.to_string(),
+                false,
+                None,
+            ),
+        }
+    }
+
+    async fn journal_lockdown_quota(
+        &self,
+        command_id: &str,
+        status: &crate::lockdown::LockdownStatus,
+    ) -> Result<(), SessionHubError> {
+        let providers = self
+            .hub
+            .accounts()?
+            .and_then(|accounts| accounts.management.read())
+            .map(|view| {
+                view.providers
+                    .into_iter()
+                    .filter(|provider| {
+                        !matches!(provider.trust, haider_rpc::ProviderTrustWire::Full)
+                    })
+                    .map(|provider| provider.provider)
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let payload = serde_json::to_value(EventPayload::LockdownQuota(
+            haider_protocol::lockdown::LockdownQuota {
+                provider: None,
+                used: status.quota_used,
+                limit: status.quota_limit,
+            },
+        ))
+        .map_err(|error| SessionHubError::Task(error.to_string()))?;
+        let event_id = EventId::new(format!("lockdown-quota-{command_id}"));
+        for session_id in self.hub.inner.store.session_ids().await? {
+            let Some(metadata) = self.hub.inner.store.session_metadata(&session_id).await? else {
+                continue;
+            };
+            let lockdown = self.hub.bound_session_lockdown(&session_id)?.map_or_else(
+                || providers.contains(&metadata.provider),
+                |(_, lockdown)| lockdown,
+            );
+            if !lockdown {
+                continue;
+            }
+            let mut cursor = 0_u64;
+            let mut exists = false;
+            loop {
+                let page =
+                    haider_core::StoreHandle::read(&self.hub.inner.store, &session_id, cursor, 512)
+                        .await?;
+                if page.is_empty() {
+                    break;
+                }
+                exists = page
+                    .iter()
+                    .any(|envelope| envelope.event_id == event_id && envelope.payload == payload);
+                if exists {
+                    break;
+                }
+                let Some(next) = page.last().map(|envelope| envelope.seq) else {
+                    break;
+                };
+                if next <= cursor {
+                    return Err(SessionHubError::Task(
+                        "lockdown quota journal scan did not advance".to_owned(),
+                    ));
+                }
+                cursor = next;
+            }
+            if exists {
+                continue;
+            }
+            let mut envelope = haider_protocol::envelope::EventEnvelope {
+                schema_version: haider_protocol::envelope::SCHEMA_VERSION,
+                event_id: event_id.clone(),
+                seq: 0,
+                session_id,
+                branch_id: None,
+                run_id: None,
+                agent_id: None,
+                device_id: DeviceId::new("lockdown-management"),
+                authority_epoch: 0,
+                worker_generation: self.hub.inner.store.worker_generation(),
+                causation_id: None,
+                correlation_id: None,
+                committed_at_ms: 0,
+                render: haider_protocol::envelope::RenderTargets {
+                    ui: true,
+                    durable: true,
+                    prompt: haider_protocol::envelope::PromptRender::Omit,
+                },
+                payload: payload.clone(),
+            };
+            haider_core::StoreHandle::append(
+                &self.hub.inner.store,
+                std::slice::from_mut(&mut envelope),
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     fn provider_models_refresh(

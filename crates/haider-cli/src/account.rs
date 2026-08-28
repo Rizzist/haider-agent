@@ -10,8 +10,8 @@ use haider_client::{ClientError, EnsureError, EnsureOptions, ProfileEnv, resolve
 use haider_protocol::credential::{AuthMethod, CredentialDescriptor};
 use haider_rpc::{
     Capability, CapabilitySet, ClientKind, CommandId, ErrorData, ProviderApiFamilyWire,
-    ProviderAuthRequirementWire, ProviderProbeFailureWire, ProviderSummaryWire, RequestBody,
-    ResponseBody, SecretWire, SnapshotAvailabilityWire, StagePurpose,
+    ProviderAuthRequirementWire, ProviderProbeFailureWire, ProviderSummaryWire, ProviderTrustWire,
+    RequestBody, ResponseBody, SecretWire, SnapshotAvailabilityWire, StagePurpose,
 };
 use serde::Serialize;
 use zeroize::Zeroizing;
@@ -60,6 +60,7 @@ pub(crate) struct CustomAccountOptions {
     secret: Option<SecretInput>,
     api_family: Option<ProviderApiFamilyWire>,
     response_open_timeout_ms: Option<u64>,
+    trust: Option<ProviderTrustWire>,
     json: bool,
 }
 
@@ -252,7 +253,7 @@ pub(crate) fn parse_account_command(rest: &[String]) -> Result<AccountCommand, S
 }
 
 fn account_usage() -> String {
-    "expected list [--json], import <codex|claude-code> [--confirm], refresh <alias>, remove <alias> --confirm, add <alias> --base-url <url> [--api-key <key> | --api-key-env <VAR> | --api-key-stdin | --no-auth] [--api-family openai|anthropic] [--response-open-timeout <duration>] [--json], probe <alias> [--json], or update <alias> [mutable options] [--json]".into()
+    "expected list [--json], import <codex|claude-code> [--confirm], refresh <alias>, remove <alias> --confirm, add <alias> --base-url <url> [--api-key <key> | --api-key-env <VAR> | --api-key-stdin | --no-auth] [--api-family openai|anthropic] [--response-open-timeout <duration>] [--lockdown|--full] [--json], probe <alias> [--json], or update <alias> [mutable options] [--json]".into()
 }
 
 fn parse_custom_options(
@@ -264,6 +265,7 @@ fn parse_custom_options(
     let mut secret = None;
     let mut api_family = None;
     let mut response_open_timeout_ms = None;
+    let mut trust = None;
     let mut json = false;
     let mut index = 0;
     while index < rest.len() {
@@ -300,6 +302,8 @@ fn parse_custom_options(
             "--response-open-timeout" if response_open_timeout_ms.is_none() => {
                 response_open_timeout_ms = Some(parse_duration_ms(value(&mut index, flag)?)?);
             }
+            "--lockdown" if trust.is_none() => trust = Some(ProviderTrustWire::Lockdown),
+            "--full" if trust.is_none() => trust = Some(ProviderTrustWire::Full),
             "--json" if !json => json = true,
             _ if matches!(
                 flag,
@@ -331,12 +335,18 @@ fn parse_custom_options(
             "account update does not change --api-family; remove and re-add the provider".into(),
         );
     }
+    if !create && trust.is_some() {
+        return Err(
+            "account update does not change provider trust; use `haider provider set`".into(),
+        );
+    }
     Ok(CustomAccountOptions {
         alias: alias.to_owned(),
         base_url,
         secret,
         api_family: api_family.or(create.then_some(ProviderApiFamilyWire::OpenAiChatCompletions)),
         response_open_timeout_ms,
+        trust,
         json,
     })
 }
@@ -425,6 +435,9 @@ pub(crate) async fn account_command(rest: &[String]) -> ExitCode {
     if matches!(&command, AccountCommand::Add(_) | AccountCommand::Update(_)) {
         required_features.insert(haider_rpc::FEATURE_PROVIDER_CONFIGURE_V1.to_owned());
         required_features.insert(haider_rpc::FEATURE_PROVIDER_MODELS_V1.to_owned());
+    }
+    if matches!(&command, AccountCommand::Add(_)) {
+        required_features.insert(haider_rpc::FEATURE_PROVIDER_LOCKDOWN_V1.to_owned());
     }
     if matches!(&command, AccountCommand::Probe { .. }) {
         required_features.insert(haider_rpc::FEATURE_PROVIDER_MODELS_V1.to_owned());
@@ -735,6 +748,7 @@ async fn execute_custom(
             default_model: existing.and_then(|provider| provider.default_model.clone()),
             response_open_timeout_ms: options.response_open_timeout_ms,
             probe_vault_reference: vault_reference.clone(),
+            trust: options.trust,
             expected_revision: revision,
         })
         .await

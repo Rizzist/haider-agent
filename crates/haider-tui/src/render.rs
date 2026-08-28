@@ -399,6 +399,10 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
     } else if model.monitors_open {
         render_monitors_overlay(model, theme, frame, body, &mut hits);
     }
+    if model.lockdown_overlay {
+        render_lockdown_overlay(model, theme, frame, body);
+        hits.clear();
+    }
     if status_height > 0 {
         render_status_bar(model, theme, frame, status, &mut hits);
     }
@@ -2149,6 +2153,11 @@ fn render_providers(
             Span::raw("  "),
             Span::styled(format!("{dot} {health}"), dot_style),
         ]);
+        if !matches!(summary.trust, haider_rpc::ProviderTrustWire::Full) {
+            header
+                .spans
+                .push(Span::styled("  🔒 lockdown", theme.gold_style()));
+        }
         if model.providers.cursor == index {
             header = hover_band(header, true, area.width, theme);
         }
@@ -2262,7 +2271,7 @@ fn render_providers(
     // G4a: the preset roster outgrew one hint line at narrow widths — the
     // key map splits into the action line and the preset line so `esc back`
     // stays visible at 100-118 columns.
-    let hint = "click a model to set the default · e edits · x removes · f refresh · esc back";
+    let hint = "model click sets default · t trust · e edit · x remove · f refresh · esc back";
     let preset_hint = "presets: h HuggingFace · z Zen · g Go · o Ollama · l LM Studio";
     let enterprise_hint = "named: d DeepSeek · enterprise: a Azure · b Bedrock · v Vertex";
     let mut footer_lines: Vec<Line<'_>> = Vec::new();
@@ -3770,7 +3779,17 @@ fn render_model_picker(
             ),
             Span::styled(default_mark.to_owned(), theme.gold_style()),
             Span::raw(" "),
-            Span::styled(format!("{:<provider_w$}", row.provider), ink),
+            Span::styled(
+                format!(
+                    "{:<provider_w$}",
+                    if row.lockdown {
+                        format!("🔒 {}", row.provider)
+                    } else {
+                        row.provider.clone()
+                    }
+                ),
+                ink,
+            ),
             Span::raw(" "),
             Span::styled(format!("{:<5}", row.auth), theme.dim_style()),
             Span::styled(
@@ -3827,7 +3846,7 @@ fn render_model_picker(
     }
     frame.render_widget(
         Paragraph::new(Line::styled(
-            " ⏎ select · esc close · ↑↓ move · type to search",
+            " ⏎ select · tab toggle trust · esc close · ↑↓ move · type to search",
             theme.faint_style(),
         )),
         hint_area,
@@ -6435,6 +6454,9 @@ fn render_subtree(
                     ));
                 }
             }
+            if chip.lockdown {
+                spans.push(Span::styled(" · 🔒", theme.gold_style()));
+            }
             if let Some(roll) = chip.graph.as_ref().filter(|_| !chip.closed) {
                 // Sim: the NAME stays put while the workflow identity and
                 // its current position rotate beside it.
@@ -8485,6 +8507,9 @@ fn render_subagent(
         ),
         theme.dim_style(),
     )];
+    if chip.lockdown {
+        header_bottom.push(Span::styled("🔒 lockdown  ", theme.gold_style()));
+    }
     if let Some(handoff) = chip
         .handoff_dir
         .as_deref()
@@ -8993,6 +9018,11 @@ fn render_aura(
                     Span::styled(text.as_str(), theme.dim_style()),
                 ]));
             }
+            TranscriptEntry::Refusal {
+                provider,
+                tool,
+                reason,
+            } => refusal_entry_line(&mut lines, provider, tool, reason, theme),
             TranscriptEntry::Error { text, presentation } => {
                 // The same card-shaped treatment as the session view
                 // (title / detail / fact line via one shared helper).
@@ -10984,6 +11014,7 @@ fn render_help(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
     );
 }
 
+<<<<<<< HEAD
 /// Floating terminal-registry details. This reuses the existing body overlay
 /// layer and status strip; it never allocates new top-level chrome.
 fn render_shells_overlay(
@@ -11188,10 +11219,58 @@ fn render_ssh_form(
     .areas(area);
     frame.render_widget(
         Paragraph::new(Text::from(lines)).style(theme.text_style().bg(theme.bar_bg.into())),
+=======
+/// Compact, non-modal explanation for the persistent lockdown status chip.
+fn render_lockdown_overlay(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
+    let status = model.lockdown_status.as_ref();
+    let provider = status
+        .and_then(|status| status.provider.as_deref())
+        .unwrap_or(model.identity.provider.as_str());
+    let (used, limit) = status.map_or((0, 0), |status| (status.quota_used, status.quota_limit));
+    let allowed = "workspace/sandbox read · redacted search · web · text/plan · sandbox write";
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("🔒 provider lockdown", theme.gold_style()),
+            Span::styled("  any key closes", theme.faint_style()),
+        ]),
+        Line::styled(format!("provider  {provider}"), theme.bright_style()),
+        Line::styled(
+            "denied  shell/SSH · peer send · hooks/MCP · monitors · checkpoints · external writes",
+            theme.dim_style(),
+        ),
+        Line::styled(format!("available  {allowed}"), theme.dim_style()),
+        Line::styled(
+            format!("global quota  {} / {}", fmt_bytes(used), fmt_bytes(limit)),
+            theme.text_style(),
+        ),
+    ];
+    let panel_width = area.width.min(92);
+    let panel_height = area
+        .height
+        .min(u16::try_from(lines.len() + 2).unwrap_or(area.height));
+    let [_, centered, _] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(panel_height),
+        Constraint::Min(0),
+    ])
+    .areas(area);
+    let [_, panel, _] = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(panel_width),
+        Constraint::Min(0),
+    ])
+    .areas(centered);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(Block::bordered().style(theme.frame_style()))
+            .wrap(Wrap { trim: true })
+            .style(theme.text_style().bg(theme.bar_bg.into())),
+>>>>>>> wave-965-d
         panel,
     );
 }
 
+<<<<<<< HEAD
 fn render_ssh_terminal(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
     let Some(terminal) = model.ssh_terminal.as_ref() else {
         return;
@@ -11295,6 +11374,21 @@ fn render_monitors_overlay(
         Paragraph::new(Text::from(lines)).style(theme.text_style().bg(theme.bar_bg.into())),
         panel,
     );
+=======
+fn fmt_bytes(bytes: u64) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    const KIB: u64 = 1024;
+    if bytes >= GIB {
+        format!("{}.{:02} GiB", bytes / GIB, (bytes % GIB) * 100 / GIB)
+    } else if bytes >= MIB {
+        format!("{}.{:01} MiB", bytes / MIB, (bytes % MIB) * 10 / MIB)
+    } else if bytes >= KIB {
+        format!("{}.{:01} KiB", bytes / KIB, (bytes % KIB) * 10 / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+>>>>>>> wave-965-d
 }
 
 /// One text run of the status bar's bottom-left strip: the content and
@@ -11416,6 +11510,16 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
             action: None,
         },
     ];
+    if let Some(provider) = model.active_lockdown_provider() {
+        let text = format!("  🔒 lockdown · {provider}");
+        badge_cells += text.chars().count();
+        segments.push(StatusSegment {
+            text,
+            tone: StatusSegmentTone::Hook,
+            state: None,
+            detail: Some("read/search/web/text/plan plus quota-limited sandbox writes".to_owned()),
+        });
+    }
     if let Some(progress) = model.provider_wait_progress()
         && badge_cells + progress.chars().count() + 2 <= width as usize
     {
@@ -11702,6 +11806,27 @@ fn render_status_bar(
         Paragraph::new(Line::from(left)).style(theme.text_style()),
         left_area,
     );
+    if let Some(provider) = model.active_lockdown_provider() {
+        let prefix = status_left_string(model, area.width);
+        let marker = format!("🔒 lockdown · {provider}");
+        if let Some(byte_offset) = prefix.find(&marker) {
+            let x_offset = Line::from(prefix[..byte_offset].to_owned()).width();
+            let marker_width = Line::from(marker).width();
+            if let (Ok(x_offset), Ok(marker_width)) =
+                (u16::try_from(x_offset), u16::try_from(marker_width))
+            {
+                hits.push((
+                    Rect {
+                        x: area.x.saturating_add(x_offset),
+                        y: area.y,
+                        width: marker_width.min(left_area.width.saturating_sub(x_offset)),
+                        height: 1,
+                    },
+                    Hit::LockdownStatus,
+                ));
+            }
+        }
+    }
     if right_width > 0 {
         frame.render_widget(
             Paragraph::new(Line::styled(right, theme.dim_style()))
@@ -11788,6 +11913,11 @@ fn transcript_lines<'a>(
                 Span::styled(text.as_str(), theme.dim_style()),
             ]));
         }
+        TranscriptEntry::Refusal {
+            provider,
+            tool,
+            reason,
+        } => refusal_entry_line(lines, provider, tool, reason, theme),
         TranscriptEntry::Error { text, presentation } => {
             error_entry_lines(lines, text, presentation.as_ref(), theme, width);
         }
@@ -11807,6 +11937,26 @@ fn transcript_lines<'a>(
             }
         }
     }
+}
+
+fn refusal_entry_line(
+    lines: &mut Vec<Line<'_>>,
+    provider: &str,
+    tool: &str,
+    reason: &str,
+    theme: &Theme,
+) {
+    lines.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            "🔒 refused",
+            theme.gold_style().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" · {provider} · {tool} — {reason}"),
+            theme.dim_style(),
+        ),
+    ]));
 }
 
 fn peer_entry_lines<'a>(

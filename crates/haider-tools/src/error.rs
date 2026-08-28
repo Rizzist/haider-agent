@@ -24,6 +24,14 @@ pub struct FsEditAnchorMismatch {
 /// Typed failures at the tool boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolError {
+    RefusedByLockdown {
+        tool: String,
+        reason: String,
+    },
+    LockdownQuotaExceeded {
+        used: u64,
+        limit: u64,
+    },
     InvalidArgument {
         message: String,
     },
@@ -120,6 +128,14 @@ impl ToolError {
 impl std::fmt::Display for ToolError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::RefusedByLockdown { tool, reason } => write!(
+                formatter,
+                "RefusedByLockdown {{ tool: {tool}, reason: {reason} }}"
+            ),
+            Self::LockdownQuotaExceeded { used, limit } => write!(
+                formatter,
+                "LockdownQuotaExceeded {{ used: {used}, limit: {limit} }}"
+            ),
             Self::InvalidArgument { message } => formatter.write_str(message),
             Self::PermissionDenied { reason } => {
                 write!(formatter, "effect denied by policy: {reason}")

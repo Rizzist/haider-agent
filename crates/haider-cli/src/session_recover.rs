@@ -563,6 +563,7 @@ mod tests {
             latest_context_footprint: None,
             pending_menus: menus,
             subagents: Vec::new(),
+            lockdown: None,
             updated_at_ms: 0,
             last_event_kinds: Vec::new(),
             turn_count: None,

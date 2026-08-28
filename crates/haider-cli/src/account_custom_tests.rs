@@ -66,6 +66,7 @@ fn provider() -> ProviderSummaryWire {
         availability_reason: None,
         default_model: Some("alpha".into()),
         enabled: true,
+        trust: haider_rpc::ProviderTrustWire::Full,
     }
 }
 
@@ -178,6 +179,7 @@ async fn keyed_add_reuses_one_stage_for_discovery_and_login() {
             ))),
             api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
             response_open_timeout_ms: Some(45_000),
+            trust: None,
             json: true,
         }),
     )
@@ -231,6 +233,7 @@ async fn no_auth_add_skips_vault_and_login_and_discovers_empty_input() {
             secret: Some(SecretInput::NoAuth),
             api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
             response_open_timeout_ms: None,
+            trust: None,
             json: true,
         }),
     )
@@ -355,6 +358,7 @@ async fn update_base_key_and_timeout_preserves_immutable_shape() {
             ))),
             api_family: None,
             response_open_timeout_ms: Some(90_000),
+            trust: None,
             json: true,
         }),
     )

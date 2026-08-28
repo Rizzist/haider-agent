@@ -310,6 +310,7 @@ async fn mobile_dispatcher_fixture_with_grant(
     let dispatcher = TurnToolFactory::create(
         &factory,
         WorkerToolContext {
+            lockdown: None,
             diagnostics: None,
             metadata: SessionMetadataV1 {
                 cwd,

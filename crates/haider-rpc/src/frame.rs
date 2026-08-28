@@ -186,6 +186,9 @@ pub const ERROR_CODE_UNAUTHORIZED: &str = "unauthorized";
 /// Stable code for an authenticated identity that lacks permission for the
 /// selected model/endpoint (HTTP 403). Non-retryable.
 pub const ERROR_CODE_PERMISSION_DENIED: &str = "permission_denied";
+/// Stable code for a write or quota reduction refused by the shared
+/// provider-lockdown byte ceiling.
+pub const ERROR_CODE_LOCKDOWN_QUOTA_EXCEEDED: &str = "lockdown_quota_exceeded";
 /// Stable code for an operation that needs a credential no account provides.
 pub const ERROR_CODE_CREDENTIAL_MISSING: &str = "credential_missing";
 /// Stable code for a platform without a working secret vault (R10: the W3c
@@ -558,6 +561,9 @@ pub const FEATURE_LOOM_REGISTRY_WATCH_V1: &str = "loom_registry_watch_v1";
 pub const FEATURE_ACCOUNT_IDENTITY_V1: &str = "account_identity_v1";
 /// Durable bounded workspace pre-images plus receipted undo/redo/rollback.
 pub const FEATURE_CHECKPOINT_V1: &str = "checkpoint_v1";
+/// Daemon-enforced provider trust ceilings, the fixed lockdown envelope, and
+/// the machine-user-wide lockdown quota.
+pub const FEATURE_PROVIDER_LOCKDOWN_V1: &str = "provider_lockdown_v1";
 
 /// Maximum UTF-8 bytes accepted for one mirrored input value or injected text.
 pub const SURFACE_INPUT_MAX_BYTES: usize = 64 * 1024;
@@ -1178,6 +1184,32 @@ pub struct ModelDetailWire {
 }
 
 /// One provider's read-only management projection.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ProviderTrustWire {
+    /// Full compatibility for built-ins and records created before lockdown
+    /// trust existed.
+    #[default]
+    Full,
+    /// The daemon applies the fixed reduced tool envelope at every turn.
+    Lockdown,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Self-sufficient lockdown state exposed to clients and child projections.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockdownStatusWire {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools_allowed: Vec<String>,
+    pub quota_used: u64,
+    pub quota_limit: u64,
+}
+
+/// One provider's read-only management projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderSummaryWire {
     pub provider: String,
@@ -1209,6 +1241,10 @@ pub struct ProviderSummaryWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
     pub enabled: bool,
+    /// Missing on older daemon payloads means Full, preserving upgrade
+    /// behavior for every provider that predates lockdown mode.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub trust: ProviderTrustWire,
 }
 
 impl ProviderSummaryWire {
@@ -1986,6 +2022,16 @@ pub struct ObserveSubagentWire {
     pub callsign: Option<String>,
     pub task: String,
     pub state: String,
+    /// Provider selected for this child. Absent on observations reduced from
+    /// manifests written before provider lockdown state was exposed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Daemon-internal turn-boundary pin carried through the observe fold.
+    /// It is never serialized; `lockdown` is the public self-sufficient view.
+    #[serde(skip)]
+    pub lockdown_bound: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lockdown: Option<LockdownStatusWire>,
 }
 
 /// One read-only digest reduced from committed daemon truth.
@@ -2017,6 +2063,11 @@ pub struct SessionObserveDigest {
     pub pending_menus: Vec<ObserveMenuWire>,
     #[serde(default)]
     pub subagents: Vec<ObserveSubagentWire>,
+    /// The capability ceiling frozen for the active model provider at its
+    /// accepted turn boundary. A trust toggle changes the following turn,
+    /// never this observed in-flight run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lockdown: Option<LockdownStatusWire>,
     pub updated_at_ms: u64,
     #[serde(default)]
     pub last_event_kinds: Vec<String>,
@@ -3579,6 +3630,10 @@ pub enum RequestBody {
         /// leaves the same reference available to `account.login_api`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         probe_vault_reference: Option<String>,
+        /// Omission preserves an existing record's trust and defaults a new
+        /// custom provider to Lockdown in the daemon.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trust: Option<ProviderTrustWire>,
         expected_revision: u64,
     },
     /// Durably removes one custom provider. Release-owned providers and
@@ -3826,6 +3881,7 @@ pub enum RequestBody {
         run_id: RunId,
     },
 <<<<<<< HEAD
+<<<<<<< HEAD
     /// Lists every currently live Haider session and registered external peer.
     #[serde(rename = "peer.list")]
     PeerList {},
@@ -3903,6 +3959,28 @@ pub enum RequestBody {
     #[serde(rename = "shell.close")]
     ShellClose { id: String },
 >>>>>>> wave-965-c
+=======
+    /// Changes the provider ceiling. Live sessions snapshot this value only
+    /// at their next turn boundary.
+    #[serde(rename = "provider.set_trust")]
+    ProviderSetTrust {
+        command_id: CommandId,
+        name: String,
+        trust: ProviderTrustWire,
+        expected_revision: u64,
+    },
+    /// Returns the global envelope/quota, optionally with one provider's
+    /// active trust coordinate.
+    #[serde(rename = "lockdown.status")]
+    LockdownStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+    },
+    /// Sets the machine-user-wide byte ceiling shared across profiles and
+    /// lockdown providers.
+    #[serde(rename = "lockdown.set_quota")]
+    LockdownSetQuota { command_id: CommandId, bytes: u64 },
+>>>>>>> wave-965-d
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline). W3b answers it with a protocol error, not a panic.
     #[serde(other)]
@@ -4668,6 +4746,7 @@ pub enum ResponseBody {
         receipt: haider_protocol::checkpoint::CheckpointMutationReceipt,
     },
 <<<<<<< HEAD
+<<<<<<< HEAD
     #[serde(rename = "peer.list")]
     PeerList { agents: Vec<PeerDescriptor> },
     #[serde(rename = "peer.send")]
@@ -4703,6 +4782,17 @@ pub enum ResponseBody {
     #[serde(rename = "shell.close")]
     ShellClose { shell: ShellWire },
 >>>>>>> wave-965-c
+=======
+    #[serde(rename = "provider.set_trust")]
+    ProviderSetTrust {
+        provider: ProviderSummaryWire,
+        revision: u64,
+    },
+    #[serde(rename = "lockdown.status")]
+    LockdownStatus { status: LockdownStatusWire },
+    #[serde(rename = "lockdown.set_quota")]
+    LockdownSetQuota { status: LockdownStatusWire },
+>>>>>>> wave-965-d
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline).
     #[serde(other)]
@@ -4898,8 +4988,22 @@ pub enum ErrorData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         requested_branch_id: Option<BranchId>,
     },
+<<<<<<< HEAD
     /// Candidates returned when a bare peer name is not unique.
     PeerAmbiguous { candidates: Vec<PeerCandidate> },
+=======
+    /// A daemon provider ceiling refused an operation before ordinary user
+    /// Ask/Allow policy. Clients render this as a refusal, not a failure.
+    RefusedByLockdown {
+        provider: String,
+        tool: String,
+        reason: String,
+        tools_allowed: Vec<String>,
+    },
+    /// A sandbox write or quota reduction would exceed the shared
+    /// machine-user-wide byte ceiling.
+    LockdownQuotaExceeded { used: u64, limit: u64 },
+>>>>>>> wave-965-d
     /// Decode artifact for a data kind this crate does not know (tolerance
     /// discipline).
     #[serde(other)]

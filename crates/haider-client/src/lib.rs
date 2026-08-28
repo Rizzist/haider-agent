@@ -24,6 +24,7 @@ pub mod checkpoint;
 pub mod client;
 pub mod graph;
 pub mod headless;
+pub mod lockdown;
 pub mod observe;
 pub mod peer;
 pub mod permission;
@@ -62,6 +63,10 @@ pub use headless::{
     required_headless_features, required_headless_features_with_attachments,
     required_headless_features_with_hook_trust, run_headless, run_headless_with_session_config,
     run_headless_with_session_config_and_event_mode, stop_headless_run,
+};
+pub use lockdown::{
+    LockdownClientError, ProviderLockdown, lockdown_set_quota_response, lockdown_status_response,
+    provider_lockdown, provider_lockdown_available, provider_set_trust_response,
 };
 pub use observe::{
     DescendantLiveAttachment, DescendantView, ObserveClient, ObserveError, observe_stream_all,
@@ -115,6 +120,9 @@ pub use workflow_graph_rpc::{WorkflowGraphRpcAdapter, WorkflowGraphRpcAdapterErr
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-client";
 
+#[cfg(test)]
+#[path = "lockdown_tests.rs"]
+mod lockdown_tests;
 #[cfg(test)]
 mod peer_tests;
 #[cfg(test)]

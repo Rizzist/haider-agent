@@ -2958,6 +2958,7 @@ surface enforces this choice as `DescendantView::Live` versus
 `DescendantView::Snapshot`; the snapshot variant has no event receiver.
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 ## 18. `peer_messaging_v1`
 
 `peer.list` requires `view` and returns `agents[]` with exactly these fields:
@@ -3063,3 +3064,34 @@ daemon Welcome advertises **98** feature strings: the prior 96 plus these two
 feature bits. Integration must reconcile these counts if another lane also
 tail-appends methods or bits before release.
 >>>>>>> wave-965-c
+=======
+## 24. Provider lockdown v1
+
+`provider_lockdown_v1` owns the provider trust ceiling and the machine-user
+quota. A client MUST negotiate this feature before sending
+`provider.set_trust`, `lockdown.status`, or `lockdown.set_quota`. The typed
+`haider_client::provider_lockdown` helper returns `None` when the feature is
+absent and never emulates the calls.
+
+`provider.set_trust` carries `command_id`, provider name, `full | lockdown`,
+and `expected_revision`; success returns the complete provider summary and new
+management revision. `lockdown.status` optionally names a provider and returns
+`provider`, `tools_allowed`, `quota_used`, and `quota_limit`.
+`lockdown.set_quota` carries a command id and nonnegative byte limit and returns
+the same status shape. The quota is shared across profiles and providers.
+
+Provider summaries default a missing `trust` field to `full`, preserving old
+daemon/provider records. A present unknown trust value is not authority to
+render or enable Full capabilities. Observation digests and child rows may
+carry an optional `lockdown` object; absence from an older daemon is unknown,
+not proof of Full trust. Enforcement remains daemon-owned regardless of what
+a client renders.
+
+Native Pipe clients consume raw self-sufficient `lockdown.refused`,
+`lockdown.quota`, and `provider.trust_changed` payloads. Refusal includes
+provider, tool, reason, and allowed tools; quota includes provider when
+applicable plus used and limit; trust change includes provider, previous trust,
+new trust, and revision. They MUST NOT infer these facts from assistant text or
+error styling. See `docs/provider-lockdown-v1.md` for the normative envelope,
+quota, toggle-boundary, and subagent rules.
+>>>>>>> wave-965-d

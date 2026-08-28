@@ -535,6 +535,7 @@ fn adapter_cache_profile(provider: &str, endpoint: &str) -> ProviderSummaryWire 
         availability_reason: None,
         default_model: Some("adapter-cache-model".to_owned()),
         enabled: true,
+        trust: haider_rpc::ProviderTrustWire::Full,
     }
 }
 
@@ -862,6 +863,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
         availability_reason: None,
         default_model: Some("llama-fixture".to_owned()),
         enabled: true,
+        trust: haider_rpc::ProviderTrustWire::Full,
     };
     assert_eq!(
         account_openai_compatible_base_url(
@@ -961,6 +963,7 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
         availability_reason: None,
         default_model: Some("model-small".to_owned()),
         enabled: true,
+        trust: haider_rpc::ProviderTrustWire::Full,
     };
     let metadata = haider_protocol::session::SessionMetadataV1 {
         cwd: "/tmp/compaction-promotion".to_owned(),
@@ -1078,6 +1081,7 @@ fn keyless_summary(provider: &str, origin: &str) -> ProviderSummaryWire {
         availability_reason: None,
         default_model: Some("llama3.1:8b".to_owned()),
         enabled: true,
+        trust: haider_rpc::ProviderTrustWire::Full,
     }
 }
 
@@ -1279,6 +1283,7 @@ async fn lk2_keyless_preset_configure_persists_and_mock_discovery_flips_availabl
             models: vec!["llama3.1:8b".to_owned()],
             default_model: Some("llama3.1:8b".to_owned()),
             response_open_timeout_ms: None,
+            trust: None,
         })
         .expect("keyless preset configure");
     assert_eq!(
@@ -1834,6 +1839,47 @@ async fn fallback_chain_is_one_pass_no_wrap_and_skips_missing_credentials() {
         .await
         .expect("terminal traversal");
     assert!(matches!(next, haider_core::ProviderAttemptDecision::Stop));
+}
+
+/// PROVIDER LOCKDOWN: the trust class is a turn-boundary coordinate. A
+/// Lockdown lane cannot change providers mid-turn because that would retain
+/// the old provider's sandbox identity, and a Full lane cannot enter a
+/// Lockdown target while retaining its Full advertised pack.
+///
+/// MUTATION CHECK: remove either resolver fence. Expected failure: one of
+/// these health failures returns `Switch` across the capability boundary.
+#[tokio::test]
+async fn fallback_chain_cannot_cross_a_lockdown_trust_boundary_mid_turn() {
+    let quota = haider_provider::ProviderError::new(
+        ProviderErrorKind::QuotaExhausted,
+        "current provider quota wall",
+    );
+
+    let (mut lockdown_source, current) = fallback_chain_resolver_fixture();
+    lockdown_source.lockdown = true;
+    assert!(matches!(
+        lockdown_source
+            .resolve_fallback(&current, &quota)
+            .await
+            .expect("lockdown source resolution"),
+        haider_core::ProviderAttemptDecision::Stop
+    ));
+
+    let (mut full_source, current) = fallback_chain_resolver_fixture();
+    let mut lockdown_target = adapter_cache_profile(OPENAI_PROVIDER_NAME, "https://example.test");
+    lockdown_target.trust = haider_rpc::ProviderTrustWire::Lockdown;
+    full_source.factory.management = Some(ManagementSnapshot::new(
+        1,
+        Vec::new(),
+        vec![lockdown_target],
+    ));
+    assert!(matches!(
+        full_source
+            .resolve_fallback(&current, &quota)
+            .await
+            .expect("full source resolution"),
+        haider_core::ProviderAttemptDecision::Stop
+    ));
 }
 
 /// MUTATION CHECK: broaden cross-provider fallback to request/context or
@@ -2528,6 +2574,7 @@ async fn custom_provider_configure_discovers_before_successful_commit() {
                 origin: Some("http://127.0.0.1:18080/".into()),
                 auth_requirement: Some(ProviderAuthRequirementWire::None),
                 enabled: true,
+                trust: haider_rpc::ProviderTrustWire::Full,
                 models: Vec::new(),
                 default_model: None,
                 response_open_timeout_ms: Some(45_000),
@@ -2618,6 +2665,7 @@ async fn endpoint_transport_failure_is_a_typed_unreachable_probe_error() {
                 origin: Some("http://127.0.0.1:9".into()),
                 auth_requirement: Some(ProviderAuthRequirementWire::None),
                 enabled: true,
+                trust: haider_rpc::ProviderTrustWire::Full,
                 models: Vec::new(),
                 default_model: None,
                 response_open_timeout_ms: None,
@@ -5583,6 +5631,7 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
                 origin: Some("https://models.example.invalid/".into()),
                 auth_requirement: Some(ProviderAuthRequirementWire::ApiKey),
                 enabled: true,
+                trust: haider_rpc::ProviderTrustWire::Full,
                 models: vec!["model-a".into(), "model-b".into()],
                 default_model: Some("model-a".into()),
                 response_open_timeout_ms: None,
@@ -5654,6 +5703,7 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
                 origin: None,
                 auth_requirement: None,
                 enabled: true,
+                trust: haider_rpc::ProviderTrustWire::Full,
                 models: vec!["model-a".into()],
                 default_model: Some("model-a".into()),
                 response_open_timeout_ms: None,
@@ -5751,6 +5801,102 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
     actor.shutdown().await;
 }
 
+/// MUTATION CHECK: finalize trust before journaling, omit the recovery
+/// coordinates, or render only prose. Expected failure: the response/replay
+/// revision or exact raw `provider.trust_changed` payload below diverges.
+#[tokio::test]
+async fn provider_trust_toggle_is_receipted_persisted_and_journaled_raw() {
+    let dir = test_store_dir();
+    let store = open_store(dir.path()).await;
+    let session_id = haider_protocol::ids::SessionId::new("trust-session");
+    store
+        .create_session(haider_core::SessionCreateCommand {
+            command_id: "trust-session-create".into(),
+            request_digest: "trust-session-digest".into(),
+            request_json: r#"{"fixture":"provider-trust"}"#.into(),
+            session_id: session_id.clone(),
+            cwd: dir.path().to_string_lossy().into_owned(),
+            provider: OPENAI_PROVIDER_NAME.into(),
+            model: "gpt-test".into(),
+            max_tokens: 4_096,
+            permission_overrides: None,
+            effort: None,
+            fast: false,
+            cache_policy: Default::default(),
+            system_prompt_version: "test-system-v1".into(),
+            event_id: haider_protocol::ids::EventId::new("trust-session-created"),
+            device_id: haider_protocol::ids::DeviceId::new("trust-test"),
+        })
+        .await
+        .expect("create trust session");
+
+    let providers = test_provider_registry();
+    let management = ManagementSnapshot::new(0, Vec::new(), providers.summaries(&|_| false));
+    let mut actor = start_account_actor(AccountActorConfig {
+        store: store.clone(),
+        accounts: memory_accounts(),
+        vault: Arc::new(MemoryVault::new()),
+        validator: Arc::new(ProviderCredentialValidator),
+        snapshot: Arc::new(StdMutex::new(Vec::new())),
+        management: Some(management.clone()),
+        profile_id: "provider-trust".into(),
+        default_model: "unused".into(),
+        providers,
+        provider_endpoint_validator: Arc::new(ProductionProviderEndpointValidator),
+        reserved_aliases: HashSet::new(),
+        refresh_fences: RefreshFenceRegistry::default(),
+    });
+    let (sink, mut frames) = channel_sink();
+    actor
+        .commands()
+        .send(AccountCommand::SetProviderTrust(Box::new(
+            ProviderSetTrustJob {
+                command_id: "provider-trust-command".into(),
+                provider: OPENAI_PROVIDER_NAME.into(),
+                trust: ProviderTrustWire::Lockdown,
+                expected_revision: 0,
+                route: LoginRoute {
+                    request_id: RequestId::new("provider-trust-request"),
+                    sink,
+                },
+            },
+        )))
+        .await
+        .expect("send trust toggle");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), frames.recv())
+            .await
+            .expect("trust response deadline")
+            .expect("trust response"),
+        WireFrame::Response {
+            body: ResponseBody::ProviderSetTrust {
+                provider: ProviderSummaryWire {
+                    trust: ProviderTrustWire::Lockdown,
+                    ..
+                },
+                revision: 1,
+            },
+            ..
+        }
+    ));
+    assert_eq!(management.read().expect("management").revision, 1);
+
+    let events = haider_core::StoreHandle::read(&store, &session_id, 0, 64)
+        .await
+        .expect("read trust journal");
+    let trust = events
+        .iter()
+        .find(|event| event.payload["type"] == "provider.trust_changed")
+        .expect("raw trust event");
+    assert_eq!(trust.payload["provider"], OPENAI_PROVIDER_NAME);
+    assert_eq!(trust.payload["previous"], "full");
+    assert_eq!(trust.payload["trust"], "lockdown");
+    assert_eq!(trust.payload["revision"], 1);
+
+    actor.shutdown().await;
+    store.close().await.expect("close store");
+}
+
 #[derive(Clone)]
 struct EndpointEditProviderStore {
     profiles: Arc<StdMutex<Vec<ProviderProfileV1>>>,
@@ -5814,6 +5960,7 @@ fn endpoint_edit_profile(provider: &str, origin: &str) -> ProviderProfileV1 {
         default_model: Some("model-a".to_owned()),
         promotion_model: None,
         provenance: ProviderProvenance::Custom,
+        trust: haider_rpc::ProviderTrustWire::Full,
     }
 }
 
@@ -5854,6 +6001,7 @@ fn endpoint_repoint_input(provider: &str, origin: &str) -> ProviderConfigureInpu
         models: vec!["model-a".to_owned()],
         default_model: Some("model-a".to_owned()),
         response_open_timeout_ms: None,
+        trust: None,
     }
 }
 
@@ -5867,6 +6015,7 @@ fn endpoint_create_input(provider: &str, origin: &str) -> ProviderConfigureInput
         models: vec!["model-a".to_owned()],
         default_model: Some("model-a".to_owned()),
         response_open_timeout_ms: None,
+        trust: None,
     }
 }
 
@@ -6581,6 +6730,7 @@ async fn pre_v8_pending_provider_receipts_reconcile_without_a_discovered_cache()
             default_model: Some("frontier-legacy-a".to_owned()),
             promotion_model: None,
             provenance: crate::provider_registry::ProviderProvenance::Custom,
+            trust: haider_rpc::ProviderTrustWire::Full,
         },
         ProviderProfileV1 {
             provider_id: "legacy-configure".to_owned(),
@@ -6594,6 +6744,7 @@ async fn pre_v8_pending_provider_receipts_reconcile_without_a_discovered_cache()
             default_model: Some("frontier-legacy-old".to_owned()),
             promotion_model: None,
             provenance: crate::provider_registry::ProviderProvenance::Custom,
+            trust: haider_rpc::ProviderTrustWire::Full,
         },
     ];
     let provider_store: Box<dyn ProviderRegistryStoreLike> =
@@ -6635,6 +6786,7 @@ async fn pre_v8_pending_provider_receipts_reconcile_without_a_discovered_cache()
         models: vec!["frontier-legacy-new".to_owned()],
         default_model: Some("frontier-legacy-new".to_owned()),
         response_open_timeout_ms: None,
+        trust: None,
     };
     let configure_identity = ProviderConfigureIdentity {
         input: configure_input.clone(),
@@ -6719,6 +6871,7 @@ async fn pending_custom_configure_reconciliation_restores_discovered_inventory()
         models: vec!["recovered-model".into()],
         default_model: Some("recovered-model".into()),
         response_open_timeout_ms: Some(45_000),
+        trust: None,
     };
     let identity = ProviderConfigureIdentity {
         input: input.clone(),
@@ -7020,6 +7173,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
             default_model: Some("seed-key".to_owned()),
             promotion_model: None,
             provenance: ProviderProvenance::Custom,
+            trust: haider_rpc::ProviderTrustWire::Full,
         },
         ProviderProfileV1 {
             provider_id: no_auth_provider.to_owned(),
@@ -7033,6 +7187,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
             default_model: Some("seed-none".to_owned()),
             promotion_model: None,
             provenance: ProviderProvenance::Custom,
+            trust: haider_rpc::ProviderTrustWire::Full,
         },
         ProviderProfileV1 {
             provider_id: GEMINI_PROVIDER_NAME.to_owned(),
@@ -7046,6 +7201,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
             default_model: None,
             promotion_model: None,
             provenance: ProviderProvenance::BuiltIn,
+            trust: haider_rpc::ProviderTrustWire::Full,
         },
     ];
     let provider_store: Box<dyn ProviderRegistryStoreLike> =
@@ -9605,6 +9761,7 @@ fn removable_provider_profile(provider: &str) -> ProviderProfileV1 {
         default_model: Some("custom-model".to_owned()),
         promotion_model: None,
         provenance: ProviderProvenance::Custom,
+        trust: haider_rpc::ProviderTrustWire::Full,
     }
 }
 
@@ -9634,6 +9791,7 @@ async fn provider_remove_commits_replays_fences_and_beats_restart_resurrection()
         models: vec!["custom-model".to_owned()],
         default_model: Some("custom-model".to_owned()),
         response_open_timeout_ms: None,
+        trust: None,
     };
     let older_identity = ProviderConfigureIdentity {
         input: older_configure.clone(),
@@ -10016,6 +10174,7 @@ fn custom_login_targets_only_custom_compatible_profiles() {
                 availability_reason: None,
                 default_model: Some("llama3.1:8b".to_owned()),
                 enabled: true,
+                trust: haider_rpc::ProviderTrustWire::Full,
             },
             ProviderSummaryWire {
                 provider: "openai".to_owned(),
@@ -10031,6 +10190,7 @@ fn custom_login_targets_only_custom_compatible_profiles() {
                 availability_reason: None,
                 default_model: None,
                 enabled: true,
+                trust: haider_rpc::ProviderTrustWire::Full,
             },
             ProviderSummaryWire {
                 provider: "custom-claude".to_owned(),
@@ -10046,6 +10206,7 @@ fn custom_login_targets_only_custom_compatible_profiles() {
                 availability_reason: None,
                 default_model: Some("claude-private".to_owned()),
                 enabled: true,
+                trust: haider_rpc::ProviderTrustWire::Full,
             },
             ProviderSummaryWire {
                 provider: "azure".to_owned(),
@@ -10061,6 +10222,7 @@ fn custom_login_targets_only_custom_compatible_profiles() {
                 availability_reason: None,
                 default_model: Some("my-gpt-deployment".to_owned()),
                 enabled: true,
+                trust: haider_rpc::ProviderTrustWire::Full,
             },
             ProviderSummaryWire {
                 provider: ANTHROPIC_PROVIDER_NAME.to_owned(),
@@ -10076,6 +10238,7 @@ fn custom_login_targets_only_custom_compatible_profiles() {
                 availability_reason: None,
                 default_model: Some("claude-fable-5".to_owned()),
                 enabled: true,
+                trust: haider_rpc::ProviderTrustWire::Full,
             },
             enterprise_summary(
                 BEDROCK_PROVIDER_NAME,
@@ -10104,6 +10267,7 @@ fn custom_login_targets_only_custom_compatible_profiles() {
                 availability_reason: Some("provider has no credential".to_owned()),
                 default_model: Some(haider_provider::DEEPSEEK_SEED_MODELS[0].to_owned()),
                 enabled: true,
+                trust: haider_rpc::ProviderTrustWire::Full,
             },
         ],
     );
@@ -10801,6 +10965,7 @@ fn stale_effort_clamps_for_anthropic_and_drops_for_declared_openai_ladders() {
         availability_reason: None,
         default_model: Some("gpt-5.5".to_owned()),
         enabled: true,
+        trust: haider_rpc::ProviderTrustWire::Full,
     };
     assert_eq!(
         openai_effort_for(&tuning, Some(&summary), "gpt-5.5"),
@@ -10863,6 +11028,7 @@ fn enterprise_summary(provider: &str, endpoint: Option<&str>) -> ProviderSummary
         availability_reason: None,
         default_model: Some(default_model.to_owned()),
         enabled: true,
+        trust: haider_rpc::ProviderTrustWire::Full,
     }
 }
 
@@ -11371,6 +11537,7 @@ async fn lv2_gcloud_device_import_vaults_the_token_and_lights_vertex() {
             models: vertex_models,
             default_model: Some("claude-fable-5".to_owned()),
             response_open_timeout_ms: None,
+            trust: None,
         })
         .expect("configure vertex endpoint");
     let management = ManagementSnapshot::new(
@@ -11780,6 +11947,7 @@ async fn each_turn_resolves_the_currently_active_account() {
         availability_reason: None,
         default_model: Some("llama-fixture".to_owned()),
         enabled: true,
+        trust: haider_rpc::ProviderTrustWire::Full,
     };
     let management =
         ManagementSnapshot::new(0, snapshot.lock().expect("snapshot").clone(), vec![summary]);

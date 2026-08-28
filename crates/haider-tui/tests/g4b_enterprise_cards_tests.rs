@@ -50,6 +50,7 @@ fn enterprise_summary(
         availability_reason: Some("provider has no credential".to_owned()),
         default_model: Some(default_model.to_owned()),
         enabled: true,
+        trust: haider_rpc::ProviderTrustWire::Full,
     }
 }
 

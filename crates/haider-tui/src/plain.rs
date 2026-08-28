@@ -104,6 +104,13 @@ fn render_plain_impl(
                 out.push_str(text);
                 out.push('\n');
             }
+            TranscriptEntry::Refusal {
+                provider,
+                tool,
+                reason,
+            } => {
+                out.push_str(&format!("🔒 REFUSED · {provider} · {tool} — {reason}\n"));
+            }
             TranscriptEntry::Error { text, .. } => {
                 // `text` is the flattened presentation (title — detail
                 // [subcode] · facts · actions) — plain carries the same

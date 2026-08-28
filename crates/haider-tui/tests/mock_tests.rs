@@ -52,7 +52,9 @@ fn demo_script_produces_the_expected_transcript() {
         .iter()
         .map(|entry| match entry {
             TranscriptEntry::User { .. } => "user",
+            TranscriptEntry::Peer { .. } => "peer",
             TranscriptEntry::Note { .. } => "note",
+            TranscriptEntry::Refusal { .. } => "refusal",
             TranscriptEntry::Error { .. } => "error",
             TranscriptEntry::Shell { .. } => "shell",
             TranscriptEntry::Item(block) => match block.item {
@@ -70,7 +72,9 @@ fn demo_script_produces_the_expected_transcript() {
     assert!(entries.iter().all(|entry| match entry {
         TranscriptEntry::Item(block) => !block.streaming,
         TranscriptEntry::User { .. }
+        | TranscriptEntry::Peer { .. }
         | TranscriptEntry::Note { .. }
+        | TranscriptEntry::Refusal { .. }
         | TranscriptEntry::Error { .. }
         | TranscriptEntry::Shell { .. } => true,
     }));

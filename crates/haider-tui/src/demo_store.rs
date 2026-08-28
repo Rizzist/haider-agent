@@ -599,6 +599,13 @@ fn entry_to_dto(entry: &TranscriptEntry) -> EntryDto {
             spoken: block.spoken,
         },
         TranscriptEntry::Note { text } => EntryDto::Note { text: text.clone() },
+        TranscriptEntry::Refusal {
+            provider,
+            tool,
+            reason,
+        } => EntryDto::Note {
+            text: format!("🔒 refused · {provider} · {tool} — {reason}"),
+        },
         // Demo persistence has no error rows (errors are live-envelope
         // facts); a note keeps the text without a DTO schema change. The
         // typed presentation is display-only and flattens with it (the
@@ -875,6 +882,7 @@ fn chip_from_dto(dto: ChipDto) -> ChipModel {
         full: dto.full,
         name: dto.name,
         model: dto.model,
+        lockdown: false,
         device: dto.device,
         state: chip_state_from_label(&dto.state),
         tokens: dto.tokens,

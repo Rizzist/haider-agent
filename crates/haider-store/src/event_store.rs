@@ -1322,6 +1322,7 @@ pub const ACCOUNT_REMOVE_METHOD: &str = "account.remove";
 pub const ACCOUNT_SET_DEFAULT_MODEL_METHOD: &str = "account.set_default_model";
 pub const PROVIDER_CONFIGURE_METHOD: &str = "provider.configure";
 pub const PROVIDER_REMOVE_METHOD: &str = "provider.remove";
+pub const PROVIDER_SET_TRUST_METHOD: &str = "provider.set_trust";
 const PROVIDER_CONFIGURE_NOOP_RESPONSE_FIELD: &str = "revision_unchanged_response";
 pub const HOOKS_TRUST_METHOD: &str = "hooks.trust";
 pub const HOOKS_REVOKE_METHOD: &str = "hooks.revoke";
@@ -1336,6 +1337,7 @@ fn is_management_method(method: &str) -> bool {
             | ACCOUNT_SET_DEFAULT_MODEL_METHOD
             | PROVIDER_CONFIGURE_METHOD
             | PROVIDER_REMOVE_METHOD
+            | PROVIDER_SET_TRUST_METHOD
     )
 }
 
@@ -10635,6 +10637,7 @@ impl Store {
                 | ACCOUNT_SET_DEFAULT_MODEL_METHOD
                 | PROVIDER_CONFIGURE_METHOD
                 | PROVIDER_REMOVE_METHOD
+                | PROVIDER_SET_TRUST_METHOD
         ) {
             return Err(store_error(
                 ErrorCode::InvalidArgument,
@@ -11016,6 +11019,7 @@ impl Store {
             ACCOUNT_SET_ACTIVE_METHOD
                 | ACCOUNT_SET_DEFAULT_MODEL_METHOD
                 | PROVIDER_CONFIGURE_METHOD
+                | PROVIDER_SET_TRUST_METHOD
         ) {
             return Err(store_error(
                 ErrorCode::InvalidArgument,
@@ -11165,7 +11169,7 @@ impl Store {
                 "SELECT command_id, method, state, request_json, recovery_json,
                         response_json, final_revision
                  FROM command_receipts
-                 WHERE method IN (?1, ?2, ?3)
+                 WHERE method IN (?1, ?2, ?3, ?4)
                    AND state IN ('pending', 'committed')
                  ORDER BY created_at_ms, rowid",
             )
@@ -11175,7 +11179,8 @@ impl Store {
                 params![
                     ACCOUNT_SET_DEFAULT_MODEL_METHOD,
                     PROVIDER_CONFIGURE_METHOD,
-                    PROVIDER_REMOVE_METHOD
+                    PROVIDER_REMOVE_METHOD,
+                    PROVIDER_SET_TRUST_METHOD
                 ],
                 management_receipt_row,
             )

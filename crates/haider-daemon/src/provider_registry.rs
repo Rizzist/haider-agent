@@ -22,7 +22,7 @@ use haider_provider::{
 };
 use haider_rpc::{
     ModelDetailWire, ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
-    ProviderSummaryWire,
+    ProviderSummaryWire, ProviderTrustWire,
 };
 use serde::{Deserialize, Serialize};
 
@@ -89,6 +89,10 @@ pub(crate) struct ProviderProfileV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub promotion_model: Option<String>,
     pub provenance: ProviderProvenance,
+    /// Missing in pre-lockdown records means Full so an upgrade cannot
+    /// silently revoke capabilities from an existing custom provider.
+    #[serde(default)]
+    pub trust: ProviderTrustWire,
 }
 
 /// One validated provider/model coordinate from the profile's resilience
@@ -531,6 +535,26 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         Ok(profile)
     }
 
+    pub(crate) fn set_trust(
+        &mut self,
+        provider: &str,
+        trust: ProviderTrustWire,
+    ) -> Result<ProviderProfileV1, HaiderError> {
+        if matches!(trust, ProviderTrustWire::Unknown) {
+            return Err(invalid("provider trust must be full or lockdown"));
+        }
+        let mut next = self.profiles.clone();
+        let profile = next
+            .iter_mut()
+            .find(|profile| profile.provider_id == provider)
+            .ok_or_else(|| invalid(format!("provider `{provider}` is not registered")))?;
+        profile.trust = trust;
+        let profile = profile.clone();
+        self.store.save(&next)?;
+        self.profiles = next;
+        Ok(profile)
+    }
+
     pub(crate) fn validate_configure(
         &self,
         input: ProviderConfigureInput,
@@ -627,6 +651,9 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         discovered_models: &[String],
     ) -> Result<(Vec<ProviderProfileV1>, ProviderProfileV1), HaiderError> {
         validate_provider_id(&input.provider)?;
+        if matches!(input.trust, Some(ProviderTrustWire::Unknown)) {
+            return Err(invalid("provider trust must be full or lockdown"));
+        }
         let mut next = self.profiles.clone();
         let profile = if let Some(existing) = next
             .iter_mut()
@@ -663,6 +690,14 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             if let Some(timeout_ms) = input.response_open_timeout_ms {
                 validate_response_open_timeout_ms(timeout_ms)?;
                 existing.response_open_timeout_ms = Some(timeout_ms);
+            }
+            if let Some(trust) = input.trust {
+                if existing.trust != trust {
+                    return Err(invalid(format!(
+                        "provider `{}` trust changes must use provider.set_trust",
+                        existing.provider_id
+                    )));
+                }
             }
             existing.clone()
         } else {
@@ -710,6 +745,7 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
                 default_model,
                 promotion_model: None,
                 provenance: ProviderProvenance::Custom,
+                trust: input.trust.unwrap_or(ProviderTrustWire::Lockdown),
             };
             next.push(profile.clone());
             profile
@@ -1009,6 +1045,8 @@ pub(crate) struct ProviderConfigureInput {
     pub default_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_open_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<ProviderTrustWire>,
 }
 
 pub(crate) fn initial_provider_profiles(
@@ -1099,6 +1137,7 @@ fn provider_summary(
         }),
         default_model,
         enabled: profile.enabled,
+        trust: profile.trust,
     }
 }
 
@@ -1124,6 +1163,7 @@ fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> Provider
             default_model: Some(BEDROCK_SEED_MODELS[0].to_owned()),
             promotion_model: None,
             provenance: ProviderProvenance::BuiltIn,
+            trust: ProviderTrustWire::Full,
         };
     }
     if provider == VERTEX_PROVIDER_NAME {
@@ -1142,6 +1182,7 @@ fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> Provider
             default_model: Some(VERTEX_SEED_MODELS[0].to_owned()),
             promotion_model: None,
             provenance: ProviderProvenance::BuiltIn,
+            trust: ProviderTrustWire::Full,
         };
     }
     if provider == DEEPSEEK_PROVIDER_NAME {
@@ -1160,6 +1201,7 @@ fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> Provider
             default_model: Some(DEEPSEEK_SEED_MODELS[0].to_owned()),
             promotion_model: None,
             provenance: ProviderProvenance::BuiltIn,
+            trust: ProviderTrustWire::Full,
         };
     }
     if provider == XAI_PROVIDER_NAME {
@@ -1178,6 +1220,7 @@ fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> Provider
             default_model: Some(XAI_SEED_MODELS[0].to_owned()),
             promotion_model: None,
             provenance: ProviderProvenance::BuiltIn,
+            trust: ProviderTrustWire::Full,
         };
     }
     if provider == HAIDER_CODE_PROVIDER_NAME {
@@ -1196,6 +1239,7 @@ fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> Provider
             default_model: Some(HAIDER_CODE_SEED_MODELS[0].to_owned()),
             promotion_model: None,
             provenance: ProviderProvenance::BuiltIn,
+            trust: ProviderTrustWire::Full,
         };
     }
     let (api_family, base_url, auth_requirement, enabled, provenance) = match provider {
@@ -1281,6 +1325,7 @@ fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> Provider
         default_model: None,
         promotion_model: None,
         provenance,
+        trust: ProviderTrustWire::Full,
     }
 }
 
@@ -1495,6 +1540,12 @@ fn validate_profiles(profiles: &[ProviderProfileV1]) -> Result<(), HaiderError> 
     let mut ids = std::collections::HashSet::new();
     for profile in profiles {
         validate_provider_id(&profile.provider_id)?;
+        if matches!(profile.trust, ProviderTrustWire::Unknown) {
+            return Err(invalid(format!(
+                "provider `{}` trust must be full or lockdown",
+                profile.provider_id
+            )));
+        }
         if !ids.insert(profile.provider_id.as_str()) {
             return Err(HaiderError::new(
                 ErrorCode::StoreCorrupt,

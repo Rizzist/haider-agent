@@ -387,6 +387,7 @@
     },
     {
 <<<<<<< HEAD
+<<<<<<< HEAD
       "request_method": "peer.list",
       "response_method": "peer.list",
       "request": {"method":"peer.list"},
@@ -475,6 +476,24 @@
       "request": {"method":"shell.close","id":"sh-0123456789abcdef0123"},
       "response": {"method":"shell.close","shell":{"id":"sh-0123456789abcdef0123","kind":{"kind":"ssh","profile":"prod"},"status":{"status":"closed"},"title":"prod: uname -a","cwd_or_host":"prod.example.invalid","created_at_ms":1720000006000,"last_activity_ms":1720000007000,"bytes_out":11}}
 >>>>>>> wave-965-c
+=======
+      "request_method": "provider.set_trust",
+      "response_method": "provider.set_trust",
+      "request": {"method":"provider.set_trust","command_id":"command-provider-trust","name":"research","trust":"lockdown","expected_revision":12},
+      "response": {"method":"provider.set_trust","provider":{"provider":"research","api_family":"openai_chat_completions","models":["search-1"],"model_details":[],"auth_methods":[],"availability":"available","enabled":true,"trust":"lockdown"},"revision":13}
+    },
+    {
+      "request_method": "lockdown.status",
+      "response_method": "lockdown.status",
+      "request": {"method":"lockdown.status","provider":"research"},
+      "response": {"method":"lockdown.status","status":{"provider":"research","tools_allowed":["fs_read","fs_search","web_search"],"quota_used":4096,"quota_limit":1073741824}}
+    },
+    {
+      "request_method": "lockdown.set_quota",
+      "response_method": "lockdown.set_quota",
+      "request": {"method":"lockdown.set_quota","command_id":"command-lockdown-quota","bytes":2147483648},
+      "response": {"method":"lockdown.set_quota","status":{"tools_allowed":["fs_read","fs_search","web_search"],"quota_used":4096,"quota_limit":2147483648}}
+>>>>>>> wave-965-d
     }
   ]
 }

@@ -20,9 +20,11 @@ pub(crate) mod account;
 pub(crate) mod export;
 pub(crate) mod graph;
 pub(crate) mod hooks;
+pub(crate) mod lockdown;
 pub(crate) mod models;
 pub(crate) mod observe;
 pub(crate) mod peer;
+pub(crate) mod provider;
 pub(crate) mod run;
 pub(crate) mod session_config;
 pub(crate) mod session_item;
@@ -206,6 +208,8 @@ async fn dispatch(args: &[String]) -> ExitCode {
         }
         [command, rest @ ..] if command == "session" => observe::session_command(rest).await,
         [command, rest @ ..] if command == "account" => account::account_command(rest).await,
+        [command, rest @ ..] if command == "provider" => provider::provider_command(rest).await,
+        [command, rest @ ..] if command == "lockdown" => lockdown::lockdown_command(rest).await,
         [command, rest @ ..] if command == "models" => models::models_command(rest).await,
         [command, rest @ ..] if command == "fleet" => observe::fleet_command(rest).await,
         [command, rest @ ..] if command == "events" => observe::events_command(rest).await,
@@ -264,6 +268,8 @@ async fn dispatch(args: &[String]) -> ExitCode {
                  account list [--json], account import <codex|claude-code> [--confirm], account refresh <alias>, account remove <alias> --confirm, \
                  account add <alias> --base-url <url> [--api-key <key>|--api-key-env <VAR>|--api-key-stdin|--no-auth] [--api-family openai|anthropic] [--response-open-timeout <dur>] [--json], \
                  account probe <alias> [--json], account update <alias> [--base-url <url>] [--api-key <key>|--api-key-env <VAR>|--api-key-stdin] [--response-open-timeout <dur>] [--json], \
+                 provider list [--json], provider show <name> [--json], provider add <name> --base-url <url> [--lockdown|--full] ..., provider set <name> (--lockdown|--full), provider remove <name> --confirm, \
+                 lockdown status [--json], lockdown quota [--set <bytes>] [--json], \
                  models [--json] [--refresh [<alias>]], \
                  fleet [<session-id>] [--json] [--no-spawn], \
                  events [--follow] [--no-spawn], \

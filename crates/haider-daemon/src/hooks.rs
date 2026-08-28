@@ -25,6 +25,7 @@ use haider_core::{
 use haider_protocol::effect::{AuthorizationVerdict, EffectIntent, EffectPhase};
 use haider_protocol::envelope::{PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::error::ErrorCode;
+use haider_protocol::headless::HeadlessRunEventPayload;
 use haider_protocol::hook::{
     HOOKS_CONFIG_SCHEMA, HookAttachmentMetadata, HookAttachmentSet, HookDecisionKind,
     HookEventPayload, HookFired, HookInput, HookNotice, HookOutput, HookRuntimeKind,
@@ -663,6 +664,54 @@ impl HookService {
         }];
         if let Err(error) = self.inner.hub.append(&mut envelope).await {
             tracing::warn!(target: "haider.hooks", ?error, "hook fact append failed");
+            return false;
+        }
+        true
+    }
+
+    async fn journal_lockdown_refusal(
+        &self,
+        cause: &RawEnvelope,
+        provider: &str,
+        reason: &str,
+    ) -> bool {
+        let payload = match serde_json::to_value(EventPayload::LockdownRefused(
+            haider_protocol::lockdown::LockdownRefused {
+                provider: provider.to_owned(),
+                tool: "hooks".to_owned(),
+                reason: reason.to_owned(),
+                tools_allowed: crate::lockdown::allowed_tool_names(),
+            },
+        )) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!(target: "haider.hooks", ?error, "lockdown refusal serialization failed");
+                return false;
+            }
+        };
+        let mut envelope = [RawEnvelope {
+            schema_version: SCHEMA_VERSION,
+            event_id: self.next_event_id(),
+            seq: 0,
+            session_id: cause.session_id.clone(),
+            branch_id: cause.branch_id.clone(),
+            run_id: cause.run_id.clone(),
+            agent_id: cause.agent_id.clone(),
+            device_id: self.inner.hub.device_id(),
+            authority_epoch: cause.authority_epoch,
+            worker_generation: self.inner.hub.worker_generation(),
+            causation_id: Some(cause.event_id.clone()),
+            correlation_id: cause.correlation_id.clone(),
+            committed_at_ms: 0,
+            render: RenderTargets {
+                ui: true,
+                durable: true,
+                prompt: PromptRender::Omit,
+            },
+            payload,
+        }];
+        if let Err(error) = self.inner.hub.append(&mut envelope).await {
+            tracing::warn!(target: "haider.hooks", ?error, "lockdown refusal append failed");
             return false;
         }
         true
@@ -1772,6 +1821,37 @@ async fn handle_committed(
         return true;
     }
 
+    // A headless acceptance journals its fully resolved provider immediately
+    // before the user-message fact in the same batch. Pin that actual model
+    // provider first; session metadata can deliberately name another pair.
+    if let Some(HeadlessRunEventPayload::HeadlessRunConfigured(spec)) =
+        HeadlessRunEventPayload::from_payload_value(&envelope.payload)
+    {
+        let Some(run_id) = envelope.run_id.as_ref() else {
+            tracing::warn!(target: "haider.hooks", "headless provider fact has no run id");
+            return false;
+        };
+        let proposed = match service.inner.hub.provider_lockdown_policy(&spec.provider) {
+            Ok(lockdown) => lockdown,
+            Err(error) => {
+                tracing::warn!(target: "haider.hooks", ?error, "headless provider trust lookup failed");
+                return false;
+            }
+        };
+        return match service.inner.hub.bind_lockdown_turn(
+            &envelope.session_id,
+            run_id,
+            &spec.provider,
+            proposed,
+        ) {
+            Ok(_) => true,
+            Err(error) => {
+                tracing::warn!(target: "haider.hooks", ?error, "headless turn-ceiling bind failed");
+                false
+            }
+        };
+    }
+
     let decision = reduce_decoded_durable_state(state, &envelope, &payload);
     if let DecodedCommittedPayload::Hook(HookEventPayload::HookRunTrust { enabled }) = &payload {
         if !*enabled && let Some(run_id) = envelope.run_id.clone() {
@@ -1846,11 +1926,95 @@ async fn handle_committed(
     // process work. Discovery notices and live subscriber/server
     // reconciliation still run below: configuration removal and malformed
     // definitions are observable even when this event matches no hook.
-    let any_match = discovery.hooks.values().any(|definition| {
-        definition
-            .matcher
-            .matches(&envelope, &metadata.provider, &facts)
-    });
+    let bound = match envelope.run_id.as_ref() {
+        Some(run_id) => match service
+            .inner
+            .hub
+            .bound_lockdown_run(&envelope.session_id, run_id)
+        {
+            Ok(bound) => bound,
+            Err(error) => {
+                tracing::warn!(target: "haider.hooks", ?error, "hook turn-ceiling lookup failed");
+                return false;
+            }
+        },
+        None => match service
+            .inner
+            .hub
+            .bound_session_lockdown(&envelope.session_id)
+        {
+            Ok(bound) => bound,
+            Err(error) => {
+                tracing::warn!(target: "haider.hooks", ?error, "hook session-ceiling lookup failed");
+                return false;
+            }
+        },
+    };
+    let (provider, lockdown) = match bound {
+        Some(bound) => bound,
+        None => {
+            let proposed = match service
+                .inner
+                .hub
+                .provider_lockdown_policy(&metadata.provider)
+            {
+                Ok(lockdown) => lockdown,
+                Err(error) => {
+                    tracing::warn!(target: "haider.hooks", ?error, "hook provider trust lookup failed");
+                    return false;
+                }
+            };
+            let lockdown = match envelope.run_id.as_ref() {
+                Some(run_id) => match service.inner.hub.bind_lockdown_turn(
+                    &envelope.session_id,
+                    run_id,
+                    &metadata.provider,
+                    proposed,
+                ) {
+                    Ok(lockdown) => lockdown,
+                    Err(error) => {
+                        tracing::warn!(target: "haider.hooks", ?error, "hook turn-ceiling bind failed");
+                        return false;
+                    }
+                },
+                None => proposed,
+            };
+            (metadata.provider.clone(), lockdown)
+        }
+    };
+    let any_match = discovery
+        .hooks
+        .values()
+        .any(|definition| definition.matcher.matches(&envelope, &provider, &facts));
+    if lockdown {
+        let workspace = Path::new(&metadata.cwd);
+        state
+            .subscribers
+            .retain(|_, handle| handle.workspace_cwd != workspace);
+        service.inner.servers.reconcile_workspace(
+            workspace,
+            &HashSet::new(),
+            &HashSet::new(),
+            Some(&HashSet::new()),
+        );
+        if let Some(terminal_scope) = terminal_scope {
+            state
+                .subscribers
+                .retain(|_, handle| handle.run_scope.as_ref() != Some(&terminal_scope));
+            service.inner.servers.kill_scope(&terminal_scope);
+        }
+        if !any_match {
+            return true;
+        }
+        return journal_lockdown_refusal_once(
+            service,
+            state,
+            &envelope,
+            &provider,
+            "automatic hooks cannot execute for a lockdown provider",
+        )
+        .await;
+    }
     service.prepare_workspace_trust(&discovery).await;
     let current_servers = discovery
         .hooks
@@ -1916,10 +2080,7 @@ async fn handle_committed(
 
     let mut prepared_input = None::<Result<Arc<[u8]>, String>>;
     for definition in discovery.hooks.into_values() {
-        if !definition
-            .matcher
-            .matches(&envelope, &metadata.provider, &facts)
-        {
+        if !definition.matcher.matches(&envelope, &provider, &facts) {
             continue;
         }
         let profile_trusted = service.is_trusted(&definition, false, discovery.policy);
@@ -2185,6 +2346,31 @@ async fn journal_notice_once(
     }
     if service
         .journal(cause, HookEventPayload::HookNotice(notice))
+        .await
+    {
+        state.notice_dedup.insert(key);
+        true
+    } else {
+        false
+    }
+}
+
+async fn journal_lockdown_refusal_once(
+    service: &HookService,
+    state: &mut EngineState,
+    cause: &RawEnvelope,
+    provider: &str,
+    reason: &str,
+) -> bool {
+    let key = format!(
+        "lockdown\0{}\0{}\0{}\0{}",
+        cause.session_id, cause.event_id, provider, reason
+    );
+    if state.notice_dedup.contains(&key) {
+        return true;
+    }
+    if service
+        .journal_lockdown_refusal(cause, provider, reason)
         .await
     {
         state.notice_dedup.insert(key);

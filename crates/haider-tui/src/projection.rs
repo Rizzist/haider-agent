@@ -66,6 +66,14 @@ pub enum TranscriptEntry {
     /// A display-only UI note (sim `NoteRow`): auto-title, interrupt, and
     /// mid-turn echoes. The ONLY non-envelope entry source besides Shell.
     Note { text: String },
+    /// A daemon-enforced provider capability refusal. This is deliberately
+    /// neither a failed run nor a generic note: the model can adapt and the
+    /// turn remains healthy.
+    Refusal {
+        provider: String,
+        tool: String,
+        reason: String,
+    },
     /// A failed run's public reason. `text` is the plain/greppable
     /// authority; a typed presentation enables the structured card render.
     /// Client-observed and legacy wire failures carry `None`.
@@ -711,6 +719,18 @@ impl SessionProjection {
                     rotation.provider
                 ));
             }
+            EventPayload::LockdownRefused(refusal) => {
+                self.entries.push(TranscriptEntry::Refusal {
+                    provider: refusal.provider.clone(),
+                    tool: refusal.tool.clone(),
+                    reason: refusal.reason.clone(),
+                });
+            }
+            EventPayload::LockdownQuota(_) => {}
+            EventPayload::ProviderTrustChanged(change) => self.push_note(format!(
+                "provider trust changed · {} → {}",
+                change.provider, change.trust
+            )),
             // Consumed by later waves (effects timeline, subagent tree,
             // accounts). The projection stays tolerant of them now.
             EventPayload::Effect(_)

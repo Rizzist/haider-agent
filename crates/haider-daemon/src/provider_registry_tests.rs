@@ -341,6 +341,7 @@ fn enabled_profile_with_unknown_api_family_is_never_available() {
             default_model: Some("future-model".to_owned()),
             promotion_model: None,
             provenance: ProviderProvenance::Custom,
+            trust: haider_rpc::ProviderTrustWire::Full,
         }])
         .expect("seed store");
     let source = model_source([(
@@ -447,9 +448,144 @@ fn configured_default_must_come_from_the_discovered_inventory() {
             models: vec!["configured-only".to_owned()],
             default_model: Some("configured-only".to_owned()),
             response_open_timeout_ms: None,
+            trust: None,
         })
         .expect_err("undiscovered default must fail");
     assert_eq!(error.code, ErrorCode::InvalidArgument);
+}
+
+/// MUTATION CHECK: change `ProviderTrustWire::default()` to Lockdown.
+/// Expected failure: a record written before the trust field existed silently
+/// loses capabilities during upgrade.
+#[test]
+fn legacy_provider_record_without_trust_migrates_to_full() {
+    let mut legacy_custom = resilience_profiles()
+        .into_iter()
+        .next()
+        .expect("profile template");
+    legacy_custom.provider_id = "existing-custom".to_owned();
+    legacy_custom.provenance = ProviderProvenance::Custom;
+    let mut value = serde_json::to_value(legacy_custom).expect("profile JSON");
+    value
+        .as_object_mut()
+        .expect("profile object")
+        .remove("trust");
+    let profile: ProviderProfileV1 = serde_json::from_value(value).expect("legacy profile");
+    assert_eq!(profile.provenance, ProviderProvenance::Custom);
+    assert_eq!(profile.trust, ProviderTrustWire::Full);
+}
+
+/// MUTATION CHECK: default a new custom provider to Full, or fail to save a
+/// later typed setter. Expected failure: the first and/or reopened assertion.
+#[test]
+fn new_custom_provider_defaults_lockdown_and_typed_setter_persists() {
+    let dir = tempfile::tempdir().expect("provider registry profile");
+    let source = model_source([("research", vec![discovered("search-1", true, None)])]);
+    let mut registry = ProviderRegistry::new(
+        JsonProviderRegistryStore::new(dir.path()),
+        Vec::new(),
+        Arc::clone(&source),
+    )
+    .expect("empty provider registry");
+    let profile = registry
+        .configure(ProviderConfigureInput {
+            provider: "research".to_owned(),
+            api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+            origin: Some("https://research.example.invalid/v1".to_owned()),
+            auth_requirement: Some(ProviderAuthRequirementWire::None),
+            enabled: true,
+            models: vec!["search-1".to_owned()],
+            default_model: Some("search-1".to_owned()),
+            response_open_timeout_ms: None,
+            trust: None,
+        })
+        .expect("create custom provider");
+    assert_eq!(profile.trust, ProviderTrustWire::Lockdown);
+    registry
+        .set_trust("research", ProviderTrustWire::Full)
+        .expect("set trust");
+    drop(registry);
+
+    let reopened = ProviderRegistry::new(
+        JsonProviderRegistryStore::new(dir.path()),
+        Vec::new(),
+        source,
+    )
+    .expect("reopen provider registry");
+    assert_eq!(
+        reopened.get("research").map(|profile| profile.trust),
+        Some(ProviderTrustWire::Full)
+    );
+}
+
+/// `provider.configure` carries trust for atomic creation and crash replay,
+/// but it must never become an unjournaled toggle for an existing provider.
+/// An exact-value retry remains idempotent so a create receipt can reconcile.
+///
+/// MUTATION CHECK: restore the assignment to `existing.trust`. Expected
+/// failure: the first reconfigure silently widens the provider to Full.
+#[test]
+fn existing_provider_trust_changes_require_the_typed_setter() {
+    let store = MemoryProviderStore::default();
+    let source = model_source([]);
+    let mut registry =
+        ProviderRegistry::new(store, Vec::new(), source).expect("empty provider registry");
+    let create = ProviderConfigureInput {
+        provider: "research".to_owned(),
+        api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
+        origin: Some("https://research.example/v1".to_owned()),
+        auth_requirement: Some(ProviderAuthRequirementWire::ApiKey),
+        enabled: true,
+        models: vec!["research-model".to_owned()],
+        default_model: Some("research-model".to_owned()),
+        response_open_timeout_ms: None,
+        trust: Some(ProviderTrustWire::Lockdown),
+    };
+    registry
+        .configure(create.clone())
+        .expect("new provider accepts explicit lockdown trust");
+
+    let mut widen = create.clone();
+    widen.api_family = None;
+    widen.origin = None;
+    widen.auth_requirement = None;
+    widen.trust = Some(ProviderTrustWire::Full);
+    let error = registry
+        .configure(widen)
+        .expect_err("configure cannot bypass provider.set_trust");
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert!(error.message.contains("provider.set_trust"));
+    assert_eq!(
+        registry.get("research").map(|profile| profile.trust),
+        Some(ProviderTrustWire::Lockdown)
+    );
+
+    let mut replay = create;
+    replay.api_family = None;
+    replay.origin = None;
+    replay.auth_requirement = None;
+    let profile = registry
+        .configure(replay)
+        .expect("same-trust configure replay remains idempotent");
+    assert_eq!(profile.trust, ProviderTrustWire::Lockdown);
+
+    let mut unknown = create;
+    unknown.provider = "future-trust".to_owned();
+    unknown.origin = Some("https://future.example/v1".to_owned());
+    unknown.trust = Some(ProviderTrustWire::Unknown);
+    let error = registry
+        .configure(unknown)
+        .expect_err("unknown trust cannot enter a new durable record");
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+}
+
+#[test]
+fn all_built_in_provider_records_are_full_trust() {
+    assert!(
+        resilience_profiles()
+            .iter()
+            .all(|profile| profile.trust == ProviderTrustWire::Full)
+    );
 }
 
 #[test]
@@ -467,6 +603,7 @@ fn provider_response_open_timeout_override_must_be_nonzero() {
             models: vec!["probe-model".to_owned()],
             default_model: Some("probe-model".to_owned()),
             response_open_timeout_ms: Some(0),
+            trust: None,
         })
         .expect_err("a zero response-open budget must fail typed validation");
     assert_eq!(error.code, ErrorCode::InvalidArgument);
@@ -492,6 +629,7 @@ fn existing_custom_provider_keeps_api_family_and_auth_create_only() {
             models: vec!["frontier-a".to_owned()],
             default_model: Some("frontier-a".to_owned()),
             response_open_timeout_ms: None,
+            trust: None,
         })
         .expect("create custom");
     let error = registry
@@ -504,6 +642,7 @@ fn existing_custom_provider_keeps_api_family_and_auth_create_only() {
             models: vec!["frontier-a".to_owned()],
             default_model: Some("frontier-a".to_owned()),
             response_open_timeout_ms: None,
+            trust: None,
         })
         .expect_err("API-family mutation must fail");
     assert!(error.message.contains("cannot change its API family"));
@@ -518,6 +657,7 @@ fn existing_custom_provider_keeps_api_family_and_auth_create_only() {
             models: vec!["frontier-a".to_owned()],
             default_model: Some("frontier-a".to_owned()),
             response_open_timeout_ms: None,
+            trust: None,
         })
         .expect_err("auth-requirement mutation must fail");
     assert!(error.message.contains("auth requirement"));
@@ -547,6 +687,7 @@ fn summaries_report_pickable_discovered_models_not_profile_literals() {
             default_model: Some("frontier-a".to_owned()),
             promotion_model: None,
             provenance: ProviderProvenance::Custom,
+            trust: haider_rpc::ProviderTrustWire::Full,
         }])
         .expect("seed store");
     let source = model_source([(
@@ -590,6 +731,7 @@ fn custom_summary_preserves_configured_default_across_mismatched_and_empty_catal
         default_model: Some("deepseek-v4-flash".to_owned()),
         promotion_model: None,
         provenance: ProviderProvenance::Custom,
+        trust: haider_rpc::ProviderTrustWire::Full,
     };
     let store = MemoryProviderStore::default();
     store
@@ -646,6 +788,7 @@ fn summaries_align_model_details_with_pickable_models_and_windows() {
             default_model: Some("frontier-a".to_owned()),
             promotion_model: None,
             provenance: ProviderProvenance::Custom,
+            trust: haider_rpc::ProviderTrustWire::Full,
         }])
         .expect("seed store");
     let source = model_source([(
@@ -959,6 +1102,7 @@ fn a_new_provider_creates_one_shot_on_its_stated_inventory() {
             models: vec!["probe-model".to_owned()],
             default_model: Some("probe-model".to_owned()),
             response_open_timeout_ms: Some(75_000),
+            trust: None,
         })
         .expect("a stated inventory carries the one-shot create");
     assert_eq!(profile.default_model.as_deref(), Some("probe-model"));
@@ -982,6 +1126,7 @@ fn a_new_provider_creates_one_shot_on_its_stated_inventory() {
             models: vec!["probe-model".to_owned()],
             default_model: Some("probe-model".to_owned()),
             response_open_timeout_ms: None,
+            trust: None,
         })
         .expect("an omitted timeout preserves the durable profile override");
     assert_eq!(updated.response_open_timeout_ms, Some(75_000));
@@ -998,6 +1143,7 @@ fn a_new_provider_creates_one_shot_on_its_stated_inventory() {
             models: vec!["served".to_owned()],
             default_model: Some("unserved".to_owned()),
             response_open_timeout_ms: None,
+            trust: None,
         })
         .expect_err("a default outside the stated inventory still fails");
     assert_eq!(error.code, ErrorCode::InvalidArgument);
@@ -1034,6 +1180,7 @@ fn provider_registry_removes_only_custom_profiles_and_clears_models() {
             models: vec!["custom-model".to_owned()],
             default_model: Some("custom-model".to_owned()),
             response_open_timeout_ms: None,
+            trust: None,
         })
         .expect("create custom profile");
 
@@ -1071,6 +1218,7 @@ fn ordinary_release_owned_provider_origin_remains_immutable() {
             models: Vec::new(),
             default_model: None,
             response_open_timeout_ms: None,
+            trust: None,
         })
         .expect_err("fixed release-owned origin must refuse");
     assert!(error.message.contains("origin is mutable only"));
@@ -1278,6 +1426,7 @@ fn lz2_azure_custom_keeps_manual_deployments_available_without_discovery() {
         default_model: Some("my-gpt-deployment".to_owned()),
         promotion_model: None,
         provenance: ProviderProvenance::Custom,
+        trust: haider_rpc::ProviderTrustWire::Full,
     };
     let store = MemoryProviderStore::default();
     store
@@ -1344,6 +1493,7 @@ fn enterprise_origin_reconfigure_is_shape_validated() {
         models: models.clone(),
         default_model: Some("anthropic.claude-fable-5".to_owned()),
         response_open_timeout_ms: None,
+        trust: None,
     };
 
     let profile = registry

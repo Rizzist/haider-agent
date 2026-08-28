@@ -317,6 +317,7 @@ fn provider_summary(provider: &str, models: Vec<String>) -> haider_rpc::Provider
         availability_reason: None,
         default_model: None,
         enabled: true,
+        trust: haider_rpc::ProviderTrustWire::Full,
     }
 }
 
