@@ -1432,12 +1432,11 @@ impl ClaudeNativeCredentialStore for ClaudeNativeCredentialAccess {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if event == ClaudeNativeReadEvent::Ordinary {
-                if let Some((observed_at, input)) = state.discovery_handoff.take()
-                    && observed_at.elapsed() <= Self::DISCOVERY_HANDOFF_TTL
-                {
-                    return Ok(input);
-                }
+            if event == ClaudeNativeReadEvent::Ordinary
+                && let Some((observed_at, input)) = state.discovery_handoff.take()
+                && observed_at.elapsed() <= Self::DISCOVERY_HANDOFF_TTL
+            {
+                return Ok(input);
             }
             if let Some(cached) = state.last_failure
                 && (event == ClaudeNativeReadEvent::Ordinary
