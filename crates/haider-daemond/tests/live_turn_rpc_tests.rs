@@ -871,6 +871,7 @@ impl WindowsProcessStartTrace {
         workspace: &std::path::Path,
         fake: &dyn FakeRequestCounter,
         result: &Result<ProcessStartObservation, tokio::time::error::Elapsed>,
+        observer: Option<&WindowsExecStartObserver>,
     ) {
         if !self.enabled {
             return;
@@ -884,7 +885,11 @@ impl WindowsProcessStartTrace {
                 "haider-daemond windows-process test={} phase=start-observation-failed result=Failed reason={reason:?}",
                 self.test_name,
             ),
-            _ => return,
+            Ok(ProcessStartObservation::Terminal) => eprintln!(
+                "haider-daemond windows-process test={} phase=start-observation-failed result=Terminal",
+                self.test_name,
+            ),
+            Ok(ProcessStartObservation::Started) => return,
         }
         eprintln!(
             "haider-daemond windows-process test={} phase=workspace-listing entries={:?}",
@@ -896,6 +901,13 @@ impl WindowsProcessStartTrace {
             self.test_name,
             fake.request_count(),
         );
+        if let Some(observer) = observer {
+            eprintln!(
+                "haider-daemond windows-process test={} phase=observer-state {}",
+                self.test_name,
+                observer.diagnostic_summary(),
+            );
+        }
     }
 }
 
@@ -924,6 +936,198 @@ fn workspace_listing(workspace: &std::path::Path) -> Vec<String> {
         .collect::<Vec<_>>();
     listing.sort();
     listing
+}
+
+#[cfg(windows)]
+struct WindowsExecTreeFailureDiagnostics {
+    started_at: std::time::Instant,
+    phase: &'static str,
+    workspace: std::path::PathBuf,
+    store_dir: std::path::PathBuf,
+    runtime_dir: std::path::PathBuf,
+    endpoint_path: std::path::PathBuf,
+    live_tree_observations: Vec<(String, String)>,
+    process_start_observations: Vec<(String, String)>,
+}
+
+#[cfg(windows)]
+impl WindowsExecTreeFailureDiagnostics {
+    fn new(config: &DaemonConfig, workspace: &std::path::Path) -> Self {
+        Self {
+            started_at: std::time::Instant::now(),
+            phase: "fixture-created",
+            workspace: workspace.to_path_buf(),
+            store_dir: config.store_dir.clone(),
+            runtime_dir: config.runtime_dir.clone(),
+            endpoint_path: config.endpoint_path(),
+            live_tree_observations: Vec::new(),
+            process_start_observations: Vec::new(),
+        }
+    }
+
+    fn set_phase(&mut self, phase: &'static str) {
+        self.phase = phase;
+    }
+
+    fn observe_live_tree(&mut self) {
+        self.live_tree_observations = windows_exec_process_snapshots(&self.workspace)
+            .into_iter()
+            .map(|(role, state)| (format!("{role}-before-cancel"), state))
+            .collect();
+    }
+
+    fn observe_process_start(
+        &mut self,
+        attempt: &str,
+        result: &Result<ProcessStartObservation, tokio::time::error::Elapsed>,
+        observer: Option<String>,
+    ) {
+        self.process_start_observations
+            .push((format!("{attempt}-result"), format!("{result:?}")));
+        if let Some(observer) = observer {
+            self.process_start_observations
+                .push((format!("{attempt}-observer"), observer));
+        }
+    }
+
+    fn snapshot(&self) -> support::BoundarySnapshot {
+        let mut snapshot = support::BoundarySnapshot::default()
+            .observation("test_phase", self.phase)
+            .observation(
+                "workspace_listing",
+                format!("{:?}", workspace_listing(&self.workspace)),
+            );
+        for name in [
+            "powershell-parent.pid",
+            "ps-alive.log",
+            "descendant.pid",
+            "descendant-started.log",
+            "heartbeat.log",
+            "descendant-survived.log",
+        ] {
+            snapshot = snapshot.observation(
+                format!("workspace_file[{name}]"),
+                windows_failure_file_state(&self.workspace.join(name)),
+            );
+        }
+        for (role, state) in &self.live_tree_observations {
+            snapshot = snapshot.process(role, state);
+        }
+        for (name, state) in &self.process_start_observations {
+            snapshot = snapshot.observation(name, state);
+        }
+        for (role, state) in windows_exec_process_snapshots(&self.workspace) {
+            snapshot = snapshot.process(format!("{role}-at-failure"), state);
+        }
+        snapshot
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsExecTreeFailureDiagnostics {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        let context = support::BoundaryContext {
+            store_dir: &self.store_dir,
+            runtime_dir: &self.runtime_dir,
+            endpoint_path: &self.endpoint_path,
+            captured_daemon_stderr: &[],
+        };
+        support::report_boundary_failure(
+            "w4a2_cancelled_exec_child_process_group_dies",
+            self.started_at.elapsed(),
+            &context,
+            self.snapshot(),
+        );
+    }
+}
+
+#[cfg(windows)]
+fn windows_failure_file_state(path: &std::path::Path) -> String {
+    use std::io::Read as _;
+
+    const CAPTURE_BYTES: u64 = 4 * 1024;
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return "exists=false".into();
+        }
+        Err(error) => return format!("metadata_error={error}"),
+    };
+    let mut bytes = Vec::new();
+    let read = fs::File::open(path).and_then(|file| {
+        file.take(CAPTURE_BYTES).read_to_end(&mut bytes)?;
+        Ok(())
+    });
+    match read {
+        Ok(()) => format!(
+            "exists=true size={} captured={} truncated={} contents={:?}",
+            metadata.len(),
+            bytes.len(),
+            metadata.len() > CAPTURE_BYTES,
+            String::from_utf8_lossy(&bytes),
+        ),
+        Err(error) => format!("exists=true size={} read_error={error}", metadata.len(),),
+    }
+}
+
+#[cfg(windows)]
+fn windows_exec_process_snapshots(workspace: &std::path::Path) -> Vec<(String, String)> {
+    let parent_pid = windows_fixture_pid(&workspace.join("powershell-parent.pid"));
+    let descendant_pid = windows_fixture_pid(&workspace.join("descendant.pid"));
+    let parent_group = parent_pid
+        .as_ref()
+        .ok()
+        .and_then(|pid| haider_platform::process_group(Some(*pid)));
+    let mut snapshots = Vec::new();
+    match parent_pid {
+        Ok(pid) => snapshots.push((
+            "powershell-parent".into(),
+            windows_process_state_text(pid, parent_group),
+        )),
+        Err(state) => snapshots.push(("powershell-parent".into(), state)),
+    }
+    match descendant_pid {
+        Ok(pid) => snapshots.push((
+            "cmd-descendant".into(),
+            windows_process_state_text(pid, parent_group),
+        )),
+        Err(state) => snapshots.push(("cmd-descendant".into(), state)),
+    }
+    snapshots
+}
+
+#[cfg(windows)]
+fn windows_fixture_pid(path: &std::path::Path) -> Result<u32, String> {
+    let value = fs::read_to_string(path).map_err(|error| format!("pid_unavailable={error}"))?;
+    value
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid != 0)
+        .ok_or_else(|| format!("invalid_pid_contents={value:?}"))
+}
+
+#[cfg(windows)]
+fn windows_process_state_text(pid: u32, group: Option<haider_platform::ProcessGroup>) -> String {
+    let state = match haider_platform::windows_process_state(pid) {
+        Ok(Some(state)) => format!(
+            "pid={pid} alive={} exit_code={:?} in_any_job={}",
+            state.alive, state.exit_code, state.in_any_job,
+        ),
+        Ok(None) => format!("pid={pid} alive=false exit_code=unavailable in_any_job=unavailable"),
+        Err(error) => format!("pid={pid} state_error={error}"),
+    };
+    let registered_membership = match group {
+        Some(group) => match haider_platform::windows_process_in_group(group, pid) {
+            Ok(in_group) => in_group.to_string(),
+            Err(error) => format!("unavailable({error})"),
+        },
+        None => "unavailable(parent Job Object is not registered)".into(),
+    };
+    format!("{state} in_parent_registered_job={registered_membership}")
 }
 
 #[cfg(windows)]
@@ -1145,6 +1349,23 @@ impl WindowsExecStartObserver {
                 "{reason}; tool_result={tool_result}; decoded_output={output:?}; decoded_stderr={stderr:?}"
             ),
         }
+    }
+
+    fn diagnostic_summary(&self) -> String {
+        let tool_result = self
+            .tool_result
+            .as_ref()
+            .map_or("<not observed>", |(_, result)| result.as_str());
+        format!(
+            "exec_item={:?} exec_call_id={:?} tool_result={tool_result} output_bytes={} stdout_bytes={} stderr_bytes={} decoded_output={:?} decoded_stderr={:?}",
+            self.exec_item,
+            self.exec_call_id,
+            self.output_tail.len(),
+            self.stdout_tail.len(),
+            self.stderr_tail.len(),
+            String::from_utf8_lossy(&self.output_tail),
+            String::from_utf8_lossy(&self.stderr_tail),
+        )
     }
 }
 
@@ -1383,7 +1604,7 @@ async fn wait_for_direct_shell_process_tree(
             }
         })
         .await;
-        trace.failure_diagnostics(_workspace, _fake, &result);
+        trace.failure_diagnostics(_workspace, _fake, &result, None);
         result
     }
 }
@@ -1398,7 +1619,10 @@ async fn wait_for_exec_child_started(
     _workspace: &std::path::Path,
     _fake: &dyn FakeRequestCounter,
     _approved_menu: &MenuId,
-) -> Result<ProcessStartObservation, tokio::time::error::Elapsed> {
+) -> (
+    Result<ProcessStartObservation, tokio::time::error::Elapsed>,
+    Option<String>,
+) {
     #[cfg(windows)]
     let mut trace = WindowsProcessStartTrace::new(
         "w4a2_cancelled_exec_child_process_group_dies",
@@ -1477,8 +1701,12 @@ async fn wait_for_exec_child_started(
     })
     .await;
     #[cfg(windows)]
-    trace.failure_diagnostics(_workspace, _fake, &result);
-    result
+    trace.failure_diagnostics(_workspace, _fake, &result, Some(&observer));
+    #[cfg(windows)]
+    let observer_diagnostics = Some(observer.diagnostic_summary());
+    #[cfg(not(windows))]
+    let observer_diagnostics = None;
+    (result, observer_diagnostics)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1803,7 +2031,9 @@ async fn clean_timed_out_process_start_files(
     );
     for path in [
         heartbeat.to_path_buf(),
+        workspace.join("powershell-parent.pid"),
         workspace.join("ps-alive.log"),
+        workspace.join("descendant.pid"),
         workspace.join("descendant-started.log"),
     ] {
         match fs::remove_file(path) {
@@ -2000,6 +2230,9 @@ fn cancellable_exec_command() -> String {
     // PowerShell's location and .NET's relative-path base aligned: they are
     // distinct process state on Windows and can otherwise name different dirs.
     windows_powershell_command(concat!(
+        "[IO.File]::WriteAllText((Join-Path (Get-Location).Path 'powershell-parent.pid'),",
+        "$PID.ToString([Globalization.CultureInfo]::InvariantCulture),",
+        "[Text.Encoding]::ASCII);",
         "[IO.File]::WriteAllText((Join-Path (Get-Location).Path 'ps-alive.log'),",
         "'x',[Text.Encoding]::ASCII);",
         "$workspace=(Get-Location).Path;Write-Error ('resolved-workspace='+$workspace);",
@@ -2019,6 +2252,9 @@ fn cancellable_exec_command() -> String {
         "$start.WorkingDirectory=$workspace;$start.UseShellExecute=$false;",
         "$start.CreateNoWindow=$true;$child=[Diagnostics.Process]::Start($start);",
         "if($null -eq $child){throw 'descendant process did not start'};",
+        "[IO.File]::WriteAllText((Join-Path $workspace 'descendant.pid'),",
+        "$child.Id.ToString([Globalization.CultureInfo]::InvariantCulture),",
+        "[Text.Encoding]::ASCII);",
         "$readyWait=[Diagnostics.Stopwatch]::StartNew();",
         "while(-not [IO.File]::Exists($ready)){",
         "if($child.HasExited){$child.Dispose();",
@@ -8539,6 +8775,8 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
     let task = ready_with_dependencies(&config, dependencies).await;
     #[cfg(windows)]
     let mut failure_diagnostics = support::FailureDiagnostics::install("w4a2-exec-cancel", &task);
+    #[cfg(windows)]
+    let mut process_tree_diagnostics = WindowsExecTreeFailureDiagnostics::new(&config, &workspace);
     let mut client = UdsClient::connect_control(
         &config.endpoint_path(),
         config.frame_limit,
@@ -8597,10 +8835,12 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
     )
     .await;
     #[cfg(windows)]
+    process_tree_diagnostics.set_phase("waiting-for-first-start");
+    #[cfg(windows)]
     eprintln!(
         "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=waiting-for-first-start"
     );
-    let start = wait_for_exec_child_started(
+    let (start, _start_observer_diagnostics) = wait_for_exec_child_started(
         &mut client,
         &config,
         &session_id,
@@ -8611,6 +8851,14 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
         &approved_menu,
     )
     .await;
+    #[cfg(windows)]
+    process_tree_diagnostics.observe_process_start(
+        "first-attempt",
+        &start,
+        _start_observer_diagnostics,
+    );
+    #[cfg(windows)]
+    process_tree_diagnostics.set_phase("first-start-observed");
     #[cfg(windows)]
     eprintln!(
         "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=first-start-observed result={start:?}"
@@ -8629,6 +8877,7 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
         // ordinary RPC deadline instead of restarting a bound at every phase.
         let recovery_deadline = tokio::time::Instant::now() + support::DEADLINE;
         tokio::time::timeout_at(recovery_deadline, async {
+            process_tree_diagnostics.set_phase("settling-first-attempt");
             eprintln!(
                 "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=settling-first-attempt"
             );
@@ -8644,10 +8893,12 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
                 "cancel-exec-timeout-cleanup-command",
             )
             .await;
+            process_tree_diagnostics.set_phase("cleaning-first-attempt");
             eprintln!(
                 "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=cleaning-first-attempt"
             );
             clean_timed_out_process_start_files(&workspace, &heartbeat).await;
+            process_tree_diagnostics.set_phase("submitting-retry");
             eprintln!(
                 "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=submitting-retry"
             );
@@ -8698,11 +8949,11 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
                 0,
             )
             .await;
+            process_tree_diagnostics.set_phase("waiting-for-retry-start");
             eprintln!(
                 "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=waiting-for-retry-start"
             );
-            assert_eq!(
-                wait_for_exec_child_started(
+            let (retry_start, retry_observer_diagnostics) = wait_for_exec_child_started(
                     &mut client,
                     &config,
                     &session_id,
@@ -8712,7 +8963,14 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
                     &fake,
                     &retry_approved_menu,
                 )
-                .await
+                .await;
+            process_tree_diagnostics.observe_process_start(
+                "retry-attempt",
+                &retry_start,
+                retry_observer_diagnostics,
+            );
+            assert_eq!(
+                retry_start
                 .expect("exec child starts within the deadline on its single retry"),
                 ProcessStartObservation::Started,
                 "the single retry must start a live process tree"
@@ -8734,6 +8992,11 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
     } else {
         (run_id, answerer, 1_usize)
     };
+    #[cfg(windows)]
+    {
+        process_tree_diagnostics.set_phase("verifying-live-descendant-before-cancel");
+        process_tree_diagnostics.observe_live_tree();
+    }
     assert!(heartbeat.exists(), "real child started");
     #[cfg(windows)]
     assert!(
@@ -8757,6 +9020,8 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
     #[cfg(not(windows))]
     let events = events_until_terminal(&mut client, &run_id).await;
     #[cfg(windows)]
+    process_tree_diagnostics.set_phase("cancelling-live-attempt");
+    #[cfg(windows)]
     eprintln!(
         "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=cancelling-live-attempt"
     );
@@ -8772,6 +9037,8 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
     )
     .await;
     #[cfg(windows)]
+    process_tree_diagnostics.set_phase("cancelled-and-idle");
+    #[cfg(windows)]
     eprintln!(
         "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=cancelled-and-idle"
     );
@@ -8785,6 +9052,8 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
         "cancelled exec settles interrupted Idle only after dispatcher close"
     );
     #[cfg(windows)]
+    process_tree_diagnostics.set_phase("reading-durable-session");
+    #[cfg(windows)]
     eprintln!(
         "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=reading-durable-session"
     );
@@ -8795,6 +9064,8 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
         "cancel-exec-durable-read",
     )
     .await;
+    #[cfg(windows)]
+    process_tree_diagnostics.set_phase("validating-durable-tool-terminal");
     #[cfg(windows)]
     eprintln!(
         "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=durable-session-read"
@@ -8834,6 +9105,8 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
         )),
         "command output delta followed the tool item's terminal event"
     );
+    #[cfg(windows)]
+    process_tree_diagnostics.set_phase("checking-heartbeat-stopped");
     let stopped_size = fs::metadata(&heartbeat).expect("heartbeat metadata").len();
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     assert_eq!(
@@ -8843,6 +9116,7 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
     );
     #[cfg(windows)]
     {
+        process_tree_diagnostics.set_phase("checking-descendant-did-not-survive");
         tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
         assert!(
             !workspace.join("descendant-survived.log").exists(),
@@ -8851,6 +9125,8 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
     }
     #[cfg(not(windows))]
     assert_eq!(fake.request_count(), 1);
+    #[cfg(windows)]
+    process_tree_diagnostics.set_phase("checking-attempt-counts");
     #[cfg(windows)]
     assert!(
         (1..=2).contains(&fake.first_attempt_request_count()),
@@ -8866,6 +9142,7 @@ async fn w4a2_cancelled_exec_child_process_group_dies() {
     task.shutdown_handle().request("test complete");
     #[cfg(windows)]
     {
+        process_tree_diagnostics.set_phase("joining-daemon");
         eprintln!(
             "haider-daemond windows-process test=w4a2_cancelled_exec_child_process_group_dies phase=joining-daemon"
         );

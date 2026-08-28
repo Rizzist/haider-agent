@@ -48,7 +48,10 @@ pub use process::{
     signal_process, signal_process_group, signal_process_group_id, wait_for_child_exit,
 };
 #[cfg(windows)]
-pub use process::{windows_command_interpreter, windows_powershell};
+pub use process::{
+    WindowsProcessState, windows_command_interpreter, windows_powershell, windows_process_in_group,
+    windows_process_state,
+};
 pub use shutdown::{ShutdownInstallError, ShutdownSignal, ShutdownSignals, shutdown_signal};
 pub use spawn::{
     DAEMON_LIVENESS_ARG, DAEMON_LOG_DIRECTORY, DAEMON_LOG_FILE, DAEMON_LOG_PATH_ENV,

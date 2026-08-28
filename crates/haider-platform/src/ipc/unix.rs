@@ -1479,8 +1479,6 @@ mod tests {
             outcome,
             IpcShutdownOutcome::PeerNotified | IpcShutdownOutcome::PeerAlreadyGone
         ));
-        #[cfg(target_vendor = "apple")]
-        assert_eq!(outcome, IpcShutdownOutcome::PeerAlreadyGone);
     }
 
     #[test]

@@ -97,6 +97,19 @@ pub struct ProcessGroup {
     token: u64,
 }
 
+/// Failure-only state for a Windows process observed by integration tests and
+/// boundary diagnostics. `None` from [`windows_process_state`] means the PID
+/// no longer names an openable process; an exited process retains its code
+/// only while Windows still exposes the process object.
+#[cfg(windows)]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowsProcessState {
+    pub alive: bool,
+    pub exit_code: Option<u32>,
+    pub in_any_job: bool,
+}
+
 impl ProcessGroup {
     #[must_use]
     pub fn id(self) -> u32 {
@@ -111,6 +124,120 @@ impl ProcessGroup {
 #[must_use]
 pub fn process_group(pid: Option<u32>) -> Option<ProcessGroup> {
     pid.filter(|pid| *pid != 0).map(ProcessGroup)
+}
+
+/// Returns non-blocking process state for failure diagnostics.
+#[cfg(windows)]
+#[doc(hidden)]
+#[allow(unsafe_code)]
+pub fn windows_process_state(pid: u32) -> std::io::Result<Option<WindowsProcessState>> {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
+    };
+
+    // SYNCHRONIZE is a frozen Win32 access-right bit; windows-sys moves its
+    // module home between releases, so pin the ABI value directly.
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+
+    if pid == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid process PID",
+        ));
+    }
+    // SAFETY: the access mask and PID are values, and no borrowed pointer is
+    // passed. A non-null return is one newly owned process handle.
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+    if raw.is_null() {
+        let error = std::io::Error::last_os_error();
+        return if process_error_is_missing(&error) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    // SAFETY: `raw` is the non-null owned handle returned immediately above;
+    // transferring it prevents every error path below from leaking it.
+    let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+    // SAFETY: `handle` remains live for the call and a zero timeout never
+    // blocks this failure-only diagnostic.
+    let wait = unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) };
+    let alive = match wait {
+        WAIT_OBJECT_0 => false,
+        WAIT_TIMEOUT => true,
+        _ => return Err(std::io::Error::last_os_error()),
+    };
+    let mut raw_exit_code = 0_u32;
+    // SAFETY: `handle` remains live and `raw_exit_code` is writable for the
+    // duration of the call.
+    if unsafe { GetExitCodeProcess(handle.as_raw_handle(), &raw mut raw_exit_code) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut in_any_job = 0;
+    // SAFETY: a null Job handle asks about membership in any Job Object;
+    // `handle` and the writable result remain live for the call.
+    if unsafe {
+        IsProcessInJob(
+            handle.as_raw_handle(),
+            std::ptr::null_mut(),
+            &raw mut in_any_job,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(Some(WindowsProcessState {
+        alive,
+        exit_code: (!alive).then_some(raw_exit_code),
+        in_any_job: in_any_job != 0,
+    }))
+}
+
+/// Reports whether `pid` belongs to the exact registered Job Object.
+#[cfg(windows)]
+#[doc(hidden)]
+#[allow(unsafe_code)]
+pub fn windows_process_in_group(group: ProcessGroup, pid: u32) -> std::io::Result<bool> {
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+    use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    if pid == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid process PID",
+        ));
+    }
+    // SAFETY: the access mask and PID are values, and no borrowed pointer is
+    // passed. A non-null return is one newly owned process handle.
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if raw.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is the non-null owned handle returned immediately above.
+    let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let registry = windows_job_registry()
+        .lock()
+        .map_err(|_| std::io::Error::other("Windows job registry is poisoned"))?;
+    let job = registry.by_token.get(&group.token).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "Windows process group {} is no longer registered",
+                group.pid
+            ),
+        )
+    })?;
+    let mut in_group = 0;
+    // SAFETY: both handles remain live under this registry guard and the
+    // result storage is writable for the duration of the call.
+    if unsafe { IsProcessInJob(process.as_raw_handle(), job.0, &raw mut in_group) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(in_group != 0)
 }
 
 #[cfg(unix)]

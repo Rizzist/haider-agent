@@ -270,7 +270,7 @@ impl WindowsComputerBackend {
             })?;
         let mut rgb = Vec::with_capacity(rgb_len);
         for (row_index, row) in bgra.chunks_exact(row_bytes).enumerate() {
-            if row_index % 64 == 0 {
+            if row_index.is_multiple_of(64) {
                 cancel.check()?;
             }
             for pixel in row.chunks_exact(4) {
@@ -564,7 +564,7 @@ impl WindowsComputerBackend {
     async fn type_text(&self, text: &str, cancel: &ComputerCancelToken) -> ComputerResult<()> {
         for (index, scalar) in text.chars().enumerate() {
             Self::type_scalar(scalar, cancel)?;
-            if index % 32 == 31 {
+            if index.wrapping_add(1).is_multiple_of(32) {
                 tokio::task::yield_now().await;
             }
         }

@@ -140,14 +140,42 @@ pub fn report_boundary_timeout(
     context: &BoundaryContext<'_>,
     snapshot: BoundarySnapshot,
 ) {
+    report_boundary_failure_inner(boundary, elapsed, Some(deadline), context, snapshot);
+}
+
+/// Prints the same complete, best-effort post-mortem for an assertion or
+/// terminal-state failure whose boundary was not itself a timeout.
+pub fn report_boundary_failure(
+    boundary: &str,
+    elapsed: Duration,
+    context: &BoundaryContext<'_>,
+    snapshot: BoundarySnapshot,
+) {
+    report_boundary_failure_inner(boundary, elapsed, None, context, snapshot);
+}
+
+fn report_boundary_failure_inner(
+    boundary: &str,
+    elapsed: Duration,
+    deadline: Option<Duration>,
+    context: &BoundaryContext<'_>,
+    snapshot: BoundarySnapshot,
+) {
     println!("===== haider boundary post-mortem =====");
     println!("boundary={boundary}");
-    println!(
-        "timing elapsed_ms={} deadline_ms={}",
-        elapsed.as_millis(),
-        deadline.as_millis()
-    );
-    println!("----- predicate state (re-evaluated at timeout) -----");
+    match deadline {
+        Some(deadline) => println!(
+            "timing elapsed_ms={} deadline_ms={}",
+            elapsed.as_millis(),
+            deadline.as_millis()
+        ),
+        None => println!("timing elapsed_ms={}", elapsed.as_millis()),
+    }
+    if deadline.is_some() {
+        println!("----- predicate state (re-evaluated at timeout) -----");
+    } else {
+        println!("----- predicate state (captured at failure) -----");
+    }
     if snapshot.observations.is_empty() {
         println!("observation_state=unavailable");
     } else {

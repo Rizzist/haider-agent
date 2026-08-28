@@ -797,7 +797,7 @@ pub(super) fn inspect_owned_directory(
         let mut offset = 0_usize;
         loop {
             let header_bytes = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
-            if offset % std::mem::align_of::<FILE_ID_BOTH_DIR_INFO>() != 0
+            if !offset.is_multiple_of(std::mem::align_of::<FILE_ID_BOTH_DIR_INFO>())
                 || offset
                     .checked_add(header_bytes)
                     .is_none_or(|end| end > BUFFER_BYTES)
@@ -818,7 +818,7 @@ pub(super) fn inspect_owned_directory(
             };
             let name_bytes = information.FileNameLength as usize;
             let name_start = offset + header_bytes;
-            if name_bytes % std::mem::size_of::<u16>() != 0
+            if !name_bytes.is_multiple_of(std::mem::size_of::<u16>())
                 || name_start
                     .checked_add(name_bytes)
                     .is_none_or(|end| end > BUFFER_BYTES)
