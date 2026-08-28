@@ -285,7 +285,8 @@ pub async fn connect(path: &Path, config: ClientConfig) -> Result<Connected, Con
         &welcome,
         encoding,
         peer_credentials,
-    );
+    )
+    .map_err(ConnectError::Io)?;
     Ok(Connected {
         client,
         welcome,
@@ -418,6 +419,9 @@ pub struct RpcClient {
     outbound_limit: usize,
     encoding: WireEncoding,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Kernel close authority retained outside the reader/writer tasks so a
+    /// synchronous `close` does not depend on polling their executor again.
+    shutdown: haider_platform::IpcShutdown,
     /// The handshake the connection negotiated on. Retained so a client that
     /// only receives the `RpcClient` (the TUI's `run_live`) can still gate
     /// its affordances on what the daemon ADVERTISED — report §4.1's
@@ -436,7 +440,8 @@ impl RpcClient {
         welcome: &Welcome,
         encoding: WireEncoding,
         peer_credentials: PeerCredentials,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
+        let shutdown = haider_platform::shutdown_handle(&stream)?;
         let (state, _) = watch::channel(ConnectionState::Connected);
         let shared = Arc::new(Shared {
             pending: StdMutex::new(HashMap::new()),
@@ -476,16 +481,17 @@ impl RpcClient {
                 config.pong_deadline,
             )),
         ];
-        Self {
+        Ok(Self {
             shared,
             outbound,
             events: StdMutex::new(Some(events_rx)),
             outbound_limit,
             encoding,
             tasks,
+            shutdown,
             welcome: welcome.clone(),
             peer_credentials,
-        }
+        })
     }
 
     /// The negotiated handshake (daemon version, granted capabilities, and
@@ -661,6 +667,10 @@ impl RpcClient {
     /// [`Self::disconnected`] returns the first recorded reason.
     pub fn close(&self) {
         self.shared.fail(DisconnectReason::Closed);
+        let _ = self.shutdown.request();
+        for task in &self.tasks {
+            task.abort();
+        }
     }
 
     fn disconnect_reason(&self) -> DisconnectReason {
@@ -697,10 +707,7 @@ impl PendingResponse {
 
 impl Drop for RpcClient {
     fn drop(&mut self) {
-        self.shared.fail(DisconnectReason::Closed);
-        for task in &self.tasks {
-            task.abort();
-        }
+        self.close();
     }
 }
 

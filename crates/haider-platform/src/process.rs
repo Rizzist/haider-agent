@@ -343,10 +343,11 @@ pub fn windows_powershell() -> std::path::PathBuf {
 #[cfg(unix)]
 pub fn configure_background_process(command: &mut tokio::process::Command) {
     use std::os::unix::process::CommandExt as _;
+    let upper_bound = inherited_descriptor_upper_bound();
     #[allow(unsafe_code)]
     unsafe {
-        command.as_std_mut().pre_exec(|| {
-            close_inherited_descriptors();
+        command.as_std_mut().pre_exec(move || {
+            close_inherited_descriptors_from(3, upper_bound);
             Ok(())
         });
     }
@@ -354,13 +355,16 @@ pub fn configure_background_process(command: &mut tokio::process::Command) {
 
 #[cfg(unix)]
 #[allow(unsafe_code)]
-pub(crate) fn close_inherited_descriptors() {
-    close_inherited_descriptors_from(3);
+pub(crate) fn close_inherited_descriptors(upper_bound: std::os::raw::c_int) {
+    close_inherited_descriptors_from(3, upper_bound);
 }
 
 #[cfg(unix)]
 #[allow(unsafe_code)]
-pub(crate) fn close_inherited_descriptors_from(first: std::os::raw::c_int) {
+pub(crate) fn close_inherited_descriptors_from(
+    first: std::os::raw::c_int,
+    upper_bound: std::os::raw::c_int,
+) {
     if close_inherited_descriptor_range(first) {
         return;
     }
@@ -369,25 +373,48 @@ pub(crate) fn close_inherited_descriptors_from(first: std::os::raw::c_int) {
     // Mark rather than close: std::process creates a private CLOEXEC pipe
     // before fork so the child can report pre-exec/exec errors to its parent.
     // Closing that unknown descriptor here would turn ENOENT/EACCES into a
-    // false successful spawn. `getrlimit(2)` and `fcntl(2)` are raw,
-    // async-signal-safe libc calls; EBADF is expected for unused slots.
-    let upper_bound = inherited_descriptor_upper_bound();
+    // false successful spawn. The parent computes and captures `upper_bound`;
+    // the child only calls async-signal-safe `fcntl(2)`. EBADF is expected for
+    // unused slots.
     for fd in first..upper_bound {
         let _ = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
     }
 }
 
-/// Returns the exact parent descriptor-table ceiling without allocating.
+/// Returns a conservative descriptor ceiling while still in the parent.
 ///
-/// The parent never lowers `RLIMIT_NOFILE`, so every descriptor it could have
-/// handed to the fork child is below `rlim_cur`. A failed limit probe retains
-/// the historical conservative ceiling.
+/// macOS commonly reports an `RLIMIT_NOFILE` of 1,048,576. Sweeping that
+/// entire range in every forked child adds roughly one million `fcntl` calls
+/// before `exec`. `/dev/fd` exposes the parent's actual open set; 64 spare
+/// slots cover the small fixed set `Command` may allocate before the hook.
+/// A failed enumeration retains the historical rlimit-based ceiling.
+#[cfg(unix)]
+pub(crate) fn inherited_descriptor_upper_bound() -> std::os::raw::c_int {
+    const COMMAND_DESCRIPTOR_HEADROOM: std::os::raw::c_int = 64;
+
+    let maximum = std::fs::read_dir("/dev/fd").ok().and_then(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                name.to_str()
+                    .and_then(|name| name.parse::<std::os::raw::c_int>().ok())
+            })
+            .max()
+    });
+    maximum.map_or_else(inherited_descriptor_limit, |maximum| {
+        maximum
+            .saturating_add(1)
+            .saturating_add(COMMAND_DESCRIPTOR_HEADROOM)
+    })
+}
+
 #[cfg(all(
     unix,
     not(any(target_os = "espidf", target_os = "horizon", target_os = "vita"))
 ))]
 #[allow(unsafe_code)]
-fn inherited_descriptor_upper_bound() -> std::os::raw::c_int {
+fn inherited_descriptor_limit() -> std::os::raw::c_int {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -405,7 +432,7 @@ fn inherited_descriptor_upper_bound() -> std::os::raw::c_int {
     unix,
     any(target_os = "espidf", target_os = "horizon", target_os = "vita")
 ))]
-fn inherited_descriptor_upper_bound() -> std::os::raw::c_int {
+fn inherited_descriptor_limit() -> std::os::raw::c_int {
     65_536
 }
 
@@ -468,6 +495,7 @@ fn close_inherited_descriptor_range(_first: std::os::raw::c_int) -> bool {
 pub(crate) fn install_daemon_spawn_descriptors(
     readiness: Option<std::os::raw::c_int>,
     liveness: Option<std::os::raw::c_int>,
+    upper_bound: std::os::raw::c_int,
 ) -> std::io::Result<()> {
     const DAEMON_READINESS_FD: std::os::raw::c_int = 3;
     const DAEMON_LIVENESS_FD: std::os::raw::c_int = 4;
@@ -503,7 +531,7 @@ pub(crate) fn install_daemon_spawn_descriptors(
     } else {
         DAEMON_READINESS_FD
     };
-    close_inherited_descriptors_from(last + 1);
+    close_inherited_descriptors_from(last + 1, upper_bound);
     Ok(())
 }
 

@@ -136,7 +136,7 @@ pub(crate) async fn bind(
     config: &DaemonConfig,
     runtime: RuntimeDirectory,
 ) -> Result<BoundEndpoint, DaemonError> {
-    let endpoint = haider_platform::Endpoint::new(&config.runtime_dir, &config.profile_id);
+    let endpoint = haider_platform::Endpoint::from_address(config.endpoint_path());
     let mut inner = haider_platform::BoundEndpoint::bind(&endpoint, &config.runtime_dir)
         .await
         .map_err(map_error)?;
@@ -221,9 +221,26 @@ pub(crate) fn map_error(error: haider_platform::EndpointError) -> DaemonError {
             path,
             source,
         },
+        haider_platform::EndpointError::AddressTooLong {
+            path,
+            length,
+            limit,
+            unit,
+        } => DaemonError::EndpointAddressTooLong {
+            path,
+            length,
+            limit,
+            unit,
+        },
         haider_platform::EndpointError::Endpoint { message } => DaemonError::Endpoint { message },
         haider_platform::EndpointError::Task { message } => DaemonError::Task { message },
     }
+}
+
+pub(crate) fn validate_budget(config: &DaemonConfig) -> Result<(), DaemonError> {
+    haider_platform::Endpoint::from_address(config.endpoint_path())
+        .validate_for_bind(&config.runtime_dir)
+        .map_err(map_error)
 }
 
 impl From<haider_platform::EndpointError> for DaemonError {

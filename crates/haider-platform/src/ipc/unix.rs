@@ -8,6 +8,7 @@ use super::{Endpoint, EndpointError, PeerCredentials};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
 use std::fs;
+use std::os::fd::AsRawFd as _;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
@@ -18,6 +19,41 @@ pub type IpcStream = UnixStream;
 pub type IpcReadHalf = tokio::net::unix::OwnedReadHalf;
 pub type IpcWriteHalf = tokio::net::unix::OwnedWriteHalf;
 pub type EndpointAddress = tokio::net::unix::SocketAddr;
+
+// sockaddr_un::sun_path has 108 bytes on Linux/Android and 104 on Apple
+// platforms. Filesystem addresses also need a trailing NUL, so these are the
+// maximum path-byte counts, not the array capacities.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const UNIX_SOCKET_PATH_BYTES: usize = 107;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const UNIX_SOCKET_PATH_BYTES: usize = 103;
+
+const STAGING_PREFIX: &str = ".haiderd-";
+const STAGING_RANDOM_BYTES: usize = 12;
+const STAGING_RANDOM_CHARS: usize = 16;
+const STAGING_BASENAME_BYTES: usize = STAGING_PREFIX.len() + STAGING_RANDOM_CHARS;
+const BASE64_URL_SAFE: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// A duplicate of a connected socket retained outside its async tasks.
+///
+/// `shutdown(2)` applies to the shared socket, so it wakes both halves and
+/// makes a synchronous client close visible even while a current-thread Tokio
+/// runtime is not being driven.
+pub struct IpcShutdown {
+    socket: OwnedFd,
+}
+
+impl IpcShutdown {
+    #[allow(unsafe_code)]
+    pub fn request(&self) -> std::io::Result<()> {
+        if unsafe { libc::shutdown(self.socket.as_raw_fd(), libc::SHUT_RDWR) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SocketIdentity {
@@ -41,6 +77,7 @@ pub struct BoundEndpoint {
 
 impl BoundEndpoint {
     pub async fn bind(endpoint: &Endpoint, runtime_dir: &Path) -> Result<Self, EndpointError> {
+        validate_endpoint_budget(endpoint, runtime_dir)?;
         let runtime_dir_owned = runtime_dir.to_path_buf();
         let (directory, owner_uid) =
             tokio::task::spawn_blocking(move || prepare_runtime_dir(&runtime_dir_owned))
@@ -717,22 +754,61 @@ fn restore(directory: &OwnedFd, claim: &str, name: &str) -> Result<(), EndpointE
     }
 }
 
-const STAGING_PREFIX: &str = ".haiderd-";
-
 fn staging_name() -> Result<String, EndpointError> {
-    let mut bytes = [0_u8; 16];
+    // Ninety-six random bits retain a wide pre-knowledge margin while their
+    // unpadded URL-safe base64 encoding keeps the full basename to 25 bytes.
+    // The old 128-bit hex form used 41 bytes and overflowed macOS sun_path
+    // beneath its ordinary per-user TMPDIR.
+    let mut bytes = [0_u8; STAGING_RANDOM_BYTES];
     getrandom::fill(&mut bytes).map_err(|error| EndpointError::Task {
         message: format!("cannot generate endpoint staging name: {error}"),
     })?;
-    let mut staging = String::with_capacity(STAGING_PREFIX.len() + bytes.len() * 2);
+    let mut staging = String::with_capacity(STAGING_BASENAME_BYTES);
     staging.push_str(STAGING_PREFIX);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        write!(&mut staging, "{byte:02x}").map_err(|error| EndpointError::Task {
-            message: format!("cannot format endpoint staging name: {error}"),
-        })?;
+    for chunk in bytes.chunks_exact(3) {
+        let indexes = [
+            chunk[0] >> 2,
+            ((chunk[0] & 0x03) << 4) | (chunk[1] >> 4),
+            ((chunk[1] & 0x0f) << 2) | (chunk[2] >> 6),
+            chunk[2] & 0x3f,
+        ];
+        for index in indexes {
+            staging.push(char::from(BASE64_URL_SAFE[usize::from(index)]));
+        }
     }
     Ok(staging)
+}
+
+fn longest_staging_path(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.join(format!(
+        "{STAGING_PREFIX}{}",
+        "A".repeat(STAGING_RANDOM_CHARS)
+    ))
+}
+
+pub(super) fn validate_endpoint_budget(
+    endpoint: &Endpoint,
+    runtime_dir: &Path,
+) -> Result<(), EndpointError> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let staging = longest_staging_path(runtime_dir);
+    let longest =
+        if endpoint.address().as_os_str().as_bytes().len() > staging.as_os_str().as_bytes().len() {
+            endpoint.address()
+        } else {
+            &staging
+        };
+    let length = longest.as_os_str().as_bytes().len();
+    if length > UNIX_SOCKET_PATH_BYTES {
+        return Err(EndpointError::AddressTooLong {
+            path: longest.to_path_buf(),
+            length,
+            limit: UNIX_SOCKET_PATH_BYTES,
+            unit: "bytes",
+        });
+    }
+    Ok(())
 }
 
 async fn sweep_staging(
@@ -801,15 +877,61 @@ pub async fn connect(endpoint: impl AsRef<Path>) -> std::io::Result<IpcStream> {
     UnixStream::connect(endpoint).await
 }
 
+pub fn shutdown_handle(stream: &IpcStream) -> std::io::Result<IpcShutdown> {
+    let socket = rustix::io::fcntl_dupfd_cloexec(stream, 0).map_err(std::io::Error::from)?;
+    Ok(IpcShutdown { socket })
+}
+
 pub fn split(stream: IpcStream) -> (IpcReadHalf, IpcWriteHalf) {
     stream.into_split()
 }
 
 pub fn peer_credentials(stream: &IpcStream) -> std::io::Result<PeerCredentials> {
-    stream.peer_cred().map(|credentials| PeerCredentials {
-        pid: credentials.pid().and_then(|pid| u32::try_from(pid).ok()),
+    let credentials = stream.peer_cred()?;
+    #[cfg(target_vendor = "apple")]
+    let pid = Some(apple_peer_pid(stream)?);
+    #[cfg(not(target_vendor = "apple"))]
+    let pid = credentials.pid().and_then(|pid| u32::try_from(pid).ok());
+    Ok(PeerCredentials {
+        pid,
         uid: credentials.uid(),
         gid: credentials.gid(),
+    })
+}
+
+#[cfg(target_vendor = "apple")]
+#[allow(unsafe_code)]
+fn apple_peer_pid(stream: &IpcStream) -> std::io::Result<u32> {
+    let mut pid = 0 as libc::pid_t;
+    let mut length = libc::socklen_t::try_from(size_of::<libc::pid_t>()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "pid_t size does not fit socklen_t",
+        )
+    })?;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&raw mut pid).cast(),
+            &raw mut length,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if usize::try_from(length).ok() != Some(size_of::<libc::pid_t>()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "LOCAL_PEERPID returned an unexpected value length",
+        ));
+    }
+    u32::try_from(pid).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "LOCAL_PEERPID returned an invalid process id",
+        )
     })
 }
 
@@ -833,10 +955,93 @@ pub fn write_immediate(stream: &IpcStream, bytes: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{EndpointError, is_synthesized_probe_timeout, probe_failure};
+    use super::{
+        Endpoint, EndpointError, STAGING_BASENAME_BYTES, STAGING_PREFIX, UNIX_SOCKET_PATH_BYTES,
+        is_synthesized_probe_timeout, longest_staging_path, probe_failure, staging_name,
+        validate_endpoint_budget,
+    };
     use rustix::io::Errno;
     use std::io::{Error, ErrorKind};
-    use std::path::Path;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn staging_name_is_twenty_five_url_safe_bytes_with_ninety_six_random_bits() {
+        let name = match staging_name() {
+            Ok(name) => name,
+            Err(error) => panic!("generate staging name: {error}"),
+        };
+        assert_eq!(name.len(), STAGING_BASENAME_BYTES);
+        assert!(name.starts_with(STAGING_PREFIX));
+        assert!(
+            name[STAGING_PREFIX.len()..]
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        );
+    }
+
+    #[test]
+    fn endpoint_budget_checks_the_longest_staging_path_before_bind() {
+        let runtime_length = UNIX_SOCKET_PATH_BYTES - STAGING_BASENAME_BYTES - 1;
+        let allowed_runtime =
+            PathBuf::from(format!("/{}", "r".repeat(runtime_length.saturating_sub(1))));
+        let allowed = Endpoint::new(&allowed_runtime, "profile");
+        assert_eq!(
+            longest_staging_path(&allowed_runtime)
+                .as_os_str()
+                .as_bytes()
+                .len(),
+            UNIX_SOCKET_PATH_BYTES
+        );
+        assert!(validate_endpoint_budget(&allowed, &allowed_runtime).is_ok());
+
+        let too_long_runtime = allowed_runtime.join("x");
+        let too_long = Endpoint::new(&too_long_runtime, "profile");
+        match validate_endpoint_budget(&too_long, &too_long_runtime) {
+            Err(EndpointError::AddressTooLong {
+                path,
+                length,
+                limit,
+                unit,
+            }) => {
+                assert_eq!(path, longest_staging_path(&too_long_runtime));
+                assert_eq!(length, UNIX_SOCKET_PATH_BYTES + 2);
+                assert_eq!(limit, UNIX_SOCKET_PATH_BYTES);
+                assert_eq!(unit, "bytes");
+            }
+            other => panic!("expected typed endpoint budget error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn connected_unix_peers_report_the_authenticated_process_id() {
+        let directory = match tempfile::tempdir() {
+            Ok(directory) => directory,
+            Err(error) => panic!("create peer credential fixture: {error}"),
+        };
+        let path = directory.path().join("peer.sock");
+        let listener = match tokio::net::UnixListener::bind(&path) {
+            Ok(listener) => listener,
+            Err(error) => panic!("bind peer credential fixture: {error}"),
+        };
+        let (client, accepted) =
+            tokio::join!(tokio::net::UnixStream::connect(&path), listener.accept());
+        let client = match client {
+            Ok(client) => client,
+            Err(error) => panic!("connect peer credential fixture: {error}"),
+        };
+        let server = match accepted {
+            Ok((server, _)) => server,
+            Err(error) => panic!("accept peer credential fixture: {error}"),
+        };
+        for stream in [&client, &server] {
+            let credentials = match super::peer_credentials(stream) {
+                Ok(credentials) => credentials,
+                Err(error) => panic!("read authenticated peer credentials: {error}"),
+            };
+            assert_eq!(credentials.pid, Some(std::process::id()));
+        }
+    }
 
     /// MUTATION CHECK (executed): restore the raw-I/O mapping for `TimedOut`
     /// in `probe_failure` — this test fails at the unexpected-variant panic.

@@ -639,6 +639,7 @@ async fn run_inner(
     config
         .validate()
         .map_err(|message| DaemonError::InvalidConfig { message })?;
+    endpoint::validate_budget(config)?;
     if !matches!(*shutdown.borrow(), ShutdownRequest::None) {
         let request = shutdown.borrow().clone();
         return shutdown_without_store(config, states, request, &shutdown);

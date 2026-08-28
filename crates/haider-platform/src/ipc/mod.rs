@@ -7,13 +7,15 @@ mod windows;
 
 #[cfg(unix)]
 pub use unix::{
-    BoundEndpoint, EndpointAddress, IpcReadHalf, IpcStream, IpcWriteHalf, connect,
-    peer_credentials, peer_is_owner, split, sweep_stale_endpoints, write_immediate,
+    BoundEndpoint, EndpointAddress, IpcReadHalf, IpcShutdown, IpcStream, IpcWriteHalf, connect,
+    peer_credentials, peer_is_owner, shutdown_handle, split, sweep_stale_endpoints,
+    write_immediate,
 };
 #[cfg(windows)]
 pub use windows::{
-    BoundEndpoint, EndpointAddress, IpcReadHalf, IpcStream, IpcWriteHalf, connect,
-    peer_credentials, peer_is_owner, split, sweep_stale_endpoints, write_immediate,
+    BoundEndpoint, EndpointAddress, IpcReadHalf, IpcShutdown, IpcStream, IpcWriteHalf, connect,
+    peer_credentials, peer_is_owner, shutdown_handle, split, sweep_stale_endpoints,
+    write_immediate,
 };
 
 /// Creates and validates one profile's private runtime and temporary
@@ -83,6 +85,19 @@ impl Endpoint {
     pub fn into_address(self) -> PathBuf {
         self.address
     }
+
+    /// Validates the longest platform address used while binding this
+    /// endpoint before the daemon touches its store or runtime directory.
+    pub fn validate_for_bind(&self, runtime_dir: &Path) -> Result<(), EndpointError> {
+        #[cfg(unix)]
+        {
+            unix::validate_endpoint_budget(self, runtime_dir)
+        }
+        #[cfg(windows)]
+        {
+            windows::validate_endpoint_budget(self, runtime_dir)
+        }
+    }
 }
 
 impl AsRef<Path> for Endpoint {
@@ -99,6 +114,14 @@ pub enum EndpointError {
         operation: &'static str,
         path: PathBuf,
         source: std::io::Error,
+    },
+    /// A deterministic endpoint or its longest staging address cannot be
+    /// represented by the platform IPC API.
+    AddressTooLong {
+        path: PathBuf,
+        length: usize,
+        limit: usize,
+        unit: &'static str,
     },
     Endpoint {
         message: String,
@@ -130,6 +153,16 @@ impl std::fmt::Display for EndpointError {
                 path,
                 source,
             } => write!(formatter, "{operation} {}: {source}", path.display()),
+            Self::AddressTooLong {
+                path,
+                length,
+                limit,
+                unit,
+            } => write!(
+                formatter,
+                "endpoint path {} is {length} {unit}; platform IPC limit is {limit} {unit}",
+                path.display()
+            ),
             Self::Endpoint { message } | Self::Task { message } => formatter.write_str(message),
         }
     }

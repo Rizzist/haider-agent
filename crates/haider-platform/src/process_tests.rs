@@ -123,6 +123,7 @@ fn spawned_daemon_startup_descriptors_survive_the_bounded_sweep() {
     let liveness = std::fs::File::open("/dev/null").expect("open liveness source");
     let readiness_fd = readiness.as_raw_fd();
     let liveness_fd = liveness.as_raw_fd();
+    let upper_bound = super::inherited_descriptor_upper_bound();
     let executable = std::env::current_exe().expect("locate platform test binary");
     let output = unsafe {
         std::process::Command::new(executable)
@@ -130,7 +131,11 @@ fn spawned_daemon_startup_descriptors_survive_the_bounded_sweep() {
             .arg("--nocapture")
             .env(CHILD_MARKER, "1")
             .pre_exec(move || {
-                super::install_daemon_spawn_descriptors(Some(readiness_fd), Some(liveness_fd))
+                super::install_daemon_spawn_descriptors(
+                    Some(readiness_fd),
+                    Some(liveness_fd),
+                    upper_bound,
+                )
             })
             .output()
     }

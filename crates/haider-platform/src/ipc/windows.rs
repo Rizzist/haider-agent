@@ -3,6 +3,7 @@ use std::io;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -22,17 +23,74 @@ use windows_sys::Win32::System::Threading::{
 
 const BIND_RETRY_WINDOW: Duration = Duration::from_secs(3);
 const BIND_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+const NAMED_PIPE_PATH_CODE_UNITS: usize = 256;
 
 pub type IpcReadHalf = tokio::io::ReadHalf<IpcStream>;
 pub type IpcWriteHalf = tokio::io::WriteHalf<IpcStream>;
 pub type EndpointAddress = ();
 
-/// A connected Windows named-pipe instance. Tokio uses distinct client and
-/// server types, so this small enum presents one byte-stream type to callers.
 #[derive(Debug)]
-pub enum IpcStream {
+enum PipeStream {
     Client(NamedPipeClient),
     Server(NamedPipeServer),
+}
+
+/// A connected Windows named-pipe instance. Tokio uses distinct client and
+/// server types, so the shared slot presents one byte-stream type to callers
+/// and gives synchronous close authority access to the owning handle.
+#[derive(Debug)]
+pub struct IpcStream {
+    stream: Arc<StdMutex<Option<PipeStream>>>,
+}
+
+impl IpcStream {
+    fn client(stream: NamedPipeClient) -> Self {
+        Self::new(PipeStream::Client(stream))
+    }
+
+    fn server(stream: NamedPipeServer) -> Self {
+        Self::new(PipeStream::Server(stream))
+    }
+
+    fn new(stream: PipeStream) -> Self {
+        Self {
+            stream: Arc::new(StdMutex::new(Some(stream))),
+        }
+    }
+
+    fn lock_stream(&self) -> io::Result<StdMutexGuard<'_, Option<PipeStream>>> {
+        self.stream
+            .lock()
+            .map_err(|_| io::Error::other("Windows named-pipe state lock poisoned"))
+    }
+}
+
+impl Drop for IpcStream {
+    fn drop(&mut self) {
+        take_pipe(&self.stream);
+    }
+}
+
+/// Shared ownership of the pipe slot retained outside the async tasks.
+/// Taking the Tokio pipe drops its sole OS handle synchronously, so `close`
+/// does not depend on a current-thread runtime polling aborted tasks again.
+pub struct IpcShutdown {
+    stream: Arc<StdMutex<Option<PipeStream>>>,
+}
+
+impl IpcShutdown {
+    pub fn request(&self) -> io::Result<()> {
+        take_pipe(&self.stream);
+        Ok(())
+    }
+}
+
+fn take_pipe(stream: &StdMutex<Option<PipeStream>>) {
+    let mut stream = match stream.lock() {
+        Ok(stream) => stream,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    stream.take();
 }
 
 impl AsyncRead for IpcStream {
@@ -41,9 +99,14 @@ impl AsyncRead for IpcStream {
         context: &mut Context<'_>,
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Client(stream) => Pin::new(stream).poll_read(context, buffer),
-            Self::Server(stream) => Pin::new(stream).poll_read(context, buffer),
+        let mut stream = match self.get_mut().lock_stream() {
+            Ok(stream) => stream,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        match stream.as_mut() {
+            Some(PipeStream::Client(stream)) => Pin::new(stream).poll_read(context, buffer),
+            Some(PipeStream::Server(stream)) => Pin::new(stream).poll_read(context, buffer),
+            None => Poll::Ready(Err(closed_pipe_error())),
         }
     }
 }
@@ -54,25 +117,44 @@ impl AsyncWrite for IpcStream {
         context: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            Self::Client(stream) => Pin::new(stream).poll_write(context, bytes),
-            Self::Server(stream) => Pin::new(stream).poll_write(context, bytes),
+        let mut stream = match self.get_mut().lock_stream() {
+            Ok(stream) => stream,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        match stream.as_mut() {
+            Some(PipeStream::Client(stream)) => Pin::new(stream).poll_write(context, bytes),
+            Some(PipeStream::Server(stream)) => Pin::new(stream).poll_write(context, bytes),
+            None => Poll::Ready(Err(closed_pipe_error())),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Client(stream) => Pin::new(stream).poll_flush(context),
-            Self::Server(stream) => Pin::new(stream).poll_flush(context),
+        let mut stream = match self.get_mut().lock_stream() {
+            Ok(stream) => stream,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        match stream.as_mut() {
+            Some(PipeStream::Client(stream)) => Pin::new(stream).poll_flush(context),
+            Some(PipeStream::Server(stream)) => Pin::new(stream).poll_flush(context),
+            None => Poll::Ready(Err(closed_pipe_error())),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Client(stream) => Pin::new(stream).poll_shutdown(context),
-            Self::Server(stream) => Pin::new(stream).poll_shutdown(context),
+        let mut stream = match self.get_mut().lock_stream() {
+            Ok(stream) => stream,
+            Err(error) => return Poll::Ready(Err(error)),
+        };
+        match stream.as_mut() {
+            Some(PipeStream::Client(stream)) => Pin::new(stream).poll_shutdown(context),
+            Some(PipeStream::Server(stream)) => Pin::new(stream).poll_shutdown(context),
+            None => Poll::Ready(Err(closed_pipe_error())),
         }
     }
+}
+
+fn closed_pipe_error() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "Windows named pipe is closed")
 }
 
 pub struct BoundEndpoint {
@@ -81,7 +163,8 @@ pub struct BoundEndpoint {
 }
 
 impl BoundEndpoint {
-    pub async fn bind(endpoint: &Endpoint, _runtime_dir: &Path) -> Result<Self, EndpointError> {
+    pub async fn bind(endpoint: &Endpoint, runtime_dir: &Path) -> Result<Self, EndpointError> {
+        validate_endpoint_budget(endpoint, runtime_dir)?;
         let name = pipe_name(endpoint).map_err(|error| {
             EndpointError::io("resolve Windows named-pipe name", endpoint.address(), error)
         })?;
@@ -133,12 +216,30 @@ impl BoundEndpoint {
         let connected = listener.replace(next).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotConnected, "daemon listener is closed")
         })?;
-        Ok((IpcStream::Server(connected), ()))
+        Ok((IpcStream::server(connected), ()))
     }
 
     pub fn close_listener(&mut self) {
         self.listener.get_mut().take();
     }
+}
+
+pub(super) fn validate_endpoint_budget(
+    endpoint: &Endpoint,
+    _runtime_dir: &Path,
+) -> Result<(), EndpointError> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let length = endpoint.address().as_os_str().encode_wide().count();
+    if length > NAMED_PIPE_PATH_CODE_UNITS {
+        return Err(EndpointError::AddressTooLong {
+            path: endpoint.address().to_path_buf(),
+            length,
+            limit: NAMED_PIPE_PATH_CODE_UNITS,
+            unit: "UTF-16 code units",
+        });
+    }
+    Ok(())
 }
 
 async fn bind_first_instance(name: &str, retry_window: Duration) -> io::Result<NamedPipeServer> {
@@ -193,7 +294,13 @@ pub async fn connect(endpoint: impl AsRef<Path>) -> io::Result<IpcStream> {
             "Windows named-pipe endpoint is not valid UTF-8",
         )
     })?;
-    ClientOptions::new().open(name).map(IpcStream::Client)
+    ClientOptions::new().open(name).map(IpcStream::client)
+}
+
+pub fn shutdown_handle(stream: &IpcStream) -> io::Result<IpcShutdown> {
+    Ok(IpcShutdown {
+        stream: Arc::clone(&stream.stream),
+    })
 }
 
 pub fn split(stream: IpcStream) -> (IpcReadHalf, IpcWriteHalf) {
@@ -206,11 +313,13 @@ pub fn peer_credentials(stream: &IpcStream) -> io::Result<PeerCredentials> {
         GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
     };
 
+    let stream = stream.lock_stream()?;
+    let pipe = stream.as_ref().ok_or_else(closed_pipe_error)?;
     let mut pid = 0_u32;
     let ok = unsafe {
-        match stream {
-            IpcStream::Client(pipe) => GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut pid),
-            IpcStream::Server(pipe) => GetNamedPipeClientProcessId(pipe.as_raw_handle(), &mut pid),
+        match pipe {
+            PipeStream::Client(pipe) => GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut pid),
+            PipeStream::Server(pipe) => GetNamedPipeClientProcessId(pipe.as_raw_handle(), &mut pid),
         }
     };
     if ok == 0 {
@@ -407,11 +516,17 @@ fn peer_process_has_current_user_sid(pid: u32) -> io::Result<bool> {
 }
 
 pub fn write_immediate(stream: &IpcStream, bytes: &[u8]) {
+    let Ok(mut stream) = stream.lock_stream() else {
+        return;
+    };
+    let Some(pipe) = stream.as_mut() else {
+        return;
+    };
     let mut written = 0;
     while written < bytes.len() {
-        let result = match stream {
-            IpcStream::Client(pipe) => pipe.try_write(&bytes[written..]),
-            IpcStream::Server(pipe) => pipe.try_write(&bytes[written..]),
+        let result = match pipe {
+            PipeStream::Client(pipe) => pipe.try_write(&bytes[written..]),
+            PipeStream::Server(pipe) => pipe.try_write(&bytes[written..]),
         };
         match result {
             Ok(0) | Err(_) => break,
@@ -427,6 +542,7 @@ mod tests {
     use super::{
         BIND_RETRY_INTERVAL, BIND_RETRY_WINDOW, BoundEndpoint, bind_first_instance, connect,
         peer_credentials, peer_is_owner, pipe_name, retryable_bind_error, sids_equal,
+        validate_endpoint_budget,
     };
     use crate::ipc::{Endpoint, peer_credentials_are_owner};
     use std::path::Path;
@@ -445,6 +561,25 @@ mod tests {
             "ignored",
             &format!("{label}-{}-{unique}", std::process::id()),
         )
+    }
+
+    #[test]
+    fn named_pipe_budget_has_a_typed_early_failure() {
+        let endpoint = Endpoint::from_address(format!(r"\\.\pipe\{}", "x".repeat(256)));
+        match validate_endpoint_budget(&endpoint, Path::new("ignored")) {
+            Err(crate::ipc::EndpointError::AddressTooLong {
+                path,
+                length,
+                limit,
+                unit,
+            }) => {
+                assert_eq!(path, endpoint.address());
+                assert!(length > limit);
+                assert_eq!(limit, super::NAMED_PIPE_PATH_CODE_UNITS);
+                assert_eq!(unit, "UTF-16 code units");
+            }
+            other => panic!("expected typed named-pipe budget error, got {other:?}"),
+        }
     }
 
     #[tokio::test]

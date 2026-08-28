@@ -32,6 +32,13 @@ pub enum DaemonError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// The longest endpoint address cannot fit the platform IPC namespace.
+    EndpointAddressTooLong {
+        path: PathBuf,
+        length: usize,
+        limit: usize,
+        unit: &'static str,
+    },
     /// The rendezvous endpoint could not be owned safely (unverified stale
     /// socket, wrong directory owner, live socket under a held lock, ...).
     Endpoint { message: String },
@@ -62,7 +69,10 @@ impl DaemonError {
         match self {
             Self::AlreadyRunning { .. } => 75,
             Self::InvalidConfig { .. } => 64,
-            Self::Store(_) | Self::Io { .. } | Self::Endpoint { .. } => 74,
+            Self::Store(_)
+            | Self::Io { .. }
+            | Self::EndpointAddressTooLong { .. }
+            | Self::Endpoint { .. } => 74,
             Self::Protocol { .. } | Self::Task { .. } => 70,
         }
     }
@@ -100,6 +110,16 @@ impl std::fmt::Display for DaemonError {
                 path,
                 source,
             } => write!(formatter, "{operation} {}: {source}", path.display()),
+            Self::EndpointAddressTooLong {
+                path,
+                length,
+                limit,
+                unit,
+            } => write!(
+                formatter,
+                "daemon endpoint path {} is {length} {unit}; platform IPC limit is {limit} {unit}",
+                path.display()
+            ),
             Self::Endpoint { message } => write!(formatter, "daemon endpoint error: {message}"),
             Self::Protocol { message } => write!(formatter, "daemon protocol error: {message}"),
             Self::Task { message } => write!(formatter, "daemon task error: {message}"),

@@ -53,7 +53,34 @@ fn ensure_haiderd_built() -> PathBuf {
         "haiderd sibling missing at {}",
         sibling.display()
     );
+    warm_autospawn_binaries(&haider_binary(), &sibling);
     sibling
+}
+
+fn warm_autospawn_binaries(haider: &Path, haiderd: &Path) {
+    static WARM: std::sync::Once = std::sync::Once::new();
+    WARM.call_once(|| {
+        // macOS validates each newly written Mach-O inode before entering
+        // `main`: measured cold launches were 4.975 s and 4.79 s, while the
+        // same inodes then launched in 0.23 s, 0.20 s, and 0.24 s. Charge
+        // that one-time validation to this process fixture, not the 950 ms
+        // own-child authentication assertion. Both binaries handle
+        // `--version` before profile/store/runtime-directory/socket setup, so warming
+        // cannot create a daemon or mutate a test profile.
+        for (name, binary) in [("haider", haider), ("haiderd", haiderd)] {
+            let status = Command::new(binary)
+                .arg("--version")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap_or_else(|error| panic!("warm {name} binary: {error}"));
+            assert!(
+                status.success(),
+                "{name} --version warm-up failed: {status}"
+            );
+        }
+    });
 }
 
 fn resolved_for(store: &Path) -> ResolvedProfile {

@@ -30,9 +30,10 @@ pub use fs::{
     metadata_link_count, metadata_mode, replace_file, set_mode, sync_file,
 };
 pub use ipc::{
-    BoundEndpoint, Endpoint, EndpointAddress, EndpointError, IpcReadHalf, IpcStream, IpcWriteHalf,
-    PeerCredentials, connect, peer_credentials, peer_credentials_are_owner, peer_is_owner,
-    prepare_runtime_directory, split, sweep_stale_endpoints, write_immediate,
+    BoundEndpoint, Endpoint, EndpointAddress, EndpointError, IpcReadHalf, IpcShutdown, IpcStream,
+    IpcWriteHalf, PeerCredentials, connect, peer_credentials, peer_credentials_are_owner,
+    peer_is_owner, prepare_runtime_directory, shutdown_handle, split, sweep_stale_endpoints,
+    write_immediate,
 };
 pub use process::program_on_path;
 pub use process::{

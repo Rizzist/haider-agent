@@ -825,6 +825,7 @@ fn configure_daemon(
 ) {
     use std::os::unix::process::CommandExt as _;
     command.process_group(0);
+    let upper_bound = crate::process::inherited_descriptor_upper_bound();
     // SAFETY: the hook runs between fork and exec and uses only raw,
     // async-signal-safe descriptor syscalls; no allocation or runtime state
     // is touched.
@@ -832,9 +833,9 @@ fn configure_daemon(
     unsafe {
         command.pre_exec(move || {
             if readiness.is_some() || liveness.is_some() {
-                crate::process::install_daemon_spawn_descriptors(readiness, liveness)?;
+                crate::process::install_daemon_spawn_descriptors(readiness, liveness, upper_bound)?;
             } else {
-                crate::process::close_inherited_descriptors();
+                crate::process::close_inherited_descriptors(upper_bound);
             }
             Ok(())
         });

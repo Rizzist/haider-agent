@@ -68,6 +68,23 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("build test runtime")
 }
 
+fn test_root() -> tempfile::TempDir {
+    #[cfg(unix)]
+    {
+        // These tests isolate launcher-liveness and runtime-tree ownership.
+        // Keep their socket-bearing fixture below macOS sun_path; the real
+        // long-TMPDIR launch path is exercised by autospawn_tests.
+        tempfile::Builder::new()
+            .prefix("haider-live-")
+            .tempdir_in("/tmp")
+            .expect("short private liveness test root")
+    }
+    #[cfg(windows)]
+    {
+        tempfile::tempdir().expect("private liveness test root")
+    }
+}
+
 fn profile(store: &Path, runtime_root: &Path) -> ResolvedProfile {
     resolve_profile(&ProfileEnv {
         profile_dir: Some(store.to_path_buf()),
@@ -269,7 +286,7 @@ fn ephemeral_client_process_helper() {
 #[test]
 fn killed_spawning_client_reaps_ephemeral_daemon_and_runtime_files() {
     let _guard = process_test_guard();
-    let root = tempfile::tempdir().expect("test root");
+    let root = test_root();
     let profile = profile(&root.path().join("store"), &root.path().join("runtime"));
     let marker = root.path().join("client-ready");
     let mut helper = spawn_helper(&profile, &marker, true);
@@ -293,7 +310,7 @@ fn killed_spawning_client_reaps_ephemeral_daemon_and_runtime_files() {
 #[test]
 fn killed_ready_spawning_client_reaps_ephemeral_daemon_and_runtime_files() {
     let _guard = process_test_guard();
-    let root = tempfile::tempdir().expect("test root");
+    let root = test_root();
     let profile = profile(&root.path().join("store"), &root.path().join("runtime"));
     let marker = root.path().join("client-ready");
     let mut helper = spawn_helper(&profile, &marker, false);
@@ -326,7 +343,7 @@ fn killed_ready_spawning_client_reaps_ephemeral_daemon_and_runtime_files() {
 #[test]
 fn killed_attached_client_does_not_stop_persistent_daemon() {
     let _guard = process_test_guard();
-    let root = tempfile::tempdir().expect("test root");
+    let root = test_root();
     let profile = profile(&root.path().join("store"), &root.path().join("runtime"));
     let mut daemon = spawn_persistent_daemon(&profile);
     let runtime = runtime();
@@ -364,7 +381,7 @@ fn killed_attached_client_does_not_stop_persistent_daemon() {
 #[test]
 fn second_client_holds_ephemeral_daemon_until_its_disconnect() {
     let _guard = process_test_guard();
-    let root = tempfile::tempdir().expect("test root");
+    let root = test_root();
     let profile = profile(&root.path().join("store"), &root.path().join("runtime"));
     let marker = root.path().join("client-ready");
     let mut helper = spawn_helper(&profile, &marker, false);
@@ -402,7 +419,7 @@ fn second_client_holds_ephemeral_daemon_until_its_disconnect() {
 #[test]
 fn two_profiles_have_disjoint_runtime_trees_and_writes() {
     let _guard = process_test_guard();
-    let root = tempfile::tempdir().expect("test root");
+    let root = test_root();
     let runtime_root = root.path().join("runtime");
     let first = profile(&root.path().join("store-a"), &runtime_root);
     let second = profile(&root.path().join("store-b"), &runtime_root);
