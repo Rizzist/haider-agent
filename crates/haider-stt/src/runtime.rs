@@ -13,12 +13,12 @@
 //!   honest hint, not an error dump.
 //! - Windows: the pinned official v1.8.4 zip + sha256, downloaded with the
 //!   crate's verify-before-rename machinery, entry names screened against
-//!   zip-slip, then extracted into `<whisper_dir>/runtime/` with the
-//!   platform `tar` (bsdtar reads zip archives).
+//!   zip-slip, then extracted in-process into `<whisper_dir>/runtime/`.
 //! - Linux: no managed download (ADE `WHISPER_RUNTIME_URL = None`) — a
 //!   PATH-only hint.
 
 use std::ffi::OsStr;
+use std::io::{Read, Seek, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -236,17 +236,6 @@ pub async fn install_runtime_with_homebrew(brew_path: &Path) -> Result<(), SttEr
     )))
 }
 
-fn tar_program() -> &'static str {
-    #[cfg(windows)]
-    {
-        "tar.exe"
-    }
-    #[cfg(not(windows))]
-    {
-        "tar"
-    }
-}
-
 /// Zip-slip guard: refuses any archive entry that could escape the
 /// extraction directory (absolute paths, drive prefixes, `..` components).
 pub fn reject_unsafe_zip_entries(entry_names: &str) -> Result<(), SttError> {
@@ -257,6 +246,7 @@ pub fn reject_unsafe_zip_entries(entry_names: &str) -> Result<(), SttError> {
         let escapes = entry.starts_with('/')
             || entry.starts_with('\\')
             || entry.contains(':')
+            || entry.split(['/', '\\']).any(|component| component == "..")
             || Path::new(entry)
                 .components()
                 .any(|component| matches!(component, std::path::Component::ParentDir));
@@ -269,20 +259,208 @@ pub fn reject_unsafe_zip_entries(entry_names: &str) -> Result<(), SttError> {
     Ok(())
 }
 
-async fn tar_output(args: &[&OsStr]) -> Result<std::process::Output, SttError> {
-    tokio::time::timeout(
-        Duration::from_secs(DOWNLOAD_TIMEOUT_SECS),
-        tokio::process::Command::new(tar_program())
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(|_| SttError::Timeout("runtime archive extraction did not finish".into()))?
-    .map_err(|error| SttError::Io(format!("could not run tar: {error}")))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeArchiveFormat {
+    Zip,
+    Tar,
+}
+
+fn detect_runtime_archive_format<R: Read + Seek>(
+    reader: &mut R,
+) -> Result<RuntimeArchiveFormat, SttError> {
+    let mut prefix = [0_u8; 512];
+    let read = reader
+        .read(&mut prefix)
+        .map_err(|error| SttError::Io(format!("could not read runtime archive: {error}")))?;
+    reader
+        .rewind()
+        .map_err(|error| SttError::Io(format!("could not seek runtime archive: {error}")))?;
+
+    let zip_magic = matches!(
+        prefix.get(..4),
+        Some(b"PK\x03\x04" | b"PK\x05\x06" | b"PK\x07\x08")
+    );
+    if zip_magic {
+        return Ok(RuntimeArchiveFormat::Zip);
+    }
+    if read >= 262 && prefix.get(257..262) == Some(b"ustar") {
+        return Ok(RuntimeArchiveFormat::Tar);
+    }
+    Err(SttError::InvalidArgument(
+        "runtime archive format is not recognized".into(),
+    ))
+}
+
+fn open_runtime_zip(path: &Path) -> Result<zip::ZipArchive<std::fs::File>, SttError> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| SttError::Io(format!("could not open runtime archive: {error}")))?;
+    match detect_runtime_archive_format(&mut file)? {
+        RuntimeArchiveFormat::Zip => zip::ZipArchive::new(file)
+            .map_err(|error| SttError::Io(format!("could not read runtime archive: {error}"))),
+        RuntimeArchiveFormat::Tar => Err(SttError::InvalidArgument(
+            "runtime archive is tar, but the pinned runtime package must be zip".into(),
+        )),
+    }
+}
+
+fn zip_entry_is_symlink(mode: Option<u32>) -> bool {
+    mode.is_some_and(|mode| mode & 0o170_000 == 0o120_000)
+}
+
+fn screen_runtime_zip(archive: &mut zip::ZipArchive<std::fs::File>) -> Result<(), SttError> {
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).map_err(|error| {
+            SttError::Io(format!("could not read runtime archive entry: {error}"))
+        })?;
+        reject_unsafe_zip_entries(entry.name())?;
+        if zip_entry_is_symlink(entry.unix_mode()) {
+            return Err(SttError::InvalidArgument(format!(
+                "runtime archive entry `{}` is a symbolic link",
+                entry.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn metadata_is_symlink_like(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn reject_existing_symlink(path: &Path) -> Result<(), SttError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata_is_symlink_like(&metadata) => {
+            Err(SttError::InvalidArgument(format!(
+                "runtime archive destination `{}` traverses a symbolic link",
+                path.display()
+            )))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(SttError::Io(format!(
+            "could not inspect runtime archive destination: {error}"
+        ))),
+    }
+}
+
+fn ensure_directory_component(path: &Path) -> Result<(), SttError> {
+    reject_existing_symlink(path)?;
+    match std::fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+                SttError::Io(format!(
+                    "could not inspect runtime archive directory: {error}"
+                ))
+            })?;
+            if metadata_is_symlink_like(&metadata) {
+                return Err(SttError::InvalidArgument(format!(
+                    "runtime archive destination `{}` traverses a symbolic link",
+                    path.display()
+                )));
+            }
+            if metadata.is_dir() {
+                Ok(())
+            } else {
+                Err(SttError::Io(format!(
+                    "runtime archive directory `{}` is not a directory",
+                    path.display()
+                )))
+            }
+        }
+        Err(error) => Err(SttError::Io(format!(
+            "could not create runtime archive directory: {error}"
+        ))),
+    }
+}
+
+fn ensure_directory_without_symlinks(runtime_dir: &Path, directory: &Path) -> Result<(), SttError> {
+    reject_existing_symlink(runtime_dir)?;
+    std::fs::create_dir_all(runtime_dir)
+        .map_err(|error| SttError::Io(format!("could not create runtime directory: {error}")))?;
+    reject_existing_symlink(runtime_dir)?;
+
+    let relative = directory.strip_prefix(runtime_dir).map_err(|_| {
+        SttError::InvalidArgument(
+            "runtime archive destination escapes the runtime directory".into(),
+        )
+    })?;
+    let mut current = runtime_dir.to_path_buf();
+    for component in relative.components() {
+        match component {
+            std::path::Component::CurDir => continue,
+            std::path::Component::Normal(component) => current.push(component),
+            _ => {
+                return Err(SttError::InvalidArgument(
+                    "runtime archive destination escapes the runtime directory".into(),
+                ));
+            }
+        }
+        ensure_directory_component(&current)?;
+    }
+    Ok(())
+}
+
+fn extract_screened_runtime_zip(
+    archive: &mut zip::ZipArchive<std::fs::File>,
+    runtime_dir: &Path,
+) -> Result<(), SttError> {
+    ensure_directory_without_symlinks(runtime_dir, runtime_dir)?;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|error| {
+            SttError::Io(format!("could not read runtime archive entry: {error}"))
+        })?;
+        let destination = runtime_dir.join(entry.name());
+        if entry.is_dir() {
+            ensure_directory_without_symlinks(runtime_dir, &destination)?;
+            continue;
+        }
+        if let Some(parent) = destination.parent() {
+            ensure_directory_without_symlinks(runtime_dir, parent)?;
+        }
+        reject_existing_symlink(&destination)?;
+        let mut output = std::fs::File::create(&destination).map_err(|error| {
+            SttError::Io(format!("could not create runtime archive file: {error}"))
+        })?;
+        std::io::copy(&mut entry, &mut output).map_err(|error| {
+            SttError::Io(format!("could not extract runtime archive file: {error}"))
+        })?;
+        output.flush().map_err(|error| {
+            SttError::Io(format!("could not flush runtime archive file: {error}"))
+        })?;
+        #[cfg(unix)]
+        if let Some(mode) = entry.unix_mode() {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(mode & 0o777))
+                .map_err(|error| {
+                SttError::Io(format!(
+                    "could not set runtime archive permissions: {error}"
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn extract_runtime_zip_blocking(zip_path: &Path, runtime_dir: &Path) -> Result<PathBuf, SttError> {
+    let mut archive = open_runtime_zip(zip_path)?;
+    screen_runtime_zip(&mut archive)?;
+    extract_screened_runtime_zip(&mut archive, runtime_dir)?;
+    find_runtime_in_dir(runtime_dir).ok_or_else(|| SttError::RuntimeMissing {
+        hint: "extracted runtime archive contains no whisper executable".into(),
+    })
 }
 
 /// Extracts a VERIFIED runtime zip into `runtime_dir`.
@@ -291,32 +469,11 @@ async fn tar_output(args: &[&OsStr]) -> Result<std::process::Output, SttError> {
 /// before any byte is extracted; extraction success requires a discoverable
 /// runtime executable afterwards.
 pub async fn extract_runtime_zip(zip_path: &Path, runtime_dir: &Path) -> Result<PathBuf, SttError> {
-    let listing = tar_output(&[OsStr::new("-tf"), zip_path.as_os_str()]).await?;
-    if !listing.status.success() {
-        return Err(SttError::Io(format!(
-            "could not read runtime archive: {}",
-            first_output_line(&listing.stdout, &listing.stderr)
-        )));
-    }
-    reject_unsafe_zip_entries(&String::from_utf8_lossy(&listing.stdout))?;
-    std::fs::create_dir_all(runtime_dir)
-        .map_err(|error| SttError::Io(format!("could not create runtime directory: {error}")))?;
-    let extraction = tar_output(&[
-        OsStr::new("-xf"),
-        zip_path.as_os_str(),
-        OsStr::new("-C"),
-        runtime_dir.as_os_str(),
-    ])
-    .await?;
-    if !extraction.status.success() {
-        return Err(SttError::Io(format!(
-            "could not extract runtime archive: {}",
-            first_output_line(&extraction.stdout, &extraction.stderr)
-        )));
-    }
-    find_runtime_in_dir(runtime_dir).ok_or_else(|| SttError::RuntimeMissing {
-        hint: "extracted runtime archive contains no whisper executable".into(),
-    })
+    let zip_path = zip_path.to_path_buf();
+    let runtime_dir = runtime_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || extract_runtime_zip_blocking(&zip_path, &runtime_dir))
+        .await
+        .map_err(|error| SttError::Io(format!("runtime archive worker failed: {error}")))?
 }
 
 /// Downloads (verify-before-rename) and extracts the pinned Windows runtime

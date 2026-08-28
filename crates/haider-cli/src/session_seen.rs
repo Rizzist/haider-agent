@@ -90,11 +90,11 @@ pub(crate) async fn session_seen_command(session_id: &str, rest: &[String]) -> E
         .features
         .contains(haider_rpc::FEATURE_SESSION_SEEN_V1)
     {
-        ensured.client.close();
+        let _ = ensured.client.close();
         return failure(SeenError::MissingFeature);
     }
     let result = execute(&ensured.client, SessionId::new(session_id)).await;
-    ensured.client.close();
+    let _ = ensured.client.close();
     match result {
         Ok(receipt) => write_receipt(&receipt),
         Err(error) => failure(error),

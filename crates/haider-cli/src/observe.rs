@@ -503,26 +503,26 @@ pub(crate) async fn status_command(rest: &[String]) -> ExitCode {
             alias: descriptor.alias.as_str().to_owned(),
         }),
         Err(error) => {
-            observer.close();
+            let _ = observer.close();
             return observe_failure("status", &error);
         }
     };
     let session_count = match observer.session_ids().await {
         Ok(sessions) => sessions.len(),
         Err(error) => {
-            observer.close();
+            let _ = observer.close();
             return observe_failure("status", &error);
         }
     };
     let adoption_available = match observer.account_adoption_available().await {
         Ok(notices) => notices,
         Err(error) => {
-            observer.close();
+            let _ = observer.close();
             return observe_failure("status", &error);
         }
     };
     let welcome = observer.welcome().clone();
-    observer.close();
+    let _ = observer.close();
     let update = stamp_update_view(&profile.store_dir);
     let document = StatusDocument {
         schema: OBSERVE_SCHEMA,
@@ -568,7 +568,7 @@ pub(crate) async fn sessions_command(rest: &[String]) -> ExitCode {
                 let summaries = match observer.session_summaries().await {
                     Ok(summaries) => summaries,
                     Err(error) => {
-                        observer.close();
+                        let _ = observer.close();
                         return observe_failure("sessions", &error);
                     }
                 };
@@ -586,7 +586,7 @@ pub(crate) async fn sessions_command(rest: &[String]) -> ExitCode {
                             digests.push(digest);
                         }
                         Err(error) => {
-                            observer.close();
+                            let _ = observer.close();
                             return observe_failure("sessions", &error);
                         }
                     }
@@ -601,7 +601,7 @@ pub(crate) async fn sessions_command(rest: &[String]) -> ExitCode {
     // Roster scalars are additive garnish: an error here must not fail the
     // listing (an older daemon simply has none).
     let observer_summaries = observer.session_summaries().await.ok();
-    observer.close();
+    let _ = observer.close();
     let digests = match digests {
         Ok(digests) => digests,
         Err(error) => return observe_failure("sessions", &error),
@@ -668,7 +668,7 @@ pub(crate) async fn session_command(rest: &[String]) -> ExitCode {
     let digest = observer
         .session(SessionId::new(options.session_id), LAST_EVENT_LIMIT)
         .await;
-    observer.close();
+    let _ = observer.close();
     let digest = match digest {
         Ok(digest) => digest,
         Err(error) => return observe_failure("session", &error),
@@ -702,12 +702,12 @@ pub(crate) async fn fleet_command(rest: &[String]) -> ExitCode {
         Err(error) => return observe_failure("fleet", &error),
     };
     if let Err(error) = observer.require_fleet_feature() {
-        observer.close();
+        let _ = observer.close();
         return observe_failure("fleet", &error);
     }
     if let Some(session_id) = options.session_id {
         let snapshot = observer.fleet(SessionId::new(session_id)).await;
-        observer.close();
+        let _ = observer.close();
         let snapshot = match snapshot {
             Ok(snapshot) => snapshot,
             Err(error) => return observe_failure("fleet", &error),
@@ -723,7 +723,7 @@ pub(crate) async fn fleet_command(rest: &[String]) -> ExitCode {
     let digests = match digests {
         Ok(digests) => fleet_candidates(digests),
         Err(error) => {
-            observer.close();
+            let _ = observer.close();
             return observe_failure("fleet", &error);
         }
     };
@@ -732,7 +732,7 @@ pub(crate) async fn fleet_command(rest: &[String]) -> ExitCode {
         let snapshot = match observer.fleet(digest.session_id.clone()).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                observer.close();
+                let _ = observer.close();
                 return observe_failure("fleet", &error);
             }
         };
@@ -742,7 +742,7 @@ pub(crate) async fn fleet_command(rest: &[String]) -> ExitCode {
             snapshot,
         });
     }
-    observer.close();
+    let _ = observer.close();
     write_human(fleet_list_human_text(&entries))
 }
 

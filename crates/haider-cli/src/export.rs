@@ -1520,7 +1520,7 @@ pub async fn export_command(rest: &[String]) -> ExitCode {
     // the daemon's full-replay projection (older daemons ignore the flag and
     // serve the full digest — same authoritative fields either way).
     let digest = observer.session_metadata_only(session_id.clone()).await;
-    observer.close();
+    let _ = observer.close();
     let digest = match digest {
         Ok(digest) => digest,
         Err(error) => {

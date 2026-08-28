@@ -6,8 +6,8 @@
 mod support;
 
 use haider_client::{
-    ClientConfig, ConnectError, DAEMON_LOG_FILE, DaemonLifetime, EnsureOptions, ProfileEnv,
-    ResolvedProfile, connect, ensure_daemon, resolve_profile,
+    ClientCloseOutcome, ClientConfig, ConnectError, DAEMON_LOG_FILE, DaemonLifetime, EnsureOptions,
+    ProfileEnv, ResolvedProfile, connect, ensure_daemon, resolve_profile,
 };
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -20,6 +20,13 @@ const HELPER_DAEMON_ENV: &str = "HAIDER_EPHEMERAL_LIVENESS_DAEMON";
 const HELPER_KILL_BEFORE_READY_ENV: &str = "HAIDER_EPHEMERAL_KILL_BEFORE_READY";
 const DEADLINE: Duration = Duration::from_secs(20);
 const POLL: Duration = Duration::from_millis(20);
+
+fn assert_close_started(outcome: ClientCloseOutcome) {
+    #[cfg(unix)]
+    assert!(matches!(outcome, ClientCloseOutcome::PeerNotified));
+    #[cfg(windows)]
+    assert!(matches!(outcome, ClientCloseOutcome::LocalSlotEmptiedOnly));
+}
 
 struct ChildGuard {
     child: Child,
@@ -534,7 +541,7 @@ fn killed_ready_spawning_client_reaps_ephemeral_daemon_and_runtime_files() {
         .parse::<u32>()
         .expect("PID file carries daemon process id");
     let probe = connect_until_ready(&runtime, &profile, Some(&mut helper), Some(daemon_pid));
-    probe.client.close();
+    assert_close_started(probe.client.close());
     drop(probe);
 
     kill_helper(&mut helper);
@@ -563,7 +570,7 @@ fn killed_attached_client_does_not_stop_persistent_daemon() {
     let mut daemon = spawn_persistent_daemon(&profile);
     let runtime = runtime();
     let warmup = connect_until_ready(&runtime, &profile, None, None);
-    warmup.client.close();
+    assert_close_started(warmup.client.close());
     drop(warmup);
 
     let marker = root.path().join("attached-ready");
@@ -590,7 +597,7 @@ fn killed_attached_client_does_not_stop_persistent_daemon() {
             .is_none(),
         "attached client death must not stop the incumbent"
     );
-    still_serving.client.close();
+    assert_close_started(still_serving.client.close());
     drop(still_serving);
     let _ = daemon
         .kill_and_wait()
@@ -651,10 +658,10 @@ fn second_client_holds_ephemeral_daemon_until_its_disconnect() {
         "second client keeps daemon alive"
     );
     let probe = connect_until_ready(&runtime, &profile, Some(&mut helper), Some(daemon_pid));
-    probe.client.close();
+    assert_close_started(probe.client.close());
     drop(probe);
 
-    second.client.close();
+    assert_close_started(second.client.close());
     drop(second);
     wait_for_cleanup(&runtime, &profile, Some(&mut helper), Some(daemon_pid));
 }

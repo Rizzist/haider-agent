@@ -457,7 +457,7 @@ pub(crate) async fn account_command(rest: &[String]) -> ExitCode {
         Err(error) => return failure(&AccountError::Ensure(error), json_errors),
     };
     let result = execute(&ensured.client, command).await;
-    ensured.client.close();
+    let _ = ensured.client.close();
     match result {
         Ok(output) => output,
         Err(error) => failure(&error, json_errors),

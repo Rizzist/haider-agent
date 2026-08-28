@@ -161,11 +161,11 @@ pub(crate) async fn session_recover_command(session_id: &str, rest: &[String]) -
         .cloned()
         .collect::<BTreeSet<_>>();
     if !missing.is_empty() {
-        ensured.client.close();
+        let _ = ensured.client.close();
         return failure(&RecoverError::MissingFeatures(missing));
     }
     let result = execute(&ensured.client, SessionId::new(session_id), options).await;
-    ensured.client.close();
+    let _ = ensured.client.close();
     match result {
         Ok(RecoveryOutput::Card(document)) if options.json => write_json(&document),
         Ok(RecoveryOutput::Card(document)) => write_card(&document),

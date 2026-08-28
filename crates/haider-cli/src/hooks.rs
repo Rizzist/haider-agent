@@ -63,13 +63,13 @@ pub(crate) async fn hooks_command(rest: &[String]) -> ExitCode {
                 Ok(cwd) => cwd,
                 Err(error) => {
                     eprintln!("haider hooks: current directory is unavailable: {error}");
-                    ensured.client.close();
+                    let _ = ensured.client.close();
                     return ExitCode::FAILURE;
                 }
             };
             let Some(cwd) = cwd.to_str() else {
                 eprintln!("haider hooks: current directory is not valid UTF-8");
-                ensured.client.close();
+                let _ = ensured.client.close();
                 return ExitCode::FAILURE;
             };
             RequestBody::HooksList {
@@ -86,7 +86,7 @@ pub(crate) async fn hooks_command(rest: &[String]) -> ExitCode {
         },
     };
     let response = ensured.client.request(request).await;
-    ensured.client.close();
+    let _ = ensured.client.close();
     match (command, response) {
         (
             HooksCommand::List { json: machine },

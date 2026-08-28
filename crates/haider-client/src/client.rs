@@ -188,6 +188,7 @@ impl std::fmt::Display for DisconnectReason {
 }
 
 /// What [`RpcClient::close`] proved at the local transport boundary.
+#[must_use = "inspect whether the peer was notified or explicitly discard the close outcome"]
 #[derive(Debug)]
 pub enum ClientCloseOutcome {
     /// The peer was synchronously notified of the close. Unix provides this

@@ -114,7 +114,7 @@ async fn execute(session_id: SessionId, options: ItemOptions) -> Result<Value, I
         .session(session_id.clone(), 0)
         .await
         .map_err(|error| ItemError::Unavailable(error.to_string()));
-    observer.close();
+    let _ = observer.close();
     let head = digest?.head_seq;
     if options.seq > head {
         return Err(ItemError::Missing {

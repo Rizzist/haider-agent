@@ -140,8 +140,8 @@ fn crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
-/// Builds a minimal STORED (no compression) zip archive in memory — enough
-/// for bsdtar to read, with fully controlled entry names.
+/// Builds a minimal STORED (no compression) zip archive in memory with fully
+/// controlled entry names.
 pub fn build_stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
     let mut archive = Vec::new();
     let mut central = Vec::new();

@@ -445,7 +445,7 @@ async fn front_door_with_options(mode: FrontDoor, options: BareTuiOptions) -> Ex
                 );
                 // Parent exit leaves the daemon running (R8 shutdown
                 // policy): closing this connection never implies shutdown.
-                ensured.client.close();
+                let _ = ensured.client.close();
                 return ExitCode::SUCCESS;
             }
             let mut model = live_model(&profile);

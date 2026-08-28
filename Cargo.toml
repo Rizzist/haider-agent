@@ -66,6 +66,7 @@ unicode-width = "0.2"
 url = "2"
 x11rb = { version = "0.13.2", default-features = false, features = ["xtest"] }
 zeroize = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [workspace.dependencies.windows-sys]
 version = "0.61.2"

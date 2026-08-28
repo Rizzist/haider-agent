@@ -297,7 +297,7 @@ async fn try_attach(profile: &ResolvedProfile, options: &EnsureOptions) -> Attac
         Ok(connected) => {
             let welcome = &connected.welcome;
             if !welcome.profile_id.is_empty() && welcome.profile_id != profile.profile_id {
-                connected.client.close();
+                let _ = connected.client.close();
                 return Attach::Fatal(Box::new(EnsureError::ProfileMismatch {
                     expected: profile.profile_id.clone(),
                     actual: welcome.profile_id.clone(),
@@ -313,7 +313,7 @@ async fn try_attach(profile: &ResolvedProfile, options: &EnsureOptions) -> Attac
                 // Wire overlap but missing W3c features: explicit skew
                 // diagnostic; NEVER kill the incumbent.
                 let daemon_version = welcome.daemon_version.clone();
-                connected.client.close();
+                let _ = connected.client.close();
                 return Attach::Fatal(Box::new(EnsureError::MissingFeatures {
                     missing,
                     daemon_version,
@@ -324,7 +324,7 @@ async fn try_attach(profile: &ResolvedProfile, options: &EnsureOptions) -> Attac
                 // A draining/starting daemon is live; wait for it to finish
                 // rather than racing a competitor against its endpoint.
                 _ => {
-                    connected.client.close();
+                    let _ = connected.client.close();
                     Attach::NotYet
                 }
             }

@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::time::Duration;
 
 use haider_client::{
-    DescendantView, ObserveClient, ObserveError, ProfileEnv, ResolvedProfile,
+    ClientCloseOutcome, DescendantView, ObserveClient, ObserveError, ProfileEnv, ResolvedProfile,
     observe_stream_session, resolve_profile,
 };
 use haider_rpc::haider_protocol::envelope::{
@@ -26,6 +26,10 @@ use tokio::sync::mpsc;
 
 const LIMIT: usize = DEFAULT_FRAME_LIMIT;
 const BOUND: Duration = Duration::from_secs(5);
+
+fn assert_peer_notified(outcome: ClientCloseOutcome) {
+    assert!(matches!(outcome, ClientCloseOutcome::PeerNotified));
+}
 
 struct Peer {
     stream: UnixStream,
@@ -264,7 +268,7 @@ async fn fleet_reads_return_typed_feature_and_unknown_session_errors() {
             .await,
         Err(ObserveError::MissingFeature(FEATURE_SESSION_FLEET_V1))
     ));
-    old_client.close();
+    assert_peer_notified(old_client.close());
     old_server.await.expect("old daemon peer");
 
     let (_new_root, new_profile) = profile();
@@ -303,7 +307,7 @@ async fn fleet_reads_return_typed_feature_and_unknown_session_errors() {
         Err(ObserveError::UnknownSession(ref session_id))
             if session_id.as_str() == "fleet-missing-session"
     ));
-    new_client.close();
+    assert_peer_notified(new_client.close());
     new_server.await.expect("fleet daemon peer");
 }
 
@@ -366,7 +370,7 @@ async fn descendant_view_feature_negotiation_never_fabricates_live_lineage() {
         DescendantView::Snapshot(actual) => assert_eq!(actual, snapshot),
         DescendantView::Live(_) => panic!("absence must not fabricate a live descendant view"),
     }
-    snapshot_client.close();
+    assert_peer_notified(snapshot_client.close());
     snapshot_server.await.expect("snapshot fallback peer");
 
     let (_live_root, live_profile) = profile();
@@ -449,7 +453,7 @@ async fn descendant_view_feature_negotiation_never_fabricates_live_lineage() {
         }
         DescendantView::Snapshot(_) => panic!("advertised live method must not fall back"),
     }
-    live_client.close();
+    assert_peer_notified(live_client.close());
     live_server.await.expect("live descendant peer");
 }
 

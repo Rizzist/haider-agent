@@ -21,7 +21,9 @@ use haider_rpc::{
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
-use crate::client::{ClientConfig, ClientError, ConnectError, RpcClient, connect};
+use crate::client::{
+    ClientCloseOutcome, ClientConfig, ClientError, ConnectError, RpcClient, connect,
+};
 use crate::profile::ResolvedProfile;
 use crate::spawn::{EnsureError, EnsureOptions, ensure_daemon};
 
@@ -144,7 +146,7 @@ impl ObserveClient {
             }
         };
         if !welcome.profile_id.is_empty() && welcome.profile_id != profile.profile_id {
-            client.close();
+            let _ = client.close();
             return Err(ObserveError::ProfileMismatch {
                 expected: profile.profile_id.clone(),
                 actual: welcome.profile_id,
@@ -152,7 +154,7 @@ impl ObserveClient {
         }
         if welcome.lifecycle_phase != LifecyclePhase::Ready {
             let phase = welcome.lifecycle_phase;
-            client.close();
+            let _ = client.close();
             return Err(ObserveError::NotReady(phase));
         }
         Ok(Self { client, welcome })
@@ -163,8 +165,8 @@ impl ObserveClient {
         &self.welcome
     }
 
-    pub fn close(&self) {
-        self.client.close();
+    pub fn close(&self) -> ClientCloseOutcome {
+        self.client.close()
     }
 
     /// Number of uncorrelated frames this connection could not spool. Any
@@ -658,7 +660,7 @@ async fn list_session_ids(
 ) -> Result<Vec<SessionId>, ObserveError> {
     let client = ObserveClient::connect(profile, spawn).await?;
     let result = client.session_ids().await;
-    client.close();
+    let _ = client.close();
     result
 }
 
@@ -680,7 +682,7 @@ async fn stream_shard(
     loop {
         let observer = ObserveClient::connect(&profile, spawn).await?;
         let Some(mut events) = observer.client.take_events() else {
-            observer.close();
+            let _ = observer.close();
             return Err(ObserveError::Protocol(
                 "observation client event stream was already taken",
             ));
@@ -717,7 +719,7 @@ async fn stream_shard(
                     retryable,
                     ..
                 } => {
-                    observer.close();
+                    let _ = observer.close();
                     return Err(ObserveError::Rpc {
                         code,
                         message,
@@ -725,7 +727,7 @@ async fn stream_shard(
                     });
                 }
                 _ => {
-                    observer.close();
+                    let _ = observer.close();
                     return Err(ObserveError::Protocol(
                         "session.attach response method mismatch",
                     ));
@@ -750,7 +752,7 @@ async fn stream_shard(
                                 continue;
                             };
                             if *expected_session != session_id || envelope.session_id != session_id {
-                                observer.close();
+                                let _ = observer.close();
                                 return Err(ObserveError::Protocol("attachment event session mismatch"));
                             }
                             let cursor = cursors.entry(session_id.as_str().to_owned()).or_default();
@@ -776,7 +778,7 @@ async fn stream_shard(
                             }
                             caught_up.insert(session_id.as_str().to_owned());
                             if !follow && caught_up.len() == sessions.len() {
-                                observer.close();
+                                let _ = observer.close();
                                 return Ok(());
                             }
                         }
@@ -793,7 +795,7 @@ async fn stream_shard(
                 }
             }
         };
-        observer.close();
+        let _ = observer.close();
         if !reconnect {
             return Ok(());
         }

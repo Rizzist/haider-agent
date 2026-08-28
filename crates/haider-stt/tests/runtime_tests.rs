@@ -139,6 +139,7 @@ fn zip_entry_guard_refuses_escaping_names() {
         "/etc/passwd",
         "C:\\Windows\\evil.exe",
         "a/../../evil",
+        "a\\..\\evil",
     ] {
         assert!(
             reject_unsafe_zip_entries(evil).is_err(),
@@ -169,6 +170,10 @@ async fn runtime_zip_extraction_is_screened_and_lands_in_runtime_dir() {
         .expect("good archive extracts");
     assert!(extracted.starts_with(&runtime_dir), "{extracted:?}");
     assert_eq!(find_runtime_in_dir(&runtime_dir), Some(extracted));
+    assert_eq!(
+        std::fs::read(runtime_dir.join("Release/README.txt")).expect("read extracted bytes"),
+        b"runtime"
+    );
 
     let evil_whisper = tempfile::tempdir().expect("evil whisper dir");
     let evil_zip = build_stored_zip(&[("../evil.txt", b"escaped".as_slice())]);
@@ -183,6 +188,32 @@ async fn runtime_zip_extraction_is_screened_and_lands_in_runtime_dir() {
         !evil_whisper.path().join("evil.txt").exists(),
         "no byte of an unsafe archive may be extracted"
     );
+
+    #[cfg(unix)]
+    {
+        let linked_whisper = tempfile::tempdir().expect("linked whisper dir");
+        let outside = tempfile::tempdir().expect("outside dir");
+        let linked_runtime = runtime_directory(linked_whisper.path());
+        std::fs::create_dir_all(&linked_runtime).expect("linked runtime dir");
+        std::os::unix::fs::symlink(outside.path(), linked_runtime.join("Release"))
+            .expect("destination symlink");
+        let linked_zip = build_stored_zip(&[(
+            "Release/whisper-cli",
+            b"must stay inside runtime".as_slice(),
+        )]);
+        let linked_path = linked_whisper.path().join("runtime.zip");
+        std::fs::write(&linked_path, linked_zip).expect("write linked zip");
+        let linked_error = extract_runtime_zip(&linked_path, &linked_runtime)
+            .await
+            .expect_err("pre-existing destination symlink is refused");
+        assert!(
+            matches!(linked_error, SttError::InvalidArgument(message) if message.contains("symbolic link"))
+        );
+        assert!(
+            !outside.path().join("whisper-cli").exists(),
+            "extraction must not follow a destination symlink"
+        );
+    }
 }
 
 /// A verified archive with no whisper executable is an honest
@@ -197,4 +228,47 @@ async fn archive_without_runtime_executable_is_typed_runtime_missing() {
         .await
         .expect_err("no executable");
     assert!(matches!(error, SttError::RuntimeMissing { .. }));
+}
+
+/// Archive format is selected from bytes, never the filename or the host's
+/// `tar` implementation: ZIP is accepted, POSIX tar is diagnosed distinctly,
+/// and arbitrary bytes receive a typed format error.
+#[tokio::test]
+async fn runtime_archive_format_detection_is_magic_byte_driven() {
+    let root = tempfile::tempdir().expect("archive root");
+
+    let zip_path = root.path().join("runtime.data");
+    std::fs::write(
+        &zip_path,
+        build_stored_zip(&[("Release/whisper-cli", b"zip bytes".as_slice())]),
+    )
+    .expect("write extensionless zip");
+    let zip_runtime = root.path().join("zip-runtime");
+    extract_runtime_zip(&zip_path, &zip_runtime)
+        .await
+        .expect("ZIP magic is accepted without a zip extension");
+    assert_eq!(
+        std::fs::read(zip_runtime.join("Release/whisper-cli")).expect("read ZIP payload"),
+        b"zip bytes"
+    );
+
+    let mut tar = vec![0_u8; 512];
+    tar[257..262].copy_from_slice(b"ustar");
+    let tar_path = root.path().join("looks-like.zip");
+    std::fs::write(&tar_path, tar).expect("write tar magic");
+    let tar_error = extract_runtime_zip(&tar_path, &root.path().join("tar-runtime"))
+        .await
+        .expect_err("tar is not passed to the ZIP reader");
+    assert!(
+        matches!(tar_error, SttError::InvalidArgument(message) if message.contains("archive is tar"))
+    );
+
+    let garbage_path = root.path().join("garbage.zip");
+    std::fs::write(&garbage_path, b"not an archive").expect("write garbage");
+    let garbage_error = extract_runtime_zip(&garbage_path, &root.path().join("garbage-runtime"))
+        .await
+        .expect_err("garbage is rejected before a reader is selected");
+    assert!(
+        matches!(garbage_error, SttError::InvalidArgument(message) if message.contains("not recognized"))
+    );
 }

@@ -191,7 +191,7 @@ async fn truncated_archive_http_leaves_pair_and_live_daemon_unchanged() {
     };
     let old_instance = old.welcome.instance_id.clone();
     let old_generation = old.welcome.daemon_generation;
-    old.client.close();
+    let _ = old.client.close();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept archive request");
         let mut request = [0_u8; 4096];
@@ -257,7 +257,7 @@ async fn real_daemon_drains_once_releases_lock_and_restarts_exact_version() {
     };
     let old_instance = old.welcome.instance_id.clone();
     let old_generation = old.welcome.daemon_generation;
-    old.client.close();
+    let _ = old.client.close();
 
     let prepared = PreparedTransaction::acquire(fixture.layout.clone()).expect("prepare update");
     let pair = verified_pair_for_test(
@@ -344,7 +344,7 @@ async fn health_version_mismatch_stops_child_rolls_back_pair_and_restarts_old() 
     let Some(old) = wait_initial_ready(&fixture.profile, &mut old_child).await else {
         return;
     };
-    old.client.close();
+    let _ = old.client.close();
 
     let prepared = PreparedTransaction::acquire(fixture.layout.clone()).expect("prepare update");
     let pair = verified_pair_for_test(
@@ -642,7 +642,9 @@ async fn wait_ready(profile: &ResolvedProfile) -> haider_client::Connected {
             Ok(connected) if connected.welcome.lifecycle_phase == LifecyclePhase::Ready => {
                 return connected;
             }
-            Ok(connected) => connected.client.close(),
+            Ok(connected) => {
+                let _ = connected.client.close();
+            }
             Err(error) if error.is_spawnable() => {}
             Err(error) => panic!("daemon health connect failed: {error}"),
         }
@@ -664,7 +666,9 @@ async fn wait_initial_ready(
             Ok(connected) if connected.welcome.lifecycle_phase == LifecyclePhase::Ready => {
                 return Some(connected);
             }
-            Ok(connected) => connected.client.close(),
+            Ok(connected) => {
+                let _ = connected.client.close();
+            }
             Err(error) if error.is_spawnable() => {}
             Err(error) => panic!("daemon health connect failed: {error}"),
         }

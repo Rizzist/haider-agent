@@ -110,19 +110,19 @@ pub async fn restart_daemon_for_permission(
             .features
             .contains(FEATURE_COMPUTER_PERMISSION_ACTIONS_V1)
     {
-        connected.client.close();
+        let _ = connected.client.close();
         return Err(ComputerPermissionClientError::Restart(
             "authenticated daemon Welcome does not match the ready profile".into(),
         ));
     }
     if connected.peer_credentials.uid != effective_uid() {
-        connected.client.close();
+        let _ = connected.client.close();
         return Err(ComputerPermissionClientError::Restart(
             "daemon socket peer is not owned by this user".into(),
         ));
     }
     let Some(pid) = connected.peer_credentials.pid.filter(|pid| *pid != 0) else {
-        connected.client.close();
+        let _ = connected.client.close();
         return Err(ComputerPermissionClientError::Restart(
             "daemon socket did not expose an authenticated peer PID".into(),
         ));
@@ -160,7 +160,7 @@ pub async fn restart_daemon_for_permission(
         ComputerPermissionClientError::Restart("daemon disconnected without a drain notice".into())
     })?;
     if notice != (old_instance.clone(), old_generation) {
-        connected.client.close();
+        let _ = connected.client.close();
         return Err(ComputerPermissionClientError::Restart(
             "daemon drain notice did not match its authenticated Welcome".into(),
         ));
@@ -177,7 +177,7 @@ pub async fn restart_daemon_for_permission(
     if ensured.welcome.instance_id == old_instance
         && ensured.welcome.daemon_generation == old_generation
     {
-        ensured.client.close();
+        let _ = ensured.client.close();
         return Err(ComputerPermissionClientError::Restart(
             "permission restart reattached to the old daemon generation".into(),
         ));

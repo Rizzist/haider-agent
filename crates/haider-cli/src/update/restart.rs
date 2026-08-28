@@ -74,13 +74,13 @@ fn incumbent_from_connected(
 ) -> Result<Incumbent, UpdateError> {
     validate_ready_welcome(&connected.welcome, profile, &required_live_features())?;
     if connected.peer_credentials.uid != haider_client::effective_uid() {
-        connected.client.close();
+        let _ = connected.client.close();
         return Err(UpdateError::Refused(
             "daemon socket peer is not owned by this user".into(),
         ));
     }
     let Some(pid) = connected.peer_credentials.pid.filter(|pid| *pid != 0) else {
-        connected.client.close();
+        let _ = connected.client.close();
         return Err(UpdateError::Refused(
             "daemon socket did not expose an authenticated peer PID".into(),
         ));
@@ -196,7 +196,7 @@ async fn restart_committed_with_hooks<H: RestartHooks>(
     .await
     {
         Ok(client) => {
-            client.close();
+            let _ = client.close();
             drop(child);
             committed.finalize()
         }
@@ -225,7 +225,7 @@ async fn rollback_and_restart_old(
         wait_for_version_health(profile, old_version, &mut old_child, HEALTH_DEADLINE).await;
     match restarted {
         Ok(client) => {
-            client.close();
+            let _ = client.close();
             drop(old_child);
             Err(UpdateError::Health(format!(
                 "updated daemon failed health and the old pair was restored: {health_error}"
@@ -333,7 +333,7 @@ async fn wait_for_exact_health(
         match connect(&profile.endpoint_path, ClientConfig::default()).await {
             Ok(connected) => {
                 if connected.welcome.lifecycle_phase != LifecyclePhase::Ready {
-                    connected.client.close();
+                    let _ = connected.client.close();
                     if Instant::now() + POLL_BACKOFF > deadline {
                         return Err("updated daemon did not reach Ready before the deadline".into());
                     }
@@ -351,7 +351,7 @@ async fn wait_for_exact_health(
                 match result {
                     Ok(()) => return Ok(connected.client),
                     Err(error) => {
-                        connected.client.close();
+                        let _ = connected.client.close();
                         return Err(error);
                     }
                 }
@@ -380,7 +380,7 @@ async fn wait_for_version_health(
         match connect(&profile.endpoint_path, ClientConfig::default()).await {
             Ok(connected) => {
                 if connected.welcome.lifecycle_phase != LifecyclePhase::Ready {
-                    connected.client.close();
+                    let _ = connected.client.close();
                     if Instant::now() + POLL_BACKOFF > deadline {
                         return Err("old daemon did not reach Ready before the deadline".into());
                     }
@@ -390,13 +390,13 @@ async fn wait_for_version_health(
                 if let Err(error) =
                     validate_ready_welcome(&connected.welcome, profile, &required_live_features())
                 {
-                    connected.client.close();
+                    let _ = connected.client.close();
                     return Err(error.to_string());
                 }
                 if connected.welcome.daemon_version != version
                     || connected.peer_credentials.pid != Some(child.id())
                 {
-                    connected.client.close();
+                    let _ = connected.client.close();
                     return Err("old daemon Welcome version or peer PID did not match".into());
                 }
                 return Ok(connected.client);

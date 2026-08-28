@@ -96,7 +96,7 @@ use rustix::process::{Pid, Signal, kill_process};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::os::unix::net::UnixListener as StdUnixListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Barrier};
@@ -169,6 +169,47 @@ fn test_config(root: &tempfile::TempDir, profile: &str) -> DaemonConfig {
     // probe the developer machine's real credential stores (A2 auto-adopt).
     config.discovery_disabled = true;
     config
+}
+
+fn assert_runtime_directory_residual(
+    outcome: Result<ShutdownOutcome, DaemonError>,
+    runtime_dir: &Path,
+    mut expected: Vec<PathBuf>,
+) {
+    let DaemonError::RuntimeDirectoryNotEmpty {
+        path,
+        mut remaining_entries,
+    } = outcome.expect_err("foreign runtime entries must prevent a clean removal")
+    else {
+        panic!("shutdown returned the wrong typed residual");
+    };
+    expected.sort();
+    remaining_entries.sort();
+    assert_eq!(path, runtime_dir);
+    assert_eq!(remaining_entries, expected);
+}
+
+fn assert_racing_endpoint_shutdown(
+    outcome: Result<ShutdownOutcome, DaemonError>,
+    config: &DaemonConfig,
+) {
+    match outcome {
+        Ok(ShutdownOutcome::Graceful) => {}
+        Err(DaemonError::RuntimeDirectoryNotEmpty {
+            path,
+            remaining_entries,
+        }) => {
+            assert_eq!(path, config.runtime_dir);
+            assert!(!remaining_entries.is_empty());
+            assert!(remaining_entries.iter().all(|entry| {
+                entry == &config.endpoint_path()
+                    || entry
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with(".haiderd-"))
+            }));
+        }
+        other => panic!("unexpected racing shutdown outcome: {other:?}"),
+    }
 }
 
 fn child_command(config: &DaemonConfig) -> Command {
@@ -576,9 +617,10 @@ async fn successor_socket_deletion_guard_preserves_replacement_identity() {
     let successor = StdUnixListener::bind(&socket_path).expect("bind successor node");
     let successor_metadata = fs::symlink_metadata(&socket_path).expect("successor metadata");
     task.shutdown_handle().request("controlled handover");
-    assert_eq!(
-        task.join().await.expect("daemon joins"),
-        ShutdownOutcome::Graceful
+    assert_runtime_directory_residual(
+        task.join().await,
+        &config.runtime_dir,
+        vec![socket_path.clone()],
     );
     let after = fs::symlink_metadata(&socket_path).expect("successor node remains");
     assert_eq!(
@@ -1507,9 +1549,10 @@ async fn endpoint_replacement_before_cleanup_is_never_deleted() {
     let replacement = StdUnixListener::bind(&socket_path).expect("bind replacement node");
     let replacement_metadata = fs::symlink_metadata(&socket_path).expect("replacement metadata");
     task.shutdown_handle().request("handover");
-    assert_eq!(
-        task.join().await.expect("daemon joins"),
-        ShutdownOutcome::Graceful
+    assert_runtime_directory_residual(
+        task.join().await,
+        &config.runtime_dir,
+        vec![socket_path.clone()],
     );
     let after = fs::symlink_metadata(&socket_path).expect("replacement node survives cleanup");
     assert_eq!(
@@ -1572,10 +1615,7 @@ async fn endpoint_replacement_racing_cleanup_is_never_deleted() {
     });
 
     task.shutdown_handle().request("racing handover");
-    assert_eq!(
-        task.join().await.expect("daemon joins"),
-        ShutdownOutcome::Graceful
-    );
+    assert_racing_endpoint_shutdown(task.join().await, &config);
     stop.store(true, AtomicOrdering::Relaxed);
     racer.join().expect("racer thread");
     assert_eq!(
@@ -1684,6 +1724,9 @@ async fn stale_cleanup_never_removes_a_node_that_went_live() {
         task.shutdown_handle().request("flip round");
         match task.join().await {
             Ok(_) | Err(DaemonError::Endpoint { .. }) => {}
+            outcome @ Err(DaemonError::RuntimeDirectoryNotEmpty { .. }) => {
+                assert_racing_endpoint_shutdown(outcome, &config);
+            }
             other => panic!("unexpected startup outcome: {other:?}"),
         }
         poll_store_release(&config).await;
@@ -1738,9 +1781,10 @@ async fn stranded_staging_nodes_are_swept_but_live_ones_are_left() {
 
     drop(live_listener);
     task.shutdown_handle().request("test complete");
-    assert_eq!(
-        task.join().await.expect("daemon joins"),
-        ShutdownOutcome::Graceful
+    assert_runtime_directory_residual(
+        task.join().await,
+        &config.runtime_dir,
+        vec![live.clone(), unrelated.clone()],
     );
 }
 

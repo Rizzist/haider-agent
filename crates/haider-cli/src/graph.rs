@@ -159,7 +159,7 @@ pub(crate) async fn graph_command(rest: &[String]) -> ExitCode {
             }
         }
     };
-    ensured.client.close();
+    let _ = ensured.client.close();
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

@@ -203,12 +203,12 @@ pub(crate) async fn session_config_command(session_id: &str, rest: &[String]) ->
         .cloned()
         .collect::<BTreeSet<_>>();
     if !missing.is_empty() {
-        ensured.client.close();
+        let _ = ensured.client.close();
         return failure(&ConfigError::MissingFeatures(missing));
     }
     let json = options.json;
     let result = execute(&ensured.client, SessionId::new(session_id), options).await;
-    ensured.client.close();
+    let _ = ensured.client.close();
     match result {
         Ok(document) if document.schema == SESSION_CONFIG_SCHEMA && json => {
             write_document(&document)

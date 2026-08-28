@@ -2253,7 +2253,7 @@ async fn shutdown_owned_daemon_peer(
         || uid_changed
         || peer_credentials.pid != Some(ownership.authenticated_pid)
     {
-        client.close();
+        let _ = client.close();
         return Err(teardown_protocol(
             "owned daemon identity changed before one-shot teardown",
         ));
@@ -2326,7 +2326,7 @@ async fn shutdown_owned_daemon_peer(
         )
     })?;
     if notice.0 != ownership.instance_id || notice.1 != ownership.daemon_generation {
-        client.close();
+        let _ = client.close();
         return Err(teardown_protocol(
             "owned daemon drain notice did not match its authenticated Welcome",
         ));
@@ -2671,7 +2671,7 @@ async fn run_headless_inner(
                         return Err(cancellation_unconfirmed("turn.submit recovery"));
                     }
                     submit_timeout_grace = Some(Instant::now() + request.terminal_grace);
-                    connection.client.close();
+                    let _ = connection.client.close();
                     break Err(ClientError::Disconnected(DisconnectReason::Closed));
                 }
             }
@@ -3865,7 +3865,7 @@ async fn activate_timeout_after_stalled_recovery(
     *forced = Some(ForcedOutcome::Timeout);
     let deadline = Instant::now() + terminal_grace;
     *grace_deadline = Some(deadline);
-    connection.client.close();
+    let _ = connection.client.close();
     tokio::time::timeout_at(
         deadline,
         reconnect_after_disconnect(

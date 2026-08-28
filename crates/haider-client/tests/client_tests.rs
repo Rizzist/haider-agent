@@ -14,9 +14,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use haider_client::{
-    ClientConfig, ConnectError, ConnectionState, DisconnectReason, EnsureError, EnsureOptions,
-    ProfileEnv, ShellExecError, ShellExecRequest, connect, ensure_daemon, resolve_profile,
-    shell_exec,
+    ClientCloseOutcome, ClientConfig, ConnectError, ConnectionState, DisconnectReason, EnsureError,
+    EnsureOptions, ProfileEnv, ShellExecError, ShellExecRequest, connect, ensure_daemon,
+    resolve_profile, shell_exec,
 };
 use haider_protocol::ids::SessionId;
 use haider_rpc::{
@@ -28,6 +28,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
 const LIMIT: usize = DEFAULT_FRAME_LIMIT;
+
+fn assert_peer_notified(outcome: ClientCloseOutcome) {
+    assert!(matches!(outcome, ClientCloseOutcome::PeerNotified));
+}
 
 fn short_dir() -> tempfile::TempDir {
     tempfile::Builder::new()
@@ -240,7 +244,7 @@ async fn user_command_feature_failure_sends_zero_rpc_requests() {
     assert!(matches!(error, ShellExecError::FeatureUnavailable { .. }));
     tokio::task::yield_now().await;
     assert_eq!(requests.load(Ordering::SeqCst), 0);
-    connected.client.close();
+    assert_peer_notified(connected.client.close());
 }
 
 #[tokio::test]
@@ -344,7 +348,7 @@ async fn connect_retains_kernel_authenticated_peer_credentials() {
         connected.peer_credentials.uid,
         haider_client::effective_uid()
     );
-    connected.client.close();
+    assert_peer_notified(connected.client.close());
 }
 
 // MUTATION CHECK: the R9 client heartbeat law — a ping unmatched for the
@@ -830,7 +834,7 @@ async fn racing_launcher_never_owns_the_other_launchers_winner() {
         ensured.ownership.is_none(),
         "a losing launcher must never own the authenticated winner"
     );
-    ensured.client.close();
+    assert_peer_notified(ensured.client.close());
 }
 
 /// A closed handshake is not itself permission to spawn. Once a prior
@@ -956,7 +960,7 @@ async fn closed_handshake_is_retried_only_after_a_spawnable_failure_authorizes_a
     assert!(ensured.spawned);
     assert!(ensured.race_lost);
     assert!(ensured.ownership.is_none());
-    ensured.client.close();
+    assert_peer_notified(ensured.client.close());
     drop(ensured);
     tokio::time::timeout(Duration::from_secs(2), winner)
         .await

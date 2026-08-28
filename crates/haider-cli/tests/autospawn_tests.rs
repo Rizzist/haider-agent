@@ -320,7 +320,7 @@ fn assert_daemon_serves(profile: &ResolvedProfile) {
                 .is_superset(&haider_client::required_live_features()),
             "daemon must advertise the live feature families"
         );
-        connected.client.close();
+        let _ = connected.client.close();
     });
 }
 

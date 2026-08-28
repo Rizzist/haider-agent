@@ -139,7 +139,7 @@ pub(crate) async fn models_command(rest: &[String]) -> ExitCode {
         Err(error) => return failure(&ModelsError::Ensure(error)),
     };
     let result = read_document_with_refresh(&ensured.client, options.refresh.as_ref()).await;
-    ensured.client.close();
+    let _ = ensured.client.close();
     let document = match result {
         Ok(document) => document,
         Err(error) => return failure(&error),
