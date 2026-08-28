@@ -244,6 +244,122 @@ fn adoption_discovery_is_handed_to_candidate_lookup_without_a_second_store_call(
     assert_eq!(raw.reads.load(Ordering::SeqCst), 2);
 }
 
+struct ReleasableBlockingClaudeNative {
+    calls: AtomicUsize,
+    started: std::sync::mpsc::SyncSender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl ClaudeNativeCredentialStore for ReleasableBlockingClaudeNative {
+    fn read(
+        &self,
+        _event: ClaudeNativeReadEvent,
+    ) -> Result<ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let _ = self.started.send(());
+        let _ = self
+            .release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv();
+        Err(ClaudeNativeCredentialFailure::Missing)
+    }
+}
+
+/// P0 regression pin: a platform API that never returns is a typed source
+/// timeout, and subsequent observational discovery uses the cached outcome
+/// instead of leaking one new stuck OS thread per status call.
+#[test]
+fn native_store_timeout_is_typed_and_cooled_down_for_discovery() {
+    let (started, observed_start) = std::sync::mpsc::sync_channel(1);
+    let (release, blocked) = std::sync::mpsc::sync_channel(1);
+    let raw = Arc::new(ReleasableBlockingClaudeNative {
+        calls: AtomicUsize::new(0),
+        started,
+        release: Mutex::new(blocked),
+    });
+    let access =
+        ClaudeNativeCredentialAccess::new_with_timeout(raw.clone(), Duration::from_millis(25));
+
+    assert!(matches!(
+        access.read(ClaudeNativeReadEvent::AdoptionDiscovery),
+        Err(ClaudeNativeCredentialFailure::TimedOut)
+    ));
+    observed_start
+        .recv_timeout(Duration::from_secs(1))
+        .expect("raw platform read started");
+    assert!(matches!(
+        access.read(ClaudeNativeReadEvent::AdoptionDiscovery),
+        Err(ClaudeNativeCredentialFailure::TimedOut)
+    ));
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 1);
+    let _ = release.send(());
+}
+
+struct BlockingFirstClaudeNative {
+    calls: AtomicUsize,
+    first_started: std::sync::mpsc::SyncSender<()>,
+    first_release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl ClaudeNativeCredentialStore for BlockingFirstClaudeNative {
+    fn read(
+        &self,
+        _event: ClaudeNativeReadEvent,
+    ) -> Result<ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            let _ = self.first_started.send(());
+            let _ = self
+                .first_release
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv();
+            return Err(ClaudeNativeCredentialFailure::Missing);
+        }
+        Err(ClaudeNativeCredentialFailure::Denied)
+    }
+}
+
+/// P0 lock-scope pin: while one raw platform read is blocked, a newer explicit
+/// read reaches the injected store. Holding `state` across `store.read` makes
+/// this second call miss the deadline.
+#[test]
+fn native_platform_read_never_holds_the_access_mutex() {
+    let (first_started, observed_first) = std::sync::mpsc::sync_channel(1);
+    let (first_release, blocked_first) = std::sync::mpsc::sync_channel(1);
+    let raw = Arc::new(BlockingFirstClaudeNative {
+        calls: AtomicUsize::new(0),
+        first_started,
+        first_release: Mutex::new(blocked_first),
+    });
+    let access = Arc::new(ClaudeNativeCredentialAccess::new_with_timeout(
+        raw.clone(),
+        Duration::from_secs(1),
+    ));
+    let first_access = Arc::clone(&access);
+    let first =
+        std::thread::spawn(move || first_access.read(ClaudeNativeReadEvent::AdoptionDiscovery));
+    observed_first
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first raw read started");
+
+    let began = std::time::Instant::now();
+    assert!(matches!(
+        access.read(ClaudeNativeReadEvent::Significant),
+        Err(ClaudeNativeCredentialFailure::Denied)
+    ));
+    assert!(
+        began.elapsed() < Duration::from_millis(250),
+        "the second platform read waited behind the access mutex"
+    );
+    let _ = first_release.send(());
+    assert!(matches!(
+        first.join().expect("join first access call"),
+        Err(ClaudeNativeCredentialFailure::Missing)
+    ));
+    assert_eq!(raw.calls.load(Ordering::SeqCst), 2);
+}
+
 struct StubFixedResolver {
     address: SocketAddr,
     calls: AtomicUsize,

@@ -91,6 +91,10 @@ pub(crate) const SECRET_TTL: Duration = Duration::from_secs(300);
 
 /// Bounded account-actor admission; overflow answers typed `busy`.
 const ACTOR_CAPACITY: usize = 8;
+/// Outer bound for file-backed device discovery and its already-shorter native
+/// credential lookup. This is one continuous worker deadline; timing out a
+/// phase never grants the next phase a fresh budget.
+const DEVICE_DISCOVERY_WORKER_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ───────────────────────────── transport class ─────────────────────────────
 
@@ -1509,24 +1513,31 @@ async fn run_account_actor(
                     ClaudeNativeReadEvent::AdoptionDiscovery,
                 )
                 .await;
-                let adoption_available = discovered
-                    .iter()
-                    .filter_map(|candidate| adoption_notice(&candidate.wire, accounts.list()))
-                    .collect();
-                let candidates = discovered
-                    .into_iter()
-                    .map(|candidate| candidate.wire)
-                    .collect();
-                respond(
-                    &completed,
-                    ResponseBody::AccountDeviceCandidates {
-                        discovery_disabled: crate::device_discovery::discovery_is_disabled(
-                            discovery_disabled,
-                        ),
-                        candidates,
-                        adoption_available,
-                    },
-                );
+                match discovered {
+                    Ok(discovered) => {
+                        let adoption_available = discovered
+                            .iter()
+                            .filter_map(|candidate| {
+                                adoption_notice(&candidate.wire, accounts.list())
+                            })
+                            .collect();
+                        let candidates = discovered
+                            .into_iter()
+                            .map(|candidate| candidate.wire)
+                            .collect();
+                        respond(
+                            &completed,
+                            ResponseBody::AccountDeviceCandidates {
+                                discovery_disabled: crate::device_discovery::discovery_is_disabled(
+                                    discovery_disabled,
+                                ),
+                                candidates,
+                                adoption_available,
+                            },
+                        );
+                    }
+                    Err(error) => respond_management_error(&completed, &error),
+                }
             }
             AccountCommand::ImportDevice(job) => {
                 handle_device_import(
@@ -5265,17 +5276,14 @@ async fn handle_device_import(
 ) {
     let candidate_id = job.candidate.clone();
     let disabled = job.discovery_disabled;
-    let native_for_discovery = Arc::clone(&claude_native);
-    let candidate = tokio::task::spawn_blocking(move || {
-        crate::device_discovery::candidate_by_id_with_native(
-            disabled,
-            &candidate_id,
-            native_for_discovery.as_ref(),
-        )
-    })
-    .await
-    .ok()
-    .flatten();
+    let candidate =
+        match find_device_candidate(Arc::clone(&claude_native), disabled, candidate_id).await {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                respond_management_error(&job.route, &error);
+                return;
+            }
+        };
     let Some(candidate) = candidate else {
         respond_management_error(
             &job.route,
@@ -5364,20 +5372,67 @@ async fn discover_candidates(
     claude_native: Arc<dyn ClaudeNativeCredentialStore>,
     discovery_disabled: bool,
     event: ClaudeNativeReadEvent,
-) -> Vec<crate::device_discovery::DeviceCandidate> {
+) -> Result<Vec<crate::device_discovery::DeviceCandidate>, HaiderError> {
+    discover_candidates_with_deadline(
+        claude_native,
+        discovery_disabled,
+        event,
+        DEVICE_DISCOVERY_WORKER_TIMEOUT,
+    )
+    .await
+}
+
+async fn discover_candidates_with_deadline(
+    claude_native: Arc<dyn ClaudeNativeCredentialStore>,
+    discovery_disabled: bool,
+    event: ClaudeNativeReadEvent,
+    deadline: Duration,
+) -> Result<Vec<crate::device_discovery::DeviceCandidate>, HaiderError> {
     let native_for_discovery = Arc::clone(&claude_native);
-    let candidates = tokio::task::spawn_blocking(move || {
+    let worker = tokio::task::spawn_blocking(move || {
         crate::device_discovery::discover_device_candidates_with_native_event(
             discovery_disabled,
             native_for_discovery.as_ref(),
             event,
         )
-    })
-    .await
-    .unwrap_or_default();
+    });
     // Discovery is metadata-only. Import is exclusively the explicit,
     // Control-authorized account.import_device/account.oauth_import door.
-    candidates
+    await_device_discovery_worker(worker, deadline).await
+}
+
+async fn find_device_candidate(
+    claude_native: Arc<dyn ClaudeNativeCredentialStore>,
+    discovery_disabled: bool,
+    candidate_id: String,
+) -> Result<Option<crate::device_discovery::DeviceCandidate>, HaiderError> {
+    let worker = tokio::task::spawn_blocking(move || {
+        crate::device_discovery::candidate_by_id_with_native(
+            discovery_disabled,
+            &candidate_id,
+            claude_native.as_ref(),
+        )
+    });
+    await_device_discovery_worker(worker, DEVICE_DISCOVERY_WORKER_TIMEOUT).await
+}
+
+async fn await_device_discovery_worker<T: Send + 'static>(
+    worker: tokio::task::JoinHandle<T>,
+    deadline: Duration,
+) -> Result<T, HaiderError> {
+    match tokio::time::timeout(deadline, worker).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(_)) => Err(device_discovery_worker_error("worker was lost")),
+        Err(_) => Err(device_discovery_worker_error("deadline elapsed")),
+    }
+}
+
+fn device_discovery_worker_error(reason: &str) -> HaiderError {
+    HaiderError::new(
+        ErrorCode::ProviderError,
+        format!("device credential discovery unavailable: {reason}"),
+        true,
+    )
 }
 
 /// Imports (or refreshes) the vertex gcloud credential (G4b, LV2): run the
@@ -5782,6 +5837,7 @@ fn native_attention_reason(failure: ClaudeNativeCredentialFailure) -> Credential
         ClaudeNativeCredentialFailure::Unavailable => {
             CredentialAttentionReason::KeychainUnavailable
         }
+        ClaudeNativeCredentialFailure::TimedOut => CredentialAttentionReason::KeychainUnavailable,
     }
 }
 

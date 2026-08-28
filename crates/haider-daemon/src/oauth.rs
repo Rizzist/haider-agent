@@ -59,6 +59,13 @@ const MIN_RANDOM_BYTES: usize = 32;
 const MAX_TOKEN_LIFETIME_SECS: u64 = 366 * 24 * 60 * 60;
 const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const TOKEN_TIMEOUT: Duration = Duration::from_secs(15);
+/// A platform credential API is outside Tokio's cancellation domain and may
+/// wait for desktop authorization forever. Every call therefore runs on its
+/// own OS thread and only this bounded result is admitted back into discovery.
+const NATIVE_CREDENTIAL_STORE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Explicit import is the only event allowed to present platform credential
+/// UI. It remains bounded, but has enough room for an intentional response.
+const NATIVE_CREDENTIAL_SIGNIFICANT_TIMEOUT: Duration = Duration::from_secs(30);
 const OAUTH_REFRESH_SKEW: Duration = Duration::from_secs(30);
 const KIMI_REFRESH_REJECTED_TTL: Duration = Duration::from_secs(300);
 pub(crate) const KIMI_DEVICE_ALIAS: &str = "_kimi_oauth_device_id_v1";
@@ -1217,6 +1224,10 @@ pub(crate) enum ClaudeNativeCredentialFailure {
         allow(dead_code)
     )]
     Unavailable,
+    /// The platform API did not return inside the daemon-owned access budget.
+    /// The underlying OS thread is detached because platform credential APIs
+    /// do not expose portable cancellation.
+    TimedOut,
 }
 
 /// Explicit-import reads may retry a previously failed no-UI probe and, on
@@ -1298,26 +1309,43 @@ impl ClaudeNativeCredentialStore for PlatformClaudeNativeCredentialStore {
         &self,
         event: ClaudeNativeReadEvent,
     ) -> Result<ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
+        if deterministic_native_store_unavailable() {
+            return Err(ClaudeNativeCredentialFailure::Unavailable);
+        }
         platform_claude_credential(self, event)
     }
 
     fn probe(&self) -> Result<(), ClaudeNativeCredentialFailure> {
+        if deterministic_native_store_unavailable() {
+            return Err(ClaudeNativeCredentialFailure::Unavailable);
+        }
         platform_claude_credential_probe(self)
     }
 }
 
-/// Boot-scoped single-flight/cooldown wrapper over the injected raw seam.
-/// The account actor serializes callers, while this mutex also protects the
-/// old discovery RPC's blocking worker and makes the no-second-call law local
-/// to the seam rather than dependent on actor scheduling.
+/// Real-binary smoke-test seam. This disables only Claude's platform store;
+/// file-backed discovery remains enabled and is exercised independently.
+fn deterministic_native_store_unavailable() -> bool {
+    std::env::var_os("HAIDER_TEST_CLAUDE_CREDENTIAL_STORE")
+        .is_some_and(|value| value == std::ffi::OsStr::new("unavailable"))
+}
+
+/// Boot-scoped cooldown/handoff wrapper over the injected raw seam. Its mutex
+/// protects only local cache state and is always released before a platform
+/// call. The bounded detached call makes the no-second-call law local to this
+/// seam rather than dependent on actor scheduling.
 pub(crate) struct ClaudeNativeCredentialAccess {
     store: Arc<dyn ClaudeNativeCredentialStore>,
     state: Mutex<ClaudeNativeCredentialAccessState>,
+    timeout: Duration,
 }
 
 #[derive(Default)]
 struct ClaudeNativeCredentialAccessState {
     last_failure: Option<ClaudeNativeCredentialFailure>,
+    /// Monotonic local attempt fence: a detached older platform call can never
+    /// overwrite the cache state established by a newer explicit retry.
+    latest_attempt: u64,
     /// A metadata discovery read and its immediate candidate lookup are one
     /// observational operation. Hand the bytes to the lookup once; explicit
     /// import still owns its separate `Significant` read.
@@ -1328,9 +1356,68 @@ impl ClaudeNativeCredentialAccess {
     const DISCOVERY_HANDOFF_TTL: Duration = Duration::from_secs(5);
 
     pub(crate) fn new(store: Arc<dyn ClaudeNativeCredentialStore>) -> Self {
+        Self::new_with_timeout(store, NATIVE_CREDENTIAL_STORE_TIMEOUT)
+    }
+
+    fn new_with_timeout(store: Arc<dyn ClaudeNativeCredentialStore>, timeout: Duration) -> Self {
         Self {
             store,
             state: Mutex::new(ClaudeNativeCredentialAccessState::default()),
+            timeout,
+        }
+    }
+
+    fn bounded_read(
+        &self,
+        event: ClaudeNativeReadEvent,
+    ) -> Result<ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
+        let (completed, completion) = std::sync::mpsc::sync_channel(1);
+        let store = Arc::clone(&self.store);
+        if std::thread::Builder::new()
+            .name("haider-native-credential-read".to_owned())
+            .spawn(move || {
+                let _ = completed.send(store.read(event));
+            })
+            .is_err()
+        {
+            return Err(ClaudeNativeCredentialFailure::Unavailable);
+        }
+        let timeout = if event == ClaudeNativeReadEvent::Significant {
+            NATIVE_CREDENTIAL_SIGNIFICANT_TIMEOUT
+        } else {
+            self.timeout
+        };
+        match completion.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err(ClaudeNativeCredentialFailure::TimedOut)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(ClaudeNativeCredentialFailure::Unavailable)
+            }
+        }
+    }
+
+    fn bounded_probe(&self) -> Result<(), ClaudeNativeCredentialFailure> {
+        let (completed, completion) = std::sync::mpsc::sync_channel(1);
+        let store = Arc::clone(&self.store);
+        if std::thread::Builder::new()
+            .name("haider-native-credential-probe".to_owned())
+            .spawn(move || {
+                let _ = completed.send(store.probe());
+            })
+            .is_err()
+        {
+            return Err(ClaudeNativeCredentialFailure::Unavailable);
+        }
+        match completion.recv_timeout(self.timeout) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err(ClaudeNativeCredentialFailure::TimedOut)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(ClaudeNativeCredentialFailure::Unavailable)
+            }
         }
     }
 }
@@ -1340,21 +1427,38 @@ impl ClaudeNativeCredentialStore for ClaudeNativeCredentialAccess {
         &self,
         event: ClaudeNativeReadEvent,
     ) -> Result<ClaudeCredentialInput, ClaudeNativeCredentialFailure> {
+        let attempt = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if event == ClaudeNativeReadEvent::Ordinary {
+                if let Some((observed_at, input)) = state.discovery_handoff.take()
+                    && observed_at.elapsed() <= Self::DISCOVERY_HANDOFF_TTL
+                {
+                    return Ok(input);
+                }
+            }
+            if let Some(cached) = state.last_failure
+                && (event == ClaudeNativeReadEvent::Ordinary
+                    || cached == ClaudeNativeCredentialFailure::TimedOut)
+            {
+                return Err(cached);
+            }
+            state.latest_attempt = state.latest_attempt.saturating_add(1);
+            state.latest_attempt
+        };
+
+        // The access mutex is deliberately not held across this platform call.
+        let result = self.bounded_read(event);
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if event == ClaudeNativeReadEvent::Ordinary {
-            if let Some((observed_at, input)) = state.discovery_handoff.take()
-                && observed_at.elapsed() <= Self::DISCOVERY_HANDOFF_TTL
-            {
-                return Ok(input);
-            }
-            if let Some(cached) = state.last_failure {
-                return Err(cached);
-            }
+        if state.latest_attempt != attempt {
+            return result;
         }
-        match self.store.read(event) {
+        match result {
             Ok(input) => {
                 state.last_failure = None;
                 state.discovery_handoff = (event == ClaudeNativeReadEvent::AdoptionDiscovery)
@@ -1370,7 +1474,31 @@ impl ClaudeNativeCredentialStore for ClaudeNativeCredentialAccess {
     }
 
     fn probe(&self) -> Result<(), ClaudeNativeCredentialFailure> {
-        self.store.probe()
+        let attempt = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = state.last_failure {
+                return Err(cached);
+            }
+            state.latest_attempt = state.latest_attempt.saturating_add(1);
+            state.latest_attempt
+        };
+
+        // Like reads, a probe has no mutex guard live while entering the OS.
+        let result = self.bounded_probe();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.latest_attempt == attempt {
+            state.last_failure = result.as_ref().err().copied();
+            if result.is_ok() {
+                state.discovery_handoff = None;
+            }
+        }
+        result
     }
 }
 
@@ -1779,6 +1907,9 @@ pub(crate) fn claude_native_access_error(failure: ClaudeNativeCredentialFailure)
         }
         ClaudeNativeCredentialFailure::Unavailable => {
             "Claude Code credential store is unavailable; retry after the system store recovers"
+        }
+        ClaudeNativeCredentialFailure::TimedOut => {
+            "Claude Code credential store timed out; retry after the system store recovers"
         }
     };
     HaiderError::new(ErrorCode::CredentialMissing, message, true)

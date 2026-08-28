@@ -2699,6 +2699,23 @@ async fn custom_login_validation_authenticates_with_models_get_not_inference() {
 
 const OAUTH_IMPORT_ENV_CHILD: &str = "HAIDER_TEST_OAUTH_IMPORT_ENV_CHILD";
 
+/// P0 outer-bound pin: even a blocking worker outside Tokio's cancellation
+/// domain produces a typed retryable result before the connection can hang.
+#[tokio::test]
+async fn device_discovery_blocking_worker_has_one_continuous_deadline() {
+    let (release, blocked) = std::sync::mpsc::sync_channel(1);
+    let worker = tokio::task::spawn_blocking(move || {
+        let _ = blocked.recv();
+    });
+    let error = await_device_discovery_worker(worker, Duration::from_millis(25))
+        .await
+        .expect_err("blocking discovery worker must time out");
+    assert_eq!(error.code, ErrorCode::ProviderError);
+    assert!(error.retryable);
+    assert!(error.message.contains("deadline elapsed"));
+    let _ = release.send(());
+}
+
 fn run_oauth_import_env_child(test_name: &str, overrides: &[(&str, &std::path::Path)]) -> bool {
     if std::env::var_os(OAUTH_IMPORT_ENV_CHILD).is_some() {
         return false;

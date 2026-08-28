@@ -637,6 +637,64 @@ async fn fatal_protocol_error_frame_fails_pending_requests() {
     }
 }
 
+/// P0 regression pin: a healthy heartbeat cannot keep one unanswered RPC
+/// pending forever. The continuous deadline starts before writer admission and
+/// retires the connection with a branchable reason when no response arrives.
+#[tokio::test]
+async fn unanswered_request_reaches_typed_continuous_deadline() {
+    let dir = short_dir();
+    let endpoint = dir.path().join("request-deadline.sock");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let _daemon = spawn_fake_daemon(
+        &endpoint,
+        Arc::clone(&accepted),
+        HelloReply::Welcome(welcome("profile-timeout", BTreeSet::new())),
+        |mut stream, mut decoder| async move {
+            loop {
+                let frames = read_frames(&mut stream, &mut decoder).await;
+                if frames.is_empty() {
+                    return;
+                }
+                if frames
+                    .iter()
+                    .any(|frame| matches!(frame, WireFrame::Request { .. }))
+                {
+                    std::future::pending::<()>().await;
+                }
+            }
+        },
+    );
+    let timeout = Duration::from_millis(50);
+    let connected = connect(
+        &endpoint,
+        ClientConfig {
+            request_timeout: timeout,
+            ping_interval: Duration::from_secs(120),
+            pong_deadline: Duration::from_secs(120),
+            ..ClientConfig::default()
+        },
+    )
+    .await
+    .expect("connect fake daemon");
+
+    let error = connected
+        .client
+        .request(list_body())
+        .await
+        .expect_err("unanswered request must time out");
+    assert!(matches!(
+        error,
+        haider_client::ClientError::Disconnected(DisconnectReason::RequestTimeout {
+            ref request_id,
+            timeout: observed,
+        }) if request_id == "req-1" && observed == timeout
+    ));
+    assert!(matches!(
+        connected.client.state(),
+        ConnectionState::Disconnected(DisconnectReason::RequestTimeout { .. })
+    ));
+}
+
 /// W3c2 review finding 1: a request racing `Shared::fail` must never orphan
 /// its pending sender. The fix places the disconnect check INSIDE the
 /// pending lock, so either the flip is visible before insert (typed error,

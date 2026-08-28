@@ -39,6 +39,10 @@ pub const PING_INTERVAL: Duration = Duration::from_secs(15);
 pub const PONG_DEADLINE: Duration = Duration::from_secs(45);
 /// Default handshake deadline (mirrors the daemon's own handshake timeout).
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default continuous deadline from correlated-request admission through its
+/// response. Long-running work is accepted by a quick RPC and then observed as
+/// events; no ordinary request is allowed to wait forever while heartbeats pass.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 const OUTBOUND_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 256;
@@ -74,6 +78,7 @@ pub struct ClientConfig {
     /// Largest JSON body this client will accept (advertised in `Hello`).
     pub frame_limit: usize,
     pub handshake_timeout: Duration,
+    pub request_timeout: Duration,
     pub ping_interval: Duration,
     pub pong_deadline: Duration,
 }
@@ -88,6 +93,7 @@ impl Default for ClientConfig {
             capabilities: CapabilitySet::from([Capability::View, Capability::Control]),
             frame_limit: DEFAULT_FRAME_LIMIT,
             handshake_timeout: HANDSHAKE_TIMEOUT,
+            request_timeout: REQUEST_TIMEOUT,
             ping_interval: PING_INTERVAL,
             pong_deadline: PONG_DEADLINE,
         }
@@ -170,6 +176,13 @@ pub enum DisconnectReason {
     Fatal(ProtocolError),
     /// R9: no matching `Pong` within the pong deadline — reconnect.
     PongTimeout,
+    /// One correlated request made no response progress before its continuous
+    /// request deadline. The connection is retired so a late response cannot
+    /// be mistaken for a later attempt.
+    RequestTimeout {
+        request_id: String,
+        timeout: Duration,
+    },
 }
 
 impl std::fmt::Display for DisconnectReason {
@@ -183,6 +196,14 @@ impl std::fmt::Display for DisconnectReason {
             Self::PongTimeout => {
                 formatter.write_str("daemon made no ping progress within the pong deadline")
             }
+            Self::RequestTimeout {
+                request_id,
+                timeout,
+            } => write!(
+                formatter,
+                "daemon did not answer {request_id} within {} ms",
+                timeout.as_millis()
+            ),
         }
     }
 }
@@ -436,6 +457,7 @@ pub struct RpcClient {
     events: StdMutex<Option<mpsc::Receiver<WireFrame>>>,
     outbound_limit: usize,
     encoding: WireEncoding,
+    request_timeout: Duration,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     /// Transport shutdown authority retained outside the reader/writer tasks.
     /// Unix uses it for a peer-visible `shutdown(2)` without another executor
@@ -507,6 +529,7 @@ impl RpcClient {
             events: StdMutex::new(Some(events_rx)),
             outbound_limit,
             encoding,
+            request_timeout: config.request_timeout,
             tasks,
             shutdown,
             welcome: welcome.clone(),
@@ -632,6 +655,10 @@ impl RpcClient {
         &self,
         build: impl FnOnce(RequestId) -> WireFrame,
     ) -> Result<PendingResponse, ClientError> {
+        // One deadline covers admission to the bounded writer queue and the
+        // correlated response. No phase may reset the request's time budget.
+        let request_timeout = self.request_timeout;
+        let deadline = Instant::now() + request_timeout;
         let id = format!(
             "req-{}",
             self.shared.next_request.fetch_add(1, Ordering::Relaxed)
@@ -661,15 +688,29 @@ impl RpcClient {
             }
             pending.insert(id.clone(), sender);
         }
-        if self.outbound.send(bytes).await.is_err() {
-            if let Ok(mut pending) = self.shared.pending.lock() {
-                pending.remove(&id);
+        match tokio::time::timeout_at(deadline, self.outbound.send(bytes)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                if let Ok(mut pending) = self.shared.pending.lock() {
+                    pending.remove(&id);
+                }
+                return Err(ClientError::Disconnected(self.disconnect_reason()));
             }
-            return Err(ClientError::Disconnected(self.disconnect_reason()));
+            Err(_) => {
+                let reason = DisconnectReason::RequestTimeout {
+                    request_id: id.clone(),
+                    timeout: request_timeout,
+                };
+                self.shared.fail(reason.clone());
+                return Err(ClientError::Disconnected(reason));
+            }
         }
         Ok(PendingResponse {
             receiver,
             shared: Arc::clone(&self.shared),
+            request_id: id,
+            deadline,
+            timeout: request_timeout,
         })
     }
 
@@ -729,6 +770,9 @@ impl RpcClient {
 pub struct PendingResponse {
     receiver: oneshot::Receiver<ResponseBody>,
     shared: Arc<Shared>,
+    request_id: String,
+    deadline: Instant,
+    timeout: Duration,
 }
 
 impl PendingResponse {
@@ -737,10 +781,24 @@ impl PendingResponse {
     /// A correlation dropped by a dying connection resolves as the typed
     /// [`DisconnectReason`] — the caller's reconnect cue — never as a hang.
     pub async fn wait(self) -> Result<ResponseBody, ClientError> {
-        let Self { receiver, shared } = self;
-        match receiver.await {
-            Ok(body) => Ok(body),
-            Err(_) => Err(ClientError::Disconnected(shared.disconnect_reason())),
+        let Self {
+            receiver,
+            shared,
+            request_id,
+            deadline,
+            timeout,
+        } = self;
+        match tokio::time::timeout_at(deadline, receiver).await {
+            Ok(Ok(body)) => Ok(body),
+            Ok(Err(_)) => Err(ClientError::Disconnected(shared.disconnect_reason())),
+            Err(_) => {
+                let reason = DisconnectReason::RequestTimeout {
+                    request_id,
+                    timeout,
+                };
+                shared.fail(reason.clone());
+                Err(ClientError::Disconnected(reason))
+            }
         }
     }
 }
