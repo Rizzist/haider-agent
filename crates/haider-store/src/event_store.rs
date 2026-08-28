@@ -1889,6 +1889,40 @@ impl Store {
         Self::open_locked(lease)
     }
 
+    /// Drains connection-local resources and closes SQLite before releasing
+    /// the profile lock.
+    ///
+    /// Prepared statements normally remain resident for the store lifetime;
+    /// orderly close is the one boundary that empties the cache. Keeping this
+    /// explicit also lets SQLite close failures surface as typed store errors
+    /// instead of being discarded by `Drop`.
+    pub fn close(self) -> StoreResult<()> {
+        let Self {
+            connection,
+            _lock: profile_lock,
+            ..
+        } = self;
+        let connection = match connection.into_inner() {
+            Ok(connection) => connection,
+            Err(poisoned) => {
+                drop(poisoned);
+                drop(profile_lock);
+                return Err(store_error(
+                    ErrorCode::Internal,
+                    "SQLite journal connection lock is poisoned during close",
+                    false,
+                ));
+            }
+        };
+
+        connection.flush_prepared_statement_cache();
+        let result = connection
+            .close()
+            .map_err(|(_connection, error)| map_sqlite_error(error));
+        drop(profile_lock);
+        result
+    }
+
     /// The profile root.
     pub fn root(&self) -> &Path {
         &self.root

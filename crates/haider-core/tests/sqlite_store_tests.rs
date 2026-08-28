@@ -282,17 +282,29 @@ async fn durable_generation_prevents_same_millisecond_restart_id_collisions() {
 }
 
 #[tokio::test]
-async fn explicit_close_releases_lock_for_immediate_reopen() {
+async fn explicit_close_drops_cached_statements_and_allows_immediate_reopen() {
+    // "Immediate" means no sleep or retry. The bound leaves room for blocking
+    // pool scheduling and Windows handle teardown while still detecting a
+    // close task that is genuinely stuck.
+    const CLOSE_DEADLINE: Duration = Duration::from_secs(10);
+
     let root = tempfile::tempdir().expect("temporary profile");
     let first = SqliteStoreHandle::open(root.path())
         .await
         .expect("first handle opens");
+    assert!(
+        first
+            .session_ids()
+            .await
+            .expect("cached statement executes")
+            .is_empty()
+    );
 
-    timeout(Duration::from_secs(1), first.close())
+    timeout(CLOSE_DEADLINE, first.close())
         .await
         .expect("close completes")
         .expect("close succeeds");
-    let reopened = timeout(Duration::from_secs(1), SqliteStoreHandle::open(root.path()))
+    let reopened = timeout(CLOSE_DEADLINE, SqliteStoreHandle::open(root.path()))
         .await
         .expect("immediate reopen completes")
         .expect("profile lock was released");

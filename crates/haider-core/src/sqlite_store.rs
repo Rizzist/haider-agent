@@ -1977,9 +1977,9 @@ impl SqliteStoreHandle {
     pub async fn close(self) -> Result<(), HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || {
-            let store = owner.take_store()?;
-            drop(store);
-            Ok(())
+            owner
+                .take_store()?
+                .map_or(Ok(()), haider_store::Store::close)
         })
         .await
     }
