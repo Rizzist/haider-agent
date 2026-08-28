@@ -223,6 +223,16 @@ pub(crate) fn map_error(error: haider_platform::EndpointError) -> DaemonError {
         },
         haider_platform::EndpointError::Endpoint { message } => DaemonError::Endpoint { message },
         haider_platform::EndpointError::Task { message } => DaemonError::Task { message },
+        haider_platform::EndpointError::PathTooLong {
+            path,
+            length,
+            limit,
+        } => DaemonError::Endpoint {
+            message: format!(
+                "runtime path {} is {length} bytes; limit is {limit} bytes",
+                path.display()
+            ),
+        },
     }
 }
 

@@ -49,12 +49,15 @@ impl BoundEndpoint {
                     message: format!("runtime directory preparation task failed: {error}"),
                 })??;
         let socket_path = endpoint.address().to_path_buf();
+        super::validate_unix_socket_path(&socket_path)?;
         let name = endpoint_name(&socket_path)?;
         sweep_staging(&directory, runtime_dir, owner_uid).await?;
         preflight(&directory, &socket_path, &name, owner_uid).await?;
 
         let staging = staging_name()?;
         let staging_path = runtime_dir.join(&staging);
+        super::validate_runtime_artifact_basename(&staging_path)?;
+        super::validate_unix_socket_path(&staging_path)?;
         let listener = UnixListener::bind(&staging_path)
             .map_err(|error| EndpointError::io("bind Unix socket", &staging_path, error))?;
         let (identity, inode_anchor) =
@@ -618,8 +621,9 @@ fn platform_probe_failure(
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The one endpoint name this profile-scoped module owns (see
-/// [`super::Endpoint::new`]). The sweep only ever considers these.
+/// The primary endpoint name this profile-scoped module owns (see
+/// [`super::Endpoint::new`]). Peer v1 adds only its fixed 17-byte socket and
+/// manifest families to this allowlist.
 const ENDPOINT_NAME: &str = "h.sock";
 /// Upper bound on endpoints examined per sweep, so a runtime directory that
 /// has accumulated thousands of nodes cannot stall daemon startup. The sweep
@@ -656,7 +660,7 @@ pub async fn sweep_stale_endpoints(runtime_dir: &Path, keep: Option<&Path>) -> u
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            if name == ENDPOINT_NAME {
+            if name == ENDPOINT_NAME || is_peer_socket_name(&name) || is_peer_manifest_name(&name) {
                 names.push(name);
             }
         }
@@ -672,6 +676,16 @@ pub async fn sweep_stale_endpoints(runtime_dir: &Path, keep: Option<&Path>) -> u
         if keep_name.as_deref() == Some(name.as_str()) {
             continue;
         }
+        if is_peer_manifest_name(&name) {
+            let socket_name = format!("{}.s", &name[..name.len() - 2]);
+            if rustix::fs::statat(&directory, socket_name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+                .is_err_and(|error| error == Errno::NOENT)
+                && remove_verified_owner_file(&directory, &name, owner_uid).is_ok()
+            {
+                removed += 1;
+            }
+            continue;
+        }
         let socket_path = runtime_dir.join(&name);
         // Only a refused connect proves death. A live endpoint, a timeout, or
         // any other error leaves the node exactly as it is.
@@ -683,11 +697,63 @@ pub async fn sweep_stale_endpoints(runtime_dir: &Path, keep: Option<&Path>) -> u
                         .is_ok() =>
             {
                 removed += 1;
+                if is_peer_socket_name(&name) {
+                    let manifest_name = format!("{}.j", &name[..name.len() - 2]);
+                    let _ = remove_verified_owner_file(&directory, &manifest_name, owner_uid);
+                }
             }
             _ => {}
         }
     }
     removed
+}
+
+fn is_peer_socket_name(name: &str) -> bool {
+    is_peer_artifact_name(name, ".s")
+}
+
+fn is_peer_manifest_name(name: &str) -> bool {
+    is_peer_artifact_name(name, ".j")
+}
+
+fn is_peer_artifact_name(name: &str, extension: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() == 17
+        && name.ends_with(extension)
+        && (name.starts_with("ph-") || name.starts_with("px-"))
+        && bytes[3..15].iter().all(u8::is_ascii_hexdigit)
+}
+
+fn remove_verified_owner_file(
+    directory: &OwnedFd,
+    name: &str,
+    expected_uid: u32,
+) -> Result<(), EndpointError> {
+    let stat = match rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(Errno::NOENT) => return Ok(()),
+        Err(error) => {
+            return Err(EndpointError::io(
+                "lstat stale peer manifest",
+                Path::new(name),
+                error.into(),
+            ));
+        }
+    };
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile || stat.st_uid != expected_uid
+    {
+        return Err(EndpointError::Endpoint {
+            message: format!("refusing to remove unverified peer manifest {name}"),
+        });
+    }
+    match rustix::fs::unlinkat(directory, name, AtFlags::empty()) {
+        Ok(()) | Err(Errno::NOENT) => Ok(()),
+        Err(error) => Err(EndpointError::io(
+            "remove stale peer manifest",
+            Path::new(name),
+            error.into(),
+        )),
+    }
 }
 
 async fn probe(path: &Path) -> std::io::Result<UnixStream> {
@@ -717,10 +783,10 @@ fn restore(directory: &OwnedFd, claim: &str, name: &str) -> Result<(), EndpointE
     }
 }
 
-const STAGING_PREFIX: &str = ".haiderd-";
+const STAGING_PREFIX: &str = ".h-";
 
 fn staging_name() -> Result<String, EndpointError> {
-    let mut bytes = [0_u8; 16];
+    let mut bytes = [0_u8; 8];
     getrandom::fill(&mut bytes).map_err(|error| EndpointError::Task {
         message: format!("cannot generate endpoint staging name: {error}"),
     })?;

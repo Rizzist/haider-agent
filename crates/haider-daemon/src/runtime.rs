@@ -1091,6 +1091,53 @@ async fn run_inner(
             .await;
         }
     }
+    // Peer mailboxes start only after ordinary turn recovery has handed every
+    // previously accepted run back to the worker. This makes an Accepted
+    // mailbox record a recovery observation, never a duplicate admission.
+    let peer_service = match crate::peer::PeerService::start(config.runtime_dir.clone(), &hub).await
+    {
+        Ok(service) => service,
+        Err(error) => {
+            let _ = worker_manager.shutdown().await;
+            if let Some(broker) = &credential_broker {
+                broker.abort_and_join().await;
+            }
+            if let Some(oauth) = &oauth_coordinator {
+                oauth.abort_and_join().await;
+            }
+            if let Some(actor) = account_actor.as_mut() {
+                actor.force_and_join().await;
+            }
+            if let Some(engine) = hook_engine.take() {
+                engine.shutdown().await;
+            }
+            let _ = hub.shutdown().await;
+            let _ = store.close().await;
+            return Err(DaemonError::Task {
+                message: format!("peer messaging startup failed: {error}"),
+            });
+        }
+    };
+    if let Err(error) = hub.install_peer_service(peer_service) {
+        let _ = worker_manager.shutdown().await;
+        if let Some(broker) = &credential_broker {
+            broker.abort_and_join().await;
+        }
+        if let Some(oauth) = &oauth_coordinator {
+            oauth.abort_and_join().await;
+        }
+        if let Some(actor) = account_actor.as_mut() {
+            actor.force_and_join().await;
+        }
+        if let Some(engine) = hook_engine.take() {
+            engine.shutdown().await;
+        }
+        let _ = hub.shutdown().await;
+        let _ = store.close().await;
+        return Err(DaemonError::Task {
+            message: format!("peer messaging installation failed: {error}"),
+        });
+    }
     // Install both monitor seams before the accept task exists. From the
     // first authenticated APK frame onward, every valid SMS therefore has an
     // active source subscriber and every report has the canonical chat sink.

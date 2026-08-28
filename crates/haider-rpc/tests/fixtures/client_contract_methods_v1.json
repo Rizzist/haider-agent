@@ -384,6 +384,18 @@
       "response_method": "checkpoint.rollback_turn",
       "request": {"method":"checkpoint.rollback_turn","command_id":"command-checkpoint-rollback","session_id":"session-1","worker_generation":7,"run_id":"run-1"},
       "response": {"method":"checkpoint.rollback_turn","receipt":{"checkpoint":{"checkpoint_id":"checkpoint-rollback-1","session_id":"session-1","run_id":"checkpoint-command:command-checkpoint-rollback","effect_id":"checkpoint-effect:command-checkpoint-rollback","call_id":"command-checkpoint-rollback","seq":60,"workspace_revision":"workspace-revision-4","kind":"edit","origin":"rollback_turn","paths":[{"path":"src/lib.rs","pre_artifact":"blake3:1111111111111111111111111111111111111111111111111111111111111111","pre_digest":"blake3:1111111111111111111111111111111111111111111111111111111111111111","post_digest":"blake3:0000000000000000000000000000000000000000000000000000000000000000"}],"post_digest":"blake3:5555555555555555555555555555555555555555555555555555555555555555","recorded_at_ms":1720000003000},"restored_checkpoint_ids":["checkpoint-1"],"worker_generation":7}}
+    },
+    {
+      "request_method": "peer.list",
+      "response_method": "peer.list",
+      "request": {"method":"peer.list"},
+      "response": {"method":"peer.list","agents":[{"id":"session-peer","name":"workspace-a1b2c3","kind":"haider_session","workspace":"/tmp/workspace","model":"claude-test","state":"idle","started_at":1753500080000,"last_seen":1753500081000}]}
+    },
+    {
+      "request_method": "peer.send",
+      "response_method": "peer.send",
+      "request": {"method":"peer.send","to":"workspace-a1b2c3","message":"Please inspect the failing boundary.","summary":"debug boundary"},
+      "response": {"method":"peer.send","receipt":{"msg_id":"msg-peer-1","delivery":"queued"}}
     }
   ]
 }

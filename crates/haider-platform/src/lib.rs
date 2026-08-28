@@ -31,8 +31,10 @@ pub use fs::{
 };
 pub use ipc::{
     BoundEndpoint, Endpoint, EndpointAddress, EndpointError, IpcReadHalf, IpcStream, IpcWriteHalf,
-    PeerCredentials, connect, peer_credentials, peer_credentials_are_owner, peer_is_owner,
-    prepare_runtime_directory, split, sweep_stale_endpoints, write_immediate,
+    PeerCredentials, PeerEndpointKind, PeerEndpointPaths, RUNTIME_ARTIFACT_BASENAME_MAX_BYTES,
+    UNIX_SOCKET_PATH_MAX_BYTES, connect, peer_credentials, peer_credentials_are_owner,
+    peer_endpoint_paths, peer_is_owner, prepare_runtime_directory, split, sweep_stale_endpoints,
+    validate_runtime_artifact_basename, validate_unix_socket_path, write_immediate,
 };
 pub use process::program_on_path;
 pub use process::{

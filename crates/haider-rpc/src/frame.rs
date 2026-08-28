@@ -14,6 +14,7 @@ use haider_protocol::ids::{
     AgentId, ArtifactRef, BranchId, CredentialAlias, EventId, GraphId, GraphRunSetId, ItemId,
     MenuId, NodeId, RunId, SessionId,
 };
+use haider_protocol::peer::{PeerCandidate, PeerDescriptor, PeerMessage, PeerReceipt};
 use haider_protocol::queue::QueueRow;
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::session_fork::{SessionMetaforkProposal, SessionMetaforkReviewManifest};
@@ -256,6 +257,12 @@ pub const ERROR_CODE_GRAPH_WRONG_NODE: &str = "graph_wrong_node";
 pub const ERROR_CODE_CHECKPOINT_CONFLICT: &str = "checkpoint_conflict";
 /// A checkpoint command addressed history owned by another branch.
 pub const ERROR_CODE_CHECKPOINT_BRANCH_MISMATCH: &str = "checkpoint_branch_mismatch";
+/// A bare peer name matched more than one live identity.
+pub const ERROR_CODE_PEER_AMBIGUOUS: &str = "peer_ambiguous";
+/// A peer target or its durable mailbox could not be reached.
+pub const ERROR_CODE_PEER_UNAVAILABLE: &str = "peer_unavailable";
+/// A peer message exceeded a field bound or otherwise failed admission.
+pub const ERROR_CODE_PEER_INVALID: &str = "peer_invalid";
 
 /// Daemon implements receipt-backed session creation and metadata.
 pub const FEATURE_SESSION_MUTATION_V1: &str = "session_mutation_v1";
@@ -399,6 +406,9 @@ pub const FEATURE_SESSION_FAST_SELECT_V1: &str = "session_fast_select_v1";
 /// effort, and speed configuration through the existing observation and
 /// receipted selection methods.
 pub const FEATURE_SESSION_CONFIG_V1: &str = "session_config_v1";
+/// Daemon implements owner-private cross-session/external peer discovery,
+/// durable mailbox delivery, and additive delivery events.
+pub const FEATURE_PEER_MESSAGING_V1: &str = "peer_messaging_v1";
 /// Daemon vaults the profile transcription secret (the Deepgram API key)
 /// and serves `transcription.secret_get`/`transcription.secret_set` on
 /// authenticated same-UID local UDS connections only (T1).
@@ -3545,6 +3555,18 @@ pub enum RequestBody {
         worker_generation: u64,
         run_id: RunId,
     },
+    /// Lists every currently live Haider session and registered external peer.
+    #[serde(rename = "peer.list")]
+    PeerList {},
+    /// Durably queues one attributable message before returning its receipt.
+    /// The sender is the connection's unique control-attached session.
+    #[serde(rename = "peer.send")]
+    PeerSend {
+        to: String,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+    },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline). W3b answers it with a protocol error, not a panic.
     #[serde(other)]
@@ -4309,6 +4331,10 @@ pub enum ResponseBody {
     CheckpointRollbackTurn {
         receipt: haider_protocol::checkpoint::CheckpointMutationReceipt,
     },
+    #[serde(rename = "peer.list")]
+    PeerList { agents: Vec<PeerDescriptor> },
+    #[serde(rename = "peer.send")]
+    PeerSend { receipt: PeerReceipt },
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline).
     #[serde(other)]
@@ -4504,6 +4530,8 @@ pub enum ErrorData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         requested_branch_id: Option<BranchId>,
     },
+    /// Candidates returned when a bare peer name is not unique.
+    PeerAmbiguous { candidates: Vec<PeerCandidate> },
     /// Decode artifact for a data kind this crate does not know (tolerance
     /// discipline).
     #[serde(other)]
@@ -4799,6 +4827,10 @@ pub enum WireFrame {
         watch_id: String,
         high_water_cursor: u64,
     },
+    /// A peer message crossed the durable target-session turn boundary.
+    PeerMessageReceived { message: PeerMessage },
+    /// A sender-visible transition after the initial `peer.send` receipt.
+    PeerDeliveryChanged { receipt: PeerReceipt },
     /// Decode artifact for a frame kind this crate does not know (tolerance
     /// discipline). Never constructed for sending.
     Unknown,
@@ -4907,6 +4939,12 @@ enum WireFrameRef<'a> {
     LoomRegistryCaughtUp {
         watch_id: &'a str,
         high_water_cursor: u64,
+    },
+    PeerMessageReceived {
+        message: &'a PeerMessage,
+    },
+    PeerDeliveryChanged {
+        receipt: &'a PeerReceipt,
     },
     Unknown,
 }
@@ -5018,6 +5056,12 @@ enum WireFrameOwned {
     LoomRegistryCaughtUp {
         watch_id: String,
         high_water_cursor: u64,
+    },
+    PeerMessageReceived {
+        message: PeerMessage,
+    },
+    PeerDeliveryChanged {
+        receipt: PeerReceipt,
     },
     #[serde(other)]
     Unknown,
@@ -5202,6 +5246,8 @@ impl Serialize for WireFrame {
                 watch_id,
                 high_water_cursor: *high_water_cursor,
             },
+            Self::PeerMessageReceived { message } => WireFrameRef::PeerMessageReceived { message },
+            Self::PeerDeliveryChanged { receipt } => WireFrameRef::PeerDeliveryChanged { receipt },
             Self::Unknown => WireFrameRef::Unknown,
         };
         VersionedFrameRef {
@@ -5357,6 +5403,12 @@ impl<'de> Deserialize<'de> for WireFrame {
                 watch_id,
                 high_water_cursor,
             },
+            WireFrameOwned::PeerMessageReceived { message } => {
+                Self::PeerMessageReceived { message }
+            }
+            WireFrameOwned::PeerDeliveryChanged { receipt } => {
+                Self::PeerDeliveryChanged { receipt }
+            }
             WireFrameOwned::Unknown => Self::Unknown,
         })
     }

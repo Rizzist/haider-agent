@@ -146,15 +146,15 @@ use haider_rpc::{
     ERROR_CODE_GRAPH_ALREADY_ACTIVE, ERROR_CODE_GRAPH_NOT_ACTIVE, ERROR_CODE_GRAPH_WRONG_NODE,
     ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_INVALID_CURSOR, ERROR_CODE_NOT_FOUND,
     ERROR_CODE_OVERLOADED, ERROR_CODE_PDF_MALFORMED, ERROR_CODE_PDF_TOO_LARGE,
-    ERROR_CODE_PDF_TOO_MANY_PAGES, ERROR_CODE_PROVIDER_MODELS_UNKNOWN,
-    ERROR_CODE_REVISION_CONFLICT, ERROR_CODE_RUN_NOT_ACTIVE, ERROR_CODE_STALE_GENERATION,
-    ERROR_CODE_SURFACE_TEXT_TOO_LARGE, ERROR_CODE_TOO_MANY_ATTACHMENTS,
-    ERROR_CODE_UNSUPPORTED_SHELL_BUILTIN, ERROR_CODE_VISION_UNSUPPORTED, ErrorData, MenuInput,
-    ProtocolError, RequestBody, RequestId, ResponseBody, SURFACE_INPUT_MAX_BYTES,
-    SURFACE_STATUS_MAX_BYTES, SeqRange, SessionReadResult, SessionSummary, SubmitDisposition,
-    SurfaceInjectOp, SurfaceInputPublishWire, SurfaceInputWire, SurfaceStatusPublishWire,
-    SurfaceStatusWire, TodoGraphOpenedWire, WireFrame, WorkflowCatalogEntryV1,
-    WorkflowInstanceSourceV1, WorkflowInstanceV1,
+    ERROR_CODE_PDF_TOO_MANY_PAGES, ERROR_CODE_PEER_AMBIGUOUS, ERROR_CODE_PEER_INVALID,
+    ERROR_CODE_PEER_UNAVAILABLE, ERROR_CODE_PROVIDER_MODELS_UNKNOWN, ERROR_CODE_REVISION_CONFLICT,
+    ERROR_CODE_RUN_NOT_ACTIVE, ERROR_CODE_STALE_GENERATION, ERROR_CODE_SURFACE_TEXT_TOO_LARGE,
+    ERROR_CODE_TOO_MANY_ATTACHMENTS, ERROR_CODE_UNSUPPORTED_SHELL_BUILTIN,
+    ERROR_CODE_VISION_UNSUPPORTED, ErrorData, MenuInput, ProtocolError, RequestBody, RequestId,
+    ResponseBody, SURFACE_INPUT_MAX_BYTES, SURFACE_STATUS_MAX_BYTES, SeqRange, SessionReadResult,
+    SessionSummary, SubmitDisposition, SurfaceInjectOp, SurfaceInputPublishWire, SurfaceInputWire,
+    SurfaceStatusPublishWire, SurfaceStatusWire, TodoGraphOpenedWire, WireFrame,
+    WorkflowCatalogEntryV1, WorkflowInstanceSourceV1, WorkflowInstanceV1,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -782,6 +782,13 @@ pub(crate) struct WeakSessionHub {
     inner: Weak<HubInner>,
 }
 
+/// Per-session idle fence held while peer delivery moves from the shared
+/// mailbox claim into the target daemon's core turn store.
+pub(crate) struct PeerTurnClaim {
+    session_id: SessionId,
+    _selection: tokio::sync::OwnedMutexGuard<()>,
+}
+
 impl WeakSessionHub {
     pub(crate) fn upgrade(&self) -> Option<SessionHub> {
         self.inner.upgrade().map(|inner| SessionHub { inner })
@@ -800,6 +807,10 @@ struct HubInner {
     /// Connection-level unsolicited sinks. Store failures fan out here, and
     /// volatile input injection uses the current publisher's indexed route.
     diagnostic_sinks: Mutex<HashMap<String, Arc<dyn FrameSink>>>,
+    /// Connections that explicitly used a peer-messaging method. This is the
+    /// feature absence fence: no additive peer frame is sent to an older
+    /// connection that never opted into the feature family.
+    peer_event_subscribers: Mutex<HashSet<String>>,
     /// Latest profile-level resident-TUI binding and its current publisher.
     /// The retained value is the late-subscriber/reconnect baseline; owner
     /// identity prevents an overlapped old connection from clearing its
@@ -864,6 +875,9 @@ struct HubInner {
     device_id: DeviceId,
     cache_diagnostic_key: CacheDiagnosticKey,
     worker_manager: Mutex<Option<WorkerManagerHandle>>,
+    peer_service: Mutex<Option<Arc<crate::peer::PeerService>>>,
+    #[cfg(test)]
+    peer_handoff_count: AtomicU64,
     loom_author_provider: Mutex<Option<Arc<dyn crate::worker::ProviderFactory>>>,
     accounts: Mutex<Option<crate::accounts::AccountsFacade>>,
     creatable_providers: Mutex<Option<std::collections::BTreeSet<String>>>,
@@ -1746,6 +1760,7 @@ impl SessionHub {
             metrics: Arc::new(HubMetrics::default()),
             actors: Mutex::new(HashMap::new()),
             diagnostic_sinks: Mutex::new(HashMap::new()),
+            peer_event_subscribers: Mutex::new(HashSet::new()),
             resident_binding: Mutex::new(ResidentBindingRegistry::default()),
             resident_binding_viewers: Mutex::new(HashSet::new()),
             surfaces: Mutex::new(HashMap::new()),
@@ -1765,6 +1780,9 @@ impl SessionHub {
             device_id,
             cache_diagnostic_key,
             worker_manager: Mutex::new(None),
+            peer_service: Mutex::new(None),
+            #[cfg(test)]
+            peer_handoff_count: AtomicU64::new(0),
             loom_author_provider: Mutex::new(None),
             accounts: Mutex::new(None),
             creatable_providers: Mutex::new(None),
@@ -2021,6 +2039,26 @@ impl SessionHub {
         Ok(())
     }
 
+    pub(crate) fn install_peer_service(
+        &self,
+        service: Arc<crate::peer::PeerService>,
+    ) -> Result<(), SessionHubError> {
+        let mut installed = lock(&self.inner.peer_service)?;
+        if installed.is_some() {
+            return Err(SessionHubError::Task(
+                "peer-messaging service is already installed".into(),
+            ));
+        }
+        *installed = Some(service);
+        Ok(())
+    }
+
+    pub(crate) fn peer_service(&self) -> Result<Arc<crate::peer::PeerService>, SessionHubError> {
+        lock(&self.inner.peer_service)?
+            .clone()
+            .ok_or_else(|| SessionHubError::Task("peer-messaging service is not installed".into()))
+    }
+
     pub(crate) fn install_loom_author_provider(
         &self,
         provider: Arc<dyn crate::worker::ProviderFactory>,
@@ -2208,6 +2246,189 @@ impl SessionHub {
         session_id: &SessionId,
     ) -> Result<Option<haider_protocol::session::SessionMetadataV1>, HaiderError> {
         self.inner.store.session_metadata(session_id).await
+    }
+
+    pub(crate) async fn peer_session_summaries(
+        &self,
+    ) -> Result<Vec<SessionSummary>, SessionHubError> {
+        // Actors are the daemon's resident agents. Unlike the store-wide
+        // session index this excludes closed historical sessions while still
+        // retaining a detached agent that can receive background peer work.
+        let ids = lock(&self.inner.actors)?
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        rpc::session_summaries(self, &ids).await
+    }
+
+    pub(crate) fn peer_control_sessions(
+        &self,
+        connection_id: &str,
+    ) -> Result<Vec<SessionId>, SessionHubError> {
+        let mut sessions = lock(&self.inner.attachments)?
+            .values()
+            .filter(|owner| {
+                owner.connection_id == connection_id && owner.mode == AttachMode::Control
+            })
+            .map(|owner| owner.session_id.clone())
+            .collect::<Vec<_>>();
+        sessions.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        sessions.dedup();
+        Ok(sessions)
+    }
+
+    pub(crate) fn enable_peer_events(&self, connection_id: &str) -> Result<(), SessionHubError> {
+        lock(&self.inner.peer_event_subscribers)?.insert(connection_id.to_owned());
+        Ok(())
+    }
+
+    pub(crate) fn publish_peer_event(&self, session_id: &SessionId, frame: WireFrame) {
+        let Ok(subscribers) = self.inner.peer_event_subscribers.lock() else {
+            return;
+        };
+        let Ok(attachments) = self.inner.attachments.lock() else {
+            return;
+        };
+        let recipients = attachments
+            .values()
+            .filter(|owner| owner.session_id == *session_id)
+            .map(|owner| owner.connection_id.as_str())
+            .filter(|connection_id| peer_event_allowed(&subscribers, *connection_id))
+            .collect::<HashSet<_>>();
+        let Ok(sinks) = self.inner.diagnostic_sinks.lock() else {
+            return;
+        };
+        for (connection_id, sink) in sinks.iter() {
+            if recipients.contains(connection_id.as_str()) {
+                let _ = sink.try_send_droppable(frame.clone());
+            }
+        }
+    }
+
+    /// Acquires the ordinary admission serial and returns a claim token only
+    /// while the target is idle. The caller durably appends its shared-mailbox
+    /// claim before passing the token to `accept_claimed_peer_turn`.
+    pub(crate) async fn begin_peer_turn_claim(
+        &self,
+        message: &haider_protocol::peer::PeerMessage,
+    ) -> Result<Option<PeerTurnClaim>, SessionHubError> {
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(SessionHubError::Closed);
+        }
+        let session_id = SessionId::new(message.to.clone());
+        let selection = self.lock_workflow_selection(&session_id).await;
+        if lock(&self.inner.deleting_sessions)?.contains(&session_id) {
+            return Err(SessionHubError::Store(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "session was deleted",
+                false,
+            )));
+        }
+        if self.session_has_nonterminal_runs(&session_id).await? {
+            return Ok(None);
+        }
+        Ok(Some(PeerTurnClaim {
+            session_id,
+            _selection: selection,
+        }))
+    }
+
+    /// Commits a peer turn while retaining the idle fence acquired before the
+    /// caller's mailbox claim. There is therefore no unclaimed core commit.
+    pub(crate) async fn accept_claimed_peer_turn(
+        &self,
+        message: &haider_protocol::peer::PeerMessage,
+        claim: PeerTurnClaim,
+    ) -> Result<(AcceptedTurn, bool), SessionHubError> {
+        if claim.session_id.as_str() != message.to.as_str() {
+            return Err(SessionHubError::Task(
+                "peer turn claim target does not match its message".into(),
+            ));
+        }
+        let (command_id, request_digest, request_json) = peer_turn_coordinates(message)?;
+        let command = TurnAcceptCommand {
+            command_id,
+            request_digest,
+            request_json,
+            session_id: claim.session_id.clone(),
+            worker_generation: self.inner.store.worker_generation(),
+            run_id: RunId::new(random_id("peer-run")?),
+            agent_id: None,
+            branch_id: None,
+            text: message.render_for_prompt(),
+            attachments: Vec::new(),
+            mode: haider_protocol::DeliveryMode::Queue,
+            queued_event_id: EventId::new(random_id("peer-queued")?),
+            user_event_id: EventId::new(random_id("peer-message")?),
+            active_event_id: EventId::new(random_id("peer-active")?),
+            device_id: self.inner.device_id.clone(),
+        };
+        let actor = self.actor_for(claim.session_id.clone()).await?;
+        let (completed, result) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::AcceptTurn { command, completed })
+            .await
+            .map_err(|_| SessionHubError::Closed)?;
+        let outcome = result
+            .await
+            .map_err(|_| SessionHubError::Closed)?
+            .map_err(SessionHubError::from)?;
+        let (accepted, fresh) = match outcome {
+            TurnAcceptOutcome::Committed { accepted, .. } => (accepted, true),
+            TurnAcceptOutcome::IdempotentReplay { accepted } => (accepted, false),
+        };
+        if accepted.disposition != TurnAdmissionDisposition::Started {
+            return Err(SessionHubError::Task(
+                "idle-fenced peer delivery was not admitted as a fresh turn".into(),
+            ));
+        }
+        Ok((accepted, fresh))
+    }
+
+    /// Reads the durable core admission receipt used to reconcile a crash
+    /// after turn acceptance but before the peer mailbox records `Accepted`.
+    pub(crate) async fn peer_turn_receipt(
+        &self,
+        message: &haider_protocol::peer::PeerMessage,
+    ) -> Result<Option<AcceptedTurn>, SessionHubError> {
+        let (command_id, request_digest, request_json) = peer_turn_coordinates(message)?;
+        self.inner
+            .store
+            .turn_accept_receipt(command_id, request_digest, request_json)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Recreates the resident actor that production startup turn recovery
+    /// installs before peer-mailbox reconciliation.
+    #[cfg(test)]
+    pub(crate) async fn ensure_peer_session_actor_for_test(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(), SessionHubError> {
+        let _actor = self.actor_for(session_id).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn handoff_peer_turn(
+        &self,
+        accepted: AcceptedTurn,
+    ) -> Result<(), SessionHubError> {
+        self.worker_manager()?
+            .submit(accepted)
+            .await
+            .map_err(SessionHubError::from)?;
+        #[cfg(test)]
+        self.inner
+            .peer_handoff_count
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn peer_handoff_count_for_test(&self) -> u64 {
+        self.inner.peer_handoff_count.load(Ordering::Relaxed)
     }
 
     /// C1 — one registered Loom workflow (worker's typed-node tail).
@@ -4036,6 +4257,10 @@ impl SessionHub {
     /// nonterminal sessions are refused. The actor stops before the durable
     /// transaction, and ephemeral handoff data is cleaned only after commit.
     pub async fn delete_session(&self, session_id: SessionId) -> Result<(), HaiderError> {
+        // Peer delivery appends its shared `Claimed` marker while holding this
+        // same serial. Deletion must wait until the claim either commits its
+        // core run or fails before publishing a deletion tombstone.
+        let workflow_selection = self.lock_workflow_selection(&session_id).await;
         {
             let mut deleting = lock(&self.inner.deleting_sessions).map_err(hub_error_as_store)?;
             if !deleting.insert(session_id.clone()) {
@@ -4046,6 +4271,7 @@ impl SessionHub {
                 ));
             }
         }
+        drop(workflow_selection);
         let result = self.delete_fenced_session(&session_id).await;
         if result.is_err()
             && let Ok(mut deleting) = lock(&self.inner.deleting_sessions)
@@ -4085,6 +4311,28 @@ impl SessionHub {
                 "nonterminal session cannot be deleted",
                 true,
             ));
+        }
+        // Publish the target-unavailable terminal state before deleting the
+        // private core record. The deletion tombstone already blocks a new
+        // claim, so a crash after the store delete cannot leave a foreign
+        // scanner free to reinterpret an unresolved shared claim.
+        let peer_service = lock(&self.inner.peer_service)
+            .map_err(hub_error_as_store)?
+            .clone();
+        if let Some(peer_service) = peer_service {
+            peer_service
+                .expire_target(
+                    session_id.as_str(),
+                    haider_protocol::peer::PeerDeliveryReason::TargetUnavailable,
+                )
+                .await
+                .map_err(|error| {
+                    HaiderError::new(
+                        ErrorCode::Internal,
+                        format!("peer mailbox deletion fence failed: {error}"),
+                        true,
+                    )
+                })?;
         }
         let actor = lock(&self.inner.actors)
             .map_err(hub_error_as_store)?
@@ -5034,6 +5282,7 @@ impl SessionHub {
         connection_id: &str,
     ) -> Result<Vec<(AttachmentId, AttachmentOwner)>, SessionHubError> {
         lock(&self.inner.resident_binding_viewers)?.remove(connection_id);
+        lock(&self.inner.peer_event_subscribers)?.remove(connection_id);
         lock(&self.inner.diagnostic_sinks)?.remove(connection_id);
         self.clear_surface_owner(connection_id);
         let attachment_ids = {
@@ -5144,6 +5393,9 @@ impl SessionHub {
     /// Rejects new hub work synchronously before the runtime announces drain.
     pub fn begin_draining(&self) {
         self.inner.draining.store(true, Ordering::Release);
+        if let Ok(peer) = self.peer_service() {
+            peer.begin_draining();
+        }
     }
 
     /// Begins drain with §6.6's bounded checkpoint grace: new work is
@@ -5182,6 +5434,9 @@ impl SessionHub {
         // journal; anything unsettled is reaped by next-start adoption.
         self.shutdown_background_tasks().await;
         self.begin_draining();
+        if let Ok(peer) = self.peer_service() {
+            peer.shutdown().await;
+        }
         // Install the abort-on-drop guards (each raises the forced-stop
         // fence before aborting — see OwnedTasks) plus the standalone fence
         // backstop, all before the first await. If the global drain deadline
@@ -5283,6 +5538,10 @@ impl SessionHub {
             None => Ok(outcome),
         }
     }
+}
+
+pub(super) fn peer_event_allowed(subscribers: &HashSet<String>, connection_id: &str) -> bool {
+    subscribers.contains(connection_id)
 }
 
 /// The worker-facing store surface. Reads go straight to the store: committed
@@ -5845,6 +6104,20 @@ fn random_id(prefix: &str) -> Result<String, SessionHubError> {
         let _ = write!(&mut id, "{byte:02x}");
     }
     Ok(id)
+}
+
+fn peer_turn_coordinates(
+    message: &haider_protocol::peer::PeerMessage,
+) -> Result<(String, String, String), SessionHubError> {
+    let request_json = serde_json::to_string(message).map_err(|error| {
+        SessionHubError::Task(format!("cannot encode peer delivery coordinates: {error}"))
+    })?;
+    let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+    Ok((
+        format!("peer:{}", message.msg_id),
+        request_digest,
+        request_json,
+    ))
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, SessionHubError> {

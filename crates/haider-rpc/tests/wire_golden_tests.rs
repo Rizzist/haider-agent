@@ -557,6 +557,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "monitor.register",
         "monitor.remove",
         "monitor.watch",
+        "peer.list",
+        "peer.send",
         "provider.configure",
         "provider.list",
         "provider.models_refresh",
@@ -612,8 +614,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         expected_methods.len(),
-        104,
-        "the v1 contract covers all 99 v0.0.963 methods, account.refresh, and 4 checkpoint methods"
+        106,
+        "the v1 contract covers the 104 v0.0.964 methods plus peer.list and peer.send"
     );
     assert_eq!(
         request_methods_declared_in_source(),
@@ -1089,7 +1091,7 @@ fn compact_ws_bodies_and_length_prefixed_uds_streams_are_golden() {
 #[test]
 fn monitor_delivery_stream_is_additive_replayable_and_explicitly_bounded() {
     let frames = transcript();
-    assert_eq!(frames.len(), 133);
+    assert_eq!(frames.len(), 139);
     let WireFrame::MonitorDelivery { watch_id, report } = &frames[129] else {
         panic!("monitor delivery must be the first appended stream frame");
     };
@@ -1122,7 +1124,7 @@ fn monitor_delivery_stream_is_additive_replayable_and_explicitly_bounded() {
 #[test]
 fn loom_registry_stream_is_tail_appended_and_exactly_addressed() {
     let frames = transcript();
-    assert_eq!(frames.len(), 133);
+    assert_eq!(frames.len(), 139);
     let WireFrame::LoomRegistryDelta { watch_id, delta } = &frames[131] else {
         panic!("Loom registry delta must follow every prior golden frame");
     };
@@ -1148,6 +1150,70 @@ fn loom_registry_stream_is_tail_appended_and_exactly_addressed() {
             high_water_cursor: 44,
         } if watch_id == "loom-watch-1"
     ));
+}
+
+/// Peer messaging is a strict v0.0.965 tail append. Removing a method, either
+/// additive event, or the external trust label changes these exact positions.
+#[test]
+fn peer_messaging_methods_and_events_are_tail_appended() {
+    let frames = transcript();
+    assert_eq!(frames.len(), 139);
+    assert!(matches!(
+        &frames[133],
+        WireFrame::Request {
+            body: RequestBody::PeerList {},
+            ..
+        }
+    ));
+    assert!(matches!(
+        &frames[134],
+        WireFrame::Response { body: ResponseBody::PeerList { agents }, .. }
+            if agents.len() == 1 && agents[0].kind == haider_protocol::peer::PeerKind::HaiderSession
+    ));
+    assert!(matches!(
+        &frames[135],
+        WireFrame::Request { body: RequestBody::PeerSend { summary: Some(summary), .. }, .. }
+            if summary == "debug boundary"
+    ));
+    assert!(matches!(
+        &frames[136],
+        WireFrame::Response { body: ResponseBody::PeerSend { receipt }, .. }
+            if receipt.delivery == haider_protocol::peer::PeerDelivery::Queued
+    ));
+    let WireFrame::PeerMessageReceived { message } = &frames[137] else {
+        panic!("peer received event follows its method pair");
+    };
+    assert_eq!(
+        message.from.trust,
+        haider_protocol::peer::PeerTrust::UntrustedExternal
+    );
+    assert!(
+        message
+            .render_for_prompt()
+            .contains("NOT A USER INSTRUCTION")
+    );
+    assert!(matches!(
+        &frames[138],
+        WireFrame::PeerDeliveryChanged { receipt }
+            if receipt.delivery == haider_protocol::peer::PeerDelivery::Delivered
+    ));
+}
+
+#[test]
+fn peer_ambiguity_error_keeps_typed_candidate_coordinates() {
+    assert_eq!(
+        serde_json::to_value(ErrorData::PeerAmbiguous {
+            candidates: vec![haider_protocol::peer::PeerCandidate {
+                id: "session-peer-a".into(),
+                name: "reviewer".into(),
+            }],
+        })
+        .expect("encode peer ambiguity coordinates"),
+        serde_json::json!({
+            "kind": "peer_ambiguous",
+            "candidates": [{"id":"session-peer-a","name":"reviewer"}]
+        })
+    );
 }
 
 /// MUTATION CHECK: remove one monitor default or change its v1 meaning.

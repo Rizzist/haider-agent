@@ -86,6 +86,10 @@ mod mobile_transport;
 mod model_select;
 mod monitor;
 mod oauth;
+mod peer;
+#[cfg(test)]
+#[path = "peer_tests.rs"]
+mod peer_tests;
 #[cfg(test)]
 mod permissions_core_tests;
 mod pipe_native;
