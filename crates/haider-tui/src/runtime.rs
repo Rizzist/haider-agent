@@ -1770,6 +1770,8 @@ impl DemoDriver {
             // instead of pushing these, so the demo driver never sees one.
             | AppRequest::ShellExec { .. }
             | AppRequest::ToolsRefresh
+            | AppRequest::PeerList
+            | AppRequest::PeerSend { .. }
             // H4 live-only vocabulary: `/hooks` in demo opens its
             // sim-honest empty state and refuses trust locally — neither
             // request is ever pushed.
@@ -3291,6 +3293,9 @@ pub async fn run_live(
     // the working set before the user chose anything.
     let mut pending: std::collections::VecDeque<crate::live::LiveCommand> =
         driver.boot().into_iter().collect();
+    if model.daemon_serves(haider_rpc::FEATURE_PEER_MESSAGING_V1) {
+        pending.push_back(crate::live::LiveCommand::PeerList);
+    }
     // Boot is over the moment the daemon is reachable: there is no harness
     // startup script to watch in live mode.
     model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(

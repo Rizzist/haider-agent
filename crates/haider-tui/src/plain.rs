@@ -84,6 +84,21 @@ fn render_plain_impl(
                 }
                 out.push('\n');
             }
+            TranscriptEntry::Peer {
+                sender,
+                sender_kind,
+                text,
+                ..
+            } => {
+                out.push_str(&format!(
+                    "⇠ {sender} · {sender_kind} · UNTRUSTED PEER INPUT\n"
+                ));
+                for line in text.split('\n') {
+                    out.push_str("  ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
             TranscriptEntry::Item(block) => render_item(&mut out, block),
             TranscriptEntry::Note { text } => {
                 out.push_str(text);

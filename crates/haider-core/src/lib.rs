@@ -34,8 +34,9 @@ pub use actor::{
     RetrySleeper, STREAM_DELTA_COALESCE_WINDOW, SharedToolPacks, SubmitCheckpointTurn,
     SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn, SubmitTurn,
     ToolDispatchResult, ToolDispatcher, TurnHandle, TurnOutcome, VISION_IMAGE_ESTIMATE_TOKENS,
-    build_cache_request_diagnostic, classify_cache_request, compaction_guard_tripped,
-    context_soft_threshold_tokens, estimate_provider_request_input_tokens,
+    append_peer_message_to_provider_tail, build_cache_request_diagnostic, classify_cache_request,
+    compaction_guard_tripped, context_soft_threshold_tokens,
+    estimate_provider_request_input_tokens, peer_message_for_provider,
     presentation_for_haider_error, retry_backoff_ms, retry_jittered_backoff_ms,
     sanitized_failure_message,
 };

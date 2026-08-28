@@ -22,6 +22,7 @@ pub(crate) mod graph;
 pub(crate) mod hooks;
 pub(crate) mod models;
 pub(crate) mod observe;
+pub(crate) mod peer;
 pub(crate) mod run;
 pub(crate) mod session_config;
 pub(crate) mod session_item;
@@ -209,6 +210,7 @@ async fn dispatch(args: &[String]) -> ExitCode {
         [command, rest @ ..] if command == "graph" => graph::graph_command(rest).await,
         [command, rest @ ..] if command == "export" => export::export_command(rest).await,
         [command, rest @ ..] if command == "hooks" => hooks::hooks_command(rest).await,
+        [command, rest @ ..] if command == "peer" => peer::peer_command(rest).await,
         [command, rest @ ..] if command == "update" => update::update_command(rest).await,
         [command, rest @ ..] if command == "tui" => tui_command(rest).await,
         // Owner 2026-08-21: `haider resume` opens the all-sessions picker;
@@ -265,6 +267,7 @@ async fn dispatch(args: &[String]) -> ExitCode {
                  graph abandon <session-id> [why], \
                  export <session-id> [--format markdown|json|codex|claude-code|opencode|pipe] [--out PATH] [--masked] [--confirm], \
                  hooks list [--json], hooks trust <digest>, hooks revoke <digest>, \
+                 peer list [--json], peer send <name> <message|->, peer name <new-name>, peer watch, \
                  update [--check], \
                  tui [--theme system|light|dark|desert|oasis] [--session <id>] [--no-update-check], tui --demo [--plain], \
                  import [codex|claude-code], [--session <id>] [--no-update-check], --ready)"

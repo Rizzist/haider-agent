@@ -2,6 +2,15 @@
 
 use super::*;
 
+struct PeerPermissionJournal;
+
+#[async_trait::async_trait]
+impl JournalSink for PeerPermissionJournal {
+    async fn append(&mut self, _payload: EventPayload) -> ToolResult<()> {
+        Ok(())
+    }
+}
+
 #[test]
 fn tool_catalog_and_provider_schemas_have_process_wide_identity() {
     let first_catalog = registered_tool_catalog();
@@ -198,4 +207,96 @@ fn filtered_tool_pack_cache_is_process_bounded() {
     assert_eq!(cache.packs.len(), FILTERED_TOOL_PACK_CACHE_CAPACITY);
     assert!(cache.get(&[0]).is_none());
     assert!(cache.get(&[FILTERED_TOOL_PACK_CACHE_CAPACITY]).is_some());
+}
+
+/// MUTATION CHECK: the public peer schemas, routes, permission defaults, and
+/// provider-pack digest must move together. Changing either manifest requires
+/// an explicit update to the expected definitions below.
+#[test]
+fn peer_tool_surface_is_manifest_and_digest_pinned() {
+    let list = registered_tool_by_name("peer_list").expect("peer_list manifest");
+    assert_eq!(list.route, RegisteredToolRoute::PeerList);
+    assert_eq!(list.default, ToolPermissionDefault::Allow);
+    assert!(list.manifest.effects.is_empty());
+
+    let send = registered_tool_by_name("peer_send").expect("peer_send manifest");
+    assert_eq!(send.route, RegisteredToolRoute::PeerSend);
+    assert_eq!(send.default, ToolPermissionDefault::Ask);
+    assert_eq!(send.manifest.effects, [EffectClass::PeerMessage]);
+
+    let actual = [
+        provider_definition(&list.manifest),
+        provider_definition(&send.manifest),
+    ];
+    let expected = [
+        ToolDefinition {
+            name: "peer_list".into(),
+            description: String::new(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"filter": {"type": "string"}}
+            }),
+        },
+        ToolDefinition {
+            name: "peer_send".into(),
+            description: String::new(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string"},
+                    "message": {"type": "string"},
+                    "summary": {"type": "string"}
+                },
+                "required": ["to", "message"]
+            }),
+        },
+    ];
+    assert_eq!(actual, expected);
+    assert_eq!(
+        canonical_tool_definitions_digest(&actual),
+        canonical_tool_definitions_digest(&expected)
+    );
+}
+
+/// The manifest default is not merely descriptive: the broker must park a
+/// peer send on an ordinary permission menu before any dispatch phase exists.
+#[tokio::test]
+async fn peer_send_ask_default_is_enforced_by_the_effect_broker() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut broker = EffectBroker::new_at(
+        Box::new(PeerPermissionJournal),
+        workspace.path(),
+        SessionId::new("peer-permission-session"),
+        1,
+        1_700_000_000_000,
+    )
+    .expect("effect broker");
+    let operation = PeerSendOperation {
+        to: "reviewer".into(),
+        message: "Review the boundary".into(),
+        summary: Some("request boundary review".into()),
+    };
+    let intent = broker
+        .normalize(&operation)
+        .await
+        .expect("normalize peer send");
+    let mut policy = PermissionPolicy::default();
+    policy.ask(EffectClass::PeerMessage);
+    let AuthorizationVerdict::Ask { menu } = broker
+        .authorize(&intent, &policy)
+        .await
+        .expect("authorize peer send")
+    else {
+        panic!("peer_send must require permission");
+    };
+    let menu = broker.permission_menu(&menu).expect("permission menu");
+    assert!(menu.title.contains("send peer message to reviewer"));
+    assert_eq!(
+        broker
+            .journal_snapshot()
+            .iter()
+            .filter(|phase| matches!(phase, EffectPhase::Dispatched { .. }))
+            .count(),
+        0
+    );
 }

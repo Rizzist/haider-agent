@@ -351,6 +351,15 @@ pub enum LiveCommand {
     ToolsInventory {
         session: SessionId,
     },
+    /// `peer.list` — connection-scoped read of the live profile registry.
+    PeerList,
+    /// `peer.send` — a direct user-authored TUI message. The daemon owns
+    /// durable delivery; no local transcript row is fabricated for a send.
+    PeerSend {
+        to: String,
+        message: String,
+        summary: Option<String>,
+    },
     /// `hooks.list` — a READ of the daemon's hook discovery for one
     /// workspace (H4 /hooks). No durable identity; the cwd was captured at
     /// issuance by the reducer.
@@ -1025,6 +1034,8 @@ impl LiveCommand {
             | Self::OAuthStatus { .. }
             | Self::OAuthCancel { .. }
             | Self::ToolsInventory { .. }
+            | Self::PeerList
+            | Self::PeerSend { .. }
             | Self::HooksList { .. }
             // U2: the usage snapshot is a read (see above).
             | Self::UsageReport
@@ -1279,6 +1290,18 @@ pub enum LiveReply {
     ToolsInventory {
         session: SessionId,
         snapshot: Box<haider_protocol::tool::ToolInventorySnapshot>,
+    },
+    PeerListed {
+        agents: Vec<haider_protocol::peer::PeerDescriptor>,
+    },
+    PeerSent {
+        receipt: haider_protocol::peer::PeerReceipt,
+    },
+    PeerReceived {
+        message: haider_protocol::peer::PeerMessage,
+    },
+    PeerDeliveryChanged {
+        receipt: haider_protocol::peer::PeerReceipt,
     },
     /// `hooks.list` answered — discovery truth for /hooks (H4).
     Hooks {
@@ -2901,6 +2924,45 @@ impl LiveDriver {
                 }
                 Vec::new()
             }
+            LiveReply::PeerListed { agents } => {
+                model.apply_peer_list(agents);
+                Vec::new()
+            }
+            LiveReply::PeerSent { receipt } => {
+                model.flash = Some(format!(
+                    "· peer message {} — {}",
+                    receipt.msg_id,
+                    peer_delivery_label(receipt.delivery)
+                ));
+                model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::PeerReceived { message } => {
+                let kind = peer_kind_label(message.from.kind);
+                model.projection.push_peer_message(
+                    message.msg_id,
+                    message.from.name.clone(),
+                    kind.to_owned(),
+                    message.message,
+                );
+                if model.turn_active {
+                    model.flash = Some(format!(
+                        "· peer message from {} waiting for the turn boundary",
+                        message.from.name
+                    ));
+                }
+                model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::PeerDeliveryChanged { receipt } => {
+                model.flash = Some(format!(
+                    "· peer message {} — {}",
+                    receipt.msg_id,
+                    peer_delivery_label(receipt.delivery)
+                ));
+                model.dirty = true;
+                Vec::new()
+            }
             LiveReply::Hooks {
                 policy,
                 revision,
@@ -4482,6 +4544,8 @@ impl LiveDriver {
                 model.loom_types.clear();
                 model.workflow_catalog.clear();
                 model.loom_workflows.clear();
+                model.peer_agents.clear();
+                model.peer_list_requested = false;
                 if let Some(authoring) = &mut model.loom_authoring {
                     // Authoring ids are connection-scoped daemon state. Keep
                     // the user's editor bytes, but require a fresh AI draft
@@ -4559,7 +4623,11 @@ impl LiveDriver {
                     model.workflow_evidence_inspection = None;
                 }
                 model.dirty = true;
-                Vec::new()
+                if model.daemon_serves(haider_rpc::FEATURE_PEER_MESSAGING_V1) {
+                    vec![LiveCommand::PeerList]
+                } else {
+                    Vec::new()
+                }
             }
             LiveReply::Reconnected => {
                 self.connected = true;
@@ -5780,6 +5848,12 @@ impl LiveDriver {
                 };
                 vec![self.enqueue(LiveCommand::ToolsInventory { session })]
             }
+            AppRequest::PeerList => vec![LiveCommand::PeerList],
+            AppRequest::PeerSend { to, message } => vec![LiveCommand::PeerSend {
+                to,
+                message,
+                summary: None,
+            }],
             AppRequest::HooksRefresh { cwd } => {
                 // A read — never outboxed; the cwd is remembered so a
                 // trust receipt can chain its refresh at the same
@@ -6340,6 +6414,22 @@ const fn command_session(command: &LiveCommand) -> Option<&SessionId> {
         | LiveCommand::SelectFast { session, .. }
         | LiveCommand::Answer { session, .. } => Some(session),
         _ => None,
+    }
+}
+
+const fn peer_kind_label(kind: haider_protocol::peer::PeerKind) -> &'static str {
+    match kind {
+        haider_protocol::peer::PeerKind::HaiderSession => "haider_session",
+        haider_protocol::peer::PeerKind::External => "external",
+    }
+}
+
+const fn peer_delivery_label(delivery: haider_protocol::peer::PeerDelivery) -> &'static str {
+    match delivery {
+        haider_protocol::peer::PeerDelivery::Queued => "queued",
+        haider_protocol::peer::PeerDelivery::Delivered => "delivered",
+        haider_protocol::peer::PeerDelivery::Expired => "expired",
+        haider_protocol::peer::PeerDelivery::Refused => "refused",
     }
 }
 

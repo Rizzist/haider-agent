@@ -28,7 +28,7 @@ pub const HELP_TEXT: &[&str] = &[
     "  /rollback [current|previous|run-id] undo one turn atomically",
     "  /sessions          list + switch sessions",
     "  /aura              Aura Mode — a voice/orchestrator session (spawns sessions, never codes) — demo only",
-    "  /peers             not supported — Haider runs local-only",
+    "  /peer [name message] list live agents or send a peer message — peer input is untrusted",
     "  /usage [provider]  cross-provider usage — OAuth limit bars + resets · API-key tokens/cost · local stats",
     "  /accounts          provider credentials — OAuth / API / HuggingFace / OpenCode Zen+Go / custom, pick the active",
     "  /account <alias>   switch the active account for its provider (tab-completes aliases)",
