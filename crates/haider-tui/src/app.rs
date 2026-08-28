@@ -2712,6 +2712,383 @@ impl RuntimeMode {
     }
 }
 
+/// Opaque terminal input owned only long enough to reach `ssh.shell_input`.
+/// Debug is redacted and the allocation is wiped on drop because PTY input
+/// can include passwords typed at a remote prompt.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SshTerminalInput(zeroize::Zeroizing<Vec<u8>>);
+
+impl SshTerminalInput {
+    #[must_use]
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(zeroize::Zeroizing::new(bytes))
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+impl std::fmt::Debug for SshTerminalInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SshTerminalInput(<redacted>)")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SshTerminalPane {
+    pub profile: String,
+    pub shell_id: Option<String>,
+    output: zeroize::Zeroizing<Vec<u8>>,
+    pub size: haider_rpc::SshPtySizeWire,
+}
+
+impl std::fmt::Debug for SshTerminalPane {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SshTerminalPane")
+            .field("profile", &self.profile)
+            .field("shell_id", &self.shell_id)
+            .field("output", &"<remote terminal bytes>")
+            .field("size", &self.size)
+            .finish()
+    }
+}
+
+impl SshTerminalPane {
+    const OUTPUT_CAPACITY: usize = 1024 * 1024;
+
+    fn opening(profile: String, size: haider_rpc::SshPtySizeWire) -> Self {
+        Self {
+            profile,
+            shell_id: None,
+            output: zeroize::Zeroizing::new(Vec::new()),
+            size,
+        }
+    }
+
+    pub(crate) fn push_output(&mut self, bytes: &[u8]) {
+        let keep = bytes.len().min(Self::OUTPUT_CAPACITY);
+        let needed = self.output.len().saturating_add(keep);
+        if needed > Self::OUTPUT_CAPACITY {
+            use zeroize::Zeroize as _;
+            let remove = needed - Self::OUTPUT_CAPACITY;
+            self.output[..remove].zeroize();
+            self.output.drain(..remove);
+        }
+        self.output.extend_from_slice(&bytes[bytes.len() - keep..]);
+    }
+
+    #[must_use]
+    pub(crate) fn display_text(&self) -> String {
+        String::from_utf8_lossy(&self.output).into_owned()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshFormAuthKind {
+    Keep,
+    KeyFile,
+    Agent,
+    Password,
+    KeyMaterial,
+}
+
+impl SshFormAuthKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Keep => "keep existing",
+            Self::KeyFile => "key file (recommended)",
+            Self::Agent => "ssh-agent (recommended)",
+            Self::Password => "password in FileVault",
+            Self::KeyMaterial => "pasted key in FileVault",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SshPendingAuth {
+    Keep,
+    KeyFile { path: String },
+    Agent,
+    Password,
+    KeyMaterial,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshProfileMutation {
+    pub original: Option<String>,
+    pub name: String,
+    pub description: Option<String>,
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub auth: SshPendingAuth,
+    pub default_cwd: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct SshProfileForm {
+    pub original: Option<String>,
+    pub name: String,
+    pub description: String,
+    pub host: String,
+    pub user: String,
+    pub port: String,
+    pub auth: SshFormAuthKind,
+    pub credential: String,
+    secret: zeroize::Zeroizing<String>,
+    pub cwd: String,
+    pub focus: usize,
+    pub error: Option<String>,
+}
+
+impl std::fmt::Debug for SshProfileForm {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SshProfileForm")
+            .field("original", &self.original)
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .field("host", &self.host)
+            .field("user", &self.user)
+            .field("port", &self.port)
+            .field("auth", &self.auth)
+            .field("credential", &self.credential)
+            .field("secret", &"<redacted>")
+            .field("cwd", &self.cwd)
+            .field("focus", &self.focus)
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+impl SshProfileForm {
+    const FIELD_COUNT: usize = 8;
+
+    fn add() -> Self {
+        Self {
+            original: None,
+            name: String::new(),
+            description: String::new(),
+            host: String::new(),
+            user: String::new(),
+            port: "22".into(),
+            auth: SshFormAuthKind::KeyFile,
+            credential: String::new(),
+            secret: zeroize::Zeroizing::new(String::new()),
+            cwd: String::new(),
+            focus: 0,
+            error: None,
+        }
+    }
+
+    fn edit(profile: &haider_rpc::SshProfileWire) -> Self {
+        Self {
+            original: Some(profile.name.clone()),
+            name: profile.name.clone(),
+            description: profile.description.clone().unwrap_or_default(),
+            host: profile.host.clone(),
+            user: profile.user.clone(),
+            port: profile.port.to_string(),
+            auth: SshFormAuthKind::Keep,
+            credential: String::new(),
+            secret: zeroize::Zeroizing::new(String::new()),
+            cwd: profile.default_cwd.clone().unwrap_or_default(),
+            focus: 1,
+            error: None,
+        }
+    }
+
+    pub(crate) fn credential_display(&self) -> String {
+        match self.auth {
+            SshFormAuthKind::Password | SshFormAuthKind::KeyMaterial => {
+                "•".repeat(self.secret.chars().count())
+            }
+            SshFormAuthKind::Agent | SshFormAuthKind::Keep => "—".into(),
+            SshFormAuthKind::KeyFile => self.credential.clone(),
+        }
+    }
+
+    pub(crate) fn auth_label(&self) -> &'static str {
+        self.auth.label()
+    }
+
+    fn cycle_auth(&mut self, forward: bool) {
+        let order: &[SshFormAuthKind] = if self.original.is_some() {
+            &[
+                SshFormAuthKind::Keep,
+                SshFormAuthKind::KeyFile,
+                SshFormAuthKind::Agent,
+                SshFormAuthKind::Password,
+                SshFormAuthKind::KeyMaterial,
+            ]
+        } else {
+            &[
+                SshFormAuthKind::KeyFile,
+                SshFormAuthKind::Agent,
+                SshFormAuthKind::Password,
+                SshFormAuthKind::KeyMaterial,
+            ]
+        };
+        let current = order
+            .iter()
+            .position(|kind| *kind == self.auth)
+            .unwrap_or(0);
+        let next = if forward {
+            (current + 1) % order.len()
+        } else {
+            current.checked_sub(1).unwrap_or(order.len() - 1)
+        };
+        self.auth = order[next];
+        self.credential.clear();
+        self.secret.clear();
+    }
+
+    fn take_request(
+        &mut self,
+    ) -> Result<(SshProfileMutation, Option<haider_rpc::SecretWire>), String> {
+        let port = self
+            .port
+            .parse::<u16>()
+            .map_err(|_| "port must be 1..=65535".to_owned())?;
+        if port == 0 {
+            return Err("port must be 1..=65535".into());
+        }
+        if self.name.is_empty() || self.host.is_empty() || self.user.is_empty() {
+            return Err("name, host, and user are required".into());
+        }
+        let (auth, secret) = match self.auth {
+            SshFormAuthKind::Keep => (SshPendingAuth::Keep, None),
+            SshFormAuthKind::Agent => (SshPendingAuth::Agent, None),
+            SshFormAuthKind::KeyFile if !self.credential.is_empty() => (
+                SshPendingAuth::KeyFile {
+                    path: self.credential.clone(),
+                },
+                None,
+            ),
+            SshFormAuthKind::Password | SshFormAuthKind::KeyMaterial if !self.secret.is_empty() => {
+                let secret =
+                    std::mem::replace(&mut self.secret, zeroize::Zeroizing::new(String::new()));
+                let auth = if self.auth == SshFormAuthKind::Password {
+                    SshPendingAuth::Password
+                } else {
+                    SshPendingAuth::KeyMaterial
+                };
+                (auth, Some(haider_rpc::SecretWire::new(secret.as_str())))
+            }
+            SshFormAuthKind::KeyFile => return Err("key file path is required".into()),
+            _ => return Err("authentication secret is required".into()),
+        };
+        Ok((
+            SshProfileMutation {
+                original: self.original.clone(),
+                name: self.name.clone(),
+                description: nonempty_owned(&self.description),
+                host: self.host.clone(),
+                port,
+                user: self.user.clone(),
+                auth,
+                default_cwd: nonempty_owned(&self.cwd),
+            },
+            secret,
+        ))
+    }
+}
+
+fn nonempty_owned(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn ssh_form_push(form: &mut SshProfileForm, character: char) {
+    match form.focus {
+        0 if form.original.is_none() => form.name.push(character),
+        1 => form.description.push(character),
+        2 => form.host.push(character),
+        3 => form.user.push(character),
+        4 if character.is_ascii_digit() => form.port.push(character),
+        6 => match form.auth {
+            SshFormAuthKind::KeyFile => form.credential.push(character),
+            SshFormAuthKind::Password | SshFormAuthKind::KeyMaterial => form.secret.push(character),
+            _ => {}
+        },
+        7 => form.cwd.push(character),
+        _ => {}
+    }
+}
+
+fn ssh_form_backspace(form: &mut SshProfileForm) {
+    match form.focus {
+        0 if form.original.is_none() => {
+            form.name.pop();
+        }
+        1 => {
+            form.description.pop();
+        }
+        2 => {
+            form.host.pop();
+        }
+        3 => {
+            form.user.pop();
+        }
+        4 => {
+            form.port.pop();
+        }
+        6 => match form.auth {
+            SshFormAuthKind::KeyFile => {
+                form.credential.pop();
+            }
+            SshFormAuthKind::Password | SshFormAuthKind::KeyMaterial => {
+                form.secret.pop();
+            }
+            _ => {}
+        },
+        7 => {
+            form.cwd.pop();
+        }
+        _ => {}
+    }
+}
+
+fn ssh_terminal_key_bytes(key: KeyEvent) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        bytes.push(0x1b);
+    }
+    match key.code {
+        KeyCode::Char(character) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let lower = character.to_ascii_lowercase();
+            if lower.is_ascii_lowercase() {
+                bytes.push((lower as u8) & 0x1f);
+            } else {
+                return None;
+            }
+        }
+        KeyCode::Char(character) => {
+            let mut encoded = [0_u8; 4];
+            bytes.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+        }
+        KeyCode::Enter => bytes.push(b'\r'),
+        KeyCode::Tab => bytes.push(b'\t'),
+        KeyCode::BackTab => bytes.extend_from_slice(b"\x1b[Z"),
+        KeyCode::Backspace => bytes.push(0x7f),
+        KeyCode::Esc => bytes.push(0x1b),
+        KeyCode::Up => bytes.extend_from_slice(b"\x1b[A"),
+        KeyCode::Down => bytes.extend_from_slice(b"\x1b[B"),
+        KeyCode::Right => bytes.extend_from_slice(b"\x1b[C"),
+        KeyCode::Left => bytes.extend_from_slice(b"\x1b[D"),
+        KeyCode::Home => bytes.extend_from_slice(b"\x1b[H"),
+        KeyCode::End => bytes.extend_from_slice(b"\x1b[F"),
+        KeyCode::Delete => bytes.extend_from_slice(b"\x1b[3~"),
+        KeyCode::Insert => bytes.extend_from_slice(b"\x1b[2~"),
+        KeyCode::PageUp => bytes.extend_from_slice(b"\x1b[5~"),
+        KeyCode::PageDown => bytes.extend_from_slice(b"\x1b[6~"),
+        _ => return None,
+    }
+    Some(bytes)
+}
+
 /// Side effects the reducer requests from the runtime (the reducer itself
 /// never performs IO).
 #[derive(Debug, Clone, PartialEq)]
@@ -2766,6 +3143,25 @@ pub enum AppRequest {
     },
     SshRemove {
         profile: String,
+    },
+    SshShellOpen {
+        profile: String,
+        size: haider_rpc::SshPtySizeWire,
+    },
+    SshShellInput {
+        id: String,
+        input: SshTerminalInput,
+    },
+    SshShellResize {
+        id: String,
+        size: haider_rpc::SshPtySizeWire,
+    },
+    SshShellEof {
+        id: String,
+    },
+    SshProfileSave {
+        mutation: SshProfileMutation,
+        secret: Option<haider_rpc::SecretWire>,
     },
     ShellList,
     ShellClose {
@@ -4384,6 +4780,13 @@ pub struct AppModel {
     /// The profile whose destructive overlay removal is awaiting a second
     /// `d`. Moving the cursor or closing the overlay disarms it.
     pub ssh_remove_armed: Option<String>,
+    pub ssh_form: Option<SshProfileForm>,
+    /// Last known terminal/pane dimensions, seeded before the input pump and
+    /// updated on every resize. New SSH PTYs use this initial size.
+    pub ssh_terminal_size: haider_rpc::SshPtySizeWire,
+    /// Full-body interactive SSH pane. Distinct from the shell-list overlay,
+    /// monitor details, and subagent surfaces.
+    pub ssh_terminal: Option<SshTerminalPane>,
     /// Existing monitor details floated over the body from the status strip.
     pub monitors_open: bool,
     /// One-line transient notice shown in the status bar until the next
@@ -4702,6 +5105,14 @@ impl Default for AppModel {
             ssh_open: false,
             ssh_cursor: 0,
             ssh_remove_armed: None,
+            ssh_form: None,
+            ssh_terminal_size: haider_rpc::SshPtySizeWire {
+                cols: 80,
+                rows: 22,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            ssh_terminal: None,
             monitors_open: false,
             flash: None,
             update_available: None,
@@ -5768,6 +6179,20 @@ impl AppModel {
                 // draft content by intent, retained exactly as long as
                 // the draft itself.
                 let text = text.as_str();
+                if self.ssh_terminal.is_some() {
+                    if let Some(id) = self
+                        .ssh_terminal
+                        .as_ref()
+                        .and_then(|terminal| terminal.shell_id.clone())
+                    {
+                        self.queue_ssh_terminal_input(&id, text.as_bytes());
+                    }
+                    return;
+                }
+                if self.ssh_form.is_some() {
+                    self.ssh_form_paste(text);
+                    return;
+                }
                 // Keys are pasted more often than typed; the paste lands in
                 // the masked buffer and NOWHERE else (no pill token, no
                 // draft, no ring).
@@ -6525,6 +6950,14 @@ impl AppModel {
     }
 
     fn handle_key(&mut self, key: KeyEvent, now: std::time::Instant) {
+        if self.ssh_terminal.is_some() {
+            self.handle_ssh_terminal_key(key);
+            return;
+        }
+        if self.ssh_form.is_some() {
+            self.handle_ssh_form_key(key);
+            return;
+        }
         if self.screen == Screen::Loom
             && self
                 .loom_authoring
@@ -6723,10 +7156,18 @@ impl AppModel {
                 }
                 KeyCode::Enter => {
                     if let Some(profile) = self.ssh_profiles.get(self.ssh_cursor) {
-                        self.flash = Some(format!(
-                            "· remote PTY shells are not available yet for {}",
-                            profile.name
-                        ));
+                        let profile = profile.name.clone();
+                        self.open_ssh_terminal(profile);
+                    }
+                }
+                KeyCode::Char('a') => {
+                    self.ssh_form = Some(SshProfileForm::add());
+                    self.ssh_remove_armed = None;
+                }
+                KeyCode::Char('e') => {
+                    if let Some(profile) = self.ssh_profiles.get(self.ssh_cursor) {
+                        self.ssh_form = Some(SshProfileForm::edit(profile));
+                        self.ssh_remove_armed = None;
                     }
                 }
                 KeyCode::Char('t') => {
@@ -12698,9 +13139,7 @@ impl AppModel {
                 self.flash = Some("· /ssh shell <profile>".into());
                 return;
             }
-            self.flash = Some(format!(
-                "· remote PTY shells are not available yet for {profile}"
-            ));
+            self.open_ssh_terminal(profile.to_owned());
             return;
         }
         if let Some(profile) = argument.strip_prefix("test ") {
@@ -12794,6 +13233,175 @@ impl AppModel {
         self.dirty = true;
     }
 
+    fn open_ssh_terminal(&mut self, profile: String) {
+        self.ssh_open = false;
+        let terminal = SshTerminalPane::opening(profile.clone(), self.ssh_terminal_size);
+        self.requests.push(AppRequest::SshShellOpen {
+            profile,
+            size: terminal.size,
+        });
+        self.ssh_terminal = Some(terminal);
+        self.flash = Some("· opening remote terminal…".into());
+        self.dirty = true;
+    }
+
+    fn handle_ssh_form_key(&mut self, key: KeyEvent) {
+        let mut save = None;
+        let mut close = false;
+        {
+            let Some(form) = self.ssh_form.as_mut() else {
+                return;
+            };
+            form.error = None;
+            match key.code {
+                KeyCode::Esc => close = true,
+                KeyCode::Tab | KeyCode::Down => {
+                    form.focus = (form.focus + 1) % SshProfileForm::FIELD_COUNT;
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    form.focus = form
+                        .focus
+                        .checked_sub(1)
+                        .unwrap_or(SshProfileForm::FIELD_COUNT - 1);
+                }
+                KeyCode::Left if form.focus == 5 => form.cycle_auth(false),
+                KeyCode::Right if form.focus == 5 => form.cycle_auth(true),
+                KeyCode::Enter if form.focus + 1 < SshProfileForm::FIELD_COUNT => {
+                    form.focus += 1;
+                }
+                KeyCode::Enter if form.focus == 7 => {
+                    save = Some(form.take_request());
+                }
+                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    save = Some(form.take_request());
+                }
+                KeyCode::Backspace => ssh_form_backspace(form),
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    ssh_form_push(form, character);
+                }
+                _ => {}
+            }
+        }
+        if close {
+            self.ssh_form = None;
+        }
+        if let Some(result) = save {
+            match result {
+                Ok((mutation, secret)) => {
+                    self.requests
+                        .push(AppRequest::SshProfileSave { mutation, secret });
+                    self.ssh_form = None;
+                    self.flash = Some("· saving SSH profile…".into());
+                }
+                Err(error) => {
+                    if let Some(form) = self.ssh_form.as_mut() {
+                        form.error = Some(error);
+                    }
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn ssh_form_paste(&mut self, text: &str) {
+        let Some(form) = self.ssh_form.as_mut() else {
+            return;
+        };
+        form.error = None;
+        let secret_field = form.focus == 6
+            && matches!(
+                form.auth,
+                SshFormAuthKind::Password | SshFormAuthKind::KeyMaterial
+            );
+        for character in text.chars() {
+            if secret_field || !character.is_control() {
+                ssh_form_push(form, character);
+            }
+        }
+        self.dirty = true;
+    }
+
+    pub(crate) fn apply_ssh_shell_opened(&mut self, shell: haider_rpc::ShellWire) {
+        if let Some(terminal) = self.ssh_terminal.as_mut()
+            && matches!(
+                &shell.kind,
+                haider_rpc::ShellKindWire::Ssh { profile } if profile == &terminal.profile
+            )
+        {
+            terminal.shell_id = Some(shell.id);
+            self.flash = Some("· remote terminal connected · ⌃] close".into());
+            self.dirty = true;
+        }
+    }
+
+    pub(crate) fn apply_ssh_shell_output(&mut self, id: &str, bytes: &[u8]) {
+        if let Some(terminal) = self.ssh_terminal.as_mut()
+            && terminal.shell_id.as_deref() == Some(id)
+        {
+            terminal.push_output(bytes);
+            self.dirty = true;
+        }
+    }
+
+    pub(crate) fn apply_ssh_shell_terminal_state(&mut self, shell: &haider_rpc::ShellWire) {
+        let closes = self
+            .ssh_terminal
+            .as_ref()
+            .and_then(|terminal| terminal.shell_id.as_deref())
+            == Some(shell.id.as_str())
+            && matches!(
+                &shell.status,
+                haider_rpc::ShellStatusWire::Exited { .. } | haider_rpc::ShellStatusWire::Closed
+            );
+        if closes {
+            self.ssh_terminal = None;
+            self.flash = Some(match &shell.status {
+                haider_rpc::ShellStatusWire::Exited { code } => code.map_or_else(
+                    || "· remote terminal exited".into(),
+                    |code| format!("· remote terminal exited {code}"),
+                ),
+                _ => "· remote terminal closed".into(),
+            });
+            self.dirty = true;
+        }
+    }
+
+    fn handle_ssh_terminal_key(&mut self, key: KeyEvent) {
+        let Some(id) = self
+            .ssh_terminal
+            .as_ref()
+            .and_then(|terminal| terminal.shell_id.clone())
+        else {
+            return;
+        };
+        if key.code == KeyCode::Char(']') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.requests.push(AppRequest::ShellClose { id });
+            self.flash = Some("· closing remote terminal…".into());
+            return;
+        }
+        if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.requests.push(AppRequest::SshShellEof { id });
+            self.flash = Some("· remote terminal input closed…".into());
+            return;
+        }
+        if let Some(bytes) = ssh_terminal_key_bytes(key) {
+            self.queue_ssh_terminal_input(&id, &bytes);
+        }
+    }
+
+    fn queue_ssh_terminal_input(&mut self, id: &str, bytes: &[u8]) {
+        for chunk in bytes.chunks(haider_rpc::SSH_PTY_INPUT_MAX_BYTES) {
+            self.requests.push(AppRequest::SshShellInput {
+                id: id.to_owned(),
+                input: SshTerminalInput::new(chunk.to_vec()),
+            });
+        }
+    }
+
     pub(crate) fn apply_shell_list(&mut self, shells: Vec<haider_rpc::ShellWire>) {
         self.shells = shells;
         self.shells_cursor = self.shells_cursor.min(self.shells.len().saturating_sub(1));
@@ -12802,6 +13410,7 @@ impl AppModel {
     }
 
     pub(crate) fn apply_shell_event(&mut self, shell: haider_rpc::ShellWire) {
+        self.apply_ssh_shell_terminal_state(&shell);
         if let Some(existing) = self.shells.iter_mut().find(|entry| entry.id == shell.id) {
             *existing = shell;
         } else {
@@ -15269,6 +15878,27 @@ impl AppModel {
         // the next real motion.
         self.hovered = None;
         self.dirty = true;
+    }
+
+    pub fn handle_terminal_resize(&mut self, cols: u16, rows: u16) {
+        self.handle_resize();
+        let size = haider_rpc::SshPtySizeWire {
+            cols: u32::from(cols.max(1)),
+            // The SSH pane uses the full body width. Reserve one row for the
+            // global status strip and one for the pane's own title so the
+            // remote PTY receives its drawable rows rather than the outer
+            // terminal height.
+            rows: u32::from(rows.saturating_sub(2).max(1)),
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        self.ssh_terminal_size = size;
+        if let Some(terminal) = self.ssh_terminal.as_mut() {
+            terminal.size = size;
+            if let Some(id) = terminal.shell_id.clone() {
+                self.requests.push(AppRequest::SshShellResize { id, size });
+            }
+        }
     }
 
     /// Mouse motion over the frame (owner ask, TUI3a item 6). Motion

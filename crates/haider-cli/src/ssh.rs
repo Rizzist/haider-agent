@@ -41,7 +41,7 @@ enum SshCommand {
     },
     Shell {
         name: String,
-        command: String,
+        command: Option<String>,
     },
 }
 
@@ -109,6 +109,7 @@ enum CliSshError {
     Refused { code: String, message: String },
     FeatureAbsent,
     Protocol,
+    Interactive(String),
 }
 
 impl std::fmt::Display for CliSshError {
@@ -119,6 +120,7 @@ impl std::fmt::Display for CliSshError {
             Self::Refused { code, message } => write!(formatter, "{code}: {message}"),
             Self::FeatureAbsent => formatter.write_str("daemon does not advertise ssh_profiles_v1"),
             Self::Protocol => formatter.write_str("daemon answered with an unexpected body"),
+            Self::Interactive(message) => formatter.write_str(message),
         }
     }
 }
@@ -148,7 +150,7 @@ fn exit_code_for_refusal(code: &str) -> u8 {
             EX_BLOCKED
         }
         "ssh_agent_unavailable" | "ssh_connection_failed" | "ssh_vault_error" => EX_UNAVAILABLE,
-        "ssh_channel_closed" => EX_BLOCKED,
+        "ssh_channel_closed" | "ssh_channel_quota" => EX_BLOCKED,
         "ssh_command_failed" | "ssh_output_limit" => EX_SOFTWARE,
         "ssh_profile_not_found"
         | "ssh_profile_exists"
@@ -211,7 +213,30 @@ async fn execute(
                 result.profile.name, result.host_key_pinned
             );
         }
-        SshCommand::Shell { name, command } => {
+        SshCommand::Shell {
+            name,
+            command: None,
+        } => {
+            let exit_code = haider_tui::ssh_terminal::run_ssh_terminal(client, &name)
+                .await
+                .map_err(|error| match error {
+                    haider_tui::ssh_terminal::SshTerminalError::Client(error) => error.into(),
+                    haider_tui::ssh_terminal::SshTerminalError::Io(error) => CliSshError::Io(error),
+                    other => CliSshError::Interactive(other.to_string()),
+                })?;
+            if let Some(code) = exit_code
+                && code != 0
+            {
+                return Err(CliSshError::Refused {
+                    code: "ssh_command_failed".into(),
+                    message: format!("remote shell exited with {code}"),
+                });
+            }
+        }
+        SshCommand::Shell {
+            name,
+            command: Some(command),
+        } => {
             let result = profiles.shell(name, command, None, None).await?;
             print!("{}", result.stdout);
             eprint!("{}", result.stderr);
@@ -263,6 +288,11 @@ async fn stage_auth(
         }
         _ => return Ok(()),
     };
+    if matches!(auth, SshAuthInputWire::KeyMaterial { .. }) {
+        eprintln!(
+            "haider ssh: notice: pasted key material has the same FileVault protection as API keys (Windows relies on the enclosing profile ACL); Haider does not cryptographically encrypt it"
+        );
+    }
     let mut value = Zeroizing::new(String::new());
     io::stdin()
         .read_to_string(&mut value)
@@ -312,11 +342,15 @@ fn parse(rest: &[String]) -> Result<SshCommand, String> {
         [command, name] if command == "rm" => Ok(SshCommand::Remove { name: name.clone() }),
         [command, name] if command == "test" => Ok(SshCommand::Test { name: name.clone() }),
         [command, name, separator, tail @ ..] if command == "shell" && separator == "--" && !tail.is_empty() => {
-            Ok(SshCommand::Shell { name: name.clone(), command: tail.join(" ") })
+            Ok(SshCommand::Shell { name: name.clone(), command: Some(tail.join(" ")) })
         }
+        [command, name] if command == "shell" => Ok(SshCommand::Shell {
+            name: name.clone(),
+            command: None,
+        }),
         [command, name, flags @ ..] if command == "add" => parse_add(name, flags),
         [command, name, flags @ ..] if command == "edit" => parse_edit(name, flags),
-        _ => Err("usage: haider ssh add <name> --host H --user U [--port P] [--key PATH|--agent|--password-stdin|--key-stdin] [--description TEXT] [--cwd PATH] | list [--json] | show <name> | edit <name> ... | rm <name> | test <name> | shell <name> -- CMD... (interactive PTY shells are not yet available)".into()),
+        _ => Err("usage: haider ssh add <name> --host H --user U [--port P] [--key PATH|--agent|--password-stdin|--key-stdin] [--description TEXT] [--cwd PATH] | list [--json] | show <name> | edit <name> ... | rm <name> | test <name> | shell <name> [-- CMD...]".into()),
     }
 }
 

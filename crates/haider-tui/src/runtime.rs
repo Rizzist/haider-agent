@@ -583,6 +583,8 @@ pub async fn run_demo(
 ) -> std::io::Result<()> {
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    let initial_size = terminal.size()?;
+    model.handle_terminal_resize(initial_size.width, initial_size.height);
     // Sync the emulator's own background (window padding) to the theme
     // ground. (No Terminal::clear() here: ratatui's clear paths can issue a
     // cursor-position query that hangs non-answering PTYs; the first full
@@ -914,7 +916,7 @@ pub fn dispatch_input(
         // buffer takes the same allocation, so our one owned copy wipes
         // on drop and Debug-prints redacted.
         Event::Paste(text) => model.handle(AppEvent::Paste(crate::app::Pasted::new(text))),
-        Event::Resize(cols, _) => {
+        Event::Resize(cols, rows) => {
             // TUI6.1 fix 1 (reflow-before-input): the next frame's wrap
             // budget is a pure function of the NEW width, so apply it
             // here — before any queued key can walk the previous width's
@@ -927,7 +929,7 @@ pub fn dispatch_input(
             model
                 .composer
                 .set_wrap_budget(crate::render::composer_text_budget(cols));
-            model.handle_resize();
+            model.handle_terminal_resize(cols, rows);
         }
         Event::Mouse(mouse) => {
             let hit_at = |column: u16, row: u16| {
@@ -1776,6 +1778,11 @@ impl DemoDriver {
             | AppRequest::SshSetScope { .. }
             | AppRequest::SshTest { .. }
             | AppRequest::SshRemove { .. }
+            | AppRequest::SshShellOpen { .. }
+            | AppRequest::SshShellInput { .. }
+            | AppRequest::SshShellResize { .. }
+            | AppRequest::SshShellEof { .. }
+            | AppRequest::SshProfileSave { .. }
             | AppRequest::ShellList
             | AppRequest::ShellClose { .. }
             | AppRequest::MonitorList
@@ -3236,6 +3243,8 @@ pub async fn run_live(
 
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    let initial_size = terminal.size()?;
+    model.handle_terminal_resize(initial_size.width, initial_size.height);
     sync_terminal_bg(model.theme);
     sync_window_title(&model.window_title());
     let mut active_theme = model.theme;

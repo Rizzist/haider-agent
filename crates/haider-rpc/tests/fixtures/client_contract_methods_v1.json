@@ -428,6 +428,30 @@
       "response": {"method":"ssh.shell","result":{"profile":"prod","stdout":"Linux prod\\n","stderr":"","exit_code":0,"timed_out":false}}
     },
     {
+      "request_method": "ssh.shell_open",
+      "response_method": "ssh.shell_open",
+      "request": {"method":"ssh.shell_open","name":"prod","session_id":"session-1","term":"xterm-256color","size":{"cols":120,"rows":40,"pixel_width":960,"pixel_height":800}},
+      "response": {"method":"ssh.shell_open","shell":{"id":"sh-pty-0123456789","kind":{"kind":"ssh","profile":"prod"},"status":{"status":"running"},"title":"prod","cwd_or_host":"prod.example.invalid","created_at_ms":1720000006000,"last_activity_ms":1720000006001,"bytes_out":0}}
+    },
+    {
+      "request_method": "ssh.shell_input",
+      "response_method": "ssh.shell_input",
+      "request": {"method":"ssh.shell_input","id":"sh-pty-0123456789","data_b64":"d2hvYW1pXG4="},
+      "response": {"method":"ssh.shell_input","shell":{"id":"sh-pty-0123456789","kind":{"kind":"ssh","profile":"prod"},"status":{"status":"running"},"title":"prod","cwd_or_host":"prod.example.invalid","created_at_ms":1720000006000,"last_activity_ms":1720000006001,"bytes_out":0}}
+    },
+    {
+      "request_method": "ssh.shell_resize",
+      "response_method": "ssh.shell_resize",
+      "request": {"method":"ssh.shell_resize","id":"sh-pty-0123456789","size":{"cols":132,"rows":43,"pixel_width":1056,"pixel_height":860}},
+      "response": {"method":"ssh.shell_resize","shell":{"id":"sh-pty-0123456789","kind":{"kind":"ssh","profile":"prod"},"status":{"status":"running"},"title":"prod","cwd_or_host":"prod.example.invalid","created_at_ms":1720000006000,"last_activity_ms":1720000006001,"bytes_out":0}}
+    },
+    {
+      "request_method": "ssh.shell_eof",
+      "response_method": "ssh.shell_eof",
+      "request": {"method":"ssh.shell_eof","id":"sh-pty-0123456789"},
+      "response": {"method":"ssh.shell_eof","shell":{"id":"sh-pty-0123456789","kind":{"kind":"ssh","profile":"prod"},"status":{"status":"running"},"title":"prod","cwd_or_host":"prod.example.invalid","created_at_ms":1720000006000,"last_activity_ms":1720000006001,"bytes_out":0}}
+    },
+    {
       "request_method": "shell.list",
       "response_method": "shell.list",
       "request": {"method":"shell.list"},

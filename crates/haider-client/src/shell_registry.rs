@@ -4,7 +4,8 @@
 //! surface absent instead of returning a synthetic feature error.
 
 use haider_rpc::{
-    ErrorData, FEATURE_SHELL_REGISTRY_V1, RequestBody, ResponseBody, ShellWire, Welcome, WireFrame,
+    ErrorData, FEATURE_SHELL_REGISTRY_V1, RequestBody, ResponseBody, ShellOutputStreamWire,
+    ShellWire, Welcome, WireFrame,
 };
 use tokio::sync::mpsc;
 
@@ -63,6 +64,11 @@ pub enum ShellEvent {
     Opened(ShellWire),
     State(ShellWire),
     Closed(ShellWire),
+    Output {
+        id: String,
+        stream: ShellOutputStreamWire,
+        chunk_b64: haider_rpc::TerminalOutputWire,
+    },
 }
 
 pub struct ShellEventSubscription {
@@ -86,6 +92,15 @@ pub fn shell_event_from_frame(frame: WireFrame) -> Option<ShellEvent> {
         WireFrame::ShellOpened { shell } => Some(ShellEvent::Opened(shell)),
         WireFrame::ShellState { shell } => Some(ShellEvent::State(shell)),
         WireFrame::ShellClosed { shell } => Some(ShellEvent::Closed(shell)),
+        WireFrame::ShellOutput {
+            id,
+            stream,
+            chunk_b64,
+        } => Some(ShellEvent::Output {
+            id,
+            stream,
+            chunk_b64,
+        }),
         _ => None,
     }
 }

@@ -13,22 +13,25 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use haider_protocol::item::{ItemDelta, OutputStream};
-use haider_rpc::SshShellResultWire;
+use haider_rpc::{ShellOutputStreamWire, ShellWire, SshPtySizeWire, SshShellResultWire};
 use haider_tools::CommandOutputSink;
 use russh::client;
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh::{ChannelMsg, Disconnect};
-use tokio::sync::Mutex;
-use tokio::sync::watch;
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use zeroize::Zeroizing;
 
 use super::{PinnedHostKey, SshAuth, SshError, SshProfile, SshProfileStore};
+use crate::shell_registry::{ShellControl, ShellHandle};
 
 const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_COMMAND_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+const EXIT_DRAIN_GRACE: Duration = Duration::from_secs(1);
 const OUTPUT_LIMIT: usize = haider_tools::PROCESS_MAX_OUTPUT_BYTES;
+pub(super) const MAX_CHANNELS_PER_PROFILE: usize = 8;
+const MAX_TERM_BYTES: usize = 255;
 
 #[derive(Clone)]
 pub(crate) struct SshExecRequest {
@@ -44,6 +47,15 @@ pub(crate) struct SshExecRequest {
 pub(crate) struct SshOutput {
     pub(crate) call_id: String,
     pub(crate) sink: Arc<dyn CommandOutputSink>,
+}
+
+pub(crate) struct SshPtyRequest {
+    pub(crate) profile: String,
+    pub(crate) term: String,
+    pub(crate) size: SshPtySizeWire,
+    pub(crate) shell: ShellHandle,
+    pub(crate) controls: mpsc::Receiver<ShellControl>,
+    pub(crate) activation: Option<oneshot::Receiver<()>>,
 }
 
 #[derive(Clone)]
@@ -91,14 +103,24 @@ struct SessionLease {
 }
 
 impl SessionLease {
-    fn begin(slot: SessionSlot, activity: Arc<StdMutex<SessionActivity>>) -> Self {
+    fn begin(
+        slot: SessionSlot,
+        activity: Arc<StdMutex<SessionActivity>>,
+        profile: &str,
+    ) -> Result<Self, SshError> {
         let mut state = activity
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.active_channels >= MAX_CHANNELS_PER_PROFILE {
+            return Err(SshError::SshChannelQuota {
+                name: profile.to_owned(),
+                limit: MAX_CHANNELS_PER_PROFILE,
+            });
+        }
         state.active_channels = state.active_channels.saturating_add(1);
         state.idle_generation = state.idle_generation.wrapping_add(1);
         drop(state);
-        Self { slot, activity }
+        Ok(Self { slot, activity })
     }
 }
 
@@ -275,6 +297,257 @@ impl SshRuntime {
         }
     }
 
+    pub(crate) async fn start_pty(&self, request: SshPtyRequest) -> Result<ShellWire, SshError> {
+        let SshPtyRequest {
+            profile: requested_profile,
+            term,
+            size,
+            shell,
+            controls,
+            activation,
+        } = request;
+        let setup = async {
+            validate_pty_request(&term, size)?;
+            let slot = self.session_slot(&requested_profile).await;
+            let mut guard = slot.lock().await;
+            let profile = self.store.get(&requested_profile)?;
+            let identity = SshConnectionIdentity::from(&profile);
+            if guard
+                .as_ref()
+                .is_none_or(|session| session.handle.is_closed() || session.identity != identity)
+            {
+                *guard = Some(self.connect(&profile).await?);
+            }
+            let live = guard.as_ref().ok_or_else(|| SshError::SshConnection {
+                message: "authenticated session was not retained".into(),
+            })?;
+            let handle = Arc::clone(&live.handle);
+            let mut lease =
+                SessionLease::begin(Arc::clone(&slot), Arc::clone(&live.activity), &profile.name)?;
+            drop(guard);
+            let channel = match handle.channel_open_session().await {
+                Ok(channel) => channel,
+                Err(_) if handle.is_closed() => {
+                    drop(lease);
+                    let mut guard = slot.lock().await;
+                    *guard = Some(self.connect(&profile).await?);
+                    let live = guard.as_ref().ok_or_else(|| SshError::SshConnection {
+                        message: "reconnected session was not retained".into(),
+                    })?;
+                    let handle = Arc::clone(&live.handle);
+                    lease = SessionLease::begin(
+                        Arc::clone(&slot),
+                        Arc::clone(&live.activity),
+                        &profile.name,
+                    )?;
+                    drop(guard);
+                    handle
+                        .channel_open_session()
+                        .await
+                        .map_err(connection_error)?
+                }
+                Err(error) => return Err(connection_error(error)),
+            };
+            channel
+                .request_pty(
+                    true,
+                    &term,
+                    size.cols,
+                    size.rows,
+                    size.pixel_width,
+                    size.pixel_height,
+                    &[],
+                )
+                .await
+                .map_err(connection_error)?;
+            channel
+                .request_shell(true)
+                .await
+                .map_err(connection_error)?;
+            Ok::<_, SshError>((profile.name, channel, lease))
+        }
+        .await;
+        let (profile_name, channel, lease) = match setup {
+            Ok(setup) => setup,
+            Err(error) => {
+                let _ = shell.exited(None);
+                return Err(error);
+            }
+        };
+        let running = match shell.running() {
+            Ok(running) => running,
+            Err(error) => {
+                let _ = channel.close().await;
+                let _ = shell.exited(None);
+                return Err(registry_error(error.to_string()));
+            }
+        };
+        let runtime = self.clone();
+        let shell_id = shell.id().to_owned();
+        let failure_shell = shell.clone();
+        tokio::spawn(async move {
+            if let Some(activation) = activation
+                && activation.await.is_err()
+            {
+                let _ = channel.close().await;
+                let _ = failure_shell.exited(None);
+                return;
+            }
+            let result = runtime
+                .drive_pty(profile_name.clone(), channel, shell, controls, lease)
+                .await;
+            if let Err(error) = result {
+                let _ = failure_shell.exited(None);
+                tracing::warn!(profile = %profile_name, shell = %shell_id, error = %error, "SSH PTY channel stopped");
+            }
+        });
+        Ok(running)
+    }
+
+    async fn drive_pty(
+        &self,
+        profile: String,
+        mut channel: russh::Channel<client::Msg>,
+        shell: ShellHandle,
+        mut controls: mpsc::Receiver<ShellControl>,
+        _lease: SessionLease,
+    ) -> Result<(), SshError> {
+        let mut close = shell.close_receiver();
+        let mut exit_code = None;
+        let mut exit_grace: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+        loop {
+            enum PtyEvent {
+                Message(Option<ChannelMsg>),
+                Control(Option<ShellControl>),
+                Close,
+                ExitGrace,
+            }
+            let event = tokio::select! {
+                message = channel.wait() => PtyEvent::Message(message),
+                control = controls.recv() => PtyEvent::Control(control),
+                changed = close.changed() => {
+                    if changed.is_err() || *close.borrow_and_update() {
+                        PtyEvent::Close
+                    } else {
+                        continue;
+                    }
+                }
+                () = async {
+                    match exit_grace.as_mut() {
+                        Some(grace) => grace.as_mut().await,
+                        None => std::future::pending().await,
+                    }
+                } => PtyEvent::ExitGrace,
+            };
+            match event {
+                PtyEvent::Message(Some(ChannelMsg::Data { data })) => {
+                    shell
+                        .publish_output(ShellOutputStreamWire::Stdout, data.as_ref())
+                        .map_err(|error| registry_error(error.to_string()))?;
+                }
+                PtyEvent::Message(Some(ChannelMsg::ExtendedData { data, .. })) => {
+                    shell
+                        .publish_output(ShellOutputStreamWire::Stderr, data.as_ref())
+                        .map_err(|error| registry_error(error.to_string()))?;
+                }
+                PtyEvent::Message(Some(ChannelMsg::ExitStatus { exit_status })) => {
+                    exit_code = i32::try_from(exit_status).ok();
+                    if exit_grace.is_none() {
+                        exit_grace = Some(Box::pin(tokio::time::sleep(EXIT_DRAIN_GRACE)));
+                    }
+                }
+                PtyEvent::Message(Some(ChannelMsg::ExitSignal { .. })) => {
+                    if exit_grace.is_none() {
+                        exit_grace = Some(Box::pin(tokio::time::sleep(EXIT_DRAIN_GRACE)));
+                    }
+                }
+                PtyEvent::Message(Some(ChannelMsg::Eof)) => {
+                    // EOF only ends the server's data direction. SSH permits
+                    // the exit-status request to follow, so retain the
+                    // channel for a finite drain instead of terminalizing it
+                    // immediately with an unknown status.
+                    if exit_grace.is_none() {
+                        exit_grace = Some(Box::pin(tokio::time::sleep(EXIT_DRAIN_GRACE)));
+                    }
+                }
+                PtyEvent::Message(Some(ChannelMsg::Close)) => break,
+                PtyEvent::Message(Some(_)) => {}
+                PtyEvent::Message(None) | PtyEvent::Control(None) => break,
+                PtyEvent::Control(Some(ShellControl::Input(bytes))) => {
+                    let sent = tokio::select! {
+                        sent = channel.data(bytes.as_slice()) => Some(sent),
+                        changed = close.changed() => {
+                            if changed.is_err() || *close.borrow_and_update() {
+                                None
+                            } else {
+                                continue;
+                            }
+                        }
+                    };
+                    let Some(sent) = sent else {
+                        let _ = channel.close().await;
+                        return Ok(());
+                    };
+                    sent.map_err(connection_error)?;
+                }
+                PtyEvent::Control(Some(ShellControl::Resize(size))) => {
+                    let resized = tokio::select! {
+                        resized = channel.window_change(
+                            size.cols,
+                            size.rows,
+                            size.pixel_width,
+                            size.pixel_height,
+                        ) => Some(resized),
+                        changed = close.changed() => {
+                            if changed.is_err() || *close.borrow_and_update() {
+                                None
+                            } else {
+                                continue;
+                            }
+                        }
+                    };
+                    let Some(resized) = resized else {
+                        let _ = channel.close().await;
+                        return Ok(());
+                    };
+                    resized.map_err(connection_error)?;
+                }
+                PtyEvent::Control(Some(ShellControl::Eof)) => {
+                    let sent = tokio::select! {
+                        sent = channel.eof() => Some(sent),
+                        changed = close.changed() => {
+                            if changed.is_err() || *close.borrow_and_update() {
+                                None
+                            } else {
+                                continue;
+                            }
+                        }
+                    };
+                    let Some(sent) = sent else {
+                        let _ = channel.close().await;
+                        return Ok(());
+                    };
+                    sent.map_err(connection_error)?;
+                }
+                PtyEvent::Close => {
+                    let _ = channel.close().await;
+                    return Ok(());
+                }
+                PtyEvent::ExitGrace => {
+                    break;
+                }
+            }
+        }
+        let _ = channel.close().await;
+        shell
+            .exited(exit_code)
+            .map_err(|error| registry_error(error.to_string()))?;
+        if let Err(error) = self.store.mark_used(&profile, unix_ms()) {
+            tracing::warn!(profile = %profile, error = %error, "could not persist SSH last-used time");
+        }
+        Ok(())
+    }
+
     async fn exec_inner(&self, request: &SshExecRequest) -> Result<SshShellResultWire, SshError> {
         let slot = self.session_slot(&request.profile).await;
         let mut guard = slot.lock().await;
@@ -302,7 +575,11 @@ impl SshRuntime {
                 })?
                 .activity,
         );
-        let mut lease = Some(SessionLease::begin(Arc::clone(&slot), activity));
+        let mut lease = Some(SessionLease::begin(
+            Arc::clone(&slot),
+            activity,
+            &profile.name,
+        )?);
         drop(guard);
         let command = command_in_cwd(
             &request.command,
@@ -327,7 +604,8 @@ impl SshRuntime {
                 lease = Some(SessionLease::begin(
                     Arc::clone(&slot),
                     Arc::clone(&live.activity),
-                ));
+                    &profile.name,
+                )?);
                 drop(guard);
                 handle
                     .channel_open_session()
@@ -426,6 +704,24 @@ impl SshRuntime {
             .entry(name.to_owned())
             .or_insert_with(|| Arc::new(Mutex::new(None)))
             .clone()
+    }
+
+    #[cfg(test)]
+    pub(super) async fn active_channels(&self, name: &str) -> usize {
+        let slot = self.sessions.lock().await.get(name).cloned();
+        let Some(slot) = slot else {
+            return 0;
+        };
+        let live = slot.lock().await;
+        let Some(live) = live.as_ref() else {
+            return 0;
+        };
+        let count = live
+            .activity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active_channels;
+        count
     }
 
     async fn connect(&self, profile: &SshProfile) -> Result<LiveSession, SshError> {
@@ -689,6 +985,26 @@ fn connection_error(error: russh::Error) -> SshError {
     SshError::SshConnection {
         message: error.to_string(),
     }
+}
+
+fn registry_error(message: String) -> SshError {
+    SshError::SshConnection { message }
+}
+
+fn validate_pty_request(term: &str, size: SshPtySizeWire) -> Result<(), SshError> {
+    if term.is_empty() || term.len() > MAX_TERM_BYTES || term.chars().any(char::is_control) {
+        return Err(SshError::SshProfileInvalid {
+            field: "term",
+            message: format!("must be 1..={MAX_TERM_BYTES} non-control bytes"),
+        });
+    }
+    if size.cols == 0 || size.rows == 0 {
+        return Err(SshError::SshProfileInvalid {
+            field: "size",
+            message: "rows and columns must be greater than zero".into(),
+        });
+    }
+    Ok(())
 }
 
 fn unix_ms() -> u64 {

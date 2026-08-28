@@ -365,7 +365,10 @@ pub fn render(model: &AppModel, frame: &mut Frame<'_>) -> Vec<(Rect, Hit)> {
         Layout::vertical([Constraint::Min(1), Constraint::Length(status_height)]).areas(area);
     // F2a: the full-screen /model picker COVERS the body while open —
     // it owns the keys, so it owns the pixels and the hit map too.
-    if model.model_picker.is_some() {
+    if model.ssh_terminal.is_some() {
+        render_ssh_terminal(model, theme, frame, body);
+        hits.clear();
+    } else if model.model_picker.is_some() {
         render_model_picker(model, theme, frame, body, &mut hits);
     } else {
         match model.screen {
@@ -11072,10 +11075,14 @@ fn render_ssh_overlay(
     hits: &mut Vec<(Rect, Hit)>,
 ) {
     hits.clear();
+    if let Some(form) = model.ssh_form.as_ref() {
+        render_ssh_form(form, theme, frame, area);
+        return;
+    }
     let mut lines = vec![Line::from(vec![
         Span::styled("ssh profiles", theme.gold_style()),
         Span::styled(
-            "  ↑↓ select · t test · d,d remove · esc",
+            "  ↑↓ select · enter shell · a add · e edit · t test · d,d remove · esc",
             theme.faint_style(),
         ),
     ])];
@@ -11112,6 +11119,12 @@ fn render_ssh_overlay(
             ]));
         }
     }
+    if let Some(profile) = model.ssh_remove_armed.as_deref() {
+        lines.push(Line::styled(
+            format!("  remove {profile}? press d again to confirm"),
+            Style::default().fg(theme.err.into()),
+        ));
+    }
     let height = u16::try_from(lines.len() + 1).unwrap_or(area.height);
     let [_, panel] = Layout::vertical([
         Constraint::Min(0),
@@ -11122,6 +11135,130 @@ fn render_ssh_overlay(
         Paragraph::new(Text::from(lines)).style(theme.text_style().bg(theme.bar_bg.into())),
         panel,
     );
+}
+
+fn render_ssh_form(
+    form: &crate::app::SshProfileForm,
+    theme: &Theme,
+    frame: &mut Frame<'_>,
+    area: Rect,
+) {
+    let marker = |index| if form.focus == index { "›" } else { " " };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            if form.original.is_some() {
+                "edit SSH profile"
+            } else {
+                "add SSH profile"
+            },
+            theme.gold_style(),
+        ),
+        Span::styled(
+            "  tab fields · ←→ auth · ⌃S save · esc",
+            theme.faint_style(),
+        ),
+    ])];
+    let fields = [
+        ("name", form.name.clone()),
+        ("description", form.description.clone()),
+        ("host", form.host.clone()),
+        ("user", form.user.clone()),
+        ("port", form.port.clone()),
+        ("auth", form.auth_label().to_owned()),
+        ("key path / secret", form.credential_display()),
+        ("cwd", form.cwd.clone()),
+    ];
+    for (index, (label, value)) in fields.into_iter().enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} {label:17} ", marker(index)), theme.dim_style()),
+            Span::styled(value, theme.text_style()),
+        ]));
+    }
+    lines.push(Line::styled(
+        "  key files stay outside the vault; pasted keys/passwords match API-key FileVault protection (Windows inherits the profile ACL); no Haider encryption",
+        theme.faint_style(),
+    ));
+    if let Some(error) = &form.error {
+        lines.push(Line::styled(
+            format!("  {error}"),
+            Style::default().fg(theme.err.into()),
+        ));
+    }
+    let height = u16::try_from(lines.len() + 1).unwrap_or(area.height);
+    let [_, panel] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(height.min(area.height)),
+    ])
+    .areas(area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).style(theme.text_style().bg(theme.bar_bg.into())),
+        panel,
+    );
+}
+
+fn render_ssh_terminal(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
+    let Some(terminal) = model.ssh_terminal.as_ref() else {
+        return;
+    };
+    let title = Line::from(vec![
+        Span::styled(format!("ssh {}", terminal.profile), theme.gold_style()),
+        Span::styled("  interactive PTY · ⌃] close", theme.faint_style()),
+    ]);
+    let body = sanitize_terminal_text(&terminal.display_text());
+    let [title_area, body_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    frame.render_widget(
+        Paragraph::new(title).style(theme.text_style().bg(theme.ground.into())),
+        title_area,
+    );
+    let lines = body.lines().map(Line::raw).collect::<Vec<_>>();
+    let scroll = u16::try_from(lines.len().saturating_sub(usize::from(body_area.height)))
+        .unwrap_or(u16::MAX);
+    let paragraph = Paragraph::new(Text::from(lines))
+        .style(theme.text_style().bg(theme.ground.into()))
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+    frame.render_widget(paragraph, body_area);
+}
+
+fn sanitize_terminal_text(input: &str) -> String {
+    enum Escape {
+        Ground,
+        Esc,
+        Csi,
+        Osc,
+    }
+    let mut state = Escape::Ground;
+    let mut output = String::with_capacity(input.len());
+    for character in input.chars() {
+        match state {
+            Escape::Ground => match character {
+                '\u{1b}' => state = Escape::Esc,
+                '\r' => {}
+                '\n' | '\t' => output.push(character),
+                value if !value.is_control() => output.push(value),
+                _ => {}
+            },
+            Escape::Esc => match character {
+                '[' => state = Escape::Csi,
+                ']' => state = Escape::Osc,
+                _ => state = Escape::Ground,
+            },
+            Escape::Csi => {
+                if ('@'..='~').contains(&character) {
+                    state = Escape::Ground;
+                }
+            }
+            Escape::Osc => {
+                if character == '\u{7}' {
+                    state = Escape::Ground;
+                } else if character == '\u{1b}' {
+                    state = Escape::Esc;
+                }
+            }
+        }
+    }
+    output
 }
 
 /// Read-only details for the existing monitor primitive. This is deliberately

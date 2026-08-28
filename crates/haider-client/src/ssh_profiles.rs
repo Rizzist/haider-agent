@@ -5,9 +5,9 @@
 //! an RPC failure.
 
 use haider_rpc::{
-    ErrorData, FEATURE_SSH_PROFILES_V1, RequestBody, ResponseBody, SessionId, SshProfileInputWire,
-    SshProfileUpdateWire, SshProfileWire, SshScopeWire, SshShellResultWire, SshTestResultWire,
-    Welcome,
+    ErrorData, FEATURE_SSH_PROFILES_V1, RequestBody, ResponseBody, SecretWire, SessionId,
+    ShellWire, SshProfileInputWire, SshProfileUpdateWire, SshProfileWire, SshPtySizeWire,
+    SshScopeWire, SshShellResultWire, SshTestResultWire, Welcome,
 };
 
 use crate::client::{ClientError, RpcClient};
@@ -156,6 +156,79 @@ impl SshProfiles<'_> {
                 .await?,
             |body| match body {
                 ResponseBody::SshShell { result } => Some(result),
+                _ => None,
+            },
+        )
+    }
+
+    pub async fn open_pty(
+        &self,
+        name: impl Into<String>,
+        session_id: Option<SessionId>,
+        term: impl Into<String>,
+        size: SshPtySizeWire,
+    ) -> Result<ShellWire, SshProfilesClientError> {
+        match_response(
+            self.client
+                .request(RequestBody::SshShellOpen {
+                    name: name.into(),
+                    session_id,
+                    term: term.into(),
+                    size,
+                })
+                .await?,
+            |body| match body {
+                ResponseBody::SshShellOpen { shell } => Some(shell),
+                _ => None,
+            },
+        )
+    }
+
+    pub async fn input_b64(
+        &self,
+        id: impl Into<String>,
+        data_b64: impl Into<String>,
+    ) -> Result<ShellWire, SshProfilesClientError> {
+        match_response(
+            self.client
+                .request(RequestBody::SshShellInput {
+                    id: id.into(),
+                    data_b64: SecretWire::new(data_b64),
+                })
+                .await?,
+            |body| match body {
+                ResponseBody::SshShellInput { shell } => Some(shell),
+                _ => None,
+            },
+        )
+    }
+
+    pub async fn resize(
+        &self,
+        id: impl Into<String>,
+        size: SshPtySizeWire,
+    ) -> Result<ShellWire, SshProfilesClientError> {
+        match_response(
+            self.client
+                .request(RequestBody::SshShellResize {
+                    id: id.into(),
+                    size,
+                })
+                .await?,
+            |body| match body {
+                ResponseBody::SshShellResize { shell } => Some(shell),
+                _ => None,
+            },
+        )
+    }
+
+    pub async fn eof(&self, id: impl Into<String>) -> Result<ShellWire, SshProfilesClientError> {
+        match_response(
+            self.client
+                .request(RequestBody::SshShellEof { id: id.into() })
+                .await?,
+            |body| match body {
+                ResponseBody::SshShellEof { shell } => Some(shell),
                 _ => None,
             },
         )

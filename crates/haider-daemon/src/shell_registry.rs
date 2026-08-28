@@ -9,16 +9,66 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use haider_rpc::{ShellKindWire, ShellStatusWire, ShellWire};
-use tokio::sync::{broadcast, watch};
+use haider_rpc::{
+    ShellKindWire, ShellOutputStreamWire, ShellStatusWire, ShellWire, SshPtySizeWire,
+};
+use tokio::sync::{broadcast, mpsc, watch};
+use zeroize::Zeroizing;
 
 const EVENT_CAPACITY: usize = 256;
+const CONTROL_CAPACITY: usize = 64;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Non-retained control messages for one interactive SSH channel. Input bytes
+/// never enter a registry row, event, journal, or diagnostic.
+pub(crate) enum ShellControl {
+    Input(Zeroizing<Vec<u8>>),
+    Resize(SshPtySizeWire),
+    Eof,
+}
+
+impl fmt::Debug for ShellControl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Input(_) => formatter.write_str("Input(<redacted>)"),
+            Self::Resize(size) => formatter.debug_tuple("Resize").field(size).finish(),
+            Self::Eof => formatter.write_str("Eof"),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) enum ShellRegistryEvent {
     Opened(ShellWire),
     State(ShellWire),
     Closed(ShellWire),
+    Output {
+        owner: Option<String>,
+        id: String,
+        stream: ShellOutputStreamWire,
+        bytes: Zeroizing<Vec<u8>>,
+    },
+}
+
+impl fmt::Debug for ShellRegistryEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Opened(shell) => formatter.debug_tuple("Opened").field(shell).finish(),
+            Self::State(shell) => formatter.debug_tuple("State").field(shell).finish(),
+            Self::Closed(shell) => formatter.debug_tuple("Closed").field(shell).finish(),
+            Self::Output {
+                owner,
+                id,
+                stream,
+                bytes,
+            } => formatter
+                .debug_struct("Output")
+                .field("owner", owner)
+                .field("id", id)
+                .field("stream", stream)
+                .field("bytes", &format_args!("<redacted:{} bytes>", bytes.len()))
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +76,10 @@ pub(crate) enum ShellRegistryError {
     NotFound(String),
     Poisoned,
     IdGeneration(String),
+    NotInteractive(String),
+    ControlDenied(String),
+    ControlBusy(String),
+    ControlClosed(String),
 }
 
 impl fmt::Display for ShellRegistryError {
@@ -34,6 +88,22 @@ impl fmt::Display for ShellRegistryError {
             Self::NotFound(id) => write!(formatter, "shell `{id}` was not found"),
             Self::Poisoned => formatter.write_str("shell registry is unavailable"),
             Self::IdGeneration(message) => write!(formatter, "cannot create shell id: {message}"),
+            Self::NotInteractive(id) => write!(formatter, "shell `{id}` is not interactive"),
+            Self::ControlDenied(id) => {
+                write!(
+                    formatter,
+                    "interactive shell `{id}` belongs to another connection"
+                )
+            }
+            Self::ControlBusy(id) => {
+                write!(formatter, "interactive shell `{id}` control queue is full")
+            }
+            Self::ControlClosed(id) => {
+                write!(
+                    formatter,
+                    "interactive shell `{id}` no longer accepts input"
+                )
+            }
         }
     }
 }
@@ -43,6 +113,8 @@ impl std::error::Error for ShellRegistryError {}
 struct ShellEntry {
     wire: ShellWire,
     close: watch::Sender<bool>,
+    control: Option<mpsc::Sender<ShellControl>>,
+    owner: Option<String>,
 }
 
 struct ShellRegistryInner {
@@ -109,14 +181,38 @@ impl ShellRegistry {
         title: impl Into<String>,
         cwd_or_host: impl Into<String>,
     ) -> Result<ShellHandle, ShellRegistryError> {
+        self.open_entry(kind, title.into(), cwd_or_host.into(), None, None)
+    }
+
+    pub(crate) fn open_interactive(
+        &self,
+        kind: ShellKindWire,
+        title: impl Into<String>,
+        cwd_or_host: impl Into<String>,
+        owner: Option<String>,
+    ) -> Result<(ShellHandle, mpsc::Receiver<ShellControl>), ShellRegistryError> {
+        let (control, receiver) = mpsc::channel(CONTROL_CAPACITY);
+        let handle =
+            self.open_entry(kind, title.into(), cwd_or_host.into(), Some(control), owner)?;
+        Ok((handle, receiver))
+    }
+
+    fn open_entry(
+        &self,
+        kind: ShellKindWire,
+        title: String,
+        cwd_or_host: String,
+        control: Option<mpsc::Sender<ShellControl>>,
+        owner: Option<String>,
+    ) -> Result<ShellHandle, ShellRegistryError> {
         let id = shell_id()?;
         let now = unix_ms();
         let wire = ShellWire {
             id: id.clone(),
             kind,
             status: ShellStatusWire::Starting,
-            title: title.into(),
-            cwd_or_host: cwd_or_host.into(),
+            title,
+            cwd_or_host,
             created_at_ms: now,
             last_activity_ms: now,
             bytes_out: 0,
@@ -131,6 +227,8 @@ impl ShellRegistry {
                 ShellEntry {
                     wire: wire.clone(),
                     close,
+                    control,
+                    owner: owner.clone(),
                 },
             );
         let _ = self.inner.events.send(ShellRegistryEvent::Opened(wire));
@@ -138,7 +236,77 @@ impl ShellRegistry {
             id,
             registry: self.clone(),
             close_rx,
+            output_owner: owner,
         })
+    }
+
+    pub(crate) fn get(&self, id: &str) -> Result<ShellWire, ShellRegistryError> {
+        self.inner
+            .entries
+            .lock()
+            .map_err(|_| ShellRegistryError::Poisoned)?
+            .get(id)
+            .map(|entry| entry.wire.clone())
+            .ok_or_else(|| ShellRegistryError::NotFound(id.to_owned()))
+    }
+
+    pub(crate) fn control(
+        &self,
+        id: &str,
+        owner: Option<&str>,
+        message: ShellControl,
+    ) -> Result<ShellWire, ShellRegistryError> {
+        let sender = {
+            let entries = self
+                .inner
+                .entries
+                .lock()
+                .map_err(|_| ShellRegistryError::Poisoned)?;
+            let entry = entries
+                .get(id)
+                .ok_or_else(|| ShellRegistryError::NotFound(id.to_owned()))?;
+            if entry.owner.is_some() && entry.owner.as_deref() != owner {
+                return Err(ShellRegistryError::ControlDenied(id.to_owned()));
+            }
+            if !matches!(
+                &entry.wire.status,
+                ShellStatusWire::Starting | ShellStatusWire::Running
+            ) {
+                return Err(ShellRegistryError::ControlClosed(id.to_owned()));
+            }
+            entry
+                .control
+                .clone()
+                .ok_or_else(|| ShellRegistryError::NotInteractive(id.to_owned()))?
+        };
+        sender.try_send(message).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => ShellRegistryError::ControlBusy(id.to_owned()),
+            mpsc::error::TrySendError::Closed(_) => {
+                ShellRegistryError::ControlClosed(id.to_owned())
+            }
+        })?;
+        self.get(id)
+    }
+
+    pub(crate) fn close_control(
+        &self,
+        id: &str,
+        owner: Option<&str>,
+    ) -> Result<ShellWire, ShellRegistryError> {
+        {
+            let entries = self
+                .inner
+                .entries
+                .lock()
+                .map_err(|_| ShellRegistryError::Poisoned)?;
+            let entry = entries
+                .get(id)
+                .ok_or_else(|| ShellRegistryError::NotFound(id.to_owned()))?;
+            if entry.owner.is_some() && entry.owner.as_deref() != owner {
+                return Err(ShellRegistryError::ControlDenied(id.to_owned()));
+            }
+        }
+        self.close(id)
     }
 
     pub(crate) fn close(&self, id: &str) -> Result<ShellWire, ShellRegistryError> {
@@ -163,6 +331,28 @@ impl ShellRegistry {
             return Ok(wire);
         }
         Ok(entry.wire.clone())
+    }
+
+    pub(crate) fn close_owner(&self, owner: &str) -> Result<(), ShellRegistryError> {
+        let ids = self
+            .inner
+            .entries
+            .lock()
+            .map_err(|_| ShellRegistryError::Poisoned)?
+            .iter()
+            .filter(|(_, entry)| {
+                entry.owner.as_deref() == Some(owner)
+                    && matches!(
+                        &entry.wire.status,
+                        ShellStatusWire::Starting | ShellStatusWire::Running
+                    )
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.close(&id)?;
+        }
+        Ok(())
     }
 
     fn update(
@@ -194,10 +384,12 @@ impl ShellRegistry {
 }
 
 /// Owner-side coordinate for publishing lifecycle changes and observing close.
+#[derive(Clone)]
 pub(crate) struct ShellHandle {
     id: String,
     registry: ShellRegistry,
     close_rx: watch::Receiver<bool>,
+    output_owner: Option<String>,
 }
 
 impl ShellHandle {
@@ -210,9 +402,14 @@ impl ShellHandle {
     }
 
     pub(crate) fn running(&self) -> Result<ShellWire, ShellRegistryError> {
-        self.registry.update(&self.id, |wire| {
+        let wire = self.registry.update(&self.id, |wire| {
             wire.status = ShellStatusWire::Running;
-        })
+        })?;
+        if wire.status == ShellStatusWire::Running {
+            Ok(wire)
+        } else {
+            Err(ShellRegistryError::ControlClosed(self.id.clone()))
+        }
     }
 
     pub(crate) fn add_output(&self, bytes: usize) -> Result<ShellWire, ShellRegistryError> {
@@ -221,6 +418,23 @@ impl ShellHandle {
                 .bytes_out
                 .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
         })
+    }
+
+    pub(crate) fn publish_output(
+        &self,
+        stream: ShellOutputStreamWire,
+        bytes: &[u8],
+    ) -> Result<ShellWire, ShellRegistryError> {
+        let wire = self.add_output(bytes.len())?;
+        if !bytes.is_empty() {
+            let _ = self.registry.inner.events.send(ShellRegistryEvent::Output {
+                owner: self.output_owner.clone(),
+                id: self.id.clone(),
+                stream,
+                bytes: Zeroizing::new(bytes.to_vec()),
+            });
+        }
+        Ok(wire)
     }
 
     pub(crate) fn exited(&self, code: Option<i32>) -> Result<ShellWire, ShellRegistryError> {

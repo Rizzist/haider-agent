@@ -4983,6 +4983,188 @@ impl HubConnection {
                     }
                 }
             }
+            RequestBody::SshShellOpen {
+                name,
+                session_id,
+                term,
+                size,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                let Some(ssh) = self.hub.ssh()? else {
+                    return self.respond_error(
+                        request_id,
+                        haider_rpc::ERROR_CODE_VAULT_UNSUPPORTED,
+                        "SSH profile secret storage is unavailable",
+                        false,
+                        None,
+                    );
+                };
+                if let Some(session_id) = session_id {
+                    if self.hub.session_metadata(&session_id).await?.is_none() {
+                        return self.respond_error(
+                            request_id,
+                            ERROR_CODE_NOT_FOUND,
+                            "session was not found",
+                            false,
+                            None,
+                        );
+                    }
+                    let scope = self.hub.ssh_scope(&session_id)?;
+                    if let Err(error) = crate::ssh::enforce_scope(&scope, &session_id, &name) {
+                        return self.respond_ssh_error(request_id, error);
+                    }
+                }
+                let profile = match ssh.store.get(&name) {
+                    Ok(profile) => profile,
+                    Err(error) => return self.respond_ssh_error(request_id, error),
+                };
+                let (shell, controls) = self
+                    .hub
+                    .shell_registry()
+                    .open_interactive(
+                        haider_rpc::ShellKindWire::Ssh {
+                            profile: name.clone(),
+                        },
+                        format!("ssh {name}"),
+                        profile.ssh.host,
+                        Some(self.connection_id.clone()),
+                    )
+                    .map_err(|error| SessionHubError::Task(error.to_string()))?;
+                let (activate, activation) = tokio::sync::oneshot::channel();
+                match ssh
+                    .runtime
+                    .start_pty(crate::ssh::SshPtyRequest {
+                        profile: name,
+                        term,
+                        size,
+                        shell,
+                        controls,
+                        activation: Some(activation),
+                    })
+                    .await
+                {
+                    Ok(shell) => {
+                        self.send(WireFrame::Response {
+                            request_id,
+                            body: ResponseBody::SshShellOpen { shell },
+                        })?;
+                        let _ = activate.send(());
+                        Ok(())
+                    }
+                    Err(error) => self.respond_ssh_error(request_id, error),
+                }
+            }
+            RequestBody::SshShellInput { id, data_b64 } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                let bytes = match base64::engine::general_purpose::STANDARD
+                    .decode(data_b64.expose_secret())
+                {
+                    Ok(bytes)
+                        if !bytes.is_empty()
+                            && bytes.len() <= haider_rpc::SSH_PTY_INPUT_MAX_BYTES =>
+                    {
+                        zeroize::Zeroizing::new(bytes)
+                    }
+                    Ok(_) => {
+                        return self.respond_error(
+                            request_id,
+                            ERROR_CODE_INVALID_ARGUMENT,
+                            "SSH terminal input must decode to 1..=65536 bytes",
+                            false,
+                            None,
+                        );
+                    }
+                    Err(_) => {
+                        return self.respond_error(
+                            request_id,
+                            ERROR_CODE_INVALID_ARGUMENT,
+                            "SSH terminal input is not padded standard base64",
+                            false,
+                            None,
+                        );
+                    }
+                };
+                match self.hub.shell_registry().control(
+                    &id,
+                    Some(&self.connection_id),
+                    crate::shell_registry::ShellControl::Input(bytes),
+                ) {
+                    Ok(shell) => self.send(WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::SshShellInput { shell },
+                    }),
+                    Err(error) => self.respond_shell_control_error(request_id, error),
+                }
+            }
+            RequestBody::SshShellResize { id, size } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if size.cols == 0 || size.rows == 0 {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_INVALID_ARGUMENT,
+                        "SSH terminal rows and columns must be greater than zero",
+                        false,
+                        None,
+                    );
+                }
+                match self.hub.shell_registry().control(
+                    &id,
+                    Some(&self.connection_id),
+                    crate::shell_registry::ShellControl::Resize(size),
+                ) {
+                    Ok(shell) => self.send(WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::SshShellResize { shell },
+                    }),
+                    Err(error) => self.respond_shell_control_error(request_id, error),
+                }
+            }
+            RequestBody::SshShellEof { id } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                match self.hub.shell_registry().control(
+                    &id,
+                    Some(&self.connection_id),
+                    crate::shell_registry::ShellControl::Eof,
+                ) {
+                    Ok(shell) => self.send(WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::SshShellEof { shell },
+                    }),
+                    Err(error) => self.respond_shell_control_error(request_id, error),
+                }
+            }
             RequestBody::ShellList => {
                 if let Err(message) = authorize(&self.capabilities, Operation::View) {
                     return self.respond_error(
@@ -5013,7 +5195,11 @@ impl HubConnection {
                         None,
                     );
                 }
-                match self.hub.shell_registry().close(&id) {
+                match self
+                    .hub
+                    .shell_registry()
+                    .close_control(&id, Some(&self.connection_id))
+                {
                     Ok(shell) => self.send(WireFrame::Response {
                         request_id,
                         body: ResponseBody::ShellClose { shell },
@@ -5026,7 +5212,7 @@ impl HubConnection {
                             false,
                             None,
                         ),
-                    Err(error) => Err(SessionHubError::Task(error.to_string())),
+                    Err(error) => self.respond_shell_control_error(request_id, error),
                 }
             }
             // `Unknown` and any future method decode alike: a typed,
@@ -14485,7 +14671,9 @@ impl HubConnection {
     ) -> Result<(), SessionHubError> {
         let retryable = matches!(
             &error,
-            crate::ssh::SshError::SshConnection { .. } | crate::ssh::SshError::Vault { .. }
+            crate::ssh::SshError::SshConnection { .. }
+                | crate::ssh::SshError::SshChannelQuota { .. }
+                | crate::ssh::SshError::Vault { .. }
         );
         self.respond_error(
             request_id,
@@ -14494,6 +14682,33 @@ impl HubConnection {
             retryable,
             None,
         )
+    }
+
+    fn respond_shell_control_error(
+        &self,
+        request_id: RequestId,
+        error: crate::shell_registry::ShellRegistryError,
+    ) -> Result<(), SessionHubError> {
+        let retryable = matches!(
+            &error,
+            crate::shell_registry::ShellRegistryError::ControlBusy(_)
+        );
+        let code = match &error {
+            crate::shell_registry::ShellRegistryError::NotFound(_) => ERROR_CODE_NOT_FOUND,
+            crate::shell_registry::ShellRegistryError::NotInteractive(_) => {
+                ERROR_CODE_INVALID_ARGUMENT
+            }
+            crate::shell_registry::ShellRegistryError::ControlDenied(_) => {
+                ERROR_CODE_CAPABILITY_DENIED
+            }
+            crate::shell_registry::ShellRegistryError::ControlBusy(_) => ERROR_CODE_OVERLOADED,
+            crate::shell_registry::ShellRegistryError::ControlClosed(_) => "ssh_channel_closed",
+            crate::shell_registry::ShellRegistryError::Poisoned
+            | crate::shell_registry::ShellRegistryError::IdGeneration(_) => {
+                return Err(SessionHubError::Task(error.to_string()));
+            }
+        };
+        self.respond_error(request_id, code, &error.to_string(), retryable, None)
     }
 
     fn ssh_auth_from_wire(

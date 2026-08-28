@@ -7,13 +7,15 @@ use std::sync::Arc;
 
 use haider_accounts::Vault;
 
-pub(crate) use runtime::{SshExecRequest, SshOutput, SshRuntime};
+pub(crate) use runtime::{SshExecRequest, SshOutput, SshPtyRequest, SshRuntime};
 pub(crate) use store::{
     PinnedHostKey, SshAuth, SshError, SshProfile, SshProfileStore, SshScope, SshTarget,
+    enforce_scope,
 };
 
-/// Profile-scoped SSH services installed when the owner-only account vault is
-/// installed. Both halves share the same vault-backed store.
+/// Profile-scoped SSH services installed when the account `FileVault` is
+/// available. Both halves share the same vault-backed store and therefore the
+/// same platform-specific at-rest protection as API keys.
 #[derive(Clone)]
 pub(crate) struct SshService {
     pub(crate) store: SshProfileStore,
@@ -31,3 +33,7 @@ impl SshService {
 #[cfg(test)]
 #[path = "ssh_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ssh_fixture_tests.rs"]
+mod fixture_tests;

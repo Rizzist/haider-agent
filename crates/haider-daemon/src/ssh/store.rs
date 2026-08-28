@@ -120,6 +120,21 @@ impl SshScope {
     }
 }
 
+pub(crate) fn enforce_scope(
+    scope: &SshScope,
+    session_id: &SessionId,
+    name: &str,
+) -> Result<(), SshError> {
+    if scope.allows(name) {
+        Ok(())
+    } else {
+        Err(SshError::SshProfileOutOfScope {
+            session_id: session_id.clone(),
+            name: name.to_owned(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SshError {
     SshProfileNotFound {
@@ -155,6 +170,10 @@ pub(crate) enum SshError {
     },
     SshChannelClosed {
         name: String,
+    },
+    SshChannelQuota {
+        name: String,
+        limit: usize,
     },
     Vault {
         message: String,
@@ -206,6 +225,10 @@ impl fmt::Display for SshError {
             Self::SshChannelClosed { name } => {
                 write!(formatter, "SSH shell for profile `{name}` was closed")
             }
+            Self::SshChannelQuota { name, limit } => write!(
+                formatter,
+                "SSH profile `{name}` already has the maximum {limit} concurrent channels"
+            ),
             Self::Vault { message } => write!(formatter, "SSH profile vault failure: {message}"),
             Self::StoreCorrupt { name } => {
                 write!(formatter, "SSH profile secret record `{name}` is corrupt")
@@ -230,6 +253,7 @@ impl SshError {
             Self::SshKeyInvalid { .. } => "ssh_key_invalid",
             Self::SshConnection { .. } => "ssh_connection_failed",
             Self::SshChannelClosed { .. } => "ssh_channel_closed",
+            Self::SshChannelQuota { .. } => "ssh_channel_quota",
             Self::Vault { .. } => "ssh_vault_error",
             Self::StoreCorrupt { .. } => "ssh_profile_store_corrupt",
         }

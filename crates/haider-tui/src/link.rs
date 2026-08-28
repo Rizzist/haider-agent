@@ -637,7 +637,14 @@ pub fn command_required_features(command: &LiveCommand) -> &'static [&'static st
         LiveCommand::SshList { .. }
         | LiveCommand::SshSetScope { .. }
         | LiveCommand::SshTest { .. }
-        | LiveCommand::SshRemove { .. } => &[haider_rpc::FEATURE_SSH_PROFILES_V1],
+        | LiveCommand::SshRemove { .. }
+        | LiveCommand::SshProfileStage { .. }
+        | LiveCommand::SshAdd { .. }
+        | LiveCommand::SshUpdate { .. }
+        | LiveCommand::SshShellOpen { .. }
+        | LiveCommand::SshShellInput { .. }
+        | LiveCommand::SshShellResize { .. }
+        | LiveCommand::SshShellEof { .. } => &[haider_rpc::FEATURE_SSH_PROFILES_V1],
         LiveCommand::ShellList | LiveCommand::ShellClose { .. } => {
             &[haider_rpc::FEATURE_SHELL_REGISTRY_V1]
         }
@@ -727,6 +734,9 @@ pub struct CommandContext {
     /// Exact job filter for an install-status read. The response can be
     /// empty, so the requested identity cannot be reconstructed from it.
     loom_install_status: Option<(u64, u64, String)>,
+    ssh_stage: Option<crate::app::SshProfileMutation>,
+    ssh_test: bool,
+    ssh_shell_open: bool,
 }
 
 impl CommandContext {
@@ -859,6 +869,12 @@ impl CommandContext {
                 } => Some((*generation, *epoch, job_id.clone())),
                 _ => None,
             },
+            ssh_stage: match command {
+                LiveCommand::SshProfileStage { mutation, .. } => Some(mutation.clone()),
+                _ => None,
+            },
+            ssh_test: matches!(command, LiveCommand::SshTest { .. }),
+            ssh_shell_open: matches!(command, LiveCommand::SshShellOpen { .. }),
         }
     }
 }
@@ -867,6 +883,15 @@ impl CommandContext {
 #[must_use]
 pub fn request_body(command: LiveCommand) -> RequestBody {
     request_body_for_features(command, &haider_client::required_user_command_features())
+}
+
+fn client_term() -> String {
+    std::env::var("TERM")
+        .ok()
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 255 && !value.chars().any(char::is_control)
+        })
+        .unwrap_or_else(|| "xterm-256color".into())
 }
 
 /// The wire request one driver command becomes under one negotiated daemon
@@ -1171,6 +1196,39 @@ pub fn request_body_for_features(
             timeout_s: None,
         },
         LiveCommand::SshRemove { profile } => RequestBody::SshRemove { name: profile },
+        LiveCommand::SshProfileStage {
+            stage_id,
+            purpose,
+            secret,
+            ..
+        } => RequestBody::VaultStage {
+            stage_id,
+            purpose,
+            secret,
+        },
+        LiveCommand::SshAdd { profile } => RequestBody::SshAdd { profile },
+        LiveCommand::SshUpdate { name, changes } => RequestBody::SshUpdate { name, changes },
+        LiveCommand::SshShellOpen {
+            profile,
+            session,
+            size,
+        } => RequestBody::SshShellOpen {
+            name: profile,
+            session_id: session,
+            term: client_term(),
+            size,
+        },
+        LiveCommand::SshShellInput { id, input } => {
+            use base64::Engine as _;
+            RequestBody::SshShellInput {
+                id,
+                data_b64: haider_rpc::SecretWire::new(
+                    base64::engine::general_purpose::STANDARD.encode(input.as_slice()),
+                ),
+            }
+        }
+        LiveCommand::SshShellResize { id, size } => RequestBody::SshShellResize { id, size },
+        LiveCommand::SshShellEof { id } => RequestBody::SshShellEof { id },
         LiveCommand::ShellList => RequestBody::ShellList,
         LiveCommand::ShellClose { id } => RequestBody::ShellClose { id },
         LiveCommand::MonitorList { session } => RequestBody::MonitorList {
@@ -1754,13 +1812,15 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         ResponseBody::SessionSetSshScope { scope, .. } => {
             vec![LiveReply::SshScopeSet { scope }]
         }
-        // Interactive SSH needs a bidirectional PTY stream. Until that
-        // transport exists the TUI never issues this request; ignore a
-        // stray response instead of presenting a one-shot command as a shell.
         ResponseBody::SshShell { .. } => Vec::new(),
-        ResponseBody::SshTest { .. } | ResponseBody::SshRemove { .. } => {
-            vec![LiveReply::SshChanged]
-        }
+        ResponseBody::SshShellOpen { shell } => vec![LiveReply::SshShellOpened { shell }],
+        ResponseBody::SshShellInput { shell }
+        | ResponseBody::SshShellResize { shell }
+        | ResponseBody::SshShellEof { shell } => vec![LiveReply::ShellChanged { shell }],
+        ResponseBody::SshAdd { .. }
+        | ResponseBody::SshUpdate { .. }
+        | ResponseBody::SshRemove { .. } => vec![LiveReply::SshChanged],
+        ResponseBody::SshTest { result } => vec![LiveReply::SshTested { result }],
         ResponseBody::ShellList { shells } => vec![LiveReply::ShellListed { shells }],
         ResponseBody::ShellClose { shell } => vec![LiveReply::ShellChanged { shell }],
         ResponseBody::MonitorList { receipt } => vec![LiveReply::MonitorListed { receipt }],
@@ -1969,17 +2029,26 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         }
         ResponseBody::VaultStage {
             vault_reference, ..
-        } => context
-            .login
-            .clone()
-            .map_or_else(Vec::new, |(provider, alias, attempt)| {
-                vec![LiveReply::Staged {
+        } => {
+            if let Some(mutation) = context.ssh_stage.clone() {
+                vec![LiveReply::SshProfileStaged {
                     vault_reference,
-                    provider,
-                    alias,
-                    attempt,
+                    mutation,
                 }]
-            }),
+            } else {
+                context
+                    .login
+                    .clone()
+                    .map_or_else(Vec::new, |(provider, alias, attempt)| {
+                        vec![LiveReply::Staged {
+                            vault_reference,
+                            provider,
+                            alias,
+                            attempt,
+                        }]
+                    })
+            }
+        }
         ResponseBody::AccountLoginApi { descriptor } => {
             context.command_id.clone().map_or_else(Vec::new, |id| {
                 vec![LiveReply::LoggedIn {
@@ -2221,6 +2290,23 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                         message: message.clone(),
                     }];
                 }
+                if context.ssh_stage.is_some() {
+                    return vec![LiveReply::SshProfileMutationFailed {
+                        message: message.clone(),
+                    }];
+                }
+                if context.ssh_test {
+                    return vec![LiveReply::SshTestFailed {
+                        code: code.clone(),
+                        message: message.clone(),
+                    }];
+                }
+                if context.ssh_shell_open {
+                    return vec![LiveReply::SshShellFailed {
+                        code: code.clone(),
+                        message: message.clone(),
+                    }];
+                }
                 // W5e-1b: `account.oauth_start` is NON-DURABLE, so its error
                 // reply carries no command_id — the generic `Failed` path
                 // cannot correlate it and the add card would wait at
@@ -2423,6 +2509,9 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
         WireFrame::ShellOpened { shell }
         | WireFrame::ShellState { shell }
         | WireFrame::ShellClosed { shell } => vec![LiveReply::ShellChanged { shell }],
+        WireFrame::ShellOutput { id, chunk_b64, .. } => {
+            vec![LiveReply::SshShellOutput { id, chunk_b64 }]
+        }
         // This TUI is a publisher, not a consumer, of profile-level resident
         // binding signals. Name the known frame explicitly so it can never be
         // confused with the forward-compat fallback below.

@@ -26,15 +26,28 @@ moves to `closed`. Close is idempotent. For a local process it signals the
 existing supervised termination ladder. For SSH it closes that one channel,
 not the profile's authenticated session.
 
-The RPC methods are `shell.list` and `shell.close`. Additive Pipe frames are
-`shell.opened`, `shell.state`, and `shell.closed`; each carries the complete
-public row, so clients upsert by `id`. The client SDK exposes list, close, and
-typed subscription helpers only when the feature bit is present. Feature
-absence removes the surface rather than producing a synthetic error.
+The lifecycle RPC methods are `shell.list` and `shell.close`. Interactive SSH
+adds `ssh.shell_open`, `ssh.shell_input`, `ssh.shell_resize`, and
+`ssh.shell_eof`. Additive Pipe frames are `shell.opened`, `shell.state`,
+`shell.closed`, and transient `shell.output`; lifecycle frames carry the
+complete public row, so clients upsert by `id`. Input bytes and output content
+are never stored in a registry row. Output is routed only to the connection
+that opened the interactive channel, and only that connection may send its
+input, resize, EOF, or explicit-close controls. Bounded output fanout or
+connection-outbox refusal closes the affected transport and channel rather
+than silently dropping terminal bytes. The client SDK exposes list, close, and typed
+subscription helpers only when the feature bit is present. Feature absence
+removes the surface rather than producing a synthetic error.
 
 The existing TUI bottom status strip renders independent, count-pluralized
 segments (`1 shell`, `3 shells`, `1 monitor`, …), omitting zero counts. The
 shell segment opens the `/shells` activity overlay; the monitor segment routes
 to the existing monitor detail surface. No new top bar is introduced.
+
+The `/ssh` profile overlay owns add, edit, remove, test, and shell actions.
+Secret entry is masked and staged directly into the vault; it is never copied
+into a profile projection or terminal transcript. An interactive SSH terminal
+is a dedicated body pane. It does not reuse the monitor primitive or any
+subagent state, controls, counts, or rendering.
 
 The CLI JSON list envelope is stable as `haider.shell.list.v1`.

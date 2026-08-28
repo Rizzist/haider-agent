@@ -597,6 +597,10 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "ssh.list",
         "ssh.remove",
         "ssh.shell",
+        "ssh.shell_eof",
+        "ssh.shell_input",
+        "ssh.shell_open",
+        "ssh.shell_resize",
         "ssh.test",
         "ssh.update",
         "tools.inventory",
@@ -621,8 +625,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         expected_methods.len(),
-        113,
-        "the v1 contract covers the prior 104 methods plus 9 SSH/shell-registry methods"
+        117,
+        "the v1 contract covers the prior 104 methods plus 13 SSH/shell-registry methods"
     );
     assert_eq!(
         request_methods_declared_in_source(),
@@ -721,8 +725,13 @@ fn shell_registry_events_are_additive_and_golden() {
         WireFrame::ShellClosed {
             shell: haider_rpc::ShellWire {
                 status: haider_rpc::ShellStatusWire::Closed,
-                ..base
+                ..base.clone()
             },
+        },
+        WireFrame::ShellOutput {
+            id: base.id,
+            stream: haider_rpc::ShellOutputStreamWire::Stdout,
+            chunk_b64: haider_rpc::TerminalOutputWire::new("c2VjcmV0LWZyZWUtb3V0cHV0"),
         },
     ];
     assert_eq!(
@@ -734,6 +743,7 @@ fn shell_registry_events_are_additive_and_golden() {
             serde_json::json!({"v":1,"kind":"shell.opened","shell":{"id":"sh-0123456789abcdef0123","kind":{"kind":"ssh","profile":"prod"},"status":{"status":"starting"},"title":"prod: tests","cwd_or_host":"prod.example.invalid","created_at_ms":10,"last_activity_ms":11,"bytes_out":12}}),
             serde_json::json!({"v":1,"kind":"shell.state","shell":{"id":"sh-0123456789abcdef0123","kind":{"kind":"ssh","profile":"prod"},"status":{"status":"running"},"title":"prod: tests","cwd_or_host":"prod.example.invalid","created_at_ms":10,"last_activity_ms":11,"bytes_out":12}}),
             serde_json::json!({"v":1,"kind":"shell.closed","shell":{"id":"sh-0123456789abcdef0123","kind":{"kind":"ssh","profile":"prod"},"status":{"status":"closed"},"title":"prod: tests","cwd_or_host":"prod.example.invalid","created_at_ms":10,"last_activity_ms":11,"bytes_out":12}}),
+            serde_json::json!({"v":1,"kind":"shell.output","id":"sh-0123456789abcdef0123","stream":"stdout","chunk_b64":"c2VjcmV0LWZyZWUtb3V0cHV0"}),
         ]
     );
 }
@@ -758,6 +768,32 @@ fn ssh_auth_debug_redacts_all_staged_capabilities() {
     ] {
         assert!(!format!("{auth:?}").contains(sentinel));
     }
+}
+
+#[test]
+fn ssh_terminal_input_debug_is_redacted_through_request_and_frame() {
+    let sentinel = "c3NoLXRlcm1pbmFsLXNlY3JldC1zZW50aW5lbA==";
+    let request = RequestBody::SshShellInput {
+        id: "sh-pty-redaction".into(),
+        data_b64: haider_rpc::SecretWire::new(sentinel),
+    };
+    assert!(!format!("{request:?}").contains(sentinel));
+    let frame = WireFrame::Request {
+        request_id: haider_rpc::RequestId::new("request-pty-redaction"),
+        body: request,
+    };
+    assert!(!format!("{frame:?}").contains(sentinel));
+}
+
+#[test]
+fn ssh_terminal_output_debug_is_redacted_through_frame() {
+    let sentinel = "c2Vuc2l0aXZlLXJlbW90ZS1vdXRwdXQ=";
+    let frame = WireFrame::ShellOutput {
+        id: "sh-pty-output-redaction".into(),
+        stream: haider_rpc::ShellOutputStreamWire::Stdout,
+        chunk_b64: haider_rpc::TerminalOutputWire::new(sentinel),
+    };
+    assert!(!format!("{frame:?}").contains(sentinel));
 }
 
 /// MUTATION CHECK: make archived inventory or a current conflict coordinate

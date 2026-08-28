@@ -2,8 +2,8 @@
 
 use super::shell_registry::{ShellEvent, shell_event_from_frame, shell_registry_available};
 use haider_rpc::{
-    CapabilitySet, FEATURE_SHELL_REGISTRY_V1, LifecyclePhase, ShellKindWire, ShellStatusWire,
-    ShellWire, Welcome, WireFrame,
+    CapabilitySet, FEATURE_SHELL_REGISTRY_V1, LifecyclePhase, ShellKindWire, ShellOutputStreamWire,
+    ShellStatusWire, ShellWire, Welcome, WireFrame,
 };
 
 fn welcome() -> Welcome {
@@ -62,6 +62,18 @@ fn all_shell_event_frames_map_without_parallel_taxonomy() {
         shell_event_from_frame(WireFrame::ShellClosed {
             shell: shell.clone()
         }),
-        Some(ShellEvent::Closed(shell))
+        Some(ShellEvent::Closed(shell.clone()))
+    );
+    assert_eq!(
+        shell_event_from_frame(WireFrame::ShellOutput {
+            id: shell.id.clone(),
+            stream: ShellOutputStreamWire::Stderr,
+            chunk_b64: haider_rpc::TerminalOutputWire::new("Zml4dHVyZQ=="),
+        }),
+        Some(ShellEvent::Output {
+            id: shell.id,
+            stream: ShellOutputStreamWire::Stderr,
+            chunk_b64: haider_rpc::TerminalOutputWire::new("Zml4dHVyZQ=="),
+        })
     );
 }

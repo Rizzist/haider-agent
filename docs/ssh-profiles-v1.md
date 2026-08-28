@@ -4,11 +4,26 @@
 machines. A saved profile is reusable by CLI, TUI, SDK, and model tools without
 placing a credential in a prompt or asking for it again each session.
 
-The existing cross-platform `FileVault` protects records with a daemon-owned
-`0700` directory and `0600` files and namespaces them by profile. It does not
-cryptographically encrypt those files. Consequently, OS account and disk
-encryption remain part of the at-rest threat model; cryptographic at-rest
-encryption is a release blocker for the stronger owner requirement.
+The existing cross-platform `FileVault` writes each replacement through a new
+same-directory temporary file, syncs the file, atomically renames it, and uses
+the platform's directory-sync boundary. On Unix it restricts a newly created
+vault root to mode `0700` and creates temporary files with mode `0600`. On
+Windows those Unix-mode helpers do not install an owner-only ACL; FileVault
+inherits the enclosing profile directory's ACL and the owner's Windows
+account. `FileVault` does not cryptographically encrypt file
+contents, derive an encryption key, or add a Windows ACL layer. SSH passwords,
+pasted key material, key-file passphrases, and API keys therefore receive
+exactly the same FileVault protection on each platform: no worse and no better.
+OS account, enclosing-directory ACL, and disk encryption remain part of the
+at-rest threat model. A master-secret or vault-encryption design is separate
+from SSH profiles v1 and is not implied by this feature.
+
+The recommended and default authentication choices are a key file by local
+path (the private-key bytes never enter the vault) or `ssh-agent`. Passwords
+and pasted private keys remain supported. `haider ssh add --key-stdin` prints
+a one-line notice before staging bytes that they receive the same FileVault
+protection as API keys, that Windows relies on the enclosing profile ACL, and
+that Haider does not cryptographically encrypt them.
 
 ## Stored schema
 
@@ -24,13 +39,14 @@ host_key?
 
 `key_file` stores a local path and may refer to a separately vaulted
 passphrase. `key_material` and `password` store only a generated vault alias;
-the corresponding bytes are separate owner-only vault records. Public
+the corresponding bytes are separate FileVault records. Public
 `ssh.list`, `ssh.show`, CLI JSON, SDK, and model-tool projections omit
 authentication entirely. They cannot represent an authentication kind, path,
 vault alias, staged reference, password, private key, or passphrase.
 
-Secret input uses the existing same-UID, connection-scoped `vault.stage`
-mechanism with the `ssh_key_material` or `ssh_password` purpose. A staged
+Secret input uses the existing authenticated owner-scoped, connection-local
+`vault.stage` mechanism (same-UID UDS on Unix and the equivalent owner gate on
+Windows) with the `ssh_key_material` or `ssh_password` purpose. A staged
 reference is random, expiring, purpose-bound, and single-use. Successful
 profile creation moves the bytes into a uniquely named vault record. Failed
 creation removes that record; credential replacement retires the prior record.
@@ -59,9 +75,9 @@ typed `ssh_profile_out_of_scope` refusal.
 The backend is `russh` on every platform. Haider never invokes a system `ssh`
 program, never uses `SSH_ASKPASS`, and never puts credentials in argv or the
 environment. The daemon owns one authenticated client session per profile and
-opens a channel for each command. That channel model is the same
-multiplexing mechanism on every OS. A dropped session reconnects on the next
-operation; an idle session disconnects after ten minutes.
+opens a channel for each command or interactive terminal. That channel model
+is the same multiplexing mechanism on every OS. A dropped session reconnects
+on the next operation; an idle session disconnects after ten minutes.
 
 Server-key verification is native in the `russh::client::Handler`. The first
 successful handshake records the SHA-256 fingerprint (TOFU) before the
@@ -86,7 +102,7 @@ records remain raw; prompt-only compaction never rewrites receipts.
 | SSH agent | `ssh_agent_unavailable` | `SSH_AUTH_SOCK` | OpenSSH named pipe | `SSH_AUTH_SOCK` |
 | Command channels | yes | yes | yes | yes |
 | russh PTY capability | yes | yes | yes | yes |
-| v1 interactive PTY transport | not yet wired | not yet wired | not yet wired | not yet wired |
+| v1 interactive PTY transport | yes | yes | yes | yes |
 | Multiplexing | russh channels | russh channels | russh channels | russh channels |
 
 The workspace dependency selects `russh`'s `ring` and `rsa` features. `ring`
@@ -100,15 +116,23 @@ crate.
 
 ## Deliberate v1 limits
 
-There are no projects/groups, jump hosts, tunnels, SFTP, or separate per-shell
-resize protocol. `proxy_jump` is not accepted or stored. Closing an SSH shell
-closes only that channel and leaves the reusable authenticated profile session
-alive.
+There are no projects/groups, jump hosts, tunnels, or SFTP. `proxy_jump` is
+not accepted or stored. Haider does not use OpenSSH `ControlMaster` or
+`SSH_ASKPASS`; multiplexing and authentication remain inside `russh`. Closing
+an SSH shell closes only that channel and leaves the reusable authenticated
+profile session alive.
 
-The current implementation exposes bounded exec channels only. The
-bidirectional RPC/CLI/TUI transport that would connect a local terminal to
-`request_pty` + `request_shell` is a release blocker for the interactive
-`haider ssh shell <name>` form; the one-shot `-- cmd…` form is implemented.
+`haider ssh shell <name>` and `/ssh shell <name>` open a session channel,
+request a PTY using the client's `TERM` and current pane dimensions, request a
+shell, and then forward terminal bytes and window changes. Output is a
+transient event delivered only to the connection that opened the PTY and is
+not retained in the registry row; only its byte count is retained. Bounded
+fanout or connection-outbox refusal closes the affected transport and PTY
+instead of silently dropping terminal bytes. Natural
+remote completion records `exited { code? }`. EOF, explicit close, or loss of
+the opening client closes only that channel. Human terminals have no model-run
+deadline. The one-shot `-- cmd…` form stays bounded by its explicit or
+enclosing deadline.
 
 The stable CLI JSON schemas are `haider.ssh.list.v1` and
 `haider.ssh.profile.v1`. Their profile values are the public projection above.

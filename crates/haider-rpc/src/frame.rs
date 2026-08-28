@@ -778,12 +778,13 @@ pub struct Welcome {
     pub encoding: Option<String>,
 }
 
-/// A raw secret in transit on the sensitive same-UID UDS staging path (R7).
+/// Sensitive bytes in transit on authenticated, owner-scoped local IPC (R7).
 ///
 /// This type exists ONLY in the transport crate — domain `haider-protocol`
-/// stays secret-free — and only inside [`RequestBody::VaultStage`], which the
-/// daemon serves exclusively on an authenticated same-UID local UDS
-/// connection. Laws:
+/// stays secret-free. It is used by [`RequestBody::VaultStage`] and by opaque
+/// interactive-terminal input, both served exclusively on authenticated local
+/// transport (same-UID UDS on Unix and the owner-scoped equivalent elsewhere).
+/// Laws:
 ///
 /// - `Debug` is unconditionally redacted; ordinary frame formatting can
 ///   never reveal the value (test-pinned).
@@ -820,6 +821,42 @@ impl std::fmt::Debug for SecretWire {
 }
 
 impl Drop for SecretWire {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.0.zeroize();
+    }
+}
+
+/// Base64-encoded interactive terminal output that may echo sensitive input.
+///
+/// It remains serializable for transport and renderable by the opening
+/// terminal, but ordinary frame diagnostics redact it and the allocation is
+/// wiped on drop.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TerminalOutputWire(String);
+
+impl TerminalOutputWire {
+    /// Wraps base64-encoded bytes for transient terminal delivery.
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Borrows the base64 text at the terminal-render boundary.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for TerminalOutputWire {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TerminalOutputWire([REDACTED])")
+    }
+}
+
+impl Drop for TerminalOutputWire {
     fn drop(&mut self) {
         use zeroize::Zeroize;
         self.0.zeroize();
@@ -1447,6 +1484,30 @@ pub struct SshShellResultWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     pub timed_out: bool,
+}
+
+/// Terminal dimensions carried by the interactive SSH control path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshPtySizeWire {
+    pub cols: u32,
+    pub rows: u32,
+    #[serde(default)]
+    pub pixel_width: u32,
+    #[serde(default)]
+    pub pixel_height: u32,
+}
+
+/// Maximum decoded bytes carried by one interactive-terminal input request.
+/// Clients split larger paste events into requests no larger than this bound.
+pub const SSH_PTY_INPUT_MAX_BYTES: usize = 64 * 1024;
+
+/// Stream identity for transient terminal output. Interactive input is never
+/// reflected through this type or retained by the shell registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellOutputStreamWire {
+    Stdout,
+    Stderr,
 }
 
 /// Execution backend for one daemon-tracked shell.
@@ -3794,6 +3855,22 @@ pub enum RequestBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_s: Option<u32>,
     },
+    /// Opens one interactive PTY channel on the reusable profile session.
+    #[serde(rename = "ssh.shell_open")]
+    SshShellOpen {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<SessionId>,
+        term: String,
+        size: SshPtySizeWire,
+    },
+    /// Sends opaque terminal bytes. The daemon never logs or journals them.
+    #[serde(rename = "ssh.shell_input")]
+    SshShellInput { id: String, data_b64: SecretWire },
+    #[serde(rename = "ssh.shell_resize")]
+    SshShellResize { id: String, size: SshPtySizeWire },
+    #[serde(rename = "ssh.shell_eof")]
+    SshShellEof { id: String },
     /// Reads the unified local/SSH terminal registry.
     #[serde(rename = "shell.list")]
     ShellList,
@@ -4582,6 +4659,14 @@ pub enum ResponseBody {
     },
     #[serde(rename = "ssh.shell")]
     SshShell { result: SshShellResultWire },
+    #[serde(rename = "ssh.shell_open")]
+    SshShellOpen { shell: ShellWire },
+    #[serde(rename = "ssh.shell_input")]
+    SshShellInput { shell: ShellWire },
+    #[serde(rename = "ssh.shell_resize")]
+    SshShellResize { shell: ShellWire },
+    #[serde(rename = "ssh.shell_eof")]
+    SshShellEof { shell: ShellWire },
     #[serde(rename = "shell.list")]
     ShellList { shells: Vec<ShellWire> },
     #[serde(rename = "shell.close")]
@@ -5082,6 +5167,13 @@ pub enum WireFrame {
     ShellState { shell: ShellWire },
     /// A terminal was explicitly closed and released its process/channel.
     ShellClosed { shell: ShellWire },
+    /// Transient output for an interactive shell. It is delivered only to the
+    /// opening connection and is never stored in a registry row or journal.
+    ShellOutput {
+        id: String,
+        stream: ShellOutputStreamWire,
+        chunk_b64: TerminalOutputWire,
+    },
     /// Decode artifact for a frame kind this crate does not know (tolerance
     /// discipline). Never constructed for sending.
     Unknown,
@@ -5202,6 +5294,12 @@ enum WireFrameRef<'a> {
     #[serde(rename = "shell.closed")]
     ShellClosed {
         shell: &'a ShellWire,
+    },
+    #[serde(rename = "shell.output")]
+    ShellOutput {
+        id: &'a str,
+        stream: ShellOutputStreamWire,
+        chunk_b64: &'a TerminalOutputWire,
     },
     Unknown,
 }
@@ -5325,6 +5423,12 @@ enum WireFrameOwned {
     #[serde(rename = "shell.closed")]
     ShellClosed {
         shell: ShellWire,
+    },
+    #[serde(rename = "shell.output")]
+    ShellOutput {
+        id: String,
+        stream: ShellOutputStreamWire,
+        chunk_b64: TerminalOutputWire,
     },
     #[serde(other)]
     Unknown,
@@ -5512,6 +5616,15 @@ impl Serialize for WireFrame {
             Self::ShellOpened { shell } => WireFrameRef::ShellOpened { shell },
             Self::ShellState { shell } => WireFrameRef::ShellState { shell },
             Self::ShellClosed { shell } => WireFrameRef::ShellClosed { shell },
+            Self::ShellOutput {
+                id,
+                stream,
+                chunk_b64,
+            } => WireFrameRef::ShellOutput {
+                id,
+                stream: *stream,
+                chunk_b64,
+            },
             Self::Unknown => WireFrameRef::Unknown,
         };
         VersionedFrameRef {
@@ -5670,6 +5783,15 @@ impl<'de> Deserialize<'de> for WireFrame {
             WireFrameOwned::ShellOpened { shell } => Self::ShellOpened { shell },
             WireFrameOwned::ShellState { shell } => Self::ShellState { shell },
             WireFrameOwned::ShellClosed { shell } => Self::ShellClosed { shell },
+            WireFrameOwned::ShellOutput {
+                id,
+                stream,
+                chunk_b64,
+            } => Self::ShellOutput {
+                id,
+                stream,
+                chunk_b64,
+            },
             WireFrameOwned::Unknown => Self::Unknown,
         })
     }

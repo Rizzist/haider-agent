@@ -100,6 +100,7 @@ use crate::DaemonError;
 use crate::worker::WorkerManagerHandle;
 use actor::run_session_actor;
 use async_trait::async_trait;
+use base64::Engine as _;
 use descendant_stream::run_descendant_stream;
 use haider_core::{
     AbandonedGraph, AcceptedRunRetry, AcceptedShellExec, AcceptedTurn, AppendGroupBatch,
@@ -1566,6 +1567,7 @@ impl Drop for ConnectionIdentityLease {
     fn drop(&mut self) {
         self.loom_author_cancel.send_replace(true);
         self.hub.clear_resident_binding(&self.connection_id);
+        let _ = self.hub.inner.shells.close_owner(&self.connection_id);
         let Ok(attachments) = self
             .hub
             .detach_connection_registrations(&self.connection_id)
@@ -1805,21 +1807,80 @@ impl SessionHub {
             loop {
                 let event = match events.recv().await {
                     Ok(event) => event,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let Some(inner) = weak.upgrade() else {
+                            break;
+                        };
+                        let connections = match inner.diagnostic_sinks.lock() {
+                            Ok(sinks) => sinks
+                                .iter()
+                                .map(|(owner, sink)| (owner.clone(), Arc::clone(sink)))
+                                .collect::<Vec<_>>(),
+                            Err(_) => break,
+                        };
+                        // Terminal bytes are ordered protocol data, never
+                        // best-effort diagnostics. If the bounded registry
+                        // fanout overruns, close every affected transport and
+                        // PTY instead of continuing with a corrupt terminal.
+                        for (owner, sink) in connections {
+                            sink.close_after_required_delivery_failure();
+                            let _ = inner.shells.close_owner(&owner);
+                        }
+                        continue;
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
                 let Some(inner) = weak.upgrade() else {
                     break;
                 };
-                let frame = match event {
+                let (frame, delivery_required) = match event {
                     crate::shell_registry::ShellRegistryEvent::Opened(shell) => {
-                        WireFrame::ShellOpened { shell }
+                        (WireFrame::ShellOpened { shell }, false)
                     }
                     crate::shell_registry::ShellRegistryEvent::State(shell) => {
-                        WireFrame::ShellState { shell }
+                        let delivery_required = matches!(
+                            &shell.status,
+                            haider_rpc::ShellStatusWire::Exited { .. }
+                                | haider_rpc::ShellStatusWire::Closed
+                        );
+                        (WireFrame::ShellState { shell }, delivery_required)
                     }
                     crate::shell_registry::ShellRegistryEvent::Closed(shell) => {
-                        WireFrame::ShellClosed { shell }
+                        (WireFrame::ShellClosed { shell }, true)
+                    }
+                    crate::shell_registry::ShellRegistryEvent::Output {
+                        owner,
+                        id,
+                        stream,
+                        bytes,
+                    } => {
+                        let frame = WireFrame::ShellOutput {
+                            id,
+                            stream,
+                            chunk_b64: haider_rpc::TerminalOutputWire::new(
+                                base64::engine::general_purpose::STANDARD.encode(bytes.as_slice()),
+                            ),
+                        };
+                        let sinks = match inner.diagnostic_sinks.lock() {
+                            Ok(sinks) => match owner.as_deref() {
+                                Some(owner) => {
+                                    sinks.get(owner).cloned().into_iter().collect::<Vec<_>>()
+                                }
+                                None => sinks.values().cloned().collect::<Vec<_>>(),
+                            },
+                            Err(_) => break,
+                        };
+                        let mut refused = false;
+                        for sink in sinks {
+                            if sink.try_send_droppable(frame.clone()).is_err() {
+                                sink.close_after_required_delivery_failure();
+                                refused = true;
+                            }
+                        }
+                        if refused && let Some(owner) = owner {
+                            let _ = inner.shells.close_owner(&owner);
+                        }
+                        continue;
                     }
                 };
                 let sinks = match inner.diagnostic_sinks.lock() {
@@ -1827,7 +1888,9 @@ impl SessionHub {
                     Err(_) => break,
                 };
                 for sink in sinks {
-                    let _ = sink.try_send_droppable(frame.clone());
+                    if sink.try_send_droppable(frame.clone()).is_err() && delivery_required {
+                        sink.close_after_required_delivery_failure();
+                    }
                 }
             }
         }));
@@ -5167,6 +5230,10 @@ impl SessionHub {
 
     async fn detach_connection(&self, connection_id: &str) -> Result<(), SessionHubError> {
         let attachments = self.detach_connection_registrations(connection_id)?;
+        self.inner
+            .shells
+            .close_owner(connection_id)
+            .map_err(|error| SessionHubError::Task(error.to_string()))?;
         for (attachment_id, owner) in attachments {
             Self::finish_detach(&attachment_id, owner).await;
         }

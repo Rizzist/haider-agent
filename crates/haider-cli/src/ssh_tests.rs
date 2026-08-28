@@ -86,11 +86,14 @@ fn cli_parser_requires_one_explicit_auth_method_and_has_no_jump_host() {
 }
 
 #[test]
-fn cli_parser_never_misrepresents_a_login_command_as_an_interactive_pty() {
-    assert!(parse(&args(&["shell", "prod"])).is_err());
+fn cli_parser_distinguishes_interactive_pty_from_one_shot_exec() {
+    assert!(matches!(
+        parse(&args(&["shell", "prod"])),
+        Ok(SshCommand::Shell { command: None, .. })
+    ));
     assert!(matches!(
         parse(&args(&["shell", "prod", "--", "uname", "-a"])),
-        Ok(SshCommand::Shell { command, .. }) if command == "uname -a"
+        Ok(SshCommand::Shell { command: Some(command), .. }) if command == "uname -a"
     ));
 }
 
@@ -105,4 +108,5 @@ fn typed_refusals_map_to_scriptable_exit_codes() {
     assert_eq!(exit_code_for_refusal("ssh_profile_invalid_name"), EX_USAGE);
     assert_eq!(exit_code_for_refusal("ssh_command_failed"), EX_SOFTWARE);
     assert_eq!(exit_code_for_refusal("ssh_output_limit"), EX_SOFTWARE);
+    assert_eq!(exit_code_for_refusal("ssh_channel_quota"), EX_BLOCKED);
 }
