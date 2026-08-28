@@ -889,6 +889,12 @@ pub fn peer_credentials(stream: &IpcStream) -> std::io::Result<PeerCredentials> 
     })
 }
 
+pub fn peer_credentials_and_exit_watcher(
+    stream: &IpcStream,
+) -> std::io::Result<(PeerCredentials, Option<super::PeerExitWatcher>)> {
+    peer_credentials(stream).map(|credentials| (credentials, None))
+}
+
 #[cfg(target_vendor = "apple")]
 #[allow(unsafe_code)]
 fn apple_peer_pid(stream: &IpcStream) -> std::io::Result<u32> {

@@ -40,8 +40,13 @@ fn profile_id_is_deterministic_and_path_scoped() {
     // Every profile owns a distinct runtime directory and endpoint.
     assert_ne!(a1.runtime_dir, b.runtime_dir);
     assert_ne!(a1.endpoint_path, b.endpoint_path);
-    assert!(a1.endpoint_path.starts_with(&a1.runtime_dir));
-    assert!(b.endpoint_path.starts_with(&b.runtime_dir));
+    // Unix rendezvous through a filesystem socket below that directory;
+    // Windows rendezvous through a profile-hashed named-pipe address.
+    #[cfg(unix)]
+    {
+        assert!(a1.endpoint_path.starts_with(&a1.runtime_dir));
+        assert!(b.endpoint_path.starts_with(&b.runtime_dir));
+    }
 }
 
 #[test]

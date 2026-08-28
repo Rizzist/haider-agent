@@ -31,9 +31,9 @@ pub use fs::{
 };
 pub use ipc::{
     BoundEndpoint, Endpoint, EndpointAddress, EndpointError, IpcReadHalf, IpcShutdown, IpcStream,
-    IpcWriteHalf, PeerCredentials, connect, peer_credentials, peer_credentials_are_owner,
-    peer_is_owner, prepare_runtime_directory, shutdown_handle, split, sweep_stale_endpoints,
-    write_immediate,
+    IpcWriteHalf, PeerCredentials, PeerExitWatcher, connect, peer_credentials,
+    peer_credentials_and_exit_watcher, peer_credentials_are_owner, peer_is_owner,
+    prepare_runtime_directory, shutdown_handle, split, sweep_stale_endpoints, write_immediate,
 };
 pub use process::program_on_path;
 pub use process::{

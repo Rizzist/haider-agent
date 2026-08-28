@@ -1173,7 +1173,7 @@ pub(crate) async fn serve(
     let peer_operation = "read Unix peer credentials";
     #[cfg(windows)]
     let peer_operation = "authenticate Windows named-pipe peer token";
-    let credentials = haider_platform::peer_credentials(&stream)
+    let (credentials, peer_exit) = haider_platform::peer_credentials_and_exit_watcher(&stream)
         .map_err(|error| DaemonError::io(peer_operation, &context.endpoint_path, error))?;
     if !haider_platform::peer_credentials_are_owner(&credentials, context.owner_uid) {
         #[cfg(unix)]
@@ -1187,7 +1187,7 @@ pub(crate) async fn serve(
     }
 
     let (reader, writer) = haider_platform::split(stream);
-    serve_io(reader, writer, context, drain).await
+    serve_io_with_peer_exit(reader, writer, context, drain, peer_exit).await
 }
 
 /// Runs the framed connection after the transport-specific peer gate.
@@ -1195,11 +1195,26 @@ pub(crate) async fn serve(
 /// Production reaches this only through [`serve`]. Keeping the byte-stream
 /// loop generic gives every platform a no-bind `tokio::io::duplex` regression
 /// seam without bypassing the real endpoint's owner check.
+#[cfg(test)]
 async fn serve_io<R, W>(
+    reader: R,
+    writer: W,
+    context: ConnectionContext,
+    drain: watch::Receiver<Option<DrainNotice>>,
+) -> Result<ConnectionExit, DaemonError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    serve_io_with_peer_exit(reader, writer, context, drain, None).await
+}
+
+async fn serve_io_with_peer_exit<R, W>(
     mut reader: R,
     writer: W,
     context: ConnectionContext,
     mut drain: watch::Receiver<Option<DrainNotice>>,
+    peer_exit: Option<haider_platform::PeerExitWatcher>,
 ) -> Result<ConnectionExit, DaemonError>
 where
     R: AsyncRead + Unpin,
@@ -1259,10 +1274,27 @@ where
     let mut last_write_progress = Instant::now();
     let mut liveness = tokio::time::interval(LIVENESS_TICK);
     liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let peer_exit = async move {
+        match peer_exit {
+            Some(watcher) => watcher.wait().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(peer_exit);
 
     let processing = async {
         while !close {
             tokio::select! {
+                outcome = &mut peer_exit => {
+                    outcome.map_err(|error| {
+                        DaemonError::io(
+                            "wait for IPC peer process exit",
+                            &context.endpoint_path,
+                            error,
+                        )
+                    })?;
+                    break;
+                }
                 changed = drain.changed() => {
                     let notice = changed.is_ok().then(|| drain.borrow().clone()).flatten();
                     if let Some(notice) = notice {

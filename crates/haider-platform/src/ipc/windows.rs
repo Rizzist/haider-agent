@@ -1,6 +1,6 @@
 use super::{Endpoint, EndpointError, PeerCredentials};
 use std::io;
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle as _, OwnedHandle as ProcessHandle};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
@@ -307,8 +307,21 @@ pub fn split(stream: IpcStream) -> (IpcReadHalf, IpcWriteHalf) {
     tokio::io::split(stream)
 }
 
-#[allow(unsafe_code)]
 pub fn peer_credentials(stream: &IpcStream) -> io::Result<PeerCredentials> {
+    peer_credentials_and_process(stream).map(|(credentials, _process)| credentials)
+}
+
+pub fn peer_credentials_and_exit_watcher(
+    stream: &IpcStream,
+) -> io::Result<(PeerCredentials, Option<super::PeerExitWatcher>)> {
+    peer_credentials_and_process(stream)
+        .map(|(credentials, process)| (credentials, Some(super::PeerExitWatcher { process })))
+}
+
+#[allow(unsafe_code)]
+fn peer_credentials_and_process(
+    stream: &IpcStream,
+) -> io::Result<(PeerCredentials, ProcessHandle)> {
     use windows_sys::Win32::System::Pipes::{
         GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
     };
@@ -331,13 +344,27 @@ pub fn peer_credentials(stream: &IpcStream) -> io::Result<PeerCredentials> {
             "Windows named-pipe peer reported process id zero",
         ));
     }
-    let same_user = peer_process_has_current_user_sid(pid)?;
-    Ok(PeerCredentials {
-        pid: Some(pid),
-        uid: u32::MAX,
-        gid: u32::MAX,
-        same_user,
-    })
+    // SYNCHRONIZE is a frozen Win32 access-right bit; windows-sys moves its
+    // module home between releases, so pin the ABI value directly.
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    // SAFETY: `pid` came from the connected pipe instance. Retaining the
+    // returned process handle pins that exact peer identity against PID reuse.
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+    if raw.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: OpenProcess returned one newly owned real handle.
+    let process = unsafe { ProcessHandle::from_raw_handle(raw.cast()) };
+    let same_user = peer_process_has_current_user_sid(process.as_raw_handle().cast())?;
+    Ok((
+        PeerCredentials {
+            pid: Some(pid),
+            uid: u32::MAX,
+            gid: u32::MAX,
+            same_user,
+        },
+        process,
+    ))
 }
 
 pub fn peer_is_owner(stream: &IpcStream, _owner_uid: u32) -> io::Result<bool> {
@@ -497,16 +524,8 @@ fn sids_equal(left: PSID, right: PSID) -> io::Result<bool> {
 }
 
 #[allow(unsafe_code)]
-fn peer_process_has_current_user_sid(pid: u32) -> io::Result<bool> {
-    // There is a narrow PID-exit/reuse window before OpenProcess succeeds.
-    // Once acquired, this handle pins the process identity for token lookup.
-    // SAFETY: OpenProcess receives a concrete kernel-reported peer PID and no
-    // inherited handle is requested.
-    let peer_process = OwnedHandle::new(
-        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) },
-        "open Windows named-pipe peer process",
-    )?;
-    let peer_token = open_process_token(peer_process.0)?;
+fn peer_process_has_current_user_sid(peer_process: HANDLE) -> io::Result<bool> {
+    let peer_token = open_process_token(peer_process)?;
     // SAFETY: GetCurrentProcess returns the documented pseudo-handle. It is
     // passed through but never wrapped or closed.
     let current_token = open_process_token(unsafe { GetCurrentProcess() })?;

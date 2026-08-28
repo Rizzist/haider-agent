@@ -1843,7 +1843,7 @@ fn render_accounts(
                     // identity renders MASKED unless this visit revealed
                     // it (`r`) — one authority, `format::mask_identity`.
                     format!(
-                        " · {} · {status_text} · added {}",
+                        " · {} · {status_text}",
                         if model.accounts.revealed {
                             row.account_identity
                                 .as_ref()
@@ -1856,10 +1856,6 @@ fn render_accounts(
                                 ),
                             )
                         },
-                        row.created_at_ms.map_or_else(
-                            || "unknown (added before 0.0.964)".to_owned(),
-                            |created| created.to_string(),
-                        ),
                     ),
                     theme.dim_style(),
                 ),

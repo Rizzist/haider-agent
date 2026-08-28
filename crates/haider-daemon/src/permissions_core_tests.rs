@@ -1181,13 +1181,13 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     const EXPECTED_ADVERTISED_TOOLS: usize = 19;
     // The full-prefix comparison deliberately includes the platform-specific
     // computer manifest description. Linux documents X11/Wayland (+49 bytes
-    // over macOS), while Windows is two bytes longer than macOS.
+    // over macOS), while Windows is one byte shorter than macOS.
     #[cfg(target_os = "linux")]
     const EXPECTED_FULL_PREFIX_BYTES: usize = 14_832;
     #[cfg(target_os = "macos")]
     const EXPECTED_FULL_PREFIX_BYTES: usize = 14_783;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 14_785;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 14_782;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     const EXPECTED_FULL_PREFIX_BYTES: usize = 14_777;
     const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 9_911;
