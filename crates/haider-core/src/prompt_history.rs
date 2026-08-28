@@ -1,6 +1,7 @@
 //! Deterministic reconstruction of provider messages from the durable history
 //! tree and its byte-preserving journal sidecars.
 
+use crate::actor::model_tool_result_preview;
 use crate::{SessionProjectionCheckpoint, StoreHandle};
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -3345,16 +3346,20 @@ fn render_journal_with_facts(
                         | haider_protocol::item::ToolStatus::Failed
                         | haider_protocol::item::ToolStatus::Unknown,
                 } => {
+                    let model_result = pending_tool_results.remove(&call_id).map(|result| {
+                        let (preview, truncated) = model_tool_result_preview(&name, &result);
+                        (result, preview, truncated)
+                    });
                     messages.push(Message::assistant(vec![Block::ToolCall {
                         call_id: call_id.clone(),
                         name,
                         args,
                     }]));
-                    if let Some(result) = pending_tool_results.remove(&call_id) {
+                    if let Some((result, preview, truncated)) = model_result {
                         messages.push(Message::tool_result_with_images(
                             call_id,
-                            result.preview,
-                            result.truncated,
+                            preview,
+                            truncated,
                             result.images,
                         ));
                     }

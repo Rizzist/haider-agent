@@ -147,9 +147,9 @@ pub const COMMANDS: &[CommandSpec] = &[
         "",
     ),
     client_cmd(
-        "peers",
-        "Remote placement — not supported; Haider runs local-only",
-        "",
+        "peer",
+        "List live peers or send: /peer <name> <message>",
+        "<name> <message>",
     ),
     client_cmd(
         "accounts",

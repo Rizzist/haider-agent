@@ -11,7 +11,7 @@ use crate::script::{AuraState, ChipDisplayState, ChipPrefill, ChipSeed, TALK_PHR
 use crate::theme::{ThemeChoice, ThemeKey};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::error::ErrorAction;
-use haider_protocol::ids::{DeviceId, MenuId, SessionId};
+use haider_protocol::ids::{MenuId, SessionId};
 use haider_protocol::menu::{
     AnswerVia, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption, MenuScope,
 };
@@ -1765,6 +1765,9 @@ impl ChipModel {
                 _ => String::new(),
             },
             crate::projection::TranscriptEntry::User { text, .. } => text.clone(),
+            crate::projection::TranscriptEntry::Peer { sender, text, .. } => {
+                format!("peer {sender}: {text}")
+            }
             crate::projection::TranscriptEntry::Note { text } => text.clone(),
             crate::projection::TranscriptEntry::Error { text, .. } => format!("✗ {text}"),
             crate::projection::TranscriptEntry::Shell { cmd, .. } => format!("$ {cmd}"),
@@ -2187,6 +2190,13 @@ pub fn tree_rows(model: &AppModel) -> Vec<TreeRow> {
                     text = text.chars().take(58).collect::<String>() + "…";
                 }
                 format!("  ├─ ❯ {text}")
+            }
+            TranscriptEntry::Peer { sender, text, .. } => {
+                let mut text = text.replace(['\n', '\r'], " ");
+                if text.chars().count() > 48 {
+                    text = text.chars().take(48).collect::<String>() + "…";
+                }
+                format!("  ├─ ⇠ {sender}: {text}")
             }
             TranscriptEntry::Item(block) => {
                 let haider_protocol::item::TurnItem::ContextCompaction {
@@ -2733,6 +2743,10 @@ pub enum AppRequest {
     ProviderRemove { provider: String },
     /// W8b: `/tools` live — read the daemon's canonical tool inventory.
     ToolsRefresh,
+    /// `/peer` live — read the profile's advertised peer registry.
+    PeerList,
+    /// `/peer <name> <message>` live — send one user-authored message.
+    PeerSend { to: String, message: String },
     /// `/hooks` live (H4): read the daemon's hook discovery for `cwd` —
     /// workspace + profile truth. The cwd is CAPTURED AT ISSUANCE (the B2b
     /// capture law): a later screen or session switch cannot retarget the
@@ -4036,6 +4050,11 @@ pub struct AppModel {
     /// `/tools` live — the daemon's committed inventory snapshot
     /// (None while the read is in flight; the screen says "fetching").
     pub tools_inventory: Option<haider_protocol::tool::ToolInventorySnapshot>,
+    /// Last `peer.list` snapshot, used by `/peer`'s inline send affordance.
+    pub peer_agents: Vec<haider_protocol::peer::PeerDescriptor>,
+    /// True only for a user-issued bare `/peer`. Boot/reconnect also reads
+    /// `peer.list` to subscribe this connection, but must not paint a list.
+    pub peer_list_requested: bool,
     /// Per-session voice pipeline (sim DEFAULT_VOICE — ships ON).
     pub voice: VoiceState,
     /// The ◉ talk hold is live (`◉ listening…` chip + status segment).
@@ -4462,6 +4481,8 @@ impl Default for AppModel {
             tree_view: None,
             pending_jump: std::cell::RefCell::new(None),
             tools_inventory: None,
+            peer_agents: Vec::new(),
+            peer_list_requested: false,
             // Dark is the registry default AND the detection fallback
             // (owner spec §3); main.rs resolves the persisted choice and
             // the detected appearance over this before the first frame.
@@ -12209,7 +12230,7 @@ impl AppModel {
             // fabricating a roster.
             "sessions" => self.enter_sessions(),
             "accounts" => self.enter_accounts(),
-            "peers" => self.reject_remote_placement(),
+            "peer" | "peers" => self.peer_command(&remainder),
             "providers" => self.enter_providers(),
             "hooks" => self.enter_hooks(),
             // CG-M1: `/graph [pin|abandon|status]`.
@@ -12394,22 +12415,72 @@ impl AppModel {
         });
     }
 
-    /// The legacy `/peers` spelling remains decodable, but Haider has no
-    /// remote-placement lane. Reuse protocol admission's typed rejection so
-    /// the command, launcher hit, and durable agent admission tell one truth.
-    ///
-    /// E7 visual law: the rejection is a MATTER-OF-FACT status line — one
-    /// quiet flash, gone on the next keystroke. Asking for an unsupported
-    /// lane is not an error condition, so it never latches a persistent
-    /// diagnostic banner and never wears an error card.
-    fn reject_remote_placement(&mut self) {
-        let Err(error) = (haider_protocol::agent::Placement::Device {
-            device: DeviceId::new("unsupported-remote-placement"),
-        })
-        .ensure_local() else {
+    /// `/peer` is an inline transcript surface: bare lists peers and each row
+    /// includes the exact send spelling; arguments send without fabricating a
+    /// user/assistant transcript entry. `/peers` remains an input alias.
+    fn peer_command(&mut self, argument: &str) {
+        self.dirty = true;
+        if self.mode.fabricates_locally() {
+            self.flash = Some("· /peer — live only; the registry is daemon truth".to_owned());
+            return;
+        }
+        if !self.daemon_serves(haider_rpc::FEATURE_PEER_MESSAGING_V1) {
+            self.flash = Some(self.stale_daemon_note("peer messaging"));
+            return;
+        }
+        let argument = argument.trim();
+        if argument.is_empty() {
+            self.peer_list_requested = true;
+            self.requests.push(AppRequest::PeerList);
+            self.flash = Some("· reading live peers…".to_owned());
+            return;
+        }
+        let Some((to, message)) = argument.split_once(char::is_whitespace) else {
+            self.flash = Some(format!(
+                "· /peer {argument} <message> — message is required"
+            ));
             return;
         };
-        self.flash = Some(format!("· /peers — {}", error.message));
+        let message = message.trim_start();
+        if message.is_empty() {
+            self.flash = Some(format!("· /peer {to} <message> — message is required"));
+            return;
+        }
+        self.requests.push(AppRequest::PeerSend {
+            to: to.to_owned(),
+            message: message.to_owned(),
+        });
+        self.flash = Some(format!("· sending peer message to {to}…"));
+    }
+
+    pub(crate) fn apply_peer_list(&mut self, agents: Vec<haider_protocol::peer::PeerDescriptor>) {
+        self.peer_agents = agents;
+        if !std::mem::take(&mut self.peer_list_requested) {
+            self.dirty = true;
+            return;
+        }
+        if self.peer_agents.is_empty() {
+            self.projection.push_note("· no live peers".to_owned());
+        } else {
+            self.projection
+                .push_note("· live peers — send with /peer <address> <message>".to_owned());
+            for peer in &self.peer_agents {
+                let kind = match peer.kind {
+                    haider_protocol::peer::PeerKind::HaiderSession => "haider_session",
+                    haider_protocol::peer::PeerKind::External => "external",
+                };
+                let state = match peer.state {
+                    haider_protocol::peer::PeerState::Idle => "idle",
+                    haider_protocol::peer::PeerState::Busy => "busy",
+                };
+                self.projection.push_note(format!(
+                    "  {} · {} · {} · {} · last seen {} — /peer {} <message>",
+                    peer.name, kind, peer.workspace, state, peer.last_seen, peer.id
+                ));
+            }
+        }
+        self.flash = None;
+        self.dirty = true;
     }
 
     /// W-C M1: expand a custom command and submit its body as a user turn.

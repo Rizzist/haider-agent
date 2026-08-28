@@ -119,6 +119,8 @@ fn canonical_inventory_equals_advertised_dispatchable_set() {
     assert!(advertised.contains(&"computer"));
     assert!(advertised.contains(&"mobile"));
     assert!(advertised.contains(&"monitor"));
+    assert!(advertised.contains(&"peer_list"));
+    assert!(advertised.contains(&"peer_send"));
     assert!(!advertised.contains(&"exec"));
     assert!(
         advertised
@@ -161,6 +163,14 @@ fn canonical_inventory_equals_advertised_dispatchable_set() {
     assert_eq!(
         registered_tool_route("monitor"),
         Some(RegisteredToolRoute::Monitor)
+    );
+    assert_eq!(
+        registered_tool_route("peer_list"),
+        Some(RegisteredToolRoute::PeerList)
+    );
+    assert_eq!(
+        registered_tool_route("peer_send"),
+        Some(RegisteredToolRoute::PeerSend)
     );
 }
 
@@ -313,6 +323,11 @@ fn session_permission_overrides_grant_only_their_named_effect_families() {
     assert_eq!(
         decision(&baseline, EffectClass::ScreenControl),
         ToolPermissionDefault::Ask
+    );
+    assert_eq!(
+        decision(&baseline, EffectClass::PeerMessage),
+        ToolPermissionDefault::Ask,
+        "peer_send must not silently leave the permission broker"
     );
     assert_eq!(
         decision(&baseline, EffectClass::ReadSms),
@@ -730,6 +745,8 @@ async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
             "web_search",
             "computer",
             "monitor",
+            "peer_list",
+            "peer_send",
         ]
     );
     // M2e: `workflow_author` is a GATED child capability, excluded from the

@@ -25,6 +25,7 @@ pub mod client;
 pub mod graph;
 pub mod headless;
 pub mod observe;
+pub mod peer;
 pub mod permission;
 pub mod profile;
 pub mod shell;
@@ -64,6 +65,12 @@ pub use observe::{
     DescendantLiveAttachment, DescendantView, ObserveClient, ObserveError, observe_stream_all,
     observe_stream_session, observe_stream_session_after,
 };
+pub use peer::{
+    PeerClientError, PeerDelivery, PeerDeliveryReason, PeerDescriptor, PeerEvent,
+    PeerEventSubscription, PeerKind, PeerMessage, PeerMessaging, PeerReceipt, PeerSender,
+    PeerState, PeerTrust, peer_event_from_frame, peer_list_response, peer_messaging,
+    peer_messaging_available, peer_name_response, peer_send_response,
+};
 pub use permission::{
     ComputerPermissionClientError, open_permission_settings, open_permission_settings_request,
     restart_daemon_for_permission,
@@ -99,5 +106,7 @@ pub use workflow_graph_rpc::{WorkflowGraphRpcAdapter, WorkflowGraphRpcAdapterErr
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-client";
 
+#[cfg(test)]
+mod peer_tests;
 #[cfg(test)]
 mod shell_tests;

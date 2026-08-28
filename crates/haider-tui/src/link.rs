@@ -631,6 +631,9 @@ pub fn command_required_features(command: &LiveCommand) -> &'static [&'static st
         | LiveCommand::CheckpointUndo { .. }
         | LiveCommand::CheckpointRedo { .. }
         | LiveCommand::CheckpointRollbackTurn { .. } => &[haider_rpc::FEATURE_CHECKPOINT_V1],
+        LiveCommand::PeerList | LiveCommand::PeerSend { .. } => {
+            &[haider_rpc::FEATURE_PEER_MESSAGING_V1]
+        }
         _ => &[],
     }
 }
@@ -1136,6 +1139,16 @@ pub fn request_body_for_features(
         }
         LiveCommand::ToolsInventory { session } => RequestBody::ToolsInventory {
             session_id: session,
+        },
+        LiveCommand::PeerList => RequestBody::PeerList {},
+        LiveCommand::PeerSend {
+            to,
+            message,
+            summary,
+        } => RequestBody::PeerSend {
+            to,
+            message,
+            summary,
         },
         LiveCommand::HooksList { cwd } => RequestBody::HooksList { cwd },
         // U2: parameterless read (U1's wire) — CONSUMED, never redefined.
@@ -1709,6 +1722,8 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
             session: session_id,
             snapshot: Box::new(inventory),
         }],
+        ResponseBody::PeerList { agents } => vec![LiveReply::PeerListed { agents }],
+        ResponseBody::PeerSend { receipt } => vec![LiveReply::PeerSent { receipt }],
         ResponseBody::HooksList {
             policy,
             revision,
@@ -2361,6 +2376,10 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
             session: session_id,
             op,
         }],
+        WireFrame::PeerMessageReceived { message } => vec![LiveReply::PeerReceived { message }],
+        WireFrame::PeerDeliveryChanged { receipt } => {
+            vec![LiveReply::PeerDeliveryChanged { receipt }]
+        }
         // This TUI is a publisher, not a consumer, of profile-level resident
         // binding signals. Name the known frame explicitly so it can never be
         // confused with the forward-compat fallback below.

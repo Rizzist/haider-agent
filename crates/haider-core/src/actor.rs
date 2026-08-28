@@ -35,6 +35,10 @@
 //! shared with the effect journal in the daemon, self-minted in standalone
 //! use.
 
+#[cfg(test)]
+#[path = "peer_prompt_tests.rs"]
+mod peer_prompt_tests;
+
 use crate::{
     ArtifactReader, InteractionGate, InteractionResolution, InteractionResolutionPolicy,
     PromptHistoryCompiler, StoreHandle, unix_time_ms,
@@ -68,6 +72,7 @@ use haider_protocol::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{
     ErrorRecoveryCardKind, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption, MenuScope,
 };
+use haider_protocol::peer::PeerMessage;
 use haider_protocol::provider::{
     AccountUsage, Block, CacheBreakpointHashesV1, CacheBreakpointV1, CacheControlObservationV1,
     CacheCostEstimate, CacheMissClassificationV1, CachePrefixMatchV1, CacheRequestDiagnosticV1,
@@ -90,6 +95,48 @@ use haider_provider::{
     canonical_tool_definitions_digest, degrade_tool_result_images_to_placeholders,
     effective_request_budget, validate_provider_view_prefix,
 };
+
+/// Frames one boundary-delivered peer message for the provider tail.
+///
+/// The whole frame is deliberately a new user-role message because provider
+/// APIs do not have a peer role, but the protocol-owned rendering applies the
+/// exact trust label and makes clear that it is neither a user nor system
+/// instruction. Callers append this message at the next turn boundary; they
+/// must never splice it into an earlier history entry.
+#[must_use]
+pub fn peer_message_for_provider(message: &PeerMessage) -> Message {
+    Message::user_text(message.render_for_prompt())
+}
+
+/// Appends a peer frame after the already-compiled conversation. This is the
+/// only supported insertion operation: prior messages—and therefore the
+/// provider's reusable cached prefix—are left byte-for-byte untouched.
+pub fn append_peer_message_to_provider_tail(messages: &mut Vec<Message>, message: &PeerMessage) {
+    messages.push(peer_message_for_provider(message));
+}
+
+/// Shapes a tool result only at the provider boundary.
+///
+/// The durable [`BoundedResult`] remains the authority and is never rewritten.
+/// Peer inventories can be large, so their first-send and replay views use the
+/// same deterministic output diet while the journal retains the raw JSON.
+pub(crate) fn model_tool_result_preview(tool_name: &str, result: &BoundedResult) -> (String, bool) {
+    const PEER_LIST_MODEL_PREVIEW_MAX_BYTES: usize = 8 * 1024;
+    const PEER_LIST_COMPACTION_MARKER: &str =
+        "\n[… peer list compacted for model; raw result retained in journal …]";
+    if tool_name != "peer_list" || result.preview.len() <= PEER_LIST_MODEL_PREVIEW_MAX_BYTES {
+        return (result.preview.clone(), result.truncated);
+    }
+    let budget =
+        PEER_LIST_MODEL_PREVIEW_MAX_BYTES.saturating_sub(PEER_LIST_COMPACTION_MARKER.len());
+    let mut end = result.preview.len().min(budget);
+    while end > 0 && !result.preview.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut preview = result.preview[..end].to_owned();
+    preview.push_str(PEER_LIST_COMPACTION_MARKER);
+    (preview, true)
+}
 use haider_tools::{Plan, RequestInput, TodoWrite};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -5706,11 +5753,12 @@ impl HarnessActor {
             let call_id = tools[index].call_id.clone();
             self.commit_tool_settlement_and_streaming(run_id, &tools[index], &result)
                 .await?;
+            let (preview, truncated) = model_tool_result_preview(&tools[index].name, &result);
             tools.remove(index);
             return Ok(Some(Message::tool_result_with_images(
                 call_id,
-                result.preview,
-                result.truncated,
+                preview,
+                truncated,
                 result.images,
             )));
         }
@@ -6514,11 +6562,12 @@ impl HarnessActor {
         let call_id = tools[index].call_id.clone();
         self.commit_tool_settlement_and_streaming(run_id, &tools[index], &result)
             .await?;
+        let (preview, truncated) = model_tool_result_preview(&tools[index].name, &result);
         tools.remove(index);
         Ok(Message::tool_result_with_images(
             call_id,
-            result.preview,
-            result.truncated,
+            preview,
+            truncated,
             result.images,
         ))
     }

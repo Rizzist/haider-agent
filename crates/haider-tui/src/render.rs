@@ -8965,6 +8965,19 @@ fn render_aura(
                     Span::styled(text.as_str(), theme.bright_style()),
                 ]));
             }
+            TranscriptEntry::Peer {
+                sender,
+                sender_kind,
+                text,
+                ..
+            } => peer_entry_lines(
+                &mut lines,
+                sender,
+                sender_kind,
+                text,
+                theme,
+                transcript_area.width,
+            ),
             TranscriptEntry::Note { text } => {
                 lines.push(Line::from(vec![
                     Span::raw("   "),
@@ -11365,6 +11378,12 @@ fn transcript_lines<'a>(
             }
         }
         TranscriptEntry::Item(block) => item_lines(lines, block, theme, width, phase),
+        TranscriptEntry::Peer {
+            sender,
+            sender_kind,
+            text,
+            ..
+        } => peer_entry_lines(lines, sender, sender_kind, text, theme, width),
         TranscriptEntry::Note { text } => {
             // Sim NoteRow (tui.js:4572-4577): dim, indented off the margin.
             lines.push(Line::from(vec![
@@ -11390,6 +11409,32 @@ fn transcript_lines<'a>(
                 ]));
             }
         }
+    }
+}
+
+fn peer_entry_lines<'a>(
+    lines: &mut Vec<Line<'a>>,
+    sender: &'a str,
+    sender_kind: &'a str,
+    text: &'a str,
+    theme: &Theme,
+    width: u16,
+) {
+    lines.push(Line::default());
+    lines.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled("⇠ ", theme.gold_style().add_modifier(Modifier::BOLD)),
+        Span::styled(sender, theme.bright_style().add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" · {sender_kind}"), theme.dim_style()),
+        Span::styled(" · UNTRUSTED PEER INPUT", theme.maroon_style()),
+    ]));
+    let body_width = usize::from(width).saturating_sub(3).max(1);
+    for row in wrap_body(text, body_width) {
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled("▏ ", theme.rail_style()),
+            Span::styled(row, theme.text_style()),
+        ]));
     }
 }
 
