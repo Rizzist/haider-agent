@@ -436,11 +436,44 @@ impl TaskFacade {
         }
         let name = name.unwrap_or_else(|| default_task_name(&command));
         let mut operation = ProcessExec::new(context.call_id.clone(), command.clone());
-        if let Some(cwd) = cwd {
-            operation = operation.with_cwd(cwd);
+        if let Some(cwd) = cwd.as_ref() {
+            operation = operation.with_cwd(cwd.clone());
         }
         let operation = BackgroundExec::new(operation, name.clone())?;
         let spawn = broker.process_exec_background(&operation, policy).await?;
+        let shell = match self.hub.shell_registry().open(
+            haider_rpc::ShellKindWire::Local,
+            name.clone(),
+            cwd.unwrap_or_else(|| ".".into()),
+        ) {
+            Ok(shell) => shell,
+            Err(error) => {
+                let (kill, kill_signal) = task_kill_channel();
+                kill.kill();
+                tokio::spawn(supervise_background(
+                    spawn,
+                    kill_signal,
+                    shared_task_output(0, 0),
+                    self.kill_grace,
+                ));
+                return Err(ToolError::Runtime {
+                    message: format!("cannot register background shell: {error}"),
+                });
+            }
+        };
+        if let Err(error) = shell.running() {
+            let (kill, kill_signal) = task_kill_channel();
+            kill.kill();
+            tokio::spawn(supervise_background(
+                spawn,
+                kill_signal,
+                shared_task_output(0, 0),
+                self.kill_grace,
+            ));
+            return Err(ToolError::Runtime {
+                message: format!("cannot start registered background shell: {error}"),
+            });
+        }
         let task = TaskId::new(format!(
             "task-{}",
             &crate::delegation::stable_digest(&[
@@ -480,6 +513,7 @@ impl TaskFacade {
                 shared_task_output(0, 0),
                 self.kill_grace,
             ));
+            let _ = shell.exited(None);
             return Err(runtime_tool_error(error));
         }
         let (kill, kill_signal) = task_kill_channel();
@@ -496,16 +530,34 @@ impl TaskFacade {
                 branch_id: context.branch_id.clone(),
                 agent_id: context.agent_id.clone(),
                 output: Some(Arc::clone(&output)),
-                kill: Some(kill),
+                kill: Some(kill.clone()),
                 terminal_fact: None,
             },
         );
         let facade = self.clone();
         let session_id = context.session_id.clone();
         let pipeline_task = task.clone();
+        let output_for_shell = Arc::clone(&output);
         let supervision = supervise_background(spawn, kill_signal, output, self.kill_grace);
         tokio::spawn(async move {
-            let status = supervision.await;
+            tokio::pin!(supervision);
+            let mut close = shell.close_receiver();
+            let mut close_open = true;
+            let status = loop {
+                tokio::select! {
+                    status = &mut supervision => break status,
+                    changed = close.changed(), if close_open => {
+                        if changed.is_err() {
+                            close_open = false;
+                        } else if *close.borrow_and_update() {
+                            kill.kill();
+                        }
+                    }
+                }
+            };
+            let output_bytes = lock_task_output(&output_for_shell).total_bytes();
+            let _ = shell.add_output(output_bytes);
+            let _ = shell.exited(status.exit_code);
             facade
                 .complete_task(&session_id, &pipeline_task, status)
                 .await;

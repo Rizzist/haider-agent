@@ -180,6 +180,7 @@ async fn task_dispatcher_with_grant(
             metadata: task_metadata(cwd),
             store: lease,
             run_id: context_run.clone(),
+            run_deadline: None,
             branch_id: None,
             device_id: DeviceId::new(format!("{label}-tool-device")),
             event_ids: Arc::new(EventIdGenerator::new(format!("{label}-tool-event"))),

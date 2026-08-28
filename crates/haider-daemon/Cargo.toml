@@ -25,6 +25,7 @@ haider-tools = { path = "../haider-tools" }
 jsonwebtoken.workspace = true
 reqwest.workspace = true
 rmp-serde.workspace = true
+russh.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

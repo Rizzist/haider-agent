@@ -36,6 +36,9 @@ pub enum EffectClass {
     FsRead,
     FsWrite,
     ProcessExec,
+    /// Execute a command on a saved remote SSH target. This remains distinct
+    /// from local process authority and defaults to an explicit Ask.
+    RemoteExecution,
     Network {
         host: String,
     },

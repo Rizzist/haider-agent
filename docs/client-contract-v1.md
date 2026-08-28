@@ -2951,3 +2951,42 @@ labelled/refreshed as such; absence of both feature bits is unavailable
 lineage truth, not an empty tree. The non-UI `ObserveClient::descendants_attach`
 surface enforces this choice as `DescendantView::Live` versus
 `DescendantView::Snapshot`; the snapshot variant has no event receiver.
+
+## 18. SSH profiles and the unified shell registry
+
+Welcome independently negotiates `ssh_profiles_v1` and `shell_registry_v1`.
+The former exposes typed SDK helpers for `ssh.list`, `ssh.add`, `ssh.update`,
+`ssh.remove`, `ssh.test`, `ssh.shell`, and `session.set_ssh_scope`. The latter
+exposes typed helpers for `shell.list`, `shell.close`, and the unsolicited
+`shell.opened` / `shell.state` / `shell.closed` frames.
+
+Both SDK constructors obey the absence law: without the corresponding bit the
+surface is `None`. They do not issue the method and do not return a made-up
+“feature unavailable” RPC failure. The two bits are intentionally independent;
+an older daemon may manage SSH profiles without a terminal registry or expose
+local terminal tracking without SSH profiles.
+
+SSH public values contain only name, optional description, host, user, port,
+optional default cwd, optional pinned-host-key metadata, last-used time,
+multiplexing capability, and an `in_scope` flag. Authentication kinds,
+passwords, private-key bytes, key-file paths, passphrases, vault aliases, and
+staged references are never public contract fields. Secret input first uses
+`vault.stage` with a matching SSH purpose; the resulting reference is
+connection-scoped and single-use.
+
+`ssh.list { session_id? }` annotates every administrative row with the named
+session's `all | allow | none` decision when a session is supplied. An unknown
+session is `not_found`, never an implicit `all`. The model-facing `ssh_list`
+tool is stricter: it omits every row whose flag would be false. `ssh.shell` is a human Control door; model execution uses the
+separately permission-brokered `ssh_shell` tool. Remote output is untrusted.
+
+`shell.list` returns complete terminal rows. Clients upsert event rows by
+opaque shell id and treat `closed` as an explicit operator action distinct from
+natural `exited`. `shell.close` is idempotent. Closing an SSH shell closes only
+its channel, not the reusable authenticated profile connection.
+
+The exhaustive v1 method fixture now contains **113** request methods: the
+prior 104 plus these nine additive SSH/shell-registry methods. The ordinary
+daemon Welcome advertises **98** feature strings: the prior 96 plus these two
+feature bits. Integration must reconcile these counts if another lane also
+tail-appends methods or bits before release.

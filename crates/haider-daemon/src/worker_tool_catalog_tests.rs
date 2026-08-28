@@ -300,3 +300,116 @@ async fn peer_send_ask_default_is_enforced_by_the_effect_broker() {
         0
     );
 }
+
+/// MUTATION CHECK: SSH visibility, remote execution, their permission
+/// defaults, and the provider schemas must move as one contract surface.
+#[test]
+fn ssh_tool_surface_is_manifest_and_digest_pinned() {
+    let list = registered_tool_by_name("ssh_list").expect("ssh_list manifest");
+    assert_eq!(list.route, RegisteredToolRoute::SshList);
+    assert_eq!(list.default, ToolPermissionDefault::Allow);
+    assert!(list.manifest.effects.is_empty());
+
+    let shell = registered_tool_by_name("ssh_shell").expect("ssh_shell manifest");
+    assert_eq!(shell.route, RegisteredToolRoute::SshShell);
+    assert_eq!(shell.default, ToolPermissionDefault::Ask);
+    assert_eq!(shell.manifest.effects, [EffectClass::RemoteExecution]);
+
+    let process = registered_tool_by_name("process_exec").expect("process_exec manifest");
+    assert!(
+        process
+            .manifest
+            .effects
+            .contains(&EffectClass::RemoteExecution),
+        "the unified shell tool must declare remote authority for profile targets"
+    );
+
+    let actual = [
+        provider_definition(&list.manifest),
+        provider_definition(&shell.manifest),
+    ];
+    let expected = [
+        ToolDefinition {
+            name: "ssh_list".into(),
+            description: String::new(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        ToolDefinition {
+            name: "ssh_shell".into(),
+            description: String::new(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "profile": {"type": "string"},
+                    "command": {"type": "string"},
+                    "cwd": {"type": "string"},
+                    "timeout_s": {"type": "integer"}
+                },
+                "required": ["profile", "command"]
+            }),
+        },
+    ];
+    assert_eq!(actual, expected);
+    assert_eq!(
+        canonical_tool_definitions_digest(&actual),
+        canonical_tool_definitions_digest(&expected)
+    );
+}
+
+/// A model-authored remote command must stop at an Ask menu before a russh
+/// channel can be opened. The approval copy explicitly names the machine as
+/// remote so local-process authority cannot be mistaken for SSH authority.
+#[tokio::test]
+async fn ssh_shell_ask_default_is_enforced_by_the_effect_broker() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut broker = EffectBroker::new_at(
+        Box::new(PeerPermissionJournal),
+        workspace.path(),
+        SessionId::new("ssh-permission-session"),
+        1,
+        1_700_000_000_000,
+    )
+    .expect("effect broker");
+    let operation = SshShellOperation {
+        profile: "prod".into(),
+        command: "uname -a".into(),
+        cwd: None,
+        timeout_s: Some(30),
+    };
+    assert!(matches!(
+        haider_tools::SessionGrant::for_effect(operation.effect_class(), "ssh-command-shape").scope,
+        haider_tools::SessionGrantScope::CommandShape { .. }
+    ));
+    let intent = broker
+        .normalize(&operation)
+        .await
+        .expect("normalize remote execution");
+    let mut policy = PermissionPolicy::default();
+    policy.ask(EffectClass::RemoteExecution);
+    let AuthorizationVerdict::Ask { menu } = broker
+        .authorize(&intent, &policy)
+        .await
+        .expect("authorize remote execution")
+    else {
+        panic!("ssh_shell must require permission");
+    };
+    let menu = broker.permission_menu(&menu).expect("permission menu");
+    assert!(menu.title.contains("remote SSH machine prod"));
+    assert!(
+        operation
+            .approval_preview()
+            .iter()
+            .any(|line| line.contains("Remote machine"))
+    );
+    assert_eq!(
+        broker
+            .journal_snapshot()
+            .iter()
+            .filter(|phase| matches!(phase, EffectPhase::Dispatched { .. }))
+            .count(),
+        0
+    );
+}

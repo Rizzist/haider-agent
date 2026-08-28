@@ -1255,6 +1255,9 @@ pub struct WorkerToolContext {
     pub metadata: SessionMetadataV1,
     pub store: HubStoreHandle,
     pub run_id: RunId,
+    /// Absolute run deadline. Remote command timeouts are capped to this
+    /// budget so an SSH channel cannot outlive its owning run.
+    pub run_deadline: Option<tokio::time::Instant>,
     pub branch_id: Option<BranchId>,
     pub device_id: DeviceId,
     pub event_ids: Arc<EventIdGenerator>,
@@ -5300,6 +5303,39 @@ async fn perform_shell_exec(
         // deterministic result adapter.
         PromptRender::Omit,
     );
+    let shell = match lease.hub().shell_registry().open(
+        haider_rpc::ShellKindWire::Local,
+        pending.command.clone(),
+        pending.cwd.clone().unwrap_or_else(|| metadata.cwd.clone()),
+    ) {
+        Ok(shell) => shell,
+        Err(error) => {
+            let _ = broker.close().await;
+            return fail_shell_exec(
+                lease,
+                device_id,
+                &event_ids,
+                &run_id,
+                pending.branch_id.as_ref(),
+                pending.agent_id.as_ref(),
+                HaiderError::new(ErrorCode::Internal, error.to_string(), false),
+            )
+            .await;
+        }
+    };
+    if let Err(error) = shell.running() {
+        let _ = broker.close().await;
+        return fail_shell_exec(
+            lease,
+            device_id,
+            &event_ids,
+            &run_id,
+            pending.branch_id.as_ref(),
+            pending.agent_id.as_ref(),
+            HaiderError::new(ErrorCode::Internal, error.to_string(), false),
+        )
+        .await;
+    }
     let execution = match broker
         .process_exec_user(
             &operation,
@@ -5313,6 +5349,7 @@ async fn perform_shell_exec(
     {
         Ok(execution) => execution,
         Err(error) => {
+            let _ = shell.exited(None);
             let error = tool_error(error);
             let _ = broker.close().await;
             return fail_shell_exec(
@@ -5334,11 +5371,49 @@ async fn perform_shell_exec(
     let process_cancel = execution.cancel_handle();
     let wait = execution.wait();
     tokio::pin!(wait);
+    let mut shell_close = shell.close_receiver();
     let mut cancellation_channel_open = true;
     let mut drain_channel_open = true;
+    let mut shell_close_channel_open = true;
     let result = loop {
         tokio::select! {
             biased;
+            changed = shell_close.changed(), if shell_close_channel_open => {
+                if changed.is_err() {
+                    shell_close_channel_open = false;
+                    continue;
+                }
+                if *shell_close.borrow_and_update() {
+                    begin_shell_cancellation(
+                        lease,
+                        device_id,
+                        &event_ids,
+                        &run_id,
+                        pending.branch_id.as_ref(),
+                        pending.agent_id.as_ref(),
+                    )
+                    .await?;
+                    process_cancel.cancel();
+                    let _ = wait.await;
+                    if let Err(error) = broker.cancel().await {
+                        tracing::warn!(
+                            %run_id,
+                            ?error,
+                            "direct shell broker close reported an error after registry close"
+                        );
+                    }
+                    let _ = shell.exited(None);
+                    return cancel_shell_exec(
+                        lease,
+                        device_id,
+                        &event_ids,
+                        &run_id,
+                        pending.branch_id.as_ref(),
+                        pending.agent_id.as_ref(),
+                    )
+                    .await;
+                }
+            }
             changed = drain_wakes.changed(), if drain_channel_open => {
                 if changed.is_err() {
                     drain_channel_open = false;
@@ -5364,6 +5439,7 @@ async fn perform_shell_exec(
                             "direct shell broker close reported an error during daemon drain"
                         );
                     }
+                    let _ = shell.exited(None);
                     return cancel_shell_exec(
                         lease,
                         device_id,
@@ -5390,6 +5466,7 @@ async fn perform_shell_exec(
                             "direct shell broker close reported an error during cancellation"
                         );
                     }
+                    let _ = shell.exited(None);
                     return cancel_shell_exec(
                         lease,
                         device_id,
@@ -5405,6 +5482,7 @@ async fn perform_shell_exec(
                 break match result {
                     Ok(result) => result,
                     Err(error) => {
+                        let _ = shell.exited(None);
                         let error = tool_error(error);
                         let _ = broker.close().await;
                         return fail_shell_exec(
@@ -5423,6 +5501,8 @@ async fn perform_shell_exec(
         }
     };
     if let Err(error) = broker.close().await {
+        let _ = shell.add_output(result.output_bytes);
+        let _ = shell.exited(result.exit_code);
         return fail_shell_exec(
             lease,
             device_id,
@@ -5439,6 +5519,7 @@ async fn perform_shell_exec(
         .await;
     }
     if durable_run_state(lease, &run_id).await == Some(RunState::Cancelling) {
+        let _ = shell.exited(result.exit_code);
         return cancel_shell_exec(
             lease,
             device_id,
@@ -5452,6 +5533,12 @@ async fn perform_shell_exec(
     output_context
         .record_process_signal(&run_id, &result)
         .await?;
+    shell
+        .add_output(result.output_bytes)
+        .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+    shell
+        .exited(result.exit_code)
+        .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
     let completed = append_shell_completion(
         lease,
         device_id,
@@ -6116,6 +6203,7 @@ async fn start_turn(
                 metadata: metadata.clone(),
                 store: lease.clone(),
                 run_id: accepted.run_id.clone(),
+                run_deadline: provider_deadline,
                 branch_id: accepted.branch_id.clone(),
                 device_id: device_id.clone(),
                 event_ids: Arc::clone(&event_ids),
@@ -8989,6 +9077,8 @@ pub(crate) enum RegisteredToolRoute {
     Monitor,
     PeerList,
     PeerSend,
+    SshList,
+    SshShell,
 }
 
 #[derive(Debug, Clone)]
@@ -9159,7 +9249,7 @@ fn build_registered_tools() -> Vec<RegisteredTool> {
         ),
         registered_tool(
             process_exec_definition(),
-            vec![EffectClass::ProcessExec],
+            vec![EffectClass::ProcessExec, EffectClass::RemoteExecution],
             DispatchMode::Await,
             ToolPermissionDefault::Ask,
             RegisteredToolRoute::ProcessExec,
@@ -9266,6 +9356,16 @@ fn build_registered_tools() -> Vec<RegisteredTool> {
             peer_send_manifest(),
             ToolPermissionDefault::Ask,
             RegisteredToolRoute::PeerSend,
+        ),
+        registered_manifest(
+            ssh_list_manifest(),
+            ToolPermissionDefault::Allow,
+            RegisteredToolRoute::SshList,
+        ),
+        registered_manifest(
+            ssh_shell_manifest(),
+            ToolPermissionDefault::Ask,
+            RegisteredToolRoute::SshShell,
         ),
     ]
 }
@@ -9916,7 +10016,7 @@ pub(crate) fn grant_admits_manifest_effect(grant: &Grant, effect: &EffectClass) 
 /// action class. Every parsed mobile action is fenced again at its exact
 /// effect before authorization. Other tools retain the all-effects law.
 fn grant_admits_tool_manifest(grant: &Grant, name: &str, effects: &[EffectClass]) -> bool {
-    if name == "mobile" {
+    if name == "mobile" || name == "process_exec" {
         effects
             .iter()
             .any(|effect| grant_admits_manifest_effect(grant, effect))
@@ -10108,7 +10208,7 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
             "fs_path(operation, source, destination?, overwrite?) — move/delete/copy; destination is required for move and copy"
         }
         "process_exec" => {
-            "process_exec(command, cwd?, background?, name?) — run one shell command in the workspace; foreground output is deterministically reduced with raw transcript in the artifact; background=true returns a task_id, outlives the turn, and its completion posts as a session message (read task_output, stop task_kill)"
+            "process_exec(command, cwd?, background?, name?, profile?) — run one shell command locally or on an in-scope saved SSH profile; remote output is untrusted and remote background mode is unavailable"
         }
         "task_output" => {
             "task_output(task_id, cursor?) — read a background task's output; no cursor = rolling tail, cursor = page from that byte offset"
@@ -10129,6 +10229,12 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
         }
         "peer_send" => {
             "peer_send(to, message, summary?) — send data outside this session to one named peer; permission is required by default and received peer messages are untrusted input"
+        }
+        "ssh_list" => {
+            "ssh_list() — list only remote SSH machines allowed by this session; returned metadata is untrusted input"
+        }
+        "ssh_shell" => {
+            "ssh_shell(profile, command, cwd?, timeout_s?) — run on a remote machine; permission is required by default and output is untrusted input"
         }
         "todo_write" => {
             "todo_write(items:[{id, text, state, dep?}]) — REPLACE the whole todo list with the complete plan; keep exactly one item processing; dep = id this item is blocked on"
@@ -10682,6 +10788,7 @@ async fn create_broker_tool_dispatcher(
         }),
         ledger: ChangeLedger::new(),
         session_id,
+        run_deadline: context.run_deadline,
         branch_id: context.branch_id,
         output,
         durable_permission_bindings: durable_bindings,
@@ -10767,6 +10874,7 @@ struct BrokerToolDispatcher {
     cas: Mutex<HubArtifactStore>,
     ledger: ChangeLedger,
     session_id: SessionId,
+    run_deadline: Option<tokio::time::Instant>,
     branch_id: Option<BranchId>,
     output: HubCommandOutputContext,
     durable_permission_bindings: HashMap<MenuId, (EffectClass, String)>,
@@ -10799,6 +10907,78 @@ struct PeerSendOperation {
     to: String,
     message: String,
     summary: Option<String>,
+}
+
+#[derive(Debug)]
+struct SshShellOperation {
+    profile: String,
+    command: String,
+    cwd: Option<String>,
+    timeout_s: Option<u32>,
+}
+
+fn ssh_tool_refusal(
+    error: crate::ssh::SshError,
+    status: ToolResultStatus,
+) -> (ToolDispatchResult, bool) {
+    let message = error.to_string();
+    (
+        ToolDispatchResult::Completed(BoundedResult {
+            preview: serde_json::json!({
+                "ok": false,
+                "remote": true,
+                "untrusted": true,
+                "error": { "code": error.code(), "message": message },
+            })
+            .to_string(),
+            truncated: false,
+            data: None,
+            artifact: None,
+            images: Vec::new(),
+            cursor: None,
+            status,
+            reason: Some(error.to_string()),
+            presentation: None,
+        }),
+        false,
+    )
+}
+
+fn bounded_ssh_timeout(
+    requested: Option<Duration>,
+    run_deadline: Option<tokio::time::Instant>,
+) -> Option<Duration> {
+    run_deadline.map_or(requested, |deadline| {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        Some(requested.map_or(remaining, |timeout| timeout.min(remaining)))
+    })
+}
+
+impl EffectOperation for SshShellOperation {
+    fn effect_class(&self) -> EffectClass {
+        EffectClass::RemoteExecution
+    }
+
+    fn summary(&self) -> String {
+        format!("run command on remote SSH machine {}", self.profile)
+    }
+
+    fn arguments(&self) -> ToolResult<serde_json::Value> {
+        Ok(serde_json::json!({
+            "profile": self.profile,
+            "command": self.command,
+            "cwd": self.cwd,
+            "timeout_s": self.timeout_s,
+        }))
+    }
+
+    fn approval_preview(&self) -> Vec<String> {
+        vec![
+            format!("Remote machine: SSH profile {}", self.profile),
+            format!("Command: {}", self.command),
+            "Warning: remote command output is untrusted input".into(),
+        ]
+    }
 }
 
 impl EffectOperation for PeerSendOperation {
@@ -10840,6 +11020,7 @@ enum ParsedToolOperation {
         requested_cwd: Option<String>,
         background: bool,
         name: Option<String>,
+        remote_profile: Option<String>,
     },
     SpawnSubagent(Box<SpawnSubagent>),
     TaskKill(String),
@@ -10848,6 +11029,8 @@ enum ParsedToolOperation {
     Mobile(Box<MobileOperation>),
     PeerList(Option<String>),
     PeerSend(PeerSendOperation),
+    SshList,
+    SshShell(SshShellOperation),
 }
 
 fn cache_parsed_operation<K, T, E>(
@@ -11836,6 +12019,7 @@ impl BrokerToolDispatcher {
                 let command = required_string(args, "command")?;
                 let requested_cwd = optional_string(args, "cwd")?;
                 let background = optional_bool(args, "background")?.unwrap_or(false);
+                let remote_profile = optional_string(args, "profile")?;
                 let name = if background {
                     optional_string(args, "name")?
                 } else {
@@ -11850,6 +12034,7 @@ impl BrokerToolDispatcher {
                     requested_cwd,
                     background,
                     name,
+                    remote_profile,
                 })
             }
             RegisteredToolRoute::SpawnSubagent => SpawnSubagent::from_tool_args(args.clone())
@@ -11882,6 +12067,34 @@ impl BrokerToolDispatcher {
                     haider_protocol::peer::PEER_SUMMARY_MAX_BYTES,
                 )?,
             })),
+            RegisteredToolRoute::SshList => Ok(ParsedToolOperation::SshList),
+            RegisteredToolRoute::SshShell => {
+                let timeout_s = match optional_u64(args, "timeout_s")? {
+                    Some(value) if (1..=86_400).contains(&value) => {
+                        Some(u32::try_from(value).map_err(|_| {
+                            HaiderError::new(
+                                ErrorCode::InvalidArgument,
+                                "tool argument `timeout_s` is outside 1..=86400",
+                                false,
+                            )
+                        })?)
+                    }
+                    Some(_) => {
+                        return Err(HaiderError::new(
+                            ErrorCode::InvalidArgument,
+                            "tool argument `timeout_s` is outside 1..=86400",
+                            false,
+                        ));
+                    }
+                    None => None,
+                };
+                Ok(ParsedToolOperation::SshShell(SshShellOperation {
+                    profile: required_string(args, "profile")?,
+                    command: required_string(args, "command")?,
+                    cwd: optional_string(args, "cwd")?,
+                    timeout_s,
+                }))
+            }
             RegisteredToolRoute::FsWrite => {
                 let path = required_string(args, "path")?;
                 let content = required_string_allow_empty(args, "content")?;
@@ -11999,6 +12212,242 @@ impl BrokerToolDispatcher {
             .retain(|key, _| {
                 &key.run_id != run_id || &key.item_id != item_id || key.call_id.as_str() != call_id
             });
+    }
+
+    async fn dispatch_ssh_shell(
+        &self,
+        broker: &mut EffectBroker,
+        policy: &PermissionPolicy,
+        operation: &SshShellOperation,
+        run_id: &RunId,
+        item_id: &ItemId,
+        call_id: &str,
+    ) -> Result<(ToolDispatchResult, bool), HaiderError> {
+        let scope = self
+            .output
+            .store
+            .hub()
+            .ssh_scope(&self.session_id)
+            .map_err(hub_error)?;
+        if !scope.allows(&operation.profile) {
+            let error = crate::ssh::SshError::SshProfileOutOfScope {
+                session_id: self.session_id.clone(),
+                name: operation.profile.clone(),
+            };
+            return Ok(ssh_tool_refusal(error, ToolResultStatus::Rejected));
+        }
+        // Resolve every local prerequisite before the broker's dispatch
+        // boundary. A missing profile or vault did not contact a remote host
+        // and must retain its typed SSH refusal instead of an Unknown effect.
+        let service = match self.output.store.hub().ssh().map_err(hub_error)? {
+            Some(service) => service,
+            None => {
+                return Ok(ssh_tool_refusal(
+                    crate::ssh::SshError::Vault {
+                        message: "SSH profile secret storage is unavailable".into(),
+                    },
+                    ToolResultStatus::Rejected,
+                ));
+            }
+        };
+        let profile = match service.store.get(&operation.profile) {
+            Ok(profile) => profile,
+            Err(error) => return Ok(ssh_tool_refusal(error, ToolResultStatus::Rejected)),
+        };
+        let intent = broker.normalize(operation).await.map_err(tool_error)?;
+        match broker
+            .authorize(&intent, policy)
+            .await
+            .map_err(tool_error)?
+        {
+            AuthorizationVerdict::Allow | AuthorizationVerdict::PreAuthorized { .. } => {}
+            AuthorizationVerdict::Ask { menu } => {
+                let menu = broker.permission_menu(&menu).cloned().ok_or_else(|| {
+                    HaiderError::new(
+                        ErrorCode::Internal,
+                        "remote shell permission menu disappeared before publication",
+                        false,
+                    )
+                })?;
+                return Ok((ToolDispatchResult::ApprovalRequired(menu), true));
+            }
+            AuthorizationVerdict::Deny { reason } => {
+                return Err(tool_error(ToolError::PermissionDenied { reason }));
+            }
+        }
+        // Scope is mutable while a permission menu is open. This second check
+        // is the launch linearization point: after it, a scope change affects
+        // later channels but does not rewrite an already-authorized command.
+        let scope = self
+            .output
+            .store
+            .hub()
+            .ssh_scope(&self.session_id)
+            .map_err(hub_error)?;
+        if !scope.allows(&operation.profile) {
+            return Ok(ssh_tool_refusal(
+                crate::ssh::SshError::SshProfileOutOfScope {
+                    session_id: self.session_id.clone(),
+                    name: operation.profile.clone(),
+                },
+                ToolResultStatus::Rejected,
+            ));
+        }
+        let shell = self
+            .output
+            .store
+            .hub()
+            .shell_registry()
+            .open(
+                haider_rpc::ShellKindWire::Ssh {
+                    profile: operation.profile.clone(),
+                },
+                format!("ssh {}", operation.profile),
+                profile.ssh.host,
+            )
+            .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+        if let Err(error) = broker.journal_dispatched(&intent).await {
+            let _ = self.output.store.hub().shell_registry().close(shell.id());
+            return Err(tool_error(error));
+        }
+        shell
+            .running()
+            .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+        let result = service
+            .runtime
+            .exec(crate::ssh::SshExecRequest {
+                profile: operation.profile.clone(),
+                command: operation.command.clone(),
+                cwd: operation.cwd.clone(),
+                timeout: bounded_ssh_timeout(
+                    operation
+                        .timeout_s
+                        .map(|seconds| Duration::from_secs(u64::from(seconds))),
+                    self.run_deadline,
+                ),
+                close: Some(shell.close_receiver()),
+                output: Some(crate::ssh::SshOutput {
+                    call_id: call_id.to_owned(),
+                    sink: Arc::new(self.output.sink(
+                        run_id.clone(),
+                        item_id.clone(),
+                        call_id.to_owned(),
+                        PromptRender::Omit,
+                    )),
+                }),
+            })
+            .await;
+        match result {
+            Ok(result) => {
+                shell
+                    .add_output(result.stdout.len().saturating_add(result.stderr.len()))
+                    .map_err(|error| {
+                        HaiderError::new(ErrorCode::Internal, error.to_string(), false)
+                    })?;
+                shell.exited(result.exit_code).map_err(|error| {
+                    HaiderError::new(ErrorCode::Internal, error.to_string(), false)
+                })?;
+                let output_limited = result.stdout_truncated || result.stderr_truncated;
+                let unsuccessful_exit = result.exit_code.filter(|code| *code != 0);
+                broker
+                    .journal_outcome(
+                        &intent,
+                        if result.timed_out {
+                            EffectOutcome::Failed {
+                                error: "remote command reached its deadline".into(),
+                            }
+                        } else if output_limited {
+                            EffectOutcome::Failed {
+                                error: "remote command reached the shell output cap".into(),
+                            }
+                        } else if let Some(code) = unsuccessful_exit {
+                            EffectOutcome::Failed {
+                                error: format!("remote command exited with status {code}"),
+                            }
+                        } else {
+                            EffectOutcome::Ok
+                        },
+                    )
+                    .await
+                    .map_err(tool_error)?;
+                let failed = result.timed_out || output_limited || unsuccessful_exit.is_some();
+                Ok((
+                    ToolDispatchResult::Completed(BoundedResult {
+                        preview: serde_json::json!({
+                            "remote": true,
+                            "untrusted": true,
+                            "profile": result.profile,
+                            "stdout": result.stdout,
+                            "stderr": result.stderr,
+                            "stdout_truncated": result.stdout_truncated,
+                            "stderr_truncated": result.stderr_truncated,
+                            "exit_code": result.exit_code,
+                            "timed_out": result.timed_out,
+                        })
+                        .to_string(),
+                        truncated: result.stdout_truncated || result.stderr_truncated,
+                        data: None,
+                        artifact: None,
+                        images: Vec::new(),
+                        cursor: None,
+                        status: if failed {
+                            ToolResultStatus::Failed
+                        } else {
+                            ToolResultStatus::Completed
+                        },
+                        reason: if result.timed_out {
+                            Some("remote command reached its deadline".into())
+                        } else if output_limited {
+                            Some("remote command reached the shell output cap".into())
+                        } else if let Some(code) = unsuccessful_exit {
+                            Some(format!("remote command exited with status {code}"))
+                        } else {
+                            None
+                        },
+                        presentation: None,
+                    }),
+                    false,
+                ))
+            }
+            Err(error) => {
+                shell.exited(None).map_err(|registry_error| {
+                    HaiderError::new(ErrorCode::Internal, registry_error.to_string(), false)
+                })?;
+                broker
+                    .journal_outcome(
+                        &intent,
+                        if matches!(&error, crate::ssh::SshError::SshChannelClosed { .. }) {
+                            EffectOutcome::Cancelled
+                        } else {
+                            EffectOutcome::Failed {
+                                error: error.to_string(),
+                            }
+                        },
+                    )
+                    .await
+                    .map_err(tool_error)?;
+                Ok((
+                    ToolDispatchResult::Completed(BoundedResult {
+                        preview: serde_json::json!({
+                            "remote": true,
+                            "untrusted": true,
+                            "ok": false,
+                            "error": { "code": error.code(), "message": error.to_string() },
+                        })
+                        .to_string(),
+                        truncated: false,
+                        data: None,
+                        artifact: None,
+                        images: Vec::new(),
+                        cursor: None,
+                        status: ToolResultStatus::Failed,
+                        reason: Some(error.to_string()),
+                        presentation: None,
+                    }),
+                    false,
+                ))
+            }
+        }
     }
 
     async fn close_effects(&self, cancelled: bool) -> Result<(), HaiderError> {
@@ -12739,6 +13188,77 @@ impl ToolDispatcher for BrokerToolDispatcher {
                 presentation: None,
             }));
         }
+        if route == RegisteredToolRoute::SshList {
+            let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
+            let ParsedToolOperation::SshList = operation.as_ref() else {
+                return Err(cached_operation_route_mismatch(route));
+            };
+            let scope = self
+                .output
+                .store
+                .hub()
+                .ssh_scope(&self.session_id)
+                .map_err(hub_error)?;
+            let service = self
+                .output
+                .store
+                .hub()
+                .ssh()
+                .map_err(hub_error)?
+                .ok_or_else(|| {
+                    HaiderError::new(
+                        ErrorCode::InvalidArgument,
+                        "SSH profile secret storage is unavailable",
+                        false,
+                    )
+                })?;
+            let profiles = service
+                .store
+                .list()
+                .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?
+                .into_iter()
+                .filter(|profile| scope.allows(&profile.name))
+                .map(|profile| {
+                    serde_json::json!({
+                        "name": profile.name,
+                        "description": profile.description,
+                        "host": profile.ssh.host,
+                        "user": profile.ssh.user,
+                        "port": profile.ssh.port,
+                        "multiplexing": true,
+                        "in_scope": true,
+                    })
+                })
+                .collect::<Vec<_>>();
+            return Ok(ToolDispatchResult::Completed(BoundedResult {
+                preview: serde_json::json!({
+                    "profiles": profiles,
+                    "untrusted": true,
+                })
+                .to_string(),
+                truncated: false,
+                data: None,
+                artifact: None,
+                images: Vec::new(),
+                cursor: None,
+                status: ToolResultStatus::Completed,
+                reason: None,
+                presentation: None,
+            }));
+        }
+        if route == RegisteredToolRoute::SshShell {
+            let parsed = self.cached_tool_operation(&operation_key, args.as_ref())?;
+            let ParsedToolOperation::SshShell(operation) = parsed.as_ref() else {
+                return Err(cached_operation_route_mismatch(route));
+            };
+            let (result, retain_for_approval) = self
+                .dispatch_ssh_shell(broker, &policy, operation, run_id, item_id, call_id)
+                .await?;
+            if retain_for_approval {
+                operation_lease.retain_for_approval();
+            }
+            return Ok(result);
+        }
         if route == RegisteredToolRoute::PeerList {
             let operation = self.cached_tool_operation(&operation_key, args.as_ref())?;
             let ParsedToolOperation::PeerList(filter) = operation.as_ref() else {
@@ -12939,10 +13459,68 @@ impl ToolDispatcher for BrokerToolDispatcher {
                     requested_cwd,
                     background,
                     name,
+                    remote_profile,
                 } = parsed.as_ref()
                 else {
                     return Err(cached_operation_route_mismatch(route));
                 };
+                let required_effect = if remote_profile.is_some() {
+                    EffectClass::RemoteExecution
+                } else {
+                    EffectClass::ProcessExec
+                };
+                if effective_grant
+                    .is_some_and(|grant| !effect_within_grant(grant, &required_effect))
+                {
+                    self.clear_cached_operation(&operation_key);
+                    return Ok(ToolDispatchResult::Completed(grant_ceiling_result(
+                        "process_exec",
+                    )));
+                }
+                if let Some(profile) = remote_profile {
+                    if *background {
+                        self.clear_cached_operation(&operation_key);
+                        return Ok(ToolDispatchResult::Completed(BoundedResult {
+                            preview: serde_json::json!({
+                                "ok": false,
+                                "remote": true,
+                                "error": "profile-targeted process_exec does not support background mode",
+                            })
+                            .to_string(),
+                            truncated: false,
+                            data: None,
+                            artifact: None,
+                            images: Vec::new(),
+                            cursor: None,
+                            status: ToolResultStatus::Rejected,
+                            reason: Some(
+                                "remote background commands are not supported in SSH profiles v1"
+                                    .into(),
+                            ),
+                            presentation: None,
+                        }));
+                    }
+                    let remote = SshShellOperation {
+                        profile: profile.clone(),
+                        command: operation.command.clone(),
+                        cwd: requested_cwd.clone(),
+                        timeout_s: None,
+                    };
+                    let (result, retain_for_approval) = self
+                        .dispatch_ssh_shell(
+                            broker,
+                            &policy,
+                            &remote,
+                            run_id,
+                            item_id,
+                            call_id,
+                        )
+                        .await?;
+                    if retain_for_approval {
+                        operation_lease.retain_for_approval();
+                    }
+                    return Ok(result);
+                }
                 // B3 (review round 2) — the typed CLI fence: a leaf
                 // specialist runs its DECLARED CLIs, one program per call
                 // (foreground AND background). A refusal is a completed
@@ -13003,39 +13581,84 @@ impl ToolDispatcher for BrokerToolDispatcher {
                         .process_exec(operation, &policy, cas, output, ProcessBounds::default())
                         .await
                     {
-                        Ok(execution) => match execution.wait().await {
-                            Ok(result) => {
-                                match self.output.record_process_signal(run_id, &result).await {
-                                    Ok(signal) => {
-                                        if result.status
-                                            == haider_protocol::item::ToolStatus::Completed
-                                        {
-                                            let preview = process_output_preview(&result);
-                                            if let Err(error) = self
-                                                .emit_created_images(CreatedImageScan {
-                                                    run_id,
-                                                    call_id,
-                                                    tool: "process_exec",
-                                                    command: &operation.command,
-                                                    output_preview: &preview,
-                                                    cwd: &effective_cwd,
-                                                    started,
-                                                })
-                                                .await
-                                            {
-                                                self.clear_cached_operation(&operation_key);
-                                                return Err(tool_error(error));
-                                            }
+                        Ok(execution) => {
+                            let process_cancel = execution.cancel_handle();
+                            let shell = match self.output.store.hub().shell_registry().open(
+                                haider_rpc::ShellKindWire::Local,
+                                name.clone().unwrap_or_else(|| operation.command.clone()),
+                                effective_cwd.to_string_lossy().into_owned(),
+                            ) {
+                                Ok(shell) => shell,
+                                Err(error) => {
+                                    process_cancel.cancel();
+                                    let _ = execution.wait().await;
+                                    return Err(tool_error(ToolError::Runtime {
+                                        message: error.to_string(),
+                                    }));
+                                }
+                            };
+                            if let Err(error) = shell.running() {
+                                process_cancel.cancel();
+                                let _ = execution.wait().await;
+                                return Err(tool_error(ToolError::Runtime {
+                                    message: error.to_string(),
+                                }));
+                            }
+                            let wait = execution.wait();
+                            tokio::pin!(wait);
+                            let mut close = shell.close_receiver();
+                            let mut close_open = true;
+                            let waited = loop {
+                                tokio::select! {
+                                    result = &mut wait => break result,
+                                    changed = close.changed(), if close_open => {
+                                        if changed.is_err() {
+                                            close_open = false;
+                                        } else if *close.borrow_and_update() {
+                                            process_cancel.cancel();
                                         }
-                                        Ok(process_result_with_signal(result, Some(&signal)))
                                     }
-                                    Err(error) => Err(ToolError::Runtime {
-                                        message: error.message,
-                                    }),
+                                }
+                            };
+                            match waited {
+                                Ok(result) => {
+                                    let _ = shell.add_output(result.output_bytes);
+                                    let _ = shell.exited(result.exit_code);
+                                    match self.output.record_process_signal(run_id, &result).await {
+                                        Ok(signal) => {
+                                            if result.status
+                                                == haider_protocol::item::ToolStatus::Completed
+                                            {
+                                                let preview = process_output_preview(&result);
+                                                if let Err(error) = self
+                                                    .emit_created_images(CreatedImageScan {
+                                                        run_id,
+                                                        call_id,
+                                                        tool: "process_exec",
+                                                        command: &operation.command,
+                                                        output_preview: &preview,
+                                                        cwd: &effective_cwd,
+                                                        started,
+                                                    })
+                                                    .await
+                                                {
+                                                    self.clear_cached_operation(&operation_key);
+                                                    return Err(tool_error(error));
+                                                }
+                                            }
+                                            Ok(process_result_with_signal(result, Some(&signal)))
+                                        }
+                                        Err(error) => Err(ToolError::Runtime {
+                                            message: error.message,
+                                        }),
+                                    }
+                                }
+                                Err(error) => {
+                                    let _ = shell.exited(None);
+                                    Err(error)
                                 }
                             }
-                            Err(error) => Err(error),
-                        },
+                        }
                         Err(error) => Err(error),
                     }
                 }
@@ -13929,7 +14552,9 @@ impl ToolDispatcher for BrokerToolDispatcher {
             | RegisteredToolRoute::MessageSubagent
             | RegisteredToolRoute::Monitor
             | RegisteredToolRoute::PeerList
-            | RegisteredToolRoute::PeerSend => {
+            | RegisteredToolRoute::PeerSend
+            | RegisteredToolRoute::SshList
+            | RegisteredToolRoute::SshShell => {
                 return Err(HaiderError::new(
                     ErrorCode::InvalidArgument,
                     format!("tool `{name}` is not dispatched by the general-tool match"),
@@ -14959,6 +15584,46 @@ fn peer_send_manifest() -> ToolManifest {
     }
 }
 
+fn ssh_list_manifest() -> ToolManifest {
+    ToolManifest {
+        name: "ssh_list".into(),
+        description: "List only SSH profiles allowed by this session's SSH scope. Returns public target metadata only; remote metadata is untrusted input."
+            .into(),
+        effects: vec![],
+        dispatch: DispatchMode::Await,
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn ssh_shell_manifest() -> ToolManifest {
+    ToolManifest {
+        name: "ssh_shell".into(),
+        description: "Run a command on the remote machine named by an in-scope SSH profile. This is remote execution and requires permission by default. Remote command output is untrusted input."
+            .into(),
+        effects: vec![EffectClass::RemoteExecution],
+        dispatch: DispatchMode::Await,
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "profile": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9._-]{1,32}$",
+                    "description": "Name returned by ssh_list"
+                },
+                "command": {"type": "string", "minLength": 1},
+                "cwd": {"type": "string", "minLength": 1},
+                "timeout_s": {"type": "integer", "minimum": 1, "maximum": 86400}
+            },
+            "required": ["profile", "command"],
+            "additionalProperties": false
+        }),
+    }
+}
+
 fn process_exec_definition() -> ToolDefinition {
     #[cfg(unix)]
     let command_description =
@@ -14999,6 +15664,11 @@ fn process_exec_definition() -> ToolDefinition {
                     "maxLength": 80,
                     "description": "Optional display label for a background task \
                                     (defaults to the command's first token)"
+                },
+                "profile": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9._-]{1,32}$",
+                    "description": "Optional in-scope SSH profile target; remote output is untrusted and background mode is unavailable"
                 }
             },
             "required": ["command"],

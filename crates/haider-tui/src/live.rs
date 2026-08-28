@@ -360,6 +360,26 @@ pub enum LiveCommand {
         message: String,
         summary: Option<String>,
     },
+    SshList {
+        session: Option<SessionId>,
+    },
+    SshSetScope {
+        session: SessionId,
+        scope: haider_rpc::SshScopeWire,
+    },
+    SshTest {
+        profile: String,
+    },
+    SshRemove {
+        profile: String,
+    },
+    ShellList,
+    ShellClose {
+        id: String,
+    },
+    MonitorList {
+        session: SessionId,
+    },
     /// `hooks.list` — a READ of the daemon's hook discovery for one
     /// workspace (H4 /hooks). No durable identity; the cwd was captured at
     /// issuance by the reducer.
@@ -1036,6 +1056,13 @@ impl LiveCommand {
             | Self::ToolsInventory { .. }
             | Self::PeerList
             | Self::PeerSend { .. }
+            | Self::SshList { .. }
+            | Self::SshSetScope { .. }
+            | Self::SshTest { .. }
+            | Self::SshRemove { .. }
+            | Self::ShellList
+            | Self::ShellClose { .. }
+            | Self::MonitorList { .. }
             | Self::HooksList { .. }
             // U2: the usage snapshot is a read (see above).
             | Self::UsageReport
@@ -1302,6 +1329,22 @@ pub enum LiveReply {
     },
     PeerDeliveryChanged {
         receipt: haider_protocol::peer::PeerReceipt,
+    },
+    SshListed {
+        profiles: Vec<haider_rpc::SshProfileWire>,
+    },
+    SshScopeSet {
+        scope: haider_rpc::SshScopeWire,
+    },
+    SshChanged,
+    ShellListed {
+        shells: Vec<haider_rpc::ShellWire>,
+    },
+    ShellChanged {
+        shell: haider_rpc::ShellWire,
+    },
+    MonitorListed {
+        receipt: haider_rpc::MonitorListReceiptWire,
     },
     /// `hooks.list` answered — discovery truth for /hooks (H4).
     Hooks {
@@ -2820,6 +2863,14 @@ impl LiveDriver {
                         session: session.clone(),
                     });
                 }
+                if model.daemon_serves(haider_rpc::FEATURE_MONITOR_CONTROL_V1) {
+                    queue_read.push(LiveCommand::MonitorList {
+                        session: session.clone(),
+                    });
+                }
+                if model.daemon_serves(haider_rpc::FEATURE_SHELL_REGISTRY_V1) {
+                    queue_read.push(LiveCommand::ShellList);
+                }
                 self.generations.insert(session.clone(), worker_generation);
                 self.routes.insert(attachment.clone(), session.clone());
                 self.attachments.insert(session.clone(), attachment);
@@ -2961,6 +3012,32 @@ impl LiveDriver {
                     peer_delivery_label(receipt.delivery)
                 ));
                 model.dirty = true;
+                Vec::new()
+            }
+            LiveReply::SshListed { profiles } => {
+                model.apply_ssh_list(profiles);
+                Vec::new()
+            }
+            LiveReply::SshScopeSet { scope } => {
+                model.flash = Some(format!("· SSH scope set to {scope:?}"));
+                model.dirty = true;
+                vec![LiveCommand::SshList {
+                    session: model.active_session.clone(),
+                }]
+            }
+            LiveReply::SshChanged => vec![LiveCommand::SshList {
+                session: model.active_session.clone(),
+            }],
+            LiveReply::ShellListed { shells } => {
+                model.apply_shell_list(shells);
+                Vec::new()
+            }
+            LiveReply::ShellChanged { shell } => {
+                model.apply_shell_event(shell);
+                Vec::new()
+            }
+            LiveReply::MonitorListed { receipt } => {
+                model.apply_monitor_list(receipt);
                 Vec::new()
             }
             LiveReply::Hooks {
@@ -5854,6 +5931,21 @@ impl LiveDriver {
                 message,
                 summary: None,
             }],
+            AppRequest::SshList => vec![LiveCommand::SshList {
+                session: model.active_session.clone(),
+            }],
+            AppRequest::SshSetScope { scope } => match model.active_session.clone() {
+                Some(session) => vec![LiveCommand::SshSetScope { session, scope }],
+                None => Vec::new(),
+            },
+            AppRequest::SshTest { profile } => vec![LiveCommand::SshTest { profile }],
+            AppRequest::SshRemove { profile } => vec![LiveCommand::SshRemove { profile }],
+            AppRequest::ShellList => vec![LiveCommand::ShellList],
+            AppRequest::ShellClose { id } => vec![LiveCommand::ShellClose { id }],
+            AppRequest::MonitorList => match model.active_session.clone() {
+                Some(session) => vec![LiveCommand::MonitorList { session }],
+                None => Vec::new(),
+            },
             AppRequest::HooksRefresh { cwd } => {
                 // A read — never outboxed; the cwd is remembered so a
                 // trust receipt can chain its refresh at the same
@@ -6407,6 +6499,8 @@ const fn command_session(command: &LiveCommand) -> Option<&SessionId> {
         | LiveCommand::AgentMessage { session, .. }
         | LiveCommand::ShellExec { session, .. }
         | LiveCommand::ToolsInventory { session }
+        | LiveCommand::SshSetScope { session, .. }
+        | LiveCommand::MonitorList { session }
         | LiveCommand::SelectModel { session, .. }
         | LiveCommand::Rename { session, .. }
         | LiveCommand::Seen { session, .. }

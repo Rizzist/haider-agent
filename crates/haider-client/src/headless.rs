@@ -433,6 +433,9 @@ pub struct HeadlessSessionConfig {
     /// reject this before connecting and direct callers to a provider/model
     /// selector, which is the implemented headless routing control.
     pub account: Option<String>,
+    /// Launch-time model visibility for saved SSH profiles. `None` omits the
+    /// additive field and therefore means the daemon's `All` default.
+    pub ssh_scope: Option<haider_rpc::SshScopeWire>,
 }
 
 /// Incremental facts exposed to output adapters.
@@ -2504,6 +2507,7 @@ async fn run_headless_inner(
             .then_some(request.permission_overrides),
         cache_policy: None,
         interaction_mode: SessionInteractionModeV1::Autonomous,
+        ssh_scope: session_config.ssh_scope.clone(),
     };
 
     let (session_id, created_generation, created_seq, created_metadata) =
@@ -3480,6 +3484,11 @@ fn normalize_session_config_features(
         options
             .required_features
             .insert(haider_rpc::FEATURE_SESSION_FAST_SELECT_V1.to_owned());
+    }
+    if config.ssh_scope.is_some() {
+        options
+            .required_features
+            .insert(haider_rpc::FEATURE_SSH_PROFILES_V1.to_owned());
     }
     Ok(())
 }

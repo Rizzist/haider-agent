@@ -28,6 +28,8 @@ pub(crate) mod session_config;
 pub(crate) mod session_item;
 pub(crate) mod session_recover;
 pub(crate) mod session_seen;
+pub(crate) mod shell_registry;
+pub(crate) mod ssh;
 pub(crate) mod update;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -211,6 +213,8 @@ async fn dispatch(args: &[String]) -> ExitCode {
         [command, rest @ ..] if command == "export" => export::export_command(rest).await,
         [command, rest @ ..] if command == "hooks" => hooks::hooks_command(rest).await,
         [command, rest @ ..] if command == "peer" => peer::peer_command(rest).await,
+        [command, rest @ ..] if command == "ssh" => ssh::ssh_command(rest).await,
+        [command, rest @ ..] if command == "shell" => shell_registry::shell_command(rest).await,
         [command, rest @ ..] if command == "update" => update::update_command(rest).await,
         [command, rest @ ..] if command == "tui" => tui_command(rest).await,
         // Owner 2026-08-21: `haider resume` opens the all-sessions picker;

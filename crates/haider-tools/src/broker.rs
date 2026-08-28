@@ -222,7 +222,10 @@ pub const ALLOW_SCREEN_CONTROL_SESSION_GRANT: &str = "allow_screen_control";
 
 impl SessionGrant {
     pub fn for_effect(class: EffectClass, args_digest: impl Into<String>) -> Self {
-        let scope = if class == EffectClass::ProcessExec {
+        let scope = if matches!(
+            class,
+            EffectClass::ProcessExec | EffectClass::RemoteExecution
+        ) {
             SessionGrantScope::CommandShape {
                 args_digest: args_digest.into(),
             }
@@ -363,8 +366,9 @@ impl PermissionPolicy {
         &self.always_allow
     }
 
-    /// Adds a durable-menu-derived class grant. `ProcessExec` is deliberately
-    /// refused here: shell session grants must use [`SessionGrantScope::CommandShape`].
+    /// Adds a durable-menu-derived class grant. Local and remote execution are
+    /// deliberately refused here: shell session grants must use
+    /// [`SessionGrantScope::CommandShape`].
     pub fn allow_for_session(&mut self, class: EffectClass) -> ToolResult<()> {
         self.allow_session_grant(SessionGrant {
             class,
@@ -372,12 +376,16 @@ impl PermissionPolicy {
         })
     }
 
-    /// Adds a reconstructed session grant after validating that process
-    /// execution can never become class-wide.
+    /// Adds a reconstructed session grant after validating that local or
+    /// remote execution can never become class-wide.
     pub fn allow_session_grant(&mut self, grant: SessionGrant) -> ToolResult<()> {
-        if grant.class == EffectClass::ProcessExec && grant.scope == SessionGrantScope::Class {
+        if matches!(
+            grant.class,
+            EffectClass::ProcessExec | EffectClass::RemoteExecution
+        ) && grant.scope == SessionGrantScope::Class
+        {
             return Err(ToolError::invalid_argument(
-                "class-wide ProcessExec session grants are forbidden",
+                "class-wide local or remote execution session grants are forbidden",
             ));
         }
         if !self.session_allow.contains(&grant) {

@@ -866,6 +866,13 @@ struct HubInner {
     worker_manager: Mutex<Option<WorkerManagerHandle>>,
     loom_author_provider: Mutex<Option<Arc<dyn crate::worker::ProviderFactory>>>,
     accounts: Mutex<Option<crate::accounts::AccountsFacade>>,
+    /// Installed beside the profile-scoped, owner-only secret vault. SSH sessions are
+    /// process-local and shared by every Haider session in this profile.
+    ssh: Mutex<Option<crate::ssh::SshService>>,
+    /// Session launch/interactive scope. Absence means the v1 default: All.
+    ssh_scopes: Mutex<HashMap<SessionId, crate::ssh::SshScope>>,
+    /// One registry for all daemon-owned terminal channels.
+    shells: crate::shell_registry::ShellRegistry,
     creatable_providers: Mutex<Option<std::collections::BTreeSet<String>>>,
     hooks: Arc<Mutex<Option<crate::hooks::WeakHookService>>>,
     /// One post-commit fan-out shared by every session actor. The journal is
@@ -1767,6 +1774,9 @@ impl SessionHub {
             worker_manager: Mutex::new(None),
             loom_author_provider: Mutex::new(None),
             accounts: Mutex::new(None),
+            ssh: Mutex::new(None),
+            ssh_scopes: Mutex::new(HashMap::new()),
+            shells: crate::shell_registry::ShellRegistry::default(),
             creatable_providers: Mutex::new(None),
             hooks,
             commit_projection,
@@ -1781,10 +1791,47 @@ impl SessionHub {
             prompt_history: PromptHistoryCache::default(),
         });
         let hub = Self { inner };
+        hub.spawn_shell_registry_events()?;
         hub.spawn_profile_fault_watcher();
         hub.spawn_usage_history_reconciler()?;
         hub.spawn_typed_install_resume()?;
         Ok(hub)
+    }
+
+    fn spawn_shell_registry_events(&self) -> Result<(), SessionHubError> {
+        let mut events = self.inner.shells.subscribe();
+        let weak = Arc::downgrade(&self.inner);
+        lock(&self.inner.actor_tasks)?.push(tokio::spawn(async move {
+            loop {
+                let event = match events.recv().await {
+                    Ok(event) => event,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
+                let Some(inner) = weak.upgrade() else {
+                    break;
+                };
+                let frame = match event {
+                    crate::shell_registry::ShellRegistryEvent::Opened(shell) => {
+                        WireFrame::ShellOpened { shell }
+                    }
+                    crate::shell_registry::ShellRegistryEvent::State(shell) => {
+                        WireFrame::ShellState { shell }
+                    }
+                    crate::shell_registry::ShellRegistryEvent::Closed(shell) => {
+                        WireFrame::ShellClosed { shell }
+                    }
+                };
+                let sinks = match inner.diagnostic_sinks.lock() {
+                    Ok(sinks) => sinks.values().cloned().collect::<Vec<_>>(),
+                    Err(_) => break,
+                };
+                for sink in sinks {
+                    let _ = sink.try_send_droppable(frame.clone());
+                }
+            }
+        }));
+        Ok(())
     }
 
     fn spawn_typed_install_resume(&self) -> Result<(), SessionHubError> {
@@ -2075,8 +2122,62 @@ impl SessionHub {
                 "account facade is already installed".into(),
             ));
         }
+        if let Some(vault) = facade.vault.clone() {
+            *lock(&self.inner.ssh)? = Some(crate::ssh::SshService::new(vault));
+        }
         *installed = Some(facade);
         Ok(())
+    }
+
+    pub(crate) fn ssh(&self) -> Result<Option<crate::ssh::SshService>, SessionHubError> {
+        Ok(lock(&self.inner.ssh)?.clone())
+    }
+
+    pub(crate) fn ssh_scope(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<crate::ssh::SshScope, SessionHubError> {
+        // Hold the cache lock through the durable read. This is deliberately
+        // synchronous: otherwise a concurrent narrowing can be overwritten by
+        // a cache-miss reader that loaded the older `All` value.
+        let mut scopes = lock(&self.inner.ssh_scopes)?;
+        if let Some(scope) = scopes.get(session_id).cloned() {
+            return Ok(scope);
+        }
+        let scope = lock(&self.inner.ssh)?
+            .as_ref()
+            .map_or_else(
+                || Ok(crate::ssh::SshScope::All),
+                |ssh| ssh.store.session_scope(session_id),
+            )
+            .map_err(|error| SessionHubError::Task(error.to_string()))?;
+        scopes.insert(session_id.clone(), scope.clone());
+        Ok(scope)
+    }
+
+    pub(crate) fn set_ssh_scope(
+        &self,
+        session_id: SessionId,
+        scope: crate::ssh::SshScope,
+    ) -> Result<(), SessionHubError> {
+        // Serialize persistence and cache publication with cache misses. A
+        // caller can therefore never observe `All` after narrowing started.
+        let mut scopes = lock(&self.inner.ssh_scopes)?;
+        if let Some(ssh) = lock(&self.inner.ssh)?.as_ref() {
+            ssh.store
+                .set_session_scope(&session_id, &scope)
+                .map_err(|error| SessionHubError::Task(error.to_string()))?;
+        } else if !matches!(scope, crate::ssh::SshScope::All) {
+            return Err(SessionHubError::Task(
+                "SSH scope secret storage is unavailable".into(),
+            ));
+        }
+        scopes.insert(session_id, scope);
+        Ok(())
+    }
+
+    pub(crate) fn shell_registry(&self) -> &crate::shell_registry::ShellRegistry {
+        &self.inner.shells
     }
 
     pub(crate) fn accounts(

@@ -634,6 +634,14 @@ pub fn command_required_features(command: &LiveCommand) -> &'static [&'static st
         LiveCommand::PeerList | LiveCommand::PeerSend { .. } => {
             &[haider_rpc::FEATURE_PEER_MESSAGING_V1]
         }
+        LiveCommand::SshList { .. }
+        | LiveCommand::SshSetScope { .. }
+        | LiveCommand::SshTest { .. }
+        | LiveCommand::SshRemove { .. } => &[haider_rpc::FEATURE_SSH_PROFILES_V1],
+        LiveCommand::ShellList | LiveCommand::ShellClose { .. } => {
+            &[haider_rpc::FEATURE_SHELL_REGISTRY_V1]
+        }
+        LiveCommand::MonitorList { .. } => &[haider_rpc::FEATURE_MONITOR_CONTROL_V1],
         _ => &[],
     }
 }
@@ -925,6 +933,7 @@ pub fn request_body_for_features(
             cache_policy: None,
             interaction_mode:
                 haider_rpc::haider_protocol::session::SessionInteractionModeV1::Interactive,
+            ssh_scope: None,
         },
         // B2b encode-selection law: a captured branch rides the
         // branch-capable decode form; `None` keeps the LEGACY variant so
@@ -1149,6 +1158,23 @@ pub fn request_body_for_features(
             to,
             message,
             summary,
+        },
+        LiveCommand::SshList { session } => RequestBody::SshList {
+            session_id: session,
+        },
+        LiveCommand::SshSetScope { session, scope } => RequestBody::SessionSetSshScope {
+            session_id: session,
+            scope,
+        },
+        LiveCommand::SshTest { profile } => RequestBody::SshTest {
+            name: profile,
+            timeout_s: None,
+        },
+        LiveCommand::SshRemove { profile } => RequestBody::SshRemove { name: profile },
+        LiveCommand::ShellList => RequestBody::ShellList,
+        LiveCommand::ShellClose { id } => RequestBody::ShellClose { id },
+        LiveCommand::MonitorList { session } => RequestBody::MonitorList {
+            session_id: session,
         },
         LiveCommand::HooksList { cwd } => RequestBody::HooksList { cwd },
         // U2: parameterless read (U1's wire) — CONSUMED, never redefined.
@@ -1724,6 +1750,20 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
         }],
         ResponseBody::PeerList { agents } => vec![LiveReply::PeerListed { agents }],
         ResponseBody::PeerSend { receipt } => vec![LiveReply::PeerSent { receipt }],
+        ResponseBody::SshList { profiles } => vec![LiveReply::SshListed { profiles }],
+        ResponseBody::SessionSetSshScope { scope, .. } => {
+            vec![LiveReply::SshScopeSet { scope }]
+        }
+        // Interactive SSH needs a bidirectional PTY stream. Until that
+        // transport exists the TUI never issues this request; ignore a
+        // stray response instead of presenting a one-shot command as a shell.
+        ResponseBody::SshShell { .. } => Vec::new(),
+        ResponseBody::SshTest { .. } | ResponseBody::SshRemove { .. } => {
+            vec![LiveReply::SshChanged]
+        }
+        ResponseBody::ShellList { shells } => vec![LiveReply::ShellListed { shells }],
+        ResponseBody::ShellClose { shell } => vec![LiveReply::ShellChanged { shell }],
+        ResponseBody::MonitorList { receipt } => vec![LiveReply::MonitorListed { receipt }],
         ResponseBody::HooksList {
             policy,
             revision,
@@ -2380,6 +2420,9 @@ pub fn map_frame(frame: WireFrame) -> Vec<LiveReply> {
         WireFrame::PeerDeliveryChanged { receipt } => {
             vec![LiveReply::PeerDeliveryChanged { receipt }]
         }
+        WireFrame::ShellOpened { shell }
+        | WireFrame::ShellState { shell }
+        | WireFrame::ShellClosed { shell } => vec![LiveReply::ShellChanged { shell }],
         // This TUI is a publisher, not a consumer, of profile-level resident
         // binding signals. Name the known frame explicitly so it can never be
         // confused with the forward-compat fallback below.

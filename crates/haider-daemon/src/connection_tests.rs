@@ -199,12 +199,16 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// MUTATION CHECK: remove `FEATURE_WORKFLOW_GRAPH_V1`. Expected runtime
 /// failure: clients cannot discover the indexed activation state and
 /// cursor-replay surfaces served by this daemon.
+///
+/// MUTATION CHECK: remove `FEATURE_SSH_PROFILES_V1` or
+/// `FEATURE_SHELL_REGISTRY_V1`. Expected runtime failure: clients expose a
+/// management or terminal-registry surface that the handshake says is absent.
 #[test]
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
         welcome_features().len(),
-        96,
-        "the ordinary Welcome advertises all 94 v0.0.963 tokens plus account_identity_v1 and checkpoint_v1"
+        98,
+        "the ordinary Welcome advertises the prior 96 tokens plus ssh_profiles_v1 and shell_registry_v1"
     );
     assert_eq!(
         welcome_features(),
@@ -291,6 +295,8 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_SESSION_AGENT_TYPE_SELECT_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_LINEAGE_V1.to_owned(),
             FEATURE_SHELL_EXEC_V1.to_owned(),
+            FEATURE_SSH_PROFILES_V1.to_owned(),
+            FEATURE_SHELL_REGISTRY_V1.to_owned(),
             haider_rpc::FEATURE_USER_COMMAND_V1.to_owned(),
             FEATURE_TOOL_INVENTORY_V1.to_owned(),
             haider_rpc::FEATURE_MONITOR_V1.to_owned(),

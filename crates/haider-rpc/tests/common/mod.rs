@@ -379,6 +379,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 permission_overrides: None,
                 cache_policy: None,
                 interaction_mode: haider_protocol::session::SessionInteractionModeV1::Interactive,
+                ssh_scope: None,
             },
         },
         WireFrame::Response {
@@ -987,6 +988,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 }),
                 cache_policy: None,
                 interaction_mode: haider_protocol::session::SessionInteractionModeV1::Interactive,
+                ssh_scope: None,
             },
         },
         // B2a append-only branch shapes. Every earlier frame stays byte-for-

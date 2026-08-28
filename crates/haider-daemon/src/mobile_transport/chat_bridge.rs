@@ -158,6 +158,7 @@ impl DaemonMobileChatBridge {
                 }),
                 cache_policy: None,
                 interaction_mode: SessionInteractionModeV1::Interactive,
+                ssh_scope: None,
             })
             .await?;
         let (session_id, created_seq, worker_generation) = match created.body {

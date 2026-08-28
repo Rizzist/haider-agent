@@ -317,6 +317,11 @@ fn session_permission_overrides_grant_only_their_named_effect_families() {
         ToolPermissionDefault::Ask
     );
     assert_eq!(
+        decision(&baseline, EffectClass::RemoteExecution),
+        ToolPermissionDefault::Ask,
+        "SSH remote execution must require approval by default"
+    );
+    assert_eq!(
         decision(&baseline, EffectClass::ScreenObserve),
         ToolPermissionDefault::Ask
     );
@@ -370,6 +375,11 @@ fn session_permission_overrides_grant_only_their_named_effect_families() {
     assert_eq!(
         decision(&exec, EffectClass::ProcessExec),
         ToolPermissionDefault::Allow
+    );
+    assert_eq!(
+        decision(&exec, EffectClass::RemoteExecution),
+        ToolPermissionDefault::Ask,
+        "allow_exec grants local process authority, not remote execution"
     );
     assert_eq!(
         decision(&exec, EffectClass::ScreenObserve),

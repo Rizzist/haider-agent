@@ -1772,6 +1772,13 @@ impl DemoDriver {
             | AppRequest::ToolsRefresh
             | AppRequest::PeerList
             | AppRequest::PeerSend { .. }
+            | AppRequest::SshList
+            | AppRequest::SshSetScope { .. }
+            | AppRequest::SshTest { .. }
+            | AppRequest::SshRemove { .. }
+            | AppRequest::ShellList
+            | AppRequest::ShellClose { .. }
+            | AppRequest::MonitorList
             // H4 live-only vocabulary: `/hooks` in demo opens its
             // sim-honest empty state and refuses trust locally — neither
             // request is ever pushed.

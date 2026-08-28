@@ -2734,29 +2734,59 @@ pub enum AppRequest {
         branch: Option<haider_protocol::ids::BranchId>,
     },
     /// W10b: durable account removal (receipt-backed `account.remove`).
-    AccountRemove { alias: String },
+    AccountRemove {
+        alias: String,
+    },
     /// Explicitly confirmed copy of a discovered first-party CLI login.
-    AccountImportDevice { candidate: String, source: String },
+    AccountImportDevice {
+        candidate: String,
+        source: String,
+    },
     /// W10b: durable custom-provider removal (`provider.remove`) — the
     /// daemon refuses builtins and account-referenced providers with
     /// typed reasons; the client never pre-judges.
-    ProviderRemove { provider: String },
+    ProviderRemove {
+        provider: String,
+    },
     /// W8b: `/tools` live — read the daemon's canonical tool inventory.
     ToolsRefresh,
     /// `/peer` live — read the profile's advertised peer registry.
     PeerList,
     /// `/peer <name> <message>` live — send one user-authored message.
-    PeerSend { to: String, message: String },
+    PeerSend {
+        to: String,
+        message: String,
+    },
+    SshList,
+    SshSetScope {
+        scope: haider_rpc::SshScopeWire,
+    },
+    SshTest {
+        profile: String,
+    },
+    SshRemove {
+        profile: String,
+    },
+    ShellList,
+    ShellClose {
+        id: String,
+    },
+    MonitorList,
     /// `/hooks` live (H4): read the daemon's hook discovery for `cwd` —
     /// workspace + profile truth. The cwd is CAPTURED AT ISSUANCE (the B2b
     /// capture law): a later screen or session switch cannot retarget the
     /// listing.
-    HooksRefresh { cwd: String },
+    HooksRefresh {
+        cwd: String,
+    },
     /// A trust (`trusted == true`) or revoke (`false`) for one digest —
     /// receipted daemon commands (H3's R2 pattern). The receipt installs
     /// NOTHING locally: the driver chains a fresh `hooks.list` and daemon
     /// truth moves the rows (the branch discipline).
-    HooksTrust { digest: String, trusted: bool },
+    HooksTrust {
+        digest: String,
+        trusted: bool,
+    },
     /// Run a respond() turn for user text. `voice` turns skip the script's
     /// UserMessage (the reducer already pushed the ◉ row); `title` asks the
     /// driver to schedule the 1.5 s auto-title micro-call, which names the
@@ -2780,7 +2810,9 @@ pub enum AppRequest {
     /// [`Self::CopySelection`]: the runtime reads bounded bytes, then
     /// either flashes the honest refusal or hands the bytes back through
     /// [`AppModel::begin_attachment_upload`].
-    AttachRead { path: String },
+    AttachRead {
+        path: String,
+    },
     /// Upload one attachment's bytes into the daemon CAS (B4b) — the
     /// receipt-free `artifact.put` (content-addressed, naturally
     /// idempotent; deliberately NO command id and never outboxed).
@@ -2857,12 +2889,20 @@ pub enum AppRequest {
     /// rides S1's `agent.message` wire — the daemon chooses steer vs
     /// queued and its receipt flashes the delivery kind; the transcript
     /// rows arrive as journal facts, nothing painted locally.
-    ChipSubmit { agent: String, text: String },
+    ChipSubmit {
+        agent: String,
+        text: String,
+    },
     /// Close a chip (✕ / the docs-recovery close arm): lifecycle flags are
     /// the reducer's; the driver owns the 5 s removal + resume timers.
-    ChipClose { agent: String },
+    ChipClose {
+        agent: String,
+    },
     /// Run an aura orchestrate turn (§3.4).
-    AuraSubmit { text: String, voice: bool },
+    AuraSubmit {
+        text: String,
+        voice: bool,
+    },
     /// The aura hold-to-talk: 1100 ms listening, then the canned phrase.
     AuraTalk,
     /// `/reset` reseeded the aura — bump its script guard.
@@ -2892,14 +2932,18 @@ pub enum AppRequest {
     /// saw the cancel). Queued-but-undrained `LoginApi` requests for the
     /// attempt were already dropped by `close_login_card` before this is
     /// pushed.
-    LoginRetired { attempt: u64 },
+    LoginRetired {
+        attempt: u64,
+    },
     /// LIVE launcher submit (W3c3, report R11 cut 4): ask the daemon to
     /// create a session for `text`. Deliberately NOT accompanied by a row,
     /// a session id, a screen flip or a turn: in live mode there is no
     /// local truth to fabricate, so the launcher shows nothing new until
     /// `session.create` answers. The demo path (`new_session`) is the
     /// opposite by design — its world IS local.
-    CreateSession { text: String },
+    CreateSession {
+        text: String,
+    },
     /// The strict gap law fired (W3c3, report R11 cut 2): reduction STOPPED
     /// for `session` with its cursor still at `after_seq`, and NOTHING later
     /// may be applied until the driver reattaches from there. The demo
@@ -2967,7 +3011,9 @@ pub enum AppRequest {
     GraphInspectRefresh,
     /// Owner 2026-08-16 (manual retry): re-run a terminal-failed session's
     /// last user turn — receipt-backed `run.retry`, no new user message.
-    RunRetry { session: SessionId },
+    RunRetry {
+        session: SessionId,
+    },
     /// Grant card: open the macOS System Settings pane for a parked computer
     /// OS-permission (`computer.permission_open_settings`).
     OpenPermissionSettings {
@@ -2977,18 +3023,24 @@ pub enum AppRequest {
     },
     /// Owner 2026-08-16 (fleet member detail): read the DETAIL member's own
     /// child-graph status for its workflow section.
-    FleetMemberGraph { session: SessionId },
+    FleetMemberGraph {
+        session: SessionId,
+    },
     /// CG-M1: receipt-backed pin of a graph template for the active session
     /// (`/graph pin`, `p` on the /workflows pane). The driver mints the
     /// command id + worker generation; nothing is installed until the
     /// daemon's fact arrives. `template` is the `graph.pin` name (built-in
     /// catalog first, then the Loom registry — store resolution order);
     /// `None` keeps the legacy ship-loop fallback for old callers.
-    GraphPin { template: Option<String> },
+    GraphPin {
+        template: Option<String>,
+    },
     /// CG-M1: receipt-backed abandonment of the active graph (`/graph
     /// abandon`, `p` on the /workflows `none` row). Carries a public reason
     /// string.
-    GraphAbandon { why: String },
+    GraphAbandon {
+        why: String,
+    },
     /// W-flow: re-read the Loom registry (`loom.list`). Pushed on every
     /// loom-pane entry so a registration landed by authoring confirmation is
     /// visible on return — the once-per-connection Listed fetch stays the
@@ -3037,7 +3089,10 @@ pub enum AppRequest {
         expected_digest: String,
     },
     /// Cancel the durable required-CLI install created by this confirmation.
-    LoomInstallCancel { generation: u64, job_id: String },
+    LoomInstallCancel {
+        generation: u64,
+        job_id: String,
+    },
     /// `account.set_default_model` under the expected-revision CAS. The
     /// default marker moves only on the correlated reply.
     SetDefaultModel {
@@ -3059,10 +3114,15 @@ pub enum AppRequest {
     /// on an attached session. The daemon normalizes the title; the name
     /// moves only on the correlated NORMALIZED reply (optimism forbidden,
     /// same law as [`Self::SelectModel`]).
-    Rename { session: SessionId, title: String },
+    Rename {
+        session: SessionId,
+        title: String,
+    },
     /// Durable shared attention acknowledgement. The daemon owns the seen
     /// timestamp; this surface merely says that the user viewed a session.
-    Seen { session: SessionId },
+    Seen {
+        session: SessionId,
+    },
     /// G3: receipted live-session effort selection
     /// (`session.select_effort`). `None` reverts to the provider default;
     /// the identity's reasoning segment moves only on the correlated reply.
@@ -3083,7 +3143,9 @@ pub enum AppRequest {
     /// validated by the daemon (a miss is a typed refusal that binds
     /// nothing). Identity moves only on the `agent_type_selected` FACT —
     /// the response is receipt + flash, never an install.
-    SelectAgentType { agent_type: Option<String> },
+    SelectAgentType {
+        agent_type: Option<String>,
+    },
     /// Start an OAuth add flow (`account.oauth_start`) for the card.
     OAuthAddStart {
         provider: String,
@@ -3091,11 +3153,15 @@ pub enum AppRequest {
         attempt: u64,
     },
     /// Cancel the card's flow (`account.oauth_cancel` when one is bound).
-    OAuthAddCancel { attempt: u64 },
+    OAuthAddCancel {
+        attempt: u64,
+    },
     /// Retire a custom-provider card whose staged credential/configure may
     /// still be in flight. The stage is connection-scoped and not durable;
     /// a late reply for this attempt must not configure anything.
-    CustomProviderRetired { attempt: u64 },
+    CustomProviderRetired {
+        attempt: u64,
+    },
     /// Create or edit a custom OpenAI-compatible provider
     /// (`provider.configure`, W5g-4/W10b). The provider name is the stable
     /// identity; origin and model are mutable under the daemon revision CAS.
@@ -3128,13 +3194,19 @@ pub enum AppRequest {
     /// (`provider.models_refresh`) — pushed by `f` on `/providers` and by a
     /// committed keyless configure. A READ against the stored origin; the
     /// inventory moves only on the daemon's refreshed snapshot.
-    ProviderModelsRefresh { provider: String },
+    ProviderModelsRefresh {
+        provider: String,
+    },
     /// Open a URL in the user's browser (runtime-owned effect; the demo
     /// flashes it instead). Carried for the OAuth authorize hop — the URL
     /// always originates from the daemon's sanctioned registration.
-    OpenUrl { url: String },
+    OpenUrl {
+        url: String,
+    },
     /// Reveal an image-created transcript payload in the OS file explorer.
-    RevealPath { path: String },
+    RevealPath {
+        path: String,
+    },
     /// T2: read the vaulted Deepgram key (`transcription.secret_get`,
     /// UDS-only). A READ — never outboxed; the answer routes by
     /// [`crate::talk::TalkState::secret_intent`].
@@ -3324,6 +3396,12 @@ pub enum Hit {
     BackChip,
     TalkChip,
     HelpHint,
+    /// Clickable shell-count segment in the existing bottom status strip.
+    ShellStatus,
+    /// Clickable monitor-count segment in the existing bottom status strip.
+    MonitorStatus,
+    /// Close affordance for the shell-registry overlay.
+    ShellClose(String),
     /// A SubTree row — opens the chip's own view.
     ChipRow(String),
     /// The SubTree header (collapse toggle).
@@ -4055,6 +4133,15 @@ pub struct AppModel {
     /// True only for a user-issued bare `/peer`. Boot/reconnect also reads
     /// `peer.list` to subscribe this connection, but must not paint a list.
     pub peer_list_requested: bool,
+    /// Public, secret-free SSH target rows from the daemon.
+    pub ssh_profiles: Vec<haider_rpc::SshProfileWire>,
+    /// Unified local/SSH terminal rows used by `/shells` and the status strip.
+    pub shells: Vec<haider_rpc::ShellWire>,
+    /// The distinct existing monitor primitive's active count. This is never
+    /// derived from or stored in the shell registry.
+    pub monitor_count: usize,
+    /// Rows from the existing monitor primitive; kept separate from shells.
+    pub monitors: Vec<haider_rpc::MonitorRegistrationWire>,
     /// Per-session voice pipeline (sim DEFAULT_VOICE — ships ON).
     pub voice: VoiceState,
     /// The ◉ talk hold is live (`◉ listening…` chip + status segment).
@@ -4287,6 +4374,18 @@ pub struct AppModel {
     pub palette_dismissed: bool,
     /// The /help overlay (esc closes).
     pub help_open: bool,
+    /// `/shells` terminal-registry overlay; activity floats over the body.
+    pub shells_open: bool,
+    /// Selected shell row in the overlay's keyboard path.
+    pub shells_cursor: usize,
+    /// `/ssh` profile overlay and its keyboard selection.
+    pub ssh_open: bool,
+    pub ssh_cursor: usize,
+    /// The profile whose destructive overlay removal is awaiting a second
+    /// `d`. Moving the cursor or closing the overlay disarms it.
+    pub ssh_remove_armed: Option<String>,
+    /// Existing monitor details floated over the body from the status strip.
+    pub monitors_open: bool,
     /// One-line transient notice shown in the status bar until the next
     /// keystroke (honest stubs: "/tree lands with the daemon").
     pub flash: Option<String>,
@@ -4483,6 +4582,10 @@ impl Default for AppModel {
             tools_inventory: None,
             peer_agents: Vec::new(),
             peer_list_requested: false,
+            ssh_profiles: Vec::new(),
+            shells: Vec::new(),
+            monitor_count: 0,
+            monitors: Vec::new(),
             // Dark is the registry default AND the detection fallback
             // (owner spec §3); main.rs resolves the persisted choice and
             // the detected appearance over this before the first frame.
@@ -4594,6 +4697,12 @@ impl Default for AppModel {
             palette_scroll: 0,
             palette_dismissed: false,
             help_open: false,
+            shells_open: false,
+            shells_cursor: 0,
+            ssh_open: false,
+            ssh_cursor: 0,
+            ssh_remove_armed: None,
+            monitors_open: false,
             flash: None,
             update_available: None,
             profile_diagnostic: None,
@@ -6568,6 +6677,93 @@ impl AppModel {
             if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
                 self.help_open = false;
             }
+            return;
+        }
+        if self.shells_open {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.shells_open = false,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.shells_cursor = self.shells_cursor.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.shells_cursor = self
+                        .shells_cursor
+                        .saturating_add(1)
+                        .min(self.shells.len().saturating_sub(1));
+                }
+                KeyCode::Enter => {
+                    if let Some(shell) = self.shells.get(self.shells_cursor) {
+                        self.requests.push(AppRequest::ShellClose {
+                            id: shell.id.clone(),
+                        });
+                        self.flash = Some(format!("· closing shell {}…", shell.id));
+                    }
+                }
+                _ => {}
+            }
+            self.dirty = true;
+            return;
+        }
+        if self.ssh_open {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.ssh_open = false;
+                    self.ssh_remove_armed = None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.ssh_cursor = self.ssh_cursor.saturating_sub(1);
+                    self.ssh_remove_armed = None;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.ssh_cursor = self
+                        .ssh_cursor
+                        .saturating_add(1)
+                        .min(self.ssh_profiles.len().saturating_sub(1));
+                    self.ssh_remove_armed = None;
+                }
+                KeyCode::Enter => {
+                    if let Some(profile) = self.ssh_profiles.get(self.ssh_cursor) {
+                        self.flash = Some(format!(
+                            "· remote PTY shells are not available yet for {}",
+                            profile.name
+                        ));
+                    }
+                }
+                KeyCode::Char('t') => {
+                    if let Some(profile) = self.ssh_profiles.get(self.ssh_cursor) {
+                        self.requests.push(AppRequest::SshTest {
+                            profile: profile.name.clone(),
+                        });
+                        self.flash = Some(format!("· testing SSH profile {}…", profile.name));
+                    }
+                }
+                KeyCode::Char('d') => {
+                    if let Some(profile) = self.ssh_profiles.get(self.ssh_cursor) {
+                        let name = profile.name.clone();
+                        if self.ssh_remove_armed.as_deref() == Some(name.as_str()) {
+                            self.requests.push(AppRequest::SshRemove {
+                                profile: name.clone(),
+                            });
+                            self.ssh_remove_armed = None;
+                            self.flash = Some(format!("· removing SSH profile {name}…"));
+                        } else {
+                            self.ssh_remove_armed = Some(name.clone());
+                            self.flash = Some(format!(
+                                "· remove SSH profile {name}? press d again to confirm"
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            self.dirty = true;
+            return;
+        }
+        if self.monitors_open {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                self.monitors_open = false;
+            }
+            self.dirty = true;
             return;
         }
         // The `/model` picker owns EVERY key while it is showing (F2a —
@@ -12231,6 +12427,9 @@ impl AppModel {
             "sessions" => self.enter_sessions(),
             "accounts" => self.enter_accounts(),
             "peer" | "peers" => self.peer_command(&remainder),
+            "ssh" => self.ssh_command(&remainder),
+            "shells" => self.shells_command(&remainder),
+            "monitors" => self.monitors_command(),
             "providers" => self.enter_providers(),
             "hooks" => self.enter_hooks(),
             // CG-M1: `/graph [pin|abandon|status]`.
@@ -12451,6 +12650,164 @@ impl AppModel {
             message: message.to_owned(),
         });
         self.flash = Some(format!("· sending peer message to {to}…"));
+    }
+
+    fn ssh_command(&mut self, argument: &str) {
+        self.dirty = true;
+        if self.mode.fabricates_locally() {
+            self.flash = Some("· /ssh — live only; profiles are daemon truth".into());
+            return;
+        }
+        if !self.daemon_serves(haider_rpc::FEATURE_SSH_PROFILES_V1) {
+            self.flash = Some(self.stale_daemon_note("SSH profiles"));
+            return;
+        }
+        let argument = argument.trim();
+        if argument.is_empty() {
+            self.ssh_open = true;
+            self.requests.push(AppRequest::SshList);
+            self.flash = Some("· reading SSH profiles…".into());
+            return;
+        }
+        if let Some(value) = argument.strip_prefix("scope ") {
+            let value = value.trim();
+            let scope = match value {
+                "all" => haider_rpc::SshScopeWire::All,
+                "none" => haider_rpc::SshScopeWire::None,
+                _ => {
+                    let names = value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>();
+                    if names.is_empty() {
+                        self.flash = Some("· /ssh scope all|none|name[,name…]".into());
+                        return;
+                    }
+                    haider_rpc::SshScopeWire::Allow { names }
+                }
+            };
+            self.requests.push(AppRequest::SshSetScope { scope });
+            self.flash = Some("· updating this session's SSH scope…".into());
+            return;
+        }
+        if let Some(profile) = argument.strip_prefix("shell ") {
+            let profile = profile.trim();
+            if profile.is_empty() {
+                self.flash = Some("· /ssh shell <profile>".into());
+                return;
+            }
+            self.flash = Some(format!(
+                "· remote PTY shells are not available yet for {profile}"
+            ));
+            return;
+        }
+        if let Some(profile) = argument.strip_prefix("test ") {
+            let profile = profile.trim();
+            if !profile.is_empty() {
+                self.requests.push(AppRequest::SshTest {
+                    profile: profile.to_owned(),
+                });
+                self.flash = Some(format!("· testing SSH profile {profile}…"));
+                return;
+            }
+        }
+        if let Some(profile) = argument.strip_prefix("rm ") {
+            let profile = profile.trim();
+            if !profile.is_empty() {
+                self.requests.push(AppRequest::SshRemove {
+                    profile: profile.to_owned(),
+                });
+                self.flash = Some(format!("· removing SSH profile {profile}…"));
+                return;
+            }
+        }
+        self.flash = Some(
+            "· /ssh [scope all|none|name,… | shell <profile> | test <profile> | rm <profile>]"
+                .into(),
+        );
+    }
+
+    fn shells_command(&mut self, argument: &str) {
+        self.dirty = true;
+        if self.mode.fabricates_locally() {
+            self.flash = Some("· /shells — live only; terminals are daemon truth".into());
+            return;
+        }
+        if !self.daemon_serves(haider_rpc::FEATURE_SHELL_REGISTRY_V1) {
+            self.flash = Some(self.stale_daemon_note("shell registry"));
+            return;
+        }
+        let argument = argument.trim();
+        if let Some(id) = argument.strip_prefix("close ") {
+            self.requests.push(AppRequest::ShellClose {
+                id: id.trim().to_owned(),
+            });
+            self.flash = Some("· closing shell…".into());
+        } else if argument.is_empty() {
+            self.shells_open = true;
+            self.requests.push(AppRequest::ShellList);
+            self.flash = Some("· reading terminal registry…".into());
+        } else {
+            self.flash = Some("· /shells [close <id>]".into());
+        }
+    }
+
+    fn monitors_command(&mut self) {
+        self.dirty = true;
+        if self.mode.fabricates_locally() {
+            self.flash = Some("· /monitors — live only; monitors are daemon truth".into());
+            return;
+        }
+        if self.screen != Screen::Session || self.active_session.is_none() {
+            self.flash = Some("· /monitors — attach a session first".into());
+            return;
+        }
+        if !self.daemon_serves(haider_rpc::FEATURE_MONITOR_CONTROL_V1) {
+            self.flash = Some(self.stale_daemon_note("monitor details"));
+            return;
+        }
+        self.monitors_open = true;
+        self.requests.push(AppRequest::MonitorList);
+        self.flash = Some("· reading existing monitor registry…".into());
+    }
+
+    pub(crate) fn apply_monitor_list(&mut self, receipt: haider_rpc::MonitorListReceiptWire) {
+        self.monitors = match receipt.outcome {
+            haider_rpc::MonitorListOutcomeWire::Listed { monitors } => monitors,
+            haider_rpc::MonitorListOutcomeWire::Rejected { .. }
+            | haider_rpc::MonitorListOutcomeWire::Unknown => Vec::new(),
+        };
+        self.monitor_count = self.monitors.len();
+        self.flash = None;
+        self.dirty = true;
+    }
+
+    pub(crate) fn apply_ssh_list(&mut self, profiles: Vec<haider_rpc::SshProfileWire>) {
+        self.ssh_profiles = profiles;
+        self.ssh_remove_armed = None;
+        self.ssh_cursor = self
+            .ssh_cursor
+            .min(self.ssh_profiles.len().saturating_sub(1));
+        self.flash = None;
+        self.dirty = true;
+    }
+
+    pub(crate) fn apply_shell_list(&mut self, shells: Vec<haider_rpc::ShellWire>) {
+        self.shells = shells;
+        self.shells_cursor = self.shells_cursor.min(self.shells.len().saturating_sub(1));
+        self.flash = None;
+        self.dirty = true;
+    }
+
+    pub(crate) fn apply_shell_event(&mut self, shell: haider_rpc::ShellWire) {
+        if let Some(existing) = self.shells.iter_mut().find(|entry| entry.id == shell.id) {
+            *existing = shell;
+        } else {
+            self.shells.push(shell);
+        }
+        self.dirty = true;
     }
 
     pub(crate) fn apply_peer_list(&mut self, agents: Vec<haider_protocol::peer::PeerDescriptor>) {
@@ -14280,6 +14637,15 @@ impl AppModel {
         if self.help_open {
             return;
         }
+        if self.shells_open && !matches!(hit, Hit::ShellClose(_) | Hit::ShellStatus) {
+            return;
+        }
+        if self.ssh_open {
+            return;
+        }
+        if self.monitors_open && !matches!(hit, Hit::MonitorStatus) {
+            return;
+        }
         // TUI6.2b: the login card is MODAL against hits exactly as it is
         // against keys (login_key owns the keyboard) — the frame beneath
         // it still lists clickable rows, and a click that fell through
@@ -14575,6 +14941,12 @@ impl AppModel {
                 }
             }
             Hit::HelpHint if self.screen == Screen::Launcher => self.help_open = true,
+            Hit::ShellStatus => self.shells_command(""),
+            Hit::MonitorStatus => self.monitors_command(),
+            Hit::ShellClose(id) if self.shells_open => {
+                self.requests.push(AppRequest::ShellClose { id });
+                self.flash = Some("· closing shell…".into());
+            }
             // The SubTree panel exists only on the session/subagent screens,
             // and its rows only while it is expanded.
             Hit::ChipRow(agent)
@@ -15908,6 +16280,10 @@ pub fn tools_card(seq: u64) -> Menu {
 #[cfg(test)]
 #[path = "custom_provider_tests.rs"]
 mod custom_provider_tests;
+
+#[cfg(test)]
+#[path = "ssh_shell_registry_tests.rs"]
+mod ssh_shell_registry_tests;
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]

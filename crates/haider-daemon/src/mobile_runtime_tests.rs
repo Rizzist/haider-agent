@@ -328,6 +328,7 @@ async fn mobile_dispatcher_fixture_with_grant(
             },
             store: lease,
             run_id: run_id.clone(),
+            run_deadline: None,
             branch_id: None,
             device_id: DeviceId::new(format!("{label}-tool-device")),
             event_ids: Arc::new(EventIdGenerator::new(format!("{label}-tool-event"))),

@@ -97,6 +97,8 @@ mod provider_registry;
 mod run_budget_tests;
 mod runtime;
 mod session_hub;
+mod shell_registry;
+mod ssh;
 #[cfg(test)]
 mod subagent_core_tests;
 mod tasks;

@@ -152,6 +152,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         "<name> <message>",
     ),
     client_cmd(
+        "ssh",
+        "SSH profiles — list, scope, or open a remote shell",
+        "[scope all|none|name,…|shell name]",
+    ),
+    client_cmd("shells", "List local and SSH terminal sessions", ""),
+    client_cmd(
         "accounts",
         "Accounts — provider credentials (OAuth / API), pick the active one",
         "",

@@ -105,6 +105,7 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
     let mut effort = None;
     let mut fast = None;
     let mut account = None;
+    let mut ssh_scope = None;
     let mut attachments = Vec::new();
     let mut prompt = None;
     let mut prompt_stdin = false;
@@ -273,6 +274,15 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
                 account = Some(value.clone());
             }
             "--account" => return Err("duplicate --account flag".into()),
+            "--ssh-profiles" if ssh_scope.is_none() => {
+                index += 1;
+                let value = rest
+                    .get(index)
+                    .filter(|value| !value.is_empty() && !value.starts_with("--"))
+                    .ok_or_else(|| "--ssh-profiles requires all|none|name[,name...]".to_owned())?;
+                ssh_scope = Some(parse_ssh_scope(value)?);
+            }
+            "--ssh-profiles" => return Err("duplicate --ssh-profiles flag".into()),
             "--attach" => {
                 index += 1;
                 let value = rest
@@ -321,6 +331,7 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
             || effort.is_some()
             || fast.is_some()
             || account.is_some()
+            || ssh_scope.is_some()
             || !attachments.is_empty()
             || !budget.is_empty()
             || seed.is_some()
@@ -341,6 +352,7 @@ fn parse_run_options_with_config(rest: &[String]) -> Result<ParsedRunOptions, St
         effort,
         fast,
         account,
+        ssh_scope,
     };
     Ok(ParsedRunOptions {
         options: RunOptions {
@@ -372,6 +384,34 @@ fn parse_positive_u64(value: Option<&str>, flag: &str) -> Result<u64, String> {
         return Err(format!("{flag} must be greater than zero"));
     }
     Ok(parsed)
+}
+
+fn parse_ssh_scope(value: &str) -> Result<haider_rpc::SshScopeWire, String> {
+    match value {
+        "all" => Ok(haider_rpc::SshScopeWire::All),
+        "none" => Ok(haider_rpc::SshScopeWire::None),
+        _ => {
+            let names = value
+                .split(',')
+                .map(str::trim)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+            if names.is_empty()
+                || names.iter().any(|name| {
+                    name.is_empty()
+                        || name.len() > 32
+                        || !name.bytes().all(|byte| {
+                            byte.is_ascii_lowercase()
+                                || byte.is_ascii_digit()
+                                || b"._-".contains(&byte)
+                        })
+                })
+            {
+                return Err("--ssh-profiles names must match [a-z0-9._-]{1,32}".to_owned());
+            }
+            Ok(haider_rpc::SshScopeWire::Allow { names })
+        }
+    }
 }
 
 fn parse_run_id(value: &str, flag: &str) -> Result<RunId, String> {
