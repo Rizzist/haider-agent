@@ -1,4 +1,4 @@
-use super::{Endpoint, EndpointError, PeerCredentials, PeerExitReason};
+use super::{Endpoint, EndpointError, IpcShutdownOutcome, PeerCredentials, PeerExitReason};
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle as _, OwnedHandle as ProcessHandle};
 use std::path::Path;
@@ -77,8 +77,18 @@ impl Drop for IpcStream {
 }
 
 /// Shared ownership of the pipe slot retained outside the async tasks.
-/// Taking the Tokio pipe drops its sole OS handle synchronously, so `close`
-/// does not depend on a current-thread runtime polling aborted tasks again.
+///
+/// Taking this slot drops Tokio's named-pipe object and cancels its overlapped
+/// operations, but mio retains handle-owning references until the IOCP driver
+/// dequeues their completion packets. Therefore [`Self::request`] does not by
+/// itself notify the peer or close the kernel handle: after a
+/// [`IpcShutdownOutcome::LocalSlotEmptiedOnly`] result, the owning Tokio runtime
+/// must be polled before peer-visible closure is guaranteed.
+///
+/// Follow-up for a reactor-independent protocol goodbye: the immediate writer
+/// must first share a whole-frame exclusion gate with the async writer. The
+/// current `try_write` loop can be partial or `WouldBlock`, and serializes only
+/// each syscall, so injecting a frame here could interleave with an async frame.
 pub struct IpcShutdown {
     stream: Arc<StdMutex<Option<PipeStream>>>,
 }
@@ -207,9 +217,11 @@ fn pipe_peer_is_connected(stream: &StdMutex<Option<PipeStream>>) -> io::Result<b
 }
 
 impl IpcShutdown {
-    pub fn request(&self) -> io::Result<()> {
-        let _ = take_pipe(&self.stream);
-        Ok(())
+    pub fn request(&self) -> io::Result<IpcShutdownOutcome> {
+        Ok(match take_pipe(&self.stream) {
+            Some(_) => IpcShutdownOutcome::LocalSlotEmptiedOnly,
+            None => IpcShutdownOutcome::AlreadyRequested,
+        })
     }
 }
 
@@ -334,6 +346,9 @@ impl BoundEndpoint {
     }
 
     pub fn cleanup(&mut self) -> Result<(), EndpointError> {
+        // Named pipes have no filesystem node to unlink. Their names remain
+        // kernel-visible while any listener or connected instance is held,
+        // so this step cannot claim that the pipe name was released.
         Ok(())
     }
 

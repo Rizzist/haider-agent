@@ -1,5 +1,17 @@
 use std::path::{Path, PathBuf};
 
+/// What a synchronous IPC shutdown request proved at the transport boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcShutdownOutcome {
+    /// The peer was synchronously notified that this connection is closing.
+    PeerNotified,
+    /// The local async-stream slot was emptied, but peer visibility still
+    /// depends on the owning Tokio runtime polling cancelled I/O.
+    LocalSlotEmptiedOnly,
+    /// A prior request had already consumed the shutdown authority.
+    AlreadyRequested,
+}
+
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]

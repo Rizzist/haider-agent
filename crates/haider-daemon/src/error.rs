@@ -32,6 +32,11 @@ pub enum DaemonError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// A runtime directory still existed after bounded cleanup retries.
+    RuntimeDirectoryNotEmpty {
+        path: PathBuf,
+        remaining_entries: Vec<PathBuf>,
+    },
     /// The longest endpoint address cannot fit the platform IPC namespace.
     EndpointAddressTooLong {
         path: PathBuf,
@@ -71,6 +76,7 @@ impl DaemonError {
             Self::InvalidConfig { .. } => 64,
             Self::Store(_)
             | Self::Io { .. }
+            | Self::RuntimeDirectoryNotEmpty { .. }
             | Self::EndpointAddressTooLong { .. }
             | Self::Endpoint { .. } => 74,
             Self::Protocol { .. } | Self::Task { .. } => 70,
@@ -110,6 +116,24 @@ impl std::fmt::Display for DaemonError {
                 path,
                 source,
             } => write!(formatter, "{operation} {}: {source}", path.display()),
+            Self::RuntimeDirectoryNotEmpty {
+                path,
+                remaining_entries,
+            } => {
+                write!(
+                    formatter,
+                    "daemon runtime directory {} still exists; remaining entries:",
+                    path.display()
+                )?;
+                if remaining_entries.is_empty() {
+                    formatter.write_str(" <none visible>")?;
+                } else {
+                    for entry in remaining_entries {
+                        write!(formatter, " {}", entry.display())?;
+                    }
+                }
+                Ok(())
+            }
             Self::EndpointAddressTooLong {
                 path,
                 length,

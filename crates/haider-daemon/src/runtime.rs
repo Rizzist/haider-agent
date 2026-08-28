@@ -1840,6 +1840,7 @@ fn daemon_error_class(error: &DaemonError) -> &'static str {
         DaemonError::InvalidConfig { .. } => "invalid_config",
         DaemonError::Store(_) => "store",
         DaemonError::Io { .. } => "io",
+        DaemonError::RuntimeDirectoryNotEmpty { .. } => "runtime_directory_not_empty",
         DaemonError::EndpointAddressTooLong { .. } => "endpoint_address_too_long",
         DaemonError::Endpoint { .. } => "endpoint",
         DaemonError::Protocol { .. } => "protocol",

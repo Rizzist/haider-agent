@@ -102,8 +102,11 @@ impl BoundarySnapshot {
 
 /// Polls a synchronous boundary and prints a complete stdout post-mortem
 /// before failing it. `snapshot` is deliberately lazy: success does no I/O,
-/// tree walking, endpoint probing, allocation, or process inspection.
+/// tree walking, endpoint probing, allocation, or process inspection. The
+/// delay is driven by the caller's runtime so cancelled Tokio I/O reaches the
+/// platform driver before the predicate is checked again.
 pub fn wait_until(
+    runtime: &tokio::runtime::Runtime,
     boundary: &str,
     deadline: Duration,
     poll: Duration,
@@ -122,7 +125,8 @@ pub fn wait_until(
             report_boundary_timeout(boundary, started.elapsed(), deadline, context, snapshot());
             panic!("deadline waiting for {boundary}");
         }
-        std::thread::sleep(poll.min(deadline_at.saturating_duration_since(now)));
+        let delay = poll.min(deadline_at.saturating_duration_since(now));
+        runtime.block_on(async { tokio::time::sleep(delay).await });
     }
 }
 

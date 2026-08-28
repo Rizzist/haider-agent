@@ -187,6 +187,22 @@ impl std::fmt::Display for DisconnectReason {
     }
 }
 
+/// What [`RpcClient::close`] proved at the local transport boundary.
+#[derive(Debug)]
+pub enum ClientCloseOutcome {
+    /// The peer was synchronously notified of the close. Unix provides this
+    /// through `shutdown(2)` without another executor poll.
+    PeerNotified,
+    /// The local stream slot was emptied, but the owning Tokio runtime must be
+    /// polled before the close becomes peer-visible. This is the Windows
+    /// named-pipe outcome while cancelled IOCP operations are still pending.
+    LocalSlotEmptiedOnly,
+    /// A prior close already consumed the transport shutdown authority.
+    AlreadyClosed,
+    /// The platform shutdown request itself failed.
+    ShutdownFailed(std::io::Error),
+}
+
 /// A correlated request failed.
 #[derive(Debug)]
 pub enum ClientError {
@@ -419,8 +435,10 @@ pub struct RpcClient {
     outbound_limit: usize,
     encoding: WireEncoding,
     tasks: Vec<tokio::task::JoinHandle<()>>,
-    /// Kernel close authority retained outside the reader/writer tasks so a
-    /// synchronous `close` does not depend on polling their executor again.
+    /// Transport shutdown authority retained outside the reader/writer tasks.
+    /// Unix uses it for a peer-visible `shutdown(2)` without another executor
+    /// poll. On Windows it only empties the Tokio pipe slot; the runtime must
+    /// subsequently poll cancelled IOCP operations before the handle closes.
     shutdown: haider_platform::IpcShutdown,
     /// The handshake the connection negotiated on. Retained so a client that
     /// only receives the `RpcClient` (the TUI's `run_live`) can still gate
@@ -663,14 +681,31 @@ impl RpcClient {
             .map_err(|_| ClientError::Disconnected(self.disconnect_reason()))
     }
 
-    /// Closes the connection locally. Idempotent; a later
-    /// [`Self::disconnected`] returns the first recorded reason.
-    pub fn close(&self) {
+    /// Closes the connection locally and reports what the transport proved.
+    ///
+    /// The call is idempotent, and a later [`Self::disconnected`] returns the
+    /// first recorded reason. Unix notifies the peer synchronously. Windows
+    /// returns [`ClientCloseOutcome::LocalSlotEmptiedOnly`]; callers at a
+    /// synchronous boundary must poll the owning Tokio runtime so cancelled
+    /// IOCP completions can release the named-pipe handle.
+    pub fn close(&self) -> ClientCloseOutcome {
         self.shared.fail(DisconnectReason::Closed);
-        let _ = self.shutdown.request();
+        let outcome = match self.shutdown.request() {
+            Ok(haider_platform::IpcShutdownOutcome::PeerNotified) => {
+                ClientCloseOutcome::PeerNotified
+            }
+            Ok(haider_platform::IpcShutdownOutcome::LocalSlotEmptiedOnly) => {
+                ClientCloseOutcome::LocalSlotEmptiedOnly
+            }
+            Ok(haider_platform::IpcShutdownOutcome::AlreadyRequested) => {
+                ClientCloseOutcome::AlreadyClosed
+            }
+            Err(error) => ClientCloseOutcome::ShutdownFailed(error),
+        };
         for task in &self.tasks {
             task.abort();
         }
+        outcome
     }
 
     fn disconnect_reason(&self) -> DisconnectReason {
@@ -707,7 +742,7 @@ impl PendingResponse {
 
 impl Drop for RpcClient {
     fn drop(&mut self) {
-        self.close();
+        let _ = self.close();
     }
 }
 

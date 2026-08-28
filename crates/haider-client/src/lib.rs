@@ -36,9 +36,9 @@ pub mod workflow_graph_rpc;
 
 pub use checkpoint::{CheckpointClientError, checkpoints, redo, rollback_turn, undo};
 pub use client::{
-    ClientConfig, ClientError, ConnectError, Connected, ConnectionState, DisconnectReason,
-    MenuAnswerRequest, PING_INTERVAL, PONG_DEADLINE, PeerCredentials, PendingResponse, RpcClient,
-    connect,
+    ClientCloseOutcome, ClientConfig, ClientError, ConnectError, Connected, ConnectionState,
+    DisconnectReason, MenuAnswerRequest, PING_INTERVAL, PONG_DEADLINE, PeerCredentials,
+    PendingResponse, RpcClient, connect,
 };
 pub use graph::{
     GraphAbandonResult, GraphClientError, GraphInspectPage, GraphPinResult, GraphRunSetOpenResult,

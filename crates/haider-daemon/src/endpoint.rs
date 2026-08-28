@@ -3,6 +3,10 @@
 use crate::{DaemonConfig, DaemonError};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+const RUNTIME_REMOVE_RETRY_WINDOW: Duration = Duration::from_millis(250);
+const RUNTIME_REMOVE_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Advisory process file inside one profile's private runtime directory.
 /// The store lock remains the only singleton authority.
@@ -90,9 +94,9 @@ impl BoundEndpoint {
                     );
                     #[cfg(windows)]
                     journal_cleanup_success(
-                        "endpoint_remove",
+                        "endpoint_cleanup",
                         self.inner.path(),
-                        "kernel_pipe_instances_released",
+                        "no_filesystem_remove_pipe_name_may_outlive_cleanup",
                     );
                 }
                 Err(error) => {
@@ -208,22 +212,34 @@ pub(crate) async fn bind(
 
 pub(crate) fn cleanup_runtime_dirs(runtime_dir: &Path) -> Result<(), DaemonError> {
     let temp = runtime_dir.join("tmp");
-    for (operation, path, preserve_nonempty) in [
-        ("remove daemon temporary directory", temp.as_path(), false),
-        ("remove profile runtime directory", runtime_dir, true),
+    for (operation, path) in [
+        ("remove daemon temporary directory", temp.as_path()),
+        ("remove profile runtime directory", runtime_dir),
     ] {
+        remove_runtime_directory(operation, path)?;
+    }
+    Ok(())
+}
+
+fn remove_runtime_directory(operation: &'static str, path: &Path) -> Result<(), DaemonError> {
+    let retry_deadline = Instant::now() + RUNTIME_REMOVE_RETRY_WINDOW;
+    loop {
         match std::fs::remove_dir(path) {
-            Ok(()) => journal_cleanup_success(operation, path, "removed"),
+            Ok(()) => return journal_removed_directory(operation, path),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 journal_cleanup_success(operation, path, "already_absent");
+                return Ok(());
             }
-            Err(error)
-                if preserve_nonempty && error.kind() == std::io::ErrorKind::DirectoryNotEmpty =>
-            {
-                // Exact socket/PID ownership cleanup may intentionally leave
-                // a successor or unrelated node behind. Preserve it; an
-                // empty ephemeral tree is still removed by the success path.
-                journal_cleanup_success(operation, path, "preserved_nonempty");
+            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                let now = Instant::now();
+                if now < retry_deadline {
+                    std::thread::sleep(
+                        RUNTIME_REMOVE_RETRY_INTERVAL
+                            .min(retry_deadline.saturating_duration_since(now)),
+                    );
+                    continue;
+                }
+                return runtime_directory_not_empty(operation, path);
             }
             Err(error) => {
                 journal_io_failure(operation, path, &error);
@@ -231,7 +247,53 @@ pub(crate) fn cleanup_runtime_dirs(runtime_dir: &Path) -> Result<(), DaemonError
             }
         }
     }
-    Ok(())
+}
+
+fn journal_removed_directory(operation: &'static str, path: &Path) -> Result<(), DaemonError> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            journal_cleanup_success(operation, path, "removed");
+            Ok(())
+        }
+        Ok(_) => runtime_directory_not_empty(operation, path),
+        Err(error) => {
+            journal_io_failure("verify removed runtime directory", path, &error);
+            Err(DaemonError::io(
+                "verify removed runtime directory",
+                path,
+                error,
+            ))
+        }
+    }
+}
+
+fn runtime_directory_not_empty(operation: &'static str, path: &Path) -> Result<(), DaemonError> {
+    let mut remaining_entries = std::fs::read_dir(path)
+        .map_err(|error| {
+            journal_io_failure("list nonempty runtime directory", path, &error);
+            DaemonError::io("list nonempty runtime directory", path, error)
+        })?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            journal_io_failure("inspect nonempty runtime directory", path, &error);
+            DaemonError::io("inspect nonempty runtime directory", path, error)
+        })?;
+    remaining_entries.sort();
+    eprintln!(
+        "haiderd: ephemeral-lifecycle event=cleanup step={operation} outcome=not_removed_remaining_entries path={} remaining_entries={remaining_entries:?}",
+        path.display()
+    );
+    tracing::warn!(
+        step = operation,
+        path = %path.display(),
+        remaining_entries = ?remaining_entries,
+        "daemon runtime cleanup left a directory behind"
+    );
+    Err(DaemonError::RuntimeDirectoryNotEmpty {
+        path: path.to_path_buf(),
+        remaining_entries,
+    })
 }
 
 fn journal_cleanup_success(step: &str, path: &Path, outcome: &str) {

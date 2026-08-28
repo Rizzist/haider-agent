@@ -4,7 +4,7 @@
 //! directory-relative verification, unpredictable staging names, non-replacing
 //! publication/restoration, stale probing, and device/inode cleanup identity.
 
-use super::{Endpoint, EndpointError, PeerCredentials, PeerExitReason};
+use super::{Endpoint, EndpointError, IpcShutdownOutcome, PeerCredentials, PeerExitReason};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
 use std::fs;
@@ -12,6 +12,7 @@ use std::os::fd::AsRawFd as _;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
 
@@ -37,11 +38,13 @@ const BASE64_URL_SAFE: &[u8; 64] =
 
 /// A duplicate of a connected socket retained outside its async tasks.
 ///
-/// `shutdown(2)` applies to the shared socket, so it wakes both halves and
-/// makes a synchronous client close visible even while a current-thread Tokio
-/// runtime is not being driven.
+/// On Unix, `shutdown(2)` applies to the shared socket, so it wakes both halves
+/// and makes a synchronous client close visible even while a current-thread
+/// Tokio runtime is not being driven. Windows does not share this guarantee;
+/// see the platform-specific [`crate::IpcShutdown`] contract there.
 pub struct IpcShutdown {
     socket: OwnedFd,
+    requested: AtomicBool,
 }
 
 /// Unix sockets report peer closure through their ordinary read path, so the
@@ -56,10 +59,14 @@ impl PeerExitWatcher {
 
 impl IpcShutdown {
     #[allow(unsafe_code)]
-    pub fn request(&self) -> std::io::Result<()> {
+    pub fn request(&self) -> std::io::Result<IpcShutdownOutcome> {
+        if self.requested.swap(true, Ordering::AcqRel) {
+            return Ok(IpcShutdownOutcome::AlreadyRequested);
+        }
         if unsafe { libc::shutdown(self.socket.as_raw_fd(), libc::SHUT_RDWR) } == 0 {
-            Ok(())
+            Ok(IpcShutdownOutcome::PeerNotified)
         } else {
+            self.requested.store(false, Ordering::Release);
             Err(std::io::Error::last_os_error())
         }
     }
@@ -879,7 +886,10 @@ pub async fn connect(endpoint: impl AsRef<Path>) -> std::io::Result<IpcStream> {
 
 pub fn shutdown_handle(stream: &IpcStream) -> std::io::Result<IpcShutdown> {
     let socket = rustix::io::fcntl_dupfd_cloexec(stream, 0).map_err(std::io::Error::from)?;
-    Ok(IpcShutdown { socket })
+    Ok(IpcShutdown {
+        socket,
+        requested: AtomicBool::new(false),
+    })
 }
 
 pub fn split(stream: IpcStream) -> (IpcReadHalf, IpcWriteHalf) {
