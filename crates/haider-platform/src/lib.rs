@@ -5,6 +5,8 @@
 //! daemon detachment, descriptor hygiene, process signalling, and shutdown
 //! delivery preserve the pre-abstraction implementations exactly.
 
+#[cfg(windows)]
+mod console;
 mod directory;
 pub mod fs;
 mod ipc;
@@ -14,6 +16,8 @@ mod spawn;
 mod system;
 mod user;
 
+#[cfg(windows)]
+pub use console::{ConsoleHoldError, SoleProcessConsole, sole_process_console};
 #[cfg(windows)]
 pub use directory::{
     WindowsFileIdentity, open_workspace_subdirectory, windows_file_identity,

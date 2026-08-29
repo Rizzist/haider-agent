@@ -94,7 +94,7 @@ fn main() -> ExitCode {
         .name("haider-main".into())
         .stack_size(8 * 1024 * 1024)
         .spawn(|| run_cli(args));
-    match launched {
+    let code = match launched {
         Ok(thread) => match thread.join() {
             Ok(code) => code,
             Err(_) => {
@@ -106,7 +106,33 @@ fn main() -> ExitCode {
             eprintln!("haider: could not start main runtime thread: {error}");
             ExitCode::from(EX_SOFTWARE)
         }
+    };
+    hold_explorer_console_on_failure(code);
+    code
+}
+
+/// Explorer destroys a double-clicked console as soon as the process exits.
+/// Preserve the already-printed failure until a key is pressed, but only when
+/// Win32 proves this process is alone, every standard stream is still attached
+/// to the console, and no CI marker makes the invocation non-interactive.
+#[cfg(windows)]
+fn hold_explorer_console_on_failure(code: ExitCode) {
+    use std::io::IsTerminal as _;
+
+    if code == ExitCode::SUCCESS
+        || std::env::var_os("CI").is_some()
+        || !io::stdin().is_terminal()
+        || !io::stdout().is_terminal()
+        || !io::stderr().is_terminal()
+    {
+        return;
     }
+    let Ok(Some(console)) = haider_platform::sole_process_console() else {
+        return;
+    };
+    eprintln!("haider: press any key to close this window");
+    let _ = io::stderr().flush();
+    let _ = console.wait_for_keypress();
 }
 
 /// Select the runtime before constructing an async command future. In

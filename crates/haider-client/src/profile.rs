@@ -52,6 +52,8 @@ pub struct ProfileEnv {
     pub profile_dir: Option<PathBuf>,
     /// `HOME`.
     pub home: Option<PathBuf>,
+    /// `USERPROFILE` (the standard Windows user-home variable).
+    pub user_profile: Option<PathBuf>,
     /// `HAIDER_MODEL`.
     pub model: Option<String>,
     /// `HAIDER_RUNTIME_DIR`, interpreted as a root; the resolver always adds
@@ -67,6 +69,7 @@ impl ProfileEnv {
         Self {
             profile_dir: std::env::var_os(PROFILE_DIR_ENV).map(PathBuf::from),
             home: std::env::var_os("HOME").map(PathBuf::from),
+            user_profile: std::env::var_os("USERPROFILE").map(PathBuf::from),
             model: std::env::var(MODEL_ENV)
                 .ok()
                 .filter(|m| !m.trim().is_empty()),
@@ -119,7 +122,7 @@ pub struct ResolvedProfile {
 /// Typed profile-resolution failure.
 #[derive(Debug)]
 pub enum ProfileError {
-    /// Neither `HAIDER_PROFILE_DIR` nor `HOME` is available.
+    /// Neither `HAIDER_PROFILE_DIR` nor a platform home variable is available.
     NoStoreDir,
     /// A filesystem step failed at a named path.
     Io {
@@ -138,9 +141,7 @@ pub enum ProfileError {
 impl std::fmt::Display for ProfileError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NoStoreDir => formatter.write_str(
-                "cannot resolve a profile directory: HAIDER_PROFILE_DIR is unset and HOME is unavailable",
-            ),
+            Self::NoStoreDir => formatter.write_str(profile_store_unavailable_message()),
             Self::Io {
                 operation,
                 path,
@@ -152,7 +153,11 @@ impl std::fmt::Display for ProfileError {
                 path.display()
             ),
             Self::InvalidConfig { path, message } => {
-                write!(formatter, "invalid profile config {}: {message}", path.display())
+                write!(
+                    formatter,
+                    "invalid profile config {}: {message}",
+                    path.display()
+                )
             }
         }
     }
@@ -178,10 +183,7 @@ struct ProfileConfig {
 pub fn resolve_profile(env: &ProfileEnv) -> Result<ResolvedProfile, ProfileError> {
     let store_dir = match &env.profile_dir {
         Some(dir) => dir.clone(),
-        None => env
-            .home
-            .as_ref()
-            .filter(|home| !home.as_os_str().is_empty())
+        None => profile_home(env)
             .map(|home| home.join(".haider").join("dev-profile"))
             .ok_or(ProfileError::NoStoreDir)?,
     };
@@ -220,6 +222,35 @@ pub fn resolve_profile(env: &ProfileEnv) -> Result<ResolvedProfile, ProfileError
         default_model,
         default_max_tokens: DEFAULT_MAX_TOKENS,
     })
+}
+
+#[cfg(target_os = "windows")]
+fn profile_home(env: &ProfileEnv) -> Option<&Path> {
+    env.user_profile
+        .as_deref()
+        .filter(|home| !home.as_os_str().is_empty())
+        .or_else(|| {
+            env.home
+                .as_deref()
+                .filter(|home| !home.as_os_str().is_empty())
+        })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn profile_home(env: &ProfileEnv) -> Option<&Path> {
+    env.home
+        .as_deref()
+        .filter(|home| !home.as_os_str().is_empty())
+}
+
+#[cfg(target_os = "windows")]
+fn profile_store_unavailable_message() -> &'static str {
+    "cannot resolve a profile directory: HAIDER_PROFILE_DIR is unset and USERPROFILE/HOME are unavailable"
+}
+
+#[cfg(not(target_os = "windows"))]
+fn profile_store_unavailable_message() -> &'static str {
+    "cannot resolve a profile directory: HAIDER_PROFILE_DIR is unset and HOME is unavailable"
 }
 
 /// The deterministic rendezvous socket path.

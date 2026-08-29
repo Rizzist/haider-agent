@@ -408,6 +408,7 @@ impl RestartFixture {
         let profile = haider_client::resolve_profile(&haider_client::ProfileEnv {
             profile_dir: Some(root.path().join("profile")),
             home: None,
+            user_profile: None,
             model: None,
             runtime_dir: None,
             xdg_runtime_dir: None,
@@ -784,6 +785,7 @@ fn resolved_test_profile(path: PathBuf) -> ResolvedProfile {
     haider_client::resolve_profile(&haider_client::ProfileEnv {
         profile_dir: Some(path),
         home: None,
+        user_profile: None,
         model: None,
         runtime_dir: None,
         xdg_runtime_dir: None,

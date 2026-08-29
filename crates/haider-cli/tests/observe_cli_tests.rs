@@ -567,6 +567,7 @@ fn no_daemon_no_spawn_paths_are_typed_69_and_do_not_start_a_daemon() {
     let resolved = resolve_profile(&ProfileEnv {
         profile_dir: Some(profile_dir.clone()),
         home: None,
+        user_profile: None,
         model: None,
         runtime_dir: None,
         xdg_runtime_dir: None,

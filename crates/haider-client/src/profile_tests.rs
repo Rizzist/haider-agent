@@ -9,6 +9,7 @@ fn env_for(dir: &Path) -> ProfileEnv {
     ProfileEnv {
         profile_dir: Some(dir.to_path_buf()),
         home: None,
+        user_profile: None,
         model: None,
         runtime_dir: None,
         xdg_runtime_dir: None,
@@ -55,6 +56,7 @@ fn default_home_store_dir_is_preserved() {
     let env = ProfileEnv {
         profile_dir: None,
         home: Some(root.path().to_path_buf()),
+        user_profile: None,
         model: None,
         runtime_dir: None,
         xdg_runtime_dir: None,
@@ -67,6 +69,142 @@ fn default_home_store_dir_is_preserved() {
 fn missing_store_dir_and_home_is_a_typed_error() {
     let error = resolve_profile(&ProfileEnv::default());
     assert!(matches!(error, Err(ProfileError::NoStoreDir)));
+}
+
+#[test]
+fn explicit_profile_dir_precedes_every_home_variable() {
+    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let explicit = root.path().join("explicit");
+    let mut env = env_for(&explicit);
+    env.user_profile = Some(root.path().join("user-profile"));
+    env.home = Some(root.path().join("home"));
+
+    let profile = resolve_profile(&env).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(
+        profile.store_dir,
+        explicit
+            .canonicalize()
+            .unwrap_or_else(|error| panic!("canonicalize explicit profile: {error}"))
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn userprofile_only_resolves_on_windows() {
+    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let user_profile = root.path().join("user-profile");
+    let env = ProfileEnv {
+        profile_dir: None,
+        home: None,
+        user_profile: Some(user_profile.clone()),
+        model: None,
+        runtime_dir: None,
+        xdg_runtime_dir: None,
+    };
+
+    let profile = resolve_profile(&env).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(
+        profile.store_dir,
+        user_profile
+            .join(".haider/dev-profile")
+            .canonicalize()
+            .unwrap_or_else(|error| panic!("canonicalize USERPROFILE store: {error}"))
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn userprofile_precedes_home_on_windows() {
+    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let user_profile = root.path().join("user-profile");
+    let env = ProfileEnv {
+        profile_dir: None,
+        home: Some(root.path().join("home")),
+        user_profile: Some(user_profile.clone()),
+        model: None,
+        runtime_dir: None,
+        xdg_runtime_dir: None,
+    };
+
+    let profile = resolve_profile(&env).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(
+        profile.store_dir,
+        user_profile
+            .join(".haider/dev-profile")
+            .canonicalize()
+            .unwrap_or_else(|error| panic!("canonicalize USERPROFILE store: {error}"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn home_remains_authoritative_and_userprofile_is_ignored_on_unix() {
+    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let home = root.path().join("home");
+    let env = ProfileEnv {
+        profile_dir: None,
+        home: Some(home.clone()),
+        user_profile: Some(root.path().join("user-profile")),
+        model: None,
+        runtime_dir: None,
+        xdg_runtime_dir: None,
+    };
+
+    let profile = resolve_profile(&env).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(
+        profile.store_dir,
+        home.join(".haider/dev-profile")
+            .canonicalize()
+            .unwrap_or_else(|error| panic!("canonicalize HOME store: {error}"))
+    );
+
+    let userprofile_only = ProfileEnv { home: None, ..env };
+    assert!(matches!(
+        resolve_profile(&userprofile_only),
+        Err(ProfileError::NoStoreDir)
+    ));
+}
+
+#[test]
+fn capture_reads_userprofile_from_a_scrubbed_environment() {
+    const CHILD_USERPROFILE_BASENAME: &str = "haider-capture-userprofile-only";
+    let captured_user_profile = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    let is_scrubbed_child = std::env::var_os("HOME").is_none()
+        && captured_user_profile
+            .as_deref()
+            .is_some_and(|path| path.ends_with(CHILD_USERPROFILE_BASENAME));
+    if is_scrubbed_child {
+        let captured = ProfileEnv::capture();
+        assert_eq!(captured.profile_dir, None);
+        assert_eq!(captured.home, None);
+        assert_eq!(captured.user_profile, captured_user_profile);
+        #[cfg(windows)]
+        assert!(resolve_profile(&captured).is_ok());
+        #[cfg(not(windows))]
+        assert!(matches!(
+            resolve_profile(&captured),
+            Err(ProfileError::NoStoreDir)
+        ));
+        return;
+    }
+
+    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let user_profile = root.path().join(CHILD_USERPROFILE_BASENAME);
+    let output = std::process::Command::new(
+        std::env::current_exe().unwrap_or_else(|error| panic!("current test executable: {error}")),
+    )
+    .arg("capture_reads_userprofile_from_a_scrubbed_environment")
+    .arg("--nocapture")
+    .env_clear()
+    .env("USERPROFILE", user_profile)
+    .output()
+    .unwrap_or_else(|error| panic!("run scrubbed capture child: {error}"));
+    assert!(
+        output.status.success(),
+        "scrubbed capture child failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
