@@ -8,12 +8,11 @@ use haider_tui::app::{AppModel, AppRequest, RuntimeMode};
 use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};
 use haider_tui::runtime::live_pass;
 
-/// E7 visual law: the local-only rejection is a MATTER-OF-FACT status
-/// line — the typed protocol admission message in one quiet flash, gone on
-/// the next keystroke. It never latches the persistent diagnostic banner:
-/// asking for an unsupported lane is not an error condition.
+/// E7 visual law: the demo-mode live-only notice is a MATTER-OF-FACT status
+/// line — the canonical `/peer` registry message in one quiet flash, gone on
+/// the next keystroke. It never latches the persistent diagnostic banner.
 #[test]
-fn e7_legacy_peers_command_is_a_typed_local_only_rejection() {
+fn e7_peers_alias_uses_the_quiet_peer_registry_notice() {
     let mut model = common::launcher_model();
     common::submit(&mut model, "/peers");
 
@@ -21,8 +20,8 @@ fn e7_legacy_peers_command_is_a_typed_local_only_rejection() {
         model
             .flash
             .as_deref()
-            .is_some_and(|text| text.contains("not supported — Haider runs local-only")),
-        "the typed admission message rides the flash line"
+            .is_some_and(|text| text == "· /peer — live only; the registry is daemon truth"),
+        "the canonical live-only message rides the flash line"
     );
     assert!(
         model.command_diagnostic.is_none(),

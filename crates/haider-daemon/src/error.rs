@@ -77,17 +77,12 @@ impl DaemonError {
         match self {
             Self::AlreadyRunning { .. } => 75,
             Self::InvalidConfig { .. } => 64,
-<<<<<<< HEAD
             Self::Store(_)
             | Self::Io { .. }
             | Self::RuntimeDirectoryNotEmpty { .. }
             | Self::EndpointAddressTooLong { .. }
             | Self::Endpoint { .. } => 74,
-            Self::Protocol { .. } | Self::Task { .. } => 70,
-=======
-            Self::Store(_) | Self::Io { .. } | Self::Endpoint { .. } => 74,
             Self::Protocol { .. } | Self::Task { .. } | Self::Lockdown { .. } => 70,
->>>>>>> wave-965-d
         }
     }
 }

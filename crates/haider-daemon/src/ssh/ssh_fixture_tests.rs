@@ -129,7 +129,9 @@ impl server::Handler for FixtureHandler {
         user: &str,
         public_key: &PublicKey,
     ) -> Result<server::Auth, Self::Error> {
-        if user == FIXTURE_USER && public_key == &self.state.client_key {
+        // SSH transports key material, not the private key file's local
+        // comment. Compare the cryptographic identity the server receives.
+        if user == FIXTURE_USER && public_key.key_data() == self.state.client_key.key_data() {
             self.state.public_key_auths.fetch_add(1, Ordering::Relaxed);
             Ok(server::Auth::Accept)
         } else {
@@ -153,7 +155,7 @@ impl server::Handler for FixtureHandler {
         command: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        session.channel_success(channel);
+        let _ = session.channel_success(channel);
         let command = String::from_utf8_lossy(command);
         if command.contains("fixture-drop") {
             return Err(russh::Error::Disconnect);
@@ -188,7 +190,7 @@ impl server::Handler for FixtureHandler {
                 pixel_height,
             },
         );
-        session.channel_success(channel);
+        let _ = session.channel_success(channel);
         Ok(())
     }
 
@@ -197,7 +199,7 @@ impl server::Handler for FixtureHandler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        session.channel_success(channel);
+        let _ = session.channel_success(channel);
         session.data(channel, b"fixture-shell-ready\r\n".to_vec())?;
         session.extended_data(channel, 1, b"fixture-shell-stderr\r\n".to_vec())?;
         Ok(())
@@ -254,7 +256,7 @@ impl server::Handler for FixtureHandler {
                 pixel_height,
             },
         );
-        session.channel_success(channel);
+        let _ = session.channel_success(channel);
         Ok(())
     }
 }

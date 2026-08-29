@@ -69,7 +69,8 @@ Use `haider lockdown status`, `haider lockdown quota`, or
 
 Built-in providers are `Full`. A provider record written before the trust
 field existed also decodes as `Full`, including existing custom providers.
-New custom providers default to `Lockdown` unless created with `--full`.
+New providers also default to `Full`; Lockdown is entered only through an
+explicit `--lockdown` create flag or a later trust toggle.
 
 Trust can be changed with:
 

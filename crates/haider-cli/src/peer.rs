@@ -9,7 +9,7 @@ use haider_client::{
 };
 use serde::Serialize;
 
-use crate::run::{EX_BLOCKED, EX_IOERR, EX_PROTOCOL, EX_UNAVAILABLE, EX_USAGE};
+use super::run::{EX_BLOCKED, EX_IOERR, EX_PROTOCOL, EX_UNAVAILABLE, EX_USAGE};
 
 pub(crate) const PEER_LIST_SCHEMA: &str = "haider.peer.list.v1";
 pub(crate) const PEER_EVENT_SCHEMA: &str = "haider.peer.event.v1";
@@ -104,7 +104,7 @@ pub(crate) async fn peer_command(rest: &[String]) -> ExitCode {
     };
     let Some(peers) = peer_messaging(&ensured.client) else {
         eprintln!("haider peer: daemon does not advertise peer_messaging_v1");
-        ensured.client.close();
+        let _ = ensured.client.close();
         return ExitCode::from(EX_UNAVAILABLE);
     };
 
@@ -158,7 +158,7 @@ pub(crate) async fn peer_command(rest: &[String]) -> ExitCode {
             Err(error) => Err(error),
         },
     };
-    ensured.client.close();
+    let _ = ensured.client.close();
     match result {
         Ok(PeerCommandOutcome::Complete) => ExitCode::SUCCESS,
         Ok(PeerCommandOutcome::RefusedDelivery(receipt)) => {

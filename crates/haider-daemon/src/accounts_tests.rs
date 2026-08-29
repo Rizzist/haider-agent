@@ -2574,7 +2574,7 @@ async fn custom_provider_configure_discovers_before_successful_commit() {
                 origin: Some("http://127.0.0.1:18080/".into()),
                 auth_requirement: Some(ProviderAuthRequirementWire::None),
                 enabled: true,
-                trust: haider_rpc::ProviderTrustWire::Full,
+                trust: Some(haider_rpc::ProviderTrustWire::Full),
                 models: Vec::new(),
                 default_model: None,
                 response_open_timeout_ms: Some(45_000),
@@ -2665,7 +2665,7 @@ async fn endpoint_transport_failure_is_a_typed_unreachable_probe_error() {
                 origin: Some("http://127.0.0.1:9".into()),
                 auth_requirement: Some(ProviderAuthRequirementWire::None),
                 enabled: true,
-                trust: haider_rpc::ProviderTrustWire::Full,
+                trust: Some(haider_rpc::ProviderTrustWire::Full),
                 models: Vec::new(),
                 default_model: None,
                 response_open_timeout_ms: None,
@@ -5631,7 +5631,7 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
                 origin: Some("https://models.example.invalid/".into()),
                 auth_requirement: Some(ProviderAuthRequirementWire::ApiKey),
                 enabled: true,
-                trust: haider_rpc::ProviderTrustWire::Full,
+                trust: Some(haider_rpc::ProviderTrustWire::Full),
                 models: vec!["model-a".into(), "model-b".into()],
                 default_model: Some("model-a".into()),
                 response_open_timeout_ms: None,
@@ -5703,7 +5703,7 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
                 origin: None,
                 auth_requirement: None,
                 enabled: true,
-                trust: haider_rpc::ProviderTrustWire::Full,
+                trust: Some(haider_rpc::ProviderTrustWire::Full),
                 models: vec!["model-a".into()],
                 default_model: Some("model-a".into()),
                 response_open_timeout_ms: None,
@@ -6880,6 +6880,7 @@ async fn pending_custom_configure_reconciliation_restores_discovered_inventory()
     let (request_json, request_digest) = command_json(&identity).expect("configure identity");
     let recovery = ProviderConfigureRecovery {
         input,
+        previous_auth_requirement: None,
         discovered_models: Some(vec![haider_provider::DiscoveredModel {
             slug: "recovered-model".into(),
             display_name: "Recovered Model".into(),

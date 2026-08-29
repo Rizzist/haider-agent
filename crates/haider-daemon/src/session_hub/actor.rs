@@ -909,11 +909,18 @@ pub(super) async fn run_session_actor(
                 }
                 let _ = completed.send(result);
             }
-            ActorCommand::AcceptTurn { command, completed } => {
+            ActorCommand::AcceptTurn {
+                command,
+                peer_message,
+                completed,
+            } => {
                 // MUTATION CHECK: publishing before this durable transaction
                 // returns makes live clients observe an acceptance a restart
                 // cannot recover; the live lost-response test must fail.
-                let result = store.accept_turn(command).await;
+                let result = match peer_message {
+                    Some(message) => store.accept_peer_turn(command, message).await,
+                    None => store.accept_turn(command).await,
+                };
                 if let Ok(TurnAcceptOutcome::Committed { envelopes, .. }) = &result {
                     if let Some(last) = envelopes.last() {
                         head = last.seq;

@@ -93,6 +93,11 @@ pub enum EventPayload {
         #[serde(default)]
         mode: DeliveryMode,
     },
+    /// A boundary-delivered message from another agent. This is a distinct
+    /// durable record rather than a user turn: peer content remains untrusted
+    /// input even though the prompt compiler transports it with a user role.
+    #[serde(rename = "peer.message")]
+    PeerMessage(peer::PeerMessage),
     /// Volatile-looking queue control is journaled because its revision fence
     /// and watch delta must share the same serialized session truth.
     QueueChanged(queue::QueueDelta),
@@ -148,6 +153,8 @@ pub enum EventPayload {
     LockdownQuota(lockdown::LockdownQuota),
     #[serde(rename = "provider.trust_changed")]
     ProviderTrustChanged(lockdown::ProviderTrustChanged),
+    #[serde(rename = "provider.auth_changed")]
+    ProviderAuthChanged(lockdown::ProviderAuthChanged),
 }
 
 /// Mid-turn input delivery (§3): steer is the default.

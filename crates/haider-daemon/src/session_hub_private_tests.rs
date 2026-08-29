@@ -279,6 +279,7 @@ async fn deletion_barrier_preserves_a_prefence_accepted_turn_and_its_actor() {
                 active_event_id: EventId::new("delete-barrier-active"),
                 device_id: DeviceId::new("delete-barrier-device"),
             },
+            peer_message: None,
             completed: accepted,
         })
         .await

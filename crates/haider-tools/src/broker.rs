@@ -498,6 +498,7 @@ fn denied_effect_error(
                 EffectClass::FsRead => "fs_read",
                 EffectClass::FsWrite => "fs_write",
                 EffectClass::ProcessExec => "process_exec",
+                EffectClass::RemoteExecution => "ssh_shell",
                 EffectClass::Network { .. } => "network",
                 EffectClass::GitOp => "git",
                 EffectClass::AgentSpawn => "spawn_subagent",

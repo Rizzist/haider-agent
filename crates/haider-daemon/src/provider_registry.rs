@@ -660,6 +660,26 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             .find(|profile| profile.provider_id == input.provider)
         {
             require_matching_identity(existing, &input)?;
+            if let Some(auth_requirement) = input
+                .auth_requirement
+                .filter(|auth_requirement| *auth_requirement != existing.auth_requirement)
+            {
+                if !matches!(existing.provenance, ProviderProvenance::Custom) {
+                    return Err(invalid(format!(
+                        "provider `{}` authentication mode is release-owned",
+                        existing.provider_id
+                    )));
+                }
+                if !matches!(
+                    auth_requirement,
+                    ProviderAuthRequirementWire::ApiKey | ProviderAuthRequirementWire::None
+                ) {
+                    return Err(invalid(
+                        "custom providers may require api_key authentication or none",
+                    ));
+                }
+                existing.auth_requirement = auth_requirement;
+            }
             // A custom provider's NAME is its stable identity. Its validated
             // origin is mutable metadata, but one endpoint cannot be claimed
             // by two different provider names during a repoint.
@@ -691,13 +711,13 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
                 validate_response_open_timeout_ms(timeout_ms)?;
                 existing.response_open_timeout_ms = Some(timeout_ms);
             }
-            if let Some(trust) = input.trust {
-                if existing.trust != trust {
-                    return Err(invalid(format!(
-                        "provider `{}` trust changes must use provider.set_trust",
-                        existing.provider_id
-                    )));
-                }
+            if let Some(trust) = input.trust
+                && existing.trust != trust
+            {
+                return Err(invalid(format!(
+                    "provider `{}` trust changes must use provider.set_trust",
+                    existing.provider_id
+                )));
             }
             existing.clone()
         } else {
@@ -745,7 +765,7 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
                 default_model,
                 promotion_model: None,
                 provenance: ProviderProvenance::Custom,
-                trust: input.trust.unwrap_or(ProviderTrustWire::Lockdown),
+                trust: input.trust.unwrap_or(ProviderTrustWire::Full),
             };
             next.push(profile.clone());
             profile
@@ -1347,12 +1367,9 @@ fn require_matching_identity(
             // URL-shape validators.
             && !matches!(existing.provenance, ProviderProvenance::Custom)
             && enterprise_origin_validator(&existing.provider_id).is_none()
-        || input
-            .auth_requirement
-            .is_some_and(|requirement| requirement != existing.auth_requirement)
     {
         return Err(invalid(format!(
-            "provider `{}` cannot change its API family or auth requirement, and its origin is mutable only when the provider supports repointing",
+            "provider `{}` cannot change its API family, and its origin is mutable only when the provider supports repointing",
             existing.provider_id
         )));
     }

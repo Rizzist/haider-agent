@@ -53,11 +53,11 @@ pub(crate) async fn lockdown_command(rest: &[String]) -> ExitCode {
         },
         None => {
             eprintln!("haider lockdown: daemon does not advertise provider_lockdown_v1");
-            ensured.client.close();
+            let _ = ensured.client.close();
             return ExitCode::from(EX_UNAVAILABLE);
         }
     };
-    ensured.client.close();
+    let _ = ensured.client.close();
     match result {
         Ok(status) => {
             match render_status(&status, json) {

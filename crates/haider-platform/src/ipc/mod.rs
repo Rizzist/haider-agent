@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 
-<<<<<<< HEAD
 /// A descriptor-backed receipt for one directory this process created.
 ///
 /// The retained descriptor/handle keeps the created filesystem identity live,
@@ -184,7 +183,8 @@ pub enum IpcShutdownOutcome {
     LocalSlotEmptiedOnly,
     /// A prior request had already consumed the shutdown authority.
     AlreadyRequested,
-=======
+}
+
 /// Maximum portable basename for anything published in a profile runtime.
 /// Keeping this independent from the profile-directory digest prevents a new
 /// rendezvous family from consuming the Unix socket path budget by accident.
@@ -287,7 +287,6 @@ fn basename_len(name: &std::ffi::OsStr) -> usize {
 #[cfg(windows)]
 fn basename_len(name: &std::ffi::OsStr) -> usize {
     name.to_string_lossy().len()
->>>>>>> wave-965-a
 }
 
 #[cfg(unix)]
@@ -435,19 +434,17 @@ pub enum EndpointError {
     Task {
         message: String,
     },
-<<<<<<< HEAD
     /// Endpoint setup created this exact filesystem artifact and then failed
     /// to remove it. The daemon uses the path as ownership evidence for its
     /// typed runtime-residual report.
     OwnedResidual {
         path: PathBuf,
         source: Box<EndpointError>,
-=======
+    },
     PathTooLong {
         path: PathBuf,
         length: usize,
         limit: usize,
->>>>>>> wave-965-a
     },
 }
 
@@ -492,11 +489,11 @@ impl std::fmt::Display for EndpointError {
                 path.display()
             ),
             Self::Endpoint { message } | Self::Task { message } => formatter.write_str(message),
-<<<<<<< HEAD
             Self::OwnedResidual { path, source } => write!(
                 formatter,
                 "owned endpoint residual {} remained after setup failure: {source}",
-=======
+                path.display()
+            ),
             Self::PathTooLong {
                 path,
                 length,
@@ -504,7 +501,6 @@ impl std::fmt::Display for EndpointError {
             } => write!(
                 formatter,
                 "runtime path {} is {length} bytes; limit is {limit} bytes",
->>>>>>> wave-965-a
                 path.display()
             ),
         }

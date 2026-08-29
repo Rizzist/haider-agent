@@ -1898,6 +1898,7 @@ fn daemon_error_class(error: &DaemonError) -> &'static str {
         DaemonError::Endpoint { .. } => "endpoint",
         DaemonError::Protocol { .. } => "protocol",
         DaemonError::Task { .. } => "task",
+        DaemonError::Lockdown { .. } => "lockdown",
     }
 }
 

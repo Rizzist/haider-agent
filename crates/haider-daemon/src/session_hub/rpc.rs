@@ -15,6 +15,10 @@
 #[path = "checkpoint_tests.rs"]
 mod checkpoint_tests;
 
+#[cfg(test)]
+#[path = "direct_ssh_tests.rs"]
+mod direct_ssh_tests;
+
 use super::*;
 use crate::delegation::{DelegationHandle, MessageCoordinates};
 use base64::Engine as _;
@@ -28,7 +32,7 @@ use haider_protocol::item::ItemEvent;
 use haider_protocol::menu::{Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::permission::{PermissionEventPayload, SystemPermission};
 use haider_protocol::state::RunState;
-use haider_rpc::{ERROR_CODE_RESTAGE_REQUIRED, ProviderSummaryWire};
+use haider_rpc::{ERROR_CODE_PERMISSION_DENIED, ERROR_CODE_RESTAGE_REQUIRED, ProviderSummaryWire};
 use haider_tools::MessageSubagent;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
@@ -924,6 +928,21 @@ fn lockdown_refusal_error_data(provider: &str, tool: &str, reason: &str) -> haid
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectSshSession<'a> {
+    OutsideSession,
+    Session(&'a SessionId),
+    Ambiguous,
+}
+
+fn direct_ssh_session(sessions: &[SessionId]) -> DirectSshSession<'_> {
+    match sessions {
+        [] => DirectSshSession::OutsideSession,
+        [session_id] => DirectSshSession::Session(session_id),
+        _ => DirectSshSession::Ambiguous,
+    }
+}
+
 #[derive(Debug)]
 struct ObservedRun {
     state: RunState,
@@ -1059,8 +1078,14 @@ impl ObserveFold {
             );
         }
         if envelope.agent_id.is_none()
-            && serde_json::from_value::<EventPayload>(envelope.payload.clone())
-                .is_ok_and(|payload| matches!(payload, EventPayload::UserMessage { .. }))
+            && serde_json::from_value::<EventPayload>(envelope.payload.clone()).is_ok_and(
+                |payload| {
+                    matches!(
+                        payload,
+                        EventPayload::UserMessage { .. } | EventPayload::PeerMessage(_)
+                    )
+                },
+            )
         {
             self.turns = self.turns.saturating_add(1);
         }
@@ -2093,10 +2118,22 @@ async fn effect_probe_observation(
             "durable delegation probe found {} child record(s)",
             delegation_count.unwrap_or(0)
         ),
-        // Keep this catch-all future-safe: lane A is adding another effect
-        // class on the integration branch. Every remaining class is unsafe
-        // to probe automatically, including local/remote execution.
-        _ => "inconclusive — no safe automatic probe exists for this effect class".into(),
+        // Every remaining class is unsafe to probe automatically, including
+        // peer delivery and local/remote execution. Keep this exhaustive so a
+        // new authority class cannot inherit probe semantics accidentally.
+        EffectClass::ProcessExec
+        | EffectClass::RemoteExecution
+        | EffectClass::GitOp
+        | EffectClass::PeerMessage
+        | EffectClass::CredentialAccess
+        | EffectClass::GuiAct
+        | EffectClass::ScreenObserve
+        | EffectClass::ScreenControl
+        | EffectClass::MobileObserve
+        | EffectClass::MobileControl
+        | EffectClass::ReadSms => {
+            "inconclusive — no safe automatic probe exists for this effect class".into()
+        }
     }
 }
 
@@ -3718,7 +3755,7 @@ impl HubConnection {
                     return self.respond_error(
                         request_id,
                         ERROR_CODE_PERMISSION_DENIED,
-                        format!(
+                        &format!(
                             "RefusedByLockdown {{ tool: shell.exec, reason: provider {provider} is in lockdown mode }}"
                         ),
                         false,
@@ -3781,7 +3818,7 @@ impl HubConnection {
                     return self.respond_error(
                         request_id,
                         ERROR_CODE_PERMISSION_DENIED,
-                        format!(
+                        &format!(
                             "RefusedByLockdown {{ tool: shell.exec, reason: provider {provider} is in lockdown mode }}"
                         ),
                         false,
@@ -4364,7 +4401,7 @@ impl HubConnection {
                     return self.respond_error(
                         request_id,
                         ERROR_CODE_PERMISSION_DENIED,
-                        format!(
+                        &format!(
                             "RefusedByLockdown {{ tool: monitor.register, reason: provider {provider} is in lockdown mode }}"
                         ),
                         false,
@@ -4440,7 +4477,7 @@ impl HubConnection {
                     return self.respond_error(
                         request_id,
                         ERROR_CODE_PERMISSION_DENIED,
-                        format!(
+                        &format!(
                             "RefusedByLockdown {{ tool: monitor.remove, reason: provider {provider} is in lockdown mode }}"
                         ),
                         false,
@@ -4519,7 +4556,7 @@ impl HubConnection {
                     return self.respond_error(
                         request_id,
                         ERROR_CODE_PERMISSION_DENIED,
-                        format!(
+                        &format!(
                             "RefusedByLockdown {{ tool: computer.permission_open_settings, reason: provider {provider} is in lockdown mode }}"
                         ),
                         false,
@@ -4833,7 +4870,7 @@ impl HubConnection {
                     return self.respond_error(
                         request_id,
                         ERROR_CODE_PERMISSION_DENIED,
-                        format!(
+                        &format!(
                             "RefusedByLockdown {{ tool: checkpoint.undo, reason: provider {provider} is in lockdown mode }}"
                         ),
                         false,
@@ -4884,7 +4921,7 @@ impl HubConnection {
                     return self.respond_error(
                         request_id,
                         ERROR_CODE_PERMISSION_DENIED,
-                        format!(
+                        &format!(
                             "RefusedByLockdown {{ tool: checkpoint.redo, reason: provider {provider} is in lockdown mode }}"
                         ),
                         false,
@@ -4935,7 +4972,7 @@ impl HubConnection {
                     return self.respond_error(
                         request_id,
                         ERROR_CODE_PERMISSION_DENIED,
-                        format!(
+                        &format!(
                             "RefusedByLockdown {{ tool: checkpoint.rollback_turn, reason: provider {provider} is in lockdown mode }}"
                         ),
                         false,
@@ -4958,11 +4995,7 @@ impl HubConnection {
                 )
                 .await
             }
-<<<<<<< HEAD
             RequestBody::PeerList {} => {
-=======
-            RequestBody::SshList { session_id } => {
->>>>>>> wave-965-c
                 if let Err(message) = authorize(&self.capabilities, Operation::View) {
                     return self.respond_error(
                         request_id,
@@ -4972,7 +5005,6 @@ impl HubConnection {
                         None,
                     );
                 }
-<<<<<<< HEAD
                 self.hub.enable_peer_events(&self.connection_id)?;
                 match self.hub.peer_service()?.list().await {
                     Ok(agents) => self.send(WireFrame::Response {
@@ -4986,7 +5018,72 @@ impl HubConnection {
                 to,
                 message,
                 summary,
-=======
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                let sessions = self.hub.peer_control_sessions(&self.connection_id)?;
+                let [session_id] = sessions.as_slice() else {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_PEER_INVALID,
+                        "peer.send requires exactly one control-attached sender session",
+                        false,
+                        None,
+                    );
+                };
+                self.hub.enable_peer_events(&self.connection_id)?;
+                match self
+                    .hub
+                    .peer_service()?
+                    .send(session_id, to, message, summary)
+                    .await
+                {
+                    Ok(receipt) => self.send(WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::PeerSend { receipt },
+                    }),
+                    Err(error) => self.respond_peer_error(request_id, error),
+                }
+            }
+            RequestBody::PeerName { name } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                let sessions = self.hub.peer_control_sessions(&self.connection_id)?;
+                let [session_id] = sessions.as_slice() else {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_PEER_INVALID,
+                        "peer.name requires exactly one control-attached session",
+                        false,
+                        None,
+                    );
+                };
+                self.peer_name(request_id, session_id.clone(), name).await
+            }
+            RequestBody::SshList { session_id } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
                 let Some(ssh) = self.hub.ssh()? else {
                     return self.respond_error(
                         request_id,
@@ -5234,7 +5331,6 @@ impl HubConnection {
                 command,
                 cwd,
                 timeout_s,
->>>>>>> wave-965-c
             } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
                     return self.respond_error(
@@ -5245,38 +5341,55 @@ impl HubConnection {
                         None,
                     );
                 }
-<<<<<<< HEAD
-                let sessions = self.hub.peer_control_sessions(&self.connection_id)?;
-                let [session_id] = sessions.as_slice() else {
+                let control_sessions = self.hub.peer_control_sessions(&self.connection_id)?;
+                if matches!(
+                    direct_ssh_session(&control_sessions),
+                    DirectSshSession::Ambiguous
+                ) {
                     return self.respond_error(
                         request_id,
-                        ERROR_CODE_PEER_INVALID,
-                        "peer.send requires exactly one control-attached sender session",
-=======
+                        ERROR_CODE_INVALID_ARGUMENT,
+                        "ssh.shell requires at most one control-attached session",
+                        false,
+                        None,
+                    );
+                }
+                if let DirectSshSession::Session(session_id) = direct_ssh_session(&control_sessions)
+                {
+                    if let Some(provider) = self.session_lockdown_provider(session_id).await? {
+                        let reason = "remote SSH execution is outside the fixed lockdown envelope";
+                        self.journal_session_lockdown_refusal(
+                            session_id,
+                            request_id.0.as_str(),
+                            &provider,
+                            "ssh_shell",
+                            reason,
+                        )
+                        .await?;
+                        return self.respond_error(
+                            request_id,
+                            ERROR_CODE_PERMISSION_DENIED,
+                            &format!(
+                                "RefusedByLockdown {{ tool: ssh_shell, reason: provider {provider} is in lockdown mode }}"
+                            ),
+                            false,
+                            Some(lockdown_refusal_error_data(&provider, "ssh_shell", reason)),
+                        );
+                    }
+                    let scope = self.hub.ssh_scope(session_id)?;
+                    if let Err(error) = crate::ssh::enforce_scope(&scope, session_id, &name) {
+                        return self.respond_ssh_error(request_id, error);
+                    }
+                }
                 let Some(ssh) = self.hub.ssh()? else {
                     return self.respond_error(
                         request_id,
                         haider_rpc::ERROR_CODE_VAULT_UNSUPPORTED,
                         "SSH profile secret storage is unavailable",
->>>>>>> wave-965-c
                         false,
                         None,
                     );
                 };
-<<<<<<< HEAD
-                self.hub.enable_peer_events(&self.connection_id)?;
-                match self
-                    .hub
-                    .peer_service()?
-                    .send(session_id, to, message, summary)
-                    .await
-                {
-                    Ok(receipt) => self.send(WireFrame::Response {
-                        request_id,
-                        body: ResponseBody::PeerSend { receipt },
-                    }),
-                    Err(error) => self.respond_peer_error(request_id, error),
-=======
                 let profile = match ssh.store.get(&name) {
                     Ok(profile) => profile,
                     Err(error) => return self.respond_ssh_error(request_id, error),
@@ -5355,8 +5468,8 @@ impl HubConnection {
                         None,
                     );
                 };
-                if let Some(session_id) = session_id {
-                    if self.hub.session_metadata(&session_id).await?.is_none() {
+                if let Some(session_id) = session_id.as_ref() {
+                    if self.hub.session_metadata(session_id).await?.is_none() {
                         return self.respond_error(
                             request_id,
                             ERROR_CODE_NOT_FOUND,
@@ -5365,8 +5478,40 @@ impl HubConnection {
                             None,
                         );
                     }
-                    let scope = self.hub.ssh_scope(&session_id)?;
-                    if let Err(error) = crate::ssh::enforce_scope(&scope, &session_id, &name) {
+                    if !self
+                        .hub
+                        .holds_control_attachment(&self.connection_id, session_id)?
+                    {
+                        return self.respond_error(
+                            request_id,
+                            ERROR_CODE_CAPABILITY_DENIED,
+                            "SSH terminal open requires a control attachment to this session",
+                            false,
+                            None,
+                        );
+                    }
+                    if let Some(provider) = self.session_lockdown_provider(session_id).await? {
+                        let reason = "remote SSH execution is outside the fixed lockdown envelope";
+                        self.journal_session_lockdown_refusal(
+                            session_id,
+                            request_id.0.as_str(),
+                            &provider,
+                            "ssh_shell",
+                            reason,
+                        )
+                        .await?;
+                        return self.respond_error(
+                            request_id,
+                            ERROR_CODE_PERMISSION_DENIED,
+                            &format!(
+                                "RefusedByLockdown {{ tool: ssh_shell, reason: provider {provider} is in lockdown mode }}"
+                            ),
+                            false,
+                            Some(lockdown_refusal_error_data(&provider, "ssh_shell", reason)),
+                        );
+                    }
+                    let scope = self.hub.ssh_scope(session_id)?;
+                    if let Err(error) = crate::ssh::enforce_scope(&scope, session_id, &name) {
                         return self.respond_ssh_error(request_id, error);
                     }
                 }
@@ -5556,12 +5701,11 @@ impl HubConnection {
                         .respond_error(
                             request_id,
                             ERROR_CODE_NOT_FOUND,
-                            format!("shell `{id}` was not found"),
+                            &format!("shell `{id}` was not found"),
                             false,
                             None,
                         ),
                     Err(error) => self.respond_shell_control_error(request_id, error),
->>>>>>> wave-965-c
                 }
             }
             // `Unknown` and any future method decode alike: a typed,
@@ -5590,16 +5734,108 @@ impl HubConnection {
                 Some(ErrorData::PeerAmbiguous { candidates }),
             ),
             crate::peer::PeerError::Invalid { message } => {
-                self.respond_error(request_id, ERROR_CODE_PEER_INVALID, message, false, None)
+                self.respond_error(request_id, ERROR_CODE_PEER_INVALID, &message, false, None)
             }
             error => self.respond_error(
                 request_id,
                 ERROR_CODE_PEER_UNAVAILABLE,
-                error.to_string(),
+                &error.to_string(),
                 true,
                 None,
             ),
         }
+    }
+
+    /// `peer.name` is the peer-shaped view of the existing durable session
+    /// rename authority. The request has no caller-supplied command id, so
+    /// this door mints one command/event coordinate and returns only after the
+    /// peer publication has reconciled the committed title.
+    async fn peer_name(
+        &self,
+        request_id: RequestId,
+        session_id: SessionId,
+        name: String,
+    ) -> Result<(), SessionHubError> {
+        let Some(title) = normalize_session_title(Some(name)) else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_PEER_INVALID,
+                "peer.name requires a non-empty printable name",
+                false,
+                None,
+            );
+        };
+        let Some(summary) = self
+            .hub
+            .peer_session_summaries()
+            .await?
+            .into_iter()
+            .find(|summary| summary.session_id == session_id)
+        else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_NOT_FOUND,
+                "peer.name session is not live",
+                false,
+                None,
+            );
+        };
+        let command_id = random_id("peer-name")?;
+        let request_json = serde_json::to_string(&serde_json::json!({
+            "session_id": &session_id,
+            "worker_generation": summary.worker_generation,
+            "title": &title,
+        }))
+        .map_err(|error| {
+            SessionHubError::Task(format!("cannot encode peer-name coordinates: {error}"))
+        })?;
+        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
+        let command = SessionRenameCommand {
+            command_id: command_id.clone(),
+            request_digest,
+            request_json,
+            session_id: session_id.clone(),
+            worker_generation: summary.worker_generation,
+            title: Some(title),
+            only_if_untitled: false,
+            event_id: EventId::new(format!("session-renamed-{command_id}")),
+            device_id: self.hub.inner.device_id.clone(),
+        };
+        match self.hub.rename_session(command).await {
+            Ok(
+                SessionRenameOutcome::Committed { .. }
+                | SessionRenameOutcome::IdempotentReplay { .. },
+            ) => {}
+            Ok(SessionRenameOutcome::Skipped) => {
+                return Err(SessionHubError::Task(
+                    "explicit peer name cannot be skipped".into(),
+                ));
+            }
+            Err(SessionHubError::Store(error)) => {
+                return self.respond_turn_error(request_id, error);
+            }
+            Err(error) => return Err(error),
+        }
+        let agents = match self.hub.peer_service()?.list().await {
+            Ok(agents) => agents,
+            Err(error) => return self.respond_peer_error(request_id, error),
+        };
+        let Some(agent) = agents
+            .into_iter()
+            .find(|agent| agent.id == session_id.as_str())
+        else {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_PEER_UNAVAILABLE,
+                "renamed peer publication is unavailable",
+                true,
+                None,
+            );
+        };
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::PeerName { agent },
+        })
     }
 
     async fn command_invoke(
@@ -7658,7 +7894,7 @@ impl HubConnection {
             Err(error) => self.respond_error(
                 request_id,
                 haider_rpc::ERROR_CODE_PROVIDER_ERROR,
-                error.to_string(),
+                &error.to_string(),
                 false,
                 None,
             ),
@@ -7785,7 +8021,7 @@ impl HubConnection {
                 .respond_error(
                     request_id,
                     haider_rpc::ERROR_CODE_LOCKDOWN_QUOTA_EXCEEDED,
-                    format!("LockdownQuotaExceeded {{ used: {used}, limit: {limit} }}"),
+                    &format!("LockdownQuotaExceeded {{ used: {used}, limit: {limit} }}"),
                     false,
                     Some(haider_rpc::ErrorData::LockdownQuotaExceeded { used, limit }),
                 ),
@@ -7793,7 +8029,7 @@ impl HubConnection {
                 .respond_error(
                     request_id,
                     ERROR_CODE_INVALID_ARGUMENT,
-                    format!(
+                    &format!(
                         "lockdown quota command `{command_id}` was already used with different bytes"
                     ),
                     false,
@@ -7802,7 +8038,7 @@ impl HubConnection {
             Err(error) => self.respond_error(
                 request_id,
                 haider_rpc::ERROR_CODE_PROVIDER_ERROR,
-                error.to_string(),
+                &error.to_string(),
                 false,
                 None,
             ),

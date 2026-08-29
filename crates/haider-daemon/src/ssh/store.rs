@@ -409,11 +409,11 @@ impl SshProfileStore {
         if let Some(description) = changes.description {
             profile.description = description;
         }
-        if let Some(host) = changes.host {
-            if host != profile.ssh.host {
-                profile.ssh.host = host;
-                profile.ssh.host_key = None;
-            }
+        if let Some(host) = changes.host
+            && host != profile.ssh.host
+        {
+            profile.ssh.host = host;
+            profile.ssh.host_key = None;
         }
         if let Some(port) = changes.port {
             if port != profile.ssh.port {

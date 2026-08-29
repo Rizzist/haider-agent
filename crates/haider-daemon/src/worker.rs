@@ -4330,7 +4330,7 @@ async fn durable_runs(
                     }
                     runs.insert(run_id, (state, accepted, branch_id, prompt_run_id));
                 }
-                EventPayload::UserMessage { .. } => {
+                EventPayload::UserMessage { .. } | EventPayload::PeerMessage(_) => {
                     let (state, branch_id, prompt_run_id) = runs.get(&run_id).map_or(
                         (RunState::Queued, envelope.branch_id.clone(), None),
                         |(state, _, branch_id, prompt_run_id)| {
@@ -11073,20 +11073,7 @@ async fn create_broker_tool_dispatcher(
             .deny_unresolved_asks("no_human_available: autonomous mode cannot approve this effect");
     }
     if context.lockdown.is_some() {
-        for class in [
-            EffectClass::ProcessExec,
-            EffectClass::GitOp,
-            EffectClass::CredentialAccess,
-            EffectClass::GuiAct,
-            EffectClass::ScreenObserve,
-            EffectClass::ScreenControl,
-            EffectClass::MobileObserve,
-            EffectClass::MobileControl,
-            EffectClass::ReadSms,
-            // Lane A supplies the core class consumed by lane B's peer
-            // surface; lockdown must remain below its Ask/Allow path.
-            EffectClass::PeerMessage,
-        ] {
+        for class in LOCKDOWN_HARD_DENIED_EFFECTS.iter().cloned() {
             policy.hard_deny(
                 class,
                 "provider capability ceiling: lockdown cannot be lifted by user approval",
@@ -11136,6 +11123,23 @@ async fn create_broker_tool_dispatcher(
         active_tool_name,
     })))
 }
+
+// This ceiling sits below the ordinary Ask/Allow broker. Keep it independent
+// from the advertised-pack filter so a stale or alternate route cannot recover
+// an authority the lockdown provider was never allowed to exercise.
+const LOCKDOWN_HARD_DENIED_EFFECTS: &[EffectClass] = &[
+    EffectClass::ProcessExec,
+    EffectClass::RemoteExecution,
+    EffectClass::GitOp,
+    EffectClass::CredentialAccess,
+    EffectClass::GuiAct,
+    EffectClass::ScreenObserve,
+    EffectClass::ScreenControl,
+    EffectClass::MobileObserve,
+    EffectClass::MobileControl,
+    EffectClass::ReadSms,
+    EffectClass::PeerMessage,
+];
 
 pub(crate) fn effective_permission_defaults(
     metadata: &SessionMetadataV1,
@@ -12730,10 +12734,9 @@ impl BrokerToolDispatcher {
                             Some("remote command reached its deadline".into())
                         } else if output_limited {
                             Some("remote command reached the shell output cap".into())
-                        } else if let Some(code) = unsuccessful_exit {
-                            Some(format!("remote command exited with status {code}"))
                         } else {
-                            None
+                            unsuccessful_exit
+                                .map(|code| format!("remote command exited with status {code}"))
                         },
                         presentation: None,
                     }),

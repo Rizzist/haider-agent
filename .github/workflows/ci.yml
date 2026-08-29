@@ -11,7 +11,7 @@ on:
 # the Linux X11 computer-use E2E. xplat.yml concurrently runs check, clippy,
 # and the same full tests on Linux + Windows, plus the Android native/Kotlin
 # build. SHIP GATE: ship-gate.yml runs the complete demo+live PTY probe ladder
-# with profile.ci and the two-way render benchmark with the true release
+# with profile.ci and the upper-bound render benchmark with the true release
 # profile. It runs automatically on main, is a required `needs` dependency of
 # release.yml for every v* tag/manual release build, and can be invoked before
 # tagging with `gh workflow run ship-gate.yml --ref <candidate-ref>`; the

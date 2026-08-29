@@ -3202,12 +3202,9 @@ pub enum AppRequest {
     /// W10b: durable custom-provider removal (`provider.remove`) — the
     /// daemon refuses builtins and account-referenced providers with
     /// typed reasons; the client never pre-judges.
-<<<<<<< HEAD
     ProviderRemove {
         provider: String,
     },
-=======
-    ProviderRemove { provider: String },
     /// Toggle the selected provider's daemon-enforced trust ceiling.
     ProviderSetTrust {
         provider: String,
@@ -3215,8 +3212,9 @@ pub enum AppRequest {
         expected_revision: u64,
     },
     /// Read the envelope/quota for the active provider explainer.
-    LockdownStatus { provider: Option<String> },
->>>>>>> wave-965-d
+    LockdownStatus {
+        provider: Option<String>,
+    },
     /// W8b: `/tools` live — read the daemon's canonical tool inventory.
     ToolsRefresh,
     /// `/peer` live — read the profile's advertised peer registry.
@@ -4868,7 +4866,6 @@ pub struct AppModel {
     pub palette_dismissed: bool,
     /// The /help overlay (esc closes).
     pub help_open: bool,
-<<<<<<< HEAD
     /// `/shells` terminal-registry overlay; activity floats over the body.
     pub shells_open: bool,
     /// Selected shell row in the overlay's keyboard path.
@@ -4888,7 +4885,6 @@ pub struct AppModel {
     pub ssh_terminal: Option<SshTerminalPane>,
     /// Existing monitor details floated over the body from the status strip.
     pub monitors_open: bool,
-=======
     /// Small status-line explainer overlay for the active lockdown provider.
     pub lockdown_overlay: bool,
     pub lockdown_status: Option<haider_rpc::LockdownStatusWire>,
@@ -4896,7 +4892,6 @@ pub struct AppModel {
     /// Provider roster trust may already describe the following turn.
     pub lockdown_provider: Option<String>,
     pub lockdown_boundary_known: bool,
->>>>>>> wave-965-d
     /// One-line transient notice shown in the status bar until the next
     /// keystroke (honest stubs: "/tree lands with the daemon").
     pub flash: Option<String>,
@@ -5208,7 +5203,6 @@ impl Default for AppModel {
             palette_scroll: 0,
             palette_dismissed: false,
             help_open: false,
-<<<<<<< HEAD
             shells_open: false,
             shells_cursor: 0,
             ssh_open: false,
@@ -5223,12 +5217,10 @@ impl Default for AppModel {
             },
             ssh_terminal: None,
             monitors_open: false,
-=======
             lockdown_overlay: false,
             lockdown_status: None,
             lockdown_provider: None,
             lockdown_boundary_known: false,
->>>>>>> wave-965-d
             flash: None,
             update_available: None,
             profile_diagnostic: None,
@@ -7065,18 +7057,17 @@ impl AppModel {
     }
 
     fn handle_key(&mut self, key: KeyEvent, now: std::time::Instant) {
-<<<<<<< HEAD
         if self.ssh_terminal.is_some() {
             self.handle_ssh_terminal_key(key);
             return;
         }
         if self.ssh_form.is_some() {
             self.handle_ssh_form_key(key);
-=======
+            return;
+        }
         if self.lockdown_overlay {
             self.lockdown_overlay = false;
             self.dirty = true;
->>>>>>> wave-965-d
             return;
         }
         if self.screen == Screen::Loom
@@ -13394,6 +13385,7 @@ impl AppModel {
             haider_rpc::MonitorListOutcomeWire::Listed { monitors } => monitors,
             haider_rpc::MonitorListOutcomeWire::Rejected { .. }
             | haider_rpc::MonitorListOutcomeWire::Unknown => Vec::new(),
+            _ => Vec::new(),
         };
         self.monitor_count = self.monitors.len();
         self.flash = None;
@@ -13596,7 +13588,10 @@ impl AppModel {
         self.dirty = true;
     }
 
-    pub(crate) fn apply_peer_list(&mut self, agents: Vec<haider_protocol::peer::PeerDescriptor>) {
+    /// Public only so `tests/` can pin the peer-list affordance without a
+    /// daemon (the same precedent as [`crate::link::CommandContext`]).
+    #[doc(hidden)]
+    pub fn apply_peer_list(&mut self, agents: Vec<haider_protocol::peer::PeerDescriptor>) {
         self.peer_agents = agents;
         if !std::mem::take(&mut self.peer_list_requested) {
             self.dirty = true;
@@ -15472,7 +15467,6 @@ impl AppModel {
         if self.help_open {
             return;
         }
-<<<<<<< HEAD
         if self.shells_open && !matches!(hit, Hit::ShellClose(_) | Hit::ShellStatus) {
             return;
         }
@@ -15480,10 +15474,10 @@ impl AppModel {
             return;
         }
         if self.monitors_open && !matches!(hit, Hit::MonitorStatus) {
-=======
+            return;
+        }
         if self.lockdown_overlay {
             self.lockdown_overlay = false;
->>>>>>> wave-965-d
             return;
         }
         // TUI6.2b: the login card is MODAL against hits exactly as it is
@@ -15556,7 +15550,7 @@ impl AppModel {
             Hit::ExtraRow(which) if self.screen == Screen::Launcher => match which {
                 LauncherRow::Aura => self.enter_aura(),
                 LauncherRow::Accounts => self.enter_accounts(),
-                LauncherRow::Peers => self.reject_remote_placement(),
+                LauncherRow::Peers => self.peer_command(""),
                 LauncherRow::Workflows => self.enter_workflows(),
                 LauncherRow::Loom => self.enter_loom(),
                 LauncherRow::Sessions => self.enter_sessions(),

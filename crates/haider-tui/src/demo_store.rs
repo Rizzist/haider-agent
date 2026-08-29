@@ -389,6 +389,8 @@ pub enum EntryDto {
         sender: String,
         sender_kind: String,
         text: String,
+        #[serde(default)]
+        receipt: Option<haider_protocol::peer::PeerDelivery>,
     },
     Item {
         item_id: ItemId,
@@ -583,11 +585,13 @@ fn entry_to_dto(entry: &TranscriptEntry) -> EntryDto {
             sender,
             sender_kind,
             text,
+            receipt,
         } => EntryDto::Peer {
             msg_id: msg_id.clone(),
             sender: sender.clone(),
             sender_kind: sender_kind.clone(),
             text: text.clone(),
+            receipt: *receipt,
         },
         TranscriptEntry::Item(block) => EntryDto::Item {
             item_id: block.item_id.clone(),
@@ -834,11 +838,13 @@ fn entry_from_dto(dto: EntryDto) -> TranscriptEntry {
             sender,
             sender_kind,
             text,
+            receipt,
         } => TranscriptEntry::Peer {
             msg_id,
             sender,
             sender_kind,
             text,
+            receipt,
         },
         EntryDto::Item {
             item_id,

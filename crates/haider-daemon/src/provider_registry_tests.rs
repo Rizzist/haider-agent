@@ -475,16 +475,16 @@ fn legacy_provider_record_without_trust_migrates_to_full() {
     assert_eq!(profile.trust, ProviderTrustWire::Full);
 }
 
-/// MUTATION CHECK: default a new custom provider to Full, or fail to save a
-/// later typed setter. Expected failure: the first and/or reopened assertion.
+/// MUTATION CHECK: default a new custom provider to Lockdown, or fail to save
+/// a later explicit setter. Expected failure: the first and/or reopened assertion.
 #[test]
-fn new_custom_provider_defaults_lockdown_and_typed_setter_persists() {
+fn new_custom_provider_defaults_full_and_typed_setter_persists() {
     let dir = tempfile::tempdir().expect("provider registry profile");
     let source = model_source([("research", vec![discovered("search-1", true, None)])]);
     let mut registry = ProviderRegistry::new(
         JsonProviderRegistryStore::new(dir.path()),
         Vec::new(),
-        Arc::clone(&source),
+        source.clone(),
     )
     .expect("empty provider registry");
     let profile = registry
@@ -500,9 +500,9 @@ fn new_custom_provider_defaults_lockdown_and_typed_setter_persists() {
             trust: None,
         })
         .expect("create custom provider");
-    assert_eq!(profile.trust, ProviderTrustWire::Lockdown);
+    assert_eq!(profile.trust, ProviderTrustWire::Full);
     registry
-        .set_trust("research", ProviderTrustWire::Full)
+        .set_trust("research", ProviderTrustWire::Lockdown)
         .expect("set trust");
     drop(registry);
 
@@ -514,7 +514,7 @@ fn new_custom_provider_defaults_lockdown_and_typed_setter_persists() {
     .expect("reopen provider registry");
     assert_eq!(
         reopened.get("research").map(|profile| profile.trust),
-        Some(ProviderTrustWire::Full)
+        Some(ProviderTrustWire::Lockdown)
     );
 }
 
@@ -560,7 +560,7 @@ fn existing_provider_trust_changes_require_the_typed_setter() {
         Some(ProviderTrustWire::Lockdown)
     );
 
-    let mut replay = create;
+    let mut replay = create.clone();
     replay.api_family = None;
     replay.origin = None;
     replay.auth_requirement = None;
@@ -610,11 +610,11 @@ fn provider_response_open_timeout_override_must_be_nonzero() {
     assert!(error.message.contains("greater than zero"));
 }
 
-/// MUTATION CHECK: make `require_matching_identity` return `Ok(())`
-/// unconditionally. Expected runtime failure: the existing custom provider
-/// accepts an API-family mutation instead of returning `invalid_argument`.
+/// MUTATION CHECK: make `require_matching_identity` return `Ok(())`, or remove
+/// the custom-auth update. Expected failure: family mutation succeeds or the
+/// in-place keyless transition is refused.
 #[test]
-fn existing_custom_provider_keeps_api_family_and_auth_create_only() {
+fn existing_custom_provider_keeps_api_family_and_switches_auth_in_place() {
     let store = MemoryProviderStore::default();
     let source = model_source([("custom", vec![discovered("frontier-a", true, None)])]);
     let mut registry =
@@ -647,7 +647,7 @@ fn existing_custom_provider_keeps_api_family_and_auth_create_only() {
         .expect_err("API-family mutation must fail");
     assert!(error.message.contains("cannot change its API family"));
 
-    let error = registry
+    let no_auth = registry
         .configure(ProviderConfigureInput {
             provider: "custom".to_owned(),
             api_family: None,
@@ -659,8 +659,22 @@ fn existing_custom_provider_keeps_api_family_and_auth_create_only() {
             response_open_timeout_ms: None,
             trust: None,
         })
-        .expect_err("auth-requirement mutation must fail");
-    assert!(error.message.contains("auth requirement"));
+        .expect("custom auth requirement is mutable in place");
+    assert_eq!(no_auth.auth_requirement, ProviderAuthRequirementWire::None);
+    let keyed = registry
+        .configure(ProviderConfigureInput {
+            provider: "custom".to_owned(),
+            api_family: None,
+            origin: None,
+            auth_requirement: Some(ProviderAuthRequirementWire::ApiKey),
+            enabled: true,
+            models: vec!["frontier-a".to_owned()],
+            default_model: Some("frontier-a".to_owned()),
+            response_open_timeout_ms: None,
+            trust: None,
+        })
+        .expect("custom provider can return to keyed mode");
+    assert_eq!(keyed.auth_requirement, ProviderAuthRequirementWire::ApiKey);
 }
 
 /// Summary inventory comes only from the provider-owned cache and applies

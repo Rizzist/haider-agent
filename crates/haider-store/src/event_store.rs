@@ -77,6 +77,7 @@ use haider_protocol::loom::{
     compile_pipe, parse_pipe,
 };
 use haider_protocol::menu::{Menu, MenuAnswer, MenuCloseReason, MenuKind};
+use haider_protocol::peer::PeerMessage;
 use haider_protocol::permission::PermissionEventPayload;
 use haider_protocol::pipe::InstructEvidenceRef;
 use haider_protocol::project_instructions::ProjectInstructionsEventPayload;
@@ -9636,6 +9637,25 @@ impl Store {
     /// composition — unfenced replay, then fenced acceptance — reproduces
     /// the menu CAS's replay-before-fence semantics end to end.
     pub fn accept_turn(&self, command: &TurnAcceptCommand) -> StoreResult<TurnAcceptOutcome> {
+        self.accept_turn_with_peer(command, None)
+    }
+
+    /// Typed peer-origin variant of [`Self::accept_turn`]. The provider still
+    /// receives the message's defensive prompt rendering, while the journal
+    /// and history tree retain peer identity as their own record kinds.
+    pub fn accept_peer_turn(
+        &self,
+        command: &TurnAcceptCommand,
+        message: &PeerMessage,
+    ) -> StoreResult<TurnAcceptOutcome> {
+        self.accept_turn_with_peer(command, Some(message))
+    }
+
+    fn accept_turn_with_peer(
+        &self,
+        command: &TurnAcceptCommand,
+        peer_message: Option<&PeerMessage>,
+    ) -> StoreResult<TurnAcceptOutcome> {
         let mut command = command.clone();
         validate_command_identity(
             &command.command_id,
@@ -9652,6 +9672,17 @@ impl Store {
             return Err(store_error(
                 ErrorCode::InvalidArgument,
                 "turn text must not be empty",
+                false,
+            ));
+        }
+        if let Some(message) = peer_message
+            && (command.text != message.render_for_prompt()
+                || !command.attachments.is_empty()
+                || command.mode != DeliveryMode::Queue)
+        {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "peer turn coordinates do not match the typed peer message",
                 false,
             ));
         }
@@ -9796,9 +9827,22 @@ impl Store {
         let user_node = TreeNode {
             node: NodeId::new(format!("node-{}", command.user_event_id)),
             parent,
-            kind: NodeKind::UserTurn {
+            kind: match peer_message {
+                Some(message) => NodeKind::PeerTurn {
+                    message: message.clone(),
+                },
+                None => NodeKind::UserTurn {
+                    text: command.text.clone(),
+                    attachments: command.attachments.clone(),
+                },
+            },
+        };
+        let turn_payload = || match peer_message {
+            Some(message) => EventPayload::PeerMessage(message.clone()),
+            None => EventPayload::UserMessage {
                 text: command.text.clone(),
                 attachments: command.attachments.clone(),
+                mode: command.mode,
             },
         };
         let mut envelopes = if same_run_delivery {
@@ -9810,11 +9854,7 @@ impl Store {
                     Some(command.run_id.clone()),
                     command.device_id.clone(),
                     self.worker_generation,
-                    EventPayload::UserMessage {
-                        text: command.text.clone(),
-                        attachments: command.attachments.clone(),
-                        mode: command.mode,
-                    },
+                    turn_payload(),
                     PromptRender::Verbatim,
                 )?,
                 unstamped_command_envelope(
@@ -9847,11 +9887,7 @@ impl Store {
                     Some(command.run_id.clone()),
                     command.device_id.clone(),
                     self.worker_generation,
-                    EventPayload::UserMessage {
-                        text: command.text.clone(),
-                        attachments: command.attachments.clone(),
-                        mode: command.mode,
-                    },
+                    turn_payload(),
                     PromptRender::Verbatim,
                 )?,
                 unstamped_command_envelope(

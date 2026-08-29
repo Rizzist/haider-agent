@@ -272,14 +272,9 @@ fn looks_high_entropy(value: &str) -> bool {
 }
 
 #[cfg(test)]
-<<<<<<< HEAD
 #[path = "redact_tests.rs"]
 mod redact_tests;
-=======
-#[path = "redact/tests/redact_tests.rs"]
-mod tests;
 
 #[cfg(test)]
 #[path = "redact_lockdown_tests.rs"]
 mod lockdown_tests;
->>>>>>> wave-965-d

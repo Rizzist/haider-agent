@@ -682,6 +682,7 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
             Some(
                 EventPayload::RunState(_)
                     | EventPayload::UserMessage { .. }
+                    | EventPayload::PeerMessage(_)
                     | EventPayload::Item(_)
                     | EventPayload::MenuOpened(_)
                     | EventPayload::MenuAnswered(_)
@@ -734,7 +735,9 @@ fn reduce(reductions: &mut HashMap<RunId, RunReduction>, envelope: &RawEnvelope)
             reduction.state = Some((state, envelope.seq));
             reduction.state_generation = envelope.worker_generation;
         }
-        EventPayload::UserMessage { .. } => reduction.user_seq = Some(envelope.seq),
+        EventPayload::UserMessage { .. } | EventPayload::PeerMessage(_) => {
+            reduction.user_seq = Some(envelope.seq);
+        }
         EventPayload::Item(ItemEvent::Started { item_id, item }) => {
             if let TurnItem::ToolCall {
                 call_id,

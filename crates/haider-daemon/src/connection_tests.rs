@@ -207,18 +207,8 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
         welcome_features().len(),
-<<<<<<< HEAD
-<<<<<<< HEAD
-        97,
-        "the ordinary Welcome advertises the 96 v0.0.964 tokens plus peer_messaging_v1"
-=======
-        98,
-        "the ordinary Welcome advertises the prior 96 tokens plus ssh_profiles_v1 and shell_registry_v1"
->>>>>>> wave-965-c
-=======
-        97,
-        "the ordinary Welcome advertises the 96 pre-lockdown tokens plus provider_lockdown_v1"
->>>>>>> wave-965-d
+        100,
+        "the ordinary Welcome advertises the 96 v0.0.964 tokens plus peer, SSH/shell, and lockdown families"
     );
     assert_eq!(
         welcome_features(),

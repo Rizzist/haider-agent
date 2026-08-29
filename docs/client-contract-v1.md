@@ -206,7 +206,7 @@ An operation not listed here is part of the v1 base surface. “Field” means t
 client may use that field only when it is present; the named token permits an
 affordance before the response exists.
 
-The ordinary v0.0.965 `welcome_features()` set contains all 97 tokens below.
+The ordinary v0.0.965 `welcome_features()` set contains all 100 tokens below.
 The re-verification anchors are the `welcome_features()` function in
 `crates/haider-daemon/src/connection.rs` and the `FEATURE_*` constant block in
 `crates/haider-rpc/src/frame.rs`. The one peer-specific withholding exception
@@ -221,7 +221,7 @@ is §4.1.
 | `headless_run_v1` | `headless.run.start`, `headless.run.status`, `headless.run.stop`, durable `HeadlessRunConfigured`, and typed replay divergence reports |
 | `run_budget_v1` | daemon-enforced token/cost/time limits and durable `RunBudgetExhausted` followed by `RunFailed { code: budget_exhausted }` and `Errored` |
 | `queue_control_v1` | `queue.list`, `queue.remove`, `queue.promote_steer`, and durable `QueueChanged` events on an attached session |
-| `peer_messaging_v1` | `peer.list`, `peer.send`, `PeerMessageReceived`, and `PeerDeliveryChanged` |
+| `peer_messaging_v1` | `peer.list`, `peer.send`, `peer.name`, `PeerMessageReceived`, and `PeerDeliveryChanged` |
 | `run_retry_v1` | `run.retry` |
 | `context_compaction_v1` | `session.compact` |
 | `fallback_chain_v1` | durable fallback-lane events and next-lane continuation; no separate method |
@@ -456,11 +456,12 @@ retried with the same `command_id`. “Snapshot” never subscribes.
 | `checkpoint.rollback_turn` | `CheckpointRollbackTurn` | atomic reverse-order guarded turn rollback receipt |
 | `peer.list` | `PeerList` | live Haider sessions and external manifests after liveness verification |
 | `peer.send` | `PeerSend` | durable target-side queue receipt; later state changes arrive as `PeerDeliveryChanged` |
+| `peer.name` | `PeerName` | durable rename of the exactly one control-attached session and refreshed peer descriptor |
 
 The golden matrix at
 `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`, combined
 with the historical `wire_transcript.json`, pins a request and successful
-response for every one of the 106 v1 request methods. `menu.answer` and resident
+response for every one of the 123 v1 request methods. `menu.answer` and resident
 binding are top-level frames, not `RequestBody` methods.
 
 ### 5.3 Account identity and local-login adoption
@@ -1081,7 +1082,8 @@ or metadata-only digest.
 | account remove `expected_revision` | legacy unfenced request; clients with revision truth should supply it |
 | account label `label` | clear display label; alias identity does not change |
 | account/provider list `provider` | all providers |
-| provider configure `api_family`, `auth_requirement` | on update, leave create-only metadata unchanged; creation requires both fields |
+| provider configure `api_family` | on update, leave create-only identity unchanged; creation requires the field |
+| provider configure `auth_requirement` | on update, preserve the stored mode; creation requires the field. A custom provider may explicitly switch between `api_key` and `none` |
 | provider configure `origin` | on update, leave the origin unchanged; custom providers may instead supply a replacement origin under `expected_revision` (fixed release-owned origins remain immutable except their explicit enterprise configuration surfaces) |
 | provider configure `default_model` | no declared default/clear according to mutation validation; never choose one client-side |
 | provider configure `response_open_timeout_ms` | on update, preserve the stored response-header budget; on create, select the documented 60,000 ms compatible-transport default. A present value must be greater than zero |
@@ -2482,11 +2484,11 @@ The machine-checkable contract lives in these fixtures/tests:
   WebSocket bodies and four-byte length-prefixed UDS bytes, including
   Hello/Welcome, raw replay, menu CAS, accounts/providers/usage, and mutation
   receipts; the appended monitor and Loom registry delta/caught-up entries pin
-  both dedicated non-chat streams and the peer-messaging tail. The exact
-  current transcript count is 139.
+  both dedicated non-chat streams and the A/C/D union tail. The exact current
+  transcript count is 173.
 - `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`: the
-  66 methods added after the historical matrix, completing its 40 with golden
-  request and successful response coverage for all 106 request methods and all
+  64 methods absent from the expanded transcript, completing its 59 with golden
+  request and successful response coverage for all 123 request methods and all
   five command dynamic slots.
 - `crates/haider-rpc/tests/fixtures/snapshot_availability_compat_v1.json`:
   old and new account/provider/usage response bytes.
@@ -2633,9 +2635,9 @@ Undo, redo, and rollback are themselves `FsWrite` effects and append a fresh
 `CheckpointRecorded` fact. Their post-state is never rewritten into an older
 record, and neither journal rows nor CAS objects are deleted.
 
-The exact v0.0.965 recount is 97 Welcome feature tokens and 106 request
-methods: `peer_messaging_v1`, `peer.list`, and `peer.send` are tail additions
-to v0.0.964's 96/104 base.
+The exact v0.0.965 recount is 100 Welcome feature tokens, 123 request methods,
+and 173 compact wire-transcript frames: the peer, SSH/shell-registry, and
+provider-lockdown families are tail additions to v0.0.964's 96/104/133 base.
 
 **Absence law.** Without `checkpoint_v1`, a client MUST NOT call any checkpoint
 method, infer pre-images from ordinary file-change summaries, replay local
@@ -2725,15 +2727,23 @@ credential. A no-auth create omits the reference and creates no credential
 descriptor. The create response and the following `provider.list` snapshot
 carry only public profile/model facts.
 
-`api_family` and `auth_requirement` are create-only identity. The alias,
-origin, enabled flag, configured/default model, credential, and
-`response_open_timeout_ms` follow the existing revision and field-specific
-mutation laws. An update may replace the origin, credential, or response-open
-timeout but never silently change provider identity. OpenAI family means
+`api_family` is create-only identity. A custom provider may switch
+`auth_requirement` in place between `api_key` and `none`; its alias remains
+the stable provider identity. Key-to-none removes the now-inapplicable vaulted
+credential after the profile transition, while none-to-key stages and commits
+the replacement credential through the ordinary guarded login door. The
+transition is journaled as a self-sufficient `provider.auth_changed` record,
+parallel to `provider.trust_changed`. The origin, enabled flag,
+configured/default model, credential, and `response_open_timeout_ms` follow
+the existing revision and field-specific mutation laws. OpenAI family means
 standard Chat Completions; Anthropic family means standard Messages. Azure
 OpenAI origins retain their existing resource-host predicate, `api-key`
 header, and deployment handling instead of falling through to generic Bearer
 rules.
+
+This explicitly supports local and free key-less OpenAI-compatible servers
+such as loopback model runtimes: create them with `--no-auth`, or switch an
+existing custom provider with `haider account update <alias> --no-auth`.
 
 A credential update sends `account.login_api.replace_existing=true`. That
 boolean is secret-free but belongs to the durable command identity: after a
@@ -2980,8 +2990,6 @@ lineage truth, not an empty tree. The non-UI `ObserveClient::descendants_attach`
 surface enforces this choice as `DescendantView::Live` versus
 `DescendantView::Snapshot`; the snapshot variant has no event receiver.
 
-<<<<<<< HEAD
-<<<<<<< HEAD
 ## 18. `peer_messaging_v1`
 
 `peer.list` requires `view` and returns `agents[]` with exactly these fields:
@@ -3041,14 +3049,20 @@ sender additionally carries `trust: untrusted_external` and the exact
 payload. A client MUST preserve that provenance and MUST NOT render an
 external peer as the user.
 
+`peer.name {name}` requires `control` and exactly one control-attached
+session. It durably renames that session through the existing session-rename
+authority and returns the caller's refreshed peer descriptor. It is one
+method with one daemon route; clients must not emulate it by rewriting a
+local roster row.
+
 **Absence law.** If Welcome omits `peer_messaging_v1`, the client MUST NOT call
-either method, render a peer roster or mailbox state, or wait for either event.
+any peer method, render a peer roster or mailbox state, or wait for either event.
 The daemon sends no peer event to a connection that has not opted into the
 family. An absent feature is “peer messaging unavailable,” never an empty peer
 list. The non-Haider local wire, manifest, pathname budgets, and trust rules
 are normative in `docs/peer-messaging-v1.md`.
-=======
-## 18. SSH profiles and the unified shell registry
+
+## 19. SSH profiles and the unified shell registry
 
 Welcome independently negotiates `ssh_profiles_v1` and `shell_registry_v1`.
 The former exposes typed SDK helpers for `ssh.list`, `ssh.add`, `ssh.update`,
@@ -3081,14 +3095,12 @@ opaque shell id and treat `closed` as an explicit operator action distinct from
 natural `exited`. `shell.close` is idempotent. Closing an SSH shell closes only
 its channel, not the reusable authenticated profile connection.
 
-The exhaustive v1 method fixture now contains **113** request methods: the
-prior 104 plus these nine additive SSH/shell-registry methods. The ordinary
-daemon Welcome advertises **98** feature strings: the prior 96 plus these two
-feature bits. Integration must reconcile these counts if another lane also
-tail-appends methods or bits before release.
->>>>>>> wave-965-c
-=======
-## 24. Provider lockdown v1
+The SSH/shell family adds 13 request methods and two feature strings. In the
+integrated v0.0.965 contract, the exhaustive fixtures contain **123** request
+methods, the compact transcript contains **173** frames, and the ordinary
+daemon Welcome advertises **100** feature strings.
+
+## 20. Provider lockdown v1
 
 `provider_lockdown_v1` owns the provider trust ceiling and the machine-user
 quota. A client MUST negotiate this feature before sending
@@ -3117,4 +3129,3 @@ applicable plus used and limit; trust change includes provider, previous trust,
 new trust, and revision. They MUST NOT infer these facts from assistant text or
 error styling. See `docs/provider-lockdown-v1.md` for the normative envelope,
 quota, toggle-boundary, and subagent rules.
->>>>>>> wave-965-d

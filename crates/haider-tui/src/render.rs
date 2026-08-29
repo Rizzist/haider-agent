@@ -9068,12 +9068,14 @@ fn render_aura(
                 sender,
                 sender_kind,
                 text,
+                receipt,
                 ..
             } => peer_entry_lines(
                 &mut lines,
                 sender,
                 sender_kind,
                 text,
+                *receipt,
                 theme,
                 transcript_area.width,
             ),
@@ -11079,7 +11081,6 @@ fn render_help(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rec
     );
 }
 
-<<<<<<< HEAD
 /// Floating terminal-registry details. This reuses the existing body overlay
 /// layer and status strip; it never allocates new top-level chrome.
 fn render_shells_overlay(
@@ -11284,7 +11285,10 @@ fn render_ssh_form(
     .areas(area);
     frame.render_widget(
         Paragraph::new(Text::from(lines)).style(theme.text_style().bg(theme.bar_bg.into())),
-=======
+        panel,
+    );
+}
+
 /// Compact, non-modal explanation for the persistent lockdown status chip.
 fn render_lockdown_overlay(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
     let status = model.lockdown_status.as_ref();
@@ -11330,12 +11334,10 @@ fn render_lockdown_overlay(model: &AppModel, theme: &Theme, frame: &mut Frame<'_
             .block(Block::bordered().style(theme.frame_style()))
             .wrap(Wrap { trim: true })
             .style(theme.text_style().bg(theme.bar_bg.into())),
->>>>>>> wave-965-d
         panel,
     );
 }
 
-<<<<<<< HEAD
 fn render_ssh_terminal(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
     let Some(terminal) = model.ssh_terminal.as_ref() else {
         return;
@@ -11348,14 +11350,14 @@ fn render_ssh_terminal(model: &AppModel, theme: &Theme, frame: &mut Frame<'_>, a
     let [title_area, body_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
     frame.render_widget(
-        Paragraph::new(title).style(theme.text_style().bg(theme.ground.into())),
+        Paragraph::new(title).style(theme.text_style().bg(theme.bg.into())),
         title_area,
     );
     let lines = body.lines().map(Line::raw).collect::<Vec<_>>();
     let scroll = u16::try_from(lines.len().saturating_sub(usize::from(body_area.height)))
         .unwrap_or(u16::MAX);
     let paragraph = Paragraph::new(Text::from(lines))
-        .style(theme.text_style().bg(theme.ground.into()))
+        .style(theme.text_style().bg(theme.bg.into()))
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     frame.render_widget(paragraph, body_area);
@@ -11439,7 +11441,8 @@ fn render_monitors_overlay(
         Paragraph::new(Text::from(lines)).style(theme.text_style().bg(theme.bar_bg.into())),
         panel,
     );
-=======
+}
+
 fn fmt_bytes(bytes: u64) -> String {
     const GIB: u64 = 1024 * 1024 * 1024;
     const MIB: u64 = 1024 * 1024;
@@ -11453,7 +11456,6 @@ fn fmt_bytes(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
->>>>>>> wave-965-d
 }
 
 /// One text run of the status bar's bottom-left strip: the content and
@@ -11583,6 +11585,7 @@ pub fn status_left_segments(model: &AppModel, width: u16) -> Vec<StatusSegment> 
             tone: StatusSegmentTone::Hook,
             state: None,
             detail: Some("read/search/web/text/plan plus quota-limited sandbox writes".to_owned()),
+            action: None,
         });
     }
     if let Some(progress) = model.provider_wait_progress()
@@ -11969,8 +11972,9 @@ fn transcript_lines<'a>(
             sender,
             sender_kind,
             text,
+            receipt,
             ..
-        } => peer_entry_lines(lines, sender, sender_kind, text, theme, width),
+        } => peer_entry_lines(lines, sender, sender_kind, text, *receipt, theme, width),
         TranscriptEntry::Note { text } => {
             // Sim NoteRow (tui.js:4572-4577): dim, indented off the margin.
             lines.push(Line::from(vec![
@@ -12029,14 +12033,16 @@ fn peer_entry_lines<'a>(
     sender: &'a str,
     sender_kind: &'a str,
     text: &'a str,
+    receipt: Option<haider_protocol::peer::PeerDelivery>,
     theme: &Theme,
     width: u16,
 ) {
     lines.push(Line::default());
     lines.push(Line::from(vec![
         Span::raw(" "),
-        Span::styled("⇠ ", theme.gold_style().add_modifier(Modifier::BOLD)),
+        Span::styled("@ ", theme.gold_style().add_modifier(Modifier::BOLD)),
         Span::styled(sender, theme.bright_style().add_modifier(Modifier::BOLD)),
+        Span::styled("›", theme.gold_style().add_modifier(Modifier::BOLD)),
         Span::styled(format!(" · {sender_kind}"), theme.dim_style()),
         Span::styled(" · UNTRUSTED PEER INPUT", theme.maroon_style()),
     ]));
@@ -12046,6 +12052,18 @@ fn peer_entry_lines<'a>(
             Span::raw(" "),
             Span::styled("▏ ", theme.rail_style()),
             Span::styled(row, theme.text_style()),
+        ]));
+    }
+    if let Some(receipt) = receipt {
+        let label = match receipt {
+            haider_protocol::peer::PeerDelivery::Queued => "queued",
+            haider_protocol::peer::PeerDelivery::Delivered => "delivered",
+            haider_protocol::peer::PeerDelivery::Expired => "expired",
+            haider_protocol::peer::PeerDelivery::Refused => "refused",
+        };
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(format!("receipt · {label}"), theme.dim_style()),
         ]));
     }
 }

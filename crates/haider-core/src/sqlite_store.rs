@@ -55,6 +55,7 @@ pub struct SqliteStoreHandle {
 struct StoreOwner {
     root: PathBuf,
     worker_generation: u64,
+    profile_installation_id: String,
     store: Mutex<Option<Store>>,
     fault: tokio::sync::watch::Sender<Option<ProfileStoreFault>>,
     #[cfg(test)]
@@ -96,25 +97,25 @@ impl SqliteStoreHandle {
     /// stays the one-step acquire-and-open for standalone and tests; both
     /// paths consume one worker generation per successful open.
     pub async fn open_locked(lease: ProfileLease) -> Result<Self, HaiderError> {
-        let store = run_blocking(move || Store::open_locked(lease)).await?;
-        Ok(Self::from_store(store))
+        run_blocking(move || Store::open_locked(lease).and_then(Self::from_store)).await
     }
 
     /// Opens or creates `root` without blocking the calling runtime worker.
     pub async fn open(root: impl AsRef<Path>) -> Result<Self, HaiderError> {
         let root = root.as_ref().to_path_buf();
-        let store = run_blocking(move || Store::open(root)).await?;
-        Ok(Self::from_store(store))
+        run_blocking(move || Store::open(root).and_then(Self::from_store)).await
     }
 
-    fn from_store(store: Store) -> Self {
+    fn from_store(store: Store) -> Result<Self, HaiderError> {
         let root = store.root().to_path_buf();
         let worker_generation = store.worker_generation();
+        let profile_installation_id = store.profile_installation_id()?;
         let (fault, _) = tokio::sync::watch::channel(None);
-        Self {
+        Ok(Self {
             owner: Arc::new(StoreOwner {
                 root,
                 worker_generation,
+                profile_installation_id,
                 store: Mutex::new(Some(store)),
                 fault,
                 #[cfg(test)]
@@ -122,7 +123,7 @@ impl SqliteStoreHandle {
                 #[cfg(test)]
                 injected_profile_write_error: Mutex::new(None),
             }),
-        }
+        })
     }
 
     /// Subscribes to the profile-wide store health latch. Every clone shares
@@ -176,11 +177,18 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(Store::advance_daemon_generation)).await
     }
 
-    /// Lazily mints or reads the durable per-profile installation id used by
-    /// usage-history provenance.
+    /// Returns the durable per-profile installation id captured during the
+    /// blocking store-open operation.
     pub async fn profile_installation_id(&self) -> Result<String, HaiderError> {
-        let owner = Arc::clone(&self.owner);
-        run_blocking(move || owner.with_store(Store::profile_installation_id)).await
+        Ok(self.owner.profile_installation_id.clone())
+    }
+
+    /// Already-validated installation identity captured while the store was
+    /// opened. Synchronous daemon policy paths use this cached coordinate and
+    /// never block a runtime worker on SQLite.
+    #[must_use]
+    pub fn cached_profile_installation_id(&self) -> &str {
+        &self.owner.profile_installation_id
     }
 
     /// Completes the one-time journal backfill and reconciles closed slots
@@ -969,6 +977,17 @@ impl SqliteStoreHandle {
     ) -> Result<TurnAcceptOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.accept_turn(&command))).await
+    }
+
+    /// Blocking-pool adapter for the typed peer-origin acceptance path.
+    pub async fn accept_peer_turn(
+        &self,
+        command: TurnAcceptCommand,
+        message: haider_protocol::peer::PeerMessage,
+    ) -> Result<TurnAcceptOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.accept_peer_turn(&command, &message)))
+            .await
     }
 
     pub async fn queue_snapshot(

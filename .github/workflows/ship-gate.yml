@@ -50,8 +50,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: macos-ship-render-release-profile
-      # Ledger row 17 is a two-way performance gate: it rejects rendering that
-      # is too slow or implausibly fast. Its thresholds remain calibrated to
-      # the actual shipped profile, so this job deliberately stays --release.
-      - name: render benchmark (release — ledger row 17's two-way gate)
+      # Ledger row 17 enforces calibrated upper bounds only. The
+      # minimum_duration assertion selects min-vs-max samples; it is not a
+      # lower performance floor. Calibrating a no-op/implausibly-fast guard is
+      # an explicit 966 task. This job deliberately stays --release.
+      - name: render benchmark (release — ledger row 17 upper bounds)
         run: cargo test --release -p haider-tui --test w3c3_render_bench_tests --locked

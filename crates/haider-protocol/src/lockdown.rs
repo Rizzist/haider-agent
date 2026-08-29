@@ -26,3 +26,13 @@ pub struct ProviderTrustChanged {
     pub trust: String,
     pub revision: u64,
 }
+
+/// A custom provider changed between API-key and key-less operation without
+/// changing its stable provider identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderAuthChanged {
+    pub provider: String,
+    pub previous: String,
+    pub auth_requirement: String,
+    pub revision: u64,
+}

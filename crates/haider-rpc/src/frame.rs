@@ -334,11 +334,6 @@ pub const FEATURE_MODELS_LIST_V1: &str = "models_list_v1";
 pub const FEATURE_ACCOUNT_ROTATION_V1: &str = "account_rotation_v1";
 /// Daemon implements receipt-backed direct user shell execution.
 pub const FEATURE_SHELL_EXEC_V1: &str = "shell_exec_v1";
-/// Daemon implements profile-scoped SSH profile management, session scope,
-/// and remote shell execution without exposing stored authentication data.
-pub const FEATURE_SSH_PROFILES_V1: &str = "ssh_profiles_v1";
-/// Daemon exposes one registry for local and SSH-backed terminal lifecycles.
-pub const FEATURE_SHELL_REGISTRY_V1: &str = "shell_registry_v1";
 /// Daemon commits direct shell provenance/output into later model context and
 /// returns an immediate synthetic-run cancellation coordinate.
 pub const FEATURE_USER_COMMAND_V1: &str = "user_command_v1";
@@ -418,9 +413,6 @@ pub const FEATURE_SESSION_FAST_SELECT_V1: &str = "session_fast_select_v1";
 /// effort, and speed configuration through the existing observation and
 /// receipted selection methods.
 pub const FEATURE_SESSION_CONFIG_V1: &str = "session_config_v1";
-/// Daemon implements owner-private cross-session/external peer discovery,
-/// durable mailbox delivery, and additive delivery events.
-pub const FEATURE_PEER_MESSAGING_V1: &str = "peer_messaging_v1";
 /// Daemon vaults the profile transcription secret (the Deepgram API key)
 /// and serves `transcription.secret_get`/`transcription.secret_set` on
 /// authenticated same-UID local UDS connections only (T1).
@@ -561,6 +553,14 @@ pub const FEATURE_LOOM_REGISTRY_WATCH_V1: &str = "loom_registry_watch_v1";
 pub const FEATURE_ACCOUNT_IDENTITY_V1: &str = "account_identity_v1";
 /// Durable bounded workspace pre-images plus receipted undo/redo/rollback.
 pub const FEATURE_CHECKPOINT_V1: &str = "checkpoint_v1";
+/// Daemon implements owner-private cross-session/external peer discovery,
+/// durable mailbox delivery, and additive delivery events.
+pub const FEATURE_PEER_MESSAGING_V1: &str = "peer_messaging_v1";
+/// Daemon implements profile-scoped SSH profile management, session scope,
+/// and remote shell execution without exposing stored authentication data.
+pub const FEATURE_SSH_PROFILES_V1: &str = "ssh_profiles_v1";
+/// Daemon exposes one registry for local and SSH-backed terminal lifecycles.
+pub const FEATURE_SHELL_REGISTRY_V1: &str = "shell_registry_v1";
 /// Daemon-enforced provider trust ceilings, the fixed lockdown envelope, and
 /// the machine-user-wide lockdown quota.
 pub const FEATURE_PROVIDER_LOCKDOWN_V1: &str = "provider_lockdown_v1";
@@ -3599,8 +3599,9 @@ pub enum RequestBody {
     #[serde(rename = "provider.models_refresh")]
     ProviderModelsRefresh { provider: String },
     /// Creates a custom provider or safely updates mutable fields on an
-    /// existing profile. API family and auth requirement are create-only;
-    /// the `provider` key remains the stable identity. A custom provider's
+    /// existing profile. API family is create-only; a custom provider may
+    /// switch its auth requirement between `api_key` and `none` in place.
+    /// The `provider` key remains the stable identity. A custom provider's
     /// origin may be changed on update (under `expected_revision`); fixed
     /// release-owned origins remain immutable except for explicitly
     /// shape-validated enterprise configuration surfaces.
@@ -3631,7 +3632,7 @@ pub enum RequestBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         probe_vault_reference: Option<String>,
         /// Omission preserves an existing record's trust and defaults a new
-        /// custom provider to Lockdown in the daemon.
+        /// custom provider to Full in the daemon. Lockdown is explicit only.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trust: Option<ProviderTrustWire>,
         expected_revision: u64,
@@ -3880,8 +3881,6 @@ pub enum RequestBody {
         worker_generation: u64,
         run_id: RunId,
     },
-<<<<<<< HEAD
-<<<<<<< HEAD
     /// Lists every currently live Haider session and registered external peer.
     #[serde(rename = "peer.list")]
     PeerList {},
@@ -3894,7 +3893,10 @@ pub enum RequestBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
     },
-=======
+    /// Renames the connection's unique control-attached Haider session and
+    /// returns its refreshed peer descriptor.
+    #[serde(rename = "peer.name")]
+    PeerName { name: String },
     /// Lists saved SSH profiles. When `session_id` is present, each
     /// administrative row carries that session's `in_scope` decision. The
     /// model-facing tool separately omits false rows.
@@ -3958,8 +3960,6 @@ pub enum RequestBody {
     /// shell deliberately leaves its reusable authenticated profile session.
     #[serde(rename = "shell.close")]
     ShellClose { id: String },
->>>>>>> wave-965-c
-=======
     /// Changes the provider ceiling. Live sessions snapshot this value only
     /// at their next turn boundary.
     #[serde(rename = "provider.set_trust")]
@@ -3980,7 +3980,6 @@ pub enum RequestBody {
     /// lockdown providers.
     #[serde(rename = "lockdown.set_quota")]
     LockdownSetQuota { command_id: CommandId, bytes: u64 },
->>>>>>> wave-965-d
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline). W3b answers it with a protocol error, not a panic.
     #[serde(other)]
@@ -4745,13 +4744,12 @@ pub enum ResponseBody {
     CheckpointRollbackTurn {
         receipt: haider_protocol::checkpoint::CheckpointMutationReceipt,
     },
-<<<<<<< HEAD
-<<<<<<< HEAD
     #[serde(rename = "peer.list")]
     PeerList { agents: Vec<PeerDescriptor> },
     #[serde(rename = "peer.send")]
     PeerSend { receipt: PeerReceipt },
-=======
+    #[serde(rename = "peer.name")]
+    PeerName { agent: PeerDescriptor },
     #[serde(rename = "ssh.list")]
     SshList { profiles: Vec<SshProfileWire> },
     #[serde(rename = "ssh.add")]
@@ -4781,8 +4779,6 @@ pub enum ResponseBody {
     ShellList { shells: Vec<ShellWire> },
     #[serde(rename = "shell.close")]
     ShellClose { shell: ShellWire },
->>>>>>> wave-965-c
-=======
     #[serde(rename = "provider.set_trust")]
     ProviderSetTrust {
         provider: ProviderSummaryWire,
@@ -4792,7 +4788,6 @@ pub enum ResponseBody {
     LockdownStatus { status: LockdownStatusWire },
     #[serde(rename = "lockdown.set_quota")]
     LockdownSetQuota { status: LockdownStatusWire },
->>>>>>> wave-965-d
     /// Decode artifact for a method this crate does not know (tolerance
     /// discipline).
     #[serde(other)]
@@ -4988,10 +4983,8 @@ pub enum ErrorData {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         requested_branch_id: Option<BranchId>,
     },
-<<<<<<< HEAD
     /// Candidates returned when a bare peer name is not unique.
     PeerAmbiguous { candidates: Vec<PeerCandidate> },
-=======
     /// A daemon provider ceiling refused an operation before ordinary user
     /// Ask/Allow policy. Clients render this as a refusal, not a failure.
     RefusedByLockdown {
@@ -5003,7 +4996,6 @@ pub enum ErrorData {
     /// A sandbox write or quota reduction would exceed the shared
     /// machine-user-wide byte ceiling.
     LockdownQuotaExceeded { used: u64, limit: u64 },
->>>>>>> wave-965-d
     /// Decode artifact for a data kind this crate does not know (tolerance
     /// discipline).
     #[serde(other)]
@@ -5299,12 +5291,10 @@ pub enum WireFrame {
         watch_id: String,
         high_water_cursor: u64,
     },
-<<<<<<< HEAD
     /// A peer message crossed the durable target-session turn boundary.
     PeerMessageReceived { message: PeerMessage },
     /// A sender-visible transition after the initial `peer.send` receipt.
     PeerDeliveryChanged { receipt: PeerReceipt },
-=======
     /// A local or SSH-backed terminal entered the unified registry.
     ShellOpened { shell: ShellWire },
     /// A tracked terminal changed lifecycle state or counters.
@@ -5318,7 +5308,6 @@ pub enum WireFrame {
         stream: ShellOutputStreamWire,
         chunk_b64: TerminalOutputWire,
     },
->>>>>>> wave-965-c
     /// Decode artifact for a frame kind this crate does not know (tolerance
     /// discipline). Never constructed for sending.
     Unknown,
@@ -5428,13 +5417,12 @@ enum WireFrameRef<'a> {
         watch_id: &'a str,
         high_water_cursor: u64,
     },
-<<<<<<< HEAD
     PeerMessageReceived {
         message: &'a PeerMessage,
     },
     PeerDeliveryChanged {
         receipt: &'a PeerReceipt,
-=======
+    },
     #[serde(rename = "shell.opened")]
     ShellOpened {
         shell: &'a ShellWire,
@@ -5452,7 +5440,6 @@ enum WireFrameRef<'a> {
         id: &'a str,
         stream: ShellOutputStreamWire,
         chunk_b64: &'a TerminalOutputWire,
->>>>>>> wave-965-c
     },
     Unknown,
 }
@@ -5565,13 +5552,12 @@ enum WireFrameOwned {
         watch_id: String,
         high_water_cursor: u64,
     },
-<<<<<<< HEAD
     PeerMessageReceived {
         message: PeerMessage,
     },
     PeerDeliveryChanged {
         receipt: PeerReceipt,
-=======
+    },
     #[serde(rename = "shell.opened")]
     ShellOpened {
         shell: ShellWire,
@@ -5589,7 +5575,6 @@ enum WireFrameOwned {
         id: String,
         stream: ShellOutputStreamWire,
         chunk_b64: TerminalOutputWire,
->>>>>>> wave-965-c
     },
     #[serde(other)]
     Unknown,
@@ -5774,10 +5759,8 @@ impl Serialize for WireFrame {
                 watch_id,
                 high_water_cursor: *high_water_cursor,
             },
-<<<<<<< HEAD
             Self::PeerMessageReceived { message } => WireFrameRef::PeerMessageReceived { message },
             Self::PeerDeliveryChanged { receipt } => WireFrameRef::PeerDeliveryChanged { receipt },
-=======
             Self::ShellOpened { shell } => WireFrameRef::ShellOpened { shell },
             Self::ShellState { shell } => WireFrameRef::ShellState { shell },
             Self::ShellClosed { shell } => WireFrameRef::ShellClosed { shell },
@@ -5790,7 +5773,6 @@ impl Serialize for WireFrame {
                 stream: *stream,
                 chunk_b64,
             },
->>>>>>> wave-965-c
             Self::Unknown => WireFrameRef::Unknown,
         };
         VersionedFrameRef {
@@ -5946,14 +5928,12 @@ impl<'de> Deserialize<'de> for WireFrame {
                 watch_id,
                 high_water_cursor,
             },
-<<<<<<< HEAD
             WireFrameOwned::PeerMessageReceived { message } => {
                 Self::PeerMessageReceived { message }
             }
             WireFrameOwned::PeerDeliveryChanged { receipt } => {
                 Self::PeerDeliveryChanged { receipt }
             }
-=======
             WireFrameOwned::ShellOpened { shell } => Self::ShellOpened { shell },
             WireFrameOwned::ShellState { shell } => Self::ShellState { shell },
             WireFrameOwned::ShellClosed { shell } => Self::ShellClosed { shell },
@@ -5966,7 +5946,6 @@ impl<'de> Deserialize<'de> for WireFrame {
                 stream,
                 chunk_b64,
             },
->>>>>>> wave-965-c
             WireFrameOwned::Unknown => Self::Unknown,
         })
     }

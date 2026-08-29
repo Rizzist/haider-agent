@@ -33,7 +33,9 @@ const UNIX_SOCKET_PATH_BYTES: usize = 107;
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 const UNIX_SOCKET_PATH_BYTES: usize = 103;
 
-const STAGING_PREFIX: &str = ".haiderd-";
+// Keep the 96-bit random coordinate while fitting the portable runtime
+// artifact basename ceiling. This name exists only until publication.
+const STAGING_PREFIX: &str = ".hd-";
 const STAGING_RANDOM_BYTES: usize = 12;
 const STAGING_RANDOM_CHARS: usize = 16;
 const STAGING_BASENAME_BYTES: usize = STAGING_PREFIX.len() + STAGING_RANDOM_CHARS;
@@ -1322,19 +1324,12 @@ fn restore(directory: &OwnedFd, claim: &str, name: &str) -> Result<(), EndpointE
     }
 }
 
-<<<<<<< HEAD
 fn staging_name() -> Result<String, EndpointError> {
     // Ninety-six random bits retain a wide pre-knowledge margin while their
-    // unpadded URL-safe base64 encoding keeps the full basename to 25 bytes.
+    // unpadded URL-safe base64 encoding keeps the full basename to 20 bytes.
     // The old 128-bit hex form used 41 bytes and overflowed macOS sun_path
     // beneath its ordinary per-user TMPDIR.
     let mut bytes = [0_u8; STAGING_RANDOM_BYTES];
-=======
-const STAGING_PREFIX: &str = ".h-";
-
-fn staging_name() -> Result<String, EndpointError> {
-    let mut bytes = [0_u8; 8];
->>>>>>> wave-965-a
     getrandom::fill(&mut bytes).map_err(|error| EndpointError::Task {
         message: format!("cannot generate endpoint staging name: {error}"),
     })?;
@@ -1503,7 +1498,7 @@ mod tests {
         is_synthesized_probe_timeout, longest_staging_path, probe_failure, shutdown_error_outcome,
         shutdown_handle, staging_name, validate_endpoint_budget,
     };
-    use crate::ipc::IpcShutdownOutcome;
+    use crate::ipc::{IpcShutdownOutcome, RUNTIME_ARTIFACT_BASENAME_MAX_BYTES};
     use rustix::io::Errno;
     use std::io::{Error, ErrorKind};
     use std::os::unix::ffi::OsStrExt as _;
@@ -1555,12 +1550,13 @@ mod tests {
     }
 
     #[test]
-    fn staging_name_is_twenty_five_url_safe_bytes_with_ninety_six_random_bits() {
+    fn staging_name_fits_runtime_ceiling_with_ninety_six_random_bits() {
         let name = match staging_name() {
             Ok(name) => name,
             Err(error) => panic!("generate staging name: {error}"),
         };
         assert_eq!(name.len(), STAGING_BASENAME_BYTES);
+        assert_eq!(name.len(), RUNTIME_ARTIFACT_BASENAME_MAX_BYTES);
         assert!(name.starts_with(STAGING_PREFIX));
         assert!(
             name[STAGING_PREFIX.len()..]

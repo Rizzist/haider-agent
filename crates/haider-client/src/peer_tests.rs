@@ -49,7 +49,7 @@ fn typed_peer_responses_preserve_contract_fields() {
             agents: vec![descriptor.clone()]
         })
         .expect("peer list"),
-        [descriptor.clone()]
+        std::slice::from_ref(&descriptor)
     );
     let receipt = PeerReceipt {
         msg_id: "msg-1".into(),

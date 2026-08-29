@@ -3,6 +3,7 @@
 
 use crate::agent::ChildReport;
 use crate::ids::{AgentId, ArtifactRef, NodeId};
+use crate::peer::PeerMessage;
 use crate::provider::FinishReason;
 use crate::tool::AttachmentBlock;
 use crate::verify::VerifyVerdict;
@@ -28,6 +29,12 @@ pub enum NodeKind {
         text: String,
         #[serde(default)]
         attachments: Vec<AttachmentBlock>,
+    },
+    /// A peer-originated turn keeps its own history taxonomy and full sender
+    /// coordinates. It must never acquire user-instruction semantics merely
+    /// because providers expose only a user-role input channel.
+    PeerTurn {
+        message: PeerMessage,
     },
     AssistantCommit {
         text: String,

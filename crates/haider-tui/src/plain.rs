@@ -88,14 +88,25 @@ fn render_plain_impl(
                 sender,
                 sender_kind,
                 text,
+                receipt,
                 ..
             } => {
                 out.push_str(&format!(
-                    "⇠ {sender} · {sender_kind} · UNTRUSTED PEER INPUT\n"
+                    "@ {sender}› · {sender_kind} · UNTRUSTED PEER INPUT\n"
                 ));
                 for line in text.split('\n') {
-                    out.push_str("  ");
+                    out.push_str("  ▏ ");
                     out.push_str(line);
+                    out.push('\n');
+                }
+                if let Some(receipt) = receipt {
+                    out.push_str("    receipt · ");
+                    out.push_str(match receipt {
+                        haider_protocol::peer::PeerDelivery::Queued => "queued",
+                        haider_protocol::peer::PeerDelivery::Delivered => "delivered",
+                        haider_protocol::peer::PeerDelivery::Expired => "expired",
+                        haider_protocol::peer::PeerDelivery::Refused => "refused",
+                    });
                     out.push('\n');
                 }
             }

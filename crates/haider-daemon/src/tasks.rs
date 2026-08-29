@@ -556,7 +556,7 @@ impl TaskFacade {
                 }
             };
             let output_bytes = lock_task_output(&output_for_shell).total_bytes();
-            let _ = shell.add_output(output_bytes);
+            let _ = shell.add_output(usize::try_from(output_bytes).unwrap_or(usize::MAX));
             let _ = shell.exited(status.exit_code);
             facade
                 .complete_task(&session_id, &pipeline_task, status)

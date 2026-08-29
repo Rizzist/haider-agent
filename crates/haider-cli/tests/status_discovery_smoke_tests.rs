@@ -95,6 +95,11 @@ fn built_status_json_completes_with_enabled_discovery() {
         .args(["status", "--json"])
         .current_dir(&workspace)
         .env("HAIDER_PROFILE_DIR", &profile)
+        // The daemon's lockdown ledger is machine-user global. Keep this
+        // real-artifact smoke hermetic while discovery paths remain the
+        // explicit fixtures below.
+        .env("HOME", root.path())
+        .env("USERPROFILE", root.path())
         .env_remove("HAIDER_DISCOVERY_DISABLED")
         .env_remove("HAIDER_DEVICE_DISCOVERY_DISABLED")
         .env("HAIDER_TEST_CLAUDE_CREDENTIAL_STORE", "unavailable")

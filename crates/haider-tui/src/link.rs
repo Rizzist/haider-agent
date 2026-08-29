@@ -635,7 +635,6 @@ pub fn command_required_features(command: &LiveCommand) -> &'static [&'static st
         LiveCommand::PeerList | LiveCommand::PeerSend { .. } => {
             &[haider_rpc::FEATURE_PEER_MESSAGING_V1]
         }
-<<<<<<< HEAD
         LiveCommand::SshList { .. }
         | LiveCommand::SshSetScope { .. }
         | LiveCommand::SshTest { .. }
@@ -651,11 +650,9 @@ pub fn command_required_features(command: &LiveCommand) -> &'static [&'static st
             &[haider_rpc::FEATURE_SHELL_REGISTRY_V1]
         }
         LiveCommand::MonitorList { .. } => &[haider_rpc::FEATURE_MONITOR_CONTROL_V1],
-=======
         LiveCommand::ProviderSetTrust { .. } | LiveCommand::LockdownStatus { .. } => {
             &[haider_rpc::FEATURE_PROVIDER_LOCKDOWN_V1]
         }
->>>>>>> wave-965-d
         _ => &[],
     }
 }

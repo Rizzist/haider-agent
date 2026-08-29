@@ -48,7 +48,7 @@ use haider_protocol::credential::{
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{CredentialAlias, DeviceId, EventId};
-use haider_protocol::lockdown::ProviderTrustChanged;
+use haider_protocol::lockdown::{ProviderAuthChanged, ProviderTrustChanged};
 use haider_provider::{
     ANTHROPIC_OAUTH_PROVIDER_NAME, ANTHROPIC_PROVIDER_NAME, AnthropicProvider,
     AnthropicTransportConfig, BEDROCK_PROVIDER_NAME, BUILTIN_PROVIDER_NAMES, CatalogError,
@@ -3186,6 +3186,10 @@ struct ProviderConfigureIdentity {
 struct ProviderConfigureRecovery {
     #[serde(flatten)]
     input: ProviderConfigureInput,
+    /// The prior custom-provider auth mode, retained so crash reconciliation
+    /// journals the same transition even if the profile file was already saved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_auth_requirement: Option<ProviderAuthRequirementWire>,
     /// Public catalog facts already authenticated before the receipt claim.
     /// Retaining them lets a crash-resume rebuild the durable cache without
     /// persisting or reusing the ephemeral probe credential.
@@ -3978,6 +3982,9 @@ async fn handle_provider_configure(
             return;
         }
     };
+    let mut previous_auth_requirement = providers
+        .get(&job.input.provider)
+        .map(|profile| profile.auth_requirement);
     let preflight = store
         .management_receipt_preflight::<ProviderReceipt>(
             job.command_id.clone(),
@@ -4011,6 +4018,7 @@ async fn handle_provider_configure(
         })) => match serde_json::from_str::<ProviderConfigureRecovery>(&recovery) {
             Ok(recovery) => {
                 job.input = recovery.input;
+                previous_auth_requirement = recovery.previous_auth_requirement;
                 if let Some(models) = recovery.discovered_models {
                     recovered_catalog = Some(DiscoveredCatalog {
                         models,
@@ -4301,6 +4309,7 @@ async fn handle_provider_configure(
     };
     let recovery_json = match serde_json::to_string(&ProviderConfigureRecovery {
         input: job.input.clone(),
+        previous_auth_requirement,
         discovered_models: discovered_catalog
             .as_ref()
             .map(|catalog| catalog.models.clone()),
@@ -4349,6 +4358,7 @@ async fn handle_provider_configure(
         }) => {
             if let Ok(recovery) = serde_json::from_str::<ProviderConfigureRecovery>(&recovery) {
                 job.input = recovery.input;
+                previous_auth_requirement = recovery.previous_auth_requirement;
                 revision_unchanged = recovery.revision_unchanged;
             }
         }
@@ -4358,6 +4368,9 @@ async fn handle_provider_configure(
             return;
         }
     }
+    let auth_change = previous_auth_requirement
+        .zip(job.input.auth_requirement)
+        .filter(|(previous, current)| previous != current);
     let profile = if revision_unchanged {
         match providers.get(&job.input.provider).cloned() {
             Some(profile) => profile,
@@ -4385,6 +4398,35 @@ async fn handle_provider_configure(
                 return;
             }
         }
+    };
+    let auth_event_revision = if let Some((previous, auth_requirement)) = auth_change {
+        let Some(anticipated_revision) = job.expected_revision.checked_add(1) else {
+            respond_management_error(
+                &job.route,
+                &HaiderError::new(
+                    ErrorCode::StoreCorrupt,
+                    "provider auth revision space is exhausted",
+                    false,
+                ),
+            );
+            return;
+        };
+        if let Err(error) = journal_provider_auth_changed(
+            store,
+            &job.command_id,
+            &profile.provider_id,
+            previous,
+            auth_requirement,
+            anticipated_revision,
+        )
+        .await
+        {
+            respond_management_error(&job.route, &error);
+            return;
+        }
+        Some(anticipated_revision)
+    } else {
+        None
     };
     if let Some(catalog) = discovered_catalog {
         let models_json = match serde_json::to_string(&catalog.models) {
@@ -4454,6 +4496,21 @@ async fn handle_provider_configure(
             return;
         }
     };
+    if let Some(anticipated_revision) = auth_event_revision
+        && revision != anticipated_revision
+    {
+        respond_management_error(
+            &job.route,
+            &HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                format!(
+                    "provider auth event revision {anticipated_revision} differs from committed revision {revision}"
+                ),
+                false,
+            ),
+        );
+        return;
+    }
     if !revision_unchanged && let Some(management) = management {
         management.publish(
             revision,
@@ -4886,8 +4943,52 @@ async fn journal_provider_trust_changed(
             false,
         )
     })?;
-    let event_id = EventId::new(format!("provider-trust-{command_id}"));
-    let profile_id = store.profile_installation_id()?;
+    journal_provider_management_event(
+        store,
+        EventId::new(format!("provider-trust-{command_id}")),
+        provider,
+        payload,
+    )
+    .await
+}
+
+async fn journal_provider_auth_changed(
+    store: &SqliteStoreHandle,
+    command_id: &str,
+    provider: &str,
+    previous: ProviderAuthRequirementWire,
+    auth_requirement: ProviderAuthRequirementWire,
+    revision: u64,
+) -> Result<(), HaiderError> {
+    let payload = serde_json::to_value(EventPayload::ProviderAuthChanged(ProviderAuthChanged {
+        provider: provider.to_owned(),
+        previous: provider_auth_label(previous).to_owned(),
+        auth_requirement: provider_auth_label(auth_requirement).to_owned(),
+        revision,
+    }))
+    .map_err(|error| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            format!("cannot serialize provider auth event: {error}"),
+            false,
+        )
+    })?;
+    journal_provider_management_event(
+        store,
+        EventId::new(format!("provider-auth-{command_id}")),
+        provider,
+        payload,
+    )
+    .await
+}
+
+async fn journal_provider_management_event(
+    store: &SqliteStoreHandle,
+    event_id: EventId,
+    provider: &str,
+    payload: serde_json::Value,
+) -> Result<(), HaiderError> {
+    let profile_id = store.profile_installation_id().await?;
     for session_id in store.session_ids().await? {
         let Some(metadata) = store.session_metadata(&session_id).await? else {
             continue;
@@ -4920,7 +5021,7 @@ async fn journal_provider_trust_changed(
             if next <= cursor {
                 return Err(HaiderError::new(
                     ErrorCode::StoreCorrupt,
-                    "provider trust journal scan did not advance",
+                    "provider management journal scan did not advance",
                     false,
                 ));
             }
@@ -4960,6 +5061,16 @@ const fn provider_trust_label(trust: ProviderTrustWire) -> &'static str {
         ProviderTrustWire::Full => "full",
         ProviderTrustWire::Lockdown => "lockdown",
         ProviderTrustWire::Unknown => "unknown",
+        _ => "unknown",
+    }
+}
+
+const fn provider_auth_label(auth: ProviderAuthRequirementWire) -> &'static str {
+    match auth {
+        ProviderAuthRequirementWire::ApiKey => "api_key",
+        ProviderAuthRequirementWire::None => "none",
+        ProviderAuthRequirementWire::OAuth => "oauth",
+        ProviderAuthRequirementWire::Unknown => "unknown",
         _ => "unknown",
     }
 }
@@ -9790,7 +9901,10 @@ async fn reconcile_provider_receipts(
             }
             continue;
         }
-        let (profile, revision_unchanged, recovered_catalog) = match row.method.as_str() {
+        let (profile, revision_unchanged, recovered_catalog, auth_change) = match row
+            .method
+            .as_str()
+        {
             ACCOUNT_SET_DEFAULT_MODEL_METHOD => {
                 let identity: SetDefaultModelIdentity = serde_json::from_str(&row.request_json)
                     .map_err(|error| {
@@ -9803,6 +9917,7 @@ async fn reconcile_provider_receipts(
                 (
                     providers.reconcile_set_default_model(&identity.provider, &identity.model)?,
                     false,
+                    None,
                     None,
                 )
             }
@@ -9844,9 +9959,17 @@ async fn reconcile_provider_receipts(
                     anticipated_revision,
                 )
                 .await?;
-                (profile, false, None)
+                (profile, false, None, None)
             }
             PROVIDER_CONFIGURE_METHOD => {
+                let identity: ProviderConfigureIdentity = serde_json::from_str(&row.request_json)
+                    .map_err(|error| {
+                    HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        format!("pending provider-configure identity is invalid: {error}"),
+                        false,
+                    )
+                })?;
                 let recovery: ProviderConfigureRecovery = row
                     .recovery_json
                     .as_deref()
@@ -9859,6 +9982,26 @@ async fn reconcile_provider_receipts(
                         )
                     })?;
                 let revision_unchanged = recovery.revision_unchanged;
+                let auth_change = recovery
+                    .previous_auth_requirement
+                    .zip(recovery.input.auth_requirement)
+                    .filter(|(previous, current)| previous != current)
+                    .map(|(previous, current)| {
+                        identity
+                            .expected_revision
+                            .checked_add(1)
+                            .map(|revision| {
+                                (recovery.input.provider.clone(), previous, current, revision)
+                            })
+                            .ok_or_else(|| {
+                                HaiderError::new(
+                                    ErrorCode::StoreCorrupt,
+                                    "provider auth revision space is exhausted during reconciliation",
+                                    false,
+                                )
+                            })
+                    })
+                    .transpose()?;
                 let recovered_catalog =
                     recovery.discovered_models.map(|models| DiscoveredCatalog {
                         models,
@@ -9878,7 +10021,7 @@ async fn reconcile_provider_receipts(
                 } else {
                     providers.reconcile_configure(recovery.input)?
                 };
-                (profile, revision_unchanged, recovered_catalog)
+                (profile, revision_unchanged, recovered_catalog, auth_change)
             }
             PROVIDER_REMOVE_METHOD => {
                 let identity: ProviderRemoveIdentity = serde_json::from_str(&row.request_json)
@@ -9922,6 +10065,17 @@ async fn reconcile_provider_receipts(
                 ));
             }
         };
+        if let Some((provider, previous, auth_requirement, revision)) = auth_change {
+            journal_provider_auth_changed(
+                store,
+                &row.command_id,
+                &provider,
+                previous,
+                auth_requirement,
+                revision,
+            )
+            .await?;
+        }
         if let Some(catalog) = recovered_catalog {
             let models_json = serde_json::to_string(&catalog.models).map_err(|error| {
                 HaiderError::new(

@@ -757,6 +757,8 @@ async fn inventory_snapshot_projects_registry_defaults_and_durable_grants() {
             "monitor",
             "peer_list",
             "peer_send",
+            "ssh_list",
+            "ssh_shell",
         ]
     );
     // M2e: `workflow_author` is a GATED child capability, excluded from the
@@ -1204,20 +1206,20 @@ fn every_advertised_tool_is_manual_described_and_wire_is_description_free() {
 /// instruct pipe stops being a material (at least 30%) net reduction.
 #[test]
 fn instruct_pipe_shrinks_the_advertised_wire_pack() {
-    const EXPECTED_REGISTERED_TOOLS: usize = 22;
-    const EXPECTED_ADVERTISED_TOOLS: usize = 19;
+    const EXPECTED_REGISTERED_TOOLS: usize = 26;
+    const EXPECTED_ADVERTISED_TOOLS: usize = 23;
     // The full-prefix comparison deliberately includes the platform-specific
     // computer manifest description. Linux documents X11/Wayland (+49 bytes
     // over macOS), while Windows is one byte shorter than macOS.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 14_832;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 16_470;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 14_783;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 16_421;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 14_782;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 16_420;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 14_777;
-    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 9_911;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 16_415;
+    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 10_783;
 
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let stubbed =

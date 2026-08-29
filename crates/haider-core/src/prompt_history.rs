@@ -3300,6 +3300,13 @@ fn render_journal_with_facts(
                     current_user_start.get_or_insert(messages.len().saturating_sub(1));
                 }
             }
+            EventPayload::PeerMessage(message) => {
+                messages.push(Message::user_text(message.render_for_prompt()));
+                if is_current {
+                    current_user_seen = true;
+                    current_user_start.get_or_insert(messages.len().saturating_sub(1));
+                }
+            }
             EventPayload::Item(ItemEvent::Completed { item_id, item }) if !is_current => match item
             {
                 TurnItem::AgentMessage { text } => {

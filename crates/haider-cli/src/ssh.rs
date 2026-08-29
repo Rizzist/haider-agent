@@ -13,7 +13,7 @@ use haider_rpc::{
 use serde::Serialize;
 use zeroize::Zeroizing;
 
-use crate::run::{
+use super::run::{
     EX_BLOCKED, EX_IOERR, EX_PROTOCOL, EX_SOFTWARE, EX_TIMEOUT, EX_UNAVAILABLE, EX_USAGE,
 };
 
@@ -84,7 +84,7 @@ pub(crate) async fn ssh_command(rest: &[String]) -> ExitCode {
         }
     };
     let result = execute(&ensured.client, command).await;
-    ensured.client.close();
+    let _ = ensured.client.close();
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(CliSshError::Io(error)) => {

@@ -399,7 +399,7 @@ fn haider_target_expiry_is_owned_only_by_the_target_mailbox() {
 async fn startup_does_not_recover_another_daemons_accepted_mailbox() {
     use super::peer::PeerService;
     use crate::session_hub::{SessionHub, SessionHubConfig};
-    use haider_core::{SqliteStoreHandle, StoreHandle};
+    use haider_core::SqliteStoreHandle;
 
     let root = tempfile::tempdir().expect("temporary peer profile");
     let runtime = root.path().join("runtime");
@@ -448,7 +448,7 @@ async fn startup_does_not_recover_another_daemons_accepted_mailbox() {
 async fn foreign_daemon_defers_expiry_while_the_target_endpoint_is_live() {
     use super::peer::PeerService;
     use crate::session_hub::{SessionHub, SessionHubConfig};
-    use haider_core::{SqliteStoreHandle, StoreHandle};
+    use haider_core::SqliteStoreHandle;
     use std::os::unix::fs::PermissionsExt as _;
 
     let root = tempfile::tempdir().expect("temporary shared peer profile");
@@ -536,7 +536,7 @@ async fn foreign_daemon_defers_expiry_while_the_target_endpoint_is_live() {
 async fn foreign_expiry_refold_honors_a_claim_appended_after_its_snapshot() {
     use super::peer::PeerService;
     use crate::session_hub::{SessionHub, SessionHubConfig};
-    use haider_core::{SqliteStoreHandle, StoreHandle};
+    use haider_core::SqliteStoreHandle;
 
     let root = tempfile::tempdir().expect("temporary foreign expiry profile");
     let runtime = root.path().join("runtime");
@@ -688,6 +688,42 @@ async fn foreign_store_cannot_expire_a_target_claimed_core_accept_crash() {
         .expect("commit peer turn after mailbox claim");
     assert!(fresh);
     assert_eq!(accepted.session_id, target);
+    let accepted_events = StoreHandle::read(&target_store, &target, 0, 64)
+        .await
+        .expect("read typed peer admission");
+    let mut peer_records = 0;
+    let mut user_records = 0;
+    let mut peer_nodes = 0;
+    for envelope in &accepted_events {
+        let Ok(payload) =
+            serde_json::from_value::<haider_protocol::EventPayload>(envelope.payload.clone())
+        else {
+            continue;
+        };
+        match payload {
+            haider_protocol::EventPayload::PeerMessage(message) => {
+                peer_records += 1;
+                assert_eq!(message, queued);
+                let row = haider_protocol::pipe::sidecar_row_line(envelope)
+                    .expect("peer journal record projects independently");
+                assert!(row.contains(r#""kind":"peer_message""#));
+                assert!(row.contains(r#""sender_id":"external-test""#));
+            }
+            haider_protocol::EventPayload::UserMessage { .. } => user_records += 1,
+            haider_protocol::EventPayload::NodeCommitted(node)
+                if matches!(
+                    node.kind,
+                    haider_protocol::history::NodeKind::PeerTurn { .. }
+                ) =>
+            {
+                peer_nodes += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(peer_records, 1, "one peer-specific journal record");
+    assert_eq!(user_records, 0, "peer input is never a user journal record");
+    assert_eq!(peer_nodes, 1, "history retains a peer-specific node kind");
     assert!(
         deletion.await.expect("deletion fence task").is_err(),
         "the committed peer run must make deletion refuse the session"
@@ -763,7 +799,7 @@ async fn claimed_pre_core_crash_is_admitted_after_a_real_restart() {
     use super::peer::PeerService;
     use crate::session_hub::{SessionHub, SessionHubConfig};
     use crate::worker::{SystemPromptBuilder, WorkerDependencies, WorkerManager};
-    use haider_core::{SessionCreateCommand, SqliteStoreHandle, StoreHandle};
+    use haider_core::{SessionCreateCommand, SqliteStoreHandle};
     use haider_protocol::ids::{DeviceId, EventId, SessionId};
 
     let root = tempfile::tempdir().expect("temporary pre-core crash profile");
@@ -907,7 +943,7 @@ async fn claimed_pre_core_crash_is_admitted_after_a_real_restart() {
 async fn accepted_turn_is_not_declared_delivered_when_handoff_fails_on_removal() {
     use super::peer::PeerService;
     use crate::session_hub::{SessionHub, SessionHubConfig};
-    use haider_core::{SqliteStoreHandle, StoreHandle};
+    use haider_core::SqliteStoreHandle;
 
     let root = tempfile::tempdir().expect("temporary peer profile");
     let store = SqliteStoreHandle::open(root.path().join("store"))
@@ -1002,7 +1038,7 @@ async fn peer_event_route_excludes_an_attached_legacy_connection() {
     use crate::accounts::ConnectionTransport;
     use crate::session_hub::{SessionHub, SessionHubConfig};
     use crate::worker::SystemPromptBuilder;
-    use haider_core::{SessionCreateCommand, SqliteStoreHandle, StoreHandle};
+    use haider_core::{SessionCreateCommand, SqliteStoreHandle};
     use haider_protocol::ids::{DeviceId, EventId, SessionId};
     use haider_rpc::{AttachMode, Capability, RequestBody, RequestId, WireFrame};
     use std::collections::BTreeSet;
@@ -1363,10 +1399,18 @@ async fn socket_sender_cannot_claim_verified_haider_provenance() {
     assert_eq!(receipt.delivery, PeerDelivery::Delivered);
 
     let events = store.read(&target, 0, 256).await.expect("target history");
-    let rendered = events
+    let message = events
         .iter()
-        .map(|event| event.payload.to_string())
-        .collect::<String>();
+        .find_map(|event| {
+            serde_json::from_value::<haider_protocol::EventPayload>(event.payload.clone())
+                .ok()
+                .and_then(|payload| match payload {
+                    haider_protocol::EventPayload::PeerMessage(message) => Some(message),
+                    _ => None,
+                })
+        })
+        .expect("typed peer message journal record");
+    let rendered = message.render_for_prompt();
     assert!(rendered.contains("UNTRUSTED EXTERNAL DATA"));
     assert!(rendered.contains("NOT A USER INSTRUCTION"));
     assert!(rendered.contains("From: fixture"));
@@ -1523,9 +1567,10 @@ async fn two_daemons_deliver_only_after_the_busy_target_turn_boundary() {
         .await
         .expect("target history");
     assert!(
-        before
-            .iter()
-            .all(|event| !event.payload.to_string().contains("PEER MESSAGE")),
+        before.iter().all(|event| !matches!(
+            serde_json::from_value::<EventPayload>(event.payload.clone()),
+            Ok(EventPayload::PeerMessage(_))
+        )),
         "busy target must not receive peer text mid-turn"
     );
 
@@ -1562,9 +1607,12 @@ async fn two_daemons_deliver_only_after_the_busy_target_turn_boundary() {
             .read(&target, 0, 256)
             .await
             .expect("target history");
-        let target_received = events
-            .iter()
-            .any(|event| event.payload.to_string().contains("PEER MESSAGE"));
+        let target_received = events.iter().any(|event| {
+            matches!(
+                serde_json::from_value::<EventPayload>(event.payload.clone()),
+                Ok(EventPayload::PeerMessage(_))
+            )
+        });
         let sender_delivered = std::fs::read_to_string(&sender_mailbox)
             .is_ok_and(|journal| journal.contains(r#""delivery":"delivered""#));
         if target_received && sender_delivered {

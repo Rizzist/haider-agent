@@ -397,8 +397,13 @@ fn rendered_text(model: &AppModel, width: u16, height: u16) -> String {
     let buffer = terminal.backend().buffer();
     let mut rendered = String::new();
     for y in 0..buffer.area.height {
-        for x in 0..buffer.area.width {
-            rendered.push_str(buffer[(x, y)].symbol());
+        let mut x = 0;
+        while x < buffer.area.width {
+            let symbol = buffer[(x, y)].symbol();
+            // Match `select::selection_text`: a wide glyph's following cell
+            // is filler, not an additional display-space character.
+            rendered.push_str(symbol);
+            x += u16::try_from(unicode_width::UnicodeWidthStr::width(symbol).max(1)).unwrap_or(1);
         }
         rendered.push('\n');
     }

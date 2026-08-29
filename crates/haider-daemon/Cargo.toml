@@ -12,6 +12,7 @@ base64.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 getrandom.workspace = true
+hex.workspace = true
 haider-client = { path = "../haider-client" }
 haider-core = { path = "../haider-core" }
 haider-pdf = { path = "../haider-pdf" }

@@ -839,6 +839,10 @@ struct HubInner {
     /// race actor recreation or fresh admission.
     deleting_sessions: Mutex<HashSet<SessionId>>,
     actor_tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Wakes the daemon-wide shell fan-out actor before shutdown joins the
+    /// hub-owned task set. The registry sender itself lives in `HubInner`, so
+    /// dropping the hub cannot close that actor's broadcast receiver first.
+    shell_registry_events_cancel: watch::Sender<bool>,
     /// Serializes every package-manager side effect in this daemon. Durable
     /// CAS protects state, while this process-local mutex prevents a startup
     /// resume and a concurrent registration from both executing the same
@@ -1437,6 +1441,7 @@ enum ActorCommand {
     },
     AcceptTurn {
         command: TurnAcceptCommand,
+        peer_message: Option<haider_protocol::peer::PeerMessage>,
         completed: oneshot::Sender<Result<TurnAcceptOutcome, HaiderError>>,
     },
     QueueList {
@@ -1763,6 +1768,7 @@ impl SessionHub {
         let (loom_registry_publications, _) = broadcast::channel(1_024);
         let (descendant_lineage_publications, _) = watch::channel(0_u64);
         let (haider_code_plan_changes, _) = watch::channel(0_u64);
+        let (shell_registry_events_cancel, _) = watch::channel(false);
         let hooks = Arc::new(Mutex::new(None));
         let observe_digests = Arc::new(rpc::ObserveDigestCache::default());
         let commit_projection = Arc::new(CommitProjection {
@@ -1788,6 +1794,7 @@ impl SessionHub {
             surface_publications,
             deleting_sessions: Mutex::new(HashSet::new()),
             actor_tasks: Mutex::new(Vec::new()),
+            shell_registry_events_cancel,
             typed_install_serial: Arc::new(tokio::sync::Mutex::new(())),
             workflow_selection_serials: tokio::sync::Mutex::new(HashMap::new()),
             checkpoint_serials: tokio::sync::Mutex::new(HashMap::new()),
@@ -1833,10 +1840,14 @@ impl SessionHub {
 
     fn spawn_shell_registry_events(&self) -> Result<(), SessionHubError> {
         let mut events = self.inner.shells.subscribe();
+        let mut cancel = self.inner.shell_registry_events_cancel.subscribe();
         let weak = Arc::downgrade(&self.inner);
         lock(&self.inner.actor_tasks)?.push(tokio::spawn(async move {
             loop {
-                let event = match events.recv().await {
+                let event = match tokio::select! {
+                    _ = cancel.changed() => break,
+                    event = events.recv() => event,
+                } {
                     Ok(event) => event,
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         let Some(inner) = weak.upgrade() else {
@@ -2106,9 +2117,7 @@ impl SessionHub {
             .providers
             .iter()
             .find(|summary| summary.provider == provider)
-            .map_or(true, |summary| {
-                !matches!(summary.trust, haider_rpc::ProviderTrustWire::Full)
-            }))
+            .is_none_or(|summary| !matches!(summary.trust, haider_rpc::ProviderTrustWire::Full)))
     }
 
     /// Atomically freezes one provider ceiling for a run. The hook engine and
@@ -2123,11 +2132,11 @@ impl SessionHub {
     ) -> Result<bool, SessionHubError> {
         let durable = match crate::lockdown::global() {
             Ok(manager) => {
-                let profile_id = self.inner.store.profile_installation_id()?;
+                let profile_id = self.inner.store.cached_profile_installation_id();
                 Some(
                     manager
                         .bind_turn(
-                            &profile_id,
+                            profile_id,
                             session_id.as_str(),
                             run_id.as_str(),
                             provider,
@@ -2172,9 +2181,9 @@ impl SessionHub {
         }
         let binding = match crate::lockdown::global() {
             Ok(manager) => {
-                let profile_id = self.inner.store.profile_installation_id()?;
+                let profile_id = self.inner.store.cached_profile_installation_id();
                 manager
-                    .turn_binding(&profile_id, session_id.as_str(), run_id.as_str())
+                    .turn_binding(profile_id, session_id.as_str(), run_id.as_str())
                     .map_err(|error| SessionHubError::Task(error.to_string()))?
             }
             #[cfg(test)]
@@ -2205,9 +2214,9 @@ impl SessionHub {
     ) -> Result<(), SessionHubError> {
         match crate::lockdown::global() {
             Ok(manager) => {
-                let profile_id = self.inner.store.profile_installation_id()?;
+                let profile_id = self.inner.store.cached_profile_installation_id();
                 manager
-                    .activate_turn(&profile_id, session_id.as_str(), run_id.as_str())
+                    .activate_turn(profile_id, session_id.as_str(), run_id.as_str())
                     .map_err(|error| SessionHubError::Task(error.to_string()))?;
             }
             #[cfg(test)]
@@ -2235,9 +2244,9 @@ impl SessionHub {
     ) -> Result<Option<(String, bool)>, SessionHubError> {
         match crate::lockdown::global() {
             Ok(manager) => {
-                let profile_id = self.inner.store.profile_installation_id()?;
+                let profile_id = self.inner.store.cached_profile_installation_id();
                 Ok(manager
-                    .active_session_binding(&profile_id, session_id.as_str())
+                    .active_session_binding(profile_id, session_id.as_str())
                     .map_err(|error| SessionHubError::Task(error.to_string()))?
                     .map(|(_, provider, lockdown)| (provider, lockdown)))
             }
@@ -2635,7 +2644,7 @@ impl SessionHub {
             .values()
             .filter(|owner| owner.session_id == *session_id)
             .map(|owner| owner.connection_id.as_str())
-            .filter(|connection_id| peer_event_allowed(&subscribers, *connection_id))
+            .filter(|connection_id| peer_event_allowed(&subscribers, connection_id))
             .collect::<HashSet<_>>();
         let Ok(sinks) = self.inner.diagnostic_sinks.lock() else {
             return;
@@ -2709,7 +2718,11 @@ impl SessionHub {
         let (completed, result) = oneshot::channel();
         actor
             .commands
-            .send(ActorCommand::AcceptTurn { command, completed })
+            .send(ActorCommand::AcceptTurn {
+                command,
+                peer_message: Some(message.clone()),
+                completed,
+            })
             .await
             .map_err(|_| SessionHubError::Closed)?;
         let outcome = result
@@ -4325,7 +4338,11 @@ impl SessionHub {
         let (completed, result) = oneshot::channel();
         actor
             .commands
-            .send(ActorCommand::AcceptTurn { command, completed })
+            .send(ActorCommand::AcceptTurn {
+                command,
+                peer_message: None,
+                completed,
+            })
             .await
             .map_err(|_| SessionHubError::Closed)?;
         result
@@ -4751,9 +4768,9 @@ impl SessionHub {
             .map_err(hub_error_as_store)?
             .retain(|(candidate, _), _| candidate != session_id);
         if let Ok(manager) = crate::lockdown::global() {
-            let profile_id = self.inner.store.profile_installation_id()?;
+            let profile_id = self.inner.store.cached_profile_installation_id();
             manager
-                .remove_session_bindings(&profile_id, session_id.as_str())
+                .remove_session_bindings(profile_id, session_id.as_str())
                 .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
         }
         if let Ok(Some(hooks)) = self.hooks() {
@@ -5748,6 +5765,7 @@ impl SessionHub {
     /// Rejects new hub work synchronously before the runtime announces drain.
     pub fn begin_draining(&self) {
         self.inner.draining.store(true, Ordering::Release);
+        let _ = self.inner.shell_registry_events_cancel.send(true);
         if let Ok(peer) = self.peer_service() {
             peer.begin_draining();
         }

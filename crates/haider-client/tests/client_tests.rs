@@ -28,6 +28,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
 const LIMIT: usize = DEFAULT_FRAME_LIMIT;
+const DESCRIPTOR_HYGIENE_HELPER_ROOT_ENV: &str = "HAIDER_DESCRIPTOR_HYGIENE_HELPER_ROOT";
 
 /// These fixtures keep their serving loop alive until client EOF, so the peer
 /// is controlled and must still be present when close synchronously notifies it.
@@ -1055,11 +1056,39 @@ async fn closed_handshake_is_retried_only_after_a_spawnable_failure_authorizes_a
 /// the timed read below reports a leak instead of a clean close.
 #[test]
 fn spawned_daemon_inherits_no_descriptors_beyond_stdio() {
+    if let Some(root) = std::env::var_os(DESCRIPTOR_HYGIENE_HELPER_ROOT_ENV) {
+        assert_spawned_daemon_inherits_no_descriptors_beyond_stdio(Path::new(&root));
+        return;
+    }
+
+    let root = tempfile::tempdir().expect("profile root");
+    let status = std::process::Command::new(
+        std::env::current_exe().expect("descriptor-hygiene test executable"),
+    )
+    .args([
+        "--exact",
+        "spawned_daemon_inherits_no_descriptors_beyond_stdio",
+        "--nocapture",
+    ])
+    .env(DESCRIPTOR_HYGIENE_HELPER_ROOT_ENV, root.path())
+    // The real daemon owns a machine-user-wide lockdown root. Give this
+    // black-box launch an isolated machine-user home without racing other
+    // tests through process-global environment mutation.
+    .env("HOME", root.path())
+    .env("USERPROFILE", root.path())
+    .status()
+    .expect("spawn descriptor-hygiene helper");
+    assert!(
+        status.success(),
+        "descriptor-hygiene helper failed: {status}"
+    );
+}
+
+fn assert_spawned_daemon_inherits_no_descriptors_beyond_stdio(root: &Path) {
     use haider_client::spawn::spawn_daemon_retained;
     use std::io::Read;
 
-    let root = tempfile::tempdir().expect("profile root");
-    let store_dir = root.path().join("store");
+    let store_dir = root.join("store");
     std::fs::create_dir_all(&store_dir).expect("store dir");
     let env = ProfileEnv {
         profile_dir: Some(store_dir),

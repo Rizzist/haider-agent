@@ -127,7 +127,7 @@ pub fn transcript() -> Vec<WireFrame> {
         model_proposal: metafork_proposal.clone(),
     };
 
-    vec![
+    let mut frames = vec![
         WireFrame::Hello(Hello {
             protocol_min: 1,
             protocol_max: 2,
@@ -2007,7 +2007,111 @@ pub fn transcript() -> Vec<WireFrame> {
                 reason: None,
             },
         },
-    ]
+    ];
+    append_union_contract_tail(&mut frames);
+    frames
+}
+
+/// A/C/D union tail. These method pairs are decoded through the public wire
+/// types before the byte golden is generated, so serde defaults and canonical
+/// field ordering remain part of the transcript contract.
+fn append_union_contract_tail(frames: &mut Vec<WireFrame>) {
+    for (request_id, request, response) in [
+        (
+            "request-union-peer-name",
+            r##"{"method":"peer.name","name":"reviewer"}"##,
+            r##"{"method":"peer.name","agent":{"id":"session-peer","name":"reviewer","kind":"haider_session","workspace":"/tmp/workspace","model":"claude-test","state":"idle","started_at":1753500080000,"last_seen":1753500081000}}"##,
+        ),
+        (
+            "request-union-ssh-list",
+            r##"{"method":"ssh.list","session_id":"session-1"}"##,
+            r##"{"method":"ssh.list","profiles":[{"name":"prod","description":"Production console","host":"prod.example.invalid","port":22,"user":"deploy","default_cwd":"/srv/app","last_used_ms":1720000004000,"multiplexing":true,"in_scope":true}]}"##,
+        ),
+        (
+            "request-union-ssh-add",
+            r##"{"method":"ssh.add","profile":{"name":"prod","description":"Production console","host":"prod.example.invalid","port":22,"user":"deploy","auth":{"kind":"key_material","vault_reference":"staged-ssh-key-1"},"default_cwd":"/srv/app"}}"##,
+            r##"{"method":"ssh.add","profile":{"name":"prod","description":"Production console","host":"prod.example.invalid","port":22,"user":"deploy","default_cwd":"/srv/app","multiplexing":true,"in_scope":true}}"##,
+        ),
+        (
+            "request-union-ssh-update",
+            r##"{"method":"ssh.update","name":"prod","changes":{"description":"Primary production console","port":2222}}"##,
+            r##"{"method":"ssh.update","profile":{"name":"prod","description":"Primary production console","host":"prod.example.invalid","port":2222,"user":"deploy","default_cwd":"/srv/app","multiplexing":true,"in_scope":true}}"##,
+        ),
+        (
+            "request-union-ssh-remove",
+            r##"{"method":"ssh.remove","name":"prod"}"##,
+            r##"{"method":"ssh.remove","removed":"prod"}"##,
+        ),
+        (
+            "request-union-ssh-test",
+            r##"{"method":"ssh.test","name":"prod","timeout_s":15}"##,
+            r##"{"method":"ssh.test","result":{"profile":{"name":"prod","description":"Production console","host":"prod.example.invalid","port":22,"user":"deploy","default_cwd":"/srv/app","host_key":{"algorithm":"ssh-ed25519","fingerprint":"SHA256:golden-fingerprint","pinned_at_ms":1720000005000},"last_used_ms":1720000005001,"multiplexing":true,"in_scope":true},"connected":true,"host_key_pinned":true}}"##,
+        ),
+        (
+            "request-union-session-set-ssh-scope",
+            r##"{"method":"session.set_ssh_scope","session_id":"session-1","scope":{"kind":"allow","names":["prod"]}}"##,
+            r##"{"method":"session.set_ssh_scope","session_id":"session-1","scope":{"kind":"allow","names":["prod"]}}"##,
+        ),
+        (
+            "request-union-ssh-shell",
+            r##"{"method":"ssh.shell","name":"prod","command":"uname -a","cwd":"/srv/app","timeout_s":30}"##,
+            r##"{"method":"ssh.shell","result":{"profile":"prod","stdout":"Linux prod\\n","stderr":"","exit_code":0,"timed_out":false}}"##,
+        ),
+        (
+            "request-union-ssh-shell-open",
+            r##"{"method":"ssh.shell_open","name":"prod","session_id":"session-1","term":"xterm-256color","size":{"cols":120,"rows":40,"pixel_width":960,"pixel_height":800}}"##,
+            r##"{"method":"ssh.shell_open","shell":{"id":"sh-pty-0123456789","kind":{"kind":"ssh","profile":"prod"},"status":{"status":"running"},"title":"prod","cwd_or_host":"prod.example.invalid","created_at_ms":1720000006000,"last_activity_ms":1720000006001,"bytes_out":0}}"##,
+        ),
+        (
+            "request-union-ssh-shell-input",
+            r##"{"method":"ssh.shell_input","id":"sh-pty-0123456789","data_b64":"d2hvYW1pXG4="}"##,
+            r##"{"method":"ssh.shell_input","shell":{"id":"sh-pty-0123456789","kind":{"kind":"ssh","profile":"prod"},"status":{"status":"running"},"title":"prod","cwd_or_host":"prod.example.invalid","created_at_ms":1720000006000,"last_activity_ms":1720000006001,"bytes_out":0}}"##,
+        ),
+        (
+            "request-union-ssh-shell-resize",
+            r##"{"method":"ssh.shell_resize","id":"sh-pty-0123456789","size":{"cols":132,"rows":43,"pixel_width":1056,"pixel_height":860}}"##,
+            r##"{"method":"ssh.shell_resize","shell":{"id":"sh-pty-0123456789","kind":{"kind":"ssh","profile":"prod"},"status":{"status":"running"},"title":"prod","cwd_or_host":"prod.example.invalid","created_at_ms":1720000006000,"last_activity_ms":1720000006001,"bytes_out":0}}"##,
+        ),
+        (
+            "request-union-ssh-shell-eof",
+            r##"{"method":"ssh.shell_eof","id":"sh-pty-0123456789"}"##,
+            r##"{"method":"ssh.shell_eof","shell":{"id":"sh-pty-0123456789","kind":{"kind":"ssh","profile":"prod"},"status":{"status":"running"},"title":"prod","cwd_or_host":"prod.example.invalid","created_at_ms":1720000006000,"last_activity_ms":1720000006001,"bytes_out":0}}"##,
+        ),
+        (
+            "request-union-shell-list",
+            r##"{"method":"shell.list"}"##,
+            r##"{"method":"shell.list","shells":[{"id":"sh-0123456789abcdef0123","kind":{"kind":"ssh","profile":"prod"},"status":{"status":"running"},"title":"prod: uname -a","cwd_or_host":"prod.example.invalid","created_at_ms":1720000006000,"last_activity_ms":1720000006001,"bytes_out":11}]}"##,
+        ),
+        (
+            "request-union-shell-close",
+            r##"{"method":"shell.close","id":"sh-0123456789abcdef0123"}"##,
+            r##"{"method":"shell.close","shell":{"id":"sh-0123456789abcdef0123","kind":{"kind":"ssh","profile":"prod"},"status":{"status":"closed"},"title":"prod: uname -a","cwd_or_host":"prod.example.invalid","created_at_ms":1720000006000,"last_activity_ms":1720000007000,"bytes_out":11}}"##,
+        ),
+        (
+            "request-union-provider-set-trust",
+            r##"{"method":"provider.set_trust","command_id":"command-provider-trust","name":"research","trust":"lockdown","expected_revision":12}"##,
+            r##"{"method":"provider.set_trust","provider":{"provider":"research","api_family":"openai_chat_completions","models":["search-1"],"model_details":[],"auth_methods":[],"availability":"available","enabled":true,"trust":"lockdown"},"revision":13}"##,
+        ),
+        (
+            "request-union-lockdown-status",
+            r##"{"method":"lockdown.status","provider":"research"}"##,
+            r##"{"method":"lockdown.status","status":{"provider":"research","tools_allowed":["fs_read","fs_search","web_search"],"quota_used":4096,"quota_limit":1073741824}}"##,
+        ),
+        (
+            "request-union-lockdown-set-quota",
+            r##"{"method":"lockdown.set_quota","command_id":"command-lockdown-quota","bytes":2147483648}"##,
+            r##"{"method":"lockdown.set_quota","status":{"tools_allowed":["fs_read","fs_search","web_search"],"quota_used":4096,"quota_limit":2147483648}}"##,
+        ),
+    ] {
+        frames.push(WireFrame::Request {
+            request_id: RequestId(request_id.into()),
+            body: serde_json::from_str(request).expect("decode union-tail golden request"),
+        });
+        frames.push(WireFrame::Response {
+            request_id: RequestId(request_id.into()),
+            body: serde_json::from_str(response).expect("decode union-tail golden response"),
+        });
+    }
 }
 
 /// Golden credential descriptor: public global alias, verified display

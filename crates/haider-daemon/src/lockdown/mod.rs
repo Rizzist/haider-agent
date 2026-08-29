@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub(crate) const DEFAULT_QUOTA_BYTES: u64 = 1024 * 1024 * 1024;
+#[cfg(not(test))]
 const LOCKDOWN_DIRECTORY: &str = "lockdown";
 const QUOTA_FILE: &str = "quota.json";
 const QUOTA_LOCK_FILE: &str = "quota.lock";
@@ -201,9 +202,7 @@ impl LockdownManager {
     pub(crate) fn initialize_default() -> Result<Self, LockdownError> {
         #[cfg(test)]
         {
-            return Self::initialize(
-                std::env::temp_dir().join(format!("haider-ld-{}", std::process::id())),
-            );
+            Self::initialize(std::env::temp_dir().join(format!("haider-ld-{}", std::process::id())))
         }
         #[cfg(not(test))]
         let home = crate::oauth::oauth_home_dir().ok_or_else(|| LockdownError::InvalidLedger {
@@ -539,11 +538,12 @@ impl LockdownManager {
                 .take(MAX_DIRECTORY_ENTRIES)
                 .map(|entry| {
                     let entry = entry.map_err(|source| io_error("list", &target, source))?;
+                    let path = entry.path();
                     let metadata = entry
                         .file_type()
-                        .map_err(|source| io_error("inspect", entry.path(), source))?;
+                        .map_err(|source| io_error("inspect", &path, source))?;
                     if metadata.is_symlink() {
-                        return Err(LockdownError::SymlinkRefused { path: entry.path() });
+                        return Err(LockdownError::SymlinkRefused { path });
                     }
                     let mut name = entry.file_name().to_string_lossy().into_owned();
                     if metadata.is_dir() {
@@ -1064,19 +1064,19 @@ fn write_and_replace(
     options.write(true).create_new(true);
     configure_file_mode(&mut options, 0o600);
     let mut file = options
-        .open(&temporary)
-        .map_err(|source| io_error("create", &temporary, source))?;
+        .open(temporary)
+        .map_err(|source| io_error("create", temporary, source))?;
     let write_result = (|| {
         file.write_all(contents)
-            .map_err(|source| io_error("write", &temporary, source))?;
+            .map_err(|source| io_error("write", temporary, source))?;
         haider_platform::sync_file(&file, SyncPolicy::Full)
-            .map_err(|source| io_error("sync", &temporary, source))?;
+            .map_err(|source| io_error("sync", temporary, source))?;
         drop(file);
         haider_platform::replace_file(temporary, target)
             .map_err(|source| io_error("replace", target, source))
     })();
     if write_result.is_err() {
-        let _ = fs::remove_file(&temporary);
+        let _ = fs::remove_file(temporary);
     }
     write_result
 }

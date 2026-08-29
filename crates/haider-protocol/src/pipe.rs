@@ -5,6 +5,7 @@ use crate::envelope::RawEnvelope;
 use crate::history::NodeKind;
 use crate::ids::ArtifactRef;
 use crate::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
+use crate::peer::{PeerKind, PeerTrust};
 use crate::state::RunState;
 use crate::tool::{BoundedResult, ToolResultStatus};
 use serde::{Deserialize, Serialize};
@@ -862,6 +863,29 @@ struct TextRow {
     compat: bool,
 }
 
+/// Self-sufficient peer row: an ADE can render this record later without
+/// reopening the mailbox or joining it to an unsolicited live frame.
+#[derive(Serialize)]
+struct PeerMessageRow {
+    kind: &'static str,
+    msg_id: String,
+    sender_id: String,
+    sender: String,
+    sender_kind: PeerKind,
+    sender_trust: PeerTrust,
+    to: String,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    queued_at: u64,
+    expires_at: u64,
+    at_ms: u64,
+    seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch_id: Option<String>,
+    ordinal: u32,
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -930,6 +954,7 @@ pub struct SidecarRow(SidecarRowKind);
 #[serde(untagged)]
 enum SidecarRowKind {
     Text(TextRow),
+    PeerMessage(PeerMessageRow),
     Incomplete(IncompleteRow),
     Error(ErrorRow),
     Tool(ToolRow),
@@ -994,6 +1019,7 @@ impl SidecarRow {
     pub fn seq(&self) -> u64 {
         match &self.0 {
             SidecarRowKind::Text(row) => row.seq,
+            SidecarRowKind::PeerMessage(row) => row.seq,
             SidecarRowKind::Incomplete(row) => row.seq,
             SidecarRowKind::Error(row) => row.seq,
             SidecarRowKind::Tool(row) => row.seq,
@@ -1021,6 +1047,16 @@ impl SidecarRow {
                     escape_pipe_field(&row.text)
                 )
             }
+            SidecarRowKind::PeerMessage(row) => format!(
+                "P  {} {} {} {} kind={} trust={} id={}",
+                row.seq,
+                row.at_ms,
+                escape_pipe_field(&row.sender),
+                escape_pipe_field(&row.text),
+                peer_sender_kind_name(row.sender_kind),
+                peer_trust_name(row.sender_trust),
+                escape_pipe_field(&row.msg_id),
+            ),
             SidecarRowKind::Incomplete(row) => format!(
                 "A! {} {} {} interrupted={}",
                 row.seq,
@@ -1078,6 +1114,20 @@ fn terminal_tool_status(status: ToolStatus) -> Option<ToolResultStatus> {
         ToolStatus::Rejected => Some(ToolResultStatus::Rejected),
         ToolStatus::Conflict => Some(ToolResultStatus::Conflict),
         ToolStatus::Unknown => Some(ToolResultStatus::Unknown),
+    }
+}
+
+fn peer_sender_kind_name(kind: PeerKind) -> &'static str {
+    match kind {
+        PeerKind::HaiderSession => "haider_session",
+        PeerKind::External => "external",
+    }
+}
+
+fn peer_trust_name(trust: PeerTrust) -> &'static str {
+    match trust {
+        PeerTrust::VerifiedHaider => "verified_haider",
+        PeerTrust::UntrustedExternal => "untrusted_external",
     }
 }
 
@@ -1146,8 +1196,8 @@ fn sidecar_projection(
     let tool_join = joiner.observe(envelope);
     // Ship-gate round 2: the peek goes DEEP enough that the common case —
     // item Started/Delta/ordinary-Completed, non-projecting node kinds —
-    // never pays the full payload clone+decode. Only the exact five
-    // qualifying shapes proceed.
+    // never pays the full payload clone+decode. Only exact transcript shapes
+    // proceed.
     let payload_value = &envelope.payload;
     let type_tag = payload_value
         .get("type")
@@ -1172,6 +1222,7 @@ fn sidecar_projection(
         Some("run_failed") => payload_value
             .get("presentation")
             .is_some_and(|presentation| presentation.is_object()),
+        Some("peer.message") => true,
         _ => false,
     };
     if !qualifies {
@@ -1243,6 +1294,26 @@ fn sidecar_projection(
             }),
             _ => None,
         },
+        EventPayload::PeerMessage(message) => Some(SidecarProjection {
+            row: SidecarRow(SidecarRowKind::PeerMessage(PeerMessageRow {
+                kind: "peer_message",
+                msg_id: message.msg_id,
+                sender_id: message.from.id,
+                sender: message.from.name,
+                sender_kind: message.from.kind,
+                sender_trust: message.from.trust,
+                to: message.to,
+                text: message.message,
+                summary: message.summary,
+                queued_at: message.queued_at,
+                expires_at: message.expires_at,
+                at_ms,
+                seq,
+                branch_id,
+                ordinal: 0,
+            })),
+            unresolved_tool: None,
+        }),
         EventPayload::Item(ItemEvent::Completed {
             item: TurnItem::IncompleteAgentMessage { text, interruption },
             ..
@@ -1627,6 +1698,49 @@ mod tests {
 
         let foreign = envelope(10, EventPayload::IdleDecayed);
         assert!(matching_result(&foreign).is_none());
+    }
+
+    /// MUTATION CHECK: project the provider prompt as a user row, omit any
+    /// sender coordinate, or require a mailbox join. The JSON/pipe assertions
+    /// below must fail: one durable peer event is independently renderable.
+    #[test]
+    fn peer_message_is_a_self_sufficient_non_user_pipe_row() {
+        let event = envelope(
+            11,
+            EventPayload::PeerMessage(crate::peer::PeerMessage {
+                msg_id: "peer-msg-11".into(),
+                from: crate::peer::PeerSender {
+                    id: "peer-agent-7".into(),
+                    name: "reviewer".into(),
+                    kind: crate::peer::PeerKind::External,
+                    trust: crate::peer::PeerTrust::UntrustedExternal,
+                },
+                to: "session-safe".into(),
+                message: "inspect | this\ncarefully".into(),
+                summary: Some("review".into()),
+                queued_at: 10,
+                expires_at: 20,
+            }),
+        );
+        let json = sidecar_row_line(&event).expect("peer sidecar row");
+        let row: serde_json::Value = serde_json::from_str(&json).expect("peer row JSON");
+        assert_eq!(row["kind"], "peer_message");
+        assert_eq!(row["msg_id"], "peer-msg-11");
+        assert_eq!(row["sender_id"], "peer-agent-7");
+        assert_eq!(row["sender"], "reviewer");
+        assert_eq!(row["sender_kind"], "external");
+        assert_eq!(row["sender_trust"], "untrusted_external");
+        assert_eq!(row["to"], "session-safe");
+        assert_eq!(row["text"], "inspect | this\ncarefully");
+        assert_eq!(row["summary"], "review");
+        assert_eq!(row["queued_at"], 10);
+        assert_eq!(row["expires_at"], 20);
+        assert_eq!(
+            pipe_body_line(&event).as_deref(),
+            Some(
+                "P  11 1700000000011 |reviewer| |inspect \\| this\\ncarefully| kind=external trust=untrusted_external id=|peer-msg-11|"
+            )
+        );
     }
 
     #[test]

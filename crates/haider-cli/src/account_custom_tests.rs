@@ -129,10 +129,16 @@ fn parser_requires_one_explicit_auth_choice_on_add() {
 }
 
 #[test]
-fn update_rejects_auth_mode_and_api_family_changes() {
+fn update_accepts_auth_mode_changes_but_rejects_api_family_changes() {
     let no_auth = parse_account_command(&["update".into(), "router".into(), "--no-auth".into()])
-        .expect_err("auth mode is immutable");
-    assert!(no_auth.contains("does not change authentication mode"));
+        .expect("auth mode is mutable in place");
+    assert!(matches!(
+        no_auth,
+        AccountCommand::Update(super::CustomAccountOptions {
+            secret: Some(SecretInput::NoAuth),
+            ..
+        })
+    ));
 
     let family = parse_account_command(&[
         "update".into(),
@@ -321,9 +327,8 @@ async fn probe_preserves_the_typed_failure_class() {
     ));
 }
 
-/// MUTATION CHECK: update carries only mutable profile fields. Family and
-/// authentication requirement remain absent while a replacement key is
-/// probed and then consumed by account.login_api.
+/// MUTATION CHECK: a replacement key explicitly selects API-key mode while
+/// immutable family stays absent, then the staged key is consumed by login.
 #[tokio::test]
 async fn update_base_key_and_timeout_preserves_immutable_shape() {
     let mut updated = provider();
@@ -371,7 +376,7 @@ async fn update_base_key_and_timeout_preserves_immutable_shape() {
         RequestBody::ProviderConfigure {
             api_family: None,
             origin: Some(origin),
-            auth_requirement: None,
+            auth_requirement: Some(haider_rpc::ProviderAuthRequirementWire::ApiKey),
             response_open_timeout_ms: Some(90_000),
             models,
             probe_vault_reference: Some(reference),
@@ -390,5 +395,71 @@ async fn update_base_key_and_timeout_preserves_immutable_shape() {
             replace_existing: true,
             ..
         } if provider == "router" && alias == "router" && vault_reference == "update-vault-ref"
+    ));
+}
+
+/// MUTATION CHECK: switching to no-auth must update the provider first, then
+/// remove the now-inapplicable vaulted credential at the returned revision.
+#[tokio::test]
+async fn update_to_no_auth_reuses_the_provider_and_removes_its_key() {
+    let mut configured = provider();
+    configured.auth_methods.clear();
+    let client = FakeClient::new([
+        ResponseBody::ProviderList {
+            providers: vec![provider()],
+            revision: 30,
+            availability: Some(SnapshotAvailabilityWire::Available),
+        },
+        ResponseBody::ProviderConfigure {
+            provider: configured,
+            revision: 31,
+        },
+        ResponseBody::AccountList {
+            descriptors: vec![descriptor()],
+            revision: Some(31),
+            provider_active: Vec::new(),
+            provider_defaults: Vec::new(),
+            availability: Some(SnapshotAvailabilityWire::Available),
+        },
+        ResponseBody::AccountRemove {
+            removed_alias: haider_protocol::ids::CredentialAlias::new("router"),
+            replacement_active_alias: None,
+            revision: 32,
+        },
+    ]);
+    let result = execute(
+        &client,
+        AccountCommand::Update(super::CustomAccountOptions {
+            alias: "router".into(),
+            base_url: None,
+            secret: Some(SecretInput::NoAuth),
+            api_family: None,
+            response_open_timeout_ms: None,
+            trust: None,
+            json: true,
+        }),
+    )
+    .await;
+    assert!(matches!(result, Ok(code) if code == ExitCode::SUCCESS));
+    let requests = client.requests();
+    assert_eq!(requests.len(), 4);
+    assert!(matches!(
+        &requests[1],
+        RequestBody::ProviderConfigure {
+            provider,
+            auth_requirement: Some(haider_rpc::ProviderAuthRequirementWire::None),
+            probe_vault_reference: None,
+            expected_revision: 30,
+            ..
+        } if provider == "router"
+    ));
+    assert!(matches!(requests[2], RequestBody::AccountList { .. }));
+    assert!(matches!(
+        &requests[3],
+        RequestBody::AccountRemove {
+            alias,
+            expected_revision: Some(31),
+            ..
+        } if alias == "router"
     ));
 }

@@ -180,6 +180,10 @@ fn spawn_helper(
     marker: &Path,
     kill_before_readiness: bool,
 ) -> ChildGuard {
+    let test_home = profile
+        .store_dir
+        .parent()
+        .expect("isolated profile has a test home");
     let runtime_root = profile
         .runtime_dir
         .parent()
@@ -194,6 +198,11 @@ fn spawn_helper(
         .env("HAIDER_PROFILE_DIR", &profile.store_dir)
         .env("HAIDER_RUNTIME_DIR", runtime_root)
         .env("HAIDER_DISCOVERY_DISABLED", "1")
+        // Lockdown is intentionally machine-user global. Keep that global
+        // root inside this black-box fixture rather than touching the
+        // developer/runner account's real home.
+        .env("HOME", test_home)
+        .env("USERPROFILE", test_home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -322,6 +331,10 @@ fn process_snapshot(
 }
 
 fn spawn_persistent_daemon(profile: &ResolvedProfile) -> ChildGuard {
+    let test_home = profile
+        .store_dir
+        .parent()
+        .expect("isolated profile has a test home");
     let child = Command::new(env!("CARGO_BIN_EXE_haiderd"))
         .arg("--profile")
         .arg(&profile.profile_id)
@@ -330,6 +343,8 @@ fn spawn_persistent_daemon(profile: &ResolvedProfile) -> ChildGuard {
         .arg("--runtime-dir")
         .arg(&profile.runtime_dir)
         .env("HAIDER_DISCOVERY_DISABLED", "1")
+        .env("HOME", test_home)
+        .env("USERPROFILE", test_home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

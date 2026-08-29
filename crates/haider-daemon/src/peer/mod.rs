@@ -276,7 +276,7 @@ impl PeerService {
         if let Some(task) = background {
             let _ = task.await;
         }
-        let publications = self
+        let publications: Vec<LocalPublication> = self
             .publications
             .lock()
             .map(|mut publications| publications.drain().map(|(_, value)| value).collect())

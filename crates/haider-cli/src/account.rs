@@ -327,9 +327,6 @@ fn parse_custom_options(
             "account update requires --base-url, a key option, or --response-open-timeout".into(),
         );
     }
-    if !create && matches!(secret, Some(SecretInput::NoAuth)) {
-        return Err("account update does not change authentication mode; remove and re-add the provider to use --no-auth".into());
-    }
     if !create && api_family.is_some() {
         return Err(
             "account update does not change --api-family; remove and re-add the provider".into(),
@@ -712,16 +709,10 @@ async fn execute_custom(
         .api_family
         .or_else(|| existing.map(|provider| provider.api_family))
         .ok_or(AccountError::Protocol("provider has no API family"))?;
-    let auth_requirement = if create {
-        Some(
-            if matches!(options.secret.as_ref(), Some(SecretInput::NoAuth)) {
-                ProviderAuthRequirementWire::None
-            } else {
-                ProviderAuthRequirementWire::ApiKey
-            },
-        )
-    } else {
-        None
+    let auth_requirement = match options.secret.as_ref() {
+        Some(SecretInput::NoAuth) => Some(ProviderAuthRequirementWire::None),
+        Some(_) => Some(ProviderAuthRequirementWire::ApiKey),
+        None => create.then_some(ProviderAuthRequirementWire::ApiKey),
     };
     let secret = match options.secret.as_ref() {
         Some(SecretInput::NoAuth) | None => None,
@@ -753,8 +744,8 @@ async fn execute_custom(
         })
         .await
         .map_err(AccountError::Client)?;
-    let configured = match response {
-        ResponseBody::ProviderConfigure { provider, .. } => provider,
+    let (configured, configured_revision) = match response {
+        ResponseBody::ProviderConfigure { provider, revision } => (provider, revision),
         ResponseBody::Error {
             code,
             message,
@@ -774,7 +765,50 @@ async fn execute_custom(
             ));
         }
     };
-    if let Some(vault_reference) = vault_reference {
+    if !create && matches!(options.secret.as_ref(), Some(SecretInput::NoAuth)) {
+        let (descriptors, revision) = account_snapshot(client).await?;
+        let revision = revision.unwrap_or(configured_revision);
+        if descriptors
+            .iter()
+            .any(|descriptor| descriptor.alias.as_str() == options.alias)
+        {
+            match client
+                .request(RequestBody::AccountRemove {
+                    command_id: CommandId::new(command_id("account-auth-none")),
+                    alias: options.alias.clone(),
+                    expected_revision: Some(revision),
+                })
+                .await
+                .map_err(AccountError::Client)?
+            {
+                ResponseBody::AccountRemove { removed_alias, .. }
+                    if removed_alias.as_str() == options.alias => {}
+                ResponseBody::AccountRemove { .. } => {
+                    return Err(AccountError::Protocol(
+                        "account.remove response named a different alias",
+                    ));
+                }
+                ResponseBody::Error {
+                    code,
+                    message,
+                    retryable,
+                    data,
+                } => {
+                    return Err(AccountError::Rpc {
+                        code,
+                        message,
+                        retryable,
+                        data,
+                    });
+                }
+                _ => {
+                    return Err(AccountError::Protocol(
+                        "account.remove response method mismatch",
+                    ));
+                }
+            }
+        }
+    } else if let Some(vault_reference) = vault_reference {
         match client
             .request(RequestBody::AccountLoginApi {
                 command_id: CommandId::new(command_id("account-login-api")),

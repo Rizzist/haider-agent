@@ -119,7 +119,7 @@ pub(crate) async fn provider_command(rest: &[String]) -> ExitCode {
         }
     };
     let result = execute(&ensured.client, operation, name, trust, json).await;
-    ensured.client.close();
+    let _ = ensured.client.close();
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {

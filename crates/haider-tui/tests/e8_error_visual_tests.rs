@@ -605,12 +605,12 @@ fn e8e_web_fetch_retry_note_on_completed_row_is_dim() {
     );
 }
 
-/// LOCAL-ONLY LINE: `/peers` produces one dim matter-of-fact status flash
-/// — the typed admission message — and NO banner row above the frame.
-/// MUTATION: latch the rejection into `command_diagnostic` again and the
+/// DEMO LIVE-ONLY LINE: `/peers` produces one dim matter-of-fact status flash
+/// — the canonical `/peer` registry message — and NO banner row above the
+/// frame. MUTATION: latch the notice into `command_diagnostic` again and the
 /// no-banner assertion fails.
 #[test]
-fn e8f_local_only_rejection_is_one_quiet_status_line() {
+fn e8f_peer_live_only_notice_is_one_quiet_status_line() {
     let mut model = launcher_model();
     common::submit(&mut model, "/peers");
     let theme = model.theme.theme();
@@ -621,18 +621,18 @@ fn e8f_local_only_rejection_is_one_quiet_status_line() {
         "no persistent banner for a matter-of-fact rejection: {:?}",
         rows[0]
     );
-    let flash = "· /peers — not supported — Haider runs local-only";
+    let flash = "· /peer — live only; the registry is daemon truth";
     let y = row_of(&rows, flash);
     assert_eq!(
         buffer[(col_of(&rows[y as usize], flash), y)].fg,
         ink(theme.dim),
-        "the flash is the quiet status register"
+        "the live-only flash is the quiet status register"
     );
     for x in 0..buffer.area.width {
         assert_ne!(
             buffer[(x, y)].fg,
             ink(theme.err),
-            "matter-of-fact, never an error tone"
+            "live-only availability is never an error tone"
         );
     }
 }

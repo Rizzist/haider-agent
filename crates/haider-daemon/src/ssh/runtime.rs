@@ -716,12 +716,10 @@ impl SshRuntime {
         let Some(live) = live.as_ref() else {
             return 0;
         };
-        let count = live
-            .activity
+        live.activity
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .active_channels;
-        count
+            .active_channels
     }
 
     async fn connect(&self, profile: &SshProfile) -> Result<LiveSession, SshError> {
@@ -730,9 +728,11 @@ impl SshRuntime {
             expected: profile.ssh.host_key.clone(),
             observed: Arc::clone(&observed),
         };
-        let mut config = client::Config::default();
-        config.keepalive_interval = Some(KEEPALIVE_INTERVAL);
-        config.keepalive_max = 3;
+        let config = client::Config {
+            keepalive_interval: Some(KEEPALIVE_INTERVAL),
+            keepalive_max: 3,
+            ..client::Config::default()
+        };
         let config = Arc::new(config);
         let mut handle = client::connect(
             config,

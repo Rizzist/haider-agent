@@ -648,6 +648,7 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         "monitor.remove",
         "monitor.watch",
         "peer.list",
+        "peer.name",
         "peer.send",
         "provider.configure",
         "provider.list",
@@ -718,18 +719,8 @@ fn every_request_method_has_a_golden_request_and_success_response() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         expected_methods.len(),
-<<<<<<< HEAD
-<<<<<<< HEAD
-        106,
-        "the v1 contract covers the 104 v0.0.964 methods plus peer.list and peer.send"
-=======
-        117,
-        "the v1 contract covers the prior 104 methods plus 13 SSH/shell-registry methods"
->>>>>>> wave-965-c
-=======
-        107,
-        "the v1 contract covers the 104 pre-lockdown methods plus provider.set_trust and two lockdown methods"
->>>>>>> wave-965-d
+        123,
+        "the v1 contract covers 104 v0.0.964 methods plus 3 peer, 13 SSH/shell, and 3 lockdown methods"
     );
     assert_eq!(
         request_methods_declared_in_source(),
@@ -761,6 +752,11 @@ fn every_request_method_has_a_golden_request_and_success_response() {
             covered.insert(request_method);
         }
     }
+    assert_eq!(
+        covered.len(),
+        59,
+        "the union transcript must retain 42 historical plus 17 A/C/D tail method pairs"
+    );
 
     let fixture: ContractMethodFixture = serde_json::from_str(
         &std::fs::read_to_string(contract_methods_fixture_path())
@@ -768,6 +764,11 @@ fn every_request_method_has_a_golden_request_and_success_response() {
     )
     .expect("decode client contract method fixture");
     assert_eq!(fixture.contract, "haider-client-wire/v1");
+    assert_eq!(
+        fixture.methods.len(),
+        64,
+        "the supplemental fixture must contain the 64 methods absent from the union transcript"
+    );
     for pair in fixture.methods {
         assert_eq!(wire_method(&pair.request), pair.request_method);
         assert_eq!(wire_method(&pair.response), pair.response_method);
@@ -1240,12 +1241,17 @@ fn hex_to_bytes(hex: &str) -> Vec<u8> {
         .collect()
 }
 
-/// MUTATION CHECK: remove either appended W8a shell/inventory frame from the
-/// transcript. Expected runtime failure: the compact WS and UDS golden byte
-/// arrays differ in length/content while every pre-W8 frame stays unchanged.
+/// MUTATION CHECK: remove or retype any historical or A/C/D union-tail frame.
+/// Expected runtime failure: the compact WS and UDS golden byte arrays differ
+/// in length/content while every earlier frame stays unchanged.
 #[test]
 fn compact_ws_bodies_and_length_prefixed_uds_streams_are_golden() {
     let expected_frames = transcript();
+    // The integrated transcript is the 133-frame v0.0.964 prefix plus A's six
+    // peer frames, the peer.name pair, C's 13 SSH/shell pairs, and D's three
+    // lockdown pairs. The 17 moved pairs are absent from the supplemental
+    // fixture, so the two sources remain disjoint.
+    assert_eq!(expected_frames.len(), 173);
     let expected_bytes: Vec<GoldenWireBytes> = expected_frames
         .iter()
         .map(|frame| {
@@ -1306,7 +1312,7 @@ fn compact_ws_bodies_and_length_prefixed_uds_streams_are_golden() {
 #[test]
 fn monitor_delivery_stream_is_additive_replayable_and_explicitly_bounded() {
     let frames = transcript();
-    assert_eq!(frames.len(), 139);
+    assert_eq!(frames.len(), 173);
     let WireFrame::MonitorDelivery { watch_id, report } = &frames[129] else {
         panic!("monitor delivery must be the first appended stream frame");
     };
@@ -1339,7 +1345,7 @@ fn monitor_delivery_stream_is_additive_replayable_and_explicitly_bounded() {
 #[test]
 fn loom_registry_stream_is_tail_appended_and_exactly_addressed() {
     let frames = transcript();
-    assert_eq!(frames.len(), 139);
+    assert_eq!(frames.len(), 173);
     let WireFrame::LoomRegistryDelta { watch_id, delta } = &frames[131] else {
         panic!("Loom registry delta must follow every prior golden frame");
     };
@@ -1372,7 +1378,7 @@ fn loom_registry_stream_is_tail_appended_and_exactly_addressed() {
 #[test]
 fn peer_messaging_methods_and_events_are_tail_appended() {
     let frames = transcript();
-    assert_eq!(frames.len(), 139);
+    assert_eq!(frames.len(), 173);
     assert!(matches!(
         &frames[133],
         WireFrame::Request {
@@ -1412,6 +1418,53 @@ fn peer_messaging_methods_and_events_are_tail_appended() {
         WireFrame::PeerDeliveryChanged { receipt }
             if receipt.delivery == haider_protocol::peer::PeerDelivery::Delivered
     ));
+
+    let union_methods = frames[139..]
+        .chunks_exact(2)
+        .map(|pair| {
+            let [
+                WireFrame::Request {
+                    request_id,
+                    body: request,
+                },
+                WireFrame::Response {
+                    request_id: response_id,
+                    body: response,
+                },
+            ] = pair
+            else {
+                panic!("each union-tail method must be a request/success pair");
+            };
+            assert_eq!(request_id, response_id);
+            let request = serde_json::to_value(request).expect("encode union-tail request");
+            let response = serde_json::to_value(response).expect("encode union-tail response");
+            assert_eq!(wire_method(&request), wire_method(&response));
+            wire_method(&request).to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        union_methods,
+        [
+            "peer.name",
+            "ssh.list",
+            "ssh.add",
+            "ssh.update",
+            "ssh.remove",
+            "ssh.test",
+            "session.set_ssh_scope",
+            "ssh.shell",
+            "ssh.shell_open",
+            "ssh.shell_input",
+            "ssh.shell_resize",
+            "ssh.shell_eof",
+            "shell.list",
+            "shell.close",
+            "provider.set_trust",
+            "lockdown.status",
+            "lockdown.set_quota",
+        ]
+        .map(str::to_owned)
+    );
 }
 
 #[test]
@@ -3259,12 +3312,13 @@ fn device_discovery_goldens_are_additive_and_tolerance_re_proved() {
     // have moved.
     assert_eq!(
         frames.len() - d1_start,
-        6 + 7 + 3 + 3 + 4 + 3 + 4 + 1 + 2 + 2,
+        6 + 7 + 3 + 3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34,
         "six D1 frames, then T1's seven transcription frames, then U1's \
          three usage frames, then G2's three session-rename frames, then \
          G3's four session-tuning frames, F1's three fleet frames, then \
          WIRE-GAPS' four read frames, Slice 2's folded response, then #6's \
-         two monitor-delivery frames, then L4's two loom-registry stream frames \
+         two monitor-delivery frames, L4's two loom-registry stream frames, \
+         then 965's six peer frames and 34 peer-name/SSH/shell/lockdown union frames \
          — the accounted tail pins that nothing before d1_start moved"
     );
     for frame in &frames[d1_start..d1_start + 6] {
@@ -3555,10 +3609,11 @@ fn session_rename_frames_are_additive_and_golden() {
         .expect("G2 welcome frame in the golden transcript");
     assert_eq!(
         frames.len() - g2_start,
-        3 + 4 + 3 + 4 + 1 + 2 + 2,
+        3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34,
         "G2's three frames, then G3's four tuning frames, F1's three fleet frames, \
          WIRE-GAPS' four read frames, Slice 2's folded response, then #6's two \
-         monitor-delivery frames, then L4's two loom-registry stream frames"
+         monitor-delivery frames, L4's two loom-registry stream frames, then \
+         965's six peer frames and 34 peer-name/SSH/shell/lockdown union frames"
     );
 
     // Exact golden bytes for the titled request/response pair.
@@ -3707,11 +3762,12 @@ fn transcription_secret_frames_are_additive_and_redacted() {
         .expect("T1 first set request in the golden transcript");
     assert_eq!(
         frames.len() - t1_start,
-        7 + 3 + 3 + 4 + 3 + 4 + 1 + 2 + 2,
+        7 + 3 + 3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34,
         "T1's seven frames, U1's three usage frames, G2's three rename frames, \
          G3's four tuning frames, F1's three fleet frames, WIRE-GAPS' four read \
          frames, Slice 2's folded response, #6's two monitor-delivery frames, \
-         then L4's two loom-registry stream frames"
+         L4's two loom-registry stream frames, then 965's six peer frames and \
+         34 peer-name/SSH/shell/lockdown union frames"
     );
     let tail = &frames[t1_start..t1_start + 7];
     let methods: Vec<String> = tail
@@ -3840,11 +3896,12 @@ fn usage_report_goldens_are_additive_normalized_and_secret_free() {
         .expect("U1 welcome frame in the golden transcript");
     assert_eq!(
         frames.len() - u1_start,
-        3 + 3 + 4 + 3 + 4 + 1 + 2 + 2,
+        3 + 3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34,
         "three U1 frames, then G2's three session-rename frames, then G3's \
          four session-tuning frames, F1's three fleet frames, then \
          WIRE-GAPS' four read frames, Slice 2's folded response, then #6's two \
-         monitor-delivery frames, then L4's two loom-registry stream frames \
+         monitor-delivery frames, L4's two loom-registry stream frames, then \
+         965's six peer frames and 34 peer-name/SSH/shell/lockdown union frames \
          (each later wave's own law pins its append)"
     );
     for frame in &frames[u1_start..u1_start + 3] {
@@ -4247,7 +4304,7 @@ fn model_detail_tuning_fields_are_additive_and_skip_empty() {
 /// historical transcript block, keeps protocol v1, and retains the open-enum tolerance
 /// used throughout the existing read surfaces.
 ///
-/// MUTATION CHECK: remove either final L4 stream frame or move it before the
+/// MUTATION CHECK: remove either L4 stream frame or move it before the
 /// fleet block. Expected runtime failure: the exact suffix count below or
 /// L4's exact tail indices no longer match.
 #[test]
@@ -4267,10 +4324,11 @@ fn session_fleet_frames_are_additive_and_unknown_tolerant() {
         .expect("fleet feature welcome");
     assert_eq!(
         frames.len() - fleet_start,
-        3 + 4 + 1 + 2 + 2,
+        3 + 4 + 1 + 2 + 2 + 6 + 34,
         "three fleet frames, then WIRE-GAPS' four read frames, Slice 2's \
          folded response, #6's two monitor-delivery frames, and L4's two \
-         loom-registry stream frames"
+         loom-registry stream frames, then 965's six peer frames and 34 \
+         peer-name/SSH/shell/lockdown union frames"
     );
     assert!(matches!(
         &frames[fleet_start],

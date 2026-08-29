@@ -44,6 +44,8 @@ pub enum EffectClass {
     },
     GitOp,
     AgentSpawn,
+    /// Deliver untrusted input to another peer at a turn boundary.
+    PeerMessage,
     CredentialAccess,
     /// Reserved (§9.3) — the computer-use pack lands post-0.1.
     GuiAct,

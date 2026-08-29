@@ -118,6 +118,7 @@ fn lockdown_turn_advertises_only_the_fixed_reduced_pack() {
         "plan",
         "spawn_subagent",
         "peer_list",
+        "ssh_list",
     ] {
         assert!(
             names.contains(&required),
@@ -131,6 +132,7 @@ fn lockdown_turn_advertises_only_the_fixed_reduced_pack() {
         "fs_edit",
         "fs_path",
         "peer_send",
+        "ssh_shell",
         "monitor",
         "computer",
         "mobile",
@@ -142,6 +144,14 @@ fn lockdown_turn_advertises_only_the_fixed_reduced_pack() {
             "lockdown advertised forbidden tool {forbidden}"
         );
     }
+    assert!(
+        LOCKDOWN_HARD_DENIED_EFFECTS.contains(&EffectClass::RemoteExecution),
+        "ssh_shell must remain below the lockdown hard ceiling, not ordinary Ask/Allow"
+    );
+    assert!(
+        LOCKDOWN_HARD_DENIED_EFFECTS.contains(&EffectClass::PeerMessage),
+        "peer_send must remain below the lockdown hard ceiling, not ordinary Ask/Allow"
+    );
 }
 
 /// MUTATION CHECK: reuse a mutable provider-trust lookup from inside the

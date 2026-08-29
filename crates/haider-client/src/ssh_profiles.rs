@@ -4,10 +4,11 @@
 //! entire surface absent instead of turning normal feature negotiation into
 //! an RPC failure.
 
+use haider_protocol::ids::SessionId;
 use haider_rpc::{
-    ErrorData, FEATURE_SSH_PROFILES_V1, RequestBody, ResponseBody, SecretWire, SessionId,
-    ShellWire, SshProfileInputWire, SshProfileUpdateWire, SshProfileWire, SshPtySizeWire,
-    SshScopeWire, SshShellResultWire, SshTestResultWire, Welcome,
+    ErrorData, FEATURE_SSH_PROFILES_V1, RequestBody, ResponseBody, SecretWire, ShellWire,
+    SshProfileInputWire, SshProfileUpdateWire, SshProfileWire, SshPtySizeWire, SshScopeWire,
+    SshShellResultWire, SshTestResultWire, Welcome,
 };
 
 use crate::client::{ClientError, RpcClient};

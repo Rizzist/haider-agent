@@ -187,7 +187,7 @@ fn assert_racing_endpoint_shutdown(
                 entry == &config.endpoint_path()
                     || entry
                         .file_name()
-                        .is_some_and(|name| name.to_string_lossy().starts_with(".haiderd-"))
+                        .is_some_and(|name| name.to_string_lossy().starts_with(".hd-"))
             }));
         }
         other => panic!("unexpected racing shutdown outcome: {other:?}"),

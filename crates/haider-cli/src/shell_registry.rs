@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use haider_client::{EnsureOptions, ProfileEnv, ensure_daemon, resolve_profile, shell_registry};
 use serde::Serialize;
 
-use crate::run::{EX_PROTOCOL, EX_UNAVAILABLE, EX_USAGE};
+use super::run::{EX_PROTOCOL, EX_UNAVAILABLE, EX_USAGE};
 
 pub(crate) const SHELL_LIST_SCHEMA: &str = "haider.shell.list.v1";
 
@@ -108,12 +108,12 @@ pub(crate) async fn shell_command(rest: &[String]) -> ExitCode {
             .await
         }
         None => {
-            ensured.client.close();
+            let _ = ensured.client.close();
             eprintln!("haider shell: daemon does not advertise shell_registry_v1");
             return ExitCode::from(EX_UNAVAILABLE);
         }
     };
-    ensured.client.close();
+    let _ = ensured.client.close();
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
