@@ -8033,6 +8033,7 @@ impl Store {
                     .as_ref()
                     .map_or(0, |provenance| provenance.seq),
                 &source_envelopes,
+                source_owner_agent.as_ref(),
             )?;
         }
         let inherited_cache_segment = if model_proposal.is_none() {
@@ -8233,10 +8234,10 @@ impl Store {
                 "session-fork"
             },
         )?;
-        rebuild_run_head_projection(&transaction, &command.session_id)?;
+        rebuild_run_head_projection(&transaction, command.session_id)?;
         update_workflow_graph_projection_after_append(
             &transaction,
-            &command.session_id,
+            command.session_id,
             &child_envelopes,
         )?;
         transaction.commit().map_err(map_sqlite_error)?;
@@ -20562,22 +20563,29 @@ fn resolve_prompt_fork_cut(
                 false,
             )
         })?;
-    let EventPayload::UserMessage {
-        text, attachments, ..
-    } = decode_payload::<EventPayload>(&prompt.payload).map_err(|_| {
-        prompt_fork_invalid_cut(
-            session_id,
-            prompt_seq,
-            SessionForkInvalidCutReason::NotUserPrompt,
-            "selected event is not a committed user prompt",
-        )
-    })?
-    else {
+    let prompt_kind = prompt
+        .payload
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| corrupt("selected prompt payload has no valid type discriminator"))?;
+    if prompt_kind != "user_message" {
         return Err(prompt_fork_invalid_cut(
             session_id,
             prompt_seq,
             SessionForkInvalidCutReason::NotUserPrompt,
             "selected event is not a committed user prompt",
+        ));
+    }
+    let EventPayload::UserMessage {
+        text, attachments, ..
+    } = decode_payload::<EventPayload>(&prompt.payload).map_err(|error| {
+        corrupt(format!(
+            "committed user prompt {session_id}:{prompt_seq} is invalid: {error}"
+        ))
+    })?
+    else {
+        return Err(corrupt(
+            "selected user-message payload decoded as a different event kind",
         ));
     };
     if prompt.branch_id.as_ref() != source_branch_id {
@@ -20648,13 +20656,28 @@ fn resolve_prompt_fork_cut(
                 "selected prompt lost its queued admission fact",
             )
         })?;
+    let queued_kind = queued
+        .payload
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| corrupt("prompt admission payload has no valid type discriminator"))?;
+    if queued_kind != "run_state" {
+        return Err(prompt_fork_invalid_cut(
+            session_id,
+            prompt_seq,
+            SessionForkInvalidCutReason::Unknown,
+            "selected prompt does not begin at a coherent turn-admission batch",
+        ));
+    }
+    let queued_payload = decode_payload::<EventPayload>(&queued.payload).map_err(|error| {
+        corrupt(format!(
+            "prompt admission for {session_id}:{prompt_seq} is invalid: {error}"
+        ))
+    })?;
     let queued_is_coherent = queued.run_id.as_ref() == Some(prompt_run_id)
         && queued.branch_id.as_ref() == source_branch_id
         && queued.agent_id.as_ref() == owner_agent_id
-        && matches!(
-            decode_payload::<EventPayload>(&queued.payload),
-            Ok(EventPayload::RunState(RunState::Queued))
-        );
+        && matches!(queued_payload, EventPayload::RunState(RunState::Queued));
     if !queued_is_coherent {
         return Err(prompt_fork_invalid_cut(
             session_id,
@@ -20737,18 +20760,36 @@ fn validate_prompt_user_node(
                 "selected prompt has no committed user-turn node",
             )
         })?;
+    let node_kind = node
+        .payload
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| corrupt("prompt user-node payload has no valid type discriminator"))?;
+    if node_kind != "node_committed" {
+        return Err(prompt_fork_invalid_cut(
+            session_id,
+            prompt_seq,
+            SessionForkInvalidCutReason::Unknown,
+            "selected prompt's user-turn node is missing or inconsistent",
+        ));
+    }
+    let node_payload = decode_payload::<EventPayload>(&node.payload).map_err(|error| {
+        corrupt(format!(
+            "committed user node for {session_id}:{prompt_seq} is invalid: {error}"
+        ))
+    })?;
     let node_is_coherent = node.run_id == prompt.run_id
         && node.branch_id == prompt.branch_id
         && node.agent_id == prompt.agent_id
         && matches!(
-            decode_payload::<EventPayload>(&node.payload),
-            Ok(EventPayload::NodeCommitted(TreeNode {
+            node_payload,
+            EventPayload::NodeCommitted(TreeNode {
                 kind: NodeKind::UserTurn {
                     text: node_text,
                     attachments: node_attachments,
                 },
                 ..
-            })) if node_text == text && node_attachments == attachments
+            }) if node_text == text && node_attachments == attachments
         );
     if node_is_coherent {
         Ok(())
@@ -20831,25 +20872,55 @@ fn validate_prompt_fork_tool_pairs(
     session_id: &SessionId,
     prompt_seq: u64,
     envelopes: &[RawEnvelope],
+    owner_agent_id: Option<&AgentId>,
 ) -> StoreResult<()> {
     let mut calls = HashSet::new();
     let mut results = HashSet::new();
+    let mut visible_fragments = HashMap::<Option<AgentId>, u64>::new();
+    let mut visible_results = HashMap::<(Option<AgentId>, u64, String), PromptForkToolKey>::new();
     for envelope in envelopes {
+        let child_agent_id = if envelope.agent_id.as_ref() == owner_agent_id {
+            None
+        } else {
+            envelope.agent_id.clone()
+        };
+        if payload_kind(envelope) == "node_committed" {
+            let payload = decode_payload::<EventPayload>(&envelope.payload).map_err(|_| {
+                corrupt("prompt-fork prefix contains an invalid history-node payload")
+            })?;
+            let EventPayload::NodeCommitted(_) = payload else {
+                return Err(corrupt(
+                    "prompt-fork payload-kind index disagrees with its history node",
+                ));
+            };
+            let fragment = visible_fragments.entry(child_agent_id.clone()).or_default();
+            *fragment = fragment
+                .checked_add(1)
+                .ok_or_else(|| corrupt("prompt-fork history-fragment space is exhausted"))?;
+        }
         let pair = match payload_kind(envelope) {
             "item_tool_call" => {
                 let payload = decode_payload::<EventPayload>(&envelope.payload).map_err(|_| {
                     corrupt("prompt-fork prefix contains an invalid tool-call payload")
                 })?;
-                let EventPayload::Item(ItemEvent::Completed {
-                    item: TurnItem::ToolCall { call_id, .. },
-                    ..
-                }) = payload
-                else {
-                    return Err(corrupt(
-                        "prompt-fork tool-call index does not name a completed tool call",
-                    ));
-                };
-                Some((true, call_id))
+                match payload {
+                    EventPayload::Item(ItemEvent::Started {
+                        item: TurnItem::ToolCall { .. },
+                        ..
+                    }) => None,
+                    EventPayload::Item(ItemEvent::Completed {
+                        item:
+                            TurnItem::ToolCall {
+                                call_id, status, ..
+                            },
+                        ..
+                    }) => Some((true, call_id, Some(status))),
+                    _ => {
+                        return Err(corrupt(
+                            "prompt-fork tool-call index does not name a tool-call lifecycle fact",
+                        ));
+                    }
+                }
             }
             "tool_result" => {
                 let payload = decode_payload::<EventPayload>(&envelope.payload).map_err(|_| {
@@ -20860,11 +20931,11 @@ fn validate_prompt_fork_tool_pairs(
                         "prompt-fork tool-result index does not name a tool result",
                     ));
                 };
-                Some((false, call_id))
+                Some((false, call_id, None))
             }
             _ => None,
         };
-        let Some((is_call, call_id)) = pair else {
+        let Some((is_call, call_id, status)) = pair else {
             continue;
         };
         let run_id = envelope.run_id.clone().ok_or_else(|| {
@@ -20879,12 +20950,12 @@ fn validate_prompt_fork_tool_pairs(
             branch_id: envelope.branch_id.clone(),
             run_id,
             agent_id: envelope.agent_id.clone(),
-            call_id,
+            call_id: call_id.clone(),
         };
         let inserted = if is_call {
-            calls.insert(key)
+            calls.insert(key.clone())
         } else {
-            results.insert(key)
+            results.insert(key.clone())
         };
         if !inserted {
             return Err(prompt_fork_invalid_cut(
@@ -20894,8 +20965,44 @@ fn validate_prompt_fork_tool_pairs(
                 "copied prefix contains a duplicate tool-call/result coordinate",
             ));
         }
+        if envelope.render.prompt == PromptRender::Omit {
+            continue;
+        }
+        let fragment = visible_fragments.get(&child_agent_id).copied().unwrap_or(0);
+        let visible_key = (child_agent_id, fragment, call_id);
+        if is_call {
+            let replayable = status.is_some_and(|status| {
+                matches!(
+                    status,
+                    haider_protocol::item::ToolStatus::Completed
+                        | haider_protocol::item::ToolStatus::Rejected
+                        | haider_protocol::item::ToolStatus::Conflict
+                        | haider_protocol::item::ToolStatus::Failed
+                        | haider_protocol::item::ToolStatus::Unknown
+                )
+            });
+            if replayable
+                && visible_results
+                    .remove(&visible_key)
+                    .is_none_or(|result_key| result_key != key)
+            {
+                return Err(prompt_fork_invalid_cut(
+                    session_id,
+                    prompt_seq,
+                    SessionForkInvalidCutReason::Unknown,
+                    "copied prefix would render a tool call before or without its matching result",
+                ));
+            }
+        } else if visible_results.insert(visible_key, key).is_some() {
+            return Err(prompt_fork_invalid_cut(
+                session_id,
+                prompt_seq,
+                SessionForkInvalidCutReason::Unknown,
+                "copied prefix contains model-visible tool results with a colliding call id",
+            ));
+        }
     }
-    if calls == results {
+    if calls == results && visible_results.is_empty() {
         Ok(())
     } else {
         Err(prompt_fork_invalid_cut(

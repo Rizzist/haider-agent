@@ -6,7 +6,7 @@ use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
 use haider_protocol::error::ErrorCode;
-use haider_protocol::history::{NodeKind, TreeNode};
+use haider_protocol::history::{CompactionResume, NodeKind, TreeNode};
 use haider_protocol::ids::{BranchId, DeviceId, EventId, ItemId, NodeId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::session_fork::{SessionForkProvenance, SessionForked};
@@ -59,16 +59,28 @@ fn create_session(store: &Store, session_id: &SessionId) {
         .expect("create source session");
 }
 
-fn accept_turn(
-    store: &Store,
-    session_id: &SessionId,
-    label: &str,
-    text: &str,
+struct AcceptTurnFixture<'a> {
+    label: &'a str,
+    text: &'a str,
     attachments: Vec<AttachmentBlock>,
     branch_id: Option<BranchId>,
     mode: DeliveryMode,
     run_id: Option<RunId>,
+}
+
+fn accept_turn_with(
+    store: &Store,
+    session_id: &SessionId,
+    fixture: AcceptTurnFixture<'_>,
 ) -> AcceptedFixture {
+    let AcceptTurnFixture {
+        label,
+        text,
+        attachments,
+        branch_id,
+        mode,
+        run_id,
+    } = fixture;
     let run_id = run_id.unwrap_or_else(|| RunId::new(format!("run-{session_id}-{label}")));
     let request_json = serde_json::json!({
         "session_id": session_id,
@@ -128,6 +140,23 @@ fn accept_turn(
         node_seq,
         user_seq,
     }
+}
+
+macro_rules! accept_turn {
+    ($store:expr, $session_id:expr, $label:expr, $text:expr, $attachments:expr, $branch_id:expr, $mode:expr, $run_id:expr $(,)?) => {
+        accept_turn_with(
+            $store,
+            $session_id,
+            AcceptTurnFixture {
+                label: $label,
+                text: $text,
+                attachments: $attachments,
+                branch_id: $branch_id,
+                mode: $mode,
+                run_id: $run_id,
+            },
+        )
+    };
 }
 
 fn raw(
@@ -208,6 +237,23 @@ fn completed_agent_facts(
             let mut parent = accepted.node_id.clone();
             for index in 1..=2 {
                 let call_id = format!("tool-call-{session_id}-{index}");
+                facts.push(raw(
+                    store,
+                    session_id,
+                    run(),
+                    None,
+                    format!("tool-started-{session_id}-{index}"),
+                    EventPayload::Item(ItemEvent::Started {
+                        item_id: ItemId::new(format!("tool-item-{session_id}-{index}")),
+                        item: TurnItem::ToolCall {
+                            call_id: call_id.clone(),
+                            name: format!("tool_{index}"),
+                            args: serde_json::json!({}),
+                            status: ToolStatus::InProgress,
+                        },
+                    }),
+                    PromptRender::Verbatim,
+                ));
                 facts.push(raw(
                     store,
                     session_id,
@@ -448,7 +494,7 @@ fn golden_prompt_cuts_cover_terminal_boundaries_and_first_prompt() {
         let source = SessionId::new(format!("golden-{name}-source"));
         create_session(&store, &source);
         if let Some(case) = case {
-            let a = accept_turn(
+            let a = accept_turn!(
                 &store,
                 &source,
                 "a",
@@ -460,7 +506,7 @@ fn golden_prompt_cuts_cover_terminal_boundaries_and_first_prompt() {
             );
             append_completed_turn(&store, &source, &a, case);
         }
-        let b = accept_turn(
+        let b = accept_turn!(
             &store,
             &source,
             "b",
@@ -536,7 +582,7 @@ fn queued_and_steered_prompts_are_retryably_unstable() {
         let store = Store::open(root.path()).expect("store");
         let source = SessionId::new(format!("unstable-{label}-source"));
         create_session(&store, &source);
-        let a = accept_turn(
+        let a = accept_turn!(
             &store,
             &source,
             "a",
@@ -546,7 +592,7 @@ fn queued_and_steered_prompts_are_retryably_unstable() {
             DeliveryMode::Queue,
             None,
         );
-        let b = accept_turn(
+        let b = accept_turn!(
             &store,
             &source,
             "b",
@@ -578,7 +624,7 @@ fn prompt_on_another_branch_is_a_typed_structural_cut_error() {
     let store = Store::open(root.path()).expect("store");
     let source = SessionId::new("wrong-branch-source");
     create_session(&store, &source);
-    let a = accept_turn(
+    let a = accept_turn!(
         &store,
         &source,
         "a",
@@ -616,7 +662,7 @@ fn prompt_on_another_branch_is_a_typed_structural_cut_error() {
     else {
         panic!("fresh branch must commit");
     };
-    let b = accept_turn(
+    let b = accept_turn!(
         &store,
         &source,
         "b",
@@ -676,7 +722,7 @@ fn retry_reuses_child_cas_refs_stay_deduplicated_and_running_parent_cannot_chang
         artifact: artifact.clone(),
         lines: 1,
     };
-    let a = accept_turn(
+    let a = accept_turn!(
         &store,
         &source,
         "a",
@@ -687,7 +733,7 @@ fn retry_reuses_child_cas_refs_stay_deduplicated_and_running_parent_cannot_chang
         None,
     );
     append_completed_turn(&store, &source, &a, CompletedTurn::Successful);
-    let b = accept_turn(
+    let b = accept_turn!(
         &store,
         &source,
         "b",
@@ -747,7 +793,14 @@ fn retry_reuses_child_cas_refs_stay_deduplicated_and_running_parent_cannot_chang
 
     let mut conflict = command.clone();
     conflict.prompt_seq = a.user_seq;
-    conflict.request_json.push(' ');
+    conflict.request_json = serde_json::json!({
+        "session_id": &source,
+        "worker_generation": conflict.worker_generation,
+        "source_branch_id": &conflict.source_branch_id,
+        "prompt": {"seq": conflict.prompt_seq},
+        "name": "editable fork",
+    })
+    .to_string();
     conflict.request_digest = blake3::hash(conflict.request_json.as_bytes())
         .to_hex()
         .to_string();
@@ -853,7 +906,7 @@ fn terminal_boundaries_never_copy_an_unpaired_tool_half() {
         let store = Store::open(root.path()).expect("store");
         let source = SessionId::new(format!("unpaired-{label}-source"));
         create_session(&store, &source);
-        let a = accept_turn(
+        let a = accept_turn!(
             &store,
             &source,
             "a",
@@ -887,7 +940,7 @@ fn terminal_boundaries_never_copy_an_unpaired_tool_half() {
         store
             .append_worker(&mut facts)
             .expect("append incomplete terminal turn");
-        let b = accept_turn(
+        let b = accept_turn!(
             &store,
             &source,
             "b",
@@ -921,13 +974,764 @@ fn terminal_boundaries_never_copy_an_unpaired_tool_half() {
     }
 }
 
+fn completed_tool_fact(
+    store: &Store,
+    source: &SessionId,
+    run_id: &RunId,
+    event_id: &str,
+    call_id: &str,
+    render: PromptRender,
+) -> RawEnvelope {
+    raw(
+        store,
+        source,
+        Some(run_id.clone()),
+        None,
+        event_id,
+        EventPayload::Item(ItemEvent::Completed {
+            item_id: ItemId::new(format!("item-{event_id}")),
+            item: TurnItem::ToolCall {
+                call_id: call_id.into(),
+                name: "fs_read".into(),
+                args: serde_json::json!({"path": "note.txt"}),
+                status: ToolStatus::Completed,
+            },
+        }),
+        render,
+    )
+}
+
+fn tool_result_fact(
+    store: &Store,
+    source: &SessionId,
+    run_id: &RunId,
+    event_id: &str,
+    call_id: &str,
+    render: PromptRender,
+) -> RawEnvelope {
+    raw(
+        store,
+        source,
+        Some(run_id.clone()),
+        None,
+        event_id,
+        EventPayload::ToolResult {
+            call_id: call_id.into(),
+            result: BoundedResult {
+                preview: "contents".into(),
+                truncated: false,
+                data: None,
+                artifact: None,
+                images: Vec::new(),
+                cursor: None,
+                status: ToolResultStatus::Completed,
+                reason: None,
+                presentation: None,
+            },
+        },
+        render,
+    )
+}
+
+#[test]
+fn model_visible_tool_order_and_render_mismatches_are_refused() {
+    for (label, result_first, result_render, call_render) in [
+        (
+            "call-before-result",
+            false,
+            PromptRender::Verbatim,
+            PromptRender::Verbatim,
+        ),
+        (
+            "result-omitted",
+            true,
+            PromptRender::Omit,
+            PromptRender::Verbatim,
+        ),
+        (
+            "call-omitted",
+            true,
+            PromptRender::Verbatim,
+            PromptRender::Omit,
+        ),
+    ] {
+        let root = tempfile::tempdir().expect("profile");
+        let store = Store::open(root.path()).expect("store");
+        let source = SessionId::new(format!("visible-{label}-source"));
+        create_session(&store, &source);
+        let a = accept_turn!(
+            &store,
+            &source,
+            "a",
+            "A uses one tool",
+            Vec::new(),
+            None,
+            DeliveryMode::Queue,
+            None,
+        );
+        let result = tool_result_fact(
+            &store,
+            &source,
+            &a.run_id,
+            &format!("result-{label}"),
+            "call-1",
+            result_render,
+        );
+        let call = completed_tool_fact(
+            &store,
+            &source,
+            &a.run_id,
+            &format!("call-{label}"),
+            "call-1",
+            call_render,
+        );
+        let mut facts = if result_first {
+            vec![result, call]
+        } else {
+            vec![call, result]
+        };
+        facts.extend([
+            raw(
+                &store,
+                &source,
+                Some(a.run_id.clone()),
+                None,
+                format!("done-{label}"),
+                EventPayload::RunState(RunState::Done),
+                PromptRender::Omit,
+            ),
+            raw(
+                &store,
+                &source,
+                None,
+                None,
+                format!("idle-{label}"),
+                EventPayload::SessionState(SessionState::Idle { interrupted: false }),
+                PromptRender::Omit,
+            ),
+        ]);
+        store
+            .append_worker(&mut facts)
+            .expect("append malformed model-visible exchange");
+        let b = accept_turn!(
+            &store,
+            &source,
+            "b",
+            "prompt B",
+            Vec::new(),
+            None,
+            DeliveryMode::Queue,
+            None,
+        );
+        let error = store
+            .fork_session_from_prompt(&prompt_command(
+                &store,
+                &source,
+                None,
+                b.user_seq,
+                &format!("visible-{label}-command"),
+                &format!("visible-{label}-child"),
+            ))
+            .expect_err("unsafe model-visible tool exchange must be refused");
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert_eq!(
+            error.details.as_ref().expect("typed invalid cut")["kind"],
+            "session_fork_invalid_cut"
+        );
+        assert_eq!(
+            store.session_ids().expect("sessions after refusal").len(),
+            1
+        );
+    }
+}
+
+#[test]
+fn terminal_boundaries_accept_only_closed_tool_exchanges() {
+    for (label, interrupted) in [("cancelled", false), ("interrupted", true)] {
+        let root = tempfile::tempdir().expect("profile");
+        let store = Store::open(root.path()).expect("store");
+        let source = SessionId::new(format!("closed-{label}-source"));
+        create_session(&store, &source);
+        let a = accept_turn!(
+            &store,
+            &source,
+            "a",
+            "A finishes a tool before cancellation",
+            Vec::new(),
+            None,
+            DeliveryMode::Queue,
+            None,
+        );
+        let mut facts = vec![
+            raw(
+                &store,
+                &source,
+                Some(a.run_id.clone()),
+                None,
+                format!("started-{label}"),
+                EventPayload::Item(ItemEvent::Started {
+                    item_id: ItemId::new(format!("item-{label}")),
+                    item: TurnItem::ToolCall {
+                        call_id: "closed-call".into(),
+                        name: "fs_read".into(),
+                        args: serde_json::json!({}),
+                        status: ToolStatus::InProgress,
+                    },
+                }),
+                PromptRender::Verbatim,
+            ),
+            tool_result_fact(
+                &store,
+                &source,
+                &a.run_id,
+                &format!("result-{label}"),
+                "closed-call",
+                PromptRender::Verbatim,
+            ),
+            completed_tool_fact(
+                &store,
+                &source,
+                &a.run_id,
+                &format!("call-{label}"),
+                "closed-call",
+                PromptRender::Verbatim,
+            ),
+            raw(
+                &store,
+                &source,
+                Some(a.run_id.clone()),
+                None,
+                format!("cancelling-{label}"),
+                EventPayload::RunState(RunState::Cancelling),
+                PromptRender::Omit,
+            ),
+            raw(
+                &store,
+                &source,
+                Some(a.run_id.clone()),
+                None,
+                format!("cancelled-{label}"),
+                EventPayload::RunState(RunState::Cancelled),
+                PromptRender::Omit,
+            ),
+            raw(
+                &store,
+                &source,
+                None,
+                None,
+                format!("idle-{label}"),
+                EventPayload::SessionState(SessionState::Idle { interrupted }),
+                PromptRender::Omit,
+            ),
+        ];
+        store
+            .append_worker(&mut facts)
+            .expect("append closed terminal tool exchange");
+        let b = accept_turn!(
+            &store,
+            &source,
+            "b",
+            "prompt B",
+            Vec::new(),
+            None,
+            DeliveryMode::Queue,
+            None,
+        );
+        let SessionForkOutcome::Committed { .. } = store
+            .fork_session_from_prompt(&prompt_command(
+                &store,
+                &source,
+                None,
+                b.user_seq,
+                &format!("closed-{label}-command"),
+                &format!("closed-{label}-child"),
+            ))
+            .expect("closed tool exchange is a coherent terminal boundary")
+        else {
+            panic!("fresh closed tool exchange must commit");
+        };
+    }
+}
+
+#[test]
+fn prompt_omitted_server_tool_pair_may_settle_after_its_call() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let source = SessionId::new("omitted-server-tool-source");
+    create_session(&store, &source);
+    let a = accept_turn!(
+        &store,
+        &source,
+        "a",
+        "A uses a provider-owned tool",
+        Vec::new(),
+        None,
+        DeliveryMode::Queue,
+        None,
+    );
+    let mut facts = vec![
+        raw(
+            &store,
+            &source,
+            Some(a.run_id.clone()),
+            None,
+            "server-started",
+            EventPayload::Item(ItemEvent::Started {
+                item_id: ItemId::new("server-item"),
+                item: TurnItem::ToolCall {
+                    call_id: "server-call".into(),
+                    name: "web_search".into(),
+                    args: serde_json::json!({}),
+                    status: ToolStatus::InProgress,
+                },
+            }),
+            PromptRender::Omit,
+        ),
+        completed_tool_fact(
+            &store,
+            &source,
+            &a.run_id,
+            "server-completed",
+            "server-call",
+            PromptRender::Omit,
+        ),
+        tool_result_fact(
+            &store,
+            &source,
+            &a.run_id,
+            "server-result",
+            "server-call",
+            PromptRender::Omit,
+        ),
+        raw(
+            &store,
+            &source,
+            Some(a.run_id.clone()),
+            None,
+            "server-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        raw(
+            &store,
+            &source,
+            None,
+            None,
+            "server-idle",
+            EventPayload::SessionState(SessionState::Idle { interrupted: false }),
+            PromptRender::Omit,
+        ),
+    ];
+    store
+        .append_worker(&mut facts)
+        .expect("append omitted server tool exchange");
+    let b = accept_turn!(
+        &store,
+        &source,
+        "b",
+        "prompt B",
+        Vec::new(),
+        None,
+        DeliveryMode::Queue,
+        None,
+    );
+    let SessionForkOutcome::Committed { .. } = store
+        .fork_session_from_prompt(&prompt_command(
+            &store,
+            &source,
+            None,
+            b.user_seq,
+            "omitted-server-tool-command",
+            "omitted-server-tool-child",
+        ))
+        .expect("prompt-omitted server exchange has no model-visible pair")
+    else {
+        panic!("fresh omitted server exchange must commit");
+    };
+}
+
+#[test]
+fn compaction_boundary_requires_a_visible_tool_pair_in_one_selected_fragment() {
+    for (label, result_before_compaction) in [("straddled", true), ("same-fragment", false)] {
+        let root = tempfile::tempdir().expect("profile");
+        let store = Store::open(root.path()).expect("store");
+        let source = SessionId::new(format!("compaction-{label}-source"));
+        create_session(&store, &source);
+        let a = accept_turn!(
+            &store,
+            &source,
+            "a",
+            "A compacts around a tool exchange",
+            Vec::new(),
+            None,
+            DeliveryMode::Queue,
+            None,
+        );
+        let result = tool_result_fact(
+            &store,
+            &source,
+            &a.run_id,
+            &format!("result-{label}"),
+            "compacted-call",
+            PromptRender::Verbatim,
+        );
+        let compaction_node_id = NodeId::new(format!("compaction-node-{label}"));
+        let summary = store
+            .put(b"bounded compaction summary")
+            .expect("summary CAS");
+        let compaction = raw(
+            &store,
+            &source,
+            Some(a.run_id.clone()),
+            None,
+            format!("compaction-{label}"),
+            EventPayload::NodeCommitted(TreeNode {
+                node: compaction_node_id.clone(),
+                parent: Some(a.node_id.clone()),
+                kind: NodeKind::Compaction {
+                    covers_from: a.node_id.clone(),
+                    covers_to: a.node_id.clone(),
+                    summary_artifact: summary,
+                    tokens_before: 100,
+                    tokens_after: 10,
+                    resume_cause: CompactionResume::ManualIdle,
+                },
+            }),
+            PromptRender::Omit,
+        );
+        let mut facts = Vec::new();
+        if result_before_compaction {
+            facts.push(result.clone());
+        }
+        facts.push(compaction);
+        if !result_before_compaction {
+            facts.push(result);
+        }
+        facts.extend([
+            completed_tool_fact(
+                &store,
+                &source,
+                &a.run_id,
+                &format!("call-{label}"),
+                "compacted-call",
+                PromptRender::Verbatim,
+            ),
+            raw(
+                &store,
+                &source,
+                Some(a.run_id.clone()),
+                None,
+                format!("tool-node-{label}"),
+                EventPayload::NodeCommitted(TreeNode {
+                    node: NodeId::new(format!("tool-node-{label}")),
+                    parent: Some(compaction_node_id),
+                    kind: NodeKind::ToolExchange {
+                        tool: "fs_read".into(),
+                        summary: "tool completed after compaction".into(),
+                        artifact: None,
+                    },
+                }),
+                PromptRender::Omit,
+            ),
+            raw(
+                &store,
+                &source,
+                Some(a.run_id.clone()),
+                None,
+                format!("done-{label}"),
+                EventPayload::RunState(RunState::Done),
+                PromptRender::Omit,
+            ),
+            raw(
+                &store,
+                &source,
+                None,
+                None,
+                format!("idle-{label}"),
+                EventPayload::SessionState(SessionState::Idle { interrupted: false }),
+                PromptRender::Omit,
+            ),
+        ]);
+        store
+            .append_worker(&mut facts)
+            .expect("append compaction tool boundary");
+        let b = accept_turn!(
+            &store,
+            &source,
+            "b",
+            "prompt B",
+            Vec::new(),
+            None,
+            DeliveryMode::Queue,
+            None,
+        );
+        let outcome = store.fork_session_from_prompt(&prompt_command(
+            &store,
+            &source,
+            None,
+            b.user_seq,
+            &format!("compaction-{label}-command"),
+            &format!("compaction-{label}-child"),
+        ));
+        if result_before_compaction {
+            let error = outcome.expect_err("compaction must fence the earlier result fragment");
+            assert_eq!(error.code, ErrorCode::InvalidArgument);
+            assert_eq!(
+                error.details.as_ref().expect("typed invalid cut")["kind"],
+                "session_fork_invalid_cut"
+            );
+            assert_eq!(
+                store.session_ids().expect("sessions after refusal").len(),
+                1
+            );
+        } else {
+            let SessionForkOutcome::Committed { .. } =
+                outcome.expect("same-fragment pair remains coherent")
+            else {
+                panic!("fresh same-fragment pair must commit");
+            };
+        }
+    }
+}
+
+#[test]
+fn later_compaction_cannot_selectively_prune_one_side_of_a_visible_tool_pair() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let source = SessionId::new("late-compaction-source");
+    create_session(&store, &source);
+    let a = accept_turn!(
+        &store,
+        &source,
+        "a",
+        "A compacts after a split tool exchange",
+        Vec::new(),
+        None,
+        DeliveryMode::Queue,
+        None,
+    );
+    let result_node_id = NodeId::new("late-compaction-result-node");
+    let tool_node_id = NodeId::new("late-compaction-tool-node");
+    let summary = store
+        .put(b"late selective compaction summary")
+        .expect("summary CAS");
+    let mut facts = vec![
+        tool_result_fact(
+            &store,
+            &source,
+            &a.run_id,
+            "late-compaction-result",
+            "late-compaction-call",
+            PromptRender::Verbatim,
+        ),
+        raw(
+            &store,
+            &source,
+            Some(a.run_id.clone()),
+            None,
+            "late-compaction-result-node-event",
+            EventPayload::NodeCommitted(TreeNode {
+                node: result_node_id.clone(),
+                parent: Some(a.node_id.clone()),
+                kind: NodeKind::AssistantCommit {
+                    text: "result fragment".into(),
+                    verdict: VerifyVerdict::NotApplicable,
+                },
+            }),
+            PromptRender::Omit,
+        ),
+        completed_tool_fact(
+            &store,
+            &source,
+            &a.run_id,
+            "late-compaction-call-event",
+            "late-compaction-call",
+            PromptRender::Verbatim,
+        ),
+        raw(
+            &store,
+            &source,
+            Some(a.run_id.clone()),
+            None,
+            "late-compaction-tool-node-event",
+            EventPayload::NodeCommitted(TreeNode {
+                node: tool_node_id.clone(),
+                parent: Some(result_node_id.clone()),
+                kind: NodeKind::ToolExchange {
+                    tool: "fs_read".into(),
+                    summary: "tool completed in a later fragment".into(),
+                    artifact: None,
+                },
+            }),
+            PromptRender::Omit,
+        ),
+        raw(
+            &store,
+            &source,
+            Some(a.run_id.clone()),
+            None,
+            "late-compaction-node-event",
+            EventPayload::NodeCommitted(TreeNode {
+                node: NodeId::new("late-compaction-node"),
+                parent: Some(tool_node_id),
+                kind: NodeKind::Compaction {
+                    covers_from: result_node_id.clone(),
+                    covers_to: result_node_id,
+                    summary_artifact: summary,
+                    tokens_before: 100,
+                    tokens_after: 10,
+                    resume_cause: CompactionResume::ManualIdle,
+                },
+            }),
+            PromptRender::Omit,
+        ),
+        raw(
+            &store,
+            &source,
+            Some(a.run_id.clone()),
+            None,
+            "late-compaction-done",
+            EventPayload::RunState(RunState::Done),
+            PromptRender::Omit,
+        ),
+        raw(
+            &store,
+            &source,
+            None,
+            None,
+            "late-compaction-idle",
+            EventPayload::SessionState(SessionState::Idle { interrupted: false }),
+            PromptRender::Omit,
+        ),
+    ];
+    store
+        .append_worker(&mut facts)
+        .expect("append late selective compaction");
+    let b = accept_turn!(
+        &store,
+        &source,
+        "b",
+        "prompt B",
+        Vec::new(),
+        None,
+        DeliveryMode::Queue,
+        None,
+    );
+    let error = store
+        .fork_session_from_prompt(&prompt_command(
+            &store,
+            &source,
+            None,
+            b.user_seq,
+            "late-compaction-command",
+            "late-compaction-child",
+        ))
+        .expect_err("a fork must reject a tool pair split across selectable fragments");
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert_eq!(
+        error.details.as_ref().expect("typed invalid cut")["kind"],
+        "session_fork_invalid_cut"
+    );
+    assert_eq!(
+        store.session_ids().expect("sessions after refusal").len(),
+        1
+    );
+}
+
+fn replace_committed_payload(
+    store: &Store,
+    session_id: &SessionId,
+    seq: u64,
+    payload: serde_json::Value,
+) {
+    let mut envelope = store
+        .journal_replay(session_id)
+        .expect("read event for corruption fixture")
+        .into_iter()
+        .find(|envelope| envelope.seq == seq)
+        .expect("corruption target");
+    envelope.payload = payload;
+    let connection =
+        rusqlite::Connection::open(store.database_path()).expect("open corruption fixture db");
+    connection
+        .execute(
+            "UPDATE events SET envelope_json = ?3 WHERE session_id = ?1 AND seq = ?2",
+            rusqlite::params![
+                session_id.as_str(),
+                i64::try_from(seq).expect("sequence fits sqlite"),
+                rmp_serde::to_vec_named(&envelope).expect("encode corrupt fixture"),
+            ],
+        )
+        .expect("replace committed payload");
+}
+
+#[test]
+fn malformed_committed_cut_payloads_stay_store_corrupt() {
+    for (label, offset, payload) in [
+        (
+            "admission",
+            -1_i64,
+            serde_json::json!({"type": "run_state", "state": 7}),
+        ),
+        (
+            "prompt",
+            0_i64,
+            serde_json::json!({"type": "user_message", "text": 7, "attachments": []}),
+        ),
+        (
+            "node",
+            1_i64,
+            serde_json::json!({"type": "node_committed", "node": 7}),
+        ),
+    ] {
+        let root = tempfile::tempdir().expect("profile");
+        let store = Store::open(root.path()).expect("store");
+        let source = SessionId::new(format!("corrupt-{label}-source"));
+        create_session(&store, &source);
+        let b = accept_turn!(
+            &store,
+            &source,
+            "b",
+            "prompt B",
+            Vec::new(),
+            None,
+            DeliveryMode::Queue,
+            None,
+        );
+        let target_seq = b
+            .user_seq
+            .checked_add_signed(offset)
+            .expect("fixture target sequence");
+        replace_committed_payload(&store, &source, target_seq, payload);
+        let error = store
+            .fork_session_from_prompt(&prompt_command(
+                &store,
+                &source,
+                None,
+                b.user_seq,
+                &format!("corrupt-{label}-command"),
+                &format!("corrupt-{label}-child"),
+            ))
+            .expect_err("malformed committed payload must be store corruption");
+        assert_eq!(error.code, ErrorCode::StoreCorrupt);
+        assert!(!error.retryable);
+        assert_eq!(
+            store
+                .session_ids()
+                .expect("sessions after corruption")
+                .len(),
+            1
+        );
+    }
+}
+
 #[test]
 fn non_user_prompt_and_stale_generation_keep_their_typed_errors() {
     let root = tempfile::tempdir().expect("profile");
     let store = Store::open(root.path()).expect("store");
     let source = SessionId::new("typed-error-source");
     create_session(&store, &source);
-    let b = accept_turn(
+    let b = accept_turn!(
         &store,
         &source,
         "b",
