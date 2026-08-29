@@ -3,7 +3,9 @@
 //! This seam never performs a DNS lookup, ping, HTTP request, or any other
 //! network probe. macOS reads `SCNetworkReachability` flags for the default
 //! route, Linux asks the kernel route table with `RTM_GETROUTE`, Windows reads
-//! Network List Manager connectivity, and Android reads `ConnectivityManager`.
+//! Network List Manager connectivity, and Android reads `ConnectivityManager`
+//! when its host has initialized `ndk-context` (otherwise the result is
+//! `Unknown`).
 //!
 //! Only the negative is authoritative: [`RouteStatus::Unavailable`] means the
 //! OS has positively reported that no usable route exists, so a provider idle
@@ -84,7 +86,7 @@ fn platform_route_status() -> RouteStatus {
         fn SCNetworkReachabilityGetFlags(
             target: ReachabilityRef,
             flags: *mut ReachabilityFlags,
-        ) -> bool;
+        ) -> u8;
     }
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
@@ -105,7 +107,7 @@ fn platform_route_status() -> RouteStatus {
         let succeeded = unsafe { SCNetworkReachabilityGetFlags(target, &mut flags) };
         // SAFETY: create-rule reference is released exactly once after its last use.
         unsafe { CFRelease(target) };
-        succeeded.then_some(flags & REACHABLE != 0)
+        (succeeded != 0).then_some(flags & REACHABLE != 0)
     };
     let ipv4 = libc::sockaddr_in {
         sin_len: u8::try_from(std::mem::size_of::<libc::sockaddr_in>()).unwrap_or(u8::MAX),
@@ -143,7 +145,9 @@ fn platform_route_status() -> RouteStatus {
     const RTM_NEWROUTE: u16 = 24;
     const NLMSG_ERROR: u16 = 2;
     const NLMSG_DONE: u16 = 3;
+    const NLMSG_OVERRUN: u16 = 4;
     const NLM_F_REQUEST: u16 = 1;
+    const NLM_F_DUMP_INTR: u16 = 0x10;
     const NLM_F_DUMP: u16 = 0x300;
     const RTN_UNICAST: u8 = 1;
 
@@ -257,13 +261,18 @@ fn platform_route_status() -> RouteStatus {
     let mut completed = false;
     let mut inconclusive = false;
     loop {
-        // SAFETY: buffer is writable for its full advertised length.
+        let mut sender_length = u32::try_from(size_of::<libc::sockaddr_nl>()).unwrap_or(u32::MAX);
+        // SAFETY: buffer is writable for its full advertised length. `kernel`
+        // is no longer needed as the send destination and is writable storage
+        // for the source address; `sender_length` advertises its exact size.
         let received = unsafe {
-            libc::recv(
+            libc::recvfrom(
                 socket,
                 buffer.as_mut_ptr().cast(),
                 buffer.len(),
                 libc::MSG_TRUNC,
+                (&raw mut kernel).cast(),
+                &raw mut sender_length,
             )
         };
         if received < 0 {
@@ -279,6 +288,16 @@ fn platform_route_status() -> RouteStatus {
             inconclusive = true;
             break;
         }
+        if usize::try_from(sender_length).unwrap_or_default() != size_of::<libc::sockaddr_nl>()
+            || kernel.nl_family != libc::AF_NETLINK as libc::sa_family_t
+            || kernel.nl_pid != 0
+            || kernel.nl_groups != 0
+        {
+            // Only a complete source address identifying the kernel may make
+            // a route-table dump authoritative.
+            inconclusive = true;
+            break;
+        }
         let mut offset = 0;
         while received.saturating_sub(offset) >= size_of::<NetlinkHeader>() {
             // SAFETY: the bounds check covers the fixed header.
@@ -290,9 +309,35 @@ fn platform_route_status() -> RouteStatus {
                 inconclusive = true;
                 break;
             }
+            if header.sequence != request.header.sequence || header.flags & NLM_F_DUMP_INTR != 0 {
+                // A mismatched reply is not ours. DUMP_INTR explicitly means
+                // objects may be missing, so it can never support Unavailable.
+                inconclusive = true;
+                break;
+            }
             match header.message_type {
-                NLMSG_DONE => completed = true,
-                NLMSG_ERROR => {
+                NLMSG_DONE => {
+                    let payload_length = length - size_of::<NetlinkHeader>();
+                    if payload_length == 0 {
+                        completed = true;
+                    } else if payload_length >= size_of::<i32>() {
+                        let payload_start = offset + size_of::<NetlinkHeader>();
+                        let error = buffer
+                            .get(payload_start..payload_start + size_of::<i32>())
+                            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                            .map(i32::from_ne_bytes);
+                        if error == Some(0) {
+                            completed = true;
+                        } else {
+                            inconclusive = true;
+                            break;
+                        }
+                    } else {
+                        inconclusive = true;
+                        break;
+                    }
+                }
+                NLMSG_ERROR | NLMSG_OVERRUN => {
                     inconclusive = true;
                     break;
                 }
@@ -402,38 +447,66 @@ fn platform_route_status() -> RouteStatus {
     let Ok(mut environment) = vm.attach_current_thread() else {
         return RouteStatus::Unknown;
     };
-    let Ok(service_name) = environment.new_string("connectivity") else {
-        return RouteStatus::Unknown;
-    };
-    let service_name = JObject::from(service_name);
-    // SAFETY: Android's application context is a process-lifetime global JNI
-    // reference owned by the runtime. This wrapper borrows it only for the
-    // attached thread call and does not delete JNI references on drop.
-    let application_context = unsafe { JObject::from_raw(context.context().cast()) };
-    let Ok(manager) = environment.call_method(
-        &application_context,
-        "getSystemService",
-        "(Ljava/lang/String;)Ljava/lang/Object;",
-        &[JValue::Object(&service_name)],
-    ) else {
-        return RouteStatus::Unknown;
-    };
-    let Ok(manager) = manager.l() else {
-        return RouteStatus::Unknown;
-    };
-    if manager.is_null() {
+    // Do not disturb an exception already owned by an embedding Java caller.
+    if environment.exception_check() != Ok(false) {
         return RouteStatus::Unknown;
     }
-    let Ok(network) =
-        environment.call_method(manager, "getActiveNetwork", "()Landroid/net/Network;", &[])
-    else {
-        return RouteStatus::Unknown;
-    };
-    match network.l() {
-        Ok(network) if network.is_null() => RouteStatus::Unavailable,
-        Ok(_) => RouteStatus::Available,
-        Err(_) => RouteStatus::Unknown,
-    }
+    let status =
+        environment.with_local_frame(8, |environment| -> jni::errors::Result<RouteStatus> {
+            let Ok(service_name) = environment.new_string("connectivity") else {
+                return Ok(RouteStatus::Unknown);
+            };
+            let service_name = JObject::from(service_name);
+            // SAFETY: a valid attached JNIEnv exposes a valid JNI function table.
+            // ndk-context's runtime-owned context reference remains live under its
+            // activity-lifetime contract. NewLocalRef accepts that shared reference
+            // and returns a unique, thread-local reference; NULL is checked before
+            // the reference is wrapped exactly once. The enclosing local frame
+            // deletes this local copy and every local returned below.
+            let application_context = unsafe {
+                let native_interface = environment.get_native_interface();
+                let Some(new_local_ref) = (**native_interface).NewLocalRef else {
+                    return Ok(RouteStatus::Unknown);
+                };
+                let local = new_local_ref(native_interface, context.context().cast());
+                if local.is_null() {
+                    return Ok(RouteStatus::Unknown);
+                }
+                JObject::from_raw(local)
+            };
+            let Ok(manager) = environment.call_method(
+                &application_context,
+                "getSystemService",
+                "(Ljava/lang/String;)Ljava/lang/Object;",
+                &[JValue::Object(&service_name)],
+            ) else {
+                return Ok(RouteStatus::Unknown);
+            };
+            let Ok(manager) = manager.l() else {
+                return Ok(RouteStatus::Unknown);
+            };
+            if manager.is_null() {
+                return Ok(RouteStatus::Unknown);
+            }
+            let Ok(network) = environment.call_method(
+                manager,
+                "getActiveNetwork",
+                "()Landroid/net/Network;",
+                &[],
+            ) else {
+                return Ok(RouteStatus::Unknown);
+            };
+            Ok(match network.l() {
+                Ok(network) if network.is_null() => RouteStatus::Unavailable,
+                Ok(_) => RouteStatus::Available,
+                Err(_) => RouteStatus::Unknown,
+            })
+        });
+    // JNI leaves Java exceptions pending. None existed on entry, so clear any
+    // exception raised by this optional inspection before returning to a thread
+    // that may already have been attached by the host runtime.
+    let _ = environment.exception_clear();
+    status.unwrap_or(RouteStatus::Unknown)
 }
 
 #[cfg(not(any(
