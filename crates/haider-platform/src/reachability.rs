@@ -448,9 +448,9 @@ fn platform_route_status() -> RouteStatus {
         return RouteStatus::Unknown;
     };
     // Do not disturb an exception already owned by an embedding Java caller.
-    if environment.exception_check() != Ok(false) {
+    let Ok(false) = environment.exception_check() else {
         return RouteStatus::Unknown;
-    }
+    };
     let status =
         environment.with_local_frame(8, |environment| -> jni::errors::Result<RouteStatus> {
             let Ok(service_name) = environment.new_string("connectivity") else {

@@ -549,7 +549,15 @@ impl PeerService {
     async fn discover(&self) -> Result<Vec<PeerDescriptor>, PeerError> {
         #[cfg(unix)]
         {
-            let _ = haider_platform::sweep_stale_endpoints(&self.runtime_dir, None).await;
+            // The Unix primary endpoint is scoped entirely by its runtime
+            // directory. Keep it out of recurring peer hygiene so discovery
+            // never connects the daemon to its own listener.
+            let own_endpoint = Endpoint::new(&self.runtime_dir, "");
+            let _ = haider_platform::sweep_stale_endpoints(
+                &self.runtime_dir,
+                Some(own_endpoint.address()),
+            )
+            .await;
             discover_unix(&self.runtime_dir).await
         }
         #[cfg(windows)]

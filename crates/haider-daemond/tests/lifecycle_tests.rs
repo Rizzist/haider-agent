@@ -34,6 +34,7 @@
 //! - capability downscoping        -> `view_only_connection_is_denied_the_control_frame`
 //! - binding capability rule       -> `binding_baseline_requires_view_or_control_capability`
 //! - ordered unbound baseline      -> `view_connection_receives_exactly_one_unbound_baseline_after_welcome`
+//! - idle internal admission       -> `idle_daemon_admits_zero_connections_without_clients`
 //! - pre-Hello slot exhaustion     -> `silent_peer_is_closed_at_the_handshake_deadline_and_frees_its_slot`
 //! - connection admission cap      -> `connection_admission_cap_rejects_over_limit_peers_and_readmits_a_freed_slot`
 //! - queued-byte budget            -> `outbound_byte_budget_refuses_a_frame_the_connection_cannot_hold`
@@ -1903,6 +1904,32 @@ async fn view_only_connection_is_denied_the_control_frame() {
     assert_eq!(
         task.join().await.expect("daemon joins"),
         ShutdownOutcome::Graceful
+    );
+}
+
+/// An idle daemon must not connect to its own primary endpoint while peer
+/// discovery reconciles in the background.
+#[tokio::test]
+async fn idle_daemon_admits_zero_connections_without_clients() {
+    let root = test_root("w3b1-");
+    let config = test_config(&root, "idle-admissions");
+    let task = spawn(config);
+    let diagnostics = task.diagnostics();
+    wait_for_state(task.readiness(), |state| *state == DaemonState::Ready).await;
+
+    // Span more than two 500 ms peer-reconcile intervals. There are no test
+    // clients, so every admission in this window would be daemon-internal.
+    tokio::time::sleep(Duration::from_millis(1_250)).await;
+    let admissions = diagnostics.snapshot().connection_admissions;
+
+    task.shutdown_handle().request("test complete");
+    assert_eq!(
+        task.join().await.expect("daemon joins"),
+        ShutdownOutcome::Graceful
+    );
+    assert_eq!(
+        admissions, 0,
+        "an idle daemon must admit no connections without clients"
     );
 }
 
