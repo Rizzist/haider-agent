@@ -48,6 +48,7 @@
 use crate::checkpoint::{CheckpointCapture, FreezeCheckpointInput, freeze_checkpoint};
 use crate::filesystem::CasSink;
 use crate::process::ProcessRegistry;
+use crate::workspace_receipt::{WorkspaceReceiptLease, WorkspaceReceiptTracker};
 use crate::{ComputerCancelToken, MobileCancelToken, ToolError, ToolResult};
 use async_trait::async_trait;
 use haider_protocol::EventPayload;
@@ -1106,6 +1107,7 @@ pub struct EffectBroker {
     observed_finalizers: Arc<Mutex<HashSet<u64>>>,
     computer_cancellations: HashMap<EffectId, ComputerCancelToken>,
     mobile_cancellations: HashMap<EffectId, MobileCancelToken>,
+    workspace_receipts: WorkspaceReceiptTracker,
     pub(crate) processes: ProcessRegistry,
 }
 
@@ -1172,6 +1174,7 @@ impl EffectBroker {
             observed_finalizers: Arc::new(Mutex::new(HashSet::new())),
             computer_cancellations: HashMap::new(),
             mobile_cancellations: HashMap::new(),
+            workspace_receipts: WorkspaceReceiptTracker::default(),
             processes: ProcessRegistry::default(),
         })
     }
@@ -1185,6 +1188,22 @@ impl EffectBroker {
     ) -> ToolResult<haider_platform::WorkspaceDirectory> {
         haider_platform::duplicate_workspace_directory(&self.workspace_dir)
             .map_err(|error| ToolError::io("duplicate workspace root", &self.workspace_root, error))
+    }
+
+    pub(crate) async fn begin_workspace_receipt(&self) -> WorkspaceReceiptLease {
+        self.workspace_receipts
+            .begin_foreground_for_root(self.workspace_root.clone())
+            .await
+    }
+
+    pub(crate) async fn begin_detached_workspace_receipt(&self) -> WorkspaceReceiptLease {
+        self.workspace_receipts
+            .begin_detached_for_root(self.workspace_root.clone())
+            .await
+    }
+
+    pub(crate) fn invalidate_workspace_receipts(&self) {
+        self.workspace_receipts.invalidate();
     }
 
     /// Read-only copy of every effect phase whose durable append succeeded.
@@ -1256,6 +1275,10 @@ impl EffectBroker {
         mut self,
         cancelled: bool,
     ) -> Result<EffectBrokerCloseReport, EffectBrokerCloseError> {
+        // Detached tasks retain a receipt lease after leaving the broker. Turn
+        // close makes their remaining lifetime attribution-ambiguous without
+        // cancelling the process itself.
+        self.workspace_receipts.invalidate();
         self.processes.cancel_all();
         let mut errors = Vec::new();
         self.drain_finalizers(&mut errors).await;

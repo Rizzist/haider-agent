@@ -67,8 +67,11 @@ fn repository_root_and_nested_ignore_rules_remain_workspace_confined() {
         &workspace.join("repo/src"),
         WalkOptions {
             respect_gitignore: true,
+            respect_global_gitignore: true,
             include_hidden: false,
+            stable_order: true,
             max_files: 100,
+            max_ignore_control_bytes: None,
             deadline: None,
         },
     )
@@ -80,6 +83,43 @@ fn repository_root_and_nested_ignore_rules_remain_workspace_confined() {
             std::path::PathBuf::from("repo/src/visible.rs"),
         ]
     );
+}
+
+#[test]
+fn repository_walk_reports_an_aggregate_ignore_control_byte_limit() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    fs::create_dir(workspace.path().join(".git")).expect("git marker");
+    fs::write(workspace.path().join(".gitignore"), "ignored\n").expect("ignore control");
+    fs::write(workspace.path().join("ignored"), "content").expect("ignored file");
+    let mut status = None;
+
+    stream_walk_files(
+        workspace.path(),
+        workspace.path(),
+        WalkOptions {
+            respect_gitignore: true,
+            respect_global_gitignore: false,
+            include_hidden: true,
+            stable_order: false,
+            max_files: 100,
+            max_ignore_control_bytes: Some(4),
+            deadline: None,
+        },
+        |entry| {
+            if let WalkEntry::Status {
+                ignore_control_bytes_read,
+                ignore_control_budget_reached,
+                ..
+            } = entry
+            {
+                status = Some((ignore_control_bytes_read, ignore_control_budget_reached));
+            }
+            Ok(ControlFlow::Continue(()))
+        },
+    )
+    .expect("bounded walk");
+
+    assert_eq!(status, Some((0, true)));
 }
 
 #[cfg(unix)]
@@ -96,8 +136,11 @@ fn symlinked_gitignore_controls_are_never_followed() {
         workspace.path(),
         WalkOptions {
             respect_gitignore: true,
+            respect_global_gitignore: true,
             include_hidden: true,
+            stable_order: true,
             max_files: 100,
+            max_ignore_control_bytes: None,
             deadline: None,
         },
     )
@@ -119,8 +162,11 @@ fn symlinked_git_metadata_ancestors_are_never_opened() {
         workspace.path(),
         WalkOptions {
             respect_gitignore: true,
+            respect_global_gitignore: true,
             include_hidden: true,
+            stable_order: true,
             max_files: 100,
+            max_ignore_control_bytes: None,
             deadline: None,
         },
     )
@@ -136,8 +182,11 @@ fn symlinked_git_metadata_ancestors_are_never_opened() {
         workspace.path(),
         WalkOptions {
             respect_gitignore: true,
+            respect_global_gitignore: true,
             include_hidden: true,
+            stable_order: true,
             max_files: 100,
+            max_ignore_control_bytes: None,
             deadline: None,
         },
     )
@@ -156,8 +205,11 @@ fn hidden_policy_and_file_cap_are_deterministic() {
         workspace.path(),
         WalkOptions {
             respect_gitignore: false,
+            respect_global_gitignore: true,
             include_hidden: false,
+            stable_order: true,
             max_files: 1,
+            max_ignore_control_bytes: None,
             deadline: None,
         },
     )
@@ -174,8 +226,11 @@ fn streamed_walk_preserves_empty_exact_cap_and_over_cap_results() {
         workspace.path(),
         WalkOptions {
             respect_gitignore: false,
+            respect_global_gitignore: true,
             include_hidden: false,
+            stable_order: true,
             max_files: 2,
+            max_ignore_control_bytes: None,
             deadline: None,
         },
     )
@@ -190,8 +245,11 @@ fn streamed_walk_preserves_empty_exact_cap_and_over_cap_results() {
         workspace.path(),
         WalkOptions {
             respect_gitignore: false,
+            respect_global_gitignore: true,
             include_hidden: false,
+            stable_order: true,
             max_files: 2,
+            max_ignore_control_bytes: None,
             deadline: None,
         },
     )
@@ -208,8 +266,11 @@ fn streamed_walk_preserves_empty_exact_cap_and_over_cap_results() {
         workspace.path(),
         WalkOptions {
             respect_gitignore: false,
+            respect_global_gitignore: true,
             include_hidden: false,
+            stable_order: true,
             max_files: 2,
+            max_ignore_control_bytes: None,
             deadline: None,
         },
     )
@@ -228,8 +289,11 @@ fn hidden_entries_consume_the_enumeration_cap() {
         workspace.path(),
         WalkOptions {
             respect_gitignore: false,
+            respect_global_gitignore: true,
             include_hidden: false,
+            stable_order: true,
             max_files: 1,
+            max_ignore_control_bytes: None,
             deadline: None,
         },
     )
@@ -248,8 +312,11 @@ fn ignore_controls_precede_caps_and_strip_utf8_bom() {
         workspace.path(),
         WalkOptions {
             respect_gitignore: true,
+            respect_global_gitignore: true,
             include_hidden: true,
+            stable_order: true,
             max_files: 100,
+            max_ignore_control_bytes: None,
             deadline: None,
         },
     )
@@ -268,8 +335,11 @@ fn ignore_controls_precede_caps_and_strip_utf8_bom() {
         workspace.path(),
         WalkOptions {
             respect_gitignore: true,
+            respect_global_gitignore: true,
             include_hidden: true,
+            stable_order: true,
             max_files: 1,
+            max_ignore_control_bytes: None,
             deadline: None,
         },
     )
@@ -293,8 +363,11 @@ fn dot_git_is_always_excluded_and_noncanonical_roots_are_rejected() {
         workspace.path(),
         WalkOptions {
             respect_gitignore: false,
+            respect_global_gitignore: true,
             include_hidden: true,
+            stable_order: true,
             max_files: 100,
+            max_ignore_control_bytes: None,
             deadline: Some(Instant::now() + std::time::Duration::from_secs(1)),
         },
     )
@@ -308,8 +381,11 @@ fn dot_git_is_always_excluded_and_noncanonical_roots_are_rejected() {
             &escaped,
             WalkOptions {
                 respect_gitignore: false,
+                respect_global_gitignore: true,
                 include_hidden: true,
+                stable_order: true,
                 max_files: 100,
+                max_ignore_control_bytes: None,
                 deadline: None,
             },
         )

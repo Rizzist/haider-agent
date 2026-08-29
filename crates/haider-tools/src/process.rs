@@ -13,6 +13,7 @@
 use crate::broker::{EffectBroker, EffectOperation, FinalizerObserver, PermissionPolicy};
 use crate::filesystem::CasSink;
 use crate::shell::UserProcessExec;
+use crate::workspace_receipt::{WorkspaceStateReceipt, workspace_state_receipt};
 use crate::{ToolError, ToolResult};
 use async_trait::async_trait;
 use base64::Engine;
@@ -28,13 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::env;
-use std::io::{Read, Write};
-#[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
-#[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,205 +53,6 @@ pub const PROCESS_MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 /// Bounded raw result retained solely as deterministic adapter input. The
 /// process bound validator prevents diagnostic prefixes from being discarded.
 pub const PROCESS_ADAPTER_INPUT_BYTES: usize = PROCESS_MAX_OUTPUT_BYTES;
-
-/// Maximum regular-file content read by one workspace receipt.
-///
-/// Metadata for every visited entry is still included. This budget prevents a
-/// large build tree, sparse file, or concurrently growing file from delaying
-/// process spawn/completion in proportion to workspace byte size.
-const WORKSPACE_DIGEST_CONTENT_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
-
-fn update_workspace_digest_field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
-    hasher.update(&(bytes.len() as u64).to_be_bytes());
-    hasher.update(bytes);
-}
-
-fn hash_regular_file(
-    path: &Path,
-    observed_len: u64,
-    hasher: &mut blake3::Hasher,
-    content_budget: &mut u64,
-) {
-    let permitted = observed_len.min(*content_budget);
-    let mut read_total = 0_u64;
-    match std::fs::File::open(path) {
-        Ok(mut file) => {
-            let mut buffer = [0_u8; 64 * 1024];
-            while read_total < permitted {
-                let chunk_len = buffer.len().min((permitted - read_total) as usize);
-                match file.read(&mut buffer[..chunk_len]) {
-                    Ok(0) => {
-                        hasher.update(b"content-short-read");
-                        break;
-                    }
-                    Ok(read) => {
-                        hasher.update(&buffer[..read]);
-                        read_total += read as u64;
-                    }
-                    Err(error) => {
-                        hasher.update(b"read-file-error");
-                        update_workspace_digest_field(hasher, error.kind().to_string().as_bytes());
-                        break;
-                    }
-                }
-            }
-        }
-        Err(error) => {
-            hasher.update(b"open-file-error");
-            update_workspace_digest_field(hasher, error.kind().to_string().as_bytes());
-            return;
-        }
-    }
-    *content_budget = content_budget.saturating_sub(read_total);
-    if read_total == observed_len {
-        hasher.update(b"content-complete");
-    } else {
-        hasher.update(b"content-elided");
-        hasher.update(&observed_len.saturating_sub(read_total).to_be_bytes());
-    }
-}
-
-/// Fingerprints the observable workspace tree before and after a process.
-/// Directory ordering and all field boundaries are canonical. File metadata
-/// is always included, while contents use a global budget so command execution
-/// is never gated on reading an arbitrarily large file in full. Atime is
-/// deliberately excluded so taking the snapshot cannot classify itself as a
-/// mutation.
-#[cfg(unix)]
-pub fn workspace_state_digest(root: &Path) -> String {
-    fn walk(root: &Path, relative: &Path, hasher: &mut blake3::Hasher, content_budget: &mut u64) {
-        let path = root.join(relative);
-        let metadata = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                hasher.update(b"metadata-error");
-                update_workspace_digest_field(hasher, relative.as_os_str().as_bytes());
-                update_workspace_digest_field(hasher, error.kind().to_string().as_bytes());
-                return;
-            }
-        };
-        update_workspace_digest_field(hasher, relative.as_os_str().as_bytes());
-        hasher.update(&metadata.mode().to_be_bytes());
-        hasher.update(&metadata.uid().to_be_bytes());
-        hasher.update(&metadata.gid().to_be_bytes());
-        hasher.update(&metadata.ino().to_be_bytes());
-        hasher.update(&metadata.mtime().to_be_bytes());
-        hasher.update(&metadata.mtime_nsec().to_be_bytes());
-        hasher.update(&metadata.ctime().to_be_bytes());
-        hasher.update(&metadata.ctime_nsec().to_be_bytes());
-        let file_type = metadata.file_type();
-        if file_type.is_dir() {
-            hasher.update(b"directory");
-            let mut entries = match std::fs::read_dir(&path) {
-                Ok(entries) => entries.filter_map(Result::ok).collect::<Vec<_>>(),
-                Err(error) => {
-                    hasher.update(b"read-dir-error");
-                    update_workspace_digest_field(hasher, error.kind().to_string().as_bytes());
-                    return;
-                }
-            };
-            entries.sort_by(|left, right| {
-                left.file_name()
-                    .as_bytes()
-                    .cmp(right.file_name().as_bytes())
-            });
-            for entry in entries {
-                walk(
-                    root,
-                    &relative.join(entry.file_name()),
-                    hasher,
-                    content_budget,
-                );
-            }
-        } else if file_type.is_file() {
-            hasher.update(b"file");
-            hasher.update(&metadata.len().to_be_bytes());
-            hash_regular_file(&path, metadata.len(), hasher, content_budget);
-        } else if file_type.is_symlink() {
-            hasher.update(b"symlink");
-            match std::fs::read_link(&path) {
-                Ok(target) => update_workspace_digest_field(hasher, target.as_os_str().as_bytes()),
-                Err(error) => {
-                    hasher.update(b"read-link-error");
-                    update_workspace_digest_field(hasher, error.kind().to_string().as_bytes());
-                }
-            }
-        } else {
-            hasher.update(b"special");
-            hasher.update(&metadata.rdev().to_be_bytes());
-        }
-    }
-
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"haider.workspace-state.v2");
-    let mut content_budget = WORKSPACE_DIGEST_CONTENT_BUDGET_BYTES;
-    walk(root, Path::new(""), &mut hasher, &mut content_budget);
-    format!("blake3:{}", hasher.finalize().to_hex())
-}
-
-#[cfg(windows)]
-pub fn workspace_state_digest(root: &Path) -> String {
-    fn walk(root: &Path, relative: &Path, hasher: &mut blake3::Hasher, content_budget: &mut u64) {
-        let path = root.join(relative);
-        let metadata = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                hasher.update(b"metadata-error");
-                update_workspace_digest_field(hasher, relative.to_string_lossy().as_bytes());
-                update_workspace_digest_field(hasher, error.kind().to_string().as_bytes());
-                return;
-            }
-        };
-        update_workspace_digest_field(hasher, relative.to_string_lossy().as_bytes());
-        hasher.update(&metadata.len().to_be_bytes());
-        hasher.update(&metadata.file_attributes().to_be_bytes());
-        hasher.update(&metadata.creation_time().to_be_bytes());
-        hasher.update(&metadata.last_write_time().to_be_bytes());
-        let file_type = metadata.file_type();
-        if file_type.is_dir() {
-            hasher.update(b"directory");
-            let mut entries = match std::fs::read_dir(&path) {
-                Ok(entries) => entries.filter_map(Result::ok).collect::<Vec<_>>(),
-                Err(error) => {
-                    hasher.update(b"read-dir-error");
-                    update_workspace_digest_field(hasher, error.kind().to_string().as_bytes());
-                    return;
-                }
-            };
-            entries.sort_by_key(std::fs::DirEntry::file_name);
-            for entry in entries {
-                walk(
-                    root,
-                    &relative.join(entry.file_name()),
-                    hasher,
-                    content_budget,
-                );
-            }
-        } else if file_type.is_file() {
-            hasher.update(b"file");
-            hash_regular_file(&path, metadata.len(), hasher, content_budget);
-        } else if file_type.is_symlink() {
-            hasher.update(b"symlink");
-            match std::fs::read_link(&path) {
-                Ok(target) => {
-                    update_workspace_digest_field(hasher, target.to_string_lossy().as_bytes())
-                }
-                Err(error) => {
-                    hasher.update(b"read-link-error");
-                    update_workspace_digest_field(hasher, error.kind().to_string().as_bytes());
-                }
-            }
-        } else {
-            hasher.update(b"special");
-        }
-    }
-
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"haider.workspace-state.v2");
-    let mut content_budget = WORKSPACE_DIGEST_CONTENT_BUDGET_BYTES;
-    walk(root, Path::new(""), &mut hasher, &mut content_budget);
-    format!("blake3:{}", hasher.finalize().to_hex())
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessExec {
@@ -909,14 +705,7 @@ impl EffectBroker {
             None => self.begin_user_typed(&prepared).await?,
         };
         let workspace_root = self.workspace_root().to_path_buf();
-        let before_workspace_digest = tokio::task::spawn_blocking({
-            let workspace_root = workspace_root.clone();
-            move || workspace_state_digest(&workspace_root)
-        })
-        .await
-        .map_err(|error| ToolError::Runtime {
-            message: format!("workspace snapshot worker failed before process execution: {error}"),
-        })?;
+        let workspace_receipt = self.begin_workspace_receipt().await;
         let cwd_fd =
             match prepared.cwd_for_spawn(self.workspace_root(), self.duplicate_workspace_dir()?) {
                 Ok(cwd_fd) => cwd_fd,
@@ -1084,26 +873,22 @@ impl EffectBroker {
                         .push(ProcessLifecycleEvent::RegistryRemoved);
                 }
             }
-            let after_workspace_digest =
-                tokio::task::spawn_blocking(move || workspace_state_digest(&workspace_root))
+            let after_workspace_receipt =
+                match tokio::task::spawn_blocking(move || workspace_state_receipt(&workspace_root))
                     .await
-                    .map_err(|error| ToolError::Runtime {
-                        message: format!(
-                            "workspace snapshot worker failed after process execution: {error}"
-                        ),
+                {
+                    Ok(receipt) => receipt,
+                    Err(_) => WorkspaceStateReceipt::worker_failed(),
+                };
+            let workspace_mutation =
+                workspace_receipt
+                    .finish(after_workspace_receipt)
+                    .map(|mutation_digest| WorkspaceMutation {
+                        effect_id: effect.clone(),
+                        mutation_digest,
+                        workspace_revision: None,
+                        subject_digest: None,
                     });
-            let workspace_mutation = match after_workspace_digest {
-                Ok(after) => (after != before_workspace_digest).then(|| WorkspaceMutation {
-                    effect_id: effect.clone(),
-                    mutation_digest: after,
-                    workspace_revision: None,
-                    subject_digest: None,
-                }),
-                Err(error) => {
-                    process_result.result = Err(error);
-                    None
-                }
-            };
             let outcome = match (&process_result.result, process_result.cancelled) {
                 (_, true) => match &process_result.escalation_note {
                     Some(note) => EffectOutcome::CancelledEscalated { note: note.clone() },

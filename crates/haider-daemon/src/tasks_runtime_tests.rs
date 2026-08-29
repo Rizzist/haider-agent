@@ -791,6 +791,10 @@ impl Provider for GatedProvider {
 async fn active_run_completion_steers_mid_turn_with_exactly_one_durable_nudge() {
     let profile = tempfile::tempdir().expect("profile");
     let (_workspace, cwd) = workspace();
+    // This fixture journals the background effect to `DropJournal`, outside
+    // the session store. Use a repository receipt so the no-op workspace path
+    // remains precise and does not fabricate provenance for that absent effect.
+    std::fs::create_dir(std::path::Path::new(&cwd).join(".git")).expect("repository marker");
     let store = SqliteStoreHandle::open(profile.path())
         .await
         .expect("store");

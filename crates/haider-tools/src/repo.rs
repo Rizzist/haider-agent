@@ -20,12 +20,22 @@ const IGNORE_CONTROL_MAX_BYTES: usize = 256 * 1024;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct WalkOptions {
     pub respect_gitignore: bool,
+    /// Honor Git's user-global ignore file. Receipt callers disable this so a
+    /// workspace digest never reads policy outside the workspace root.
+    pub respect_global_gitignore: bool,
     pub include_hidden: bool,
+    /// Preserve deterministic path order by sorting each directory before it
+    /// is yielded. Receipt callers disable this: sorting a single enormous
+    /// directory would enumerate it before the entry cap can fire.
+    pub stable_order: bool,
     /// Hard cap on enumerated directories, visible files, ignore controls,
     /// and symlinks. Hidden regular files directly under the requested root
     /// are filtered before this cap; hidden directories and their descendants
     /// still consume it so traversal remains bounded.
     pub max_files: usize,
+    /// Aggregate bytes that may be read from repository-local ignore control
+    /// files. `None` preserves the legacy per-file-only limit.
+    pub max_ignore_control_bytes: Option<u64>,
     pub deadline: Option<Instant>,
 }
 
@@ -33,6 +43,9 @@ pub(crate) struct WalkOptions {
 pub(crate) struct WalkOutcome {
     pub truncated: bool,
     pub time_budget_reached: bool,
+    pub entries_visited: usize,
+    pub symlinks_visited: usize,
+    pub special_entries_visited: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -45,6 +58,8 @@ pub(crate) enum WalkEntry<'a> {
     Status {
         truncated: bool,
         time_budget_reached: bool,
+        ignore_control_bytes_read: u64,
+        ignore_control_budget_reached: bool,
     },
     HiddenSensitiveFile(&'a Path),
     File(&'a Path),
@@ -135,11 +150,6 @@ pub(crate) fn walk_files(
         .git_ignore(false)
         .git_global(false)
         .git_exclude(false)
-        .sort_by_file_path(|left, right| {
-            is_gitignore_name(right)
-                .cmp(&is_gitignore_name(left))
-                .then_with(|| left.cmp(right))
-        })
         .filter_entry(move |entry| {
             let path = entry.path();
             if path != filter_root && is_git_metadata_name(path) {
@@ -154,10 +164,19 @@ pub(crate) fn walk_files(
                 || path.starts_with(&requested)
                 || ancestor_gitignore
         });
+    if options.stable_order {
+        builder.sort_by_file_path(|left, right| {
+            is_gitignore_name(right)
+                .cmp(&is_gitignore_name(left))
+                .then_with(|| left.cmp(right))
+        });
+    }
 
     let mut raw_files = Vec::new();
     let mut raw_directories = Vec::new();
     let mut entries_seen = 0usize;
+    let mut symlinks_seen = 0usize;
+    let mut special_entries_seen = 0usize;
     let mut truncated = false;
     let mut time_budget_reached = false;
     for entry in builder.build() {
@@ -190,6 +209,11 @@ pub(crate) fn walk_files(
             // silently discarding it would turn an unsafe control into an
             // environment-dependent empty walk.
             raw_files.push(entry.path().to_path_buf());
+        }
+        if file_type.is_symlink() {
+            symlinks_seen = symlinks_seen.saturating_add(1);
+        } else if !file_type.is_dir() && !file_type.is_file() {
+            special_entries_seen = special_entries_seen.saturating_add(1);
         }
         let root_hidden_regular_file = !options.include_hidden
             && file_type.is_file()
@@ -228,12 +252,20 @@ pub(crate) fn walk_files(
     raw_directories.dedup();
 
     let loaded = if options.respect_gitignore {
-        load_ignore_rules(workspace_root, repo_root.as_deref(), &raw_files)?
+        load_ignore_rules(
+            workspace_root,
+            repo_root.as_deref(),
+            &raw_files,
+            options.respect_global_gitignore,
+            options.max_ignore_control_bytes,
+        )?
     } else {
         LoadedIgnoreRules {
             global: Gitignore::empty(),
             repository_exclude: Gitignore::empty(),
             local: Vec::new(),
+            control_bytes_read: 0,
+            control_budget_reached: false,
         }
     };
     let ignore_rules = IgnoreRules {
@@ -273,6 +305,9 @@ pub(crate) fn walk_files(
                 return Ok(WalkOutcome {
                     truncated,
                     time_budget_reached,
+                    entries_visited: entries_seen,
+                    symlinks_visited: symlinks_seen,
+                    special_entries_visited: special_entries_seen,
                 });
             }
         }
@@ -288,6 +323,9 @@ pub(crate) fn walk_files(
                 return Ok(WalkOutcome {
                     truncated,
                     time_budget_reached,
+                    entries_visited: entries_seen,
+                    symlinks_visited: symlinks_seen,
+                    special_entries_visited: special_entries_seen,
                 });
             }
         }
@@ -295,12 +333,17 @@ pub(crate) fn walk_files(
     if consume(WalkEntry::Status {
         truncated,
         time_budget_reached,
+        ignore_control_bytes_read: loaded.control_bytes_read,
+        ignore_control_budget_reached: loaded.control_budget_reached,
     })?
     .is_break()
     {
         return Ok(WalkOutcome {
             truncated,
             time_budget_reached,
+            entries_visited: entries_seen,
+            symlinks_visited: symlinks_seen,
+            special_entries_visited: special_entries_seen,
         });
     }
     // Hidden-sensitive accounting is complete before the first visible file
@@ -322,6 +365,9 @@ pub(crate) fn walk_files(
                 return Ok(WalkOutcome {
                     truncated,
                     time_budget_reached,
+                    entries_visited: entries_seen,
+                    symlinks_visited: symlinks_seen,
+                    special_entries_visited: special_entries_seen,
                 });
             }
         }
@@ -344,6 +390,9 @@ pub(crate) fn walk_files(
     Ok(WalkOutcome {
         truncated,
         time_budget_reached,
+        entries_visited: entries_seen,
+        symlinks_visited: symlinks_seen,
+        special_entries_visited: special_entries_seen,
     })
 }
 
@@ -351,6 +400,9 @@ fn empty_walk() -> WalkOutcome {
     WalkOutcome {
         truncated: false,
         time_budget_reached: false,
+        entries_visited: 0,
+        symlinks_visited: 0,
+        special_entries_visited: 0,
     }
 }
 
@@ -402,22 +454,40 @@ struct LoadedIgnoreRules {
     global: Gitignore,
     repository_exclude: Gitignore,
     local: Vec<LocalIgnore>,
+    control_bytes_read: u64,
+    control_budget_reached: bool,
 }
 
 fn load_ignore_rules(
     workspace_root: &Path,
     repo_root: Option<&Path>,
     files: &[PathBuf],
+    respect_global_gitignore: bool,
+    max_control_bytes: Option<u64>,
 ) -> ToolResult<LoadedIgnoreRules> {
     // This intentionally honors Git's user-configured global policy. Unlike
     // WalkBuilder's git flags, it does not discover repository parents.
-    let (global, _) = GitignoreBuilder::new(workspace_root).build_global();
+    let global = if respect_global_gitignore {
+        GitignoreBuilder::new(workspace_root).build_global().0
+    } else {
+        Gitignore::empty()
+    };
+    let mut control_budget = max_control_bytes.unwrap_or(u64::MAX);
+    let mut control_bytes_read = 0_u64;
+    let mut control_budget_reached = false;
     let repository_exclude = if let Some(repo_root) = repo_root {
         let metadata = repo_root.join(".git");
         if std::fs::symlink_metadata(&metadata).is_ok_and(|m| m.file_type().is_dir()) {
             let exclude = metadata.join("info/exclude");
             let relative = workspace_relative(workspace_root, &exclude)?;
-            build_anchored_ignore(workspace_root, repo_root, relative)?
+            build_anchored_ignore(
+                workspace_root,
+                repo_root,
+                relative,
+                &mut control_budget,
+                &mut control_bytes_read,
+                &mut control_budget_reached,
+            )?
         } else {
             Gitignore::empty()
         }
@@ -437,15 +507,26 @@ fn load_ignore_rules(
             continue;
         };
         let relative = workspace_relative(workspace_root, &control)?;
-        local.push(LocalIgnore {
-            base: base.to_path_buf(),
-            matcher: build_anchored_ignore(workspace_root, base, relative)?,
-        });
+        if !control_budget_reached {
+            local.push(LocalIgnore {
+                base: base.to_path_buf(),
+                matcher: build_anchored_ignore(
+                    workspace_root,
+                    base,
+                    relative,
+                    &mut control_budget,
+                    &mut control_bytes_read,
+                    &mut control_budget_reached,
+                )?,
+            });
+        }
     }
     Ok(LoadedIgnoreRules {
         global,
         repository_exclude,
         local,
+        control_bytes_read,
+        control_budget_reached,
     })
 }
 
@@ -453,9 +534,23 @@ fn build_anchored_ignore(
     workspace_root: &Path,
     base: &Path,
     relative: &Path,
+    control_budget: &mut u64,
+    control_bytes_read: &mut u64,
+    control_budget_reached: &mut bool,
 ) -> ToolResult<Gitignore> {
-    let Some(contents) = read_anchored_optional(workspace_root, relative)? else {
+    let Some(contents) = read_anchored_optional(workspace_root, relative, *control_budget)? else {
         return Ok(Gitignore::empty());
+    };
+    let contents = match contents {
+        IgnoreControlRead::Complete { contents, bytes } => {
+            *control_budget = control_budget.saturating_sub(bytes);
+            *control_bytes_read = control_bytes_read.saturating_add(bytes);
+            contents
+        }
+        IgnoreControlRead::BudgetExceeded => {
+            *control_budget_reached = true;
+            return Ok(Gitignore::empty());
+        }
     };
     let mut builder = GitignoreBuilder::new(base);
     for (index, line) in contents.lines().enumerate() {
@@ -479,8 +574,17 @@ fn build_anchored_ignore(
     })
 }
 
+enum IgnoreControlRead {
+    Complete { contents: String, bytes: u64 },
+    BudgetExceeded,
+}
+
 #[cfg(unix)]
-fn read_anchored_optional(workspace_root: &Path, relative: &Path) -> ToolResult<Option<String>> {
+fn read_anchored_optional(
+    workspace_root: &Path,
+    relative: &Path,
+    remaining_budget: u64,
+) -> ToolResult<Option<IgnoreControlRead>> {
     use rustix::fs::{Mode, OFlags};
 
     let mut directory = haider_platform::open_workspace_directory(workspace_root)
@@ -517,12 +621,17 @@ fn read_anchored_optional(workspace_root: &Path, relative: &Path) -> ToolResult<
     read_ignore_file(
         std::fs::File::from(directory),
         workspace_root.join(relative),
+        remaining_budget,
     )
     .map(Some)
 }
 
 #[cfg(windows)]
-fn read_anchored_optional(workspace_root: &Path, relative: &Path) -> ToolResult<Option<String>> {
+fn read_anchored_optional(
+    workspace_root: &Path,
+    relative: &Path,
+    remaining_budget: u64,
+) -> ToolResult<Option<IgnoreControlRead>> {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
     const FILE_SHARE_READ: u32 = 0x0000_0001;
     const FILE_SHARE_WRITE: u32 = 0x0000_0002;
@@ -570,23 +679,45 @@ fn read_anchored_optional(workspace_root: &Path, relative: &Path) -> ToolResult<
             message: "ignore control is a reparse point".into(),
         });
     }
-    read_ignore_file(file, path).map(Some)
+    read_ignore_file(file, path, remaining_budget).map(Some)
 }
 
-fn read_ignore_file(file: std::fs::File, path: PathBuf) -> ToolResult<String> {
-    let mut bytes = Vec::new();
-    let byte_limit = u64::try_from(IGNORE_CONTROL_MAX_BYTES.saturating_add(1)).unwrap_or(u64::MAX);
-    file.take(byte_limit)
-        .read_to_end(&mut bytes)
-        .map_err(|error| ToolError::io("read ignore control", &path, error))?;
-    if bytes.len() > IGNORE_CONTROL_MAX_BYTES {
+fn read_ignore_file(
+    mut file: std::fs::File,
+    path: PathBuf,
+    remaining_budget: u64,
+) -> ToolResult<IgnoreControlRead> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| ToolError::io("inspect ignore control", &path, error))?;
+    let observed_len = metadata.len();
+    if observed_len > IGNORE_CONTROL_MAX_BYTES as u64 {
         return Err(ToolError::invalid_argument(format!(
             "ignore control {} exceeds {IGNORE_CONTROL_MAX_BYTES} bytes",
             path.display()
         )));
     }
-    String::from_utf8(bytes).map_err(|error| ToolError::InvalidArgument {
+    if observed_len > remaining_budget {
+        return Ok(IgnoreControlRead::BudgetExceeded);
+    }
+    let capacity = usize::try_from(observed_len).unwrap_or(IGNORE_CONTROL_MAX_BYTES);
+    let mut bytes = Vec::with_capacity(capacity);
+    std::io::Read::by_ref(&mut file)
+        .take(observed_len)
+        .read_to_end(&mut bytes)
+        .map_err(|error| ToolError::io("read ignore control", &path, error))?;
+    if bytes.len() as u64 != observed_len {
+        return Err(ToolError::PathChanged {
+            path,
+            message: "ignore control changed while it was read".into(),
+        });
+    }
+    let contents = String::from_utf8(bytes).map_err(|error| ToolError::InvalidArgument {
         message: format!("ignore control {} is not UTF-8: {error}", path.display()),
+    })?;
+    Ok(IgnoreControlRead::Complete {
+        contents,
+        bytes: observed_len,
     })
 }
 

@@ -7,6 +7,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use haider_protocol::EventPayload;
 use haider_protocol::effect::{
     AuthorizationSource, AuthorizationVerdict, EffectClass, EffectOutcome, EffectPhase,
+    WorkspaceMutation,
 };
 use haider_protocol::ids::{ArtifactRef, SessionId};
 use haider_protocol::item::{ItemDelta, ToolStatus};
@@ -203,6 +204,36 @@ fn process_policy() -> PermissionPolicy {
     policy
 }
 
+fn run_git(workspace: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(workspace)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .status()
+        .expect("run git fixture command");
+    assert!(status.success(), "git fixture command failed: {args:?}");
+}
+
+fn initialize_git_workspace(workspace: &Path) {
+    run_git(workspace, &["init", "-q"]);
+    run_git(workspace, &["add", "."]);
+    run_git(
+        workspace,
+        &[
+            "-c",
+            "user.name=Haider Tests",
+            "-c",
+            "user.email=haider-tests@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    );
+}
+
 fn phases(observer: &Arc<Mutex<Vec<EventPayload>>>) -> Vec<EffectPhase> {
     observer
         .lock()
@@ -210,6 +241,18 @@ fn phases(observer: &Arc<Mutex<Vec<EventPayload>>>) -> Vec<EffectPhase> {
         .iter()
         .filter_map(|payload| match payload {
             EventPayload::Effect(phase) => Some(phase.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn workspace_mutations(observer: &Arc<Mutex<Vec<EventPayload>>>) -> Vec<Option<WorkspaceMutation>> {
+    phases(observer)
+        .into_iter()
+        .filter_map(|phase| match phase {
+            EffectPhase::Outcome {
+                workspace_mutation, ..
+            } => Some(workspace_mutation),
             _ => None,
         })
         .collect()
@@ -234,6 +277,7 @@ fn output_bytes(deltas: &[ItemDelta]) -> Vec<u8> {
 #[test]
 fn process_exec_runs_and_returns_output_with_a_huge_workspace_file() {
     let workspace = tempfile::tempdir().expect("tempdir");
+    run_git(workspace.path(), &["init", "-q"]);
     let huge_path = workspace.path().join("huge-sparse.bin");
     let huge_file = fs::File::create(&huge_path).expect("create sparse workspace file");
     huge_file
@@ -250,6 +294,10 @@ fn process_exec_runs_and_returns_output_with_a_huge_workspace_file() {
         .recv_timeout(Duration::from_secs(5))
         .expect("workspace receipt must not read a huge file in full");
     assert!(digest.starts_with("blake3:"));
+    assert!(
+        digest.contains("reason=content_limit") || digest.contains("reason=wall_time_limit"),
+        "large-file receipt must expose the first hard bound reached: {digest}"
+    );
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -282,6 +330,63 @@ fn process_exec_runs_and_returns_output_with_a_huge_workspace_file() {
         assert_eq!(
             output_bytes(&observer.lock().expect("output observer")),
             b"scan-complete\n"
+        );
+        broker.close().await.expect("broker closes");
+    });
+}
+
+#[test]
+fn process_exec_repository_without_a_git_binary_still_detects_source_mutation() {
+    const CHILD: &str = "HAIDER_PROCESS_RECEIPT_NO_GIT_CHILD";
+    if std::env::var(CHILD).as_deref() != Ok("1") {
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "process_exec_repository_without_a_git_binary_still_detects_source_mutation",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PATH", "/definitely/no/git/here")
+            .status()
+            .expect("run no-git child");
+        assert!(status.success(), "no-git child must pass");
+        return;
+    }
+
+    let workspace = tempfile::tempdir().expect("tempdir");
+    fs::create_dir(workspace.path().join(".git")).expect("repository marker");
+    fs::write(workspace.path().join("source.rs"), "before").expect("seed source");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        let (mut broker, journal) = broker(workspace.path());
+        broker
+            .process_exec(
+                &ProcessExec::new("no-git-source", "printf after > source.rs"),
+                &process_policy(),
+                RecordingCas::default(),
+                RecordingOutput::default(),
+                ProcessBounds::default(),
+            )
+            .await
+            .expect("process starts without git")
+            .wait()
+            .await
+            .expect("process completes without git");
+
+        assert!(
+            workspace_mutations(&journal)
+                .into_iter()
+                .next()
+                .flatten()
+                .is_some(),
+            "repository walk fallback must detect the source mutation"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("source.rs")).expect("read source"),
+            "after"
         );
         broker.close().await.expect("broker closes");
     });
@@ -370,6 +475,7 @@ async fn workspace_mutation_fact_fires_only_when_process_changes_the_tree() {
     // advance revision state or lets a real process mutation disappear.
     let workspace = tempfile::tempdir().expect("tempdir");
     fs::write(workspace.path().join("input.txt"), "stable").expect("seed input");
+    initialize_git_workspace(workspace.path());
     let (mut broker, journal) = broker(workspace.path());
 
     broker
@@ -399,21 +505,310 @@ async fn workspace_mutation_fact_fires_only_when_process_changes_the_tree() {
         .await
         .expect("mutating process completes");
 
-    let outcomes = phases(&journal)
-        .into_iter()
-        .filter_map(|phase| match phase {
-            EffectPhase::Outcome {
-                workspace_mutation, ..
-            } => Some(workspace_mutation),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let outcomes = workspace_mutations(&journal);
     assert_eq!(outcomes.len(), 2);
     assert!(outcomes[0].is_none(), "pure read must not mutate");
     assert!(
         outcomes[1].is_some(),
         "real process mutation must be recorded"
     );
+    broker.close().await.expect("broker closes");
+}
+
+#[tokio::test]
+async fn non_repository_source_mutation_is_conservatively_detected_without_a_walk() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    fs::write(workspace.path().join("source.rs"), "before").expect("seed source");
+    let (mut broker, journal) = broker(workspace.path());
+
+    broker
+        .process_exec(
+            &ProcessExec::new("non-repo-mutation", "printf after > source.rs"),
+            &process_policy(),
+            RecordingCas::default(),
+            RecordingOutput::default(),
+            ProcessBounds::default(),
+        )
+        .await
+        .expect("process starts")
+        .wait()
+        .await
+        .expect("process completes");
+
+    let mutation = workspace_mutations(&journal)
+        .into_iter()
+        .next()
+        .flatten()
+        .expect("unknown non-repository coverage assumes mutation");
+    assert!(
+        mutation
+            .mutation_digest
+            .contains("reason=not_enumerated_non_repository")
+    );
+    assert!(mutation.mutation_digest.contains("before_entries=0"));
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("source.rs")).expect("read mutation"),
+        "after"
+    );
+    broker.close().await.expect("broker closes");
+}
+
+#[tokio::test]
+async fn entry_bound_is_reported_and_source_mutation_still_registers() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    fs::create_dir(workspace.path().join(".git")).expect("broken repository marker");
+    fs::create_dir(workspace.path().join("wide")).expect("wide directory");
+    for index in 0..4_200 {
+        fs::write(
+            workspace.path().join("wide").join(format!("entry-{index}")),
+            b"content",
+        )
+        .expect("wide entry");
+    }
+    let (mut broker, journal) = broker(workspace.path());
+
+    let execution = tokio::time::timeout(
+        Duration::from_secs(5),
+        broker.process_exec(
+            &ProcessExec::new("bounded-tree", "printf changed > source.rs"),
+            &process_policy(),
+            RecordingCas::default(),
+            RecordingOutput::default(),
+            ProcessBounds::default(),
+        ),
+    )
+    .await
+    .expect("entry-bounded receipt must not delay spawn")
+    .expect("process starts");
+    tokio::time::timeout(Duration::from_secs(5), execution.wait())
+        .await
+        .expect("entry-bounded receipt must not delay completion")
+        .expect("process completes");
+
+    let mutation = workspace_mutations(&journal)
+        .into_iter()
+        .next()
+        .flatten()
+        .expect("bounded unknown assumes mutation");
+    assert!(mutation.mutation_digest.contains("reason=entry_limit"));
+    assert!(mutation.mutation_digest.contains("before_entries=4097"));
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("source.rs")).expect("read mutation"),
+        "changed"
+    );
+    broker.close().await.expect("broker closes");
+}
+
+#[tokio::test]
+async fn gitignored_only_change_is_deliberately_not_a_workspace_mutation() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    fs::write(workspace.path().join(".gitignore"), "ignored.log\n").expect("ignore control");
+    fs::write(workspace.path().join("source.rs"), "stable").expect("tracked source");
+    initialize_git_workspace(workspace.path());
+    let (mut broker, journal) = broker(workspace.path());
+
+    broker
+        .process_exec(
+            &ProcessExec::new("ignored-only", "printf generated > ignored.log"),
+            &process_policy(),
+            RecordingCas::default(),
+            RecordingOutput::default(),
+            ProcessBounds::default(),
+        )
+        .await
+        .expect("process starts")
+        .wait()
+        .await
+        .expect("process completes");
+
+    assert_eq!(workspace_mutations(&journal), vec![None]);
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("ignored.log")).expect("ignored output"),
+        "generated"
+    );
+    broker.close().await.expect("broker closes");
+}
+
+#[tokio::test]
+async fn git_index_visibility_flags_cannot_hide_real_source_mutations() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    fs::write(workspace.path().join("assumed.rs"), "before assumed").expect("assumed source");
+    fs::write(workspace.path().join("skipped.rs"), "before skipped").expect("skipped source");
+    initialize_git_workspace(workspace.path());
+    run_git(
+        workspace.path(),
+        &["update-index", "--assume-unchanged", "assumed.rs"],
+    );
+    run_git(
+        workspace.path(),
+        &["update-index", "--skip-worktree", "skipped.rs"],
+    );
+    let (mut broker, journal) = broker(workspace.path());
+
+    broker
+        .process_exec(
+            &ProcessExec::new(
+                "git-hidden-source",
+                "printf 'after assumed' > assumed.rs; printf 'after skipped' > skipped.rs",
+            ),
+            &process_policy(),
+            RecordingCas::default(),
+            RecordingOutput::default(),
+            ProcessBounds::default(),
+        )
+        .await
+        .expect("process starts")
+        .wait()
+        .await
+        .expect("process completes");
+
+    assert!(
+        workspace_mutations(&journal)
+            .into_iter()
+            .next()
+            .flatten()
+            .is_some(),
+        "assume-unchanged and skip-worktree paths are content-hashed"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("assumed.rs")).expect("assumed source"),
+        "after assumed"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("skipped.rs")).expect("skipped source"),
+        "after skipped"
+    );
+    broker.close().await.expect("broker closes");
+}
+
+#[tokio::test]
+async fn a_commit_that_leaves_git_status_clean_is_detected_by_content_receipt() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    fs::write(workspace.path().join("source.rs"), "before").expect("tracked source");
+    initialize_git_workspace(workspace.path());
+    let (mut broker, journal) = broker(workspace.path());
+    let operation = ProcessExec::new(
+        "commit-source",
+        "printf after > source.rs; git add source.rs; \
+         git -c user.name='Haider Tests' -c user.email=haider-tests@example.invalid \
+         -c commit.gpgsign=false commit -qm command-mutation",
+    )
+    .with_env_allowlist(vec!["PATH".into()]);
+
+    broker
+        .process_exec(
+            &operation,
+            &process_policy(),
+            RecordingCas::default(),
+            RecordingOutput::default(),
+            ProcessBounds::default(),
+        )
+        .await
+        .expect("process starts")
+        .wait()
+        .await
+        .expect("process completes");
+
+    assert!(
+        workspace_mutations(&journal)
+            .into_iter()
+            .next()
+            .flatten()
+            .is_some(),
+        "anchored content coverage must detect a committed source mutation"
+    );
+    let clean = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(workspace.path())
+        .output()
+        .expect("git status");
+    assert!(clean.status.success());
+    assert!(clean.stdout.is_empty(), "fixture must end clean");
+    broker.close().await.expect("broker closes");
+}
+
+#[tokio::test]
+async fn prior_after_receipt_is_the_next_sequential_before_receipt() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    fs::write(workspace.path().join("source.rs"), "stable").expect("tracked source");
+    initialize_git_workspace(workspace.path());
+    let (mut broker, journal) = broker(workspace.path());
+
+    broker
+        .process_exec(
+            &ProcessExec::new("create-transient", "printf transient > transient.txt"),
+            &process_policy(),
+            RecordingCas::default(),
+            RecordingOutput::default(),
+            ProcessBounds::default(),
+        )
+        .await
+        .expect("create starts")
+        .wait()
+        .await
+        .expect("create completes");
+    broker
+        .process_exec(
+            &ProcessExec::new("remove-transient", "rm transient.txt"),
+            &process_policy(),
+            RecordingCas::default(),
+            RecordingOutput::default(),
+            ProcessBounds::default(),
+        )
+        .await
+        .expect("remove starts")
+        .wait()
+        .await
+        .expect("remove completes");
+
+    let mutations = workspace_mutations(&journal);
+    assert_eq!(mutations.len(), 2);
+    assert!(mutations[0].is_some(), "creation must register");
+    assert!(
+        mutations[1].is_some(),
+        "removal must compare with the prior after-receipt, not the turn-start receipt"
+    );
+    broker.close().await.expect("broker closes");
+}
+
+#[tokio::test]
+async fn overlapping_process_receipts_are_conservatively_unknown_for_both_commands() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    fs::write(workspace.path().join("source.rs"), "stable").expect("tracked source");
+    initialize_git_workspace(workspace.path());
+    let (mut broker, journal) = broker(workspace.path());
+
+    let first = broker
+        .process_exec(
+            &ProcessExec::new("overlap-first", "sleep 0.2"),
+            &process_policy(),
+            RecordingCas::default(),
+            RecordingOutput::default(),
+            ProcessBounds::default(),
+        )
+        .await
+        .expect("first starts");
+    let second = broker
+        .process_exec(
+            &ProcessExec::new("overlap-second", "printf stable >/dev/null"),
+            &process_policy(),
+            RecordingCas::default(),
+            RecordingOutput::default(),
+            ProcessBounds::default(),
+        )
+        .await
+        .expect("second starts");
+    second.wait().await.expect("second completes");
+    first.wait().await.expect("first completes");
+
+    let mutations = workspace_mutations(&journal);
+    assert_eq!(mutations.len(), 2);
+    assert!(mutations.iter().all(Option::is_some));
+    assert!(mutations.iter().flatten().all(|mutation| {
+        mutation
+            .mutation_digest
+            .contains("reason=concurrent_or_interleaved_mutation")
+    }));
     broker.close().await.expect("broker closes");
 }
 

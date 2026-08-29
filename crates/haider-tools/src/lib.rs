@@ -29,6 +29,7 @@ mod tasks;
 mod todo_write;
 mod webfetch;
 mod workflow_author;
+mod workspace_receipt;
 
 /// Default byte ceiling for a complete tool result to remain inline. A result
 /// that crosses this boundary is frozen in CAS and represented by a bounded
@@ -92,7 +93,6 @@ pub use process::{
     PROCESS_MAX_OUTPUT_BYTES, PROCESS_OUTPUT_CHUNK_BYTES, ProcessBounds, ProcessCancelHandle,
     ProcessControl, ProcessControlAction, ProcessControlResult, ProcessExec, ProcessExecution,
     ProcessLifecycleEvent, ProcessLimit, ProcessOutputChunk, ProcessResult, ProcessSignal,
-    workspace_state_digest,
 };
 pub use redact::redact_lockdown_text;
 pub use request_input::{RequestInput, RequestInputAnswer, RequestInputKind, RequestInputOption};
@@ -114,6 +114,10 @@ pub use webfetch::{
     WEB_FETCH_TOOL_OUTPUT_CAP_BYTES, WebFetch, web_fetch_manifest, web_search_manifest,
 };
 pub use workflow_author::{WorkflowAuthor, workflow_author_manifest};
+pub use workspace_receipt::{
+    WorkspaceReceiptCoverage, WorkspaceReceiptStrategy, WorkspaceReceiptUnknownReason,
+    WorkspaceStateReceipt, workspace_state_digest, workspace_state_receipt,
+};
 
 /// Crate marker used by the workspace self-test.
 pub const CRATE_NAME: &str = "haider-tools";

@@ -133,6 +133,15 @@ async fn background_spawn_returns_immediately_and_survives_broker_close() {
     kill.kill();
     let status = supervision.await.expect("supervision joins");
     assert!(status.killed, "kill ladder must report killed: {status:?}");
+    assert!(
+        status
+            .workspace_mutation
+            .as_ref()
+            .is_some_and(|mutation| mutation
+                .mutation_digest
+                .contains("reason=concurrent_or_interleaved_mutation")),
+        "turn close makes the detached lifetime conservatively unknown"
+    );
     assert_eq!(probe_group_liveness(pid), PidLiveness::Dead);
 }
 
