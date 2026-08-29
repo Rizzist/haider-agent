@@ -275,6 +275,27 @@ impl ChipDisplayState {
         }
     }
 
+    /// True while the chip's turn is ACTIVELY RUNNING — the chip-view twin of
+    /// [`crate::projection::SessionProjection::is_turn_active`], and the gate
+    /// for that view's `● thinking…` tail. The session and the subagent screen
+    /// share one law: the indicator is up for the whole run, not just the
+    /// THINKING beat, so the sim/demo surface cannot drift from the real UI.
+    ///
+    /// The exclusions mirror the session's exactly: `Waiting` (a child holds
+    /// the turn, and that case already prints its own "waiting on N child"
+    /// tail row — including it here would stack two indicators), `Idle`,
+    /// `InputRequired` (blocked on the user, with a menu on screen), and the
+    /// terminal `Done`/`Error`. Call it on `display_state()`, never on the raw
+    /// `state`, so a chip promoted to `Waiting` by live children is judged by
+    /// the same truth its badge shows.
+    #[must_use]
+    pub const fn is_turn_active(self) -> bool {
+        matches!(
+            self,
+            Self::Thinking | Self::Streaming | Self::Running | Self::Tool
+        )
+    }
+
     /// `CHIP_GLYPH` (tui.js:332-342); closed chips render `⊘` everywhere.
     #[must_use]
     pub const fn glyph(self) -> &'static str {

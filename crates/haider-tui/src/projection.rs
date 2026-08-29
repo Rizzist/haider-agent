@@ -1315,11 +1315,46 @@ impl SessionProjection {
         })
     }
 
-    /// True while the run is in its THINKING beat — the sim shows a
-    /// transient `● thinking…` line at the transcript tail.
+    /// True while the run is in its THINKING beat SPECIFICALLY. This is the
+    /// narrow beat predicate — it is NOT the tail-indicator gate (that is
+    /// [`Self::is_turn_active`]). Its remaining caller is the provider-open
+    /// progress readout, which is only meaningful before the response stream
+    /// opens; once the provider is streaming there is nothing left to wait on.
     #[must_use]
     pub const fn is_thinking(&self) -> bool {
         matches!(self.run, Some(RunState::Thinking))
+    }
+
+    /// True while a turn is ACTIVELY RUNNING — the gate for the transcript-tail
+    /// `● thinking…` indicator (owner report: the indicator vanished the moment
+    /// the run left the Thinking beat, so a visibly `▮ STREAMING` turn showed
+    /// nothing above the composer; it must be up for the whole run).
+    ///
+    /// Derived from [`Self::badge_tone`] ON PURPOSE rather than from a second
+    /// hand-written variant list: the badge already classifies every
+    /// `RunState`, and two parallel taxonomies would drift the first time a
+    /// variant is added. A new state is therefore classified in exactly one
+    /// place, and the exhaustive match there is the compiler's reminder.
+    ///
+    /// Shows for the Active / Tool / Compacting groups (`Thinking`,
+    /// `Streaming`, `Concluding`, `Verifying`, `RunningTool`, `Cancelling`,
+    /// `Compacting`). Deliberately EXCLUDED:
+    /// * Idle — `None`/`Done`/`Cancelled`: nothing is running.
+    /// * Restful — `Queued`/`Waiting`/`Retrying`: the owner excluded waiting,
+    ///   and `Retrying` already owns a dedicated tail row (`retrying_line`),
+    ///   so including it would stack two indicators at the same tail.
+    /// * Attention — `InputRequired`/`PermissionRequired`: blocked on the
+    ///   user, with a menu already on screen.
+    /// * `EffectUnknown` / `Error`: terminal honesty states, not work.
+    ///
+    /// Also false while the harness is `Starting` (the badge's own early
+    /// return), which keeps the boot screen's animation the only one running.
+    #[must_use]
+    pub fn is_turn_active(&self) -> bool {
+        matches!(
+            self.badge_tone(),
+            BadgeTone::Active | BadgeTone::Tool | BadgeTone::Compacting
+        )
     }
 
     /// W-G: true while the turn is actively producing OUTPUT — `Streaming`
