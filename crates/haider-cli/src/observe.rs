@@ -9,6 +9,7 @@ use haider_client::{
 };
 use haider_protocol::context::ContextFootprintTruth;
 use haider_protocol::ids::SessionId;
+use haider_protocol::session_fork::SessionForkProvenance;
 use haider_rpc::{ObserveRunStateWire, SessionFleetSnapshot, SessionObserveDigest};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -151,6 +152,10 @@ pub(crate) struct SessionSummaryView {
     pub last_activity_ms: Option<u64>,
     pub waiting_why: Option<haider_rpc::WaitingWhyWire>,
     pub needs_input: Option<haider_rpc::NeedsInputWire>,
+    /// Prompt-oriented fork provenance from `session.list`. Unlike delegation
+    /// lineage, this carries the exact source-prompt sequence selected as the
+    /// child's editable draft.
+    pub forked_from: Option<SessionForkProvenance>,
 }
 
 pub(crate) struct SessionDepthView {
@@ -306,6 +311,12 @@ impl ObserveJson for SessionSummaryView {
         }
         if let Some(needs_input) = &self.needs_input {
             object["needs_input"] = serde_json::to_value(needs_input).unwrap_or(Value::Null);
+        }
+        if let Some(provenance) = &self.forked_from {
+            object["forked_from"] = json!({
+                "session_id": provenance.session_id.as_str(),
+                "seq": provenance.seq,
+            });
         }
         object
     }
@@ -875,6 +886,7 @@ pub(crate) fn summary_view(digest: SessionObserveDigest) -> SessionSummaryView {
         last_activity_ms: None,
         waiting_why: None,
         needs_input: None,
+        forked_from: None,
         title: digest.title,
         run_state: run_state_name(digest.run_state),
         run_id: digest.run_id.as_ref().map(|run| run.as_str().to_owned()),
@@ -968,6 +980,7 @@ pub(crate) fn merge_roster_summary(
     view.last_activity_ms = summary.last_activity_ms;
     view.waiting_why = summary.waiting_why.clone();
     view.needs_input = summary.needs_input.clone();
+    view.forked_from = summary.forked_from.clone();
 }
 
 pub(crate) fn depth_view(digest: SessionObserveDigest) -> SessionDepthView {
@@ -1340,6 +1353,21 @@ pub(crate) fn exit_code_for_observe_error(error: &ObserveError) -> u8 {
 mod roster_scalar_tests {
     use super::*;
 
+    fn roster_summary(forked_from: Option<SessionForkProvenance>) -> haider_rpc::SessionSummary {
+        let mut value = json!({
+            "session_id": "session-view",
+            "head_seq": 7,
+            "worker_generation": 3,
+        });
+        if let Some(provenance) = forked_from {
+            value["forked_from"] = json!({
+                "session_id": provenance.session_id.as_str(),
+                "seq": provenance.seq,
+            });
+        }
+        serde_json::from_value(value).expect("roster summary decodes")
+    }
+
     fn view() -> SessionSummaryView {
         SessionSummaryView {
             id: "session-view".into(),
@@ -1363,18 +1391,21 @@ mod roster_scalar_tests {
             last_activity_ms: None,
             waiting_why: None,
             needs_input: None,
+            forked_from: None,
         }
     }
 
-    /// v0.0.936 CLI riders: the roster scalars and attention fields ride
+    /// Additive roster scalars, attention fields, and prompt-fork provenance ride
     /// `sessions --json` rows ADDITIVELY — absent when the daemon (or the
     /// merge) has nothing, present with their wire shapes when populated.
     ///
-    /// MUTATION CHECK (executed): serialize a field unconditionally (or drop
-    /// one of the merge assignments) and the absent/present halves fail.
+    /// MUTATION CHECK (executed): serialize a field unconditionally or drop the
+    /// fork-provenance merge assignment and the absent/present halves fail.
     #[test]
     fn roster_scalars_ride_sessions_json_rows_additively() {
-        let bare = view().json();
+        let mut bare = view();
+        merge_roster_summary(&mut bare, &roster_summary(None));
+        let bare = bare.json();
         for key in [
             "effort",
             "fast",
@@ -1383,11 +1414,19 @@ mod roster_scalar_tests {
             "last_activity_ms",
             "waiting_why",
             "needs_input",
+            "forked_from",
         ] {
             assert!(bare.get(key).is_none(), "absent `{key}` must not serialize");
         }
 
         let mut populated = view();
+        merge_roster_summary(
+            &mut populated,
+            &roster_summary(Some(SessionForkProvenance {
+                session_id: SessionId::new("session-source"),
+                seq: 42,
+            })),
+        );
         populated.effort = Some("high".into());
         populated.fast = Some(false);
         populated.agent_type = Some("@scout".into());
@@ -1415,6 +1454,10 @@ mod roster_scalar_tests {
         assert_eq!(json["agent_type"], "@scout");
         assert_eq!(json["seen_at_ms"], 1_000);
         assert_eq!(json["last_activity_ms"], 2_000);
+        assert_eq!(
+            json["forked_from"],
+            serde_json::json!({"session_id": "session-source", "seq": 42})
+        );
         assert_eq!(
             json["waiting_why"],
             serde_json::json!({"kind": "permission"})
