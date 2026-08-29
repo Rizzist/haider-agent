@@ -77,6 +77,7 @@ fn haider() -> HaiderCommand {
     // real ~/AGENTS.md into every test daemon's prompt and journal.
     let workspace = profile_root.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace dir");
+    configure_test_home(&mut command, &profile);
     command
         .current_dir(&workspace)
         .env("HAIDER_PROFILE_DIR", &profile)
@@ -91,6 +92,12 @@ fn haider() -> HaiderCommand {
         _profile_root: profile_root,
         profile,
     }
+}
+
+fn configure_test_home(command: &mut Command, profile: &Path) {
+    let home = profile.parent().unwrap_or(profile).join("machine-home");
+    std::fs::create_dir_all(&home).expect("create isolated machine-user home");
+    command.env("HOME", &home).env("USERPROFILE", home);
 }
 
 impl Drop for HaiderCommand {
@@ -814,6 +821,7 @@ fn detached_run_lifecycle_attempt() -> Result<(), DetachedLifecycleFailure> {
 
     let invoke = |arguments: &[&str]| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_haider"));
+        configure_test_home(&mut command, &starter.profile);
         command
             .args(arguments)
             .env("HAIDER_PROFILE_DIR", &starter.profile)
@@ -935,6 +943,7 @@ fn replay_reports_provider_divergence_without_hiding_it() {
     );
 
     let mut replay_command = Command::new(env!("CARGO_BIN_EXE_haider"));
+    configure_test_home(&mut replay_command, &source.profile);
     replay_command
         .args(["run", "--replay", run_id])
         .env("HAIDER_PROFILE_DIR", &source.profile)
@@ -1165,7 +1174,9 @@ fn one_shot_never_shuts_down_a_prestarted_incumbent() {
     );
     let pid = daemon_pid(&incumbent.profile).expect("incumbent PID");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_haider"))
+    let mut attached = Command::new(env!("CARGO_BIN_EXE_haider"));
+    configure_test_home(&mut attached, &incumbent.profile);
+    let output = attached
         .args(["run", "--provider", "fake", "--jsonl", "hello"])
         .env("HAIDER_PROFILE_DIR", &incumbent.profile)
         .env("HAIDER_DISCOVERY_DISABLED", "1")
@@ -1423,7 +1434,9 @@ fn sequential_ephemeral_cli_runs_advance_profile_owned_worker_generations() {
     let profile_parent = tempfile::tempdir().expect("temporary CLI profile parent");
     let profile = profile_parent.path().join("profile");
     let run = |prompt: &str| {
-        Command::new(env!("CARGO_BIN_EXE_haider"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_haider"));
+        configure_test_home(&mut command, &profile);
+        command
             .args(["run", "--provider", "fake", "--jsonl", prompt])
             .env("HAIDER_PROFILE_DIR", &profile)
             .env("HAIDER_DISCOVERY_DISABLED", "1")

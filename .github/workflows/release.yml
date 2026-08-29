@@ -51,9 +51,12 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           grep -q "^version = \"$TAG\"" Cargo.toml || { echo "tag v$TAG != workspace version"; exit 1; }
-      # Defender scans every intermediate artifact cargo writes, which is the
-      # largest single tax on the Windows runner. Best-effort: never fail a
-      # release over it.
+      # Defender scans every intermediate artifact cargo writes -- every .rlib,
+      # every object file -- which is the single largest tax on the Windows
+      # runner. Combined with lto="fat" + codegen-units=1 it made the Windows
+      # leg a ~2h long pole while every other platform finished in a fraction of
+      # that. Excluding the build tree and the toolchain processes is the
+      # cheapest available win. Best-effort: never fail a release over it.
       - name: exclude the build tree from Defender (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -64,7 +67,7 @@ jobs:
             foreach ($p in @('rustc.exe','cargo.exe','link.exe','lld-link.exe')) {
               Add-MpPreference -ExclusionProcess $p -ErrorAction Stop
             }
-            Write-Host "Defender exclusions applied."
+            Write-Host "Defender exclusions applied for the build tree and toolchain."
           } catch {
             Write-Warning "Could not apply Defender exclusions: $_. Build continues, just slower."
           }
@@ -72,14 +75,28 @@ jobs:
         if: runner.os != 'Windows'
         run: cargo build --release --locked -p haider-cli -p haider-daemond --target ${{ matrix.target }}
       # WINDOWS ONLY: thin LTO across 16 codegen units instead of fat LTO in one.
-      # v0.0.965 added russh for cross-platform SSH and with it 76 crates of
-      # crypto (fiat-crypto, curve25519-dalek, elliptic-curve, ml-kem, p256 ...),
-      # which are heavily generic and emit enormous LLVM IR. Under
-      # lto="fat" + codegen-units=1 all of it is optimised as ONE single-threaded
-      # unit and the cost is superlinear in IR size: the Windows leg went from 33
-      # minutes on v0.0.964 to over 3.5 hours here while every other platform
-      # stayed fast. Set via CARGO_PROFILE_RELEASE_* so every other platform keeps
-      # fat LTO byte-for-byte unchanged.
+      #
+      # v0.0.965 added russh for cross-platform SSH, which pulls 76 crates of
+      # crypto -- fiat-crypto, curve25519-dalek, elliptic-curve, crypto-bigint,
+      # ml-kem, p256, ed25519-dalek. That code is heavily generic and heavily
+      # inlined, so it produces an enormous amount of LLVM IR. Under
+      # lto="fat" + codegen-units=1 all of it is optimised as ONE
+      # single-threaded unit, and the cost is superlinear in IR size: the
+      # Windows leg went from 33 minutes on v0.0.964 to over 3.5 hours on
+      # v0.0.965 while every other platform stayed fast. MSVC compounds it by
+      # writing the PDB single-threaded from the same link.
+      #
+      # Thin LTO is parallel and incremental across codegen units and recovers
+      # most of fat LTO's runtime benefit for a fraction of the link cost. The
+      # trade is a marginally less optimised Windows binary, which is plainly
+      # worth it against a multi-hour link that risks the 6h job ceiling.
+      #
+      # Set via CARGO_PROFILE_RELEASE_* rather than Cargo.toml so EVERY other
+      # platform keeps fat LTO byte-for-byte unchanged.
+      #
+      # MEASURED on the v0.0.965 re-tag: 28m42s, i.e. faster than v0.0.964's
+      # 33 minutes despite 86 more crates. Record the number each release
+      # rather than trusting this comment.
       - name: build (Windows, thin LTO)
         if: runner.os == 'Windows'
         env:
@@ -160,6 +177,49 @@ jobs:
             test "$("$BIN" --version)" = "haider $TAG"
           else
             "$BIN" --version
+          fi
+      # THE GATE THAT WOULD HAVE CAUGHT THE 0.0.964 WINDOWS P0.
+      #
+      # `self-test` and `--version` never reach profile resolution, so for the
+      # entire life of the project the release gate could not see that
+      # ProfileEnv::capture() read only HOME -- which is not a Windows
+      # environment variable. Every Windows user got exit 70 before anything
+      # happened; on Explorer the console vanished with the message inside it.
+      #
+      # `--ready` is the scriptable front door: it resolves the profile,
+      # connect-or-spawns the daemon, reports, and exits. It is the shallowest
+      # command that exercises the real startup path.
+      #
+      # HAIDER_PROFILE_DIR is deliberately NOT set here. Setting it is exactly
+      # what blinded every existing Windows integration test: it short-circuits
+      # the resolver under test. HOME is scrubbed for the same reason -- the
+      # xplat suite runs under Git Bash, which exports HOME, so a stock-Windows
+      # bug survives a green Windows CI run. This asserts what a real user has:
+      # USERPROFILE and no HOME.
+      - name: front door resolves a profile from a stock environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXE=""; [ "$RUNNER_OS" = "Windows" ] && EXE=".exe"
+          BIN="$PWD/target/${{ matrix.target }}/release/haider$EXE"
+          OUT="$RUNNER_TEMP/front-door.txt"
+
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # Reproduce Explorer/PowerShell: USERPROFILE present, HOME absent.
+            env -u HOME -u HAIDER_PROFILE_DIR "$BIN" --ready > "$OUT" 2>&1 && rc=0 || rc=$?
+          else
+            env -u HAIDER_PROFILE_DIR "$BIN" --ready > "$OUT" 2>&1 && rc=0 || rc=$?
+          fi
+
+          cat "$OUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::the front door failed with exit $rc from a stock environment" >&2
+            exit 1
+          fi
+          # Belt and braces: even a zero exit must not carry the resolver error.
+          if grep -qi "cannot resolve a profile directory" "$OUT"; then
+            echo "::error::profile resolution failed -- this is the 0.0.964 Windows P0 class" >&2
+            exit 1
           fi
       - name: notarize macOS binaries
         if: runner.os == 'macOS'
@@ -243,6 +303,60 @@ jobs:
           cp "$BIN" "$DBIN" dist/$NAME/
           if [ "$RUNNER_OS" = "Linux" ]; then cp "$WBIN" dist/$NAME/; fi
           if [ "$RUNNER_OS" = "Windows" ]; then
+            # haider.exe is a CONSOLE binary. Double-clicked from Explorer,
+            # Windows destroys the console the instant the process exits and
+            # takes any error with it -- the reported "blank window for a
+            # second, then disappears". Ship a launcher that holds the window
+            # open on a non-zero exit, and a README covering the SmartScreen
+            # prompt that an unsigned binary necessarily produces.
+            # printf, not a heredoc: a heredoc terminator must sit at column 0
+            # and would break this YAML block scalar.
+            printf '%s\r\n' \
+              '@echo off' \
+              'cd /d "%~dp0"' \
+              'haider.exe %*' \
+              'set HAIDER_EXIT=%ERRORLEVEL%' \
+              'if not "%HAIDER_EXIT%"=="0" (' \
+              '  echo.' \
+              '  echo haider exited with code %HAIDER_EXIT%.' \
+              '  echo The message above is the reason.' \
+              '  echo Report it at https://github.com/Rizzist/haider-agent/issues' \
+              '  echo.' \
+              '  pause' \
+              ')' \
+              'exit /b %HAIDER_EXIT%' > "dist/$NAME/haider.cmd"
+            printf '%s\r\n' \
+              'Haider for Windows' \
+              '==================' \
+              '' \
+              'RUN IT' \
+              '  Double-click haider.cmd  (not haider.exe -- see below)' \
+              '' \
+              '  Or from a terminal, which is better because you keep the output:' \
+              '      cd path\to\this\folder' \
+              '      haider.exe' \
+              '' \
+              '  haider.exe is a console program. Double-clicked from Explorer,' \
+              '  Windows closes the window the moment it exits, so you never get' \
+              '  to read an error. haider.cmd keeps the window open on failure.' \
+              '' \
+              '"WINDOWS PROTECTED YOUR PC"' \
+              '  These binaries are not yet code-signed, so SmartScreen warns and' \
+              '  Defender may quarantine them. That warning is about the ABSENCE' \
+              '  of a signature, not about detected malicious behaviour.' \
+              '  To run anyway: click "More info", then "Run anyway".' \
+              '' \
+              '  Verify what you downloaded -- the release page publishes a' \
+              '  SHA-256 next to the zip:' \
+              '      certutil -hashfile <the-zip-you-downloaded> SHA256' \
+              '' \
+              'KEEP BOTH FILES TOGETHER' \
+              '  haider.exe starts haiderd.exe from its own folder. Moving one' \
+              '  without the other breaks it. To put haider on PATH, add this' \
+              '  whole folder rather than copying haider.exe elsewhere.' \
+              '' \
+              'Source, releases and issues:' \
+              '  https://github.com/Rizzist/haider-agent' > "dist/$NAME/README.txt"
             # Zip is the native Windows archive expectation; Explorer opens it
             # without extra tooling and sha256sum ships with Git Bash.
             (cd dist && 7z a -tzip "$NAME.zip" "$NAME" > /dev/null)

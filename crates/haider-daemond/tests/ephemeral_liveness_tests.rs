@@ -116,6 +116,7 @@ fn profile(store: &Path, runtime_root: &Path) -> ResolvedProfile {
     resolve_profile(&ProfileEnv {
         profile_dir: Some(store.to_path_buf()),
         home: None,
+        user_profile: None,
         model: None,
         runtime_dir: Some(runtime_root.to_path_buf()),
         xdg_runtime_dir: None,

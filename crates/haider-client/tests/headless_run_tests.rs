@@ -113,6 +113,7 @@ fn profile() -> (tempfile::TempDir, ResolvedProfile) {
     let profile = resolve_profile(&ProfileEnv {
         profile_dir: Some(root.path().join("profile")),
         home: None,
+        user_profile: None,
         model: None,
         runtime_dir: None,
         xdg_runtime_dir: None,

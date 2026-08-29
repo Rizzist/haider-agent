@@ -125,6 +125,7 @@ fn profile_for(store: &Path, endpoint: &Path) -> ResolvedProfile {
     let env = ProfileEnv {
         profile_dir: Some(store.to_path_buf()),
         home: None,
+        user_profile: None,
         model: None,
         runtime_dir: None,
         xdg_runtime_dir: None,

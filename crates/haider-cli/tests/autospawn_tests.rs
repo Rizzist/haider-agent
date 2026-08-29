@@ -87,6 +87,7 @@ fn resolved_for(store: &Path) -> ResolvedProfile {
     resolve_profile(&ProfileEnv {
         profile_dir: Some(store.to_path_buf()),
         home: None,
+        user_profile: None,
         model: None,
         runtime_dir: None,
         xdg_runtime_dir: None,
@@ -96,6 +97,7 @@ fn resolved_for(store: &Path) -> ResolvedProfile {
 
 fn haider_command(store: &Path) -> Command {
     let mut command = Command::new(haider_binary());
+    configure_test_home(&mut command, store);
     command
         .env("HAIDER_PROFILE_DIR", store)
         .env("HAIDER_DISCOVERY_DISABLED", "1")
@@ -113,6 +115,12 @@ fn haider_command(store: &Path) -> Command {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     command
+}
+
+fn configure_test_home(command: &mut Command, store: &Path) {
+    let home = store.join("machine-home");
+    std::fs::create_dir_all(&home).expect("create isolated machine-user home");
+    command.env("HOME", &home).env("USERPROFILE", home);
 }
 
 const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -495,7 +503,9 @@ fn a_second_daemon_candidate_for_one_profile_exits_seventy_five() {
         store: store.path().to_path_buf(),
     };
 
-    let winner = Command::new(&haiderd)
+    let mut winner = Command::new(&haiderd);
+    configure_test_home(&mut winner, store.path());
+    let winner = winner
         .arg("--profile")
         .arg(&profile.profile_id)
         .arg("--store-dir")
@@ -517,8 +527,10 @@ fn a_second_daemon_candidate_for_one_profile_exits_seventy_five() {
         "winner must bind its endpoint"
     );
 
+    let mut loser = Command::new(&haiderd);
+    configure_test_home(&mut loser, store.path());
     let loser = output_with_timeout(
-        Command::new(&haiderd)
+        loser
             .arg("--profile")
             .arg(&profile.profile_id)
             .arg("--store-dir")
