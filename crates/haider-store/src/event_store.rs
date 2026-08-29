@@ -79,7 +79,7 @@ use haider_protocol::loom::{
 use haider_protocol::menu::{Menu, MenuAnswer, MenuCloseReason, MenuKind};
 use haider_protocol::peer::PeerMessage;
 use haider_protocol::permission::PermissionEventPayload;
-use haider_protocol::pipe::InstructEvidenceRef;
+use haider_protocol::pipe::{InstructEvidenceRef, TranscriptProjector};
 use haider_protocol::project_instructions::ProjectInstructionsEventPayload;
 use haider_protocol::queue::{QueueChange, QueueDelta, QueueRow};
 use haider_protocol::retry::RunRetryEventPayload;
@@ -132,6 +132,13 @@ const WORKFLOW_BACKFILL_MAX_RESIDENT_BYTES: usize = 32 * 1_024 * 1_024;
 /// cannot be made useful by queueing it. The per-row charge below deliberately
 /// overestimates decoded strings, vectors, and allocator bookkeeping.
 const LOOM_REGISTRY_SNAPSHOT_MAX_RESIDENT_BYTES: usize = 16 * 1_024 * 1_024;
+/// A fork temporarily holds its selected source, remapped child, event-id
+/// index, and native-Pipe projection. Bound that complete operation before a
+/// large journal can turn a user request into process-wide allocation failure.
+const SESSION_FORK_MAX_RESIDENT_BYTES: usize = 128 * 1_024 * 1_024;
+/// Preserve a small filesystem cushion for SQLite transaction bookkeeping,
+/// metadata/receipt rows, Pipe headers, and concurrent non-fork maintenance.
+const SESSION_FORK_STORAGE_RESERVE_BYTES: u64 = 8 * 1_024 * 1_024;
 const USAGE_REDUCER_PAYLOAD_KINDS: &[&str] =
     &["usage", "agent_spawned", "run_failed", "session_forked"];
 const QUEUE_REDUCER_PAYLOAD_KINDS: &[&str] = &["user_message", "queue_changed"];
@@ -7982,26 +7989,6 @@ impl Store {
             decode_session_metadata(command.source_session_id, &source_metadata_json)?
                 .ok_or_else(|| corrupt("typed source session lost its metadata"))?;
         metadata.created_at_ms = now;
-        if let Some(name) = command.name {
-            metadata.title = Some(name.clone());
-        }
-        let metadata_json = serde_json::to_string(&metadata).map_err(|error| {
-            store_error(
-                ErrorCode::InvalidArgument,
-                format!("cannot serialize forked session metadata: {error}"),
-                false,
-            )
-        })?;
-        transaction
-            .execute(
-                "INSERT INTO sessions(id, created_at_ms, meta_json) VALUES (?1, ?2, ?3)",
-                params![
-                    command.session_id.as_str(),
-                    to_sqlite_integer(now)?,
-                    metadata_json
-                ],
-            )
-            .map_err(map_sqlite_error)?;
 
         let scopes = branch_lineage_scopes(
             &transaction,
@@ -8023,6 +8010,28 @@ impl Store {
                 "fork source lineage does not contain its created envelope",
             ));
         }
+        let fork_turn = fork_turn_ordinal(&source_envelopes, source_owner_agent.as_ref())?;
+        metadata.title = Some(match command.name {
+            Some(name) => name.to_owned(),
+            None => default_fork_title(metadata.title.as_deref(), fork_turn),
+        });
+        let metadata_json = serde_json::to_string(&metadata).map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize forked session metadata: {error}"),
+                false,
+            )
+        })?;
+        transaction
+            .execute(
+                "INSERT INTO sessions(id, created_at_ms, meta_json) VALUES (?1, ?2, ?3)",
+                params![
+                    command.session_id.as_str(),
+                    to_sqlite_integer(now)?,
+                    metadata_json
+                ],
+            )
+            .map_err(map_sqlite_error)?;
         if resolved_cut.forked_from.is_some() {
             resolved_cut.fork_node_id =
                 prompt_fork_head_node(&source_envelopes, source_owner_agent.as_ref())?;
@@ -8066,6 +8075,22 @@ impl Store {
                 )
             })
             .collect::<HashMap<_, _>>();
+        let source_resident_bytes = source_envelopes
+            .iter()
+            .map(envelope_weight_bytes)
+            .fold(0_usize, usize::saturating_add);
+        let event_id_index_bytes = event_ids.iter().fold(
+            event_ids
+                .len()
+                .saturating_mul(std::mem::size_of::<(EventId, EventId)>()),
+            |total, (source, child)| {
+                total
+                    .saturating_add(source.as_str().len())
+                    .saturating_add(child.as_str().len())
+            },
+        );
+        let mut fork_resident_bytes = source_resident_bytes.saturating_add(event_id_index_bytes);
+        ensure_fork_resident_budget(fork_resident_bytes)?;
         let mut matched_removals = model_proposal
             .as_ref()
             .map(|proposal| vec![false; proposal.removals.len()])
@@ -8126,7 +8151,8 @@ impl Store {
                     }
                 }
             }
-            insert_forked_envelope(&transaction, &child)?;
+            fork_resident_bytes = fork_resident_bytes.saturating_add(envelope_weight_bytes(&child));
+            ensure_fork_resident_budget(fork_resident_bytes)?;
             child_envelopes.push(child);
         }
         if matched_removals.iter().any(|matched| !matched) {
@@ -8140,14 +8166,19 @@ impl Store {
         // A copied source run is historical authority, never live child work.
         // Close any run whose terminal fact lies after the fork coordinate so
         // startup recovery cannot resume it in the independent child.
+        let boundary_start = child_envelopes.len();
         append_fork_boundary_closures(
-            &transaction,
             command.session_id,
             command.worker_generation,
             command.device_id,
             now,
             &mut child_envelopes,
         )?;
+        for envelope in &child_envelopes[boundary_start..] {
+            fork_resident_bytes =
+                fork_resident_bytes.saturating_add(envelope_weight_bytes(envelope));
+            ensure_fork_resident_budget(fork_resident_bytes)?;
+        }
 
         let audit_seq = u64::try_from(child_envelopes.len())
             .map_err(|_| corrupt("forked journal is too large"))?
@@ -8198,9 +8229,17 @@ impl Store {
                 )
             })?,
         };
-        insert_forked_envelope(&transaction, &audit)?;
-        enqueue_hook_dispatch(&transaction, &audit)?;
+        fork_resident_bytes = fork_resident_bytes.saturating_add(envelope_weight_bytes(&audit));
+        ensure_fork_resident_budget(fork_resident_bytes)?;
         child_envelopes.push(audit);
+
+        preflight_session_fork_storage(&self.root, &child_envelopes)?;
+        for envelope in &child_envelopes {
+            insert_forked_envelope(&transaction, envelope)?;
+        }
+        if let Some(audit) = child_envelopes.last() {
+            enqueue_hook_dispatch(&transaction, audit)?;
+        }
 
         let created = CreatedSessionFork {
             session_id: command.session_id.clone(),
@@ -21055,6 +21094,7 @@ fn load_fork_source_envelopes(
         .query([session_id.as_str()])
         .map_err(map_sqlite_error)?;
     let mut envelopes = Vec::new();
+    let mut resident_bytes = 0_usize;
     while let Some(row) = rows.next().map_err(map_sqlite_error)? {
         let stored_seq: i64 = row.get(0).map_err(map_sqlite_error)?;
         let stored_event_id: String = row.get(2).map_err(map_sqlite_error)?;
@@ -21076,10 +21116,181 @@ fn load_fork_source_envelopes(
                 .get(&envelope.branch_id)
                 .is_some_and(|ceiling| envelope.seq <= *ceiling)
         {
+            resident_bytes = resident_bytes.saturating_add(envelope_weight_bytes(&envelope));
+            if resident_bytes > SESSION_FORK_MAX_RESIDENT_BYTES {
+                return Err(store_error(
+                    ErrorCode::StoreFull,
+                    format!(
+                        "session fork source exceeds the bounded \
+                         {SESSION_FORK_MAX_RESIDENT_BYTES}-byte resident budget"
+                    ),
+                    false,
+                ));
+            }
             envelopes.push(envelope);
         }
     }
     Ok(envelopes)
+}
+
+fn fork_turn_ordinal(
+    source_envelopes: &[RawEnvelope],
+    source_owner_agent: Option<&AgentId>,
+) -> StoreResult<u64> {
+    let copied_turns = source_envelopes
+        .iter()
+        .filter(|envelope| {
+            envelope.agent_id.as_ref() == source_owner_agent
+                && payload_kind(envelope) == "user_message"
+        })
+        .count();
+    u64::try_from(copied_turns)
+        .map_err(|_| corrupt("fork turn count exceeds u64"))?
+        .checked_add(1)
+        .ok_or_else(|| corrupt("fork turn count is exhausted"))
+}
+
+fn default_fork_title(parent_title: Option<&str>, turn: u64) -> String {
+    const TITLE_MAX_CHARS: usize = 80;
+
+    let label = format!("fork before turn {turn}");
+    let Some(parent_title) = parent_title.filter(|title| !title.is_empty()) else {
+        return label;
+    };
+    let suffix = format!(" · {label}");
+    let parent_chars = TITLE_MAX_CHARS.saturating_sub(suffix.chars().count());
+    let parent = parent_title
+        .chars()
+        .take(parent_chars)
+        .collect::<String>()
+        .trim_end()
+        .to_owned();
+    if parent.is_empty() {
+        label
+    } else {
+        format!("{parent}{suffix}")
+    }
+}
+
+fn ensure_fork_resident_budget(resident_bytes: usize) -> StoreResult<()> {
+    if resident_bytes > SESSION_FORK_MAX_RESIDENT_BYTES {
+        return Err(store_error(
+            ErrorCode::StoreFull,
+            format!(
+                "session fork exceeds the bounded \
+                 {SESSION_FORK_MAX_RESIDENT_BYTES}-byte resident budget"
+            ),
+            false,
+        ));
+    }
+    Ok(())
+}
+
+fn preflight_session_fork_storage(root: &Path, envelopes: &[RawEnvelope]) -> StoreResult<()> {
+    let mut envelope_bytes = 0_u64;
+    for envelope in envelopes {
+        let encoded = encode_envelope(envelope).map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot estimate forked envelope storage: {error}"),
+                false,
+            )
+        })?;
+        envelope_bytes = checked_fork_storage_add(
+            envelope_bytes,
+            u64::try_from(encoded.len()).map_err(|_| fork_storage_overflow())?,
+        )?;
+    }
+
+    let pipe_bytes = projected_fork_pipe_bytes(envelopes)?;
+    // SQLite may hold the new pages in both its WAL and main database during
+    // checkpoint, while event indexes and projection rows add overhead. Pipe
+    // first-touch writes may likewise use a temporary root. These factors are
+    // intentionally conservative; the real write path still maps a racing
+    // ENOSPC to the same typed `store_full` outcome and rolls back SQLite.
+    let sqlite_growth = envelope_bytes
+        .checked_mul(6)
+        .ok_or_else(fork_storage_overflow)?;
+    let pipe_growth = pipe_bytes
+        .checked_mul(2)
+        .ok_or_else(fork_storage_overflow)?;
+    let required = checked_fork_storage_add(
+        checked_fork_storage_add(sqlite_growth, pipe_growth)?,
+        SESSION_FORK_STORAGE_RESERVE_BYTES,
+    )?;
+    let available = haider_platform::available_space(root).map_err(|error| {
+        store_error(
+            ErrorCode::StoreUnavailable,
+            format!(
+                "cannot inspect profile filesystem capacity at {}: {error}",
+                root.display()
+            ),
+            true,
+        )
+    })?;
+    ensure_session_fork_storage_available(required, available)
+}
+
+fn ensure_session_fork_storage_available(required: u64, available: u64) -> StoreResult<()> {
+    if available >= required {
+        return Ok(());
+    }
+    Err(store_error(
+        ErrorCode::StoreFull,
+        format!(
+            "session fork requires an estimated {required} bytes for journal and Pipe growth, \
+             but only {available} bytes are available"
+        ),
+        true,
+    ))
+}
+
+fn projected_fork_pipe_bytes(envelopes: &[RawEnvelope]) -> StoreResult<u64> {
+    let mut projector = TranscriptProjector::default();
+    let mut bytes = 0_u64;
+    for envelope in envelopes {
+        add_projected_pipe_rows(projector.push(envelope), &mut bytes)?;
+    }
+    add_projected_pipe_rows(projector.flush_unresolved_tools(), &mut bytes)?;
+    let envelope_count = u64::try_from(envelopes.len()).map_err(|_| fork_storage_overflow())?;
+    let structural_overhead = envelope_count
+        .checked_mul(512)
+        .and_then(|bytes| bytes.checked_add(4_096))
+        .ok_or_else(fork_storage_overflow)?;
+    checked_fork_storage_add(bytes, structural_overhead)
+}
+
+fn add_projected_pipe_rows(
+    rows: impl IntoIterator<Item = haider_protocol::pipe::SidecarRow>,
+    bytes: &mut u64,
+) -> StoreResult<()> {
+    for row in rows {
+        let encoded = serde_json::to_vec(&row).map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot estimate forked Pipe row storage: {error}"),
+                false,
+            )
+        })?;
+        let row_bytes = u64::try_from(encoded.len())
+            .map_err(|_| fork_storage_overflow())?
+            .checked_add(1)
+            .ok_or_else(fork_storage_overflow)?;
+        *bytes = checked_fork_storage_add(*bytes, row_bytes)?;
+    }
+    Ok(())
+}
+
+fn checked_fork_storage_add(left: u64, right: u64) -> StoreResult<u64> {
+    left.checked_add(right).ok_or_else(fork_storage_overflow)
+}
+
+fn fork_storage_overflow() -> HaiderError {
+    store_error(
+        ErrorCode::StoreFull,
+        "session fork storage estimate exceeds the supported size",
+        false,
+    )
 }
 
 fn remapped_fork_event_id(session_id: &SessionId, source_event_id: &EventId) -> EventId {
@@ -21160,7 +21371,6 @@ fn insert_forked_envelope(connection: &Connection, envelope: &RawEnvelope) -> St
 }
 
 fn append_fork_boundary_closures(
-    connection: &Connection,
     session_id: &SessionId,
     worker_generation: u64,
     device_id: &DeviceId,
@@ -21215,7 +21425,6 @@ fn append_fork_boundary_closures(
                 },
             )?,
         };
-        insert_forked_envelope(connection, &envelope)?;
         envelopes.push(envelope);
     }
     let seq = u64::try_from(envelopes.len())
@@ -21252,7 +21461,6 @@ fn append_fork_boundary_closures(
             )
         })?,
     };
-    insert_forked_envelope(connection, &idle)?;
     envelopes.push(idle);
     Ok(())
 }

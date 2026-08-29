@@ -18,7 +18,7 @@ use haider_protocol::verify::VerifyVerdict;
 use haider_store::{
     BranchCreateCommand, DelegationRecord, DelegationState, EventStore,
     ForkCacheInheritanceCandidate, SessionCreateCommand, SessionForkCommand, SessionForkOutcome,
-    SessionMetaforkCommit, Store, TurnAcceptCommand, TurnAcceptOutcome,
+    SessionMetaforkCommit, SessionRenameCommand, Store, TurnAcceptCommand, TurnAcceptOutcome,
     fork_provider_view_prefix_digest,
 };
 use rusqlite::types::ValueRef;
@@ -438,6 +438,87 @@ fn fork_audit(envelopes: &[EventEnvelope<serde_json::Value>]) -> SessionForked {
         .last()
         .and_then(|envelope| SessionForked::from_payload_value(&envelope.payload))
         .expect("fork audit fact")
+}
+
+/// The default fork title is provenance, not a prompt preview. Explicit names
+/// remain authoritative and the parent title is retained within the metadata
+/// limit.
+#[test]
+fn fork_title_uses_parent_provenance_and_never_prompt_text() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let source = SessionId::new("fork-title-parent");
+    create_session(&store, &source);
+    let rename_json = r#"{"title":"Parent plan"}"#.to_owned();
+    store
+        .rename_session(&SessionRenameCommand {
+            command_id: "fork-title-parent-rename".into(),
+            request_digest: blake3::hash(rename_json.as_bytes()).to_hex().to_string(),
+            request_json: rename_json,
+            session_id: source.clone(),
+            worker_generation: store.worker_generation(),
+            title: Some("Parent plan".into()),
+            only_if_untitled: false,
+            event_id: EventId::new("fork-title-parent-renamed"),
+            device_id: DeviceId::new("session-fork-test-device"),
+        })
+        .expect("title parent");
+    let sensitive_prompt = "SENSITIVE customer acquisition details";
+    let (_, node, seq, _) = source_turn(&store, &source, sensitive_prompt);
+
+    let mut default_command = fork_command(
+        &store,
+        "fork-title-default-command",
+        &source,
+        "fork-title-default-child",
+        node.clone(),
+        seq,
+        None,
+    );
+    default_command.name = None;
+    let SessionForkOutcome::Committed {
+        created: default_child,
+        ..
+    } = store
+        .fork_session(&default_command)
+        .expect("default-title fork")
+    else {
+        panic!("default-title fork must commit");
+    };
+    assert_eq!(
+        default_child.metadata.title.as_deref(),
+        Some("Parent plan · fork before turn 2")
+    );
+    assert!(
+        !default_child
+            .metadata
+            .title
+            .as_deref()
+            .is_some_and(|title| title.contains(sensitive_prompt))
+    );
+
+    let explicit_command = fork_command(
+        &store,
+        "fork-title-explicit-command",
+        &source,
+        "fork-title-explicit-child",
+        node,
+        seq,
+        None,
+    );
+    let SessionForkOutcome::Committed {
+        created: explicit_child,
+        ..
+    } = store
+        .fork_session(&explicit_command)
+        .expect("explicit-title fork")
+    else {
+        panic!("explicit-title fork must commit");
+    };
+    assert_eq!(
+        explicit_child.metadata.title.as_deref(),
+        Some("child fork-title-explicit-child")
+    );
 }
 
 /// MUTATION CHECK: change the clone loop's child `session_id` predicate to the

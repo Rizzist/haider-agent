@@ -297,6 +297,17 @@ impl SshProfileStore {
     /// Loads one durable session scope from the profile-scoped secret vault.
     /// Legacy sessions and sessions never narrowed default to `All`.
     pub(crate) fn session_scope(&self, session_id: &SessionId) -> Result<SshScope, SshError> {
+        Ok(self
+            .session_scope_if_present(session_id)?
+            .unwrap_or(SshScope::All))
+    }
+
+    /// Loads an explicitly persisted session scope without applying the
+    /// legacy absent-means-`All` compatibility rule.
+    pub(crate) fn session_scope_if_present(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<SshScope>, SshError> {
         let alias = scope_alias(session_id);
         match self.vault.resolve(&alias) {
             Ok(secret) => {
@@ -311,9 +322,9 @@ impl SshProfileStore {
                         name: format!("scope:{}", session_id.as_str()),
                     });
                 }
-                SshScope::from_wire(stored.scope)
+                SshScope::from_wire(stored.scope).map(Some)
             }
-            Err(error) if error.code == ErrorCode::CredentialMissing => Ok(SshScope::All),
+            Err(error) if error.code == ErrorCode::CredentialMissing => Ok(None),
             Err(error) => Err(vault_error(error)),
         }
     }
@@ -334,6 +345,15 @@ impl SshProfileStore {
         })?;
         self.vault
             .put(&scope_alias(session_id), &bytes)
+            .map_err(vault_error)
+    }
+
+    /// Removes a provisional fork scope. The session row is the visibility
+    /// authority, so this is used only while rolling back a child which never
+    /// committed to the journal.
+    pub(crate) fn delete_session_scope(&self, session_id: &SessionId) -> Result<(), SshError> {
+        self.vault
+            .delete(&scope_alias(session_id))
             .map_err(vault_error)
     }
 

@@ -2,20 +2,26 @@
 //! Private session-hub accounting tests.
 
 use super::*;
+use haider_accounts::Vault as _;
 use haider_protocol::EventPayload;
 use haider_protocol::effect::{
-    AuthorizationSource, AuthorizationVerdict, EffectOutcome, EffectPhase,
+    AuthorizationSource, AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome,
+    EffectPhase,
 };
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::graph::{EvidenceVerdict, GraphPhase, SHIP_LOOP_TEMPLATE};
-use haider_protocol::ids::{AgentId, BranchId, EventId, GraphId, ItemId, MenuId, RunId};
+use haider_protocol::history::{NodeKind, TreeNode};
+use haider_protocol::ids::{AgentId, BranchId, EventId, GraphId, ItemId, MenuId, NodeId, RunId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
-use haider_protocol::menu::{Menu, MenuCloseReason, MenuKind, MenuOption, MenuScope};
+use haider_protocol::menu::{
+    AnswerVia, DecisionKind, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption, MenuScope,
+};
 use haider_protocol::queue::QueueChange;
 use haider_protocol::session_fork::{
     SessionMetaforkProposal, SessionMetaforkRemoval, SessionMetaforkReviewManifest,
 };
 use haider_protocol::state::RunState;
+use haider_protocol::verify::VerifyVerdict;
 use haider_store::{
     GraphEvidenceCommand, GraphPinCommand, QueuePromoteCommand, QueueRemoveCommand,
     SessionCreateCommand, ShellExecAcceptCommand, ShellExecAcceptOutcome, TurnAcceptCommand,
@@ -38,7 +44,7 @@ fn model_inventory_miss_refreshes_even_without_a_fetch_timestamp() {
     ));
 }
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 
@@ -523,6 +529,10 @@ async fn concurrent_duplicate_fork_discards_the_losing_candidate_actor() {
     let root = tempfile::tempdir().expect("temp store");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    hub.install_accounts(transcription_facade(Arc::new(
+        haider_accounts::MemoryVault::default(),
+    )))
+    .expect("install scope vault");
     let source = SessionId::new("duplicate-fork-source");
     let generation = store.worker_generation();
     hub.create_internal_session(create_command(&source, "duplicate-fork-source"))
@@ -604,6 +614,592 @@ async fn concurrent_duplicate_fork_discards_the_losing_candidate_actor() {
         vec![created_id],
         "only the committed child candidate remains resident"
     );
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+async fn create_fork_ready_source(
+    hub: &SessionHub,
+    store: &SqliteStoreHandle,
+    label: &str,
+) -> (SessionId, NodeId, u64) {
+    let source = SessionId::new(format!("{label}-source"));
+    let run_id = RunId::new(format!("{label}-run"));
+    let generation = store.worker_generation();
+    hub.create_internal_session(create_command(&source, label))
+        .await
+        .expect("create fork source");
+    hub.accept_internal_turn(accept_command(&source, &run_id, generation, label))
+        .await
+        .expect("accept fork source turn");
+    let mut terminal = [run_state_envelope(
+        &source,
+        &run_id,
+        generation,
+        &format!("{label}-done"),
+        RunState::Done,
+    )];
+    hub.append(&mut terminal)
+        .await
+        .expect("complete fork source turn");
+    let events = store.read(&source, 0, 64).await.expect("read fork source");
+    let (node_id, seq) = events
+        .into_iter()
+        .find_map(|event| {
+            let EventPayload::NodeCommitted(node) =
+                serde_json::from_value::<EventPayload>(event.payload).ok()?
+            else {
+                return None;
+            };
+            Some((node.node, event.seq))
+        })
+        .expect("fork source node");
+    (source, node_id, seq)
+}
+
+fn private_fork_command(
+    store: &SqliteStoreHandle,
+    label: &str,
+    source: SessionId,
+    child: SessionId,
+    fork_node_id: NodeId,
+    fork_seq: u64,
+) -> SessionForkCommand {
+    let request_json = serde_json::json!({
+        "source": &source,
+        "fork_node_id": &fork_node_id,
+        "fork_seq": fork_seq,
+    })
+    .to_string();
+    SessionForkCommand {
+        command_id: format!("{label}-fork-command"),
+        request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+        request_json,
+        source_session_id: source,
+        session_id: child,
+        worker_generation: store.worker_generation(),
+        source_branch_id: None,
+        fork_node_id,
+        fork_seq,
+        name: None,
+        metafork: None,
+        audit_event_id: EventId::new(format!("{label}-fork-audit")),
+        device_id: DeviceId::new("fork-security-test"),
+    }
+}
+
+/// Fork scope inheritance is exact and durable for both narrowed variants;
+/// neither child may fall through the missing-record `All` compatibility path.
+#[tokio::test]
+async fn fork_clones_allow_and_none_ssh_scopes_exactly() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let vault = Arc::new(haider_accounts::MemoryVault::default());
+    hub.install_accounts(transcription_facade(vault.clone()))
+        .expect("install scope vault");
+
+    let cases = [
+        (
+            "allow-scope",
+            crate::ssh::SshScope::Allow(std::collections::BTreeSet::from(["a".to_owned()])),
+        ),
+        ("none-scope", crate::ssh::SshScope::None),
+    ];
+    for (label, scope) in cases {
+        let (source, fork_node_id, fork_seq) = create_fork_ready_source(&hub, &store, label).await;
+        hub.set_ssh_scope(source.clone(), scope.clone())
+            .expect("set parent scope");
+        let child = SessionId::new(format!("{label}-child"));
+        let outcome = hub
+            .fork_session(private_fork_command(
+                &store,
+                label,
+                source,
+                child.clone(),
+                fork_node_id,
+                fork_seq,
+            ))
+            .await
+            .expect("fork with narrowed scope");
+        assert!(matches!(
+            outcome,
+            SessionForkOutcome::Committed { ref created, .. }
+                if created.session_id == child
+        ));
+        assert_eq!(hub.ssh_scope(&child).expect("cached child scope"), scope);
+        let durable = crate::ssh::SshProfileStore::new(vault.clone());
+        assert_eq!(
+            durable.session_scope(&child).expect("durable child scope"),
+            scope,
+            "the child must have a physical scope record"
+        );
+    }
+
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+struct FailingScopePutVault {
+    inner: haider_accounts::MemoryVault,
+    fail_scope_put: AtomicBool,
+}
+
+impl haider_accounts::Vault for FailingScopePutVault {
+    fn put(
+        &self,
+        alias: &haider_accounts::CredentialAlias,
+        secret: &[u8],
+    ) -> haider_accounts::AccountsResult<()> {
+        if self.fail_scope_put.load(Ordering::SeqCst)
+            && alias.as_str().starts_with("haider.ssh.scope.")
+        {
+            return Err(haider_accounts::HaiderError::new(
+                haider_accounts::ErrorCode::Internal,
+                "injected SSH scope persistence failure",
+                false,
+            ));
+        }
+        self.inner.put(alias, secret)
+    }
+
+    fn resolve(
+        &self,
+        alias: &haider_accounts::CredentialAlias,
+    ) -> haider_accounts::AccountsResult<haider_accounts::SecretHandle> {
+        self.inner.resolve(alias)
+    }
+
+    fn delete(
+        &self,
+        alias: &haider_accounts::CredentialAlias,
+    ) -> haider_accounts::AccountsResult<()> {
+        self.inner.delete(alias)
+    }
+
+    fn list(&self) -> haider_accounts::AccountsResult<Vec<haider_accounts::CredentialAlias>> {
+        self.inner.list()
+    }
+}
+
+/// A failed scope write precedes the SQLite transaction, leaving no roster
+/// row, resident actor, journal, or provisional vault item.
+#[tokio::test]
+async fn failed_fork_scope_clone_leaves_no_observable_child() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let vault = Arc::new(FailingScopePutVault {
+        inner: haider_accounts::MemoryVault::default(),
+        fail_scope_put: AtomicBool::new(false),
+    });
+    hub.install_accounts(transcription_facade(vault.clone()))
+        .expect("install scope vault");
+    let (source, fork_node_id, fork_seq) =
+        create_fork_ready_source(&hub, &store, "scope-failure").await;
+    hub.set_ssh_scope(source.clone(), crate::ssh::SshScope::None)
+        .expect("set source scope");
+    let child = SessionId::new("scope-failure-child");
+    let sessions_before = store.session_ids().await.expect("sessions before");
+    vault.fail_scope_put.store(true, Ordering::SeqCst);
+
+    let error = hub
+        .fork_session(private_fork_command(
+            &store,
+            "scope-failure",
+            source,
+            child.clone(),
+            fork_node_id,
+            fork_seq,
+        ))
+        .await
+        .expect_err("scope clone must fail the fork");
+    assert!(error.to_string().contains("injected SSH scope"));
+    assert_eq!(
+        store.session_ids().await.expect("sessions after"),
+        sessions_before
+    );
+    assert!(hub.existing_actor(&child).expect("actor lookup").is_none());
+    assert!(
+        vault
+            .list()
+            .expect("vault aliases")
+            .iter()
+            .all(|alias| !alias.as_str().ends_with(child.as_str())),
+        "no provisional child scope alias may survive"
+    );
+
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+struct TouchThenFailScopeVault {
+    inner: haider_accounts::MemoryVault,
+    scope_failures_remaining: AtomicUsize,
+}
+
+impl haider_accounts::Vault for TouchThenFailScopeVault {
+    fn put(
+        &self,
+        alias: &haider_accounts::CredentialAlias,
+        secret: &[u8],
+    ) -> haider_accounts::AccountsResult<()> {
+        self.inner.put(alias, secret)?;
+        if self
+            .scope_failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+            && alias.as_str().starts_with("haider.ssh.scope.")
+        {
+            return Err(haider_accounts::HaiderError::new(
+                haider_accounts::ErrorCode::Internal,
+                "injected post-commit SSH scope failure",
+                false,
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolve(
+        &self,
+        alias: &haider_accounts::CredentialAlias,
+    ) -> haider_accounts::AccountsResult<haider_accounts::SecretHandle> {
+        self.inner.resolve(alias)
+    }
+
+    fn delete(
+        &self,
+        alias: &haider_accounts::CredentialAlias,
+    ) -> haider_accounts::AccountsResult<()> {
+        self.inner.delete(alias)
+    }
+
+    fn list(&self) -> haider_accounts::AccountsResult<Vec<haider_accounts::CredentialAlias>> {
+        self.inner.list()
+    }
+}
+
+/// A vault error after the exact bytes landed still requires a fully
+/// successful retry. Read-back alone cannot prove the directory entry was
+/// crash-durable after a directory-fsync failure.
+#[tokio::test]
+async fn post_touch_scope_error_requires_successful_retry_before_fork_commit() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let vault = Arc::new(TouchThenFailScopeVault {
+        inner: haider_accounts::MemoryVault::default(),
+        scope_failures_remaining: AtomicUsize::new(0),
+    });
+    hub.install_accounts(transcription_facade(vault.clone()))
+        .expect("install scope vault");
+    let (source, fork_node_id, fork_seq) =
+        create_fork_ready_source(&hub, &store, "post-touch-scope").await;
+    hub.set_ssh_scope(source.clone(), crate::ssh::SshScope::None)
+        .expect("set source scope");
+    vault.scope_failures_remaining.store(1, Ordering::SeqCst);
+    let child = SessionId::new("post-touch-scope-child");
+
+    let outcome = hub
+        .fork_session(private_fork_command(
+            &store,
+            "post-touch-scope",
+            source,
+            child.clone(),
+            fork_node_id,
+            fork_seq,
+        ))
+        .await
+        .expect("successful scope retry permits the fork");
+    assert!(matches!(outcome, SessionForkOutcome::Committed { .. }));
+    assert_eq!(
+        crate::ssh::SshProfileStore::new(vault)
+            .session_scope_if_present(&child)
+            .expect("read explicit child scope"),
+        Some(crate::ssh::SshScope::None)
+    );
+
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// If both the initial write and its durability retry fail after touching the
+/// vault, SQLite is never called and the best-effort delete leaves no child
+/// identity on any roster authority.
+#[tokio::test]
+async fn persistent_post_touch_scope_failure_leaves_no_observable_child() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let vault = Arc::new(TouchThenFailScopeVault {
+        inner: haider_accounts::MemoryVault::default(),
+        scope_failures_remaining: AtomicUsize::new(0),
+    });
+    hub.install_accounts(transcription_facade(vault.clone()))
+        .expect("install scope vault");
+    let (source, fork_node_id, fork_seq) =
+        create_fork_ready_source(&hub, &store, "persistent-post-touch").await;
+    hub.set_ssh_scope(source.clone(), crate::ssh::SshScope::None)
+        .expect("set source scope");
+    let child = SessionId::new("persistent-post-touch-child");
+    let sessions_before = store.session_ids().await.expect("sessions before");
+    vault.scope_failures_remaining.store(2, Ordering::SeqCst);
+
+    let error = hub
+        .fork_session(private_fork_command(
+            &store,
+            "persistent-post-touch",
+            source,
+            child.clone(),
+            fork_node_id,
+            fork_seq,
+        ))
+        .await
+        .expect_err("two failed durable writes must reject the fork");
+    assert!(error.to_string().contains("retry failed"));
+    assert_eq!(
+        store.session_ids().await.expect("sessions after"),
+        sessions_before
+    );
+    assert!(hub.existing_actor(&child).expect("actor lookup").is_none());
+    assert!(
+        vault
+            .list()
+            .expect("vault aliases")
+            .iter()
+            .all(|alias| !alias.as_str().ends_with(child.as_str()))
+    );
+
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// The final fork audit is the consent cut: historical `AllowAlways` answers
+/// stop there, while the metadata's explicit creation policy is inherited and
+/// remains an ordinary policy default for the child.
+#[tokio::test]
+async fn fork_resets_remembered_grants_but_keeps_creation_permission_policy() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    hub.install_accounts(transcription_facade(Arc::new(
+        haider_accounts::MemoryVault::default(),
+    )))
+    .expect("install scope vault");
+    let source = SessionId::new("permission-fork-source");
+    let run_id = RunId::new("permission-fork-run");
+    let mut create = create_command(&source, "permission-fork");
+    create.permission_overrides = Some(haider_protocol::session::SessionPermissionOverridesV1 {
+        allow_writes: true,
+        allow_exec: false,
+        allow_mobile: false,
+        auto_allow: false,
+    });
+    hub.create_internal_session(create)
+        .await
+        .expect("create permission source");
+    hub.accept_internal_turn(accept_command(
+        &source,
+        &run_id,
+        store.worker_generation(),
+        "permission-fork",
+    ))
+    .await
+    .expect("accept permission source turn");
+    let user_node = store
+        .read(&source, 0, 32)
+        .await
+        .expect("read user node")
+        .into_iter()
+        .find_map(|event| {
+            let EventPayload::NodeCommitted(node) =
+                serde_json::from_value::<EventPayload>(event.payload).ok()?
+            else {
+                return None;
+            };
+            Some(node.node)
+        })
+        .expect("user node");
+    let effect = haider_protocol::ids::EffectId::new("permission-fork-effect");
+    let menu_id = MenuId::new("permission-fork-menu");
+    let menu = Menu {
+        id: menu_id.clone(),
+        kind: MenuKind::Permission {
+            effect_summary: "write a file".into(),
+        },
+        title: "Allow write?".into(),
+        body: vec!["Allow this write for the session".into()],
+        options: vec![MenuOption {
+            key: "allow_always".into(),
+            label: "Always allow".into(),
+            detail: None,
+            decision: Some(DecisionKind::AllowAlways),
+        }],
+        blocking: true,
+        scope: MenuScope::Session,
+        origin: "fork-security-test".into(),
+        ttl_ms: None,
+        timeout_option: None,
+    };
+    let assistant_node = NodeId::new("permission-fork-assistant-node");
+    let generation = store.worker_generation();
+    let mut permission_facts = vec![
+        run_payload_envelope(
+            &source,
+            &run_id,
+            generation,
+            "permission-fork-intent",
+            EventPayload::Effect(EffectPhase::Intent(EffectIntent {
+                effect: effect.clone(),
+                class: EffectClass::FsWrite,
+                summary: "write a file".into(),
+                args_digest: "permission-fork-write-shape".into(),
+                workspace_revision: None,
+            })),
+        ),
+        run_payload_envelope(
+            &source,
+            &run_id,
+            generation,
+            "permission-fork-authorized",
+            EventPayload::Effect(EffectPhase::Authorized {
+                effect,
+                verdict: AuthorizationVerdict::Ask {
+                    menu: menu_id.clone(),
+                },
+            }),
+        ),
+        run_payload_envelope(
+            &source,
+            &run_id,
+            generation,
+            "permission-fork-menu-opened",
+            EventPayload::MenuOpened(menu),
+        ),
+        run_payload_envelope(
+            &source,
+            &run_id,
+            generation,
+            "permission-fork-menu-answered",
+            EventPayload::MenuAnswered(MenuAnswer {
+                menu: menu_id,
+                option_index: 0,
+                option_key: Some("allow_always".into()),
+                value: None,
+                via: AnswerVia::Rpc,
+            }),
+        ),
+        run_payload_envelope(
+            &source,
+            &run_id,
+            generation,
+            "permission-fork-computer-use",
+            EventPayload::UserMessage {
+                text: "/computer-use".into(),
+                attachments: Vec::new(),
+                mode: haider_protocol::DeliveryMode::Steer,
+            },
+        ),
+        run_payload_envelope(
+            &source,
+            &run_id,
+            generation,
+            "permission-fork-mobile-use",
+            EventPayload::UserMessage {
+                text: "/mobile-use".into(),
+                attachments: Vec::new(),
+                mode: haider_protocol::DeliveryMode::Steer,
+            },
+        ),
+        run_payload_envelope(
+            &source,
+            &run_id,
+            generation,
+            "permission-fork-assistant-node-event",
+            EventPayload::NodeCommitted(TreeNode {
+                node: assistant_node.clone(),
+                parent: Some(user_node),
+                kind: NodeKind::AssistantCommit {
+                    text: "completed write".into(),
+                    verdict: VerifyVerdict::NotApplicable,
+                },
+            }),
+        ),
+        run_state_envelope(
+            &source,
+            &run_id,
+            generation,
+            "permission-fork-done",
+            RunState::Done,
+        ),
+    ];
+    hub.append(&mut permission_facts)
+        .await
+        .expect("append permission history");
+    let fork_seq = permission_facts[6].seq;
+    let parent_state = crate::worker::durable_session_tool_state(&store, &source)
+        .await
+        .expect("parent grants");
+    assert!(
+        parent_state
+            .grants
+            .iter()
+            .any(|grant| grant.class == EffectClass::FsWrite),
+        "fixture must hold remembered AllowAlways consent"
+    );
+    assert!(
+        parent_state.mobile_use_active,
+        "fixture must hold prompt-derived mobile consent"
+    );
+
+    let child = SessionId::new("permission-fork-child");
+    let SessionForkOutcome::Committed { created, .. } = hub
+        .fork_session(private_fork_command(
+            &store,
+            "permission-fork",
+            source,
+            child.clone(),
+            assistant_node,
+            fork_seq,
+        ))
+        .await
+        .expect("fork permission history")
+    else {
+        panic!("permission fork must commit");
+    };
+    let child_state = crate::worker::durable_session_tool_state(&store, &child)
+        .await
+        .expect("child grants");
+    assert!(
+        child_state.grants.is_empty(),
+        "remembered and prompt-derived computer consent must not cross the fork audit boundary"
+    );
+    assert!(
+        !child_state.mobile_use_active,
+        "prompt-derived mobile consent must not cross the fork audit boundary"
+    );
+    let expected_overrides = haider_protocol::session::SessionPermissionOverridesV1 {
+        allow_writes: true,
+        allow_exec: false,
+        allow_mobile: false,
+        auto_allow: false,
+    };
+    assert_eq!(
+        created.metadata.permission_overrides,
+        Some(expected_overrides),
+        "creation policy is committed configuration, not accumulated consent"
+    );
+    assert!(
+        crate::worker::effective_permission_defaults(&created.metadata)
+            .into_iter()
+            .any(|(class, default)| {
+                class == EffectClass::FsWrite
+                    && default == haider_protocol::tool::ToolPermissionDefault::Allow
+            })
+    );
+
     hub.shutdown().await.expect("hub stops");
     store.close().await.expect("store closes");
 }
@@ -1466,6 +2062,10 @@ async fn metafork_review_is_write_free_until_human_acceptance() {
     let root = tempfile::tempdir().expect("profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    hub.install_accounts(transcription_facade(Arc::new(
+        haider_accounts::MemoryVault::default(),
+    )))
+    .expect("install scope vault");
     let source = SessionId::new("metafork-review-parent");
     hub.create_internal_session(SessionCreateCommand {
         command_id: "create-metafork-review-parent".into(),

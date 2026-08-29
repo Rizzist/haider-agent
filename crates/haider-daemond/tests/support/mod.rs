@@ -686,7 +686,14 @@ pub fn test_root(prefix: &str) -> tempfile::TempDir {
 fn hermetic(config: &DaemonConfig) -> DaemonConfig {
     let mut config = config.clone();
     config.discovery_disabled = true;
+    config.lockdown_root_override = Some(hermetic_machine_home().join(".haider").join("lockdown"));
     config
+}
+
+fn hermetic_machine_home() -> &'static Path {
+    static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
+    HOME.get_or_init(|| test_root("haider-machine-home-"))
+        .path()
 }
 
 pub async fn ready(config: &DaemonConfig) -> DaemonTask {

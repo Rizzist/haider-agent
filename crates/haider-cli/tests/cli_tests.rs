@@ -80,6 +80,10 @@ fn haider() -> HaiderCommand {
     command
         .current_dir(&workspace)
         .env("HAIDER_PROFILE_DIR", &profile)
+        // Lockdown and other machine-user-global subsystems must never escape
+        // this nominally hermetic profile into the developer's real home.
+        .env("HOME", profile_root.path())
+        .env("USERPROFILE", profile_root.path())
         .env_remove("HAIDER_MODEL")
         // Hermetic accounts: startup auto-adoption (A2) would otherwise read
         // the HOST machine's real codex/Claude credentials into this

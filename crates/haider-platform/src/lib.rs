@@ -26,8 +26,9 @@ pub use directory::{
 #[cfg(windows)]
 pub use fs::replace_file_with_backup;
 pub use fs::{
-    SyncPolicy, configure_directory_mode, configure_file_mode, metadata_is_current_user,
-    metadata_link_count, metadata_mode, replace_file, set_mode, sync_file,
+    SyncPolicy, available_space, configure_directory_mode, configure_file_mode,
+    metadata_is_current_user, metadata_link_count, metadata_mode, replace_file, set_mode,
+    sync_file,
 };
 pub use ipc::{
     BoundEndpoint, Endpoint, EndpointAddress, EndpointError, IpcReadHalf, IpcShutdown,
