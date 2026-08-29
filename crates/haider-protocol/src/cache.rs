@@ -5,6 +5,10 @@ use crate::item::TurnItem;
 use crate::provider::CacheRequestDiagnosticV1;
 use serde::{Deserialize, Serialize};
 
+/// Current exact provider-view ledger encoding. Older/future encodings remain
+/// decodable for audit, but cannot authorize fork cache inheritance.
+pub const PROVIDER_VIEW_SERIALIZATION_VERSION: &str = "haider.provider-view.json.v2";
+
 /// Stable additive extension kind for a named cache-epoch transition.
 pub const CACHE_EPOCH_TRANSITION_EXTENSION_KIND: &str = "cache_epoch_transition_v1";
 
@@ -95,6 +99,11 @@ pub struct ProviderViewStorageV1 {
 pub struct ProviderViewLedgerV1 {
     pub provider: String,
     pub model: String,
+    /// Exact output budget carried by the provider request. Although it sits
+    /// after the reusable prompt on common wires, changing it is a material
+    /// request-configuration boundary and must not inherit another route.
+    #[serde(default)]
+    pub max_tokens: u64,
     pub dialect: String,
     pub serialization_version: String,
     /// Content address of provider/model/system/tools/dialect/serialization.
@@ -133,6 +142,7 @@ impl ProviderViewLedgerV1 {
         struct Prefix<'a> {
             provider: &'a str,
             model: &'a str,
+            max_tokens: u64,
             dialect: &'a str,
             serialization_version: &'a str,
             header_epoch: &'a str,
@@ -153,6 +163,7 @@ impl ProviderViewLedgerV1 {
         let bytes = serde_json::to_vec(&Prefix {
             provider: &self.provider,
             model: &self.model,
+            max_tokens: self.max_tokens,
             dialect: &self.dialect,
             serialization_version: &self.serialization_version,
             header_epoch: &self.header_epoch,

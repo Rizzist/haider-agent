@@ -1,10 +1,11 @@
 use std::fmt;
 
-use haider_protocol::cache::{ProviderViewBlobV1, ProviderViewBoundaryV1, ProviderViewLedgerV1};
+use haider_protocol::cache::{
+    PROVIDER_VIEW_SERIALIZATION_VERSION, ProviderViewBlobV1, ProviderViewBoundaryV1,
+    ProviderViewLedgerV1,
+};
 
 use crate::TurnRequest;
-
-pub const PROVIDER_VIEW_SERIALIZATION_VERSION: &str = "haider.provider-view.json.v1";
 
 /// Adapter-prepared exact view. Only the content-addressed ledger survives
 /// request preparation. `storage_blobs` and `previous_history_blocks` are
@@ -228,6 +229,7 @@ pub(crate) fn prepared_serialized_provider_view(
         ledger: ProviderViewLedgerV1 {
             provider: metadata.provider.clone(),
             model: request.model.clone(),
+            max_tokens: request.max_tokens,
             dialect: dialect.to_owned(),
             serialization_version: PROVIDER_VIEW_SERIALIZATION_VERSION.into(),
             header_epoch,

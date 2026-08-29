@@ -678,7 +678,10 @@ impl SqliteStoreHandle {
         command: SessionForkCommand,
     ) -> Result<SessionForkOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
-        run_blocking(move || owner.with_store(|store| store.fork_session(&command))).await
+        run_blocking(move || {
+            owner.with_store(|store| store.fork_session_with_durable_cache_candidate(&command))
+        })
+        .await
     }
 
     /// Resolves and physically copies the stable prefix before one committed
@@ -688,8 +691,12 @@ impl SqliteStoreHandle {
         command: SessionPromptForkCommand,
     ) -> Result<SessionForkOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
-        run_blocking(move || owner.with_store(|store| store.fork_session_from_prompt(&command)))
-            .await
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.fork_session_from_prompt_with_durable_cache_candidate(&command)
+            })
+        })
+        .await
     }
 
     pub async fn branch_create_receipt(

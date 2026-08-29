@@ -2057,6 +2057,61 @@ fn prepared_cohort_key(provider: &dyn crate::Provider, request: &TurnRequest) ->
     .expect("prepared cohort key")
 }
 
+fn prepared_fork_provider_view_and_key(request: &TurnRequest) -> (String, String) {
+    let vault = MemoryVault::new();
+    let alias = CredentialAlias::new("fork-provider-view-key");
+    vault
+        .put(&alias, b"fork-provider-view-key-secret")
+        .expect("store fork provider-view credential");
+    let provider = OpenAiProvider::new(
+        vault.resolve(&alias).expect("resolve fork credential"),
+        &request.model,
+    )
+    .expect("construct fork provider");
+    let prepared = crate::Provider::prepare_turn(&provider, request).expect("prepare fork view");
+    let provider_view_key = prepared
+        .provider_view()
+        .expect("prepared fork provider view")
+        .ledger()
+        .prefix_digest()
+        .expect("digest fork provider view");
+    let prompt_cache_key = prepared
+        .wire
+        .as_ref()
+        .expect("prepared fork wire")
+        .payload
+        .get("prompt_cache_key")
+        .and_then(serde_json::Value::as_str)
+        .expect("prepared fork prompt cache key")
+        .to_owned();
+    (provider_view_key, prompt_cache_key)
+}
+
+fn fork_parent_request() -> TurnRequest {
+    let mut request = probe_request("gpt-5.6");
+    request.max_tokens = 4_096;
+    request.cache_metadata = Some(cm2_cache_metadata(OPENAI_PROVIDER_NAME, 1));
+    request
+}
+
+fn fork_child_request(parent: &TurnRequest) -> TurnRequest {
+    let mut child = parent.clone();
+    child
+        .cache_metadata
+        .as_mut()
+        .expect("child cache metadata")
+        .session_scope = "session-b".into();
+    child
+}
+
+fn inherit_parent_fork_route(request: &mut TurnRequest) {
+    request
+        .cache_metadata
+        .as_mut()
+        .expect("child cache metadata")
+        .cache_cohort = Some("session-a".into());
+}
+
 fn remove_openai_cache_metadata(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Array(values) => {
@@ -2326,10 +2381,10 @@ fn cm2d_openai_prompt_cache_key_is_stable_and_domain_sensitive() {
 }
 
 /// HAIDER963 Q5. MUTATION CHECK: keep the generic/custom dialect outside the
-/// v3 cohort overlay, accept a builtin provider name, or drop the account
+/// v4 cohort overlay, accept a builtin provider name, or drop the account
 /// scope. The presence/absence assertions below fail in each direction.
 #[test]
-fn custom_openai_compatible_uses_v3_prompt_cache_cohort() {
+fn custom_openai_compatible_uses_v4_prompt_cache_cohort() {
     let vault = MemoryVault::new();
     let alias = CredentialAlias::new("router-lab");
     vault
@@ -2500,6 +2555,194 @@ fn openai_prompt_cache_key_isolates_sessions_and_shares_only_an_inherited_fork_r
         parent_key, inherited_key,
         "a byte-identical inherited fork must share its durable root cohort"
     );
+}
+
+/// LANE966-D equality proof: an exact provider view is the only condition
+/// under which the child receives the parent's durable route.
+#[test]
+fn exact_fork_provider_view_and_prompt_cache_keys_are_equal() {
+    let parent = fork_parent_request();
+    let mut child = fork_child_request(&parent);
+    inherit_parent_fork_route(&mut child);
+
+    let parent_keys = prepared_fork_provider_view_and_key(&parent);
+    let child_keys = prepared_fork_provider_view_and_key(&child);
+    assert_eq!(parent_keys.0, child_keys.0, "provider views must be exact");
+    assert_eq!(parent_keys.1, child_keys.1, "fork routes must match");
+}
+
+#[test]
+fn unrelated_session_prompt_cache_key_differs_despite_equal_provider_view() {
+    let parent = fork_parent_request();
+    let child = fork_child_request(&parent);
+
+    let parent_keys = prepared_fork_provider_view_and_key(&parent);
+    let child_keys = prepared_fork_provider_view_and_key(&child);
+    assert_eq!(parent_keys.0, child_keys.0, "the model prefix is identical");
+    assert_ne!(
+        parent_keys.1, child_keys.1,
+        "fresh sessions cannot share routing"
+    );
+}
+
+#[test]
+fn different_account_provider_view_and_prompt_cache_keys_differ() {
+    let parent = fork_parent_request();
+    let mut child = fork_child_request(&parent);
+    inherit_parent_fork_route(&mut child);
+    child
+        .cache_metadata
+        .as_mut()
+        .expect("child cache metadata")
+        .account_scope = Some("account-b".into());
+
+    let parent_keys = prepared_fork_provider_view_and_key(&parent);
+    let child_keys = prepared_fork_provider_view_and_key(&child);
+    assert_ne!(
+        parent_keys.0, child_keys.0,
+        "account is in the provider view"
+    );
+    assert_ne!(
+        parent_keys.1, child_keys.1,
+        "account is a hard route boundary"
+    );
+}
+
+#[test]
+fn changed_request_header_provider_view_and_prompt_cache_keys_differ() {
+    let parent = fork_parent_request();
+    let mut child = fork_child_request(&parent);
+    inherit_parent_fork_route(&mut child);
+    child.tools.push(ToolDefinition {
+        name: "changed_header_tool".into(),
+        description: "changes the provider-rendered tool header".into(),
+        input_schema: serde_json::json!({"type": "object"}),
+    });
+
+    let parent_keys = prepared_fork_provider_view_and_key(&parent);
+    let child_keys = prepared_fork_provider_view_and_key(&child);
+    assert_ne!(
+        parent_keys.0, child_keys.0,
+        "rendered header must be addressed"
+    );
+    assert_ne!(parent_keys.1, child_keys.1, "header changes must reroute");
+}
+
+#[test]
+fn changed_model_provider_view_and_prompt_cache_keys_differ() {
+    let parent = fork_parent_request();
+    let mut child = fork_child_request(&parent);
+    inherit_parent_fork_route(&mut child);
+    child.model = "gpt-5.6-mini".into();
+
+    let parent_keys = prepared_fork_provider_view_and_key(&parent);
+    let child_keys = prepared_fork_provider_view_and_key(&child);
+    assert_ne!(parent_keys.0, child_keys.0, "model is in the provider view");
+    assert_ne!(
+        parent_keys.1, child_keys.1,
+        "model is a hard route boundary"
+    );
+}
+
+#[test]
+fn changed_max_tokens_provider_view_and_prompt_cache_keys_differ() {
+    let parent = fork_parent_request();
+    let mut child = fork_child_request(&parent);
+    inherit_parent_fork_route(&mut child);
+    child.max_tokens = child.max_tokens.saturating_add(1);
+
+    let parent_keys = prepared_fork_provider_view_and_key(&parent);
+    let child_keys = prepared_fork_provider_view_and_key(&child);
+    assert_ne!(
+        parent_keys.0, child_keys.0,
+        "output budget is in the provider view"
+    );
+    assert_ne!(parent_keys.1, child_keys.1, "output budget must reroute");
+}
+
+#[test]
+fn changed_system_policy_provider_view_and_prompt_cache_keys_differ() {
+    let parent = fork_parent_request();
+    let mut child = fork_child_request(&parent);
+    inherit_parent_fork_route(&mut child);
+    child.system_prompt = Some("Changed deterministic system policy.".into());
+
+    let parent_keys = prepared_fork_provider_view_and_key(&parent);
+    let child_keys = prepared_fork_provider_view_and_key(&child);
+    assert_ne!(
+        parent_keys.0, child_keys.0,
+        "system policy is in the exact view"
+    );
+    assert_ne!(parent_keys.1, child_keys.1, "system policy must reroute");
+}
+
+#[test]
+fn changed_effort_provider_view_and_prompt_cache_keys_differ() {
+    let parent = fork_parent_request();
+    let mut child = fork_child_request(&parent);
+    inherit_parent_fork_route(&mut child);
+    let metadata = child.cache_metadata.as_mut().expect("child cache metadata");
+    metadata.cache_epoch = "epoch-effort-high".into();
+    metadata.prefix_digests.reasoning_settings = "effort-high".into();
+
+    let parent_keys = prepared_fork_provider_view_and_key(&parent);
+    let child_keys = prepared_fork_provider_view_and_key(&child);
+    assert_ne!(
+        parent_keys.0, child_keys.0,
+        "effort is in the provider view"
+    );
+    assert_ne!(parent_keys.1, child_keys.1, "effort must reroute");
+}
+
+#[test]
+fn changed_fast_mode_provider_view_and_prompt_cache_keys_differ() {
+    let parent = fork_parent_request();
+    let mut child = fork_child_request(&parent);
+    inherit_parent_fork_route(&mut child);
+    let metadata = child.cache_metadata.as_mut().expect("child cache metadata");
+    metadata.cache_epoch = "epoch-fast-enabled".into();
+    metadata.prefix_digests.reasoning_settings = "fast-enabled".into();
+
+    let parent_keys = prepared_fork_provider_view_and_key(&parent);
+    let child_keys = prepared_fork_provider_view_and_key(&child);
+    assert_ne!(
+        parent_keys.0, child_keys.0,
+        "fast mode is in the provider view"
+    );
+    assert_ne!(parent_keys.1, child_keys.1, "fast mode must reroute");
+}
+
+#[test]
+fn one_prefix_byte_change_provider_view_key_differs() {
+    let parent = fork_parent_request();
+    let mut child = fork_child_request(&parent);
+    child.messages = vec![Message::user_text("say PINGACJ")];
+
+    let parent_keys = prepared_fork_provider_view_and_key(&parent);
+    let child_keys = prepared_fork_provider_view_and_key(&child);
+    assert_ne!(
+        parent_keys.0, child_keys.0,
+        "every prefix byte is addressed"
+    );
+}
+
+#[test]
+fn prompt_cache_key_is_omitted_when_cache_epoch_is_uncertain() {
+    let mut request = fork_parent_request();
+    request
+        .cache_metadata
+        .as_mut()
+        .expect("cache metadata")
+        .cache_epoch
+        .clear();
+    assert_eq!(openai_prompt_cache_key(&request), None);
+}
+
+#[test]
+fn prompt_cache_key_is_omitted_when_max_tokens_is_uncertain() {
+    let mut request = fork_parent_request();
+    request.max_tokens = 0;
+    assert_eq!(openai_prompt_cache_key(&request), None);
 }
 
 /// HAIDER949(b). MUTATION CHECK: add `request.messages.len()` to the cache-key

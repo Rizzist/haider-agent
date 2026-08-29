@@ -2,6 +2,10 @@
 
 use haider_protocol::DeliveryMode;
 use haider_protocol::EventPayload;
+use haider_protocol::cache::{
+    PROVIDER_VIEW_SERIALIZATION_VERSION, ProviderViewAttemptV1, ProviderViewBlockRefV1,
+    ProviderViewLedgerV1,
+};
 use haider_protocol::envelope::{
     EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
 };
@@ -9,7 +13,7 @@ use haider_protocol::error::ErrorCode;
 use haider_protocol::history::{CompactionResume, NodeKind, TreeNode};
 use haider_protocol::ids::{BranchId, DeviceId, EventId, ItemId, NodeId, RunId, SessionId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
-use haider_protocol::session_fork::{SessionForkProvenance, SessionForked};
+use haider_protocol::session_fork::{ForkContextEpoch, SessionForkProvenance, SessionForked};
 use haider_protocol::state::{RunState, SessionState};
 use haider_protocol::tool::{AttachmentBlock, BoundedResult, ToolResultStatus};
 use haider_protocol::verify::VerifyVerdict;
@@ -570,6 +574,105 @@ fn golden_prompt_cuts_cover_terminal_boundaries_and_first_prompt() {
             "B and its admission batch remain outside the child prefix"
         );
     }
+}
+
+#[test]
+fn production_prompt_fork_derives_the_exact_durable_cache_candidate() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let source = SessionId::new("prompt-cache-parent");
+    create_session(&store, &source);
+    let first = accept_turn!(
+        &store,
+        &source,
+        "cacheable",
+        "cacheable parent prompt",
+        Vec::new(),
+        None,
+        DeliveryMode::Queue,
+        None,
+    );
+    let block = ProviderViewBlockRefV1::for_bytes(b"prompt-fork-provider-view");
+    let view = ProviderViewLedgerV1 {
+        provider: "fake".into(),
+        model: "fake-model".into(),
+        max_tokens: 4_096,
+        dialect: "fake-provider-v1".into(),
+        serialization_version: PROVIDER_VIEW_SERIALIZATION_VERSION.into(),
+        header_epoch: "prompt-fork-header".into(),
+        cache_epoch: "prompt-fork-cache".into(),
+        compaction_epoch: "prompt-fork-root".into(),
+        reasoning_retention: "append-only".into(),
+        account_scope: Some("account-a".into()),
+        stable_history_end: 1,
+        current_user_start: 1,
+        latest_compaction_summary_end: None,
+        trim_sentinel: "prompt-fork-root".into(),
+        boundaries: Vec::new(),
+        system_block: block.clone(),
+        tool_schema_block: block.clone(),
+        history_blocks: vec![block],
+        storage: None,
+    };
+    let attempt = ProviderViewAttemptV1 {
+        ordinal: 1,
+        view: view.clone(),
+    };
+    let mut provider_view_fact = [raw(
+        &store,
+        &source,
+        Some(first.run_id.clone()),
+        None,
+        "prompt-cache-provider-view",
+        EventPayload::Item(ItemEvent::Completed {
+            item_id: ItemId::new("prompt-cache-provider-view-item"),
+            item: attempt.extension_item().expect("provider-view item"),
+        }),
+        PromptRender::Omit,
+    )];
+    store
+        .append_worker(&mut provider_view_fact)
+        .expect("append durable provider view");
+    append_completed_turn(&store, &source, &first, CompletedTurn::Successful);
+
+    let second = accept_turn!(
+        &store,
+        &source,
+        "editable",
+        "editable child prompt",
+        Vec::new(),
+        None,
+        DeliveryMode::Queue,
+        None,
+    );
+    let command = prompt_command(
+        &store,
+        &source,
+        None,
+        second.user_seq,
+        "prompt-cache-fork",
+        "prompt-cache-child",
+    );
+    let SessionForkOutcome::Committed { created, envelopes } = store
+        .fork_session_from_prompt_with_durable_cache_candidate(&command)
+        .expect("production prompt fork")
+    else {
+        panic!("fresh production prompt fork commits");
+    };
+    let audit = envelopes
+        .iter()
+        .filter_map(|envelope| SessionForked::from_payload_value(&envelope.payload))
+        .next_back()
+        .expect("prompt fork audit");
+    assert_eq!(audit.context_epoch, ForkContextEpoch::Inherited);
+    assert_eq!(
+        created
+            .inherited_cache_segment
+            .as_ref()
+            .expect("prompt fork inherited segment")
+            .prefix_digest,
+        view.prefix_digest().expect("exact provider-view digest")
+    );
 }
 
 #[test]

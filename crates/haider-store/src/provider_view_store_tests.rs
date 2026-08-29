@@ -23,8 +23,9 @@ fn provider_view(seed: &str) -> (ProviderViewLedgerV1, Vec<ProviderViewBlobV1>) 
     let ledger = ProviderViewLedgerV1 {
         provider: "test-provider".into(),
         model: "test-model".into(),
+        max_tokens: 4_096,
         dialect: "test-dialect".into(),
-        serialization_version: "haider.provider-view.json.v1".into(),
+        serialization_version: "haider.provider-view.json.v2".into(),
         header_epoch: "header".into(),
         cache_epoch: "cache".into(),
         compaction_epoch: "root".into(),
