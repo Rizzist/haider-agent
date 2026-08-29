@@ -371,6 +371,10 @@ pub const FEATURE_RESIDENT_TURN_SUBMIT_V1: &str = "resident_turn_submit_v1";
 pub const FEATURE_EFFECT_RECOVERY_V1: &str = "effect_recovery_v1";
 /// Daemon implements the bounded, durable descendant-tree fleet snapshot.
 pub const FEATURE_SESSION_FLEET_V1: &str = "session_fleet_v1";
+/// Fleet snapshots and descendant baselines carry the child's persisted
+/// display identity plus its resolved model/provider pair. Every field is
+/// absence-preserving; clients must not infer coordinates when it is absent.
+pub const FEATURE_SESSION_FLEET_IDENTITY_V1: &str = "session_fleet_identity_v1";
 /// Daemon implements the reconnectable, per-child-cursor descendant stream.
 pub const FEATURE_SESSION_DESCENDANT_STREAM_V1: &str = "session_descendant_stream_v1";
 /// The daemon serves receipt-backed named branch creation and branch-scoped turns.
@@ -2132,6 +2136,15 @@ pub struct FleetNodeWire {
     /// when a callsign has not yet been assigned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub callsign: Option<String>,
+    /// Resolved child model persisted in the delegation manifest. Absent for
+    /// legacy or unresolved manifests; consumers must not guess from parent
+    /// session state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Resolved child provider persisted in the delegation manifest. Absent
+    /// when durable provider truth is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     pub task: String,
     /// Absolute delegation depth from durable relation truth.
     pub depth: u32,
@@ -2279,6 +2292,13 @@ pub struct DescendantStreamNodeWire {
     pub depth: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub callsign: Option<String>,
+    /// Same absence-preserving manifest model as [`FleetNodeWire::model`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Same absence-preserving manifest provider as
+    /// [`FleetNodeWire::provider`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     pub task: String,
     pub state: FleetAgentStateWire,
     /// Echo of the reconnect cursor accepted for this child.

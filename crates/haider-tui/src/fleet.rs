@@ -436,6 +436,8 @@ pub fn snapshot_from_chips(
             agent_id,
             session_id,
             callsign: (!chip.callsign.is_empty()).then(|| chip.callsign.clone()),
+            model: None,
+            provider: None,
             task: chip.name.clone(),
             depth,
             parent_session_id: parent_session.clone(),

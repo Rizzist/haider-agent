@@ -2,7 +2,9 @@
 
 #[cfg(unix)]
 use crate::connection::{ConnectionContext, DrainNotice, serve};
-use crate::delegation::{DelegationHandle, MessageCoordinates, SpawnCoordinates};
+use crate::delegation::{
+    DelegationHandle, MessageCoordinates, SpawnCoordinates, callsign_from_identity,
+};
 use crate::session_hub::{SessionHub, SessionHubConfig};
 use crate::worker::{
     BrokerToolFactory, ProviderFactory, ResolvedTurnProvider, TurnToolFactory, WorkerDependencies,
@@ -1424,9 +1426,20 @@ async fn production_spawn_effect_wait_and_report_chain_is_end_to_end() {
     assert_eq!(projected_prompt.branch_id, Some(branch_a.clone()));
     assert!(projected_prompt.render.ui && projected_prompt.render.durable);
     assert_eq!(projected_prompt.render.prompt, PromptRender::Omit);
-    // Owner ask: the wire carries NO neutral callsign — the TUI claims
-    // the honor roll (mutation: restore the SUB-hex mint → fails).
-    assert!(spawned.callsign.is_none());
+    // X1: the handle is stable identity data, not a restatement or parsing of
+    // the already-separate task. Malformed/non-digest input stays unnamed.
+    let identity = spawned
+        .agent
+        .as_str()
+        .strip_prefix("agent-")
+        .expect("minted agent id prefix");
+    assert_eq!(
+        spawned.callsign,
+        callsign_from_identity(identity),
+        "manifest persists the deterministic digest handle"
+    );
+    assert_ne!(spawned.callsign.as_deref(), Some(spawned.task.as_str()));
+    assert_eq!(callsign_from_identity("not-a-delegation-digest"), None);
     let delegation = hub
         .delegation(spawned.agent.clone())
         .await

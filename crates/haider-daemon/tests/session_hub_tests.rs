@@ -2402,7 +2402,7 @@ fn fleet_delegation(
             fencing_epoch: 1,
             attempt: 0,
             parent: parent_agent_id,
-            coordinates: None,
+            coordinates: Some(serde_json::json!({"provider": "anthropic"})),
             cli_scope: None,
         },
         state: DelegationState::Spawned,
@@ -5254,6 +5254,12 @@ async fn descendant_stream_reconnects_per_child_without_gaps_or_duplicates() {
         "session identity is not lineage identity"
     );
     assert_eq!(baseline_child.child_run_id, record.child_run_id);
+    assert_eq!(
+        baseline_child.callsign.as_deref(),
+        Some("CALL-stream-child")
+    );
+    assert_eq!(baseline_child.model.as_deref(), Some("gpt-5.2"));
+    assert_eq!(baseline_child.provider.as_deref(), Some("anthropic"));
     assert_eq!(baseline_child.requested_after_seq, 1);
     assert_eq!(baseline_child.replay_through_seq, 2);
     assert_eq!(baseline_child.parent_anchors.spawn_seq, Some(spawn_seq));
@@ -5873,6 +5879,8 @@ async fn session_fleet_reduces_nested_terminal_tree_and_rollup_with_view_capabil
         .expect("live root node");
     assert_eq!(live_node.state, FleetAgentStateWire::Live);
     assert_eq!(live_node.callsign.as_deref(), Some("CALL-live"));
+    assert_eq!(live_node.model.as_deref(), Some("gpt-5.2"));
+    assert_eq!(live_node.provider.as_deref(), Some("anthropic"));
     assert_eq!(live_node.children.len(), 1);
     assert_eq!(live_node.children[0].state, FleetAgentStateWire::Waiting);
     assert_eq!(
