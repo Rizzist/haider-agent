@@ -54,6 +54,7 @@ fn summary(id: &str, seen_at_ms: Option<u64>, last_activity_ms: Option<u64>) -> 
         effort: None,
         fast: None,
         account_alias: None,
+        forked_from: None,
     };
     summary.title = Some(id.to_owned());
     summary

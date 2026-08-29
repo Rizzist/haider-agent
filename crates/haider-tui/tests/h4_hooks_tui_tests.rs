@@ -516,6 +516,7 @@ fn trust_revision_event_refreshes_the_summary_workspace() {
                 effort: None,
                 fast: None,
                 account_alias: None,
+                forked_from: None,
             }],
             next_cursor: None,
         },

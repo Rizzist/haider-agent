@@ -6580,6 +6580,7 @@ async fn scenario_2_real_uds_creates_attaches_and_replays_typed_session() {
             effort: metadata.effort.clone(),
             fast: Some(metadata.fast),
             account_alias: None,
+            forked_from: None,
         }
     );
 

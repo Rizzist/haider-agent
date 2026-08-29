@@ -5,10 +5,50 @@
 //! records why, what, and where they were omitted.
 
 use crate::ids::{BranchId, EventId, NodeId, SessionId};
+use crate::tool::AttachmentBlock;
 use serde::{Deserialize, Serialize};
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+/// One user-prompt event selected as the exclusive session-fork cut.
+///
+/// The daemon resolves this durable sequence to the history boundary before
+/// the prompt. Exact-node selectors remain a separate legacy request shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionForkPromptSelector {
+    pub seq: u64,
+}
+
+/// Source prompt coordinate retained by a prompt-oriented fork.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionForkProvenance {
+    pub session_id: SessionId,
+    pub seq: u64,
+}
+
+/// Editable, unsent prompt returned after a prompt-oriented fork.
+///
+/// Attachment bytes remain in the CAS. The complete typed attachment blocks
+/// are returned so resubmitting this draft does not lose image dimensions,
+/// filenames, PDF delivery mode, or other provider-ingress coordinates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionForkDraft {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentBlock>,
+}
+
+/// Why an existing event cannot be used as a prompt-oriented fork cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SessionForkInvalidCutReason {
+    NotUserPrompt,
+    WrongBranch,
+    #[serde(other)]
+    Unknown,
 }
 
 /// One exact prompt-visible source event shown in a removal review.

@@ -1241,17 +1241,19 @@ fn hex_to_bytes(hex: &str) -> Vec<u8> {
         .collect()
 }
 
-/// MUTATION CHECK: remove or retype any historical or A/C/D union-tail frame.
-/// Expected runtime failure: the compact WS and UDS golden byte arrays differ
-/// in length/content while every earlier frame stays unchanged.
+/// MUTATION CHECK: remove or retype any historical, A/C/D union-tail, or
+/// prompt-fork tail frame. Expected runtime failure: the compact WS and UDS
+/// golden byte arrays differ in length/content while every earlier frame stays
+/// unchanged.
 #[test]
 fn compact_ws_bodies_and_length_prefixed_uds_streams_are_golden() {
     let expected_frames = transcript();
-    // The integrated transcript is the 133-frame v0.0.964 prefix plus A's six
-    // peer frames, the peer.name pair, C's 13 SSH/shell pairs, and D's three
-    // lockdown pairs. The 17 moved pairs are absent from the supplemental
-    // fixture, so the two sources remain disjoint.
-    assert_eq!(expected_frames.len(), 173);
+    // Recount arithmetic: 133-frame v0.0.964 prefix + 6 peer frames + 2
+    // peer.name frames + 26 SSH/shell frames + 6 lockdown frames = the frozen
+    // 173-frame v0.0.965 prefix; prompt forking appends exactly 4, for 177.
+    // The 17 moved method pairs remain absent from the supplemental fixture,
+    // so the two sources stay disjoint.
+    assert_eq!(expected_frames.len(), 177);
     let expected_bytes: Vec<GoldenWireBytes> = expected_frames
         .iter()
         .map(|frame| {
@@ -1312,7 +1314,7 @@ fn compact_ws_bodies_and_length_prefixed_uds_streams_are_golden() {
 #[test]
 fn monitor_delivery_stream_is_additive_replayable_and_explicitly_bounded() {
     let frames = transcript();
-    assert_eq!(frames.len(), 173);
+    assert_eq!(frames.len(), 177);
     let WireFrame::MonitorDelivery { watch_id, report } = &frames[129] else {
         panic!("monitor delivery must be the first appended stream frame");
     };
@@ -1345,7 +1347,7 @@ fn monitor_delivery_stream_is_additive_replayable_and_explicitly_bounded() {
 #[test]
 fn loom_registry_stream_is_tail_appended_and_exactly_addressed() {
     let frames = transcript();
-    assert_eq!(frames.len(), 173);
+    assert_eq!(frames.len(), 177);
     let WireFrame::LoomRegistryDelta { watch_id, delta } = &frames[131] else {
         panic!("Loom registry delta must follow every prior golden frame");
     };
@@ -1378,7 +1380,7 @@ fn loom_registry_stream_is_tail_appended_and_exactly_addressed() {
 #[test]
 fn peer_messaging_methods_and_events_are_tail_appended() {
     let frames = transcript();
-    assert_eq!(frames.len(), 173);
+    assert_eq!(frames.len(), 177);
     assert!(matches!(
         &frames[133],
         WireFrame::Request {
@@ -1419,7 +1421,7 @@ fn peer_messaging_methods_and_events_are_tail_appended() {
             if receipt.delivery == haider_protocol::peer::PeerDelivery::Delivered
     ));
 
-    let union_methods = frames[139..]
+    let union_methods = frames[139..173]
         .chunks_exact(2)
         .map(|pair| {
             let [
@@ -1465,6 +1467,192 @@ fn peer_messaging_methods_and_events_are_tail_appended() {
         ]
         .map(str::to_owned)
     );
+}
+
+/// Prompt-oriented forking appends exactly four frames after the complete
+/// 173-frame v0.0.965 prefix.
+///
+/// MUTATION CHECK: insert any frame before index 173, remove one of indices
+/// 173..=176, restore the legacy exact-node fields on the prompt request, or
+/// omit draft attachment/provenance coordinates. Expected runtime failure:
+/// the exact index, count, selector, or typed coordinate assertions below.
+#[test]
+fn prompt_fork_frames_are_exactly_the_four_frame_tail() {
+    let frames = transcript();
+    assert_eq!(frames.len(), 177, "173 frozen + 4 prompt-fork frames");
+    assert!(matches!(
+        &frames[173],
+        WireFrame::Welcome(Welcome { features, .. })
+            if features.contains(haider_rpc::FEATURE_SESSION_FORK_V1)
+                && features.contains(haider_rpc::FEATURE_SESSION_PROMPT_FORK_V1)
+    ));
+    assert!(matches!(
+        &frames[174],
+        WireFrame::Request {
+            body: RequestBody::SessionFork {
+                fork_node_id: None,
+                fork_seq: None,
+                prompt: Some(prompt),
+                ..
+            },
+            ..
+        } if prompt.seq == 58
+    ));
+    #[derive(Deserialize)]
+    struct LegacyExactSelector {
+        #[serde(rename = "fork_node_id")]
+        _fork_node_id: haider_protocol::ids::NodeId,
+        #[serde(rename = "fork_seq")]
+        _fork_seq: u64,
+    }
+    let prompt_body = match &frames[174] {
+        WireFrame::Request { body, .. } => {
+            serde_json::to_value(body).expect("encode prompt selector request")
+        }
+        _ => panic!("prompt request must be frame 174"),
+    };
+    assert!(
+        serde_json::from_value::<LegacyExactSelector>(prompt_body).is_err(),
+        "an old decoder must not mistake the prompt shape for an exact-node fork"
+    );
+    let WireFrame::Response {
+        body:
+            ResponseBody::SessionFork {
+                session_id,
+                source_session_id,
+                fork_node_id,
+                fork_seq,
+                forked_from: Some(forked_from),
+                draft: Some(draft),
+                ..
+            },
+        ..
+    } = &frames[175]
+    else {
+        panic!("prompt-fork response must be frame 175");
+    };
+    assert_eq!(session_id.as_str(), "session-prompt-child");
+    assert_eq!(source_session_id.as_str(), "session-prompt-source");
+    assert_eq!(fork_node_id.as_str(), "node-before-prompt-b");
+    assert_eq!(*fork_seq, 57);
+    assert_eq!(forked_from.session_id.as_str(), source_session_id.as_str());
+    assert_eq!(forked_from.seq, 58);
+    assert_eq!(
+        draft.text,
+        "Revise the implementation plan using this file."
+    );
+    assert!(matches!(
+        draft.attachments.as_slice(),
+        [haider_protocol::tool::AttachmentBlock::File {
+            artifact,
+            name,
+            lines: 12,
+        }] if artifact.as_str() == "blake3:prompt-b-file" && name == "requirements.txt"
+    ));
+    assert!(matches!(
+        &frames[176],
+        WireFrame::SessionRosterDelta { summaries }
+            if matches!(
+                summaries.as_slice(),
+                [summary]
+                    if summary.session_id.as_str() == "session-prompt-child"
+                        && summary.forked_from.as_ref() == Some(forked_from)
+            )
+    ));
+}
+
+/// The original fork Welcome/request/response remain the historical entries
+/// at indices 75..=77 and decode/re-encode to their checked-in bytes.
+///
+/// MUTATION CHECK: serialize any new prompt field when it is absent or change
+/// the legacy exact-node selector representation. Expected runtime failure:
+/// at least one compact WS body or length-prefixed UDS byte string differs.
+#[test]
+fn preexisting_session_fork_frames_decode_with_identical_bytes() {
+    let pinned: Vec<GoldenWireBytes> =
+        serde_json::from_str(&std::fs::read_to_string(fixture_path()).expect("read wire fixture"))
+            .expect("decode wire fixture");
+    let frames = transcript();
+    for index in 75..=77 {
+        let ws = ws_codec::decode(&pinned[index].ws_body, TEST_FRAME_LIMIT)
+            .expect("decode historical fork WS body");
+        assert_eq!(ws, frames[index]);
+        assert_eq!(
+            ws_codec::encode(&ws, TEST_FRAME_LIMIT).expect("re-encode historical fork WS body"),
+            pinned[index].ws_body
+        );
+
+        let mut decoder = uds_codec::Decoder::new(TEST_FRAME_LIMIT);
+        let batch = decoder.push(&hex_to_bytes(&pinned[index].uds_stream_hex));
+        assert!(batch.error.is_none());
+        assert_eq!(batch.frames, vec![frames[index].clone()]);
+        assert_eq!(
+            bytes_to_hex(
+                &uds_codec::encode(&frames[index], TEST_FRAME_LIMIT)
+                    .expect("re-encode historical fork UDS frame")
+            ),
+            pinned[index].uds_stream_hex
+        );
+        assert!(!pinned[index].ws_body.contains("\"prompt\""));
+        assert!(!pinned[index].ws_body.contains("\"forked_from\""));
+        assert!(!pinned[index].ws_body.contains("\"draft\""));
+    }
+}
+
+/// The prompt-cut refusal taxonomy adds only one wire code and one typed data
+/// kind; feature absence remains an SDK-local `missing_feature` preflight.
+#[test]
+fn prompt_fork_error_taxonomy_is_typed_and_retryability_is_explicit() {
+    use haider_protocol::error::ErrorCode;
+
+    assert_eq!(
+        haider_rpc::ERROR_CODE_FORK_CUT_UNSTABLE,
+        "fork_cut_unstable"
+    );
+    assert_eq!(
+        [
+            ErrorCode::StoreReadOnly,
+            ErrorCode::StoreCorrupt,
+            ErrorCode::StoreUnavailable,
+            ErrorCode::StoreFull,
+        ]
+        .map(ErrorCode::as_str),
+        [
+            "store_read_only",
+            "store_corrupt",
+            "store_unavailable",
+            "store_full",
+        ],
+        "the prompt-fork handler must preserve each existing store error code"
+    );
+    assert_eq!(
+        serde_json::to_value(ErrorData::SessionForkInvalidCut {
+            session_id: haider_protocol::ids::SessionId::new("source-session"),
+            seq: 58,
+            reason: haider_protocol::session_fork::SessionForkInvalidCutReason::WrongBranch,
+        })
+        .expect("encode invalid prompt cut"),
+        serde_json::json!({
+            "kind": "session_fork_invalid_cut",
+            "session_id": "source-session",
+            "seq": 58,
+            "reason": "wrong_branch"
+        })
+    );
+    let unstable = ResponseBody::Error {
+        code: haider_rpc::ERROR_CODE_FORK_CUT_UNSTABLE.into(),
+        message: "the preceding boundary is still interleaved".into(),
+        retryable: true,
+        data: None,
+    };
+    assert!(matches!(
+        unstable,
+        ResponseBody::Error {
+            retryable: true,
+            ref code,
+            ..
+        } if code == haider_rpc::ERROR_CODE_FORK_CUT_UNSTABLE
+    ));
 }
 
 #[test]
@@ -2068,6 +2256,7 @@ fn session_summary_workspace_is_additive_and_old_decoder_tolerant() {
         effort: None,
         fast: None,
         account_alias: None,
+        forked_from: None,
     };
     let value = serde_json::to_value(&current).expect("encode current summary");
     assert_eq!(value["workspace_cwd"], "/work/original");
@@ -3306,19 +3495,20 @@ fn device_discovery_goldens_are_additive_and_tolerance_re_proved() {
     // D1's six frames stay contiguous at their original offset; T1 then
     // appended seven transcription-secret frames, U1 three usage-report
     // frames, G2 three session-rename frames, G3 four tuning frames, F1 three
-    // fleet frames, and L4 two loom-registry stream frames AFTER them — each
-    // append pinned by its own additive law — so D1 ends at the NEXT appended
-    // welcome (whichever wave owns it) and nothing before `d1_start` can
-    // have moved.
+    // fleet frames, L4 two loom-registry stream frames, and v0.0.966 four
+    // prompt-fork frames AFTER them — each append pinned by its own additive
+    // law — so D1 ends at the NEXT appended welcome (whichever wave owns it)
+    // and nothing before `d1_start` can have moved.
     assert_eq!(
         frames.len() - d1_start,
-        6 + 7 + 3 + 3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34,
+        6 + 7 + 3 + 3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34 + 4,
         "six D1 frames, then T1's seven transcription frames, then U1's \
          three usage frames, then G2's three session-rename frames, then \
          G3's four session-tuning frames, F1's three fleet frames, then \
          WIRE-GAPS' four read frames, Slice 2's folded response, then #6's \
          two monitor-delivery frames, L4's two loom-registry stream frames, \
-         then 965's six peer frames and 34 peer-name/SSH/shell/lockdown union frames \
+         then 965's six peer frames and 34 peer-name/SSH/shell/lockdown union frames, \
+         then four prompt-fork frames \
          — the accounted tail pins that nothing before d1_start moved"
     );
     for frame in &frames[d1_start..d1_start + 6] {
@@ -3595,7 +3785,8 @@ fn session_rename_frames_are_additive_and_golden() {
     // The G2 frames were appended at the then-END of the transcript: three
     // frames, append-only; G3 later appended its four session-tuning frames
     // and F1 its three fleet frames strictly AFTER them, followed by L4's two
-    // loom-registry stream frames (each pinned by its own law).
+    // loom-registry stream frames and four prompt-fork frames (each pinned by
+    // its own law).
     let frames = transcript();
     let g2_start = frames
         .iter()
@@ -3609,11 +3800,12 @@ fn session_rename_frames_are_additive_and_golden() {
         .expect("G2 welcome frame in the golden transcript");
     assert_eq!(
         frames.len() - g2_start,
-        3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34,
+        3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34 + 4,
         "G2's three frames, then G3's four tuning frames, F1's three fleet frames, \
          WIRE-GAPS' four read frames, Slice 2's folded response, then #6's two \
          monitor-delivery frames, L4's two loom-registry stream frames, then \
-         965's six peer frames and 34 peer-name/SSH/shell/lockdown union frames"
+         965's six peer frames and 34 peer-name/SSH/shell/lockdown union frames, \
+         then four prompt-fork frames"
     );
 
     // Exact golden bytes for the titled request/response pair.
@@ -3709,6 +3901,7 @@ fn session_rename_frames_are_additive_and_golden() {
         effort: None,
         fast: None,
         account_alias: None,
+        forked_from: None,
     })
     .expect("encode bare summary");
     assert!(
@@ -3743,10 +3936,10 @@ fn transcription_secret_frames_are_additive_and_redacted() {
     // The seven T1 frames sit directly before U1's three usage frames,
     // G2's three session-rename frames, G3's four session-tuning frames, F1's
     // three fleet frames, WIRE-GAPS' four reads, Slice 2's folded response,
-    // #6's two monitor-delivery frames, and L4's two loom-registry stream
-    // frames (each later wave's own law pins its append). Anchor the intended
-    // block by identity so a later tail append cannot silently slide this
-    // sequence window onto unrelated frames.
+    // #6's two monitor-delivery frames, L4's two loom-registry stream frames,
+    // and v0.0.966's four prompt-fork frames (each later wave's own law pins
+    // its append). Anchor the intended block by identity so a later tail
+    // append cannot silently slide this sequence window onto unrelated frames.
     let frames = transcript();
     let t1_start = frames
         .iter()
@@ -3762,12 +3955,12 @@ fn transcription_secret_frames_are_additive_and_redacted() {
         .expect("T1 first set request in the golden transcript");
     assert_eq!(
         frames.len() - t1_start,
-        7 + 3 + 3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34,
+        7 + 3 + 3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34 + 4,
         "T1's seven frames, U1's three usage frames, G2's three rename frames, \
          G3's four tuning frames, F1's three fleet frames, WIRE-GAPS' four read \
          frames, Slice 2's folded response, #6's two monitor-delivery frames, \
          L4's two loom-registry stream frames, then 965's six peer frames and \
-         34 peer-name/SSH/shell/lockdown union frames"
+         34 peer-name/SSH/shell/lockdown union frames, then four prompt-fork frames"
     );
     let tail = &frames[t1_start..t1_start + 7];
     let methods: Vec<String> = tail
@@ -3881,8 +4074,8 @@ fn usage_report_goldens_are_additive_normalized_and_secret_free() {
 
     // The U1 frames were appended at the then-END of the transcript: three
     // frames, append-only; G2 later appended three session-rename frames, G3
-    // four tuning frames, F1 three fleet frames, and L4 two loom-registry
-    // stream frames strictly AFTER them.
+    // four tuning frames, F1 three fleet frames, L4 two loom-registry stream
+    // frames, and v0.0.966 four prompt-fork frames strictly AFTER them.
     let frames = transcript();
     let u1_start = frames
         .iter()
@@ -3896,12 +4089,13 @@ fn usage_report_goldens_are_additive_normalized_and_secret_free() {
         .expect("U1 welcome frame in the golden transcript");
     assert_eq!(
         frames.len() - u1_start,
-        3 + 3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34,
+        3 + 3 + 4 + 3 + 4 + 1 + 2 + 2 + 6 + 34 + 4,
         "three U1 frames, then G2's three session-rename frames, then G3's \
          four session-tuning frames, F1's three fleet frames, then \
          WIRE-GAPS' four read frames, Slice 2's folded response, then #6's two \
          monitor-delivery frames, L4's two loom-registry stream frames, then \
-         965's six peer frames and 34 peer-name/SSH/shell/lockdown union frames \
+         965's six peer frames and 34 peer-name/SSH/shell/lockdown union frames, \
+         then four prompt-fork frames \
          (each later wave's own law pins its append)"
     );
     for frame in &frames[u1_start..u1_start + 3] {
@@ -4304,9 +4498,9 @@ fn model_detail_tuning_fields_are_additive_and_skip_empty() {
 /// historical transcript block, keeps protocol v1, and retains the open-enum tolerance
 /// used throughout the existing read surfaces.
 ///
-/// MUTATION CHECK: remove either L4 stream frame or move it before the
-/// fleet block. Expected runtime failure: the exact suffix count below or
-/// L4's exact tail indices no longer match.
+/// MUTATION CHECK: remove either L4 stream frame or any prompt-fork tail frame,
+/// or move it before the fleet block. Expected runtime failure: the exact
+/// suffix count below or the explicitly pinned tail indices no longer match.
 #[test]
 fn session_fleet_frames_are_additive_and_unknown_tolerant() {
     assert_eq!(haider_rpc::FEATURE_SESSION_FLEET_V1, "session_fleet_v1");
@@ -4324,11 +4518,11 @@ fn session_fleet_frames_are_additive_and_unknown_tolerant() {
         .expect("fleet feature welcome");
     assert_eq!(
         frames.len() - fleet_start,
-        3 + 4 + 1 + 2 + 2 + 6 + 34,
+        3 + 4 + 1 + 2 + 2 + 6 + 34 + 4,
         "three fleet frames, then WIRE-GAPS' four read frames, Slice 2's \
          folded response, #6's two monitor-delivery frames, and L4's two \
          loom-registry stream frames, then 965's six peer frames and 34 \
-         peer-name/SSH/shell/lockdown union frames"
+         peer-name/SSH/shell/lockdown union frames, then four prompt-fork frames"
     );
     assert!(matches!(
         &frames[fleet_start],
@@ -4539,6 +4733,7 @@ fn session_summary_lineage_is_additive_and_old_decoder_tolerant() {
         effort: None,
         fast: None,
         account_alias: None,
+        forked_from: None,
     };
     let value = serde_json::to_value(&child).expect("encode child summary");
     assert_eq!(value["kind"], "subagent");

@@ -444,6 +444,7 @@ fn summary(session_id: &str, head_seq: u64, tokens: u64) -> haider_rpc::SessionS
         effort: None,
         fast: None,
         account_alias: None,
+        forked_from: None,
     }
 }
 
@@ -839,6 +840,7 @@ fn direct_metrics_render_subtree_detail_usage_and_plain_parity() {
         effort: None,
         fast: None,
         account_alias: None,
+        forked_from: None,
     });
 
     let text = draw_rows(&model, 150, 40).join("\n");

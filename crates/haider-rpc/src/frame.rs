@@ -17,7 +17,10 @@ use haider_protocol::ids::{
 use haider_protocol::peer::{PeerCandidate, PeerDescriptor, PeerMessage, PeerReceipt};
 use haider_protocol::queue::QueueRow;
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
-use haider_protocol::session_fork::{SessionMetaforkProposal, SessionMetaforkReviewManifest};
+use haider_protocol::session_fork::{
+    SessionForkDraft, SessionForkPromptSelector, SessionForkProvenance, SessionMetaforkProposal,
+    SessionMetaforkReviewManifest,
+};
 use haider_protocol::tool::{AttachmentBlock, ToolInventorySnapshot};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -156,6 +159,9 @@ pub const ERROR_CODE_INVALID_CURSOR: &str = "invalid_cursor";
 pub const ERROR_CODE_INVALID_ARGUMENT: &str = "invalid_argument";
 /// Stable code for a control command fenced by a newer worker generation.
 pub const ERROR_CODE_STALE_GENERATION: &str = "stale_generation";
+/// Stable retryable code for a prompt-fork cut whose preceding boundary is
+/// not yet an idle, non-queued, non-interleaved history boundary.
+pub const ERROR_CODE_FORK_CUT_UNSTABLE: &str = "fork_cut_unstable";
 /// Stable code for a command that requires an active/nonterminal run.
 pub const ERROR_CODE_RUN_NOT_ACTIVE: &str = "run_not_active";
 /// Stable code for a session resource that is already occupied.
@@ -371,6 +377,9 @@ pub const FEATURE_SESSION_DESCENDANT_STREAM_V1: &str = "session_descendant_strea
 pub const FEATURE_BRANCH_CREATE_V1: &str = "branch_create_v1";
 /// Daemon serves receipt-backed session-level fork and review-gated metafork.
 pub const FEATURE_SESSION_FORK_V1: &str = "session_fork_v1";
+/// Daemon accepts a user-prompt sequence as an exclusive `session.fork` cut
+/// and returns that prompt as an editable, unsent draft.
+pub const FEATURE_SESSION_PROMPT_FORK_V1: &str = "session_prompt_fork_v1";
 /// The daemon accepts receipt-free, content-addressed `artifact.put` uploads.
 pub const FEATURE_ARTIFACT_PUT_V1: &str = "artifact_put_v1";
 /// Daemon-owned hook discovery, execution, decision answers, and trust receipts.
@@ -1784,6 +1793,10 @@ pub struct SessionSummary {
     /// the daemon default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_alias: Option<String>,
+    /// Additive prompt-fork provenance. The sequence names the selected source
+    /// user prompt returned as a draft, not the child's copied-history head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<SessionForkProvenance>,
 }
 
 /// Typed session lineage kind (`session_lineage_v1`), from the durable
@@ -3192,8 +3205,17 @@ pub enum RequestBody {
         worker_generation: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_branch_id: Option<BranchId>,
-        fork_node_id: NodeId,
-        fork_seq: u64,
+        /// Legacy exact-node selector. Both fields are present together and
+        /// retain their shipped meaning; prompt-oriented requests omit both.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fork_node_id: Option<NodeId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fork_seq: Option<u64>,
+        /// Additive exclusive user-prompt cut. An older daemon sees the old
+        /// required exact-node fields missing and cannot honor this as a
+        /// legacy fork when the feature was not negotiated.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<SessionForkPromptSelector>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
@@ -3986,6 +4008,21 @@ pub enum RequestBody {
     Unknown,
 }
 
+impl RequestBody {
+    /// Returns the additive feature required before this particular request
+    /// shape may be sent. Legacy exact-node `session.fork` requests require
+    /// only their already-shipped `session_fork_v1` method token.
+    #[must_use]
+    pub const fn additive_shape_feature(&self) -> Option<&'static str> {
+        match self {
+            Self::SessionFork {
+                prompt: Some(_), ..
+            } => Some(FEATURE_SESSION_PROMPT_FORK_V1),
+            _ => None,
+        }
+    }
+}
+
 /// v0.1 response method bodies.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method")]
@@ -4230,6 +4267,14 @@ pub enum ResponseBody {
         created_seq: u64,
         worker_generation: u64,
         metadata: SessionMetadataV1,
+        /// Present only for a prompt-oriented fork; names the source prompt
+        /// returned in `draft` rather than the copied-history boundary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        forked_from: Option<SessionForkProvenance>,
+        /// Editable and unsent. Full attachment blocks retain the CAS and
+        /// provider-ingress coordinates needed for a later turn submission.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        draft: Option<SessionForkDraft>,
     },
     /// A metafork review (`committed=false`) or its stable committed receipt.
     /// Optional child fields are absent during the write-free review phase.
@@ -4883,6 +4928,13 @@ pub enum ErrorData {
     AlreadyResolved {
         /// Sequence of the envelope recording the winning resolution.
         resolution_seq: u64,
+    },
+    /// An existing event is not a forkable user prompt on the requested
+    /// source branch (`invalid_argument`). Missing events use `not_found`.
+    SessionForkInvalidCut {
+        session_id: SessionId,
+        seq: u64,
+        reason: haider_protocol::session_fork::SessionForkInvalidCutReason,
     },
     /// A revision-fenced compare-and-set request observed a newer snapshot
     /// ([`ERROR_CODE_REVISION_CONFLICT`]).

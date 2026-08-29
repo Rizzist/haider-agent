@@ -104,6 +104,10 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// MUTATION CHECK: remove `FEATURE_SESSION_FORK_V1`. Expected RUNTIME failure:
 /// clients cannot discover the served session-level fork/metafork doors.
 ///
+/// MUTATION CHECK: remove `FEATURE_SESSION_PROMPT_FORK_V1`. Expected RUNTIME
+/// failure: clients cannot discover the additive exclusive-prompt selector,
+/// draft response, or roster provenance field.
+///
 /// MUTATION CHECK: remove `FEATURE_SESSION_OBSERVE_V1`. Expected RUNTIME
 /// failure: scriptable clients cannot discover the served state digest.
 ///
@@ -207,8 +211,8 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
         welcome_features().len(),
-        100,
-        "the ordinary Welcome advertises the 96 v0.0.964 tokens plus peer, SSH/shell, and lockdown families"
+        101,
+        "the 100-token v0.0.965 Welcome plus session_prompt_fork_v1"
     );
     assert_eq!(
         welcome_features(),
@@ -226,6 +230,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_EXPORT_SEQ_V1.to_owned(),
             haider_rpc::FEATURE_BRANCH_CREATE_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_FORK_V1.to_owned(),
+            haider_rpc::FEATURE_SESSION_PROMPT_FORK_V1.to_owned(),
             FEATURE_COMMAND_DOOR_V1.to_owned(),
             haider_rpc::FEATURE_COMPACTION_GUARD_V1.to_owned(),
             FEATURE_CONTEXT_COMPACTION_V1.to_owned(),
@@ -362,11 +367,16 @@ fn welcome_advertises_resident_session_binding_token_echo() {
     );
 }
 
+/// MUTATION CHECK: reverse the withholding order or omit the retained feature
+/// set. Expected runtime failure: a peer at the preceding Welcome limit no
+/// longer receives byte-identical v0.0.965 bytes, or the grant admits a shape
+/// that its Welcome did not advertise.
+///
 /// MUTATION CHECK: replace `welcome.user_command_withheld = true` in the
-/// fallback with `false`. Expected runtime failure: the tight Welcome still
-/// omits `user_command_v1` but loses the causal marker pinned below.
+/// second fallback with `false`. Expected runtime failure: the older tight
+/// Welcome loses the already-shipped causal marker pinned below.
 #[test]
-fn tight_welcome_omits_only_the_additive_user_command_feature() {
+fn tight_welcome_restores_the_pre_prompt_bytes_before_older_withholding() {
     let welcome = Welcome {
         protocol: haider_rpc::WIRE_PROTOCOL_VERSION,
         instance_id: "instance".into(),
@@ -386,54 +396,75 @@ fn tight_welcome_omits_only_the_additive_user_command_feature() {
 
     let ample = encode_welcome_for_peer(welcome.clone(), full_body_len)
         .expect("exact full limit carries every feature");
-    assert_eq!(ample.as_slice(), full.as_slice());
+    assert_eq!(ample.bytes.as_slice(), full.as_slice());
+    assert_eq!(ample.features, welcome.features);
     assert!(
-        !std::str::from_utf8(&ample[4..])
+        !std::str::from_utf8(&ample.bytes[4..])
             .expect("Welcome is JSON")
             .contains("\"uw\""),
         "nothing withheld serializes no marker, never false"
     );
     let mut ample_decoder = uds_codec::Decoder::new(full_body_len);
-    let ample_frames = ample_decoder.push(&ample).frames;
+    let ample_frames = ample_decoder.push(&ample.bytes).frames;
     assert!(matches!(
         ample_frames.as_slice(),
         [WireFrame::Welcome(Welcome { features, user_command_withheld, .. })]
             if features == &welcome.features && !user_command_withheld
     ));
 
-    let tight = encode_welcome_for_peer(welcome.clone(), full_body_len - 1)
-        .expect("tight peer retains the pre-T4 handshake");
-    let mut without_feature = welcome.clone();
-    assert!(without_feature.features.remove(FEATURE_USER_COMMAND_V1));
-    let without_feature = uds_codec::encode(&WireFrame::Welcome(without_feature), usize::MAX)
-        .expect("unmarked Welcome without user command encodes");
-    let without_feature_body_len = without_feature.len() - 4;
-    let tight_body_len = tight.len() - 4;
+    let mut pre_prompt_welcome = welcome.clone();
+    assert!(
+        pre_prompt_welcome
+            .features
+            .remove(FEATURE_SESSION_PROMPT_FORK_V1)
+    );
+    let pre_prompt = uds_codec::encode(&WireFrame::Welcome(pre_prompt_welcome.clone()), usize::MAX)
+        .expect("pre-prompt Welcome encodes");
+    let pre_prompt_body_len = pre_prompt.len() - 4;
+    let prompt_tight = encode_welcome_for_peer(welcome.clone(), full_body_len - 1)
+        .expect("tight peer retains the exact pre-prompt handshake");
+    assert_eq!(prompt_tight.bytes.as_slice(), pre_prompt.as_slice());
+    assert_eq!(prompt_tight.features, pre_prompt_welcome.features);
+    assert!(
+        !prompt_tight
+            .features
+            .contains(FEATURE_SESSION_PROMPT_FORK_V1)
+    );
+
+    let tight = encode_welcome_for_peer(welcome.clone(), pre_prompt_body_len - 1)
+        .expect("older user-command fallback still fits");
+    let mut without_features = pre_prompt_welcome.clone();
+    assert!(without_features.features.remove(FEATURE_USER_COMMAND_V1));
+    let without_features = uds_codec::encode(&WireFrame::Welcome(without_features), usize::MAX)
+        .expect("unmarked Welcome without either additive feature encodes");
+    let without_features_body_len = without_features.len() - 4;
+    let tight_body_len = tight.bytes.len() - 4;
     assert_eq!(
-        full_body_len - without_feature_body_len,
+        pre_prompt_body_len - without_features_body_len,
         18,
         "the real encoder's feature-array element costs 18 bytes"
     );
     assert_eq!(
-        tight_body_len - without_feature_body_len,
+        tight_body_len - without_features_body_len,
         10,
         "the short true marker costs 10 bytes"
     );
     assert_eq!(
-        full_body_len - tight_body_len,
+        pre_prompt_body_len - tight_body_len,
         8,
         "replacement must be strictly smaller than the withheld token"
     );
     assert!(
-        std::str::from_utf8(&tight[4..])
+        std::str::from_utf8(&tight.bytes[4..])
             .expect("Welcome is JSON")
             .contains("\"uw\":true"),
         "a withheld token carries the causal marker"
     );
-    let mut tight_decoder = uds_codec::Decoder::new(full_body_len - 1);
-    let tight_frames = tight_decoder.push(&tight).frames;
-    let mut expected = welcome.features.clone();
+    let mut tight_decoder = uds_codec::Decoder::new(pre_prompt_body_len - 1);
+    let tight_frames = tight_decoder.push(&tight.bytes).frames;
+    let mut expected = pre_prompt_welcome.features.clone();
     assert!(expected.remove(FEATURE_USER_COMMAND_V1));
+    assert_eq!(tight.features, expected);
     assert!(matches!(
         tight_frames.as_slice(),
         [WireFrame::Welcome(Welcome { features, user_command_withheld, .. })]
@@ -442,22 +473,40 @@ fn tight_welcome_omits_only_the_additive_user_command_feature() {
 
     let mut selected_encoding = welcome;
     selected_encoding.encoding = Some("msgpack".into());
-    let selected_full =
-        uds_codec::encode(&WireFrame::Welcome(selected_encoding.clone()), usize::MAX)
-            .expect("selected-encoding Welcome encodes");
-    let selected_full_body_len = selected_full.len() - 4;
     let mut selected_unmarked = selected_encoding.clone();
+    assert!(
+        selected_unmarked
+            .features
+            .remove(FEATURE_SESSION_PROMPT_FORK_V1)
+    );
     assert!(selected_unmarked.features.remove(FEATURE_USER_COMMAND_V1));
     let selected_unmarked = uds_codec::encode(&WireFrame::Welcome(selected_unmarked), usize::MAX)
         .expect("selected-encoding unmarked Welcome encodes");
-    let selected_tight = encode_welcome_for_peer(selected_encoding, selected_full_body_len - 1)
-        .expect("selected-encoding fallback fits");
-    assert_eq!(selected_full_body_len - (selected_unmarked.len() - 4), 18);
+    let mut selected_pre_prompt = selected_encoding.clone();
+    assert!(
+        selected_pre_prompt
+            .features
+            .remove(FEATURE_SESSION_PROMPT_FORK_V1)
+    );
+    let selected_pre_prompt =
+        uds_codec::encode(&WireFrame::Welcome(selected_pre_prompt), usize::MAX)
+            .expect("selected-encoding pre-prompt Welcome encodes");
+    let selected_pre_prompt_body_len = selected_pre_prompt.len() - 4;
+    let selected_tight =
+        encode_welcome_for_peer(selected_encoding, selected_pre_prompt_body_len - 1)
+            .expect("selected-encoding fallback fits");
     assert_eq!(
-        (selected_tight.len() - 4) - (selected_unmarked.len() - 4),
+        selected_pre_prompt_body_len - (selected_unmarked.len() - 4),
+        18
+    );
+    assert_eq!(
+        (selected_tight.bytes.len() - 4) - (selected_unmarked.len() - 4),
         10
     );
-    assert_eq!(selected_full_body_len - (selected_tight.len() - 4), 8);
+    assert_eq!(
+        selected_pre_prompt_body_len - (selected_tight.bytes.len() - 4),
+        8
+    );
 }
 
 #[tokio::test]
@@ -497,7 +546,9 @@ async fn standard_welcome_cache_reuses_byte_identical_golden_frame() {
     )
     .expect("golden Welcome frame");
 
-    let (OutboundBytes::Contiguous(first), OutboundBytes::Contiguous(second)) = (&first, &second)
+    assert_eq!(first.features, second.features);
+    let (OutboundBytes::Contiguous(first), OutboundBytes::Contiguous(second)) =
+        (&first.bytes, &second.bytes)
     else {
         panic!("standard JSON Welcome must use contiguous cached bytes");
     };

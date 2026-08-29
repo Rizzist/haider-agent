@@ -738,7 +738,8 @@ fn failure_code(error: &ConfigError) -> ExitCode {
         | ConfigError::InvalidSelector(_) => EX_PROTOCOL,
         ConfigError::Ensure(_) => EX_UNAVAILABLE,
         ConfigError::Client(ClientError::Disconnected(_)) => EX_IOERR,
-        ConfigError::Client(ClientError::Encode(_)) | ConfigError::MissingMetadata => EX_SOFTWARE,
+        ConfigError::Client(ClientError::Encode(_) | ClientError::MissingFeature(_))
+        | ConfigError::MissingMetadata => EX_SOFTWARE,
         ConfigError::Rpc { code, .. }
             if matches!(
                 code.as_str(),

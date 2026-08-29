@@ -4526,6 +4526,10 @@ fn client_error(
             stage,
             message: error.to_string(),
         }),
+        ClientError::MissingFeature(feature) => Err(HeadlessRunError::Protocol {
+            stage,
+            message: format!("missing_feature: {feature}"),
+        }),
     }
 }
 
@@ -4535,6 +4539,10 @@ fn client_error_as_headless(stage: &'static str, error: ClientError) -> Headless
         ClientError::Encode(error) => HeadlessRunError::Encode {
             stage,
             message: error.to_string(),
+        },
+        ClientError::MissingFeature(feature) => HeadlessRunError::Protocol {
+            stage,
+            message: format!("missing_feature: {feature}"),
         },
     }
 }

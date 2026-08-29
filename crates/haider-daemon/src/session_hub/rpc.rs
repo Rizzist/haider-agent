@@ -2889,6 +2889,7 @@ impl HubConnection {
                 source_branch_id,
                 fork_node_id,
                 fork_seq,
+                prompt,
                 name,
             } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
@@ -2900,6 +2901,16 @@ impl HubConnection {
                         None,
                     );
                 }
+                let (Some(fork_node_id), Some(fork_seq), None) = (fork_node_id, fork_seq, prompt)
+                else {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_INVALID_ARGUMENT,
+                        "session.fork requires exactly one complete selector",
+                        false,
+                        None,
+                    );
+                };
                 self.session_fork(
                     request_id,
                     command_id,
@@ -9144,6 +9155,8 @@ impl HubConnection {
                 created_seq: created.created_seq,
                 worker_generation: created.worker_generation,
                 metadata: created.metadata,
+                forked_from: None,
+                draft: None,
             },
         })
     }
@@ -16276,6 +16289,7 @@ pub(crate) async fn session_summaries(
             effort,
             fast,
             account_alias: None,
+            forked_from: None,
         });
     }
     Ok(sessions)
@@ -16586,6 +16600,7 @@ mod roster_wave_tests {
             effort: None,
             fast: None,
             account_alias: None,
+            forked_from: None,
         }
     }
 

@@ -1300,7 +1300,9 @@ pub(crate) fn exit_code_for_observe_error(error: &ObserveError) -> u8 {
         | ObserveError::Connect(_) => EX_UNAVAILABLE,
         ObserveError::Client(haider_client::ClientError::Disconnected(_))
         | ObserveError::OutputClosed => EX_IOERR,
-        ObserveError::Client(haider_client::ClientError::Encode(_))
+        ObserveError::Client(
+            haider_client::ClientError::Encode(_) | haider_client::ClientError::MissingFeature(_),
+        )
         | ObserveError::StreamTask(_)
         | ObserveError::UnknownSession(_) => EX_SOFTWARE,
         ObserveError::Rpc { code, .. } if code == "timeout_before_acceptance" => EX_TIMEOUT,

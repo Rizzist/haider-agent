@@ -206,7 +206,7 @@ An operation not listed here is part of the v1 base surface. “Field” means t
 client may use that field only when it is present; the named token permits an
 affordance before the response exists.
 
-The ordinary v0.0.965 `welcome_features()` set contains all 100 tokens below.
+The ordinary v0.0.966 `welcome_features()` set contains all 101 tokens below.
 The re-verification anchors are the `welcome_features()` function in
 `crates/haider-daemon/src/connection.rs` and the `FEATURE_*` constant block in
 `crates/haider-rpc/src/frame.rs`. The one peer-specific withholding exception
@@ -229,6 +229,7 @@ is §4.1.
 | `artifact_put_v1` | `artifact.put` |
 | `branch_create_v1` | `branch.create`, branch-scoped submit/compact fields and responses |
 | `session_fork_v1` | `session.fork`, `session.metafork` |
+| `session_prompt_fork_v1` | additive prompt selector, editable draft response, and `forked_from` response/roster provenance on the existing `session.fork` method |
 | `session_observe_v1` | `session.observe` |
 | `session_observe_batch_v1` | `session.observe_batch` |
 | `session_fleet_v1` | `session.fleet` |
@@ -1069,6 +1070,7 @@ or metadata-only digest.
 | surface publish `input` or `status` | leave that surface unchanged; empty text/line is a value |
 | branch-scoped `branch_id` | implicit main branch |
 | branch/fork `source_branch_id` | source main branch |
+| fork `fork_node_id`, `fork_seq` | omitted only for a `session_prompt_fork_v1` request carrying `prompt`; legacy exact-node requests carry both with their shipped meanings |
 | branch/fork/metafork `name` | daemon-generated/default name |
 | metafork `accepted_proposal_digest` | write-free review only; presence is acceptance of the exact returned review manifest |
 | model-select `provider` | select within current provider; presence selects the named provider/model row |
@@ -1354,6 +1356,8 @@ surface tables above.
 | fleet `children=[]`, `folded_children=0` | a real leaf. A positive `folded_children` says bounded children were omitted; the rollup covers only returned nodes |
 | hook `trust_state` | old daemon; only the legacy `trusted` boolean may be used, with no invented revoked-by-edit state |
 | branch/fork/metafork response `source_branch_id` | source was the implicit main branch |
+| fork response / summary `forked_from` | legacy exact-node fork, non-forked session, or an older daemon; when present its sequence names the selected source prompt returned as the draft, not the copied-history boundary |
+| fork response `draft` | legacy exact-node fork or an older daemon; a prompt fork returns the selected prompt text plus its complete typed attachment blocks |
 | metafork review fields | with `committed=false`, `session_id`, `created_seq`, `worker_generation`, `metadata`, and `omission_count` are absent while `review_manifest` is present. With `committed=true`, those receipt fields are present and `review_manifest` is absent |
 | rename/effort/agent-type receipt value | the committed result is cleared title, provider-default effort, or plain session respectively—the same semantics as the request |
 | device candidate `account_label`, `expires_at_ms` | the external store supplied no label or expiry. `unsupported_reason=None` means no public reason, not that import is supported; use `import_supported` |
@@ -1366,6 +1370,54 @@ surface tables above.
 `ObserveMenuWire.body=[]`, empty pending menus/subagents, empty hook lists, and
 empty fleet roots are genuine emptiness for their successful full snapshots.
 They are not subsystem-unavailable sentinels.
+
+### 9.8.1 Prompt-oriented session fork
+
+`session_prompt_fork_v1` extends the existing `session.fork` method; it does
+not add or rename a method. A legacy exact-node request carries
+`fork_node_id: NodeId` and `fork_seq: u64` together and omits `prompt`; those
+fields retain their shipped inclusive-node semantics and their encoded bytes.
+A prompt-oriented request instead omits both legacy coordinates and carries
+`prompt: { seq: u64 }`. The sequence names an existing durable user-prompt
+event in `session_id` and, when supplied, `source_branch_id`.
+
+The mutually exclusive shape is compatibility-critical. A client that does
+not see `session_prompt_fork_v1` stops locally with `missing_feature` and sends
+no request. If a new client disregards that preflight and sends the prompt
+shape to an older daemon, the old request decoder sees its required
+`fork_node_id`/`fork_seq` absent and cannot silently execute the legacy fork.
+The token grants no authority: Control capability and a live Control
+attachment to the source remain required.
+
+Selecting prompt B creates a child containing the source history through the
+complete turn immediately before B. B itself is not committed to the child.
+The existing response `session_id` remains the daemon-minted child id and the
+existing `fork_node_id`/`fork_seq` report the resolved copied-history boundary.
+The additive `forked_from: { session_id, seq }` names B, while
+`draft: { text, attachments }` returns B as editable, unsent input.
+`attachments` is the full `AttachmentBlock` vector from the durable user
+message: CAS artifact refs plus image dimensions/MIME, pasted-text line count,
+sanitized file name/line count, PDF page/delivery coordinates, or skill pin as
+applicable. Bytes never ride this response. `SessionSummary.forked_from`
+publishes the same provenance in `session.list` and `SessionRosterDelta`.
+
+The refusal taxonomy is exhaustive:
+
+| Condition | Result |
+|---|---|
+| Feature absent | SDK-local `missing_feature`; no wire request or wire error |
+| No Control capability or source Control attachment | existing non-retryable `capability_denied` |
+| Source session or selected event absent | existing non-retryable `not_found` |
+| Stale worker generation | existing `stale_generation` |
+| Existing event is not a forkable user prompt | `invalid_argument` with `ErrorData.kind=session_fork_invalid_cut`, the source `session_id`/`seq`, and `reason=not_user_prompt` |
+| Existing prompt is not on `source_branch_id` | `invalid_argument` with the same typed data and `reason=wrong_branch` |
+| Boundary before the prompt is mid-run, queued, or interleaved | new `fork_cut_unstable` with `retryable=true` |
+| Command id reappears with different canonical input | existing non-retryable `invalid_argument` receipt conflict |
+| Store failure | preserve `store_read_only`, `store_corrupt`, `store_unavailable`, or `store_full` and the store's retryability; never collapse to `invalid_argument` |
+
+`SessionForkInvalidCutReason` is a new unknown-tolerant enum scoped to this
+feature. An unknown reason supplies no cut authority. `fork_cut_unstable` is
+the only new wire error code; `missing_feature` remains client-local.
 
 ### 9.9 Zero, revision, generation, and timestamp inventory
 
@@ -2484,8 +2536,8 @@ The machine-checkable contract lives in these fixtures/tests:
   WebSocket bodies and four-byte length-prefixed UDS bytes, including
   Hello/Welcome, raw replay, menu CAS, accounts/providers/usage, and mutation
   receipts; the appended monitor and Loom registry delta/caught-up entries pin
-  both dedicated non-chat streams and the A/C/D union tail. The exact current
-  transcript count is 173.
+  both dedicated non-chat streams, the A/C/D union tail, and the four-frame
+  prompt-fork tail. The exact current transcript count is 177.
 - `crates/haider-rpc/tests/fixtures/client_contract_methods_v1.json`: the
   64 methods absent from the expanded transcript, completing its 59 with golden
   request and successful response coverage for all 123 request methods and all
@@ -2635,9 +2687,13 @@ Undo, redo, and rollback are themselves `FsWrite` effects and append a fresh
 `CheckpointRecorded` fact. Their post-state is never rewritten into an older
 record, and neither journal rows nor CAS objects are deleted.
 
-The exact v0.0.965 recount is 100 Welcome feature tokens, 123 request methods,
-and 173 compact wire-transcript frames: the peer, SSH/shell-registry, and
-provider-lockdown families are tail additions to v0.0.964's 96/104/133 base.
+The exact v0.0.966 recount is 101 Welcome feature tokens, 123 request methods,
+and 177 compact wire-transcript frames. The prompt-fork derivation is explicit:
+features `100 + 1 = 101`, methods `123 + 0 = 123` because `session.fork`
+already exists, and frames `173 + 4 = 177` for Welcome, request, response, and
+roster delta. The supplemental 64-method absent fixture is unchanged: the
+transcript still covers 59 distinct successful request methods, and
+`59 + 64 = 123`.
 
 **Absence law.** Without `checkpoint_v1`, a client MUST NOT call any checkpoint
 method, infer pre-images from ordinary file-change summaries, replay local
@@ -3095,10 +3151,10 @@ opaque shell id and treat `closed` as an explicit operator action distinct from
 natural `exited`. `shell.close` is idempotent. Closing an SSH shell closes only
 its channel, not the reusable authenticated profile connection.
 
-The SSH/shell family adds 13 request methods and two feature strings. In the
-integrated v0.0.965 contract, the exhaustive fixtures contain **123** request
-methods, the compact transcript contains **173** frames, and the ordinary
-daemon Welcome advertises **100** feature strings.
+The SSH/shell family adds 13 request methods and two feature strings. After the
+additive v0.0.966 prompt-fork extension, the exhaustive fixtures still contain
+**123** request methods, the compact transcript contains **177** frames, and
+the ordinary daemon Welcome advertises **101** feature strings.
 
 ## 20. Provider lockdown v1
 

@@ -272,6 +272,7 @@ fn sustained_unknown_payloads_emit_one_durable_compatibility_diagnostic() {
                 effort: None,
                 fast: None,
                 account_alias: None,
+                forked_from: None,
             }],
             next_cursor: None,
         },

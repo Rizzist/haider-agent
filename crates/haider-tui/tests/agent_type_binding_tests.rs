@@ -590,6 +590,7 @@ fn roster_row_accent_joins_the_summary_and_falls_back() {
         effort: None,
         fast: None,
         account_alias: None,
+        forked_from: None,
     };
     model.note_summary_counts(&summary);
     assert_eq!(
