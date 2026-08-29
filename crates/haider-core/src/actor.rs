@@ -1302,6 +1302,7 @@ impl TurnHandle {
 pub struct HarnessHandle {
     commands: mpsc::Sender<ActorCommand>,
     events: broadcast::Sender<RawEnvelope>,
+    committed_batches: broadcast::Sender<Arc<[RawEnvelope]>>,
     state: watch::Receiver<Option<RunState>>,
     committed_menus: watch::Sender<Option<RawEnvelope>>,
     provider_retry_wake: Arc<ProviderRetryWake>,
@@ -1474,6 +1475,12 @@ impl HarnessHandle {
     /// Live feed of committed envelopes (from subscription time onward).
     pub fn subscribe(&self) -> broadcast::Receiver<RawEnvelope> {
         self.events.subscribe()
+    }
+
+    /// Live feed of committed batches. Each batch is the exact owned slice
+    /// returned by the durability seam, shared without cloning its payloads.
+    pub fn subscribe_committed_batches(&self) -> broadcast::Receiver<Arc<[RawEnvelope]>> {
+        self.committed_batches.subscribe()
     }
 
     pub fn current_state(&self) -> Option<RunState> {
@@ -1788,6 +1795,7 @@ pub struct HarnessActor {
     validated_tool_image_refs: HashMap<ArtifactRef, ImageBlockRef>,
     commands: mpsc::Receiver<ActorCommand>,
     events: broadcast::Sender<RawEnvelope>,
+    committed_batches: broadcast::Sender<Arc<[RawEnvelope]>>,
     state: watch::Sender<Option<RunState>>,
     committed_menus: watch::Receiver<Option<RawEnvelope>>,
     provider_retry_wake: Arc<ProviderRetryWake>,
@@ -1860,6 +1868,7 @@ impl HarnessActor {
         });
         let (command_sender, commands) = mpsc::channel(config.command_capacity.max(1));
         let (events, _) = broadcast::channel(config.broadcast_capacity.max(1));
+        let (committed_batches, _) = broadcast::channel(config.broadcast_capacity.max(1));
         let (state, state_receiver) = watch::channel(None);
         let (committed_menus, committed_menu_receiver) = watch::channel(None);
         let provider_retry_wake = Arc::new(ProviderRetryWake::default());
@@ -1867,6 +1876,7 @@ impl HarnessActor {
         let handle = HarnessHandle {
             commands: command_sender,
             events: events.clone(),
+            committed_batches: committed_batches.clone(),
             state: state_receiver,
             committed_menus,
             provider_retry_wake: Arc::clone(&provider_retry_wake),
@@ -1883,6 +1893,7 @@ impl HarnessActor {
                 validated_tool_image_refs: HashMap::new(),
                 commands,
                 events,
+                committed_batches,
                 state,
                 committed_menus: committed_menu_receiver,
                 provider_retry_wake,
@@ -4110,10 +4121,14 @@ impl HarnessActor {
                                     .await;
                             }
                         }
-                        if !assistant_blocks.is_empty() {
+                        let current_assistant_message_index = if !assistant_blocks.is_empty() {
+                            let index = messages.len();
                             messages
                                 .push(Message::assistant(std::mem::take(&mut assistant_blocks)));
-                        }
+                            Some(index)
+                        } else {
+                            None
+                        };
                         if !deferred.is_empty() {
                             if let Err(error) = self
                                 .commit_state(
@@ -4563,6 +4578,13 @@ impl HarnessActor {
                                         &mut tools,
                                     )
                                     .await;
+                            }
+                            // Every continuation fence has now closed. Release
+                            // only this request's replay copy before the
+                            // terminal append builds the same text into its
+                            // required Item and Node facts.
+                            if let Some(index) = current_assistant_message_index {
+                                messages.truncate(index);
                             }
                             return match self
                                 .commit_post_stream_facts(
@@ -5412,7 +5434,7 @@ impl HarnessActor {
         // Arm against the actor-minted event id BEFORE the append becomes
         // visible. A daemon can therefore never observe this durable
         // `Retrying` fact in the small gap before its wake seam exists.
-        let mut envelopes = [
+        let envelopes = [
             self.uncommitted_envelope(
                 run_id,
                 EventPayload::RunState(waiting),
@@ -5432,12 +5454,9 @@ impl HarnessActor {
             .await
             .map_err(DriveError::Store)?;
         retry_wake.arm(retrying_event_id.clone());
-        if let Err(error) = self.store.append(&mut envelopes).await {
+        if let Err(error) = self.append_and_publish_owned(Vec::from(envelopes)).await {
             retry_wake.disarm(&retrying_event_id);
             return Err(DriveError::Store(error));
-        }
-        for committed in envelopes {
-            let _ = self.events.send(committed);
         }
         self.state.send_replace(Some(retrying));
         // Clone the sleeper Arc into a local so the pinned backoff future
@@ -7180,7 +7199,7 @@ impl HarnessActor {
         item: TurnItem,
     ) -> Result<(), DriveError> {
         let item_id = self.next_item_id();
-        let mut envelopes = [
+        let envelopes = [
             self.uncommitted_envelope(
                 run_id,
                 EventPayload::Item(ItemEvent::Started {
@@ -7200,13 +7219,9 @@ impl HarnessActor {
         self.flush_pending_item_delta()
             .await
             .map_err(DriveError::Store)?;
-        self.store
-            .append(&mut envelopes)
+        self.append_and_publish_owned(Vec::from(envelopes))
             .await
             .map_err(DriveError::Store)?;
-        for envelope in envelopes {
-            let _ = self.events.send(envelope);
-        }
         Ok(())
     }
 
@@ -7218,7 +7233,7 @@ impl HarnessActor {
         item: TurnItem,
     ) -> Result<(), DriveError> {
         let item_id = self.next_item_id();
-        let mut envelopes = [
+        let envelopes = [
             self.uncommitted_envelope(
                 run_id,
                 EventPayload::Item(ItemEvent::Started {
@@ -7238,13 +7253,9 @@ impl HarnessActor {
         self.flush_pending_item_delta()
             .await
             .map_err(DriveError::Store)?;
-        self.store
-            .append(&mut envelopes)
+        self.append_and_publish_owned(Vec::from(envelopes))
             .await
             .map_err(DriveError::Store)?;
-        for envelope in envelopes {
-            let _ = self.events.send(envelope);
-        }
         Ok(())
     }
 
@@ -7452,7 +7463,6 @@ impl HarnessActor {
             )
             .map_err(DriveError::Store)?,
         );
-        let node_committed_index = envelopes.len();
         envelopes.push(
             self.uncommitted_envelope(
                 run_id,
@@ -7471,16 +7481,10 @@ impl HarnessActor {
                 .map_err(DriveError::Store)?,
             );
         }
-        self.store
-            .append(&mut envelopes)
+        self.append_and_publish_owned(envelopes)
             .await
             .map_err(DriveError::Store)?;
-        for (index, committed) in envelopes.into_iter().enumerate() {
-            let _ = self.events.send(committed);
-            if index == node_committed_index {
-                self.tree_head = Some(node.node.clone());
-            }
-        }
+        self.tree_head = Some(node.node);
         if resume_streaming {
             self.state.send_replace(Some(RunState::Streaming));
         }
@@ -7682,7 +7686,7 @@ impl HarnessActor {
         run_id: &RunId,
         error: &HaiderError,
     ) -> Result<(), HaiderError> {
-        let mut envelopes = [
+        let envelopes = [
             self.uncommitted_envelope(
                 run_id,
                 EventPayload::RunFailed {
@@ -7700,12 +7704,7 @@ impl HarnessActor {
             )?,
         ];
         self.flush_pending_item_delta().await?;
-        self.store.append(&mut envelopes).await?;
-        for committed in envelopes {
-            // No live subscribers is fine — the store already has the
-            // complete failure terminal.
-            let _ = self.events.send(committed);
-        }
+        self.append_and_publish_owned(Vec::from(envelopes)).await?;
         self.state.send_replace(Some(RunState::Errored));
         Ok(())
     }
@@ -7821,7 +7820,7 @@ impl HarnessActor {
                 verdict: VerifyVerdict::NotApplicable,
             },
         };
-        let mut envelopes = [
+        let envelopes = [
             self.uncommitted_envelope(
                 run_id,
                 EventPayload::Item(ItemEvent::Started {
@@ -7847,13 +7846,9 @@ impl HarnessActor {
         self.flush_pending_item_delta()
             .await
             .map_err(DriveError::Store)?;
-        self.store
-            .append(&mut envelopes)
+        self.append_and_publish_owned(Vec::from(envelopes))
             .await
             .map_err(DriveError::Store)?;
-        for committed in envelopes {
-            let _ = self.events.send(committed);
-        }
         self.tree_head = Some(node.node);
         Ok(())
     }
@@ -7921,14 +7916,9 @@ impl HarnessActor {
                 prompt_omit_render(),
             )
             .map_err(DriveError::Store)?;
-        let mut envelopes = [started, completed, result];
-        self.store
-            .append(&mut envelopes)
+        self.append_and_publish_owned(vec![started, completed, result])
             .await
             .map_err(DriveError::Store)?;
-        for committed in envelopes {
-            let _ = self.events.send(committed);
-        }
         Ok(())
     }
 
@@ -7982,13 +7972,16 @@ impl HarnessActor {
             cache_attempt_data,
             hidden_prompt_omit_render(),
         )?);
-        self.store.append(&mut envelopes).await?;
-        for (index, committed) in envelopes.into_iter().enumerate() {
-            let _ = self.events.send(committed);
+        let committed = self.store.append_owned(envelopes).await?;
+        for (index, envelope) in committed.iter().enumerate() {
+            if self.events.receiver_count() != 0 {
+                let _ = self.events.send(envelope.clone());
+            }
             if thinking_index == Some(index) {
                 self.state.send_replace(Some(RunState::Thinking));
             }
         }
+        let _ = self.committed_batches.send(committed);
         *thinking_pending = false;
         Ok(())
     }
@@ -8051,11 +8044,8 @@ impl HarnessActor {
         usage: Usage,
     ) -> Result<(), HaiderError> {
         self.flush_pending_item_delta().await?;
-        let mut envelopes = self.uncommitted_usage_envelopes(run_id, footprint, usage)?;
-        self.store.append(&mut envelopes).await?;
-        for committed in envelopes {
-            let _ = self.events.send(committed);
-        }
+        let envelopes = self.uncommitted_usage_envelopes(run_id, footprint, usage)?;
+        self.append_and_publish_owned(envelopes).await?;
         Ok(())
     }
 
@@ -8182,10 +8172,7 @@ impl HarnessActor {
             prompt_omit_render(),
         )?);
 
-        self.store.append(&mut envelopes).await?;
-        for committed in envelopes {
-            let _ = self.events.send(committed);
-        }
+        self.append_and_publish_owned(envelopes).await?;
         if let Some(node) = message_node {
             self.tree_head = Some(node.node);
         }
@@ -8203,12 +8190,9 @@ impl HarnessActor {
         data: serde_json::Value,
         render: RenderTargets,
     ) -> Result<(), HaiderError> {
-        let mut envelopes = self.uncommitted_extension_marker(run_id, kind, data, render)?;
+        let envelopes = self.uncommitted_extension_marker(run_id, kind, data, render)?;
         self.flush_pending_item_delta().await?;
-        self.store.append(&mut envelopes).await?;
-        for committed in envelopes {
-            let _ = self.events.send(committed);
-        }
+        self.append_and_publish_owned(Vec::from(envelopes)).await?;
         Ok(())
     }
 
@@ -8227,7 +8211,7 @@ impl HarnessActor {
             parent: self.tree_parent().await?,
             kind,
         };
-        let mut envelopes = [
+        let envelopes = [
             self.uncommitted_envelope(run_id, payload, render)?,
             self.uncommitted_envelope(
                 run_id,
@@ -8235,12 +8219,15 @@ impl HarnessActor {
                 prompt_omit_render(),
             )?,
         ];
-        self.store.append(&mut envelopes).await?;
-        for committed in &envelopes {
-            let _ = self.events.send(committed.clone());
-        }
+        let committed = self.append_and_publish_owned(Vec::from(envelopes)).await?;
         self.tree_head = Some(node.node);
-        Ok(envelopes[0].clone())
+        committed.first().cloned().ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                "tree fragment append returned an empty committed batch",
+                false,
+            )
+        })
     }
 
     async fn tree_parent(&mut self) -> Result<Option<NodeId>, HaiderError> {
@@ -8266,12 +8253,15 @@ impl HarnessActor {
         render: RenderTargets,
     ) -> Result<RawEnvelope, HaiderError> {
         self.flush_pending_item_delta().await?;
-        let mut envelopes = [self.uncommitted_envelope(run_id, payload, render)?];
-        self.store.append(&mut envelopes).await?;
-        let [committed] = envelopes;
-        // No live subscribers is fine — the store already has the envelope.
-        let _ = self.events.send(committed.clone());
-        Ok(committed)
+        let envelopes = vec![self.uncommitted_envelope(run_id, payload, render)?];
+        let committed = self.append_and_publish_owned(envelopes).await?;
+        committed.first().cloned().ok_or_else(|| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                "single-envelope append returned an empty committed batch",
+                false,
+            )
+        })
     }
 
     /// Holds only provider-stream deltas. A buffered value has not crossed the
@@ -8336,14 +8326,25 @@ impl HarnessActor {
                 return Err(error);
             }
         };
-        let mut envelopes = [envelope];
-        if let Err(error) = self.store.append(&mut envelopes).await {
+        if let Err(error) = self.append_and_publish_owned(vec![envelope]).await {
             self.restore_pending_item_delta(pending);
             return Err(error);
         }
-        let [committed] = envelopes;
-        let _ = self.events.send(committed);
         Ok(())
+    }
+
+    async fn append_and_publish_owned(
+        &self,
+        envelopes: Vec<RawEnvelope>,
+    ) -> Result<Arc<[RawEnvelope]>, HaiderError> {
+        let committed = self.store.append_owned(envelopes).await?;
+        if self.events.receiver_count() != 0 {
+            for envelope in committed.iter() {
+                let _ = self.events.send(envelope.clone());
+            }
+        }
+        let _ = self.committed_batches.send(Arc::clone(&committed));
+        Ok(committed)
     }
 
     fn restore_pending_item_delta(&mut self, pending: PendingItemDelta) {

@@ -3,12 +3,12 @@
 #[cfg(unix)]
 use super::hook_command;
 use super::{
-    CapturedBytes, DecisionState, EngineState, HOOK_ENGINE_SNAPSHOT_FILE,
-    HOOK_ENGINE_SNAPSHOT_VERSION, HookDefinition, HookEngine, HookEngineSnapshot,
-    HookEngineSnapshotFile, HookKind, HookMatcher, HookService, HookSource, HookStartupHydrator,
-    HookTrustPolicy, MatchEvent, SnapshotSchedule, classify, discover, encode_hook_snapshot_file,
-    hook_digest, make_output, next_subscriber_backoff, prepare_hook_input,
-    prune_terminal_run_trust, reduce_durable_state, run_command,
+    CapturedBytes, DecisionState, EngineState, HOOK_DRAIN_PAGE_MAX_REQUESTS,
+    HOOK_ENGINE_SNAPSHOT_FILE, HOOK_ENGINE_SNAPSHOT_VERSION, HookDefinition, HookEngine,
+    HookEngineSnapshot, HookEngineSnapshotFile, HookKind, HookMatcher, HookService, HookSource,
+    HookStartupHydrator, HookTrustPolicy, MatchEvent, SnapshotSchedule, classify, discover,
+    encode_hook_snapshot_file, hook_digest, make_output, next_subscriber_backoff,
+    prepare_hook_input, prune_terminal_run_trust, reduce_durable_state, run_command,
 };
 #[cfg(unix)]
 use super::{HOOK_LEADER_EXIT_POLL_MAX, poll_hook_leader_exit};
@@ -1052,6 +1052,24 @@ async fn snapshot_cadence_coalesces_batches_and_forces_terminal_delete_and_shutd
         )];
         fixture.hub.append(&mut batch).await.expect("commit burst");
     }
+    // One durable append larger than the hook page-count ceiling must wake
+    // successive immediate pages without retaining or losing the tail.
+    let mut paged_batch = (0..=HOOK_DRAIN_PAGE_MAX_REQUESTS)
+        .map(|index| {
+            raw_event(
+                &fixture.session_id,
+                &fixture.run_id,
+                fixture.store.worker_generation(),
+                &format!("snapshot-paged-{index}"),
+                EventPayload::RunState(RunState::Thinking),
+            )
+        })
+        .collect::<Vec<_>>();
+    fixture
+        .hub
+        .append(&mut paged_batch)
+        .await
+        .expect("commit paged burst");
     wait_for_hook_outbox_drain(&fixture.store).await;
     assert!(
         fixture.service.snapshot_persist_count() - baseline <= 1,
@@ -1092,7 +1110,11 @@ async fn snapshot_cadence_coalesces_batches_and_forces_terminal_delete_and_shutd
     .expect("terminal snapshot deadline");
 
     let before_delete = fixture.service.snapshot_persist_count();
-    fixture.service.session_deleted(fixture.session_id.clone());
+    fixture
+        .hub
+        .delete_session(fixture.session_id.clone())
+        .await
+        .expect("durably delete terminal hook session");
     tokio::time::timeout(Duration::from_secs(1), async {
         while fixture.service.snapshot_persist_count() == before_delete {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2458,6 +2480,18 @@ async fn recovery_replays_exactly_the_unacknowledged_rows() {
         .complete_hook_dispatches(vec![(session_id.clone(), seqs[1])])
         .await
         .expect("pre-ack middle row");
+    let one_oversized = store
+        .pending_hook_dispatches_bounded(16, 1)
+        .await
+        .expect("byte-bounded recovery page");
+    assert_eq!(
+        one_oversized
+            .iter()
+            .map(|event| event.seq)
+            .collect::<Vec<_>>(),
+        [seqs[0]],
+        "a page smaller than one envelope still makes FIFO progress"
+    );
 
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("reopen hub");
     let (service, engine) = HookEngine::start(profile, store.clone(), hub.clone())

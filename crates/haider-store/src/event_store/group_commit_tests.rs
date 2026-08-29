@@ -311,7 +311,7 @@ fn loaded_group_uses_one_commit_instead_of_one_per_append() {
         .collect::<Vec<_>>();
 
     let outcomes = store
-        .append_group(&mut batches)
+        .append_owned_group(&mut batches)
         .expect("loaded group commits");
     assert!(outcomes.iter().all(Result::is_ok));
     assert_eq!(commits.load(Ordering::SeqCst), 1);

@@ -93,6 +93,7 @@ use haider_protocol::cache::{
 use haider_protocol::envelope::{RawEnvelope, envelope_weight_bytes};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{BranchId, SessionId};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Crate marker used by the workspace self-test.
@@ -132,6 +133,19 @@ fn envelope_payload_kind(envelope: &RawEnvelope) -> &str {
 #[async_trait]
 pub trait StoreHandle: Send + Sync {
     async fn append(&self, envelopes: &mut [RawEnvelope]) -> Result<CommittedRange, HaiderError>;
+
+    /// Consumes one logical append and returns its stamped durable batch.
+    ///
+    /// Implementations with an owned storage path override this to avoid a
+    /// deep copy. The default preserves the compatibility contract for test
+    /// and embedding stores that only implement the in-place seam.
+    async fn append_owned(
+        &self,
+        mut envelopes: Vec<RawEnvelope>,
+    ) -> Result<Arc<[RawEnvelope]>, HaiderError> {
+        self.append(&mut envelopes).await?;
+        Ok(envelopes.into())
+    }
 
     async fn read(
         &self,

@@ -75,14 +75,9 @@ async fn hot_batch_uses_stamped_head_unless_the_sidecar_cursor_trails() {
     let _third = append_one(&store, &session_id, 3).await;
     let fourth = append_one(&store, &session_id, 4).await;
     writer
-        .maintain(
-            &store,
-            &session_id,
-            std::slice::from_ref(&fourth),
-            fourth.seq,
-        )
+        .maintain(&store, &session_id, &[], fourth.seq)
         .await
-        .expect("trailing cursor reconciles");
+        .expect("coalesced head wake reconciles the trailing cursor");
     assert_eq!(writer.journal_head_reads.load(Ordering::Relaxed), 1);
 
     drop(writer);

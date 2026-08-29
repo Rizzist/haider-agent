@@ -145,7 +145,10 @@ pub(super) async fn run_replay(
             match registration.events.try_recv() {
                 Ok(queued) => {
                     credit_catch_up(&registration.catch_up_bytes, queued.weight);
-                    let envelope = queued.envelope;
+                    let Some(envelope) = queued.envelopes.get(queued.index) else {
+                        lag_and_detach(&hub, &sink, &attachment_id, last_sent_seq).await;
+                        return ReplayCompletion::Complete;
+                    };
                     if envelope.seq <= last_sent_seq || envelope.seq <= high_water {
                         continue;
                     }
@@ -154,7 +157,7 @@ pub(super) async fn run_replay(
                         &sink,
                         &attachment_id,
                         &session_id,
-                        envelope.as_ref(),
+                        envelope,
                         &mut last_sent_seq,
                         DeliveryPhase::Buffered,
                         &mut registration.lagged,
@@ -248,7 +251,10 @@ pub(super) async fn run_replay(
                         return ReplayCompletion::Complete;
                     };
                     credit_catch_up(&registration.catch_up_bytes, queued.weight);
-                    let envelope = queued.envelope;
+                    let Some(envelope) = queued.envelopes.get(queued.index) else {
+                        lag_and_detach(&hub, &sink, &attachment_id, last_sent_seq).await;
+                        return ReplayCompletion::Complete;
+                    };
                     if envelope.seq <= last_sent_seq {
                         continue;
                     }
@@ -257,7 +263,7 @@ pub(super) async fn run_replay(
                         &sink,
                         &attachment_id,
                         &session_id,
-                        envelope.as_ref(),
+                        envelope,
                         &mut last_sent_seq,
                         DeliveryPhase::Live,
                         &mut registration.lagged,

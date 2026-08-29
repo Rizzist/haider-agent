@@ -1751,7 +1751,7 @@ impl SqliteStoreHandle {
         run_blocking(move || {
             owner.with_store(|store| {
                 let mut envelopes = envelopes;
-                store.append_worker(&mut envelopes)?;
+                store.append_worker_owned(&mut envelopes)?;
                 Ok(envelopes)
             })
         })
@@ -1794,7 +1794,7 @@ impl SqliteStoreHandle {
                         validate_worker_transitions: batch.validate_worker_transitions,
                     })
                     .collect::<Vec<_>>();
-                let outcomes = store.append_group(&mut batches)?;
+                let outcomes = store.append_owned_group(&mut batches)?;
                 Ok(batches
                     .into_iter()
                     .zip(outcomes)
@@ -1954,6 +1954,33 @@ impl SqliteStoreHandle {
     ) -> Result<Vec<RawEnvelope>, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.pending_hook_dispatches(limit))).await
+    }
+
+    /// Loads one count- and true-weight-bounded page of durable hook work.
+    pub async fn pending_hook_dispatches_bounded(
+        &self,
+        limit: usize,
+        byte_budget: usize,
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.pending_hook_dispatches_bounded(limit, byte_budget))
+        })
+        .await
+    }
+
+    /// Reports whether one session still has committed hook work in its
+    /// durable outbox.
+    pub async fn has_pending_hook_dispatches(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<bool, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let session_id = session_id.clone();
+        run_blocking(move || {
+            owner.with_store(|store| store.has_pending_hook_dispatches(&session_id))
+        })
+        .await
     }
 
     /// Idempotently acknowledges one committed hook-dispatch outbox row.
@@ -2210,6 +2237,40 @@ impl StoreHandle for SqliteStoreHandle {
             first_seq: range.first_seq,
             last_seq: range.last_seq,
         })
+    }
+
+    async fn append_owned(
+        &self,
+        mut envelopes: Vec<RawEnvelope>,
+    ) -> Result<Arc<[RawEnvelope]>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let failed_write_ids = envelopes
+            .iter()
+            .map(|envelope| envelope.event_id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let result = run_blocking(move || {
+            #[cfg(test)]
+            if let Some(error) = owner
+                .injected_append_error
+                .lock()
+                .map_err(|_| owner_lock_error())?
+                .take()
+            {
+                return Err(error);
+            }
+            owner.with_store(|store| {
+                store.append_owned(&mut envelopes)?;
+                Ok(envelopes)
+            })
+        })
+        .await;
+        match result {
+            Ok(envelopes) => Ok(envelopes.into()),
+            Err(error) => {
+                self.owner.note_failed_write(&error, failed_write_ids);
+                Err(error)
+            }
+        }
     }
 
     async fn read(
