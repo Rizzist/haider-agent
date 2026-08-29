@@ -4438,10 +4438,14 @@ fn render_session(
         model.anim_phase,
     );
     let mut tail: Vec<Line<'static>> = Vec::new();
-    // Sim `.thinking` (tui.js:4458-4462): a transient gold tail while
-    // thinking, pulsing (1.4s). The port also breathes the dot ● ↔ ◌ on
-    // the shared clock — the owner's marquee "alive" element.
-    if model.projection.is_thinking() {
+    // Sim `.thinking` (tui.js:4458-4462): a gold tail for the WHOLE running
+    // turn, pulsing (1.4s). The port also breathes the dot ● ↔ ◌ on the
+    // shared clock — the owner's marquee "alive" element.
+    // Gated on the run being ACTIVE, not on the Thinking beat: the beat-only
+    // gate blanked the indicator the instant the run reached `Streaming`, so
+    // a plainly-working turn looked dead above the composer. `Retrying` stays
+    // out of this set — it owns the dedicated tail row pushed just below.
+    if model.projection.is_turn_active() {
         // S2 item 5: one breathing row above the badge — it must never
         // sit flush against the last output line.
         tail.push(Line::default());
@@ -8643,7 +8647,12 @@ fn render_subagent(
         model.anim_phase,
     );
     let mut tail: Vec<Line<'static>> = Vec::new();
-    if chip.state == crate::script::ChipDisplayState::Thinking {
+    // Session parity: the tail is up for the WHOLE running turn, not just the
+    // THINKING beat. Judged on `display` (the badge's truth), NOT the raw
+    // `chip.state`: a chip whose live children promoted it to `Waiting` prints
+    // the dedicated "waiting on N child" row just below, and reading the raw
+    // state here would show both rows at once.
+    if display.is_turn_active() {
         // S2 item 5: the chip view keeps the session's rhythm — one
         // breathing row above the thinking badge.
         tail.push(Line::default());

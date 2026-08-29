@@ -5855,7 +5855,16 @@ impl AppModel {
                 // (tui.js:4694-4697) · chip glyph pulses (tui.js:4823-4834)
                 // — plus the viewed chip's own thinking tail and tool rows
                 // on the subagent screen.
-                self.projection.is_thinking()
+                //
+                // This term MUST track the tail indicator's render gate
+                // (`render.rs`, `projection.is_turn_active()`), not the
+                // narrower Thinking beat: this function is the ONLY thing that
+                // advances `anim_phase`, so a state that renders the pulsing
+                // row without registering here would paint it FROZEN — a dead
+                // `●` and a static shimmer for the whole stream. Widening it
+                // costs no idle wakeups, because every state it adds is one in
+                // which a turn is actively running.
+                self.projection.is_turn_active()
                     || streaming_tool_live(self.projection.entries())
                     || self
                         .projection
@@ -5875,7 +5884,11 @@ impl AppModel {
                     || self.tasks.running_count() > 0
                     || (self.screen == Screen::Subagent
                         && self.viewed_chip().is_some_and(|chip| {
-                            chip.state == ChipDisplayState::Thinking
+                            // Tracks the chip tail's render gate for the same
+                            // reason the session term above does: the row only
+                            // breathes while this function keeps the clock
+                            // running. Same `display_state()` truth as there.
+                            chip.display_state().is_turn_active()
                                 || streaming_tool_live(chip.transcript.entries())
                         }))
             }
