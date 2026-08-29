@@ -51,6 +51,26 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           grep -q "^version = \"$TAG\"" Cargo.toml || { echo "tag v$TAG != workspace version"; exit 1; }
+      # Defender scans every intermediate artifact cargo writes -- every .rlib,
+      # every object file -- which is the single largest tax on the Windows
+      # runner. Combined with lto="fat" + codegen-units=1 it made the Windows
+      # leg a ~2h long pole while every other platform finished in a fraction of
+      # that. Excluding the build tree and the toolchain processes is the
+      # cheapest available win. Best-effort: never fail a release over it.
+      - name: exclude the build tree from Defender (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          try {
+            Add-MpPreference -ExclusionPath "${{ github.workspace }}\target" -ErrorAction Stop
+            foreach ($p in @('rustc.exe','cargo.exe','link.exe','lld-link.exe')) {
+              Add-MpPreference -ExclusionProcess $p -ErrorAction Stop
+            }
+            Write-Host "Defender exclusions applied for the build tree and toolchain."
+          } catch {
+            Write-Warning "Could not apply Defender exclusions: $_. Build continues, just slower."
+          }
       - name: build
         run: cargo build --release --locked -p haider-cli -p haider-daemond --target ${{ matrix.target }}
       - name: build Wayland portal companion (Linux only)
@@ -127,6 +147,49 @@ jobs:
             test "$("$BIN" --version)" = "haider $TAG"
           else
             "$BIN" --version
+          fi
+      # THE GATE THAT WOULD HAVE CAUGHT THE 0.0.964 WINDOWS P0.
+      #
+      # `self-test` and `--version` never reach profile resolution, so for the
+      # entire life of the project the release gate could not see that
+      # ProfileEnv::capture() read only HOME -- which is not a Windows
+      # environment variable. Every Windows user got exit 70 before anything
+      # happened; on Explorer the console vanished with the message inside it.
+      #
+      # `--ready` is the scriptable front door: it resolves the profile,
+      # connect-or-spawns the daemon, reports, and exits. It is the shallowest
+      # command that exercises the real startup path.
+      #
+      # HAIDER_PROFILE_DIR is deliberately NOT set here. Setting it is exactly
+      # what blinded every existing Windows integration test: it short-circuits
+      # the resolver under test. HOME is scrubbed for the same reason -- the
+      # xplat suite runs under Git Bash, which exports HOME, so a stock-Windows
+      # bug survives a green Windows CI run. This asserts what a real user has:
+      # USERPROFILE and no HOME.
+      - name: front door resolves a profile from a stock environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXE=""; [ "$RUNNER_OS" = "Windows" ] && EXE=".exe"
+          BIN="$PWD/target/${{ matrix.target }}/release/haider$EXE"
+          OUT="$RUNNER_TEMP/front-door.txt"
+
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # Reproduce Explorer/PowerShell: USERPROFILE present, HOME absent.
+            env -u HOME -u HAIDER_PROFILE_DIR "$BIN" --ready > "$OUT" 2>&1 && rc=0 || rc=$?
+          else
+            env -u HAIDER_PROFILE_DIR "$BIN" --ready > "$OUT" 2>&1 && rc=0 || rc=$?
+          fi
+
+          cat "$OUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::the front door failed with exit $rc from a stock environment" >&2
+            exit 1
+          fi
+          # Belt and braces: even a zero exit must not carry the resolver error.
+          if grep -qi "cannot resolve a profile directory" "$OUT"; then
+            echo "::error::profile resolution failed -- this is the 0.0.964 Windows P0 class" >&2
+            exit 1
           fi
       - name: notarize macOS binaries
         if: runner.os == 'macOS'
