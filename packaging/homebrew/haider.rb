@@ -7,20 +7,20 @@ class Haider < Formula
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.964/haider-v0.0.964-aarch64-apple-darwin.tar.xz"
-      sha256 "124a56691d52479eae7b0a6851188105959cfbd297cb7c698a008225f3b1105f"
+      sha256 "47125b4d3e7dd5169f4e2d7b4e5a3a34b8bc7e84b4bbc8135211dc99c38665d9"
     else
       url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.964/haider-v0.0.964-x86_64-apple-darwin.tar.xz"
-      sha256 "397bc7898269a189949e936f48e543d4fe7ed0afdf704a883310fc957eb480d4"
+      sha256 "a9e5262a1bb5cb7802ccfdecd30290dc803eab6d04d86c2e0df90ca2cba132f1"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
       url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.964/haider-v0.0.964-aarch64-unknown-linux-gnu.tar.xz"
-      sha256 "1a87748c207e6312abf78c1c22196fefa81032482df9a9f170ad66aa5bfba94d"
+      sha256 "d618db44d7bcf7df014569ce7a8552c6402b4d83e5233538018eb100f343a531"
     else
       url "https://github.com/Rizzist/haider-agent/releases/download/v0.0.964/haider-v0.0.964-x86_64-unknown-linux-gnu.tar.xz"
-      sha256 "0507d7a5213de0f190f8b3cff188c7e422e34e80076ba37ebcffe69b984176d5"
+      sha256 "dba3814352dd8806b9f19c84361d557db1b74040f11a7dbdcdf9c307cbe3ea95"
     end
   end
 
