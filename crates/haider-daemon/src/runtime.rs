@@ -681,9 +681,11 @@ async fn run_inner(
     // The lockdown ceiling is machine-user global, not profile-scoped. Open
     // and reconcile it before acquiring any per-profile resources so a
     // typed startup failure cannot strand a lease, store, or actor.
-    crate::lockdown::initialize_global().map_err(|error| DaemonError::Lockdown {
-        message: error.to_string(),
-    })?;
+    crate::lockdown::initialize_global(config.lockdown_root_override.as_deref()).map_err(
+        |error| DaemonError::Lockdown {
+            message: error.to_string(),
+        },
+    )?;
     let endpoint_path = config.endpoint_path();
     // R1: the profile lifetime lock is acquired before any socket cleanup or
     // store open, and it is the only singleton authority. A held lock means

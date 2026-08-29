@@ -66,6 +66,16 @@ struct SessionSelectModelInput {
     confirm_new_epoch: bool,
 }
 
+enum SessionForkSelectorInput {
+    Exact {
+        node_id: haider_protocol::ids::NodeId,
+        seq: u64,
+    },
+    Prompt {
+        seq: u64,
+    },
+}
+
 struct CheckpointDoorInput {
     command_id: CommandId,
     session_id: SessionId,
@@ -2889,6 +2899,7 @@ impl HubConnection {
                 source_branch_id,
                 fork_node_id,
                 fork_seq,
+                prompt,
                 name,
             } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
@@ -2900,14 +2911,30 @@ impl HubConnection {
                         None,
                     );
                 }
+                let selector = match (fork_node_id, fork_seq, prompt) {
+                    (Some(node_id), Some(seq), None) => {
+                        SessionForkSelectorInput::Exact { node_id, seq }
+                    }
+                    (None, None, Some(prompt)) => {
+                        SessionForkSelectorInput::Prompt { seq: prompt.seq }
+                    }
+                    _ => {
+                        return self.respond_error(
+                            request_id,
+                            ERROR_CODE_INVALID_ARGUMENT,
+                            "session.fork requires exactly one complete selector",
+                            false,
+                            None,
+                        );
+                    }
+                };
                 self.session_fork(
                     request_id,
                     command_id,
                     session_id,
                     worker_generation,
                     source_branch_id,
-                    fork_node_id,
-                    fork_seq,
+                    selector,
                     name,
                 )
                 .await
@@ -9052,12 +9079,17 @@ impl HubConnection {
         source_session_id: SessionId,
         worker_generation: u64,
         source_branch_id: Option<haider_protocol::ids::BranchId>,
-        fork_node_id: haider_protocol::ids::NodeId,
-        fork_seq: u64,
+        selector: SessionForkSelectorInput,
         name: Option<String>,
     ) -> Result<(), SessionHubError> {
         let name = normalize_session_title(name);
-        if command_id.as_str().is_empty() || fork_node_id.as_str().is_empty() || fork_seq == 0 {
+        let selector_is_valid = match &selector {
+            SessionForkSelectorInput::Exact { node_id, seq } => {
+                !node_id.as_str().is_empty() && *seq > 0
+            }
+            SessionForkSelectorInput::Prompt { seq } => *seq > 0,
+        };
+        if command_id.as_str().is_empty() || !selector_is_valid {
             return self.respond_error(
                 request_id,
                 ERROR_CODE_INVALID_ARGUMENT,
@@ -9066,15 +9098,24 @@ impl HubConnection {
                 None,
             );
         }
-        let request_json = serde_json::to_string(&serde_json::json!({
-            "session_id": &source_session_id,
-            "worker_generation": worker_generation,
-            "source_branch_id": &source_branch_id,
-            "fork_node_id": &fork_node_id,
-            "fork_seq": fork_seq,
-            "name": &name,
-        }))
-        .map_err(|error| {
+        let request_value = match &selector {
+            SessionForkSelectorInput::Exact { node_id, seq } => serde_json::json!({
+                "session_id": &source_session_id,
+                "worker_generation": worker_generation,
+                "source_branch_id": &source_branch_id,
+                "fork_node_id": node_id,
+                "fork_seq": seq,
+                "name": &name,
+            }),
+            SessionForkSelectorInput::Prompt { seq } => serde_json::json!({
+                "session_id": &source_session_id,
+                "worker_generation": worker_generation,
+                "source_branch_id": &source_branch_id,
+                "prompt": { "seq": seq },
+                "name": &name,
+            }),
+        };
+        let request_json = serde_json::to_string(&request_value).map_err(|error| {
             SessionHubError::Task(format!("cannot encode session-fork coordinates: {error}"))
         })?;
         let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
@@ -9083,10 +9124,16 @@ impl HubConnection {
             .session_fork_receipt(&command_id, &request_digest, &request_json, false)
             .await
         {
-            Ok(Some(created)) => return self.respond_session_fork_created(request_id, created),
+            Ok(Some(created)) => match self.hub.publish_received_fork(&created).await {
+                Ok(()) => return self.respond_session_fork_created(request_id, created),
+                Err(SessionHubError::Store(error)) => {
+                    return self.respond_session_fork_error(request_id, error);
+                }
+                Err(error) => return Err(error),
+            },
             Ok(None) => {}
             Err(SessionHubError::Store(error)) => {
-                return self.respond_turn_error(request_id, error);
+                return self.respond_session_fork_error(request_id, error);
             }
             Err(error) => return Err(error),
         }
@@ -9102,26 +9149,51 @@ impl HubConnection {
                 None,
             );
         }
-        let command = SessionForkCommand {
-            command_id: command_id.0,
-            request_digest,
-            request_json,
-            source_session_id,
-            session_id: SessionId::new(random_id("session")?),
-            worker_generation,
-            source_branch_id,
-            fork_node_id,
-            fork_seq,
-            name,
-            metafork: None,
-            audit_event_id: EventId::new(random_id("session-forked")?),
-            device_id: self.hub.inner.device_id.clone(),
+        let session_id = SessionId::new(random_id("session")?);
+        let audit_event_id = EventId::new(random_id("session-forked")?);
+        let outcome = match selector {
+            SessionForkSelectorInput::Exact { node_id, seq } => {
+                self.hub
+                    .fork_session(SessionForkCommand {
+                        command_id: command_id.0,
+                        request_digest,
+                        request_json,
+                        source_session_id,
+                        session_id,
+                        worker_generation,
+                        source_branch_id,
+                        fork_node_id: node_id,
+                        fork_seq: seq,
+                        name,
+                        metafork: None,
+                        audit_event_id,
+                        device_id: self.hub.inner.device_id.clone(),
+                    })
+                    .await
+            }
+            SessionForkSelectorInput::Prompt { seq } => {
+                self.hub
+                    .fork_session_from_prompt(SessionPromptForkCommand {
+                        command_id: command_id.0,
+                        request_digest,
+                        request_json,
+                        source_session_id,
+                        session_id,
+                        worker_generation,
+                        source_branch_id,
+                        prompt_seq: seq,
+                        name,
+                        audit_event_id,
+                        device_id: self.hub.inner.device_id.clone(),
+                    })
+                    .await
+            }
         };
-        let created = match self.hub.fork_session(command).await {
+        let created = match outcome {
             Ok(SessionForkOutcome::Committed { created, .. })
             | Ok(SessionForkOutcome::IdempotentReplay { created }) => created,
             Err(SessionHubError::Store(error)) => {
-                return self.respond_turn_error(request_id, error);
+                return self.respond_session_fork_error(request_id, error);
             }
             Err(error) => return Err(error),
         };
@@ -9144,6 +9216,8 @@ impl HubConnection {
                 created_seq: created.created_seq,
                 worker_generation: created.worker_generation,
                 metadata: created.metadata,
+                forked_from: created.forked_from,
+                draft: created.draft,
             },
         })
     }
@@ -9205,7 +9279,7 @@ impl HubConnection {
             {
                 Ok(proposal) => proposal,
                 Err(SessionHubError::Store(error)) => {
-                    return self.respond_turn_error(request_id, error);
+                    return self.respond_session_fork_error(request_id, error);
                 }
                 Err(error) => return Err(error),
             };
@@ -9298,10 +9372,16 @@ impl HubConnection {
             .session_fork_receipt(&command_id, &request_digest, &request_json, true)
             .await
         {
-            Ok(Some(created)) => return self.respond_session_metafork_created(request_id, created),
+            Ok(Some(created)) => match self.hub.publish_received_fork(&created).await {
+                Ok(()) => return self.respond_session_metafork_created(request_id, created),
+                Err(SessionHubError::Store(error)) => {
+                    return self.respond_session_fork_error(request_id, error);
+                }
+                Err(error) => return Err(error),
+            },
             Ok(None) => {}
             Err(SessionHubError::Store(error)) => {
-                return self.respond_turn_error(request_id, error);
+                return self.respond_session_fork_error(request_id, error);
             }
             Err(error) => return Err(error),
         }
@@ -9330,7 +9410,7 @@ impl HubConnection {
         {
             Ok(proposal) => proposal,
             Err(SessionHubError::Store(error)) => {
-                return self.respond_turn_error(request_id, error);
+                return self.respond_session_fork_error(request_id, error);
             }
             Err(error) => return Err(error),
         };
@@ -9395,7 +9475,7 @@ impl HubConnection {
             Ok(SessionForkOutcome::Committed { created, .. })
             | Ok(SessionForkOutcome::IdempotentReplay { created }) => created,
             Err(SessionHubError::Store(error)) => {
-                return self.respond_turn_error(request_id, error);
+                return self.respond_session_fork_error(request_id, error);
             }
             Err(error) => return Err(error),
         };
@@ -13506,6 +13586,48 @@ impl HubConnection {
         self.respond_error(request_id, code, &error.message, error.retryable, None)
     }
 
+    pub(super) fn respond_session_fork_error(
+        &self,
+        request_id: RequestId,
+        error: HaiderError,
+    ) -> Result<(), SessionHubError> {
+        let invalid_cut = error.details.as_ref().and_then(|details| {
+            if details.get("kind").and_then(serde_json::Value::as_str)
+                != Some("session_fork_invalid_cut")
+            {
+                return None;
+            }
+            let session_id = details
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .map(SessionId::new)?;
+            let seq = details.get("seq").and_then(serde_json::Value::as_u64)?;
+            let reason = serde_json::from_value(details.get("reason")?.clone()).ok()?;
+            Some(ErrorData::SessionForkInvalidCut {
+                session_id,
+                seq,
+                reason,
+            })
+        });
+        let code = match error.code {
+            ErrorCode::SingleWriterViolation => ERROR_CODE_STALE_GENERATION,
+            ErrorCode::SessionNotFound => ERROR_CODE_NOT_FOUND,
+            ErrorCode::ForkCutUnstable => ERROR_CODE_FORK_CUT_UNSTABLE,
+            ErrorCode::StoreReadOnly
+            | ErrorCode::StoreCorrupt
+            | ErrorCode::StoreUnavailable
+            | ErrorCode::StoreFull => error.code.as_str(),
+            _ => ERROR_CODE_INVALID_ARGUMENT,
+        };
+        self.respond_error(
+            request_id,
+            code,
+            &error.message,
+            error.retryable,
+            invalid_cut,
+        )
+    }
+
     fn respond_queue_error(
         &self,
         request_id: RequestId,
@@ -13824,7 +13946,7 @@ impl HubConnection {
                 None,
             );
         }
-        let ids = self.hub.inner.store.session_ids().await?;
+        let ids = self.hub.roster_session_ids().await?;
         let mut selected = ids
             .into_iter()
             .filter(|session_id| {
@@ -14086,7 +14208,7 @@ impl HubConnection {
             let mut reconcile_all = true;
             loop {
                 if reconcile_all {
-                    let Ok(ids) = hub.inner.store.session_ids().await else {
+                    let Ok(ids) = hub.roster_session_ids().await else {
                         ticker.tick().await;
                         continue;
                     };
@@ -16181,6 +16303,9 @@ pub(crate) async fn session_summaries(
 ) -> Result<Vec<SessionSummary>, SessionHubError> {
     let mut sessions = Vec::with_capacity(session_ids.len());
     for session_id in session_ids {
+        if !hub.is_roster_visible(session_id)? {
+            continue;
+        }
         // Seal the head before metadata and accept the pair only when the
         // cached fold lands on that exact seal. A commit during either read
         // forces a retry, preventing OLD metadata from being published with
@@ -16249,6 +16374,14 @@ pub(crate) async fn session_summaries(
             .as_ref()
             .and_then(|metadata| metadata.effort.clone());
         let fast = metadata.as_ref().map(|metadata| metadata.fast);
+        let forked_from = if metadata.is_some() {
+            hub.inner
+                .store
+                .session_fork_provenance(session_id.clone())
+                .await?
+        } else {
+            None
+        };
         sessions.push(SessionSummary {
             session_id: session_id.clone(),
             head_seq,
@@ -16276,6 +16409,7 @@ pub(crate) async fn session_summaries(
             effort,
             fast,
             account_alias: None,
+            forked_from,
         });
     }
     Ok(sessions)
@@ -16586,6 +16720,7 @@ mod roster_wave_tests {
             effort: None,
             fast: None,
             account_alias: None,
+            forked_from: None,
         }
     }
 

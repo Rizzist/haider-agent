@@ -233,6 +233,9 @@ pub enum ClientError {
     Disconnected(DisconnectReason),
     /// The request body could not be encoded within the negotiated limit.
     Encode(CodecError),
+    /// A request used an additive shape the peer did not advertise. Nothing
+    /// was encoded or sent.
+    MissingFeature(&'static str),
 }
 
 impl std::fmt::Display for ClientError {
@@ -240,6 +243,10 @@ impl std::fmt::Display for ClientError {
         match self {
             Self::Disconnected(reason) => write!(formatter, "request failed: {reason}"),
             Self::Encode(error) => write!(formatter, "request could not be encoded: {error}"),
+            Self::MissingFeature(feature) => write!(
+                formatter,
+                "missing_feature: daemon does not advertise required feature `{feature}`"
+            ),
         }
     }
 }
@@ -641,6 +648,11 @@ impl RpcClient {
     /// race to `outbound.send`, and the daemon then sees the attach first and
     /// rejects it at `max_attachments_per_connection` (review W3c3 P1-3).
     pub async fn begin_request(&self, body: RequestBody) -> Result<PendingResponse, ClientError> {
+        if let Some(feature) = body.additive_shape_feature()
+            && !self.welcome.features.contains(feature)
+        {
+            return Err(ClientError::MissingFeature(feature));
+        }
         self.begin_correlated_frame(|request_id| WireFrame::Request { request_id, body })
             .await
     }

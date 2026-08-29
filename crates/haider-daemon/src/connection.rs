@@ -63,14 +63,14 @@ use haider_rpc::{
     FEATURE_RESIDENT_TURN_SUBMIT_V1, FEATURE_RUN_BUDGET_V1, FEATURE_RUN_RETRY_V1,
     FEATURE_SESSION_CONFIG_V1, FEATURE_SESSION_DESCENDANT_STREAM_V1, FEATURE_SESSION_FLEET_V1,
     FEATURE_SESSION_FORK_V1, FEATURE_SESSION_MUTATION_V1, FEATURE_SESSION_OBSERVE_BATCH_V1,
-    FEATURE_SESSION_OBSERVE_V1, FEATURE_SESSION_PERMISSION_OVERRIDES_V1, FEATURE_SESSION_RUN_ID_V1,
-    FEATURE_SESSION_WORKFLOW_STATE_V1, FEATURE_SHELL_EXEC_V1, FEATURE_SHELL_REGISTRY_V1,
-    FEATURE_SSH_PROFILES_V1, FEATURE_TOOL_INVENTORY_V1, FEATURE_TURN_CONTROL_V1,
-    FEATURE_TYPED_AGENT_INSTALL_CANCEL_V1, FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1,
-    FEATURE_TYPED_AGENT_INSTALL_V1, FEATURE_USER_COMMAND_V1, FEATURE_VAULT_STAGE_V1,
-    FEATURE_WORKFLOW_CATALOG_V1, FEATURE_WORKFLOW_GRAPH_V1, Hello, LifecyclePhase, ProtocolError,
-    RequestBody, RequestId, ResponseBody, ServerRange, Welcome, WireEncoding, WireFrame, negotiate,
-    uds_codec,
+    FEATURE_SESSION_OBSERVE_V1, FEATURE_SESSION_PERMISSION_OVERRIDES_V1,
+    FEATURE_SESSION_PROMPT_FORK_V1, FEATURE_SESSION_RUN_ID_V1, FEATURE_SESSION_WORKFLOW_STATE_V1,
+    FEATURE_SHELL_EXEC_V1, FEATURE_SHELL_REGISTRY_V1, FEATURE_SSH_PROFILES_V1,
+    FEATURE_TOOL_INVENTORY_V1, FEATURE_TURN_CONTROL_V1, FEATURE_TYPED_AGENT_INSTALL_CANCEL_V1,
+    FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1, FEATURE_TYPED_AGENT_INSTALL_V1,
+    FEATURE_USER_COMMAND_V1, FEATURE_VAULT_STAGE_V1, FEATURE_WORKFLOW_CATALOG_V1,
+    FEATURE_WORKFLOW_GRAPH_V1, Hello, LifecyclePhase, ProtocolError, RequestBody, RequestId,
+    ResponseBody, ServerRange, Welcome, WireEncoding, WireFrame, negotiate, uds_codec,
 };
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::IoSlice;
@@ -210,6 +210,9 @@ pub(crate) struct ConnectionGrant {
     /// Exactly what `negotiate` granted this connection — never re-derived
     /// from the client's request, and never widened afterwards.
     pub(crate) capabilities: CapabilitySet,
+    /// Exact additive feature set carried by this peer's Welcome. Tight-frame
+    /// withholding must narrow request shapes as well as client affordances.
+    pub(crate) features: BTreeSet<String>,
 }
 
 /// One fair scheduling lane (policy stated on [`OutboundLane`]). System
@@ -1785,6 +1788,30 @@ async fn handle_frame(
             Ok(false)
         }
         WireFrame::Request { request_id, body } => {
+            let required_feature = body.additive_shape_feature();
+            if let Some(feature) = required_feature
+                && !grant
+                    .as_ref()
+                    .is_some_and(|grant| grant.features.contains(feature))
+            {
+                enqueue(
+                    lane,
+                    &WireFrame::Response {
+                        request_id,
+                        body: ResponseBody::Error {
+                            code: haider_rpc::ERROR_CODE_INVALID_ARGUMENT.into(),
+                            message: format!(
+                                "request shape requires unadvertised feature `{feature}`"
+                            ),
+                            retryable: false,
+                            data: None,
+                        },
+                    },
+                    *outbound_limit,
+                    *encoding,
+                )?;
+                return Ok(false);
+            }
             let connection = hub_connection.as_ref().ok_or_else(|| DaemonError::Task {
                 message: "negotiated connection has no session-hub registration".into(),
             })?;
@@ -1923,7 +1950,7 @@ fn negotiate_hello(
     } else {
         LifecyclePhase::Ready
     };
-    let bytes = if lifecycle_phase == LifecyclePhase::Ready
+    let encoded_welcome = if lifecycle_phase == LifecyclePhase::Ready
         && negotiated.capabilities_granted == server_range.capabilities
         && negotiated.encoding.is_none()
     {
@@ -1942,13 +1969,18 @@ fn negotiate_hello(
             user_command_withheld: false,
             encoding: negotiated.encoding.clone(),
         };
-        encode_welcome_for_peer(welcome, outbound_limit)?.into()
+        let encoded = encode_welcome_for_peer(welcome, outbound_limit)?;
+        AdvertisedWelcome {
+            bytes: encoded.bytes.into(),
+            features: encoded.features,
+        }
     };
-    lane.try_push(LaneKey::System, QueuedFrame::welcome(bytes))?;
+    lane.try_push(LaneKey::System, QueuedFrame::welcome(encoded_welcome.bytes))?;
     // Retained, not discarded: the grant is what later frames are authorized
     // against (W3b2 reads it through `ConnectionGrant`).
     *grant = Some(ConnectionGrant {
         capabilities: negotiated.capabilities_granted,
+        features: encoded_welcome.features,
     });
     Ok(Some(match negotiated.encoding.as_deref() {
         Some("msgpack") => WireEncoding::MessagePack,
@@ -1965,8 +1997,20 @@ struct StandardWelcomeCacheKey {
     profile_id: String,
 }
 
-static STANDARD_WELCOME_CACHE: OnceLock<Mutex<HashMap<StandardWelcomeCacheKey, OutboundBytes>>> =
-    OnceLock::new();
+#[derive(Clone)]
+struct AdvertisedWelcome {
+    bytes: OutboundBytes,
+    features: BTreeSet<String>,
+}
+
+struct EncodedWelcome {
+    bytes: Zeroizing<Vec<u8>>,
+    features: BTreeSet<String>,
+}
+
+static STANDARD_WELCOME_CACHE: OnceLock<
+    Mutex<HashMap<StandardWelcomeCacheKey, AdvertisedWelcome>>,
+> = OnceLock::new();
 
 /// Caches the ordinary Ready + View/Control + JSON Welcome once per daemon.
 /// Tight, draining, capability-restricted, and MessagePack-negotiating peers
@@ -1976,7 +2020,7 @@ fn cached_standard_welcome(
     protocol: u32,
     frame_limit: u32,
     outbound_limit: usize,
-) -> Result<OutboundBytes, DaemonError> {
+) -> Result<AdvertisedWelcome, DaemonError> {
     let key = StandardWelcomeCacheKey {
         protocol,
         instance_id: context.instance_id.clone(),
@@ -1989,10 +2033,10 @@ fn cached_standard_welcome(
         Ok(cache) => cache,
         Err(poisoned) => poisoned.into_inner(),
     };
-    if let Some(bytes) = cache.get(&key)
-        && bytes.len() <= outbound_limit.saturating_add(4)
+    if let Some(welcome) = cache.get(&key)
+        && welcome.bytes.len() <= outbound_limit.saturating_add(4)
     {
-        return Ok(bytes.clone());
+        return Ok(welcome.clone());
     }
     let welcome = Welcome {
         protocol,
@@ -2009,13 +2053,19 @@ fn cached_standard_welcome(
     };
     match uds_codec::encode_zeroizing(&WireFrame::Welcome(welcome.clone()), outbound_limit) {
         Ok(encoded) => {
-            let encoded = OutboundBytes::from(encoded);
-            cache.insert(key, encoded.clone());
-            Ok(encoded)
+            let advertised = AdvertisedWelcome {
+                bytes: OutboundBytes::from(encoded),
+                features: welcome.features,
+            };
+            cache.insert(key, advertised.clone());
+            Ok(advertised)
         }
         Err(haider_rpc::CodecError::FrameLimitExceeded { .. }) => {
             drop(cache);
-            encode_welcome_for_peer(welcome, outbound_limit).map(OutboundBytes::from)
+            encode_welcome_for_peer(welcome, outbound_limit).map(|encoded| AdvertisedWelcome {
+                bytes: encoded.bytes.into(),
+                features: encoded.features,
+            })
         }
         Err(error) => Err(DaemonError::Protocol {
             message: format!("outbound frame rejected by peer limit: {error}"),
@@ -2037,6 +2087,7 @@ fn welcome_features() -> BTreeSet<String> {
         FEATURE_ARTIFACT_PUT_V1.to_owned(),
         FEATURE_BRANCH_CREATE_V1.to_owned(),
         FEATURE_SESSION_FORK_V1.to_owned(),
+        FEATURE_SESSION_PROMPT_FORK_V1.to_owned(),
         FEATURE_COMMAND_DOOR_V1.to_owned(),
         FEATURE_COMPACTION_GUARD_V1.to_owned(),
         FEATURE_CONTEXT_COMPACTION_V1.to_owned(),
@@ -2131,31 +2182,36 @@ fn welcome_features() -> BTreeSet<String> {
 /// Encodes the handshake without letting one additive feature make the whole
 /// pre-existing connection surface unavailable to a tightly bounded peer.
 ///
-/// `user_command_v1` is the only feature added with the T4 shell semantics.
-/// If that one advertisement is exactly what crosses the peer's receive
-/// limit, omit it and retry the otherwise unchanged Welcome. The connection
-/// then conservatively reports those semantics unavailable, so a typed client
-/// rejects before sending a mutating `shell.exec`. Every other encode failure
-/// remains fatal, and ordinary peers receive the full feature set.
+/// The newest additive token is withheld first, restoring the exact preceding
+/// Welcome for a peer whose old receive ceiling was already tight. If the
+/// older `user_command_v1` token must also be withheld, its shipped `uw`
+/// marker remains byte-for-byte unchanged. The retained feature set fences
+/// request shapes as well as client affordances.
 fn encode_welcome_for_peer(
     mut welcome: Welcome,
     outbound_limit: usize,
-) -> Result<Zeroizing<Vec<u8>>, DaemonError> {
-    match uds_codec::encode_zeroizing(&WireFrame::Welcome(welcome.clone()), outbound_limit) {
-        Ok(bytes) => Ok(bytes),
-        Err(haider_rpc::CodecError::FrameLimitExceeded { .. })
-            if welcome.features.remove(FEATURE_USER_COMMAND_V1) =>
-        {
-            welcome.user_command_withheld = true;
-            encode_outbound(
-                &WireFrame::Welcome(welcome),
-                outbound_limit,
-                WireEncoding::Json,
-            )
+) -> Result<EncodedWelcome, DaemonError> {
+    loop {
+        match uds_codec::encode_zeroizing(&WireFrame::Welcome(welcome.clone()), outbound_limit) {
+            Ok(bytes) => {
+                return Ok(EncodedWelcome {
+                    bytes,
+                    features: welcome.features,
+                });
+            }
+            Err(haider_rpc::CodecError::FrameLimitExceeded { .. })
+                if welcome.features.remove(FEATURE_SESSION_PROMPT_FORK_V1) => {}
+            Err(haider_rpc::CodecError::FrameLimitExceeded { .. })
+                if welcome.features.remove(FEATURE_USER_COMMAND_V1) =>
+            {
+                welcome.user_command_withheld = true;
+            }
+            Err(error) => {
+                return Err(DaemonError::Protocol {
+                    message: format!("outbound frame rejected by peer limit: {error}"),
+                });
+            }
         }
-        Err(error) => Err(DaemonError::Protocol {
-            message: format!("outbound frame rejected by peer limit: {error}"),
-        }),
     }
 }
 

@@ -80,3 +80,17 @@ fn malformed_workflow_precedes_later_malformed_queue_in_append() {
     assert_eq!(error.code, ErrorCode::StoreCorrupt);
     assert_eq!(store.latest_seq(&envelopes[0].session_id).expect("head"), 0);
 }
+
+/// MUTATION CHECK: allow an undersized capacity estimate to proceed or map it
+/// to a new ad-hoc code. Fork preflight must reuse the existing typed
+/// `store_full` contract before the copy transaction can publish anything.
+#[test]
+fn fork_capacity_preflight_is_typed_store_full() {
+    let error = ensure_session_fork_storage_available(1_001, 1_000)
+        .expect_err("insufficient capacity must fail the fork preflight");
+    assert_eq!(error.code, ErrorCode::StoreFull);
+    assert!(error.retryable);
+    assert!(error.message.contains("journal and Pipe growth"));
+    ensure_session_fork_storage_available(1_000, 1_000)
+        .expect("an exact-capacity estimate is admissible");
+}

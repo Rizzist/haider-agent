@@ -721,11 +721,16 @@ fn lockdown_status(ledger: &QuotaLedger) -> LockdownStatus {
     }
 }
 
-pub(crate) fn initialize_global() -> Result<&'static LockdownManager, LockdownError> {
+pub(crate) fn initialize_global(
+    root: Option<&Path>,
+) -> Result<&'static LockdownManager, LockdownError> {
     if let Some(manager) = GLOBAL_MANAGER.get() {
         return Ok(manager);
     }
-    let manager = LockdownManager::initialize_default()?;
+    let manager = match root {
+        Some(root) => LockdownManager::initialize(root.to_path_buf())?,
+        None => LockdownManager::initialize_default()?,
+    };
     let _ = GLOBAL_MANAGER.set(manager);
     GLOBAL_MANAGER
         .get()

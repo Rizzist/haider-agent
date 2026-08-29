@@ -20,9 +20,9 @@ use haider_client::{
 };
 use haider_protocol::ids::SessionId;
 use haider_rpc::{
-    Capability, CapabilitySet, CommandId, DEFAULT_FRAME_LIMIT, FEATURE_SHELL_EXEC_V1,
-    FEATURE_TURN_CONTROL_V1, LifecyclePhase, ProtocolError, RequestBody, ResponseBody,
-    WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec,
+    Capability, CapabilitySet, CommandId, DEFAULT_FRAME_LIMIT, FEATURE_SESSION_PROMPT_FORK_V1,
+    FEATURE_SHELL_EXEC_V1, FEATURE_TURN_CONTROL_V1, LifecyclePhase, ProtocolError, RequestBody,
+    ResponseBody, WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -245,6 +245,73 @@ async fn user_command_feature_failure_sends_zero_rpc_requests() {
     .await
     .expect_err("missing user-command semantics must reject before mutation");
     assert!(matches!(error, ShellExecError::FeatureUnavailable { .. }));
+    tokio::task::yield_now().await;
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    assert_live_peer_notified(connected.client.close());
+}
+
+/// MUTATION CHECK: remove the additive-shape preflight from `begin_request`.
+/// Expected runtime failure: the feature-deficient peer observes a prompt-cut
+/// `session.fork` request instead of the SDK-local `missing_feature` result.
+#[tokio::test]
+async fn unnegotiated_prompt_fork_is_missing_feature_and_sends_nothing() {
+    let dir = short_dir();
+    let endpoint = dir.path().join("prompt-fork-feature.sock");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let observed_requests = Arc::clone(&requests);
+    let _daemon = spawn_fake_daemon(
+        &endpoint,
+        accepted,
+        HelloReply::Welcome(welcome(
+            "profile-x",
+            BTreeSet::from([haider_rpc::FEATURE_SESSION_FORK_V1.to_owned()]),
+        )),
+        move |mut stream, mut decoder| {
+            let observed_requests = Arc::clone(&observed_requests);
+            async move {
+                loop {
+                    let frames = read_frames(&mut stream, &mut decoder).await;
+                    if frames.is_empty() {
+                        return;
+                    }
+                    for frame in frames {
+                        match frame {
+                            WireFrame::Ping { nonce } => {
+                                write_frame(&mut stream, &WireFrame::Pong { nonce }).await;
+                            }
+                            WireFrame::Request { .. } => {
+                                observed_requests.fetch_add(1, Ordering::SeqCst);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        },
+    );
+    let connected = connect(&endpoint, ClientConfig::default())
+        .await
+        .expect("connect feature-deficient daemon");
+    let result = connected
+        .client
+        .begin_request(RequestBody::SessionFork {
+            command_id: CommandId::new("prompt-fork-must-not-send"),
+            session_id: SessionId::new("source-session"),
+            worker_generation: 7,
+            source_branch_id: None,
+            fork_node_id: None,
+            fork_seq: None,
+            prompt: Some(haider_protocol::session_fork::SessionForkPromptSelector { seq: 41 }),
+            name: None,
+        })
+        .await;
+    assert!(matches!(
+        result,
+        Err(haider_client::ClientError::MissingFeature(
+            FEATURE_SESSION_PROMPT_FORK_V1
+        ))
+    ));
     tokio::task::yield_now().await;
     assert_eq!(requests.load(Ordering::SeqCst), 0);
     assert_live_peer_notified(connected.client.close());

@@ -118,13 +118,14 @@ use haider_core::{
     QueueRemoveCommand, QueueRemoveOutcome, QueueSnapshot, RenamedSession, RunRetryCommand,
     RunRetryOutcome, SeenSession, SelectedAgentType, SelectedEffort, SelectedFast, SelectedModel,
     SessionCreateCommand, SessionCreateOutcome, SessionForkCommand, SessionForkOutcome,
-    SessionMetaforkCommit, SessionProjectionCheckpoint, SessionRenameCommand, SessionRenameOutcome,
-    SessionSeenCommand, SessionSeenOutcome, SessionSelectAgentTypeCommand,
-    SessionSelectAgentTypeOutcome, SessionSelectEffortCommand, SessionSelectEffortOutcome,
-    SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
-    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle,
-    StoreHandle, SwitchedGraph, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
-    TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
+    SessionMetaforkCommit, SessionProjectionCheckpoint, SessionPromptForkCommand,
+    SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome,
+    SessionSelectAgentTypeCommand, SessionSelectAgentTypeOutcome, SessionSelectEffortCommand,
+    SessionSelectEffortOutcome, SessionSelectFastCommand, SessionSelectFastOutcome,
+    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
+    ShellExecAcceptOutcome, SqliteStoreHandle, StoreHandle, SwitchedGraph, TurnAcceptCommand,
+    TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome,
+    TurnCancellationStatus,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::branch::BranchDescriptor;
@@ -144,18 +145,19 @@ use haider_rpc::{
     ERROR_CODE_ATTACHMENT_MIME_UNSUPPORTED, ERROR_CODE_ATTACHMENT_NOT_FOUND,
     ERROR_CODE_ATTACHMENT_TOO_LARGE, ERROR_CODE_ATTACHMENTS_TOO_LARGE, ERROR_CODE_BUSY,
     ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD, ERROR_CODE_DRAINING,
-    ERROR_CODE_GRAPH_ALREADY_ACTIVE, ERROR_CODE_GRAPH_NOT_ACTIVE, ERROR_CODE_GRAPH_WRONG_NODE,
-    ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_INVALID_CURSOR, ERROR_CODE_NOT_FOUND,
-    ERROR_CODE_OVERLOADED, ERROR_CODE_PDF_MALFORMED, ERROR_CODE_PDF_TOO_LARGE,
-    ERROR_CODE_PDF_TOO_MANY_PAGES, ERROR_CODE_PEER_AMBIGUOUS, ERROR_CODE_PEER_INVALID,
-    ERROR_CODE_PEER_UNAVAILABLE, ERROR_CODE_PROVIDER_MODELS_UNKNOWN, ERROR_CODE_REVISION_CONFLICT,
-    ERROR_CODE_RUN_NOT_ACTIVE, ERROR_CODE_STALE_GENERATION, ERROR_CODE_SURFACE_TEXT_TOO_LARGE,
-    ERROR_CODE_TOO_MANY_ATTACHMENTS, ERROR_CODE_UNSUPPORTED_SHELL_BUILTIN,
-    ERROR_CODE_VISION_UNSUPPORTED, ErrorData, MenuInput, ProtocolError, RequestBody, RequestId,
-    ResponseBody, SURFACE_INPUT_MAX_BYTES, SURFACE_STATUS_MAX_BYTES, SeqRange, SessionReadResult,
-    SessionSummary, SubmitDisposition, SurfaceInjectOp, SurfaceInputPublishWire, SurfaceInputWire,
-    SurfaceStatusPublishWire, SurfaceStatusWire, TodoGraphOpenedWire, WireFrame,
-    WorkflowCatalogEntryV1, WorkflowInstanceSourceV1, WorkflowInstanceV1,
+    ERROR_CODE_FORK_CUT_UNSTABLE, ERROR_CODE_GRAPH_ALREADY_ACTIVE, ERROR_CODE_GRAPH_NOT_ACTIVE,
+    ERROR_CODE_GRAPH_WRONG_NODE, ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_INVALID_CURSOR,
+    ERROR_CODE_NOT_FOUND, ERROR_CODE_OVERLOADED, ERROR_CODE_PDF_MALFORMED,
+    ERROR_CODE_PDF_TOO_LARGE, ERROR_CODE_PDF_TOO_MANY_PAGES, ERROR_CODE_PEER_AMBIGUOUS,
+    ERROR_CODE_PEER_INVALID, ERROR_CODE_PEER_UNAVAILABLE, ERROR_CODE_PROVIDER_MODELS_UNKNOWN,
+    ERROR_CODE_REVISION_CONFLICT, ERROR_CODE_RUN_NOT_ACTIVE, ERROR_CODE_STALE_GENERATION,
+    ERROR_CODE_SURFACE_TEXT_TOO_LARGE, ERROR_CODE_TOO_MANY_ATTACHMENTS,
+    ERROR_CODE_UNSUPPORTED_SHELL_BUILTIN, ERROR_CODE_VISION_UNSUPPORTED, ErrorData, MenuInput,
+    ProtocolError, RequestBody, RequestId, ResponseBody, SURFACE_INPUT_MAX_BYTES,
+    SURFACE_STATUS_MAX_BYTES, SeqRange, SessionReadResult, SessionSummary, SubmitDisposition,
+    SurfaceInjectOp, SurfaceInputPublishWire, SurfaceInputWire, SurfaceStatusPublishWire,
+    SurfaceStatusWire, TodoGraphOpenedWire, WireFrame, WorkflowCatalogEntryV1,
+    WorkflowInstanceSourceV1, WorkflowInstanceV1,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -815,6 +817,14 @@ struct HubInner {
     observer: Arc<dyn SessionHubObserver>,
     metrics: Arc<HubMetrics>,
     actors: Mutex<HashMap<SessionId, SessionActorHandle>>,
+    /// Child ids whose fork transaction/publication barrier has not completed.
+    /// External actor admission and peer rosters exclude them; publication may
+    /// install the child's actor behind this fence before making it visible.
+    fork_candidates: Mutex<HashSet<SessionId>>,
+    /// Fork publication spans source/child journals, SSH scope, Pipe, actor,
+    /// and roster state. Serialize that cross-session sequence so a receipt
+    /// replay cannot outrun the winning publication barrier.
+    fork_publication_serial: tokio::sync::Mutex<()>,
     /// Connection-level unsolicited sinks. Store failures fan out here, and
     /// volatile input injection uses the current publisher's indexed route.
     diagnostic_sinks: Mutex<HashMap<String, Arc<dyn FrameSink>>>,
@@ -900,6 +910,10 @@ struct HubInner {
     ssh: Mutex<Option<crate::ssh::SshService>>,
     /// Session launch/interactive scope. Absence means the v1 default: All.
     ssh_scopes: Mutex<HashMap<SessionId, crate::ssh::SshScope>>,
+    /// A setter whose durable write and retry both failed is crash-ambiguous.
+    /// Forks refuse that source until a later successful setter re-establishes
+    /// one cache/vault authority.
+    ssh_scope_uncertain: Mutex<HashSet<SessionId>>,
     /// One registry for all daemon-owned terminal channels.
     shells: crate::shell_registry::ShellRegistry,
     creatable_providers: Mutex<Option<std::collections::BTreeSet<String>>>,
@@ -1137,6 +1151,34 @@ impl<T> Drop for OwnedTasks<T> {
 #[derive(Clone)]
 struct SessionActorHandle {
     commands: mpsc::Sender<ActorCommand>,
+}
+
+struct ForkCandidateReservation {
+    inner: Arc<HubInner>,
+    session_id: SessionId,
+    committed: bool,
+}
+
+impl Drop for ForkCandidateReservation {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if let Ok(mut candidates) = self.inner.fork_candidates.lock() {
+            candidates.remove(&self.session_id);
+        }
+    }
+}
+
+impl ForkCandidateReservation {
+    fn retain_until_published(&mut self) {
+        self.committed = true;
+    }
+}
+
+enum SessionForkRequest {
+    Exact(SessionForkCommand),
+    Prompt(SessionPromptForkCommand),
 }
 
 #[derive(Clone, Copy)]
@@ -1415,10 +1457,6 @@ enum ActorCommand {
         command: SessionCreateCommand,
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         completed: oneshot::Sender<Result<SessionCreateOutcome, HaiderError>>,
-    },
-    ForkSession {
-        command: SessionForkCommand,
-        completed: oneshot::Sender<Result<SessionForkOutcome, HaiderError>>,
     },
     CreateBranch {
         command: BranchCreateCommand,
@@ -1759,6 +1797,15 @@ impl From<HaiderError> for SessionHubError {
     }
 }
 
+fn fork_pipe_publication_error(error: crate::pipe_native::PipeNativeError) -> SessionHubError {
+    match error.into_store_error() {
+        Ok(error) => SessionHubError::Store(error),
+        Err(error) => SessionHubError::Task(format!(
+            "native Pipe fork projection did not reach the committed head: {error}"
+        )),
+    }
+}
+
 impl From<SessionHubError> for DaemonError {
     fn from(error: SessionHubError) -> Self {
         match error {
@@ -1842,6 +1889,8 @@ impl SessionHub {
             observer,
             metrics: Arc::new(HubMetrics::default()),
             actors: Mutex::new(HashMap::new()),
+            fork_candidates: Mutex::new(HashSet::new()),
+            fork_publication_serial: tokio::sync::Mutex::new(()),
             diagnostic_sinks: Mutex::new(HashMap::new()),
             peer_event_subscribers: Mutex::new(HashSet::new()),
             resident_binding: Mutex::new(ResidentBindingRegistry::default()),
@@ -1871,6 +1920,7 @@ impl SessionHub {
             accounts: Mutex::new(None),
             ssh: Mutex::new(None),
             ssh_scopes: Mutex::new(HashMap::new()),
+            ssh_scope_uncertain: Mutex::new(HashSet::new()),
             shells: crate::shell_registry::ShellRegistry::default(),
             creatable_providers: Mutex::new(None),
             hooks,
@@ -2468,6 +2518,11 @@ impl SessionHub {
         }
         if let Some(vault) = facade.vault.clone() {
             *lock(&self.inner.ssh)? = Some(crate::ssh::SshService::new(vault));
+            // A pre-install compatibility read may only have observed the
+            // synthetic legacy default. Once durable storage is available,
+            // every scope must be resolved from that authority again.
+            lock(&self.inner.ssh_scopes)?.clear();
+            lock(&self.inner.ssh_scope_uncertain)?.clear();
         }
         *installed = Some(facade);
         Ok(())
@@ -2488,12 +2543,15 @@ impl SessionHub {
         if let Some(scope) = scopes.get(session_id).cloned() {
             return Ok(scope);
         }
-        let scope = lock(&self.inner.ssh)?
-            .as_ref()
-            .map_or_else(
-                || Ok(crate::ssh::SshScope::All),
-                |ssh| ssh.store.session_scope(session_id),
-            )
+        let Some(ssh) = lock(&self.inner.ssh)?.clone() else {
+            // Do not cache this synthetic compatibility value: account/SSH
+            // storage can be installed later in startup and may contain a
+            // narrower durable scope.
+            return Ok(crate::ssh::SshScope::All);
+        };
+        let scope = ssh
+            .store
+            .session_scope(session_id)
             .map_err(|error| SessionHubError::Task(error.to_string()))?;
         scopes.insert(session_id.clone(), scope.clone());
         Ok(scope)
@@ -2508,16 +2566,167 @@ impl SessionHub {
         // caller can therefore never observe `All` after narrowing started.
         let mut scopes = lock(&self.inner.ssh_scopes)?;
         if let Some(ssh) = lock(&self.inner.ssh)?.as_ref() {
-            ssh.store
-                .set_session_scope(&session_id, &scope)
-                .map_err(|error| SessionHubError::Task(error.to_string()))?;
+            if let Err(first_error) = ssh.store.set_session_scope(&session_id, &scope)
+                && let Err(retry_error) = ssh.store.set_session_scope(&session_id, &scope)
+            {
+                lock(&self.inner.ssh_scope_uncertain)?.insert(session_id);
+                return Err(SessionHubError::Task(format!(
+                    "cannot commit SSH scope: {first_error}; retry failed: {retry_error}"
+                )));
+            }
         } else if !matches!(scope, crate::ssh::SshScope::All) {
             return Err(SessionHubError::Task(
                 "SSH scope secret storage is unavailable".into(),
             ));
         }
+        lock(&self.inner.ssh_scope_uncertain)?.remove(&session_id);
         scopes.insert(session_id, scope);
         Ok(())
+    }
+
+    /// Snapshots the source scope and durably installs the exact same value
+    /// for a candidate fork while holding the scope serialization lock. A
+    /// missing source record legitimately decodes as historical `All`, but
+    /// the child always receives an explicit record, including for `None`.
+    fn clone_ssh_scope_for_fork(
+        &self,
+        source_session_id: &SessionId,
+        child_session_id: &SessionId,
+    ) -> Result<(), SessionHubError> {
+        let mut scopes = lock(&self.inner.ssh_scopes)?;
+        let ssh = lock(&self.inner.ssh)?.clone().ok_or_else(|| {
+            SessionHubError::Task("SSH scope secret storage is unavailable".into())
+        })?;
+        if lock(&self.inner.ssh_scope_uncertain)?.contains(source_session_id) {
+            return Err(SessionHubError::Task(
+                "source SSH scope has an unresolved durable write".into(),
+            ));
+        }
+        if scopes.contains_key(child_session_id)
+            || ssh
+                .store
+                .session_scope_if_present(child_session_id)
+                .map_err(|error| SessionHubError::Task(error.to_string()))?
+                .is_some()
+        {
+            return Err(SessionHubError::Task(
+                "fork child already has an SSH scope".into(),
+            ));
+        }
+        let source_scope = if let Some(scope) = scopes.get(source_session_id).cloned() {
+            scope
+        } else {
+            let scope = ssh
+                .store
+                .session_scope(source_session_id)
+                .map_err(|error| SessionHubError::Task(error.to_string()))?;
+            scopes.insert(source_session_id.clone(), scope.clone());
+            scope
+        };
+        if let Err(first_error) = ssh.store.set_session_scope(child_session_id, &source_scope) {
+            // FileVault can rename the exact bytes and then fail its directory
+            // fsync. A read-back would prove only current visibility, not
+            // crash durability, so require one complete retry to report a
+            // successful durable commit before SQLite may create the child.
+            if let Err(retry_error) = ssh.store.set_session_scope(child_session_id, &source_scope) {
+                let _ = ssh.store.delete_session_scope(child_session_id);
+                return Err(SessionHubError::Task(format!(
+                    "cannot commit fork SSH scope: {first_error}; retry failed: {retry_error}"
+                )));
+            }
+        }
+        scopes.insert(child_session_id.clone(), source_scope);
+        Ok(())
+    }
+
+    fn cache_committed_fork_scope(
+        &self,
+        child_session_id: &SessionId,
+    ) -> Result<(), SessionHubError> {
+        let mut scopes = lock(&self.inner.ssh_scopes)?;
+        if scopes.contains_key(child_session_id) {
+            return Ok(());
+        }
+        let ssh = lock(&self.inner.ssh)?.clone().ok_or_else(|| {
+            SessionHubError::Task("SSH scope secret storage is unavailable".into())
+        })?;
+        let scope = ssh
+            .store
+            .session_scope_if_present(child_session_id)
+            .map_err(|error| SessionHubError::Task(error.to_string()))?
+            .ok_or_else(|| {
+                SessionHubError::Task("committed fork is missing its explicit SSH scope".into())
+            })?;
+        scopes.insert(child_session_id.clone(), scope);
+        Ok(())
+    }
+
+    fn discard_provisional_ssh_scope(
+        &self,
+        child_session_id: &SessionId,
+    ) -> Result<(), SessionHubError> {
+        let mut scopes = lock(&self.inner.ssh_scopes)?;
+        let ssh = lock(&self.inner.ssh)?.clone().ok_or_else(|| {
+            SessionHubError::Task("SSH scope secret storage is unavailable".into())
+        })?;
+        let deleted = ssh
+            .store
+            .delete_session_scope(child_session_id)
+            .map_err(|error| SessionHubError::Task(error.to_string()));
+        scopes.remove(child_session_id);
+        deleted
+    }
+
+    async fn discard_fork_scope_if_session_absent(&self, child_session_id: &SessionId) {
+        match self.inner.store.session_ids().await {
+            Ok(session_ids) if !session_ids.contains(child_session_id) => {
+                if let Err(error) = self.discard_provisional_ssh_scope(child_session_id) {
+                    tracing::warn!(
+                        session_id = %child_session_id,
+                        %error,
+                        "could not remove an uncommitted fork SSH scope"
+                    );
+                }
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    session_id = %child_session_id,
+                    "retaining fork SSH scope because a durable child exists"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %child_session_id,
+                    %error,
+                    "retaining fork SSH scope because child absence could not be proved"
+                );
+            }
+        }
+    }
+
+    fn reserve_fork_candidate(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<ForkCandidateReservation, SessionHubError> {
+        {
+            let mut candidates = lock(&self.inner.fork_candidates)?;
+            if !candidates.insert(session_id.clone()) {
+                return Err(SessionHubError::Task(
+                    "fork child session id is already reserved".into(),
+                ));
+            }
+        }
+        let reservation = ForkCandidateReservation {
+            inner: Arc::clone(&self.inner),
+            session_id: session_id.clone(),
+            committed: false,
+        };
+        if lock(&self.inner.actors)?.contains_key(session_id) {
+            return Err(SessionHubError::Task(
+                "fork child session id already has a live actor".into(),
+            ));
+        }
+        Ok(reservation)
     }
 
     pub(crate) fn shell_registry(&self) -> &crate::shell_registry::ShellRegistry {
@@ -3687,53 +3896,258 @@ impl SessionHub {
         }
     }
 
-    /// Routes creation through the candidate child actor so attachment,
-    /// sidecar, and roster publication are ordered after the atomic clone.
+    /// Owns the complete fork attempt in a hub task. A disconnected RPC may
+    /// stop awaiting the result, but it cannot cancel the scope/store
+    /// reconciliation halfway through and accidentally expose a child whose
+    /// explicit scope was removed.
     async fn fork_session(
         &self,
         command: SessionForkCommand,
     ) -> Result<SessionForkOutcome, SessionHubError> {
-        let candidate_session_id = command.session_id.clone();
-        let actor = self.actor_for(candidate_session_id.clone()).await?;
+        self.fork_session_request(SessionForkRequest::Exact(command))
+            .await
+    }
+
+    async fn fork_session_from_prompt(
+        &self,
+        command: SessionPromptForkCommand,
+    ) -> Result<SessionForkOutcome, SessionHubError> {
+        self.fork_session_request(SessionForkRequest::Prompt(command))
+            .await
+    }
+
+    async fn fork_session_request(
+        &self,
+        command: SessionForkRequest,
+    ) -> Result<SessionForkOutcome, SessionHubError> {
+        let hub = self.clone();
         let (completed, result) = oneshot::channel();
-        actor
-            .commands
-            .send(ActorCommand::ForkSession { command, completed })
-            .await
-            .map_err(|_| SessionHubError::Closed)?;
-        let outcome = result
-            .await
-            .map_err(|_| SessionHubError::Closed)?
-            .map_err(SessionHubError::from)?;
-        if matches!(
-            &outcome,
-            SessionForkOutcome::IdempotentReplay { created }
-                if created.session_id != candidate_session_id
-        ) {
-            self.stop_discarded_candidate_actor(&candidate_session_id, &actor)
-                .await?;
+        let task = tokio::spawn(async move {
+            let outcome = hub.fork_session_owned(command).await;
+            let _ = completed.send(outcome);
+        });
+        lock(&self.inner.actor_tasks)?.push(task);
+        result.await.map_err(|_| SessionHubError::Closed)?
+    }
+
+    async fn fork_session_owned(
+        &self,
+        command: SessionForkRequest,
+    ) -> Result<SessionForkOutcome, SessionHubError> {
+        let _publication_serial = self.inner.fork_publication_serial.lock().await;
+        let (
+            receipt_command_id,
+            request_digest,
+            request_json,
+            metafork,
+            candidate_session_id,
+            source_session_id,
+        ) = match &command {
+            SessionForkRequest::Exact(command) => (
+                CommandId::new(command.command_id.clone()),
+                command.request_digest.clone(),
+                command.request_json.clone(),
+                command.metafork.is_some(),
+                command.session_id.clone(),
+                command.source_session_id.clone(),
+            ),
+            SessionForkRequest::Prompt(command) => (
+                CommandId::new(command.command_id.clone()),
+                command.request_digest.clone(),
+                command.request_json.clone(),
+                false,
+                command.session_id.clone(),
+                command.source_session_id.clone(),
+            ),
+        };
+        if let Some(created) = self
+            .session_fork_receipt(
+                &receipt_command_id,
+                &request_digest,
+                &request_json,
+                metafork,
+            )
+            .await?
+        {
+            self.cache_committed_fork_scope(&created.session_id)?;
+            self.publish_committed_fork(&created, None).await?;
+            return Ok(SessionForkOutcome::IdempotentReplay { created });
+        }
+        let mut reservation = Some(self.reserve_fork_candidate(&candidate_session_id)?);
+        if self
+            .inner
+            .store
+            .session_ids()
+            .await?
+            .contains(&candidate_session_id)
+        {
+            return Err(SessionHubError::Store(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "daemon-minted child session id already exists",
+                false,
+            )));
+        }
+        self.clone_ssh_scope_for_fork(&source_session_id, &candidate_session_id)?;
+        let stored = match command {
+            SessionForkRequest::Exact(command) => self.inner.store.fork_session(command).await,
+            SessionForkRequest::Prompt(command) => {
+                self.inner.store.fork_session_from_prompt(command).await
+            }
+        };
+        let outcome = match stored {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // SQLite COMMIT errors can be ambiguous. Reconcile the durable
+                // receipt before any compensation; deleting scope while the
+                // child actually committed would reopen absent-means-`All`.
+                match self
+                    .session_fork_receipt(
+                        &receipt_command_id,
+                        &request_digest,
+                        &request_json,
+                        metafork,
+                    )
+                    .await
+                {
+                    Ok(Some(created)) => {
+                        if created.session_id == candidate_session_id
+                            && let Some(reservation) = reservation.as_mut()
+                        {
+                            reservation.retain_until_published();
+                        }
+                        if created.session_id != candidate_session_id {
+                            self.discard_fork_scope_if_session_absent(&candidate_session_id)
+                                .await;
+                        }
+                        self.cache_committed_fork_scope(&created.session_id)?;
+                        self.publish_committed_fork(&created, None).await?;
+                        return Ok(SessionForkOutcome::IdempotentReplay { created });
+                    }
+                    Ok(None) => {
+                        self.discard_fork_scope_if_session_absent(&candidate_session_id)
+                            .await;
+                    }
+                    Err(reconcile_error) => {
+                        tracing::warn!(
+                            session_id = %candidate_session_id,
+                            error = %reconcile_error,
+                            "retaining fork SSH scope after ambiguous commit failure"
+                        );
+                    }
+                }
+                return Err(error.into());
+            }
+        };
+        match &outcome {
+            SessionForkOutcome::Committed { created, envelopes } => {
+                if let Some(reservation) = reservation.as_mut() {
+                    reservation.retain_until_published();
+                }
+                if let Some(last) = envelopes.last() {
+                    self.inner.observer.observe(HubObservation::Persisted {
+                        session_id: candidate_session_id.clone(),
+                        through_seq: last.seq,
+                    });
+                }
+                self.publish_committed_fork(created, Some(envelopes))
+                    .await?;
+            }
+            SessionForkOutcome::IdempotentReplay { created } => {
+                // A racing command may have won after the initial receipt
+                // preflight. Its child scope is authority; the losing
+                // candidate remains unobservable and can be discarded.
+                if created.session_id != candidate_session_id {
+                    self.discard_fork_scope_if_session_absent(&candidate_session_id)
+                        .await;
+                    self.cache_committed_fork_scope(&created.session_id)?;
+                } else if let Some(reservation) = reservation.as_mut() {
+                    reservation.retain_until_published();
+                }
+                self.publish_committed_fork(created, None).await?;
+            }
         }
         Ok(outcome)
     }
 
-    async fn stop_discarded_candidate_actor(
+    /// Completes the one publication barrier for a durable fork. The child
+    /// stays in `fork_candidates` until its ordinary actor exists and the
+    /// native Pipe proves coverage through the committed child head. Removing
+    /// that fence is the visibility linearization point; the normal commit
+    /// projection then wakes roster observers.
+    async fn publish_committed_fork(
         &self,
-        candidate_session_id: &SessionId,
-        candidate_actor: &SessionActorHandle,
+        created: &CreatedSessionFork,
+        committed: Option<&[RawEnvelope]>,
     ) -> Result<(), SessionHubError> {
-        let removed = {
-            let mut actors = lock(&self.inner.actors)?;
-            let owns_candidate = actors
-                .get(candidate_session_id)
-                .is_some_and(|current| current.commands.same_channel(&candidate_actor.commands));
-            owns_candidate
-                .then(|| actors.remove(candidate_session_id))
-                .flatten()
-        };
-        if let Some(actor) = removed {
-            let _ = actor.commands.send(ActorCommand::Stop).await;
+        let actor_ready = self.existing_actor(&created.session_id)?.is_some();
+        let pipe_ready = self
+            .inner
+            .pipe_native
+            .confirms_coverage(&created.session_id, created.created_seq);
+        {
+            let mut candidates = lock(&self.inner.fork_candidates)?;
+            if !candidates.contains(&created.session_id) && actor_ready && pipe_ready {
+                return Ok(());
+            }
+            // Receipt replay may be the first process-local knowledge of a
+            // fork whose durable transaction committed before a crash.
+            // Reinstall the visibility fence before any repair await.
+            candidates.insert(created.session_id.clone());
         }
+        self.cache_committed_fork_scope(&created.session_id)?;
+        self.actor_for_inner(created.session_id.clone(), true)
+            .await?;
+        self.inner
+            .pipe_native
+            .maintain_and_confirm_coverage(
+                &self.inner.store,
+                &created.session_id,
+                committed.unwrap_or_default(),
+                created.created_seq,
+            )
+            .await
+            .map_err(fork_pipe_publication_error)?;
+        let final_envelope = match committed.and_then(|envelopes| envelopes.last()).cloned() {
+            Some(envelope) if envelope.seq == created.created_seq => envelope,
+            _ => self
+                .inner
+                .store
+                .read(
+                    &created.session_id,
+                    created.created_seq.saturating_sub(1),
+                    1,
+                )
+                .await?
+                .into_iter()
+                .find(|envelope| envelope.seq == created.created_seq)
+                .ok_or_else(|| {
+                    SessionHubError::Store(HaiderError::new(
+                        ErrorCode::StoreCorrupt,
+                        "committed fork receipt has no matching final audit envelope",
+                        false,
+                    ))
+                })?,
+        };
+        lock(&self.inner.fork_candidates)?.remove(&created.session_id);
+        // Copied parent facts must not rerun hooks. Only the final fork audit
+        // originated in this transaction; this is the same projection seam
+        // every session actor's `publish` uses.
+        self.inner
+            .commit_projection
+            .observe_committed(std::slice::from_ref(&final_envelope));
+        self.inner.observer.observe(HubObservation::Published {
+            session_id: created.session_id.clone(),
+            through_seq: created.created_seq,
+        });
         Ok(())
+    }
+
+    async fn publish_received_fork(
+        &self,
+        created: &CreatedSessionFork,
+    ) -> Result<(), SessionHubError> {
+        let _publication_serial = self.inner.fork_publication_serial.lock().await;
+        self.publish_committed_fork(created, None).await
     }
 
     async fn branch_create_receipt(
@@ -4667,6 +5081,17 @@ impl SessionHub {
         self.inner.store.session_ids().await.map_err(Into::into)
     }
 
+    async fn roster_session_ids(&self) -> Result<Vec<SessionId>, SessionHubError> {
+        let mut session_ids = self.inner.store.session_ids().await?;
+        let fork_candidates = lock(&self.inner.fork_candidates)?;
+        session_ids.retain(|session_id| !fork_candidates.contains(session_id));
+        Ok(session_ids)
+    }
+
+    fn is_roster_visible(&self, session_id: &SessionId) -> Result<bool, SessionHubError> {
+        Ok(!lock(&self.inner.fork_candidates)?.contains(session_id))
+    }
+
     /// Deletes one quiesced session through the daemon's production
     /// lifecycle. New actor admission is fenced first; attached or
     /// nonterminal sessions are refused. The actor stops before the durable
@@ -5037,6 +5462,14 @@ impl SessionHub {
         &self,
         session_id: SessionId,
     ) -> Result<SessionActorHandle, SessionHubError> {
+        self.actor_for_inner(session_id, false).await
+    }
+
+    async fn actor_for_inner(
+        &self,
+        session_id: SessionId,
+        allow_committed_fork_candidate: bool,
+    ) -> Result<SessionActorHandle, SessionHubError> {
         if self.inner.draining.load(Ordering::Acquire) {
             return Err(SessionHubError::Closed);
         }
@@ -5046,6 +5479,13 @@ impl SessionHub {
                 "session was deleted",
                 false,
             )));
+        }
+        if !allow_committed_fork_candidate
+            && lock(&self.inner.fork_candidates)?.contains(&session_id)
+        {
+            return Err(SessionHubError::Task(
+                "session fork candidate is not yet committed".into(),
+            ));
         }
         {
             let actors = lock(&self.inner.actors)?;
@@ -5074,6 +5514,13 @@ impl SessionHub {
                 "session was deleted",
                 false,
             )));
+        }
+        if !allow_committed_fork_candidate
+            && lock(&self.inner.fork_candidates)?.contains(&session_id)
+        {
+            return Err(SessionHubError::Task(
+                "session fork candidate is not yet committed".into(),
+            ));
         }
         if let Some(actor) = actors.get(&session_id) {
             return Ok(actor.clone());

@@ -20,10 +20,12 @@ use haider_protocol::peer::{
 };
 use haider_protocol::session::{SessionMetadataV1, SessionPermissionOverridesV1};
 use haider_protocol::session_fork::{
-    SessionMetaforkProposal, SessionMetaforkRemoval, SessionMetaforkReviewManifest,
+    SessionForkDraft, SessionForkPromptSelector, SessionForkProvenance, SessionMetaforkProposal,
+    SessionMetaforkRemoval, SessionMetaforkReviewManifest,
 };
 use haider_protocol::tool::{
-    DispatchMode, ToolInventoryEntry, ToolInventorySnapshot, ToolManifest, ToolPermissionDefault,
+    AttachmentBlock, DispatchMode, ToolInventoryEntry, ToolInventorySnapshot, ToolManifest,
+    ToolPermissionDefault,
 };
 use haider_protocol::usage::{
     AccountMeterStateV1, AccountUsageReportV1, LocalUsageStatsV1, UsageReportV1, UsageWindowV1,
@@ -37,14 +39,14 @@ use haider_rpc::{
     FEATURE_ACCOUNT_OAUTH_PKCE_V1, FEATURE_ACCOUNT_ROTATION_V1, FEATURE_ARTIFACT_PUT_V1,
     FEATURE_BRANCH_CREATE_V1, FEATURE_PROVIDER_CONFIGURE_V1, FEATURE_PROVIDER_MANAGEMENT_V1,
     FEATURE_PROVIDER_MODELS_V1, FEATURE_PROVIDER_REMOVE_V1, FEATURE_SESSION_FLEET_V1,
-    FEATURE_SESSION_FORK_V1, FEATURE_SESSION_MUTATION_V1, FEATURE_SESSION_RENAME_V1,
-    FEATURE_TURN_CONTROL_V1, FEATURE_USAGE_REPORT_V1, FEATURE_VAULT_STAGE_V1, FleetAgentStateWire,
-    FleetMetricsTotalsWire, FleetNodeWire, FleetRollupWire, FleetStateCountsWire, Hello,
-    HookSummaryWire, HookTrustStateWire, LifecyclePhase, MenuInput, ModelDetailWire,
-    MonitorActionWire, MonitorDeliveryDedupeWire, MonitorDeliveryReportWire,
-    MonitorEventPayloadWire, MonitorEventWire, MonitorReportStatusWire, MonitorSourceKindWire,
-    OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId, OAuthFlowStatusWire,
-    OAuthReadyRefWire, ObserveRunStateWire, ProtocolError, ProviderActiveWire,
+    FEATURE_SESSION_FORK_V1, FEATURE_SESSION_MUTATION_V1, FEATURE_SESSION_PROMPT_FORK_V1,
+    FEATURE_SESSION_RENAME_V1, FEATURE_TURN_CONTROL_V1, FEATURE_USAGE_REPORT_V1,
+    FEATURE_VAULT_STAGE_V1, FleetAgentStateWire, FleetMetricsTotalsWire, FleetNodeWire,
+    FleetRollupWire, FleetStateCountsWire, Hello, HookSummaryWire, HookTrustStateWire,
+    LifecyclePhase, MenuInput, ModelDetailWire, MonitorActionWire, MonitorDeliveryDedupeWire,
+    MonitorDeliveryReportWire, MonitorEventPayloadWire, MonitorEventWire, MonitorReportStatusWire,
+    MonitorSourceKindWire, OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId,
+    OAuthFlowStatusWire, OAuthReadyRefWire, ObserveRunStateWire, ProtocolError, ProviderActiveWire,
     ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
     ProviderDefaultWire, ProviderRemoveRefusalReasonWire, ProviderSummaryWire, RequestBody,
     RequestId, ResponseBody, SecretWire, SeqRange, SessionFleetSnapshot, SessionObserveDigest,
@@ -214,6 +216,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     effort: None,
                     fast: None,
                     account_alias: None,
+                    forked_from: None,
                 }],
                 next_cursor: Some("cursor-after-session-1".into()),
             },
@@ -251,6 +254,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     effort: None,
                     fast: None,
                     account_alias: None,
+                    forked_from: None,
                 }],
                 next_cursor: None,
             },
@@ -1063,8 +1067,9 @@ pub fn transcript() -> Vec<WireFrame> {
                 session_id: SessionId::new("session-1"),
                 worker_generation: 7,
                 source_branch_id: Some(BranchId::new("branch-plan-b")),
-                fork_node_id: NodeId::new("node-fork-2"),
-                fork_seq: 57,
+                fork_node_id: Some(NodeId::new("node-fork-2")),
+                fork_seq: Some(57),
+                prompt: None,
                 name: Some("Independent plan B".into()),
             },
         },
@@ -1079,6 +1084,8 @@ pub fn transcript() -> Vec<WireFrame> {
                 created_seq: 61,
                 worker_generation: 7,
                 metadata: fork_metadata.clone(),
+                forked_from: None,
+                draft: None,
             },
         },
         WireFrame::Request {
@@ -1145,7 +1152,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 proposal_digest: "reviewed-proposal-digest".into(),
                 created_seq: Some(64),
                 worker_generation: Some(7),
-                metadata: Some(fork_metadata),
+                metadata: Some(fork_metadata.clone()),
                 omission_count: Some(6),
             },
         },
@@ -1801,6 +1808,7 @@ pub fn transcript() -> Vec<WireFrame> {
                     effort: None,
                     fast: None,
                     account_alias: None,
+                    forked_from: None,
                 }],
                 next_cursor: None,
             },
@@ -2009,6 +2017,7 @@ pub fn transcript() -> Vec<WireFrame> {
         },
     ];
     append_union_contract_tail(&mut frames);
+    append_prompt_fork_contract_tail(&mut frames, fork_metadata);
     frames
 }
 
@@ -2112,6 +2121,102 @@ fn append_union_contract_tail(frames: &mut Vec<WireFrame>) {
             body: serde_json::from_str(response).expect("decode union-tail golden response"),
         });
     }
+}
+
+/// Prompt-oriented session forking is a strict four-frame tail append. The
+/// existing `session.fork` method remains transcript-covered exactly once as
+/// a method even though both selector shapes now have golden witnesses.
+fn append_prompt_fork_contract_tail(frames: &mut Vec<WireFrame>, metadata: SessionMetadataV1) {
+    let source_session_id = SessionId::new("session-prompt-source");
+    let child_session_id = SessionId::new("session-prompt-child");
+    let provenance = SessionForkProvenance {
+        session_id: source_session_id.clone(),
+        seq: 58,
+    };
+    frames.extend([
+        WireFrame::Welcome(Welcome {
+            protocol: 1,
+            instance_id: "instance-session-prompt-fork".into(),
+            daemon_generation: 10,
+            frame_limit: TEST_FRAME_LIMIT as u32,
+            profile_id: "profile-1".into(),
+            daemon_version: "0.0.966".into(),
+            lifecycle_phase: LifecyclePhase::Ready,
+            capabilities_granted: capabilities([Capability::View, Capability::Control]),
+            features: BTreeSet::from([
+                FEATURE_SESSION_FORK_V1.to_owned(),
+                FEATURE_SESSION_PROMPT_FORK_V1.to_owned(),
+            ]),
+            user_command_withheld: false,
+            encoding: None,
+        }),
+        WireFrame::Request {
+            request_id: RequestId::new("request-session-prompt-fork"),
+            body: RequestBody::SessionFork {
+                command_id: CommandId::new("command-session-prompt-fork"),
+                session_id: source_session_id.clone(),
+                worker_generation: 7,
+                source_branch_id: Some(BranchId::new("branch-plan-b")),
+                fork_node_id: None,
+                fork_seq: None,
+                prompt: Some(SessionForkPromptSelector { seq: 58 }),
+                name: Some("Edit plan B".into()),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-session-prompt-fork"),
+            body: ResponseBody::SessionFork {
+                session_id: child_session_id.clone(),
+                source_session_id: source_session_id.clone(),
+                source_branch_id: Some(BranchId::new("branch-plan-b")),
+                fork_node_id: NodeId::new("node-before-prompt-b"),
+                fork_seq: 57,
+                created_seq: 58,
+                worker_generation: 7,
+                metadata,
+                forked_from: Some(provenance.clone()),
+                draft: Some(SessionForkDraft {
+                    text: "Revise the implementation plan using this file.".into(),
+                    attachments: vec![AttachmentBlock::File {
+                        artifact: ArtifactRef::new("blake3:prompt-b-file"),
+                        name: "requirements.txt".into(),
+                        lines: 12,
+                    }],
+                }),
+            },
+        },
+        WireFrame::SessionRosterDelta {
+            summaries: vec![SessionSummary {
+                session_id: child_session_id,
+                head_seq: 58,
+                worker_generation: 7,
+                run_state: Some(ObserveRunStateWire::Idle),
+                run_id: None,
+                seen_at_ms: None,
+                last_activity_ms: Some(1_753_500_090_000),
+                waiting_why: None,
+                needs_input: None,
+                metadata: None,
+                provider: None,
+                last_model: None,
+                cache_lifetime_hit_basis_points: None,
+                cache_reread_hit_basis_points: None,
+                workspace_cwd: None,
+                turn_count: Some(3),
+                footprint_tokens: None,
+                footprint_truth: None,
+                title: Some("Edit plan B".into()),
+                agent_metrics: None,
+                parent_session_id: None,
+                kind: Some(haider_rpc::SessionKindWire::Root),
+                agent_type: None,
+                effort: None,
+                fast: None,
+                account_alias: None,
+                forked_from: Some(provenance),
+            }],
+        },
+    ]);
 }
 
 /// Golden credential descriptor: public global alias, verified display

@@ -31,10 +31,10 @@ use haider_store::{
     QueuePromoteCommand, QueuePromoteOutcome, QueuePromotePreview, QueueRemoveCommand,
     QueueRemoveOutcome, QueueSnapshot, RunRetryCommand, RunRetryOutcome, SessionCreateCommand,
     SessionCreateOutcome, SessionForkCommand, SessionForkOutcome, SessionProjectionCheckpoint,
-    SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome,
-    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
-    ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand,
-    TurnCancelOutcome, TypedAgentInstallCas,
+    SessionPromptForkCommand, SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand,
+    SessionSeenOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
+    ShellExecAcceptCommand, ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome,
+    TurnCancelCommand, TurnCancelOutcome, TypedAgentInstallCas,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::{Path, PathBuf};
@@ -624,6 +624,17 @@ impl SqliteStoreHandle {
         .await
     }
 
+    /// Loads prompt-fork provenance for the roster projection on the blocking
+    /// store owner.
+    pub async fn session_fork_provenance(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<haider_protocol::session_fork::SessionForkProvenance>, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.session_fork_provenance(&session_id)))
+            .await
+    }
+
     pub async fn session_metafork_receipt(
         &self,
         command_id: String,
@@ -667,7 +678,25 @@ impl SqliteStoreHandle {
         command: SessionForkCommand,
     ) -> Result<SessionForkOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
-        run_blocking(move || owner.with_store(|store| store.fork_session(&command))).await
+        run_blocking(move || {
+            owner.with_store(|store| store.fork_session_with_durable_cache_candidate(&command))
+        })
+        .await
+    }
+
+    /// Resolves and physically copies the stable prefix before one committed
+    /// user prompt on the blocking store owner.
+    pub async fn fork_session_from_prompt(
+        &self,
+        command: SessionPromptForkCommand,
+    ) -> Result<SessionForkOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| {
+                store.fork_session_from_prompt_with_durable_cache_candidate(&command)
+            })
+        })
+        .await
     }
 
     pub async fn branch_create_receipt(

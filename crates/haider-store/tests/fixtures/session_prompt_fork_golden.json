@@ -1,0 +1,91 @@
+{
+  "successful": {
+    "outcome": "committed",
+    "copied": [
+      "session_state:created",
+      "run_state:queued",
+      "user_message",
+      "node_committed:user_turn",
+      "session_state:active_run",
+      "item:completed:agent_message",
+      "node_committed:assistant_commit",
+      "run_state:done",
+      "session_state:idle:false"
+    ]
+  },
+  "tool_heavy": {
+    "outcome": "committed",
+    "copied": [
+      "session_state:created",
+      "run_state:queued",
+      "user_message",
+      "node_committed:user_turn",
+      "session_state:active_run",
+      "item:started:tool_call",
+      "tool_result",
+      "item:completed:tool_call",
+      "node_committed:tool_exchange",
+      "item:started:tool_call",
+      "tool_result",
+      "item:completed:tool_call",
+      "node_committed:tool_exchange",
+      "item:completed:agent_message",
+      "node_committed:assistant_commit",
+      "run_state:done",
+      "session_state:idle:false"
+    ]
+  },
+  "errored": {
+    "outcome": "committed",
+    "copied": [
+      "session_state:created",
+      "run_state:queued",
+      "user_message",
+      "node_committed:user_turn",
+      "session_state:active_run",
+      "run_failed",
+      "run_state:errored",
+      "session_state:idle:false"
+    ]
+  },
+  "cancelled": {
+    "outcome": "committed",
+    "copied": [
+      "session_state:created",
+      "run_state:queued",
+      "user_message",
+      "node_committed:user_turn",
+      "session_state:active_run",
+      "run_state:cancelling",
+      "run_state:cancelled",
+      "session_state:idle:false"
+    ]
+  },
+  "interrupted": {
+    "outcome": "committed",
+    "copied": [
+      "session_state:created",
+      "run_state:queued",
+      "user_message",
+      "node_committed:user_turn",
+      "session_state:active_run",
+      "run_state:cancelling",
+      "run_state:cancelled",
+      "session_state:idle:true"
+    ]
+  },
+  "first_prompt": {
+    "outcome": "committed",
+    "copied": [
+      "session_state:created"
+    ]
+  },
+  "queued_prompt": {
+    "outcome": "fork_cut_unstable",
+    "retryable": true
+  },
+  "another_branch": {
+    "outcome": "invalid_argument",
+    "reason": "wrong_branch"
+  }
+}

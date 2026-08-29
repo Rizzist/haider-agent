@@ -21,6 +21,7 @@
 
 use haider_core::{SqliteStoreHandle, StoreHandle};
 use haider_protocol::envelope::RawEnvelope;
+use haider_protocol::error::HaiderError;
 use haider_protocol::ids::SessionId;
 use haider_protocol::pipe::TranscriptProjector;
 use serde::{Deserialize, Serialize};
@@ -134,7 +135,7 @@ impl RebuildTemporary {
     fn path(&self) -> Result<PathBuf, PipeNativeError> {
         self.path
             .clone()
-            .ok_or_else(|| PipeNativeError("boot rebuild temporary is unavailable".into()))
+            .ok_or_else(|| PipeNativeError::other("boot rebuild temporary is unavailable".into()))
     }
 
     fn disarm(&mut self) {
@@ -188,7 +189,7 @@ impl PipeBootSession {
                 let chunk = render_rows_after(page, durable_cursor.seq, projector);
                 if !chunk.is_empty() {
                     let open = file.take().ok_or_else(|| {
-                        PipeNativeError("boot sidecar append handle is unavailable".into())
+                        PipeNativeError::other("boot sidecar append handle is unavailable".into())
                     })?;
                     let (next, next_segment) = write_segmented_open(
                         open,
@@ -216,7 +217,7 @@ impl PipeBootSession {
                 let chunk = render_rows_after(page, 0, projector);
                 if !chunk.is_empty() {
                     let open = file.take().ok_or_else(|| {
-                        PipeNativeError("boot sidecar rebuild handle is unavailable".into())
+                        PipeNativeError::other("boot sidecar rebuild handle is unavailable".into())
                     })?;
                     let (next, next_segment) = write_segmented_open(
                         open,
@@ -251,7 +252,7 @@ impl PipeBootSession {
                 ..
             } => {
                 let mut open = file.take().ok_or_else(|| {
-                    PipeNativeError("boot sidecar append handle is unavailable".into())
+                    PipeNativeError::other("boot sidecar append handle is unavailable".into())
                 })?;
                 let trailing = render_projected_rows(projector.flush_unresolved_tools());
                 if !trailing.is_empty() {
@@ -293,7 +294,7 @@ impl PipeBootSession {
                 mut temporary,
             } => {
                 let mut open = file.take().ok_or_else(|| {
-                    PipeNativeError("boot sidecar rebuild handle is unavailable".into())
+                    PipeNativeError::other("boot sidecar rebuild handle is unavailable".into())
                 })?;
                 let trailing = render_projected_rows(projector.flush_unresolved_tools());
                 if !trailing.is_empty() {
@@ -320,7 +321,9 @@ impl PipeBootSession {
                 } else {
                     let file = sync_open(open).await?;
                     let root_file = sealed_root.take().ok_or_else(|| {
-                        PipeNativeError("segmented boot rebuild lost its sealed root handle".into())
+                        PipeNativeError::other(
+                            "segmented boot rebuild lost its sealed root handle".into(),
+                        )
                     })?;
                     finish_temp(root_file, temporary.path()?, base_path.clone()).await?;
                     temporary.disarm();
@@ -378,17 +381,46 @@ fn is_zero(value: &u64) -> bool {
 }
 
 #[derive(Debug)]
-pub(crate) struct PipeNativeError(String);
+pub(crate) struct PipeNativeError {
+    message: String,
+    store_error: Option<HaiderError>,
+}
+
+impl PipeNativeError {
+    fn other(message: String) -> Self {
+        Self {
+            message,
+            store_error: None,
+        }
+    }
+
+    pub(crate) fn store(context: &str, error: HaiderError) -> Self {
+        Self {
+            message: format!("{context}: {error:?}"),
+            store_error: Some(error),
+        }
+    }
+
+    pub(crate) fn into_store_error(self) -> Result<HaiderError, Self> {
+        match self {
+            Self {
+                store_error: Some(error),
+                ..
+            } => Ok(error),
+            error => Err(error),
+        }
+    }
+}
 
 impl fmt::Display for PipeNativeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.message)
     }
 }
 
 impl From<std::io::Error> for PipeNativeError {
     fn from(error: std::io::Error) -> Self {
-        Self(error.to_string())
+        Self::other(error.to_string())
     }
 }
 
@@ -424,7 +456,7 @@ impl PipeNativeWriter {
         store
             .latest_seq(session_id)
             .await
-            .map_err(|error| PipeNativeError(format!("journal head inspection failed: {error:?}")))
+            .map_err(|error| PipeNativeError::store("journal head inspection failed", error))
     }
 
     /// Forgets an in-memory cursor after an asynchronous writer exits before
@@ -475,7 +507,7 @@ impl PipeNativeWriter {
                 let generation = other
                     .generation()
                     .checked_add(1)
-                    .ok_or_else(|| PipeNativeError("sidecar generation exhausted".into()))?;
+                    .ok_or_else(|| PipeNativeError::other("sidecar generation exhausted".into()))?;
                 let (mut file, temp_path) = create_temp(path.clone()).await?;
                 let temporary = RebuildTemporary::new(temp_path);
                 file = write_temp(file, header_line(session_id, generation, 0, 0)?).await?;
@@ -531,6 +563,67 @@ impl PipeNativeWriter {
         result
     }
 
+    /// Fork publication barrier: reconcile the sidecar and prove that its
+    /// live generation covers the durable child head before the roster can
+    /// expose that child. Ordinary appends remain best-effort and async; this
+    /// stronger seam is intentionally reserved for first publication.
+    pub(crate) async fn maintain_and_confirm_coverage(
+        &self,
+        store: &SqliteStoreHandle,
+        session_id: &SessionId,
+        committed: &[RawEnvelope],
+        known_committed_head: u64,
+    ) -> Result<(), PipeNativeError> {
+        self.maintain(store, session_id, committed, known_committed_head)
+            .await?;
+        if self.confirms_coverage(session_id, known_committed_head) {
+            return Ok(());
+        }
+        let covered = self
+            .reconciled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .map(|state| (state.cursor.seq, state.cursor.generation));
+        match covered {
+            Some((coverage, generation)) if coverage >= known_committed_head && generation > 0 => {
+                Ok(())
+            }
+            Some((coverage, generation)) => {
+                self.invalidate(session_id);
+                Err(PipeNativeError::other(format!(
+                    "sidecar generation {generation} covers {coverage}, below journal head {known_committed_head}"
+                )))
+            }
+            None => Err(PipeNativeError::other(
+                "sidecar reconciliation completed without a live coverage cursor".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn confirms_coverage(
+        &self,
+        session_id: &SessionId,
+        known_committed_head: u64,
+    ) -> bool {
+        self.reconciled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .is_some_and(|state| {
+                state.cursor.seq >= known_committed_head && state.cursor.generation > 0
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn confirmed_coverage(&self, session_id: &SessionId) -> Option<(u64, u64)> {
+        self.reconciled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .map(|state| (state.cursor.seq, state.cursor.generation))
+    }
+
     /// Publishes one completed shared boot fold into the live writer map. The
     /// caller feeds recovery-appended suffix pages before invoking this.
     pub(crate) async fn finish_boot_session(
@@ -539,7 +632,7 @@ impl PipeNativeWriter {
         boot: PipeBootSession,
     ) -> Result<(), PipeNativeError> {
         if &boot.session_id != session_id {
-            return Err(PipeNativeError(format!(
+            return Err(PipeNativeError::other(format!(
                 "boot sidecar session mismatch: expected {}, got {}",
                 boot.session_id, session_id
             )));
@@ -693,9 +786,7 @@ impl PipeNativeWriter {
                     PIPE_PROJECTION_PAYLOAD_KINDS,
                 )
                 .await
-                .map_err(|error| {
-                    PipeNativeError(format!("journal reconciliation failed: {error:?}"))
-                })?;
+                .map_err(|error| PipeNativeError::store("journal reconciliation failed", error))?;
             let Some(last) = page.envelopes.last() else {
                 if let Some((through_seq, _)) = page.observed_head {
                     read_cursor = read_cursor.max(through_seq);
@@ -762,7 +853,7 @@ impl PipeNativeWriter {
         let (mut file, temp_path) = create_temp(path.clone()).await?;
         let generation = generation
             .checked_add(1)
-            .ok_or_else(|| PipeNativeError("sidecar generation exhausted".into()))?;
+            .ok_or_else(|| PipeNativeError::other("sidecar generation exhausted".into()))?;
         file = write_temp(file, header_line(session_id, generation, 0, 0)?).await?;
         let mut segment = 0;
         let mut sealed_root = None;
@@ -778,7 +869,7 @@ impl PipeNativeWriter {
                     PIPE_PROJECTION_PAYLOAD_KINDS,
                 )
                 .await
-                .map_err(|error| PipeNativeError(format!("journal rebuild failed: {error:?}")))?;
+                .map_err(|error| PipeNativeError::store("journal rebuild failed", error))?;
             let Some(last) = page.envelopes.last() else {
                 if let Some((through_seq, _)) = page.observed_head {
                     read_cursor = read_cursor.max(through_seq);
@@ -820,7 +911,7 @@ impl PipeNativeWriter {
         } else {
             let file = sync_open(file).await?;
             let root_file = sealed_root.take().ok_or_else(|| {
-                PipeNativeError("segmented rebuild lost its sealed root handle".into())
+                PipeNativeError::other("segmented rebuild lost its sealed root handle".into())
             })?;
             finish_temp(root_file, temp_path, path.clone()).await?;
             file
@@ -850,7 +941,7 @@ impl PipeNativeWriter {
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
             || matches!(id, "." | "..")
         {
-            return Err(PipeNativeError(format!(
+            return Err(PipeNativeError::other(format!(
                 "session id is not a safe sidecar filename: {id:?}"
             )));
         }
@@ -859,7 +950,7 @@ impl PipeNativeWriter {
         } else {
             std::env::current_dir()
                 .map_err(|error| {
-                    PipeNativeError(format!("cannot resolve absolute sidecar path: {error}"))
+                    PipeNativeError::other(format!("cannot resolve absolute sidecar path: {error}"))
                 })?
                 .join(&self.pipe_dir)
         };
@@ -884,7 +975,7 @@ async fn prewarm_projector(
                 PIPE_PROJECTION_PAYLOAD_KINDS,
             )
             .await
-            .map_err(|error| PipeNativeError(format!("journal join prewarm failed: {error:?}")))?;
+            .map_err(|error| PipeNativeError::store("journal join prewarm failed", error))?;
         let mut advanced = false;
         for envelope in ordered_after(&page, read_cursor) {
             if envelope.seq > through_seq {
@@ -943,7 +1034,9 @@ fn coverage_line(coverage: u64, generation: u64) -> Result<String, PipeNativeErr
         coverage,
         generation,
     })
-    .map_err(|error| PipeNativeError(format!("sidecar coverage serialization failed: {error}")))?;
+    .map_err(|error| {
+        PipeNativeError::other(format!("sidecar coverage serialization failed: {error}"))
+    })?;
     line.push('\n');
     Ok(line)
 }
@@ -962,7 +1055,9 @@ fn header_line(
         segment,
         starts_after,
     })
-    .map_err(|error| PipeNativeError(format!("sidecar header serialization failed: {error}")))?;
+    .map_err(|error| {
+        PipeNativeError::other(format!("sidecar header serialization failed: {error}"))
+    })?;
     line.push('\n');
     Ok(line)
 }
@@ -977,11 +1072,11 @@ fn segment_path(
     }
     let parent = base_path
         .parent()
-        .ok_or_else(|| PipeNativeError("sidecar path has no parent".into()))?;
+        .ok_or_else(|| PipeNativeError::other("sidecar path has no parent".into()))?;
     let stem = base_path
         .file_stem()
         .and_then(std::ffi::OsStr::to_str)
-        .ok_or_else(|| PipeNativeError("sidecar path has no UTF-8 file stem".into()))?;
+        .ok_or_else(|| PipeNativeError::other("sidecar path has no UTF-8 file stem".into()))?;
     Ok(parent.join(format!("{stem}.g{generation}.s{segment}.pipe")))
 }
 
@@ -1028,7 +1123,7 @@ fn sweep_orphan_segments_blocking(
     }
     let parent = base_path
         .parent()
-        .ok_or_else(|| PipeNativeError("sidecar path has no parent".into()))?;
+        .ok_or_else(|| PipeNativeError::other("sidecar path has no parent".into()))?;
     haider_platform::sync_directory(parent)?;
     Ok(swept)
 }
@@ -1050,7 +1145,7 @@ fn quarantine_and_sweep_candidate(
         Ok(header) => header,
         Err(error) => {
             restore_quarantined_candidate(&quarantine, candidate).map_err(|restore_error| {
-                PipeNativeError(format!(
+                PipeNativeError::other(format!(
                     "{error}; quarantined file was preserved but could not be restored: {restore_error}"
                 ))
             })?;
@@ -1061,7 +1156,7 @@ fn quarantine_and_sweep_candidate(
         Ok(owns_segment) => owns_segment,
         Err(error) => {
             restore_quarantined_candidate(&quarantine, candidate).map_err(|restore_error| {
-                PipeNativeError(format!(
+                PipeNativeError::other(format!(
                     "{error}; quarantined file was preserved but could not be restored: {restore_error}"
                 ))
             })?;
@@ -1069,12 +1164,12 @@ fn quarantine_and_sweep_candidate(
         }
     };
     if !owns_segment {
-        let error = PipeNativeError(format!(
+        let error = PipeNativeError::other(format!(
             "quarantined sidecar candidate changed ownership: {}",
             candidate.display()
         ));
         restore_quarantined_candidate(&quarantine, candidate).map_err(|restore_error| {
-            PipeNativeError(format!(
+            PipeNativeError::other(format!(
                 "{error}; quarantined file was preserved but could not be restored: {restore_error}"
             ))
         })?;
@@ -1084,7 +1179,7 @@ fn quarantine_and_sweep_candidate(
         Ok(reachable) => reachable,
         Err(error) => {
             restore_quarantined_candidate(&quarantine, candidate).map_err(|restore_error| {
-                PipeNativeError(format!(
+                PipeNativeError::other(format!(
                     "{error}; quarantined file was preserved but could not be restored: {restore_error}"
                 ))
             })?;
@@ -1094,18 +1189,18 @@ fn quarantine_and_sweep_candidate(
     if reachable.contains(&quarantine) {
         // The live chain now names the quarantine path. Moving or deleting it
         // would destroy history, so preserve it exactly where the pointer found it.
-        return Err(PipeNativeError(format!(
+        return Err(PipeNativeError::other(format!(
             "quarantined sidecar candidate became reachable: {}",
             quarantine.display()
         )));
     }
     if reachable.contains(candidate) {
-        let error = PipeNativeError(format!(
+        let error = PipeNativeError::other(format!(
             "sidecar candidate pathname became reachable while quarantined: {}",
             candidate.display()
         ));
         restore_quarantined_candidate(&quarantine, candidate).map_err(|restore_error| {
-            PipeNativeError(format!(
+            PipeNativeError::other(format!(
                 "{error}; quarantined file was preserved but could not be restored: {restore_error}"
             ))
         })?;
@@ -1121,11 +1216,11 @@ fn quarantine_candidate(
 ) -> Result<Option<PathBuf>, PipeNativeError> {
     let parent = base_path
         .parent()
-        .ok_or_else(|| PipeNativeError("sidecar path has no parent".into()))?;
+        .ok_or_else(|| PipeNativeError::other("sidecar path has no parent".into()))?;
     let stem = base_path
         .file_stem()
         .and_then(std::ffi::OsStr::to_str)
-        .ok_or_else(|| PipeNativeError("sidecar path has no UTF-8 file stem".into()))?;
+        .ok_or_else(|| PipeNativeError::other("sidecar path has no UTF-8 file stem".into()))?;
     loop {
         let suffix = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let quarantine = parent.join(format!(
@@ -1177,7 +1272,7 @@ fn reachable_sidecar_paths(
 ) -> Result<HashSet<PathBuf>, PipeNativeError> {
     let parent = base_path
         .parent()
-        .ok_or_else(|| PipeNativeError("sidecar path has no parent".into()))?;
+        .ok_or_else(|| PipeNativeError::other("sidecar path has no parent".into()))?;
     let mut reachable = HashSet::new();
     let mut current_path = base_path.to_owned();
     let mut expected_segment = 0_u64;
@@ -1185,32 +1280,32 @@ fn reachable_sidecar_paths(
     let mut chain_generation = None;
     loop {
         if !reachable.insert(current_path.clone()) {
-            return Err(PipeNativeError(
+            return Err(PipeNativeError::other(
                 "sidecar successor chain contains a loop".into(),
             ));
         }
         let data = read_sidecar_without_following(&current_path)?;
         if data.is_empty() || !data.ends_with(b"\n") {
-            return Err(PipeNativeError(format!(
+            return Err(PipeNativeError::other(format!(
                 "sidecar chain member is empty or torn: {}",
                 current_path.display()
             )));
         }
         let text = std::str::from_utf8(&data).map_err(|_| {
-            PipeNativeError(format!(
+            PipeNativeError::other(format!(
                 "sidecar chain member is not UTF-8: {}",
                 current_path.display()
             ))
         })?;
         let mut lines = text.strip_suffix('\n').unwrap_or(text).split('\n');
         let header_line = lines.next().ok_or_else(|| {
-            PipeNativeError(format!(
+            PipeNativeError::other(format!(
                 "sidecar chain member has no header: {}",
                 current_path.display()
             ))
         })?;
         let header: SidecarHeader = serde_json::from_str(header_line).map_err(|error| {
-            PipeNativeError(format!(
+            PipeNativeError::other(format!(
                 "sidecar chain header is unreadable at {}: {error}",
                 current_path.display()
             ))
@@ -1224,7 +1319,7 @@ fn reachable_sidecar_paths(
             || header.segment != expected_segment
             || header.starts_after != expected_starts_after
         {
-            return Err(PipeNativeError(format!(
+            return Err(PipeNativeError::other(format!(
                 "sidecar chain header does not match the live root at {}",
                 current_path.display()
             )));
@@ -1234,7 +1329,7 @@ fn reachable_sidecar_paths(
         let body = lines
             .map(|line| {
                 serde_json::from_str::<serde_json::Value>(line).map_err(|error| {
-                    PipeNativeError(format!(
+                    PipeNativeError::other(format!(
                         "sidecar chain row is unreadable at {}: {error}",
                         current_path.display()
                     ))
@@ -1248,14 +1343,14 @@ fn reachable_sidecar_paths(
             .iter()
             .any(|value| value.get("segment_end").is_some())
         {
-            return Err(PipeNativeError(format!(
+            return Err(PipeNativeError::other(format!(
                 "sidecar chain has a non-final terminator at {}",
                 current_path.display()
             )));
         }
         if tail.get("segment_end").is_some() {
             let end: SidecarSegmentEnd = serde_json::from_value(tail.clone()).map_err(|error| {
-                PipeNativeError(format!(
+                PipeNativeError::other(format!(
                     "sidecar chain terminator is unreadable at {}: {error}",
                     current_path.display()
                 ))
@@ -1273,15 +1368,15 @@ fn reachable_sidecar_paths(
                 || end.coverage < expected_starts_after
                 || !previous_is_boundary
             {
-                return Err(PipeNativeError(format!(
+                return Err(PipeNativeError::other(format!(
                     "sidecar chain terminator is inconsistent at {}",
                     current_path.display()
                 )));
             }
             current_path = direct_successor_path(parent, &end.successor)?;
-            expected_segment = expected_segment
-                .checked_add(1)
-                .ok_or_else(|| PipeNativeError("sidecar segment ordinal exhausted".into()))?;
+            expected_segment = expected_segment.checked_add(1).ok_or_else(|| {
+                PipeNativeError::other("sidecar segment ordinal exhausted".into())
+            })?;
             expected_starts_after = end.coverage;
             continue;
         }
@@ -1306,7 +1401,7 @@ fn reachable_sidecar_paths(
             .is_some()
             && tail.get("generation").and_then(serde_json::Value::as_u64) == Some(generation);
         if boundary_shaped || (!row_shaped && !coverage_shaped) {
-            return Err(PipeNativeError(format!(
+            return Err(PipeNativeError::other(format!(
                 "sidecar chain has an invalid active tail at {}",
                 current_path.display()
             )));
@@ -1315,13 +1410,13 @@ fn reachable_sidecar_paths(
             .get(if row_shaped { "seq" } else { "coverage" })
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| {
-                PipeNativeError(format!(
+                PipeNativeError::other(format!(
                     "sidecar chain tail has no sequence at {}",
                     current_path.display()
                 ))
             })?;
         if seq < expected_starts_after {
-            return Err(PipeNativeError(format!(
+            return Err(PipeNativeError::other(format!(
                 "sidecar chain tail regresses coverage at {}",
                 current_path.display()
             )));
@@ -1333,12 +1428,12 @@ fn reachable_sidecar_paths(
 fn direct_successor_path(parent: &Path, successor: &str) -> Result<PathBuf, PipeNativeError> {
     let mut components = Path::new(successor).components();
     let Some(std::path::Component::Normal(filename)) = components.next() else {
-        return Err(PipeNativeError(
+        return Err(PipeNativeError::other(
             "sidecar successor is not one direct-child filename".into(),
         ));
     };
     if components.next().is_some() {
-        return Err(PipeNativeError(
+        return Err(PipeNativeError::other(
             "sidecar successor is not one direct-child filename".into(),
         ));
     }
@@ -1352,11 +1447,11 @@ fn orphan_segment_candidates(
 ) -> Result<Vec<PathBuf>, PipeNativeError> {
     let parent = base_path
         .parent()
-        .ok_or_else(|| PipeNativeError("sidecar path has no parent".into()))?;
+        .ok_or_else(|| PipeNativeError::other("sidecar path has no parent".into()))?;
     let stem = base_path
         .file_stem()
         .and_then(std::ffi::OsStr::to_str)
-        .ok_or_else(|| PipeNativeError("sidecar path has no UTF-8 file stem".into()))?;
+        .ok_or_else(|| PipeNativeError::other("sidecar path has no UTF-8 file stem".into()))?;
     let prefix = format!("{stem}.g");
     let mut candidates = Vec::new();
     for entry in std::fs::read_dir(parent)? {
@@ -1408,7 +1503,7 @@ fn read_sidecar_header_without_following(path: &Path) -> Result<SidecarHeader, P
     let mut header = String::new();
     BufReader::new(&mut file).read_line(&mut header)?;
     serde_json::from_str(header.trim_end_matches('\n')).map_err(|error| {
-        PipeNativeError(format!(
+        PipeNativeError::other(format!(
             "sidecar candidate header is unreadable at {}: {error}",
             path.display()
         ))
@@ -1454,7 +1549,7 @@ fn segment_end_line(
     let successor = successor
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
-        .ok_or_else(|| PipeNativeError("sidecar successor has no UTF-8 filename".into()))?;
+        .ok_or_else(|| PipeNativeError::other("sidecar successor has no UTF-8 filename".into()))?;
     let mut line = serde_json::to_string(&SidecarSegmentEnd {
         segment_end: "sealed".into(),
         coverage,
@@ -1462,7 +1557,7 @@ fn segment_end_line(
         successor: successor.to_owned(),
     })
     .map_err(|error| {
-        PipeNativeError(format!(
+        PipeNativeError::other(format!(
             "sidecar segment terminator serialization failed: {error}"
         ))
     })?;
@@ -1516,7 +1611,7 @@ async fn write_segmented_open(
         };
         let successor_segment = segment
             .checked_add(1)
-            .ok_or_else(|| PipeNativeError("sidecar segment ordinal exhausted".into()))?;
+            .ok_or_else(|| PipeNativeError::other("sidecar segment ordinal exhausted".into()))?;
         // Create and durably publish the successor before making it reachable
         // from the sealed predecessor.
         let (successor_file, successor_path) = create_successor_segment(
@@ -1621,7 +1716,9 @@ async fn inspect_sidecar(
 ) -> Result<SidecarState, PipeNativeError> {
     tokio::task::spawn_blocking(move || inspect_sidecar_blocking(&path, &session_id))
         .await
-        .map_err(|error| PipeNativeError(format!("sidecar inspection task failed: {error}")))?
+        .map_err(|error| {
+            PipeNativeError::other(format!("sidecar inspection task failed: {error}"))
+        })?
 }
 
 fn inspect_sidecar_blocking(
@@ -1708,9 +1805,9 @@ fn inspect_sidecar_blocking(
             let Ok(end) = serde_json::from_value::<SidecarSegmentEnd>(value) else {
                 return Ok(SidecarState::Corrupt { generation });
             };
-            let successor_segment = expected_segment
-                .checked_add(1)
-                .ok_or_else(|| PipeNativeError("sidecar segment ordinal exhausted".into()))?;
+            let successor_segment = expected_segment.checked_add(1).ok_or_else(|| {
+                PipeNativeError::other("sidecar segment ordinal exhausted".into())
+            })?;
             let successor_path = segment_path(path, generation, successor_segment)?;
             let expected_successor = successor_path.file_name().and_then(std::ffi::OsStr::to_str);
             let previous_is_boundary = read_line_before(&mut file, line_start)?
@@ -1824,12 +1921,12 @@ fn contains_nonfinal_segment_end(
 fn read_tail_line(file: &mut File, len: u64) -> Result<(u64, String), PipeNativeError> {
     let line_start = find_previous_newline(file, len - 1)?.map_or(0, |position| position + 1);
     let line_len = usize::try_from((len - 1) - line_start)
-        .map_err(|_| PipeNativeError("sidecar tail is too large to inspect".into()))?;
+        .map_err(|_| PipeNativeError::other("sidecar tail is too large to inspect".into()))?;
     let mut bytes = vec![0_u8; line_len];
     file.seek(SeekFrom::Start(line_start))?;
     file.read_exact(&mut bytes)?;
     let line = String::from_utf8(bytes)
-        .map_err(|_| PipeNativeError("sidecar tail is not UTF-8".into()))?;
+        .map_err(|_| PipeNativeError::other("sidecar tail is not UTF-8".into()))?;
     Ok((line_start, line))
 }
 
@@ -1843,12 +1940,12 @@ fn read_line_before(
     let newline = line_start - 1;
     let previous_start = find_previous_newline(file, newline)?.map_or(0, |position| position + 1);
     let line_len = usize::try_from(newline - previous_start)
-        .map_err(|_| PipeNativeError("sidecar prior tail line is too large".into()))?;
+        .map_err(|_| PipeNativeError::other("sidecar prior tail line is too large".into()))?;
     let mut bytes = vec![0_u8; line_len];
     file.seek(SeekFrom::Start(previous_start))?;
     file.read_exact(&mut bytes)?;
     let line = String::from_utf8(bytes)
-        .map_err(|_| PipeNativeError("sidecar prior tail line is not UTF-8".into()))?;
+        .map_err(|_| PipeNativeError::other("sidecar prior tail line is not UTF-8".into()))?;
     Ok(Some((previous_start, line)))
 }
 
@@ -1876,7 +1973,7 @@ async fn open_append(path: PathBuf) -> Result<File, PipeNativeError> {
             .map_err(PipeNativeError::from)
     })
     .await
-    .map_err(|error| PipeNativeError(format!("sidecar append-open task failed: {error}")))?
+    .map_err(|error| PipeNativeError::other(format!("sidecar append-open task failed: {error}")))?
 }
 
 async fn write_open(mut file: File, data: String) -> Result<File, PipeNativeError> {
@@ -1885,7 +1982,7 @@ async fn write_open(mut file: File, data: String) -> Result<File, PipeNativeErro
         Ok(file)
     })
     .await
-    .map_err(|error| PipeNativeError(format!("sidecar page append task failed: {error}")))?
+    .map_err(|error| PipeNativeError::other(format!("sidecar page append task failed: {error}")))?
 }
 
 async fn sync_open(file: File) -> Result<File, PipeNativeError> {
@@ -1894,14 +1991,14 @@ async fn sync_open(file: File) -> Result<File, PipeNativeError> {
         Ok(file)
     })
     .await
-    .map_err(|error| PipeNativeError(format!("sidecar append sync task failed: {error}")))?
+    .map_err(|error| PipeNativeError::other(format!("sidecar append sync task failed: {error}")))?
 }
 
 async fn create_temp(path: PathBuf) -> Result<(File, PathBuf), PipeNativeError> {
     tokio::task::spawn_blocking(move || {
         let parent = path
             .parent()
-            .ok_or_else(|| PipeNativeError("sidecar path has no parent".into()))?;
+            .ok_or_else(|| PipeNativeError::other("sidecar path has no parent".into()))?;
         std::fs::create_dir_all(parent)?;
         loop {
             let suffix = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1919,7 +2016,9 @@ async fn create_temp(path: PathBuf) -> Result<(File, PathBuf), PipeNativeError> 
         }
     })
     .await
-    .map_err(|error| PipeNativeError(format!("sidecar temp creation task failed: {error}")))?
+    .map_err(|error| {
+        PipeNativeError::other(format!("sidecar temp creation task failed: {error}"))
+    })?
 }
 
 async fn write_temp(mut file: File, data: String) -> Result<File, PipeNativeError> {
@@ -1928,7 +2027,9 @@ async fn write_temp(mut file: File, data: String) -> Result<File, PipeNativeErro
         Ok(file)
     })
     .await
-    .map_err(|error| PipeNativeError(format!("sidecar rebuild write task failed: {error}")))?
+    .map_err(|error| {
+        PipeNativeError::other(format!("sidecar rebuild write task failed: {error}"))
+    })?
 }
 
 async fn finish_temp(file: File, temp_path: PathBuf, path: PathBuf) -> Result<(), PipeNativeError> {
@@ -1941,12 +2042,14 @@ async fn finish_temp(file: File, temp_path: PathBuf, path: PathBuf) -> Result<()
         })?;
         let parent = path
             .parent()
-            .ok_or_else(|| PipeNativeError("sidecar path has no parent".into()))?;
+            .ok_or_else(|| PipeNativeError::other("sidecar path has no parent".into()))?;
         haider_platform::sync_directory(parent)?;
         Ok(())
     })
     .await
-    .map_err(|error| PipeNativeError(format!("sidecar rebuild finalize task failed: {error}")))?
+    .map_err(|error| {
+        PipeNativeError::other(format!("sidecar rebuild finalize task failed: {error}"))
+    })?
 }
 
 #[cfg(test)]

@@ -1213,7 +1213,7 @@ fn failure(error: &AccountError, json: bool) -> ExitCode {
         | AccountError::Protocol(_) => EX_PROTOCOL,
         AccountError::Ensure(_) | AccountError::SnapshotUnavailable(_) => EX_UNAVAILABLE,
         AccountError::Client(ClientError::Disconnected(_)) => EX_IOERR,
-        AccountError::Client(ClientError::Encode(_))
+        AccountError::Client(ClientError::Encode(_) | ClientError::MissingFeature(_))
         | AccountError::Rpc { .. }
         | AccountError::MissingAlias(_)
         | AccountError::SecretInput(_) => EX_SOFTWARE,

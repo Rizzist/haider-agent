@@ -406,35 +406,6 @@ pub(super) async fn run_session_actor(
                 }
                 let _ = completed.send(result);
             }
-            ActorCommand::ForkSession { command, completed } => {
-                // Child metadata, copied history, boundary facts, audit, and
-                // receipt are one store transaction. Only a fresh commit is
-                // projected; a receipt replay remains response-only.
-                let result = store.fork_session(command).await;
-                if let Ok(SessionForkOutcome::Committed { envelopes, .. }) = &result {
-                    if let Some(last) = envelopes.last() {
-                        head = last.seq;
-                        authority_epoch = last.authority_epoch;
-                    }
-                    observer.observe(HubObservation::Persisted {
-                        session_id: session_id.clone(),
-                        through_seq: head,
-                    });
-                    pipe_sidecar.enqueue(envelopes);
-                    publish_seeded_session(
-                        &mut attachments,
-                        envelopes,
-                        catch_up_byte_budget,
-                        &metrics,
-                        &hooks,
-                    );
-                    observer.observe(HubObservation::Published {
-                        session_id: session_id.clone(),
-                        through_seq: head,
-                    });
-                }
-                let _ = completed.send(result);
-            }
             ActorCommand::CreateBranch { command, completed } => {
                 // The registry row, BranchCreated fact, and R2 receipt are
                 // one transaction. Only the committed fact is publishable.
@@ -1647,22 +1618,6 @@ fn publish_shared(
 ) {
     hooks.observe_committed(envelopes.as_ref());
     publish_shared_attachments(attachments, envelopes, byte_budget, metrics);
-}
-
-/// Publishes a newly seeded session without replaying copied parent facts into
-/// hook execution. The final fork audit is the only newly-originated fact;
-/// observe/roster caches seeing its non-one sequence rebuild from child truth.
-fn publish_seeded_session(
-    attachments: &mut HashMap<AttachmentId, ActorAttachment>,
-    envelopes: &[RawEnvelope],
-    byte_budget: usize,
-    metrics: &HubMetrics,
-    hooks: &Arc<CommitProjection>,
-) {
-    if let Some(audit) = envelopes.last() {
-        hooks.observe_committed(std::slice::from_ref(audit));
-    }
-    publish_attachments(attachments, envelopes, byte_budget, metrics);
 }
 
 fn publish_attachments(

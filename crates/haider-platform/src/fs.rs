@@ -5,6 +5,52 @@ mod tests;
 use std::fs::{DirBuilder, File, Metadata, OpenOptions};
 use std::path::Path;
 
+/// Bytes currently available to the calling user on the filesystem
+/// containing `path`.
+#[cfg(unix)]
+pub fn available_space(path: &Path) -> std::io::Result<u64> {
+    let statistics = rustix::fs::statvfs(path).map_err(std::io::Error::from)?;
+    let fragment_size = if statistics.f_frsize == 0 {
+        statistics.f_bsize
+    } else {
+        statistics.f_frsize
+    };
+    statistics
+        .f_bavail
+        .checked_mul(fragment_size)
+        .ok_or_else(|| std::io::Error::other("filesystem available-space value overflowed"))
+}
+
+/// Bytes currently available to the calling user on the filesystem
+/// containing `path`.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub fn available_space(path: &Path) -> std::io::Result<u64> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut available = 0_u64;
+    // SAFETY: `wide` is a live NUL-terminated UTF-16 path, `available` is a
+    // valid writable u64, and the two optional output pointers are null.
+    let succeeded = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if succeeded == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(available)
+    }
+}
+
 /// Durability strength for an explicit filesystem synchronization boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncPolicy {

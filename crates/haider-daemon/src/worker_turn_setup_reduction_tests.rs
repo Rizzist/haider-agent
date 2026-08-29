@@ -284,6 +284,7 @@ fn fused_turn_setup_reduction_preserves_every_standalone_head() {
     let provider_view = ProviderViewLedgerV1 {
         provider: "provider-a".into(),
         model: "model-a".into(),
+        max_tokens: 4_096,
         dialect: "setup-dialect".into(),
         serialization_version: "setup-v1".into(),
         header_epoch: "setup-header".into(),
@@ -474,8 +475,9 @@ fn turn_setup_cache_cohort_tracks_the_active_inherited_fork_segment() {
     let inherited_view = ProviderViewLedgerV1 {
         provider: "openai".into(),
         model: "gpt-5.6".into(),
+        max_tokens: 4_096,
         dialect: "openai_responses".into(),
-        serialization_version: "haider.provider-view.json.v1".into(),
+        serialization_version: "haider.provider-view.json.v2".into(),
         header_epoch: "header-epoch".into(),
         cache_epoch: "cache-epoch".into(),
         compaction_epoch: "root".into(),
@@ -507,6 +509,7 @@ fn turn_setup_cache_cohort_tracks_the_active_inherited_fork_segment() {
     let audit = |context_epoch, inherited_cache_segment| SessionForked {
         source_session_id: SessionId::new("fork-parent"),
         source_branch_id: None,
+        forked_from: None,
         fork_node_id: NodeId::new("fork-node"),
         fork_seq: 10,
         mode: haider_protocol::session_fork::SessionForkMode::Fork,
@@ -562,15 +565,15 @@ fn turn_setup_cache_cohort_tracks_the_active_inherited_fork_segment() {
     );
 
     let mut divergent_view = inherited_view;
-    divergent_view.stable_history_end = 5;
-    divergent_view.current_user_start = 5;
+    divergent_view.system_block =
+        haider_protocol::cache::ProviderViewBlockRefV1::for_bytes(b"fork-viex");
     inherited
         .observe_envelope(provider_view_envelope(3, divergent_view))
         .expect("reduce divergent child provider view");
     assert_eq!(
         inherited.cache_cohort(),
         None,
-        "the first divergent provider view starts the child's own cohort"
+        "one changed provider-prefix byte starts the child's own cohort"
     );
 
     let mut fresh = TurnSetupReduction::new(selector());

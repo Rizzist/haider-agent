@@ -131,6 +131,7 @@ fn footer_model(reread_basis_points: Option<u32>) -> AppModel {
         effort: None,
         fast: None,
         account_alias: None,
+        forked_from: None,
     });
     // The nested copy was valid and equal when the summary arrived, but the
     // footer must remain driven by the independently hydrated promoted field.

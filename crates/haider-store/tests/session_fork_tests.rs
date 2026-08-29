@@ -18,7 +18,7 @@ use haider_protocol::verify::VerifyVerdict;
 use haider_store::{
     BranchCreateCommand, DelegationRecord, DelegationState, EventStore,
     ForkCacheInheritanceCandidate, SessionCreateCommand, SessionForkCommand, SessionForkOutcome,
-    SessionMetaforkCommit, Store, TurnAcceptCommand, TurnAcceptOutcome,
+    SessionMetaforkCommit, SessionRenameCommand, Store, TurnAcceptCommand, TurnAcceptOutcome,
     fork_provider_view_prefix_digest,
 };
 use rusqlite::types::ValueRef;
@@ -319,8 +319,9 @@ fn provider_view(account_scope: &str, history: &str) -> serde_json::Value {
     serde_json::json!({
         "provider": "fake",
         "model": "fake-model",
+        "max_tokens": 4096,
         "dialect": "fake-provider-v1",
-        "serialization_version": "haider.provider-view.json.v1",
+        "serialization_version": "haider.provider-view.json.v2",
         "header_epoch": "header-epoch",
         "cache_epoch": "cache-epoch",
         "compaction_epoch": "root-compaction",
@@ -438,6 +439,87 @@ fn fork_audit(envelopes: &[EventEnvelope<serde_json::Value>]) -> SessionForked {
         .last()
         .and_then(|envelope| SessionForked::from_payload_value(&envelope.payload))
         .expect("fork audit fact")
+}
+
+/// The default fork title is provenance, not a prompt preview. Explicit names
+/// remain authoritative and the parent title is retained within the metadata
+/// limit.
+#[test]
+fn fork_title_uses_parent_provenance_and_never_prompt_text() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let source = SessionId::new("fork-title-parent");
+    create_session(&store, &source);
+    let rename_json = r#"{"title":"Parent plan"}"#.to_owned();
+    store
+        .rename_session(&SessionRenameCommand {
+            command_id: "fork-title-parent-rename".into(),
+            request_digest: blake3::hash(rename_json.as_bytes()).to_hex().to_string(),
+            request_json: rename_json,
+            session_id: source.clone(),
+            worker_generation: store.worker_generation(),
+            title: Some("Parent plan".into()),
+            only_if_untitled: false,
+            event_id: EventId::new("fork-title-parent-renamed"),
+            device_id: DeviceId::new("session-fork-test-device"),
+        })
+        .expect("title parent");
+    let sensitive_prompt = "SENSITIVE customer acquisition details";
+    let (_, node, seq, _) = source_turn(&store, &source, sensitive_prompt);
+
+    let mut default_command = fork_command(
+        &store,
+        "fork-title-default-command",
+        &source,
+        "fork-title-default-child",
+        node.clone(),
+        seq,
+        None,
+    );
+    default_command.name = None;
+    let SessionForkOutcome::Committed {
+        created: default_child,
+        ..
+    } = store
+        .fork_session(&default_command)
+        .expect("default-title fork")
+    else {
+        panic!("default-title fork must commit");
+    };
+    assert_eq!(
+        default_child.metadata.title.as_deref(),
+        Some("Parent plan · fork before turn 2")
+    );
+    assert!(
+        !default_child
+            .metadata
+            .title
+            .as_deref()
+            .is_some_and(|title| title.contains(sensitive_prompt))
+    );
+
+    let explicit_command = fork_command(
+        &store,
+        "fork-title-explicit-command",
+        &source,
+        "fork-title-explicit-child",
+        node,
+        seq,
+        None,
+    );
+    let SessionForkOutcome::Committed {
+        created: explicit_child,
+        ..
+    } = store
+        .fork_session(&explicit_command)
+        .expect("explicit-title fork")
+    else {
+        panic!("explicit-title fork must commit");
+    };
+    assert_eq!(
+        explicit_child.metadata.title.as_deref(),
+        Some("child fork-title-explicit-child")
+    );
 }
 
 /// MUTATION CHECK: change the clone loop's child `session_id` predicate to the
@@ -696,6 +778,214 @@ fn byte_identical_fork_inherits_parent_cache_segment() {
         Some(segment),
         "receipt and audit carry one inheritance decision"
     );
+}
+
+/// LANE966-D production wiring proof. The caller supplies no rendered JSON;
+/// the store may clone only the authoritative view in the copied source slice.
+#[test]
+fn production_durable_candidate_inherits_the_exact_parent_provider_view() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let source = SessionId::new("production-cache-parent");
+    create_session(&store, &source);
+    let (run_id, parent, _, _) = source_turn(&store, &source, "production cached history");
+    let view = provider_view("account-a", "production cached history");
+    let (node, seq, _, _) = append_provider_view_head(&store, &source, &run_id, parent, &view);
+    let command = fork_command(
+        &store,
+        "production-cache-command",
+        &source,
+        "production-cache-child",
+        node,
+        seq,
+        None,
+    );
+
+    let SessionForkOutcome::Committed { created, envelopes } = store
+        .fork_session_with_durable_cache_candidate(&command)
+        .expect("production cache-inheriting fork")
+    else {
+        panic!("fresh production fork commits");
+    };
+    let record = fork_audit(&envelopes);
+    assert_eq!(record.context_epoch, ForkContextEpoch::Inherited);
+    assert_eq!(
+        created
+            .inherited_cache_segment
+            .as_ref()
+            .expect("production inherited segment")
+            .prefix_digest,
+        fork_provider_view_prefix_digest(&view).expect("exact source view digest")
+    );
+}
+
+#[test]
+fn production_missing_provider_view_fails_closed_without_a_candidate() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let source = SessionId::new("production-cache-missing-parent");
+    create_session(&store, &source);
+    let (_, node, seq, _) = source_turn(&store, &source, "history without provider view");
+    let command = fork_command(
+        &store,
+        "production-cache-missing-command",
+        &source,
+        "production-cache-missing-child",
+        node,
+        seq,
+        None,
+    );
+
+    let SessionForkOutcome::Committed { created, envelopes } = store
+        .fork_session_with_durable_cache_candidate(&command)
+        .expect("fresh production fork without view")
+    else {
+        panic!("fresh production fork commits");
+    };
+    let record = fork_audit(&envelopes);
+    assert_eq!(record.context_epoch, ForkContextEpoch::Fresh);
+    assert!(record.inherited_cache_segment.is_none());
+    assert!(created.inherited_cache_segment.is_none());
+}
+
+#[test]
+fn production_malformed_newest_provider_view_fails_closed_without_fallback() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let source = SessionId::new("production-cache-malformed-parent");
+    create_session(&store, &source);
+    let (run_id, parent, _, _) = source_turn(&store, &source, "cached history");
+    let view = provider_view("account-a", "cached history");
+    let (valid_node, _, _, _) = append_provider_view_head(&store, &source, &run_id, parent, &view);
+    let (malformed_node, malformed_seq, _, _) = append_provider_view_head_data(
+        &store,
+        &source,
+        &run_id,
+        valid_node,
+        serde_json::json!({"view": &view}),
+    );
+    let command = fork_command(
+        &store,
+        "production-cache-malformed-command",
+        &source,
+        "production-cache-malformed-child",
+        malformed_node,
+        malformed_seq,
+        None,
+    );
+
+    let SessionForkOutcome::Committed { created, envelopes } = store
+        .fork_session_with_durable_cache_candidate(&command)
+        .expect("fresh production fork after malformed view")
+    else {
+        panic!("fresh production fork commits");
+    };
+    let record = fork_audit(&envelopes);
+    assert_eq!(record.context_epoch, ForkContextEpoch::Fresh);
+    assert!(record.inherited_cache_segment.is_none());
+    assert!(created.inherited_cache_segment.is_none());
+}
+
+#[test]
+fn production_unknown_provider_view_serialization_fails_closed() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let source = SessionId::new("production-cache-unknown-view-parent");
+    create_session(&store, &source);
+    let (run_id, parent, _, _) = source_turn(&store, &source, "cached history");
+    let mut view = provider_view("account-a", "cached history");
+    view["serialization_version"] = serde_json::json!("haider.provider-view.json.future");
+    let (node, seq, _, _) = append_provider_view_head(&store, &source, &run_id, parent, &view);
+    let command = fork_command(
+        &store,
+        "production-cache-unknown-view-command",
+        &source,
+        "production-cache-unknown-view-child",
+        node,
+        seq,
+        None,
+    );
+
+    let SessionForkOutcome::Committed { created, envelopes } = store
+        .fork_session_with_durable_cache_candidate(&command)
+        .expect("fresh production fork for unknown provider view")
+    else {
+        panic!("fresh production fork commits");
+    };
+    let record = fork_audit(&envelopes);
+    assert_eq!(record.context_epoch, ForkContextEpoch::Fresh);
+    assert!(record.inherited_cache_segment.is_none());
+    assert!(created.inherited_cache_segment.is_none());
+}
+
+#[test]
+fn production_zero_provider_request_ordinal_fails_closed() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let source = SessionId::new("production-cache-zero-ordinal-parent");
+    create_session(&store, &source);
+    let (run_id, parent, _, _) = source_turn(&store, &source, "cached history");
+    let view = provider_view("account-a", "cached history");
+    let (node, seq, _, _) = append_provider_view_head_data(
+        &store,
+        &source,
+        &run_id,
+        parent,
+        serde_json::json!({"ordinal": 0, "view": &view}),
+    );
+    let command = fork_command(
+        &store,
+        "production-cache-zero-ordinal-command",
+        &source,
+        "production-cache-zero-ordinal-child",
+        node,
+        seq,
+        None,
+    );
+
+    let SessionForkOutcome::Committed { created, envelopes } = store
+        .fork_session_with_durable_cache_candidate(&command)
+        .expect("fresh production fork for zero request ordinal")
+    else {
+        panic!("fresh production fork commits");
+    };
+    let record = fork_audit(&envelopes);
+    assert_eq!(record.context_epoch, ForkContextEpoch::Fresh);
+    assert!(record.inherited_cache_segment.is_none());
+    assert!(created.inherited_cache_segment.is_none());
+}
+
+#[test]
+fn production_incoherent_provider_view_boundaries_fail_closed() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let source = SessionId::new("production-cache-incoherent-view-parent");
+    create_session(&store, &source);
+    let (run_id, parent, _, _) = source_turn(&store, &source, "cached history");
+    let mut view = provider_view("account-a", "cached history");
+    view["stable_history_end"] = serde_json::json!(3);
+    view["latest_compaction_summary_end"] = serde_json::json!(2);
+    let (node, seq, _, _) = append_provider_view_head(&store, &source, &run_id, parent, &view);
+    let command = fork_command(
+        &store,
+        "production-cache-incoherent-view-command",
+        &source,
+        "production-cache-incoherent-view-child",
+        node,
+        seq,
+        None,
+    );
+
+    let SessionForkOutcome::Committed { created, envelopes } = store
+        .fork_session_with_durable_cache_candidate(&command)
+        .expect("fresh production fork for incoherent provider view")
+    else {
+        panic!("fresh production fork commits");
+    };
+    let record = fork_audit(&envelopes);
+    assert_eq!(record.context_epoch, ForkContextEpoch::Fresh);
+    assert!(record.inherited_cache_segment.is_none());
+    assert!(created.inherited_cache_segment.is_none());
 }
 
 /// MUTATION CHECK: compare history block counts but not exact bytes. Expected

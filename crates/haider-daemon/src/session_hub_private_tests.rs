@@ -2,20 +2,26 @@
 //! Private session-hub accounting tests.
 
 use super::*;
+use haider_accounts::Vault as _;
 use haider_protocol::EventPayload;
 use haider_protocol::effect::{
-    AuthorizationSource, AuthorizationVerdict, EffectOutcome, EffectPhase,
+    AuthorizationSource, AuthorizationVerdict, EffectClass, EffectIntent, EffectOutcome,
+    EffectPhase,
 };
 use haider_protocol::envelope::{EventEnvelope, PromptRender, RenderTargets, SCHEMA_VERSION};
 use haider_protocol::graph::{EvidenceVerdict, GraphPhase, SHIP_LOOP_TEMPLATE};
-use haider_protocol::ids::{AgentId, BranchId, EventId, GraphId, ItemId, MenuId, RunId};
+use haider_protocol::history::{NodeKind, TreeNode};
+use haider_protocol::ids::{AgentId, BranchId, EventId, GraphId, ItemId, MenuId, NodeId, RunId};
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
-use haider_protocol::menu::{Menu, MenuCloseReason, MenuKind, MenuOption, MenuScope};
+use haider_protocol::menu::{
+    AnswerVia, DecisionKind, Menu, MenuAnswer, MenuCloseReason, MenuKind, MenuOption, MenuScope,
+};
 use haider_protocol::queue::QueueChange;
 use haider_protocol::session_fork::{
     SessionMetaforkProposal, SessionMetaforkRemoval, SessionMetaforkReviewManifest,
 };
 use haider_protocol::state::RunState;
+use haider_protocol::verify::VerifyVerdict;
 use haider_store::{
     GraphEvidenceCommand, GraphPinCommand, QueuePromoteCommand, QueueRemoveCommand,
     SessionCreateCommand, ShellExecAcceptCommand, ShellExecAcceptOutcome, TurnAcceptCommand,
@@ -38,7 +44,7 @@ fn model_inventory_miss_refreshes_even_without_a_fetch_timestamp() {
     ));
 }
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 
@@ -523,6 +529,10 @@ async fn concurrent_duplicate_fork_discards_the_losing_candidate_actor() {
     let root = tempfile::tempdir().expect("temp store");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    hub.install_accounts(transcription_facade(Arc::new(
+        haider_accounts::MemoryVault::default(),
+    )))
+    .expect("install scope vault");
     let source = SessionId::new("duplicate-fork-source");
     let generation = store.worker_generation();
     hub.create_internal_session(create_command(&source, "duplicate-fork-source"))
@@ -608,6 +618,592 @@ async fn concurrent_duplicate_fork_discards_the_losing_candidate_actor() {
     store.close().await.expect("store closes");
 }
 
+async fn create_fork_ready_source(
+    hub: &SessionHub,
+    store: &SqliteStoreHandle,
+    label: &str,
+) -> (SessionId, NodeId, u64) {
+    let source = SessionId::new(format!("{label}-source"));
+    let run_id = RunId::new(format!("{label}-run"));
+    let generation = store.worker_generation();
+    hub.create_internal_session(create_command(&source, label))
+        .await
+        .expect("create fork source");
+    hub.accept_internal_turn(accept_command(&source, &run_id, generation, label))
+        .await
+        .expect("accept fork source turn");
+    let mut terminal = [run_state_envelope(
+        &source,
+        &run_id,
+        generation,
+        &format!("{label}-done"),
+        RunState::Done,
+    )];
+    hub.append(&mut terminal)
+        .await
+        .expect("complete fork source turn");
+    let events = store.read(&source, 0, 64).await.expect("read fork source");
+    let (node_id, seq) = events
+        .into_iter()
+        .find_map(|event| {
+            let EventPayload::NodeCommitted(node) =
+                serde_json::from_value::<EventPayload>(event.payload).ok()?
+            else {
+                return None;
+            };
+            Some((node.node, event.seq))
+        })
+        .expect("fork source node");
+    (source, node_id, seq)
+}
+
+fn private_fork_command(
+    store: &SqliteStoreHandle,
+    label: &str,
+    source: SessionId,
+    child: SessionId,
+    fork_node_id: NodeId,
+    fork_seq: u64,
+) -> SessionForkCommand {
+    let request_json = serde_json::json!({
+        "source": &source,
+        "fork_node_id": &fork_node_id,
+        "fork_seq": fork_seq,
+    })
+    .to_string();
+    SessionForkCommand {
+        command_id: format!("{label}-fork-command"),
+        request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+        request_json,
+        source_session_id: source,
+        session_id: child,
+        worker_generation: store.worker_generation(),
+        source_branch_id: None,
+        fork_node_id,
+        fork_seq,
+        name: None,
+        metafork: None,
+        audit_event_id: EventId::new(format!("{label}-fork-audit")),
+        device_id: DeviceId::new("fork-security-test"),
+    }
+}
+
+/// Fork scope inheritance is exact and durable for both narrowed variants;
+/// neither child may fall through the missing-record `All` compatibility path.
+#[tokio::test]
+async fn fork_clones_allow_and_none_ssh_scopes_exactly() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let vault = Arc::new(haider_accounts::MemoryVault::default());
+    hub.install_accounts(transcription_facade(vault.clone()))
+        .expect("install scope vault");
+
+    let cases = [
+        (
+            "allow-scope",
+            crate::ssh::SshScope::Allow(std::collections::BTreeSet::from(["a".to_owned()])),
+        ),
+        ("none-scope", crate::ssh::SshScope::None),
+    ];
+    for (label, scope) in cases {
+        let (source, fork_node_id, fork_seq) = create_fork_ready_source(&hub, &store, label).await;
+        hub.set_ssh_scope(source.clone(), scope.clone())
+            .expect("set parent scope");
+        let child = SessionId::new(format!("{label}-child"));
+        let outcome = hub
+            .fork_session(private_fork_command(
+                &store,
+                label,
+                source,
+                child.clone(),
+                fork_node_id,
+                fork_seq,
+            ))
+            .await
+            .expect("fork with narrowed scope");
+        assert!(matches!(
+            outcome,
+            SessionForkOutcome::Committed { ref created, .. }
+                if created.session_id == child
+        ));
+        assert_eq!(hub.ssh_scope(&child).expect("cached child scope"), scope);
+        let durable = crate::ssh::SshProfileStore::new(vault.clone());
+        assert_eq!(
+            durable.session_scope(&child).expect("durable child scope"),
+            scope,
+            "the child must have a physical scope record"
+        );
+    }
+
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+struct FailingScopePutVault {
+    inner: haider_accounts::MemoryVault,
+    fail_scope_put: AtomicBool,
+}
+
+impl haider_accounts::Vault for FailingScopePutVault {
+    fn put(
+        &self,
+        alias: &haider_accounts::CredentialAlias,
+        secret: &[u8],
+    ) -> haider_accounts::AccountsResult<()> {
+        if self.fail_scope_put.load(Ordering::SeqCst)
+            && alias.as_str().starts_with("haider.ssh.scope.")
+        {
+            return Err(haider_accounts::HaiderError::new(
+                haider_accounts::ErrorCode::Internal,
+                "injected SSH scope persistence failure",
+                false,
+            ));
+        }
+        self.inner.put(alias, secret)
+    }
+
+    fn resolve(
+        &self,
+        alias: &haider_accounts::CredentialAlias,
+    ) -> haider_accounts::AccountsResult<haider_accounts::SecretHandle> {
+        self.inner.resolve(alias)
+    }
+
+    fn delete(
+        &self,
+        alias: &haider_accounts::CredentialAlias,
+    ) -> haider_accounts::AccountsResult<()> {
+        self.inner.delete(alias)
+    }
+
+    fn list(&self) -> haider_accounts::AccountsResult<Vec<haider_accounts::CredentialAlias>> {
+        self.inner.list()
+    }
+}
+
+/// A failed scope write precedes the SQLite transaction, leaving no roster
+/// row, resident actor, journal, or provisional vault item.
+#[tokio::test]
+async fn failed_fork_scope_clone_leaves_no_observable_child() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let vault = Arc::new(FailingScopePutVault {
+        inner: haider_accounts::MemoryVault::default(),
+        fail_scope_put: AtomicBool::new(false),
+    });
+    hub.install_accounts(transcription_facade(vault.clone()))
+        .expect("install scope vault");
+    let (source, fork_node_id, fork_seq) =
+        create_fork_ready_source(&hub, &store, "scope-failure").await;
+    hub.set_ssh_scope(source.clone(), crate::ssh::SshScope::None)
+        .expect("set source scope");
+    let child = SessionId::new("scope-failure-child");
+    let sessions_before = store.session_ids().await.expect("sessions before");
+    vault.fail_scope_put.store(true, Ordering::SeqCst);
+
+    let error = hub
+        .fork_session(private_fork_command(
+            &store,
+            "scope-failure",
+            source,
+            child.clone(),
+            fork_node_id,
+            fork_seq,
+        ))
+        .await
+        .expect_err("scope clone must fail the fork");
+    assert!(error.to_string().contains("injected SSH scope"));
+    assert_eq!(
+        store.session_ids().await.expect("sessions after"),
+        sessions_before
+    );
+    assert!(hub.existing_actor(&child).expect("actor lookup").is_none());
+    assert!(
+        vault
+            .list()
+            .expect("vault aliases")
+            .iter()
+            .all(|alias| !alias.as_str().ends_with(child.as_str())),
+        "no provisional child scope alias may survive"
+    );
+
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+struct TouchThenFailScopeVault {
+    inner: haider_accounts::MemoryVault,
+    scope_failures_remaining: AtomicUsize,
+}
+
+impl haider_accounts::Vault for TouchThenFailScopeVault {
+    fn put(
+        &self,
+        alias: &haider_accounts::CredentialAlias,
+        secret: &[u8],
+    ) -> haider_accounts::AccountsResult<()> {
+        self.inner.put(alias, secret)?;
+        if self
+            .scope_failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+            && alias.as_str().starts_with("haider.ssh.scope.")
+        {
+            return Err(haider_accounts::HaiderError::new(
+                haider_accounts::ErrorCode::Internal,
+                "injected post-commit SSH scope failure",
+                false,
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolve(
+        &self,
+        alias: &haider_accounts::CredentialAlias,
+    ) -> haider_accounts::AccountsResult<haider_accounts::SecretHandle> {
+        self.inner.resolve(alias)
+    }
+
+    fn delete(
+        &self,
+        alias: &haider_accounts::CredentialAlias,
+    ) -> haider_accounts::AccountsResult<()> {
+        self.inner.delete(alias)
+    }
+
+    fn list(&self) -> haider_accounts::AccountsResult<Vec<haider_accounts::CredentialAlias>> {
+        self.inner.list()
+    }
+}
+
+/// A vault error after the exact bytes landed still requires a fully
+/// successful retry. Read-back alone cannot prove the directory entry was
+/// crash-durable after a directory-fsync failure.
+#[tokio::test]
+async fn post_touch_scope_error_requires_successful_retry_before_fork_commit() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let vault = Arc::new(TouchThenFailScopeVault {
+        inner: haider_accounts::MemoryVault::default(),
+        scope_failures_remaining: AtomicUsize::new(0),
+    });
+    hub.install_accounts(transcription_facade(vault.clone()))
+        .expect("install scope vault");
+    let (source, fork_node_id, fork_seq) =
+        create_fork_ready_source(&hub, &store, "post-touch-scope").await;
+    hub.set_ssh_scope(source.clone(), crate::ssh::SshScope::None)
+        .expect("set source scope");
+    vault.scope_failures_remaining.store(1, Ordering::SeqCst);
+    let child = SessionId::new("post-touch-scope-child");
+
+    let outcome = hub
+        .fork_session(private_fork_command(
+            &store,
+            "post-touch-scope",
+            source,
+            child.clone(),
+            fork_node_id,
+            fork_seq,
+        ))
+        .await
+        .expect("successful scope retry permits the fork");
+    assert!(matches!(outcome, SessionForkOutcome::Committed { .. }));
+    assert_eq!(
+        crate::ssh::SshProfileStore::new(vault)
+            .session_scope_if_present(&child)
+            .expect("read explicit child scope"),
+        Some(crate::ssh::SshScope::None)
+    );
+
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// If both the initial write and its durability retry fail after touching the
+/// vault, SQLite is never called and the best-effort delete leaves no child
+/// identity on any roster authority.
+#[tokio::test]
+async fn persistent_post_touch_scope_failure_leaves_no_observable_child() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let vault = Arc::new(TouchThenFailScopeVault {
+        inner: haider_accounts::MemoryVault::default(),
+        scope_failures_remaining: AtomicUsize::new(0),
+    });
+    hub.install_accounts(transcription_facade(vault.clone()))
+        .expect("install scope vault");
+    let (source, fork_node_id, fork_seq) =
+        create_fork_ready_source(&hub, &store, "persistent-post-touch").await;
+    hub.set_ssh_scope(source.clone(), crate::ssh::SshScope::None)
+        .expect("set source scope");
+    let child = SessionId::new("persistent-post-touch-child");
+    let sessions_before = store.session_ids().await.expect("sessions before");
+    vault.scope_failures_remaining.store(2, Ordering::SeqCst);
+
+    let error = hub
+        .fork_session(private_fork_command(
+            &store,
+            "persistent-post-touch",
+            source,
+            child.clone(),
+            fork_node_id,
+            fork_seq,
+        ))
+        .await
+        .expect_err("two failed durable writes must reject the fork");
+    assert!(error.to_string().contains("retry failed"));
+    assert_eq!(
+        store.session_ids().await.expect("sessions after"),
+        sessions_before
+    );
+    assert!(hub.existing_actor(&child).expect("actor lookup").is_none());
+    assert!(
+        vault
+            .list()
+            .expect("vault aliases")
+            .iter()
+            .all(|alias| !alias.as_str().ends_with(child.as_str()))
+    );
+
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// The final fork audit is the consent cut: historical `AllowAlways` answers
+/// stop there, while the metadata's explicit creation policy is inherited and
+/// remains an ordinary policy default for the child.
+#[tokio::test]
+async fn fork_resets_remembered_grants_but_keeps_creation_permission_policy() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    hub.install_accounts(transcription_facade(Arc::new(
+        haider_accounts::MemoryVault::default(),
+    )))
+    .expect("install scope vault");
+    let source = SessionId::new("permission-fork-source");
+    let run_id = RunId::new("permission-fork-run");
+    let mut create = create_command(&source, "permission-fork");
+    create.permission_overrides = Some(haider_protocol::session::SessionPermissionOverridesV1 {
+        allow_writes: true,
+        allow_exec: false,
+        allow_mobile: false,
+        auto_allow: false,
+    });
+    hub.create_internal_session(create)
+        .await
+        .expect("create permission source");
+    hub.accept_internal_turn(accept_command(
+        &source,
+        &run_id,
+        store.worker_generation(),
+        "permission-fork",
+    ))
+    .await
+    .expect("accept permission source turn");
+    let user_node = store
+        .read(&source, 0, 32)
+        .await
+        .expect("read user node")
+        .into_iter()
+        .find_map(|event| {
+            let EventPayload::NodeCommitted(node) =
+                serde_json::from_value::<EventPayload>(event.payload).ok()?
+            else {
+                return None;
+            };
+            Some(node.node)
+        })
+        .expect("user node");
+    let effect = haider_protocol::ids::EffectId::new("permission-fork-effect");
+    let menu_id = MenuId::new("permission-fork-menu");
+    let menu = Menu {
+        id: menu_id.clone(),
+        kind: MenuKind::Permission {
+            effect_summary: "write a file".into(),
+        },
+        title: "Allow write?".into(),
+        body: vec!["Allow this write for the session".into()],
+        options: vec![MenuOption {
+            key: "allow_always".into(),
+            label: "Always allow".into(),
+            detail: None,
+            decision: Some(DecisionKind::AllowAlways),
+        }],
+        blocking: true,
+        scope: MenuScope::Session,
+        origin: "fork-security-test".into(),
+        ttl_ms: None,
+        timeout_option: None,
+    };
+    let assistant_node = NodeId::new("permission-fork-assistant-node");
+    let generation = store.worker_generation();
+    let mut permission_facts = vec![
+        run_payload_envelope(
+            &source,
+            &run_id,
+            generation,
+            "permission-fork-intent",
+            EventPayload::Effect(EffectPhase::Intent(EffectIntent {
+                effect: effect.clone(),
+                class: EffectClass::FsWrite,
+                summary: "write a file".into(),
+                args_digest: "permission-fork-write-shape".into(),
+                workspace_revision: None,
+            })),
+        ),
+        run_payload_envelope(
+            &source,
+            &run_id,
+            generation,
+            "permission-fork-authorized",
+            EventPayload::Effect(EffectPhase::Authorized {
+                effect,
+                verdict: AuthorizationVerdict::Ask {
+                    menu: menu_id.clone(),
+                },
+            }),
+        ),
+        run_payload_envelope(
+            &source,
+            &run_id,
+            generation,
+            "permission-fork-menu-opened",
+            EventPayload::MenuOpened(menu),
+        ),
+        run_payload_envelope(
+            &source,
+            &run_id,
+            generation,
+            "permission-fork-menu-answered",
+            EventPayload::MenuAnswered(MenuAnswer {
+                menu: menu_id,
+                option_index: 0,
+                option_key: Some("allow_always".into()),
+                value: None,
+                via: AnswerVia::Rpc,
+            }),
+        ),
+        run_payload_envelope(
+            &source,
+            &run_id,
+            generation,
+            "permission-fork-computer-use",
+            EventPayload::UserMessage {
+                text: "/computer-use".into(),
+                attachments: Vec::new(),
+                mode: haider_protocol::DeliveryMode::Steer,
+            },
+        ),
+        run_payload_envelope(
+            &source,
+            &run_id,
+            generation,
+            "permission-fork-mobile-use",
+            EventPayload::UserMessage {
+                text: "/mobile-use".into(),
+                attachments: Vec::new(),
+                mode: haider_protocol::DeliveryMode::Steer,
+            },
+        ),
+        run_payload_envelope(
+            &source,
+            &run_id,
+            generation,
+            "permission-fork-assistant-node-event",
+            EventPayload::NodeCommitted(TreeNode {
+                node: assistant_node.clone(),
+                parent: Some(user_node),
+                kind: NodeKind::AssistantCommit {
+                    text: "completed write".into(),
+                    verdict: VerifyVerdict::NotApplicable,
+                },
+            }),
+        ),
+        run_state_envelope(
+            &source,
+            &run_id,
+            generation,
+            "permission-fork-done",
+            RunState::Done,
+        ),
+    ];
+    hub.append(&mut permission_facts)
+        .await
+        .expect("append permission history");
+    let fork_seq = permission_facts[6].seq;
+    let parent_state = crate::worker::durable_session_tool_state(&store, &source)
+        .await
+        .expect("parent grants");
+    assert!(
+        parent_state
+            .grants
+            .iter()
+            .any(|grant| grant.class == EffectClass::FsWrite),
+        "fixture must hold remembered AllowAlways consent"
+    );
+    assert!(
+        parent_state.mobile_use_active,
+        "fixture must hold prompt-derived mobile consent"
+    );
+
+    let child = SessionId::new("permission-fork-child");
+    let SessionForkOutcome::Committed { created, .. } = hub
+        .fork_session(private_fork_command(
+            &store,
+            "permission-fork",
+            source,
+            child.clone(),
+            assistant_node,
+            fork_seq,
+        ))
+        .await
+        .expect("fork permission history")
+    else {
+        panic!("permission fork must commit");
+    };
+    let child_state = crate::worker::durable_session_tool_state(&store, &child)
+        .await
+        .expect("child grants");
+    assert!(
+        child_state.grants.is_empty(),
+        "remembered and prompt-derived computer consent must not cross the fork audit boundary"
+    );
+    assert!(
+        !child_state.mobile_use_active,
+        "prompt-derived mobile consent must not cross the fork audit boundary"
+    );
+    let expected_overrides = haider_protocol::session::SessionPermissionOverridesV1 {
+        allow_writes: true,
+        allow_exec: false,
+        allow_mobile: false,
+        auto_allow: false,
+    };
+    assert_eq!(
+        created.metadata.permission_overrides,
+        Some(expected_overrides),
+        "creation policy is committed configuration, not accumulated consent"
+    );
+    assert!(
+        crate::worker::effective_permission_defaults(&created.metadata)
+            .into_iter()
+            .any(|(class, default)| {
+                class == EffectClass::FsWrite
+                    && default == haider_protocol::tool::ToolPermissionDefault::Allow
+            })
+    );
+
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
 #[derive(Default)]
 struct CapturingFrameSink(Mutex<Vec<WireFrame>>);
 
@@ -616,6 +1212,555 @@ impl FrameSink for CapturingFrameSink {
         self.0.lock().expect("capturing sink").push(frame);
         Ok(())
     }
+}
+
+struct ForkPublicationGate {
+    child: SessionId,
+    gated: AtomicBool,
+    reached: mpsc::UnboundedSender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl SessionHubObserver for ForkPublicationGate {
+    fn observe(&self, observation: HubObservation) {
+        let is_child_commit = matches!(
+            observation,
+            HubObservation::Persisted { ref session_id, .. } if *session_id == self.child
+        );
+        if !is_child_commit || self.gated.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _ = self.reached.send(());
+        self.release
+            .lock()
+            .expect("fork publication release")
+            .recv()
+            .expect("test releases fork publication");
+    }
+}
+
+fn listed_sessions(sink: &CapturingFrameSink, request_id: &str) -> Vec<SessionSummary> {
+    sink.0
+        .lock()
+        .expect("captured roster frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id: seen,
+                body: ResponseBody::SessionList { sessions, .. },
+            } if seen.as_str() == request_id => Some(sessions.clone()),
+            _ => None,
+        })
+        .expect("session-list response")
+}
+
+/// The durable child row is not the roster linearization point. While a fork
+/// is paused immediately after commit, list observers see no child. Once the
+/// fork returns, the child has an actor, Pipe coverage through its full head,
+/// prompt provenance in the roster, and sequence-zero attachment replay.
+///
+/// MUTATION CHECK: remove the `fork_candidates` list filter, publish the
+/// commit projection before Pipe maintenance, or install the actor after
+/// removing the fence. Expected failure: the during-commit list exposes the
+/// child or one of the post-publication readiness assertions fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fork_roster_publication_waits_for_actor_and_complete_pipe_projection() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let child = SessionId::new("fork-publication-barrier-child");
+    let (reached_tx, mut reached_rx) = mpsc::unbounded_channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let observer = Arc::new(ForkPublicationGate {
+        child: child.clone(),
+        gated: AtomicBool::new(false),
+        reached: reached_tx,
+        release: Mutex::new(release_rx),
+    });
+    let hub = SessionHub::with_observer(store.clone(), SessionHubConfig::default(), observer)
+        .expect("hub");
+    hub.install_accounts(transcription_facade(Arc::new(
+        haider_accounts::MemoryVault::default(),
+    )))
+    .expect("install scope vault");
+    let (source, _, _) = create_fork_ready_source(&hub, &store, "fork-publication-barrier").await;
+    let prompt_seq = store
+        .read(&source, 0, 64)
+        .await
+        .expect("source transcript")
+        .into_iter()
+        .find_map(|envelope| {
+            matches!(
+                serde_json::from_value::<EventPayload>(envelope.payload),
+                Ok(EventPayload::UserMessage { .. })
+            )
+            .then_some(envelope.seq)
+        })
+        .expect("source user prompt");
+    let request_json = serde_json::json!({
+        "source": &source,
+        "prompt": { "seq": prompt_seq },
+    })
+    .to_string();
+    let command = SessionPromptForkCommand {
+        command_id: "fork-publication-barrier-command".into(),
+        request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+        request_json,
+        source_session_id: source,
+        session_id: child.clone(),
+        worker_generation: store.worker_generation(),
+        source_branch_id: None,
+        prompt_seq,
+        name: Some("Published fork".into()),
+        audit_event_id: EventId::new("fork-publication-barrier-audit"),
+        device_id: DeviceId::new("fork-publication-barrier-device"),
+    };
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([haider_rpc::Capability::View]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("roster observer");
+    sink.0.lock().expect("frames").clear();
+
+    let fork_hub = hub.clone();
+    let fork = tokio::spawn(async move { fork_hub.fork_session_from_prompt(command).await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), reached_rx.recv())
+        .await
+        .expect("fork reaches durable boundary")
+        .expect("observer remains open");
+    connection
+        .request(
+            RequestId::new("list-during-fork-publication"),
+            RequestBody::SessionList {
+                cursor: None,
+                limit: 100,
+            },
+        )
+        .await
+        .expect("list during fork");
+    assert!(
+        listed_sessions(&sink, "list-during-fork-publication")
+            .iter()
+            .all(|summary| summary.session_id != child),
+        "a durable but unprojected fork must remain outside the roster"
+    );
+
+    release_tx.send(()).expect("release publication barrier");
+    let outcome = fork.await.expect("fork task").expect("fork publishes");
+    let SessionForkOutcome::Committed { created, .. } = outcome else {
+        panic!("fresh prompt fork commits");
+    };
+    assert!(
+        hub.existing_actor(&child)
+            .expect("actor registry")
+            .is_some(),
+        "the actor exists before roster publication"
+    );
+    assert!(matches!(
+        hub.inner.pipe_native.confirmed_coverage(&child),
+        Some((coverage, generation))
+            if coverage >= created.created_seq && generation > 0
+    ));
+
+    connection
+        .request(
+            RequestId::new("list-after-fork-publication"),
+            RequestBody::SessionList {
+                cursor: None,
+                limit: 100,
+            },
+        )
+        .await
+        .expect("list after fork");
+    let summary = listed_sessions(&sink, "list-after-fork-publication")
+        .into_iter()
+        .find(|summary| summary.session_id == child)
+        .expect("published child appears in roster");
+    assert_eq!(summary.forked_from, created.forked_from);
+    assert!(
+        summary.forked_from.is_some(),
+        "prompt provenance is projected"
+    );
+
+    sink.0.lock().expect("frames").clear();
+    connection
+        .request(
+            RequestId::new("attach-published-fork"),
+            RequestBody::SessionAttach {
+                session_id: child.clone(),
+                after_seq: 0,
+                mode: AttachMode::View,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("published child is addressable");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let caught_up = sink.0.lock().expect("frames").iter().any(|frame| {
+                matches!(
+                    frame,
+                    WireFrame::AttachCaughtUp { high_water_seq, .. }
+                        if *high_water_seq == created.created_seq
+                )
+            });
+            if caught_up {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("sequence-zero replay catches up");
+    let replayed = sink
+        .0
+        .lock()
+        .expect("frames")
+        .iter()
+        .filter_map(|frame| match frame {
+            WireFrame::Event { envelope, .. } if envelope.session_id == child => Some(envelope.seq),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(replayed.first(), Some(&1));
+    assert_eq!(replayed.last(), Some(&created.created_seq));
+
+    drop(connection);
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// The additive prompt selector reaches the prompt-cut store transaction over
+/// the real RPC dispatcher, and the response/list projections share the exact
+/// durable provenance rather than requiring a second client read.
+#[tokio::test]
+async fn prompt_fork_rpc_publishes_response_draft_and_roster_provenance() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    hub.install_accounts(transcription_facade(Arc::new(
+        haider_accounts::MemoryVault::default(),
+    )))
+    .expect("install scope vault");
+    let (source, _, _) = create_fork_ready_source(&hub, &store, "prompt-fork-rpc").await;
+    let prompt_seq = store
+        .read(&source, 0, 64)
+        .await
+        .expect("source transcript")
+        .into_iter()
+        .find_map(|envelope| {
+            matches!(
+                serde_json::from_value::<EventPayload>(envelope.payload),
+                Ok(EventPayload::UserMessage { .. })
+            )
+            .then_some(envelope.seq)
+        })
+        .expect("source user prompt");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::View,
+                haider_rpc::Capability::Control,
+            ]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("control connection");
+    connection
+        .request(
+            RequestId::new("attach-prompt-fork-source"),
+            RequestBody::SessionAttach {
+                session_id: source.clone(),
+                after_seq: store.latest_seq(&source).await.expect("source head"),
+                mode: AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("source control attachment");
+    connection
+        .request(
+            RequestId::new("prompt-fork-rpc"),
+            RequestBody::SessionFork {
+                command_id: CommandId::new("prompt-fork-rpc-command"),
+                session_id: source.clone(),
+                worker_generation: store.worker_generation(),
+                source_branch_id: None,
+                fork_node_id: None,
+                fork_seq: None,
+                prompt: Some(haider_protocol::session_fork::SessionForkPromptSelector {
+                    seq: prompt_seq,
+                }),
+                name: Some("RPC prompt fork".into()),
+            },
+        )
+        .await
+        .expect("prompt fork routes");
+    let (child, created_seq, forked_from, draft) = sink
+        .0
+        .lock()
+        .expect("frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id,
+                body:
+                    ResponseBody::SessionFork {
+                        session_id,
+                        created_seq,
+                        forked_from,
+                        draft,
+                        ..
+                    },
+            } if request_id.as_str() == "prompt-fork-rpc" => Some((
+                session_id.clone(),
+                *created_seq,
+                forked_from.clone(),
+                draft.clone(),
+            )),
+            _ => None,
+        })
+        .expect("typed prompt-fork response");
+    assert!(forked_from.is_some());
+    assert_eq!(
+        forked_from.as_ref().map(|provenance| provenance.seq),
+        Some(prompt_seq)
+    );
+    assert_eq!(
+        draft.as_ref().map(|draft| draft.text.as_str()),
+        Some("fixture turn")
+    );
+    assert!(
+        hub.existing_actor(&child)
+            .expect("actor registry")
+            .is_some()
+    );
+    assert!(matches!(
+        hub.inner.pipe_native.confirmed_coverage(&child),
+        Some((coverage, generation)) if coverage >= created_seq && generation > 0
+    ));
+
+    // Model receipt replay in a fresh hub generation: durable authority knows
+    // the child, but neither the actor registry nor the in-memory Pipe cursor
+    // does. The retry must reinstall its own fence and fully repair both.
+    hub.inner.actors.lock().expect("actors").remove(&child);
+    hub.inner.pipe_native.invalidate(&child);
+    assert!(
+        !hub.inner
+            .fork_candidates
+            .lock()
+            .expect("fork candidates")
+            .contains(&child)
+    );
+    assert!(
+        hub.existing_actor(&child)
+            .expect("actor registry")
+            .is_none()
+    );
+    assert!(hub.inner.pipe_native.confirmed_coverage(&child).is_none());
+    connection
+        .request(
+            RequestId::new("prompt-fork-rpc-retry"),
+            RequestBody::SessionFork {
+                command_id: CommandId::new("prompt-fork-rpc-command"),
+                session_id: source,
+                worker_generation: store.worker_generation(),
+                source_branch_id: None,
+                fork_node_id: None,
+                fork_seq: None,
+                prompt: Some(haider_protocol::session_fork::SessionForkPromptSelector {
+                    seq: prompt_seq,
+                }),
+                name: Some("RPC prompt fork".into()),
+            },
+        )
+        .await
+        .expect("prompt fork receipt repairs publication");
+    assert!(
+        !hub.inner
+            .fork_candidates
+            .lock()
+            .expect("fork candidates")
+            .contains(&child)
+    );
+    assert!(
+        hub.existing_actor(&child)
+            .expect("actor registry")
+            .is_some()
+    );
+    assert!(matches!(
+        hub.inner.pipe_native.confirmed_coverage(&child),
+        Some((coverage, generation)) if coverage >= created_seq && generation > 0
+    ));
+    assert!(sink.0.lock().expect("frames").iter().any(|frame| matches!(
+        frame,
+        WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionFork { session_id, .. },
+        } if request_id.as_str() == "prompt-fork-rpc-retry" && session_id == &child
+    )));
+
+    connection
+        .request(
+            RequestId::new("list-prompt-fork-rpc"),
+            RequestBody::SessionList {
+                cursor: None,
+                limit: 100,
+            },
+        )
+        .await
+        .expect("list published prompt fork");
+    let summary = listed_sessions(&sink, "list-prompt-fork-rpc")
+        .into_iter()
+        .find(|summary| summary.session_id == child)
+        .expect("child roster row");
+    assert_eq!(summary.forked_from, forked_from);
+
+    drop(connection);
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// Fork-only errors preserve their stable code/data at the correlated RPC
+/// boundary. In particular, typed invalid-cut details and store families do
+/// not disappear into the generic turn mapper's `invalid_argument` fallback.
+#[tokio::test]
+async fn session_fork_error_mapper_preserves_every_typed_boundary_variant() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([haider_rpc::Capability::View]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    sink.0.lock().expect("frames").clear();
+
+    for code in [
+        ErrorCode::StoreReadOnly,
+        ErrorCode::StoreCorrupt,
+        ErrorCode::StoreUnavailable,
+        ErrorCode::StoreFull,
+    ] {
+        let mapped = fork_pipe_publication_error(crate::pipe_native::PipeNativeError::store(
+            "fork projection read failed",
+            HaiderError::new(code, "typed Pipe store failure", false),
+        ));
+        assert!(matches!(
+            mapped,
+            SessionHubError::Store(error) if error.code == code
+        ));
+    }
+
+    let mut invalid_cut = HaiderError::new(ErrorCode::InvalidArgument, "invalid cut", false);
+    invalid_cut.details = Some(serde_json::json!({
+        "kind": "session_fork_invalid_cut",
+        "session_id": "source",
+        "seq": 7,
+        "reason": "wrong_branch",
+    }));
+    let cases = [
+        (
+            "unstable",
+            HaiderError::new(ErrorCode::ForkCutUnstable, "unstable", true),
+            "fork_cut_unstable",
+        ),
+        (
+            "not-found",
+            HaiderError::new(ErrorCode::SessionNotFound, "missing", false),
+            "not_found",
+        ),
+        (
+            "stale",
+            HaiderError::new(ErrorCode::SingleWriterViolation, "stale", false),
+            "stale_generation",
+        ),
+        ("invalid-cut", invalid_cut, "invalid_argument"),
+        (
+            "read-only",
+            HaiderError::new(ErrorCode::StoreReadOnly, "read only", false),
+            "store_read_only",
+        ),
+        (
+            "corrupt",
+            HaiderError::new(ErrorCode::StoreCorrupt, "corrupt", false),
+            "store_corrupt",
+        ),
+        (
+            "unavailable",
+            HaiderError::new(ErrorCode::StoreUnavailable, "unavailable", true),
+            "store_unavailable",
+        ),
+        (
+            "full",
+            HaiderError::new(ErrorCode::StoreFull, "full", false),
+            "store_full",
+        ),
+    ];
+    for (request_id, error, _) in &cases {
+        connection
+            .respond_session_fork_error(RequestId::new(*request_id), error.clone())
+            .expect("typed fork error sends");
+    }
+    {
+        let frames = sink.0.lock().expect("frames");
+        for (request_id, _, expected_code) in cases {
+            let body = frames
+                .iter()
+                .find_map(|frame| match frame {
+                    WireFrame::Response {
+                        request_id: seen,
+                        body: ResponseBody::Error { code, data, .. },
+                    } if seen.as_str() == request_id => Some((code.as_str(), data.as_ref())),
+                    _ => None,
+                })
+                .expect("mapped response");
+            assert_eq!(body.0, expected_code, "{request_id}");
+            if request_id == "invalid-cut" {
+                assert!(matches!(
+                    body.1,
+                    Some(ErrorData::SessionForkInvalidCut { session_id, seq: 7, .. })
+                        if session_id.as_str() == "source"
+                ));
+            }
+        }
+    }
+
+    connection
+        .request(
+            RequestId::new("capability"),
+            RequestBody::SessionFork {
+                command_id: CommandId::new("denied"),
+                session_id: SessionId::new("source"),
+                worker_generation: store.worker_generation(),
+                source_branch_id: None,
+                fork_node_id: None,
+                fork_seq: None,
+                prompt: Some(haider_protocol::session_fork::SessionForkPromptSelector { seq: 1 }),
+                name: None,
+            },
+        )
+        .await
+        .expect("capability refusal routes");
+    assert!(sink.0.lock().expect("frames").iter().any(|frame| {
+        matches!(
+            frame,
+            WireFrame::Response {
+                request_id,
+                body: ResponseBody::Error { code, .. },
+            } if request_id.as_str() == "capability" && code == "capability_denied"
+        )
+    }));
+
+    drop(connection);
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
 }
 
 /// Queue-control changes share the existing attachment pipe. Each durable
@@ -1466,6 +2611,10 @@ async fn metafork_review_is_write_free_until_human_acceptance() {
     let root = tempfile::tempdir().expect("profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    hub.install_accounts(transcription_facade(Arc::new(
+        haider_accounts::MemoryVault::default(),
+    )))
+    .expect("install scope vault");
     let source = SessionId::new("metafork-review-parent");
     hub.create_internal_session(SessionCreateCommand {
         command_id: "create-metafork-review-parent".into(),

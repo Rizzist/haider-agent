@@ -4898,7 +4898,7 @@ fn xai_prompt_cache_conversation_id(
     prompt_cache_cohort_key_with_header(request, metadata, header_epoch)
 }
 
-/// Custom OpenAI-compatible profiles use the same v3 routing cohort as the
+/// Custom OpenAI-compatible profiles use the same v4 routing cohort as the
 /// named OpenAI-family adapters. The provider name is intentionally not a
 /// constructor constant: custom aliases are daemon-owned metadata carried in
 /// the request, and the resolved account scope provides the hard isolation
@@ -4921,10 +4921,10 @@ fn custom_prompt_cache_key(
 /// to their own `session_scope`; only C3 forks whose exact inherited
 /// provider-view segment is still active carry the fork-root route in
 /// `cache_cohort`.
-/// Provider/account/model and the finalized provider-view header epoch remain
-/// hard domain boundaries. History and compaction epochs never enter, so one
-/// legitimate lineage stays stable across append-only turns without exposing
-/// the account to cache-key contention from unrelated traffic.
+/// Provider/account/model, the finalized provider-view header, the full cache
+/// epoch, and the output budget remain hard domain boundaries. Immutable
+/// history bytes stay at the provider's prefix-match layer; a divergent fork
+/// never receives the inherited cohort in the first place.
 fn prompt_cache_cohort_key(
     request: &TurnRequest,
     metadata: &crate::PromptCacheMetadata,
@@ -4937,10 +4937,15 @@ fn prompt_cache_cohort_key_with_header(
     metadata: &crate::PromptCacheMetadata,
     header_epoch: Option<&str>,
 ) -> Option<String> {
+    if request.max_tokens == 0 {
+        return None;
+    }
     let account_scope = metadata
         .account_scope
         .as_deref()
         .filter(|scope| !scope.is_empty())?;
+    let cache_epoch =
+        (!metadata.cache_epoch.is_empty()).then_some(metadata.cache_epoch.as_str())?;
     let header_epoch = header_epoch
         .filter(|header_epoch| !header_epoch.is_empty())
         .or_else(|| {
@@ -4954,11 +4959,13 @@ fn prompt_cache_cohort_key_with_header(
             (!metadata.session_scope.is_empty()).then_some(metadata.session_scope.as_str())
         })?;
     let domain = serde_json::json!({
-        "schema": "haider.prompt-cache-cohort.v3",
+        "schema": "haider.prompt-cache-cohort.v4",
         "provider": metadata.provider,
         "model": request.model,
+        "max_tokens": request.max_tokens,
         "account_scope": account_scope,
         "header_epoch": header_epoch,
+        "cache_epoch": cache_epoch,
         "cohort": cohort,
     });
     serde_json::to_vec(&domain)

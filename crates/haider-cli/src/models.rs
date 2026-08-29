@@ -533,7 +533,8 @@ fn failure(error: &ModelsError) -> ExitCode {
         | ModelsError::Protocol(_) => EX_PROTOCOL,
         ModelsError::Ensure(_) => EX_UNAVAILABLE,
         ModelsError::Client(ClientError::Disconnected(_)) => EX_IOERR,
-        ModelsError::Client(ClientError::Encode(_)) | ModelsError::SnapshotChanged => EX_SOFTWARE,
+        ModelsError::Client(ClientError::Encode(_) | ClientError::MissingFeature(_))
+        | ModelsError::SnapshotChanged => EX_SOFTWARE,
         ModelsError::Rpc { code, .. }
             if matches!(
                 code.as_str(),

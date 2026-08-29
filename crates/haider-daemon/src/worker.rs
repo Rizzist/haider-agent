@@ -609,6 +609,7 @@ impl DaemonContextCompactor {
         let cache_epoch = digest_json(&serde_json::json!({
             "provider": self.usage_scope.provider,
             "model": self.model,
+            "max_tokens": self.max_tokens,
             "account_scope": self.usage_account,
             "system_digest": prefix_digests.system,
             "tool_digest": prefix_digests.tools,
@@ -7025,6 +7026,7 @@ impl TurnSetupReduction {
             self.fork_cache_boundary_seq = Some(envelope.seq);
             self.inherited_cache_segment = SessionForked::from_payload_value(&envelope.payload)
                 .and_then(inherited_fork_cache_segment);
+            self.durable_tools.reset_at_session_fork();
             return Ok(());
         }
         if !matches!(
@@ -15455,6 +15457,21 @@ struct DurableToolStateReduction {
 }
 
 impl DurableToolStateReduction {
+    /// A fork's final audit fact is a new consent boundary. The copied
+    /// transcript remains useful history, but neither answers to historical
+    /// permission menus nor prompt-derived capability activations authorize
+    /// the independent child. Creation-time permission overrides live in
+    /// `SessionMetadataV1` and are applied separately by
+    /// `effective_permission_defaults`.
+    fn reset_at_session_fork(&mut self) {
+        self.intents.clear();
+        self.opened.clear();
+        self.grants.clear();
+        self.bindings.clear();
+        self.explicit_computer_intent = false;
+        self.mobile_use_active = false;
+    }
+
     fn observe(&mut self, agent_id: Option<&AgentId>, payload: &EventPayload) {
         match payload {
             EventPayload::Effect(EffectPhase::Intent(intent)) => {
@@ -15595,6 +15612,15 @@ pub(crate) async fn durable_session_tool_state(
         }
         cursor = page.last().map_or(cursor, |envelope| envelope.seq);
         for envelope in page {
+            if envelope
+                .payload
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                == Some("session_forked")
+            {
+                reduction.reset_at_session_fork();
+                continue;
+            }
             let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload) else {
                 continue;
             };

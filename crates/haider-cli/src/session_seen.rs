@@ -206,7 +206,7 @@ fn failure(error: SeenError) -> ExitCode {
         | SeenError::Protocol(_) => EX_PROTOCOL,
         SeenError::Ensure(_) => EX_UNAVAILABLE,
         SeenError::Client(ClientError::Disconnected(_)) | SeenError::Io(_) => EX_IOERR,
-        SeenError::Client(ClientError::Encode(_)) => EX_SOFTWARE,
+        SeenError::Client(ClientError::Encode(_) | ClientError::MissingFeature(_)) => EX_SOFTWARE,
         SeenError::Rpc { .. } => EX_UNAVAILABLE,
     })
 }

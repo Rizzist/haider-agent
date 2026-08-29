@@ -350,6 +350,8 @@ pub enum ErrorCode {
     GraphAlreadyActive,
     GraphNotActive,
     GraphWrongNode,
+    /// A prompt-fork cut cannot yet be resolved at a stable idle boundary.
+    ForkCutUnstable,
     // providers
     ProviderError,
     ProviderTimeout,
@@ -395,6 +397,7 @@ impl ErrorCode {
             Self::GraphAlreadyActive => "graph_already_active",
             Self::GraphNotActive => "graph_not_active",
             Self::GraphWrongNode => "graph_wrong_node",
+            Self::ForkCutUnstable => "fork_cut_unstable",
             Self::ProviderError => "provider_error",
             Self::ProviderTimeout => "provider_timeout",
             Self::VisionUnsupported => "vision_unsupported",
@@ -433,6 +436,7 @@ impl ErrorCode {
             Self::GraphAlreadyActive => "graph-already-active",
             Self::GraphNotActive => "graph-not-active",
             Self::GraphWrongNode => "graph-wrong-node",
+            Self::ForkCutUnstable => "fork-cut-unstable",
             Self::ProviderError => "provider-error",
             Self::ProviderTimeout => "provider-timeout",
             Self::VisionUnsupported => "vision-unsupported",

@@ -68,6 +68,7 @@ fn summary(n: usize, head_seq: u64) -> SessionSummary {
         effort: None,
         fast: None,
         account_alias: None,
+        forked_from: None,
     }
 }
 
