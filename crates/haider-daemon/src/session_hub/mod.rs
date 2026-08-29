@@ -161,7 +161,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 #[cfg(test)]
@@ -171,6 +171,10 @@ use replay::{ReplayCompletion, run_replay};
 const REPLAY_PAGE_SIZE: usize = 256;
 const MAX_LIST_PAGE: usize = 100;
 const MAX_READ_ENVELOPES: usize = 1_024;
+const APPEND_QUEUE_MAX_REQUESTS: usize = 128;
+const APPEND_QUEUE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const APPEND_GROUP_MAX_REQUESTS: usize = 32;
+const APPEND_GROUP_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// Real-time home for the UTC-aligned usage-ledger timer.
 ///
@@ -1144,6 +1148,8 @@ enum AppendCommitKind {
 struct AppendCommitRequest {
     kind: AppendCommitKind,
     envelopes: Vec<RawEnvelope>,
+    byte_weight: usize,
+    _byte_permit: OwnedSemaphorePermit,
     completed: oneshot::Sender<Result<Vec<RawEnvelope>, HaiderError>>,
 }
 
@@ -1155,7 +1161,8 @@ enum AppendCommitMessage {
 /// Profile-global group-commit admission shared by every session actor.
 #[derive(Clone)]
 struct AppendCommitter {
-    requests: mpsc::UnboundedSender<AppendCommitMessage>,
+    requests: mpsc::Sender<AppendCommitMessage>,
+    bytes: Arc<Semaphore>,
 }
 
 impl AppendCommitter {
@@ -1164,13 +1171,35 @@ impl AppendCommitter {
         kind: AppendCommitKind,
         envelopes: Vec<RawEnvelope>,
     ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        let byte_weight = envelopes
+            .iter()
+            .map(envelope_weight_bytes)
+            .fold(0_usize, usize::saturating_add);
+        // A request is indivisible. Charging an oversized request the entire
+        // semaphore admits it alone while its existing producer-side limit
+        // remains the absolute single-request ceiling.
+        let charged_bytes = byte_weight.clamp(1, APPEND_QUEUE_MAX_BYTES);
+        let permits = u32::try_from(charged_bytes).map_err(|_| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                "append admission byte charge exceeds semaphore range",
+                false,
+            )
+        })?;
+        let byte_permit = Arc::clone(&self.bytes)
+            .acquire_many_owned(permits)
+            .await
+            .map_err(|_| hub_closed_store_error())?;
         let (completed, result) = oneshot::channel();
         self.requests
             .send(AppendCommitMessage::Commit(AppendCommitRequest {
                 kind,
                 envelopes,
+                byte_weight,
+                _byte_permit: byte_permit,
                 completed,
             }))
+            .await
             .map_err(|_| hub_closed_store_error())?;
         result.await.map_err(|_| hub_closed_store_error())?
     }
@@ -1180,6 +1209,7 @@ impl AppendCommitter {
         if self
             .requests
             .send(AppendCommitMessage::Shutdown(completed))
+            .await
             .is_ok()
         {
             let _ = result.await;
@@ -1189,9 +1219,17 @@ impl AppendCommitter {
 
 async fn run_append_committer(
     store: SqliteStoreHandle,
-    mut requests: mpsc::UnboundedReceiver<AppendCommitMessage>,
+    mut requests: mpsc::Receiver<AppendCommitMessage>,
 ) {
-    while let Some(message) = requests.recv().await {
+    let mut next_message = None;
+    loop {
+        let message = match next_message.take() {
+            Some(message) => message,
+            None => match requests.recv().await {
+                Some(message) => message,
+                None => break,
+            },
+        };
         let first = match message {
             AppendCommitMessage::Commit(first) => first,
             AppendCommitMessage::Shutdown(completed) => {
@@ -1199,11 +1237,25 @@ async fn run_append_committer(
                 break;
             }
         };
+        let mut pending_bytes = first.byte_weight;
         let mut pending = vec![first];
         let mut shutdown = None;
-        while let Ok(message) = requests.try_recv() {
+        while pending.len() < APPEND_GROUP_MAX_REQUESTS {
+            let Ok(message) = requests.try_recv() else {
+                break;
+            };
             match message {
-                AppendCommitMessage::Commit(request) => pending.push(request),
+                AppendCommitMessage::Commit(request)
+                    if pending_bytes.saturating_add(request.byte_weight)
+                        > APPEND_GROUP_MAX_BYTES =>
+                {
+                    next_message = Some(AppendCommitMessage::Commit(request));
+                    break;
+                }
+                AppendCommitMessage::Commit(request) => {
+                    pending_bytes = pending_bytes.saturating_add(request.byte_weight);
+                    pending.push(request);
+                }
                 AppendCommitMessage::Shutdown(completed) => {
                     shutdown = Some(completed);
                     break;
@@ -1293,11 +1345,14 @@ struct DescendantAttachmentOwner {
     cancel: watch::Sender<bool>,
 }
 
-/// One committed envelope in flight on a catch-up channel, carrying the
-/// weight it was charged so receive-side credit is exactly symmetric.
+/// One committed envelope in flight on a catch-up channel. All entries for a
+/// shared committed batch index the same allocation; the final queued entry
+/// carries that allocation's full charge so receive-side credit happens only
+/// after no earlier entry can retain it.
 struct QueuedEnvelope {
     weight: usize,
-    envelope: Arc<RawEnvelope>,
+    envelopes: Arc<[RawEnvelope]>,
+    index: usize,
 }
 
 /// Actor-side delivery state for one registered attachment.
@@ -1758,9 +1813,10 @@ impl SessionHub {
                 SessionHubError::Task(format!("cannot load cache diagnostic key: {error}"))
             })?;
         let device_id = DeviceId::new(format!("daemon-session-hub-{}", store.worker_generation()));
-        let (append_requests, append_receiver) = mpsc::unbounded_channel();
+        let (append_requests, append_receiver) = mpsc::channel(APPEND_QUEUE_MAX_REQUESTS);
         let append_committer = AppendCommitter {
             requests: append_requests,
+            bytes: Arc::new(Semaphore::new(APPEND_QUEUE_MAX_BYTES)),
         };
         let append_commit_task = tokio::spawn(run_append_committer(store.clone(), append_receiver));
         let (surface_publications, _) = watch::channel(0_u64);
@@ -4616,6 +4672,37 @@ impl SessionHub {
     /// nonterminal sessions are refused. The actor stops before the durable
     /// transaction, and ephemeral handoff data is cleaned only after commit.
     pub async fn delete_session(&self, session_id: SessionId) -> Result<(), HaiderError> {
+        // Preserve the old immediate refusal before waiting on any unrelated
+        // hook backlog. Eligibility is checked again under the tombstone.
+        let _ = self.deletion_metadata_if_eligible(&session_id).await?;
+        let (hooks_were_installed, hooks) = {
+            let installed = lock(&self.inner.hooks).map_err(hub_error_as_store)?;
+            (
+                installed.is_some(),
+                installed
+                    .as_ref()
+                    .and_then(crate::hooks::WeakHookService::upgrade),
+            )
+        };
+        if hooks_were_installed
+            && hooks.is_none()
+            && self
+                .inner
+                .store
+                .has_pending_hook_dispatches(&session_id)
+                .await?
+        {
+            return Err(HaiderError::new(
+                ErrorCode::Busy,
+                "hook engine is unavailable with dispatch pending; retry session deletion",
+                true,
+            ));
+        }
+        if let Some(hooks) = &hooks {
+            hooks
+                .drain_session_before_delete(session_id.clone())
+                .await?;
+        }
         // Peer delivery appends its shared `Claimed` marker while holding this
         // same serial. Deletion must wait until the claim either commits its
         // core run or fails before publishing a deletion tombstone.
@@ -4631,7 +4718,9 @@ impl SessionHub {
             }
         }
         drop(workflow_selection);
-        let result = self.delete_fenced_session(&session_id).await;
+        let result = self
+            .delete_fenced_session(&session_id, hooks_were_installed, hooks.as_ref())
+            .await;
         if result.is_err()
             && let Ok(mut deleting) = lock(&self.inner.deleting_sessions)
         {
@@ -4640,7 +4729,10 @@ impl SessionHub {
         result
     }
 
-    async fn delete_fenced_session(&self, session_id: &SessionId) -> Result<(), HaiderError> {
+    async fn deletion_metadata_if_eligible(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<haider_protocol::session::SessionMetadataV1, HaiderError> {
         let metadata = self
             .inner
             .store
@@ -4671,6 +4763,16 @@ impl SessionHub {
                 true,
             ));
         }
+        Ok(metadata)
+    }
+
+    async fn delete_fenced_session(
+        &self,
+        session_id: &SessionId,
+        hooks_were_installed: bool,
+        hooks: Option<&crate::hooks::HookService>,
+    ) -> Result<(), HaiderError> {
+        let metadata = self.deletion_metadata_if_eligible(session_id).await?;
         // Publish the target-unavailable terminal state before deleting the
         // private core record. The deletion tombstone already blocks a new
         // claim, so a crash after the store delete cannot leave a foreign
@@ -4730,6 +4832,24 @@ impl SessionHub {
                 .map_err(hub_error_as_store)?
                 .remove(session_id);
         }
+        // The pre-tombstone hook drain and this post-actor check form one
+        // deletion fence. Any append admitted between them either precedes
+        // StopIfQuiescent in the actor FIFO and leaves a durable outbox row,
+        // or is rejected by the deletion tombstone. Never erase an outbox row
+        // merely because its payload-carrying live queue became a wake.
+        if hooks_were_installed
+            && self
+                .inner
+                .store
+                .has_pending_hook_dispatches(session_id)
+                .await?
+        {
+            return Err(HaiderError::new(
+                ErrorCode::Busy,
+                "hook dispatch remains pending; retry session deletion",
+                true,
+            ));
+        }
         // W-A fence law: session close kills every pgid the session owns,
         // after the actor is provably stopped and before the durable delete.
         self.fence_background_tasks(session_id).await;
@@ -4763,18 +4883,45 @@ impl SessionHub {
                 return Err(error);
             }
         }
+        self.inner.pipe_native.release_clean(session_id);
+        self.inner
+            .workflow_selection_serials
+            .lock()
+            .await
+            .remove(session_id);
+        self.inner
+            .checkpoint_serials
+            .lock()
+            .await
+            .remove(session_id);
+        self.inner
+            .web_degrade
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
         self.inner.observe_digests.remove(session_id);
-        lock(&self.inner.lockdown_turns)
-            .map_err(hub_error_as_store)?
+        self.inner
+            .ssh_scopes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+        self.inner
+            .lockdown_turns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|(candidate, _), _| candidate != session_id);
         if let Ok(manager) = crate::lockdown::global() {
             let profile_id = self.inner.store.cached_profile_installation_id();
-            manager
-                .remove_session_bindings(profile_id, session_id.as_str())
-                .map_err(|error| HaiderError::new(ErrorCode::Internal, error.to_string(), false))?;
+            if let Err(error) = manager.remove_session_bindings(profile_id, session_id.as_str()) {
+                tracing::warn!(
+                    session_id = %session_id,
+                    ?error,
+                    "durable session deletion committed but lockdown shell cleanup failed"
+                );
+            }
         }
-        if let Ok(Some(hooks)) = self.hooks() {
-            hooks.session_deleted(session_id.clone());
+        if let Some(hooks) = hooks {
+            hooks.session_deleted(session_id.clone()).await;
         }
         let _ = self.inner.roster_publications.send(session_id.clone());
         self.clear_session_surface(session_id);
@@ -5372,13 +5519,22 @@ impl SessionHub {
         session_id: &SessionId,
         seen_generation: u64,
     ) -> Option<SessionSurfaceSnapshot> {
+        let deleting = self
+            .inner
+            .deleting_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(session_id);
         let surfaces = self
             .inner
             .surfaces
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = surfaces.get(session_id);
-        let change_generation = state.map_or(0, |state| state.change_generation);
+        let change_generation = state.map_or_else(
+            || if deleting { u64::MAX } else { 0 },
+            |state| state.change_generation,
+        );
         if change_generation == seen_generation {
             return None;
         }
@@ -5633,15 +5789,11 @@ impl SessionHub {
             .surfaces
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let state = surfaces.entry(session_id.clone()).or_default();
-        state.input = None;
-        state.status = None;
-        state.input_revisions.clear();
-        state.status_revisions.clear();
-        // Session death itself is a change even when both fields were empty;
-        // a registered watcher must receive the cleared terminal snapshot.
-        state.change_generation = state.change_generation.saturating_add(1);
+        surfaces.remove(session_id);
         drop(surfaces);
+        // The permanent deletion tombstone supplies `u64::MAX` as the one
+        // cleared terminal generation, so watchers still observe deletion
+        // while this non-authoritative shell is released.
         self.notify_surface_watchers();
     }
 
@@ -5925,52 +6077,19 @@ impl StoreHandle for HubStoreHandle {
         &self,
         envelopes: &mut [RawEnvelope],
     ) -> Result<haider_core::CommittedRange, HaiderError> {
-        let Some(first) = envelopes.first() else {
-            return Err(HaiderError::new(
-                ErrorCode::InvalidArgument,
-                "cannot append an empty worker envelope batch",
-                false,
-            ));
-        };
-        if envelopes.iter().any(|envelope| {
-            envelope.session_id != self.session_id
-                || envelope.worker_generation != self.worker_generation
-        }) {
-            return Err(HaiderError::new(
-                ErrorCode::SingleWriterViolation,
-                "worker envelope identity does not match its lease",
-                false,
-            ));
-        }
-        if inject_test_done_append_failure(envelopes) {
-            return Err(HaiderError::new(
-                ErrorCode::StoreCorrupt,
-                "injected terminal append failure",
-                false,
-            ));
-        }
-        let actor = self
-            .hub
-            .existing_actor(&first.session_id)
-            .map_err(hub_error_as_store)?
-            .ok_or_else(hub_closed_store_error)?;
-        let (completed, response) = oneshot::channel();
-        actor
-            .commands
-            .send(ActorCommand::WorkerAppend {
-                lease_id: self.lease_id.clone(),
-                expected_head: None,
-                envelopes: envelopes.to_vec(),
-                completed,
-            })
-            .await
-            .map_err(|_| hub_closed_store_error())?;
-        let committed = response.await.map_err(|_| hub_closed_store_error())??;
+        let committed = self.append_owned_inner(None, envelopes.to_vec()).await?;
         envelopes.clone_from_slice(&committed);
         Ok(haider_core::CommittedRange {
             first_seq: committed.first().map_or(0, |envelope| envelope.seq),
             last_seq: committed.last().map_or(0, |envelope| envelope.seq),
         })
+    }
+
+    async fn append_owned(
+        &self,
+        envelopes: Vec<RawEnvelope>,
+    ) -> Result<Arc<[RawEnvelope]>, HaiderError> {
+        self.append_owned_inner(None, envelopes).await
     }
 
     async fn read(
@@ -6126,6 +6245,54 @@ fn inject_test_done_append_failure(envelopes: &[RawEnvelope]) -> bool {
 }
 
 impl HubStoreHandle {
+    async fn append_owned_inner(
+        &self,
+        expected_head: Option<u64>,
+        envelopes: Vec<RawEnvelope>,
+    ) -> Result<Arc<[RawEnvelope]>, HaiderError> {
+        let Some(first) = envelopes.first() else {
+            return Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "cannot append an empty worker envelope batch",
+                false,
+            ));
+        };
+        if envelopes.iter().any(|envelope| {
+            envelope.session_id != self.session_id
+                || envelope.worker_generation != self.worker_generation
+        }) {
+            return Err(HaiderError::new(
+                ErrorCode::SingleWriterViolation,
+                "worker envelope identity does not match its lease",
+                false,
+            ));
+        }
+        if inject_test_done_append_failure(&envelopes) {
+            return Err(HaiderError::new(
+                ErrorCode::StoreCorrupt,
+                "injected terminal append failure",
+                false,
+            ));
+        }
+        let actor = self
+            .hub
+            .existing_actor(&first.session_id)
+            .map_err(hub_error_as_store)?
+            .ok_or_else(hub_closed_store_error)?;
+        let (completed, response) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::WorkerAppend {
+                lease_id: self.lease_id.clone(),
+                expected_head,
+                envelopes,
+                completed,
+            })
+            .await
+            .map_err(|_| hub_closed_store_error())?;
+        response.await.map_err(|_| hub_closed_store_error())?
+    }
+
     pub(crate) async fn consume_queued_turn(
         &self,
         run_id: RunId,
@@ -6163,40 +6330,9 @@ impl HubStoreHandle {
         expected_head: u64,
         envelopes: &mut [RawEnvelope],
     ) -> Result<haider_core::CommittedRange, HaiderError> {
-        let Some(first) = envelopes.first() else {
-            return Err(HaiderError::new(
-                ErrorCode::InvalidArgument,
-                "cannot append an empty worker envelope batch",
-                false,
-            ));
-        };
-        if envelopes.iter().any(|envelope| {
-            envelope.session_id != self.session_id
-                || envelope.worker_generation != self.worker_generation
-        }) {
-            return Err(HaiderError::new(
-                ErrorCode::SingleWriterViolation,
-                "worker envelope identity does not match its lease",
-                false,
-            ));
-        }
-        let actor = self
-            .hub
-            .existing_actor(&first.session_id)
-            .map_err(hub_error_as_store)?
-            .ok_or_else(hub_closed_store_error)?;
-        let (completed, response) = oneshot::channel();
-        actor
-            .commands
-            .send(ActorCommand::WorkerAppend {
-                lease_id: self.lease_id.clone(),
-                expected_head: Some(expected_head),
-                envelopes: envelopes.to_vec(),
-                completed,
-            })
-            .await
-            .map_err(|_| hub_closed_store_error())?;
-        let committed = response.await.map_err(|_| hub_closed_store_error())??;
+        let committed = self
+            .append_owned_inner(Some(expected_head), envelopes.to_vec())
+            .await?;
         envelopes.clone_from_slice(&committed);
         Ok(haider_core::CommittedRange {
             first_seq: committed.first().map_or(0, |envelope| envelope.seq),

@@ -27,14 +27,8 @@ const PIPE_SIDECAR_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::fro
 struct PipeSidecarTask {
     session_id: SessionId,
     writer: Arc<crate::pipe_native::PipeNativeWriter>,
-    latest_enqueued_head: Arc<AtomicU64>,
-    batches: Option<mpsc::UnboundedSender<PipeCommittedBatch>>,
+    durable_head: Option<watch::Sender<u64>>,
     task: Option<JoinHandle<()>>,
-}
-
-struct PipeCommittedBatch {
-    envelopes: Arc<[RawEnvelope]>,
-    head_seq: u64,
 }
 
 impl PipeSidecarTask {
@@ -43,26 +37,14 @@ impl PipeSidecarTask {
         store: SqliteStoreHandle,
         session_id: SessionId,
     ) -> Self {
-        let (batches, mut receiver) = mpsc::unbounded_channel::<PipeCommittedBatch>();
+        let (durable_head, mut receiver) = watch::channel(0_u64);
         let task_writer = Arc::clone(&writer);
         let task_session = session_id.clone();
-        let latest_enqueued_head = Arc::new(AtomicU64::new(0));
-        let task_latest_enqueued_head = Arc::clone(&latest_enqueued_head);
         let task = tokio::spawn(async move {
-            while let Some(batch) = receiver.recv().await {
-                // The actor can enqueue another already-committed batch while
-                // this writer is behind. Use the shared queue high-water mark
-                // so an earlier batch is not mistaken for durable EOF.
-                let latest_enqueued_head = task_latest_enqueued_head
-                    .load(Ordering::Acquire)
-                    .max(batch.head_seq);
+            while receiver.changed().await.is_ok() {
+                let latest_enqueued_head = *receiver.borrow_and_update();
                 if let Err(error) = task_writer
-                    .maintain(
-                        &store,
-                        &task_session,
-                        batch.envelopes.as_ref(),
-                        latest_enqueued_head,
-                    )
+                    .maintain(&store, &task_session, &[], latest_enqueued_head)
                     .await
                 {
                     tracing::warn!(
@@ -76,33 +58,35 @@ impl PipeSidecarTask {
         Self {
             session_id,
             writer,
-            latest_enqueued_head,
-            batches: Some(batches),
+            durable_head: Some(durable_head),
             task: Some(task),
         }
     }
 
-    fn enqueue(&self, envelopes: Arc<[RawEnvelope]>) {
+    fn enqueue(&self, envelopes: &[RawEnvelope]) {
         let Some(head_seq) = envelopes.last().map(|envelope| envelope.seq) else {
             return;
         };
-        let batch = PipeCommittedBatch {
-            envelopes,
-            head_seq,
-        };
-        self.latest_enqueued_head
-            .fetch_max(head_seq, Ordering::Release);
-        if self
-            .batches
-            .as_ref()
-            .is_none_or(|batches| batches.send(batch).is_err())
-        {
+        let Some(durable_head) = self.durable_head.as_ref() else {
             self.writer.invalidate(&self.session_id);
+            return;
+        };
+        if durable_head.receiver_count() == 0 {
+            self.writer.invalidate(&self.session_id);
+            return;
         }
+        durable_head.send_if_modified(|current| {
+            if head_seq > *current {
+                *current = head_seq;
+                true
+            } else {
+                false
+            }
+        });
     }
 
     async fn finish(&mut self) {
-        self.batches.take();
+        self.durable_head.take();
         let Some(mut task) = self.task.take() else {
             return;
         };
@@ -371,10 +355,10 @@ pub(super) async fn run_session_actor(
                             session_id: session_id.clone(),
                             through_seq: head,
                         });
-                        pipe_sidecar.enqueue(Arc::clone(&envelopes));
-                        publish(
+                        pipe_sidecar.enqueue(&envelopes);
+                        publish_shared(
                             &mut attachments,
-                            &envelopes,
+                            Arc::clone(&envelopes),
                             catch_up_byte_budget,
                             &metrics,
                             &hooks,
@@ -436,7 +420,7 @@ pub(super) async fn run_session_actor(
                         session_id: session_id.clone(),
                         through_seq: head,
                     });
-                    pipe_sidecar.enqueue(Arc::from(envelopes.clone()));
+                    pipe_sidecar.enqueue(envelopes);
                     publish_seeded_session(
                         &mut attachments,
                         envelopes,
@@ -488,7 +472,7 @@ pub(super) async fn run_session_actor(
                         through_seq: head,
                     });
                     let envelopes = Arc::<[RawEnvelope]>::from(envelopes.clone());
-                    pipe_sidecar.enqueue(Arc::clone(&envelopes));
+                    pipe_sidecar.enqueue(&envelopes);
                     publish(
                         &mut attachments,
                         &envelopes,
@@ -930,7 +914,7 @@ pub(super) async fn run_session_actor(
                         session_id: session_id.clone(),
                         through_seq: head,
                     });
-                    pipe_sidecar.enqueue(Arc::from(envelopes.clone()));
+                    pipe_sidecar.enqueue(envelopes);
                     publish(
                         &mut attachments,
                         envelopes,
@@ -959,7 +943,7 @@ pub(super) async fn run_session_actor(
                         session_id: session_id.clone(),
                         through_seq: head,
                     });
-                    pipe_sidecar.enqueue(Arc::from(outcome.envelopes.clone()));
+                    pipe_sidecar.enqueue(&outcome.envelopes);
                     publish(
                         &mut attachments,
                         &outcome.envelopes,
@@ -1030,7 +1014,7 @@ pub(super) async fn run_session_actor(
                         session_id: session_id.clone(),
                         through_seq: head,
                     });
-                    pipe_sidecar.enqueue(Arc::from(outcome.envelopes.clone()));
+                    pipe_sidecar.enqueue(&outcome.envelopes);
                     publish(
                         &mut attachments,
                         &outcome.envelopes,
@@ -1074,7 +1058,7 @@ pub(super) async fn run_session_actor(
                         session_id: session_id.clone(),
                         through_seq: head,
                     });
-                    pipe_sidecar.enqueue(Arc::from(vec![(*outcome.envelope).clone()]));
+                    pipe_sidecar.enqueue(std::slice::from_ref(outcome.envelope.as_ref()));
                     publish(
                         &mut attachments,
                         std::slice::from_ref(outcome.envelope.as_ref()),
@@ -1242,10 +1226,10 @@ pub(super) async fn run_session_actor(
                             session_id: session_id.clone(),
                             through_seq: head,
                         });
-                        pipe_sidecar.enqueue(Arc::clone(&envelopes));
-                        publish(
+                        pipe_sidecar.enqueue(&envelopes);
+                        publish_shared(
                             &mut attachments,
-                            &envelopes,
+                            Arc::clone(&envelopes),
                             catch_up_byte_budget,
                             &metrics,
                             &hooks,
@@ -1446,7 +1430,7 @@ pub(super) async fn run_session_actor(
                                 head = last.seq;
                                 authority_epoch = last.authority_epoch;
                             }
-                            pipe_sidecar.enqueue(Arc::from(envelopes.clone()));
+                            pipe_sidecar.enqueue(&envelopes);
                             publish(
                                 &mut attachments,
                                 &envelopes,
@@ -1654,6 +1638,17 @@ fn publish(
     publish_attachments(attachments, envelopes, byte_budget, metrics);
 }
 
+fn publish_shared(
+    attachments: &mut HashMap<AttachmentId, ActorAttachment>,
+    envelopes: Arc<[RawEnvelope]>,
+    byte_budget: usize,
+    metrics: &HubMetrics,
+    hooks: &Arc<CommitProjection>,
+) {
+    hooks.observe_committed(envelopes.as_ref());
+    publish_shared_attachments(attachments, envelopes, byte_budget, metrics);
+}
+
 /// Publishes a newly seeded session without replaying copied parent facts into
 /// hook execution. The final fork audit is the only newly-originated fact;
 /// observe/roster caches seeing its non-one sequence rebuild from child truth.
@@ -1679,41 +1674,78 @@ fn publish_attachments(
     if !attachments.values().any(|attachment| attachment.active) {
         return;
     }
-    // Weighed once per envelope, not once per attachment.
-    let weights = envelopes
+    publish_shared_attachments(
+        attachments,
+        Arc::from(envelopes.to_vec()),
+        byte_budget,
+        metrics,
+    );
+}
+
+fn publish_shared_attachments(
+    attachments: &mut HashMap<AttachmentId, ActorAttachment>,
+    envelopes: Arc<[RawEnvelope]>,
+    byte_budget: usize,
+    metrics: &HubMetrics,
+) {
+    if !attachments.values().any(|attachment| attachment.active) {
+        return;
+    }
+    // The Arc allocation is shared across every index. Charge its entire
+    // decoded weight once per attachment and keep that charge on the final
+    // queued index, which is the last one whose removal can release the Arc.
+    let batch_weight = envelopes
         .iter()
         .map(envelope_weight_bytes)
-        .collect::<Vec<_>>();
-    // One durable envelope clone per publication, shared across every
-    // attachment lane. The replay task encodes it by reference.
-    let shared = envelopes.iter().cloned().map(Arc::new).collect::<Vec<_>>();
+        .fold(0_usize, usize::saturating_add);
     let mut orphaned = Vec::new();
     for (attachment_id, attachment) in attachments.iter_mut() {
         if !attachment.active {
             continue;
         }
-        for ((envelope, weight), shared) in envelopes.iter().zip(&weights).zip(&shared) {
-            let queued = attachment.queued_bytes.load(Ordering::Acquire);
-            if queued.saturating_add(*weight) > byte_budget {
-                metrics.catch_up_overflows.fetch_add(1, Ordering::Relaxed);
-                attachment.active = false;
-                if attachment
-                    .lagged
-                    .send(Some(attachment.last_buffered_seq))
-                    .is_err()
-                {
-                    orphaned.push(attachment_id.clone());
-                }
-                break;
+        let queued = attachment.queued_bytes.load(Ordering::Acquire);
+        if queued.saturating_add(batch_weight) > byte_budget {
+            metrics.catch_up_overflows.fetch_add(1, Ordering::Relaxed);
+            attachment.active = false;
+            if attachment
+                .lagged
+                .send(Some(attachment.last_buffered_seq))
+                .is_err()
+            {
+                orphaned.push(attachment_id.clone());
             }
-            attachment.queued_bytes.fetch_add(*weight, Ordering::AcqRel);
+            continue;
+        }
+        let accepted_count = envelopes.len().min(attachment.events.capacity());
+        if accepted_count == 0 {
+            metrics.catch_up_overflows.fetch_add(1, Ordering::Relaxed);
+            attachment.active = false;
+            if attachment
+                .lagged
+                .send(Some(attachment.last_buffered_seq))
+                .is_err()
+            {
+                orphaned.push(attachment_id.clone());
+            }
+            continue;
+        }
+        attachment
+            .queued_bytes
+            .fetch_add(batch_weight, Ordering::AcqRel);
+        for (index, envelope) in envelopes.iter().take(accepted_count).enumerate() {
+            let weight = usize::from(index + 1 == accepted_count).saturating_mul(batch_weight);
             match attachment.events.try_send(QueuedEnvelope {
-                weight: *weight,
-                envelope: Arc::clone(shared),
+                weight,
+                envelopes: Arc::clone(&envelopes),
+                index,
             }) {
                 Ok(()) => attachment.last_buffered_seq = envelope.seq,
                 Err(_) => {
-                    attachment.queued_bytes.fetch_sub(*weight, Ordering::AcqRel);
+                    if index == 0 {
+                        attachment
+                            .queued_bytes
+                            .fetch_sub(batch_weight, Ordering::AcqRel);
+                    }
                     if attachment.events.is_closed() {
                         // The receiver is gone — a registration cancelled
                         // mid-flight or a dead replay task. Nobody can ever
@@ -1733,6 +1765,17 @@ fn publish_attachments(
                     }
                     break;
                 }
+            }
+        }
+        if accepted_count < envelopes.len() && attachment.active {
+            metrics.catch_up_overflows.fetch_add(1, Ordering::Relaxed);
+            attachment.active = false;
+            if attachment
+                .lagged
+                .send(Some(attachment.last_buffered_seq))
+                .is_err()
+            {
+                orphaned.push(attachment_id.clone());
             }
         }
     }
@@ -1787,7 +1830,8 @@ mod discarded_result_tests {
             events
                 .try_send(QueuedEnvelope {
                     weight: 1,
-                    envelope: Arc::new(envelope.clone()),
+                    envelopes: Arc::from(vec![envelope.clone()]),
+                    index: 0,
                 })
                 .unwrap();
         }

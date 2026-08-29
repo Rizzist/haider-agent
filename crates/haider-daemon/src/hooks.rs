@@ -24,7 +24,7 @@ use haider_core::{
 };
 use haider_protocol::effect::{AuthorizationVerdict, EffectIntent, EffectPhase};
 use haider_protocol::envelope::{PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION};
-use haider_protocol::error::ErrorCode;
+use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::headless::HeadlessRunEventPayload;
 use haider_protocol::hook::{
     HOOKS_CONFIG_SCHEMA, HookAttachmentMetadata, HookAttachmentSet, HookDecisionKind,
@@ -56,7 +56,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 #[cfg(unix)]
@@ -82,6 +82,10 @@ const SUBSCRIBE_BACKOFF_MIN: Duration = Duration::from_millis(200);
 const SUBSCRIBE_BACKOFF_MAX: Duration = Duration::from_secs(5);
 const HOOK_SNAPSHOT_IDLE_DELAY: Duration = Duration::from_secs(1);
 const HOOK_SNAPSHOT_BUSY_INTERVAL: Duration = Duration::from_secs(5);
+const HOOK_CONTROL_MAX_REQUESTS: usize = 64;
+const HOOK_CONTROL_MAX_BYTES: usize = 64 * 1024;
+const HOOK_DRAIN_PAGE_MAX_REQUESTS: usize = 256;
+const HOOK_DRAIN_PAGE_MAX_BYTES: usize = 16 * 1024 * 1024;
 #[cfg(unix)]
 const HOOK_LEADER_EXIT_POLL_MIN: Duration = Duration::from_millis(1);
 #[cfg(unix)]
@@ -280,7 +284,10 @@ struct HookServiceInner {
     profile_root: PathBuf,
     store: haider_core::SqliteStoreHandle,
     hub: SessionHub,
-    committed: mpsc::UnboundedSender<EngineMessage>,
+    controls: mpsc::Sender<QueuedEngineControl>,
+    control_bytes: Arc<Semaphore>,
+    committed_wake: watch::Sender<Option<DurableHeadWake>>,
+    dispatch_progress: Notify,
     shutdown: watch::Sender<bool>,
     servers: HookServerRegistry,
     pins: RwLock<HashSet<String>>,
@@ -316,6 +323,23 @@ impl HookService {
         }
     }
 
+    async fn send_control(&self, message: EngineMessage, weight: usize) -> Result<(), ()> {
+        let charged = weight.clamp(1, HOOK_CONTROL_MAX_BYTES);
+        let permits = u32::try_from(charged).map_err(|_| ())?;
+        let permit = Arc::clone(&self.inner.control_bytes)
+            .acquire_many_owned(permits)
+            .await
+            .map_err(|_| ())?;
+        self.inner
+            .controls
+            .send(QueuedEngineControl {
+                message,
+                _byte_permit: permit,
+            })
+            .await
+            .map_err(|_| ())
+    }
+
     pub(crate) fn observe_committed(&self, envelopes: &[RawEnvelope]) {
         if envelopes
             .iter()
@@ -323,24 +347,54 @@ impl HookService {
         {
             return;
         }
-        if self
-            .inner
-            .committed
-            .send(EngineMessage::Committed(envelopes.to_vec()))
-            .is_err()
-        {
-            tracing::warn!(
-                target: "haider.hooks",
-                "committed hook observer is closed; facts remain durable but were not dispatched"
-            );
+        if let Some(last) = envelopes.last() {
+            self.inner
+                .committed_wake
+                .send_replace(Some(DurableHeadWake {
+                    session_id: last.session_id.clone(),
+                    head_seq: last.seq,
+                }));
         }
     }
 
-    pub(crate) fn session_deleted(&self, session_id: SessionId) {
+    pub(crate) async fn session_deleted(&self, session_id: SessionId) {
+        let weight = std::mem::size_of::<SessionId>().saturating_add(session_id.as_str().len());
         let _ = self
-            .inner
-            .committed
-            .send(EngineMessage::SessionDeleted(session_id));
+            .send_control(EngineMessage::SessionDeleted(session_id), weight)
+            .await;
+    }
+
+    /// Drains the durable outbox through its current tail before session
+    /// deletion publishes its admission tombstone. A second store check after
+    /// the actor FIFO fence catches an append that won the intervening race.
+    pub(crate) async fn drain_session_before_delete(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(), HaiderError> {
+        let weight = std::mem::size_of::<SessionId>().saturating_add(session_id.as_str().len());
+        let (completed, wait) = oneshot::channel();
+        self.send_control(
+            EngineMessage::DrainSession {
+                session_id,
+                completed,
+            },
+            weight,
+        )
+        .await
+        .map_err(|()| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                "hook engine stopped before session deletion drain",
+                true,
+            )
+        })?;
+        wait.await.map_err(|_| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                "hook engine stopped during session deletion drain",
+                true,
+            )
+        })?
     }
 
     pub(crate) async fn list(
@@ -472,10 +526,12 @@ impl HookService {
                     .retain(|_, digest| digest != &change.digest);
             }
         }
+        let weight = std::mem::size_of::<HookTrustChange>()
+            .saturating_add(change.digest.len())
+            .saturating_add(change.workspace.as_deref().map_or(0, str::len));
         let _ = self
-            .inner
-            .committed
-            .send(EngineMessage::TrustChanged(change.clone()));
+            .send_control(EngineMessage::TrustChanged(change.clone()), weight)
+            .await;
         let revision = if change.revision == 0 {
             u64::try_from(self.inner.store.hook_trust_changes().await?.len()).unwrap_or(u64::MAX)
         } else {
@@ -770,7 +826,9 @@ impl HookEngine {
                 pins.remove(&change.digest);
             }
         }
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (controls, control_receiver) = mpsc::channel(HOOK_CONTROL_MAX_REQUESTS);
+        let control_bytes = Arc::new(Semaphore::new(HOOK_CONTROL_MAX_BYTES));
+        let (committed_wake, wake_receiver) = watch::channel(None);
         let (shutdown, _) = watch::channel(false);
         let observed_trusted = workspace_baselines.clone();
         let service = HookService {
@@ -778,7 +836,10 @@ impl HookEngine {
                 profile_root,
                 store,
                 hub,
-                committed: sender,
+                controls,
+                control_bytes,
+                committed_wake,
+                dispatch_progress: Notify::new(),
                 shutdown,
                 servers: HookServerRegistry::default(),
                 pins: RwLock::new(pins),
@@ -796,7 +857,12 @@ impl HookEngine {
             tracing::warn!(target: "haider.hooks", %error, "hook-engine snapshot persistence failed; journal rebuild remains authoritative");
         }
         let manager_service = service.clone();
-        let task = tokio::spawn(run_engine(receiver, manager_service, state));
+        let task = tokio::spawn(run_engine(
+            control_receiver,
+            wake_receiver,
+            manager_service,
+            state,
+        ));
         Ok((
             service.clone(),
             Self {
@@ -816,9 +882,8 @@ impl HookEngine {
         let (done, wait) = oneshot::channel();
         let _ = self
             .service
-            .inner
-            .committed
-            .send(EngineMessage::Shutdown(done));
+            .send_control(EngineMessage::Shutdown(done), 1)
+            .await;
         let _ = wait.await;
         if let Some(task) = self.task.take() {
             let _ = task.await;
@@ -837,10 +902,24 @@ impl Drop for HookEngine {
 }
 
 enum EngineMessage {
-    Committed(Vec<RawEnvelope>),
+    DrainSession {
+        session_id: SessionId,
+        completed: oneshot::Sender<Result<(), HaiderError>>,
+    },
     SessionDeleted(SessionId),
     TrustChanged(HookTrustChange),
     Shutdown(oneshot::Sender<()>),
+}
+
+struct QueuedEngineControl {
+    message: EngineMessage,
+    _byte_permit: OwnedSemaphorePermit,
+}
+
+#[derive(Clone)]
+struct DurableHeadWake {
+    session_id: SessionId,
+    head_seq: u64,
 }
 
 struct EngineState {
@@ -855,6 +934,15 @@ struct EngineState {
 
 type BatchDiscoveryCache =
     HashMap<SessionId, Option<(SessionMetadataV1, Result<Discovery, String>)>>;
+
+#[derive(Default)]
+struct HookDispatchFlights {
+    active: HashSet<(SessionId, u64)>,
+    completed: HashSet<(SessionId, u64)>,
+    blocked: HashSet<(SessionId, u64)>,
+}
+
+type InflightHookDispatches = Arc<Mutex<HookDispatchFlights>>;
 
 struct SubscriberHandle {
     sender: mpsc::Sender<SubscriberMessage>,
@@ -1443,12 +1531,14 @@ async fn attempt_scheduled_snapshot(
 }
 
 async fn run_engine(
-    mut messages: mpsc::UnboundedReceiver<EngineMessage>,
+    mut controls: mpsc::Receiver<QueuedEngineControl>,
+    mut committed_wake: watch::Receiver<Option<DurableHeadWake>>,
     service: HookService,
     mut state: EngineState,
 ) {
     let mut jobs = JoinSet::new();
-    if !replay_pending_dispatches(&service, &mut state, &mut jobs).await {
+    let inflight_dispatches = Arc::new(Mutex::new(HookDispatchFlights::default()));
+    if !replay_pending_dispatches(&service, &mut state, &mut jobs, &inflight_dispatches).await {
         state.subscribers.clear();
         jobs.abort_all();
         while jobs.join_next().await.is_some() {}
@@ -1461,8 +1551,40 @@ async fn run_engine(
         let snapshot_deadline = snapshot_schedule.deadline();
         tokio::select! {
             biased;
-            message = messages.recv() => {
-                let Some(message) = message else {
+            changed = committed_wake.changed() => {
+                if changed.is_err() {
+                    continue;
+                }
+                let Some(wake) = committed_wake.borrow_and_update().clone() else {
+                    continue;
+                };
+                tracing::trace!(
+                    target: "haider.hooks",
+                    session_id = %wake.session_id,
+                    head_seq = wake.head_seq,
+                    "draining durable hook outbox wake"
+                );
+                if matches!(
+                    drain_hook_dispatch_page(
+                        &service,
+                        &mut state,
+                        &mut jobs,
+                        &mut snapshot_schedule,
+                        &mut blocked_run_acks,
+                        &inflight_dispatches,
+                    ).await,
+                    HookDrainPage::Progress
+                ) && controls.is_empty()
+                {
+                    // An extra empty read is intentional: only the durable
+                    // outbox can prove this page reached its current tail when
+                    // count and byte ceilings may stop at different rows. A
+                    // queued control gets one turn first and re-arms the wake.
+                    service.inner.committed_wake.send_modify(|_| {});
+                }
+            }
+            control = controls.recv() => {
+                let Some(control) = control else {
                     if let Err(error) = attempt_scheduled_snapshot(
                         &service,
                         &state,
@@ -1472,113 +1594,31 @@ async fn run_engine(
                     }
                     break;
                 };
-                // Drain cycle: consume the received message plus every
-                // already-queued Committed batch, then acknowledge all
-                // handled outbox rows in ONE durable transaction instead
-                // of one autocommit DELETE per event. A control message
-                // ends the cycle and is handled after the flush, preserving
-                // arrival order; the ack batch is capped so one transaction
-                // never grows unbounded under sustained commit load.
-                let mut next = Some(message);
-                let mut acks: Vec<(SessionId, u64)> = Vec::new();
-                let mut ordered_ack_scopes = HashSet::new();
-                let mut terminal_trust_acks = HashSet::new();
-                let mut terminal_snapshot = false;
-                let control = loop {
-                    match next.take() {
-                        Some(EngineMessage::Committed(envelopes)) => {
-                            snapshot_schedule.note_commit(Instant::now());
-                            let mut batch_discoveries = BatchDiscoveryCache::new();
-                            let mut aborted = false;
-                            let mut batch_terminal = false;
-                            for envelope in envelopes {
-                                // Run-scoped trust must remain replayable until
-                                // every earlier row in that run is acknowledged.
-                                // Handle those server hooks synchronously so
-                                // their outbox ACKs preserve journal order.
-                                let ordered_run_scope = envelope.run_id.as_ref().and_then(|run_id| {
-                                    let scope = (envelope.session_id.clone(), run_id.clone());
-                                    state.run_trust.contains(&scope).then_some(scope)
-                                });
-                                let ack_count = acks.len();
-                                let outcome = handle_and_complete(
-                                    &service,
-                                    &mut state,
-                                    &mut jobs,
-                                    envelope,
-                                    ordered_run_scope.is_none(),
-                                    &mut acks,
-                                    &mut batch_discoveries,
-                                )
-                                .await;
-                                batch_terminal |= outcome.terminal_scope.is_some();
-                                if !outcome.completed {
-                                    if let Some(scope) = ordered_run_scope {
-                                        blocked_run_acks.insert(scope);
-                                    }
-                                    aborted = true;
-                                    break;
-                                }
-                                if acks.len() > ack_count
-                                    && let Some(scope) = &ordered_run_scope
-                                {
-                                    ordered_ack_scopes.insert(scope.clone());
-                                }
-                                if acks.len() > ack_count
-                                    && let Some(scope) = outcome.terminal_scope
-                                    && state.terminal_run_trust.contains(&scope)
-                                    && !blocked_run_acks.contains(&scope)
-                                {
-                                    terminal_trust_acks.insert(scope);
-                                }
-                            }
-                            terminal_snapshot |= batch_terminal;
-                            let cadence_due = snapshot_schedule
-                                .deadline()
-                                .is_some_and(|deadline| deadline <= Instant::now());
-                            if aborted
-                                || batch_terminal
-                                || cadence_due
-                                || acks.len() >= HOOK_ACK_BATCH_MAX
-                            {
-                                break None;
-                            }
-                            match messages.try_recv() {
-                                Ok(message) => next = Some(message),
-                                Err(_) => break None,
-                            }
-                        }
-                        other => break other,
+                match control.message {
+                    EngineMessage::DrainSession {
+                        session_id,
+                        completed,
+                    } => {
+                        let result = drain_hook_dispatches_through_session(
+                            &service,
+                            &mut state,
+                            &mut jobs,
+                            &mut snapshot_schedule,
+                            &mut blocked_run_acks,
+                            &inflight_dispatches,
+                            &session_id,
+                        ).await;
+                        let _ = completed.send(result);
+                        service.inner.committed_wake.send_modify(|_| {});
                     }
-                };
-                if flush_hook_dispatch_acks(&service, acks).await {
-                    for scope in terminal_trust_acks {
-                        state.terminal_run_trust.remove(&scope);
-                        state.run_trust.remove(&scope);
-                    }
-                } else {
-                    blocked_run_acks.extend(ordered_ack_scopes);
-                }
-                let cadence_due = snapshot_schedule
-                    .deadline()
-                    .is_some_and(|deadline| deadline <= Instant::now());
-                if (terminal_snapshot || cadence_due)
-                    && let Err(error) = attempt_scheduled_snapshot(
-                        &service,
-                        &state,
-                        &mut snapshot_schedule,
-                    ).await
-                {
-                    tracing::warn!(target: "haider.hooks", %error, "hook-engine scheduled snapshot persistence failed; journal rebuild remains authoritative");
-                }
-                match control {
-                    Some(EngineMessage::TrustChanged(change)) => {
+                    EngineMessage::TrustChanged(change) => {
                         if !change.trusted {
                             service.inner.servers.kill_digest(&change.digest);
                             state.subscribers.retain(|_, handle| handle.digest != change.digest);
                         }
+                        service.inner.committed_wake.send_modify(|_| {});
                     }
-                    Some(EngineMessage::SessionDeleted(session_id)) => {
+                    EngineMessage::SessionDeleted(session_id) => {
                         state.sessions.remove(&session_id);
                         state.through_seq.remove(&session_id);
                         state.through_digest.remove(&session_id);
@@ -1603,8 +1643,20 @@ async fn run_engine(
                         {
                             tracing::warn!(target: "haider.hooks", %error, "hook-engine snapshot persistence failed after session deletion");
                         }
+                        service.inner.committed_wake.send_modify(|_| {});
                     }
-                    Some(EngineMessage::Shutdown(done)) => {
+                    EngineMessage::Shutdown(done) => {
+                        while matches!(
+                            drain_hook_dispatch_page(
+                                &service,
+                                &mut state,
+                                &mut jobs,
+                                &mut snapshot_schedule,
+                                &mut blocked_run_acks,
+                                &inflight_dispatches,
+                            ).await,
+                            HookDrainPage::Progress
+                        ) {}
                         state.subscribers.clear();
                         jobs.abort_all();
                         while jobs.join_next().await.is_some() {}
@@ -1618,9 +1670,6 @@ async fn run_engine(
                         let _ = done.send(());
                         break;
                     }
-                    // The cycle loop only breaks with a non-Committed
-                    // message or None; Committed is consumed above.
-                    Some(EngineMessage::Committed(_)) | None => {}
                 }
             }
             _ = wait_for_snapshot_deadline(snapshot_deadline) => {
@@ -1633,6 +1682,197 @@ async fn run_engine(
                 }
             }
             _ = jobs.join_next(), if !jobs.is_empty() => {}
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HookDrainPage {
+    Empty,
+    Progress,
+    Waiting,
+    Blocked,
+}
+
+async fn drain_hook_dispatch_page(
+    service: &HookService,
+    state: &mut EngineState,
+    jobs: &mut JoinSet<()>,
+    snapshot_schedule: &mut SnapshotSchedule,
+    blocked_run_acks: &mut HashSet<(SessionId, RunId)>,
+    inflight_dispatches: &InflightHookDispatches,
+) -> HookDrainPage {
+    // A completed coordinate from an earlier page is safe to forget before a
+    // fresh database read: its ACK committed before it entered this set. Any
+    // job completing after this point remains visible through the whole page
+    // and suppresses a stale decoded copy of the just-acknowledged row.
+    inflight_dispatches
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .completed
+        .clear();
+    let pending = match service
+        .inner
+        .store
+        .pending_hook_dispatches_bounded(HOOK_DRAIN_PAGE_MAX_REQUESTS, HOOK_DRAIN_PAGE_MAX_BYTES)
+        .await
+    {
+        Ok(pending) => pending,
+        Err(error) => {
+            tracing::warn!(target: "haider.hooks", ?error, "hook recovery outbox read failed");
+            return HookDrainPage::Blocked;
+        }
+    };
+    if pending.is_empty() {
+        return HookDrainPage::Empty;
+    }
+    snapshot_schedule.note_commit(Instant::now());
+    let mut acks = Vec::with_capacity(pending.len());
+    let mut ordered_ack_scopes = HashSet::new();
+    let mut terminal_trust_acks = HashSet::new();
+    let mut terminal_snapshot = false;
+    let mut aborted = false;
+    let mut started_dispatch = false;
+    let mut waiting_on_inflight = false;
+    let mut blocked_inflight = false;
+    let mut batch_discoveries = BatchDiscoveryCache::new();
+    for envelope in pending {
+        let coordinate = (envelope.session_id.clone(), envelope.seq);
+        let (blocked, completed, active) = {
+            let flight = inflight_dispatches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                flight.blocked.contains(&coordinate),
+                flight.completed.contains(&coordinate),
+                flight.active.contains(&coordinate),
+            )
+        };
+        if blocked {
+            blocked_inflight = true;
+            continue;
+        }
+        if completed {
+            continue;
+        }
+        if active {
+            waiting_on_inflight = true;
+            continue;
+        }
+        started_dispatch = true;
+        let ordered_run_scope = envelope.run_id.as_ref().and_then(|run_id| {
+            let scope = (envelope.session_id.clone(), run_id.clone());
+            state.run_trust.contains(&scope).then_some(scope)
+        });
+        let ack_count = acks.len();
+        let outcome = handle_and_complete(
+            HookHandleContext {
+                service,
+                state,
+                jobs,
+                acks: &mut acks,
+                batch_discoveries: &mut batch_discoveries,
+                inflight_dispatches,
+            },
+            envelope,
+            ordered_run_scope.is_none(),
+        )
+        .await;
+        terminal_snapshot |= outcome.terminal_scope.is_some();
+        if !outcome.completed {
+            if let Some(scope) = ordered_run_scope {
+                blocked_run_acks.insert(scope);
+            }
+            aborted = true;
+            break;
+        }
+        if acks.len() > ack_count
+            && let Some(scope) = &ordered_run_scope
+        {
+            ordered_ack_scopes.insert(scope.clone());
+        }
+        if acks.len() > ack_count
+            && let Some(scope) = outcome.terminal_scope
+            && state.terminal_run_trust.contains(&scope)
+            && !blocked_run_acks.contains(&scope)
+        {
+            terminal_trust_acks.insert(scope);
+        }
+    }
+    let acknowledgements_flushed = flush_hook_dispatch_acks(service, acks).await;
+    if acknowledgements_flushed {
+        for scope in terminal_trust_acks {
+            state.terminal_run_trust.remove(&scope);
+            state.run_trust.remove(&scope);
+        }
+    } else {
+        blocked_run_acks.extend(ordered_ack_scopes);
+    }
+    let cadence_due = snapshot_schedule
+        .deadline()
+        .is_some_and(|deadline| deadline <= Instant::now());
+    if (terminal_snapshot || cadence_due)
+        && let Err(error) = attempt_scheduled_snapshot(service, state, snapshot_schedule).await
+    {
+        tracing::warn!(target: "haider.hooks", %error, "hook-engine scheduled snapshot persistence failed; journal rebuild remains authoritative");
+    }
+    if aborted || !acknowledgements_flushed || (!started_dispatch && blocked_inflight) {
+        HookDrainPage::Blocked
+    } else if !started_dispatch && waiting_on_inflight {
+        HookDrainPage::Waiting
+    } else {
+        HookDrainPage::Progress
+    }
+}
+
+async fn drain_hook_dispatches_through_session(
+    service: &HookService,
+    state: &mut EngineState,
+    jobs: &mut JoinSet<()>,
+    snapshot_schedule: &mut SnapshotSchedule,
+    blocked_run_acks: &mut HashSet<(SessionId, RunId)>,
+    inflight_dispatches: &InflightHookDispatches,
+    session_id: &SessionId,
+) -> Result<(), HaiderError> {
+    loop {
+        let progress = service.inner.dispatch_progress.notified();
+        match service
+            .inner
+            .store
+            .has_pending_hook_dispatches(session_id)
+            .await
+        {
+            Ok(false) => return Ok(()),
+            Err(error) => return Err(error),
+            Ok(true) => {}
+        }
+        match drain_hook_dispatch_page(
+            service,
+            state,
+            jobs,
+            snapshot_schedule,
+            blocked_run_acks,
+            inflight_dispatches,
+        )
+        .await
+        {
+            HookDrainPage::Progress => {}
+            HookDrainPage::Waiting => progress.await,
+            HookDrainPage::Empty | HookDrainPage::Blocked => {
+                if !service
+                    .inner
+                    .store
+                    .has_pending_hook_dispatches(session_id)
+                    .await?
+                {
+                    return Ok(());
+                }
+                return Err(HaiderError::new(
+                    ErrorCode::Busy,
+                    "hook dispatch remains pending; retry session deletion",
+                    true,
+                ));
+            }
         }
     }
 }
@@ -1650,10 +1890,6 @@ fn terminal_run_scope(
     }
     Some((envelope.session_id.clone(), envelope.run_id.clone()?))
 }
-
-/// Upper bound on outbox acknowledgements folded into one drain-cycle
-/// transaction; a longer backlog flushes in successive batches.
-const HOOK_ACK_BATCH_MAX: usize = 256;
 
 /// Acknowledges one drain cycle's handled hook-dispatch rows in a single
 /// durable transaction. On failure the rows stay in the outbox and replay
@@ -1673,9 +1909,18 @@ async fn replay_pending_dispatches(
     service: &HookService,
     state: &mut EngineState,
     jobs: &mut JoinSet<()>,
+    inflight_dispatches: &InflightHookDispatches,
 ) -> bool {
     loop {
-        let pending = match service.inner.store.pending_hook_dispatches(1_024).await {
+        let pending = match service
+            .inner
+            .store
+            .pending_hook_dispatches_bounded(
+                HOOK_DRAIN_PAGE_MAX_REQUESTS,
+                HOOK_DRAIN_PAGE_MAX_BYTES,
+            )
+            .await
+        {
             Ok(pending) => pending,
             Err(error) => {
                 tracing::warn!(target: "haider.hooks", ?error, "hook recovery outbox read failed");
@@ -1692,13 +1937,16 @@ async fn replay_pending_dispatches(
         let mut batch_discoveries = BatchDiscoveryCache::new();
         for envelope in pending {
             if !handle_and_complete(
-                service,
-                state,
-                jobs,
+                HookHandleContext {
+                    service,
+                    state,
+                    jobs,
+                    acks: &mut acks,
+                    batch_discoveries: &mut batch_discoveries,
+                    inflight_dispatches,
+                },
                 envelope,
                 false,
-                &mut acks,
-                &mut batch_discoveries,
             )
             .await
             .completed
@@ -1720,15 +1968,28 @@ struct HandleOutcome {
     completed: bool,
 }
 
+struct HookHandleContext<'a> {
+    service: &'a HookService,
+    state: &'a mut EngineState,
+    jobs: &'a mut JoinSet<()>,
+    acks: &'a mut Vec<(SessionId, u64)>,
+    batch_discoveries: &'a mut BatchDiscoveryCache,
+    inflight_dispatches: &'a InflightHookDispatches,
+}
+
 async fn handle_and_complete(
-    service: &HookService,
-    state: &mut EngineState,
-    jobs: &mut JoinSet<()>,
+    context: HookHandleContext<'_>,
     envelope: RawEnvelope,
     defer_servers: bool,
-    acks: &mut Vec<(SessionId, u64)>,
-    batch_discoveries: &mut BatchDiscoveryCache,
 ) -> HandleOutcome {
+    let HookHandleContext {
+        service,
+        state,
+        jobs,
+        acks,
+        batch_discoveries,
+        inflight_dispatches,
+    } = context;
     let payload = decode_committed_payload(&envelope.payload);
     let terminal_scope = terminal_run_scope(&envelope, &payload);
     let committed = DecodedCommittedEnvelope {
@@ -1756,23 +2017,47 @@ async fn handle_and_complete(
     }
     if defer_servers && !pending.is_empty() {
         let service = service.clone();
+        let coordinate = (envelope.session_id.clone(), envelope.seq);
+        inflight_dispatches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .insert(coordinate.clone());
+        let inflight_dispatches = Arc::clone(inflight_dispatches);
         jobs.spawn(async move {
             let handled = complete_server_fires(&service, pending).await;
             if let Some(scope) = &terminal_server_scope {
                 service.inner.servers.kill_scope(scope);
             }
-            if handled {
+            let acknowledged = if handled {
                 match service
                     .inner
                     .store
                     .complete_hook_dispatch(&envelope.session_id, envelope.seq)
                     .await
                 {
-                    Ok(()) => {}
+                    Ok(()) => true,
                     Err(error) => {
                         tracing::warn!(target: "haider.hooks", ?error, "hook recovery outbox acknowledgement failed");
+                        false
                     }
                 }
+            } else {
+                false
+            };
+            let mut flights = inflight_dispatches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            flights.active.remove(&coordinate);
+            if acknowledged {
+                flights.completed.insert(coordinate);
+            } else {
+                flights.blocked.insert(coordinate);
+            }
+            drop(flights);
+            service.inner.dispatch_progress.notify_one();
+            if acknowledged {
+                service.inner.committed_wake.send_modify(|_| {});
             }
         });
         return HandleOutcome {

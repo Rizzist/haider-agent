@@ -580,10 +580,13 @@ impl PipeNativeWriter {
         let state = if let Some(mut state) = known {
             let already_processed = committed
                 .last()
-                .is_none_or(|last| last.seq <= state.cursor.pending_seq);
-            let directly_follows = committed
-                .first()
-                .is_some_and(|first| state.cursor.pending_seq.checked_add(1) == Some(first.seq));
+                .map_or(known_committed_head <= state.cursor.pending_seq, |last| {
+                    last.seq <= state.cursor.pending_seq
+                });
+            let directly_follows = !committed.is_empty()
+                && committed.first().is_some_and(|first| {
+                    state.cursor.pending_seq.checked_add(1) == Some(first.seq)
+                });
             if already_processed {
                 // First-touch rebuild may have absorbed later queued commits.
                 // Their queue entries are acknowledgements, not cursor gaps,

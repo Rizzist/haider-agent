@@ -7119,6 +7119,19 @@ impl Store {
         append_envelopes(self, envelopes, true)
     }
 
+    /// Consuming-path append: stamps the caller-owned allocation in place.
+    pub fn append_owned(&self, envelopes: &mut [RawEnvelope]) -> StoreResult<CommittedSeqRange> {
+        append_owned_envelopes(self, envelopes, false)
+    }
+
+    /// Consuming-path live-worker append with the terminal transition gate.
+    pub fn append_worker_owned(
+        &self,
+        envelopes: &mut [RawEnvelope],
+    ) -> StoreResult<CommittedSeqRange> {
+        append_owned_envelopes(self, envelopes, true)
+    }
+
     /// Commits already-queued actor appends under one outer SQLite transaction.
     ///
     /// A savepoint isolates each logical request, preserving the pre-batching
@@ -7136,6 +7149,29 @@ impl Store {
         &self,
         batches: &mut [JournalAppendBatch],
     ) -> StoreResult<Vec<StoreResult<CommittedSeqRange>>> {
+        let mut owned = batches
+            .iter()
+            .map(|batch| JournalAppendBatch {
+                envelopes: batch.envelopes.clone(),
+                validate_worker_transitions: batch.validate_worker_transitions,
+            })
+            .collect::<Vec<_>>();
+        let results = self.append_owned_group(&mut owned)?;
+        for ((batch, owned), result) in batches.iter_mut().zip(owned).zip(&results) {
+            if result.is_ok() {
+                batch.envelopes = owned.envelopes;
+            }
+        }
+        Ok(results)
+    }
+
+    /// Owned form of [`Self::append_group`]. Successful batches are stamped
+    /// in their original allocations; request-local failures never escape the
+    /// daemon's consuming adapter.
+    pub fn append_owned_group(
+        &self,
+        batches: &mut [JournalAppendBatch],
+    ) -> StoreResult<Vec<StoreResult<CommittedSeqRange>>> {
         if batches.is_empty() {
             return Err(store_error(
                 ErrorCode::InvalidArgument,
@@ -7144,7 +7180,7 @@ impl Store {
             ));
         }
         if let [batch] = batches {
-            return match append_envelopes(
+            return match append_owned_envelopes(
                 self,
                 &mut batch.envelopes,
                 batch.validate_worker_transitions,
@@ -7160,11 +7196,11 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite_error)?;
         let mut outcomes = Vec::with_capacity(batches.len());
-        for batch in batches.iter() {
+        for batch in batches.iter_mut() {
             let savepoint = transaction.savepoint().map_err(map_sqlite_error)?;
             match append_envelopes_in_transaction(
                 &savepoint,
-                &batch.envelopes,
+                &mut batch.envelopes,
                 batch.validate_worker_transitions,
             ) {
                 Ok(outcome) => {
@@ -7184,7 +7220,6 @@ impl Store {
         for (batch, outcome) in batches.iter_mut().zip(outcomes) {
             match outcome {
                 Ok(outcome) => {
-                    batch.envelopes = outcome.stamped;
                     update_append_caches(
                         self,
                         &connection,
@@ -10829,6 +10864,19 @@ impl Store {
     /// event, so recovery can distinguish durable truth from an accepted but
     /// uncommitted attempt without relying on live publication.
     pub fn pending_hook_dispatches(&self, limit: usize) -> StoreResult<Vec<RawEnvelope>> {
+        self.pending_hook_dispatches_bounded(limit, usize::MAX)
+    }
+
+    /// Reads one count- and true-weight-bounded page of durable hook work.
+    ///
+    /// The first row is always returned when `limit > 0`, even when that one
+    /// envelope exceeds `byte_budget`. This preserves forward progress while
+    /// bounding ordinary pages by `byte_budget` plus at most one decoded row.
+    pub fn pending_hook_dispatches_bounded(
+        &self,
+        limit: usize,
+        byte_budget: usize,
+    ) -> StoreResult<Vec<RawEnvelope>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -10840,12 +10888,13 @@ impl Store {
                  FROM hook_dispatch_outbox AS o
                  JOIN events AS e
                    ON e.session_id = o.session_id AND e.seq = o.seq
-                 ORDER BY e.committed_at_ms ASC, e.session_id ASC, e.seq ASC
+                 ORDER BY o.rowid ASC
                  LIMIT ?1",
             )
             .map_err(map_sqlite_error)?;
         let mut rows = statement.query([limit]).map_err(map_sqlite_error)?;
         let mut envelopes = Vec::new();
+        let mut resident_bytes = 0_usize;
         while let Some(row) = rows.next().map_err(map_sqlite_error)? {
             let session_id: String = row.get(0).map_err(map_sqlite_error)?;
             let seq: i64 = row.get(1).map_err(map_sqlite_error)?;
@@ -10861,9 +10910,36 @@ impl Store {
                     "hook outbox coordinates disagree with the authoritative envelope",
                 ));
             }
+            let weight = envelope_weight_bytes(&envelope);
+            if !envelopes.is_empty() && resident_bytes.saturating_add(weight) > byte_budget {
+                break;
+            }
+            resident_bytes = resident_bytes.saturating_add(weight);
             envelopes.push(envelope);
+            if resident_bytes >= byte_budget {
+                break;
+            }
         }
         Ok(envelopes)
+    }
+
+    /// Reports whether any committed hook input for one session still awaits
+    /// dispatch. Session deletion uses this after its actor FIFO fence so a
+    /// coalesced wake can never be erased together with the authoritative
+    /// outbox row it names.
+    pub fn has_pending_hook_dispatches(&self, session_id: &SessionId) -> StoreResult<bool> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM hook_dispatch_outbox
+                     WHERE session_id = ?1
+                     LIMIT 1
+                 )",
+                [session_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(map_sqlite_error)
     }
 
     /// Idempotently acknowledges one recovered/live hook-dispatch row after
@@ -18907,12 +18983,22 @@ impl EventStore for Store {
 
 struct AppendTransactionOutcome {
     range: CommittedSeqRange,
-    stamped: Vec<RawEnvelope>,
     changes_graph_reduction: bool,
     changes_graph_telemetry: bool,
 }
 
 fn append_envelopes(
+    store: &Store,
+    envelopes: &mut [RawEnvelope],
+    validate_worker_transitions: bool,
+) -> StoreResult<CommittedSeqRange> {
+    let mut owned = envelopes.to_vec();
+    let range = append_owned_envelopes(store, &mut owned, validate_worker_transitions)?;
+    envelopes.clone_from_slice(&owned);
+    Ok(range)
+}
+
+fn append_owned_envelopes(
     store: &Store,
     envelopes: &mut [RawEnvelope],
     validate_worker_transitions: bool,
@@ -18926,7 +19012,6 @@ fn append_envelopes(
     let outcome =
         append_envelopes_in_transaction(&transaction, envelopes, validate_worker_transitions)?;
     transaction.commit().map_err(map_sqlite_error)?;
-    envelopes.clone_from_slice(&outcome.stamped);
     update_append_caches(
         store,
         &connection,
@@ -18940,7 +19025,7 @@ fn append_envelopes(
 
 fn append_envelopes_in_transaction(
     transaction: &Connection,
-    envelopes: &[RawEnvelope],
+    envelopes: &mut [RawEnvelope],
     validate_worker_transitions: bool,
 ) -> StoreResult<AppendTransactionOutcome> {
     let (session, batch_len) = same_session_batch(envelopes)?;
@@ -18980,7 +19065,6 @@ fn append_envelopes_in_transaction(
     let last_seq = first_seq
         .checked_add(batch_len - 1)
         .ok_or_else(|| corrupt("event sequence space is exhausted"))?;
-    let mut stamped = Vec::with_capacity(envelopes.len());
     {
         let mut insert = transaction
             .prepare_cached(
@@ -18989,14 +19073,13 @@ fn append_envelopes_in_transaction(
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )
             .map_err(map_sqlite_error)?;
-        for (seq, envelope) in (first_seq..=last_seq).zip(envelopes.iter()) {
-            let mut envelope = envelope.clone();
+        for (seq, envelope) in (first_seq..=last_seq).zip(envelopes.iter_mut()) {
             envelope.seq = seq;
             envelope.committed_at_ms = committed_at_ms;
-            stamp_queue_delta(&mut envelope)?;
-            stamp_workspace_mutation(transaction, &mut envelope)?;
-            let checkpoint = stamp_checkpoint_record(transaction, &mut envelope)?;
-            let envelope_bytes = encode_envelope(&envelope).map_err(|error| {
+            stamp_queue_delta(envelope)?;
+            stamp_workspace_mutation(transaction, envelope)?;
+            let checkpoint = stamp_checkpoint_record(transaction, envelope)?;
+            let envelope_bytes = encode_envelope(envelope).map_err(|error| {
                 store_error(
                     ErrorCode::InvalidArgument,
                     format!("cannot serialize event envelope: {error}"),
@@ -19010,26 +19093,24 @@ fn append_envelopes_in_transaction(
                     envelope_bytes,
                     envelope.event_id.as_str(),
                     committed_at_sql,
-                    payload_kind(&envelope),
+                    payload_kind(envelope),
                 ])
                 .map_err(map_sqlite_error)?;
-            enqueue_hook_dispatch(transaction, &envelope)?;
+            enqueue_hook_dispatch(transaction, envelope)?;
             if let Some(checkpoint) = checkpoint.as_ref() {
-                project_checkpoint_record(transaction, &envelope, checkpoint)?;
+                project_checkpoint_record(transaction, envelope, checkpoint)?;
             }
-            stamped.push(envelope);
         }
     }
-    update_run_head_projection_after_append(transaction, &session, &stamped)?;
-    update_workflow_graph_projection_after_append(transaction, &session, &stamped)?;
-    update_branch_heads(transaction, &stamped)?;
+    update_run_head_projection_after_append(transaction, &session, envelopes)?;
+    update_workflow_graph_projection_after_append(transaction, &session, envelopes)?;
+    update_branch_heads(transaction, envelopes)?;
     Ok(AppendTransactionOutcome {
         range: CommittedSeqRange {
             session_id: session,
             first_seq,
             last_seq,
         },
-        stamped,
         changes_graph_reduction,
         changes_graph_telemetry,
     })
