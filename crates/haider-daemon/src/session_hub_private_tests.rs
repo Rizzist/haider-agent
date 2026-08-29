@@ -1214,6 +1214,555 @@ impl FrameSink for CapturingFrameSink {
     }
 }
 
+struct ForkPublicationGate {
+    child: SessionId,
+    gated: AtomicBool,
+    reached: mpsc::UnboundedSender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl SessionHubObserver for ForkPublicationGate {
+    fn observe(&self, observation: HubObservation) {
+        let is_child_commit = matches!(
+            observation,
+            HubObservation::Persisted { ref session_id, .. } if *session_id == self.child
+        );
+        if !is_child_commit || self.gated.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _ = self.reached.send(());
+        self.release
+            .lock()
+            .expect("fork publication release")
+            .recv()
+            .expect("test releases fork publication");
+    }
+}
+
+fn listed_sessions(sink: &CapturingFrameSink, request_id: &str) -> Vec<SessionSummary> {
+    sink.0
+        .lock()
+        .expect("captured roster frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id: seen,
+                body: ResponseBody::SessionList { sessions, .. },
+            } if seen.as_str() == request_id => Some(sessions.clone()),
+            _ => None,
+        })
+        .expect("session-list response")
+}
+
+/// The durable child row is not the roster linearization point. While a fork
+/// is paused immediately after commit, list observers see no child. Once the
+/// fork returns, the child has an actor, Pipe coverage through its full head,
+/// prompt provenance in the roster, and sequence-zero attachment replay.
+///
+/// MUTATION CHECK: remove the `fork_candidates` list filter, publish the
+/// commit projection before Pipe maintenance, or install the actor after
+/// removing the fence. Expected failure: the during-commit list exposes the
+/// child or one of the post-publication readiness assertions fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fork_roster_publication_waits_for_actor_and_complete_pipe_projection() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let child = SessionId::new("fork-publication-barrier-child");
+    let (reached_tx, mut reached_rx) = mpsc::unbounded_channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let observer = Arc::new(ForkPublicationGate {
+        child: child.clone(),
+        gated: AtomicBool::new(false),
+        reached: reached_tx,
+        release: Mutex::new(release_rx),
+    });
+    let hub = SessionHub::with_observer(store.clone(), SessionHubConfig::default(), observer)
+        .expect("hub");
+    hub.install_accounts(transcription_facade(Arc::new(
+        haider_accounts::MemoryVault::default(),
+    )))
+    .expect("install scope vault");
+    let (source, _, _) = create_fork_ready_source(&hub, &store, "fork-publication-barrier").await;
+    let prompt_seq = store
+        .read(&source, 0, 64)
+        .await
+        .expect("source transcript")
+        .into_iter()
+        .find_map(|envelope| {
+            matches!(
+                serde_json::from_value::<EventPayload>(envelope.payload),
+                Ok(EventPayload::UserMessage { .. })
+            )
+            .then_some(envelope.seq)
+        })
+        .expect("source user prompt");
+    let request_json = serde_json::json!({
+        "source": &source,
+        "prompt": { "seq": prompt_seq },
+    })
+    .to_string();
+    let command = SessionPromptForkCommand {
+        command_id: "fork-publication-barrier-command".into(),
+        request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+        request_json,
+        source_session_id: source,
+        session_id: child.clone(),
+        worker_generation: store.worker_generation(),
+        source_branch_id: None,
+        prompt_seq,
+        name: Some("Published fork".into()),
+        audit_event_id: EventId::new("fork-publication-barrier-audit"),
+        device_id: DeviceId::new("fork-publication-barrier-device"),
+    };
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([haider_rpc::Capability::View]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("roster observer");
+    sink.0.lock().expect("frames").clear();
+
+    let fork_hub = hub.clone();
+    let fork = tokio::spawn(async move { fork_hub.fork_session_from_prompt(command).await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), reached_rx.recv())
+        .await
+        .expect("fork reaches durable boundary")
+        .expect("observer remains open");
+    connection
+        .request(
+            RequestId::new("list-during-fork-publication"),
+            RequestBody::SessionList {
+                cursor: None,
+                limit: 100,
+            },
+        )
+        .await
+        .expect("list during fork");
+    assert!(
+        listed_sessions(&sink, "list-during-fork-publication")
+            .iter()
+            .all(|summary| summary.session_id != child),
+        "a durable but unprojected fork must remain outside the roster"
+    );
+
+    release_tx.send(()).expect("release publication barrier");
+    let outcome = fork.await.expect("fork task").expect("fork publishes");
+    let SessionForkOutcome::Committed { created, .. } = outcome else {
+        panic!("fresh prompt fork commits");
+    };
+    assert!(
+        hub.existing_actor(&child)
+            .expect("actor registry")
+            .is_some(),
+        "the actor exists before roster publication"
+    );
+    assert!(matches!(
+        hub.inner.pipe_native.confirmed_coverage(&child),
+        Some((coverage, generation))
+            if coverage >= created.created_seq && generation > 0
+    ));
+
+    connection
+        .request(
+            RequestId::new("list-after-fork-publication"),
+            RequestBody::SessionList {
+                cursor: None,
+                limit: 100,
+            },
+        )
+        .await
+        .expect("list after fork");
+    let summary = listed_sessions(&sink, "list-after-fork-publication")
+        .into_iter()
+        .find(|summary| summary.session_id == child)
+        .expect("published child appears in roster");
+    assert_eq!(summary.forked_from, created.forked_from);
+    assert!(
+        summary.forked_from.is_some(),
+        "prompt provenance is projected"
+    );
+
+    sink.0.lock().expect("frames").clear();
+    connection
+        .request(
+            RequestId::new("attach-published-fork"),
+            RequestBody::SessionAttach {
+                session_id: child.clone(),
+                after_seq: 0,
+                mode: AttachMode::View,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("published child is addressable");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let caught_up = sink.0.lock().expect("frames").iter().any(|frame| {
+                matches!(
+                    frame,
+                    WireFrame::AttachCaughtUp { high_water_seq, .. }
+                        if *high_water_seq == created.created_seq
+                )
+            });
+            if caught_up {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("sequence-zero replay catches up");
+    let replayed = sink
+        .0
+        .lock()
+        .expect("frames")
+        .iter()
+        .filter_map(|frame| match frame {
+            WireFrame::Event { envelope, .. } if envelope.session_id == child => Some(envelope.seq),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(replayed.first(), Some(&1));
+    assert_eq!(replayed.last(), Some(&created.created_seq));
+
+    drop(connection);
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// The additive prompt selector reaches the prompt-cut store transaction over
+/// the real RPC dispatcher, and the response/list projections share the exact
+/// durable provenance rather than requiring a second client read.
+#[tokio::test]
+async fn prompt_fork_rpc_publishes_response_draft_and_roster_provenance() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    hub.install_accounts(transcription_facade(Arc::new(
+        haider_accounts::MemoryVault::default(),
+    )))
+    .expect("install scope vault");
+    let (source, _, _) = create_fork_ready_source(&hub, &store, "prompt-fork-rpc").await;
+    let prompt_seq = store
+        .read(&source, 0, 64)
+        .await
+        .expect("source transcript")
+        .into_iter()
+        .find_map(|envelope| {
+            matches!(
+                serde_json::from_value::<EventPayload>(envelope.payload),
+                Ok(EventPayload::UserMessage { .. })
+            )
+            .then_some(envelope.seq)
+        })
+        .expect("source user prompt");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::View,
+                haider_rpc::Capability::Control,
+            ]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("control connection");
+    connection
+        .request(
+            RequestId::new("attach-prompt-fork-source"),
+            RequestBody::SessionAttach {
+                session_id: source.clone(),
+                after_seq: store.latest_seq(&source).await.expect("source head"),
+                mode: AttachMode::Control,
+                sealed_replay: false,
+            },
+        )
+        .await
+        .expect("source control attachment");
+    connection
+        .request(
+            RequestId::new("prompt-fork-rpc"),
+            RequestBody::SessionFork {
+                command_id: CommandId::new("prompt-fork-rpc-command"),
+                session_id: source.clone(),
+                worker_generation: store.worker_generation(),
+                source_branch_id: None,
+                fork_node_id: None,
+                fork_seq: None,
+                prompt: Some(haider_protocol::session_fork::SessionForkPromptSelector {
+                    seq: prompt_seq,
+                }),
+                name: Some("RPC prompt fork".into()),
+            },
+        )
+        .await
+        .expect("prompt fork routes");
+    let (child, created_seq, forked_from, draft) = sink
+        .0
+        .lock()
+        .expect("frames")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id,
+                body:
+                    ResponseBody::SessionFork {
+                        session_id,
+                        created_seq,
+                        forked_from,
+                        draft,
+                        ..
+                    },
+            } if request_id.as_str() == "prompt-fork-rpc" => Some((
+                session_id.clone(),
+                *created_seq,
+                forked_from.clone(),
+                draft.clone(),
+            )),
+            _ => None,
+        })
+        .expect("typed prompt-fork response");
+    assert!(forked_from.is_some());
+    assert_eq!(
+        forked_from.as_ref().map(|provenance| provenance.seq),
+        Some(prompt_seq)
+    );
+    assert_eq!(
+        draft.as_ref().map(|draft| draft.text.as_str()),
+        Some("fixture turn")
+    );
+    assert!(
+        hub.existing_actor(&child)
+            .expect("actor registry")
+            .is_some()
+    );
+    assert!(matches!(
+        hub.inner.pipe_native.confirmed_coverage(&child),
+        Some((coverage, generation)) if coverage >= created_seq && generation > 0
+    ));
+
+    // Model receipt replay in a fresh hub generation: durable authority knows
+    // the child, but neither the actor registry nor the in-memory Pipe cursor
+    // does. The retry must reinstall its own fence and fully repair both.
+    hub.inner.actors.lock().expect("actors").remove(&child);
+    hub.inner.pipe_native.invalidate(&child);
+    assert!(
+        !hub.inner
+            .fork_candidates
+            .lock()
+            .expect("fork candidates")
+            .contains(&child)
+    );
+    assert!(
+        hub.existing_actor(&child)
+            .expect("actor registry")
+            .is_none()
+    );
+    assert!(hub.inner.pipe_native.confirmed_coverage(&child).is_none());
+    connection
+        .request(
+            RequestId::new("prompt-fork-rpc-retry"),
+            RequestBody::SessionFork {
+                command_id: CommandId::new("prompt-fork-rpc-command"),
+                session_id: source,
+                worker_generation: store.worker_generation(),
+                source_branch_id: None,
+                fork_node_id: None,
+                fork_seq: None,
+                prompt: Some(haider_protocol::session_fork::SessionForkPromptSelector {
+                    seq: prompt_seq,
+                }),
+                name: Some("RPC prompt fork".into()),
+            },
+        )
+        .await
+        .expect("prompt fork receipt repairs publication");
+    assert!(
+        !hub.inner
+            .fork_candidates
+            .lock()
+            .expect("fork candidates")
+            .contains(&child)
+    );
+    assert!(
+        hub.existing_actor(&child)
+            .expect("actor registry")
+            .is_some()
+    );
+    assert!(matches!(
+        hub.inner.pipe_native.confirmed_coverage(&child),
+        Some((coverage, generation)) if coverage >= created_seq && generation > 0
+    ));
+    assert!(sink.0.lock().expect("frames").iter().any(|frame| matches!(
+        frame,
+        WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionFork { session_id, .. },
+        } if request_id.as_str() == "prompt-fork-rpc-retry" && session_id == &child
+    )));
+
+    connection
+        .request(
+            RequestId::new("list-prompt-fork-rpc"),
+            RequestBody::SessionList {
+                cursor: None,
+                limit: 100,
+            },
+        )
+        .await
+        .expect("list published prompt fork");
+    let summary = listed_sessions(&sink, "list-prompt-fork-rpc")
+        .into_iter()
+        .find(|summary| summary.session_id == child)
+        .expect("child roster row");
+    assert_eq!(summary.forked_from, forked_from);
+
+    drop(connection);
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
+/// Fork-only errors preserve their stable code/data at the correlated RPC
+/// boundary. In particular, typed invalid-cut details and store families do
+/// not disappear into the generic turn mapper's `invalid_argument` fallback.
+#[tokio::test]
+async fn session_fork_error_mapper_preserves_every_typed_boundary_variant() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([haider_rpc::Capability::View]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("connection");
+    sink.0.lock().expect("frames").clear();
+
+    for code in [
+        ErrorCode::StoreReadOnly,
+        ErrorCode::StoreCorrupt,
+        ErrorCode::StoreUnavailable,
+        ErrorCode::StoreFull,
+    ] {
+        let mapped = fork_pipe_publication_error(crate::pipe_native::PipeNativeError::store(
+            "fork projection read failed",
+            HaiderError::new(code, "typed Pipe store failure", false),
+        ));
+        assert!(matches!(
+            mapped,
+            SessionHubError::Store(error) if error.code == code
+        ));
+    }
+
+    let mut invalid_cut = HaiderError::new(ErrorCode::InvalidArgument, "invalid cut", false);
+    invalid_cut.details = Some(serde_json::json!({
+        "kind": "session_fork_invalid_cut",
+        "session_id": "source",
+        "seq": 7,
+        "reason": "wrong_branch",
+    }));
+    let cases = [
+        (
+            "unstable",
+            HaiderError::new(ErrorCode::ForkCutUnstable, "unstable", true),
+            "fork_cut_unstable",
+        ),
+        (
+            "not-found",
+            HaiderError::new(ErrorCode::SessionNotFound, "missing", false),
+            "not_found",
+        ),
+        (
+            "stale",
+            HaiderError::new(ErrorCode::SingleWriterViolation, "stale", false),
+            "stale_generation",
+        ),
+        ("invalid-cut", invalid_cut, "invalid_argument"),
+        (
+            "read-only",
+            HaiderError::new(ErrorCode::StoreReadOnly, "read only", false),
+            "store_read_only",
+        ),
+        (
+            "corrupt",
+            HaiderError::new(ErrorCode::StoreCorrupt, "corrupt", false),
+            "store_corrupt",
+        ),
+        (
+            "unavailable",
+            HaiderError::new(ErrorCode::StoreUnavailable, "unavailable", true),
+            "store_unavailable",
+        ),
+        (
+            "full",
+            HaiderError::new(ErrorCode::StoreFull, "full", false),
+            "store_full",
+        ),
+    ];
+    for (request_id, error, _) in &cases {
+        connection
+            .respond_session_fork_error(RequestId::new(*request_id), error.clone())
+            .expect("typed fork error sends");
+    }
+    {
+        let frames = sink.0.lock().expect("frames");
+        for (request_id, _, expected_code) in cases {
+            let body = frames
+                .iter()
+                .find_map(|frame| match frame {
+                    WireFrame::Response {
+                        request_id: seen,
+                        body: ResponseBody::Error { code, data, .. },
+                    } if seen.as_str() == request_id => Some((code.as_str(), data.as_ref())),
+                    _ => None,
+                })
+                .expect("mapped response");
+            assert_eq!(body.0, expected_code, "{request_id}");
+            if request_id == "invalid-cut" {
+                assert!(matches!(
+                    body.1,
+                    Some(ErrorData::SessionForkInvalidCut { session_id, seq: 7, .. })
+                        if session_id.as_str() == "source"
+                ));
+            }
+        }
+    }
+
+    connection
+        .request(
+            RequestId::new("capability"),
+            RequestBody::SessionFork {
+                command_id: CommandId::new("denied"),
+                session_id: SessionId::new("source"),
+                worker_generation: store.worker_generation(),
+                source_branch_id: None,
+                fork_node_id: None,
+                fork_seq: None,
+                prompt: Some(haider_protocol::session_fork::SessionForkPromptSelector { seq: 1 }),
+                name: None,
+            },
+        )
+        .await
+        .expect("capability refusal routes");
+    assert!(sink.0.lock().expect("frames").iter().any(|frame| {
+        matches!(
+            frame,
+            WireFrame::Response {
+                request_id,
+                body: ResponseBody::Error { code, .. },
+            } if request_id.as_str() == "capability" && code == "capability_denied"
+        )
+    }));
+
+    drop(connection);
+    hub.shutdown().await.expect("hub stops");
+    store.close().await.expect("store closes");
+}
+
 /// Queue-control changes share the existing attachment pipe. Each durable
 /// queue transition must publish exactly one typed delta whose revision is
 /// the committing envelope sequence; no queue-specific polling path exists.
