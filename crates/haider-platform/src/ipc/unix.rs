@@ -139,31 +139,28 @@ impl BoundEndpoint {
         super::validate_unix_socket_path(&staging_path)?;
         let listener = UnixListener::bind(&staging_path)
             .map_err(|error| EndpointError::io("bind Unix socket", &staging_path, error))?;
-        let (identity, inode_anchor) =
-            match stage_and_publish(&directory, &staging, &name, owner_uid) {
-                Ok(published) => published,
-                // The staging pathname can be replaced after bind. Without a
-                // retained identity receipt from the failed publication path,
-                // unlinking that name could delete a replacement. Preserve it
-                // as a typed owned-coordinate residual instead.
-                Err(error) => {
-                    return Err(EndpointError::OwnedResidual {
-                        path: staging_path,
-                        source: Box::new(error),
-                    });
-                }
-            };
+        let (identity, inode_anchor) = identify_staged_socket(&directory, &staging, owner_uid)?;
+        let mut cleanup = SocketCleanup {
+            directory,
+            name: staging.clone(),
+            path: staging_path.clone(),
+            identity,
+            owned_path_candidates: vec![staging_path],
+            _inode_anchor: inode_anchor,
+            active: true,
+        };
+        if let Err(error) = chmod_staged_socket(&cleanup.directory, &staging) {
+            return Err(retire_failed_staging(cleanup, error));
+        }
+        if let Err(publication_error) = publish(&cleanup.directory, &staging, &name) {
+            return Err(retire_failed_staging(cleanup, publication_error));
+        }
+        cleanup.name = name;
+        cleanup.path = socket_path.clone();
+        cleanup.owned_path_candidates.push(socket_path);
         Ok(Self {
             listener: Some(listener),
-            cleanup: SocketCleanup {
-                directory,
-                name,
-                path: socket_path,
-                identity,
-                owned_path_candidates: vec![endpoint.address().to_path_buf()],
-                _inode_anchor: inode_anchor,
-                active: true,
-            },
+            cleanup,
             owner_uid,
         })
     }
@@ -384,10 +381,9 @@ impl Drop for SocketCleanup {
     }
 }
 
-fn stage_and_publish(
+fn identify_staged_socket(
     directory: &OwnedFd,
     staging: &str,
-    name: &str,
     owner_uid: u32,
 ) -> Result<(SocketIdentity, SocketAnchor), EndpointError> {
     let stat =
@@ -399,17 +395,45 @@ fn stage_and_publish(
             message: format!("bound endpoint {staging} is not an owner-matched socket"),
         });
     }
+    let identity = identity_of(&stat);
+    let inode_anchor = anchor_socket(directory, staging, identity)?;
+    Ok((identity, inode_anchor))
+}
+
+fn chmod_staged_socket(directory: &OwnedFd, staging: &str) -> Result<(), EndpointError> {
     rustix::fs::chmodat(
         directory,
         staging,
         Mode::from_bits_truncate(0o600),
         AtFlags::empty(),
     )
-    .map_err(|error| EndpointError::io("chmod Unix socket", Path::new(staging), error.into()))?;
-    let identity = identity_of(&stat);
-    let inode_anchor = anchor_socket(directory, staging, identity)?;
-    publish(directory, staging, name)?;
-    Ok((identity, inode_anchor))
+    .map_err(|error| EndpointError::io("chmod Unix socket", Path::new(staging), error.into()))
+}
+
+fn retire_failed_staging(mut cleanup: SocketCleanup, setup_error: EndpointError) -> EndpointError {
+    let Err(cleanup_error) = cleanup.remove_owned() else {
+        return setup_error;
+    };
+    let cleanup_message = cleanup_error.to_string();
+    if let Ok(mut paths) = cleanup.owned_runtime_paths()
+        && let Some(path) = paths.pop()
+    {
+        cleanup.active = false;
+        return EndpointError::OwnedResidual {
+            path,
+            source: Box::new(EndpointError::Endpoint {
+                message: format!(
+                    "{setup_error}; failed to remove the exact staged socket: {cleanup_message}"
+                ),
+            }),
+        };
+    }
+    EndpointError::Endpoint {
+        message: format!(
+            "{setup_error}; staged-socket cleanup failed without a verified residual coordinate: \
+             {cleanup_message}"
+        ),
+    }
 }
 
 #[cfg(target_os = "linux")]

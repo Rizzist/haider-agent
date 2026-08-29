@@ -744,6 +744,13 @@ pub(crate) fn global() -> Result<&'static LockdownManager, LockdownError> {
         })
 }
 
+/// Returns the process-global manager only after daemon startup installed it.
+/// Read-only projections use this door so constructing an in-process hub does
+/// not open machine-user-global state as a side effect.
+pub(crate) fn global_if_initialized() -> Option<&'static LockdownManager> {
+    GLOBAL_MANAGER.get()
+}
+
 pub(crate) fn allowed_tool_names() -> Vec<String> {
     ALLOWED_TOOLS
         .iter()

@@ -1475,11 +1475,7 @@ async fn session_observe_digest(
         .flatten();
     for subagent in &mut digest.subagents {
         subagent.lockdown = match (subagent.provider.as_deref(), subagent.lockdown_bound) {
-            (Some(provider), Some(true)) => Some(lockdown_status_wire(
-                crate::lockdown::global()
-                    .and_then(|manager| manager.status(Some(provider)))
-                    .map_err(|error| SessionHubError::Task(error.to_string()))?,
-            )),
+            (Some(provider), Some(true)) => observed_lockdown_manager_status(provider)?,
             (_, Some(false)) => None,
             (Some(provider), None) => observed_lockdown_status(hub, None, provider)?,
             (None, _) => None,
@@ -1494,16 +1490,33 @@ fn observed_lockdown_status(
     provider: &str,
 ) -> Result<Option<haider_rpc::LockdownStatusWire>, SessionHubError> {
     let (provider, lockdown) = match session_id {
-        Some(session_id) => hub
-            .bound_session_lockdown(session_id)?
-            .unwrap_or((provider.to_owned(), hub.provider_lockdown_policy(provider)?)),
+        Some(session_id) => {
+            let active_binding = if crate::lockdown::global_if_initialized().is_some() {
+                hub.bound_session_lockdown(session_id)?
+            } else {
+                None
+            };
+            active_binding.unwrap_or((provider.to_owned(), hub.provider_lockdown_policy(provider)?))
+        }
         None => (provider.to_owned(), hub.provider_lockdown_policy(provider)?),
     };
     if !lockdown {
         return Ok(None);
     }
-    crate::lockdown::global()
-        .and_then(|manager| manager.status(Some(&provider)))
+    observed_lockdown_manager_status(&provider)
+}
+
+fn observed_lockdown_manager_status(
+    provider: &str,
+) -> Result<Option<haider_rpc::LockdownStatusWire>, SessionHubError> {
+    let Some(manager) = crate::lockdown::global_if_initialized() else {
+        // The quota ledger is machine-user-global and may already contain
+        // data, so a pre-start projection cannot truthfully invent usage.
+        // Absence is the wire's backward-compatible "not projected" state.
+        return Ok(None);
+    };
+    manager
+        .status(Some(provider))
         .map(lockdown_status_wire)
         .map(Some)
         .map_err(|error| SessionHubError::Task(error.to_string()))

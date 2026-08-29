@@ -1704,9 +1704,10 @@ async fn stale_cleanup_never_removes_a_node_that_went_live() {
         task.shutdown_handle().request("flip round");
         match task.join().await {
             Ok(_) | Err(DaemonError::Endpoint { .. }) => {}
-            outcome @ Err(DaemonError::RuntimeDirectoryNotEmpty { .. }) => {
-                assert_racing_endpoint_shutdown(outcome, &config);
-            }
+            Err(DaemonError::RuntimeDirectoryNotEmpty { .. }) => panic!(
+                "failed publication must retire its exact staged socket and retain only the \
+                 replacement endpoint"
+            ),
             other => panic!("unexpected startup outcome: {other:?}"),
         }
         poll_store_release(&config).await;

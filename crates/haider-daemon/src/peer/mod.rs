@@ -4,13 +4,12 @@ use crate::session_hub::{SessionHub, SessionHubError, WeakSessionHub};
 use haider_core::AcceptedTurn;
 use haider_protocol::ids::SessionId;
 #[cfg(unix)]
+use haider_protocol::peer::{PEER_FRAME_MAX_BYTES, PeerWireBody, PeerWireFrame};
 use haider_protocol::peer::{
-    PEER_FRAME_MAX_BYTES, PEER_MSG_ID_MAX_BYTES, PeerWireBody, PeerWireFrame,
-};
-use haider_protocol::peer::{
-    PEER_ID_MAX_BYTES, PEER_MESSAGE_MAX_BYTES, PEER_NAME_MAX_BYTES, PEER_SUMMARY_MAX_BYTES,
-    PEER_WIRE_VERSION, PeerCandidate, PeerDelivery, PeerDeliveryReason, PeerDescriptor, PeerKind,
-    PeerManifest, PeerMessage, PeerReceipt, PeerSender, PeerState, PeerTrust,
+    PEER_ID_MAX_BYTES, PEER_MESSAGE_MAX_BYTES, PEER_MSG_ID_MAX_BYTES, PEER_NAME_MAX_BYTES,
+    PEER_SUMMARY_MAX_BYTES, PEER_WIRE_VERSION, PeerCandidate, PeerDelivery, PeerDeliveryReason,
+    PeerDescriptor, PeerKind, PeerManifest, PeerMessage, PeerReceipt, PeerSender, PeerState,
+    PeerTrust,
 };
 use haider_rpc::{ObserveRunStateWire, SessionSummary, WireFrame};
 use serde::{Deserialize, Serialize};

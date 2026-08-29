@@ -36,6 +36,8 @@ fn unowned_runtime_leftover_is_retained_with_a_truthful_journal_line() {
         );
         assert!(stderr.contains("retained_entries=["));
         assert!(stderr.contains("store"));
+        assert!(stderr.contains(".hd-replacement"));
+        assert!(stderr.contains("h.sock"));
         return;
     }
 
@@ -45,12 +47,18 @@ fn unowned_runtime_leftover_is_retained_with_a_truthful_journal_line() {
     let store = runtime_path.join("store");
     std::fs::create_dir_all(&store).expect("durable store directory");
     std::fs::write(store.join("accounts.json"), b"[]").expect("durable store data");
+    let replacement_claim = runtime_path.join(".hd-replacement");
+    let replacement_endpoint = runtime_path.join("h.sock");
+    std::fs::write(&replacement_claim, b"replacement claim").expect("replacement claim");
+    std::fs::write(&replacement_endpoint, b"replacement endpoint").expect("replacement endpoint");
 
     runtime
         .cleanup()
-        .expect("an unowned store must not fail daemon cleanup");
+        .expect("unowned store and replacement nodes must not fail daemon cleanup");
 
     assert!(store.join("accounts.json").is_file());
+    assert!(replacement_claim.is_file());
+    assert!(replacement_endpoint.is_file());
 }
 
 #[test]

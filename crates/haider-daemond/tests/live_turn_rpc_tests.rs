@@ -5176,6 +5176,12 @@ async fn w8a_shell_busy_builtin_rejection_and_inventory_are_typed() {
             "computer",
             // §E: effect-free session monitor registry administration.
             "monitor",
+            // 965: peer discovery/messaging and SSH inventory/execution are
+            // canonical registry entries with their own typed effects.
+            "peer_list",
+            "peer_send",
+            "ssh_list",
+            "ssh_shell",
         ]
     );
     assert!(!names.contains(&"exec"));
@@ -5185,7 +5191,10 @@ async fn w8a_shell_busy_builtin_rejection_and_inventory_are_typed() {
         .iter()
         .find(|entry| entry.manifest.name == "process_exec")
         .expect("canonical process tool");
-    assert_eq!(process.manifest.effects, [EffectClass::ProcessExec]);
+    assert_eq!(
+        process.manifest.effects,
+        [EffectClass::ProcessExec, EffectClass::RemoteExecution]
+    );
     assert_eq!(process.default, ToolPermissionDefault::Ask);
     let task_output = inventory
         .tools
