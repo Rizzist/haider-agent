@@ -222,7 +222,9 @@ pub fn windows_file_identity(file: &std::fs::File) -> std::io::Result<WindowsFil
         BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
     };
 
-    let mut information = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `file` owns the live handle and `information` is writable for
+    // exactly the structure size expected by GetFileInformationByHandle.
     let read = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &raw mut information) };
     if read == 0 {
         return Err(std::io::Error::last_os_error());

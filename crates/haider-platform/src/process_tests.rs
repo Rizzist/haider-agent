@@ -125,6 +125,8 @@ fn spawned_daemon_startup_descriptors_survive_the_bounded_sweep() {
     let liveness_fd = liveness.as_raw_fd();
     let upper_bound = super::inherited_descriptor_upper_bound();
     let executable = std::env::current_exe().expect("locate platform test binary");
+    // SAFETY: std marks pre_exec unsafe because post-fork closures must avoid
+    // runtime state; this fixture calls only the audited descriptor installer.
     let output = unsafe {
         std::process::Command::new(executable)
             .arg("spawned_daemon_startup_descriptors_survive_the_bounded_sweep")

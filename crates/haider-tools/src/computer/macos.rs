@@ -285,8 +285,12 @@ impl MacOsComputerBackend {
         // returned retained dictionary is released by the caller.
         let key = unsafe { kAXTrustedCheckOptionPrompt };
         let value = if prompt {
+            // SAFETY: this imported singleton has process lifetime and is only
+            // borrowed while constructing the dictionary.
             unsafe { kCFBooleanTrue }
         } else {
+            // SAFETY: this imported singleton has process lifetime and is only
+            // borrowed while constructing the dictionary.
             unsafe { kCFBooleanFalse }
         };
         // SAFETY: one valid key/value pointer is provided and null callbacks
@@ -351,12 +355,16 @@ impl MacOsComputerBackend {
             .checked_mul(height)
             .and_then(|pixels| pixels.checked_mul(4))
         else {
+            // SAFETY: `image` is the retained non-null create result and no
+            // other path has released it.
             unsafe { CGImageRelease(image) };
             return Err(ComputerError::Backend {
                 message: "macOS screen dimensions overflow the capture buffer".into(),
             });
         };
         if width == 0 || height == 0 || width > u32::MAX as usize || height > u32::MAX as usize {
+            // SAFETY: `image` is still the retained non-null create result and
+            // this failing branch releases it exactly once.
             unsafe { CGImageRelease(image) };
             return Err(ComputerError::Backend {
                 message: "macOS screen capture returned invalid dimensions".into(),
@@ -366,6 +374,8 @@ impl MacOsComputerBackend {
         // SAFETY: create returns a retained color space.
         let color_space = unsafe { CGColorSpaceCreateDeviceRGB() };
         if color_space.is_null() {
+            // SAFETY: `image` remains the retained create result; color-space
+            // creation failed and produced no object requiring release.
             unsafe { CGImageRelease(image) };
             return Err(ComputerError::Backend {
                 message: "could not create an RGB color space for screen capture".into(),
@@ -385,6 +395,8 @@ impl MacOsComputerBackend {
             )
         };
         if context.is_null() {
+            // SAFETY: both objects are live retained create results, and this
+            // branch releases each once after context creation failed.
             unsafe {
                 CGColorSpaceRelease(color_space);
                 CGImageRelease(image);
@@ -586,8 +598,12 @@ impl MacOsComputerBackend {
             });
         }
         if click_state > 0 {
+            // SAFETY: `event` is the live non-null create result and the field
+            // setter borrows it without retaining any caller pointer.
             unsafe { CGEventSetIntegerValueField(event, CG_MOUSE_EVENT_CLICK_STATE, click_state) };
         }
+        // SAFETY: `event` remains live through the synchronous post and is
+        // released exactly once immediately afterward.
         unsafe {
             CGEventPost(CG_EVENT_TAP_HID, event);
             CFRelease(event.cast_const());
@@ -692,6 +708,8 @@ impl MacOsComputerBackend {
                     message: "macOS could not create a text keyboard event".into(),
                 });
             }
+            // SAFETY: `event` is live; `chunk` remains allocated for the
+            // synchronous setter, then the event is posted and released once.
             unsafe {
                 CGEventKeyboardSetUnicodeString(event, chunk.len(), chunk.as_ptr());
                 CGEventPost(CG_EVENT_TAP_HID, event);
@@ -752,12 +770,16 @@ impl MacOsComputerBackend {
             message: format!("unsupported macOS key `{last}`"),
         })?;
         let post = |key_down| -> ComputerResult<()> {
+            // SAFETY: null requests the system event source; key code and state
+            // are value arguments and success returns a retained event.
             let event = unsafe { CGEventCreateKeyboardEvent(ptr::null(), key_code, key_down) };
             if event.is_null() {
                 return Err(ComputerError::Backend {
                     message: "macOS could not create a keyboard shortcut event".into(),
                 });
             }
+            // SAFETY: `event` is the live create result, flags are a value,
+            // and the synchronous post is followed by its single release.
             unsafe {
                 CGEventSetFlags(event, flags);
                 CGEventPost(CG_EVENT_TAP_HID, event);
@@ -797,6 +819,8 @@ impl MacOsComputerBackend {
         // axis count. Horizontal scrolling supplies zero vertical delta and
         // the requested second-axis delta.
         let event = if horizontal {
+            // SAFETY: the variadic call receives exactly two i32 axis values,
+            // matching its declared count, and null requests a system source.
             unsafe {
                 CGEventCreateScrollWheelEvent(
                     ptr::null(),
@@ -807,6 +831,8 @@ impl MacOsComputerBackend {
                 )
             }
         } else {
+            // SAFETY: the variadic call receives exactly one i32 axis value,
+            // matching its declared count, and null requests a system source.
             unsafe {
                 CGEventCreateScrollWheelEvent(ptr::null(), CG_SCROLL_EVENT_UNIT_LINE, 1, delta)
             }
@@ -816,6 +842,8 @@ impl MacOsComputerBackend {
                 message: "macOS could not create a scroll event".into(),
             });
         }
+        // SAFETY: `event` is the live retained create result; location/post
+        // borrow it synchronously and CFRelease balances creation exactly once.
         unsafe {
             CGEventSetLocation(event, point);
             CGEventPost(CG_EVENT_TAP_HID, event);

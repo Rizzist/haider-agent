@@ -4,7 +4,7 @@ use super::{
     PreparedRuntimeDirectory,
 };
 use std::io;
-use std::os::windows::io::{AsRawHandle, FromRawHandle as _, OwnedHandle as ProcessHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle as _, OwnedHandle};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
@@ -16,7 +16,7 @@ use tokio::net::windows::named_pipe::{
 };
 use tokio::sync::Mutex;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_PIPE_BUSY, HANDLE,
+    ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, ERROR_PIPE_BUSY, HANDLE,
 };
 use windows_sys::Win32::Security::{
     EqualSid, GetTokenInformation, IsValidSid, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
@@ -29,6 +29,8 @@ const BIND_RETRY_WINDOW: Duration = Duration::from_secs(3);
 const BIND_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const PEER_LIVENESS_POLL: Duration = Duration::from_millis(250);
 const NAMED_PIPE_PATH_CODE_UNITS: usize = 256;
+
+type ProcessHandle = OwnedHandle;
 
 pub type IpcReadHalf = tokio::io::ReadHalf<IpcStream>;
 pub type IpcWriteHalf = tokio::io::WriteHalf<IpcStream>;
@@ -864,7 +866,7 @@ pub(super) fn windows_handle_link_count(file: &std::fs::File) -> io::Result<u32>
         BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
     };
 
-    let mut information = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: `file` owns a live handle and `information` is writable for the
     // exact structure expected by GetFileInformationByHandle.
     if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &raw mut information) } == 0
@@ -905,6 +907,8 @@ fn rename_directory_handle(receipt: &OwnedDirectoryReceipt, destination: &Path) 
     let words = buffer_bytes.div_ceil(std::mem::size_of::<usize>());
     let mut buffer = vec![0_usize; words];
     let information = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: `buffer` is usize-aligned and sized for FILE_RENAME_INFO plus
+    // the full UTF-16 name; all writes remain within that allocation.
     unsafe {
         (*information).Anonymous.ReplaceIfExists = false;
         (*information).RootDirectory = std::ptr::null_mut();
@@ -1092,6 +1096,8 @@ fn peer_credentials_and_process(
     let stream = stream.lock_stream()?;
     let pipe = stream.as_ref().ok_or_else(closed_pipe_error)?;
     let mut pid = 0_u32;
+    // SAFETY: the locked stream keeps either pipe handle live, and `pid` is a
+    // writable u32 out parameter for the selected client/server query.
     let ok = unsafe {
         match pipe {
             PipeStream::Client(pipe) => GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut pid),
@@ -1132,33 +1138,6 @@ fn peer_credentials_and_process(
 
 pub fn peer_is_owner(stream: &IpcStream, _owner_uid: u32) -> io::Result<bool> {
     peer_credentials(stream).map(|credentials| credentials.same_user)
-}
-
-struct OwnedHandle(HANDLE);
-
-impl OwnedHandle {
-    fn new(handle: HANDLE, operation: &'static str) -> io::Result<Self> {
-        if handle.is_null() {
-            let error = io::Error::last_os_error();
-            Err(io::Error::new(
-                error.kind(),
-                format!("{operation}: {error}"),
-            ))
-        } else {
-            Ok(Self(handle))
-        }
-    }
-}
-
-#[allow(unsafe_code)]
-impl Drop for OwnedHandle {
-    fn drop(&mut self) {
-        // SAFETY: OwnedHandle is constructed only for real owned process or
-        // token handles and never wraps the GetCurrentProcess pseudo-handle.
-        unsafe {
-            CloseHandle(self.0);
-        }
-    }
 }
 
 struct TokenUserBuffer {
@@ -1204,7 +1183,16 @@ fn open_process_token(process: HANDLE) -> io::Result<OwnedHandle> {
     if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    OwnedHandle::new(token, "open Windows process token")
+    if token.is_null() {
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            error.kind(),
+            format!("open Windows process token: {error}"),
+        ));
+    }
+    // SAFETY: OpenProcessToken returned a non-null newly owned real handle,
+    // and this is its unique transfer into the standard RAII owner.
+    Ok(unsafe { OwnedHandle::from_raw_handle(token.cast()) })
 }
 
 #[allow(unsafe_code)]
@@ -1276,6 +1264,8 @@ fn sids_equal(left: PSID, right: PSID) -> io::Result<bool> {
             "cannot compare a null Windows SID",
         ));
     }
+    // SAFETY: both non-null pointers are borrowed from live, aligned token
+    // buffers; IsValidSid reads only the self-described SID bytes.
     if unsafe { IsValidSid(left) } == 0 || unsafe { IsValidSid(right) } == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1292,8 +1282,8 @@ fn peer_process_has_current_user_sid(peer_process: HANDLE) -> io::Result<bool> {
     // SAFETY: GetCurrentProcess returns the documented pseudo-handle. It is
     // passed through but never wrapped or closed.
     let current_token = open_process_token(unsafe { GetCurrentProcess() })?;
-    let peer_user = token_user(peer_token.0)?;
-    let current_user = token_user(current_token.0)?;
+    let peer_user = token_user(peer_token.as_raw_handle().cast())?;
+    let current_user = token_user(current_token.as_raw_handle().cast())?;
     token_user_sids_equal(&peer_user, &current_user)
 }
 

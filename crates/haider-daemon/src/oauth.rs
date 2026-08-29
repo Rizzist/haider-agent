@@ -1731,6 +1731,8 @@ mod windows_claude_store {
 
     impl Drop for CredentialGuard {
         fn drop(&mut self) {
+            // SAFETY: CredentialGuard is created only from the non-null
+            // allocation returned by CredReadW and owns that allocation once.
             unsafe { CredFree(self.0.cast::<c_void>()) };
         }
     }
@@ -1738,7 +1740,6 @@ mod windows_claude_store {
     pub(super) fn read() -> Result<Zeroizing<Vec<u8>>, super::ClaudeNativeCredentialFailure> {
         use windows_sys::Win32::Foundation::{
             ERROR_ACCESS_DENIED, ERROR_LOGON_FAILURE, ERROR_NO_SUCH_LOGON_SESSION, ERROR_NOT_FOUND,
-            GetLastError,
         };
 
         // Claude Code's generic-credential target is the same stable string as
@@ -1748,24 +1749,37 @@ mod windows_claude_store {
             .chain([0])
             .collect::<Vec<_>>();
         let mut credential = ptr::null_mut::<CREDENTIALW>();
+        // SAFETY: `target` is NUL-terminated and remains live; `credential` is
+        // a writable out pointer that this function adopts only on success.
         let found = unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) };
         if found == 0 || credential.is_null() {
-            return Err(match unsafe { GetLastError() } {
-                ERROR_NOT_FOUND => super::ClaudeNativeCredentialFailure::Missing,
-                ERROR_ACCESS_DENIED => super::ClaudeNativeCredentialFailure::Denied,
-                ERROR_LOGON_FAILURE | ERROR_NO_SUCH_LOGON_SESSION => {
+            // Capture the same-thread Win32 last-error value immediately,
+            // before another platform call can replace it.
+            let raw_error = std::io::Error::last_os_error()
+                .raw_os_error()
+                .map(|error| error as u32);
+            return Err(match raw_error {
+                Some(ERROR_NOT_FOUND) => super::ClaudeNativeCredentialFailure::Missing,
+                Some(ERROR_ACCESS_DENIED) => super::ClaudeNativeCredentialFailure::Denied,
+                Some(ERROR_LOGON_FAILURE | ERROR_NO_SUCH_LOGON_SESSION) => {
                     super::ClaudeNativeCredentialFailure::Locked
                 }
                 _ => super::ClaudeNativeCredentialFailure::Unavailable,
             });
         }
         let guard = CredentialGuard(credential);
+        // SAFETY: `guard` owns the live CREDENTIALW allocation returned by
+        // CredReadW, whose fixed header is readable until CredFree in Drop.
         let size = unsafe { (*guard.0).CredentialBlobSize as usize };
+        // SAFETY: the same live CREDENTIALW header contains this borrowed blob
+        // pointer, which remains valid while `guard` is alive.
         let blob = unsafe { (*guard.0).CredentialBlob };
         if size == 0 || blob.is_null() {
             return Err(super::ClaudeNativeCredentialFailure::Unavailable);
         }
         Ok(Zeroizing::new(
+            // SAFETY: WinCred guarantees CredentialBlobSize readable bytes at
+            // the non-null blob pointer for the lifetime of the credential.
             unsafe { slice::from_raw_parts(blob, size) }.to_vec(),
         ))
     }

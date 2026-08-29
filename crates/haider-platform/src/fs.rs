@@ -195,21 +195,22 @@ fn execute_file_sync(file: &File, operation: SyncOperation) -> std::io::Result<(
     use std::os::fd::AsRawFd as _;
 
     let result = match operation {
+        // SAFETY: `file` owns the live descriptor for the duration of the call;
+        // F_FULLFSYNC takes no pointer arguments and does not transfer ownership.
         SyncOperation::FullFsync => unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) },
+        // SAFETY: `file` owns the live descriptor for the duration of the call;
+        // F_BARRIERFSYNC takes no pointer arguments and does not transfer ownership.
         SyncOperation::BarrierFsync => unsafe {
             libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC)
         },
-        SyncOperation::Fsync => unsafe { libc::fsync(file.as_raw_fd()) },
+        SyncOperation::Fsync => return plain_fsync(file),
     };
     if result == 0 {
         return Ok(());
     }
     let error = std::io::Error::last_os_error();
     if operation == SyncOperation::BarrierFsync && barrier_is_unsupported(&error) {
-        if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
-            return Ok(());
-        }
-        return Err(std::io::Error::last_os_error());
+        return plain_fsync(file);
     }
     Err(error)
 }
@@ -222,15 +223,13 @@ fn barrier_is_unsupported(error: &std::io::Error) -> bool {
 }
 
 #[cfg(all(unix, not(target_vendor = "apple")))]
-#[allow(unsafe_code)]
 fn execute_file_sync(file: &File, _operation: SyncOperation) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd as _;
+    plain_fsync(file)
+}
 
-    if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+#[cfg(unix)]
+fn plain_fsync(file: &File) -> std::io::Result<()> {
+    rustix::fs::fsync(file).map_err(std::io::Error::from)
 }
 
 #[cfg(windows)]
@@ -293,6 +292,8 @@ fn replace_file_impl(source: &Path, target: &Path, backup: Option<&Path>) -> std
             .chain([0])
             .collect::<Vec<_>>()
     });
+    // SAFETY: all UTF-16 buffers are NUL-terminated and live for the call;
+    // optional backup is either null or another live NUL-terminated buffer.
     let replaced = unsafe {
         ReplaceFileW(
             target.as_ptr(),
@@ -319,6 +320,8 @@ fn replace_file_impl(source: &Path, target: &Path, backup: Option<&Path>) -> std
     ) {
         return Err(error);
     }
+    // SAFETY: source and target are live NUL-terminated UTF-16 buffers, and
+    // MoveFileExW neither retains their pointers nor transfers ownership.
     let moved = unsafe {
         MoveFileExW(
             source.as_ptr(),

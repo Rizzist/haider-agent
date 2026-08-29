@@ -5046,6 +5046,8 @@ fn copy_windows_dacl(
 
     const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
     let mut needed = 0_u32;
+    // SAFETY: `source` owns a live handle; the null descriptor requests only
+    // the required size and `needed` is a writable u32 out parameter.
     let measured = unsafe {
         GetKernelObjectSecurity(
             source.as_raw_handle(),
@@ -5068,6 +5070,8 @@ fn copy_windows_dacl(
     let words = bytes.div_ceil(std::mem::size_of::<usize>());
     let mut descriptor = vec![0_usize; words];
     let descriptor_pointer = descriptor.as_mut_ptr().cast();
+    // SAFETY: usize storage provides security-descriptor alignment and at
+    // least `needed` writable bytes; `source` keeps its handle live.
     let read = unsafe {
         GetKernelObjectSecurity(
             source.as_raw_handle(),
@@ -5086,6 +5090,8 @@ fn copy_windows_dacl(
     }
     let mut control = 0_u16;
     let mut revision = 0_u32;
+    // SAFETY: the preceding API initialized the descriptor buffer; both
+    // control/revision outputs are writable for their documented widths.
     let inspected = unsafe {
         GetSecurityDescriptorControl(descriptor_pointer, &raw mut control, &raw mut revision)
     };
@@ -5104,6 +5110,8 @@ fn copy_windows_dacl(
     let mut dacl_present = 0;
     let mut dacl_defaulted = 0;
     let mut dacl = std::ptr::null_mut();
+    // SAFETY: `descriptor_pointer` names the validated live descriptor and all
+    // three outputs are writable; any DACL pointer borrows that buffer.
     let extracted = unsafe {
         GetSecurityDescriptorDacl(
             descriptor_pointer,
@@ -5122,6 +5130,8 @@ fn copy_windows_dacl(
     if dacl_present == 0 {
         dacl = std::ptr::null_mut();
     }
+    // SAFETY: `destination` owns a live handle and `dacl` is null or points
+    // into the still-live descriptor buffer for this synchronous call.
     let written = unsafe {
         SetSecurityInfo(
             destination.as_raw_handle(),
@@ -5703,6 +5713,8 @@ fn delete_windows_entry(handle: fs::File, display_path: &Path) -> ToolResult<()>
     };
 
     let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: `handle` owns a live DELETE-capable handle and `disposition` is
+    // an initialized input structure with the exact advertised size.
     let deleted = unsafe {
         SetFileInformationByHandle(
             handle.as_raw_handle(),
@@ -5983,6 +5995,8 @@ fn rename_windows_entry(
     } else {
         FileRenameInfo
     };
+    // SAFETY: `buffer` is usize-aligned and sized for FILE_RENAME_INFO plus
+    // the entire UTF-16 name; every header/name write stays in that buffer.
     unsafe {
         if replace_existing {
             (*information).Anonymous.Flags =
@@ -5999,6 +6013,8 @@ fn rename_windows_entry(
             destination.len(),
         );
     }
+    // SAFETY: `handle` remains live, `information` points at the fully
+    // initialized aligned buffer, and `buffer_bytes` is its exact used size.
     let renamed = unsafe {
         SetFileInformationByHandle(
             handle.as_raw_handle(),

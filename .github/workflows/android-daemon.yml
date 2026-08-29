@@ -27,6 +27,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: unsafe-count gate
+        shell: bash
+        run: bash scripts/check-unsafe-counts.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
