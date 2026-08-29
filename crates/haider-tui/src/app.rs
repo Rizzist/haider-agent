@@ -3913,6 +3913,12 @@ pub enum Hit {
     /// agent id it was rendered for, so a refreshed snapshot can never
     /// drill a different agent than the one clicked.
     FleetNode(String),
+    /// The fleet member-detail frame's transcript door. VALUE-CARRYING:
+    /// the agent id the row was rendered for.
+    FleetTranscript(String),
+    /// The fleet member-detail frame's `✕ destroy this subagent`. Clicking
+    /// it only ARMS the kill — the second, confirming press is what acts.
+    FleetKill(String),
     /// The chip view's `✕ close`.
     ChipCloseBtn(String),
     /// A breadcrumb hop in the chip view (session root = empty path).
@@ -6643,6 +6649,85 @@ impl AppModel {
         self.fleet.sel = 0;
     }
 
+    /// Open a fleet member's OWN transcript — the chip view rooted on that
+    /// member. Three things this does that the old inline body did not:
+    /// it walks the REAL chip path (`path_to_chip`) instead of assuming a
+    /// depth-1 member, so a nested member keeps a truthful breadcrumb; it
+    /// enters through [`Self::switch_surface`], the documented draft-swap
+    /// authority every other subagent door already uses; and it releases
+    /// the scroll, so the view opens ON the member's own session instead of
+    /// inheriting wherever the previous surface happened to be scrolled.
+    /// Returns false when the member is not one of this session's chips.
+    fn open_fleet_member_transcript(&mut self, agent: &str) -> bool {
+        let Some(path) = path_to_chip(&self.chips, agent) else {
+            return false;
+        };
+        self.view_path = path;
+        self.switch_surface(Screen::Subagent);
+        self.scroll_back.set(0);
+        self.dirty = true;
+        true
+    }
+
+    /// The armed member's display name — the fleet's own callsign rule,
+    /// which falls back to the opaque id rather than inventing a name.
+    fn fleet_member_label(&self, agent: &haider_protocol::ids::AgentId) -> String {
+        let fallback = || agent.as_str().to_owned();
+        let Some(snapshot) = self.fleet.snapshot.as_ref() else {
+            return fallback();
+        };
+        let (level, _) = crate::fleet::resolve(snapshot, &self.fleet.stack);
+        crate::fleet::flatten(level)
+            .into_iter()
+            .find(|row| &row.node.agent_id == agent)
+            .map_or_else(fallback, |row| crate::fleet::callsign(row.node).to_owned())
+    }
+
+    /// One press of the destroy affordance. The FIRST press only arms it,
+    /// naming the member; the second press on the SAME member acts. Offered
+    /// only from the member-detail frame — a destroy is never one keystroke
+    /// away from a moving list.
+    fn fleet_kill_step(&mut self) {
+        let Some(agent) = self.fleet.detail.clone() else {
+            self.fleet.kill_armed = None;
+            return;
+        };
+        if self.fleet.kill_armed.as_ref() != Some(&agent) {
+            let label = self.fleet_member_label(&agent);
+            self.fleet.kill_armed = Some(agent);
+            self.flash = Some(format!("· destroy {label}? press d again to confirm"));
+            return;
+        }
+        self.fleet.kill_armed = None;
+        self.fleet_kill_confirmed(&agent);
+    }
+
+    /// A CONFIRMED destroy. The client may only act on a member that is one
+    /// of this session's own chips, and only where it is the fabricating
+    /// authority. A LIVE child is the daemon's to stop and the wire carries
+    /// no agent-scoped cancel, so the live lane says so plainly instead of
+    /// pretending to have killed something. Either way the member KEEPS its
+    /// row: a destroyed subagent reads `⊘ cancelled`, it never just vanishes.
+    fn fleet_kill_confirmed(&mut self, agent: &haider_protocol::ids::AgentId) {
+        let label = self.fleet_member_label(agent);
+        if find_chip(&self.chips, agent.as_str()).is_none() {
+            self.flash = Some(format!(
+                "· {label} runs on its own session — this view cannot destroy it"
+            ));
+            self.dirty = true;
+            return;
+        }
+        if self.mode.fabricates_locally() {
+            self.requests.push(AppRequest::ChipClose {
+                agent: agent.as_str().to_owned(),
+            });
+            self.flash = Some(format!("· destroying {label} — its row reads ⊘ cancelled"));
+        } else {
+            self.refuse_demo_only("destroying a subagent");
+        }
+        self.dirty = true;
+    }
+
     fn fleet_move(&mut self, delta: isize) {
         let Some((count, _)) = self.fleet_nav() else {
             return;
@@ -6661,6 +6746,11 @@ impl AppModel {
     /// level, and out to the session only from the root.
     fn handle_fleet_key(&mut self, code: KeyCode) {
         self.dirty = true;
+        // Every key but the confirming `d` DISARMS a pending destroy: an
+        // arm never survives navigation (the `ssh_remove_armed` discipline).
+        if !matches!(code, KeyCode::Char('d')) {
+            self.fleet.kill_armed = None;
+        }
         let grid = matches!(self.fleet_nav(), Some((_, crate::fleet::Density::Grid)));
         let stride = if grid {
             isize::try_from(self.fleet.grid_cols.get().max(1)).unwrap_or(1)
@@ -6686,11 +6776,7 @@ impl AppModel {
                 // session's own chips; deeper/foreign members keep the
                 // honest flash.
                 if let Some(agent) = self.fleet.detail.clone() {
-                    if find_chip(&self.chips, agent.as_str()).is_some() {
-                        self.view_path = vec![agent.as_str().to_owned()];
-                        self.screen = Screen::Subagent;
-                        self.dirty = true;
-                    } else {
+                    if !self.open_fleet_member_transcript(agent.as_str()) {
                         self.flash = Some(
                             "· transcript lives on the member's own session — attach to view"
                                 .to_owned(),
@@ -6701,6 +6787,8 @@ impl AppModel {
                     self.fleet_drill();
                 }
             }
+            // The destroy step — detail-frame only, always two presses.
+            KeyCode::Char('d') => self.fleet_kill_step(),
             KeyCode::Up | KeyCode::Char('k') => self.fleet_move(-stride),
             KeyCode::Down | KeyCode::Char('j') => self.fleet_move(stride),
             KeyCode::Left if grid => self.fleet_move(-1),
@@ -6732,26 +6820,6 @@ impl AppModel {
                 .iter()
                 .position(|node| node.agent_id.as_str() == agent),
         }
-    }
-
-    /// A click drills only a node WITH children — a leaf click is a plain
-    /// selection, no refusal flash (⏎ keeps its honest one).
-    fn fleet_drill_hit(&mut self, agent: &str) {
-        let Some(snapshot) = self.fleet.snapshot.as_ref() else {
-            return;
-        };
-        let (level, _) = crate::fleet::resolve(snapshot, &self.fleet.stack);
-        let has_children = crate::fleet::flatten(level)
-            .iter()
-            .find(|row| row.node.agent_id.as_str() == agent)
-            .is_some_and(|row| !row.node.children.is_empty());
-        if has_children {
-            self.fleet
-                .stack
-                .push(haider_protocol::ids::AgentId::new(agent.to_owned()));
-            self.fleet.sel = 0;
-        }
-        self.dirty = true;
     }
 
     /// A committed `session.fleet` snapshot landed. Guarded by session
@@ -9865,8 +9933,16 @@ impl AppModel {
     /// nothing — never a guess.
     #[must_use]
     pub fn identity_auth_label(&self) -> Option<&'static str> {
+        self.auth_label_for(&self.identity.provider)
+    }
+
+    /// The same derivation for an ARBITRARY provider key. The auth flavor
+    /// is a property of the provider and the account behind it, not of the
+    /// session, so a child agent's provider resolves through exactly this
+    /// ladder — no second, divergent rule.
+    #[must_use]
+    fn auth_label_for(&self, provider: &str) -> Option<&'static str> {
         use haider_protocol::credential::AuthMethod;
-        let provider = &self.identity.provider;
         if provider.ends_with("-oauth") {
             return Some("oauth");
         }
@@ -9925,6 +10001,88 @@ impl AppModel {
         candidates
             .into_iter()
             .find(|candidate| candidate.chars().count() <= budget && !candidate.is_empty())
+    }
+
+    /// The identity the composer band speaks for the surface being STEERED.
+    ///
+    /// Every surface but one speaks the SESSION's pair. The SUBAGENT
+    /// surface steers a CHILD, so it must speak the CHILD's: the owner's
+    /// screenshot showed the parent's `glm-5.2 · api` on the footer under a
+    /// child header that correctly read `deepseek-v4-flash`. The bug was
+    /// never only the model — the auth label, the reasoning level and the
+    /// fast marker were all parent-scoped while a child was being steered.
+    ///
+    /// The child's model is its MANIFEST fact (`ChipModel::model`, stamped
+    /// from `AgentManifest::model_profile`); its auth flavor comes from the
+    /// provider it actually billed, or the one the fleet snapshot records.
+    /// The session's reasoning level and fast marker are not the child's
+    /// and no manifest carries them, so they DROP rather than mislabel the
+    /// child — [`crate::fleet::node_metric`]'s law. A child with no model
+    /// renders NO identity; the parent's never stands in for it.
+    #[must_use]
+    pub fn surface_composer_identity(&self, budget: usize) -> Option<String> {
+        if self.screen != Screen::Subagent {
+            return self.composer_identity(budget);
+        }
+        let Some(chip) = self.viewed_chip() else {
+            return self.composer_identity(budget);
+        };
+        let model = chip.model.trim();
+        if model.is_empty() {
+            return None;
+        }
+        let mut candidates: Vec<String> = Vec::new();
+        if let Some(auth) = self.child_auth_label(chip) {
+            candidates.push(format!("{model} · {auth}"));
+        }
+        candidates.push(model.to_owned());
+        candidates
+            .into_iter()
+            .find(|candidate| candidate.chars().count() <= budget)
+    }
+
+    /// A viewed child's auth flavor. Truth order: the provider the child
+    /// ACTUALLY billed against (its own usage breakdowns carry the method
+    /// outright), then the provider the fleet snapshot records for it, run
+    /// through the shared [`Self::auth_label_for`] ladder. Breakdowns that
+    /// disagree are ambiguous, and ambiguity renders nothing — never a
+    /// coin-flip between two true answers.
+    #[must_use]
+    fn child_auth_label(&self, chip: &ChipModel) -> Option<&'static str> {
+        use haider_protocol::credential::AuthMethod;
+        if let Some(usage) = chip
+            .metrics
+            .as_ref()
+            .and_then(|metrics| metrics.usage.as_ref())
+        {
+            let mut seen: Option<AuthMethod> = None;
+            let mut ambiguous = false;
+            for breakdown in &usage.breakdowns {
+                let Some(method) = breakdown.auth_method else {
+                    continue;
+                };
+                match seen {
+                    None => seen = Some(method),
+                    Some(held) if held == method => {}
+                    Some(_) => ambiguous = true,
+                }
+            }
+            if ambiguous {
+                return None;
+            }
+            if let Some(method) = seen {
+                return Some(match method {
+                    AuthMethod::OAuth => "oauth",
+                    AuthMethod::ApiKey => "api",
+                });
+            }
+        }
+        let snapshot = self.fleet.snapshot.as_ref()?;
+        let provider = crate::fleet::find_node(snapshot, &chip.agent)?
+            .provider
+            .as_deref()
+            .filter(|text| !text.is_empty())?;
+        self.auth_label_for(provider)
     }
 
     /// Daemon-truth identity bootstrap (W5f-2): until the user pins a
@@ -15836,8 +15994,41 @@ impl AppModel {
             Hit::FleetNode(agent) if self.screen == Screen::Fleet => {
                 if let Some(index) = self.fleet_index_of(&agent) {
                     self.fleet.sel = index;
-                    self.fleet_drill_hit(&agent);
+                    self.fleet.kill_armed = None;
+                    // A click is now an ACTIVATION, not a dead selection:
+                    // it re-roots a subtree and opens a leaf's detail frame
+                    // exactly as ⏎ does. `sel` was just resolved FROM the
+                    // clicked agent id, so the shared drill acts on the row
+                    // that was clicked and no other.
+                    self.fleet_drill();
                 }
+            }
+            // The detail frame's transcript door, by mouse — the same door
+            // ⏎ opens, never a parallel one.
+            Hit::FleetTranscript(agent)
+                if self.screen == Screen::Fleet && find_chip(&self.chips, &agent).is_some() =>
+            {
+                self.open_fleet_member_transcript(&agent);
+            }
+            // A member whose transcript lives on its own session keeps the
+            // keyboard door's honest refusal.
+            Hit::FleetTranscript(_) if self.screen == Screen::Fleet => {
+                self.flash = Some(
+                    "· transcript lives on the member's own session — attach to view".to_owned(),
+                );
+            }
+            // Clicking `✕ destroy` ARMS it; the confirming press is what
+            // acts, so no single stray click can destroy a subagent.
+            Hit::FleetKill(agent)
+                if self.screen == Screen::Fleet
+                    && self
+                        .fleet
+                        .detail
+                        .as_ref()
+                        .map(haider_protocol::ids::AgentId::as_str)
+                        == Some(agent.as_str()) =>
+            {
+                self.fleet_kill_step();
             }
             // The ⌂ home row and the ✕ close button belong to the subagent
             // screen; ✕ closes only the chip actually being VIEWED.
