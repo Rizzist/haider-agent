@@ -609,6 +609,7 @@ impl DaemonContextCompactor {
         let cache_epoch = digest_json(&serde_json::json!({
             "provider": self.usage_scope.provider,
             "model": self.model,
+            "max_tokens": self.max_tokens,
             "account_scope": self.usage_account,
             "system_digest": prefix_digests.system,
             "tool_digest": prefix_digests.tools,

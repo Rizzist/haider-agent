@@ -953,6 +953,16 @@ enum SessionForkCutRequest<'a> {
     },
 }
 
+#[derive(Clone, Copy)]
+enum ForkCacheCandidateSource<'a> {
+    None,
+    Provided(&'a ForkCacheInheritanceCandidate),
+    /// Clone only the newest authoritative provider view already present in
+    /// the exact copied prefix. Uncertain or malformed evidence becomes no
+    /// candidate; this mode never reconstructs provider bytes.
+    DurableCopiedPrefix,
+}
+
 struct SessionForkTransactionCommand<'a> {
     command_id: &'a str,
     request_digest: &'a str,
@@ -7785,7 +7795,19 @@ impl Store {
     /// admitted source lineage through the requested node, appends an audit
     /// fact, and finalizes the command receipt. Source rows are read-only.
     pub fn fork_session(&self, command: &SessionForkCommand) -> StoreResult<SessionForkOutcome> {
-        self.fork_session_with_cache_candidate(command, None)
+        self.fork_session_transaction_for_exact(command, ForkCacheCandidateSource::None)
+    }
+
+    /// Production fork path: inherit only when the copied source slice itself
+    /// contains a complete authoritative provider view.
+    pub fn fork_session_with_durable_cache_candidate(
+        &self,
+        command: &SessionForkCommand,
+    ) -> StoreResult<SessionForkOutcome> {
+        self.fork_session_transaction_for_exact(
+            command,
+            ForkCacheCandidateSource::DurableCopiedPrefix,
+        )
     }
 
     /// Same atomic fork with a provider-rendered child view eligible for
@@ -7795,6 +7817,18 @@ impl Store {
         &self,
         command: &SessionForkCommand,
         cache_candidate: Option<&ForkCacheInheritanceCandidate>,
+    ) -> StoreResult<SessionForkOutcome> {
+        let candidate_source = cache_candidate.map_or(
+            ForkCacheCandidateSource::None,
+            ForkCacheCandidateSource::Provided,
+        );
+        self.fork_session_transaction_for_exact(command, candidate_source)
+    }
+
+    fn fork_session_transaction_for_exact(
+        &self,
+        command: &SessionForkCommand,
+        candidate_source: ForkCacheCandidateSource<'_>,
     ) -> StoreResult<SessionForkOutcome> {
         if let Some(metafork) = &command.metafork {
             validate_metafork_commit(command, metafork)?;
@@ -7817,7 +7851,7 @@ impl Store {
                     fork_seq: command.fork_seq,
                 },
             },
-            cache_candidate,
+            candidate_source,
         )
     }
 
@@ -7827,6 +7861,26 @@ impl Store {
     pub fn fork_session_from_prompt(
         &self,
         command: &SessionPromptForkCommand,
+    ) -> StoreResult<SessionForkOutcome> {
+        self.fork_session_from_prompt_with_candidate_source(command, ForkCacheCandidateSource::None)
+    }
+
+    /// Production prompt-cut path with the same exact durable-view proof as an
+    /// exact-node fork. A prefix with no certain provider view stays fresh.
+    pub fn fork_session_from_prompt_with_durable_cache_candidate(
+        &self,
+        command: &SessionPromptForkCommand,
+    ) -> StoreResult<SessionForkOutcome> {
+        self.fork_session_from_prompt_with_candidate_source(
+            command,
+            ForkCacheCandidateSource::DurableCopiedPrefix,
+        )
+    }
+
+    fn fork_session_from_prompt_with_candidate_source(
+        &self,
+        command: &SessionPromptForkCommand,
+        candidate_source: ForkCacheCandidateSource<'_>,
     ) -> StoreResult<SessionForkOutcome> {
         self.fork_session_transaction(
             SessionForkTransactionCommand {
@@ -7845,14 +7899,14 @@ impl Store {
                     prompt_seq: command.prompt_seq,
                 },
             },
-            None,
+            candidate_source,
         )
     }
 
     fn fork_session_transaction(
         &self,
         command: SessionForkTransactionCommand<'_>,
-        cache_candidate: Option<&ForkCacheInheritanceCandidate>,
+        candidate_source: ForkCacheCandidateSource<'_>,
     ) -> StoreResult<SessionForkOutcome> {
         validate_command_identity(
             command.command_id,
@@ -8045,6 +8099,17 @@ impl Store {
                 source_owner_agent.as_ref(),
             )?;
         }
+        let durable_candidate = match candidate_source {
+            ForkCacheCandidateSource::DurableCopiedPrefix => {
+                durable_fork_cache_candidate(&source_envelopes, source_owner_agent.as_ref())
+            }
+            ForkCacheCandidateSource::None | ForkCacheCandidateSource::Provided(_) => None,
+        };
+        let cache_candidate = match candidate_source {
+            ForkCacheCandidateSource::Provided(candidate) => Some(candidate),
+            ForkCacheCandidateSource::DurableCopiedPrefix => durable_candidate.as_ref(),
+            ForkCacheCandidateSource::None => None,
+        };
         let inherited_cache_segment = if model_proposal.is_none() {
             if let Some(candidate) = cache_candidate {
                 let source_cache_boundary =
@@ -20377,18 +20442,22 @@ fn inherited_fork_cache_segment(
 
         // The newest known ledger is authoritative. A malformed newest
         // record must not fall back to an older, apparently compatible view.
-        data.get("ordinal")?.as_u64()?;
+        if data.get("ordinal")?.as_u64()? == 0 {
+            return None;
+        }
         let source_view = data.get("view")?;
         if !provider_views_share_cache_prefix(source_view, &candidate.provider_view) {
             return None;
         }
         let provider = source_view.get("provider")?.as_str()?;
         let model = source_view.get("model")?.as_str()?;
+        let max_tokens = source_view.get("max_tokens")?.as_u64()?;
         let account_scope = source_view.get("account_scope")?.as_str()?;
         let cache_epoch = source_view.get("cache_epoch")?.as_str()?;
         let stable_history_end = source_view.get("stable_history_end")?.as_u64()?;
         if provider != source_metadata.provider
             || model != source_metadata.model
+            || max_tokens != source_metadata.max_tokens
             || account_scope.is_empty()
             || cache_epoch.is_empty()
         {
@@ -20416,6 +20485,61 @@ fn inherited_fork_cache_segment(
             stable_history_end,
             source_provider_view_seq: envelope.seq,
             source_provider_view_event_id: envelope.event_id.clone(),
+        });
+    }
+    None
+}
+
+fn durable_fork_cache_candidate(
+    source_envelopes: &[RawEnvelope],
+    source_owner_agent: Option<&AgentId>,
+) -> Option<ForkCacheInheritanceCandidate> {
+    const PROVIDER_VIEW_ATTEMPT_KIND: &str = "provider_view_attempt_v1";
+    const PROVIDER_VIEW_ATTEMPT_PREFIX: &str = "provider_view_attempt_";
+
+    for envelope in source_envelopes.iter().rev() {
+        if envelope.agent_id.as_ref() != source_owner_agent {
+            continue;
+        }
+        let payload = match decode_payload::<EventPayload>(&envelope.payload) {
+            Ok(payload) => payload,
+            Err(_)
+                if raw_provider_view_kind(&envelope.payload)
+                    .is_some_and(|kind| kind.starts_with(PROVIDER_VIEW_ATTEMPT_PREFIX)) =>
+            {
+                return None;
+            }
+            Err(_) => continue,
+        };
+        let EventPayload::Item(item_event) = payload else {
+            continue;
+        };
+        let item = match item_event {
+            ItemEvent::Completed { item, .. } => item,
+            ItemEvent::Started {
+                item: TurnItem::Extension { kind, .. },
+                ..
+            } if kind.starts_with(PROVIDER_VIEW_ATTEMPT_PREFIX) => return None,
+            ItemEvent::Started { .. } | ItemEvent::Delta { .. } => continue,
+        };
+        let TurnItem::Extension { kind, data } = item else {
+            continue;
+        };
+        if kind != PROVIDER_VIEW_ATTEMPT_KIND {
+            if kind.starts_with(PROVIDER_VIEW_ATTEMPT_PREFIX) {
+                return None;
+            }
+            continue;
+        }
+        if data.get("ordinal")?.as_u64()? == 0 {
+            return None;
+        }
+        let provider_view = data.get("view")?;
+        if !provider_view_is_complete(provider_view) {
+            return None;
+        }
+        return Some(ForkCacheInheritanceCandidate {
+            provider_view: provider_view.clone(),
         });
     }
     None
@@ -20467,6 +20591,7 @@ fn provider_views_share_cache_prefix(
     let same_domain = [
         "provider",
         "model",
+        "max_tokens",
         "dialect",
         "serialization_version",
         "header_epoch",
@@ -20513,76 +20638,65 @@ fn provider_views_share_cache_prefix(
 }
 
 fn provider_view_is_complete(view: &serde_json::Value) -> bool {
-    let nonempty_string = |field| {
-        view.get(field)
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|value| !value.is_empty())
+    let Ok(view) = decode_payload::<ProviderViewLedgerV1>(view) else {
+        return false;
     };
-    let block_ref = |value: &serde_json::Value| {
-        value
-            .get("content_hash")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|hash| {
-                hash.len() == 71
-                    && hash.starts_with("blake3:")
-                    && hash[7..]
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            })
-            && value
-                .get("byte_len")
-                .and_then(serde_json::Value::as_u64)
-                .is_some()
+    let nonempty = |value: &str| !value.is_empty();
+    let block_ref = |block: &haider_protocol::cache::ProviderViewBlockRefV1| {
+        let hash = block.content_hash.as_bytes();
+        hash.len() == 71
+            && hash.starts_with(b"blake3:")
+            && hash[7..]
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
     };
-    let history_blocks = view
-        .get("history_blocks")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|blocks| blocks.iter().all(block_ref));
-    let latest_compaction_boundary_valid = view
-        .get("latest_compaction_summary_end")
-        .is_none_or(|boundary| boundary.is_null() || boundary.as_u64().is_some());
-    let boundaries_valid = view.get("boundaries").is_none_or(|boundaries| {
-        boundaries.as_array().is_some_and(|boundaries| {
-            boundaries.iter().all(|boundary| {
-                boundary
-                    .get("section")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some()
-                    && boundary.get("message_end").is_none_or(|message_end| {
-                        message_end.is_null() || message_end.as_u64().is_some()
-                    })
-            })
-        })
-    });
+    let latest_compaction_boundary_valid =
+        view.latest_compaction_summary_end.is_none_or(|boundary| {
+            boundary > 0
+                && boundary <= view.current_user_start
+                && boundary <= view.stable_history_end
+        });
+    let mut saw_system = false;
+    let mut saw_tools = false;
+    let mut last_history_end = None;
+    let boundaries_valid = view
+        .boundaries
+        .iter()
+        .all(|boundary| match boundary.section.as_str() {
+            "system" if !saw_system && !saw_tools && last_history_end.is_none() => {
+                saw_system = true;
+                boundary.message_end.is_none()
+            }
+            "tools" if !saw_tools && last_history_end.is_none() => {
+                saw_tools = true;
+                boundary.message_end.is_none()
+            }
+            "history" => boundary.message_end.is_some_and(|message_end| {
+                let ordered = last_history_end.is_none_or(|previous| previous < message_end);
+                last_history_end = Some(message_end);
+                message_end > 0 && message_end <= view.stable_history_end && ordered
+            }),
+            _ => false,
+        });
 
-    [
-        "provider",
-        "model",
-        "dialect",
-        "serialization_version",
-        "header_epoch",
-        "cache_epoch",
-        "compaction_epoch",
-        "reasoning_retention",
-        "trim_sentinel",
-    ]
-    .into_iter()
-    .all(nonempty_string)
-        && view
-            .get("account_scope")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|scope| !scope.is_empty())
-        && view
-            .get("stable_history_end")
-            .and_then(serde_json::Value::as_u64)
-            .is_some()
-        && view
-            .get("current_user_start")
-            .and_then(serde_json::Value::as_u64)
-            .is_some()
-        && view.get("system_block").is_some_and(block_ref)
-        && view.get("tool_schema_block").is_some_and(block_ref)
-        && history_blocks
+    view.serialization_version == haider_protocol::cache::PROVIDER_VIEW_SERIALIZATION_VERSION
+        && [
+            view.provider.as_str(),
+            view.model.as_str(),
+            view.dialect.as_str(),
+            view.header_epoch.as_str(),
+            view.cache_epoch.as_str(),
+            view.compaction_epoch.as_str(),
+            view.reasoning_retention.as_str(),
+            view.trim_sentinel.as_str(),
+        ]
+        .into_iter()
+        .all(nonempty)
+        && view.max_tokens > 0
+        && view.account_scope.as_deref().is_some_and(nonempty)
+        && block_ref(&view.system_block)
+        && block_ref(&view.tool_schema_block)
+        && view.history_blocks.iter().all(block_ref)
         && latest_compaction_boundary_valid
         && boundaries_valid
 }

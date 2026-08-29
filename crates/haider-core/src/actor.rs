@@ -9513,6 +9513,7 @@ fn prompt_cache_metadata(
     let cache_epoch = digest_json(&serde_json::json!({
         "provider": config.usage_scope.provider,
         "model": config.model,
+        "max_tokens": config.max_tokens,
         "account_scope": account_scope,
         "system_digest": prefix_digests.system,
         "tool_digest": prefix_digests.tools,

@@ -25,8 +25,9 @@ fn provider_view(
     let ledger = ProviderViewLedgerV1 {
         provider: "openai".into(),
         model: "gpt-test".into(),
+        max_tokens: 4_096,
         dialect: "responses".into(),
-        serialization_version: "haider.provider-view.json.v1".into(),
+        serialization_version: "haider.provider-view.json.v2".into(),
         header_epoch: "header".into(),
         cache_epoch: "cache".into(),
         compaction_epoch: "root".into(),
