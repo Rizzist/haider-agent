@@ -71,7 +71,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Semaphore, watch};
@@ -119,6 +119,14 @@ struct PreparedDaemonTask {
     completion: Arc<DaemonTaskCompletion>,
 }
 
+struct DaemonTaskControl {
+    shutdown_handle: ShutdownHandle,
+    shutdown: watch::Receiver<ShutdownRequest>,
+    shutdown_observer: ShutdownObserver,
+    crash: watch::Receiver<bool>,
+    diagnostics: Arc<DaemonTaskCompletion>,
+}
+
 impl PreparedDaemonTask {
     fn new() -> Self {
         let (states, readiness) = StatePublisher::channel();
@@ -145,6 +153,7 @@ impl PreparedDaemonTask {
             readiness: self.readiness.clone(),
             completion: Arc::clone(&self.completion),
         };
+        let task_diagnostics = Arc::clone(&self.completion);
         let task_shutdown = self.shutdown.clone();
         let completion_guard = DaemonTaskCompletionGuard {
             completion: self.completion,
@@ -154,10 +163,13 @@ impl PreparedDaemonTask {
                 config,
                 dependencies,
                 self.states,
-                task_shutdown,
-                self.shutdown_receiver,
-                self.shutdown_observer,
-                self.crash_receiver,
+                DaemonTaskControl {
+                    shutdown_handle: task_shutdown,
+                    shutdown: self.shutdown_receiver,
+                    shutdown_observer: self.shutdown_observer,
+                    crash: self.crash_receiver,
+                    diagnostics: task_diagnostics,
+                },
             )
             .await;
             completion_guard.record(format!("{result:?}"));
@@ -192,12 +204,15 @@ pub struct DaemonTaskDiagnosticSnapshot {
     pub finished: bool,
     /// Bounded typed result, or the panic/abort marker installed by the guard.
     pub outcome: Option<String>,
+    /// Connections admitted by the daemon since this task started.
+    pub connection_admissions: u64,
 }
 
 #[derive(Default)]
 struct DaemonTaskCompletion {
     finished: AtomicBool,
     outcome: StdMutex<Option<String>>,
+    connection_admissions: Arc<AtomicU64>,
 }
 
 struct DaemonTaskCompletionGuard {
@@ -255,6 +270,10 @@ impl DaemonTaskDiagnostics {
             state: self.readiness.current(),
             finished,
             outcome,
+            connection_admissions: self
+                .completion
+                .connection_admissions
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -638,21 +657,9 @@ async fn run_owner(
     config: DaemonConfig,
     dependencies: DaemonDependencies,
     states: StatePublisher,
-    shutdown_handle: ShutdownHandle,
-    shutdown: watch::Receiver<ShutdownRequest>,
-    shutdown_observer: ShutdownObserver,
-    crash: watch::Receiver<bool>,
+    control: DaemonTaskControl,
 ) -> Result<ShutdownOutcome, DaemonError> {
-    let result = run_inner(
-        &config,
-        dependencies,
-        &states,
-        shutdown_handle,
-        shutdown,
-        &shutdown_observer,
-        crash,
-    )
-    .await;
+    let result = run_inner(&config, dependencies, &states, control).await;
     if let Err(error) = &result {
         states.publish(DaemonState::Failed {
             message: error.to_string(),
@@ -665,11 +672,15 @@ async fn run_inner(
     config: &DaemonConfig,
     dependencies: DaemonDependencies,
     states: &StatePublisher,
-    shutdown_handle: ShutdownHandle,
-    mut shutdown: watch::Receiver<ShutdownRequest>,
-    shutdown_observer: &ShutdownObserver,
-    mut crash: watch::Receiver<bool>,
+    control: DaemonTaskControl,
 ) -> Result<ShutdownOutcome, DaemonError> {
+    let DaemonTaskControl {
+        shutdown_handle,
+        mut shutdown,
+        shutdown_observer,
+        mut crash,
+        diagnostics,
+    } = control;
     config
         .validate()
         .map_err(|message| DaemonError::InvalidConfig { message })?;
@@ -1288,7 +1299,11 @@ async fn run_inner(
     // Recovering) or loses (Ready, then a normal drain).
     shutdown_observer.publish_ready_if_idle(states);
 
-    let mut runtime = ConnectionRuntime::new(config.max_connections, writer_receiver);
+    let mut runtime = ConnectionRuntime::new(
+        config.max_connections,
+        writer_receiver,
+        Arc::clone(&diagnostics.connection_admissions),
+    );
     let (stop, listener_error) = runtime
         .accept_until_shutdown(
             &endpoint,
@@ -1633,6 +1648,7 @@ struct ConnectionRuntime {
     /// on abort alike. Nothing about listener close or drain ordering depends
     /// on it (report §2.5).
     admission: Arc<Semaphore>,
+    connection_admissions: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1645,12 +1661,14 @@ impl ConnectionRuntime {
     fn new(
         max_connections: usize,
         writer_receiver: tokio::sync::mpsc::UnboundedReceiver<JoinHandle<()>>,
+        connection_admissions: Arc<AtomicU64>,
     ) -> Self {
         Self {
             connections: JoinSet::new(),
             writers: Vec::new(),
             writer_receiver,
             admission: Arc::new(Semaphore::new(max_connections)),
+            connection_admissions,
         }
     }
 
@@ -1725,6 +1743,7 @@ impl ConnectionRuntime {
                         Ok((stream, _)) => {
                             match Arc::clone(&self.admission).try_acquire_owned() {
                                 Ok(permit) => {
+                                    self.connection_admissions.fetch_add(1, Ordering::Relaxed);
                                     let connection_context = context.clone();
                                     let connection_drain = drain_receiver.clone();
                                     self.connections.spawn(async move {
