@@ -41,6 +41,8 @@ fn enterprise_summary(
         api_family: haider_rpc::ProviderApiFamilyWire::AnthropicMessages,
         endpoint: endpoint.map(str::to_owned),
         response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
         models: models.iter().map(|model| (*model).to_owned()).collect(),
         model_details: Vec::new(),
         inventory_fetched_at_ms: None,

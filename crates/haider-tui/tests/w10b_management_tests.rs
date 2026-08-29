@@ -50,6 +50,8 @@ fn provider_summary(name: &str) -> haider_rpc::ProviderSummaryWire {
         api_family: haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some("http://127.0.0.1:9999/v1".into()),
         response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
         models: vec!["m-1".into()],
         model_details: Vec::new(),
         inventory_fetched_at_ms: None,

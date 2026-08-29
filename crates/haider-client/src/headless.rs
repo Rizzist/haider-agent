@@ -64,6 +64,12 @@ use crate::spawn::{
 
 /// Default time allowed for a durable cancellation to reach a correlated
 /// terminal after timeout or blocked-input detection.
+///
+/// Supervisor contract: an outer process hard-kill deadline must be strictly
+/// later than Haider's internal `--timeout` plus this terminal grace. Killing
+/// at the same instant as `--timeout` prevents the client from cancelling and
+/// observing the durable terminal fact, turning a truthful timeout into an
+/// ambiguous process disappearance.
 pub const DEFAULT_TERMINAL_GRACE: Duration = Duration::from_secs(2);
 
 /// No daemon account descriptor is currently active for headless bootstrap.

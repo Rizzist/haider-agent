@@ -3046,6 +3046,8 @@ impl HarnessActor {
                 self.config.provider_deadline,
                 attempt_provider.stream_prepared_turn_ref(&provider_request, prepared),
             ));
+            let trusts_default_route_absence = attempt_provider.trusts_default_route_absence();
+            let mut opening_network_waiting = false;
             let mut stream = loop {
                 let opened = tokio::select! {
                     biased;
@@ -3058,6 +3060,25 @@ impl HarnessActor {
                                 &mut tools,
                             )
                             .await;
+                    }
+                    () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                        let unavailable = trusts_default_route_absence
+                            && haider_platform::route_status()
+                                == haider_platform::RouteStatus::Unavailable;
+                        if unavailable != opening_network_waiting {
+                            let state = if unavailable {
+                                RunState::Waiting {
+                                    reason: WaitReason::NetworkUnavailable,
+                                }
+                            } else {
+                                RunState::Thinking
+                            };
+                            if let Err(error) = self.commit_state(&run_id, state).await {
+                                return self.errored_state_outcome(&run_id, error).await;
+                            }
+                            opening_network_waiting = unavailable;
+                        }
+                        continue;
                     }
                     opened = &mut opening => opened,
                     command = self.commands.recv() => {
@@ -3350,7 +3371,12 @@ impl HarnessActor {
                 });
                 let event = match next {
                     Ok(event) => {
-                        if !matches!(event, StreamEvent::UsageUpdate(_)) {
+                        if !matches!(
+                            event,
+                            StreamEvent::UsageUpdate(_)
+                                | StreamEvent::NetworkUnavailable
+                                | StreamEvent::NetworkRestored
+                        ) {
                             provider_content_seen = true;
                         }
                         event
@@ -3598,6 +3624,30 @@ impl HarnessActor {
                     }
                 };
 
+                match &event {
+                    StreamEvent::NetworkUnavailable => {
+                        if let Err(error) = self
+                            .commit_state(
+                                &run_id,
+                                RunState::Waiting {
+                                    reason: WaitReason::NetworkUnavailable,
+                                },
+                            )
+                            .await
+                        {
+                            return self.errored_state_outcome(&run_id, error).await;
+                        }
+                        continue;
+                    }
+                    StreamEvent::NetworkRestored => {
+                        if let Err(error) = self.commit_state(&run_id, RunState::Streaming).await {
+                            return self.errored_state_outcome(&run_id, error).await;
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+
                 // `stream.recv()` is intentionally biased ahead of command
                 // service, so drain already-arrived input once more at the
                 // exact pre-dispatch boundary. Otherwise a ready ToolCallEnd
@@ -3637,6 +3687,8 @@ impl HarnessActor {
                 }
 
                 let event_result: Result<Option<Message>, DriveError> = match event {
+                    // Consumed by the state-transition gate immediately above.
+                    StreamEvent::NetworkUnavailable | StreamEvent::NetworkRestored => Ok(None),
                     StreamEvent::TextDelta { text } => {
                         assistant_blocks.push(Block::Text { text: text.clone() });
                         self.apply_text_delta(&run_id, &mut message, text, false)
@@ -5390,10 +5442,10 @@ impl HarnessActor {
             };
             return Err(DriveError::Provider(capped));
         }
-        let reason = if error.kind == ProviderErrorKind::RateLimited {
-            WaitReason::RateLimit
-        } else {
-            WaitReason::ProviderBackoff
+        let reason = match error.kind {
+            ProviderErrorKind::RateLimited => WaitReason::RateLimit,
+            ProviderErrorKind::NetworkUnavailable => WaitReason::NetworkUnavailable,
+            _ => WaitReason::ProviderBackoff,
         };
         // `retry_after_ms` (429/529 Retry-After) OVERRIDES the computed
         // backoff; otherwise use the jittered exponential schedule.
@@ -9176,7 +9228,8 @@ fn provider_error_allows_retry(
     if !error.retryable
         || !matches!(
             error.kind,
-            ProviderErrorKind::Transport
+            ProviderErrorKind::NetworkUnavailable
+                | ProviderErrorKind::Transport
                 | ProviderErrorKind::StreamInterrupted
                 | ProviderErrorKind::RateLimited
                 | ProviderErrorKind::Overloaded
@@ -9222,7 +9275,9 @@ fn provider_error_allows_retry(
 fn provider_error_is_transport_fault(error: &ProviderError) -> bool {
     matches!(
         error.kind,
-        ProviderErrorKind::Transport | ProviderErrorKind::StreamInterrupted
+        ProviderErrorKind::NetworkUnavailable
+            | ProviderErrorKind::Transport
+            | ProviderErrorKind::StreamInterrupted
     )
 }
 
@@ -9236,6 +9291,7 @@ fn provider_error_allows_rotation(error: &ProviderError) -> bool {
         | ProviderErrorKind::Overloaded
         | ProviderErrorKind::ContextExceeded
         | ProviderErrorKind::InvalidRequest
+        | ProviderErrorKind::NetworkUnavailable
         | ProviderErrorKind::Transport
         | ProviderErrorKind::MalformedFrame
         | ProviderErrorKind::InvalidUtf8

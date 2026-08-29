@@ -39,6 +39,8 @@ fn live_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
         api_family: haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some("http://127.0.0.1:9999/v1".to_owned()),
         response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
         models: Vec::new(),
         model_details: Vec::new(),
         inventory_fetched_at_ms: None,

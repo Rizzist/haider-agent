@@ -266,8 +266,8 @@ async fn dispatch(args: &[String]) -> ExitCode {
                  session <id> seen, session <id> recover [--json] [--probe|--mark-done|--retry|--abandon], \
                  session <id> item <seq> --json [--masked] [--no-spawn], \
                  account list [--json], account import <codex|claude-code> [--confirm], account refresh <alias>, account remove <alias> --confirm, \
-                 account add <alias> --base-url <url> [--api-key <key>|--api-key-env <VAR>|--api-key-stdin|--no-auth] [--api-family openai|anthropic] [--response-open-timeout <dur>] [--json], \
-                 account probe <alias> [--json], account update <alias> [--base-url <url>] [--api-key <key>|--api-key-env <VAR>|--api-key-stdin] [--response-open-timeout <dur>] [--json], \
+                 account add <alias> --base-url <url> [--api-key <key>|--api-key-env <VAR>|--api-key-stdin|--no-auth] [--api-family openai|anthropic] [--response-open-timeout <dur>] [--chunk-idle-timeout <dur>] [--semantic-progress-timeout <dur>] [--json], \
+                 account probe <alias> [--json], account update <alias> [--base-url <url>] [--api-key <key>|--api-key-env <VAR>|--api-key-stdin] [--response-open-timeout <dur>] [--chunk-idle-timeout <dur>] [--semantic-progress-timeout <dur>] [--json], \
                  provider list [--json], provider show <name> [--json], provider add <name> --base-url <url> [--lockdown|--full] ..., provider set <name> (--lockdown|--full), provider remove <name> --confirm, \
                  lockdown status [--json], lockdown quota [--set <bytes>] [--json], \
                  models [--json] [--refresh [<alias>]], \

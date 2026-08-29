@@ -1220,6 +1220,14 @@ pub struct ProviderSummaryWire {
     /// the daemon's documented 60-second default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_open_timeout_ms: Option<u64>,
+    /// Maximum silence between raw response chunks. Omission selects the
+    /// provider adapter's 90-second default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_idle_timeout_ms: Option<u64>,
+    /// Maximum active-route time without content/tool/usage progress.
+    /// Omission selects the provider adapter's five-minute default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_progress_timeout_ms: Option<u64>,
     #[serde(default)]
     pub models: Vec<String>,
     #[serde(default)]
@@ -3624,6 +3632,14 @@ pub enum RequestBody {
         /// value on update and selects the 60-second default on create.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         response_open_timeout_ms: Option<u64>,
+        /// Raw response-chunk idle wait. Omission preserves the stored value
+        /// on update and selects the adapter default on create.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chunk_idle_timeout_ms: Option<u64>,
+        /// Semantic content/tool/usage idle wait. Omission preserves the
+        /// stored value on update and selects the adapter default on create.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        semantic_progress_timeout_ms: Option<u64>,
         /// Ephemeral staged API key used only to authenticate model
         /// discovery before this mutation is accepted. The daemon borrows
         /// the connection-scoped stage without consuming it, excludes the

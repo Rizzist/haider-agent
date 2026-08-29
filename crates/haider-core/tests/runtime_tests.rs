@@ -27,7 +27,7 @@ use haider_protocol::ids::{
 use haider_protocol::item::{ItemEvent, ToolStatus, TurnItem};
 use haider_protocol::menu::{AnswerVia, Menu, MenuAnswer, MenuKind, MenuOption, MenuScope};
 use haider_protocol::provider::{Block, CapabilityDoc, FinishReason, Usage, UsageSource};
-use haider_protocol::state::RunState;
+use haider_protocol::state::{RunState, WaitReason};
 use haider_protocol::tool::{
     AttachmentBlock, BoundedResult, ImageBlockRef, TOOL_RESULT_IMAGE_MAX_COUNT_PER_TURN,
 };
@@ -2485,6 +2485,68 @@ async fn transport_error_after_first_event_is_typed_failure_not_input_required()
         payload,
         EventPayload::RunState(RunState::InputRequired { .. })
     )));
+}
+
+#[tokio::test]
+async fn link_drop_mid_stream_is_waiting_not_a_provider_fault() {
+    let (handle, store, provider) = runtime(vec![
+        FakeStep::EmitText {
+            text: "before".into(),
+        },
+        FakeStep::EmitNetworkUnavailable,
+        FakeStep::Delay { ms: 10 },
+        FakeStep::EmitNetworkRestored,
+        FakeStep::EmitText {
+            text: " after".into(),
+        },
+        FakeStep::Finish {
+            reason: FinishReason::EndTurn,
+        },
+    ]);
+    let outcome = handle
+        .submit_turn(SubmitTurn::new("survive a local link drop"))
+        .await
+        .expect("turn accepted")
+        .wait()
+        .await
+        .expect("outcome");
+    assert_eq!(outcome.state, RunState::Done);
+    assert_eq!(provider.requests().len(), 1, "link recovery never replays");
+
+    let payloads = store
+        .events(&SessionId::new(SESSION))
+        .await
+        .into_iter()
+        .map(|event| typed(&event))
+        .collect::<Vec<_>>();
+    let waiting = payloads.iter().position(|payload| {
+        matches!(
+            payload,
+            EventPayload::RunState(RunState::Waiting {
+                reason: WaitReason::NetworkUnavailable
+            })
+        )
+    });
+    let restored = waiting.and_then(|waiting| {
+        payloads
+            .iter()
+            .enumerate()
+            .skip(waiting + 1)
+            .find_map(|(index, payload)| {
+                matches!(payload, EventPayload::RunState(RunState::Streaming)).then_some(index)
+            })
+    });
+    assert!(
+        waiting.is_some(),
+        "route-down is durably attributed locally"
+    );
+    assert!(restored.is_some(), "route restoration returns to streaming");
+    assert!(
+        !payloads
+            .iter()
+            .any(|payload| matches!(payload, EventPayload::RunFailed { .. }))
+    );
+    handle.stop().await.expect("actor stops");
 }
 
 #[tokio::test]

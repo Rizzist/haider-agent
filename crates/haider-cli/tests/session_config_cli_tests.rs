@@ -22,6 +22,8 @@ fn provider_summary(provider: &str) -> ProviderSummaryWire {
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: None,
         response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
         models: vec![],
         model_details: vec![],
         inventory_fetched_at_ms: None,

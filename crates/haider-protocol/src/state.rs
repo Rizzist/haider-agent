@@ -104,6 +104,10 @@ pub enum RunState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum WaitReason {
+    /// A provider request is paused because the local OS positively reports
+    /// no usable route. Distinct from provider backoff: the provider is not
+    /// blamed, and the absolute run deadline remains armed.
+    NetworkUnavailable,
     ProviderBackoff,
     RateLimit,
     RemoteChild,

@@ -39,6 +39,7 @@ const TRANSPORT_CONFIG: GeminiTransportConfig = GeminiTransportConfig {
     connect_timeout: Duration::from_secs(10),
     response_open_timeout: Duration::from_secs(30),
     chunk_idle_timeout: Duration::from_secs(90),
+    semantic_progress_timeout: Duration::from_secs(5 * 60),
 };
 
 struct GeminiTransport {
@@ -143,6 +144,7 @@ pub struct GeminiTransportConfig {
     pub connect_timeout: Duration,
     pub response_open_timeout: Duration,
     pub chunk_idle_timeout: Duration,
+    pub semantic_progress_timeout: Duration,
 }
 
 /// Raw response returned only to the explicitly gated fixture-promotion path.
@@ -430,9 +432,10 @@ impl GeminiProvider {
             full_payload
         };
         let request = self.request_body(payload).await?;
-        tokio::time::timeout(
+        crate::route_gated_timeout(
             Self::transport_config().response_open_timeout,
             self.client.execute(request),
+            crate::RouteGating::Enabled,
         )
         .await
         .map_err(|_| response_open_timeout_error(Self::transport_config().response_open_timeout))?
@@ -468,6 +471,7 @@ impl GeminiProvider {
         let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
         let account = self.account.clone();
         let chunk_idle_timeout = Self::transport_config().chunk_idle_timeout;
+        let semantic_progress_timeout = Self::transport_config().semantic_progress_timeout;
         let producer = tokio::spawn(async move {
             stream_sse_source(
                 response,
@@ -475,6 +479,7 @@ impl GeminiProvider {
                 next_call_index,
                 sender,
                 chunk_idle_timeout,
+                semantic_progress_timeout,
             )
             .await;
         });
@@ -484,6 +489,10 @@ impl GeminiProvider {
 
 #[async_trait]
 impl Provider for GeminiProvider {
+    fn trusts_default_route_absence(&self) -> bool {
+        true
+    }
+
     fn credential_surface(&self) -> crate::ProviderCredentialSurface {
         crate::ProviderCredentialSurface::ApiKey
     }
@@ -647,9 +656,10 @@ impl GeminiCacheBackend for GeminiHttpCacheBackend {
             .json(payload)
             .build()
             .map_err(transport_error)?;
-        let response = tokio::time::timeout(
+        let response = crate::route_gated_timeout(
             GeminiProvider::transport_config().response_open_timeout,
             self.client.execute(request),
+            crate::RouteGating::Enabled,
         )
         .await
         .map_err(|_| {
@@ -708,9 +718,10 @@ impl GeminiCacheBackend for GeminiHttpCacheBackend {
             .header("x-goog-api-key", api_key)
             .build()
             .map_err(transport_error)?;
-        let response = tokio::time::timeout(
+        let response = crate::route_gated_timeout(
             GeminiProvider::transport_config().response_open_timeout,
             self.client.execute(request),
+            crate::RouteGating::Enabled,
         )
         .await
         .map_err(|_| {
@@ -1712,27 +1723,47 @@ pub(crate) async fn stream_sse_source<S: GeminiSseChunkSource>(
     next_call_index: u64,
     sender: mpsc::Sender<ProviderStreamItem>,
     chunk_idle_timeout: Duration,
+    semantic_progress_timeout: Duration,
 ) {
     let mut decoder = GeminiDecoder::new(account, next_call_index);
+    let mut progress = crate::ProviderProgressClock::new(
+        chunk_idle_timeout,
+        semantic_progress_timeout,
+        crate::RouteGating::Enabled,
+    );
     loop {
-        let chunk = match tokio::time::timeout(chunk_idle_timeout, source.next_chunk()).await {
-            Ok(Ok(Some(chunk))) => chunk,
-            Ok(Ok(None)) => {
+        let chunk = match progress.wait_for_next(source.next_chunk(), &sender).await {
+            Ok(Some(Ok(Some(chunk)))) => chunk,
+            Ok(Some(Ok(None))) => {
                 send_items(&sender, decoder.finish()).await;
                 return;
             }
-            Ok(Err(error)) => {
+            Ok(Some(Err(error))) => {
                 let _ = sender.send(Err(error)).await;
                 return;
             }
-            Err(_) => {
+            Ok(None) => return,
+            Err(crate::ProgressClockExpired::ChunkIdle) => {
                 let _ = sender
                     .send(Err(stream_idle_error(chunk_idle_timeout)))
                     .await;
                 return;
             }
+            Err(crate::ProgressClockExpired::SemanticIdle) => {
+                let _ = sender
+                    .send(Err(crate::semantic_progress_timeout_error(
+                        "Gemini",
+                        semantic_progress_timeout,
+                    )))
+                    .await;
+                return;
+            }
         };
+        progress.observe_raw_chunk();
         let items = decoder.push(chunk.as_ref());
+        if crate::has_semantic_progress(&items) {
+            progress.observe_semantic_progress();
+        }
         if !send_items(&sender, items).await || decoder.terminal {
             return;
         }
@@ -2440,6 +2471,7 @@ fn provider_kind_name(kind: ProviderErrorKind) -> &'static str {
         ProviderErrorKind::Overloaded => "overload",
         ProviderErrorKind::ContextExceeded => "context overflow",
         ProviderErrorKind::InvalidRequest => "invalid request",
+        ProviderErrorKind::NetworkUnavailable => "local network unavailability",
         ProviderErrorKind::Transport => "transport failure",
         ProviderErrorKind::MalformedFrame => "malformed frame",
         ProviderErrorKind::InvalidUtf8 => "invalid UTF-8",
@@ -2451,7 +2483,7 @@ fn provider_kind_name(kind: ProviderErrorKind) -> &'static str {
 }
 
 fn transport_error(error: reqwest::Error) -> ProviderError {
-    crate::reqwest_transport_error("Gemini", error)
+    crate::reqwest_transport_error_with_route_gating("Gemini", error, crate::RouteGating::Enabled)
 }
 
 fn response_open_timeout_error(timeout: Duration) -> ProviderError {

@@ -43,6 +43,8 @@ fn windowed_summary(
         api_family: haider_rpc::ProviderApiFamilyWire::OpenAiResponses,
         endpoint: None,
         response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
         models: entries.iter().map(|(slug, _)| (*slug).to_owned()).collect(),
         model_details: entries
             .iter()

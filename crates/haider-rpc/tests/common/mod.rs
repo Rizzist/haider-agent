@@ -671,6 +671,8 @@ pub fn transcript() -> Vec<WireFrame> {
                     api_family: ProviderApiFamilyWire::OpenAiResponses,
                     endpoint: Some("https://api.openai.com/v1/responses".into()),
                     response_open_timeout_ms: None,
+                    chunk_idle_timeout_ms: None,
+                    semantic_progress_timeout_ms: None,
                     models: vec!["frontier-a".into()],
                     model_details: vec![ModelDetailWire {
                         name: "frontier-a".into(),
@@ -742,6 +744,8 @@ pub fn transcript() -> Vec<WireFrame> {
                     api_family: ProviderApiFamilyWire::OpenAiResponses,
                     endpoint: Some("https://api.openai.com/v1/responses".into()),
                     response_open_timeout_ms: None,
+                    chunk_idle_timeout_ms: None,
+                    semantic_progress_timeout_ms: None,
                     models: vec!["frontier-a".into()],
                     model_details: vec![ModelDetailWire {
                         name: "frontier-a".into(),
@@ -775,6 +779,8 @@ pub fn transcript() -> Vec<WireFrame> {
                 models: vec!["local-frontier-a".into()],
                 default_model: Some("local-frontier-a".into()),
                 response_open_timeout_ms: None,
+                chunk_idle_timeout_ms: None,
+                semantic_progress_timeout_ms: None,
                 probe_vault_reference: None,
                 trust: None,
                 expected_revision: 10,
@@ -788,6 +794,8 @@ pub fn transcript() -> Vec<WireFrame> {
                     api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
                     endpoint: Some("http://127.0.0.1:11434".into()),
                     response_open_timeout_ms: None,
+                    chunk_idle_timeout_ms: None,
+                    semantic_progress_timeout_ms: None,
                     models: vec!["local-frontier-a".into()],
                     model_details: vec![ModelDetailWire {
                         name: "local-frontier-a".into(),
@@ -852,6 +860,8 @@ pub fn transcript() -> Vec<WireFrame> {
                     api_family: ProviderApiFamilyWire::OpenAiResponses,
                     endpoint: Some("https://chatgpt.com/backend-api/codex/responses".into()),
                     response_open_timeout_ms: None,
+                    chunk_idle_timeout_ms: None,
+                    semantic_progress_timeout_ms: None,
                     models: vec!["frontier-a".into(), "frontier-b".into()],
                     model_details: vec![
                         ModelDetailWire {
@@ -1283,6 +1293,8 @@ pub fn transcript() -> Vec<WireFrame> {
                     api_family: ProviderApiFamilyWire::GeminiGenerateContent,
                     endpoint: Some("https://generativelanguage.googleapis.com/v1beta".into()),
                     response_open_timeout_ms: None,
+                    chunk_idle_timeout_ms: None,
+                    semantic_progress_timeout_ms: None,
                     models: vec!["gemini-2.5-flash".into()],
                     model_details: vec![ModelDetailWire {
                         name: "gemini-2.5-flash".into(),

@@ -46,6 +46,8 @@ fn provider_summary(
         api_family: haider_rpc::ProviderApiFamilyWire::OpenAiResponses,
         endpoint: None,
         response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
         models: models.iter().map(|slug| (*slug).to_owned()).collect(),
         model_details: models
             .iter()

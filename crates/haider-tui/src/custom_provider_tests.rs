@@ -51,6 +51,8 @@ fn discovered_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
         api_family: haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some("https://router.example.test/v1".to_owned()),
         response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
         models: vec!["router-fast".to_owned(), "router-deep".to_owned()],
         model_details: Vec::new(),
         inventory_fetched_at_ms: Some(1_725_000_000_000u64),

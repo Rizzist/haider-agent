@@ -79,6 +79,13 @@ pub(crate) struct ProviderProfileV1 {
     /// OpenAI-family response-header budget; absent selects 60 seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_open_timeout_ms: Option<u64>,
+    /// Raw response-chunk idle budget; absent selects the adapter default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_idle_timeout_ms: Option<u64>,
+    /// Active-route semantic-progress budget; absent selects the adapter
+    /// default. Heartbeat/comment bytes do not reset it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_progress_timeout_ms: Option<u64>,
     pub enabled: bool,
     pub auth_requirement: ProviderAuthRequirementWire,
     #[serde(default)]
@@ -711,6 +718,14 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
                 validate_response_open_timeout_ms(timeout_ms)?;
                 existing.response_open_timeout_ms = Some(timeout_ms);
             }
+            if let Some(timeout_ms) = input.chunk_idle_timeout_ms {
+                validate_chunk_idle_timeout_ms(timeout_ms)?;
+                existing.chunk_idle_timeout_ms = Some(timeout_ms);
+            }
+            if let Some(timeout_ms) = input.semantic_progress_timeout_ms {
+                validate_semantic_progress_timeout_ms(timeout_ms)?;
+                existing.semantic_progress_timeout_ms = Some(timeout_ms);
+            }
             if let Some(trust) = input.trust
                 && existing.trust != trust
             {
@@ -753,12 +768,20 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
             if let Some(timeout_ms) = input.response_open_timeout_ms {
                 validate_response_open_timeout_ms(timeout_ms)?;
             }
+            if let Some(timeout_ms) = input.chunk_idle_timeout_ms {
+                validate_chunk_idle_timeout_ms(timeout_ms)?;
+            }
+            if let Some(timeout_ms) = input.semantic_progress_timeout_ms {
+                validate_semantic_progress_timeout_ms(timeout_ms)?;
+            }
             let profile = ProviderProfileV1 {
                 provider_id: input.provider.clone(),
                 display_name: input.provider,
                 api_family,
                 base_url: Some(base_url),
                 response_open_timeout_ms: input.response_open_timeout_ms,
+                chunk_idle_timeout_ms: input.chunk_idle_timeout_ms,
+                semantic_progress_timeout_ms: input.semantic_progress_timeout_ms,
                 enabled: input.enabled,
                 auth_requirement,
                 configured_models,
@@ -1066,6 +1089,10 @@ pub(crate) struct ProviderConfigureInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_open_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_idle_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_progress_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust: Option<ProviderTrustWire>,
 }
 
@@ -1126,6 +1153,8 @@ fn provider_summary(
         api_family: profile.api_family,
         endpoint: profile.base_url.clone(),
         response_open_timeout_ms: profile.response_open_timeout_ms,
+        chunk_idle_timeout_ms: profile.chunk_idle_timeout_ms,
+        semantic_progress_timeout_ms: profile.semantic_progress_timeout_ms,
         models: discovered_models,
         model_details,
         inventory_fetched_at_ms,
@@ -1174,6 +1203,8 @@ fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> Provider
             api_family: ProviderApiFamilyWire::AnthropicMessages,
             base_url: Some(BEDROCK_MANTLE_DEFAULT_BASE_URL.to_owned()),
             response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
             enabled: true,
             auth_requirement: ProviderAuthRequirementWire::ApiKey,
             configured_models: BEDROCK_SEED_MODELS
@@ -1193,6 +1224,8 @@ fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> Provider
             api_family: ProviderApiFamilyWire::AnthropicMessages,
             base_url: None,
             response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
             enabled: true,
             auth_requirement: ProviderAuthRequirementWire::ApiKey,
             configured_models: VERTEX_SEED_MODELS
@@ -1212,6 +1245,8 @@ fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> Provider
             api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
             base_url: Some(DEEPSEEK_BASE_URL.to_owned()),
             response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
             enabled: true,
             auth_requirement: ProviderAuthRequirementWire::ApiKey,
             configured_models: DEEPSEEK_SEED_MODELS
@@ -1231,6 +1266,8 @@ fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> Provider
             api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
             base_url: Some(XAI_BASE_URL.to_owned()),
             response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
             enabled: true,
             auth_requirement: ProviderAuthRequirementWire::ApiKey,
             configured_models: XAI_SEED_MODELS
@@ -1250,6 +1287,8 @@ fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> Provider
             api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
             base_url: Some(HAIDER_CODE_BASE_URL.to_owned()),
             response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
             enabled: true,
             auth_requirement: ProviderAuthRequirementWire::ApiKey,
             configured_models: HAIDER_CODE_SEED_MODELS
@@ -1339,6 +1378,8 @@ fn builtin_or_unknown(provider: &str, anthropic_default_model: &str) -> Provider
         api_family,
         base_url,
         response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
         enabled,
         auth_requirement,
         configured_models: Vec::new(),
@@ -1586,6 +1627,12 @@ fn validate_profiles(profiles: &[ProviderProfileV1]) -> Result<(), HaiderError> 
         if let Some(timeout_ms) = profile.response_open_timeout_ms {
             validate_response_open_timeout_ms(timeout_ms)?;
         }
+        if let Some(timeout_ms) = profile.chunk_idle_timeout_ms {
+            validate_chunk_idle_timeout_ms(timeout_ms)?;
+        }
+        if let Some(timeout_ms) = profile.semantic_progress_timeout_ms {
+            validate_semantic_progress_timeout_ms(timeout_ms)?;
+        }
     }
     Ok(())
 }
@@ -1594,6 +1641,24 @@ fn validate_response_open_timeout_ms(timeout_ms: u64) -> Result<(), HaiderError>
     if timeout_ms == 0 {
         return Err(invalid(
             "provider response_open_timeout_ms must be greater than zero",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_chunk_idle_timeout_ms(timeout_ms: u64) -> Result<(), HaiderError> {
+    if timeout_ms == 0 {
+        return Err(invalid(
+            "provider chunk_idle_timeout_ms must be greater than zero",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_semantic_progress_timeout_ms(timeout_ms: u64) -> Result<(), HaiderError> {
+    if timeout_ms == 0 {
+        return Err(invalid(
+            "provider semantic_progress_timeout_ms must be greater than zero",
         ));
     }
     Ok(())

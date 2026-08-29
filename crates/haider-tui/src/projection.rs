@@ -2209,6 +2209,7 @@ pub enum BadgeTone {
 
 fn wait_reason_label(reason: &WaitReason) -> String {
     match reason {
+        WaitReason::NetworkUnavailable => "network unavailable".to_owned(),
         WaitReason::ProviderBackoff => "provider backoff".to_owned(),
         WaitReason::RateLimit => "rate limit".to_owned(),
         WaitReason::RemoteChild => "unsupported remote wait — local-only".to_owned(),

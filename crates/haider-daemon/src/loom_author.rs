@@ -175,7 +175,9 @@ pub(crate) async fn draft_from_prose(
             }
             StreamEvent::ReasoningDelta { .. }
             | StreamEvent::UsageUpdate(_)
-            | StreamEvent::ProviderOpaque { .. } => {}
+            | StreamEvent::ProviderOpaque { .. }
+            | StreamEvent::NetworkUnavailable
+            | StreamEvent::NetworkRestored => {}
             StreamEvent::ToolCallStart { .. }
             | StreamEvent::ToolCallArgsDelta { .. }
             | StreamEvent::ToolCallEnd { .. }

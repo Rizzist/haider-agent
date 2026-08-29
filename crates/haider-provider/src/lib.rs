@@ -53,6 +53,299 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, sleep};
 
+/// Frequency at which a blame clock re-reads the cached OS route signal.
+/// The absolute run deadline is owned outside these clocks and is never
+/// sampled, moved, or suspended here.
+const ROUTE_STATE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Which route-gated provider progress clock exhausted its active time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProgressClockExpired {
+    ChunkIdle,
+    SemanticIdle,
+}
+
+/// Whether an endpoint is known to require an OS network route.
+///
+/// Custom endpoints are not automatically eligible: they may resolve to a
+/// loopback or LAN service that remains healthy with no Internet/default
+/// route. In that ambiguous case clocks keep counting exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouteGating {
+    Enabled,
+    Disabled,
+}
+
+impl RouteGating {
+    #[must_use]
+    pub(crate) fn for_endpoint(endpoint: &str) -> Self {
+        let Ok(url) = reqwest::Url::parse(endpoint) else {
+            return Self::Disabled;
+        };
+        let Some(host) = url.host_str() else {
+            return Self::Disabled;
+        };
+        if host.eq_ignore_ascii_case("localhost")
+            || host.to_ascii_lowercase().ends_with(".localhost")
+        {
+            return Self::Disabled;
+        }
+        match host.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(address))
+                if address.is_loopback()
+                    || address.is_private()
+                    || address.is_link_local()
+                    || address.is_unspecified() =>
+            {
+                Self::Disabled
+            }
+            Ok(std::net::IpAddr::V6(address))
+                if address.is_loopback()
+                    || address.is_unique_local()
+                    || address.is_unicast_link_local()
+                    || address.is_unspecified() =>
+            {
+                Self::Disabled
+            }
+            _ => Self::Enabled,
+        }
+    }
+
+    const fn enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+/// Two active-time clocks for one response body. Raw chunks reset only the
+/// byte-idle clock; normalized content/tool/usage events reset the longer
+/// semantic-progress clock. Confirmed route-down intervals decrement neither.
+///
+/// This type deliberately knows nothing about the run deadline. The daemon's
+/// absolute monotonic deadline remains armed outside the provider producer,
+/// so pausing these attribution clocks can never extend a run's hard budget.
+#[derive(Debug)]
+pub(crate) struct ProviderProgressClock {
+    chunk_idle_budget: Duration,
+    semantic_idle_budget: Duration,
+    chunk_idle_remaining: Duration,
+    semantic_idle_remaining: Duration,
+    sampled_at: Instant,
+    sampled_route: haider_platform::RouteStatus,
+    reported_unavailable: bool,
+    route_gating: RouteGating,
+}
+
+impl ProviderProgressClock {
+    #[must_use]
+    pub(crate) fn new(
+        chunk_idle_budget: Duration,
+        semantic_idle_budget: Duration,
+        route_gating: RouteGating,
+    ) -> Self {
+        let sampled_route = if route_gating.enabled() {
+            haider_platform::route_status()
+        } else {
+            haider_platform::RouteStatus::Unknown
+        };
+        Self {
+            chunk_idle_budget,
+            semantic_idle_budget,
+            chunk_idle_remaining: chunk_idle_budget,
+            semantic_idle_remaining: semantic_idle_budget,
+            sampled_at: Instant::now(),
+            sampled_route,
+            reported_unavailable: false,
+            route_gating,
+        }
+    }
+
+    pub(crate) fn observe_raw_chunk(&mut self) {
+        self.chunk_idle_remaining = self.chunk_idle_budget;
+    }
+
+    pub(crate) fn observe_semantic_progress(&mut self) {
+        self.semantic_idle_remaining = self.semantic_idle_budget;
+    }
+
+    #[cfg(test)]
+    fn elapse_for_test(
+        &mut self,
+        elapsed: Duration,
+        previous: haider_platform::RouteStatus,
+        current: haider_platform::RouteStatus,
+    ) {
+        self.sampled_route = previous;
+        self.account_route_interval(elapsed, current);
+    }
+
+    #[cfg(test)]
+    fn expired_for_test(&self) -> Option<ProgressClockExpired> {
+        if self.chunk_idle_remaining.is_zero() {
+            Some(ProgressClockExpired::ChunkIdle)
+        } else if self.semantic_idle_remaining.is_zero() {
+            Some(ProgressClockExpired::SemanticIdle)
+        } else {
+            None
+        }
+    }
+
+    async fn sample_route_and_publish(
+        &mut self,
+        sender: &mpsc::Sender<ProviderStreamItem>,
+    ) -> bool {
+        let current = if self.route_gating.enabled() {
+            haider_platform::route_status()
+        } else {
+            haider_platform::RouteStatus::Unknown
+        };
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.sampled_at);
+        self.account_route_interval(elapsed, current);
+        self.sampled_at = now;
+
+        let unavailable = current == haider_platform::RouteStatus::Unavailable;
+        if unavailable != self.reported_unavailable {
+            self.reported_unavailable = unavailable;
+            let event = if unavailable {
+                StreamEvent::NetworkUnavailable
+            } else {
+                StreamEvent::NetworkRestored
+            };
+            if sender.send(Ok(event)).await.is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn account_route_interval(&mut self, elapsed: Duration, current: haider_platform::RouteStatus) {
+        let current = if self.route_gating.enabled() {
+            current
+        } else {
+            self.sampled_route = haider_platform::RouteStatus::Unknown;
+            haider_platform::RouteStatus::Unknown
+        };
+        if self.sampled_route != haider_platform::RouteStatus::Unavailable
+            && current != haider_platform::RouteStatus::Unavailable
+        {
+            self.chunk_idle_remaining = self.chunk_idle_remaining.saturating_sub(elapsed);
+            self.semantic_idle_remaining = self.semantic_idle_remaining.saturating_sub(elapsed);
+        }
+        self.sampled_route = current;
+    }
+
+    pub(crate) async fn wait_for_next<T>(
+        &mut self,
+        future: impl std::future::Future<Output = T>,
+        sender: &mpsc::Sender<ProviderStreamItem>,
+    ) -> Result<Option<T>, ProgressClockExpired> {
+        tokio::pin!(future);
+        loop {
+            if !self.sample_route_and_publish(sender).await {
+                return Ok(None);
+            }
+            if self.chunk_idle_remaining.is_zero() {
+                return Err(ProgressClockExpired::ChunkIdle);
+            }
+            if self.semantic_idle_remaining.is_zero() {
+                return Err(ProgressClockExpired::SemanticIdle);
+            }
+            let until_sample = if self.sampled_route == haider_platform::RouteStatus::Unavailable {
+                ROUTE_STATE_POLL_INTERVAL
+            } else {
+                ROUTE_STATE_POLL_INTERVAL
+                    .min(self.chunk_idle_remaining)
+                    .min(self.semantic_idle_remaining)
+            };
+            tokio::select! {
+                biased;
+                result = &mut future => {
+                    // Charge active time up to the raw chunk BEFORE the caller
+                    // resets byte/semantic budgets for that progress. Sampling
+                    // on only the next loop would subtract the pre-progress
+                    // wait from freshly reset clocks and make periodic output
+                    // time out as if it were one continuous silence.
+                    if !self.sample_route_and_publish(sender).await {
+                        return Ok(None);
+                    }
+                    return Ok(Some(result));
+                },
+                () = sleep(until_sample) => {}
+            }
+        }
+    }
+}
+
+/// Runs a response-open blame clock in active route time. The caller's
+/// enclosing [`before_provider_request_deadline`] remains a separate absolute
+/// timer and can still terminate this future while the route is down.
+pub(crate) async fn route_gated_timeout<T>(
+    budget: Duration,
+    future: impl std::future::Future<Output = T>,
+    route_gating: RouteGating,
+) -> Result<T, ()> {
+    if !route_gating.enabled() {
+        return tokio::time::timeout(budget, future).await.map_err(|_| ());
+    }
+    let mut remaining = budget;
+    let mut sampled_at = Instant::now();
+    let mut sampled_route = haider_platform::route_status();
+    tokio::pin!(future);
+    loop {
+        let current = haider_platform::route_status();
+        let now = Instant::now();
+        if sampled_route != haider_platform::RouteStatus::Unavailable
+            && current != haider_platform::RouteStatus::Unavailable
+        {
+            remaining = remaining.saturating_sub(now.saturating_duration_since(sampled_at));
+        }
+        sampled_at = now;
+        sampled_route = current;
+        if remaining.is_zero() {
+            return Err(());
+        }
+        let until_sample = if sampled_route == haider_platform::RouteStatus::Unavailable {
+            ROUTE_STATE_POLL_INTERVAL
+        } else {
+            ROUTE_STATE_POLL_INTERVAL.min(remaining)
+        };
+        tokio::select! {
+            biased;
+            result = &mut future => return Ok(result),
+            () = sleep(until_sample) => {}
+        }
+    }
+}
+
+pub(crate) fn has_semantic_progress(items: &[ProviderStreamItem]) -> bool {
+    items.iter().any(|item| {
+        matches!(
+            item,
+            Ok(StreamEvent::TextDelta { .. }
+                | StreamEvent::ReasoningDelta { .. }
+                | StreamEvent::RefusalDelta { .. }
+                | StreamEvent::ToolCallStart { .. }
+                | StreamEvent::ToolCallArgsDelta { .. }
+                | StreamEvent::ToolCallEnd { .. }
+                | StreamEvent::ServerToolUse { .. }
+                | StreamEvent::ServerToolResult { .. }
+                | StreamEvent::UsageUpdate(_))
+        )
+    })
+}
+
+pub(crate) fn semantic_progress_timeout_error(provider: &str, timeout: Duration) -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::Transport,
+        format!(
+            "{provider} stream produced no model content, tool use, or usage for {} seconds",
+            timeout.as_secs()
+        ),
+    )
+    .with_presentation(provider_timeout_presentation())
+    .with_timeout_budget(duration_ms(timeout), duration_ms(timeout))
+}
+
 /// Time reserved after a provider request is stopped so the daemon can
 /// durably terminalize the run and the client can receive that fact before
 /// its own wall-clock deadline.
@@ -1189,6 +1482,10 @@ pub enum ProviderErrorKind {
     /// active model context window. Core may compact and retry this once.
     ContextExceeded,
     InvalidRequest,
+    /// The local OS positively reported that the host has no usable route.
+    /// This is local and retryable; it must never be presented as a provider
+    /// transport fault or used to rotate credentials/fallback providers.
+    NetworkUnavailable,
     Transport,
     MalformedFrame,
     InvalidUtf8,
@@ -1319,7 +1616,11 @@ impl ProviderErrorKind {
     const fn default_retryable(self) -> bool {
         matches!(
             self,
-            Self::RateLimited | Self::Overloaded | Self::Transport | Self::StreamInterrupted
+            Self::RateLimited
+                | Self::Overloaded
+                | Self::NetworkUnavailable
+                | Self::Transport
+                | Self::StreamInterrupted
         )
     }
 }
@@ -1377,6 +1678,13 @@ fn provider_error_presentation(kind: ProviderErrorKind) -> ErrorPresentation {
             "The provider could not accept this request shape.",
             ErrorScope::Turn,
             [ErrorAction::None],
+        ),
+        ProviderErrorKind::NetworkUnavailable => ErrorPresentation::new(
+            "network-unavailable",
+            "Network unavailable",
+            "This device currently has no usable network route.",
+            ErrorScope::Turn,
+            [ErrorAction::Wait, ErrorAction::Retry],
         ),
         ProviderErrorKind::Transport => ErrorPresentation::new(
             "provider-transport",
@@ -1503,6 +1811,14 @@ async fn read_http_error_body_bounded(
 /// configuration changes; DNS/connect/reset/timeout and transient TLS errors
 /// remain retryable transport failures.
 pub(crate) fn reqwest_transport_error(provider: &str, error: reqwest::Error) -> ProviderError {
+    reqwest_transport_error_with_route_gating(provider, error, RouteGating::Disabled)
+}
+
+pub(crate) fn reqwest_transport_error_with_route_gating(
+    provider: &str,
+    error: reqwest::Error,
+    route_gating: RouteGating,
+) -> ProviderError {
     let mut diagnostic = error.to_string();
     let mut permanent_tls = false;
     let mut source = error.source();
@@ -1542,6 +1858,13 @@ pub(crate) fn reqwest_transport_error(provider: &str, error: reqwest::Error) -> 
             format!(
                 "{provider} connection configuration failed; check the endpoint, proxy, and certificate trust settings"
             ),
+        )
+    } else if route_gating.enabled()
+        && haider_platform::route_status() == haider_platform::RouteStatus::Unavailable
+    {
+        ProviderError::new(
+            ProviderErrorKind::NetworkUnavailable,
+            format!("{provider} request stopped while this device had no network route"),
         )
     } else {
         ProviderError::new(
@@ -1673,6 +1996,15 @@ impl Drop for ProviderStream {
 /// Asynchronous provider adapter contract.
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// Whether a confirmed missing OS default route is authoritative for this
+    /// adapter's current endpoint. Custom/local providers override this to
+    /// false because they may remain healthy on loopback, LAN, or host-file
+    /// routes. This controls attribution only; it never changes the absolute
+    /// caller deadline.
+    fn trusts_default_route_absence(&self) -> bool {
+        false
+    }
+
     /// Describes how this adapter authenticates its outbound request.
     fn credential_surface(&self) -> ProviderCredentialSurface {
         ProviderCredentialSurface::Opaque
@@ -1770,6 +2102,11 @@ pub(crate) async fn optional_http_prewarm(client: &reqwest::Client, endpoint: &s
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "step", rename_all = "snake_case")]
 pub enum FakeStep {
+    /// Emits the local transport-control transition used to prove that a link
+    /// loss becomes a Waiting fact without becoming provider content.
+    EmitNetworkUnavailable,
+    /// Emits the matching local route-restored transition.
+    EmitNetworkRestored,
     /// Asserts that this request contains the named result from a preceding
     /// request. A `Finish` ends one request segment; the following steps are
     /// consumed only by the next `stream_turn` call.
@@ -2028,6 +2365,16 @@ async fn play_script(script: Arc<Vec<FakeStep>>, sender: mpsc::Sender<ProviderSt
     for step in script.iter().cloned() {
         match step {
             FakeStep::ExpectToolResult { .. } => {}
+            FakeStep::EmitNetworkUnavailable => {
+                if !send_event(&sender, StreamEvent::NetworkUnavailable).await {
+                    return;
+                }
+            }
+            FakeStep::EmitNetworkRestored => {
+                if !send_event(&sender, StreamEvent::NetworkRestored).await {
+                    return;
+                }
+            }
             FakeStep::EmitText { text } => {
                 if !emit_bytes(&sender, &mut utf8, text.as_bytes()).await {
                     return;
@@ -2370,6 +2717,110 @@ mod e2_contract_tests {
     use super::*;
 
     #[test]
+    fn heartbeat_bytes_cannot_keep_a_semantically_dead_stream_alive() {
+        let mut clock = ProviderProgressClock::new(
+            Duration::from_secs(90),
+            Duration::from_secs(180),
+            RouteGating::Enabled,
+        );
+        for _ in 0..2 {
+            clock.elapse_for_test(
+                Duration::from_secs(80),
+                haider_platform::RouteStatus::Available,
+                haider_platform::RouteStatus::Available,
+            );
+            clock.observe_raw_chunk();
+            assert_eq!(clock.expired_for_test(), None);
+        }
+        clock.elapse_for_test(
+            Duration::from_secs(20),
+            haider_platform::RouteStatus::Available,
+            haider_platform::RouteStatus::Available,
+        );
+        assert_eq!(
+            clock.expired_for_test(),
+            Some(ProgressClockExpired::SemanticIdle)
+        );
+    }
+
+    #[test]
+    fn local_endpoints_never_trust_default_route_absence() {
+        assert_eq!(
+            RouteGating::for_endpoint("http://127.0.0.1:11434/v1"),
+            RouteGating::Disabled
+        );
+        assert_eq!(
+            RouteGating::for_endpoint("http://192.168.1.20:11434/v1"),
+            RouteGating::Disabled
+        );
+        assert_eq!(
+            RouteGating::for_endpoint("https://api.openai.com/v1"),
+            RouteGating::Enabled
+        );
+
+        let budget = Duration::from_secs(1);
+        let mut clock = ProviderProgressClock::new(budget, budget, RouteGating::Disabled);
+        clock.elapse_for_test(
+            budget,
+            haider_platform::RouteStatus::Unavailable,
+            haider_platform::RouteStatus::Unavailable,
+        );
+        assert_eq!(
+            clock.expired_for_test(),
+            Some(ProgressClockExpired::ChunkIdle),
+            "a healthy local provider must not pause on default-route loss"
+        );
+    }
+
+    /// Regression for the supervisor contract: an idle timeout is not a
+    /// naive total-response timeout. Periodic semantic progress may span many
+    /// individual idle budgets; the separate absolute run deadline remains
+    /// the outer termination guarantee.
+    #[test]
+    fn periodic_semantic_chunks_can_outlive_a_naive_total_timeout() {
+        let budget = Duration::from_secs(90);
+        let mut clock = ProviderProgressClock::new(budget, budget, RouteGating::Enabled);
+        for _ in 0..4 {
+            clock.elapse_for_test(
+                Duration::from_secs(80),
+                haider_platform::RouteStatus::Available,
+                haider_platform::RouteStatus::Available,
+            );
+            clock.observe_raw_chunk();
+            clock.observe_semantic_progress();
+            assert_eq!(clock.expired_for_test(), None);
+        }
+        assert!(Duration::from_secs(4 * 80) > budget);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn absolute_deadline_fires_while_blame_clocks_are_paused() {
+        let mut clock = ProviderProgressClock::new(
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            RouteGating::Enabled,
+        );
+        clock.elapse_for_test(
+            Duration::from_secs(60),
+            haider_platform::RouteStatus::Unavailable,
+            haider_platform::RouteStatus::Unavailable,
+        );
+        assert_eq!(clock.expired_for_test(), None, "route-down pauses blame");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let error = before_provider_request_deadline(
+            Some(deadline),
+            std::future::pending::<Result<(), ProviderError>>(),
+        )
+        .await
+        .expect_err("absolute deadline remains armed");
+        assert_eq!(
+            error.timeout_reason,
+            Some(ProviderTimeoutReason::DeadlineExhausted)
+        );
+    }
+
+    #[test]
     fn builtin_provider_roster_includes_both_xai_lanes() {
         assert_eq!(BUILTIN_PROVIDER_NAMES.len(), 13);
         assert!(BUILTIN_PROVIDER_NAMES.contains(&XAI_PROVIDER_NAME));
@@ -2465,6 +2916,7 @@ mod e2_contract_tests {
             | ProviderErrorKind::Overloaded
             | ProviderErrorKind::ContextExceeded
             | ProviderErrorKind::InvalidRequest
+            | ProviderErrorKind::NetworkUnavailable
             | ProviderErrorKind::Transport
             | ProviderErrorKind::MalformedFrame
             | ProviderErrorKind::InvalidUtf8
@@ -2487,6 +2939,7 @@ mod e2_contract_tests {
             ProviderErrorKind::Overloaded,
             ProviderErrorKind::ContextExceeded,
             ProviderErrorKind::InvalidRequest,
+            ProviderErrorKind::NetworkUnavailable,
             ProviderErrorKind::Transport,
             ProviderErrorKind::MalformedFrame,
             ProviderErrorKind::InvalidUtf8,

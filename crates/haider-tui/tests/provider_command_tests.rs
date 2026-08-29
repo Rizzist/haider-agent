@@ -19,6 +19,8 @@ fn provider_summary(
         api_family: haider_rpc::ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: None,
         response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
         model_details: Vec::new(),
         models,
         inventory_fetched_at_ms: None,

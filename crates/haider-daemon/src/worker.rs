@@ -1144,6 +1144,7 @@ impl ContextCompactor for DaemonContextCompactor {
                 Ok(None) => break,
             };
             match item {
+                StreamEvent::NetworkUnavailable | StreamEvent::NetworkRestored => {}
                 StreamEvent::TextDelta { text } => summary.push_str(&text),
                 StreamEvent::ReasoningDelta { .. } => {}
                 StreamEvent::UsageUpdate(mut usage) => {
