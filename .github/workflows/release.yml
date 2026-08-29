@@ -488,6 +488,39 @@ jobs:
           git pull --rebase origin "$DEFAULT_BRANCH"
           git push origin "HEAD:$DEFAULT_BRANCH"
 
+      # The Homebrew tap (Rizzist/homebrew-tap, installed as
+      # `brew install Rizzist/tap/haidercode`) is a SEPARATE repository, so
+      # GITHUB_TOKEN cannot reach it. TAP_TOKEN must be a PAT carrying
+      # contents:write on that repo. Without it we warn and skip rather than
+      # fail the release: the tap simply stays on its previous version, which
+      # is a stale tap rather than a broken release.
+      - name: Re-pin the Homebrew tap
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAP_TOKEN:-}" ]; then
+            echo "::warning::TAP_TOKEN is not set; skipping the Homebrew tap re-pin. Rizzist/homebrew-tap stays on its previous version."
+            exit 0
+          fi
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/Rizzist/homebrew-tap.git" /tmp/tap
+          # The tap's formula is the in-repo formula with its class renamed to
+          # match the filename, which Homebrew requires. Deriving it here keeps
+          # a single source of truth: the pins were already written above.
+          sed -e 's/^class Haider < Formula/class Haidercode < Formula/' \
+            packaging/homebrew/haider.rb > /tmp/tap/Formula/haidercode.rb
+          cd /tmp/tap
+          if git diff --quiet; then
+            echo "::warning::Homebrew tap is already pinned to $TAG; skipping"
+            exit 0
+          fi
+          git add Formula/haidercode.rb
+          git commit -m "haidercode: re-pin to $TAG"
+          git push origin HEAD:main
+
   chocolatey:
     name: Publish Chocolatey
     needs: publish
