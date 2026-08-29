@@ -299,6 +299,60 @@ jobs:
           cp "$BIN" "$DBIN" dist/$NAME/
           if [ "$RUNNER_OS" = "Linux" ]; then cp "$WBIN" dist/$NAME/; fi
           if [ "$RUNNER_OS" = "Windows" ]; then
+            # haider.exe is a CONSOLE binary. Double-clicked from Explorer,
+            # Windows destroys the console the instant the process exits and
+            # takes any error with it -- the reported "blank window for a
+            # second, then disappears". Ship a launcher that holds the window
+            # open on a non-zero exit, and a README covering the SmartScreen
+            # prompt that an unsigned binary necessarily produces.
+            # printf, not a heredoc: a heredoc terminator must sit at column 0
+            # and would break this YAML block scalar.
+            printf '%s\r\n' \
+              '@echo off' \
+              'cd /d "%~dp0"' \
+              'haider.exe %*' \
+              'set HAIDER_EXIT=%ERRORLEVEL%' \
+              'if not "%HAIDER_EXIT%"=="0" (' \
+              '  echo.' \
+              '  echo haider exited with code %HAIDER_EXIT%.' \
+              '  echo The message above is the reason.' \
+              '  echo Report it at https://github.com/Rizzist/haider-agent/issues' \
+              '  echo.' \
+              '  pause' \
+              ')' \
+              'exit /b %HAIDER_EXIT%' > "dist/$NAME/haider.cmd"
+            printf '%s\r\n' \
+              'Haider for Windows' \
+              '==================' \
+              '' \
+              'RUN IT' \
+              '  Double-click haider.cmd  (not haider.exe -- see below)' \
+              '' \
+              '  Or from a terminal, which is better because you keep the output:' \
+              '      cd path\to\this\folder' \
+              '      haider.exe' \
+              '' \
+              '  haider.exe is a console program. Double-clicked from Explorer,' \
+              '  Windows closes the window the moment it exits, so you never get' \
+              '  to read an error. haider.cmd keeps the window open on failure.' \
+              '' \
+              '"WINDOWS PROTECTED YOUR PC"' \
+              '  These binaries are not yet code-signed, so SmartScreen warns and' \
+              '  Defender may quarantine them. That warning is about the ABSENCE' \
+              '  of a signature, not about detected malicious behaviour.' \
+              '  To run anyway: click "More info", then "Run anyway".' \
+              '' \
+              '  Verify what you downloaded -- the release page publishes a' \
+              '  SHA-256 next to the zip:' \
+              '      certutil -hashfile <the-zip-you-downloaded> SHA256' \
+              '' \
+              'KEEP BOTH FILES TOGETHER' \
+              '  haider.exe starts haiderd.exe from its own folder. Moving one' \
+              '  without the other breaks it. To put haider on PATH, add this' \
+              '  whole folder rather than copying haider.exe elsewhere.' \
+              '' \
+              'Source, releases and issues:' \
+              '  https://github.com/Rizzist/haider-agent' > "dist/$NAME/README.txt"
             # Zip is the native Windows archive expectation; Explorer opens it
             # without extra tooling and sha256sum ships with Git Bash.
             (cd dist && 7z a -tzip "$NAME.zip" "$NAME" > /dev/null)
