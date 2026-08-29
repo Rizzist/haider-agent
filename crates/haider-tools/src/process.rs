@@ -1397,7 +1397,7 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                     deadline.await;
                 }
             }, if kill_deadline.is_some() => {
-                match platform_group_exists(group, pid) {
+                match platform_group_exists_for_sweep(group, pid, leader_is_zombie) {
                     Ok(false) => {
                         kill_deadline = None;
                         lifecycle_events.push(ProcessLifecycleEvent::GroupSweepCompleted);
@@ -1723,24 +1723,34 @@ pub(crate) fn platform_group_exists(group: ProcessGroup, pid: Pid) -> ToolResult
     })
 }
 
-pub(crate) async fn observe_process_leader_exit(pid: Pid) -> ToolResult<()> {
-    loop {
-        let exited = match haider_platform::process_leader_exited(pid) {
-            Ok(exited) => exited,
-            Err(error) => {
-                return Err(ToolError::Runtime {
-                    message: format!(
-                        "observe process leader {} exit without reaping: {error}",
-                        pid.as_raw_nonzero()
-                    ),
-                });
-            }
-        };
-        if exited {
-            return Ok(());
+fn platform_group_exists_for_sweep(
+    group: ProcessGroup,
+    pid: Pid,
+    leader_is_zombie: bool,
+) -> ToolResult<bool> {
+    match haider_platform::process_group_exists(group) {
+        Ok(exists) => Ok(exists),
+        // Darwin reports EPERM for a group containing only our zombie child.
+        // The unreaped leader pins this exact PGID, so no live member of the
+        // original group remains in that case.
+        Err(error) if leader_is_zombie && haider_platform::process_error_is_permission(&error) => {
+            Ok(false)
         }
-        sleep(Duration::from_millis(1)).await;
+        Err(error) => Err(ToolError::Runtime {
+            message: format!("probe process group {}: {error}", pid.as_raw_nonzero()),
+        }),
     }
+}
+
+pub(crate) async fn observe_process_leader_exit(pid: Pid) -> ToolResult<()> {
+    haider_platform::observe_process_leader_exit(pid)
+        .await
+        .map_err(|error| ToolError::Runtime {
+            message: format!(
+                "observe process leader {} exit without reaping: {error}",
+                pid.as_raw_nonzero()
+            ),
+        })
 }
 
 pub(crate) async fn reap_process_leader(
@@ -1785,7 +1795,7 @@ pub(crate) fn begin_group_termination(
         return;
     }
     lifecycle_events.push(ProcessLifecycleEvent::GroupSweepStarted);
-    match platform_group_exists(group, pid) {
+    match platform_group_exists_for_sweep(group, pid, leader_is_zombie) {
         Ok(false) => lifecycle_events.push(ProcessLifecycleEvent::GroupSweepCompleted),
         Ok(true) => {
             match signal_platform_group_for_sweep(group, pid, Signal::TERM, leader_is_zombie) {

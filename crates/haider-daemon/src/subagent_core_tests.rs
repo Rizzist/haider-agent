@@ -268,7 +268,9 @@ fn delegation_parent_projection_is_pinned_to_the_spawn_branch() {
 /// MUTATION CHECK: drop the parent branch while converting
 /// `SpawnCoordinates` into the durable record, or bypass spawn idempotency.
 /// Expected RUNTIME failure: replay loses branch A or creates a second child
-/// relation/run for the same parent tool call.
+/// relation/run for the same parent tool call. Also remove the bounded
+/// terminal tail: the final collection below then waits forever because this
+/// fixture deliberately never appends the child SessionState::Idle fence.
 #[tokio::test]
 async fn established_spawn_captures_parent_branch_and_replays_one_child() {
     use haider_protocol::ids::{BranchId, ItemId};
@@ -391,6 +393,50 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
             .all(|event| event.branch_id.is_none()),
         "the child session retains its own main branch"
     );
+
+    let child_session = records[0].child_session_id.clone();
+    let child_run = records[0].child_run_id.clone();
+    let mut terminal = [EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new("branch-spawn-child-done"),
+        seq: 0,
+        session_id: child_session,
+        branch_id: None,
+        run_id: Some(child_run),
+        agent_id: Some(first.ticket.manifest.agent.clone()),
+        device_id: DeviceId::new("branch-spawn-device"),
+        authority_epoch: 0,
+        worker_generation: store.worker_generation(),
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: true,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::to_value(EventPayload::RunState(RunState::Done))
+            .expect("child terminal payload"),
+    }];
+    hub.append(&mut terminal)
+        .await
+        .expect("append child terminal without idle settlement");
+    let bounded =
+        DelegationHandle::with_settlement_tail_timeout(hub.clone(), Duration::from_millis(50));
+    let collected = timeout(
+        Duration::from_secs(1),
+        bounded.collect(&first.ticket, &CancelToken::new()),
+    )
+    .await
+    .expect("durable child terminal releases the parent without idle settlement")
+    .expect("collect terminal child");
+    assert_eq!(
+        collected.report.summary,
+        "subagent completed without a text report"
+    );
+
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
 }
 
 struct InspectingProvider {

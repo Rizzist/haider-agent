@@ -988,6 +988,113 @@ pub fn process_leader_exited(pid: ProcessId) -> std::io::Result<bool> {
     }
 }
 
+/// Waits for a process leader's exit without reaping it.
+///
+/// Linux and macOS use kernel exit notifications so short commands do not
+/// inherit a coarse polling interval. Other targets use a cancel-safe poll
+/// fallback capped at one millisecond; callers may drop the future to cancel
+/// observation without changing process ownership.
+pub async fn observe_process_leader_exit(pid: ProcessId) -> std::io::Result<()> {
+    if process_leader_exited(pid)? {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    if observe_process_leader_exit_with_pidfd(pid).await? {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    if observe_process_leader_exit_with_kqueue(pid).await? {
+        return Ok(());
+    }
+
+    observe_process_leader_exit_by_polling(pid).await
+}
+
+#[cfg(target_os = "linux")]
+async fn observe_process_leader_exit_with_pidfd(pid: ProcessId) -> std::io::Result<bool> {
+    use rustix::process::{Pid, PidfdFlags, pidfd_open};
+    use tokio::io::unix::AsyncFd;
+
+    let Some(pid) = Pid::from_raw(pid.as_raw_nonzero().get()) else {
+        return Err(std::io::Error::other("process leader PID is zero"));
+    };
+    let descriptor = match pidfd_open(pid, PidfdFlags::NONBLOCK) {
+        Ok(descriptor) => descriptor,
+        Err(_) => return Ok(false),
+    };
+    let descriptor = AsyncFd::new(descriptor)?;
+    let _ready = descriptor.readable().await?;
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+async fn observe_process_leader_exit_with_kqueue(pid: ProcessId) -> std::io::Result<bool> {
+    use nix::libc::timespec;
+    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+
+    let queue = Kqueue::new().map_err(std::io::Error::other)?;
+    let event = KEvent::new(
+        pid.id() as usize,
+        EventFilter::EVFILT_PROC,
+        EvFlags::EV_ADD | EvFlags::EV_ONESHOT,
+        FilterFlag::NOTE_EXIT,
+        0,
+        0,
+    );
+    let registered = queue.kevent(
+        &[event],
+        &mut [],
+        Some(timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        }),
+    );
+    if registered.is_err() {
+        return process_leader_exited(pid).map(|exited| exited.then_some(()).is_some());
+    }
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("haider-process-exit".into())
+        .spawn(move || {
+            let mut events = [event];
+            let result = queue
+                .kevent(&[], &mut events, None)
+                .map(|count| count != 0)
+                .map_err(std::io::Error::other);
+            let _ = sender.send(result);
+        })
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("could not start process-exit observer: {error}"),
+            )
+        })?;
+    tokio::select! {
+        result = receiver => result
+            .map_err(|error| std::io::Error::other(format!("process-exit observer stopped: {error}")))?,
+        result = observe_process_leader_exit_by_polling(pid) => {
+            result?;
+            Ok(true)
+        }
+    }
+}
+
+async fn observe_process_leader_exit_by_polling(pid: ProcessId) -> std::io::Result<()> {
+    const POLL_MIN: std::time::Duration = std::time::Duration::from_micros(50);
+    const POLL_MAX: std::time::Duration = std::time::Duration::from_millis(1);
+
+    let mut backoff = POLL_MIN;
+    loop {
+        if process_leader_exited(pid)? {
+            return Ok(());
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = backoff.saturating_mul(2).min(POLL_MAX);
+    }
+}
+
 #[cfg(windows)]
 #[allow(unsafe_code)]
 pub fn process_leader_exited(pid: ProcessId) -> std::io::Result<bool> {

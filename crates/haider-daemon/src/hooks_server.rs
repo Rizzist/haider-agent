@@ -46,6 +46,7 @@ struct ServerHandle {
 pub(super) struct ServerTestState {
     leader_pid: std::sync::atomic::AtomicU32,
     running: std::sync::atomic::AtomicBool,
+    wedge_reap: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
@@ -57,6 +58,11 @@ impl ServerTestState {
 
     pub(super) fn is_running(&self) -> bool {
         self.running.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(super) fn wedge_reap(&self) {
+        self.wedge_reap
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -246,11 +252,24 @@ struct ServerProcess {
 }
 
 impl ServerProcess {
-    async fn kill(mut self) {
+    async fn kill(mut self) -> HookChildReapOutcome {
         self.group.kill();
         let _ = self.child.start_kill();
-        let _ = self.child.wait().await;
+        #[cfg(test)]
+        if self
+            .test_state
+            .wedge_reap
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return classify_hook_child_reap(std::future::pending()).await;
+        }
+        reap_hook_child(&mut self.child).await
     }
+}
+
+async fn stop_server(process: ServerProcess, context: &'static str) {
+    let reap = process.kill().await;
+    report_hook_child_reap(context, reap);
 }
 
 #[cfg(test)]
@@ -293,7 +312,7 @@ async fn run_server_actor(
                 request = requests.recv() => request,
                 _ = tokio::time::sleep(idle_timeout) => {
                     if let Some(process) = process.take() {
-                        process.kill().await;
+                        stop_server(process, "server_idle_timeout").await;
                     }
                     crash_backoff = None;
                     next_backoff = SUBSCRIBE_BACKOFF_MIN;
@@ -310,14 +329,14 @@ async fn run_server_actor(
         };
         let Some(request) = request else {
             if let Some(process) = process.take() {
-                process.kill().await;
+                stop_server(process, "server_shutdown").await;
             }
             return;
         };
 
         if !definition_current(&service, &definition, run_override).await {
             if let Some(process) = process.take() {
-                process.kill().await;
+                stop_server(process, "server_definition_changed").await;
             }
             let _ = request.response.send(ServerReply::DefinitionChanged);
             return;
@@ -329,14 +348,14 @@ async fn run_server_actor(
                     if let Some(process) = process.take() {
                         // The leader is gone, but descendants may still own
                         // the process group. Kill the group before respawn.
-                        process.kill().await;
+                        stop_server(process, "server_leader_exited").await;
                     }
                     crash_backoff = Some(next_backoff);
                     next_backoff = next_subscriber_backoff(next_backoff);
                 }
                 Err(_) => {
                     if let Some(process) = process.take() {
-                        process.kill().await;
+                        stop_server(process, "server_leader_probe_failed").await;
                     }
                     crash_backoff = Some(next_backoff);
                     next_backoff = next_subscriber_backoff(next_backoff);
@@ -359,7 +378,7 @@ async fn run_server_actor(
         // sleeping. Revalidate at the last async seam before every respawn.
         if !definition_current(&service, &definition, run_override).await {
             if let Some(process) = process.take() {
-                process.kill().await;
+                stop_server(process, "server_definition_changed_after_backoff").await;
             }
             let _ = request.response.send(ServerReply::DefinitionChanged);
             return;
@@ -398,7 +417,7 @@ async fn run_server_actor(
         .await;
         if outcome.crashed {
             if let Some(process) = process.take() {
-                process.kill().await;
+                stop_server(process, "server_exchange_failed").await;
             }
             crash_backoff = Some(next_backoff);
             next_backoff = next_subscriber_backoff(next_backoff);
@@ -410,7 +429,7 @@ async fn run_server_actor(
         let _ = request.response.send(ServerReply::Result(outcome.result));
         if cancelled {
             if let Some(process) = process.take() {
-                process.kill().await;
+                stop_server(process, "server_exchange_cancelled").await;
             }
             return;
         }

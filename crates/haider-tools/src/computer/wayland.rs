@@ -139,7 +139,29 @@ impl WaylandComputerBackend {
             .take();
         if let Some(mut child) = child {
             let _ = haider_platform::signal_process_group(child.group, ProcessSignal::Kill);
-            let _ = child.child.kill().await;
+            let _ = child.child.start_kill();
+            match haider_platform::bounded_wait(
+                "Wayland portal child reap",
+                PORTAL_STOP_TIMEOUT,
+                child.child.wait(),
+            )
+            .await
+            {
+                haider_platform::BoundedWait::Completed(Ok(_)) => {}
+                haider_platform::BoundedWait::Completed(Err(error)) => {
+                    eprintln!(
+                        "haider: lifecycle event=wayland_portal_reap_failed error_kind={:?} raw_os_error={:?}",
+                        error.kind(),
+                        error.raw_os_error()
+                    );
+                }
+                haider_platform::BoundedWait::TimedOut(timeout) => {
+                    eprintln!(
+                        "haider: lifecycle event=wayland_portal_reap_timeout timeout_ms={}",
+                        timeout.limit().as_millis()
+                    );
+                }
+            }
             haider_platform::release_process_group(child.group);
         }
         self.clear_held_left_owner();

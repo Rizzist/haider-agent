@@ -86,10 +86,7 @@ const HOOK_CONTROL_MAX_REQUESTS: usize = 64;
 const HOOK_CONTROL_MAX_BYTES: usize = 64 * 1024;
 const HOOK_DRAIN_PAGE_MAX_REQUESTS: usize = 256;
 const HOOK_DRAIN_PAGE_MAX_BYTES: usize = 16 * 1024 * 1024;
-#[cfg(unix)]
-const HOOK_LEADER_EXIT_POLL_MIN: Duration = Duration::from_millis(1);
-#[cfg(unix)]
-const HOOK_LEADER_EXIT_POLL_MAX: Duration = Duration::from_millis(50);
+const HOOK_CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(unix)]
 const ENV_ALLOWLIST: [&str; 5] = ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR"];
 // `cmd.exe` and Windows system tools need these bootstrap variables even
@@ -105,6 +102,46 @@ const ENV_ALLOWLIST: [&str; 7] = [
     "TEMP",
     "TMP",
 ];
+
+#[derive(Debug)]
+#[must_use = "hook child cleanup failures must be handled"]
+enum HookChildReapOutcome {
+    Exited(std::process::ExitStatus),
+    WaitFailed(std::io::Error),
+    TimedOut(haider_platform::WaitTimeout),
+}
+
+async fn classify_hook_child_reap(
+    wait: impl std::future::Future<Output = std::io::Result<std::process::ExitStatus>>,
+) -> HookChildReapOutcome {
+    match haider_platform::bounded_wait("hook child reap", HOOK_CHILD_REAP_TIMEOUT, wait).await {
+        haider_platform::BoundedWait::Completed(Ok(status)) => HookChildReapOutcome::Exited(status),
+        haider_platform::BoundedWait::Completed(Err(error)) => {
+            HookChildReapOutcome::WaitFailed(error)
+        }
+        haider_platform::BoundedWait::TimedOut(timeout) => HookChildReapOutcome::TimedOut(timeout),
+    }
+}
+
+async fn reap_hook_child(child: &mut tokio::process::Child) -> HookChildReapOutcome {
+    classify_hook_child_reap(child.wait()).await
+}
+
+fn report_hook_child_reap(context: &'static str, outcome: HookChildReapOutcome) {
+    match outcome {
+        HookChildReapOutcome::Exited(_) => {}
+        HookChildReapOutcome::WaitFailed(error) => eprintln!(
+            "haiderd: lifecycle event=hook_child_reap_failed context={context} error_kind={:?} raw_os_error={:?}",
+            error.kind(),
+            error.raw_os_error()
+        ),
+        HookChildReapOutcome::TimedOut(timeout) => eprintln!(
+            "haiderd: lifecycle event=hook_child_reap_timeout context={context} operation={} timeout_ms={}",
+            timeout.operation(),
+            timeout.limit().as_millis()
+        ),
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -3302,13 +3339,15 @@ async fn run_command(
     let Some(stdout) = child.stdout.take() else {
         process_group.kill();
         let _ = child.start_kill();
-        let _ = child.wait().await;
+        let reap = reap_hook_child(&mut child).await;
+        report_hook_child_reap("spawn_stdout_unavailable", reap);
         return failed_process_output("hook stdout unavailable");
     };
     let Some(stderr) = child.stderr.take() else {
         process_group.kill();
         let _ = child.start_kill();
-        let _ = child.wait().await;
+        let reap = reap_hook_child(&mut child).await;
+        report_hook_child_reap("spawn_stderr_unavailable", reap);
         return failed_process_output("hook stderr unavailable");
     };
     let stdout_task = tokio::spawn(read_limited(stdout, MAX_STREAM_OUTPUT_BYTES));
@@ -3328,9 +3367,10 @@ async fn run_command(
         None => {
             process_group.kill();
             let _ = child.start_kill();
-            let _ = child.wait().await;
-            let _ = await_hook_capture(stdout_task).await;
-            let _ = await_hook_capture(stderr_task).await;
+            let reap = reap_hook_child(&mut child).await;
+            report_hook_child_reap("shutdown", reap);
+            drain_hook_capture(stdout_task, "shutdown_stdout").await;
+            drain_hook_capture(stderr_task, "shutdown_stderr").await;
             cancelled_process_output()
         }
         Some(Ok(Ok(status))) => {
@@ -3340,12 +3380,21 @@ async fn run_command(
             process_group.kill();
             let status = match status {
                 Some(status) => status,
-                None => match child.wait().await {
-                    Ok(status) => status,
-                    Err(error) => {
-                        let _ = await_hook_capture(stdout_task).await;
-                        let _ = await_hook_capture(stderr_task).await;
+                None => match reap_hook_child(&mut child).await {
+                    HookChildReapOutcome::Exited(status) => status,
+                    HookChildReapOutcome::WaitFailed(error) => {
+                        drain_hook_capture(stdout_task, "reap_failure_stdout").await;
+                        drain_hook_capture(stderr_task, "reap_failure_stderr").await;
                         return failed_process_output(&format!("hook leader reap failed: {error}"));
+                    }
+                    HookChildReapOutcome::TimedOut(timeout) => {
+                        report_hook_child_reap(
+                            "natural_exit",
+                            HookChildReapOutcome::TimedOut(timeout),
+                        );
+                        drain_hook_capture(stdout_task, "reap_timeout_stdout").await;
+                        drain_hook_capture(stderr_task, "reap_timeout_stderr").await;
+                        return failed_process_output(&timeout.to_string());
                     }
                 },
             };
@@ -3367,16 +3416,20 @@ async fn run_command(
         }
         Some(Ok(Err(error))) => {
             process_group.kill();
-            let _ = await_hook_capture(stdout_task).await;
-            let _ = await_hook_capture(stderr_task).await;
+            let _ = child.start_kill();
+            let reap = reap_hook_child(&mut child).await;
+            report_hook_child_reap("execution_error", reap);
+            drain_hook_capture(stdout_task, "execution_error_stdout").await;
+            drain_hook_capture(stderr_task, "execution_error_stderr").await;
             failed_process_output(&format!("hook execution failed: {error}"))
         }
         Some(Err(_)) => {
             process_group.kill();
             let _ = child.start_kill();
-            let _ = child.wait().await;
-            let stdout = await_hook_capture(stdout_task).await.ok();
-            let stderr = await_hook_capture(stderr_task).await.ok();
+            let reap = reap_hook_child(&mut child).await;
+            report_hook_child_reap("wall_timeout", reap);
+            let stdout = optional_hook_capture(stdout_task, "wall_timeout_stdout").await;
+            let stderr = optional_hook_capture(stderr_task, "wall_timeout_stderr").await;
             HookProcessResult {
                 exit_code: None,
                 timed_out: true,
@@ -3409,29 +3462,52 @@ async fn observe_hook_leader_exit(
     pid: Option<haider_platform::ProcessId>,
 ) -> std::io::Result<Option<std::process::ExitStatus>> {
     let pid = pid.ok_or_else(|| std::io::Error::other("hook leader PID is unavailable"))?;
-    poll_hook_leader_exit(|| haider_platform::process_leader_exited(pid)).await?;
+    haider_platform::observe_process_leader_exit(pid).await?;
     Ok(None)
-}
-
-#[cfg(unix)]
-async fn poll_hook_leader_exit(
-    mut exited: impl FnMut() -> std::io::Result<bool>,
-) -> std::io::Result<()> {
-    let mut backoff = HOOK_LEADER_EXIT_POLL_MIN;
-    loop {
-        if exited()? {
-            return Ok(());
-        }
-        tokio::time::sleep(backoff).await;
-        backoff = backoff.saturating_mul(2).min(HOOK_LEADER_EXIT_POLL_MAX);
-    }
 }
 
 async fn await_hook_capture(
     task: tokio::task::JoinHandle<std::io::Result<CapturedBytes>>,
 ) -> std::io::Result<CapturedBytes> {
-    task.await
-        .map_err(|error| std::io::Error::other(format!("output reader stopped: {error}")))?
+    match haider_platform::bounded_wait("hook output capture", HOOK_CHILD_REAP_TIMEOUT, task).await
+    {
+        haider_platform::BoundedWait::Completed(result) => result
+            .map_err(|error| std::io::Error::other(format!("output reader stopped: {error}")))?,
+        haider_platform::BoundedWait::TimedOut(timeout) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            timeout.to_string(),
+        )),
+    }
+}
+
+async fn drain_hook_capture(
+    task: tokio::task::JoinHandle<std::io::Result<CapturedBytes>>,
+    context: &'static str,
+) {
+    if let Err(error) = await_hook_capture(task).await {
+        report_hook_capture_error(context, &error);
+    }
+}
+
+async fn optional_hook_capture(
+    task: tokio::task::JoinHandle<std::io::Result<CapturedBytes>>,
+    context: &'static str,
+) -> Option<CapturedBytes> {
+    match await_hook_capture(task).await {
+        Ok(capture) => Some(capture),
+        Err(error) => {
+            report_hook_capture_error(context, &error);
+            None
+        }
+    }
+}
+
+fn report_hook_capture_error(context: &'static str, error: &std::io::Error) {
+    eprintln!(
+        "haiderd: lifecycle event=hook_output_drain_failed context={context} error_kind={:?} raw_os_error={:?}",
+        error.kind(),
+        error.raw_os_error()
+    );
 }
 
 async fn read_limited(
@@ -3638,7 +3714,8 @@ async fn run_subscriber(
                     None => {
                         process_group.kill();
                         let _ = child.start_kill();
-                        let _ = child.wait().await;
+                        let reap = reap_hook_child(&mut child).await;
+                        report_hook_child_reap("subscription_input_closed", reap);
                         service.journal(
                             &cause,
                             HookEventPayload::HookSubscription(HookSubscription {
@@ -3656,7 +3733,8 @@ async fn run_subscriber(
                 _ = shutdown.changed() => {
                     process_group.kill();
                     let _ = child.start_kill();
-                    let _ = child.wait().await;
+                    let reap = reap_hook_child(&mut child).await;
+                    report_hook_child_reap("subscription_shutdown", reap);
                     return;
                 },
             }

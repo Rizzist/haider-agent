@@ -1863,6 +1863,7 @@ dependencies = [
  "jni 0.21.1",
  "libc",
  "ndk-context",
+ "nix 0.31.3",
  "rustix 1.1.4",
  "tempfile",
  "tokio",
@@ -1933,6 +1934,7 @@ version = "0.0.966"
 dependencies = [
  "cpal",
  "futures-util",
+ "haider-platform",
  "hex",
  "reqwest",
  "serde",
