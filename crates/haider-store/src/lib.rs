@@ -90,7 +90,7 @@ pub trait Cas: Send + Sync {
     fn put_file(&self, path: &std::path::Path) -> StoreResult<ArtifactRef>;
 
     /// Validates, bounds, and durably stores one PNG/JPEG image.
-    fn put_image(&self, _bytes: &[u8], _media_type: &str) -> StoreResult<ImageBlockRef> {
+    fn put_image(&self, _bytes: Vec<u8>, _media_type: &str) -> StoreResult<ImageBlockRef> {
         Err(HaiderError::new(
             ErrorCode::InvalidArgument,
             "this CAS implementation does not admit tool images",

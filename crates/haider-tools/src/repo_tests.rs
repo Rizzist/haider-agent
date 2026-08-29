@@ -1,8 +1,35 @@
 #![allow(clippy::expect_used)]
 
-use super::{WalkOptions, detect_repo_root, walk_files};
+use super::{WalkEntry, WalkOptions, detect_repo_root, walk_files as stream_walk_files};
+use crate::ToolResult;
 use std::fs;
+use std::ops::ControlFlow;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+#[derive(Debug)]
+struct CollectedWalk {
+    files: Vec<PathBuf>,
+    truncated: bool,
+}
+
+fn walk_files(
+    workspace_root: &Path,
+    search_root: &Path,
+    options: WalkOptions,
+) -> ToolResult<CollectedWalk> {
+    let mut files = Vec::new();
+    let outcome = stream_walk_files(workspace_root, search_root, options, |entry| {
+        if let WalkEntry::File(path) = entry {
+            files.push(path.to_path_buf());
+        }
+        Ok(ControlFlow::Continue(()))
+    })?;
+    Ok(CollectedWalk {
+        files,
+        truncated: outcome.truncated,
+    })
+}
 
 #[test]
 fn repository_root_and_nested_ignore_rules_remain_workspace_confined() {
@@ -137,6 +164,58 @@ fn hidden_policy_and_file_cap_are_deterministic() {
     .expect("walk");
     assert_eq!(walked.files, vec![std::path::PathBuf::from("a.txt")]);
     assert!(walked.truncated);
+}
+
+#[test]
+fn streamed_walk_preserves_empty_exact_cap_and_over_cap_results() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let empty = walk_files(
+        workspace.path(),
+        workspace.path(),
+        WalkOptions {
+            respect_gitignore: false,
+            include_hidden: false,
+            max_files: 2,
+            deadline: None,
+        },
+    )
+    .expect("empty walk");
+    assert!(empty.files.is_empty());
+    assert!(!empty.truncated);
+
+    fs::write(workspace.path().join("b.txt"), "b").expect("b");
+    fs::write(workspace.path().join("a.txt"), "a").expect("a");
+    let exact = walk_files(
+        workspace.path(),
+        workspace.path(),
+        WalkOptions {
+            respect_gitignore: false,
+            include_hidden: false,
+            max_files: 2,
+            deadline: None,
+        },
+    )
+    .expect("exact-cap walk");
+    assert_eq!(
+        exact.files,
+        [PathBuf::from("a.txt"), PathBuf::from("b.txt")]
+    );
+    assert!(!exact.truncated);
+
+    fs::write(workspace.path().join("c.txt"), "c").expect("c");
+    let over = walk_files(
+        workspace.path(),
+        workspace.path(),
+        WalkOptions {
+            respect_gitignore: false,
+            include_hidden: false,
+            max_files: 2,
+            deadline: None,
+        },
+    )
+    .expect("over-cap walk");
+    assert_eq!(over.files, exact.files);
+    assert!(over.truncated);
 }
 
 #[test]

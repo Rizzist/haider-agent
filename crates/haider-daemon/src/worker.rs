@@ -12116,7 +12116,7 @@ impl BrokerToolDispatcher {
         .map_err(ToolError::Computer)?;
         cancel.check().map_err(ToolError::Computer)?;
         let mut cas = self.cas.lock().await;
-        cas.put_image(&redacted, "image/png").await
+        cas.put_image(redacted, "image/png").await
     }
 
     async fn admit_mobile_screenshot(
@@ -12140,7 +12140,7 @@ impl BrokerToolDispatcher {
         })?;
         cancel.check().map_err(ToolError::Mobile)?;
         let mut cas = self.cas.lock().await;
-        cas.put_image(&redacted, "image/png").await
+        cas.put_image(redacted, "image/png").await
     }
 
     async fn record_computer_observation(
@@ -16854,6 +16854,15 @@ impl CasSink for HubArtifactStore {
             })
     }
 
+    async fn put_owned(&mut self, bytes: Vec<u8>) -> ToolResult<haider_protocol::ids::ArtifactRef> {
+        self.store
+            .put_artifact(bytes)
+            .await
+            .map_err(|error| haider_tools::ToolError::Runtime {
+                message: error.message,
+            })
+    }
+
     async fn put_batch(
         &mut self,
         blobs: &[Vec<u8>],
@@ -16877,11 +16886,11 @@ impl CasSink for HubArtifactStore {
 
     async fn put_image(
         &mut self,
-        bytes: &[u8],
+        bytes: Vec<u8>,
         media_type: &str,
     ) -> ToolResult<haider_protocol::tool::ImageBlockRef> {
         self.store
-            .put_image_artifact(bytes.to_vec(), media_type.to_owned())
+            .put_image_artifact(bytes, media_type.to_owned())
             .await
             .map_err(|error| haider_tools::ToolError::Runtime {
                 message: error.message,

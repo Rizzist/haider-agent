@@ -19777,7 +19777,7 @@ impl Cas for Store {
 
     fn put_image(
         &self,
-        bytes: &[u8],
+        bytes: Vec<u8>,
         media_type: &str,
     ) -> StoreResult<haider_protocol::tool::ImageBlockRef> {
         self.cas.put_image(bytes, media_type)

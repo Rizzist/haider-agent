@@ -2031,7 +2031,7 @@ impl SqliteStoreHandle {
     ) -> Result<haider_protocol::tool::ImageBlockRef, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || {
-            owner.with_store(|store| haider_store::Cas::put_image(store, &bytes, &media_type))
+            owner.with_store(|store| haider_store::Cas::put_image(store, bytes, &media_type))
         })
         .await
     }
@@ -2347,6 +2347,12 @@ impl CasSink for SqliteStoreHandle {
             .map_err(|error| haider_tools::ToolError::cas(error.message))
     }
 
+    async fn put_owned(&mut self, bytes: Vec<u8>) -> ToolResult<ArtifactRef> {
+        SqliteStoreHandle::put(self, bytes)
+            .await
+            .map_err(|error| haider_tools::ToolError::cas(error.message))
+    }
+
     async fn put_batch(&mut self, blobs: &[Vec<u8>]) -> ToolResult<Vec<ArtifactRef>> {
         SqliteStoreHandle::put_batch(self, blobs.to_vec())
             .await
@@ -2361,10 +2367,10 @@ impl CasSink for SqliteStoreHandle {
 
     async fn put_image(
         &mut self,
-        bytes: &[u8],
+        bytes: Vec<u8>,
         media_type: &str,
     ) -> ToolResult<haider_protocol::tool::ImageBlockRef> {
-        SqliteStoreHandle::put_image(self, bytes.to_vec(), media_type.to_owned())
+        SqliteStoreHandle::put_image(self, bytes, media_type.to_owned())
             .await
             .map_err(|error| haider_tools::ToolError::cas(error.message))
     }
