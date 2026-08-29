@@ -38,19 +38,20 @@ use haider_rpc::{
     FEATURE_ACCOUNT_LOGIN_API_V1, FEATURE_ACCOUNT_MANAGEMENT_V1, FEATURE_ACCOUNT_OAUTH_DEVICE_V1,
     FEATURE_ACCOUNT_OAUTH_PKCE_V1, FEATURE_ACCOUNT_ROTATION_V1, FEATURE_ARTIFACT_PUT_V1,
     FEATURE_BRANCH_CREATE_V1, FEATURE_PROVIDER_CONFIGURE_V1, FEATURE_PROVIDER_MANAGEMENT_V1,
-    FEATURE_PROVIDER_MODELS_V1, FEATURE_PROVIDER_REMOVE_V1, FEATURE_SESSION_FLEET_V1,
-    FEATURE_SESSION_FORK_V1, FEATURE_SESSION_MUTATION_V1, FEATURE_SESSION_PROMPT_FORK_V1,
-    FEATURE_SESSION_RENAME_V1, FEATURE_TURN_CONTROL_V1, FEATURE_USAGE_REPORT_V1,
-    FEATURE_VAULT_STAGE_V1, FleetAgentStateWire, FleetMetricsTotalsWire, FleetNodeWire,
-    FleetRollupWire, FleetStateCountsWire, Hello, HookSummaryWire, HookTrustStateWire,
-    LifecyclePhase, MenuInput, ModelDetailWire, MonitorActionWire, MonitorDeliveryDedupeWire,
-    MonitorDeliveryReportWire, MonitorEventPayloadWire, MonitorEventWire, MonitorReportStatusWire,
-    MonitorSourceKindWire, OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId,
-    OAuthFlowStatusWire, OAuthReadyRefWire, ObserveRunStateWire, ProtocolError, ProviderActiveWire,
-    ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
-    ProviderDefaultWire, ProviderRemoveRefusalReasonWire, ProviderSummaryWire, RequestBody,
-    RequestId, ResponseBody, SecretWire, SeqRange, SessionFleetSnapshot, SessionObserveDigest,
-    SessionReadResult, SessionSummary, StagePurpose, SubmitDisposition, Welcome, WireFrame,
+    FEATURE_PROVIDER_MODELS_V1, FEATURE_PROVIDER_REMOVE_V1, FEATURE_SESSION_FLEET_IDENTITY_V1,
+    FEATURE_SESSION_FLEET_V1, FEATURE_SESSION_FORK_V1, FEATURE_SESSION_MUTATION_V1,
+    FEATURE_SESSION_PROMPT_FORK_V1, FEATURE_SESSION_RENAME_V1, FEATURE_TURN_CONTROL_V1,
+    FEATURE_USAGE_REPORT_V1, FEATURE_VAULT_STAGE_V1, FleetAgentStateWire, FleetMetricsTotalsWire,
+    FleetNodeWire, FleetRollupWire, FleetStateCountsWire, Hello, HookSummaryWire,
+    HookTrustStateWire, LifecyclePhase, MenuInput, ModelDetailWire, MonitorActionWire,
+    MonitorDeliveryDedupeWire, MonitorDeliveryReportWire, MonitorEventPayloadWire,
+    MonitorEventWire, MonitorReportStatusWire, MonitorSourceKindWire, OAuthAuthorizationWire,
+    OAuthAvailabilityWire, OAuthFlowId, OAuthFlowStatusWire, OAuthReadyRefWire,
+    ObserveRunStateWire, ProtocolError, ProviderActiveWire, ProviderApiFamilyWire,
+    ProviderAuthRequirementWire, ProviderAvailabilityWire, ProviderDefaultWire,
+    ProviderRemoveRefusalReasonWire, ProviderSummaryWire, RequestBody, RequestId, ResponseBody,
+    SecretWire, SeqRange, SessionFleetSnapshot, SessionObserveDigest, SessionReadResult,
+    SessionSummary, StagePurpose, SubmitDisposition, Welcome, WireFrame,
 };
 
 pub const TEST_FRAME_LIMIT: usize = 1024 * 1024;
@@ -1704,6 +1705,8 @@ pub fn transcript() -> Vec<WireFrame> {
                         agent_id: AgentId::new("agent-child-1"),
                         session_id: SessionId::new("session-child-1"),
                         callsign: Some("Ada".into()),
+                        model: None,
+                        provider: None,
                         task: "inspect parser".into(),
                         depth: 1,
                         parent_session_id: SessionId::new("session-1"),
@@ -1852,6 +1855,8 @@ pub fn transcript() -> Vec<WireFrame> {
                         agent_id: AgentId::new("agent-folded"),
                         session_id: SessionId::new("session-folded-child"),
                         callsign: Some("Fold".into()),
+                        model: None,
+                        provider: None,
                         task: "bounded branch".into(),
                         depth: 32,
                         parent_session_id: SessionId::new("session-folded"),
@@ -2018,6 +2023,7 @@ pub fn transcript() -> Vec<WireFrame> {
     ];
     append_union_contract_tail(&mut frames);
     append_prompt_fork_contract_tail(&mut frames, fork_metadata);
+    append_fleet_identity_contract_tail(&mut frames);
     frames
 }
 
@@ -2215,6 +2221,108 @@ fn append_prompt_fork_contract_tail(frames: &mut Vec<WireFrame>, metadata: Sessi
                 account_alias: None,
                 forked_from: Some(provenance),
             }],
+        },
+    ]);
+}
+
+/// X1 appends the advertised manifest-identity shape for both fleet delivery
+/// paths. No request method is new: the existing snapshot and descendant
+/// attach methods return richer optional node records.
+fn append_fleet_identity_contract_tail(frames: &mut Vec<WireFrame>) {
+    let root_session_id = SessionId::new("session-fleet-identity-root");
+    let child_session_id = SessionId::new("session-fleet-identity-child");
+    let agent_id = AgentId::new("agent-fleet-identity-child");
+    frames.extend([
+        WireFrame::Welcome(Welcome {
+            protocol: 1,
+            instance_id: "instance-session-fleet-identity".into(),
+            daemon_generation: 16,
+            frame_limit: TEST_FRAME_LIMIT as u32,
+            profile_id: "profile-1".into(),
+            daemon_version: "0.0.966".into(),
+            lifecycle_phase: LifecyclePhase::Ready,
+            capabilities_granted: capabilities([Capability::View]),
+            features: BTreeSet::from([FEATURE_SESSION_FLEET_IDENTITY_V1.to_owned()]),
+            user_command_withheld: false,
+            encoding: None,
+        }),
+        WireFrame::Response {
+            request_id: RequestId::new("request-session-fleet-identity"),
+            body: ResponseBody::SessionFleet {
+                snapshot: SessionFleetSnapshot {
+                    session_id: root_session_id.clone(),
+                    generated_at_ms: 1_753_500_091_000,
+                    node_limit: 512,
+                    depth_limit: 32,
+                    roots: vec![FleetNodeWire {
+                        agent_id: agent_id.clone(),
+                        session_id: child_session_id.clone(),
+                        callsign: Some("jade-fox-a1b2c3".into()),
+                        model: Some("gpt-5.6".into()),
+                        provider: Some("openai".into()),
+                        task: "review data flow".into(),
+                        depth: 1,
+                        parent_session_id: root_session_id.clone(),
+                        parent_agent_id: None,
+                        state: FleetAgentStateWire::Live,
+                        metrics: None,
+                        folded_children: 0,
+                        children: Vec::new(),
+                    }],
+                    rollup: FleetRollupWire {
+                        node_count: 1,
+                        states: FleetStateCountsWire {
+                            live: 1,
+                            ..FleetStateCountsWire::default()
+                        },
+                        max_depth: 1,
+                        metrics: FleetMetricsTotalsWire::default(),
+                        metrics_complete: false,
+                        complete: true,
+                    },
+                    truncated: false,
+                },
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-session-descendants-identity"),
+            body: ResponseBody::SessionDescendantsAttach {
+                attachment_id: AttachmentId::new("descendants-identity"),
+                baseline: haider_rpc::SessionDescendantBaselineWire {
+                    session_id: root_session_id.clone(),
+                    generated_at_ms: 1_753_500_091_000,
+                    fanout: haider_rpc::DescendantFanoutWire {
+                        requested_children: 8,
+                        accepted_children: 8,
+                        hard_limit: haider_rpc::DESCENDANT_STREAM_MAX_CHILDREN,
+                    },
+                    truncation: haider_rpc::DescendantTruncationWire {
+                        truncated: false,
+                        streamed_children: 1,
+                        omitted_children: 0,
+                        count_complete: true,
+                    },
+                    roots: vec![haider_rpc::DescendantStreamNodeWire {
+                        session_id: child_session_id,
+                        agent_id,
+                        child_run_id: RunId::new("run-fleet-identity-child"),
+                        parent_session_id: root_session_id,
+                        parent_run_id: RunId::new("run-fleet-identity-parent"),
+                        parent_branch_id: None,
+                        parent_agent_id: None,
+                        depth: 1,
+                        callsign: Some("jade-fox-a1b2c3".into()),
+                        model: Some("gpt-5.6".into()),
+                        provider: Some("openai".into()),
+                        task: "review data flow".into(),
+                        state: FleetAgentStateWire::Live,
+                        requested_after_seq: 0,
+                        replay_through_seq: 4,
+                        parent_anchors: haider_rpc::DescendantParentAnchorsWire::default(),
+                        children: Vec::new(),
+                    }],
+                },
+            },
         },
     ]);
 }

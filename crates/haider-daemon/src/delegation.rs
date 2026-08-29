@@ -208,6 +208,7 @@ impl DelegationHandle {
         let child_session_id = SessionId::new(format!("session-child-{identity}"));
         let child_run_id = RunId::new(format!("run-child-{identity}"));
         let lease = LeaseId::new(format!("lease-child-{identity}"));
+        let callsign = callsign_from_identity(&identity);
         let registered_workflow = match request.workflow.as_ref() {
             Some(haider_protocol::graph::ChildWorkflowSelector::WorkflowRef(name))
                 if graph_template(name).is_none() =>
@@ -333,10 +334,10 @@ impl DelegationHandle {
             agent: agent_id.clone(),
             role: AgentRole::Subagent,
             task: request.task.clone(),
-            // W6d (owner ask): no neutral SUB-hex — an ABSENT callsign
-            // lets the TUI claim the sim's honor-roll roster
-            // deterministically from journal order.
-            callsign: None,
+            // Display identity is assigned once from the same durable digest
+            // as the agent/session/run ids. It never repeats or interprets
+            // the task, and malformed non-digest input produces no callsign.
+            callsign,
             model_profile: coordinates.metadata.model.clone(),
             grant: grant.clone(),
             budget_tokens: Some(coordinates.metadata.max_tokens),
@@ -2910,6 +2911,43 @@ pub(crate) fn stable_digest(parts: &[&str]) -> String {
         hasher.update(part.as_bytes());
     }
     hasher.finalize().to_hex().to_string()
+}
+
+const CALLSIGN_PREFIXES: [&str; 16] = [
+    "ash", "blue", "coral", "gold", "jade", "lilac", "mint", "navy", "ochre", "plum", "rose",
+    "sage", "teal", "umber", "violet", "white",
+];
+const CALLSIGN_NAMES: [&str; 16] = [
+    "ant", "bear", "crane", "dove", "elk", "fox", "gull", "hare", "ibis", "jay", "kite", "lynx",
+    "moth", "newt", "owl", "puma",
+];
+
+/// Derives a short, speakable display handle from a minted delegation digest.
+/// The two words plus six hexadecimal characters retain 32 identity bits. An
+/// arbitrary/malformed string has no honest derivation and remains unnamed.
+pub(crate) fn callsign_from_identity(identity: &str) -> Option<String> {
+    let bytes = identity.as_bytes();
+    if bytes.len() != 64
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return None;
+    }
+    let prefix_index = hex_nibble(*bytes.first()?)?;
+    let name_index = hex_nibble(*bytes.get(1)?)?;
+    let prefix = CALLSIGN_PREFIXES.get(prefix_index)?;
+    let name = CALLSIGN_NAMES.get(name_index)?;
+    let suffix = identity.get(2..8)?;
+    Some(format!("{prefix}-{name}-{suffix}"))
+}
+
+fn hex_nibble(byte: u8) -> Option<usize> {
+    match byte {
+        b'0'..=b'9' => Some(usize::from(byte - b'0')),
+        b'a'..=b'f' => Some(usize::from(byte - b'a' + 10)),
+        _ => None,
+    }
 }
 
 pub(crate) fn digest_bytes(bytes: &[u8]) -> String {

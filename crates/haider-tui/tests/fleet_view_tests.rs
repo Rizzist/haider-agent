@@ -141,6 +141,8 @@ fn node(
         agent_id: AgentId::new(agent),
         session_id: SessionId::new(format!("child-{agent}")),
         callsign: Some(callsign.to_owned()),
+        model: None,
+        provider: None,
         task: task.to_owned(),
         depth,
         parent_session_id: sid(),

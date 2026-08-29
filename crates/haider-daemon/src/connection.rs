@@ -61,12 +61,13 @@ use haider_rpc::{
     FEATURE_PROVIDER_MODELS_V1, FEATURE_PROVIDER_REMOVE_V1,
     FEATURE_RESIDENT_SESSION_BINDING_TOKEN_V1, FEATURE_RESIDENT_SESSION_BINDING_V1,
     FEATURE_RESIDENT_TURN_SUBMIT_V1, FEATURE_RUN_BUDGET_V1, FEATURE_RUN_RETRY_V1,
-    FEATURE_SESSION_CONFIG_V1, FEATURE_SESSION_DESCENDANT_STREAM_V1, FEATURE_SESSION_FLEET_V1,
-    FEATURE_SESSION_FORK_V1, FEATURE_SESSION_MUTATION_V1, FEATURE_SESSION_OBSERVE_BATCH_V1,
-    FEATURE_SESSION_OBSERVE_V1, FEATURE_SESSION_PERMISSION_OVERRIDES_V1,
-    FEATURE_SESSION_PROMPT_FORK_V1, FEATURE_SESSION_RUN_ID_V1, FEATURE_SESSION_WORKFLOW_STATE_V1,
-    FEATURE_SHELL_EXEC_V1, FEATURE_SHELL_REGISTRY_V1, FEATURE_SSH_PROFILES_V1,
-    FEATURE_TOOL_INVENTORY_V1, FEATURE_TURN_CONTROL_V1, FEATURE_TYPED_AGENT_INSTALL_CANCEL_V1,
+    FEATURE_SESSION_CONFIG_V1, FEATURE_SESSION_DESCENDANT_STREAM_V1,
+    FEATURE_SESSION_FLEET_IDENTITY_V1, FEATURE_SESSION_FLEET_V1, FEATURE_SESSION_FORK_V1,
+    FEATURE_SESSION_MUTATION_V1, FEATURE_SESSION_OBSERVE_BATCH_V1, FEATURE_SESSION_OBSERVE_V1,
+    FEATURE_SESSION_PERMISSION_OVERRIDES_V1, FEATURE_SESSION_PROMPT_FORK_V1,
+    FEATURE_SESSION_RUN_ID_V1, FEATURE_SESSION_WORKFLOW_STATE_V1, FEATURE_SHELL_EXEC_V1,
+    FEATURE_SHELL_REGISTRY_V1, FEATURE_SSH_PROFILES_V1, FEATURE_TOOL_INVENTORY_V1,
+    FEATURE_TURN_CONTROL_V1, FEATURE_TYPED_AGENT_INSTALL_CANCEL_V1,
     FEATURE_TYPED_AGENT_INSTALL_CONTROL_V1, FEATURE_TYPED_AGENT_INSTALL_V1,
     FEATURE_USER_COMMAND_V1, FEATURE_VAULT_STAGE_V1, FEATURE_WORKFLOW_CATALOG_V1,
     FEATURE_WORKFLOW_GRAPH_V1, Hello, LifecyclePhase, ProtocolError, RequestBody, RequestId,
@@ -914,6 +915,56 @@ struct ConnectionFrameSink {
     lane: OutboundLane,
     outbound_limit: usize,
     encoding: WireEncoding,
+    fleet_identity: bool,
+}
+
+impl ConnectionFrameSink {
+    fn encode(&self, frame: &WireFrame) -> Result<OutboundBytes, DaemonError> {
+        if self.fleet_identity {
+            return encode_outbound_parts(frame, self.outbound_limit, self.encoding);
+        }
+
+        let mut legacy_frame = frame.clone();
+        omit_fleet_identity(&mut legacy_frame);
+        encode_outbound_parts(&legacy_frame, self.outbound_limit, self.encoding)
+    }
+}
+
+/// Preserve the pre-X1 payload for a peer whose tight Welcome could not
+/// advertise `session_fleet_identity_v1`. Callsigns predate this token; only
+/// the two newly gated fields are omitted.
+fn omit_fleet_identity(frame: &mut WireFrame) {
+    match frame {
+        WireFrame::Response {
+            body: ResponseBody::SessionFleet { snapshot },
+            ..
+        } => omit_fleet_node_identity(&mut snapshot.roots),
+        WireFrame::Response {
+            body: ResponseBody::SessionDescendantsAttach { baseline, .. },
+            ..
+        } => omit_descendant_node_identity(&mut baseline.roots),
+        WireFrame::SessionDescendantStream {
+            event: haider_rpc::SessionDescendantStreamEventWire::Delta { child, .. },
+            ..
+        } => omit_descendant_node_identity(std::slice::from_mut(child)),
+        _ => {}
+    }
+}
+
+fn omit_fleet_node_identity(nodes: &mut [haider_rpc::FleetNodeWire]) {
+    for node in nodes {
+        node.model = None;
+        node.provider = None;
+        omit_fleet_node_identity(&mut node.children);
+    }
+}
+
+fn omit_descendant_node_identity(nodes: &mut [haider_rpc::DescendantStreamNodeWire]) {
+    for node in nodes {
+        node.model = None;
+        node.provider = None;
+        omit_descendant_node_identity(&mut node.children);
+    }
 }
 
 impl FrameSink for ConnectionFrameSink {
@@ -927,8 +978,7 @@ impl FrameSink for ConnectionFrameSink {
 
     fn try_send(&self, frame: WireFrame) -> Result<(), FrameSendError> {
         let key = attachment_lane(&frame);
-        let bytes = encode_outbound_parts(&frame, self.outbound_limit, self.encoding)
-            .map_err(|_| FrameSendError)?;
+        let bytes = self.encode(&frame).map_err(|_| FrameSendError)?;
         self.lane
             .try_push(key, QueuedFrame::ordinary(bytes))
             .map_err(|_| FrameSendError)
@@ -936,15 +986,14 @@ impl FrameSink for ConnectionFrameSink {
 
     fn try_send_droppable(&self, frame: WireFrame) -> Result<(), FrameSendError> {
         let key = attachment_lane(&frame);
-        let bytes = encode_outbound_parts(&frame, self.outbound_limit, self.encoding)
-            .map_err(|_| FrameSendError)?;
+        let bytes = self.encode(&frame).map_err(|_| FrameSendError)?;
         self.lane
             .try_push_droppable(key, QueuedFrame::ordinary(bytes))
             .map_err(|_| FrameSendError)
     }
 
     fn offer_ordered(&self, stream_id: &str, frame: &WireFrame) -> SendAdmission {
-        let Ok(bytes) = encode_outbound_parts(frame, self.outbound_limit, self.encoding) else {
+        let Ok(bytes) = self.encode(frame) else {
             return SendAdmission::Refused;
         };
         self.lane
@@ -969,7 +1018,7 @@ impl FrameSink for ConnectionFrameSink {
         frame: &WireFrame,
         ticket: &AdmissionTicket,
     ) -> SendAdmission {
-        let Ok(bytes) = encode_outbound_parts(frame, self.outbound_limit, self.encoding) else {
+        let Ok(bytes) = self.encode(frame) else {
             return SendAdmission::Refused;
         };
         self.lane
@@ -1012,8 +1061,7 @@ impl FrameSink for ConnectionFrameSink {
             return self.try_send(frame);
         };
         let marker = Some((attachment_id.clone(), request_id.clone()));
-        let bytes = encode_outbound_parts(&frame, self.outbound_limit, self.encoding)
-            .map_err(|_| FrameSendError)?;
+        let bytes = self.encode(&frame).map_err(|_| FrameSendError)?;
         self.lane
             .try_push(
                 LaneKey::System,
@@ -1032,7 +1080,7 @@ impl FrameSink for ConnectionFrameSink {
     }
 
     fn offer(&self, attachment_id: &AttachmentId, frame: &WireFrame) -> SendAdmission {
-        let Ok(bytes) = encode_outbound_parts(frame, self.outbound_limit, self.encoding) else {
+        let Ok(bytes) = self.encode(frame) else {
             // Exceeds the negotiated frame limit: no amount of draining can
             // ever admit it.
             return SendAdmission::Refused;
@@ -1042,7 +1090,7 @@ impl FrameSink for ConnectionFrameSink {
     }
 
     fn prepare(&self, frame: &WireFrame) -> Result<PreparedFrame, FrameSendError> {
-        encode_outbound_parts(frame, self.outbound_limit, self.encoding)
+        self.encode(frame)
             .map(PreparedFrame::encoded)
             .map_err(|_| FrameSendError)
     }
@@ -1086,7 +1134,7 @@ impl FrameSink for ConnectionFrameSink {
         frame: &WireFrame,
         ticket: &AdmissionTicket,
     ) -> SendAdmission {
-        let Ok(bytes) = encode_outbound_parts(frame, self.outbound_limit, self.encoding) else {
+        let Ok(bytes) = self.encode(frame) else {
             return SendAdmission::Refused;
         };
         self.lane.offer(
@@ -1733,6 +1781,7 @@ async fn handle_frame(
                 lane: lane.clone(),
                 outbound_limit: *outbound_limit,
                 encoding: *encoding,
+                fleet_identity: granted.features.contains(FEATURE_SESSION_FLEET_IDENTITY_V1),
             });
             *hub_connection = Some(
                 context
@@ -2146,6 +2195,7 @@ fn welcome_features() -> BTreeSet<String> {
         haider_rpc::FEATURE_ACCOUNT_LIST_WATCH_V1.to_owned(),
         haider_rpc::FEATURE_ACCOUNT_LABEL_V1.to_owned(),
         FEATURE_SESSION_FLEET_V1.to_owned(),
+        FEATURE_SESSION_FLEET_IDENTITY_V1.to_owned(),
         FEATURE_SESSION_DESCENDANT_STREAM_V1.to_owned(),
         FEATURE_SESSION_OBSERVE_V1.to_owned(),
         FEATURE_SESSION_OBSERVE_BATCH_V1.to_owned(),
@@ -2182,11 +2232,11 @@ fn welcome_features() -> BTreeSet<String> {
 /// Encodes the handshake without letting one additive feature make the whole
 /// pre-existing connection surface unavailable to a tightly bounded peer.
 ///
-/// The newest additive token is withheld first, restoring the exact preceding
-/// Welcome for a peer whose old receive ceiling was already tight. If the
-/// older `user_command_v1` token must also be withheld, its shipped `uw`
-/// marker remains byte-for-byte unchanged. The retained feature set fences
-/// request shapes as well as client affordances.
+/// New additive tokens are withheld newest-first, restoring the exact
+/// preceding Welcome for a peer whose old receive ceiling was already tight.
+/// If the older `user_command_v1` token must also be withheld, its shipped
+/// `uw` marker remains byte-for-byte unchanged. The retained feature set
+/// fences request shapes as well as client affordances.
 fn encode_welcome_for_peer(
     mut welcome: Welcome,
     outbound_limit: usize,
@@ -2199,6 +2249,8 @@ fn encode_welcome_for_peer(
                     features: welcome.features,
                 });
             }
+            Err(haider_rpc::CodecError::FrameLimitExceeded { .. })
+                if welcome.features.remove(FEATURE_SESSION_FLEET_IDENTITY_V1) => {}
             Err(haider_rpc::CodecError::FrameLimitExceeded { .. })
                 if welcome.features.remove(FEATURE_SESSION_PROMPT_FORK_V1) => {}
             Err(haider_rpc::CodecError::FrameLimitExceeded { .. })

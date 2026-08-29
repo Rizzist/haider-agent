@@ -10,13 +10,19 @@
 //! Densities (mockup grammar, tui.js `FleetStage`):
 //!
 //! * ≤ [`GRID_THRESHOLD`] nodes at the current root — the depth-annotated
-//!   tree LIST: state glyph · callsign · task fragment · right-aligned
+//!   tree LIST: state glyph · callsign · [`node_identity`]'s
+//!   `model · provider` tail · task fragment · right-aligned
 //!   `Nt · <tok> · ≈$<cost>` metrics (the S4 cost vocabulary: OAuth lanes
 //!   stay the labeled `≈$` API-equivalent form, never a bare `$`);
 //! * above it — the max-density GRID: one compact cell per DIRECT child,
 //!   the agent's deterministic 8-bit matrix-dot pattern state-tinted, the
-//!   callsign under the cell. The switch is automatic; slice 1 ships no
-//!   manual density toggle.
+//!   callsign under the cell and [`node_identity_cell`]'s single fact under
+//!   that. The switch is automatic; slice 1 ships no manual density toggle.
+//!
+//! IDENTITY IS NEVER INVENTED. A node renders only what the wire told it:
+//! no model and no provider renders NEITHER, exactly as [`node_metric`]
+//! drops a segment whose durable figure is absent and [`callsign`] falls
+//! back to the opaque id rather than minting a name.
 //!
 //! Drill-down re-roots: ⏎ on a row/cell WITH children re-roots the view on
 //! that subtree (the header shows the path), esc walks up one level, esc at
@@ -70,6 +76,12 @@ pub struct FleetView {
     /// The detail member's OWN child-graph status. `None` = no answer yet;
     /// `Some((session, None))` = answered honestly: no personal workflow.
     pub detail_graph: Option<(SessionId, Option<haider_protocol::graph::GraphStatus>)>,
+    /// The member whose DESTROY is armed and awaiting its confirming press
+    /// (the `ssh_remove_armed` precedent). VALUE-CARRYING on purpose: it
+    /// names the agent, so a snapshot refreshed under the arm can never
+    /// retarget the kill at whatever now occupies that row. Any navigation,
+    /// and leaving the frame, disarms it.
+    pub kill_armed: Option<AgentId>,
 }
 
 /// Which density the current root renders at. Derived, never stored —
@@ -162,6 +174,24 @@ pub fn resolve<'t>(
         }
     }
     (level, path)
+}
+
+/// Locate ONE node anywhere in a snapshot by agent id — the only way a
+/// client is TOLD a member's own wire facts (its provider, among them).
+#[must_use]
+pub fn find_node<'t>(snapshot: &'t SessionFleetSnapshot, agent: &str) -> Option<&'t FleetNodeWire> {
+    fn walk<'t>(nodes: &'t [FleetNodeWire], agent: &str) -> Option<&'t FleetNodeWire> {
+        for node in nodes {
+            if node.agent_id.as_str() == agent {
+                return Some(node);
+            }
+            if let Some(found) = walk(&node.children, agent) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    walk(&snapshot.roots, agent)
 }
 
 /// Client-side rollup over one subtree — the drill header's arithmetic.
@@ -294,6 +324,67 @@ pub fn node_metric(node: &FleetNodeWire) -> String {
         segments.push(crate::agent_metrics::compact_cost(usage));
     }
     segments.join(" · ")
+}
+
+/// A node's IDENTITY tail — `model · provider` — for the LIST density.
+///
+/// Each half renders only when the node carries it: a node with neither
+/// renders NOTHING. This is [`node_metric`]'s law (a missing durable fact
+/// DROPS its segment rather than printing a zero it does not know) and
+/// [`callsign`]'s ("never a fabrication") applied to identity — the row
+/// never guesses a model or a provider it was not told.
+///
+/// WIDTH-DEGRADATION LAW, borrowed whole from the composer rule
+/// (`AppModel::composer_identity`): segments drop WHOLE, never truncated
+/// mid-word. The provider drops first, then the model, then the tail.
+/// The model outranks the provider because it is the fact the row exists
+/// to carry; a node that knows ONLY its provider still shows it, because
+/// a true half beats an empty line.
+#[must_use]
+pub fn node_identity(node: &FleetNodeWire, budget: usize) -> Option<String> {
+    let model = node.model.as_deref().filter(|text| !text.is_empty());
+    let provider = node.provider.as_deref().filter(|text| !text.is_empty());
+    let mut candidates: Vec<String> = Vec::new();
+    if let (Some(model), Some(provider)) = (model, provider) {
+        candidates.push(format!("{model} · {provider}"));
+    }
+    match (model, provider) {
+        (Some(model), _) => candidates.push(model.to_owned()),
+        (None, Some(provider)) => candidates.push(provider.to_owned()),
+        (None, None) => {}
+    }
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.chars().count() <= budget)
+}
+
+/// The GRID cell's identity line, rendered under the callsign.
+///
+/// A cell is [`crate::render::FLEET_CELL_W`] columns wide — it cannot hold
+/// two facts, so it carries ONE: the model, or the provider when the node
+/// has no model. Absent both, the line stays EMPTY (the grid then renders
+/// byte-identically to a fleet that knows no identity at all).
+///
+/// Unlike the list tail this form TRUNCATES rather than dropping whole:
+/// that is the grid's own established law — the callsign directly above it
+/// is already cut to the same width. The cut is MARKED with `…` so a
+/// clipped name can never be read as a whole one.
+#[must_use]
+pub fn node_identity_cell(node: &FleetNodeWire, width: usize) -> Option<String> {
+    let fact = node
+        .model
+        .as_deref()
+        .filter(|text| !text.is_empty())
+        .or_else(|| node.provider.as_deref().filter(|text| !text.is_empty()))?;
+    if width < 2 {
+        return None;
+    }
+    if fact.chars().count() <= width {
+        return Some(fact.to_owned());
+    }
+    let mut cut: String = fact.chars().take(width.saturating_sub(1)).collect();
+    cut.push('…');
+    Some(cut)
 }
 
 /// A node's direct-child marker. A fold witness outranks the count of
@@ -436,6 +527,8 @@ pub fn snapshot_from_chips(
             agent_id,
             session_id,
             callsign: (!chip.callsign.is_empty()).then(|| chip.callsign.clone()),
+            model: None,
+            provider: None,
             task: chip.name.clone(),
             depth,
             parent_session_id: parent_session.clone(),
@@ -531,6 +624,12 @@ pub fn fleet_plain(model: &crate::app::AppModel) -> String {
             if let Some(marker) = child_marker(row.node) {
                 out.push(' ');
                 out.push_str(&marker);
+            }
+            // Plain carries the identity UNBUDGETED — plain parity is about
+            // information, not geometry, so nothing degrades here.
+            if let Some(identity) = node_identity(row.node, usize::MAX) {
+                out.push_str(" · ");
+                out.push_str(&identity);
             }
             if !row.node.task.is_empty() {
                 out.push_str(" — ");

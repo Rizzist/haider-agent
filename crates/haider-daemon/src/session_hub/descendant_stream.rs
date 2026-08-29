@@ -335,6 +335,7 @@ fn child_wire(
     replay_through_seq: u64,
     parent_anchors: DescendantParentAnchorsWire,
 ) -> DescendantStreamNodeWire {
+    let identity = fleet_node_identity(&record.manifest);
     DescendantStreamNodeWire {
         session_id: record.child_session_id.clone(),
         agent_id: record.agent_id.clone(),
@@ -344,7 +345,9 @@ fn child_wire(
         parent_branch_id: record.parent_branch_id.clone(),
         parent_agent_id: record.parent_agent_id.clone(),
         depth: record.depth,
-        callsign: record.manifest.callsign.clone(),
+        callsign: identity.callsign,
+        model: identity.model,
+        provider: identity.provider,
         task: record.task.clone(),
         state,
         requested_after_seq,

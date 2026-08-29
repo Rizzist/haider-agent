@@ -715,10 +715,13 @@ fn fleet_snapshot(
                 .entry(node.record.parent_session_id.clone())
                 .or_default()
                 .push(index);
+            let identity = fleet_node_identity(&node.record.manifest);
             Some(haider_rpc::FleetNodeWire {
                 agent_id: node.record.agent_id,
                 session_id: node.record.child_session_id,
-                callsign: node.record.manifest.callsign,
+                callsign: identity.callsign,
+                model: identity.model,
+                provider: identity.provider,
                 task: node.record.task,
                 depth: node.record.depth,
                 parent_session_id: node.record.parent_session_id,

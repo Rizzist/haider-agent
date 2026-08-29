@@ -342,12 +342,16 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 /// MUTATION CHECK: remove `FEATURE_SSH_PROFILES_V1` or
 /// `FEATURE_SHELL_REGISTRY_V1`. Expected runtime failure: clients expose a
 /// management or terminal-registry surface that the handshake says is absent.
+///
+/// MUTATION CHECK: remove `FEATURE_SESSION_FLEET_IDENTITY_V1`. Expected
+/// RUNTIME failure: clients cannot distinguish manifest-backed name/model/
+/// provider rows from the legacy fleet shape.
 #[test]
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
         welcome_features().len(),
-        101,
-        "the 100-token v0.0.965 Welcome plus session_prompt_fork_v1"
+        102,
+        "101 pre-X1 features plus session_fleet_identity_v1"
     );
     assert_eq!(
         welcome_features(),
@@ -423,6 +427,7 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_ACCOUNT_LIST_WATCH_V1.to_owned(),
             haider_rpc::FEATURE_ACCOUNT_LABEL_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_FLEET_V1.to_owned(),
+            haider_rpc::FEATURE_SESSION_FLEET_IDENTITY_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_DESCENDANT_STREAM_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_OBSERVE_V1.to_owned(),
             FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned(),
@@ -503,15 +508,15 @@ fn welcome_advertises_resident_session_binding_token_echo() {
 }
 
 /// MUTATION CHECK: reverse the withholding order or omit the retained feature
-/// set. Expected runtime failure: a peer at the preceding Welcome limit no
-/// longer receives byte-identical v0.0.965 bytes, or the grant admits a shape
-/// that its Welcome did not advertise.
+/// set. Expected runtime failure: a peer at either preceding Welcome limit no
+/// longer receives byte-identical pre-X1/v0.0.965 bytes, or the grant admits a
+/// shape that its Welcome did not advertise.
 ///
 /// MUTATION CHECK: replace `welcome.user_command_withheld = true` in the
 /// second fallback with `false`. Expected runtime failure: the older tight
 /// Welcome loses the already-shipped causal marker pinned below.
 #[test]
-fn tight_welcome_restores_the_pre_prompt_bytes_before_older_withholding() {
+fn tight_welcome_restores_each_pre_feature_frame_before_older_withholding() {
     let welcome = Welcome {
         protocol: haider_rpc::WIRE_PROTOCOL_VERSION,
         instance_id: "instance".into(),
@@ -547,7 +552,29 @@ fn tight_welcome_restores_the_pre_prompt_bytes_before_older_withholding() {
             if features == &welcome.features && !user_command_withheld
     ));
 
-    let mut pre_prompt_welcome = welcome.clone();
+    let mut pre_identity_welcome = welcome.clone();
+    assert!(
+        pre_identity_welcome
+            .features
+            .remove(FEATURE_SESSION_FLEET_IDENTITY_V1)
+    );
+    let pre_identity = uds_codec::encode(
+        &WireFrame::Welcome(pre_identity_welcome.clone()),
+        usize::MAX,
+    )
+    .expect("pre-identity Welcome encodes");
+    let pre_identity_body_len = pre_identity.len() - 4;
+    let identity_tight = encode_welcome_for_peer(welcome.clone(), full_body_len - 1)
+        .expect("tight peer retains the exact pre-identity handshake");
+    assert_eq!(identity_tight.bytes.as_slice(), pre_identity.as_slice());
+    assert_eq!(identity_tight.features, pre_identity_welcome.features);
+    assert!(
+        !identity_tight
+            .features
+            .contains(FEATURE_SESSION_FLEET_IDENTITY_V1)
+    );
+
+    let mut pre_prompt_welcome = pre_identity_welcome.clone();
     assert!(
         pre_prompt_welcome
             .features
@@ -556,7 +583,7 @@ fn tight_welcome_restores_the_pre_prompt_bytes_before_older_withholding() {
     let pre_prompt = uds_codec::encode(&WireFrame::Welcome(pre_prompt_welcome.clone()), usize::MAX)
         .expect("pre-prompt Welcome encodes");
     let pre_prompt_body_len = pre_prompt.len() - 4;
-    let prompt_tight = encode_welcome_for_peer(welcome.clone(), full_body_len - 1)
+    let prompt_tight = encode_welcome_for_peer(welcome.clone(), pre_identity_body_len - 1)
         .expect("tight peer retains the exact pre-prompt handshake");
     assert_eq!(prompt_tight.bytes.as_slice(), pre_prompt.as_slice());
     assert_eq!(prompt_tight.features, pre_prompt_welcome.features);
@@ -612,12 +639,22 @@ fn tight_welcome_restores_the_pre_prompt_bytes_before_older_withholding() {
     assert!(
         selected_unmarked
             .features
+            .remove(FEATURE_SESSION_FLEET_IDENTITY_V1)
+    );
+    assert!(
+        selected_unmarked
+            .features
             .remove(FEATURE_SESSION_PROMPT_FORK_V1)
     );
     assert!(selected_unmarked.features.remove(FEATURE_USER_COMMAND_V1));
     let selected_unmarked = uds_codec::encode(&WireFrame::Welcome(selected_unmarked), usize::MAX)
         .expect("selected-encoding unmarked Welcome encodes");
     let mut selected_pre_prompt = selected_encoding.clone();
+    assert!(
+        selected_pre_prompt
+            .features
+            .remove(FEATURE_SESSION_FLEET_IDENTITY_V1)
+    );
     assert!(
         selected_pre_prompt
             .features
@@ -642,6 +679,158 @@ fn tight_welcome_restores_the_pre_prompt_bytes_before_older_withholding() {
         selected_pre_prompt_body_len - (selected_tight.bytes.len() - 4),
         8
     );
+
+    assert_unadvertised_fleet_identity_is_byte_identical();
+}
+
+fn assert_unadvertised_fleet_identity_is_byte_identical() {
+    use haider_protocol::ids::{AgentId, RunId, SessionId};
+
+    let root_session_id = SessionId::new("identity-gate-root");
+    let child_session_id = SessionId::new("identity-gate-child");
+    let agent_id = AgentId::new("identity-gate-agent");
+    let fleet = WireFrame::Response {
+        request_id: RequestId::new("identity-gate-fleet"),
+        body: ResponseBody::SessionFleet {
+            snapshot: haider_rpc::SessionFleetSnapshot {
+                session_id: root_session_id.clone(),
+                generated_at_ms: 1,
+                node_limit: 512,
+                depth_limit: 32,
+                roots: vec![haider_rpc::FleetNodeWire {
+                    agent_id: agent_id.clone(),
+                    session_id: child_session_id.clone(),
+                    callsign: Some("jade-fox-a1b2c3".into()),
+                    model: Some("gpt-5.6".into()),
+                    provider: Some("openai".into()),
+                    task: "inspect identity".into(),
+                    depth: 1,
+                    parent_session_id: root_session_id.clone(),
+                    parent_agent_id: None,
+                    state: haider_rpc::FleetAgentStateWire::Live,
+                    metrics: None,
+                    folded_children: 0,
+                    children: Vec::new(),
+                }],
+                rollup: haider_rpc::FleetRollupWire {
+                    node_count: 1,
+                    states: haider_rpc::FleetStateCountsWire {
+                        live: 1,
+                        ..haider_rpc::FleetStateCountsWire::default()
+                    },
+                    max_depth: 1,
+                    metrics: haider_rpc::FleetMetricsTotalsWire::default(),
+                    metrics_complete: false,
+                    complete: true,
+                },
+                truncated: false,
+            },
+        },
+    };
+    let descendant_node = haider_rpc::DescendantStreamNodeWire {
+        session_id: child_session_id,
+        agent_id,
+        child_run_id: RunId::new("identity-gate-child-run"),
+        parent_session_id: root_session_id.clone(),
+        parent_run_id: RunId::new("identity-gate-parent-run"),
+        parent_branch_id: None,
+        parent_agent_id: None,
+        depth: 1,
+        callsign: Some("jade-fox-a1b2c3".into()),
+        model: Some("gpt-5.6".into()),
+        provider: Some("openai".into()),
+        task: "inspect identity".into(),
+        state: haider_rpc::FleetAgentStateWire::Live,
+        requested_after_seq: 0,
+        replay_through_seq: 1,
+        parent_anchors: haider_rpc::DescendantParentAnchorsWire::default(),
+        children: Vec::new(),
+    };
+    let baseline = WireFrame::Response {
+        request_id: RequestId::new("identity-gate-descendants"),
+        body: ResponseBody::SessionDescendantsAttach {
+            attachment_id: AttachmentId::new("identity-gate-attachment"),
+            baseline: haider_rpc::SessionDescendantBaselineWire {
+                session_id: root_session_id,
+                generated_at_ms: 1,
+                fanout: haider_rpc::DescendantFanoutWire {
+                    requested_children: 1,
+                    accepted_children: 1,
+                    hard_limit: haider_rpc::DESCENDANT_STREAM_MAX_CHILDREN,
+                },
+                truncation: haider_rpc::DescendantTruncationWire {
+                    truncated: false,
+                    streamed_children: 1,
+                    omitted_children: 0,
+                    count_complete: true,
+                },
+                roots: vec![descendant_node.clone()],
+            },
+        },
+    };
+    let delta = WireFrame::SessionDescendantStream {
+        attachment_id: AttachmentId::new("identity-gate-attachment"),
+        event: haider_rpc::SessionDescendantStreamEventWire::Delta {
+            change: haider_rpc::DescendantChangeKindWire::Updated,
+            child: descendant_node,
+        },
+    };
+
+    let rich_frames = [fleet, baseline, delta];
+    for encoding in [WireEncoding::Json, WireEncoding::MessagePack] {
+        let sink = ConnectionFrameSink {
+            lane: OutboundLane::new(1, 1_048_576, 1_048_576),
+            outbound_limit: 1_048_576,
+            encoding,
+            fleet_identity: false,
+        };
+        for rich_frame in &rich_frames {
+            let mut legacy_frame = (*rich_frame).clone();
+            match &mut legacy_frame {
+                WireFrame::Response {
+                    body: ResponseBody::SessionFleet { snapshot },
+                    ..
+                } => {
+                    snapshot.roots[0].model = None;
+                    snapshot.roots[0].provider = None;
+                }
+                WireFrame::Response {
+                    body: ResponseBody::SessionDescendantsAttach { baseline, .. },
+                    ..
+                } => {
+                    baseline.roots[0].model = None;
+                    baseline.roots[0].provider = None;
+                }
+                WireFrame::SessionDescendantStream {
+                    event: haider_rpc::SessionDescendantStreamEventWire::Delta { child, .. },
+                    ..
+                } => {
+                    child.model = None;
+                    child.provider = None;
+                }
+                _ => unreachable!("identity gate fixture covers all delivery shapes"),
+            }
+            assert!(
+                serde_json::to_string(&legacy_frame)
+                    .expect("legacy identity frame serializes")
+                    .contains("\"callsign\":\"jade-fox-a1b2c3\""),
+                "the pre-existing callsign field survives the X1 feature gate"
+            );
+            let expected = uds_codec::encode_with(&legacy_frame, 1_048_576, encoding)
+                .expect("legacy identity frame encodes");
+            let encoded = sink.encode(rich_frame).expect("legacy sink encodes");
+            let actual = match encoded {
+                OutboundBytes::Contiguous(bytes) => bytes.as_slice().to_vec(),
+                OutboundBytes::Framed(frame) => {
+                    let mut bytes = Vec::with_capacity(frame.framed_len());
+                    bytes.extend_from_slice(frame.prefix());
+                    bytes.extend_from_slice(frame.body());
+                    bytes
+                }
+            };
+            assert_eq!(actual, expected);
+        }
+    }
 }
 
 #[tokio::test]
@@ -1171,6 +1360,7 @@ fn queued_byte_budget_covers_the_four_byte_prefix_at_the_exact_boundary() {
         lane: OutboundLane::new(1, config.outbound_queued_bytes, frame_limit + 4),
         outbound_limit: frame_limit,
         encoding: haider_rpc::WireEncoding::Json,
+        fleet_identity: true,
     };
     assert!(
         matches!(sink.offer(&attachment_id, &event), SendAdmission::Sent),

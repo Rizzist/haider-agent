@@ -7943,6 +7943,9 @@ fn render_fleet(
     // child graph, honestly empty when it ran ad-hoc), and the transcript
     // door (⏎ opens the chip view for the active session's own chips).
     if let Some(detail) = &view.detail {
+        // (line offset, hit) — resolved to rects just before this frame's
+        // early return, which is why they cannot ride `cell_hits`.
+        let mut detail_hits: Vec<(usize, Hit)> = Vec::new();
         let node = fleet::flatten(level)
             .into_iter()
             .find(|row| &row.node.agent_id == detail)
@@ -7995,6 +7998,11 @@ fn render_fleet(
                     }
                 }
                 lines.push(Line::from(header));
+                // Identity under the name, same tail grammar as the row it
+                // was drilled from. Absent facts render nothing.
+                if let Some(identity) = fleet::node_identity(node, width.saturating_sub(2)) {
+                    lines.push(Line::styled(format!("  {identity}"), theme.dim_style()));
+                }
                 let metric = fleet::node_metric(node);
                 if !metric.is_empty() {
                     lines.push(Line::styled(format!("  {metric}"), theme.dim_style()));
@@ -8026,6 +8034,14 @@ fn render_fleet(
                 lines.push(Line::raw(""));
                 lines.push(Line::styled("transcript", theme.gold_style()));
                 if crate::app::find_chip(&model.chips, node.agent_id.as_str()).is_some() {
+                    // The detail frame used to emit NO hit rects at all
+                    // (it returns before the shared resolver below), so
+                    // this door was keyboard-only. It is now the mouse's
+                    // too — the same door, not a second one.
+                    detail_hits.push((
+                        lines.len(),
+                        Hit::FleetTranscript(node.agent_id.as_str().to_owned()),
+                    ));
                     lines.push(Line::styled(
                         "  ⏎ open the full transcript (chip view)",
                         theme.dim_style(),
@@ -8036,11 +8052,48 @@ fn render_fleet(
                         theme.dim_style(),
                     ));
                 }
+                // The DESTROY affordance. Deliberate by construction: it is
+                // a distinct row that must be ARMED before it acts, and the
+                // arm is value-carrying (it names the agent), so a refreshed
+                // snapshot under the arm can never retarget the kill.
+                lines.push(Line::raw(""));
+                if model.fleet.kill_armed.as_ref() == Some(&node.agent_id) {
+                    lines.push(Line::styled(
+                        format!(
+                            "  destroy {}? press d again to confirm · esc cancels",
+                            fleet::callsign(node)
+                        ),
+                        theme.err_style(),
+                    ));
+                } else {
+                    detail_hits.push((
+                        lines.len(),
+                        Hit::FleetKill(node.agent_id.as_str().to_owned()),
+                    ));
+                    lines.push(Line::styled(
+                        "  ✕ destroy this subagent (d)",
+                        theme.dim_style(),
+                    ));
+                }
             }
         }
         lines.push(Line::raw(""));
         lines.push(Line::styled("esc back", theme.dim_style()));
         frame.render_widget(Paragraph::new(Text::from(lines)), area);
+        for (offset, hit) in detail_hits {
+            let y = area.y + u16::try_from(offset).unwrap_or(u16::MAX);
+            if y < area.y + area.height {
+                hits.push((
+                    Rect {
+                        x: area.x,
+                        y,
+                        width: area.width,
+                        height: 1,
+                    },
+                    hit,
+                ));
+            }
+        }
         return;
     }
     let roll = fleet::rollup(level);
@@ -8160,6 +8213,25 @@ fn render_fleet(
                     spans.push(Span::styled(format!(" {marker}"), theme.faint_style()));
                 }
                 let metric = fleet::node_metric(node);
+                // The row's IDENTITY tail (`· model · provider`) sits
+                // between the NAME and the task: it ADDS identity, it never
+                // restates the task the ` — ` fragment already carries.
+                // Budgeted after the metric and before the task, and it
+                // yields WHOLE to the task's own floor (` — ` plus the
+                // 4-char fragment the branch below requires) — a long model
+                // name can never starve the task off the row. A node with
+                // neither fact renders nothing at all, so a fleet that
+                // knows no identity draws exactly today's row.
+                let task_reserve = if node.task.is_empty() { 0 } else { 3 + 4 };
+                let identity_budget = width
+                    .saturating_sub(Line::from(spans.clone()).width())
+                    .saturating_sub(metric.chars().count())
+                    .saturating_sub(5)
+                    .saturating_sub(task_reserve)
+                    .saturating_sub(3);
+                if let Some(identity) = fleet::node_identity(node, identity_budget) {
+                    spans.push(Span::styled(format!(" · {identity}"), theme.dim_style()));
+                }
                 let left = Line::from(spans.clone()).width();
                 // The task fragment fills what the right-aligned metric
                 // leaves; it truncates before the metric ever drops.
@@ -8265,6 +8337,13 @@ fn render_fleet(
                 let mut matrix_a: Vec<Span<'_>> = vec![Span::raw(" ")];
                 let mut matrix_b: Vec<Span<'_>> = vec![Span::raw(" ")];
                 let mut names: Vec<Span<'_>> = vec![Span::raw(" ")];
+                // The band's 4th row. It was a blank spacer; it now carries
+                // each cell's identity. The band height is UNCHANGED, so
+                // the max-density view still shows exactly as many cells as
+                // before — the identity costs no cells. When no cell in the
+                // band knows a model or a provider every entry falls back to
+                // the blank it replaced, and the band draws as it always did.
+                let mut idents: Vec<Span<'_>> = vec![Span::raw(" ")];
                 for (col, node) in band.iter().enumerate() {
                     let index = band_index * cols + col;
                     let selected = index == sel;
@@ -8328,6 +8407,30 @@ fn render_fleet(
                         names.push(Span::styled(format!(" {marker}"), theme.faint_style()));
                     }
                     names.push(Span::raw(" ".repeat(FLEET_CELL_GAP)));
+                    // Ten columns cannot hold two facts, so the cell carries
+                    // ONE — the model, or the provider when there is no
+                    // model. It follows the CELL's law, not the list's: the
+                    // callsign directly above it is already hard-cut to this
+                    // same width, so the identity truncates too, with `…`
+                    // marking the elision. Absent both facts the cell keeps
+                    // the plain blank, byte-identical to the old spacer.
+                    match fleet::node_identity_cell(node, FLEET_CELL_W) {
+                        Some(ident) => {
+                            let mut cell = ident;
+                            let cell_width = cell.chars().count();
+                            cell.push_str(&" ".repeat(FLEET_CELL_W.saturating_sub(cell_width)));
+                            idents.push(Span::styled(
+                                cell,
+                                if selected {
+                                    theme.selection_style()
+                                } else {
+                                    theme.faint_style()
+                                },
+                            ));
+                        }
+                        None => idents.push(Span::raw(" ".repeat(FLEET_CELL_W))),
+                    }
+                    idents.push(Span::raw(" ".repeat(FLEET_CELL_GAP)));
                     cell_hits.push((
                         lines.len(),
                         u16::try_from(1 + col * step).unwrap_or(u16::MAX),
@@ -8338,7 +8441,7 @@ fn render_fleet(
                 lines.push(Line::from(matrix_a));
                 lines.push(Line::from(matrix_b));
                 lines.push(Line::from(names));
-                lines.push(Line::raw(""));
+                lines.push(Line::from(idents));
             }
         }
     }
@@ -8353,9 +8456,10 @@ fn render_fleet(
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
     for (offset, x, hit_width, hit) in cell_hits {
         let y = area.y + u16::try_from(offset).unwrap_or(u16::MAX);
-        // Grid hits cover the matrix rows AND the callsign row.
+        // Grid hits cover the matrix rows, the callsign row AND the
+        // identity row under it — the whole cell is the click target.
         let height = match hit {
-            Hit::FleetNode(_) if matches!(density, fleet::Density::Grid) => 3,
+            Hit::FleetNode(_) if matches!(density, fleet::Density::Grid) => 4,
             _ => 1,
         };
         if y < area.y + area.height {
@@ -10114,8 +10218,12 @@ fn render_composer(
     // Width degradation drops whole segments (reasoning first, then
     // auth, then the line) — never mid-word garbage.
     let rule_width = rule_area.width as usize;
+    // SURFACE-scoped, not session-scoped: while a child is being steered
+    // this rule speaks the CHILD's identity. It read the parent's before —
+    // the owner's screenshot had `glm-5.2 · api` under a child header that
+    // said `deepseek-v4-flash`.
     let identity_text = model
-        .composer_identity(rule_width.saturating_sub(6))
+        .surface_composer_identity(rule_width.saturating_sub(6))
         .map(|identity| format!(" {identity} "));
     // W-G (owner 2026-08-15): the throughput readout moved OFF this rule to
     // its own ambient row above the composer band — the rule carries the
@@ -10125,8 +10233,12 @@ fn render_composer(
     // fallback law as the header — absent binding/snapshot renders today's
     // rule byte-identically). The chip yields WHOLE with the identity text
     // when the rule is too narrow.
+    // The bound agent-type chip is the SESSION's binding, so it is
+    // parent-scoped for exactly the same reason the model was: it does not
+    // ride the rule while a child is being steered.
     let bound_chip = identity_text
         .as_ref()
+        .filter(|_| model.screen != crate::app::Screen::Subagent)
         .and(model.bound_loom_type(model.identity.agent_type.as_deref()))
         .map(|record| {
             let chip = if record.glyph.is_empty() {

@@ -1394,6 +1394,8 @@ fn fleet_node(task: &str) -> FleetNodeWire {
         agent_id: haider_protocol::ids::AgentId::new("fleet-typed"),
         session_id: SessionId::new("child-fleet-typed"),
         callsign: Some("Ammar".to_owned()),
+        model: None,
+        provider: None,
         task: task.to_owned(),
         depth: 1,
         parent_session_id: sid(),

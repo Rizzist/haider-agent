@@ -128,6 +128,7 @@ use haider_core::{
     TurnCancellationStatus,
 };
 use haider_protocol::EventPayload;
+use haider_protocol::agent::AgentManifest;
 use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::envelope::{RawEnvelope, envelope_weight_bytes};
 use haider_protocol::error::{ErrorCode, HaiderError};
@@ -177,6 +178,30 @@ const APPEND_QUEUE_MAX_REQUESTS: usize = 128;
 const APPEND_QUEUE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const APPEND_GROUP_MAX_REQUESTS: usize = 32;
 const APPEND_GROUP_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FleetNodeIdentity {
+    callsign: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
+}
+
+/// Projects only durable manifest identity. Both fleet delivery paths call
+/// this helper so neither can fill a missing coordinate from parent/session
+/// state or drift from the other path.
+fn fleet_node_identity(manifest: &AgentManifest) -> FleetNodeIdentity {
+    let persisted = |value: &str| (!value.trim().is_empty()).then(|| value.to_owned());
+    FleetNodeIdentity {
+        callsign: manifest.callsign.as_deref().and_then(persisted),
+        model: persisted(&manifest.model_profile),
+        provider: manifest
+            .coordinates
+            .as_ref()
+            .and_then(|coordinates| coordinates.get("provider"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(persisted),
+    }
+}
 
 /// Real-time home for the UTC-aligned usage-ledger timer.
 ///

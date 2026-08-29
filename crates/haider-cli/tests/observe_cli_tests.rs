@@ -180,6 +180,8 @@ fn fleet_node(
         agent_id: AgentId::new(id),
         session_id: SessionId::new(format!("session-{id}")),
         callsign: Some(callsign.into()),
+        model: None,
+        provider: None,
         task: task.into(),
         depth,
         parent_session_id: SessionId::new("fleet-cli-session"),
