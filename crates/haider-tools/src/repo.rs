@@ -11,6 +11,7 @@ use ignore::Match;
 use ignore::WalkBuilder;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::io::Read as _;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -30,13 +31,23 @@ pub(crate) struct WalkOptions {
 
 #[derive(Debug)]
 pub(crate) struct WalkOutcome {
-    pub files: Vec<PathBuf>,
-    pub directories: Vec<PathBuf>,
     pub truncated: bool,
     pub time_budget_reached: bool,
-    /// Sensitive hidden files omitted by the walker. Callers apply their own
-    /// path filter before adding these to a per-result skip count.
-    pub hidden_sensitive_files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WalkEntry<'a> {
+    /// A directory or file in the complete stable read footprint. These are
+    /// emitted as one directory-first pass before any consumer-visible file.
+    Footprint(&'a Path),
+    /// Publishes walk bounds at the legacy handoff point: after the complete
+    /// footprint and before hidden accounting or visible-file consumption.
+    Status {
+        truncated: bool,
+        time_budget_reached: bool,
+    },
+    HiddenSensitiveFile(&'a Path),
+    File(&'a Path),
 }
 
 /// Finds the nearest repository marker between `start` and `workspace_root`,
@@ -81,6 +92,7 @@ pub(crate) fn walk_files(
     workspace_root: &Path,
     search_root: &Path,
     options: WalkOptions,
+    mut consume: impl FnMut(WalkEntry<'_>) -> ToolResult<ControlFlow<()>>,
 ) -> ToolResult<WalkOutcome> {
     if options.max_files == 0 {
         return Err(ToolError::invalid_argument(
@@ -210,6 +222,11 @@ pub(crate) fn walk_files(
         }
     }
 
+    raw_files.sort();
+    raw_files.dedup();
+    raw_directories.sort();
+    raw_directories.dedup();
+
     let loaded = if options.respect_gitignore {
         load_ignore_rules(workspace_root, repo_root.as_deref(), &raw_files)?
     } else {
@@ -226,56 +243,114 @@ pub(crate) fn walk_files(
         boundary: repo_root.as_deref().unwrap_or(search_root),
     };
 
-    let mut files = Vec::new();
-    let mut directories = Vec::new();
-    let mut hidden_sensitive_files = Vec::new();
-    for absolute in raw_directories {
-        if options.respect_gitignore && ignore_rules.path_or_parent_ignored(&absolute, true) {
+    // Preserve the legacy error order: the retained walker used to resolve
+    // every filtered path before returning anything to its consumer.
+    for absolute in &raw_directories {
+        if options.respect_gitignore && ignore_rules.path_or_parent_ignored(absolute, true) {
             continue;
         }
-        let relative = workspace_relative(workspace_root, &absolute)?;
-        if options.include_hidden || !is_hidden_path(relative, &absolute) {
-            directories.push(relative.to_path_buf());
+        let _ = workspace_relative(workspace_root, absolute)?;
+    }
+    for absolute in &raw_files {
+        if !absolute.starts_with(search_root)
+            || (options.respect_gitignore && ignore_rules.path_or_parent_ignored(absolute, false))
+        {
+            continue;
+        }
+        let _ = workspace_relative(workspace_root, absolute)?;
+    }
+
+    // The legacy consumers built this complete directory-then-file footprint
+    // before scanning any contents. Stream the same pass without retaining a
+    // second filtered path vector, and skip it under the same cacheability
+    // conditions.
+    if !options.respect_gitignore && !truncated && !time_budget_reached {
+        for absolute in &raw_directories {
+            let relative = workspace_relative(workspace_root, absolute)?;
+            if (options.include_hidden || !is_hidden_path(relative, absolute))
+                && consume(WalkEntry::Footprint(relative))?.is_break()
+            {
+                return Ok(WalkOutcome {
+                    truncated,
+                    time_budget_reached,
+                });
+            }
+        }
+        for absolute in &raw_files {
+            if !absolute.starts_with(search_root) {
+                continue;
+            }
+            let relative = workspace_relative(workspace_root, absolute)?;
+            if !options.include_hidden && is_hidden_path(relative, absolute) {
+                continue;
+            }
+            if consume(WalkEntry::Footprint(relative))?.is_break() {
+                return Ok(WalkOutcome {
+                    truncated,
+                    time_budget_reached,
+                });
+            }
         }
     }
-    for absolute in raw_files {
+    if consume(WalkEntry::Status {
+        truncated,
+        time_budget_reached,
+    })?
+    .is_break()
+    {
+        return Ok(WalkOutcome {
+            truncated,
+            time_budget_reached,
+        });
+    }
+    // Hidden-sensitive accounting is complete before the first visible file
+    // reaches a consumer, preserving the old result even when that consumer
+    // stops early at a scan/result bound.
+    if !options.include_hidden {
+        for absolute in &raw_files {
+            if !absolute.starts_with(search_root)
+                || (options.respect_gitignore
+                    && ignore_rules.path_or_parent_ignored(absolute, false))
+            {
+                continue;
+            }
+            let relative = workspace_relative(workspace_root, absolute)?;
+            if is_hidden_path(relative, absolute)
+                && crate::redact::is_sensitive_path(relative)
+                && consume(WalkEntry::HiddenSensitiveFile(relative))?.is_break()
+            {
+                return Ok(WalkOutcome {
+                    truncated,
+                    time_budget_reached,
+                });
+            }
+        }
+    }
+    for absolute in &raw_files {
         if !absolute.starts_with(search_root) {
             continue;
         }
-        if options.respect_gitignore && ignore_rules.path_or_parent_ignored(&absolute, false) {
+        if options.respect_gitignore && ignore_rules.path_or_parent_ignored(absolute, false) {
             continue;
         }
-        let relative = workspace_relative(workspace_root, &absolute)?;
-        if !options.include_hidden && is_hidden_path(relative, &absolute) {
-            if crate::redact::is_sensitive_path(relative) {
-                hidden_sensitive_files.push(relative.to_path_buf());
-            }
+        let relative = workspace_relative(workspace_root, absolute)?;
+        if !options.include_hidden && is_hidden_path(relative, absolute) {
             continue;
         }
-        files.push(relative.to_path_buf());
+        if consume(WalkEntry::File(relative))?.is_break() {
+            break;
+        }
     }
-    files.sort();
-    files.dedup();
-    directories.sort();
-    directories.dedup();
-    hidden_sensitive_files.sort();
-    hidden_sensitive_files.dedup();
     Ok(WalkOutcome {
-        files,
-        directories,
         truncated,
         time_budget_reached,
-        hidden_sensitive_files,
     })
 }
 
 fn empty_walk() -> WalkOutcome {
     WalkOutcome {
-        files: Vec::new(),
-        directories: Vec::new(),
         truncated: false,
         time_budget_reached: false,
-        hidden_sensitive_files: Vec::new(),
     }
 }
 

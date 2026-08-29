@@ -336,7 +336,7 @@ impl FileCas {
         }
     }
 
-    fn bound_image(&self, bytes: &[u8], media_type: &str) -> StoreResult<(Vec<u8>, u32, u32)> {
+    fn bound_image(&self, bytes: Vec<u8>, media_type: &str) -> StoreResult<(Vec<u8>, u32, u32)> {
         if bytes.len() > TOOL_RESULT_IMAGE_MAX_SOURCE_BYTES {
             return Err(invalid_image(format!(
                 "tool image source is {} bytes; the source limit is {TOOL_RESULT_IMAGE_MAX_SOURCE_BYTES}",
@@ -346,7 +346,7 @@ impl FileCas {
         let format = image_format(media_type)?;
         let (source_width, source_height, decoded) = match format {
             ToolImageFormat::Png => {
-                let detected = image::guess_format(bytes).map_err(|error| {
+                let detected = image::guess_format(&bytes).map_err(|error| {
                     invalid_image(format!("tool image format is invalid: {error}"))
                 })?;
                 if detected != ImageFormat::Png {
@@ -354,17 +354,17 @@ impl FileCas {
                         "tool image declares `{media_type}` but its encoded format is not PNG"
                     )));
                 }
-                let dimensions = ImageReader::with_format(Cursor::new(bytes), ImageFormat::Png)
+                let dimensions = ImageReader::with_format(Cursor::new(&bytes), ImageFormat::Png)
                     .into_dimensions()
                     .map_err(|error| {
                         invalid_image(format!("tool image dimensions are invalid: {error}"))
                     })?;
                 validate_source_dimensions(dimensions.0, dimensions.1)?;
-                let decoded = decode_png(bytes)?;
+                let decoded = decode_png(&bytes)?;
                 (dimensions.0, dimensions.1, Some(decoded))
             }
             ToolImageFormat::Jpeg => {
-                let (width, height) = jpeg_dimensions(bytes)?;
+                let (width, height) = jpeg_dimensions(&bytes)?;
                 (width, height, None)
             }
         };
@@ -373,7 +373,7 @@ impl FileCas {
             && source_height <= TOOL_RESULT_IMAGE_MAX_DIMENSION
             && u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= TOOL_RESULT_IMAGE_MAX_BYTES
         {
-            return Ok((bytes.to_vec(), source_width, source_height));
+            return Ok((bytes, source_width, source_height));
         }
 
         if format == ToolImageFormat::Jpeg {
@@ -387,6 +387,7 @@ impl FileCas {
         let decoded = decoded.ok_or_else(|| {
             invalid_image("oversized JPEG tool images require a bounded JPEG decoder")
         })?;
+        drop(bytes);
         let mut target_dimension = TOOL_RESULT_IMAGE_MAX_DIMENSION;
         loop {
             let bounded = resize_to_fit(&decoded, target_dimension);
@@ -483,7 +484,7 @@ impl Cas for FileCas {
         self.put_reader(source, source_path)
     }
 
-    fn put_image(&self, bytes: &[u8], media_type: &str) -> StoreResult<ImageBlockRef> {
+    fn put_image(&self, bytes: Vec<u8>, media_type: &str) -> StoreResult<ImageBlockRef> {
         let (bounded, width, height) = self.bound_image(bytes, media_type)?;
         let byte_len = u64::try_from(bounded.len()).map_err(|_| {
             invalid_image("bounded tool image length does not fit the protocol counter")

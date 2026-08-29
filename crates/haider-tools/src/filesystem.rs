@@ -97,6 +97,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Cursor, Read, Write};
 #[cfg(windows)]
 use std::io::{Seek, SeekFrom};
+use std::ops::ControlFlow;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 #[cfg(unix)]
@@ -110,6 +111,11 @@ use std::time::{Duration, Instant};
 #[async_trait]
 pub trait CasSink: Send {
     async fn put(&mut self, bytes: &[u8]) -> ToolResult<ArtifactRef>;
+    /// Transfers an already-owned artifact buffer. Lightweight sinks retain
+    /// the borrowed fallback; production bridges move it to blocking CAS.
+    async fn put_owned(&mut self, bytes: Vec<u8>) -> ToolResult<ArtifactRef> {
+        self.put(&bytes).await
+    }
     /// Stores one reference group before the caller publishes any of its
     /// journal references. Lightweight sinks retain the safe sequential form.
     async fn put_batch(&mut self, blobs: &[Vec<u8>]) -> ToolResult<Vec<ArtifactRef>> {
@@ -126,7 +132,7 @@ pub trait CasSink: Send {
     /// test sinks may keep the honest unsupported default.
     async fn put_image(
         &mut self,
-        _bytes: &[u8],
+        _bytes: Vec<u8>,
         _media_type: &str,
     ) -> ToolResult<haider_protocol::tool::ImageBlockRef> {
         Err(ToolError::cas(
@@ -2419,6 +2425,10 @@ fn search_files_at(
     validate_search(operation)?;
     let compiled = CompiledSearch::new(operation)?;
     let path_filters = CompiledPathFilters::new(operation)?;
+    let mut footprint = ReadFootprintBuilder::new();
+    let capture_footprint = !operation.respect_gitignore;
+    let mut matches = None;
+    let mut search_stopped = false;
     let walked = crate::repo::walk_files(
         workspace_root,
         &operation.root,
@@ -2428,66 +2438,103 @@ fn search_files_at(
             max_files: SEARCH_MAX_ENUMERATED_FILES,
             deadline: Some(started + SEARCH_WALL_TIME_BUDGET),
         },
+        |entry| match entry {
+            crate::repo::WalkEntry::Footprint(path) => {
+                if capture_footprint {
+                    push_repository_footprint(&mut footprint, &workspace_dir, path);
+                }
+                Ok(ControlFlow::Continue(()))
+            }
+            crate::repo::WalkEntry::Status {
+                truncated,
+                time_budget_reached,
+            } => {
+                let matches = ensure_search_collector(
+                    &mut matches,
+                    max_preview_bytes,
+                    operation.max_matches,
+                )?;
+                if time_budget_reached {
+                    matches.truncate(ToolTruncationReason::TimeBudget);
+                }
+                if truncated {
+                    matches.truncate(ToolTruncationReason::EnumerationLimit);
+                }
+                Ok(ControlFlow::Continue(()))
+            }
+            crate::repo::WalkEntry::HiddenSensitiveFile(path) => {
+                let Some(match_path) =
+                    portable_hidden_accounting_path(workspace_root, relative, path)
+                else {
+                    return Ok(ControlFlow::Continue(()));
+                };
+                if path_filters.matches(&match_path) {
+                    ensure_search_collector(
+                        &mut matches,
+                        max_preview_bytes,
+                        operation.max_matches,
+                    )?
+                    .skip_sensitive();
+                }
+                Ok(ControlFlow::Continue(()))
+            }
+            crate::repo::WalkEntry::File(workspace_path) => {
+                let matches = ensure_search_collector(
+                    &mut matches,
+                    max_preview_bytes,
+                    operation.max_matches,
+                )?;
+                if search_stopped {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                if started.elapsed() >= SEARCH_WALL_TIME_BUDGET {
+                    matches.truncate(ToolTruncationReason::TimeBudget);
+                    search_stopped = true;
+                    return Ok(ControlFlow::Continue(()));
+                }
+                let path_under_root =
+                    path_under_search_root(workspace_root, relative, workspace_path)?;
+                let match_path = portable_relative_path(path_under_root)?;
+                if !path_filters.matches(&match_path) {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                if crate::redact::is_sensitive_path(workspace_path) {
+                    matches.skip_sensitive();
+                    return Ok(ControlFlow::Continue(()));
+                }
+                if matches.files_scanned == SEARCH_MAX_FILES {
+                    matches.truncate(ToolTruncationReason::FilesScanned);
+                    search_stopped = true;
+                    return Ok(ControlFlow::Continue(()));
+                }
+                let entry_path = workspace_root.join(workspace_path);
+                let file = open_search_file(&workspace_dir, workspace_path, &entry_path)?;
+                matches.file_scanned();
+                collect_streamed_file_matches(
+                    file,
+                    workspace_path,
+                    &entry_path,
+                    operation,
+                    &compiled,
+                    started,
+                    matches,
+                )?;
+                search_stopped = matches.truncated_reason == Some(ToolTruncationReason::TimeBudget)
+                    || matches.truncated_reason == Some(ToolTruncationReason::BytesScanned)
+                    || matches.truncated_reason == Some(ToolTruncationReason::ResultBytes)
+                    || matches.truncated_reason == Some(ToolTruncationReason::LineTooLong)
+                    || matches.truncated_reason == Some(ToolTruncationReason::MatchLimit);
+                Ok(ControlFlow::Continue(()))
+            }
+        },
     )?;
-    let mut footprint =
-        if !operation.respect_gitignore && !walked.truncated && !walked.time_budget_reached {
-            repository_read_footprint(&workspace_dir, &walked.directories, &walked.files)
-        } else {
-            None
-        };
-    let mut matches = SearchCollector::new(max_preview_bytes, operation.max_matches)?;
-    matches.skipped_sensitive = walked
-        .hidden_sensitive_files
-        .iter()
-        .filter_map(|path| path_under_search_root(workspace_root, relative, path).ok())
-        .filter_map(|path| portable_relative_path(path).ok())
-        .filter(|path| path_filters.matches(path))
-        .count();
-    if walked.time_budget_reached {
-        matches.truncate(ToolTruncationReason::TimeBudget);
-    }
-    if walked.truncated {
-        matches.truncate(ToolTruncationReason::EnumerationLimit);
-    }
-    for workspace_path in walked.files {
-        if started.elapsed() >= SEARCH_WALL_TIME_BUDGET {
-            matches.truncate(ToolTruncationReason::TimeBudget);
-            break;
-        }
-        let path_under_root = path_under_search_root(workspace_root, relative, &workspace_path)?;
-        let match_path = portable_relative_path(path_under_root)?;
-        if !path_filters.matches(&match_path) {
-            continue;
-        }
-        if crate::redact::is_sensitive_path(&workspace_path) {
-            matches.skip_sensitive();
-            continue;
-        }
-        if matches.files_scanned == SEARCH_MAX_FILES {
-            matches.truncate(ToolTruncationReason::FilesScanned);
-            break;
-        }
-        let entry_path = workspace_root.join(&workspace_path);
-        let file = open_search_file(&workspace_dir, &workspace_path, &entry_path)?;
-        matches.file_scanned();
-        collect_streamed_file_matches(
-            file,
-            &workspace_path,
-            &entry_path,
-            operation,
-            &compiled,
-            started,
-            &mut matches,
-        )?;
-        if matches.truncated_reason == Some(ToolTruncationReason::TimeBudget)
-            || matches.truncated_reason == Some(ToolTruncationReason::BytesScanned)
-            || matches.truncated_reason == Some(ToolTruncationReason::ResultBytes)
-            || matches.truncated_reason == Some(ToolTruncationReason::LineTooLong)
-            || matches.truncated_reason == Some(ToolTruncationReason::MatchLimit)
-        {
-            break;
-        }
-    }
+    let matches = match matches {
+        Some(matches) => matches,
+        None => SearchCollector::new(max_preview_bytes, operation.max_matches)?,
+    };
+    let mut footprint = (capture_footprint && !walked.truncated && !walked.time_budget_reached)
+        .then(|| footprint.finish())
+        .flatten();
     if matches.truncated_reason == Some(ToolTruncationReason::TimeBudget) {
         footprint = None;
     }
@@ -2574,6 +2621,19 @@ struct SearchCollector {
     skipped_sensitive: usize,
     files_scanned: usize,
     bytes_scanned: usize,
+}
+
+fn ensure_search_collector(
+    collector: &mut Option<SearchCollector>,
+    max_preview_bytes: usize,
+    max_matches: usize,
+) -> ToolResult<&mut SearchCollector> {
+    if collector.is_none() {
+        *collector = Some(SearchCollector::new(max_preview_bytes, max_matches)?);
+    }
+    collector.as_mut().ok_or_else(|| ToolError::Runtime {
+        message: "search result spool was not initialized".into(),
+    })
 }
 
 fn timed_out_search(max_preview_bytes: usize, max_matches: usize) -> ToolResult<SearchOutput> {
@@ -3073,6 +3133,16 @@ fn portable_relative_path(path: &Path) -> ToolResult<String> {
     Ok(path_argument(path)?.replace('\\', "/"))
 }
 
+fn portable_hidden_accounting_path(
+    workspace_root: &Path,
+    search_root: &Path,
+    workspace_path: &Path,
+) -> Option<String> {
+    path_under_search_root(workspace_root, search_root, workspace_path)
+        .ok()
+        .and_then(|path| portable_relative_path(path).ok())
+}
+
 fn path_under_search_root<'a>(
     workspace_root: &Path,
     search_root: &Path,
@@ -3096,20 +3166,18 @@ fn path_under_search_root<'a>(
     Ok(relative)
 }
 
-fn repository_read_footprint(
+fn push_repository_footprint(
+    footprint: &mut ReadFootprintBuilder,
     workspace_dir: &OwnedFd,
-    directories: &[PathBuf],
-    files: &[PathBuf],
-) -> Option<ReadFootprint> {
-    let mut footprint = ReadFootprintBuilder::new();
-    for path in directories.iter().chain(files) {
-        if !footprint.is_cacheable() {
-            return None;
+    path: &Path,
+) {
+    if footprint.is_cacheable() {
+        if let Some(stamp) = freshness_stamp_at(workspace_dir, path) {
+            footprint.push(stamp);
+        } else {
+            footprint.disable();
         }
-        let stamp = freshness_stamp_at(workspace_dir, path)?;
-        footprint.push(stamp);
     }
-    footprint.finish()
 }
 
 #[cfg(unix)]
@@ -3478,6 +3546,11 @@ fn glob_files_at(
         ));
     }
     let pattern = compile_path_glob(&operation.pattern, "fs_glob")?;
+    let mut footprint = ReadFootprintBuilder::new();
+    let capture_footprint = !operation.respect_gitignore;
+    let mut paths = GlobCollector::new();
+    let mut skipped_sensitive = 0usize;
+    let mut files_scanned = 0usize;
     let walked = crate::repo::walk_files(
         workspace_root,
         &operation.root,
@@ -3487,37 +3560,50 @@ fn glob_files_at(
             max_files: GLOB_MAX_FILES_SCANNED,
             deadline: None,
         },
+        |entry| {
+            let workspace_path = match entry {
+                crate::repo::WalkEntry::Footprint(path) => {
+                    if capture_footprint {
+                        push_repository_footprint(&mut footprint, &workspace_dir, path);
+                    }
+                    return Ok(ControlFlow::Continue(()));
+                }
+                crate::repo::WalkEntry::Status { .. } => {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                crate::repo::WalkEntry::HiddenSensitiveFile(path) => {
+                    let Some(candidate) =
+                        portable_hidden_accounting_path(workspace_root, relative, path)
+                    else {
+                        return Ok(ControlFlow::Continue(()));
+                    };
+                    if pattern.is_match(&candidate) {
+                        skipped_sensitive = skipped_sensitive.saturating_add(1);
+                    }
+                    return Ok(ControlFlow::Continue(()));
+                }
+                crate::repo::WalkEntry::File(path) => path,
+            };
+            files_scanned = files_scanned.saturating_add(1);
+            let path_under_root = path_under_search_root(workspace_root, relative, workspace_path)?;
+            let candidate = portable_relative_path(path_under_root)?;
+            if !pattern.is_match(&candidate) {
+                return Ok(ControlFlow::Continue(()));
+            }
+            if crate::redact::is_sensitive_path(workspace_path) {
+                skipped_sensitive = skipped_sensitive.saturating_add(1);
+                return Ok(ControlFlow::Continue(()));
+            }
+            let display_path = workspace_root.join(workspace_path);
+            let file = open_search_file(&workspace_dir, workspace_path, &display_path)?;
+            drop(file);
+            paths.push(portable_relative_path(workspace_path)?);
+            Ok(ControlFlow::Continue(()))
+        },
     )?;
-    let footprint = if !operation.respect_gitignore && !walked.truncated {
-        repository_read_footprint(&workspace_dir, &walked.directories, &walked.files)
-    } else {
-        None
-    };
-    let mut paths = GlobCollector::new();
-    let mut skipped_sensitive = walked
-        .hidden_sensitive_files
-        .iter()
-        .filter_map(|path| path_under_search_root(workspace_root, relative, path).ok())
-        .filter_map(|path| portable_relative_path(path).ok())
-        .filter(|path| pattern.is_match(path))
-        .count();
-    let mut files_scanned = 0usize;
-    for workspace_path in walked.files {
-        files_scanned = files_scanned.saturating_add(1);
-        let path_under_root = path_under_search_root(workspace_root, relative, &workspace_path)?;
-        let candidate = portable_relative_path(path_under_root)?;
-        if !pattern.is_match(&candidate) {
-            continue;
-        }
-        if crate::redact::is_sensitive_path(&workspace_path) {
-            skipped_sensitive = skipped_sensitive.saturating_add(1);
-            continue;
-        }
-        let display_path = workspace_root.join(&workspace_path);
-        let file = open_search_file(&workspace_dir, &workspace_path, &display_path)?;
-        drop(file);
-        paths.push(portable_relative_path(&workspace_path)?);
-    }
+    let footprint = (capture_footprint && !walked.truncated)
+        .then(|| footprint.finish())
+        .flatten();
     let truncated = paths.truncated;
     let entries = paths.entries.into_sorted_vec();
     let (preview, collapsed_directories) = glob_preview(&entries);
@@ -7950,32 +8036,34 @@ where
         })
     );
     let presented = if sensitive_path {
-        "[REDACTED:sensitive_file]\n".to_owned()
+        Cow::Borrowed("[REDACTED:sensitive_file]\n")
     } else if matches!(&data, Some(ToolResultData::FsRead { .. })) {
         let entries = contents
             .lines()
             .map(|line| (line.to_owned(), line.ends_with('/')))
             .collect::<Vec<_>>();
-        directory_preview(&entries).0
+        Cow::Owned(directory_preview(&entries).0)
     } else {
-        preview_contents.unwrap_or_else(|| contents.clone())
+        preview_contents.map_or_else(|| Cow::Borrowed(contents.as_str()), Cow::Owned)
     };
-    let redacted = crate::redact::redact_text(&presented);
-    let presentation_reduced = presented != contents || redacted.replacements > 0;
+    let redacted = crate::redact::redact_text_bounded(&presented, bounds.max_preview_bytes);
+    let presentation_reduced = presented.as_ref() != contents || redacted.replacements > 0;
+    let contents_len = contents.len();
     let truncated = semantic_truncated
         || presentation_reduced
-        || contents.len() > bounds.max_preview_bytes
-        || redacted.text.len() > bounds.max_preview_bytes;
+        || contents_len > bounds.max_preview_bytes
+        || redacted.full_len > bounds.max_preview_bytes;
     let artifact_required = semantic_truncated
-        || contents.len() > bounds.max_preview_bytes
-        || redacted.text.len() > bounds.max_preview_bytes;
+        || contents_len > bounds.max_preview_bytes
+        || redacted.full_len > bounds.max_preview_bytes;
+    drop(presented);
     let artifact = if artifact_required {
-        Some(cas.put(contents.as_bytes()).await?)
+        Some(cas.put_owned(contents.into_bytes()).await?)
     } else {
         None
     };
     Ok(BoundedResult {
-        preview: utf8_prefix(&redacted.text, bounds.max_preview_bytes).to_owned(),
+        preview: redacted.text,
         truncated,
         data,
         artifact,
@@ -8084,7 +8172,7 @@ where
         .truncated_reason
         .or(byte_truncated.then_some(ToolTruncationReason::ResultBytes));
     let artifact = if truncated {
-        Some(cas.put(output.contents.as_bytes()).await?)
+        Some(cas.put_owned(output.contents.into_bytes()).await?)
     } else {
         None
     };
@@ -8560,7 +8648,17 @@ mod w4a13_tests;
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::{MetadataExt, symlink};
+
+    #[test]
+    fn hidden_sensitive_non_utf8_accounting_remains_best_effort() {
+        let path = PathBuf::from(".ssh").join(OsString::from_vec(vec![0xff]));
+        assert_eq!(
+            portable_hidden_accounting_path(Path::new("/workspace"), Path::new(".ssh"), &path,),
+            None
+        );
+    }
 
     /// MUTATION CHECK (layered): Apple's atomic `RENAME_NOFOLLOW_ANY` is the
     /// load-bearing final seam; reverting that flag to plain `renameat`

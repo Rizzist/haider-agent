@@ -8,6 +8,7 @@
 use flate2::read::ZlibDecoder;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read as _;
+use std::ops::Range;
 
 /// First-class PDF attachment cap. The RPC upload envelope allows one extra
 /// MiB so the daemon can return the PDF-specific typed rejection.
@@ -73,11 +74,12 @@ impl std::error::Error for PdfError {}
 
 #[derive(Debug, Clone)]
 struct PdfObject {
-    body: Vec<u8>,
+    body: Range<usize>,
 }
 
 #[derive(Debug)]
-struct ParsedPdf {
+struct ParsedPdf<'a> {
+    source: &'a [u8],
     objects: BTreeMap<(u32, u16), PdfObject>,
     pages: Vec<(u32, u16)>,
     encrypted: bool,
@@ -104,9 +106,8 @@ pub fn inspect_pdf(bytes: &[u8]) -> Result<PdfMetadata, PdfError> {
 /// inputs, so it runs under `catch_unwind`; a panic means "no answer here",
 /// never a crash.
 fn inspect_real_world(bytes: &[u8]) -> Option<PdfMetadata> {
-    let owned = bytes.to_vec();
-    std::panic::catch_unwind(move || {
-        let document = lopdf::Document::load_mem(&owned).ok()?;
+    std::panic::catch_unwind(|| {
+        let document = lopdf::Document::load_mem(bytes).ok()?;
         let pages = u32::try_from(document.get_pages().len()).ok()?;
         (pages > 0).then_some(PdfMetadata {
             pages,
@@ -123,16 +124,215 @@ fn inspect_real_world(bytes: &[u8]) -> Option<PdfMetadata> {
 /// Chrome-printed PDF). It runs under `catch_unwind` because it has panic
 /// paths on exotic font programs; a panic or error falls back to the
 /// internal pipeline rather than surfacing.
-fn extract_pages_real_world(bytes: &[u8]) -> Option<Vec<String>> {
-    let owned = bytes.to_vec();
-    std::panic::catch_unwind(move || pdf_extract::extract_text_from_mem_by_pages(&owned).ok())
-        .ok()
-        .flatten()
+fn extract_pages_real_world(
+    bytes: &[u8],
+    internal_pages: Option<usize>,
+) -> Option<ExtractedPdfText> {
+    std::panic::catch_unwind(|| {
+        // This must stay `pdf_extract::Document`: the direct `lopdf` dependency
+        // is a different version and cannot cross `output_doc_page`'s API.
+        let mut document = pdf_extract::Document::load_mem(bytes).ok()?;
+        if document.is_encrypted() {
+            document.decrypt("").ok()?;
+        }
+        let mut bounded = RealWorldAccumulator::new();
+        let mut page_number = 1_u32;
+        loop {
+            let mut writer = TrimmedPageWriter::new(MAX_PDF_PAGE_TEXT_CHARS);
+            let result = {
+                let sink: &mut dyn std::io::Write = &mut writer;
+                let mut output = pdf_extract::PlainTextOutput::new(sink);
+                pdf_extract::output_doc_page(&document, &mut output, page_number)
+            };
+            if result.is_err() {
+                break;
+            }
+            if bounded.accepting_pages {
+                bounded.push_page(page_number, writer.finish());
+            }
+            page_number = page_number.saturating_add(1);
+        }
+        let backend_pages = usize::try_from(page_number.saturating_sub(1)).unwrap_or(usize::MAX);
+        let total_pages = u32::try_from(internal_pages.unwrap_or(backend_pages).max(backend_pages))
+            .unwrap_or(u32::MAX);
+        bounded.finish(total_pages)
+    })
+    .ok()
+    .flatten()
+}
+
+struct TrimmedPageWriter {
+    text: String,
+    text_chars: usize,
+    full_chars: usize,
+    max_chars: usize,
+    saw_non_whitespace: bool,
+    pending_whitespace: String,
+    pending_whitespace_prefix_chars: usize,
+    pending_whitespace_chars: usize,
+}
+
+impl TrimmedPageWriter {
+    fn new(max_chars: usize) -> Self {
+        Self {
+            text: String::new(),
+            text_chars: 0,
+            full_chars: 0,
+            max_chars,
+            saw_non_whitespace: false,
+            pending_whitespace: String::new(),
+            pending_whitespace_prefix_chars: 0,
+            pending_whitespace_chars: 0,
+        }
+    }
+
+    fn push_str(&mut self, value: &str) {
+        for character in value.chars() {
+            if character.is_whitespace() {
+                if !self.saw_non_whitespace {
+                    continue;
+                }
+                self.pending_whitespace_chars = self.pending_whitespace_chars.saturating_add(1);
+                if self
+                    .text_chars
+                    .saturating_add(self.pending_whitespace_prefix_chars)
+                    < self.max_chars
+                {
+                    self.pending_whitespace.push(character);
+                    self.pending_whitespace_prefix_chars =
+                        self.pending_whitespace_prefix_chars.saturating_add(1);
+                }
+                continue;
+            }
+            self.saw_non_whitespace = true;
+            self.full_chars = self
+                .full_chars
+                .saturating_add(self.pending_whitespace_chars);
+            self.text.push_str(&self.pending_whitespace);
+            self.text_chars = self
+                .text_chars
+                .saturating_add(self.pending_whitespace_prefix_chars);
+            self.pending_whitespace.clear();
+            self.pending_whitespace_prefix_chars = 0;
+            self.pending_whitespace_chars = 0;
+            self.full_chars = self.full_chars.saturating_add(1);
+            if self.text_chars < self.max_chars {
+                self.text.push(character);
+                self.text_chars = self.text_chars.saturating_add(1);
+            }
+        }
+    }
+
+    fn finish(self) -> BoundedPageText {
+        BoundedPageText {
+            text: self.text,
+            truncated: self.full_chars > self.max_chars,
+        }
+    }
+}
+
+impl std::io::Write for TrimmedPageWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let value = std::str::from_utf8(bytes).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("PDF text backend emitted invalid UTF-8: {error}"),
+            )
+        })?;
+        self.push_str(value);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct BoundedPageText {
+    text: String,
+    truncated: bool,
+}
+
+struct RealWorldAccumulator {
+    output: String,
+    pages_extracted: u32,
+    truncated: bool,
+    accepting_pages: bool,
+}
+
+impl RealWorldAccumulator {
+    fn new() -> Self {
+        Self {
+            output: String::new(),
+            pages_extracted: 0,
+            truncated: false,
+            accepting_pages: true,
+        }
+    }
+
+    fn push_page(&mut self, page_number: u32, page: BoundedPageText) {
+        self.pages_extracted = page_number;
+        if page.text.is_empty() {
+            return;
+        }
+        let heading = format!("[pdf page {page_number}]\n");
+        let separator = if self.output.is_empty() { "" } else { "\n\n" };
+        let required =
+            separator.chars().count() + heading.chars().count() + page.text.chars().count();
+        if self.output.chars().count().saturating_add(required) > MAX_PDF_TOTAL_TEXT_CHARS {
+            let prefix = format!("{separator}{heading}");
+            let room = MAX_PDF_TOTAL_TEXT_CHARS
+                .saturating_sub(self.output.chars().count())
+                .saturating_sub(prefix.chars().count());
+            self.output.push_str(&prefix);
+            self.output.push_str(&take_chars(&page.text, room));
+            self.truncated = true;
+            self.accepting_pages = false;
+            return;
+        }
+        self.output.push_str(separator);
+        self.output.push_str(&heading);
+        self.output.push_str(&page.text);
+        if page.truncated {
+            self.truncated = true;
+            self.accepting_pages = false;
+        }
+    }
+
+    fn finish(mut self, total_pages: u32) -> Option<ExtractedPdfText> {
+        if self.output.trim().is_empty() {
+            return None;
+        }
+        if self.pages_extracted < total_pages {
+            self.truncated = true;
+        }
+        if self.truncated {
+            let marker = format!(
+                "[pdf truncated: {} of {total_pages} pages]",
+                self.pages_extracted
+            );
+            let reserved = marker.chars().count() + 2;
+            let keep = MAX_PDF_TOTAL_TEXT_CHARS.saturating_sub(reserved);
+            self.output = take_chars(&self.output, keep);
+            while self.output.ends_with(char::is_whitespace) {
+                self.output.pop();
+            }
+            self.output.push_str("\n\n");
+            self.output.push_str(&marker);
+        }
+        Some(ExtractedPdfText {
+            text: self.output,
+            pages_extracted: self.pages_extracted,
+            total_pages,
+            truncated: self.truncated,
+        })
+    }
 }
 
 /// Applies the exact per-page, aggregate and honest-marker bounds to
 /// pre-extracted page texts. Returns `None` when every page is blank so the
 /// caller can fall through to the internal pipeline's typed verdict.
+#[cfg(test)]
 fn bound_real_world_pages(page_texts: &[String], total_pages: u32) -> Option<ExtractedPdfText> {
     let mut output = String::new();
     let mut pages_extracted = 0_u32;
@@ -211,16 +411,8 @@ pub fn extract_text_bounded(bytes: &[u8]) -> Result<ExtractedPdfText, PdfError> 
         ));
     }
     let internal_pages = parsed.as_ref().map(|parsed| parsed.pages.len()).ok();
-    if let Some(page_texts) = extract_pages_real_world(bytes) {
-        let total_pages = u32::try_from(
-            internal_pages
-                .unwrap_or(page_texts.len())
-                .max(page_texts.len()),
-        )
-        .unwrap_or(u32::MAX);
-        if let Some(extracted) = bound_real_world_pages(&page_texts, total_pages) {
-            return Ok(extracted);
-        }
+    if let Some(extracted) = extract_pages_real_world(bytes, internal_pages) {
+        return Ok(extracted);
     }
     match parsed {
         Ok(parsed) => extract_text_bounded_internal(&parsed),
@@ -242,7 +434,7 @@ pub fn extract_text_bounded(bytes: &[u8]) -> Result<ExtractedPdfText, PdfError> 
     }
 }
 
-fn extract_text_bounded_internal(parsed: &ParsedPdf) -> Result<ExtractedPdfText, PdfError> {
+fn extract_text_bounded_internal(parsed: &ParsedPdf<'_>) -> Result<ExtractedPdfText, PdfError> {
     let total_pages = u32::try_from(parsed.pages.len()).unwrap_or(u32::MAX);
     let mut output = String::new();
     let mut pages_extracted = 0_u32;
@@ -255,7 +447,7 @@ fn extract_text_bounded_internal(parsed: &ParsedPdf) -> Result<ExtractedPdfText,
             .objects
             .get(page_id)
             .ok_or_else(|| PdfError::new(PdfErrorKind::Malformed, "PDF page object is missing"))?;
-        let content_ids = references_after_key(&page.body, b"Contents");
+        let content_ids = references_after_key(parsed.object_body(page), b"Contents");
         let mut page_text = String::new();
         let mut page_was_truncated = false;
         for content_id in content_ids {
@@ -265,7 +457,7 @@ fn extract_text_bounded_internal(parsed: &ParsedPdf) -> Result<ExtractedPdfText,
                     "PDF page references a missing content stream",
                 ));
             };
-            let decoded = decode_stream(&content.body)?;
+            let decoded = decode_stream(parsed.object_body(content))?;
             let separator_chars = usize::from(!page_text.is_empty() && !page_text.ends_with('\n'));
             let remaining = MAX_PDF_PAGE_TEXT_CHARS
                 .saturating_sub(page_text.chars().count())
@@ -338,7 +530,7 @@ fn extract_text_bounded_internal(parsed: &ParsedPdf) -> Result<ExtractedPdfText,
     })
 }
 
-fn parse_pdf(bytes: &[u8]) -> Result<ParsedPdf, PdfError> {
+fn parse_pdf(bytes: &[u8]) -> Result<ParsedPdf<'_>, PdfError> {
     if bytes.len() < 8 || !bytes.starts_with(b"%PDF-") {
         return Err(PdfError::new(
             PdfErrorKind::Malformed,
@@ -362,7 +554,7 @@ fn parse_pdf(bytes: &[u8]) -> Result<ParsedPdf, PdfError> {
         ));
     }
     let encrypted = trailer_has_name(bytes, b"Encrypt");
-    let pages = ordered_pages(&objects);
+    let pages = ordered_pages(bytes, &objects);
     if pages.is_empty() {
         return Err(PdfError::new(
             PdfErrorKind::Malformed,
@@ -370,6 +562,7 @@ fn parse_pdf(bytes: &[u8]) -> Result<ParsedPdf, PdfError> {
         ));
     }
     Ok(ParsedPdf {
+        source: bytes,
         objects,
         pages,
         encrypted,
@@ -402,7 +595,7 @@ fn parse_objects(bytes: &[u8]) -> Result<BTreeMap<(u32, u16), PdfObject>, PdfErr
         objects.insert(
             (object_id, generation),
             PdfObject {
-                body: bytes[body_start..body_end].to_vec(),
+                body: body_start..body_end,
             },
         );
         cursor = body_end.saturating_add(b"endobj".len());
@@ -445,30 +638,47 @@ fn object_body_end(bytes: &[u8], body_start: usize) -> Option<usize> {
     find_keyword(bytes, b"endobj", endstream + b"endstream".len())
 }
 
-fn ordered_pages(objects: &BTreeMap<(u32, u16), PdfObject>) -> Vec<(u32, u16)> {
+impl ParsedPdf<'_> {
+    fn object_body<'a>(&'a self, object: &PdfObject) -> &'a [u8] {
+        &self.source[object.body.clone()]
+    }
+}
+
+fn object_body<'a>(source: &'a [u8], object: &PdfObject) -> &'a [u8] {
+    &source[object.body.clone()]
+}
+
+fn ordered_pages(source: &[u8], objects: &BTreeMap<(u32, u16), PdfObject>) -> Vec<(u32, u16)> {
     let page_set: BTreeSet<_> = objects
         .iter()
-        .filter_map(|(id, object)| has_name_value(&object.body, b"Type", b"Page").then_some(*id))
+        .filter_map(|(id, object)| {
+            has_name_value(object_body(source, object), b"Type", b"Page").then_some(*id)
+        })
         .collect();
     let catalog_pages = objects.values().find_map(|object| {
-        has_name_value(&object.body, b"Type", b"Catalog")
-            .then(|| {
-                references_after_key(&object.body, b"Pages")
-                    .into_iter()
-                    .next()
-            })
+        let body = object_body(source, object);
+        has_name_value(body, b"Type", b"Catalog")
+            .then(|| references_after_key(body, b"Pages").into_iter().next())
             .flatten()
     });
     let mut ordered = Vec::new();
     let mut visiting = BTreeSet::new();
     if let Some(root) = catalog_pages {
-        walk_page_tree(objects, root, &page_set, &mut visiting, &mut ordered);
+        walk_page_tree(
+            source,
+            objects,
+            root,
+            &page_set,
+            &mut visiting,
+            &mut ordered,
+        );
         return ordered;
     }
     Vec::new()
 }
 
 fn walk_page_tree(
+    source: &[u8],
     objects: &BTreeMap<(u32, u16), PdfObject>,
     id: (u32, u16),
     pages: &BTreeSet<(u32, u16)>,
@@ -481,8 +691,8 @@ fn walk_page_tree(
     if pages.contains(&id) {
         ordered.push(id);
     } else if let Some(object) = objects.get(&id) {
-        for kid in references_after_key(&object.body, b"Kids") {
-            walk_page_tree(objects, kid, pages, visiting, ordered);
+        for kid in references_after_key(object_body(source, object), b"Kids") {
+            walk_page_tree(source, objects, kid, pages, visiting, ordered);
         }
     }
 }
@@ -963,6 +1173,45 @@ mod tests {
         pdf.into_bytes()
     }
 
+    fn streamed_bound(page_texts: &[String]) -> Option<ExtractedPdfText> {
+        let mut bounded = RealWorldAccumulator::new();
+        for (index, raw) in page_texts.iter().enumerate() {
+            if !bounded.accepting_pages {
+                break;
+            }
+            let mut writer = TrimmedPageWriter::new(MAX_PDF_PAGE_TEXT_CHARS);
+            writer.push_str(raw);
+            bounded.push_page(
+                u32::try_from(index + 1).unwrap_or(u32::MAX),
+                writer.finish(),
+            );
+        }
+        bounded.finish(u32::try_from(page_texts.len()).unwrap_or(u32::MAX))
+    }
+
+    fn parse_objects_legacy(bytes: &[u8]) -> Result<BTreeMap<(u32, u16), Vec<u8>>, PdfError> {
+        let mut objects = BTreeMap::new();
+        let mut cursor = 0;
+        while cursor < bytes.len() {
+            let Some((object_id, generation, body_start)) = find_object_header(bytes, cursor)
+            else {
+                break;
+            };
+            let body_end = object_body_end(bytes, body_start).ok_or_else(|| {
+                PdfError::new(
+                    PdfErrorKind::Malformed,
+                    format!("PDF object {object_id} has no endobj marker"),
+                )
+            })?;
+            objects.insert(
+                (object_id, generation),
+                bytes[body_start..body_end].to_vec(),
+            );
+            cursor = body_end.saturating_add(b"endobj".len());
+        }
+        Ok(objects)
+    }
+
     #[test]
     fn page_tree_order_and_text_operators_are_extracted() {
         let pdf = fixture(
@@ -1024,6 +1273,40 @@ mod tests {
         assert_eq!(extracted.pages_extracted, 5);
         assert!(extracted.text.ends_with("[pdf truncated: 5 of 5 pages]"));
         assert!(extracted.text.chars().count() <= MAX_PDF_TOTAL_TEXT_CHARS);
+    }
+
+    #[test]
+    fn streamed_backend_trimming_matches_reference_for_huge_unicode_whitespace() {
+        let leading = format!("{}leading text", "\u{2003}".repeat(50_001));
+        let internal = format!("left{}right", "\u{2002}".repeat(50_001));
+        let trailing = format!("trailing text{}", "\u{3000}".repeat(50_001));
+        for raw in [leading, internal, trailing] {
+            let pages = vec![raw];
+            assert_eq!(
+                streamed_bound(&pages),
+                bound_real_world_pages(&pages, 1),
+                "streamed trimming and truncation markers must equal the collected reference"
+            );
+        }
+    }
+
+    #[test]
+    fn range_backed_object_bodies_equal_the_legacy_copies() {
+        let pdf = fixture(
+            &[
+                "BT (first object body) Tj ET",
+                "BT [(second) 10 ( object body)] TJ ET",
+                "BT <7468697264> Tj ET",
+            ],
+            false,
+        );
+        let ranged = parse_objects(&pdf).expect("range-backed objects");
+        let legacy = parse_objects_legacy(&pdf).expect("legacy copied objects");
+        assert_eq!(ranged.len(), legacy.len());
+        for (id, copied) in legacy {
+            let range = ranged.get(&id).expect("same object id");
+            assert_eq!(object_body(&pdf, range), copied.as_slice(), "object {id:?}");
+        }
     }
 
     #[test]

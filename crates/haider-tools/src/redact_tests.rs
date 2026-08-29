@@ -2,7 +2,7 @@
 
 use super::{
     is_sensitive_path, is_token_config_path, redact_private_key_lines, redact_text,
-    token_config_contains_secret,
+    redact_text_bounded, token_config_contains_secret,
 };
 use std::path::Path;
 
@@ -69,4 +69,24 @@ fn known_and_high_entropy_tokens_are_redacted_deterministically() {
     ));
     assert_eq!(short_body.replacements, 3);
     assert!(!short_body.text.contains("AA=="));
+}
+
+#[test]
+fn bounded_redaction_is_the_exact_full_redaction_prefix() {
+    let input = format!(
+        "éprefix {} middle sk-abcdefghijklmnopQRSTUV suffix {}",
+        "aB3dE5fG7hI9jK1mN3pQ5rS7tU9vW1xY ".repeat(512),
+        "tail ".repeat(512),
+    );
+    let full = redact_text(&input);
+    for limit in [0, 1, 2, 3, 7, 31, 8 * 1024, input.len() * 2] {
+        let bounded = redact_text_bounded(&input, limit);
+        let mut end = limit.min(full.text.len());
+        while end > 0 && !full.text.is_char_boundary(end) {
+            end -= 1;
+        }
+        assert_eq!(bounded.text, full.text[..end]);
+        assert_eq!(bounded.replacements, full.replacements);
+        assert_eq!(bounded.full_len, full.text.len());
+    }
 }

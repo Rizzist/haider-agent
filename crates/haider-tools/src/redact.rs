@@ -14,6 +14,13 @@ pub(crate) struct RedactedText {
     pub replacements: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoundedRedactedText {
+    pub text: String,
+    pub replacements: usize,
+    pub full_len: usize,
+}
+
 pub(crate) fn redact_private_key_lines(input: &str) -> RedactedText {
     let mut private_key = false;
     let mut output = String::with_capacity(input.len());
@@ -115,6 +122,82 @@ pub(crate) fn token_config_contains_secret(bytes: &[u8]) -> bool {
 }
 
 pub(crate) fn redact_text(input: &str) -> RedactedText {
+    let spans = redaction_spans(input);
+    if spans.is_empty() {
+        return RedactedText {
+            text: input.to_owned(),
+            replacements: 0,
+        };
+    }
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+    let mut replacements = 0usize;
+    for span in spans {
+        if span.start < cursor {
+            continue;
+        }
+        output.push_str(&input[cursor..span.start]);
+        output.push_str("[REDACTED:");
+        output.push_str(span.kind);
+        output.push(']');
+        cursor = span.end;
+        replacements = replacements.saturating_add(1);
+    }
+    output.push_str(&input[cursor..]);
+    RedactedText {
+        text: output,
+        replacements,
+    }
+}
+
+/// Produces the exact UTF-8 byte prefix of [`redact_text`] without allocating
+/// the complete redacted value. `full_len` is the byte length that complete
+/// value would have had, so callers retain the existing truncation decision.
+pub(crate) fn redact_text_bounded(input: &str, max_bytes: usize) -> BoundedRedactedText {
+    let spans = redaction_spans(input);
+    if spans.is_empty() {
+        return BoundedRedactedText {
+            text: utf8_prefix(input, max_bytes).to_owned(),
+            replacements: 0,
+            full_len: input.len(),
+        };
+    }
+    let mut output = String::with_capacity(max_bytes.min(input.len()));
+    let mut cursor = 0;
+    let mut replacements = 0usize;
+    let mut full_len = 0usize;
+    let mut prefix_complete = true;
+    for span in spans {
+        if span.start < cursor {
+            continue;
+        }
+        let plain = &input[cursor..span.start];
+        if prefix_complete {
+            prefix_complete = push_bounded(&mut output, plain, max_bytes);
+        }
+        full_len = full_len.saturating_add(plain.len());
+        for replacement in ["[REDACTED:", span.kind, "]"] {
+            if prefix_complete {
+                prefix_complete = push_bounded(&mut output, replacement, max_bytes);
+            }
+            full_len = full_len.saturating_add(replacement.len());
+        }
+        cursor = span.end;
+        replacements = replacements.saturating_add(1);
+    }
+    let tail = &input[cursor..];
+    if prefix_complete {
+        let _ = push_bounded(&mut output, tail, max_bytes);
+    }
+    full_len = full_len.saturating_add(tail.len());
+    BoundedRedactedText {
+        text: output,
+        replacements,
+        full_len,
+    }
+}
+
+fn redaction_spans(input: &str) -> Vec<Span> {
     let mut spans = Vec::new();
     if let Some(regex) = private_key_regex() {
         for found in regex.find_iter(input) {
@@ -173,31 +256,22 @@ pub(crate) fn redact_text(input: &str) -> RedactedText {
         }
     }
     spans.sort_by_key(|span| (span.start, span.end));
-    if spans.is_empty() {
-        return RedactedText {
-            text: input.to_owned(),
-            replacements: 0,
-        };
+    spans
+}
+
+fn push_bounded(output: &mut String, value: &str, max_bytes: usize) -> bool {
+    let remaining = max_bytes.saturating_sub(output.len());
+    let prefix = utf8_prefix(value, remaining);
+    output.push_str(prefix);
+    prefix.len() == value.len()
+}
+
+fn utf8_prefix(text: &str, max_bytes: usize) -> &str {
+    let mut end = max_bytes.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
     }
-    let mut output = String::with_capacity(input.len());
-    let mut cursor = 0;
-    let mut replacements = 0usize;
-    for span in spans {
-        if span.start < cursor {
-            continue;
-        }
-        output.push_str(&input[cursor..span.start]);
-        output.push_str("[REDACTED:");
-        output.push_str(span.kind);
-        output.push(']');
-        cursor = span.end;
-        replacements = replacements.saturating_add(1);
-    }
-    output.push_str(&input[cursor..]);
-    RedactedText {
-        text: output,
-        replacements,
-    }
+    &text[..end]
 }
 
 fn private_key_regex() -> Option<&'static Regex> {

@@ -763,7 +763,7 @@ fn computer_observation_is_daemon_verified_revision_stamped_and_non_gating() {
         .append(&mut lifecycle)
         .expect("append effect lifecycle");
     let image =
-        Cas::put_image(&store, &computer_png_fixture(), "image/png").expect("admit screenshot");
+        Cas::put_image(&store, computer_png_fixture(), "image/png").expect("admit screenshot");
     let command = ComputerEvidenceCommand {
         command_id: "computer-evidence-command".into(),
         request_digest: "computer-evidence-digest".into(),

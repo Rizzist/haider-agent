@@ -66,7 +66,7 @@ fn put_image_downscales_before_publishing_and_metadata_matches_cas() {
     let source = png(4_096, 1_024);
 
     let image = cas
-        .put_image(&source, "image/png")
+        .put_image(source.clone(), "image/png")
         .expect("bound and publish image");
     let published = cas.get(&image.artifact).expect("read bounded image");
     let dimensions = ImageReader::with_format(Cursor::new(&published), ImageFormat::Png)
@@ -85,13 +85,28 @@ fn put_image_downscales_before_publishing_and_metadata_matches_cas() {
 }
 
 #[test]
+fn already_bounded_image_reuses_the_owned_source_buffer() {
+    let root = tempfile::tempdir().expect("CAS root");
+    let cas = FileCas::open(root.path()).expect("open CAS");
+    let source = png(16, 8);
+    let source_pointer = source.as_ptr();
+    let expected = source.clone();
+
+    let (bounded, width, height) = cas.bound_image(source, "image/png").expect("bounded image");
+
+    assert_eq!(bounded.as_ptr(), source_pointer);
+    assert_eq!(bounded, expected);
+    assert_eq!((width, height), (16, 8));
+}
+
+#[test]
 fn put_image_rejects_oversized_source_without_publishing_it() {
     let root = tempfile::tempdir().expect("CAS root");
     let cas = FileCas::open(root.path()).expect("open CAS");
     let oversized = vec![0_u8; TOOL_RESULT_IMAGE_MAX_SOURCE_BYTES + 1];
 
     let error = cas
-        .put_image(&oversized, "image/png")
+        .put_image(oversized.clone(), "image/png")
         .expect_err("oversized source must be rejected before decode");
 
     assert_eq!(error.code, ErrorCode::InvalidArgument);
@@ -189,7 +204,7 @@ fn put_image_rejects_truncated_or_mismatched_encodings_before_publication() {
         (complete_png.as_slice(), "image/jpeg"),
     ] {
         let error = cas
-            .put_image(bytes, media_type)
+            .put_image(bytes.to_vec(), media_type)
             .expect_err("invalid encoded image must be rejected");
         assert_eq!(error.code, ErrorCode::InvalidArgument);
         assert!(!cas.verify(&artifact_for(bytes)));
@@ -203,13 +218,13 @@ fn put_image_accepts_complete_bounded_jpeg_and_rejects_its_truncation() {
     let jpeg = jpeg_fixture();
 
     let image = cas
-        .put_image(&jpeg, "image/jpeg")
+        .put_image(jpeg.clone(), "image/jpeg")
         .expect("complete bounded JPEG");
     assert_eq!((image.width, image.height), (16, 8));
     assert_eq!(cas.get(&image.artifact).expect("stored JPEG"), jpeg);
 
     let truncated = &jpeg[..jpeg.len() - 2];
-    assert!(cas.put_image(truncated, "image/jpeg").is_err());
+    assert!(cas.put_image(truncated.to_vec(), "image/jpeg").is_err());
     assert!(!cas.verify(&artifact_for(truncated)));
 }
 
@@ -226,7 +241,7 @@ fn put_image_rejects_oversized_jpeg_and_source_pixel_bomb_without_publication() 
     }
     oversized_jpeg.extend_from_slice(&[0xff, 0xd9]);
     let error = cas
-        .put_image(&oversized_jpeg, "image/jpeg")
+        .put_image(oversized_jpeg.clone(), "image/jpeg")
         .expect_err("oversized JPEG must fail closed without a decoder");
     assert_eq!(error.code, ErrorCode::InvalidArgument);
     assert!(error.message.contains("oversized JPEG"));
@@ -238,7 +253,7 @@ fn put_image_rejects_oversized_jpeg_and_source_pixel_bomb_without_publication() 
     hasher.update(&pixel_bomb[12..29]);
     pixel_bomb[29..33].copy_from_slice(&hasher.finalize().to_be_bytes());
     let error = cas
-        .put_image(&pixel_bomb, "image/png")
+        .put_image(pixel_bomb.clone(), "image/png")
         .expect_err("source pixel ceiling must precede full decode");
     assert_eq!(error.code, ErrorCode::InvalidArgument);
     assert!(error.message.contains("safe decode limit"));
