@@ -10,8 +10,7 @@ use super::{
     encode_hook_snapshot_file, hook_digest, make_output, next_subscriber_backoff,
     prepare_hook_input, prune_terminal_run_trust, reduce_durable_state, run_command,
 };
-#[cfg(unix)]
-use super::{HOOK_LEADER_EXIT_POLL_MAX, poll_hook_leader_exit};
+use super::{HookChildReapOutcome, classify_hook_child_reap};
 use crate::runtime::finish_hook_hydration_for_test;
 use crate::session_hub::{SessionHub, SessionHubConfig};
 #[cfg(windows)]
@@ -49,42 +48,14 @@ fn snapshot_schedule_restarts_idle_window_after_a_long_clean_gap() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test(start_paused = true)]
-async fn leader_exit_poll_backoff_never_exceeds_detection_cap() {
-    let probes = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let observed = Arc::clone(&probes);
-    let mut remaining = 9_u8;
-    poll_hook_leader_exit(move || {
-        observed
-            .lock()
-            .expect("leader-exit probe log")
-            .push(tokio::time::Instant::now());
-        if remaining == 0 {
-            Ok(true)
-        } else {
-            remaining = remaining.saturating_sub(1);
-            Ok(false)
-        }
-    })
-    .await
-    .expect("leader exit observation");
-
-    let probes = probes.lock().expect("leader-exit probe observations");
-    let intervals = probes
-        .windows(2)
-        .map(|pair| pair[1].duration_since(pair[0]))
-        .collect::<Vec<_>>();
-    assert!(
-        intervals
-            .iter()
-            .all(|interval| *interval <= HOOK_LEADER_EXIT_POLL_MAX),
-        "the next probe always bounds exit detection latency"
-    );
-    assert!(
-        intervals.contains(&HOOK_LEADER_EXIT_POLL_MAX),
-        "the fixture reaches the 50 ms capped phase"
-    );
+async fn hook_child_reap_deadline_returns_a_typed_timeout() {
+    let outcome = classify_hook_child_reap(std::future::pending()).await;
+    let HookChildReapOutcome::TimedOut(timeout) = outcome else {
+        panic!("pending child reap unexpectedly completed")
+    };
+    assert_eq!(timeout.operation(), "hook child reap");
+    assert_eq!(timeout.limit(), super::HOOK_CHILD_REAP_TIMEOUT);
 }
 
 fn canonical(path: &Path) -> PathBuf {
@@ -3552,11 +3523,23 @@ async fn server_mode_spawns_once_serializes_and_dies_on_drain() {
         state.is_running(),
         "the resident server is live before drain"
     );
-    fixture.close().await;
+    // Deterministically model a child stuck below the OS wait seam. Removing
+    // the product reap deadline makes this existing drain pin hit its outer
+    // observation deadline.
+    state.wedge_reap();
+    fixture.service.inner.shutdown.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while state.is_running() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("hook server actor is bounded when child reap never resolves");
     assert!(
         !state.is_running(),
         "engine drain waits until the resident server is dropped"
     );
+    fixture.close().await;
 }
 
 /// MUTATION CHECK (hooks_server_v1): drop the actor-start shutdown check in

@@ -57,6 +57,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const CHILD_STALL_DEADLINE: Duration = Duration::from_secs(120);
+const CHILD_SETTLEMENT_TAIL_TIMEOUT: Duration = Duration::from_secs(1);
 pub(crate) const RECURSION_DEPTH_LIMIT: u32 = 3;
 pub(crate) const RECURSION_LIMIT_MESSAGE: &str = "recursion depth limit";
 const STALL_NUDGE_TEXT: &str = "report your status or conclude";
@@ -70,6 +71,24 @@ const HANDOFF_IGNORE: &[u8] = b"*";
 pub(crate) struct DelegationHandle {
     hub: SessionHub,
     stall_deadline: Duration,
+    settlement_tail_timeout: Duration,
+}
+
+#[derive(Debug)]
+#[must_use = "the terminal child settlement outcome must be handled"]
+enum ChildSettlementOutcome {
+    Settled,
+    TailTimedOut(haider_platform::WaitTimeout),
+}
+
+fn report_child_settlement_outcome(outcome: ChildSettlementOutcome) {
+    if let ChildSettlementOutcome::TailTimedOut(timeout) = outcome {
+        eprintln!(
+            "haiderd: lifecycle event=child_terminal_tail_timeout operation={} timeout_ms={}",
+            timeout.operation(),
+            timeout.limit().as_millis()
+        );
+    }
 }
 
 pub(crate) struct SpawnCoordinates {
@@ -112,6 +131,7 @@ impl DelegationHandle {
         Self {
             hub,
             stall_deadline: CHILD_STALL_DEADLINE,
+            settlement_tail_timeout: CHILD_SETTLEMENT_TAIL_TIMEOUT,
         }
     }
 
@@ -120,6 +140,19 @@ impl DelegationHandle {
         Self {
             hub,
             stall_deadline,
+            settlement_tail_timeout: CHILD_SETTLEMENT_TAIL_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_settlement_tail_timeout(
+        hub: SessionHub,
+        settlement_tail_timeout: Duration,
+    ) -> Self {
+        Self {
+            hub,
+            stall_deadline: CHILD_STALL_DEADLINE,
+            settlement_tail_timeout,
         }
     }
 
@@ -775,8 +808,10 @@ impl DelegationHandle {
             self.mirror_child_chip_states(&record, &mut chip_mirror)
                 .await?;
             if let Some(report) = record.report.clone() {
-                self.mirror_until_child_terminal(&record, &mut chip_mirror)
+                let settlement = self
+                    .mirror_until_child_terminal(&record, &mut chip_mirror)
                     .await?;
+                report_child_settlement_outcome(settlement);
                 self.collapse_child_contract(&record, &report).await?;
                 let chip = if report.verified == ReportVerification::Red {
                     ChipState::Error
@@ -790,8 +825,10 @@ impl DelegationHandle {
                 });
             }
             if let Some(completion) = self.derive_terminal_report(&record).await? {
-                self.mirror_until_child_terminal(&record, &mut chip_mirror)
+                let settlement = self
+                    .mirror_until_child_terminal(&record, &mut chip_mirror)
                     .await?;
+                report_child_settlement_outcome(settlement);
                 let stored = self
                     .hub
                     .record_delegation_report(record.agent_id.clone(), completion.report)
@@ -831,7 +868,10 @@ impl DelegationHandle {
                 biased;
                 () = cancel.cancelled() => {
                     self.cancel_subtree(&record, CancelCause::Parent).await?;
-                    self.mirror_until_child_terminal(&record, &mut chip_mirror).await?;
+                    let settlement = self
+                        .mirror_until_child_terminal(&record, &mut chip_mirror)
+                        .await?;
+                    report_child_settlement_outcome(settlement);
                     return Err(HaiderError::new(
                         ErrorCode::RunNotActive,
                         "parent cancelled while waiting for local child",
@@ -984,12 +1024,15 @@ impl DelegationHandle {
                     .await
             }
             .await;
-            if let Err(error) = result {
-                tracing::warn!(
-                    agent = %record.agent_id,
-                    ?error,
-                    "terminal child metrics flush failed"
-                );
+            match result {
+                Ok(settlement) => report_child_settlement_outcome(settlement),
+                Err(error) => {
+                    tracing::warn!(
+                        agent = %record.agent_id,
+                        ?error,
+                        "terminal child metrics flush failed"
+                    );
+                }
             }
         });
         Ok(())
@@ -2041,28 +2084,53 @@ impl DelegationHandle {
         }
     }
 
-    /// Keep folding through the terminal run state and the following durable
-    /// session-idle fence, then publish the settled snapshot at that head.
+    /// Resolve on the durable terminal run state. The following session-idle
+    /// metrics fence is valuable but cannot retain the parent indefinitely.
     async fn mirror_until_child_terminal(
         &self,
         record: &DelegationRecord,
         mirror: &mut ChipMirror,
-    ) -> Result<(), HaiderError> {
+    ) -> Result<ChildSettlementOutcome, HaiderError> {
         loop {
             self.mirror_child_chip_states(record, mirror).await?;
-            if mirror.terminal_idle_seen
-                && mirror
-                    .metrics_folder
-                    .agent_snapshot(
-                        &record.child_session_id,
-                        Some(&record.agent_id),
-                        mirror.child_cursor,
-                    )
-                    .is_some_and(|snapshot| !snapshot.live)
-            {
-                return Ok(());
+            if mirror.child_run_terminal {
+                break;
             }
             tokio::time::sleep(CHILD_POLL_INTERVAL).await;
+        }
+
+        let tail = async {
+            loop {
+                self.mirror_child_chip_states(record, mirror).await?;
+                if mirror.terminal_idle_seen
+                    && mirror
+                        .metrics_folder
+                        .agent_snapshot(
+                            &record.child_session_id,
+                            Some(&record.agent_id),
+                            mirror.child_cursor,
+                        )
+                        .is_some_and(|snapshot| !snapshot.live)
+                {
+                    return Ok::<(), HaiderError>(());
+                }
+                tokio::time::sleep(CHILD_POLL_INTERVAL).await;
+            }
+        };
+        match haider_platform::bounded_wait(
+            "terminal child idle/metrics tail",
+            self.settlement_tail_timeout,
+            tail,
+        )
+        .await
+        {
+            haider_platform::BoundedWait::Completed(result) => {
+                result?;
+                Ok(ChildSettlementOutcome::Settled)
+            }
+            haider_platform::BoundedWait::TimedOut(timeout) => {
+                Ok(ChildSettlementOutcome::TailTimedOut(timeout))
+            }
         }
     }
 

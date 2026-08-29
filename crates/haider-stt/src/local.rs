@@ -25,10 +25,65 @@ use crate::{EngineKind, SttError, TranscriptFrame, TranscriptionResult};
 
 /// Per-invocation CLI budget (ADE `WHISPER_TRANSCRIBE_TIMEOUT_SECS`).
 pub const TRANSCRIBE_TIMEOUT_SECS: u64 = 180;
+const LOCAL_CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(1);
 /// Largest WAV handed to the CLI (ADE `WHISPER_MAX_AUDIO_BYTES`).
 pub const MAX_AUDIO_BYTES: usize = 32 * 1024 * 1024;
 /// Hard partial-session audio cap, ADE capture parity (900 s).
 pub const MAX_SESSION_AUDIO_MS: u64 = 900_000;
+
+#[derive(Debug)]
+#[must_use = "local child termination failures must be handled"]
+struct LocalChildStopOutcome {
+    signal_error: Option<std::io::Error>,
+    reap: LocalChildReapOutcome,
+}
+
+#[derive(Debug)]
+enum LocalChildReapOutcome {
+    Exited,
+    WaitFailed(std::io::Error),
+    TimedOut(haider_platform::WaitTimeout),
+}
+
+async fn stop_local_child(child: &mut tokio::process::Child) -> LocalChildStopOutcome {
+    let signal_error = child.start_kill().err();
+    let reap = match haider_platform::bounded_wait(
+        "local whisper child reap",
+        LOCAL_CHILD_REAP_TIMEOUT,
+        child.wait(),
+    )
+    .await
+    {
+        haider_platform::BoundedWait::Completed(Ok(_)) => LocalChildReapOutcome::Exited,
+        haider_platform::BoundedWait::Completed(Err(error)) => {
+            LocalChildReapOutcome::WaitFailed(error)
+        }
+        haider_platform::BoundedWait::TimedOut(timeout) => LocalChildReapOutcome::TimedOut(timeout),
+    };
+    LocalChildStopOutcome { signal_error, reap }
+}
+
+fn report_local_child_stop(context: &'static str, outcome: LocalChildStopOutcome) {
+    if let Some(error) = outcome.signal_error {
+        eprintln!(
+            "haider: lifecycle event=local_whisper_kill_failed context={context} error_kind={:?} raw_os_error={:?}",
+            error.kind(),
+            error.raw_os_error()
+        );
+    }
+    match outcome.reap {
+        LocalChildReapOutcome::Exited => {}
+        LocalChildReapOutcome::WaitFailed(error) => eprintln!(
+            "haider: lifecycle event=local_whisper_reap_failed context={context} error_kind={:?} raw_os_error={:?}",
+            error.kind(),
+            error.raw_os_error()
+        ),
+        LocalChildReapOutcome::TimedOut(timeout) => eprintln!(
+            "haider: lifecycle event=local_whisper_reap_timeout context={context} timeout_ms={}",
+            timeout.limit().as_millis()
+        ),
+    }
+}
 
 /// CLI thread count: available parallelism clamped 4..=8 (ADE
 /// `whisper_cli_thread_count`).
@@ -264,7 +319,8 @@ impl LocalWhisperEngine {
         tokio::pin!(deadline);
         let status = loop {
             if cancel.is_canceled() {
-                let _ = child.kill().await;
+                let stopped = stop_local_child(&mut child).await;
+                report_local_child_stop("cancel", stopped);
                 stdout_task.abort();
                 stderr_task.abort();
                 return Err(SttError::Canceled);
@@ -276,7 +332,8 @@ impl LocalWhisperEngine {
                     })?;
                 }
                 () = &mut deadline => {
-                    let _ = child.kill().await;
+                    let stopped = stop_local_child(&mut child).await;
+                    report_local_child_stop("transcription_timeout", stopped);
                     stdout_task.abort();
                     stderr_task.abort();
                     return Err(SttError::Timeout(

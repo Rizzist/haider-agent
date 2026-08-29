@@ -14259,7 +14259,13 @@ impl ToolDispatcher for BrokerToolDispatcher {
                                 Ok(shell) => shell,
                                 Err(error) => {
                                     process_cancel.cancel();
-                                    let _ = execution.wait().await;
+                                    if let Err(cleanup) =
+                                        wait_for_cancelled_process_cleanup(execution).await
+                                    {
+                                        return Err(tool_error(ToolError::Runtime {
+                                            message: format!("{error}; {cleanup}"),
+                                        }));
+                                    }
                                     return Err(tool_error(ToolError::Runtime {
                                         message: error.to_string(),
                                     }));
@@ -14267,7 +14273,13 @@ impl ToolDispatcher for BrokerToolDispatcher {
                             };
                             if let Err(error) = shell.running() {
                                 process_cancel.cancel();
-                                let _ = execution.wait().await;
+                                if let Err(cleanup) =
+                                    wait_for_cancelled_process_cleanup(execution).await
+                                {
+                                    return Err(tool_error(ToolError::Runtime {
+                                        message: format!("{error}; {cleanup}"),
+                                    }));
+                                }
                                 return Err(tool_error(ToolError::Runtime {
                                     message: error.to_string(),
                                 }));
@@ -16708,6 +16720,24 @@ fn command_cwd(workspace: &str, requested: Option<&str>) -> PathBuf {
             }
         },
     )
+}
+
+async fn wait_for_cancelled_process_cleanup(
+    execution: haider_tools::ProcessExecution,
+) -> Result<(), String> {
+    match haider_platform::bounded_wait(
+        "cancelled foreground process cleanup",
+        Duration::from_secs(5),
+        execution.wait(),
+    )
+    .await
+    {
+        haider_platform::BoundedWait::Completed(Ok(_)) => Ok(()),
+        haider_platform::BoundedWait::Completed(Err(error)) => {
+            Err(format!("cancelled process cleanup failed: {error}"))
+        }
+        haider_platform::BoundedWait::TimedOut(timeout) => Err(timeout.to_string()),
+    }
 }
 
 fn process_output_preview(result: &ProcessResult) -> String {

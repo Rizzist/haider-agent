@@ -5,6 +5,7 @@
 //! daemon detachment, descriptor hygiene, process signalling, and shutdown
 //! delivery preserve the pre-abstraction implementations exactly.
 
+mod bounded_wait;
 #[cfg(windows)]
 mod console;
 mod directory;
@@ -17,6 +18,7 @@ mod spawn;
 mod system;
 mod user;
 
+pub use bounded_wait::{BoundedWait, WaitTimeout, bounded_wait};
 #[cfg(windows)]
 pub use console::{ConsoleHoldError, SoleProcessConsole, sole_process_console};
 #[cfg(windows)]
@@ -52,9 +54,10 @@ pub use process::program_on_path;
 pub use process::{
     ProcessGroup, ProcessId, ProcessSignal, configure_background_process,
     configure_process_environment, configure_process_group, exit_signal, kill_process_tree,
-    process_error_is_missing, process_error_is_permission, process_group, process_group_exists,
-    process_id, process_leader_exited, register_process_group, release_process_group,
-    signal_process, signal_process_group, signal_process_group_id, wait_for_child_exit,
+    observe_process_leader_exit, process_error_is_missing, process_error_is_permission,
+    process_group, process_group_exists, process_id, process_leader_exited, register_process_group,
+    release_process_group, signal_process, signal_process_group, signal_process_group_id,
+    wait_for_child_exit,
 };
 #[cfg(windows)]
 pub use process::{

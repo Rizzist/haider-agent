@@ -18,6 +18,7 @@ haider-platform = { path = "../haider-platform" }
 haider-protocol = { path = "../haider-protocol" }
 haider-provider = { path = "../haider-provider" }
 tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
@@ -38,7 +39,6 @@ rmp-serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
-tracing.workspace = true
 url.workspace = true
 zeroize.workspace = true
 

@@ -16,6 +16,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+mod telemetry;
+
 /// TEST-ONLY seam, OFF by default (W3c3 M3).
 ///
 /// When set to a `FakeProvider` step script (the same JSON the CLI's
@@ -116,6 +118,7 @@ fn daemon_runtime() -> std::io::Result<tokio::runtime::Runtime> {
 }
 
 fn initialize_process_diagnostics() {
+    telemetry::install_opt_in();
     let started = process_started_unix_ms();
     std::panic::set_hook(Box::new(move |panic| {
         let thread = std::thread::current();
