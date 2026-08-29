@@ -19,7 +19,7 @@ use tokio::net::{UnixStream, unix::OwnedWriteHalf};
 struct FirstWriteGate {
     writer: OwnedWriteHalf,
     gate: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
-    started: Option<oneshot::Sender<()>>,
+    started: Option<oneshot::Sender<Instant>>,
 }
 
 impl AsyncWrite for FirstWriteGate {
@@ -29,7 +29,7 @@ impl AsyncWrite for FirstWriteGate {
         buffer: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         if let Some(started) = self.started.take() {
-            let _ = started.send(());
+            let _ = started.send(Instant::now());
         }
         if let Some(gate) = self.gate.as_mut() {
             if gate.as_mut().poll(context).is_pending() {
@@ -53,6 +53,141 @@ impl AsyncWrite for FirstWriteGate {
     ) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.writer).poll_shutdown(context)
     }
+}
+
+async fn settle_connection_and_writer_tasks() {
+    // `advance` yields only once after waking due timers. The timeout path
+    // crosses two spawned tasks (connection -> writer), so keep this test
+    // runnable while both hops settle; that also prevents paused-time
+    // auto-advance to the next timer.
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// A silent peer's fatal handshake-timeout frame must finish writing before
+/// the connection task tears down its socket and releases its admission slot.
+/// Paused time makes the exact deadline deterministic; the gated first write
+/// makes the shutdown ordering observable without scheduler timing slack.
+#[tokio::test(start_paused = true)]
+async fn handshake_timeout_frame_precedes_teardown_and_slot_release() {
+    let (_dir, hub) = liveness_hub().await;
+    let (server, mut client) = UnixStream::pair().expect("socket pair");
+    let (reader, writer) = server.into_split();
+    let (write_started, mut started) = oneshot::channel();
+    let release = Arc::new(Notify::new());
+    let gated_writer = FirstWriteGate {
+        writer,
+        gate: Some(Box::pin(Arc::clone(&release).notified_owned())),
+        started: Some(write_started),
+    };
+    let (writers, mut registered_writers) = mpsc::unbounded_channel();
+    let mut context = connection_context(hub.clone(), writers);
+    context.handshake_timeout = std::time::Duration::from_millis(150);
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let connection_slot = Arc::clone(&slots);
+    let (_drain_tx, drain_rx) = watch::channel(Option::<DrainNotice>::None);
+    let serve_task = tokio::spawn(async move {
+        let permit = connection_slot
+            .acquire_owned()
+            .await
+            .expect("connection slot semaphore remains open");
+        let exit = serve_io(reader, gated_writer, context, drain_rx).await;
+        drop(permit);
+        exit
+    });
+
+    let registered_writer = registered_writers
+        .recv()
+        .await
+        .expect("serve_io registers its writer during connection setup");
+    let handshake_started = Instant::now();
+    assert!(
+        Arc::clone(&slots).try_acquire_owned().is_err(),
+        "the connection task must hold the only slot after writer registration"
+    );
+
+    let before_deadline = std::time::Duration::from_millis(149);
+    tokio::time::advance(before_deadline).await;
+    settle_connection_and_writer_tasks().await;
+    assert_eq!(
+        Instant::now().duration_since(handshake_started),
+        before_deadline,
+        "scheduler settling must not auto-advance the paused clock"
+    );
+    assert!(
+        matches!(started.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+        "the timeout frame must not start writing before the 150ms deadline"
+    );
+    tokio::time::advance(std::time::Duration::from_millis(1)).await;
+    settle_connection_and_writer_tasks().await;
+    let write_started_at = started
+        .try_recv()
+        .expect("the timeout frame write starts at the handshake deadline");
+    assert_eq!(
+        write_started_at.duration_since(handshake_started),
+        std::time::Duration::from_millis(150),
+        "the timeout frame write must start at exactly the handshake deadline"
+    );
+    assert!(
+        !serve_task.is_finished(),
+        "connection teardown must wait for the gated timeout-frame write"
+    );
+
+    release.notify_one();
+    let mut prefix = [0_u8; 4];
+    client
+        .read_exact(&mut prefix)
+        .await
+        .expect("timeout frame prefix reads");
+    let body_len = usize::try_from(u32::from_be_bytes(prefix)).expect("frame length fits usize");
+    let mut encoded = prefix.to_vec();
+    encoded.resize(4 + body_len, 0);
+    client
+        .read_exact(&mut encoded[4..])
+        .await
+        .expect("complete timeout frame body reads");
+    let mut decoder = uds_codec::Decoder::new(1024 * 1024);
+    let decoded = decoder.push(&encoded);
+    assert!(
+        decoded.error.is_none(),
+        "complete timeout frame must decode; got {:?}",
+        decoded.error
+    );
+    assert_eq!(
+        decoded.frames,
+        vec![WireFrame::ProtocolError(ProtocolError {
+            code: "handshake_timeout".into(),
+            message: "Hello did not arrive before the handshake deadline".into(),
+            fatal: true,
+            presentation: None,
+            failed_write_ids: Vec::new(),
+        })]
+    );
+
+    let mut trailing = [0_u8; 1];
+    assert_eq!(
+        client
+            .read(&mut trailing)
+            .await
+            .expect("read EOF after timeout frame"),
+        0,
+        "timeout frame must be complete before socket EOF"
+    );
+    assert_eq!(
+        serve_task
+            .await
+            .expect("connection task joins")
+            .expect("connection serves through timeout teardown"),
+        ConnectionExit::ClosedBeforeDrain {
+            reason: ConnectionRetirementReason::Error,
+        }
+    );
+    let _reacquired = Arc::clone(&slots)
+        .try_acquire_owned()
+        .expect("connection slot is immediately reusable after task join");
+    registered_writer.await.expect("registered writer joins");
+    hub.shutdown().await.expect("hub shutdown");
 }
 
 fn ordinary(bytes: &[u8]) -> QueuedFrame {

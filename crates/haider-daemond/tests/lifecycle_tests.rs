@@ -1920,13 +1920,16 @@ async fn silent_peer_is_closed_at_the_handshake_deadline_and_frees_its_slot() {
     let mut silent = TestClient::connect(&config.endpoint_path(), config.frame_limit)
         .await
         .expect("connect silent peer");
+    let frame = tokio::time::timeout(DEADLINE, silent.receive())
+        .await
+        .expect("silent peer close reason arrives before the test deadline");
     assert!(
         matches!(
-            silent.receive().await,
-            WireFrame::ProtocolError(ProtocolError { ref code, fatal: true, .. })
+            &frame,
+            WireFrame::ProtocolError(ProtocolError { code, fatal: true, .. })
                 if code == "handshake_timeout"
         ),
-        "a silent peer must be told why it is being closed"
+        "a silent peer must be told why it is being closed; got {frame:?}"
     );
     silent.expect_eof().await;
 
