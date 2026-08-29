@@ -14,7 +14,7 @@ use haider_tools::{
     BuiltinResult, CasSink, CommandOutputSink, ComposerSubmission, EffectBroker, JournalSink,
     PROCESS_ADAPTER_INPUT_BYTES, PROCESS_OUTPUT_CHUNK_BYTES, PermissionPolicy, ProcessBounds,
     ProcessControl, ProcessExec, ProcessLifecycleEvent, ProcessOutputChunk, REDACTED_ENV_VALUE,
-    ShellSession, ToolError, ToolResult,
+    ShellSession, ToolError, ToolResult, workspace_state_digest,
 };
 use std::fs;
 use std::path::Path;
@@ -225,6 +225,66 @@ fn output_bytes(deltas: &[ItemDelta]) -> Vec<u8> {
             _ => panic!("process sink only receives command output"),
         })
         .collect()
+}
+
+/// Regression: the pre/post execution receipt must not read an arbitrarily
+/// large workspace file in full before the command can start or complete.
+/// The old full-content snapshot leaves this test before process spawn while
+/// reading the sparse tebibyte fixture, exactly like a large `target/` tree.
+#[test]
+fn process_exec_runs_and_returns_output_with_a_huge_workspace_file() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let huge_path = workspace.path().join("huge-sparse.bin");
+    let huge_file = fs::File::create(&huge_path).expect("create sparse workspace file");
+    huge_file
+        .set_len(1024 * 1024 * 1024 * 1024)
+        .expect("size sparse workspace file");
+    drop(huge_file);
+
+    let (digest_sender, digest_receiver) = std::sync::mpsc::channel();
+    let snapshot_root = workspace.path().to_path_buf();
+    std::thread::spawn(move || {
+        let _ = digest_sender.send(workspace_state_digest(&snapshot_root));
+    });
+    let digest = digest_receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("workspace receipt must not read a huge file in full");
+    assert!(digest.starts_with("blake3:"));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        let (mut broker, _journal) = broker(workspace.path());
+        let output = RecordingOutput::default();
+        let observer = output.observer();
+        let execution = tokio::time::timeout(
+            Duration::from_secs(5),
+            broker.process_exec(
+                &ProcessExec::new("large-workspace", "printf 'scan-complete\\n'"),
+                &process_policy(),
+                RecordingCas::default(),
+                output,
+                ProcessBounds::default(),
+            ),
+        )
+        .await
+        .expect("large workspace must not block process spawn")
+        .expect("process starts");
+        let result = tokio::time::timeout(Duration::from_secs(5), execution.wait())
+            .await
+            .expect("large workspace must not block process completion")
+            .expect("process completes");
+
+        assert_eq!(result.status, ToolStatus::Completed);
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(
+            output_bytes(&observer.lock().expect("output observer")),
+            b"scan-complete\n"
+        );
+        broker.close().await.expect("broker closes");
+    });
 }
 
 #[tokio::test]

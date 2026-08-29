@@ -33,6 +33,8 @@ use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,29 +59,83 @@ pub const PROCESS_MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 /// process bound validator prevents diagnostic prefixes from being discarded.
 pub const PROCESS_ADAPTER_INPUT_BYTES: usize = PROCESS_MAX_OUTPUT_BYTES;
 
-/// Content-addresses the observable workspace tree before and after a process
-/// execution. Directory ordering and all field boundaries are canonical;
-/// atime is deliberately excluded so taking the snapshot cannot classify
-/// itself as a mutation.
+/// Maximum regular-file content read by one workspace receipt.
+///
+/// Metadata for every visited entry is still included. This budget prevents a
+/// large build tree, sparse file, or concurrently growing file from delaying
+/// process spawn/completion in proportion to workspace byte size.
+const WORKSPACE_DIGEST_CONTENT_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
+
+fn update_workspace_digest_field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn hash_regular_file(
+    path: &Path,
+    observed_len: u64,
+    hasher: &mut blake3::Hasher,
+    content_budget: &mut u64,
+) {
+    let permitted = observed_len.min(*content_budget);
+    let mut read_total = 0_u64;
+    match std::fs::File::open(path) {
+        Ok(mut file) => {
+            let mut buffer = [0_u8; 64 * 1024];
+            while read_total < permitted {
+                let chunk_len = buffer.len().min((permitted - read_total) as usize);
+                match file.read(&mut buffer[..chunk_len]) {
+                    Ok(0) => {
+                        hasher.update(b"content-short-read");
+                        break;
+                    }
+                    Ok(read) => {
+                        hasher.update(&buffer[..read]);
+                        read_total += read as u64;
+                    }
+                    Err(error) => {
+                        hasher.update(b"read-file-error");
+                        update_workspace_digest_field(hasher, error.kind().to_string().as_bytes());
+                        break;
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            hasher.update(b"open-file-error");
+            update_workspace_digest_field(hasher, error.kind().to_string().as_bytes());
+            return;
+        }
+    }
+    *content_budget = content_budget.saturating_sub(read_total);
+    if read_total == observed_len {
+        hasher.update(b"content-complete");
+    } else {
+        hasher.update(b"content-elided");
+        hasher.update(&observed_len.saturating_sub(read_total).to_be_bytes());
+    }
+}
+
+/// Fingerprints the observable workspace tree before and after a process.
+/// Directory ordering and all field boundaries are canonical. File metadata
+/// is always included, while contents use a global budget so command execution
+/// is never gated on reading an arbitrarily large file in full. Atime is
+/// deliberately excluded so taking the snapshot cannot classify itself as a
+/// mutation.
 #[cfg(unix)]
 pub fn workspace_state_digest(root: &Path) -> String {
-    fn update_field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
-        hasher.update(&(bytes.len() as u64).to_be_bytes());
-        hasher.update(bytes);
-    }
-
-    fn walk(root: &Path, relative: &Path, hasher: &mut blake3::Hasher) {
+    fn walk(root: &Path, relative: &Path, hasher: &mut blake3::Hasher, content_budget: &mut u64) {
         let path = root.join(relative);
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) => {
                 hasher.update(b"metadata-error");
-                update_field(hasher, relative.as_os_str().as_bytes());
-                update_field(hasher, error.kind().to_string().as_bytes());
+                update_workspace_digest_field(hasher, relative.as_os_str().as_bytes());
+                update_workspace_digest_field(hasher, error.kind().to_string().as_bytes());
                 return;
             }
         };
-        update_field(hasher, relative.as_os_str().as_bytes());
+        update_workspace_digest_field(hasher, relative.as_os_str().as_bytes());
         hasher.update(&metadata.mode().to_be_bytes());
         hasher.update(&metadata.uid().to_be_bytes());
         hasher.update(&metadata.gid().to_be_bytes());
@@ -95,7 +151,7 @@ pub fn workspace_state_digest(root: &Path) -> String {
                 Ok(entries) => entries.filter_map(Result::ok).collect::<Vec<_>>(),
                 Err(error) => {
                     hasher.update(b"read-dir-error");
-                    update_field(hasher, error.kind().to_string().as_bytes());
+                    update_workspace_digest_field(hasher, error.kind().to_string().as_bytes());
                     return;
                 }
             };
@@ -105,40 +161,24 @@ pub fn workspace_state_digest(root: &Path) -> String {
                     .cmp(right.file_name().as_bytes())
             });
             for entry in entries {
-                walk(root, &relative.join(entry.file_name()), hasher);
+                walk(
+                    root,
+                    &relative.join(entry.file_name()),
+                    hasher,
+                    content_budget,
+                );
             }
         } else if file_type.is_file() {
             hasher.update(b"file");
             hasher.update(&metadata.len().to_be_bytes());
-            match std::fs::File::open(&path) {
-                Ok(mut file) => {
-                    let mut buffer = [0_u8; 64 * 1024];
-                    loop {
-                        match file.read(&mut buffer) {
-                            Ok(0) => break,
-                            Ok(read) => {
-                                hasher.update(&buffer[..read]);
-                            }
-                            Err(error) => {
-                                hasher.update(b"read-file-error");
-                                update_field(hasher, error.kind().to_string().as_bytes());
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(error) => {
-                    hasher.update(b"open-file-error");
-                    update_field(hasher, error.kind().to_string().as_bytes());
-                }
-            }
+            hash_regular_file(&path, metadata.len(), hasher, content_budget);
         } else if file_type.is_symlink() {
             hasher.update(b"symlink");
             match std::fs::read_link(&path) {
-                Ok(target) => update_field(hasher, target.as_os_str().as_bytes()),
+                Ok(target) => update_workspace_digest_field(hasher, target.as_os_str().as_bytes()),
                 Err(error) => {
                     hasher.update(b"read-link-error");
-                    update_field(hasher, error.kind().to_string().as_bytes());
+                    update_workspace_digest_field(hasher, error.kind().to_string().as_bytes());
                 }
             }
         } else {
@@ -148,31 +188,30 @@ pub fn workspace_state_digest(root: &Path) -> String {
     }
 
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"haider.workspace-state.v1");
-    walk(root, Path::new(""), &mut hasher);
+    hasher.update(b"haider.workspace-state.v2");
+    let mut content_budget = WORKSPACE_DIGEST_CONTENT_BUDGET_BYTES;
+    walk(root, Path::new(""), &mut hasher, &mut content_budget);
     format!("blake3:{}", hasher.finalize().to_hex())
 }
 
 #[cfg(windows)]
 pub fn workspace_state_digest(root: &Path) -> String {
-    fn update_field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
-        hasher.update(&(bytes.len() as u64).to_be_bytes());
-        hasher.update(bytes);
-    }
-
-    fn walk(root: &Path, relative: &Path, hasher: &mut blake3::Hasher) {
+    fn walk(root: &Path, relative: &Path, hasher: &mut blake3::Hasher, content_budget: &mut u64) {
         let path = root.join(relative);
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) => {
                 hasher.update(b"metadata-error");
-                update_field(hasher, relative.to_string_lossy().as_bytes());
-                update_field(hasher, error.kind().to_string().as_bytes());
+                update_workspace_digest_field(hasher, relative.to_string_lossy().as_bytes());
+                update_workspace_digest_field(hasher, error.kind().to_string().as_bytes());
                 return;
             }
         };
-        update_field(hasher, relative.to_string_lossy().as_bytes());
+        update_workspace_digest_field(hasher, relative.to_string_lossy().as_bytes());
         hasher.update(&metadata.len().to_be_bytes());
+        hasher.update(&metadata.file_attributes().to_be_bytes());
+        hasher.update(&metadata.creation_time().to_be_bytes());
+        hasher.update(&metadata.last_write_time().to_be_bytes());
         let file_type = metadata.file_type();
         if file_type.is_dir() {
             hasher.update(b"directory");
@@ -180,45 +219,31 @@ pub fn workspace_state_digest(root: &Path) -> String {
                 Ok(entries) => entries.filter_map(Result::ok).collect::<Vec<_>>(),
                 Err(error) => {
                     hasher.update(b"read-dir-error");
-                    update_field(hasher, error.kind().to_string().as_bytes());
+                    update_workspace_digest_field(hasher, error.kind().to_string().as_bytes());
                     return;
                 }
             };
             entries.sort_by_key(std::fs::DirEntry::file_name);
             for entry in entries {
-                walk(root, &relative.join(entry.file_name()), hasher);
+                walk(
+                    root,
+                    &relative.join(entry.file_name()),
+                    hasher,
+                    content_budget,
+                );
             }
         } else if file_type.is_file() {
             hasher.update(b"file");
-            match std::fs::File::open(&path) {
-                Ok(mut file) => {
-                    let mut buffer = [0_u8; 64 * 1024];
-                    loop {
-                        match file.read(&mut buffer) {
-                            Ok(0) => break,
-                            Ok(read) => {
-                                hasher.update(&buffer[..read]);
-                            }
-                            Err(error) => {
-                                hasher.update(b"read-file-error");
-                                update_field(hasher, error.kind().to_string().as_bytes());
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(error) => {
-                    hasher.update(b"open-file-error");
-                    update_field(hasher, error.kind().to_string().as_bytes());
-                }
-            }
+            hash_regular_file(&path, metadata.len(), hasher, content_budget);
         } else if file_type.is_symlink() {
             hasher.update(b"symlink");
             match std::fs::read_link(&path) {
-                Ok(target) => update_field(hasher, target.to_string_lossy().as_bytes()),
+                Ok(target) => {
+                    update_workspace_digest_field(hasher, target.to_string_lossy().as_bytes())
+                }
                 Err(error) => {
                     hasher.update(b"read-link-error");
-                    update_field(hasher, error.kind().to_string().as_bytes());
+                    update_workspace_digest_field(hasher, error.kind().to_string().as_bytes());
                 }
             }
         } else {
@@ -227,8 +252,9 @@ pub fn workspace_state_digest(root: &Path) -> String {
     }
 
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"haider.workspace-state.v1");
-    walk(root, Path::new(""), &mut hasher);
+    hasher.update(b"haider.workspace-state.v2");
+    let mut content_budget = WORKSPACE_DIGEST_CONTENT_BUDGET_BYTES;
+    walk(root, Path::new(""), &mut hasher, &mut content_budget);
     format!("blake3:{}", hasher.finalize().to_hex())
 }
 
