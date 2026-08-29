@@ -12,7 +12,6 @@ use super::{
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
 use std::fs;
-use std::os::fd::AsRawFd as _;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
@@ -64,21 +63,19 @@ impl PeerExitWatcher {
 }
 
 impl IpcShutdown {
-    #[allow(unsafe_code)]
     pub fn request(&self) -> std::io::Result<IpcShutdownOutcome> {
         if self.requested.swap(true, Ordering::AcqRel) {
             return Ok(IpcShutdownOutcome::AlreadyRequested);
         }
-        if unsafe { libc::shutdown(self.socket.as_raw_fd(), libc::SHUT_RDWR) } == 0 {
-            Ok(IpcShutdownOutcome::PeerNotified)
-        } else {
-            match shutdown_error_outcome(std::io::Error::last_os_error()) {
+        match rustix::net::shutdown(&self.socket, rustix::net::Shutdown::Both) {
+            Ok(()) => Ok(IpcShutdownOutcome::PeerNotified),
+            Err(error) => match shutdown_error_outcome(std::io::Error::from(error)) {
                 Ok(outcome) => Ok(outcome),
                 Err(error) => {
                     self.requested.store(false, Ordering::Release);
                     Err(error)
                 }
-            }
+            },
         }
     }
 }
@@ -1440,6 +1437,8 @@ pub fn peer_credentials_and_exit_watcher(
 #[cfg(target_vendor = "apple")]
 #[allow(unsafe_code)]
 fn apple_peer_pid(stream: &IpcStream) -> std::io::Result<u32> {
+    use std::os::fd::AsRawFd as _;
+
     let mut pid = 0 as libc::pid_t;
     let mut length = libc::socklen_t::try_from(size_of::<libc::pid_t>()).map_err(|_| {
         std::io::Error::new(
@@ -1447,6 +1446,8 @@ fn apple_peer_pid(stream: &IpcStream) -> std::io::Result<u32> {
             "pid_t size does not fit socklen_t",
         )
     })?;
+    // SAFETY: `stream` owns the live socket descriptor, both output pointers
+    // are writable, and `length` advertises exactly the pid_t buffer size.
     let result = unsafe {
         libc::getsockopt(
             stream.as_raw_fd(),

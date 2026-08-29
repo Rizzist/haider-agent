@@ -38,6 +38,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - name: unsafe-count gate
+        shell: bash
+        run: bash scripts/check-unsafe-counts.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
@@ -243,6 +246,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: unsafe-count gate
+        shell: bash
+        run: bash scripts/check-unsafe-counts.sh
       - uses: actions/download-artifact@v4
         with:
           pattern: distribution-*
@@ -334,6 +340,9 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
+      - name: unsafe-count gate
+        shell: bash
+        run: bash scripts/check-unsafe-counts.sh
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -384,6 +393,9 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
           token: ${{ github.token }}
+      - name: unsafe-count gate
+        shell: bash
+        run: bash scripts/check-unsafe-counts.sh
       - uses: actions/download-artifact@v4
         with:
           pattern: distribution-*
@@ -496,6 +508,9 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
+      - name: unsafe-count gate
+        shell: bash
+        run: bash scripts/check-unsafe-counts.sh
       - uses: actions/download-artifact@v4
         with:
           pattern: distribution-*

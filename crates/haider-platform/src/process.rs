@@ -234,7 +234,7 @@ pub fn windows_process_in_group(group: ProcessGroup, pid: u32) -> std::io::Resul
     let mut in_group = 0;
     // SAFETY: both handles remain live under this registry guard and the
     // result storage is writable for the duration of the call.
-    if unsafe { IsProcessInJob(process.as_raw_handle(), job.0, &raw mut in_group) } == 0 {
+    if unsafe { IsProcessInJob(process.as_raw_handle(), job.raw(), &raw mut in_group) } == 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(in_group != 0)
@@ -271,7 +271,7 @@ pub fn process_group(pid: Option<u32>) -> Option<ProcessGroup> {
 #[cfg(windows)]
 #[allow(unsafe_code)]
 pub fn register_process_group(pid: u32) -> std::io::Result<ProcessGroup> {
-    use windows_sys::Win32::Foundation::CloseHandle;
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
@@ -287,16 +287,22 @@ pub fn register_process_group(pid: u32) -> std::io::Result<ProcessGroup> {
             "invalid process-group leader PID",
         ));
     }
+    // SAFETY: both optional name/security pointers are null, so the API reads
+    // no caller memory and returns a newly owned handle on success.
     let raw_job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
     if raw_job.is_null() {
         return Err(std::io::Error::last_os_error());
     }
-    let job = WindowsJob(raw_job);
+    // SAFETY: CreateJobObjectW returned a non-null newly owned handle, and
+    // this is the unique transfer into the standard RAII owner.
+    let job = WindowsJob(unsafe { OwnedHandle::from_raw_handle(raw_job.cast()) });
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // SAFETY: `job` owns a live Job Object and `limits` is an initialized
+    // structure whose exact size is supplied for this information class.
     let configured = unsafe {
         SetInformationJobObject(
-            job.0,
+            job.raw(),
             JobObjectExtendedLimitInformation,
             (&raw const limits).cast(),
             std::mem::size_of_val(&limits) as u32,
@@ -305,6 +311,8 @@ pub fn register_process_group(pid: u32) -> std::io::Result<ProcessGroup> {
     if configured == 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: the access mask and validated nonzero PID are value arguments;
+    // a non-null return is one newly owned process handle.
     let process = unsafe {
         OpenProcess(
             PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA | PROCESS_TERMINATE,
@@ -315,9 +323,14 @@ pub fn register_process_group(pid: u32) -> std::io::Result<ProcessGroup> {
     if process.is_null() {
         return Err(std::io::Error::last_os_error());
     }
-    let assigned = unsafe { AssignProcessToJobObject(job.0, process) };
+    // SAFETY: OpenProcess returned a non-null newly owned handle, and this is
+    // the unique transfer into the standard RAII owner.
+    let process = unsafe { OwnedHandle::from_raw_handle(process.cast()) };
+    // SAFETY: both the Job Object and process handles remain live and owned by
+    // this function for the full call; the API borrows rather than consumes.
+    let assigned = unsafe { AssignProcessToJobObject(job.raw(), process.as_raw_handle().cast()) };
     let error = (assigned == 0).then(std::io::Error::last_os_error);
-    unsafe { CloseHandle(process) };
+    drop(process);
     if let Some(error) = error {
         return Err(error);
     }
@@ -339,30 +352,40 @@ pub fn register_process_group(pid: u32) -> std::io::Result<ProcessGroup> {
 #[cfg(windows)]
 #[allow(unsafe_code)]
 fn resume_suspended_process(pid: u32) -> std::io::Result<()> {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
     };
     use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
 
+    // SAFETY: the flags and process-id value require no caller pointers; a
+    // non-sentinel return is one newly owned snapshot handle.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: the non-sentinel snapshot is a newly owned handle and is
+    // transferred exactly once into the standard RAII owner.
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot.cast()) };
     let mut entry = THREADENTRY32 {
         dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
         ..THREADENTRY32::default()
     };
-    let mut found = unsafe { Thread32First(snapshot, &raw mut entry) } != 0;
+    // SAFETY: `snapshot` is live and `entry` is writable with dwSize set to
+    // the structure size required by ToolHelp iteration.
+    let mut found = unsafe { Thread32First(snapshot.as_raw_handle().cast(), &raw mut entry) } != 0;
     let mut thread_ids = Vec::new();
     while found {
         if entry.th32OwnerProcessID == pid {
             thread_ids.push(entry.th32ThreadID);
         }
         entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
-        found = unsafe { Thread32Next(snapshot, &raw mut entry) } != 0;
+        // SAFETY: the snapshot remains live and dwSize is reset before every
+        // writable Thread32Next output operation.
+        found = unsafe { Thread32Next(snapshot.as_raw_handle().cast(), &raw mut entry) } != 0;
     }
-    unsafe { CloseHandle(snapshot) };
+    drop(snapshot);
     if thread_ids.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -380,6 +403,8 @@ fn resume_suspended_process(pid: u32) -> std::io::Result<()> {
     let mut first_error = None;
     let mut observations = Vec::with_capacity(thread_ids.len());
     for thread_id in thread_ids {
+        // SAFETY: `thread_id` came from the live snapshot and the access mask
+        // and inherit flag are value arguments; success returns an owned handle.
         let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
         if thread.is_null() {
             let error = std::io::Error::last_os_error();
@@ -392,9 +417,14 @@ fn resume_suspended_process(pid: u32) -> std::io::Result<()> {
             });
             continue;
         }
-        let previous_count = unsafe { ResumeThread(thread) };
+        // SAFETY: OpenThread returned a non-null newly owned handle and this
+        // is its unique transfer into the standard RAII owner.
+        let thread = unsafe { OwnedHandle::from_raw_handle(thread.cast()) };
+        // SAFETY: `thread` is the non-null owned handle from OpenThread and
+        // remains live while ResumeThread borrows it.
+        let previous_count = unsafe { ResumeThread(thread.as_raw_handle().cast()) };
         let resume_error = (previous_count == u32::MAX).then(std::io::Error::last_os_error);
-        unsafe { CloseHandle(thread) };
+        drop(thread);
         observations.push((thread_id, Some(previous_count)));
         if let Some(error) = resume_error {
             first_error.get_or_insert_with(|| {
@@ -514,6 +544,8 @@ pub fn windows_powershell() -> std::path::PathBuf {
 pub fn configure_background_process(command: &mut tokio::process::Command) {
     use std::os::unix::process::CommandExt as _;
     let upper_bound = inherited_descriptor_upper_bound();
+    // SAFETY: std requires unsafe because arbitrary pre_exec work can violate
+    // post-fork rules; this closure calls only the async-signal-safe fd sweep.
     #[allow(unsafe_code)]
     unsafe {
         command.as_std_mut().pre_exec(move || {
@@ -547,6 +579,8 @@ pub(crate) fn close_inherited_descriptors_from(
     // the child only calls async-signal-safe `fcntl(2)`. EBADF is expected for
     // unused slots.
     for fd in first..upper_bound {
+        // SAFETY: fcntl takes the numeric descriptor by value; open slots are
+        // owned by the child and closed slots may return EBADF, which is ignored.
         let _ = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
     }
 }
@@ -589,7 +623,9 @@ fn inherited_descriptor_limit() -> std::os::raw::c_int {
         rlim_cur: 0,
         rlim_max: 0,
     };
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+    // SAFETY: `limit` is writable for exactly one rlimit structure and the
+    // fixed RLIMIT_NOFILE selector requires no other caller-owned memory.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } == 0 {
         let capped = limit.rlim_cur.min(std::os::raw::c_int::MAX as libc::rlim_t);
         return capped as std::os::raw::c_int;
     }
@@ -616,6 +652,8 @@ fn close_inherited_descriptor_range(first: std::os::raw::c_int) -> bool {
     // named constant on every Android target supported by this workspace.
     const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
 
+    // SAFETY: this invokes Linux close_range with value-only arguments; the
+    // CLOEXEC flag preserves descriptors while preventing inheritance.
     unsafe {
         libc::syscall(
             libc::SYS_close_range,
@@ -684,9 +722,13 @@ pub(crate) fn install_daemon_spawn_descriptors(
         let Some(source) = source else {
             continue;
         };
+        // SAFETY: `source` is an inherited owned descriptor and `target` is a
+        // reserved child coordinate; dup2 atomically replaces only `target`.
         if source != target && unsafe { dup2(source, target) } == -1 {
             return Err(std::io::Error::last_os_error());
         }
+        // SAFETY: `target` is live after the identity/dup2 path and fcntl only
+        // changes its descriptor flags without borrowing Rust-managed memory.
         if unsafe { fcntl(target, F_SETFD, 0) } == -1 {
             return Err(std::io::Error::last_os_error());
         }
@@ -694,6 +736,8 @@ pub(crate) fn install_daemon_spawn_descriptors(
     // A liveness-only caller still reserves fd 4. Mark the unused fd 3 for
     // exec closure without consuming std::process's private error reporter.
     if readiness.is_none() && liveness.is_some() {
+        // SAFETY: fd 3 is deliberately unused in this child; fcntl receives
+        // only its numeric value and EBADF is an acceptable no-op result.
         let _ = unsafe { libc::fcntl(DAEMON_READINESS_FD, libc::F_SETFD, libc::FD_CLOEXEC) };
     }
     let last = if liveness.is_some() {
@@ -711,21 +755,14 @@ pub fn configure_background_process(command: &mut tokio::process::Command) {
 }
 
 #[cfg(windows)]
-struct WindowsJob(windows_sys::Win32::Foundation::HANDLE);
+struct WindowsJob(std::os::windows::io::OwnedHandle);
 
 #[cfg(windows)]
-#[allow(unsafe_code)]
-unsafe impl Send for WindowsJob {}
+impl WindowsJob {
+    fn raw(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        use std::os::windows::io::AsRawHandle as _;
 
-#[cfg(windows)]
-#[allow(unsafe_code)]
-unsafe impl Sync for WindowsJob {}
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
-impl Drop for WindowsJob {
-    fn drop(&mut self) {
-        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+        self.0.as_raw_handle().cast()
     }
 }
 
@@ -790,7 +827,7 @@ pub fn signal_process(pid: u32, signal: ProcessSignal) -> std::io::Result<()> {
 #[cfg(windows)]
 #[allow(unsafe_code)]
 pub fn signal_process(pid: u32, _signal: ProcessSignal) -> std::io::Result<()> {
-    use windows_sys::Win32::Foundation::CloseHandle;
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
 
     if pid == 0 {
@@ -799,13 +836,20 @@ pub fn signal_process(pid: u32, _signal: ProcessSignal) -> std::io::Result<()> {
             "invalid peer PID",
         ));
     }
+    // SAFETY: access rights and validated PID are value arguments; a non-null
+    // result is a newly owned process handle.
     let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
     if handle.is_null() {
         return Err(std::io::Error::last_os_error());
     }
-    let terminated = unsafe { TerminateProcess(handle, 1) };
+    // SAFETY: OpenProcess returned a non-null newly owned handle and this is
+    // its unique transfer into the standard RAII owner.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle.cast()) };
+    // SAFETY: `handle` is the live owned OpenProcess result and is borrowed
+    // only for this termination request.
+    let terminated = unsafe { TerminateProcess(handle.as_raw_handle().cast(), 1) };
     let error = (terminated == 0).then(std::io::Error::last_os_error);
-    unsafe { CloseHandle(handle) };
+    drop(handle);
     error.map_or(Ok(()), Err)
 }
 
@@ -908,9 +952,11 @@ pub fn process_group_exists(group: ProcessGroup) -> std::io::Result<bool> {
         return Ok(false);
     };
     let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+    // SAFETY: the registry guard keeps the Job Object live, `accounting` is writable,
+    // and the buffer size matches the selected Job information class.
     let queried = unsafe {
         QueryInformationJobObject(
-            job.0,
+            job.raw(),
             JobObjectBasicAccountingInformation,
             (&raw mut accounting).cast(),
             std::mem::size_of_val(&accounting) as u32,
@@ -945,7 +991,8 @@ pub fn process_leader_exited(pid: ProcessId) -> std::io::Result<bool> {
 #[cfg(windows)]
 #[allow(unsafe_code)]
 pub fn process_leader_exited(pid: ProcessId) -> std::io::Result<bool> {
-    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
     };
@@ -954,6 +1001,8 @@ pub fn process_leader_exited(pid: ProcessId) -> std::io::Result<bool> {
     // module home between releases, so pin the ABI value directly.
     const SYNCHRONIZE: u32 = 0x0010_0000;
 
+    // SAFETY: the access mask and PID are value arguments; a non-null result
+    // is one newly owned process handle.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid.0) };
     if handle.is_null() {
         let error = std::io::Error::last_os_error();
@@ -963,8 +1012,13 @@ pub fn process_leader_exited(pid: ProcessId) -> std::io::Result<bool> {
             Err(error)
         };
     }
-    let wait = unsafe { WaitForSingleObject(handle, 0) };
-    unsafe { CloseHandle(handle) };
+    // SAFETY: OpenProcess returned a non-null newly owned handle and this is
+    // its unique transfer into the standard RAII owner.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle.cast()) };
+    // SAFETY: `handle` remains live and a zero timeout makes this a nonblocking
+    // state query that does not transfer ownership.
+    let wait = unsafe { WaitForSingleObject(handle.as_raw_handle().cast(), 0) };
+    drop(handle);
     match wait {
         WAIT_OBJECT_0 => Ok(true),
         WAIT_TIMEOUT => Ok(false),
@@ -1019,7 +1073,9 @@ pub fn signal_process_group(group: ProcessGroup, signal: ProcessSignal) -> std::
     } else {
         0xC000_013Au32
     };
-    if unsafe { TerminateJobObject(job.0, exit_code) } == 0 {
+    // SAFETY: the registry guard keeps the owned Job Object live throughout
+    // the call; exit_code is a value and the handle is only borrowed.
+    if unsafe { TerminateJobObject(job.raw(), exit_code) } == 0 {
         Err(std::io::Error::last_os_error())
     } else {
         Ok(())

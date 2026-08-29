@@ -1,0 +1,73 @@
+{
+  "schema": 1,
+  "counts": {
+    "haider-accounts": {
+      "production": 0,
+      "test": 0
+    },
+    "haider-cli": {
+      "production": 0,
+      "test": 0
+    },
+    "haider-client": {
+      "production": 0,
+      "test": 0
+    },
+    "haider-core": {
+      "production": 0,
+      "test": 0
+    },
+    "haider-daemon": {
+      "production": 7,
+      "test": 0
+    },
+    "haider-daemond": {
+      "production": 1,
+      "test": 1
+    },
+    "haider-pdf": {
+      "production": 0,
+      "test": 0
+    },
+    "haider-platform": {
+      "production": 79,
+      "test": 6
+    },
+    "haider-protocol": {
+      "production": 0,
+      "test": 0
+    },
+    "haider-provider": {
+      "production": 0,
+      "test": 4
+    },
+    "haider-rpc": {
+      "production": 0,
+      "test": 0
+    },
+    "haider-store": {
+      "production": 0,
+      "test": 0
+    },
+    "haider-stt": {
+      "production": 0,
+      "test": 0
+    },
+    "haider-tools": {
+      "production": 76,
+      "test": 4
+    },
+    "haider-tui": {
+      "production": 0,
+      "test": 0
+    },
+    "haider-verify": {
+      "production": 0,
+      "test": 0
+    },
+    "xtask": {
+      "production": 0,
+      "test": 0
+    }
+  }
+}

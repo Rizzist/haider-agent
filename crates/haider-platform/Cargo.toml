@@ -17,7 +17,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
-rustix = { workspace = true, features = ["system", "pipe"] }
+rustix = { workspace = true, features = ["net", "system", "pipe"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
