@@ -150,7 +150,7 @@ use haider_tools::{
     ToolError, ToolResult, TurnAttribution, WebFetch, WorkflowAuthor,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -10766,10 +10766,22 @@ impl EffectOperation for LockdownSandboxWriteEffect<'_> {
 }
 
 fn lockdown_write_relative<'a>(sandbox: &Path, requested: &'a Path) -> Result<&'a Path, ()> {
-    if requested.is_absolute() {
-        requested.strip_prefix(sandbox).map_err(|_| ())
+    let relative = if requested.is_absolute() {
+        requested.strip_prefix(sandbox).map_err(|_| ())?
     } else {
-        Ok(requested)
+        requested
+    };
+    // LockdownManager::write validates the path again before any filesystem
+    // mutation. This guard preserves defense ordering, rather than repairing
+    // an escape: malformed paths must not reach user broker policy first.
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        Err(())
+    } else {
+        Ok(relative)
     }
 }
 

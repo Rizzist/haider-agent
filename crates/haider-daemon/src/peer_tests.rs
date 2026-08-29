@@ -1075,6 +1075,12 @@ async fn peer_event_route_excludes_an_attached_legacy_connection() {
     .await
     .expect("create peer route session");
     let runtime = root.path().join("runtime");
+    let _prepared_runtime = haider_platform::prepare_runtime_directory(&runtime)
+        .expect("prepare peer route runtime directory");
+    assert!(
+        runtime.is_dir(),
+        "the peer route runtime must exist before PeerService::start"
+    );
     let service = PeerService::start(runtime, &hub)
         .await
         .expect("start peer route service");

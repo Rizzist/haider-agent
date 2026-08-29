@@ -186,17 +186,39 @@ fn trust_toggle_changes_only_the_next_turn_pack() {
 
 #[test]
 fn lockdown_write_path_ceiling_runs_before_any_user_policy() {
-    let sandbox = Path::new("/lockdown/research");
+    let fixture = tempfile::tempdir().expect("temporary lockdown path fixture");
+    let root = std::fs::canonicalize(fixture.path()).expect("canonical lockdown path fixture");
+    let sandbox = root.join("lockdown/research");
+    let inside = sandbox.join("result.txt");
+    let outside = root.join("workspace/src/lib.rs");
     assert_eq!(
-        lockdown_write_relative(sandbox, Path::new("notes/result.txt")),
+        lockdown_write_relative(&sandbox, Path::new("notes/result.txt")),
         Ok(Path::new("notes/result.txt"))
     );
     assert_eq!(
-        lockdown_write_relative(sandbox, Path::new("/lockdown/research/result.txt")),
+        lockdown_write_relative(&sandbox, &inside),
         Ok(Path::new("result.txt"))
     );
+    assert_eq!(lockdown_write_relative(&sandbox, &outside), Err(()));
+    assert_eq!(lockdown_write_relative(&sandbox, Path::new("")), Err(()));
     assert_eq!(
-        lockdown_write_relative(sandbox, Path::new("/workspace/src/lib.rs")),
+        lockdown_write_relative(&sandbox, Path::new("./notes/result.txt")),
+        Ok(Path::new("./notes/result.txt"))
+    );
+    assert_eq!(
+        lockdown_write_relative(&sandbox, Path::new("../escape")),
+        Err(())
+    );
+    let inside_with_parent = sandbox.join("../escape");
+    assert_eq!(
+        lockdown_write_relative(&sandbox, &inside_with_parent),
+        Err(())
+    );
+    let rooted = Path::new(std::path::MAIN_SEPARATOR_STR).join("outside");
+    assert_eq!(lockdown_write_relative(&sandbox, &rooted), Err(()));
+    #[cfg(windows)]
+    assert_eq!(
+        lockdown_write_relative(&sandbox, Path::new(r"C:escape")),
         Err(())
     );
 }

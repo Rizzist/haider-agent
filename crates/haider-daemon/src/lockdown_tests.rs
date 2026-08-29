@@ -230,6 +230,49 @@ fn sandbox_rejects_parent_escape_and_sensitive_reads() {
     assert!(matches!(error, LockdownError::InvalidRelativePath { .. }));
 }
 
+#[test]
+fn manager_rejects_native_outside_paths_before_creating_any_target() {
+    let fixture = tempfile::tempdir().expect("fixture");
+    let manager = LockdownManager::initialize(fixture.path().join("lockdown")).expect("manager");
+    let provider_root = manager.provider_root("provider").expect("provider root");
+    let absolute_outside = fixture.path().join("absolute-outside.txt");
+    let rooted_name = format!(
+        "haider-lockdown-rooted-{}",
+        fixture
+            .path()
+            .file_name()
+            .expect("fixture basename")
+            .to_string_lossy()
+    );
+    let rooted_outside = Path::new(std::path::MAIN_SEPARATOR_STR).join(rooted_name);
+    let parent_outside = provider_root
+        .parent()
+        .expect("provider root parent")
+        .join("parent-outside.txt");
+
+    for (label, requested) in [
+        ("absolute outside", absolute_outside.as_path()),
+        ("rooted", rooted_outside.as_path()),
+        ("parent traversal", Path::new("../parent-outside.txt")),
+    ] {
+        let error = manager
+            .write("provider", requested, b"no")
+            .expect_err("outside write must be refused");
+        assert!(
+            matches!(error, LockdownError::InvalidRelativePath { .. }),
+            "{label} must return InvalidRelativePath, got {error:?}"
+        );
+    }
+
+    for path in [&absolute_outside, &rooted_outside, &parent_outside] {
+        assert!(
+            !path.exists(),
+            "refused write must not create {}",
+            path.display()
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn workspace_symlink_cannot_alias_a_sensitive_read() {

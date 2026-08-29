@@ -1706,8 +1706,13 @@ fn now_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-#[cfg(unix)]
 fn lock_mailbox_blocking(path: &Path) -> Result<MailboxLease, PeerError> {
+    ensure_peer_artifact_parent(path)?;
+    lock_mailbox_platform_blocking(path)
+}
+
+#[cfg(unix)]
+fn lock_mailbox_platform_blocking(path: &Path) -> Result<MailboxLease, PeerError> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let mut options = OpenOptions::new();
@@ -1727,11 +1732,12 @@ fn lock_mailbox_blocking(path: &Path) -> Result<MailboxLease, PeerError> {
 }
 
 #[cfg(windows)]
-fn lock_mailbox_blocking(_path: &Path) -> Result<MailboxLease, PeerError> {
+fn lock_mailbox_platform_blocking(_path: &Path) -> Result<MailboxLease, PeerError> {
     Ok(MailboxLease)
 }
 
 pub(super) fn append_record_blocking(path: &Path, record: &MailboxRecord) -> Result<(), PeerError> {
+    ensure_peer_artifact_parent(path)?;
     let mut bytes = serde_json::to_vec(record).map_err(|error| PeerError::Invalid {
         message: format!("cannot encode peer mailbox record: {error}"),
     })?;
@@ -2083,6 +2089,7 @@ async fn write_manifest(
 }
 
 fn write_manifest_blocking(path: &Path, manifest: &PeerManifest) -> Result<(), PeerError> {
+    ensure_peer_artifact_parent(path)?;
     let bytes = serde_json::to_vec(manifest).map_err(|error| PeerError::Invalid {
         message: format!("cannot encode peer manifest: {error}"),
     })?;
@@ -2114,6 +2121,17 @@ fn write_manifest_blocking(path: &Path, manifest: &PeerManifest) -> Result<(), P
     replace_manifest_staging(&temporary, path)
         .map_err(|error| PeerError::io("publish peer manifest", path, error))?;
     sync_parent(path)
+}
+
+fn ensure_peer_artifact_parent(path: &Path) -> Result<(), PeerError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| PeerError::Invalid {
+            message: format!("peer artifact {} has no parent directory", path.display()),
+        })?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| PeerError::io("create peer artifact parent directory", parent, error))
 }
 
 #[cfg(unix)]
