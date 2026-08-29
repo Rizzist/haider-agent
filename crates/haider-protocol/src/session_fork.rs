@@ -189,6 +189,11 @@ pub struct SessionForked {
     pub source_session_id: SessionId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_branch_id: Option<BranchId>,
+    /// Present only for an exclusive prompt-oriented cut. The sequence names
+    /// the source user message returned as an editable draft, not the copied
+    /// source-history boundary in `fork_seq`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<SessionForkProvenance>,
     pub fork_node_id: NodeId,
     pub fork_seq: u64,
     pub mode: SessionForkMode,

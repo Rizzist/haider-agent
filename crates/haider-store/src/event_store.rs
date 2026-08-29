@@ -88,7 +88,8 @@ use haider_protocol::session::{
     SessionPermissionOverridesV1,
 };
 use haider_protocol::session_fork::{
-    ForkCacheSegmentV1, ForkContextEpoch, SessionForkMode, SessionForked, SessionHistoryOmission,
+    ForkCacheSegmentV1, ForkContextEpoch, SessionForkDraft, SessionForkInvalidCutReason,
+    SessionForkMode, SessionForkProvenance, SessionForked, SessionHistoryOmission,
     SessionMetaforkProposal, SessionMetaforkReviewManifest,
 };
 use haider_protocol::state::{RunState, SessionState};
@@ -859,6 +860,23 @@ pub struct SessionForkCommand {
     pub device_id: DeviceId,
 }
 
+/// Secret-free coordinates for resolving and atomically copying the complete
+/// committed prefix before one durable user prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPromptForkCommand {
+    pub command_id: String,
+    pub request_digest: String,
+    pub request_json: String,
+    pub source_session_id: SessionId,
+    pub session_id: SessionId,
+    pub worker_generation: u64,
+    pub source_branch_id: Option<BranchId>,
+    pub prompt_seq: u64,
+    pub name: Option<String>,
+    pub audit_event_id: EventId,
+    pub device_id: DeviceId,
+}
+
 /// Provider-rendered child view proposed for exact-prefix cache inheritance.
 ///
 /// The store deliberately accepts an opaque JSON value here instead of
@@ -883,6 +901,14 @@ pub struct CreatedSessionFork {
     pub created_seq: u64,
     pub worker_generation: u64,
     pub metadata: SessionMetadataV1,
+    /// Durable prompt-cut provenance. Absent for legacy exact-node forks and
+    /// metaforks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<SessionForkProvenance>,
+    /// Editable source prompt returned by prompt-oriented forks. Attachment
+    /// blocks retain CAS references; bytes are never copied into the receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<SessionForkDraft>,
     pub mode: SessionForkMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -905,6 +931,41 @@ pub enum SessionForkOutcome {
     IdempotentReplay {
         created: CreatedSessionFork,
     },
+}
+
+const PROMPT_FORK_VIRTUAL_ROOT_NODE_ID: &str = "session-prompt-fork-root";
+
+#[derive(Clone, Copy)]
+enum SessionForkCutRequest<'a> {
+    Exact {
+        fork_node_id: &'a NodeId,
+        fork_seq: u64,
+    },
+    Prompt {
+        prompt_seq: u64,
+    },
+}
+
+struct SessionForkTransactionCommand<'a> {
+    command_id: &'a str,
+    request_digest: &'a str,
+    request_json: &'a str,
+    source_session_id: &'a SessionId,
+    session_id: &'a SessionId,
+    worker_generation: u64,
+    source_branch_id: Option<&'a BranchId>,
+    name: Option<&'a String>,
+    metafork: Option<&'a SessionMetaforkCommit>,
+    audit_event_id: &'a EventId,
+    device_id: &'a DeviceId,
+    cut: SessionForkCutRequest<'a>,
+}
+
+struct ResolvedSessionForkCut {
+    fork_node_id: NodeId,
+    fork_seq: u64,
+    forked_from: Option<SessionForkProvenance>,
+    draft: Option<SessionForkDraft>,
 }
 
 /// Secret-free coordinates for one atomic live-session model selection.
@@ -7619,6 +7680,52 @@ impl Store {
         )
     }
 
+    /// Loads the durable prompt-fork provenance used by roster projections.
+    /// Exact-node forks, metaforks, and ordinary sessions return `None`.
+    pub fn session_fork_provenance(
+        &self,
+        session_id: &SessionId,
+    ) -> StoreResult<Option<SessionForkProvenance>> {
+        let connection = self.connection()?;
+        require_typed_session(&connection, session_id)?;
+        let row = connection
+            .query_row(
+                "SELECT seq, envelope_json, event_id, committed_at_ms
+                 FROM events
+                 WHERE session_id = ?1 AND payload_kind = 'session_forked'
+                 ORDER BY seq DESC LIMIT 1",
+                [session_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        decode_envelope_column(row, 1),
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_sqlite_error)?;
+        let Some((stored_seq, envelope, event_id, committed_at_ms)) = row else {
+            return Ok(None);
+        };
+        let envelope = envelope.map_err(|error| {
+            corrupt(format!(
+                "invalid session-fork provenance envelope for {session_id}:{stored_seq}: {error}"
+            ))
+        })?;
+        validate_stored_envelope(
+            session_id,
+            stored_seq,
+            &event_id,
+            committed_at_ms,
+            &envelope,
+        )?;
+        SessionForked::from_payload_value(&envelope.payload)
+            .map(|record| record.forked_from)
+            .ok_or_else(|| corrupt("session-fork provenance index points to an invalid audit fact"))
+    }
+
     /// Looks up a committed `session.metafork` response before mutable source
     /// validation. Proposal-only review never creates a receipt.
     pub fn session_metafork_receipt(
@@ -7682,22 +7789,80 @@ impl Store {
         command: &SessionForkCommand,
         cache_candidate: Option<&ForkCacheInheritanceCandidate>,
     ) -> StoreResult<SessionForkOutcome> {
-        validate_command_identity(
-            &command.command_id,
-            &command.request_digest,
-            &command.request_json,
-        )?;
-        if command.worker_generation != self.worker_generation {
-            return Err(stale_generation(
-                command.worker_generation,
-                self.worker_generation,
-            ));
+        if let Some(metafork) = &command.metafork {
+            validate_metafork_commit(command, metafork)?;
         }
+        self.fork_session_transaction(
+            SessionForkTransactionCommand {
+                command_id: &command.command_id,
+                request_digest: &command.request_digest,
+                request_json: &command.request_json,
+                source_session_id: &command.source_session_id,
+                session_id: &command.session_id,
+                worker_generation: command.worker_generation,
+                source_branch_id: command.source_branch_id.as_ref(),
+                name: command.name.as_ref(),
+                metafork: command.metafork.as_ref(),
+                audit_event_id: &command.audit_event_id,
+                device_id: &command.device_id,
+                cut: SessionForkCutRequest::Exact {
+                    fork_node_id: &command.fork_node_id,
+                    fork_seq: command.fork_seq,
+                },
+            },
+            cache_candidate,
+        )
+    }
+
+    /// Atomically resolves a committed user-prompt coordinate to the complete
+    /// stable prefix before its admission batch, physically copies that prefix
+    /// into an independent child, and receipts the editable prompt draft.
+    pub fn fork_session_from_prompt(
+        &self,
+        command: &SessionPromptForkCommand,
+    ) -> StoreResult<SessionForkOutcome> {
+        self.fork_session_transaction(
+            SessionForkTransactionCommand {
+                command_id: &command.command_id,
+                request_digest: &command.request_digest,
+                request_json: &command.request_json,
+                source_session_id: &command.source_session_id,
+                session_id: &command.session_id,
+                worker_generation: command.worker_generation,
+                source_branch_id: command.source_branch_id.as_ref(),
+                name: command.name.as_ref(),
+                metafork: None,
+                audit_event_id: &command.audit_event_id,
+                device_id: &command.device_id,
+                cut: SessionForkCutRequest::Prompt {
+                    prompt_seq: command.prompt_seq,
+                },
+            },
+            None,
+        )
+    }
+
+    fn fork_session_transaction(
+        &self,
+        command: SessionForkTransactionCommand<'_>,
+        cache_candidate: Option<&ForkCacheInheritanceCandidate>,
+    ) -> StoreResult<SessionForkOutcome> {
+        validate_command_identity(
+            command.command_id,
+            command.request_digest,
+            command.request_json,
+        )?;
+        let cut_is_valid = match command.cut {
+            SessionForkCutRequest::Exact {
+                fork_node_id,
+                fork_seq,
+            } => !fork_node_id.as_str().is_empty() && fork_seq != 0,
+            SessionForkCutRequest::Prompt { prompt_seq } => prompt_seq != 0,
+        };
         if command.source_session_id == command.session_id
             || command.session_id.as_str().is_empty()
-            || command.fork_node_id.as_str().is_empty()
-            || command.fork_seq == 0
-            || command.name.as_ref().is_some_and(|title| {
+            || !cut_is_valid
+            || command.name.is_some_and(|title| {
                 title.trim().is_empty()
                     || title.chars().count() > 80
                     || title.chars().any(char::is_control)
@@ -7705,13 +7870,12 @@ impl Store {
         {
             return Err(store_error(
                 ErrorCode::InvalidArgument,
-                "session fork ids, fork coordinate, and optional name must be valid",
+                "session fork ids, cut selector, and optional name must be valid",
                 false,
             ));
         }
         let (method, description, model_proposal, proposal_digest, mode) =
-            if let Some(metafork) = &command.metafork {
-                validate_metafork_commit(command, metafork)?;
+            if let Some(metafork) = command.metafork {
                 (
                     "session.metafork",
                     Some(metafork.description.clone()),
@@ -7729,10 +7893,10 @@ impl Store {
             .map_err(map_sqlite_error)?;
         if let Some(created) = lookup_command_response(
             &transaction,
-            &command.command_id,
+            command.command_id,
             method,
-            &command.request_digest,
-            &command.request_json,
+            command.request_digest,
+            command.request_json,
             if command.metafork.is_some() {
                 "session-metafork"
             } else {
@@ -7742,8 +7906,14 @@ impl Store {
             transaction.commit().map_err(map_sqlite_error)?;
             return Ok(SessionForkOutcome::IdempotentReplay { created });
         }
+        if command.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                command.worker_generation,
+                self.worker_generation,
+            ));
+        }
 
-        require_typed_session(&transaction, &command.source_session_id)?;
+        require_typed_session(&transaction, command.source_session_id)?;
         if transaction
             .query_row(
                 "SELECT 1 FROM sessions WHERE id = ?1",
@@ -7761,24 +7931,44 @@ impl Store {
             ));
         }
         let source_owner_agent =
-            lookup_delegation_by_child_session(&transaction, &command.source_session_id)?
+            lookup_delegation_by_child_session(&transaction, command.source_session_id)?
                 .map(|delegation| delegation.agent_id);
-        validate_branch_fork(
-            &transaction,
-            &command.source_session_id,
-            command.source_branch_id.as_ref(),
-            &command.fork_node_id,
-            command.fork_seq,
-            source_owner_agent.as_ref(),
-        )?;
+        let mut resolved_cut = match command.cut {
+            SessionForkCutRequest::Exact {
+                fork_node_id,
+                fork_seq,
+            } => {
+                validate_branch_fork(
+                    &transaction,
+                    command.source_session_id,
+                    command.source_branch_id,
+                    fork_node_id,
+                    fork_seq,
+                    source_owner_agent.as_ref(),
+                )?;
+                ResolvedSessionForkCut {
+                    fork_node_id: fork_node_id.clone(),
+                    fork_seq,
+                    forked_from: None,
+                    draft: None,
+                }
+            }
+            SessionForkCutRequest::Prompt { prompt_seq } => resolve_prompt_fork_cut(
+                &transaction,
+                command.source_session_id,
+                command.source_branch_id,
+                prompt_seq,
+                source_owner_agent.as_ref(),
+            )?,
+        };
 
         let now = now_ms()?;
         claim_pending_receipt(
             &transaction,
-            &command.command_id,
+            command.command_id,
             method,
-            &command.request_digest,
-            &command.request_json,
+            command.request_digest,
+            command.request_json,
             now,
         )?;
         let source_metadata_json: String = transaction
@@ -7789,10 +7979,10 @@ impl Store {
             )
             .map_err(map_sqlite_error)?;
         let mut metadata =
-            decode_session_metadata(&command.source_session_id, &source_metadata_json)?
+            decode_session_metadata(command.source_session_id, &source_metadata_json)?
                 .ok_or_else(|| corrupt("typed source session lost its metadata"))?;
         metadata.created_at_ms = now;
-        if let Some(name) = &command.name {
+        if let Some(name) = command.name {
             metadata.title = Some(name.clone());
         }
         let metadata_json = serde_json::to_string(&metadata).map_err(|error| {
@@ -7815,13 +8005,13 @@ impl Store {
 
         let scopes = branch_lineage_scopes(
             &transaction,
-            &command.source_session_id,
-            command.source_branch_id.as_ref(),
+            command.source_session_id,
+            command.source_branch_id,
         )?;
         let mut source_envelopes = load_fork_source_envelopes(
             &transaction,
-            &command.source_session_id,
-            command.fork_seq,
+            command.source_session_id,
+            resolved_cut.fork_seq,
             &scopes,
         )?;
         // Checkpoints are session-owned workspace mutation facts. A session
@@ -7833,15 +8023,27 @@ impl Store {
                 "fork source lineage does not contain its created envelope",
             ));
         }
+        if resolved_cut.forked_from.is_some() {
+            resolved_cut.fork_node_id =
+                prompt_fork_head_node(&source_envelopes, source_owner_agent.as_ref())?;
+            validate_prompt_fork_tool_pairs(
+                command.source_session_id,
+                resolved_cut
+                    .forked_from
+                    .as_ref()
+                    .map_or(0, |provenance| provenance.seq),
+                &source_envelopes,
+            )?;
+        }
         let inherited_cache_segment = if model_proposal.is_none() {
             if let Some(candidate) = cache_candidate {
                 let source_cache_boundary =
-                    source_fork_cache_boundary(&transaction, &command.source_session_id)?;
+                    source_fork_cache_boundary(&transaction, command.source_session_id)?;
                 inherited_fork_cache_segment(
                     &source_envelopes,
                     source_owner_agent.as_ref(),
                     &metadata,
-                    &command.source_session_id,
+                    command.source_session_id,
                     source_cache_boundary.as_ref(),
                     candidate,
                 )
@@ -7859,7 +8061,7 @@ impl Store {
             .map(|envelope| {
                 (
                     envelope.event_id.clone(),
-                    remapped_fork_event_id(&command.session_id, &envelope.event_id),
+                    remapped_fork_event_id(command.session_id, &envelope.event_id),
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -7937,7 +8139,14 @@ impl Store {
         // A copied source run is historical authority, never live child work.
         // Close any run whose terminal fact lies after the fork coordinate so
         // startup recovery cannot resume it in the independent child.
-        append_fork_boundary_closures(&transaction, command, now, &mut child_envelopes)?;
+        append_fork_boundary_closures(
+            &transaction,
+            command.session_id,
+            command.worker_generation,
+            command.device_id,
+            now,
+            &mut child_envelopes,
+        )?;
 
         let audit_seq = u64::try_from(child_envelopes.len())
             .map_err(|_| corrupt("forked journal is too large"))?
@@ -7964,9 +8173,10 @@ impl Store {
             },
             payload: SessionForked {
                 source_session_id: command.source_session_id.clone(),
-                source_branch_id: command.source_branch_id.clone(),
-                fork_node_id: command.fork_node_id.clone(),
-                fork_seq: command.fork_seq,
+                source_branch_id: command.source_branch_id.cloned(),
+                forked_from: resolved_cut.forked_from.clone(),
+                fork_node_id: resolved_cut.fork_node_id.clone(),
+                fork_seq: resolved_cut.fork_seq,
                 mode,
                 description: description.clone(),
                 accepted_proposal_digest: proposal_digest.clone(),
@@ -7994,12 +8204,14 @@ impl Store {
         let created = CreatedSessionFork {
             session_id: command.session_id.clone(),
             source_session_id: command.source_session_id.clone(),
-            source_branch_id: command.source_branch_id.clone(),
-            fork_node_id: command.fork_node_id.clone(),
-            fork_seq: command.fork_seq,
+            source_branch_id: command.source_branch_id.cloned(),
+            fork_node_id: resolved_cut.fork_node_id,
+            fork_seq: resolved_cut.fork_seq,
             created_seq: audit_seq,
             worker_generation: self.worker_generation,
             metadata,
+            forked_from: resolved_cut.forked_from,
+            draft: resolved_cut.draft,
             mode,
             description,
             model_proposal,
@@ -8009,7 +8221,7 @@ impl Store {
         };
         finalize_command_receipt(
             &transaction,
-            &command.command_id,
+            command.command_id,
             command.session_id.as_str(),
             None,
             Some(audit_seq),
@@ -20335,6 +20547,391 @@ fn provider_view_is_complete(view: &serde_json::Value) -> bool {
         && boundaries_valid
 }
 
+fn resolve_prompt_fork_cut(
+    connection: &Connection,
+    session_id: &SessionId,
+    source_branch_id: Option<&BranchId>,
+    prompt_seq: u64,
+    owner_agent_id: Option<&AgentId>,
+) -> StoreResult<ResolvedSessionForkCut> {
+    let prompt =
+        load_fork_coordinate_envelope(connection, session_id, prompt_seq)?.ok_or_else(|| {
+            store_error(
+                ErrorCode::SessionNotFound,
+                format!("session {session_id} has no committed event at sequence {prompt_seq}"),
+                false,
+            )
+        })?;
+    let EventPayload::UserMessage {
+        text, attachments, ..
+    } = decode_payload::<EventPayload>(&prompt.payload).map_err(|_| {
+        prompt_fork_invalid_cut(
+            session_id,
+            prompt_seq,
+            SessionForkInvalidCutReason::NotUserPrompt,
+            "selected event is not a committed user prompt",
+        )
+    })?
+    else {
+        return Err(prompt_fork_invalid_cut(
+            session_id,
+            prompt_seq,
+            SessionForkInvalidCutReason::NotUserPrompt,
+            "selected event is not a committed user prompt",
+        ));
+    };
+    if prompt.branch_id.as_ref() != source_branch_id {
+        return Err(prompt_fork_invalid_cut(
+            session_id,
+            prompt_seq,
+            SessionForkInvalidCutReason::WrongBranch,
+            "selected prompt is not on the requested source branch",
+        ));
+    }
+    if prompt.agent_id.as_ref() != owner_agent_id {
+        return Err(prompt_fork_invalid_cut(
+            session_id,
+            prompt_seq,
+            SessionForkInvalidCutReason::Unknown,
+            "selected prompt is not on the source session's owning agent lane",
+        ));
+    }
+    let prompt_run_id = prompt.run_id.as_ref().ok_or_else(|| {
+        prompt_fork_invalid_cut(
+            session_id,
+            prompt_seq,
+            SessionForkInvalidCutReason::Unknown,
+            "selected prompt has no durable run coordinate",
+        )
+    })?;
+    let accepted =
+        prompt_turn_acceptance(connection, session_id, prompt_seq)?.ok_or_else(|| {
+            prompt_fork_invalid_cut(
+                session_id,
+                prompt_seq,
+                SessionForkInvalidCutReason::Unknown,
+                "selected prompt has no committed turn-admission receipt",
+            )
+        })?;
+    if accepted.session_id != *session_id
+        || accepted.accepted_seq != prompt_seq
+        || accepted.run_id != *prompt_run_id
+        || accepted.branch_id.as_ref() != source_branch_id
+        || accepted.worker_generation != prompt.worker_generation
+    {
+        return Err(corrupt(format!(
+            "turn-admission receipt disagrees with prompt {session_id}:{prompt_seq}"
+        )));
+    }
+    if accepted.disposition != TurnAdmissionDisposition::Started {
+        return Err(prompt_fork_unstable(
+            session_id,
+            prompt_seq,
+            "selected prompt was queued or steered behind nonterminal work",
+        ));
+    }
+
+    let queued_seq = prompt_seq.checked_sub(1).ok_or_else(|| {
+        prompt_fork_invalid_cut(
+            session_id,
+            prompt_seq,
+            SessionForkInvalidCutReason::Unknown,
+            "selected prompt has no atomic admission boundary",
+        )
+    })?;
+    let queued =
+        load_fork_coordinate_envelope(connection, session_id, queued_seq)?.ok_or_else(|| {
+            prompt_fork_invalid_cut(
+                session_id,
+                prompt_seq,
+                SessionForkInvalidCutReason::Unknown,
+                "selected prompt lost its queued admission fact",
+            )
+        })?;
+    let queued_is_coherent = queued.run_id.as_ref() == Some(prompt_run_id)
+        && queued.branch_id.as_ref() == source_branch_id
+        && queued.agent_id.as_ref() == owner_agent_id
+        && matches!(
+            decode_payload::<EventPayload>(&queued.payload),
+            Ok(EventPayload::RunState(RunState::Queued))
+        );
+    if !queued_is_coherent {
+        return Err(prompt_fork_invalid_cut(
+            session_id,
+            prompt_seq,
+            SessionForkInvalidCutReason::Unknown,
+            "selected prompt does not begin at a coherent turn-admission batch",
+        ));
+    }
+    validate_prompt_user_node(
+        connection,
+        session_id,
+        &prompt,
+        &text,
+        &attachments,
+        prompt_seq,
+    )?;
+    let fork_seq = queued_seq.checked_sub(1).ok_or_else(|| {
+        prompt_fork_invalid_cut(
+            session_id,
+            prompt_seq,
+            SessionForkInvalidCutReason::Unknown,
+            "selected prompt has no committed prefix boundary",
+        )
+    })?;
+    Ok(ResolvedSessionForkCut {
+        fork_node_id: NodeId::new(PROMPT_FORK_VIRTUAL_ROOT_NODE_ID),
+        fork_seq,
+        forked_from: Some(SessionForkProvenance {
+            session_id: session_id.clone(),
+            seq: prompt_seq,
+        }),
+        draft: Some(SessionForkDraft { text, attachments }),
+    })
+}
+
+fn prompt_turn_acceptance(
+    connection: &Connection,
+    session_id: &SessionId,
+    prompt_seq: u64,
+) -> StoreResult<Option<AcceptedTurn>> {
+    let response = connection
+        .query_row(
+            "SELECT response_json FROM command_receipts
+             WHERE method = 'turn.submit' AND state = 'committed'
+               AND session_id = ?1 AND accepted_seq = ?2",
+            params![session_id.as_str(), to_sqlite_integer(prompt_seq)?],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(map_sqlite_error)?
+        .flatten();
+    response
+        .map(|response| {
+            serde_json::from_str(&response).map_err(|error| {
+                corrupt(format!(
+                    "turn-admission receipt for {session_id}:{prompt_seq} is invalid: {error}"
+                ))
+            })
+        })
+        .transpose()
+}
+
+fn validate_prompt_user_node(
+    connection: &Connection,
+    session_id: &SessionId,
+    prompt: &RawEnvelope,
+    text: &str,
+    attachments: &[AttachmentBlock],
+    prompt_seq: u64,
+) -> StoreResult<()> {
+    let node_seq = prompt_seq
+        .checked_add(1)
+        .ok_or_else(|| corrupt("prompt sequence space is exhausted"))?;
+    let node =
+        load_fork_coordinate_envelope(connection, session_id, node_seq)?.ok_or_else(|| {
+            prompt_fork_invalid_cut(
+                session_id,
+                prompt_seq,
+                SessionForkInvalidCutReason::Unknown,
+                "selected prompt has no committed user-turn node",
+            )
+        })?;
+    let node_is_coherent = node.run_id == prompt.run_id
+        && node.branch_id == prompt.branch_id
+        && node.agent_id == prompt.agent_id
+        && matches!(
+            decode_payload::<EventPayload>(&node.payload),
+            Ok(EventPayload::NodeCommitted(TreeNode {
+                kind: NodeKind::UserTurn {
+                    text: node_text,
+                    attachments: node_attachments,
+                },
+                ..
+            })) if node_text == text && node_attachments == attachments
+        );
+    if node_is_coherent {
+        Ok(())
+    } else {
+        Err(prompt_fork_invalid_cut(
+            session_id,
+            prompt_seq,
+            SessionForkInvalidCutReason::Unknown,
+            "selected prompt's user-turn node is missing or inconsistent",
+        ))
+    }
+}
+
+fn load_fork_coordinate_envelope(
+    connection: &Connection,
+    session_id: &SessionId,
+    seq: u64,
+) -> StoreResult<Option<RawEnvelope>> {
+    let seq_sql = to_sqlite_integer(seq)?;
+    let row = connection
+        .query_row(
+            "SELECT envelope_json, event_id, committed_at_ms
+             FROM events WHERE session_id = ?1 AND seq = ?2",
+            params![session_id.as_str(), seq_sql],
+            |row| {
+                Ok((
+                    decode_envelope_column(row, 0),
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(map_sqlite_error)?;
+    let Some((envelope, event_id, committed_at_ms)) = row else {
+        return Ok(None);
+    };
+    let envelope = envelope.map_err(|error| {
+        corrupt(format!(
+            "invalid fork-coordinate envelope for session {session_id}, seq {seq}: {error}"
+        ))
+    })?;
+    validate_stored_envelope(session_id, seq_sql, &event_id, committed_at_ms, &envelope)?;
+    Ok(Some(envelope))
+}
+
+fn prompt_fork_head_node(
+    envelopes: &[RawEnvelope],
+    owner_agent_id: Option<&AgentId>,
+) -> StoreResult<NodeId> {
+    let mut head = None;
+    for envelope in envelopes {
+        if envelope.agent_id.as_ref() != owner_agent_id
+            || payload_kind(envelope) != "node_committed"
+        {
+            continue;
+        }
+        let EventPayload::NodeCommitted(node) =
+            decode_payload::<EventPayload>(&envelope.payload)
+                .map_err(|_| corrupt("prompt-fork prefix contains an invalid history node"))?
+        else {
+            return Err(corrupt(
+                "prompt-fork payload-kind index disagrees with its history node",
+            ));
+        };
+        head = Some(node.node);
+    }
+    Ok(head.unwrap_or_else(|| NodeId::new(PROMPT_FORK_VIRTUAL_ROOT_NODE_ID)))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PromptForkToolKey {
+    branch_id: Option<BranchId>,
+    run_id: RunId,
+    agent_id: Option<AgentId>,
+    call_id: String,
+}
+
+fn validate_prompt_fork_tool_pairs(
+    session_id: &SessionId,
+    prompt_seq: u64,
+    envelopes: &[RawEnvelope],
+) -> StoreResult<()> {
+    let mut calls = HashSet::new();
+    let mut results = HashSet::new();
+    for envelope in envelopes {
+        let pair = match payload_kind(envelope) {
+            "item_tool_call" => {
+                let payload = decode_payload::<EventPayload>(&envelope.payload).map_err(|_| {
+                    corrupt("prompt-fork prefix contains an invalid tool-call payload")
+                })?;
+                let EventPayload::Item(ItemEvent::Completed {
+                    item: TurnItem::ToolCall { call_id, .. },
+                    ..
+                }) = payload
+                else {
+                    return Err(corrupt(
+                        "prompt-fork tool-call index does not name a completed tool call",
+                    ));
+                };
+                Some((true, call_id))
+            }
+            "tool_result" => {
+                let payload = decode_payload::<EventPayload>(&envelope.payload).map_err(|_| {
+                    corrupt("prompt-fork prefix contains an invalid tool-result payload")
+                })?;
+                let EventPayload::ToolResult { call_id, .. } = payload else {
+                    return Err(corrupt(
+                        "prompt-fork tool-result index does not name a tool result",
+                    ));
+                };
+                Some((false, call_id))
+            }
+            _ => None,
+        };
+        let Some((is_call, call_id)) = pair else {
+            continue;
+        };
+        let run_id = envelope.run_id.clone().ok_or_else(|| {
+            prompt_fork_invalid_cut(
+                session_id,
+                prompt_seq,
+                SessionForkInvalidCutReason::Unknown,
+                "tool exchange in copied prefix has no run coordinate",
+            )
+        })?;
+        let key = PromptForkToolKey {
+            branch_id: envelope.branch_id.clone(),
+            run_id,
+            agent_id: envelope.agent_id.clone(),
+            call_id,
+        };
+        let inserted = if is_call {
+            calls.insert(key)
+        } else {
+            results.insert(key)
+        };
+        if !inserted {
+            return Err(prompt_fork_invalid_cut(
+                session_id,
+                prompt_seq,
+                SessionForkInvalidCutReason::Unknown,
+                "copied prefix contains a duplicate tool-call/result coordinate",
+            ));
+        }
+    }
+    if calls == results {
+        Ok(())
+    } else {
+        Err(prompt_fork_invalid_cut(
+            session_id,
+            prompt_seq,
+            SessionForkInvalidCutReason::Unknown,
+            "copied prefix would contain a tool call without its result or a result without its call",
+        ))
+    }
+}
+
+fn prompt_fork_invalid_cut(
+    session_id: &SessionId,
+    seq: u64,
+    reason: SessionForkInvalidCutReason,
+    message: &str,
+) -> HaiderError {
+    let mut error = store_error(ErrorCode::InvalidArgument, message, false);
+    error.details = Some(serde_json::json!({
+        "kind": "session_fork_invalid_cut",
+        "session_id": session_id,
+        "seq": seq,
+        "reason": reason,
+    }));
+    error
+}
+
+fn prompt_fork_unstable(session_id: &SessionId, seq: u64, message: &str) -> HaiderError {
+    let mut error = store_error(ErrorCode::ForkCutUnstable, message, true);
+    error.details = Some(serde_json::json!({
+        "session_id": session_id,
+        "seq": seq,
+    }));
+    error
+}
+
 fn load_fork_source_envelopes(
     connection: &Connection,
     session_id: &SessionId,
@@ -20457,7 +21054,9 @@ fn insert_forked_envelope(connection: &Connection, envelope: &RawEnvelope) -> St
 
 fn append_fork_boundary_closures(
     connection: &Connection,
-    command: &SessionForkCommand,
+    session_id: &SessionId,
+    worker_generation: u64,
+    device_id: &DeviceId,
     now: u64,
     envelopes: &mut Vec<RawEnvelope>,
 ) -> StoreResult<()> {
@@ -20482,15 +21081,15 @@ fn append_fork_boundary_closures(
             .ok_or_else(|| corrupt("forked journal sequence space is exhausted"))?;
         let envelope = EventEnvelope {
             schema_version: SCHEMA_VERSION,
-            event_id: fork_run_boundary_event_id(&command.session_id, &run_id, agent_id.as_ref()),
+            event_id: fork_run_boundary_event_id(session_id, &run_id, agent_id.as_ref()),
             seq,
-            session_id: command.session_id.clone(),
+            session_id: session_id.clone(),
             branch_id: None,
             run_id: Some(run_id),
             agent_id,
-            device_id: command.device_id.clone(),
+            device_id: device_id.clone(),
             authority_epoch: 0,
-            worker_generation: command.worker_generation,
+            worker_generation,
             causation_id: None,
             correlation_id: None,
             committed_at_ms: now,
@@ -20518,15 +21117,15 @@ fn append_fork_boundary_closures(
         .ok_or_else(|| corrupt("forked journal sequence space is exhausted"))?;
     let idle = EventEnvelope {
         schema_version: SCHEMA_VERSION,
-        event_id: fork_boundary_event_id(&command.session_id, "session-idle"),
+        event_id: fork_boundary_event_id(session_id, "session-idle"),
         seq,
-        session_id: command.session_id.clone(),
+        session_id: session_id.clone(),
         branch_id: None,
         run_id: None,
         agent_id: None,
-        device_id: command.device_id.clone(),
+        device_id: device_id.clone(),
         authority_epoch: 0,
-        worker_generation: command.worker_generation,
+        worker_generation,
         causation_id: None,
         correlation_id: None,
         committed_at_ms: now,
@@ -22823,6 +23422,7 @@ mod reducer_filter_tests {
         let fork = SessionForked {
             source_session_id: SessionId::new("usage-source"),
             source_branch_id: None,
+            forked_from: None,
             fork_node_id: NodeId::new("fork-node"),
             fork_seq: 1,
             mode: haider_protocol::session_fork::SessionForkMode::Fork,

@@ -507,6 +507,7 @@ fn turn_setup_cache_cohort_tracks_the_active_inherited_fork_segment() {
     let audit = |context_epoch, inherited_cache_segment| SessionForked {
         source_session_id: SessionId::new("fork-parent"),
         source_branch_id: None,
+        forked_from: None,
         fork_node_id: NodeId::new("fork-node"),
         fork_seq: 10,
         mode: haider_protocol::session_fork::SessionForkMode::Fork,
