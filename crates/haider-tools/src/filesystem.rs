@@ -1411,6 +1411,7 @@ impl EffectBroker {
         // starts so no reader can reuse a pre-mutation entry through that
         // uncertainty.
         invalidate_read_memo(self.workspace_root());
+        self.invalidate_workspace_receipts();
         let relative = anchored_relative_path(self.workspace_root(), &operation.path);
         let workspace_dir = self.duplicate_workspace_dir();
         let owned_operation = operation.clone();
@@ -1573,6 +1574,7 @@ impl EffectBroker {
             return self.finish(&intent, Err(error)).await;
         }
         invalidate_read_memo(self.workspace_root());
+        self.invalidate_workspace_receipts();
         let relative = anchored_relative_path(self.workspace_root(), &operation.path);
         let workspace_dir = self.duplicate_workspace_dir();
         let owned_operation = operation.clone();
@@ -1746,6 +1748,7 @@ impl EffectBroker {
             return self.finish(&intent, Err(error)).await;
         }
         invalidate_read_memo(self.workspace_root());
+        self.invalidate_workspace_receipts();
         let source_relative = anchored_relative_path(self.workspace_root(), &operation.source);
         let destination_relative = operation
             .destination
@@ -2434,8 +2437,11 @@ fn search_files_at(
         &operation.root,
         crate::repo::WalkOptions {
             respect_gitignore: operation.respect_gitignore,
+            respect_global_gitignore: true,
             include_hidden: operation.include_hidden,
+            stable_order: true,
             max_files: SEARCH_MAX_ENUMERATED_FILES,
+            max_ignore_control_bytes: None,
             deadline: Some(started + SEARCH_WALL_TIME_BUDGET),
         },
         |entry| match entry {
@@ -2448,6 +2454,7 @@ fn search_files_at(
             crate::repo::WalkEntry::Status {
                 truncated,
                 time_budget_reached,
+                ..
             } => {
                 let matches = ensure_search_collector(
                     &mut matches,
@@ -3556,8 +3563,11 @@ fn glob_files_at(
         &operation.root,
         crate::repo::WalkOptions {
             respect_gitignore: operation.respect_gitignore,
+            respect_global_gitignore: true,
             include_hidden: operation.include_hidden,
+            stable_order: true,
             max_files: GLOB_MAX_FILES_SCANNED,
+            max_ignore_control_bytes: None,
             deadline: None,
         },
         |entry| {

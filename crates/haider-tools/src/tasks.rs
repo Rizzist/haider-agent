@@ -20,6 +20,9 @@ use crate::process::{
     read_output, reap_process_leader, set_anchored_current_dir, shell_command, signal_group,
     signal_group_for_sweep, signal_platform_group_for_sweep,
 };
+use crate::workspace_receipt::{
+    WorkspaceReceiptLease, WorkspaceStateReceipt, workspace_state_receipt,
+};
 use crate::{ToolError, ToolResult};
 use haider_platform::{ProcessGroup, ProcessId as Pid, ProcessSignal as Signal};
 use haider_protocol::effect::WorkspaceMutation;
@@ -189,7 +192,7 @@ pub struct BackgroundSpawn {
     pid_handle: Pid,
     process_group: ProcessGroup,
     workspace_root: PathBuf,
-    workspace_digest_before: String,
+    workspace_receipt: WorkspaceReceiptLease,
 }
 
 impl std::fmt::Debug for BackgroundSpawn {
@@ -256,16 +259,7 @@ impl EffectBroker {
             )
             .await?;
         let workspace_root = self.workspace_root().to_path_buf();
-        let workspace_digest_before = tokio::task::spawn_blocking({
-            let workspace_root = workspace_root.clone();
-            move || crate::process::workspace_state_digest(&workspace_root)
-        })
-        .await
-        .map_err(|error| ToolError::Runtime {
-            message: format!(
-                "workspace snapshot worker failed before background process execution: {error}"
-            ),
-        })?;
+        let workspace_receipt = self.begin_detached_workspace_receipt().await;
         let cwd_fd =
             match prepared.cwd_for_spawn(self.workspace_root(), self.duplicate_workspace_dir()?) {
                 Ok(cwd_fd) => cwd_fd,
@@ -367,7 +361,7 @@ impl EffectBroker {
             pid_handle,
             process_group: platform_group,
             workspace_root,
-            workspace_digest_before,
+            workspace_receipt,
         };
         self.finish(&intent, Ok(spawn)).await
     }
@@ -522,7 +516,7 @@ pub async fn supervise_background(
         pid_handle: pid,
         process_group: group,
         workspace_root,
-        workspace_digest_before,
+        workspace_receipt,
     } = spawn;
     let (captured_sender, mut captured) = mpsc::channel(1);
     tokio::spawn(read_output(
@@ -749,24 +743,20 @@ pub async fn supervise_background(
     if let Some(error) = &fatal {
         fault_parts.push(error.to_string());
     }
-    let workspace_mutation = match tokio::task::spawn_blocking(move || {
-        crate::process::workspace_state_digest(&workspace_root)
-    })
-    .await
-    {
-        Ok(after) => (after != workspace_digest_before).then_some(WorkspaceMutation {
-            effect_id: effect,
-            mutation_digest: after,
-            workspace_revision: None,
-            subject_digest: None,
-        }),
-        Err(error) => {
-            fault_parts.push(format!(
-                "workspace snapshot worker failed after background process execution: {error}"
-            ));
-            None
-        }
-    };
+    let after_workspace_receipt =
+        match tokio::task::spawn_blocking(move || workspace_state_receipt(&workspace_root)).await {
+            Ok(receipt) => receipt,
+            Err(_) => WorkspaceStateReceipt::worker_failed(),
+        };
+    let workspace_mutation =
+        workspace_receipt
+            .finish(after_workspace_receipt)
+            .map(|mutation_digest| WorkspaceMutation {
+                effect_id: effect,
+                mutation_digest,
+                workspace_revision: None,
+                subject_digest: None,
+            });
     BackgroundExitStatus {
         exit_code: exit_status
             .as_ref()
