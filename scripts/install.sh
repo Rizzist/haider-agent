@@ -2,7 +2,13 @@
 set -eu
 
 REPO="Rizzist/haider-agent"
-API_URL="https://api.github.com/repos/$REPO/releases?per_page=20"
+# Ask for the ONE release marked latest, never the list. The list endpoint
+# returns every release on a single line, and the greedy `.*` in the sed below
+# then matches the LAST tag_name on that line rather than the first -- which
+# silently installed the OLDEST of the 20 most recent releases (0.0.945 while
+# 0.0.964 was current). `latest` also only moves once a release has been
+# verified, so this respects that promotion gate.
+API_URL="https://api.github.com/repos/$REPO/releases/latest"
 
 fail() {
   echo "haider install: $*" >&2
@@ -43,8 +49,11 @@ detect_target() {
 
 VERSION="${HAIDER_VERSION:-}"
 if [ -z "$VERSION" ]; then
-  releases_json=$(fetch "$API_URL" 2>/dev/null || true)
-  VERSION=$(printf '%s\n' "$releases_json" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+  release_json=$(fetch "$API_URL" 2>/dev/null || true)
+  # Split on commas so every JSON field sits on its own line: POSIX sed has no
+  # non-greedy match, so `.*` would otherwise run past the field we want.
+  VERSION=$(printf '%s\n' "$release_json" | tr ',' '\n' \
+    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
 fi
 [ -n "$VERSION" ] || fail "could not determine latest version; set HAIDER_VERSION=vX.Y.Z"
 
