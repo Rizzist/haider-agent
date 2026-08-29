@@ -57,6 +57,8 @@ fn provider() -> ProviderSummaryWire {
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         endpoint: Some("http://127.0.0.1:8080".into()),
         response_open_timeout_ms: Some(45_000),
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
         models: vec!["alpha".into(), "beta".into()],
         model_details: Vec::new(),
         inventory_fetched_at_ms: Some(1),
@@ -98,6 +100,10 @@ fn add_parser_accepts_every_secret_source_and_redacts_inline_keys() {
         "anthropic".into(),
         "--response-open-timeout".into(),
         "45s".into(),
+        "--chunk-idle-timeout".into(),
+        "90s".into(),
+        "--semantic-progress-timeout".into(),
+        "5m".into(),
         "--json".into(),
     ])
     .expect("valid add");
@@ -110,6 +116,8 @@ fn add_parser_accepts_every_secret_source_and_redacts_inline_keys() {
             secret: Some(SecretInput::Direct(_)),
             api_family: Some(ProviderApiFamilyWire::AnthropicMessages),
             response_open_timeout_ms: Some(45_000),
+            chunk_idle_timeout_ms: Some(90_000),
+            semantic_progress_timeout_ms: Some(300_000),
             json: true,
             ..
         })
@@ -185,6 +193,8 @@ async fn keyed_add_reuses_one_stage_for_discovery_and_login() {
             ))),
             api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
             response_open_timeout_ms: Some(45_000),
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
             trust: None,
             json: true,
         }),
@@ -239,6 +249,8 @@ async fn no_auth_add_skips_vault_and_login_and_discovers_empty_input() {
             secret: Some(SecretInput::NoAuth),
             api_family: Some(ProviderApiFamilyWire::OpenAiChatCompletions),
             response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
             trust: None,
             json: true,
         }),
@@ -334,6 +346,8 @@ async fn update_base_key_and_timeout_preserves_immutable_shape() {
     let mut updated = provider();
     updated.endpoint = Some("https://router.example.test/v1".into());
     updated.response_open_timeout_ms = Some(90_000);
+    updated.chunk_idle_timeout_ms = Some(120_000);
+    updated.semantic_progress_timeout_ms = Some(360_000);
     let client = FakeClient::new([
         ResponseBody::ProviderList {
             providers: vec![provider()],
@@ -363,6 +377,8 @@ async fn update_base_key_and_timeout_preserves_immutable_shape() {
             ))),
             api_family: None,
             response_open_timeout_ms: Some(90_000),
+            chunk_idle_timeout_ms: Some(120_000),
+            semantic_progress_timeout_ms: Some(360_000),
             trust: None,
             json: true,
         }),
@@ -378,6 +394,8 @@ async fn update_base_key_and_timeout_preserves_immutable_shape() {
             origin: Some(origin),
             auth_requirement: Some(haider_rpc::ProviderAuthRequirementWire::ApiKey),
             response_open_timeout_ms: Some(90_000),
+            chunk_idle_timeout_ms: Some(120_000),
+            semantic_progress_timeout_ms: Some(360_000),
             models,
             probe_vault_reference: Some(reference),
             expected_revision: 20,
@@ -435,6 +453,8 @@ async fn update_to_no_auth_reuses_the_provider_and_removes_its_key() {
             secret: Some(SecretInput::NoAuth),
             api_family: None,
             response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
             trust: None,
             json: true,
         }),

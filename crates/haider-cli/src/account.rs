@@ -60,6 +60,8 @@ pub(crate) struct CustomAccountOptions {
     secret: Option<SecretInput>,
     api_family: Option<ProviderApiFamilyWire>,
     response_open_timeout_ms: Option<u64>,
+    chunk_idle_timeout_ms: Option<u64>,
+    semantic_progress_timeout_ms: Option<u64>,
     trust: Option<ProviderTrustWire>,
     json: bool,
 }
@@ -253,7 +255,7 @@ pub(crate) fn parse_account_command(rest: &[String]) -> Result<AccountCommand, S
 }
 
 fn account_usage() -> String {
-    "expected list [--json], import <codex|claude-code> [--confirm], refresh <alias>, remove <alias> --confirm, add <alias> --base-url <url> [--api-key <key> | --api-key-env <VAR> | --api-key-stdin | --no-auth] [--api-family openai|anthropic] [--response-open-timeout <duration>] [--lockdown|--full] [--json], probe <alias> [--json], or update <alias> [mutable options] [--json]".into()
+    "expected list [--json], import <codex|claude-code> [--confirm], refresh <alias>, remove <alias> --confirm, add <alias> --base-url <url> [--api-key <key> | --api-key-env <VAR> | --api-key-stdin | --no-auth] [--api-family openai|anthropic] [--response-open-timeout <duration>] [--chunk-idle-timeout <duration>] [--semantic-progress-timeout <duration>] [--lockdown|--full] [--json], probe <alias> [--json], or update <alias> [mutable options] [--json]".into()
 }
 
 fn parse_custom_options(
@@ -265,6 +267,8 @@ fn parse_custom_options(
     let mut secret = None;
     let mut api_family = None;
     let mut response_open_timeout_ms = None;
+    let mut chunk_idle_timeout_ms = None;
+    let mut semantic_progress_timeout_ms = None;
     let mut trust = None;
     let mut json = false;
     let mut index = 0;
@@ -300,7 +304,14 @@ fn parse_custom_options(
                 });
             }
             "--response-open-timeout" if response_open_timeout_ms.is_none() => {
-                response_open_timeout_ms = Some(parse_duration_ms(value(&mut index, flag)?)?);
+                response_open_timeout_ms = Some(parse_duration_ms(flag, value(&mut index, flag)?)?);
+            }
+            "--chunk-idle-timeout" if chunk_idle_timeout_ms.is_none() => {
+                chunk_idle_timeout_ms = Some(parse_duration_ms(flag, value(&mut index, flag)?)?);
+            }
+            "--semantic-progress-timeout" if semantic_progress_timeout_ms.is_none() => {
+                semantic_progress_timeout_ms =
+                    Some(parse_duration_ms(flag, value(&mut index, flag)?)?);
             }
             "--lockdown" if trust.is_none() => trust = Some(ProviderTrustWire::Lockdown),
             "--full" if trust.is_none() => trust = Some(ProviderTrustWire::Full),
@@ -322,9 +333,15 @@ fn parse_custom_options(
     if create && secret.is_none() {
         return Err("account add requires an API-key source or --no-auth".into());
     }
-    if !create && base_url.is_none() && secret.is_none() && response_open_timeout_ms.is_none() {
+    if !create
+        && base_url.is_none()
+        && secret.is_none()
+        && response_open_timeout_ms.is_none()
+        && chunk_idle_timeout_ms.is_none()
+        && semantic_progress_timeout_ms.is_none()
+    {
         return Err(
-            "account update requires --base-url, a key option, or --response-open-timeout".into(),
+            "account update requires --base-url, a key option, or a transport timeout".into(),
         );
     }
     if !create && api_family.is_some() {
@@ -343,12 +360,14 @@ fn parse_custom_options(
         secret,
         api_family: api_family.or(create.then_some(ProviderApiFamilyWire::OpenAiChatCompletions)),
         response_open_timeout_ms,
+        chunk_idle_timeout_ms,
+        semantic_progress_timeout_ms,
         trust,
         json,
     })
 }
 
-fn parse_duration_ms(value: &str) -> Result<u64, String> {
+fn parse_duration_ms(flag: &str, value: &str) -> Result<u64, String> {
     let (digits, multiplier) = if let Some(value) = value.strip_suffix("ms") {
         (value, 1_u64)
     } else if let Some(value) = value.strip_suffix('s') {
@@ -358,18 +377,18 @@ fn parse_duration_ms(value: &str) -> Result<u64, String> {
     } else if let Some(value) = value.strip_suffix('h') {
         (value, 3_600_000)
     } else {
-        return Err(
-            "--response-open-timeout requires an integer followed by ms, s, m, or h".into(),
-        );
+        return Err(format!(
+            "{flag} requires an integer followed by ms, s, m, or h"
+        ));
     };
     let amount = digits
         .parse::<u64>()
-        .map_err(|_| "--response-open-timeout requires a positive integer duration".to_owned())?;
+        .map_err(|_| format!("{flag} requires a positive integer duration"))?;
     let millis = amount
         .checked_mul(multiplier)
-        .ok_or_else(|| "--response-open-timeout is too large".to_owned())?;
+        .ok_or_else(|| format!("{flag} is too large"))?;
     if millis == 0 {
-        return Err("--response-open-timeout must be greater than zero".into());
+        return Err(format!("{flag} must be greater than zero"));
     }
     Ok(millis)
 }
@@ -738,6 +757,8 @@ async fn execute_custom(
             models: Vec::new(),
             default_model: existing.and_then(|provider| provider.default_model.clone()),
             response_open_timeout_ms: options.response_open_timeout_ms,
+            chunk_idle_timeout_ms: options.chunk_idle_timeout_ms,
+            semantic_progress_timeout_ms: options.semantic_progress_timeout_ms,
             probe_vault_reference: vault_reference.clone(),
             trust: options.trust,
             expected_revision: revision,

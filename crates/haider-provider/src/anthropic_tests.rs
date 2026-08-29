@@ -1364,6 +1364,7 @@ impl HangingFixture {
 impl SseChunkSource for HangingFixture {
     async fn next_chunk(
         &mut self,
+        _route_gating: crate::RouteGating,
     ) -> Result<Option<impl AsRef<[u8]> + Send + 'static>, ProviderError> {
         if let Some(chunk) = self.first_chunk.take() {
             return Ok(Some(chunk));
@@ -1381,6 +1382,8 @@ async fn hanging_mid_turn_fixture_times_out_only_the_idle_chunk_await() {
         None,
         sender,
         Duration::from_secs(90),
+        Duration::from_secs(5 * 60),
+        crate::RouteGating::Enabled,
     ));
 
     assert_eq!(

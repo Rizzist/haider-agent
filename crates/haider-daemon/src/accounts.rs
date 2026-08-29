@@ -7304,6 +7304,8 @@ const ACCOUNT_PROVIDER_ADAPTER_CACHE_CAPACITY: usize = 64;
 struct AccountProviderProfileCacheKey {
     endpoint: Option<String>,
     response_open_timeout_ms: Option<u64>,
+    chunk_idle_timeout_ms: Option<u64>,
+    semantic_progress_timeout_ms: Option<u64>,
     openai_chat_completions: bool,
     auth_methods: Vec<AuthMethod>,
     selected_model: Option<AccountProviderModelCacheKey>,
@@ -7328,6 +7330,8 @@ impl AccountProviderProfileCacheKey {
         Self {
             endpoint: profile.endpoint.clone(),
             response_open_timeout_ms: profile.response_open_timeout_ms,
+            chunk_idle_timeout_ms: profile.chunk_idle_timeout_ms,
+            semantic_progress_timeout_ms: profile.semantic_progress_timeout_ms,
             openai_chat_completions: matches!(
                 profile.api_family,
                 ProviderApiFamilyWire::OpenAiChatCompletions
@@ -8047,6 +8051,12 @@ fn openai_transport_config(profile: Option<&ProviderSummaryWire>) -> OpenAiTrans
     if let Some(timeout_ms) = profile.and_then(|profile| profile.response_open_timeout_ms) {
         config.response_open_timeout = Duration::from_millis(timeout_ms);
     }
+    if let Some(timeout_ms) = profile.and_then(|profile| profile.chunk_idle_timeout_ms) {
+        config.chunk_idle_timeout = Duration::from_millis(timeout_ms);
+    }
+    if let Some(timeout_ms) = profile.and_then(|profile| profile.semantic_progress_timeout_ms) {
+        config.semantic_progress_timeout = Duration::from_millis(timeout_ms);
+    }
     config
 }
 
@@ -8054,6 +8064,12 @@ fn anthropic_transport_config(profile: Option<&ProviderSummaryWire>) -> Anthropi
     let mut transport = AnthropicProvider::transport_config();
     if let Some(timeout_ms) = profile.and_then(|profile| profile.response_open_timeout_ms) {
         transport.response_open_timeout = Duration::from_millis(timeout_ms);
+    }
+    if let Some(timeout_ms) = profile.and_then(|profile| profile.chunk_idle_timeout_ms) {
+        transport.chunk_idle_timeout = Duration::from_millis(timeout_ms);
+    }
+    if let Some(timeout_ms) = profile.and_then(|profile| profile.semantic_progress_timeout_ms) {
+        transport.semantic_progress_timeout = Duration::from_millis(timeout_ms);
     }
     transport
 }
@@ -8743,6 +8759,10 @@ impl std::fmt::Debug for IdentityAnnotatedProvider {
 
 #[async_trait::async_trait]
 impl Provider for IdentityAnnotatedProvider {
+    fn trusts_default_route_absence(&self) -> bool {
+        self.inner.trusts_default_route_absence()
+    }
+
     fn credential_surface(&self) -> haider_provider::ProviderCredentialSurface {
         self.inner.credential_surface()
     }
@@ -8992,6 +9012,7 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
             | ProviderErrorKind::Overloaded
             | ProviderErrorKind::ContextExceeded
             | ProviderErrorKind::InvalidRequest
+            | ProviderErrorKind::NetworkUnavailable
             | ProviderErrorKind::Transport
             | ProviderErrorKind::MalformedFrame
             | ProviderErrorKind::InvalidUtf8

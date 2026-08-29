@@ -6,7 +6,7 @@ use crate::history::NodeKind;
 use crate::ids::ArtifactRef;
 use crate::item::{ItemDelta, ItemEvent, ToolStatus, TurnItem};
 use crate::peer::{PeerKind, PeerTrust};
-use crate::state::RunState;
+use crate::state::{RunState, WaitReason};
 use crate::tool::{BoundedResult, ToolResultStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -916,6 +916,38 @@ struct ErrorRow {
     ordinal: u32,
 }
 
+/// Self-sufficient provider-wait fact for Pipe/JSONL automation. The row
+/// carries its run and reason directly; consumers never infer it from a later
+/// retry or transcript record.
+#[derive(Serialize)]
+struct WaitingRow {
+    kind: &'static str,
+    reason: WaitReason,
+    at_ms: u64,
+    seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch_id: Option<String>,
+    run_id: String,
+    ordinal: u32,
+}
+
+/// Self-sufficient retry fact; attempt, ceiling, delay, and reason remain on
+/// the fact that introduced them rather than being folded into transcript.
+#[derive(Serialize)]
+struct RetryingRow {
+    kind: &'static str,
+    attempt: u32,
+    max: u32,
+    delay_ms: u64,
+    reason: WaitReason,
+    at_ms: u64,
+    seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch_id: Option<String>,
+    run_id: String,
+    ordinal: u32,
+}
+
 #[derive(Serialize)]
 struct ToolRow {
     role: &'static str,
@@ -957,6 +989,8 @@ enum SidecarRowKind {
     PeerMessage(PeerMessageRow),
     Incomplete(IncompleteRow),
     Error(ErrorRow),
+    Waiting(WaitingRow),
+    Retrying(RetryingRow),
     Tool(ToolRow),
     CompactionBoundary(CompactionBoundaryRow),
 }
@@ -1022,6 +1056,8 @@ impl SidecarRow {
             SidecarRowKind::PeerMessage(row) => row.seq,
             SidecarRowKind::Incomplete(row) => row.seq,
             SidecarRowKind::Error(row) => row.seq,
+            SidecarRowKind::Waiting(row) => row.seq,
+            SidecarRowKind::Retrying(row) => row.seq,
             SidecarRowKind::Tool(row) => row.seq,
             SidecarRowKind::CompactionBoundary(row) => row.seq,
         }
@@ -1075,6 +1111,23 @@ impl SidecarRow {
                     "{}: {}",
                     row.presentation.title, row.presentation.detail
                 )),
+            ),
+            SidecarRowKind::Waiting(row) => format!(
+                "W  {} {} reason={} run={}",
+                row.seq,
+                row.at_ms,
+                escape_pipe_field(&wait_reason_wire_name(&row.reason)),
+                escape_pipe_field(&row.run_id),
+            ),
+            SidecarRowKind::Retrying(row) => format!(
+                "R  {} {} attempt={} max={} delay_ms={} reason={} run={}",
+                row.seq,
+                row.at_ms,
+                row.attempt,
+                row.max,
+                row.delay_ms,
+                escape_pipe_field(&wait_reason_wire_name(&row.reason)),
+                escape_pipe_field(&row.run_id),
             ),
             SidecarRowKind::Tool(row) => {
                 let mut line = format!(
@@ -1139,6 +1192,24 @@ fn tool_result_status_wire_name(status: ToolResultStatus) -> &'static str {
         ToolResultStatus::Failed => "failed",
         ToolResultStatus::Cancelled => "cancelled",
         ToolResultStatus::Unknown => "unknown",
+    }
+}
+
+fn wait_reason_wire_name(reason: &WaitReason) -> String {
+    match reason {
+        WaitReason::NetworkUnavailable => "network_unavailable".into(),
+        WaitReason::ProviderBackoff => "provider_backoff".into(),
+        WaitReason::RateLimit => "rate_limit".into(),
+        WaitReason::RemoteChild => "remote_child".into(),
+        WaitReason::LocalChild => "local_child".into(),
+        WaitReason::DeviceUnreachable => "device_unreachable".into(),
+        WaitReason::BlockingHook => "blocking_hook".into(),
+        WaitReason::Dependency => "dependency".into(),
+        WaitReason::VerifyHold => "verify_hold".into(),
+        WaitReason::VerifyQueue => "verify_queue".into(),
+        WaitReason::WorkspaceSettlement => "workspace_settlement".into(),
+        WaitReason::WorkspaceVerify => "workspace_verify".into(),
+        WaitReason::Other { tag } => format!("other:{tag}"),
     }
 }
 
@@ -1222,6 +1293,10 @@ fn sidecar_projection(
         Some("run_failed") => payload_value
             .get("presentation")
             .is_some_and(|presentation| presentation.is_object()),
+        Some("run_state") => payload_value
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|state| matches!(state, "waiting" | "retrying")),
         Some("peer.message") => true,
         _ => false,
     };
@@ -1345,6 +1420,38 @@ fn sidecar_projection(
             })),
             unresolved_tool: None,
         }),
+        EventPayload::RunState(RunState::Waiting { reason }) => Some(SidecarProjection {
+            row: SidecarRow(SidecarRowKind::Waiting(WaitingRow {
+                kind: "waiting",
+                reason,
+                at_ms,
+                seq,
+                branch_id,
+                run_id: envelope.run_id.as_ref()?.as_str().to_owned(),
+                ordinal: 0,
+            })),
+            unresolved_tool: None,
+        }),
+        EventPayload::RunState(RunState::Retrying {
+            attempt,
+            max,
+            delay_ms,
+            reason,
+        }) => Some(SidecarProjection {
+            row: SidecarRow(SidecarRowKind::Retrying(RetryingRow {
+                kind: "retrying",
+                attempt,
+                max,
+                delay_ms,
+                reason,
+                at_ms,
+                seq,
+                branch_id,
+                run_id: envelope.run_id.as_ref()?.as_str().to_owned(),
+                ordinal: 0,
+            })),
+            unresolved_tool: None,
+        }),
         _ => None,
     }
 }
@@ -1370,8 +1477,8 @@ pub fn escape_pipe_field(text: &str) -> String {
 
 /// Render one durable envelope as an instruct-pipe body line.
 ///
-/// Facts outside the transcript projection, including unknown future payloads,
-/// return `None` and do not create a body line.
+/// Facts outside the transcript/provider-lifecycle projection, including
+/// unknown future payloads, return `None` and do not create a body line.
 #[must_use]
 pub fn pipe_body_line(envelope: &RawEnvelope) -> Option<String> {
     pipe_body_line_with(&mut TranscriptJoiner::default(), envelope)
@@ -1739,6 +1846,54 @@ mod tests {
             pipe_body_line(&event).as_deref(),
             Some(
                 "P  11 1700000000011 |reviewer| |inspect \\| this\\ncarefully| kind=external trust=untrusted_external id=|peer-msg-11|"
+            )
+        );
+    }
+
+    #[test]
+    fn waiting_and_retrying_are_self_sufficient_pipe_rows() {
+        let mut waiting = envelope(
+            12,
+            EventPayload::RunState(RunState::Waiting {
+                reason: WaitReason::NetworkUnavailable,
+            }),
+        );
+        waiting.run_id = Some(RunId::new("run-network-wait"));
+        let mut retrying = envelope(
+            13,
+            EventPayload::RunState(RunState::Retrying {
+                attempt: 3,
+                max: 10,
+                delay_ms: 1_250,
+                reason: WaitReason::ProviderBackoff,
+            }),
+        );
+        retrying.run_id = Some(RunId::new("run-provider-retry"));
+
+        let waiting_json: serde_json::Value =
+            serde_json::from_str(&sidecar_row_line(&waiting).expect("waiting row projects"))
+                .expect("waiting row JSON");
+        assert_eq!(waiting_json["kind"], "waiting");
+        assert_eq!(waiting_json["reason"]["reason"], "network_unavailable");
+        assert_eq!(waiting_json["run_id"], "run-network-wait");
+        assert_eq!(
+            pipe_body_line(&waiting).as_deref(),
+            Some("W  12 1700000000012 reason=|network_unavailable| run=|run-network-wait|")
+        );
+
+        let retrying_json: serde_json::Value =
+            serde_json::from_str(&sidecar_row_line(&retrying).expect("retrying row projects"))
+                .expect("retrying row JSON");
+        assert_eq!(retrying_json["kind"], "retrying");
+        assert_eq!(retrying_json["attempt"], 3);
+        assert_eq!(retrying_json["max"], 10);
+        assert_eq!(retrying_json["delay_ms"], 1_250);
+        assert_eq!(retrying_json["reason"]["reason"], "provider_backoff");
+        assert_eq!(retrying_json["run_id"], "run-provider-retry");
+        assert_eq!(
+            pipe_body_line(&retrying).as_deref(),
+            Some(
+                "R  13 1700000000013 attempt=3 max=10 delay_ms=1250 reason=|provider_backoff| run=|run-provider-retry|"
             )
         );
     }

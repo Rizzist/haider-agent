@@ -1794,6 +1794,7 @@ pub(crate) const fn provider_kind_name(kind: ProviderErrorKind) -> &'static str 
         ProviderErrorKind::Overloaded => "an overloaded error",
         ProviderErrorKind::ContextExceeded => "a context-window-exceeded error",
         ProviderErrorKind::InvalidRequest => "an invalid-request error",
+        ProviderErrorKind::NetworkUnavailable => "a local network-unavailable error",
         ProviderErrorKind::Transport => "a transport error",
         ProviderErrorKind::MalformedFrame => "a malformed-frame error",
         ProviderErrorKind::InvalidUtf8 => "an invalid-UTF-8 error",

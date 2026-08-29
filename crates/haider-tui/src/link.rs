@@ -1614,6 +1614,8 @@ pub fn request_body_for_features(
                 models,
                 default_model,
                 response_open_timeout_ms: None,
+                chunk_idle_timeout_ms: None,
+                semantic_progress_timeout_ms: None,
                 probe_vault_reference,
                 trust: None,
                 expected_revision,

@@ -138,6 +138,7 @@ pub const OPENAI_DEFAULT_TRANSPORT_CONFIG: OpenAiTransportConfig = OpenAiTranspo
     connect_timeout: Duration::from_secs(10),
     response_open_timeout: Duration::from_secs(60),
     chunk_idle_timeout: Duration::from_secs(90),
+    semantic_progress_timeout: Duration::from_secs(5 * 60),
 };
 
 static OPENAI_CLIENT_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -298,6 +299,9 @@ pub struct OpenAiTransportConfig {
     pub response_open_timeout: Duration,
     /// Maximum silence between response-body chunks (90 seconds by default).
     pub chunk_idle_timeout: Duration,
+    /// Maximum active-route time without model content, tool use, or usage.
+    /// Raw SSE comments and heartbeats do not reset this five-minute clock.
+    pub semantic_progress_timeout: Duration,
 }
 
 impl Default for OpenAiTransportConfig {
@@ -546,6 +550,7 @@ impl OpenAiHttp {
         &self,
         url: &str,
         body: Vec<u8>,
+        route_gating: crate::RouteGating,
     ) -> Result<reqwest::Response, ProviderError> {
         let request = connect_before_deadline(
             self.transport_config.connect_timeout,
@@ -553,12 +558,16 @@ impl OpenAiHttp {
         )
         .await?;
         let opening = async {
-            self.client
-                .execute(request)
-                .await
-                .map_err(|error| transport_error_with_config(error, self.transport_config))
+            self.client.execute(request).await.map_err(|error| {
+                transport_error_with_config(error, self.transport_config, route_gating)
+            })
         };
-        response_before_deadline(self.transport_config.response_open_timeout, opening).await
+        response_before_deadline(
+            self.transport_config.response_open_timeout,
+            opening,
+            route_gating,
+        )
+        .await
     }
 
     async fn post_json_body_request(
@@ -590,17 +599,25 @@ impl OpenAiHttp {
         Ok(request)
     }
 
-    async fn get(&self, url: &str) -> Result<reqwest::Response, ProviderError> {
+    async fn get(
+        &self,
+        url: &str,
+        route_gating: crate::RouteGating,
+    ) -> Result<reqwest::Response, ProviderError> {
         let request =
             connect_before_deadline(self.transport_config.connect_timeout, self.get_request(url))
                 .await?;
         let opening = async {
-            self.client
-                .execute(request)
-                .await
-                .map_err(|error| transport_error_with_config(error, self.transport_config))
+            self.client.execute(request).await.map_err(|error| {
+                transport_error_with_config(error, self.transport_config, route_gating)
+            })
         };
-        response_before_deadline(self.transport_config.response_open_timeout, opening).await
+        response_before_deadline(
+            self.transport_config.response_open_timeout,
+            opening,
+            route_gating,
+        )
+        .await
     }
 
     async fn get_request(&self, url: &str) -> Result<reqwest::Request, ProviderError> {
@@ -825,7 +842,10 @@ impl OpenAiProvider {
         };
         refresh_openai_cache_routing(request, self.http.codex_responses_lite, &mut payload, None);
         let body = crate::serialize_json_body(payload)?;
-        self.http.post_json_body(&self.api_url, body).await
+        let route_gating = crate::RouteGating::for_endpoint(&self.api_url);
+        self.http
+            .post_json_body(&self.api_url, body, route_gating)
+            .await
     }
 
     async fn stream_turn_ref(
@@ -839,7 +859,9 @@ impl OpenAiProvider {
             response,
             self.http.account.clone(),
             self.http.transport_config.chunk_idle_timeout,
+            self.http.transport_config.semantic_progress_timeout,
             DecoderKind::Responses(computer_kind),
+            crate::RouteGating::for_endpoint(&self.api_url),
         )
         .await
     }
@@ -847,6 +869,10 @@ impl OpenAiProvider {
 
 #[async_trait]
 impl Provider for OpenAiProvider {
+    fn trusts_default_route_absence(&self) -> bool {
+        crate::RouteGating::for_endpoint(&self.api_url).enabled()
+    }
+
     fn credential_surface(&self) -> crate::ProviderCredentialSurface {
         if self.http.codex_responses_lite {
             crate::ProviderCredentialSurface::OAuthSubscriptionBearer
@@ -1081,6 +1107,19 @@ pub enum KimiThinkingType {
 }
 
 impl OpenAiCompatibleProvider {
+    fn route_gating(&self) -> crate::RouteGating {
+        if self.dialect == CompatibleDialect::Generic
+            && self.http.auth_header_mode != OpenAiAuthHeaderMode::AzureApiKey
+        {
+            // Generic user endpoints may be loopback, LAN, or host-file
+            // services even when their configured URL uses a hostname. A
+            // missing default route is not authoritative for that surface.
+            crate::RouteGating::Disabled
+        } else {
+            crate::RouteGating::for_endpoint(&self.chat_url)
+        }
+    }
+
     pub fn new(
         credential: SecretHandle,
         model: impl Into<String>,
@@ -1651,7 +1690,7 @@ impl OpenAiCompatibleProvider {
     /// from the daemon's cached catalog through
     /// [`Self::with_cached_catalog_model`].
     pub async fn probe_capabilities(&self) -> Result<CapabilityDoc, ProviderError> {
-        let response = self.http.get(&self.models_url).await?;
+        let response = self.http.get(&self.models_url, self.route_gating()).await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let error = http_error_from_response(response).await;
@@ -1695,13 +1734,16 @@ impl OpenAiCompatibleProvider {
         )
         .await?;
         let opening = async {
-            self.http
-                .client
-                .execute(outbound)
-                .await
-                .map_err(|error| transport_error_with_config(error, self.http.transport_config))
+            self.http.client.execute(outbound).await.map_err(|error| {
+                transport_error_with_config(error, self.http.transport_config, self.route_gating())
+            })
         };
-        response_before_deadline(self.http.transport_config.response_open_timeout, opening).await
+        response_before_deadline(
+            self.http.transport_config.response_open_timeout,
+            opening,
+            self.route_gating(),
+        )
+        .await
     }
 
     async fn inference_request(
@@ -1767,7 +1809,9 @@ impl OpenAiCompatibleProvider {
             response,
             self.http.account.clone(),
             self.http.transport_config.chunk_idle_timeout,
+            self.http.transport_config.semantic_progress_timeout,
             DecoderKind::Chat(self.dialect),
+            self.route_gating(),
         )
         .await
     }
@@ -1775,6 +1819,10 @@ impl OpenAiCompatibleProvider {
 
 #[async_trait]
 impl Provider for OpenAiCompatibleProvider {
+    fn trusts_default_route_absence(&self) -> bool {
+        self.route_gating().enabled()
+    }
+
     fn credential_surface(&self) -> crate::ProviderCredentialSurface {
         match self.dialect {
             CompatibleDialect::Generic
@@ -2012,7 +2060,9 @@ async fn checked_stream(
     response: reqwest::Response,
     account: Option<CredentialAlias>,
     chunk_idle_timeout: Duration,
+    semantic_progress_timeout: Duration,
     decoder: DecoderKind,
+    route_gating: crate::RouteGating,
 ) -> Result<ProviderStream, ProviderError> {
     if !response.status().is_success() {
         let status = response.status().as_u16();
@@ -2026,7 +2076,16 @@ async fn checked_stream(
     }
     let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
     let producer = tokio::spawn(async move {
-        stream_response(response, account, sender, chunk_idle_timeout, decoder).await;
+        stream_response(
+            response,
+            account,
+            sender,
+            chunk_idle_timeout,
+            semantic_progress_timeout,
+            decoder,
+            route_gating,
+        )
+        .await;
     });
     Ok(ProviderStream::owned(receiver, producer))
 }
@@ -2157,22 +2216,37 @@ async fn stream_response(
     account: Option<CredentialAlias>,
     sender: mpsc::Sender<ProviderStreamItem>,
     chunk_idle_timeout: Duration,
+    semantic_progress_timeout: Duration,
     kind: DecoderKind,
+    route_gating: crate::RouteGating,
 ) {
-    stream_sse_source(response, account, sender, chunk_idle_timeout, kind).await;
+    stream_sse_source(
+        response,
+        account,
+        sender,
+        chunk_idle_timeout,
+        semantic_progress_timeout,
+        kind,
+        route_gating,
+    )
+    .await;
 }
 
 trait SseChunkSource {
     async fn next_chunk(
         &mut self,
+        route_gating: crate::RouteGating,
     ) -> Result<Option<impl AsRef<[u8]> + Send + 'static>, ProviderError>;
 }
 
 impl SseChunkSource for reqwest::Response {
     async fn next_chunk(
         &mut self,
+        route_gating: crate::RouteGating,
     ) -> Result<Option<impl AsRef<[u8]> + Send + 'static>, ProviderError> {
-        self.chunk().await.map_err(transport_error)
+        self.chunk()
+            .await
+            .map_err(|error| transport_error_for_route(error, route_gating))
     }
 }
 
@@ -2181,7 +2255,9 @@ async fn stream_sse_source<S: SseChunkSource>(
     account: Option<CredentialAlias>,
     sender: mpsc::Sender<ProviderStreamItem>,
     chunk_idle_timeout: Duration,
+    semantic_progress_timeout: Duration,
     kind: DecoderKind,
+    route_gating: crate::RouteGating,
 ) {
     let mut decoder = match kind {
         DecoderKind::Responses(computer_kind) => {
@@ -2189,26 +2265,48 @@ async fn stream_sse_source<S: SseChunkSource>(
         }
         DecoderKind::Chat(dialect) => OpenAiDecoder::Chat(ChatDecoder::new(account, dialect)),
     };
+    let mut progress = crate::ProviderProgressClock::new(
+        chunk_idle_timeout,
+        semantic_progress_timeout,
+        route_gating,
+    );
     loop {
-        let chunk = match tokio::time::timeout(chunk_idle_timeout, source.next_chunk()).await {
-            Ok(Ok(Some(chunk))) => chunk,
-            Ok(Ok(None)) => {
+        let chunk = match progress
+            .wait_for_next(source.next_chunk(route_gating), &sender)
+            .await
+        {
+            Ok(Some(Ok(Some(chunk)))) => chunk,
+            Ok(Some(Ok(None))) => {
                 let items = decoder.finish();
                 let _ = send_items(&sender, items).await;
                 return;
             }
-            Ok(Err(error)) => {
+            Ok(Some(Err(error))) => {
                 let _ = sender.send(Err(error)).await;
                 return;
             }
-            Err(_) => {
+            Ok(None) => return,
+            Err(crate::ProgressClockExpired::ChunkIdle) => {
                 let _ = sender
                     .send(Err(stream_idle_error(chunk_idle_timeout)))
                     .await;
                 return;
             }
+            Err(crate::ProgressClockExpired::SemanticIdle) => {
+                let _ = sender
+                    .send(Err(crate::semantic_progress_timeout_error(
+                        "OpenAI",
+                        semantic_progress_timeout,
+                    )))
+                    .await;
+                return;
+            }
         };
+        progress.observe_raw_chunk();
         let items = decoder.push(chunk.as_ref());
+        if crate::has_semantic_progress(&items) {
+            progress.observe_semantic_progress();
+        }
         if !send_items(&sender, items).await || decoder.is_terminal() {
             return;
         }
@@ -5559,9 +5657,14 @@ pub async fn validate_openai_compatible_endpoint(
         OPENAI_DEFAULT_TRANSPORT_CONFIG.response_open_timeout,
         async {
             opening.await.map_err(|error| {
-                transport_error_with_config(error, OPENAI_DEFAULT_TRANSPORT_CONFIG)
+                transport_error_with_config(
+                    error,
+                    OPENAI_DEFAULT_TRANSPORT_CONFIG,
+                    crate::RouteGating::Disabled,
+                )
             })
         },
+        crate::RouteGating::Disabled,
     )
     .await?;
     if response.status().is_redirection() {
@@ -6189,12 +6292,20 @@ fn transport_error(error: reqwest::Error) -> ProviderError {
     crate::reqwest_transport_error("OpenAI", error)
 }
 
+fn transport_error_for_route(
+    error: reqwest::Error,
+    route_gating: crate::RouteGating,
+) -> ProviderError {
+    crate::reqwest_transport_error_with_route_gating("OpenAI", error, route_gating)
+}
+
 fn transport_error_with_config(
     error: reqwest::Error,
     transport_config: OpenAiTransportConfig,
+    route_gating: crate::RouteGating,
 ) -> ProviderError {
     let connect_timeout_fired = error.is_timeout() && error.is_connect();
-    let mut error = transport_error(error);
+    let mut error = transport_error_for_route(error, route_gating);
     if connect_timeout_fired {
         let budget_ms = duration_ms(transport_config.connect_timeout);
         error.message = format!(
@@ -6211,6 +6322,7 @@ fn validate_transport_config(config: OpenAiTransportConfig) -> Result<(), Provid
     if config.connect_timeout.is_zero()
         || config.response_open_timeout.is_zero()
         || config.chunk_idle_timeout.is_zero()
+        || config.semantic_progress_timeout.is_zero()
     {
         return Err(invalid_request(
             "OpenAI transport timeout budgets must be greater than zero",
@@ -6226,10 +6338,11 @@ fn duration_ms(duration: Duration) -> u64 {
 async fn response_before_deadline<T>(
     timeout: Duration,
     opening: impl Future<Output = Result<T, ProviderError>>,
+    route_gating: crate::RouteGating,
 ) -> Result<T, ProviderError> {
     let selected = request_phase_budget(timeout)?;
     let started = tokio::time::Instant::now();
-    match tokio::time::timeout(selected, opening).await {
+    match crate::route_gated_timeout(selected, opening, route_gating).await {
         Ok(result) => result,
         Err(_) if selected < timeout => {
             Err(crate::deadline_exhausted_error(selected, started.elapsed()))

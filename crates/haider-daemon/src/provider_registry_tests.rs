@@ -335,6 +335,8 @@ fn enabled_profile_with_unknown_api_family_is_never_available() {
             api_family: ProviderApiFamilyWire::Unknown,
             base_url: Some("https://api.future.example".to_owned()),
             response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
             enabled: true,
             auth_requirement: ProviderAuthRequirementWire::Unknown,
             configured_models: vec!["future-model".to_owned()],
@@ -448,6 +450,8 @@ fn configured_default_must_come_from_the_discovered_inventory() {
             models: vec!["configured-only".to_owned()],
             default_model: Some("configured-only".to_owned()),
             response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
             trust: None,
         })
         .expect_err("undiscovered default must fail");
@@ -497,6 +501,8 @@ fn new_custom_provider_defaults_full_and_typed_setter_persists() {
             models: vec!["search-1".to_owned()],
             default_model: Some("search-1".to_owned()),
             response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
             trust: None,
         })
         .expect("create custom provider");
@@ -539,6 +545,8 @@ fn existing_provider_trust_changes_require_the_typed_setter() {
         models: vec!["research-model".to_owned()],
         default_model: Some("research-model".to_owned()),
         response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
         trust: Some(ProviderTrustWire::Lockdown),
     };
     registry
@@ -603,6 +611,8 @@ fn provider_response_open_timeout_override_must_be_nonzero() {
             models: vec!["probe-model".to_owned()],
             default_model: Some("probe-model".to_owned()),
             response_open_timeout_ms: Some(0),
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
             trust: None,
         })
         .expect_err("a zero response-open budget must fail typed validation");
@@ -629,6 +639,8 @@ fn existing_custom_provider_keeps_api_family_and_switches_auth_in_place() {
             models: vec!["frontier-a".to_owned()],
             default_model: Some("frontier-a".to_owned()),
             response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
             trust: None,
         })
         .expect("create custom");
@@ -642,6 +654,8 @@ fn existing_custom_provider_keeps_api_family_and_switches_auth_in_place() {
             models: vec!["frontier-a".to_owned()],
             default_model: Some("frontier-a".to_owned()),
             response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
             trust: None,
         })
         .expect_err("API-family mutation must fail");
@@ -657,6 +671,8 @@ fn existing_custom_provider_keeps_api_family_and_switches_auth_in_place() {
             models: vec!["frontier-a".to_owned()],
             default_model: Some("frontier-a".to_owned()),
             response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
             trust: None,
         })
         .expect("custom auth requirement is mutable in place");
@@ -671,6 +687,8 @@ fn existing_custom_provider_keeps_api_family_and_switches_auth_in_place() {
             models: vec!["frontier-a".to_owned()],
             default_model: Some("frontier-a".to_owned()),
             response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
             trust: None,
         })
         .expect("custom provider can return to keyed mode");
@@ -695,6 +713,8 @@ fn summaries_report_pickable_discovered_models_not_profile_literals() {
             api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
             base_url: Some("https://models.example.com".to_owned()),
             response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
             enabled: true,
             auth_requirement: ProviderAuthRequirementWire::ApiKey,
             configured_models: vec!["literal-guess".to_owned()],
@@ -739,6 +759,8 @@ fn custom_summary_preserves_configured_default_across_mismatched_and_empty_catal
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         base_url: Some("https://bench.example.invalid/v1".to_owned()),
         response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
         enabled: true,
         auth_requirement: ProviderAuthRequirementWire::None,
         configured_models: vec!["deepseek-v4-flash".to_owned()],
@@ -796,6 +818,8 @@ fn summaries_align_model_details_with_pickable_models_and_windows() {
             api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
             base_url: Some("https://models.example.com".to_owned()),
             response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
             enabled: true,
             auth_requirement: ProviderAuthRequirementWire::ApiKey,
             configured_models: Vec::new(),
@@ -1116,11 +1140,15 @@ fn a_new_provider_creates_one_shot_on_its_stated_inventory() {
             models: vec!["probe-model".to_owned()],
             default_model: Some("probe-model".to_owned()),
             response_open_timeout_ms: Some(75_000),
+            chunk_idle_timeout_ms: Some(95_000),
+            semantic_progress_timeout_ms: Some(305_000),
             trust: None,
         })
         .expect("a stated inventory carries the one-shot create");
     assert_eq!(profile.default_model.as_deref(), Some("probe-model"));
     assert_eq!(profile.response_open_timeout_ms, Some(75_000));
+    assert_eq!(profile.chunk_idle_timeout_ms, Some(95_000));
+    assert_eq!(profile.semantic_progress_timeout_ms, Some(305_000));
     assert_eq!(
         registry
             .summary("probe", &|_| true)
@@ -1129,6 +1157,11 @@ fn a_new_provider_creates_one_shot_on_its_stated_inventory() {
         Some(75_000),
         "the durable typed profile override reaches adapter resolution"
     );
+    let summary = registry
+        .summary("probe", &|_| true)
+        .expect("configured provider summary");
+    assert_eq!(summary.chunk_idle_timeout_ms, Some(95_000));
+    assert_eq!(summary.semantic_progress_timeout_ms, Some(305_000));
     assert!(profile.enabled);
     let updated = registry
         .configure(ProviderConfigureInput {
@@ -1140,10 +1173,14 @@ fn a_new_provider_creates_one_shot_on_its_stated_inventory() {
             models: vec!["probe-model".to_owned()],
             default_model: Some("probe-model".to_owned()),
             response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
             trust: None,
         })
         .expect("an omitted timeout preserves the durable profile override");
     assert_eq!(updated.response_open_timeout_ms, Some(75_000));
+    assert_eq!(updated.chunk_idle_timeout_ms, Some(95_000));
+    assert_eq!(updated.semantic_progress_timeout_ms, Some(305_000));
 
     // The stated inventory is a BOOTSTRAP, not a bypass: a default outside
     // it still dies, discovery-authoritative law untouched.
@@ -1157,6 +1194,8 @@ fn a_new_provider_creates_one_shot_on_its_stated_inventory() {
             models: vec!["served".to_owned()],
             default_model: Some("unserved".to_owned()),
             response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
             trust: None,
         })
         .expect_err("a default outside the stated inventory still fails");
@@ -1194,6 +1233,8 @@ fn provider_registry_removes_only_custom_profiles_and_clears_models() {
             models: vec!["custom-model".to_owned()],
             default_model: Some("custom-model".to_owned()),
             response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
             trust: None,
         })
         .expect("create custom profile");
@@ -1232,6 +1273,8 @@ fn ordinary_release_owned_provider_origin_remains_immutable() {
             models: Vec::new(),
             default_model: None,
             response_open_timeout_ms: None,
+            chunk_idle_timeout_ms: None,
+            semantic_progress_timeout_ms: None,
             trust: None,
         })
         .expect_err("fixed release-owned origin must refuse");
@@ -1434,6 +1477,8 @@ fn lz2_azure_custom_keeps_manual_deployments_available_without_discovery() {
         api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
         base_url: Some(origin.to_owned()),
         response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
         enabled: true,
         auth_requirement: ProviderAuthRequirementWire::ApiKey,
         configured_models: vec!["my-gpt-deployment".to_owned()],
@@ -1507,6 +1552,8 @@ fn enterprise_origin_reconfigure_is_shape_validated() {
         models: models.clone(),
         default_model: Some("anthropic.claude-fable-5".to_owned()),
         response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
         trust: None,
     };
 

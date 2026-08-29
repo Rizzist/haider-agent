@@ -34,6 +34,8 @@ fn provider_summary_model_details_round_trip_names_and_windows() {
         api_family: ProviderApiFamilyWire::OpenAiResponses,
         endpoint: Some("https://api.openai.com/v1/responses".to_owned()),
         response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
         models: vec!["frontier-a".to_owned(), "frontier-b".to_owned()],
         model_details: vec![
             ModelDetailWire {
@@ -78,7 +80,7 @@ fn provider_summary_model_details_round_trip_names_and_windows() {
 /// override, or serialize the absent value. Expected runtime failure: the
 /// N-1 decode or exact presence/absence assertions below change.
 #[test]
-fn provider_summary_response_open_timeout_preserves_typed_absence() {
+fn provider_summary_transport_timeouts_preserve_typed_absence() {
     let old: ProviderSummaryWire = serde_json::from_value(serde_json::json!({
         "provider": "openai",
         "api_family": "openai_responses",
@@ -89,6 +91,8 @@ fn provider_summary_response_open_timeout_preserves_typed_absence() {
     }))
     .expect("pre-timeout provider summary decodes");
     assert_eq!(old.response_open_timeout_ms, None);
+    assert_eq!(old.chunk_idle_timeout_ms, None);
+    assert_eq!(old.semantic_progress_timeout_ms, None);
     assert!(
         serde_json::to_value(&old)
             .expect("old summary encodes")
@@ -98,8 +102,12 @@ fn provider_summary_response_open_timeout_preserves_typed_absence() {
 
     let mut current = old;
     current.response_open_timeout_ms = Some(75_000);
+    current.chunk_idle_timeout_ms = Some(95_000);
+    current.semantic_progress_timeout_ms = Some(305_000);
     let value = serde_json::to_value(&current).expect("current summary encodes");
     assert_eq!(value["response_open_timeout_ms"], 75_000);
+    assert_eq!(value["chunk_idle_timeout_ms"], 95_000);
+    assert_eq!(value["semantic_progress_timeout_ms"], 305_000);
     assert_eq!(
         serde_json::from_value::<ProviderSummaryWire>(value)
             .expect("current summary decodes")

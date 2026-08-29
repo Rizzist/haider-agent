@@ -23,6 +23,8 @@ fn summary(
         api_family: ProviderApiFamilyWire::OpenAiResponses,
         endpoint: None,
         response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
         models: models.iter().map(|model| (*model).to_owned()).collect(),
         model_details: Vec::new(),
         inventory_fetched_at_ms: None,

@@ -426,6 +426,8 @@ fn provider_summary_fixture(
         api_family: ProviderApiFamilyWire::OpenAiResponses,
         endpoint: Some("https://example.test/v1/responses".into()),
         response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
         models: models.iter().map(|model| (*model).into()).collect(),
         model_details: Vec::new(),
         inventory_fetched_at_ms: None,

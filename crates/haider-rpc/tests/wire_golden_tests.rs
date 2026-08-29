@@ -396,6 +396,8 @@ fn custom_provider_probe_wire_fields_are_pinned() {
         models: Vec::new(),
         default_model: None,
         response_open_timeout_ms: Some(45_000),
+        chunk_idle_timeout_ms: Some(90_000),
+        semantic_progress_timeout_ms: Some(300_000),
         probe_vault_reference: Some("opaque-stage-reference".into()),
         trust: Some(haider_rpc::ProviderTrustWire::Lockdown),
         expected_revision: 7,
@@ -409,6 +411,8 @@ fn custom_provider_probe_wire_fields_are_pinned() {
         encoded.get("trust").and_then(Value::as_str),
         Some("lockdown")
     );
+    assert_eq!(encoded["chunk_idle_timeout_ms"], 90_000);
+    assert_eq!(encoded["semantic_progress_timeout_ms"], 300_000);
     assert!(matches!(
         serde_json::from_value::<RequestBody>(encoded).expect("decode provider.configure"),
         RequestBody::ProviderConfigure {

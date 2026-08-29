@@ -384,6 +384,8 @@ pub fn seed_provider_summaries() -> Vec<haider_rpc::ProviderSummaryWire> {
         api_family,
         endpoint: endpoint.map(str::to_owned),
         response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
         models: models.iter().map(|&model| model.to_owned()).collect(),
         model_details: models
             .iter()

@@ -59,6 +59,14 @@ pub enum Block {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum StreamEvent {
+    /// Local transport-control fact. It is never provider/model content and
+    /// never advances the semantic-progress clock. Core projects it as
+    /// `Waiting { NetworkUnavailable }` while the OS has no route.
+    NetworkUnavailable,
+    /// Local transport-control fact emitted when an unavailable route is
+    /// restored. Core returns the run to its provider-phase state without
+    /// treating this as content or permitting a replay.
+    NetworkRestored,
     TextDelta {
         text: String,
     },

@@ -222,6 +222,7 @@ async fn hanging_mid_turn_fixture_times_out_only_the_idle_chunk_await() {
         0,
         sender,
         Duration::from_secs(90),
+        Duration::from_secs(5 * 60),
     ));
     assert_eq!(
         receiver.recv().await,

@@ -92,6 +92,7 @@ const TRANSPORT_CONFIG: AnthropicTransportConfig = AnthropicTransportConfig {
     connect_timeout: Duration::from_secs(10),
     response_open_timeout: Duration::from_secs(30),
     chunk_idle_timeout: Duration::from_secs(90),
+    semantic_progress_timeout: Duration::from_secs(5 * 60),
 };
 
 static ANTHROPIC_CLIENT_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -205,6 +206,7 @@ pub struct AnthropicTransportConfig {
     pub connect_timeout: Duration,
     pub response_open_timeout: Duration,
     pub chunk_idle_timeout: Duration,
+    pub semantic_progress_timeout: Duration,
 }
 
 /// Messages API provider backed by one already-resolved account secret.
@@ -507,6 +509,7 @@ impl AnthropicProvider {
         if transport_config.connect_timeout.is_zero()
             || transport_config.response_open_timeout.is_zero()
             || transport_config.chunk_idle_timeout.is_zero()
+            || transport_config.semantic_progress_timeout.is_zero()
         {
             return Err(ProviderError::new(
                 ProviderErrorKind::InvalidRequest,
@@ -955,11 +958,27 @@ impl AnthropicProvider {
             None => self.request_payload(request)?,
         };
         let request = self.request_body(payload).await?;
+        let route_gating = self.route_gating();
         let opening = self.client.execute(request);
-        tokio::time::timeout(self.transport_config.response_open_timeout, opening)
-            .await
-            .map_err(|_| response_open_timeout_error(self.transport_config.response_open_timeout))?
-            .map_err(transport_error)
+        crate::route_gated_timeout(
+            self.transport_config.response_open_timeout,
+            opening,
+            route_gating,
+        )
+        .await
+        .map_err(|_| response_open_timeout_error(self.transport_config.response_open_timeout))?
+        .map_err(|error| transport_error_for_route(error, route_gating))
+    }
+
+    fn route_gating(&self) -> crate::RouteGating {
+        if self.compatible_origin_guard.is_some() {
+            // A user-owned compatible origin may be a loopback/LAN service or
+            // a locally resolved hostname. A missing default route says
+            // nothing authoritative about that endpoint.
+            crate::RouteGating::Disabled
+        } else {
+            crate::RouteGating::for_endpoint(&self.api_url)
+        }
     }
 
     async fn stream_turn_ref(
@@ -993,13 +1012,17 @@ impl AnthropicProvider {
         let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
         let account = self.account.clone();
         let chunk_idle_timeout = self.transport_config.chunk_idle_timeout;
+        let semantic_progress_timeout = self.transport_config.semantic_progress_timeout;
+        let route_gating = self.route_gating();
         let producer = tokio::spawn(async move {
             stream_response(
                 response,
                 account,
                 sender,
                 chunk_idle_timeout,
+                semantic_progress_timeout,
                 native_computer,
+                route_gating,
             )
             .await;
         });
@@ -1250,6 +1273,10 @@ fn payload_uses_cache_ttl(payload: &serde_json::Value, ttl: AnthropicCacheTtl) -
 
 #[async_trait]
 impl Provider for AnthropicProvider {
+    fn trusts_default_route_absence(&self) -> bool {
+        self.route_gating().enabled()
+    }
+
     fn credential_surface(&self) -> crate::ProviderCredentialSurface {
         match self.auth_mode {
             AnthropicAuthMode::ApiKey => crate::ProviderCredentialSurface::ApiKey,
@@ -1466,26 +1493,49 @@ async fn stream_response(
     account: Option<CredentialAlias>,
     sender: mpsc::Sender<ProviderStreamItem>,
     chunk_idle_timeout: Duration,
+    semantic_progress_timeout: Duration,
     native_computer: bool,
+    route_gating: crate::RouteGating,
 ) {
     if native_computer {
-        stream_sse_source_with_native(response, account, sender, chunk_idle_timeout, true).await;
+        stream_sse_source_with_native(
+            response,
+            account,
+            sender,
+            chunk_idle_timeout,
+            semantic_progress_timeout,
+            true,
+            route_gating,
+        )
+        .await;
     } else {
-        stream_sse_source(response, account, sender, chunk_idle_timeout).await;
+        stream_sse_source(
+            response,
+            account,
+            sender,
+            chunk_idle_timeout,
+            semantic_progress_timeout,
+            route_gating,
+        )
+        .await;
     }
 }
 
 pub(crate) trait SseChunkSource {
     async fn next_chunk(
         &mut self,
+        route_gating: crate::RouteGating,
     ) -> Result<Option<impl AsRef<[u8]> + Send + 'static>, ProviderError>;
 }
 
 impl SseChunkSource for reqwest::Response {
     async fn next_chunk(
         &mut self,
+        route_gating: crate::RouteGating,
     ) -> Result<Option<impl AsRef<[u8]> + Send + 'static>, ProviderError> {
-        self.chunk().await.map_err(transport_error)
+        self.chunk()
+            .await
+            .map_err(|error| transport_error_for_route(error, route_gating))
     }
 }
 
@@ -1494,8 +1544,19 @@ pub(crate) async fn stream_sse_source<S: SseChunkSource>(
     account: Option<CredentialAlias>,
     sender: mpsc::Sender<ProviderStreamItem>,
     chunk_idle_timeout: Duration,
+    semantic_progress_timeout: Duration,
+    route_gating: crate::RouteGating,
 ) {
-    stream_sse_source_with_native(source, account, sender, chunk_idle_timeout, false).await;
+    stream_sse_source_with_native(
+        source,
+        account,
+        sender,
+        chunk_idle_timeout,
+        semantic_progress_timeout,
+        false,
+        route_gating,
+    )
+    .await;
 }
 
 async fn stream_sse_source_with_native<S: SseChunkSource>(
@@ -1503,28 +1564,52 @@ async fn stream_sse_source_with_native<S: SseChunkSource>(
     account: Option<CredentialAlias>,
     sender: mpsc::Sender<ProviderStreamItem>,
     chunk_idle_timeout: Duration,
+    semantic_progress_timeout: Duration,
     native_computer: bool,
+    route_gating: crate::RouteGating,
 ) {
     let mut decoder = SseDecoder::with_native_computer(account, native_computer);
+    let mut progress = crate::ProviderProgressClock::new(
+        chunk_idle_timeout,
+        semantic_progress_timeout,
+        route_gating,
+    );
     loop {
-        let chunk = match tokio::time::timeout(chunk_idle_timeout, source.next_chunk()).await {
-            Ok(Ok(Some(chunk))) => chunk,
-            Ok(Ok(None)) => {
+        let chunk = match progress
+            .wait_for_next(source.next_chunk(route_gating), &sender)
+            .await
+        {
+            Ok(Some(Ok(Some(chunk)))) => chunk,
+            Ok(Some(Ok(None))) => {
                 send_items(&sender, decoder.finish()).await;
                 return;
             }
-            Ok(Err(error)) => {
+            Ok(Some(Err(error))) => {
                 let _ = sender.send(Err(error)).await;
                 return;
             }
-            Err(_) => {
+            Ok(None) => return,
+            Err(crate::ProgressClockExpired::ChunkIdle) => {
                 let _ = sender
                     .send(Err(stream_idle_error(chunk_idle_timeout)))
                     .await;
                 return;
             }
+            Err(crate::ProgressClockExpired::SemanticIdle) => {
+                let _ = sender
+                    .send(Err(crate::semantic_progress_timeout_error(
+                        "Anthropic",
+                        semantic_progress_timeout,
+                    )))
+                    .await;
+                return;
+            }
         };
+        progress.observe_raw_chunk();
         let items = decoder.push(chunk.as_ref());
+        if crate::has_semantic_progress(&items) {
+            progress.observe_semantic_progress();
+        }
         if !send_items(&sender, items).await || decoder.is_terminal() {
             return;
         }
@@ -1545,6 +1630,13 @@ async fn send_items(
 
 fn transport_error(error: reqwest::Error) -> ProviderError {
     crate::reqwest_transport_error("Anthropic", error)
+}
+
+fn transport_error_for_route(
+    error: reqwest::Error,
+    route_gating: crate::RouteGating,
+) -> ProviderError {
+    crate::reqwest_transport_error_with_route_gating("Anthropic", error, route_gating)
 }
 
 fn stream_idle_error(timeout: Duration) -> ProviderError {
