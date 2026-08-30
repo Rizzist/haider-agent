@@ -54,8 +54,42 @@ fn pdf_message(artifact: ArtifactRef, delivery: PdfDeliveryMode) -> Message {
     }
 }
 
+fn assert_every_pdf_error_kind_keeps_its_user_visible_subcode() {
+    let cases = [
+        (haider_pdf::PdfErrorKind::Encrypted, "pdf-encrypted"),
+        (
+            haider_pdf::PdfErrorKind::NoExtractableText,
+            "pdf-no-extractable-text",
+        ),
+        (haider_pdf::PdfErrorKind::Malformed, "pdf-malformed"),
+        (
+            haider_pdf::PdfErrorKind::Unsupported,
+            "pdf-extraction-unsupported",
+        ),
+        (
+            haider_pdf::PdfErrorKind::DecompressionLimit,
+            "pdf-extraction-too-large",
+        ),
+    ];
+    for (kind, expected_subcode) in cases {
+        let mapped = pdf_extraction_error(haider_pdf::PdfError {
+            kind,
+            message: format!("{kind:?} corpus witness"),
+        });
+        assert_eq!(
+            mapped
+                .presentation
+                .expect("typed PDF presentation")
+                .subcode
+                .as_str(),
+            expected_subcode
+        );
+    }
+}
+
 #[tokio::test]
 async fn capability_split_keeps_native_pdf_bytes_and_extracts_elsewhere() {
+    assert_every_pdf_error_kind_keeps_its_user_visible_subcode();
     let artifact = ArtifactRef::new("blake3:pdf-split");
     let bytes = pdf_fixture("BT (daemon extracted text) Tj ET");
     let store = PdfArtifact {
