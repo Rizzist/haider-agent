@@ -951,9 +951,19 @@ async fn tool_calls_execute_and_continue_over_real_rpc() {
     }
 
     let descendant_output = observed["exec-desc"].1.as_slice();
+    // The Unix shell waits for the descendant before the leader can exit, so
+    // `child` is already in the kernel pipe at the capture boundary. When the
+    // stop watch wins, the Unix reader directly drains that nonblocking pipe
+    // to EOF or EAGAIN before closing, so reactor scheduling cannot lose it.
+    #[cfg(unix)]
+    assert_eq!(descendant_output, b"leaderchild");
+    // Tokio services Windows child-pipe reads on its blocking pool. That read
+    // result can still be pending when the stop watch becomes ready, so the
+    // leader bytes are guaranteed but Receive-Job's boundary bytes are not.
+    #[cfg(windows)]
     assert!(
         descendant_output == b"leader" || descendant_output == b"leaderchild",
-        "foreground output must retain leader bytes and may include descendant bytes ready at the leader-exit boundary: {descendant_output:?}"
+        "Windows foreground output must retain leader bytes and may include descendant bytes ready at the leader-exit boundary: {descendant_output:?}"
     );
     assert!(observed["exec-none"].1.is_empty());
     assert_eq!(observed["exec-large"].1.len(), 512 * 1024);

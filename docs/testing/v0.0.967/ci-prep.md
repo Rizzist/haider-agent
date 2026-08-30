@@ -18,15 +18,15 @@ Verification results:
 
 - `haider-tools`: 215 passed / 1 ignored across the complete crate; its focused
   background-task and process binaries are 8/8 and 28/28.
-- `haider-daemon --lib`: 833 passed / 3 ignored. W1 added five tests after the
-  brief's 828/3 correction was written.
+- `haider-daemon --lib`: 850 passed / 3 ignored. The brief's local-baseline
+  count is current; its later 828/3 verification pin has drifted.
 - `haider-daemond`: every binary passes (134 tests total), including the
   unfiltered `core_loop_e2e_tests` at 10/10.
-- `haider-rpc`: 154 tests pass. The current wire fixture contains 182 frames:
+- `haider-rpc`: 155 tests pass. The current wire fixture contains 182 frames:
   180 is the frozen v0.0.966 prefix and K1 appends two frames.
 - `haider-cli --test status_discovery_smoke_tests`: 1/1 passes.
-- Prebuilt `haiderd` and `haider` are valid arm64 Mach-O files of 178,971,504
-  and 100,419,568 bytes respectively; `haiderd` exceeds the 10 MiB guard.
+- Prebuilt `haiderd` and `haider` are valid arm64 Mach-O files of 179,364,288
+  and 100,896,656 bytes respectively; `haiderd` exceeds the 10 MiB guard.
 - The workspace all-target `cargo check` and deny-warnings Clippy commands pass.
 
 The registry's referenced `$T/ci-prep.sh` is not present in this worktree and no
@@ -142,7 +142,7 @@ list instead.
 | 61 | checked | Every claimed behavior has an assertion; no unasserted benchmark guarantee. |
 | 62 | checked | The public process API addition did not change an existing return type; workspace call sites compile. |
 | 63 | checked | No platform archive tool. |
-| 64 | checked | `file` identifies both prebuilt siblings as arm64 Mach-O; `haiderd` is 178,971,504 bytes. |
+| 64 | checked | `file` identifies both prebuilt siblings as arm64 Mach-O; `haiderd` is 179,364,288 bytes. |
 | 65 | checked | Assertions use typed semantic outcomes, not raw errnos. |
 | 66 | checked | No STT surface. |
 | 67 | checked | `haiderd` and `haider` were prebuilt and every Cargo suite used the sibling-prebuilt flag. |
@@ -157,6 +157,21 @@ list instead.
 | 76 | checked | Fork provenance is asserted through the RPC projection and child replay. |
 | 77 | fixed | The initial characterization-order miss was corrected; the guard ran first in final CI-prep and exited 0. |
 | 78 | checked | No release/tag dispatch. |
+| 79 | checked | Natural completion and the outliving-descendant boundary remain pinned. |
+| 80 | checked | The full core-loop binary passes without coupling terminal completion to aggregate idle. |
+| 81 | fixed | Unix stop handling now drains the nonblocking kernel pipe directly to EOF or `EAGAIN` before closing capture. |
+| 82 | checked | Foreground and background supervision share the repaired output-reader boundary. |
+| 83 | checked | No detach-failure fallback was changed. |
+| 84 | checked | No paused-time real-process test was introduced. |
+| 85 | checked | No terminal-classification or late-cancellation seam changed. |
+| 86 | checked | No exit-observer error arm changed. |
+| 87 | checked | The durable accepted-run fence and exact expected count of two remain intact. |
+| 88 | checked | No staged-file publication path changed. |
+| 89 | checked | No Windows endpoint/path assertion changed. |
+| 90 | checked | No sparse-file fixture changed. |
+| 91 | checked | No source pin depends on literal line endings. |
+| 92 | checked | No maintenance-loop counter or timer changed. |
+| 93 | fixed | The deadline now accepts a nonempty all-exact-two sample while every excursion still fails; the multi-thread mutation remains caught. |
 
 ## §D additions during 967 integration
 
@@ -180,10 +195,11 @@ list instead.
   capture as soon as the leader exits can stop a newly spawned output-reader
   task before it polls the pipe, or can observe leader exit in the same
   scheduler turn before the reactor schedules an already-ready pipe. Startup
-  acknowledgements and ready-read bias close the first window; a timer-free
-  scheduler yield before stop closes the second. Check the exact-byte streaming
-  pin and repeat the real-RPC outliving-child test to expose scheduler-sensitive
-  loss.
+  acknowledgements close the first window. Ready-read bias and a timer-free
+  scheduler yield reduce the second, but do not prove the reactor has published
+  kernel readiness; on Unix the stop handler must directly drain the
+  nonblocking pipe to EOF or `EAGAIN`. Check the exact-byte waited-descendant
+  pin and repeat the real-RPC outliving-child test to expose boundary loss.
 
 - **#82 foreground/background ownership split-brain** — changing only
   foreground `process_exec` leaves the durable background supervisor's old
@@ -283,3 +299,14 @@ list instead.
   timer, producing a Linux scheduler-dependent false miss. Fence on completion
   of the already-observed serialized reconciliation before advancing time; do
   not extend the audit interval or weaken the repair assertion.
+
+### §D additions — 967 gate 8 (2026-08-31)
+
+- **#93 subprocess sampling throughput mistaken for runtime state** — a
+  wall-clock settling deadline cannot also require a fixed number of samples
+  when each macOS sample forks `ps`; a loaded runner can exhaust the deadline
+  with every observation correct. Keep the consecutive-sample fast path, but
+  at the deadline classify the nonempty observations already obtained: an
+  all-exact-expected sequence disproves a persistently elevated runtime, while
+  any excursion remains a failure unless the full settling sequence completed.
+  Mutation-check the persistent bad state after changing this rule.
