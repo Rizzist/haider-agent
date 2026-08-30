@@ -1710,6 +1710,9 @@ pub(crate) async fn scope_prepared_wire<T>(
 #[serde(rename_all = "snake_case")]
 pub enum ProviderTimeoutReason {
     DeadlineExhausted,
+    /// Request execution began, but response headers did not open within the
+    /// provider's configured transport budget.
+    ResponseOpen,
 }
 
 /// Selects one request-phase budget from the provider's configured budget and
@@ -2200,9 +2203,7 @@ pub async fn before_provider_request_deadline<T>(
                 deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
             let budget =
                 effective_request_budget(Duration::MAX, remaining, PROVIDER_DEADLINE_SAFETY_MARGIN)
-                    .map_err(|ProviderTimeoutReason::DeadlineExhausted| {
-                        deadline_exhausted_error(Duration::ZERO, Duration::ZERO)
-                    })?;
+                    .map_err(|_| deadline_exhausted_error(Duration::ZERO, Duration::ZERO))?;
             if deadline.is_none() {
                 return opening.await;
             }

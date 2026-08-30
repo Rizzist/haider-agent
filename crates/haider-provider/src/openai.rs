@@ -6380,9 +6380,7 @@ fn request_phase_budget(configured: Duration) -> Result<Duration, ProviderError>
         crate::current_provider_deadline_remaining(),
         crate::PROVIDER_DEADLINE_SAFETY_MARGIN,
     )
-    .map_err(|crate::ProviderTimeoutReason::DeadlineExhausted| {
-        crate::deadline_exhausted_error(Duration::ZERO, Duration::ZERO)
-    })
+    .map_err(|_| crate::deadline_exhausted_error(Duration::ZERO, Duration::ZERO))
 }
 
 fn full_request_budget_fits(configured: Duration) -> bool {
@@ -6418,6 +6416,7 @@ fn response_open_timeout_error(timeout: Duration, elapsed: Duration) -> Provider
     )
     .with_presentation(crate::provider_timeout_presentation())
     .with_timeout_budget(opened_within_ms, budget_ms)
+    .with_timeout_reason(crate::ProviderTimeoutReason::ResponseOpen)
 }
 
 fn stream_idle_error(timeout: Duration) -> ProviderError {

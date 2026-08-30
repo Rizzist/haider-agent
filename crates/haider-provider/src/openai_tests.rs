@@ -332,17 +332,44 @@ async fn hanging_openai_fixture_times_out_only_the_idle_chunk_await() {
 }
 
 #[test]
-fn openai_transport_defaults_split_connect_open_and_idle_budgets() {
+fn openai_silent_phase_default_contract_is_deliberate_ordered_and_bounded() {
+    // The absolute-value pin is deliberate. 69800b3 widened these defaults
+    // while deleting the old guard; a future widening must be visible in test
+    // review. Supervisor-relative bounding and reconnect resume arrive in 968.
     let config = OpenAiProvider::transport_config();
     assert_eq!(config.connect_timeout, Duration::from_secs(10));
     assert_eq!(config.response_open_timeout, Duration::from_secs(60));
     assert_eq!(config.chunk_idle_timeout, Duration::from_secs(90));
+    assert_eq!(
+        config.semantic_progress_timeout,
+        Duration::from_secs(5 * 60)
+    );
+
+    let phases = [
+        ("connect", config.connect_timeout),
+        ("response-open", config.response_open_timeout),
+        ("chunk-idle", config.chunk_idle_timeout),
+        ("semantic-progress", config.semantic_progress_timeout),
+    ];
+    for (phase, deadline) in phases {
+        assert!(
+            !deadline.is_zero() && deadline != Duration::MAX,
+            "{phase} silence must have a finite, non-zero bound"
+        );
+    }
+    assert!(config.connect_timeout <= config.response_open_timeout);
+    assert!(config.response_open_timeout <= config.chunk_idle_timeout);
+    assert!(config.chunk_idle_timeout <= config.semantic_progress_timeout);
 
     let open =
         response_open_timeout_error(config.response_open_timeout, config.response_open_timeout);
     assert_eq!(open.kind, ProviderErrorKind::Transport);
     assert_eq!(open.presentation.subcode.as_str(), "provider-timeout");
     assert!(open.retryable, "response-open timeouts are transient");
+    assert_eq!(
+        open.timeout_reason,
+        Some(crate::ProviderTimeoutReason::ResponseOpen)
+    );
     assert_eq!(open.opened_within_ms, Some(60_000));
     assert_eq!(open.budget_ms, Some(60_000));
     assert_eq!(open.presentation.opened_within_ms, Some(60_000));
@@ -376,7 +403,7 @@ fn effective_request_budget_obeys_provider_and_run_deadlines() {
     assert_eq!(
         crate::effective_request_budget(Duration::from_secs(60), None, margin),
         Ok(Duration::from_secs(60)),
-        "interactive requests retain the provider's 60s default"
+        "an explicitly configured 60s provider budget remains available"
     );
     assert_eq!(
         crate::effective_request_budget(
@@ -435,15 +462,18 @@ async fn exhausted_run_deadline_is_an_immediate_terminal_provider_timeout() {
 }
 
 #[test]
-fn response_open_budget_is_a_typed_per_provider_override() {
+fn shorter_silent_phase_overrides_are_honored_for_every_openai_clock() {
     let vault = MemoryVault::new();
     let alias = CredentialAlias::new("transport-profile");
     vault
         .put(&alias, b"transport-profile-secret")
         .expect("store credential");
     let override_config = OpenAiTransportConfig {
-        response_open_timeout: Duration::from_secs(75),
-        ..OPENAI_DEFAULT_TRANSPORT_CONFIG
+        retry_policy: OpenAiRetryPolicy::Never,
+        connect_timeout: Duration::from_secs(1),
+        response_open_timeout: Duration::from_secs(2),
+        chunk_idle_timeout: Duration::from_secs(3),
+        semantic_progress_timeout: Duration::from_secs(4),
     };
     let provider = OpenAiProvider::new(
         vault.resolve(&alias).expect("resolve credential"),
@@ -465,6 +495,31 @@ fn response_open_budget_is_a_typed_per_provider_override() {
     .with_transport_config(override_config)
     .expect("apply compatible profile transport override");
     assert_eq!(compatible.http.transport_config, override_config);
+
+    assert_eq!(
+        connect_timeout_error(override_config.connect_timeout).budget_ms,
+        Some(1_000)
+    );
+    assert_eq!(
+        response_open_timeout_error(
+            override_config.response_open_timeout,
+            override_config.response_open_timeout,
+        )
+        .budget_ms,
+        Some(2_000)
+    );
+    assert_eq!(
+        stream_idle_error(override_config.chunk_idle_timeout).budget_ms,
+        Some(3_000)
+    );
+    assert_eq!(
+        crate::semantic_progress_timeout_error(
+            "OpenAI",
+            override_config.semantic_progress_timeout,
+        )
+        .budget_ms,
+        Some(4_000)
+    );
 }
 
 /// MUTATION CHECK: change the expected status or body below. Expected runtime
@@ -593,6 +648,10 @@ async fn response_open_budget_fails_typed_after_sixty_one_seconds() {
         .expect_err("the local request deadline fires");
     assert_eq!(error.kind, ProviderErrorKind::Transport);
     assert!(error.retryable);
+    assert_eq!(
+        error.timeout_reason,
+        Some(crate::ProviderTimeoutReason::ResponseOpen)
+    );
     assert_eq!(error.opened_within_ms, Some(60_000));
     assert_eq!(error.budget_ms, Some(60_000));
     assert_eq!(error.presentation.opened_within_ms, Some(60_000));
