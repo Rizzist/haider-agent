@@ -28,6 +28,37 @@ use haider_protocol::EventPayload;
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::ids::{AgentId, SessionId};
 
+/// One previous user prompt recalled by the Esc-Esc chooser.
+///
+/// `seq` is the DURABLE journal coordinate of the source `UserMessage`
+/// envelope — the exclusive cut a `session.fork` resolves. It is `Some` only
+/// for an entry rebuilt from a committed envelope; the demo twin's local
+/// prompts never had one and must not pretend otherwise, so a fork offers
+/// nothing for them rather than inventing a sequence (the fabrication law,
+/// [`crate::fleet`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptEntry {
+    pub text: String,
+    pub seq: Option<u64>,
+}
+
+impl PromptEntry {
+    /// A prompt rebuilt from a committed journal envelope.
+    #[must_use]
+    pub const fn committed(text: String, seq: u64) -> Self {
+        Self {
+            text,
+            seq: Some(seq),
+        }
+    }
+
+    /// A prompt with no durable coordinate (the local demo twin).
+    #[must_use]
+    pub const fn local(text: String) -> Self {
+        Self { text, seq: None }
+    }
+}
+
 /// One session, fully owned — the sim's `sessions[i]` (tui.js:497-579
 /// seeds, 1617-1650 `newSession`). The single-branch port folds the sim's
 /// active-branch fields (`tokens`, `chips`, `entries`, `todos`) into the
@@ -59,7 +90,7 @@ pub struct SessionState {
     pub projection: SessionProjection,
     /// Durable journal prompts for this session, newest first. This is
     /// distinct from the composer's transient submitted-input ring.
-    pub prompt_history: std::collections::VecDeque<String>,
+    pub prompt_history: std::collections::VecDeque<PromptEntry>,
     pub cache_usage: crate::cache_usage::SessionUsageFold,
     pub chips: Vec<ChipModel>,
     /// This session's branch registry, active-branch selection, warm parked
@@ -364,7 +395,8 @@ impl SessionState {
                             if envelope.agent_id.is_none()
                                 && let EventPayload::UserMessage { text, .. } = &payload
                             {
-                                self.prompt_history.push_front(text.clone());
+                                self.prompt_history
+                                    .push_front(PromptEntry::committed(text.clone(), envelope.seq));
                             }
                             if admission == Admission::Apply {
                                 self.route_admitted(

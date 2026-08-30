@@ -11108,7 +11108,7 @@ fn backtrack_block(model: &AppModel, theme: &Theme, width: u16) -> Vec<Line<'sta
         .skip(start)
         .take(MAX_ROWS)
     {
-        let one_line = prompt.replace(['\r', '\n'], " ");
+        let one_line = prompt.text.replace(['\r', '\n'], " ");
         let number = format!(" {:>2}. ", index + 1);
         let shown = ellipsize(&one_line, width.saturating_sub(number.chars().count()));
         let selected = index == chooser.selection;
@@ -11128,12 +11128,17 @@ fn backtrack_block(model: &AppModel, theme: &Theme, width: u16) -> Vec<Line<'sta
         }
         lines.push(line);
     }
+    // `f fork` appears only where a fork could actually be issued — the
+    // demo twin's recalled prompts carry no durable cut and the hint must
+    // not offer a verb that will only refuse.
+    let hint = if model.prompt_fork_offered() {
+        "↑↓ / digits choose · ⏎ load · f fork into a new session · esc older / close"
+    } else {
+        "↑↓ / digits choose · ⏎ load · esc older / close"
+    };
     lines.push(Line::from(vec![
         Span::raw("  "),
-        Span::styled(
-            "↑↓ / digits choose · ⏎ load · esc older / close",
-            theme.faint_style(),
-        ),
+        Span::styled(hint, theme.faint_style()),
     ]));
     lines
 }

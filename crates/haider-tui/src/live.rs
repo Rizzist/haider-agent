@@ -292,6 +292,19 @@ pub enum LiveCommand {
         fork_seq: u64,
         name: Option<String>,
     },
+    /// `session.fork` with an exclusive PROMPT cut — a whole new session,
+    /// not `branch.create`'s named ref. Receipt-backed: a lost response
+    /// retried under the same command id returns the ORIGINAL child rather
+    /// than minting a second one. Nothing is issued against the source, so
+    /// its transcript and terminal survive by construction.
+    SessionForkPrompt {
+        command_id: CommandId,
+        session: SessionId,
+        worker_generation: u64,
+        source_branch: Option<haider_protocol::ids::BranchId>,
+        /// Durable sequence of the selected source user prompt.
+        seq: u64,
+    },
     CheckpointList {
         session: SessionId,
         branch: Option<haider_protocol::ids::BranchId>,
@@ -1062,6 +1075,7 @@ impl LiveCommand {
             | Self::RunRetry { command_id, .. }
             | Self::Compact { command_id, .. }
             | Self::BranchCreate { command_id, .. }
+            | Self::SessionForkPrompt { command_id, .. }
             | Self::CheckpointUndo { command_id, .. }
             | Self::CheckpointRedo { command_id, .. }
             | Self::CheckpointRollbackTurn { command_id, .. }
@@ -1343,6 +1357,19 @@ pub enum LiveReply {
         session: SessionId,
         branch_id: haider_protocol::ids::BranchId,
         name: String,
+    },
+    /// A prompt-oriented `session.fork` committed: the daemon minted
+    /// `session` from `source_session` and returned the selected prompt as
+    /// an editable, unsent `draft`. The receipt retires the outbox entry and
+    /// the driver ATTACHES + opens the child; the source stays on the roster
+    /// untouched. A response without provenance and a draft is the legacy
+    /// exact-node shape and never reaches here.
+    PromptForked {
+        command_id: CommandId,
+        source_session: SessionId,
+        session: SessionId,
+        worker_generation: u64,
+        draft: haider_protocol::session_fork::SessionForkDraft,
     },
     Checkpoints {
         session: SessionId,
@@ -3650,6 +3677,45 @@ impl LiveDriver {
                 }
                 model.dirty = true;
                 Vec::new()
+            }
+            LiveReply::PromptForked {
+                command_id,
+                source_session,
+                session,
+                worker_generation,
+                draft,
+            } => {
+                self.retire(&command_id);
+                // A fork MINTS a child. A receipt naming the source as its
+                // own child would make the hand-off overwrite the original's
+                // composer — refuse it rather than touch the source.
+                if session == source_session {
+                    model.flash = Some(
+                        "· fork — the receipt named the source as its own child; nothing opened"
+                            .to_owned(),
+                    );
+                    model.dirty = true;
+                    return Vec::new();
+                }
+                self.generations.insert(session.clone(), worker_generation);
+                // THE ORDER, borrowed from `Created` (R11 cut 4): the row
+                // exists only now that the daemon's own child id is in hand,
+                // then the attach, then the surface. NOTHING is fabricated
+                // and NOTHING is issued against `source_session` — its row,
+                // transcript, chips and parked draft stay exactly as they
+                // were, which is the whole point of a fork.
+                let commands = self.ensure_attached(model, &session);
+                // Whether this client can actually reach the child. A dead
+                // socket takes no attach (`ensure_attached`), and the child
+                // is committed daemon truth regardless — so the hand-off
+                // says so and names the door instead of pretending.
+                let reachable = self.attachments.contains_key(&session)
+                    || self.attaching.contains_key(&session);
+                model.open_forked_session(&session, &draft, reachable);
+                if reachable {
+                    self.touch(&session);
+                }
+                commands
             }
             LiveReply::Checkpoints {
                 session,
@@ -6634,6 +6700,25 @@ impl LiveDriver {
                     name,
                 })]
             }
+            AppRequest::ForkFromPrompt {
+                session,
+                source_branch,
+                seq,
+            } => {
+                // The same capture law as `BranchCreate`: the reducer pinned
+                // the source session, its branch and the durable prompt
+                // sequence at issuance. Nothing is installed until the
+                // daemon's own receipt names the child it minted.
+                let command_id = self.mint();
+                let worker_generation = self.generations.get(&session).copied().unwrap_or_default();
+                vec![self.enqueue(LiveCommand::SessionForkPrompt {
+                    command_id,
+                    session,
+                    worker_generation,
+                    source_branch,
+                    seq,
+                })]
+            }
             // T2: the secret RPCs — a read and a deliberately receipt-free
             // set (no receipt may carry a secret; the daemon's vault file
             // is the durable truth). Never outboxed: a socket loss simply
@@ -6826,6 +6911,7 @@ const fn command_session(command: &LiveCommand) -> Option<&SessionId> {
         | LiveCommand::Cancel { session, .. }
         | LiveCommand::Compact { session, .. }
         | LiveCommand::BranchCreate { session, .. }
+        | LiveCommand::SessionForkPrompt { session, .. }
         | LiveCommand::CheckpointList { session, .. }
         | LiveCommand::CheckpointUndo { session, .. }
         | LiveCommand::CheckpointRedo { session, .. }

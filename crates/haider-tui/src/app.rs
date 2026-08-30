@@ -3343,6 +3343,22 @@ pub enum AppRequest {
         fork_seq: u64,
         name: Option<String>,
     },
+    /// Esc-Esc `f` / `/fork <n>` — fork the session at ONE previously
+    /// committed user prompt (`session.fork` with a prompt selector).
+    ///
+    /// This is a SESSION fork, not [`Self::BranchCreate`]'s named ref: the
+    /// daemon mints a whole new session, copies history up to the boundary
+    /// before `seq`, and returns that prompt as an editable, unsent draft.
+    /// The source session is untouched — no mutation is issued against it —
+    /// and the driver opens the CHILD, leaving the original on the roster.
+    /// Coordinates are captured at issuance (the B2b capture law): a later
+    /// branch switch cannot retarget the cut.
+    ForkFromPrompt {
+        session: haider_protocol::ids::SessionId,
+        source_branch: Option<haider_protocol::ids::BranchId>,
+        /// Durable journal sequence of the selected `UserMessage` envelope.
+        seq: u64,
+    },
     /// Durable checkpoint reads/mutations. Branch identity is captured at
     /// issuance; the live driver supplies session/generation coordinates.
     Checkpoints {
@@ -4559,8 +4575,10 @@ pub struct AppModel {
     pub projection: SessionProjection,
     pub(crate) transcript_layout: std::cell::RefCell<crate::render::TranscriptLayoutCache>,
     /// Durable-journal prompt recall for the attached session, newest first.
-    /// Identical redo prompts are distinct entries by design.
-    pub prompt_history: std::collections::VecDeque<String>,
+    /// Identical redo prompts are distinct entries by design. Each entry
+    /// carries the committed sequence a fork cut needs, or `None` when it
+    /// never had one — see [`crate::session::PromptEntry`].
+    pub prompt_history: std::collections::VecDeque<crate::session::PromptEntry>,
     /// Session-wide latest-snapshot usage fold. Kept outside branch/chip
     /// projections so every billed lane survives view switches.
     pub cache_usage: crate::cache_usage::SessionUsageFold,
@@ -5398,8 +5416,9 @@ impl AppModel {
                 upload,
                 label,
                 kind,
-                bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                bytes: Some(u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
                 artifact: None,
+                carried: None,
             });
         self.requests.push(AppRequest::AttachUpload {
             upload,
@@ -6423,7 +6442,10 @@ impl AppModel {
             AppEvent::Envelope(payload) => {
                 self.dirty = true;
                 if let EventPayload::UserMessage { text, .. } = payload.as_ref() {
-                    self.record_prompt(text.clone());
+                    // A bare payload carries no envelope: this path is the
+                    // demo/mock twin, whose prompts have no durable
+                    // sequence. Recording one would fabricate a fork cut.
+                    self.record_prompt(crate::session::PromptEntry::local(text.clone()));
                 }
                 self.handle_envelope(&payload);
             }
@@ -8165,8 +8187,8 @@ impl AppModel {
         }
     }
 
-    fn record_prompt(&mut self, text: String) {
-        self.prompt_history.push_front(text);
+    fn record_prompt(&mut self, entry: crate::session::PromptEntry) {
+        self.prompt_history.push_front(entry);
         self.close_backtrack();
     }
 
@@ -8219,11 +8241,18 @@ impl AppModel {
                 self.last_backtrack_escape = None;
             }
             KeyCode::Enter => {
-                if let Some(prompt) = self.prompt_history.get(chooser.selection).cloned() {
-                    self.composer.set_text(prompt);
+                if let Some(prompt) = self.prompt_history.get(chooser.selection) {
+                    let text = prompt.text.clone();
+                    self.composer.set_text(text);
                 }
                 self.close_backtrack();
             }
+            // `f` FORKS at the chosen prompt — the same verb the session
+            // tree binds for a fork (`tree_fork_selected`). ⏎ keeps its
+            // shipped meaning (load into THIS session's composer); the
+            // fork instead leaves this session untouched and opens a new
+            // one at that prompt.
+            KeyCode::Char('f') => self.fork_from_selected_prompt(),
             KeyCode::Esc if self.rapid_backtrack_escape(now) => {
                 chooser.selection = (chooser.selection + 1).min(last);
                 self.backtrack = Some(chooser);
@@ -8233,6 +8262,114 @@ impl AppModel {
             _ => {}
         }
         self.dirty = true;
+    }
+
+    /// Whether a prompt fork could be issued from this surface right now:
+    /// a live session on a daemon serving BOTH fork tokens. The chooser's
+    /// hint reads this so it never advertises a verb that can only refuse.
+    #[must_use]
+    pub fn prompt_fork_offered(&self) -> bool {
+        !self.mode.fabricates_locally()
+            && self.active_session.is_some()
+            && self.daemon_serves(haider_rpc::FEATURE_SESSION_FORK_V1)
+            && self.daemon_serves(haider_rpc::FEATURE_SESSION_PROMPT_FORK_V1)
+    }
+
+    /// Fork at the prompt the Esc-Esc chooser has highlighted (`f`).
+    fn fork_from_selected_prompt(&mut self) {
+        let Some(chooser) = self.backtrack else {
+            return;
+        };
+        self.issue_prompt_fork(chooser.selection);
+    }
+
+    /// `/fork [number]` — the plain-frontend parity door for the Esc-Esc
+    /// fork, exactly as `/history [number]` is for the recall (a terminal
+    /// that cannot convey rapid double-Esc timing still reaches both).
+    /// Bare opens the same chooser; an ordinal forks that row directly.
+    fn fork_command(&mut self, remainder: &str) {
+        self.dirty = true;
+        if self.screen != Screen::Session {
+            self.flash = Some("· /fork — session only".to_owned());
+            return;
+        }
+        // The same idle gate `/history` keeps: the chooser is idle chrome
+        // and `issue_prompt_fork` refuses a busy session anyway, so opening
+        // one mid-turn would only offer a verb that cannot act.
+        if self.turn_active {
+            self.flash = Some("· /fork — wait for the turn to end".to_owned());
+            return;
+        }
+        if remainder.is_empty() {
+            self.open_backtrack(std::time::Instant::now());
+            return;
+        }
+        let Some(index) = remainder
+            .parse::<usize>()
+            .ok()
+            .and_then(|number| number.checked_sub(1))
+        else {
+            self.flash = Some("· /fork <number> — fork at a previous prompt".to_owned());
+            return;
+        };
+        self.issue_prompt_fork(index);
+    }
+
+    /// THE ONE DOOR to a prompt-oriented `session.fork`.
+    ///
+    /// `index` is the newest-first ordinal into [`Self::prompt_history`].
+    /// Every refusal is an honest notice and NOTHING is installed locally:
+    /// the daemon mints the child and the reply opens it. The source
+    /// session, its transcript, and its attachment stream are untouched by
+    /// construction — this issues no mutation against them.
+    fn issue_prompt_fork(&mut self, index: usize) {
+        self.dirty = true;
+        // A forked child is a daemon-minted session; the demo has no daemon
+        // to mint one, and its recalled prompts carry no durable sequence.
+        if self.mode.fabricates_locally() {
+            self.flash = Some("· fork — live only; the new session is daemon truth".to_owned());
+            return;
+        }
+        // Feature gate BEFORE anything acts (the B2b lesson): BOTH the fork
+        // method and the additive prompt-selector shape are required — a
+        // daemon serving only the former reads the request as a fork with
+        // no coordinates at all.
+        if !self.daemon_serves(haider_rpc::FEATURE_SESSION_FORK_V1)
+            || !self.daemon_serves(haider_rpc::FEATURE_SESSION_PROMPT_FORK_V1)
+        {
+            self.flash = Some(self.stale_daemon_note("forking at a previous prompt"));
+            return;
+        }
+        let Some(session) = self.active_session.clone() else {
+            self.flash = Some("· fork — no live session attached".to_owned());
+            return;
+        };
+        // Same busy law as `issue_fork`: forking a live turn would split
+        // ownership of its open menus, tools and children.
+        if self.session_busy() {
+            self.flash = Some("· fork — wait for the turn to end".to_owned());
+            return;
+        }
+        let Some(entry) = self.prompt_history.get(index) else {
+            self.flash = Some(format!("· /fork {} — no such prompt", index + 1));
+            return;
+        };
+        // NEVER FABRICATE A CUT. A prompt with no committed sequence (the
+        // local twin's) offers no coordinate; saying so beats inventing one.
+        let Some(seq) = entry.seq else {
+            self.flash = Some("· fork — that prompt carries no committed sequence".to_owned());
+            return;
+        };
+        self.requests.push(AppRequest::ForkFromPrompt {
+            session,
+            source_branch: self.branch_state.active().cloned(),
+            seq,
+        });
+        self.close_backtrack();
+        self.flash = Some(format!(
+            "· forking at prompt {} — this session stays open",
+            index + 1
+        ));
     }
 
     fn history_command(&mut self, remainder: &str) {
@@ -8256,8 +8393,9 @@ impl AppModel {
             self.flash = Some("· /history <number> — choose a previous prompt".to_owned());
             return;
         };
-        if let Some(prompt) = self.prompt_history.get(index).cloned() {
-            self.composer.set_text(prompt);
+        if let Some(prompt) = self.prompt_history.get(index) {
+            let text = prompt.text.clone();
+            self.composer.set_text(text);
             self.close_backtrack();
         } else {
             self.flash = Some(format!("· /history {} — no such prompt", index + 1));
@@ -12814,6 +12952,10 @@ impl AppModel {
             // Esc cannot be distinguished. Bare opens the same chooser;
             // an ordinal loads that durable prompt verbatim.
             "history" => self.history_command(&remainder),
+            // The same parity door for the FORK verb the chooser binds to
+            // `f`: bare opens the chooser, an ordinal forks that prompt
+            // into a new session and leaves this one open.
+            "fork" => self.fork_command(&remainder),
             // W-C M2: the desktop-notification toggle. Works everywhere (it is
             // a display preference, not a session command); bare `/notifications`
             // flips it, `on`/`off` set it explicitly, and the runtime persists
@@ -13336,15 +13478,10 @@ impl AppModel {
                     self.run_custom_command(&command, &remainder);
                     return;
                 }
-                // Known stubs name their wave; typos say so (review r1 P2).
-                let wave = match other {
-                    "fork" => Some("the daemon wave (W3)"),
-                    _ => None,
-                };
-                self.flash = Some(match wave {
-                    Some(wave) => format!("· /{other} — UI ready; lands with {wave}"),
-                    None => format!("· unknown command /{other} — /help lists commands"),
-                });
+                // No catalog command is a stub any more — `/fork` was the
+                // last one and now reaches the prompt-fork door (review r1
+                // P2's honest-typo note is what remains).
+                self.flash = Some(format!("· unknown command /{other} — /help lists commands"));
             }
         }
     }
@@ -14236,7 +14373,10 @@ impl AppModel {
                             if envelope.agent_id.is_none()
                                 && let EventPayload::UserMessage { text, .. } = &payload
                             {
-                                self.record_prompt(text.clone());
+                                self.record_prompt(crate::session::PromptEntry::committed(
+                                    text.clone(),
+                                    envelope.seq,
+                                ));
                             }
                             if admission == Admission::Apply {
                                 self.route_admitted(
@@ -15356,6 +15496,74 @@ impl AppModel {
         self.help_open = false;
         // TUI5 item 9: the launcher's own draft comes back.
         self.restore_draft();
+    }
+
+    /// Open a daemon-minted fork child as a NEW session surface and seed its
+    /// composer with the editable, unsent draft (the owner's ask: a fork
+    /// leaves the original transcript and terminal where they were and opens
+    /// a new one).
+    ///
+    /// The source session is not touched here: [`Self::open_session`] parks
+    /// its draft into its own slot and its row, transcript and chips stay on
+    /// the roster exactly as they were.
+    ///
+    /// `reachable` is whether this client actually holds (or is opening) a
+    /// control attachment to the child. When it does not — a dead socket
+    /// takes no attach — the child is still committed daemon truth, so the
+    /// notice names `haider resume <id>` rather than losing it silently.
+    ///
+    /// Returns `false` when the surface could not move to the child at all;
+    /// that notice names the same door.
+    pub fn open_forked_session(
+        &mut self,
+        child: &SessionId,
+        draft: &haider_protocol::session_fork::SessionForkDraft,
+        reachable: bool,
+    ) -> bool {
+        self.dirty = true;
+        self.upsert_live_session(child);
+        self.open_session(child);
+        if self.active_session.as_ref() != Some(child) {
+            // Never a silent loss: the fork committed, so name the door.
+            self.flash = Some(format!(
+                "· forked — could not open the new session here · `haider resume {}`",
+                child.as_str()
+            ));
+            return false;
+        }
+        // The draft is UNSENT: the user edits it and submits when ready. It
+        // is seeded even when the child is unreachable — the bytes are this
+        // client's, and a later reattach finds them parked and waiting.
+        self.composer.set_text(draft.text.clone());
+        let mut unrepresentable = 0_usize;
+        for block in &draft.attachments {
+            if self.composer.attachments().len() >= MAX_TURN_ATTACHMENTS {
+                unrepresentable += 1;
+                continue;
+            }
+            self.upload_seq += 1;
+            match crate::composer::PendingAttachment::carrying(self.upload_seq, block.clone()) {
+                // Already in the CAS and already verified: the chip carries
+                // the daemon's exact block, so no upload is issued.
+                Some(chip) => self.composer.push_attachment(chip),
+                None => unrepresentable += 1,
+            }
+        }
+        let mut note = if reachable {
+            "· forked — new session · the prompt is an editable draft".to_owned()
+        } else {
+            format!(
+                "· forked — new session, not attached here · `haider resume {}`",
+                child.as_str()
+            )
+        };
+        if unrepresentable > 0 {
+            note.push_str(&format!(
+                " · {unrepresentable} attachment(s) could not be carried"
+            ));
+        }
+        self.flash = Some(note);
+        true
     }
 
     /// Learn (or re-learn) a LIVE session row (W3c3 M2). Idempotent: a

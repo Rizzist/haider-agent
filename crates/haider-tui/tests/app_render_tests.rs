@@ -457,18 +457,32 @@ fn slash_palette_filters_completes_and_runs() {
 }
 
 #[test]
-fn stub_commands_flash_honestly_and_help_opens() {
+fn refusals_flash_honestly_and_help_opens() {
     let mut model = AppModel::new();
     model.handle(AppEvent::Envelope(Box::new(EventPayload::HarnessStatus(
         HarnessStatus::Ready,
     ))));
+    // 967: `/fork` was the last catalog stub. It now reaches the prompt-fork
+    // door, which off a session refuses by naming its scope.
     for c in "/fork".chars() {
         model.handle(key(KeyCode::Char(c)));
     }
     model.handle(key(KeyCode::Enter));
+    assert_eq!(model.flash.as_deref(), Some("· /fork — session only"));
+
+    // A genuine typo still says exactly that.
+    for c in "/frok".chars() {
+        model.handle(key(KeyCode::Char(c)));
+    }
+    model.handle(key(KeyCode::Enter));
     assert!(
-        model.flash.as_deref().unwrap_or("").contains("lands with"),
-        "stubs name their wave"
+        model
+            .flash
+            .as_deref()
+            .unwrap_or("")
+            .contains("unknown command /frok"),
+        "typos say so: {:?}",
+        model.flash
     );
 
     for c in "/help".chars() {
