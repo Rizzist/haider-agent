@@ -12722,6 +12722,17 @@ impl HubConnection {
         // committed FIRST accept consumes it (G2 auto-title).
         let first_turn_slug = auto_title_slug(&text);
         let delivery_text = text.clone();
+        // A control client can submit another turn directly to a delegated
+        // child session. Keep that turn on the child's agent-scoped history;
+        // recording it as a root turn makes prompt reconstruction discard the
+        // committed user message when the queued run starts.
+        let agent_id = self
+            .hub
+            .inner
+            .store
+            .delegation_for_child_session(session_id.clone())
+            .await?
+            .map(|delegation| delegation.agent_id);
         let command = TurnAcceptCommand {
             command_id: command_id.0,
             request_digest,
@@ -12729,7 +12740,7 @@ impl HubConnection {
             session_id: session_id.clone(),
             worker_generation,
             run_id: haider_protocol::ids::RunId::new(random_id("run")?),
-            agent_id: None,
+            agent_id,
             branch_id,
             text,
             attachments,
