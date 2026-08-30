@@ -2036,6 +2036,17 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.complete_hook_dispatches(&acks))).await
     }
 
+    /// Releases SQLite heap retained by boot scans without lowering the
+    /// connection's cache-size ceiling or flushing prepared statements.
+    ///
+    /// `with_store` holds the shared owner mutex for the complete operation;
+    /// [`Store::release_memory`] then holds the connection mutex. No store
+    /// operation, transaction, or statement can overlap the release.
+    pub async fn release_memory(&self) -> Result<(), HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(Store::release_memory)).await
+    }
+
     /// Checkpoints committed WAL pages before orderly close.
     ///
     /// W3b1 daemon seam: the R17 drain barrier flushes before removing the

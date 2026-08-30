@@ -1243,6 +1243,15 @@ async fn run_inner(
         )
         .await;
     }
+    // Every boot scan, adoption, recovered-work handoff, and optional
+    // transport startup has returned, while no endpoint exists for external
+    // requests. The store adapter serializes this operation with every other
+    // store call, and the connection mutex excludes any live SQLite statement
+    // or transaction. Keep the normal cache ceiling and prepared-statement
+    // cache intact; discard only pages made cold by this boot.
+    if let Err(error) = store.release_memory().await {
+        tracing::warn!(%error, "SQLite boot-page release failed; continuing startup");
+    }
     let mut endpoint = match endpoint::bind(config, runtime_directory).await {
         Ok(endpoint) => endpoint,
         Err(error) => {

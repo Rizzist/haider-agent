@@ -1970,6 +1970,17 @@ impl Store {
         Self::open_locked(lease)
     }
 
+    /// Releases reclaimable heap retained by SQLite without changing the
+    /// connection's cache-size ceiling or the rusqlite statement cache.
+    ///
+    /// The connection mutex proves that no store transaction or statement is
+    /// live while SQLite performs the release. The daemon calls this once at
+    /// its final pre-listener boundary, after boot-only scans have returned.
+    pub fn release_memory(&self) -> StoreResult<()> {
+        let connection = self.connection()?;
+        connection.release_memory().map_err(map_sqlite_error)
+    }
+
     /// Drains connection-local resources and closes SQLite before releasing
     /// the profile lock.
     ///

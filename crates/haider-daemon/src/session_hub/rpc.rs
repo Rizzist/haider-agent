@@ -982,7 +982,7 @@ struct ObserveProjection {
 /// journal oracle; once installed, the session actor extends the fold with
 /// every committed envelope before waking roster consumers.
 pub(super) struct ObserveDigestCache {
-    sessions: Mutex<HashMap<SessionId, ObserveCacheEntry>>,
+    sessions: Mutex<HashMap<SessionId, Box<ObserveCacheEntry>>>,
     next_build: AtomicU64,
 }
 
@@ -1224,17 +1224,17 @@ impl ObserveDigestCache {
             .sessions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match sessions.get(session_id) {
+        match sessions.get(session_id).map(Box::as_ref) {
             Some(ObserveCacheEntry::Ready(fold)) => CacheStart::Ready(fold.snapshot(session_id)),
             Some(ObserveCacheEntry::Building { .. }) => CacheStart::BuildOnly,
             None => {
                 let token = self.next_build.fetch_add(1, Ordering::Relaxed);
                 sessions.insert(
                     session_id.clone(),
-                    ObserveCacheEntry::Building {
+                    Box::new(ObserveCacheEntry::Building {
                         token,
                         pending: Vec::new(),
-                    },
+                    }),
                 );
                 CacheStart::BuildAndInstall(token)
             }
@@ -1251,18 +1251,18 @@ impl ObserveDigestCache {
             .sessions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let pending = match sessions.remove(&session_id) {
+        let pending = match sessions.remove(&session_id).map(|entry| *entry) {
             Some(ObserveCacheEntry::Building { token, pending }) if build_token == Some(token) => {
                 pending
             }
             Some(entry @ ObserveCacheEntry::Building { .. }) => {
-                sessions.insert(session_id.clone(), entry);
+                sessions.insert(session_id.clone(), Box::new(entry));
                 return fold.snapshot(&session_id);
             }
             Some(ObserveCacheEntry::Ready(current)) => {
                 if current.head_seq >= fold.head_seq {
                     let snapshot = current.snapshot(&session_id);
-                    sessions.insert(session_id, ObserveCacheEntry::Ready(current));
+                    sessions.insert(session_id, Box::new(ObserveCacheEntry::Ready(current)));
                     return snapshot;
                 }
                 Vec::new()
@@ -1281,7 +1281,7 @@ impl ObserveDigestCache {
             }
         }
         let snapshot = fold.snapshot(&session_id);
-        sessions.insert(session_id, ObserveCacheEntry::Ready(fold));
+        sessions.insert(session_id, Box::new(ObserveCacheEntry::Ready(fold)));
         snapshot
     }
 
@@ -1291,7 +1291,7 @@ impl ObserveDigestCache {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if matches!(
-            sessions.get(session_id),
+            sessions.get(session_id).map(Box::as_ref),
             Some(ObserveCacheEntry::Building {
                 token: current,
                 ..
@@ -1314,7 +1314,7 @@ impl ObserveDigestCache {
             return;
         };
         let mut invalidate = false;
-        match entry {
+        match entry.as_mut() {
             ObserveCacheEntry::Building { pending, .. } => pending.extend_from_slice(envelopes),
             ObserveCacheEntry::Ready(fold) => {
                 for envelope in envelopes {
