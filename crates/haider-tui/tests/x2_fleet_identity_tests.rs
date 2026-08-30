@@ -31,14 +31,16 @@ use haider_protocol::agent::{
     Placement,
 };
 use haider_protocol::credential::AuthMethod;
-use haider_protocol::ids::{AgentId, LeaseId, SessionId};
+use haider_protocol::ids::{AgentId, LeaseId, RunId, SessionId};
 use haider_protocol::provider::UsageRequestKind;
 use haider_rpc::{
-    FLEET_MAX_DEPTH, FLEET_MAX_NODES, FleetAgentStateWire, FleetMetricsTotalsWire, FleetNodeWire,
-    FleetRollupWire, FleetStateCountsWire, SessionFleetSnapshot,
+    CancelStatus, FLEET_MAX_DEPTH, FLEET_MAX_NODES, FleetAgentStateWire, FleetMetricsTotalsWire,
+    FleetNodeWire, FleetRollupWire, FleetStateCountsWire, SessionFleetSnapshot,
 };
-use haider_tui::app::{AppModel, AppRequest, ChipModel, Hit, Screen};
+use haider_tui::app::{AppModel, AppRequest, ChipModel, Hit, RuntimeMode, Screen};
 use haider_tui::fleet;
+use haider_tui::link::{CommandContext, command_required_features, map_response, request_body};
+use haider_tui::live::{LiveCommand, LiveDriver, LiveReply};
 use haider_tui::render::render;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -138,14 +140,7 @@ fn fleet_model(snapshot: SessionFleetSnapshot) -> AppModel {
 }
 
 fn draw_rows(model: &AppModel, width: u16, height: u16) -> Vec<String> {
-    let backend = TestBackend::new(width, height);
-    let mut terminal = Terminal::new(backend).expect("test terminal");
-    terminal
-        .draw(|frame| {
-            render(model, frame);
-        })
-        .expect("draw");
-    let buffer = terminal.backend().buffer().clone();
+    let buffer = draw_buffer(model, width, height);
     (0..buffer.area.height)
         .map(|y| {
             (0..buffer.area.width)
@@ -153,6 +148,17 @@ fn draw_rows(model: &AppModel, width: u16, height: u16) -> Vec<String> {
                 .collect::<String>()
         })
         .collect()
+}
+
+fn draw_buffer(model: &AppModel, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| {
+            render(model, frame);
+        })
+        .expect("draw");
+    terminal.backend().buffer().clone()
 }
 
 /// The mixed tree every identity case reads: one node that knows both
@@ -187,9 +193,13 @@ fn mixed_tree() -> Vec<FleetNodeWire> {
 /// MUTATION CHECK: render `node.agent_id` instead of the identity tail.
 /// Expected runtime failure: the `recon · glm-5.2 · zai` containment below
 /// stops matching.
+///
+/// MUTATION CHECK: pass keyboard selection to the row hover band. Expected
+/// runtime failure: the selected recon row paints before a pointer hover, or
+/// the explicitly hovered probe row lacks the hover background.
 #[test]
 fn a_list_row_carries_callsign_model_and_provider() {
-    let model = fleet_model(snapshot(mixed_tree()));
+    let mut model = fleet_model(snapshot(mixed_tree()));
     let rows = draw_rows(&model, 100, 24).join("\n");
     assert!(
         rows.contains("recon · glm-5.2 · zai — map the seams"),
@@ -200,6 +210,38 @@ fn a_list_row_carries_callsign_model_and_provider() {
     assert!(
         plain.contains("recon · glm-5.2 · zai — map the seams"),
         "plain parity: {plain}"
+    );
+
+    let rows = draw_rows(&model, 100, 24);
+    let recon_y = rows
+        .iter()
+        .position(|row| row.contains("recon · glm-5.2"))
+        .expect("recon row") as u16;
+    let recon_x = rows[usize::from(recon_y)]
+        .find("recon")
+        .expect("recon column") as u16;
+    let hover_bg = ratatui::style::Color::from(model.theme.theme().sel_bg);
+    let unhovered = draw_buffer(&model, 100, 24);
+    assert_ne!(
+        unhovered[(recon_x, recon_y)].bg,
+        hover_bg,
+        "keyboard selection is not pointer hover"
+    );
+
+    model.hovered = Some(Hit::FleetNode("ag-probe".to_owned()));
+    let rows = draw_rows(&model, 100, 24);
+    let probe_y = rows
+        .iter()
+        .position(|row| row.contains("probe · anthropic"))
+        .expect("probe row") as u16;
+    let probe_x = rows[usize::from(probe_y)]
+        .find("probe")
+        .expect("probe column") as u16;
+    let hovered = draw_buffer(&model, 100, 24);
+    assert_eq!(
+        hovered[(probe_x, probe_y)].bg,
+        hover_bg,
+        "the pointer target alone wears the hover band"
     );
 }
 
@@ -632,6 +674,68 @@ fn destroy_takes_two_presses_and_the_arm_names_its_target() {
         "the confirmed destroy closes exactly that member: {:?}",
         model.requests
     );
+
+    // The same two presses in live mode cross every client layer to the
+    // additive agent.cancel wire. No local chip is required: the durable
+    // fleet row and daemon ownership check are the authority.
+    let mut live = fleet_model(snapshot(mixed_tree()));
+    live.mode = RuntimeMode::Live;
+    live.active_session = Some(sid());
+    live.daemon_features
+        .insert(haider_rpc::FEATURE_AGENT_CANCEL_V1.to_owned());
+    live.fleet.detail = Some(AgentId::new("ag-recon"));
+    live.handle(key(KeyCode::Char('d')));
+    live.handle(key(KeyCode::Char('d')));
+    let request = live.requests.pop().expect("confirmed live destroy request");
+    assert_eq!(
+        request,
+        AppRequest::AgentCancel {
+            agent: "ag-recon".to_owned()
+        }
+    );
+
+    let mut driver = LiveDriver::new("cancel-test");
+    let commands = driver.handle_request(&mut live, request);
+    let command = commands.first().expect("one agent cancel command").clone();
+    assert_eq!(
+        command_required_features(&command),
+        &[haider_rpc::FEATURE_AGENT_CANCEL_V1]
+    );
+    let (command_id, context) = match &command {
+        LiveCommand::AgentCancel {
+            command_id,
+            session,
+            agent,
+            ..
+        } => {
+            assert_eq!(session, &sid());
+            assert_eq!(agent, "ag-recon");
+            (command_id.clone(), CommandContext::of(&command))
+        }
+        other => panic!("expected AgentCancel, got {other:?}"),
+    };
+    assert!(matches!(
+        request_body(command),
+        haider_rpc::RequestBody::AgentCancel { session_id, agent, .. }
+            if session_id == sid() && agent.as_str() == "ag-recon"
+    ));
+    assert_eq!(
+        map_response(
+            &context,
+            haider_rpc::ResponseBody::AgentCancel {
+                agent: AgentId::new("ag-recon"),
+                child_session_id: SessionId::new("child-ag-recon"),
+                child_run_id: RunId::new("run-ag-recon"),
+                status: CancelStatus::Accepted,
+                terminal_seq: None,
+            }
+        ),
+        vec![LiveReply::AgentCancelled {
+            command_id,
+            agent: AgentId::new("ag-recon"),
+            status: CancelStatus::Accepted,
+        }]
+    );
 }
 
 /// Navigation DISARMS. An arm never survives the cursor moving off the
@@ -680,5 +784,20 @@ fn a_foreign_member_refuses_the_destroy_honestly() {
             .is_some_and(|flash| flash.contains("cannot destroy")),
         "the refusal is explicit: {:?}",
         model.flash
+    );
+
+    let mut stale_live = fleet_model(snapshot(mixed_tree()));
+    stale_live.mode = RuntimeMode::Live;
+    stale_live.active_session = Some(sid());
+    stale_live.fleet.detail = Some(AgentId::new("ag-recon"));
+    stale_live.handle(key(KeyCode::Char('d')));
+    stale_live.handle(key(KeyCode::Char('d')));
+    assert!(stale_live.requests.is_empty());
+    assert!(
+        stale_live.flash.as_deref().is_some_and(|flash| {
+            flash.contains("newer daemon") || flash.contains("not served")
+        }),
+        "feature absence is an honest refusal: {:?}",
+        stale_live.flash
     );
 }

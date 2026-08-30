@@ -194,12 +194,7 @@ fn fleet_node_identity(manifest: &AgentManifest) -> FleetNodeIdentity {
     FleetNodeIdentity {
         callsign: manifest.callsign.as_deref().and_then(persisted),
         model: persisted(&manifest.model_profile),
-        provider: manifest
-            .coordinates
-            .as_ref()
-            .and_then(|coordinates| coordinates.get("provider"))
-            .and_then(serde_json::Value::as_str)
-            .and_then(persisted),
+        provider: manifest.provider().and_then(persisted),
     }
 }
 

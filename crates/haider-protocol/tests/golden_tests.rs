@@ -1647,9 +1647,17 @@ fn golden_agent_spawned_handoff_coordinate_is_additive() {
         parent_session_id: SessionId,
         child_session_id: SessionId,
     }
-    let EventPayload::AgentSpawned(manifest) = fact else {
+    let EventPayload::AgentSpawned(mut manifest) = fact else {
         unreachable!("constructed agent_spawned")
     };
+    manifest
+        .coordinates
+        .as_mut()
+        .expect("coordinates")
+        .as_object_mut()
+        .expect("coordinate map")
+        .insert("provider".into(), serde_json::json!("openai"));
+    assert_eq!(manifest.provider(), Some("openai"));
     let legacy: LegacyCoordinates =
         serde_json::from_value(manifest.coordinates.expect("coordinates"))
             .expect("legacy coordinates ignore additive handoff_dir");

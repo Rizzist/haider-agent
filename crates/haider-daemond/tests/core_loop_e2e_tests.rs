@@ -30,8 +30,9 @@ use haider_provider::{
     ProviderStream, ToolDefinition, TurnRequest,
 };
 use haider_rpc::{
-    AttachMode, ClientKind, CommandId, FleetAgentStateWire, RequestBody, RequestId, ResponseBody,
-    SeqRange, SessionFleetSnapshot, SshAuthInputWire, SshProfileInputWire, SshScopeWire, WireFrame,
+    AttachMode, CancelStatus, ClientKind, CommandId, FleetAgentStateWire, RequestBody, RequestId,
+    ResponseBody, SeqRange, SessionFleetSnapshot, SshAuthInputWire, SshProfileInputWire,
+    SshScopeWire, WireFrame,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -1432,6 +1433,11 @@ async fn subagent_launch_failure_returns_to_parent_instead_of_hanging() {
 /// A2: an operator cancellation of a live child crosses the same RPC surface
 /// used by clients. The child becomes durably Cancelled, its parent receives
 /// the collapsed result, and no provider task is left holding the parent.
+///
+/// MUTATION CHECK: route through child `turn.cancel`, skip the durable cancel
+/// transition, or fail to collect the cancelled report. Expected runtime
+/// failure: the public response, terminal fleet state, or parent continuation
+/// assertion below times out or changes shape.
 #[tokio::test]
 async fn manually_cancelled_running_child_releases_parent() {
     let root = test_root("core-loop-agent-cancel-");
@@ -1507,61 +1513,38 @@ async fn manually_cancelled_running_child_releases_parent() {
         "spawn a cancellable child",
     )
     .await;
-    let (child_session, child_run) =
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let snapshot = fleet(
-                    &mut client,
-                    &config,
-                    session.clone(),
-                    "cancel-child-fleet-wait",
-                )
-                .await;
-                let Some(node) = snapshot
-                    .roots
-                    .first()
-                    .filter(|node| node.state == FleetAgentStateWire::Live)
-                else {
-                    tokio::task::yield_now().await;
-                    continue;
-                };
-                let child_session = node.session_id.clone();
-                let journal = attach_existing(
-                    &mut client,
-                    &config,
-                    child_session.clone(),
-                    "cancel-child-attach",
-                )
-                .await;
-                if let Some(run_id) = journal.iter().rev().find_map(|envelope| {
-                    let run_id = envelope.run_id.clone()?;
-                    let EventPayload::RunState(state) =
-                        serde_json::from_value::<EventPayload>(envelope.payload.clone()).ok()?
-                    else {
-                        return None;
-                    };
-                    (!matches!(
-                        state,
-                        RunState::Done | RunState::Errored | RunState::Cancelled
-                    ))
-                    .then_some(run_id)
-                }) {
-                    break (child_session, run_id);
-                }
-            }
-        })
-        .await
-        .expect("running child has durable coordinates");
+    let child_agent = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let snapshot = fleet(
+                &mut client,
+                &config,
+                session.clone(),
+                "cancel-child-fleet-wait",
+            )
+            .await;
+            let Some(node) = snapshot
+                .roots
+                .first()
+                .filter(|node| node.state == FleetAgentStateWire::Live)
+            else {
+                tokio::task::yield_now().await;
+                continue;
+            };
+            break node.agent_id.clone();
+        }
+    })
+    .await
+    .expect("running child has a durable agent coordinate");
 
     send_request(
         &mut client,
         &config,
         "cancel-running-child",
-        RequestBody::TurnCancel {
+        RequestBody::AgentCancel {
             command_id: CommandId::new("cancel-running-child-command"),
-            session_id: child_session,
+            session_id: session.clone(),
             worker_generation: generation,
-            run_id: child_run,
+            agent: child_agent.clone(),
         },
     )
     .await;
@@ -1575,11 +1558,14 @@ async fn manually_cancelled_running_child_releases_parent() {
         matches!(
             cancel_response,
             WireFrame::Response {
-                body: ResponseBody::TurnCancel { .. },
+                body: ResponseBody::AgentCancel {
+                    status: CancelStatus::Accepted,
+                    ..
+                },
                 ..
             }
         ),
-        "expected child turn.cancel response, got {cancel_response:?}"
+        "expected accepted agent.cancel response, got {cancel_response:?}"
     );
     let parent_events = tokio::time::timeout(std::time::Duration::from_secs(8), async {
         let mut attempt = 0_u32;
@@ -1615,6 +1601,31 @@ async fn manually_cancelled_running_child_releases_parent() {
     let snapshot = fleet(&mut client, &config, session, "cancelled-child-fleet").await;
     assert_eq!(snapshot.roots.len(), 1);
     assert_eq!(snapshot.roots[0].state, FleetAgentStateWire::Cancelled);
+
+    send_request(
+        &mut client,
+        &config,
+        "cancel-finished-child",
+        RequestBody::AgentCancel {
+            command_id: CommandId::new("cancel-finished-child-command"),
+            session_id: snapshot.session_id,
+            worker_generation: generation,
+            agent: child_agent,
+        },
+    )
+    .await;
+    let finished_response = next_response(&mut client).await;
+    assert!(matches!(
+        finished_response,
+        WireFrame::Response {
+            body: ResponseBody::AgentCancel {
+                status: CancelStatus::AlreadyTerminal,
+                terminal_seq: Some(_),
+                ..
+            },
+            ..
+        }
+    ));
     assert_eq!(parent.requests().len(), 2);
     assert_eq!(child.requests().len(), 1);
 

@@ -628,6 +628,7 @@ pub fn command_required_features(command: &LiveCommand) -> &'static [&'static st
             &[haider_rpc::FEATURE_TYPED_AGENT_INSTALL_CANCEL_V1]
         }
         LiveCommand::LoomInstallStatus { .. } => &[haider_rpc::FEATURE_TYPED_AGENT_INSTALL_V1],
+        LiveCommand::AgentCancel { .. } => &[haider_rpc::FEATURE_AGENT_CANCEL_V1],
         LiveCommand::CheckpointList { .. }
         | LiveCommand::CheckpointUndo { .. }
         | LiveCommand::CheckpointRedo { .. }
@@ -1147,6 +1148,17 @@ pub fn request_body_for_features(
             worker_generation,
             agent: haider_rpc::haider_protocol::ids::AgentId::new(agent),
             text,
+        },
+        LiveCommand::AgentCancel {
+            command_id,
+            session,
+            worker_generation,
+            agent,
+        } => RequestBody::AgentCancel {
+            command_id,
+            session_id: session,
+            worker_generation,
+            agent: haider_rpc::haider_protocol::ids::AgentId::new(agent),
         },
         LiveCommand::ShellExec {
             command_id,
@@ -1814,6 +1826,18 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                     receipt,
                 }]
             })
+        }
+        ResponseBody::AgentCancel { agent, status, .. } => {
+            context
+                .command_id
+                .clone()
+                .map_or_else(Vec::new, |command_id| {
+                    vec![LiveReply::AgentCancelled {
+                        command_id,
+                        agent,
+                        status,
+                    }]
+                })
         }
         ResponseBody::ShellExec { .. } => context.command_id.clone().map_or_else(Vec::new, |id| {
             vec![LiveReply::ShellAccepted { command_id: id }]
