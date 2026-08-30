@@ -13,7 +13,6 @@
 use crate::broker::{EffectBroker, EffectOperation, FinalizerObserver, PermissionPolicy};
 use crate::filesystem::CasSink;
 use crate::shell::UserProcessExec;
-use crate::workspace_receipt::{WorkspaceStateReceipt, workspace_state_receipt};
 use crate::{ToolError, ToolResult};
 use async_trait::async_trait;
 use base64::Engine;
@@ -873,16 +872,10 @@ impl EffectBroker {
                         .push(ProcessLifecycleEvent::RegistryRemoved);
                 }
             }
-            let after_workspace_receipt =
-                match tokio::task::spawn_blocking(move || workspace_state_receipt(&workspace_root))
-                    .await
-                {
-                    Ok(receipt) => receipt,
-                    Err(_) => WorkspaceStateReceipt::worker_failed(),
-                };
             let workspace_mutation =
                 workspace_receipt
-                    .finish(after_workspace_receipt)
+                    .finish_for_root(workspace_root)
+                    .await
                     .map(|mutation_digest| WorkspaceMutation {
                         effect_id: effect.clone(),
                         mutation_digest,

@@ -37,6 +37,11 @@ pub(crate) struct ProviderViewStore {
     sweep_schedule: Mutex<ProviderViewSweepSchedule>,
 }
 
+pub(crate) struct PreparedProviderView {
+    ledger: ProviderViewLedgerV1,
+    expected: HashSet<ProviderViewBlockRefV1>,
+}
+
 /// Monotonic provider-view maintenance watermark. The count bound prevents a
 /// busy long-lived daemon from postponing cleanup indefinitely, while the time
 /// bound ensures a quiet profile checks expiry on its next provider persist.
@@ -77,10 +82,27 @@ impl ProviderViewStore {
         &self,
         connection: &mut Connection,
         session_id: &SessionId,
-        mut ledger: ProviderViewLedgerV1,
+        ledger: ProviderViewLedgerV1,
         blobs: Vec<ProviderViewBlobV1>,
         expires_at_ms: u64,
     ) -> StoreResult<ProviderViewLedgerV1> {
+        let prepared = self.prepare(ledger, blobs)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_write_error)?;
+        let ledger = self.persist_prepared(&transaction, session_id, prepared, expires_at_ms)?;
+        transaction.commit().map_err(sqlite_write_error)?;
+        Ok(ledger)
+    }
+
+    /// Validates and fully fences the immutable CAS bytes. No SQLite index
+    /// reference is visible until a caller publishes [`PreparedProviderView`]
+    /// in its chosen transaction.
+    pub(crate) fn prepare(
+        &self,
+        ledger: ProviderViewLedgerV1,
+        blobs: Vec<ProviderViewBlobV1>,
+    ) -> StoreResult<PreparedProviderView> {
         if ledger.storage.is_some() {
             return Err(invalid("provider-view ledger is already storage-addressed"));
         }
@@ -119,14 +141,23 @@ impl ProviderViewStore {
         // Every blob is plain-fsynced before this one full flush and the index transaction.
         self.cas.finish_batched_puts()?;
 
-        // Queue potential CAS orphans and publish their index references in
-        // one SQLite transaction. The trailing Full above is the durability
-        // fence before any index write begins; queue_gc remains folded into
-        // this single transaction rather than owning a standalone WAL commit.
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sqlite_write_error)?;
-        self.queue_gc(&transaction, &expected)?;
+        Ok(PreparedProviderView { ledger, expected })
+    }
+
+    /// Publishes the CAS index inside the caller's transaction. The caller may
+    /// atomically append the journal attempt facts before committing it.
+    pub(crate) fn persist_prepared(
+        &self,
+        transaction: &rusqlite::Transaction<'_>,
+        session_id: &SessionId,
+        prepared: PreparedProviderView,
+        expires_at_ms: u64,
+    ) -> StoreResult<ProviderViewLedgerV1> {
+        let PreparedProviderView {
+            mut ledger,
+            expected,
+        } = prepared;
+        self.queue_gc(transaction, &expected)?;
         transaction
             .execute(
                 "INSERT OR IGNORE INTO provider_view_session_cursors(
@@ -171,7 +202,7 @@ impl ProviderViewStore {
             )
             .map_err(sqlite_write_error)?;
         insert_block(
-            &transaction,
+            transaction,
             &ledger,
             session_id,
             request_ordinal,
@@ -181,7 +212,7 @@ impl ProviderViewStore {
             expires_at_ms,
         )?;
         insert_block(
-            &transaction,
+            transaction,
             &ledger,
             session_id,
             request_ordinal,
@@ -192,7 +223,7 @@ impl ProviderViewStore {
         )?;
         for (ordinal, block) in ledger.history_blocks.iter().enumerate() {
             insert_block(
-                &transaction,
+                transaction,
                 &ledger,
                 session_id,
                 request_ordinal,
@@ -212,7 +243,6 @@ impl ProviderViewStore {
                     .map_err(sqlite_write_error)?;
             }
         }
-        transaction.commit().map_err(sqlite_write_error)?;
         ledger.storage = Some(ProviderViewStorageV1 {
             session_id: session_id.clone(),
             request_ordinal: u64::try_from(request_ordinal)

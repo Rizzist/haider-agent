@@ -79,6 +79,108 @@ fn provider_summary(provider: &str) -> haider_rpc::ProviderSummaryWire {
     }
 }
 
+/// The attachment replay preflight must keep immutable-blob validation out of
+/// an idempotent retry while still entering the fused acceptance transaction
+/// that repairs a legacy first-turn receipt with no title.
+#[test]
+fn attachment_receipt_replay_routes_through_fused_title_repair() {
+    let source = include_str!("session_hub/rpc.rs");
+    let start = source
+        .find("    async fn turn_submit(")
+        .expect("turn_submit source");
+    let tail = &source[start..];
+    let end = tail
+        .find("    #[allow(clippy::too_many_arguments)]\n    async fn shell_exec(")
+        .expect("next RPC handler boundary");
+    let body = &tail[..end];
+    let receipt = body
+        .find(".turn_accept_receipt(")
+        .expect("attachment receipt preflight");
+    let repair = body
+        .find(".accept_turn_with_auto_title(")
+        .expect("fused replay repair");
+    let validation = body
+        .find("validate_turn_attachments(")
+        .expect("attachment validation");
+
+    assert!(
+        receipt < repair && repair < validation,
+        "receipt lookup must precede fused title repair, which must precede attachment validation"
+    );
+    assert!(
+        body[repair..validation].contains("Some(first_turn_slug.clone())"),
+        "the replay transaction must carry the same deterministic auto-title"
+    );
+    assert!(
+        body[receipt..repair].contains("replay_title_user_event_id(&command_id)"),
+        "the reachable title event ID must derive from the durable command identity"
+    );
+}
+
+/// Two pre-fusion attachment receipts in one profile must repair their titles
+/// independently. The replay user event is reachable by the title envelope,
+/// so a process-wide constant would make the second transaction collide and
+/// roll back.
+#[tokio::test]
+async fn attachment_title_repairs_use_distinct_stable_event_ids_across_sessions() {
+    let root = tempfile::tempdir().expect("temp store");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let generation = store.worker_generation();
+    let fixtures = [
+        ("attachment-repair-a", "first-attachment-turn"),
+        ("attachment-repair-b", "second-attachment-turn"),
+    ];
+    let mut replay_event_ids = Vec::new();
+
+    for (suffix, title) in fixtures {
+        let session_id = SessionId::new(format!("session-{suffix}"));
+        hub.create_internal_session(create_command(&session_id, suffix))
+            .await
+            .expect("create session");
+        let run_id = RunId::new(format!("run-{suffix}"));
+        let mut legacy_command = accept_command(&session_id, &run_id, generation, suffix);
+        legacy_command.attachments = vec![haider_protocol::tool::AttachmentBlock::File {
+            artifact: haider_protocol::ids::ArtifactRef::new(format!("artifact-{suffix}")),
+            name: format!("{suffix}.txt"),
+            lines: 1,
+        }];
+        hub.accept_turn(legacy_command.clone())
+            .await
+            .expect("legacy acceptance commits without a title");
+
+        let command_id = CommandId(legacy_command.command_id.clone());
+        let replay_event_id = super::rpc::replay_title_user_event_id(&command_id);
+        assert_eq!(
+            replay_event_id,
+            super::rpc::replay_title_user_event_id(&command_id),
+            "one receipt must derive a stable replay event ID"
+        );
+        legacy_command.user_event_id = replay_event_id.clone();
+        replay_event_ids.push(replay_event_id);
+        assert!(matches!(
+            hub.accept_turn_with_auto_title(legacy_command, Some(title.into()))
+                .await
+                .expect("repair transaction commits"),
+            TurnAcceptOutcome::Committed { .. }
+        ));
+        assert_eq!(
+            hub.session_metadata(&session_id)
+                .await
+                .expect("metadata")
+                .and_then(|metadata| metadata.title),
+            Some(title.into())
+        );
+    }
+
+    assert_ne!(
+        replay_event_ids[0], replay_event_ids[1],
+        "different durable commands must not collide"
+    );
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
 #[test]
 fn cache_diagnostic_key_is_persistent_exact_length_and_private() {
     let root = tempfile::tempdir().expect("temporary profile");
@@ -288,6 +390,7 @@ async fn deletion_barrier_preserves_a_prefence_accepted_turn_and_its_actor() {
                 device_id: DeviceId::new("delete-barrier-device"),
             },
             peer_message: None,
+            auto_title: None,
             completed: accepted,
         })
         .await

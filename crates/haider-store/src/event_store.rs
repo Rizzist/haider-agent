@@ -24,7 +24,10 @@ use crate::usage_ledger::{
 use crate::{Cas, StoreResult, now_ms, store_error, to_sqlite_integer, validate_image_block};
 use haider_protocol::agent::{AgentManifest, ChildReport, ReportVerification};
 use haider_protocol::branch::{BranchCreated, BranchDescriptor};
-use haider_protocol::cache::{ProviderViewBlobV1, ProviderViewBlockRefV1, ProviderViewLedgerV1};
+use haider_protocol::cache::{
+    PROVIDER_VIEW_ATTEMPT_EXTENSION_KIND, ProviderViewAttemptV1, ProviderViewBlobV1,
+    ProviderViewBlockRefV1, ProviderViewLedgerV1,
+};
 use haider_protocol::checkpoint::{
     CHECKPOINT_LIST_MAX_PAGE, CheckpointCursor, CheckpointListPage, CheckpointRecorded,
 };
@@ -2049,6 +2052,54 @@ impl Store {
             blobs,
             default_expiry_ms()?,
         )
+    }
+
+    /// Fully fences provider-view CAS bytes, then publishes their index and
+    /// the request-attempt journal batch in one SQLite transaction. The full
+    /// CAS fence must precede the transaction: after commit, neither side can
+    /// exist durably without the other.
+    pub fn persist_provider_view_and_append_owned(
+        &self,
+        session_id: &SessionId,
+        ledger: ProviderViewLedgerV1,
+        blobs: Vec<ProviderViewBlobV1>,
+        attempt_ordinal: u64,
+        envelopes: &mut [RawEnvelope],
+    ) -> StoreResult<ProviderViewLedgerV1> {
+        let mut connection = self.connection()?;
+        let _ = self
+            .provider_views
+            .sweep_expired_if_due(&mut connection, now_ms()?)?;
+        let expected_attempt = ProviderViewAttemptV1 {
+            ordinal: attempt_ordinal,
+            view: ledger.clone(),
+        };
+        let prepared = self.provider_views.prepare(ledger, blobs)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let ledger = self.provider_views.persist_prepared(
+            &transaction,
+            session_id,
+            prepared,
+            default_expiry_ms()?,
+        )?;
+        let stored_attempt = ProviderViewAttemptV1 {
+            ordinal: attempt_ordinal,
+            view: ledger.clone(),
+        };
+        stamp_provider_view_attempt(envelopes, &expected_attempt, &stored_attempt)?;
+        let outcome = append_envelopes_in_transaction(&transaction, envelopes, true)?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        update_append_caches(
+            self,
+            &connection,
+            &outcome.range.session_id,
+            envelopes,
+            outcome.changes_graph_reduction,
+            outcome.changes_graph_telemetry,
+        );
+        Ok(ledger)
     }
 
     /// Testable storage seam with an explicit expiry; production callers use
@@ -10008,16 +10059,24 @@ impl Store {
     /// for the first runnable turn, aggregate `SessionState::ActiveRun`
     /// (R3: only after this transaction is durable may provider work start).
     ///
-    /// CALLER CONTRACT: this method fences `worker_generation` BEFORE its
-    /// in-transaction receipt replay, so calling it directly with a
-    /// pre-restart command returns `stale_generation` instead of the
-    /// committed response. Cross-restart response recovery is owned by the
-    /// unfenced [`Self::turn_accept_receipt`], which the wire layer must
-    /// consult first (R2 law on [`Self::session_create_receipt`]). The
-    /// composition — unfenced replay, then fenced acceptance — reproduces
-    /// the menu CAS's replay-before-fence semantics end to end.
+    /// Receipt replay is the first operation inside the IMMEDIATE transaction,
+    /// before the worker-generation and current-state admission fences. This
+    /// preserves cross-restart response recovery without a separate read
+    /// transaction; a fresh command then observes one serialized snapshot for
+    /// metadata, delegation, run state, optional auto-title, and acceptance.
     pub fn accept_turn(&self, command: &TurnAcceptCommand) -> StoreResult<TurnAcceptOutcome> {
-        self.accept_turn_with_peer(command, None)
+        self.accept_turn_with_peer_and_title(command, None, None, false)
+    }
+
+    /// Interactive first-turn acceptance with a daemon-derived display title.
+    /// The title stays outside the receipt coordinates so retries remain
+    /// byte-compatible with commands accepted before this fused fast path.
+    pub fn accept_turn_with_auto_title(
+        &self,
+        command: &TurnAcceptCommand,
+        auto_title: &str,
+    ) -> StoreResult<TurnAcceptOutcome> {
+        self.accept_turn_with_peer_and_title(command, None, Some(auto_title), true)
     }
 
     /// Typed peer-origin variant of [`Self::accept_turn`]. The provider still
@@ -10028,13 +10087,15 @@ impl Store {
         command: &TurnAcceptCommand,
         message: &PeerMessage,
     ) -> StoreResult<TurnAcceptOutcome> {
-        self.accept_turn_with_peer(command, Some(message))
+        self.accept_turn_with_peer_and_title(command, Some(message), None, false)
     }
 
-    fn accept_turn_with_peer(
+    fn accept_turn_with_peer_and_title(
         &self,
         command: &TurnAcceptCommand,
         peer_message: Option<&PeerMessage>,
+        auto_title: Option<&str>,
+        validate_headless: bool,
     ) -> StoreResult<TurnAcceptOutcome> {
         let mut command = command.clone();
         validate_command_identity(
@@ -10042,12 +10103,6 @@ impl Store {
             &command.request_digest,
             &command.request_json,
         )?;
-        if command.worker_generation != self.worker_generation {
-            return Err(stale_generation(
-                command.worker_generation,
-                self.worker_generation,
-            ));
-        }
         if command.text.is_empty() {
             return Err(store_error(
                 ErrorCode::InvalidArgument,
@@ -10076,10 +10131,99 @@ impl Store {
             &command.request_digest,
             &command.request_json,
         )? {
+            // Before auto-title joined acceptance, a crash could leave a
+            // committed first-turn receipt for an untitled session. Preserve
+            // the old replay repair law, but publish the repair in this same
+            // replay transaction rather than opening a rename transaction.
+            let mut repaired_envelopes = Vec::new();
+            if accepted.first_user_turn
+                && let Some(title) = auto_title
+            {
+                let mut metadata = typed_session_metadata(&transaction, &command.session_id)?;
+                if let Some(envelope) = auto_title_envelope_if_untitled(
+                    &transaction,
+                    &mut metadata,
+                    &command,
+                    title,
+                    self.worker_generation,
+                )? {
+                    repaired_envelopes.push(envelope);
+                    append_transaction_envelopes(
+                        &transaction,
+                        &command.session_id,
+                        now_ms()?,
+                        &mut repaired_envelopes,
+                    )?;
+                }
+            }
             transaction.commit().map_err(map_sqlite_error)?;
+            if !repaired_envelopes.is_empty() {
+                return Ok(TurnAcceptOutcome::Committed {
+                    accepted,
+                    envelopes: repaired_envelopes,
+                });
+            }
             return Ok(TurnAcceptOutcome::IdempotentReplay { accepted });
         }
-        require_typed_session(&transaction, &command.session_id)?;
+        // Receipt replay is deliberately ordered before every current-state
+        // admission fence. A response lost across restart remains replayable;
+        // a fresh command then observes generation, metadata, delegation, and
+        // run state from this one serialized acceptance transaction.
+        if command.worker_generation != self.worker_generation {
+            return Err(stale_generation(
+                command.worker_generation,
+                self.worker_generation,
+            ));
+        }
+        let mut metadata = typed_session_metadata(&transaction, &command.session_id)?;
+        let request =
+            serde_json::from_str::<serde_json::Value>(&command.request_json).map_err(|error| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("cannot decode turn-submit coordinates: {error}"),
+                    false,
+                )
+            })?;
+        if auto_title.is_some_and(|title| {
+            title.is_empty() || title.chars().count() > 80 || title.chars().any(char::is_control)
+        }) {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "turn auto-title must be a normalized non-empty string",
+                false,
+            ));
+        }
+        let headless_spec = request
+            .get("headless")
+            .cloned()
+            .map(serde_json::from_value::<haider_protocol::headless::HeadlessRunSpecV1>)
+            .transpose()
+            .map_err(|error| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("cannot decode headless run spec: {error}"),
+                    false,
+                )
+            })?;
+        if validate_headless && let Some(spec) = headless_spec.as_ref() {
+            validate_headless_turn_admission(&metadata, spec)?;
+        }
+        let expected_agent = lookup_delegation_by_child_session(&transaction, &command.session_id)?
+            .map(|delegation| delegation.agent_id);
+        if let Some(expected_agent) = expected_agent {
+            if command
+                .agent_id
+                .as_ref()
+                .is_some_and(|agent| agent != &expected_agent)
+            {
+                return Err(store_error(
+                    ErrorCode::InvalidArgument,
+                    "turn agent scope does not match the session's durable delegation",
+                    false,
+                ));
+            }
+            command.agent_id = Some(expected_agent);
+        }
         let named_branch = command
             .branch_id
             .as_ref()
@@ -10353,18 +10497,6 @@ impl Store {
                 PromptRender::Omit,
             )?);
         }
-        let headless_spec = serde_json::from_str::<serde_json::Value>(&command.request_json)
-            .ok()
-            .and_then(|request| request.get("headless").cloned())
-            .map(serde_json::from_value::<haider_protocol::headless::HeadlessRunSpecV1>)
-            .transpose()
-            .map_err(|error| {
-                store_error(
-                    ErrorCode::InvalidArgument,
-                    format!("cannot decode headless run spec: {error}"),
-                    false,
-                )
-            })?;
         if let Some(spec) = headless_spec {
             let payload =
                 haider_protocol::headless::HeadlessRunEventPayload::HeadlessRunConfigured(spec)
@@ -10396,6 +10528,18 @@ impl Store {
             &command.session_id,
             &mut envelopes,
         )?;
+        if first_user_turn
+            && let Some(title) = auto_title
+            && let Some(envelope) = auto_title_envelope_if_untitled(
+                &transaction,
+                &mut metadata,
+                &command,
+                title,
+                self.worker_generation,
+            )?
+        {
+            envelopes.push(envelope);
+        }
         append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
         let accepted_seq = if same_run_delivery {
             envelopes[0].seq
@@ -12850,22 +12994,116 @@ fn require_session(connection: &Connection, session_id: &SessionId) -> StoreResu
 }
 
 fn require_typed_session(connection: &Connection, session_id: &SessionId) -> StoreResult<()> {
-    require_session(connection, session_id)?;
+    typed_session_metadata(connection, session_id).map(drop)
+}
+
+fn typed_session_metadata(
+    connection: &Connection,
+    session_id: &SessionId,
+) -> StoreResult<SessionMetadataV1> {
     let metadata: String = connection
         .query_row(
             "SELECT meta_json FROM sessions WHERE id = ?1",
             [session_id.as_str()],
             |row| row.get(0),
         )
-        .map_err(map_sqlite_error)?;
-    if decode_session_metadata(session_id, &metadata)?.is_none() {
-        return Err(store_error(
+        .optional()
+        .map_err(map_sqlite_error)?
+        .ok_or_else(|| {
+            store_error(
+                ErrorCode::SessionNotFound,
+                format!("session {session_id} does not exist"),
+                false,
+            )
+        })?;
+    decode_session_metadata(session_id, &metadata)?.ok_or_else(|| {
+        store_error(
             ErrorCode::InvalidArgument,
             "legacy session has no live-worker metadata",
+            false,
+        )
+    })
+}
+
+fn validate_headless_turn_admission(
+    metadata: &SessionMetadataV1,
+    spec: &haider_protocol::headless::HeadlessRunSpecV1,
+) -> StoreResult<()> {
+    let expected_permissions =
+        (!spec.permission_overrides.is_empty()).then_some(spec.permission_overrides);
+    if metadata.cwd != spec.cwd
+        || metadata.provider != spec.provider
+        || metadata.model != spec.model
+        || metadata.max_tokens != spec.max_output_tokens
+        || metadata.effort != spec.effort
+        || metadata.fast != spec.fast
+        || metadata.permission_overrides != expected_permissions
+        || metadata.interaction_mode
+            != haider_protocol::session::SessionInteractionModeV1::Autonomous
+    {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            "headless execution pin does not match the resolved session configuration",
             false,
         ));
     }
     Ok(())
+}
+
+fn auto_title_envelope_if_untitled(
+    transaction: &rusqlite::Transaction<'_>,
+    metadata: &mut SessionMetadataV1,
+    command: &TurnAcceptCommand,
+    title: &str,
+    worker_generation: u64,
+) -> StoreResult<Option<RawEnvelope>> {
+    if metadata.title.is_some() {
+        return Ok(None);
+    }
+    if title.is_empty() || title.chars().count() > 80 || title.chars().any(char::is_control) {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            "turn auto-title must be a normalized non-empty string",
+            false,
+        ));
+    }
+    metadata.title = Some(title.to_owned());
+    let updated_metadata = serde_json::to_string(metadata).map_err(|error| {
+        store_error(
+            ErrorCode::InvalidArgument,
+            format!("cannot serialize auto-titled session metadata: {error}"),
+            false,
+        )
+    })?;
+    let updated_rows = transaction
+        .execute(
+            "UPDATE sessions SET meta_json = ?2 WHERE id = ?1",
+            params![command.session_id.as_str(), updated_metadata],
+        )
+        .map_err(map_sqlite_error)?;
+    if updated_rows != 1 {
+        return Err(corrupt("session row disappeared during turn auto-title"));
+    }
+    unstamped_raw_command_envelope(
+        EventId::new(format!("auto-title-{}", command.user_event_id)),
+        &command.session_id,
+        None,
+        None,
+        command.device_id.clone(),
+        worker_generation,
+        haider_protocol::session::SessionConfigEventPayload::session_renamed_value(Some(
+            title.to_owned(),
+        ))
+        .map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("cannot serialize auto-title payload: {error}"),
+                false,
+            )
+        })?,
+        PromptRender::Omit,
+    )
+    .map(Some)
 }
 
 fn latest_seq_in_connection(connection: &Connection, session_id: &SessionId) -> StoreResult<u64> {
@@ -19330,6 +19568,73 @@ struct AppendTransactionOutcome {
     range: CommittedSeqRange,
     changes_graph_reduction: bool,
     changes_graph_telemetry: bool,
+}
+
+fn stamp_provider_view_attempt(
+    envelopes: &mut [RawEnvelope],
+    expected: &ProviderViewAttemptV1,
+    stored: &ProviderViewAttemptV1,
+) -> StoreResult<()> {
+    let stored_data = serde_json::to_value(stored).map_err(|error| {
+        store_error(
+            ErrorCode::Internal,
+            format!("provider-view ledger could not serialize: {error}"),
+            false,
+        )
+    })?;
+    let mut stamped = 0_usize;
+    for envelope in envelopes {
+        let mut payload = decode_payload::<EventPayload>(&envelope.payload).map_err(|error| {
+            store_error(
+                ErrorCode::InvalidArgument,
+                format!("request-attempt envelope is invalid: {error}"),
+                false,
+            )
+        })?;
+        let item = match &mut payload {
+            EventPayload::Item(ItemEvent::Started { item, .. })
+            | EventPayload::Item(ItemEvent::Completed { item, .. }) => item,
+            _ => continue,
+        };
+        let TurnItem::Extension { kind, data } = item else {
+            continue;
+        };
+        if kind != PROVIDER_VIEW_ATTEMPT_EXTENSION_KIND {
+            continue;
+        }
+        let attempt =
+            serde_json::from_value::<ProviderViewAttemptV1>(data.clone()).map_err(|error| {
+                store_error(
+                    ErrorCode::InvalidArgument,
+                    format!("provider-view attempt marker is invalid: {error}"),
+                    false,
+                )
+            })?;
+        if attempt != *expected {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "provider-view attempt marker does not match its unaddressed ledger",
+                false,
+            ));
+        }
+        *data = stored_data.clone();
+        envelope.payload = serde_json::to_value(payload).map_err(|error| {
+            store_error(
+                ErrorCode::Internal,
+                format!("provider-view attempt envelope could not serialize: {error}"),
+                false,
+            )
+        })?;
+        stamped = stamped.saturating_add(1);
+    }
+    if stamped != 2 {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            "provider-view append requires one started/completed marker pair",
+            false,
+        ));
+    }
+    Ok(())
 }
 
 fn append_envelopes(

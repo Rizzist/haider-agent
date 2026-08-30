@@ -41,7 +41,7 @@ mod peer_prompt_tests;
 
 use crate::{
     ArtifactReader, InteractionGate, InteractionResolution, InteractionResolutionPolicy,
-    PromptHistoryCompiler, StoreHandle, unix_time_ms,
+    PromptHistoryCompiler, ProviderViewAppendRequest, StoreHandle, unix_time_ms,
 };
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -52,7 +52,7 @@ use haider_protocol::agent::{AgentManifest, ChildReport, ChipState, ReportVerifi
 use haider_protocol::cache::{
     CACHE_REQUEST_ATTEMPT_EXTENSION_KIND, CacheEpochTransitionReason, CacheEpochTransitionV1,
     CacheRequestAttemptV1, PROVIDER_VIEW_ATTEMPT_EXTENSION_KIND, ProviderViewAttemptV1,
-    ProviderViewLedgerV1,
+    ProviderViewBlobV1, ProviderViewLedgerV1,
 };
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::credential::RotationEvent;
@@ -2931,7 +2931,7 @@ impl HarnessActor {
                     )
                     .await;
             }
-            let mut persisted_provider_view = None;
+            let mut pending_provider_view = None;
             let mut provider_view_attempt_data = None;
             if let Some(provider_view_ledger) = prepared
                 .as_ref()
@@ -2942,21 +2942,13 @@ impl HarnessActor {
                     .as_mut()
                     .map(haider_provider::PreparedTurn::take_provider_view_storage_blobs)
                     .unwrap_or_default();
-                let stored_provider_view = match self
-                    .store
-                    .persist_provider_view(&self.config.session_id, provider_view_ledger, blobs)
-                    .await
-                {
-                    Ok(stored) => stored,
-                    Err(error) => return self.errored_state_outcome(&run_id, error).await,
-                };
                 cache_metadata
                     .header_epoch
-                    .clone_from(&stored_provider_view.header_epoch);
+                    .clone_from(&provider_view_ledger.header_epoch);
                 provider_request.cache_metadata = Some(cache_metadata.clone());
                 let provider_view_attempt = ProviderViewAttemptV1 {
                     ordinal: provider_request_ordinal,
-                    view: stored_provider_view.clone(),
+                    view: provider_view_ledger.clone(),
                 };
                 let provider_view_data = match serde_json::to_value(provider_view_attempt) {
                     Ok(data) => data,
@@ -2977,7 +2969,7 @@ impl HarnessActor {
                     }
                 };
                 provider_view_attempt_data = Some(provider_view_data);
-                persisted_provider_view = Some(stored_provider_view);
+                pending_provider_view = Some((provider_view_ledger, blobs));
             }
             let cache_control = prepared
                 .as_ref()
@@ -3026,17 +3018,20 @@ impl HarnessActor {
                         .await;
                 }
             };
-            if let Err(error) = self
+            let persisted_provider_view = match self
                 .commit_request_attempt(
                     &run_id,
+                    provider_request_ordinal,
+                    pending_provider_view,
                     provider_view_attempt_data,
                     request_attempt_data,
                     &mut thinking_pending,
                 )
                 .await
             {
-                return self.errored_state_outcome(&run_id, error).await;
-            }
+                Ok(stored) => stored,
+                Err(error) => return self.errored_state_outcome(&run_id, error).await,
+            };
             if let Some(stored_provider_view) = persisted_provider_view {
                 previous_provider_view = Some(stored_provider_view);
             }
@@ -7991,10 +7986,12 @@ impl HarnessActor {
     async fn commit_request_attempt(
         &mut self,
         run_id: &RunId,
+        provider_request_ordinal: u64,
+        provider_view: Option<(ProviderViewLedgerV1, Vec<ProviderViewBlobV1>)>,
         provider_view_data: Option<serde_json::Value>,
         cache_attempt_data: serde_json::Value,
         thinking_pending: &mut bool,
-    ) -> Result<(), HaiderError> {
+    ) -> Result<Option<ProviderViewLedgerV1>, HaiderError> {
         self.flush_pending_item_delta().await?;
         let mut envelopes = Vec::with_capacity(
             usize::from(provider_view_data.is_some()) * 2 + usize::from(*thinking_pending) + 2,
@@ -8024,7 +8021,22 @@ impl HarnessActor {
             cache_attempt_data,
             hidden_prompt_omit_render(),
         )?);
-        let committed = self.store.append_owned(envelopes).await?;
+        let (persisted_provider_view, committed) = match provider_view {
+            Some((ledger, blobs)) => {
+                let outcome = self
+                    .store
+                    .persist_provider_view_and_append_owned(ProviderViewAppendRequest {
+                        session_id: self.config.session_id.clone(),
+                        ledger,
+                        blobs,
+                        attempt_ordinal: provider_request_ordinal,
+                        envelopes,
+                    })
+                    .await?;
+                (Some(outcome.ledger), outcome.envelopes)
+            }
+            None => (None, self.store.append_owned(envelopes).await?),
+        };
         for (index, envelope) in committed.iter().enumerate() {
             if self.events.receiver_count() != 0 {
                 let _ = self.events.send(envelope.clone());
@@ -8035,7 +8047,7 @@ impl HarnessActor {
         }
         let _ = self.committed_batches.send(committed);
         *thinking_pending = false;
-        Ok(())
+        Ok(persisted_provider_view)
     }
 
     fn uncommitted_extension_marker(

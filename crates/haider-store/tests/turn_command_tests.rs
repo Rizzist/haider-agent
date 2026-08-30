@@ -90,6 +90,107 @@ fn submit_atomically_commits_receipt_and_runnable_prefix() {
     assert_eq!(store.latest_seq(&session_id).expect("head"), 5);
 }
 
+/// MUTATION CHECK: move the automatic title back to a second transaction.
+/// Expected failure: the committed acceptance batch no longer carries the
+/// final rename fact, or reopened receipt replay can observe an untitled row.
+#[test]
+fn first_turn_auto_title_is_part_of_the_acceptance_transaction() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(root.path()).expect("store");
+    let session_id = SessionId::new("session-auto-title");
+    create(&store, &session_id);
+    let command = submit(&store, "submit-title", &session_id, "run-title");
+
+    let TurnAcceptOutcome::Committed {
+        accepted,
+        envelopes,
+    } = store
+        .accept_turn_with_auto_title(&command, "first-real-turn")
+        .expect("accept")
+    else {
+        panic!("first submit commits");
+    };
+    assert!(accepted.first_user_turn);
+    assert_eq!(
+        envelopes.iter().map(|event| event.seq).collect::<Vec<_>>(),
+        [2, 3, 4, 5, 6]
+    );
+    assert_eq!(
+        haider_protocol::session::SessionConfigEventPayload::session_renamed_from_value(
+            &envelopes[4].payload
+        ),
+        Some(Some("first-real-turn".into()))
+    );
+    assert_eq!(
+        store
+            .session_metadata(&session_id)
+            .expect("metadata")
+            .and_then(|metadata| metadata.title),
+        Some("first-real-turn".into())
+    );
+    drop(store);
+
+    let reopened = Store::open(root.path()).expect("reopen");
+    assert!(matches!(
+        reopened
+            .accept_turn_with_auto_title(&command, "first-real-turn")
+            .expect("stale replay"),
+        TurnAcceptOutcome::IdempotentReplay { .. }
+    ));
+    assert_eq!(
+        reopened
+            .session_metadata(&session_id)
+            .expect("reopened metadata")
+            .and_then(|metadata| metadata.title),
+        Some("first-real-turn".into())
+    );
+
+    // Upgrade repair: the pre-fusion shape could commit the first-turn
+    // receipt and crash before its separate rename transaction. Replaying
+    // that receipt must still install and publish the title exactly once.
+    let legacy_session = SessionId::new("session-pre-fused-auto-title");
+    create(&reopened, &legacy_session);
+    let legacy_command = submit(
+        &reopened,
+        "submit-pre-fused-title",
+        &legacy_session,
+        "run-pre-fused-title",
+    );
+    reopened
+        .accept_turn(&legacy_command)
+        .expect("accept pre-fused shape");
+    let head_before_repair = reopened.latest_seq(&legacy_session).expect("head");
+    let TurnAcceptOutcome::Committed {
+        accepted,
+        envelopes,
+    } = reopened
+        .accept_turn_with_auto_title(&legacy_command, "repaired-title")
+        .expect("repair title on receipt replay")
+    else {
+        panic!("receipt replay with a missing title publishes the repair");
+    };
+    assert!(accepted.first_user_turn);
+    assert_eq!(envelopes.len(), 1);
+    assert_eq!(envelopes[0].seq, head_before_repair + 1);
+    assert_eq!(
+        reopened
+            .session_metadata(&legacy_session)
+            .expect("repaired metadata")
+            .and_then(|metadata| metadata.title),
+        Some("repaired-title".into())
+    );
+    assert!(matches!(
+        reopened
+            .accept_turn_with_auto_title(&legacy_command, "repaired-title")
+            .expect("repaired replay"),
+        TurnAcceptOutcome::IdempotentReplay { .. }
+    ));
+    assert_eq!(
+        reopened.latest_seq(&legacy_session).expect("stable head"),
+        head_before_repair + 1
+    );
+}
+
 /// MUTATION CHECK: queue a fresh run or append a second `Queued` prefix for a
 /// same-run steer. Expected runtime failure: disposition is not
 /// `SteerPending`, more than one UserMessage is appended, or its atomic tree

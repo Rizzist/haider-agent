@@ -1,7 +1,7 @@
 #![allow(clippy::expect_used)]
 
 use super::*;
-use crate::{CommittedRange, MemoryStore};
+use crate::{CommittedRange, MemoryStore, ProviderViewAppendOutcome};
 use haider_accounts::{MemoryVault, Vault};
 use haider_protocol::branch::BranchDescriptor;
 use haider_protocol::provider::{CapabilityDoc, UsageSource};
@@ -96,6 +96,24 @@ impl StoreHandle for AppendRecordingStore {
             ));
         }
         self.inner.append(envelopes).await
+    }
+
+    async fn persist_provider_view_and_append_owned(
+        &self,
+        request: ProviderViewAppendRequest,
+    ) -> Result<ProviderViewAppendOutcome, HaiderError> {
+        let ProviderViewAppendRequest {
+            session_id,
+            ledger,
+            blobs,
+            attempt_ordinal: _,
+            envelopes,
+        } = request;
+        let ledger = self
+            .persist_provider_view(&session_id, ledger, blobs)
+            .await?;
+        let envelopes = self.append_owned(envelopes).await?;
+        Ok(ProviderViewAppendOutcome { ledger, envelopes })
     }
 
     async fn read(
@@ -342,11 +360,10 @@ async fn production_request_path_batches_provider_view_with_attempt_facts() {
     ))
     .expect("cache-attempt data is typed");
     assert_eq!(provider_attempt.ordinal, cache_attempt.ordinal);
-    let storage = provider_attempt
-        .view
-        .storage
-        .expect("provider-view marker contains the exact durable cursor");
-    assert_eq!(storage.session_id, session_id);
+    assert!(
+        provider_attempt.view.storage.is_none(),
+        "a journal-only store must not claim a durable provider-view cursor"
+    );
 }
 
 /// MUTATION CHECK: publish either half before the combined append succeeds or
@@ -437,6 +454,8 @@ async fn rejected_combined_append_does_not_publish_or_advance_state() {
     actor
         .commit_request_attempt(
             &RunId::new("provider-view-rejected-publication-run"),
+            1,
+            None,
             Some(serde_json::json!({"provider_view": "exact"})),
             serde_json::json!({"cache_attempt": "diagnostic"}),
             &mut thinking_pending,
@@ -471,6 +490,8 @@ async fn provider_view_and_request_attempt_share_one_ordered_append() {
     actor
         .commit_request_attempt(
             &RunId::new("provider-view-request-run"),
+            1,
+            None,
             Some(serde_json::json!({"provider_view": "exact"})),
             serde_json::json!({"cache_attempt": "diagnostic"}),
             &mut thinking_pending,

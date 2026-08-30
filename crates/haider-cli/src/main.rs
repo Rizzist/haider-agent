@@ -64,7 +64,7 @@ enum RuntimeProfile {
 impl RuntimeProfile {
     fn for_args(args: &[String]) -> Self {
         match args.first().map(String::as_str) {
-            Some("run") => Self::EphemeralHeadless,
+            Some("run" | "status") => Self::EphemeralHeadless,
             _ => Self::Full,
         }
     }
@@ -136,8 +136,8 @@ fn hold_explorer_console_on_failure(code: ExitCode) {
 }
 
 /// Select the runtime before constructing an async command future. In
-/// particular, `haider run` never constructs the omnibus dispatcher/TUI
-/// future and never initializes terminal, theme, settings, or render state.
+/// particular, one-shot `haider run` and `haider status` commands never
+/// construct the omnibus dispatcher/TUI future or initialize terminal state.
 fn run_cli(args: Vec<String>) -> ExitCode {
     let profile = RuntimeProfile::for_args(&args);
     let runtime = match profile.build() {
@@ -148,10 +148,19 @@ fn run_cli(args: Vec<String>) -> ExitCode {
         }
     };
     match profile {
-        RuntimeProfile::EphemeralHeadless => {
-            let rest = args.get(1..).unwrap_or_default();
-            runtime.block_on(run::run_command(rest))
-        }
+        RuntimeProfile::EphemeralHeadless => match args.first().map(String::as_str) {
+            Some("run") => {
+                let rest = args.get(1..).unwrap_or_default();
+                runtime.block_on(run::run_command(rest))
+            }
+            Some("status") => {
+                let rest = args.get(1..).unwrap_or_default();
+                let code = runtime.block_on(observe::status_command(rest));
+                runtime.shutdown_background();
+                code
+            }
+            _ => ExitCode::from(EX_SOFTWARE),
+        },
         RuntimeProfile::Full => runtime.block_on(dispatch(&args)),
     }
 }
@@ -172,10 +181,12 @@ mod runtime_tests {
     }
 
     #[test]
-    fn run_uses_the_lean_current_thread_runtime() {
-        let profile = RuntimeProfile::for_args(&args(&["run", "hello"]));
-        assert_eq!(profile, RuntimeProfile::EphemeralHeadless);
-        assert_eq!(runtime_flavor(profile), RuntimeFlavor::CurrentThread);
+    fn one_shot_commands_use_the_lean_current_thread_runtime() {
+        for arguments in [args(&["run", "hello"]), args(&["status", "--json"])] {
+            let profile = RuntimeProfile::for_args(&arguments);
+            assert_eq!(profile, RuntimeProfile::EphemeralHeadless);
+            assert_eq!(runtime_flavor(profile), RuntimeFlavor::CurrentThread);
+        }
     }
 
     #[test]
