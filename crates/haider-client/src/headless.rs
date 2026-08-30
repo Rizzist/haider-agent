@@ -464,13 +464,17 @@ pub enum HeadlessEvent {
 
 /// Delivery/retention policy for a headless output adapter.
 ///
-/// All modes retain the correlated ledger. `FullRecordSet` starts that ledger
-/// on disk for single-JSON output, while ordinary runs retain small ledgers in
-/// memory and spill once at the documented threshold.
+/// Retaining modes keep the correlated ledger. `FullRecordSet` starts that
+/// ledger on disk for single-JSON output, while ordinary runs retain small
+/// ledgers in memory and spill once at the documented threshold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeadlessEventMode {
     /// Stream every envelope (for JSONL and general API consumers).
     Stream,
+    /// Stream every envelope without cloning it into the returned result.
+    /// Intended for adapters, such as CLI JSONL, whose output is itself the
+    /// lossless record and which never consume `HeadlessRunResult::events`.
+    StreamWithoutResultLedger,
     /// Stream announcements/denials only; retain the ledger for the result.
     Summary,
     /// Retain the complete ledger on disk for one final JSON document.
@@ -479,11 +483,15 @@ pub enum HeadlessEventMode {
 
 impl HeadlessEventMode {
     fn streams_envelopes(self) -> bool {
-        self == Self::Stream
+        matches!(self, Self::Stream | Self::StreamWithoutResultLedger)
     }
 
     fn spools_immediately(self) -> bool {
         self == Self::FullRecordSet
+    }
+
+    fn retains_result_ledger(self) -> bool {
+        self != Self::StreamWithoutResultLedger
     }
 }
 
@@ -1530,7 +1538,7 @@ fn write_event_spool_record(
 struct HeadlessEventOutput {
     sender: Option<mpsc::UnboundedSender<HeadlessEvent>>,
     stream_envelopes: bool,
-    ledger: HeadlessEventLedgerWriter,
+    ledger: Option<HeadlessEventLedgerWriter>,
 }
 
 impl HeadlessEventOutput {
@@ -1538,7 +1546,9 @@ impl HeadlessEventOutput {
         Self {
             sender: Some(sender),
             stream_envelopes: mode.streams_envelopes(),
-            ledger: HeadlessEventLedgerWriter::new(mode.spools_immediately()),
+            ledger: mode
+                .retains_result_ledger()
+                .then(|| HeadlessEventLedgerWriter::new(mode.spools_immediately())),
         }
     }
 
@@ -1553,11 +1563,13 @@ impl HeadlessEventOutput {
 
     fn emit_envelope(&mut self, envelope: RawEnvelope, correlated: bool) {
         if correlated && !self.stream_envelopes {
-            self.ledger.record_owned(envelope);
+            if let Some(ledger) = self.ledger.as_mut() {
+                ledger.record_owned(envelope);
+            }
             return;
         }
-        if correlated {
-            self.ledger.record(&envelope);
+        if correlated && let Some(ledger) = self.ledger.as_mut() {
+            ledger.record(&envelope);
         }
         if self.stream_envelopes {
             self.emit(HeadlessEvent::Envelope(Box::new(envelope)));
@@ -1569,7 +1581,10 @@ impl HeadlessEventOutput {
         run_id: RunId,
         expected_len: usize,
     ) -> Result<HeadlessRunEvents, HeadlessRunError> {
-        self.ledger.finish(run_id, expected_len)
+        match self.ledger {
+            Some(ledger) => ledger.finish(run_id, expected_len),
+            None => Ok(HeadlessRunEvents::empty(run_id)),
+        }
     }
 }
 
@@ -1677,12 +1692,43 @@ impl HeadlessReducer {
         {
             self.budget_exhausted = Some(exhausted);
         }
-        // Correlation and the cheap tagged-union discriminator are resolved
-        // before cloning the JSON value into the large core event union.
+        // Only payload families that change the headless projection need a
+        // typed decode. Decode from the already-parsed JSON value by reference:
+        // streamed/retained envelopes keep their original lossless payload,
+        // while unrelated large tool/history payloads avoid a second walk.
+        let reduce_core_payload = match payload_type {
+            Some("item") => {
+                envelope
+                    .payload
+                    .get("event")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("completed")
+                    && matches!(
+                        envelope
+                            .payload
+                            .get("item")
+                            .and_then(|item| item.get("item"))
+                            .and_then(serde_json::Value::as_str),
+                        Some("agent_message" | "incomplete_agent_message")
+                    )
+            }
+            Some("effect") => matches!(
+                envelope
+                    .payload
+                    .get("phase")
+                    .and_then(serde_json::Value::as_str),
+                Some("intent" | "authorized")
+            ),
+            Some(
+                "usage" | "run_failed" | "run_state" | "menu_opened" | "menu_answered"
+                | "menu_closed",
+            ) => true,
+            _ => false,
+        };
         let mut denial_to_emit = None;
         if correlated
-            && payload_type.is_some()
-            && let Ok(payload) = serde_json::from_value::<EventPayload>(envelope.payload.clone())
+            && reduce_core_payload
+            && let Ok(payload) = EventPayload::deserialize(&envelope.payload)
         {
             match payload {
                 EventPayload::Item(ItemEvent::Completed {
@@ -2378,20 +2424,59 @@ async fn reap_owned_daemon(
     ownership: DaemonOwnershipToken,
     deadline: Instant,
 ) -> Result<(), HeadlessRunError> {
+    let authenticated_pid = ownership.authenticated_pid;
     let child = ownership.child;
     // `std::process::Child::wait` blocks on the OS process-exit notification
-    // (waitpid on Unix, the process handle on Windows). The platform waiter
-    // uses a detached OS thread, so a missed deadline cannot pin Tokio runtime
-    // shutdown; while this process remains alive, it still eventually reaps.
-    let wait = haider_platform::wait_for_child_exit(child);
-    match tokio::time::timeout_at(deadline, wait).await {
+    // (waitpid on Unix, the process handle on Windows). Keep this exact waiter
+    // alive across the deadline: escalation addresses the authenticated PID,
+    // then the retained child handle supplies the unconditional final reap.
+    let mut wait = Box::pin(haider_platform::wait_for_child_exit(child));
+    match tokio::time::timeout_at(deadline, &mut wait).await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(error)) => Err(teardown_protocol(format!(
             "could not reap owned daemon: {error}"
         ))),
-        Err(_) => Err(teardown_protocol(
-            "owned daemon did not exit before drain deadline",
-        )),
+        Err(_) => {
+            let mut escalation_errors = Vec::new();
+            if let Err(error) = haider_platform::signal_process(
+                authenticated_pid,
+                haider_platform::ProcessSignal::Terminate,
+            ) && !haider_platform::process_error_is_missing(&error)
+            {
+                escalation_errors.push(format!("second shutdown signal failed: {error}"));
+            }
+
+            let forced_deadline = Instant::now() + EPHEMERAL_REAP_GRACE;
+            match tokio::time::timeout_at(forced_deadline, &mut wait).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    return Err(teardown_protocol(format!(
+                        "could not reap overdue owned daemon: {error}"
+                    )));
+                }
+                Err(_) => {
+                    if let Err(error) = haider_platform::kill_process_tree(authenticated_pid, true)
+                        && !haider_platform::process_error_is_missing(&error)
+                    {
+                        escalation_errors.push(format!("forced process-tree kill failed: {error}"));
+                    }
+                    wait.await.map_err(|error| {
+                        teardown_protocol(format!(
+                            "could not reap force-terminated owned daemon: {error}"
+                        ))
+                    })?;
+                }
+            }
+
+            let detail = if escalation_errors.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", escalation_errors.join("; "))
+            };
+            Err(teardown_protocol(format!(
+                "owned daemon exceeded its drain deadline and was terminated before final reap{detail}"
+            )))
+        }
     }
 }
 

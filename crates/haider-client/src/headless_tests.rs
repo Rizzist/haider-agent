@@ -2,12 +2,28 @@
 
 use super::{
     BufferedWireFrames, EnsureOptions, HEADLESS_EVENT_MEMORY_THRESHOLD_BYTES, HeadlessAttachment,
-    HeadlessEventLedgerWriter, HeadlessRunError, HeadlessRunEventStorage, HeadlessSessionConfig,
-    headless_submit_body, load_attachment, load_pdf_attachment, normalize_session_config_features,
+    HeadlessEvent, HeadlessEventLedgerWriter, HeadlessEventMode, HeadlessEventOutput,
+    HeadlessRunError, HeadlessRunEventStorage, HeadlessSessionConfig, headless_submit_body,
+    load_attachment, load_pdf_attachment, normalize_session_config_features,
 };
 use haider_rpc::haider_protocol::envelope::RawEnvelope;
 use haider_rpc::haider_protocol::ids::{RunId, SessionId};
 use haider_rpc::{CommandId, RequestBody};
+
+#[cfg(unix)]
+use super::reap_owned_daemon;
+#[cfg(unix)]
+use crate::spawn::DaemonOwnershipToken;
+#[cfg(unix)]
+use std::io::BufRead as _;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
+#[cfg(unix)]
+use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::time::{Duration, Instant as StdInstant};
+#[cfg(unix)]
+use tokio::time::Instant;
 
 fn spool_test_envelope(seq: u64, payload: serde_json::Value) -> RawEnvelope {
     serde_json::from_value(serde_json::json!({
@@ -84,6 +100,76 @@ fn threshold_spill_moves_the_complete_prefix_and_preserves_order() {
         .collect::<Result<Vec<_>, _>>()
         .expect("complete spool");
     assert_eq!(replayed, envelopes);
+}
+
+#[test]
+fn stream_without_result_ledger_forwards_once_and_returns_an_empty_ledger() {
+    let envelope = spool_test_envelope(1, serde_json::json!({"type": "future_event"}));
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut output = HeadlessEventOutput::new(sender, HeadlessEventMode::StreamWithoutResultLedger);
+    output.emit_envelope(envelope.clone(), true);
+    let result_events = output
+        .finish(RunId::new("spool-run"), 1)
+        .expect("stream-only output finishes without a retained clone");
+
+    assert!(result_events.is_empty());
+    assert_eq!(
+        receiver.try_recv().expect("streamed envelope"),
+        HeadlessEvent::Envelope(Box::new(envelope))
+    );
+    assert!(receiver.try_recv().is_err(), "envelope is forwarded once");
+}
+
+/// MUTATION CHECK: return directly from the first reap timeout. The TERM-
+/// ignoring owned child then remains alive and its process group survives the
+/// assertion instead of being force-terminated and unconditionally reaped.
+#[cfg(unix)]
+#[tokio::test]
+async fn timed_out_owned_daemon_reap_terminates_and_reaps_the_process_group() {
+    let mut child = Command::new("/bin/sh");
+    child
+        .arg("-c")
+        .arg("trap '' TERM; printf 'ready\\n'; while :; do sleep 1; done")
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = child.spawn().expect("spawn TERM-ignoring owned child");
+    let pid = child.id();
+    let mut ready = String::new();
+    std::io::BufReader::new(child.stdout.take().expect("owned child stdout"))
+        .read_line(&mut ready)
+        .expect("owned child readiness");
+    assert_eq!(ready, "ready\n");
+
+    let ownership = DaemonOwnershipToken {
+        child,
+        authenticated_pid: pid,
+        instance_id: "timed-out-reap-instance".into(),
+        daemon_generation: 1,
+        _liveness: None,
+    };
+    let error = reap_owned_daemon(ownership, Instant::now())
+        .await
+        .expect_err("deadline escalation remains a truthful teardown error");
+    assert!(
+        error.to_string().contains("terminated before final reap"),
+        "unexpected teardown error: {error}"
+    );
+
+    let group = haider_platform::process_group(Some(pid)).expect("owned process group");
+    let proof_deadline = StdInstant::now() + Duration::from_secs(1);
+    loop {
+        let alive = haider_platform::process_group_exists(group)
+            .expect("probe force-terminated process group");
+        if !alive {
+            break;
+        }
+        assert!(
+            StdInstant::now() < proof_deadline,
+            "owned process group {pid} survived timed-out reap escalation"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
