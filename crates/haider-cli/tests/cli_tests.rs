@@ -266,10 +266,13 @@ fn staged_process_thread_count(pid: u32) -> io::Result<Option<usize>> {
             output.status
         )));
     }
+    // macOS `ps -M` emits one process summary row before its per-thread rows.
+    // Exclude that summary so this matches Linux `/proc/<pid>/task` semantics.
     Ok(Some(
         String::from_utf8_lossy(&output.stdout)
             .lines()
             .filter(|line| !line.trim().is_empty())
+            .skip(1)
             .count(),
     ))
 }
