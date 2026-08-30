@@ -7,6 +7,11 @@ npm install -g haider-agent
 haider
 ```
 
+The published package is the unscoped `haider-agent` package. The checked-in
+`package.json` version is deliberately `0.0.0`: for a `vX.Y.Z` release tag, the
+release workflow replaces that placeholder with `X.Y.Z` immediately before
+`npm publish`. Do not hand-bump the placeholder during workspace releases.
+
 The postinstall script downloads the platform archive from the matching GitHub
 release, verifies its release-provided SHA-256 sidecar, and stores `haider` and
 its required sibling daemon `haiderd` together under this package's `vendor/`

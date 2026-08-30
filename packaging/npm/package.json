@@ -1,6 +1,6 @@
 {
   "name": "haider-agent",
-  "version": "0.0.934",
+  "version": "0.0.0",
   "description": "The Haider coding-agent TUI and runtime",
   "homepage": "https://github.com/Rizzist/haider-agent",
   "repository": {
