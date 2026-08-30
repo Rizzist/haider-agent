@@ -10447,6 +10447,7 @@ impl AccountsRuntime {
         provider_names: &std::collections::BTreeSet<String>,
         discovery_disabled: bool,
     ) -> Result<Self, HaiderError> {
+        let schema_bootstrapped_from_zero = store.schema_bootstrapped_from_zero();
         let descriptor_store: Box<dyn StoreLike> = match &dependencies.descriptor_store {
             Some(injected) => Box::new(DescriptorStore::Injected(Arc::clone(injected))),
             None => Box::new(DescriptorStore::Json(JsonFileStore::new(store_dir))),
@@ -10460,23 +10461,25 @@ impl AccountsRuntime {
             initial_provider_profiles(provider_names, default_model),
             model_source.clone(),
         )?;
-        let provider_ids = providers
-            .summaries(&|_| false)
-            .into_iter()
-            .map(|summary| summary.provider)
-            .collect::<Vec<_>>();
-        for provider in provider_ids {
-            if let Some(cached) = store.provider_models(provider.clone()).await? {
-                let models = serde_json::from_str(&cached.models_json).map_err(|error| {
-                    HaiderError::new(
-                        ErrorCode::StoreCorrupt,
-                        format!(
-                            "cached model catalog for provider `{provider}` is invalid: {error}"
-                        ),
-                        false,
-                    )
-                })?;
-                model_source.replace(provider.clone(), models, Some(cached.fetched_at_ms));
+        if !schema_bootstrapped_from_zero {
+            let provider_ids = providers
+                .summaries(&|_| false)
+                .into_iter()
+                .map(|summary| summary.provider)
+                .collect::<Vec<_>>();
+            for provider in provider_ids {
+                if let Some(cached) = store.provider_models(provider.clone()).await? {
+                    let models = serde_json::from_str(&cached.models_json).map_err(|error| {
+                        HaiderError::new(
+                            ErrorCode::StoreCorrupt,
+                            format!(
+                                "cached model catalog for provider `{provider}` is invalid: {error}"
+                            ),
+                            false,
+                        )
+                    })?;
+                    model_source.replace(provider.clone(), models, Some(cached.fetched_at_ms));
+                }
             }
         }
         // R10: every daemon vault consumer funnels through this ONE wrap.
@@ -10505,43 +10508,53 @@ impl AccountsRuntime {
             ) as Arc<dyn Vault>),
             None => VaultProvision::Unsupported,
         };
-        reconcile_remove_receipts(store, &mut accounts, &vault).await?;
-        // Removal reconciliation can finalize a reservation, so hydrate only
-        // after it completes. Login and OAuth then share one coherent receipt
-        // snapshot and the actor reuses the same post-removal alias fence.
-        // This is a single-writer pre-Ready window: no concurrent account
-        // command can invalidate the snapshot between these consumers.
-        let receipt_rows = DurableAccountReceiptRows::load(store).await?;
-        let durable_heads = durable_account_heads_from(store, &receipt_rows).await?;
-        let reserved_aliases = store
-            .reserved_account_aliases()
-            .await?
-            .into_iter()
-            .collect::<HashSet<_>>();
-        reconcile_login_receipts_from(
-            store,
-            &mut accounts,
-            &vault,
-            &receipt_rows.login,
-            &durable_heads,
-            &reserved_aliases,
-        )
-        .await?;
-        reconcile_oauth_add_receipts_from(
-            store,
-            &mut accounts,
-            &vault,
-            &receipt_rows.oauth_add,
-            &durable_heads,
-            &reserved_aliases,
-        )
-        .await?;
-        reconcile_set_active_receipts(store, &mut accounts).await?;
-        reconcile_provider_receipts(store, &accounts, &mut providers).await?;
+        let reserved_aliases = if schema_bootstrapped_from_zero {
+            HashSet::new()
+        } else {
+            reconcile_remove_receipts(store, &mut accounts, &vault).await?;
+            // Removal reconciliation can finalize a reservation, so hydrate only
+            // after it completes. Login and OAuth then share one coherent receipt
+            // snapshot and the actor reuses the same post-removal alias fence.
+            // This is a single-writer pre-Ready window: no concurrent account
+            // command can invalidate the snapshot between these consumers.
+            let receipt_rows = DurableAccountReceiptRows::load(store).await?;
+            let durable_heads = durable_account_heads_from(store, &receipt_rows).await?;
+            let reserved_aliases = store
+                .reserved_account_aliases()
+                .await?
+                .into_iter()
+                .collect::<HashSet<_>>();
+            reconcile_login_receipts_from(
+                store,
+                &mut accounts,
+                &vault,
+                &receipt_rows.login,
+                &durable_heads,
+                &reserved_aliases,
+            )
+            .await?;
+            reconcile_oauth_add_receipts_from(
+                store,
+                &mut accounts,
+                &vault,
+                &receipt_rows.oauth_add,
+                &durable_heads,
+                &reserved_aliases,
+            )
+            .await?;
+            reconcile_set_active_receipts(store, &mut accounts).await?;
+            reconcile_provider_receipts(store, &accounts, &mut providers).await?;
+            reserved_aliases
+        };
         import_bedrock_env_bearer(&mut accounts, &vault);
         let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
+        let management_revision = if schema_bootstrapped_from_zero {
+            0
+        } else {
+            store.management_revision().await?
+        };
         let management = ManagementSnapshot::new(
-            store.management_revision().await?,
+            management_revision,
             accounts.list().to_vec(),
             providers.summaries(&provider_has_credential(&accounts)),
         );

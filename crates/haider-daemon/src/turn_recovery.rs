@@ -158,6 +158,15 @@ pub(crate) struct StartupTurnRecovery {
     pub(crate) touched_sessions: Vec<SessionId>,
 }
 
+impl StartupTurnRecovery {
+    pub(crate) fn schema_zero() -> Self {
+        Self {
+            work: Vec::new(),
+            touched_sessions: Vec::new(),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct DurableTurnRecoveryCheckpoint {
     shape_version: u32,

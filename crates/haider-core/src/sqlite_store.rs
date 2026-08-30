@@ -58,6 +58,7 @@ pub struct SqliteStoreHandle {
 
 struct StoreOwner {
     root: PathBuf,
+    schema_bootstrapped_from_zero: bool,
     worker_generation: u64,
     profile_installation_id: String,
     store: Mutex<Option<Store>>,
@@ -136,12 +137,14 @@ impl SqliteStoreHandle {
 
     fn from_store(store: Store) -> Result<Self, HaiderError> {
         let root = store.root().to_path_buf();
+        let schema_bootstrapped_from_zero = store.schema_bootstrapped_from_zero();
         let worker_generation = store.worker_generation();
         let profile_installation_id = store.profile_installation_id()?;
         let (fault, _) = tokio::sync::watch::channel(None);
         Ok(Self {
             owner: Arc::new(StoreOwner {
                 root,
+                schema_bootstrapped_from_zero,
                 worker_generation,
                 profile_installation_id,
                 store: Mutex::new(Some(store)),
@@ -186,6 +189,14 @@ impl SqliteStoreHandle {
     /// Profile-owned fencing generation allocated by this store open.
     pub fn worker_generation(&self) -> u64 {
         self.owner.worker_generation
+    }
+
+    /// Positive store-issued proof that this locked open committed a complete
+    /// 0-to-latest schema bootstrap. Existing stores return false even when
+    /// every recovery table is empty.
+    #[must_use]
+    pub fn schema_bootstrapped_from_zero(&self) -> bool {
+        self.owner.schema_bootstrapped_from_zero
     }
 
     /// Profile root containing the journal and daemon-maintained native
@@ -2815,6 +2826,44 @@ where
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod error_wave_tests {
     use super::*;
+
+    /// MUTATION CHECK: derive the startup bypass from table emptiness or lose
+    /// either generation advance. Expected runtime failure: the reopened empty
+    /// store reports a fresh proof, or one generation does not reach two.
+    #[tokio::test]
+    async fn schema_zero_proof_is_open_scoped_and_generations_still_advance() {
+        let root = tempfile::tempdir().expect("profile");
+        let first = SqliteStoreHandle::open(root.path())
+            .await
+            .expect("fresh store");
+        assert!(first.schema_bootstrapped_from_zero());
+        assert_eq!(first.worker_generation(), 1);
+        assert_eq!(
+            first
+                .advance_daemon_generation()
+                .await
+                .expect("daemon generation"),
+            1
+        );
+        first.close().await.expect("close fresh store");
+
+        let reopened = SqliteStoreHandle::open(root.path())
+            .await
+            .expect("reopen empty store");
+        assert!(
+            !reopened.schema_bootstrapped_from_zero(),
+            "an empty existing store must retain the complete recovery path"
+        );
+        assert_eq!(reopened.worker_generation(), 2);
+        assert_eq!(
+            reopened
+                .advance_daemon_generation()
+                .await
+                .expect("second daemon generation"),
+            2
+        );
+        reopened.close().await.expect("close reopened store");
+    }
 
     /// E5a profile-level pin: this operation has no journal envelope, but a
     /// swallowed write error must still identify the durable write that was

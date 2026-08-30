@@ -39,7 +39,7 @@ use std::time::Duration;
 #[test]
 fn snapshot_schedule_restarts_idle_window_after_a_long_clean_gap() {
     let start = std::time::Instant::now();
-    let mut schedule = SnapshotSchedule::new(start);
+    let mut schedule = SnapshotSchedule::new(start, false);
     let commit = start + Duration::from_secs(10);
     schedule.note_commit(commit);
     assert_eq!(
@@ -994,11 +994,11 @@ async fn wait_for_hook_outbox_drain(store: &SqliteStoreHandle) {
     .expect("hook outbox drain deadline");
 }
 
-/// MUTATION CHECK: persist on every committed batch, omit the terminal or
-/// shutdown boundary. Expected runtime failure: one of the exact persist-count
-/// deltas changes.
+/// MUTATION CHECK: persist on every committed batch, omit a dirty terminal or
+/// delete boundary, or restore a clean-shutdown rewrite. Expected runtime
+/// failure: one of the exact persist-count deltas changes.
 #[tokio::test]
-async fn snapshot_cadence_coalesces_batches_and_forces_terminal_delete_and_shutdown() {
+async fn snapshot_cadence_coalesces_batches_and_avoids_clean_shutdown_rewrite() {
     let command = emit_command("terminal");
     let fixture = EngineFixture::start_with_event_and_trust(
         &command,
@@ -1096,18 +1096,19 @@ async fn snapshot_cadence_coalesces_batches_and_forces_terminal_delete_and_shutd
 
     let before_shutdown = fixture.service.snapshot_persist_count();
     fixture.engine.shutdown().await;
-    assert!(
-        fixture.service.snapshot_persist_count() > before_shutdown,
-        "shutdown forces a final snapshot persist"
+    assert_eq!(
+        fixture.service.snapshot_persist_count(),
+        before_shutdown,
+        "a clean shutdown must not rewrite the authoritative journal's cache"
     );
     fixture.hub.shutdown().await.expect("hub shutdown");
     fixture.store.close().await.expect("store close");
 }
 
-/// MUTATION CHECK: restore the post-replay boot persist. Expected runtime
-/// failure: the count is two before any committed message exists.
+/// MUTATION CHECK: restore the post-replay boot persist or the clean-shutdown
+/// persist. Expected runtime failure: a fresh no-event engine writes a cache.
 #[tokio::test]
-async fn hook_start_performs_exactly_one_immediate_snapshot_persist() {
+async fn hook_start_and_clean_shutdown_do_not_persist_an_empty_snapshot() {
     let profile = tempfile::tempdir().expect("hook profile");
     let profile_root = canonical(profile.path());
     let store = SqliteStoreHandle::open(&profile_root).await.expect("store");
@@ -1116,8 +1117,9 @@ async fn hook_start_performs_exactly_one_immediate_snapshot_persist() {
         .await
         .expect("hook engine");
     tokio::task::yield_now().await;
-    assert_eq!(service.snapshot_persist_count(), 1);
+    assert_eq!(service.snapshot_persist_count(), 0);
     engine.shutdown().await;
+    assert_eq!(service.snapshot_persist_count(), 0);
     hub.shutdown().await.expect("hub shutdown");
     store.close().await.expect("store close");
 }

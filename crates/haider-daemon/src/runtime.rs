@@ -54,7 +54,8 @@ use crate::hooks::HookStartupHydrator;
 use crate::lifecycle::{ShutdownObserver, ShutdownReason, ShutdownRequest, StatePublisher};
 use crate::pipe_native::{PipeBootSession, PipeNativeWriter};
 use crate::turn_recovery::{
-    RecoveredWork, StartupJournalVisitor, recover_interrupted_turns_report_with_visitor,
+    RecoveredWork, StartupJournalVisitor, StartupTurnRecovery,
+    recover_interrupted_turns_report_with_visitor,
 };
 use crate::worker::WorkerManager;
 use crate::{
@@ -149,6 +150,15 @@ impl PreparedDaemonTask {
     }
 
     fn spawn(self, config: DaemonConfig, dependencies: DaemonDependencies) -> DaemonTask {
+        self.spawn_with_boot_memory_release(config, dependencies, true)
+    }
+
+    fn spawn_with_boot_memory_release(
+        self,
+        config: DaemonConfig,
+        dependencies: DaemonDependencies,
+        release_boot_memory: bool,
+    ) -> DaemonTask {
         let diagnostics = DaemonTaskDiagnostics {
             readiness: self.readiness.clone(),
             completion: Arc::clone(&self.completion),
@@ -163,6 +173,7 @@ impl PreparedDaemonTask {
                 config,
                 dependencies,
                 self.states,
+                release_boot_memory,
                 DaemonTaskControl {
                     shutdown_handle: task_shutdown,
                     shutdown: self.shutdown_receiver,
@@ -289,6 +300,10 @@ struct StartupHydration {
 }
 
 impl StartupHydration {
+    fn schema_zero(store: &SqliteStoreHandle) -> Self {
+        Self::with_hooks(store, HookStartupHydrator::schema_zero())
+    }
+
     async fn prepare(store: &SqliteStoreHandle) -> Result<Self, HaiderError> {
         Ok(Self::with_hooks(
             store,
@@ -527,6 +542,7 @@ pub async fn run_with_signals_and_dependencies_and_readiness_and_liveness(
         })?;
     let prepared = PreparedDaemonTask::new();
     let shutdown = prepared.shutdown_handle();
+    let release_boot_memory = launcher_liveness.is_none();
     let (mut liveness_task, liveness_armed) = launcher_liveness.map_or_else(
         || (None, None),
         |watcher| {
@@ -571,7 +587,7 @@ pub async fn run_with_signals_and_dependencies_and_readiness_and_liveness(
             }
         }
     }
-    let task = prepared.spawn(config, dependencies);
+    let task = prepared.spawn_with_boot_memory_release(config, dependencies, release_boot_memory);
     let mut readiness = task.readiness();
     let mut joined: Pin<Box<dyn Future<Output = Result<ShutdownOutcome, DaemonError>> + Send>> =
         Box::pin(task.join());
@@ -657,9 +673,10 @@ async fn run_owner(
     config: DaemonConfig,
     dependencies: DaemonDependencies,
     states: StatePublisher,
+    release_boot_memory: bool,
     control: DaemonTaskControl,
 ) -> Result<ShutdownOutcome, DaemonError> {
-    let result = run_inner(&config, dependencies, &states, control).await;
+    let result = run_inner(&config, dependencies, &states, release_boot_memory, control).await;
     if let Err(error) = &result {
         states.publish(DaemonState::Failed {
             message: error.to_string(),
@@ -672,6 +689,7 @@ async fn run_inner(
     config: &DaemonConfig,
     dependencies: DaemonDependencies,
     states: &StatePublisher,
+    release_boot_memory: bool,
     control: DaemonTaskControl,
 ) -> Result<ShutdownOutcome, DaemonError> {
     let DaemonTaskControl {
@@ -733,6 +751,7 @@ async fn run_inner(
     // this may a listener bind or Ready be advertised.
     states.publish(DaemonState::Recovering);
     let store = SqliteStoreHandle::open_locked(lease).await?;
+    let schema_bootstrapped_from_zero = store.schema_bootstrapped_from_zero();
     if let Err(error) = store.initialize_usage_history().await {
         let _ = store.close().await;
         return Err(error.into());
@@ -778,23 +797,25 @@ async fn run_inner(
     };
     let device_id = DeviceId::new(format!("daemon-{instance_id}"));
     let effect_recovery_started = Instant::now();
-    match reconcile_before_ready(&store, &device_id, &mut shutdown).await {
-        Some(Ok(_)) => {}
-        Some(Err(error)) => {
-            let _ = store.close().await;
-            return Err(error.into());
-        }
-        None => {
-            let request = shutdown.borrow().clone();
-            return shutdown_before_listener(
-                config,
-                states,
-                store,
-                runtime_directory,
-                request,
-                &mut shutdown,
-            )
-            .await;
+    if !schema_bootstrapped_from_zero {
+        match reconcile_before_ready(&store, &device_id, &mut shutdown).await {
+            Some(Ok(_)) => {}
+            Some(Err(error)) => {
+                let _ = store.close().await;
+                return Err(error.into());
+            }
+            None => {
+                let request = shutdown.borrow().clone();
+                return shutdown_before_listener(
+                    config,
+                    states,
+                    store,
+                    runtime_directory,
+                    request,
+                    &mut shutdown,
+                )
+                .await;
+            }
         }
     }
     tracing::trace!(
@@ -815,11 +836,15 @@ async fn run_inner(
         )
         .await;
     }
-    let mut startup_hydration = match StartupHydration::prepare(&store).await {
-        Ok(hydration) => hydration,
-        Err(error) => {
-            let _ = store.close().await;
-            return Err(error.into());
+    let mut startup_hydration = if schema_bootstrapped_from_zero {
+        StartupHydration::schema_zero(&store)
+    } else {
+        match StartupHydration::prepare(&store).await {
+            Ok(hydration) => hydration,
+            Err(error) => {
+                let _ = store.close().await;
+                return Err(error.into());
+            }
         }
     };
     if let Some(request) = startup_shutdown_request(&shutdown) {
@@ -834,17 +859,21 @@ async fn run_inner(
         .await;
     }
     let turn_recovery_started = Instant::now();
-    let turn_recovery = match recover_interrupted_turns_report_with_visitor(
-        &store,
-        &device_id,
-        &mut startup_hydration,
-    )
-    .await
-    {
-        Ok(recovery) => recovery,
-        Err(error) => {
-            let _ = store.close().await;
-            return Err(error.into());
+    let turn_recovery = if schema_bootstrapped_from_zero {
+        StartupTurnRecovery::schema_zero()
+    } else {
+        match recover_interrupted_turns_report_with_visitor(
+            &store,
+            &device_id,
+            &mut startup_hydration,
+        )
+        .await
+        {
+            Ok(recovery) => recovery,
+            Err(error) => {
+                let _ = store.close().await;
+                return Err(error.into());
+            }
         }
     };
     tracing::trace!(
@@ -1245,11 +1274,10 @@ async fn run_inner(
     }
     // Every boot scan, adoption, recovered-work handoff, and optional
     // transport startup has returned, while no endpoint exists for external
-    // requests. The store adapter serializes this operation with every other
-    // store call, and the connection mutex excludes any live SQLite statement
-    // or transaction. Keep the normal cache ceiling and prepared-statement
-    // cache intact; discard only pages made cold by this boot.
-    if let Err(error) = store.release_memory().await {
+    // requests. A persistent daemon discards pages made cold by this boot.
+    // An ephemeral launcher immediately uses SQLite for its one turn, so it
+    // retains those pages instead of paying to release and fault them back in.
+    if release_boot_memory && let Err(error) = store.release_memory().await {
         tracing::warn!(%error, "SQLite boot-page release failed; continuing startup");
     }
     let mut endpoint = match endpoint::bind(config, runtime_directory).await {

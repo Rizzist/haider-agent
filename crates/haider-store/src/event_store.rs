@@ -1914,6 +1914,7 @@ pub struct ProfileLease {
 pub struct Store {
     root: PathBuf,
     database_path: PathBuf,
+    schema_bootstrapped_from_zero: bool,
     worker_generation: u64,
     connection: Mutex<Connection>,
     graph_reductions: Mutex<HashMap<SessionId, CachedGraphReduction>>,
@@ -1973,7 +1974,7 @@ impl Store {
         } = lease;
         let database_path = root.join("store.sqlite");
         let mut connection = open_connection(&database_path)?;
-        migrations::migrate(&mut connection)?;
+        let migration = migrations::migrate(&mut connection)?;
         backfill_payload_kinds(&mut connection)?;
         backfill_run_head_projections(&mut connection)?;
         connection.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
@@ -1987,6 +1988,10 @@ impl Store {
         Ok(Self {
             root,
             database_path,
+            schema_bootstrapped_from_zero: matches!(
+                migration,
+                migrations::MigrationOutcome::BootstrappedFromZero
+            ),
             worker_generation,
             connection: Mutex::new(connection),
             graph_reductions: Mutex::new(HashMap::new()),
@@ -2061,6 +2066,15 @@ impl Store {
     /// Durable fencing generation allocated by this successful profile open.
     pub fn worker_generation(&self) -> u64 {
         self.worker_generation
+    }
+
+    /// Positive proof that this store open created the complete schema from
+    /// zero while owning the profile lifetime lock.
+    ///
+    /// This is deliberately not derived from an empty sessions/events query:
+    /// an existing empty store must still run the ordinary recovery path.
+    pub fn schema_bootstrapped_from_zero(&self) -> bool {
+        self.schema_bootstrapped_from_zero
     }
 
     /// Persists one provider-rendered request view into the dedicated CAS and

@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::time::SystemTime;
 
 use super::lockdown::{LockdownError, LockdownManager, provider_slug, read_path_allowed};
 
@@ -30,6 +31,32 @@ fn quota_is_global_across_providers_and_reconciles_on_start() {
         10,
         "startup must reconcile the ledger against real files"
     );
+}
+
+/// MUTATION CHECK: restore the unconditional ledger replacement. Expected
+/// runtime failure: an unchanged startup receives a new inode and mtime.
+#[test]
+fn unchanged_startup_scan_does_not_rewrite_the_quota_ledger() {
+    let fixture = tempfile::tempdir().expect("fixture");
+    let root = fixture.path().join("lockdown");
+    let manager = LockdownManager::initialize(root.clone()).expect("manager");
+    drop(manager);
+    let path = root.join("quota.json");
+    let before = fs::metadata(&path).expect("ledger metadata before restart");
+    let before_modified = before.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+
+    let restarted = LockdownManager::initialize(root).expect("unchanged restart");
+    drop(restarted);
+    let after = fs::metadata(path).expect("ledger metadata after restart");
+    assert_eq!(
+        before_modified,
+        after.modified().unwrap_or(SystemTime::UNIX_EPOCH)
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        assert_eq!(before.ino(), after.ino());
+    }
 }
 
 #[test]
