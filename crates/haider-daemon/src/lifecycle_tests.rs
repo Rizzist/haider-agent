@@ -67,3 +67,17 @@ fn launcher_death_is_retained_as_typed_idle_shutdown_reason() {
         }
     ));
 }
+
+#[test]
+fn launcher_death_can_arm_a_bounded_idle_linger() {
+    let (shutdown, receiver, _) = ShutdownHandle::channel();
+    let idle_ttl = Duration::from_millis(250);
+    assert!(shutdown.request_after_idle(ShutdownReason::ClientVanished, idle_ttl));
+    assert!(matches!(
+        &*receiver.borrow(),
+        ShutdownRequest::GracefulAfterIdle {
+            reason: ShutdownReason::ClientVanished,
+            idle_ttl: observed,
+        } if *observed == idle_ttl
+    ));
+}

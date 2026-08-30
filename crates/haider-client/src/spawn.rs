@@ -15,10 +15,10 @@
 //! - The sibling executable next to `current_exe()` is the packaging
 //!   authority; `PATH` is diagnostic convenience only, never silently
 //!   executed.
-//! - Persistent parent exit leaves the daemon running. An
-//!   `EphemeralIfSpawned` launch carries a kernel liveness channel so the
-//!   daemon can shut itself down after the launcher vanishes and all other
-//!   clients disconnect.
+//! - Persistent parent exit leaves the daemon running. Ephemeral and bounded
+//!   linger launches carry a kernel liveness channel so the daemon can shut
+//!   itself down after the launcher vanishes, immediately or after a declared
+//!   idle interval.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -69,6 +69,11 @@ const RACE_LOSER_REAP_POLL: Duration = Duration::from_millis(25);
 pub enum DaemonLifetime {
     #[default]
     Persistent,
+    /// Keep the authenticated child available for subsequent clients, then
+    /// let the daemon shut itself down after this much time with no clients.
+    LingerIfSpawned {
+        idle_ttl: Duration,
+    },
     EphemeralIfSpawned,
 }
 
@@ -598,11 +603,18 @@ fn spawn_daemon(
         runtime_dir: &profile.runtime_dir,
         log_path: &log_path,
     };
-    let spawned = if options.daemon_lifetime == DaemonLifetime::EphemeralIfSpawned {
-        haider_platform::spawn_daemon_with_readiness_and_liveness(spec)
-            .map(|(spawned, liveness)| (spawned, Some(liveness)))
-    } else {
-        haider_platform::spawn_daemon_with_readiness(spec).map(|spawned| (spawned, None))
+    let spawned = match options.daemon_lifetime {
+        DaemonLifetime::Persistent => {
+            haider_platform::spawn_daemon_with_readiness(spec).map(|spawned| (spawned, None))
+        }
+        DaemonLifetime::LingerIfSpawned { idle_ttl } => {
+            haider_platform::spawn_daemon_with_readiness_and_liveness_and_idle_ttl(spec, idle_ttl)
+                .map(|(spawned, liveness)| (spawned, Some(liveness)))
+        }
+        DaemonLifetime::EphemeralIfSpawned => {
+            haider_platform::spawn_daemon_with_readiness_and_liveness(spec)
+                .map(|(spawned, liveness)| (spawned, Some(liveness)))
+        }
     }
     .map_err(|error| {
         let message = match error {

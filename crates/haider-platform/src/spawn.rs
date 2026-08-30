@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 #[path = "spawn_tests.rs"]
@@ -22,6 +22,7 @@ pub const DAEMON_LOG_RETENTION: usize = 32;
 pub const DAEMON_LOG_PATH_ENV: &str = "HAIDER_DAEMON_PROCESS_LOG";
 pub const DAEMON_READINESS_ARG: &str = "--startup-ready";
 pub const DAEMON_LIVENESS_ARG: &str = "--launcher-liveness";
+pub const DAEMON_IDLE_LINGER_ARG: &str = "--idle-linger-ms";
 #[cfg(unix)]
 const DAEMON_READINESS_TOKEN: &str = "3";
 #[cfg(windows)]
@@ -509,7 +510,7 @@ impl std::error::Error for DaemonSpawnError {
 /// Spawns the sibling daemon with its fixed argv/stdout/stderr contract and
 /// the platform's detach + inheritance hygiene.
 pub fn spawn_daemon(spec: DaemonSpawn<'_>) -> Result<Child, DaemonSpawnError> {
-    spawn_daemon_with_stderr(spec, false, None, None, None)
+    spawn_daemon_with_stderr(spec, false, None, None, None, None)
 }
 
 /// Test/diagnostic variant of [`spawn_daemon`] that gives a real daemon an
@@ -520,7 +521,7 @@ pub fn spawn_daemon_with_machine_user_home(
     spec: DaemonSpawn<'_>,
     machine_user_home: &Path,
 ) -> Result<Child, DaemonSpawnError> {
-    spawn_daemon_with_stderr(spec, false, None, None, Some(machine_user_home))
+    spawn_daemon_with_stderr(spec, false, None, None, None, Some(machine_user_home))
 }
 
 /// Spawns a daemon with a private one-shot readiness notification.
@@ -532,7 +533,8 @@ pub fn spawn_daemon_with_readiness(
     let coordinate = prepared
         .child_coordinate()
         .map_err(DaemonSpawnError::Readiness)?;
-    let child = spawn_daemon_with_stderr(spec, false, Some((&token, coordinate)), None, None)?;
+    let child =
+        spawn_daemon_with_stderr(spec, false, Some((&token, coordinate)), None, None, None)?;
     Ok(SpawnedDaemon {
         child,
         readiness: prepared.into_receiver(),
@@ -543,6 +545,22 @@ pub fn spawn_daemon_with_readiness(
 /// a reverse channel that independently proves launcher process liveness.
 pub fn spawn_daemon_with_readiness_and_liveness(
     spec: DaemonSpawn<'_>,
+) -> Result<(SpawnedDaemon, DaemonLivenessGuard), DaemonSpawnError> {
+    spawn_daemon_with_readiness_and_liveness_inner(spec, None)
+}
+
+/// Spawns a daemon whose kernel launcher-liveness proof arms a bounded idle
+/// linger instead of immediate idle shutdown.
+pub fn spawn_daemon_with_readiness_and_liveness_and_idle_ttl(
+    spec: DaemonSpawn<'_>,
+    idle_ttl: Duration,
+) -> Result<(SpawnedDaemon, DaemonLivenessGuard), DaemonSpawnError> {
+    spawn_daemon_with_readiness_and_liveness_inner(spec, Some(idle_ttl))
+}
+
+fn spawn_daemon_with_readiness_and_liveness_inner(
+    spec: DaemonSpawn<'_>,
+    idle_ttl: Option<Duration>,
 ) -> Result<(SpawnedDaemon, DaemonLivenessGuard), DaemonSpawnError> {
     let readiness = prepare_readiness().map_err(DaemonSpawnError::Readiness)?;
     let readiness_token = readiness.token().to_owned();
@@ -557,6 +575,7 @@ pub fn spawn_daemon_with_readiness_and_liveness(
         false,
         Some((&readiness_token, readiness_coordinate)),
         Some((&liveness_token, liveness_coordinate)),
+        idle_ttl,
         None,
     )?;
     Ok((
@@ -576,7 +595,7 @@ pub fn spawn_daemon_with_readiness_and_liveness(
 /// cannot block on a full pipe.
 #[doc(hidden)]
 pub fn spawn_daemon_with_piped_stderr(spec: DaemonSpawn<'_>) -> Result<Child, DaemonSpawnError> {
-    spawn_daemon_with_stderr(spec, true, None, None, None)
+    spawn_daemon_with_stderr(spec, true, None, None, None, None)
 }
 
 fn spawn_daemon_with_stderr(
@@ -584,6 +603,7 @@ fn spawn_daemon_with_stderr(
     pipe_stderr: bool,
     readiness: Option<(&str, ReadinessChildCoordinate)>,
     liveness: Option<(&str, LivenessChildCoordinate)>,
+    idle_ttl: Option<Duration>,
     machine_user_home: Option<&Path>,
 ) -> Result<Child, DaemonSpawnError> {
     // The daemon creates this directory only after it owns the profile lock.
@@ -626,6 +646,12 @@ fn spawn_daemon_with_stderr(
     }
     if let Some((token, _)) = liveness.as_ref() {
         command.arg(DAEMON_LIVENESS_ARG).arg(*token);
+    }
+    if let Some(idle_ttl) = idle_ttl {
+        let idle_ttl_ms = u64::try_from(idle_ttl.as_millis()).unwrap_or(u64::MAX);
+        command
+            .arg(DAEMON_IDLE_LINGER_ARG)
+            .arg(idle_ttl_ms.to_string());
     }
     #[cfg(unix)]
     command.env("TMPDIR", &runtime_temp);

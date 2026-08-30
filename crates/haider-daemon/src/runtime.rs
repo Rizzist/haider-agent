@@ -524,6 +524,7 @@ pub async fn run_with_signals_and_dependencies_and_readiness(
         dependencies,
         launcher_readiness,
         None,
+        None,
     )
     .await
 }
@@ -535,6 +536,7 @@ pub async fn run_with_signals_and_dependencies_and_readiness_and_liveness(
     dependencies: DaemonDependencies,
     mut launcher_readiness: Option<haider_platform::DaemonReadyNotifier>,
     launcher_liveness: Option<haider_platform::DaemonLivenessWatcher>,
+    launcher_idle_ttl: Option<Duration>,
 ) -> Result<ShutdownOutcome, DaemonError> {
     let mut signals =
         haider_platform::ShutdownSignals::new().map_err(|error| DaemonError::Task {
@@ -554,12 +556,12 @@ pub async fn run_with_signals_and_dependencies_and_readiness_and_liveness(
                     std::future::poll_fn(|context| Poll::Ready(wait.as_mut().poll(context))).await;
                 match initial {
                     Poll::Ready(outcome) => {
-                        record_launcher_liveness(outcome, &shutdown);
+                        record_launcher_liveness(outcome, &shutdown, launcher_idle_ttl);
                         let _ = armed_sender.send(());
                     }
                     Poll::Pending => {
                         let _ = armed_sender.send(());
-                        record_launcher_liveness(wait.await, &shutdown);
+                        record_launcher_liveness(wait.await, &shutdown, launcher_idle_ttl);
                     }
                 }
             });
@@ -621,7 +623,11 @@ pub async fn run_with_signals_and_dependencies_and_readiness_and_liveness(
     }
 }
 
-fn record_launcher_liveness(outcome: std::io::Result<()>, shutdown: &ShutdownHandle) {
+fn record_launcher_liveness(
+    outcome: std::io::Result<()>,
+    shutdown: &ShutdownHandle,
+    idle_ttl: Option<Duration>,
+) {
     match outcome {
         Ok(()) => {
             eprintln!(
@@ -639,12 +645,18 @@ fn record_launcher_liveness(outcome: std::io::Result<()>, shutdown: &ShutdownHan
             tracing::warn!(%error, "launcher-liveness watch failed");
         }
     }
-    if shutdown.request_when_idle(ShutdownReason::ClientVanished) {
+    let armed = idle_ttl.map_or_else(
+        || shutdown.request_when_idle(ShutdownReason::ClientVanished),
+        |idle_ttl| shutdown.request_after_idle(ShutdownReason::ClientVanished, idle_ttl),
+    );
+    if armed {
+        let idle_linger_ms = idle_ttl.map(duration_ms).unwrap_or(0);
         eprintln!(
-            "haiderd: ephemeral-lifecycle event=idle_shutdown_armed reason=launcher_vanished"
+            "haiderd: ephemeral-lifecycle event=idle_shutdown_armed reason=launcher_vanished idle_linger_ms={idle_linger_ms}"
         );
         tracing::info!(
             reason = ?ShutdownReason::ClientVanished,
+            idle_linger_ms,
             "ephemeral daemon observed launcher process exit"
         );
     } else {
@@ -1411,9 +1423,9 @@ async fn run_inner(
         "daemon listener closed before connection drain"
     );
     let (reason, mut forced) = match request {
-        ShutdownRequest::Graceful { reason } | ShutdownRequest::GracefulWhenIdle { reason } => {
-            (reason.to_string(), false)
-        }
+        ShutdownRequest::Graceful { reason }
+        | ShutdownRequest::GracefulWhenIdle { reason }
+        | ShutdownRequest::GracefulAfterIdle { reason, .. } => (reason.to_string(), false),
         ShutdownRequest::Forced { reason } => (reason.to_string(), true),
         // Unreachable: the loop above only breaks with a real request.
         ShutdownRequest::None => ("internal shutdown".into(), true),
@@ -1722,6 +1734,7 @@ impl ConnectionRuntime {
     ) -> (RuntimeStop, Option<DaemonError>) {
         let mut listener_error = None;
         let mut idle_wait_logged = None;
+        let mut idle_linger_deadline = None;
         #[cfg(unix)]
         let accept_operation = "accept Unix connection";
         #[cfg(windows)]
@@ -1735,6 +1748,7 @@ impl ConnectionRuntime {
                     break RuntimeStop::Shutdown(request);
                 }
                 ShutdownRequest::GracefulWhenIdle { reason } => {
+                    idle_linger_deadline = None;
                     let attached_clients = self.connections.len();
                     if attached_clients == 0 {
                         eprintln!(
@@ -1761,7 +1775,32 @@ impl ConnectionRuntime {
                         );
                     }
                 }
-                ShutdownRequest::None => {}
+                ShutdownRequest::GracefulAfterIdle { reason, idle_ttl } => {
+                    let attached_clients = self.connections.len();
+                    if attached_clients == 0 {
+                        let deadline = *idle_linger_deadline
+                            .get_or_insert_with(|| tokio::time::Instant::now() + idle_ttl);
+                        if tokio::time::Instant::now() >= deadline {
+                            eprintln!(
+                                "haiderd: ephemeral-lifecycle event=shutdown_decision reason=launcher_vanished attached_clients=0 decision=shutdown idle_linger_ms={}",
+                                duration_ms(idle_ttl)
+                            );
+                            tracing::info!(
+                                attached_clients,
+                                reason = %reason,
+                                idle_linger_ms = duration_ms(idle_ttl),
+                                decision = "shutdown",
+                                "lingering daemon reached its idle shutdown deadline"
+                            );
+                            break RuntimeStop::Shutdown(ShutdownRequest::Graceful { reason });
+                        }
+                    } else {
+                        idle_linger_deadline = None;
+                    }
+                }
+                ShutdownRequest::None => {
+                    idle_linger_deadline = None;
+                }
             }
             tokio::select! {
                 changed = crash.changed() => {
@@ -1829,6 +1868,7 @@ impl ConnectionRuntime {
                     let attached_clients = self.connections.len();
                     journal_connection_exit(&completed, attached_clients);
                 }
+                () = wait_for_idle_linger(idle_linger_deadline), if idle_linger_deadline.is_some() => {}
             }
         };
         (stop, listener_error)
@@ -1943,6 +1983,14 @@ impl ConnectionRuntime {
         while let Ok(handle) = self.writer_receiver.try_recv() {
             self.writers.push(handle);
         }
+    }
+}
+
+async fn wait_for_idle_linger(deadline: Option<tokio::time::Instant>) {
+    if let Some(deadline) = deadline {
+        tokio::time::sleep_until(deadline).await;
+    } else {
+        std::future::pending::<()>().await;
     }
 }
 
@@ -2236,9 +2284,9 @@ async fn shutdown_before_listener(
     shutdown: &mut watch::Receiver<ShutdownRequest>,
 ) -> Result<ShutdownOutcome, DaemonError> {
     let (reason, mut forced) = match request {
-        ShutdownRequest::Graceful { reason } | ShutdownRequest::GracefulWhenIdle { reason } => {
-            (reason.to_string(), false)
-        }
+        ShutdownRequest::Graceful { reason }
+        | ShutdownRequest::GracefulWhenIdle { reason }
+        | ShutdownRequest::GracefulAfterIdle { reason, .. } => (reason.to_string(), false),
         ShutdownRequest::Forced { reason } => (reason.to_string(), true),
         // `None` means the ShutdownHandle was dropped without a request
         // (watch channel closed mid-recovery); treat as forced.
@@ -2300,9 +2348,9 @@ fn shutdown_without_store(
     shutdown: &watch::Receiver<ShutdownRequest>,
 ) -> Result<ShutdownOutcome, DaemonError> {
     let (reason, mut forced) = match request {
-        ShutdownRequest::Graceful { reason } | ShutdownRequest::GracefulWhenIdle { reason } => {
-            (reason.to_string(), false)
-        }
+        ShutdownRequest::Graceful { reason }
+        | ShutdownRequest::GracefulWhenIdle { reason }
+        | ShutdownRequest::GracefulAfterIdle { reason, .. } => (reason.to_string(), false),
         ShutdownRequest::Forced { reason } => (reason.to_string(), true),
         ShutdownRequest::None => ("startup shutdown controller dropped".into(), true),
     };
