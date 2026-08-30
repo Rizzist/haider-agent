@@ -45,6 +45,7 @@ use serde::ser::{Error as _, SerializeSeq as _};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
+use zeroize::Zeroizing;
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as _;
@@ -3019,11 +3020,16 @@ async fn upload_attachments(
             "blake3:{}",
             blake3::hash(attachment.bytes()).to_hex()
         ));
-        let body = RequestBody::ArtifactPut {
-            data_base64: encode_base64(attachment.bytes()),
-        };
+        // One immutable private snapshot is the retry authority. A reconnect
+        // never reopens the pathname and every attempt borrows these exact
+        // bytes into the segmented RPC frame.
+        let data_base64 = Arc::new(Zeroizing::new(encode_base64(attachment.bytes())));
         loop {
-            match connection.client.request(body.clone()).await {
+            match connection
+                .client
+                .request_artifact_put(Arc::clone(&data_base64))
+                .await
+            {
                 Ok(ResponseBody::ArtifactPut { artifact, bytes }) => {
                     let expected_bytes =
                         u64::try_from(attachment.bytes().len()).unwrap_or(u64::MAX);

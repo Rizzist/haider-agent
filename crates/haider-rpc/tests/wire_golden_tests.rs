@@ -6,6 +6,7 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use common::{TEST_FRAME_LIMIT, transcript};
 use haider_protocol::session::SessionPermissionOverridesV1;
@@ -30,6 +31,7 @@ use haider_rpc::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use zeroize::Zeroizing;
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1885,6 +1887,68 @@ fn five_mib_artifact_put_fits_the_default_negotiated_frame() {
     };
     let encoded = ws_codec::encode(&frame, DEFAULT_FRAME_LIMIT).expect("5 MiB put fits");
     assert!(encoded.len() < DEFAULT_FRAME_LIMIT);
+
+    let stable = Arc::new(Zeroizing::new("aGVsbG8=".to_owned()));
+    for encoding in [
+        haider_rpc::WireEncoding::Json,
+        haider_rpc::WireEncoding::MessagePack,
+    ] {
+        let request_id = haider_rpc::RequestId::new("stable-artifact-put");
+        let segmented = uds_codec::encode_artifact_put_request_parts_with(
+            &request_id,
+            Arc::clone(&stable),
+            DEFAULT_FRAME_LIMIT,
+            encoding,
+        )
+        .expect("segmented artifact.put encodes");
+        let mut actual = Vec::new();
+        actual.extend_from_slice(segmented.prefix());
+        actual.extend_from_slice(segmented.head());
+        actual.extend_from_slice(segmented.data_base64());
+        actual.extend_from_slice(segmented.tail());
+        let expected = uds_codec::encode_with(
+            &WireFrame::Request {
+                request_id: request_id.clone(),
+                body: RequestBody::ArtifactPut {
+                    data_base64: stable.as_str().to_owned(),
+                },
+            },
+            DEFAULT_FRAME_LIMIT,
+            encoding,
+        )
+        .expect("ordinary artifact.put encodes");
+        assert_eq!(actual, expected);
+        assert_eq!(segmented.framed_len(), actual.len());
+        assert_eq!(
+            u32::from_be_bytes(*segmented.prefix()) as usize,
+            actual.len() - 4
+        );
+
+        let retry = uds_codec::encode_artifact_put_request_parts_with(
+            &request_id,
+            Arc::clone(&stable),
+            DEFAULT_FRAME_LIMIT,
+            encoding,
+        )
+        .expect("retry encodes from the same snapshot");
+        let retry_segments = [
+            retry.prefix().as_slice(),
+            retry.head(),
+            retry.data_base64(),
+            retry.tail(),
+        ]
+        .concat();
+        assert_eq!(retry_segments, actual, "retry bytes must be identical");
+
+        let mut decoder = uds_codec::Decoder::new_zeroizing_artifact_put(DEFAULT_FRAME_LIMIT);
+        decoder.set_encoding(encoding);
+        let step = decoder.push_one(&actual);
+        let decoded = step.artifact_put.expect("artifact.put decodes in place");
+        assert_eq!(decoded.request_id, request_id);
+        assert_eq!(decoded.bytes.as_slice(), b"hello");
+        assert!(step.frame.is_none());
+        assert!(step.error.is_none());
+    }
 }
 
 #[test]

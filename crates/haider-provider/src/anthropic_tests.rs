@@ -11,7 +11,7 @@ use haider_accounts::{CredentialAlias, MemoryVault, Vault};
 use haider_protocol::ids::ArtifactRef;
 use haider_protocol::item::ToolStatus;
 use haider_protocol::provider::{Block, PrefixDigests, StreamEvent};
-use haider_protocol::tool::ImageBlockRef;
+use haider_protocol::tool::{AttachmentBlock, ImageBlockRef, PdfDeliveryMode};
 use reqwest::header::AUTHORIZATION;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -454,6 +454,76 @@ fn prepared_anthropic_wire_bytes_match_legacy_final_render() {
         serde_json::to_vec(&prepared.wire.as_ref().expect("prepared wire").payload)
             .expect("prepared bytes"),
         serde_json::to_vec(&legacy).expect("legacy bytes")
+    );
+
+    let mut owned_request = cache_control_request();
+    let artifact = ArtifactRef::new("blake3:owned-attachment-move");
+    owned_request
+        .messages
+        .last_mut()
+        .expect("current user message")
+        .blocks
+        .push(Block::Attachment(AttachmentBlock::Image {
+            artifact: artifact.clone(),
+            mime: "image/png".into(),
+            width: None,
+            height: None,
+        }));
+    owned_request.attachments.push(ResolvedAttachment {
+        artifact,
+        data_base64: "A".repeat(1024 * 1024),
+    });
+    let legacy_owned = provider
+        .request_payload(&owned_request)
+        .expect("legacy attachment payload");
+    let original_pointer = owned_request.attachments[0].data_base64.as_ptr();
+    let owned_tools = std::mem::take(&mut owned_request.tools);
+    let owned =
+        crate::Provider::prepare_turn_with_tools_owned(&provider, &mut owned_request, &owned_tools)
+            .expect("ownership-aware prepared turn");
+    let owned_payload = &owned.wire.as_ref().expect("owned wire").payload;
+    let prepared_data = owned_payload["messages"][3]["content"][1]["source"]["data"]
+        .as_str()
+        .expect("prepared attachment data");
+    assert_eq!(prepared_data.as_ptr(), original_pointer);
+    assert_eq!(owned_payload, &legacy_owned);
+
+    let mut rejected_request = cache_control_request();
+    let rejected_artifact = ArtifactRef::new("blake3:rejected-attachment-move");
+    rejected_request
+        .messages
+        .last_mut()
+        .expect("current user message")
+        .blocks
+        .push(Block::Attachment(AttachmentBlock::Pdf {
+            artifact: rejected_artifact.clone(),
+            name: "oversized.pdf".into(),
+            pages: 1,
+            delivery: PdfDeliveryMode::NativeDocument,
+        }));
+    rejected_request.attachments.push(ResolvedAttachment {
+        artifact: rejected_artifact,
+        data_base64: "A".repeat(32 * 1024 * 1024),
+    });
+    let rejected_pointer = rejected_request.attachments[0].data_base64.as_ptr();
+    let rejected_tools = std::mem::take(&mut rejected_request.tools);
+    assert!(
+        crate::Provider::prepare_turn_with_tools_owned(
+            &provider,
+            &mut rejected_request,
+            &rejected_tools,
+        )
+        .is_none(),
+        "oversized native PDF must retain the provider's existing rejection"
+    );
+    assert_eq!(
+        rejected_request.attachments[0].data_base64.as_ptr(),
+        rejected_pointer,
+        "a rejected preparation must move the original base64 allocation back"
+    );
+    assert_eq!(
+        rejected_request.attachments[0].data_base64.len(),
+        32 * 1024 * 1024
     );
 }
 

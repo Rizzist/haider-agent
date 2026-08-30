@@ -2808,10 +2808,11 @@ impl HarnessActor {
                 attachments: request_attachments,
                 cache_metadata: Some(cache_metadata.clone()),
             };
-            let mut prepared = shared_request_tools.as_ref().map_or_else(
-                || provider.prepare_turn(&provider_request),
-                |tools| provider.prepare_turn_with_tools(&provider_request, tools),
-            );
+            let mut prepared = if let Some(tools) = shared_request_tools.as_ref() {
+                provider.prepare_turn_with_tools_owned(&mut provider_request, tools)
+            } else {
+                provider.prepare_turn_owned(&mut provider_request)
+            };
             let retained_wire = prepared
                 .as_ref()
                 .is_some_and(haider_provider::PreparedTurn::has_rendered_wire);

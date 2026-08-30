@@ -48,6 +48,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::error::Error as _;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -1341,6 +1342,272 @@ pub struct TurnRequest {
     pub cache_metadata: Option<PromptCacheMetadata>,
 }
 
+pub(crate) struct StagedAttachmentMove {
+    index: usize,
+    marker: String,
+    data_base64: Option<String>,
+    moved_path: Option<Vec<AttachmentMovePathSegment>>,
+}
+
+#[derive(Clone)]
+enum AttachmentMovePathSegment {
+    Index(usize),
+    Key(String),
+}
+
+pub(crate) fn stage_attachment_moves(
+    request: &mut TurnRequest,
+) -> Option<Vec<StagedAttachmentMove>> {
+    static NEXT_MARKER_NONCE: AtomicU64 = AtomicU64::new(0);
+
+    if request.attachments.is_empty() {
+        return Some(Vec::new());
+    }
+    let marker_prefix = loop {
+        let nonce = NEXT_MARKER_NONCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = format!("__haider_attachment_move_v1_{nonce:016x}_");
+        if !serialized_request_contains(request, candidate.as_bytes())? {
+            break candidate;
+        }
+    };
+    Some(
+        request
+            .attachments
+            .iter_mut()
+            .enumerate()
+            .map(|(index, attachment)| {
+                // `_` is outside RFC 4648's standard alphabet, and the counting
+                // pass above proves this per-call prefix is absent from every
+                // other request string before the provider renders it.
+                let marker = format!("{marker_prefix}{index}__");
+                let data_base64 = std::mem::replace(&mut attachment.data_base64, marker.clone());
+                StagedAttachmentMove {
+                    index,
+                    marker,
+                    data_base64: Some(data_base64),
+                    moved_path: None,
+                }
+            })
+            .collect(),
+    )
+}
+
+fn serialized_request_contains(request: &TurnRequest, needle: &[u8]) -> Option<bool> {
+    let mut writer = BytePatternWriter::new(needle);
+    serde_json::to_writer(&mut writer, request).ok()?;
+    Some(writer.found)
+}
+
+struct BytePatternWriter<'a> {
+    needle: &'a [u8],
+    failure: Vec<usize>,
+    matched: usize,
+    found: bool,
+}
+
+impl<'a> BytePatternWriter<'a> {
+    fn new(needle: &'a [u8]) -> Self {
+        let mut failure = vec![0; needle.len()];
+        let mut matched = 0;
+        for index in 1..needle.len() {
+            while matched > 0 && needle[index] != needle[matched] {
+                matched = failure[matched - 1];
+            }
+            if needle[index] == needle[matched] {
+                matched += 1;
+                failure[index] = matched;
+            }
+        }
+        Self {
+            needle,
+            failure,
+            matched: 0,
+            found: needle.is_empty(),
+        }
+    }
+}
+
+impl std::io::Write for BytePatternWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.found {
+            return Ok(bytes.len());
+        }
+        for byte in bytes {
+            while self.matched > 0 && *byte != self.needle[self.matched] {
+                self.matched = self.failure[self.matched - 1];
+            }
+            if *byte == self.needle[self.matched] {
+                self.matched += 1;
+                if self.matched == self.needle.len() {
+                    self.found = true;
+                    break;
+                }
+            }
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) fn apply_attachment_moves(
+    payload: &mut serde_json::Value,
+    moves: &mut [StagedAttachmentMove],
+) {
+    for staged in moves {
+        staged.moved_path = None;
+        let occurrences = count_string_value(payload, &staged.marker);
+        if occurrences == 0 {
+            continue;
+        }
+        replace_string_values(payload, staged, occurrences, &mut Vec::new());
+    }
+}
+
+fn recover_attachment_moves(payload: &mut serde_json::Value, moves: &mut [StagedAttachmentMove]) {
+    for staged in moves {
+        let Some(path) = staged.moved_path.take() else {
+            continue;
+        };
+        let Some(serde_json::Value::String(value)) = value_at_path_mut(payload, &path) else {
+            continue;
+        };
+        staged.data_base64 = Some(std::mem::replace(value, staged.marker.clone()));
+    }
+}
+
+fn value_at_path_mut<'a>(
+    mut value: &'a mut serde_json::Value,
+    path: &[AttachmentMovePathSegment],
+) -> Option<&'a mut serde_json::Value> {
+    for segment in path {
+        value = match segment {
+            AttachmentMovePathSegment::Index(index) => value.as_array_mut()?.get_mut(*index)?,
+            AttachmentMovePathSegment::Key(key) => value.as_object_mut()?.get_mut(key)?,
+        };
+    }
+    Some(value)
+}
+
+pub(crate) struct AttachmentMovePayload<'a> {
+    payload: serde_json::Value,
+    moves: Option<&'a mut [StagedAttachmentMove]>,
+    committed: bool,
+}
+
+impl<'a> AttachmentMovePayload<'a> {
+    pub(crate) fn new(
+        payload: serde_json::Value,
+        moves: Option<&'a mut [StagedAttachmentMove]>,
+    ) -> Self {
+        let mut payload_moves = Self {
+            payload,
+            moves,
+            committed: false,
+        };
+        if let Some(moves) = payload_moves.moves.as_deref_mut() {
+            apply_attachment_moves(&mut payload_moves.payload, moves);
+        }
+        payload_moves
+    }
+
+    pub(crate) fn commit(mut self) -> serde_json::Value {
+        self.committed = true;
+        std::mem::take(&mut self.payload)
+    }
+}
+
+impl std::ops::Deref for AttachmentMovePayload<'_> {
+    type Target = serde_json::Value;
+
+    fn deref(&self) -> &Self::Target {
+        &self.payload
+    }
+}
+
+impl std::ops::DerefMut for AttachmentMovePayload<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.payload
+    }
+}
+
+impl Drop for AttachmentMovePayload<'_> {
+    fn drop(&mut self) {
+        if !self.committed
+            && let Some(moves) = self.moves.as_deref_mut()
+        {
+            recover_attachment_moves(&mut self.payload, moves);
+        }
+    }
+}
+
+pub(crate) fn restore_attachment_moves(
+    request: &mut TurnRequest,
+    moves: &mut [StagedAttachmentMove],
+) {
+    for staged in moves {
+        if let Some(data_base64) = staged.data_base64.take()
+            && let Some(attachment) = request.attachments.get_mut(staged.index)
+        {
+            attachment.data_base64 = data_base64;
+        }
+    }
+}
+
+fn count_string_value(value: &serde_json::Value, target: &str) -> usize {
+    match value {
+        serde_json::Value::String(value) => usize::from(value == target),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(|value| count_string_value(value, target))
+            .sum(),
+        serde_json::Value::Object(object) => object
+            .values()
+            .map(|value| count_string_value(value, target))
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn replace_string_values(
+    value: &mut serde_json::Value,
+    staged: &mut StagedAttachmentMove,
+    mut remaining: usize,
+    path: &mut Vec<AttachmentMovePathSegment>,
+) -> usize {
+    match value {
+        serde_json::Value::String(value) if value == &staged.marker => {
+            remaining = remaining.saturating_sub(1);
+            if remaining == 0 {
+                if let Some(data_base64) = staged.data_base64.take() {
+                    *value = data_base64;
+                    staged.moved_path = Some(path.clone());
+                }
+            } else if let Some(data_base64) = staged.data_base64.as_ref() {
+                value.clone_from(data_base64);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for (index, value) in values.iter_mut().enumerate() {
+                path.push(AttachmentMovePathSegment::Index(index));
+                remaining = replace_string_values(value, staged, remaining, path);
+                path.pop();
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for (key, value) in object.iter_mut() {
+                path.push(AttachmentMovePathSegment::Key(key.clone()));
+                remaining = replace_string_values(value, staged, remaining, path);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+    remaining
+}
+
 /// Adapter-rendered request retained across cache-digest finalization. The
 /// full wire object is built once; only provider cache-routing controls may
 /// be refreshed from finalized metadata before transmission.
@@ -2036,6 +2303,13 @@ pub trait Provider: Send + Sync {
             })
     }
 
+    /// Ownership-aware preparation used by the turn engine. Compatibility
+    /// providers retain the immutable hook; native adapters may move large
+    /// resolved attachment strings into their prepared DOM.
+    fn prepare_turn_owned(&self, request: &mut TurnRequest) -> Option<PreparedTurn> {
+        self.prepare_turn(request)
+    }
+
     /// Prepares one request while borrowing an immutable tool-definition
     /// pack. Built-in adapters override this hook and render directly from the
     /// borrowed slice; injected providers retain compatibility through one
@@ -2051,6 +2325,15 @@ pub trait Provider: Send + Sync {
         let mut owned = request.clone();
         owned.tools = tools.to_vec();
         self.prepare_turn(&owned)
+    }
+
+    /// Ownership-aware counterpart to [`Self::prepare_turn_with_tools`].
+    fn prepare_turn_with_tools_owned(
+        &self,
+        request: &mut TurnRequest,
+        tools: &[ToolDefinition],
+    ) -> Option<PreparedTurn> {
+        self.prepare_turn_with_tools(request, tools)
     }
 
     /// Optionally establishes the provider origin's pooled TLS/ALPN

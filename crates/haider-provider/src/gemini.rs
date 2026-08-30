@@ -487,44 +487,16 @@ impl GeminiProvider {
     }
 }
 
-#[async_trait]
-impl Provider for GeminiProvider {
-    fn trusts_default_route_absence(&self) -> bool {
-        true
-    }
-
-    fn credential_surface(&self) -> crate::ProviderCredentialSurface {
-        crate::ProviderCredentialSurface::ApiKey
-    }
-
-    fn usage_lane_dimensions(&self) -> haider_protocol::provider::UsageLaneDimensions {
-        haider_protocol::provider::UsageLaneDimensions {
-            api_family: Some("gemini_generate_content".into()),
-            effort: self.effort.clone(),
-            speed: None,
-        }
-    }
-
-    fn rendered_cache_prefix_digests(
-        &self,
-        request: &TurnRequest,
-    ) -> Option<haider_protocol::provider::PrefixDigests> {
-        self.prepare_turn(request)
-            .map(|prepared| prepared.prefix_digests)
-    }
-
-    fn prepare_turn(&self, request: &TurnRequest) -> Option<crate::PreparedTurn> {
-        <Self as Provider>::prepare_turn_with_tools(self, request, &request.tools)
-    }
-
-    fn prepare_turn_with_tools(
+impl GeminiProvider {
+    fn prepare_turn_with_tools_inner(
         &self,
         request: &TurnRequest,
         tools: &[crate::ToolDefinition],
+        attachment_moves: Option<&mut [crate::StagedAttachmentMove]>,
     ) -> Option<crate::PreparedTurn> {
         let boundary = request.cache_metadata.as_ref()?.cacheable_history_end();
         self.validate_model(request).ok()?;
-        let (full_payload, history_boundary, previous_history_boundary) =
+        let (rendered_payload, history_boundary, previous_history_boundary) =
             gemini_request_json_with_boundary(
                 request,
                 tools,
@@ -533,6 +505,7 @@ impl Provider for GeminiProvider {
                 boundary,
             )
             .ok()?;
+        let full_payload = crate::AttachmentMovePayload::new(rendered_payload, attachment_moves);
         let contents = payload_contents(&full_payload)?;
         let history_blocks = gemini_provider_view_blocks(contents, history_boundary)?;
         let (previous_history_blocks, previous_history_block_len) = match previous_history_boundary
@@ -587,10 +560,69 @@ impl Provider for GeminiProvider {
             provider_view: Some(provider_view),
             provider_view_storage_blobs,
             wire: Some(crate::PreparedWire {
-                payload: full_payload,
+                payload: full_payload.commit(),
                 history_boundary: Some(history_boundary),
             }),
         })
+    }
+}
+
+#[async_trait]
+impl Provider for GeminiProvider {
+    fn trusts_default_route_absence(&self) -> bool {
+        true
+    }
+
+    fn credential_surface(&self) -> crate::ProviderCredentialSurface {
+        crate::ProviderCredentialSurface::ApiKey
+    }
+
+    fn usage_lane_dimensions(&self) -> haider_protocol::provider::UsageLaneDimensions {
+        haider_protocol::provider::UsageLaneDimensions {
+            api_family: Some("gemini_generate_content".into()),
+            effort: self.effort.clone(),
+            speed: None,
+        }
+    }
+
+    fn rendered_cache_prefix_digests(
+        &self,
+        request: &TurnRequest,
+    ) -> Option<haider_protocol::provider::PrefixDigests> {
+        self.prepare_turn(request)
+            .map(|prepared| prepared.prefix_digests)
+    }
+
+    fn prepare_turn(&self, request: &TurnRequest) -> Option<crate::PreparedTurn> {
+        <Self as Provider>::prepare_turn_with_tools(self, request, &request.tools)
+    }
+
+    fn prepare_turn_with_tools(
+        &self,
+        request: &TurnRequest,
+        tools: &[crate::ToolDefinition],
+    ) -> Option<crate::PreparedTurn> {
+        self.prepare_turn_with_tools_inner(request, tools, None)
+    }
+
+    fn prepare_turn_owned(&self, request: &mut TurnRequest) -> Option<crate::PreparedTurn> {
+        let tools = request.tools.clone();
+        <Self as Provider>::prepare_turn_with_tools_owned(self, request, &tools)
+    }
+
+    fn prepare_turn_with_tools_owned(
+        &self,
+        request: &mut TurnRequest,
+        tools: &[crate::ToolDefinition],
+    ) -> Option<crate::PreparedTurn> {
+        let mut attachment_moves = crate::stage_attachment_moves(request)?;
+        let prepared = self.prepare_turn_with_tools_inner(
+            request,
+            tools,
+            Some(attachment_moves.as_mut_slice()),
+        );
+        crate::restore_attachment_moves(request, &mut attachment_moves);
+        prepared
     }
 
     async fn prewarm(&self) {

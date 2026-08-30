@@ -14,6 +14,7 @@
 //! inbound bodies).
 
 use std::collections::{HashMap, VecDeque};
+use std::io::IoSlice;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -512,6 +513,17 @@ struct Shared {
     writer_failure: StdMutex<Option<DisconnectReason>>,
 }
 
+enum ClientOutboundFrame {
+    Contiguous(Zeroizing<Vec<u8>>),
+    ArtifactPut(uds_codec::ZeroizingEncodedArtifactPutFrame),
+}
+
+impl From<Zeroizing<Vec<u8>>> for ClientOutboundFrame {
+    fn from(bytes: Zeroizing<Vec<u8>>) -> Self {
+        Self::Contiguous(bytes)
+    }
+}
+
 impl Shared {
     /// The recorded death reason. A correlation that was dropped while the
     /// connection still reads as live is a local close — never a hang and
@@ -557,7 +569,7 @@ impl Shared {
 /// One live negotiated connection. See the module charter.
 pub struct RpcClient {
     shared: Arc<Shared>,
-    outbound: mpsc::Sender<Zeroizing<Vec<u8>>>,
+    outbound: mpsc::Sender<ClientOutboundFrame>,
     events: StdMutex<Option<mpsc::Receiver<WireFrame>>>,
     outbound_limit: usize,
     encoding: WireEncoding,
@@ -601,7 +613,7 @@ impl RpcClient {
         // The daemon never accepts a frame larger than its own advertised
         // limit; clamp outbound encoding to it.
         let outbound_limit = config.frame_limit.min(welcome.frame_limit as usize).max(1);
-        let (outbound, outbound_rx) = mpsc::channel::<Zeroizing<Vec<u8>>>(OUTBOUND_CAPACITY);
+        let (outbound, outbound_rx) = mpsc::channel::<ClientOutboundFrame>(OUTBOUND_CAPACITY);
         let (events_tx, events_rx) = match config.connection_usage {
             ConnectionUsage::LongLived => {
                 let (sender, receiver) = mpsc::channel::<WireFrame>(EVENT_CAPACITY);
@@ -771,6 +783,29 @@ impl RpcClient {
             .await
     }
 
+    /// Sends one `artifact.put` from a stable private base64 snapshot. The
+    /// snapshot is retained by the caller across reconnects, while each
+    /// attempt borrows it into small encoded frame segments instead of
+    /// cloning it into a `RequestBody` and serializer buffer.
+    pub(crate) async fn request_artifact_put(
+        &self,
+        data_base64: Arc<Zeroizing<String>>,
+    ) -> Result<ResponseBody, ClientError> {
+        self.begin_correlated_encoded(move |request_id| {
+            uds_codec::encode_artifact_put_request_parts_with(
+                request_id,
+                data_base64,
+                self.outbound_limit,
+                self.encoding,
+            )
+            .map(ClientOutboundFrame::ArtifactPut)
+            .map_err(ClientError::Encode)
+        })
+        .await?
+        .wait()
+        .await
+    }
+
     /// Registers correlation for a non-`Request` frame carrying an optional
     /// `request_id`, writes it, and returns its response handle.
     ///
@@ -781,6 +816,19 @@ impl RpcClient {
         &self,
         build: impl FnOnce(RequestId) -> WireFrame,
     ) -> Result<PendingResponse, ClientError> {
+        self.begin_correlated_encoded(move |request_id| {
+            let frame = build(request_id.clone());
+            uds_codec::encode_zeroizing_with(&frame, self.outbound_limit, self.encoding)
+                .map(ClientOutboundFrame::from)
+                .map_err(ClientError::Encode)
+        })
+        .await
+    }
+
+    async fn begin_correlated_encoded(
+        &self,
+        encode: impl FnOnce(&RequestId) -> Result<ClientOutboundFrame, ClientError>,
+    ) -> Result<PendingResponse, ClientError> {
         // One deadline covers admission to the bounded writer queue and the
         // correlated response. No phase may reset the request's time budget.
         let request_timeout = self.request_timeout;
@@ -789,13 +837,12 @@ impl RpcClient {
             "req-{}",
             self.shared.next_request.fetch_add(1, Ordering::Relaxed)
         );
-        let frame = build(RequestId::new(id.clone()));
+        let request_id = RequestId::new(id.clone());
         // Sensitive encode path for EVERY outbound frame: `vault.stage`
         // bodies carry raw secrets, and uniform hygiene is cheaper than a
         // per-method split — the intermediate JSON body is scrubbed inside
         // the codec and the framed buffer zeroizes when the writer drops it.
-        let bytes = uds_codec::encode_zeroizing_with(&frame, self.outbound_limit, self.encoding)
-            .map_err(ClientError::Encode)?;
+        let bytes = encode(&request_id)?;
         let (sender, receiver) = oneshot::channel();
         {
             let Ok(mut pending) = self.shared.pending.lock() else {
@@ -843,6 +890,7 @@ impl RpcClient {
     /// Sends one uncorrelated frame (`MenuAnswer` is the intended user).
     pub async fn send_frame(&self, frame: WireFrame) -> Result<(), ClientError> {
         let bytes = uds_codec::encode_zeroizing_with(&frame, self.outbound_limit, self.encoding)
+            .map(ClientOutboundFrame::from)
             .map_err(ClientError::Encode)?;
         self.outbound
             .send(bytes)
@@ -941,7 +989,7 @@ async fn run_reader(
     leftovers: VecDeque<WireFrame>,
     shared: Arc<Shared>,
     events: Option<mpsc::Sender<WireFrame>>,
-    outbound: mpsc::Sender<Zeroizing<Vec<u8>>>,
+    outbound: mpsc::Sender<ClientOutboundFrame>,
     codec: NegotiatedCodec,
 ) {
     let mut state = shared.state.subscribe();
@@ -1003,7 +1051,7 @@ async fn route_frame(
     frame: WireFrame,
     shared: &Arc<Shared>,
     events: Option<&mpsc::Sender<WireFrame>>,
-    outbound: &mpsc::Sender<Zeroizing<Vec<u8>>>,
+    outbound: &mpsc::Sender<ClientOutboundFrame>,
     outbound_limit: usize,
     encoding: WireEncoding,
 ) {
@@ -1028,7 +1076,7 @@ async fn route_frame(
                 outbound_limit,
                 encoding,
             ) {
-                let _ = outbound.try_send(bytes);
+                let _ = outbound.try_send(bytes.into());
             }
         }
         WireFrame::ProtocolError(error) => {
@@ -1063,7 +1111,7 @@ async fn route_frame(
 
 async fn run_writer(
     mut writer: IpcWriteHalf,
-    mut outbound: mpsc::Receiver<Zeroizing<Vec<u8>>>,
+    mut outbound: mpsc::Receiver<ClientOutboundFrame>,
     shared: Arc<Shared>,
 ) {
     let mut state = shared.state.subscribe();
@@ -1081,7 +1129,7 @@ async fn run_writer(
                     shared.fail(DisconnectReason::Closed);
                     break;
                 };
-                if let Err(error) = writer.write_all(&bytes).await {
+                if let Err(error) = write_client_frame(&mut writer, &bytes).await {
                     // W9b review fix: the read side may still hold
                     // undelivered final answers (a daemon that answers and
                     // then closes — crash after commit, or a graceful close
@@ -1101,9 +1149,78 @@ async fn run_writer(
     let _ = writer.shutdown().await;
 }
 
+async fn write_client_frame(
+    writer: &mut IpcWriteHalf,
+    frame: &ClientOutboundFrame,
+) -> std::io::Result<()> {
+    match frame {
+        ClientOutboundFrame::Contiguous(bytes) => writer.write_all(bytes.as_slice()).await,
+        ClientOutboundFrame::ArtifactPut(frame) => {
+            let segments: [&[u8]; 4] = [
+                frame.prefix(),
+                frame.head(),
+                frame.data_base64(),
+                frame.tail(),
+            ];
+            let mut segment = 0;
+            let mut offset = 0;
+            while segment < segments.len() {
+                while segment < segments.len() && offset == segments[segment].len() {
+                    segment += 1;
+                    offset = 0;
+                }
+                if segment == segments.len() {
+                    break;
+                }
+                let slices = [
+                    IoSlice::new(if segment == 0 {
+                        &segments[0][offset..]
+                    } else {
+                        &[]
+                    }),
+                    IoSlice::new(if segment <= 1 {
+                        &segments[1][if segment == 1 { offset } else { 0 }..]
+                    } else {
+                        &[]
+                    }),
+                    IoSlice::new(if segment <= 2 {
+                        &segments[2][if segment == 2 { offset } else { 0 }..]
+                    } else {
+                        &[]
+                    }),
+                    IoSlice::new(if segment <= 3 {
+                        &segments[3][if segment == 3 { offset } else { 0 }..]
+                    } else {
+                        &[]
+                    }),
+                ];
+                let written = writer.write_vectored(&slices[segment..]).await?;
+                if written == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "failed to write segmented artifact.put frame",
+                    ));
+                }
+                let mut remaining = written;
+                while remaining > 0 && segment < segments.len() {
+                    let available = segments[segment].len().saturating_sub(offset);
+                    let consumed = remaining.min(available);
+                    offset += consumed;
+                    remaining -= consumed;
+                    if offset == segments[segment].len() {
+                        segment += 1;
+                        offset = 0;
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 async fn run_heartbeat(
     shared: Arc<Shared>,
-    outbound: mpsc::Sender<Zeroizing<Vec<u8>>>,
+    outbound: mpsc::Sender<ClientOutboundFrame>,
     outbound_limit: usize,
     encoding: WireEncoding,
     ping_interval: Duration,
@@ -1145,7 +1262,7 @@ async fn run_heartbeat(
                 {
                     // A full outbound queue is itself no-progress evidence;
                     // the unanswered ping deadline will catch it.
-                    let _ = outbound.try_send(bytes);
+                    let _ = outbound.try_send(bytes.into());
                 }
                 unacked.push_back((nonce, Instant::now()));
             }

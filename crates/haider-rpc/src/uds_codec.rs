@@ -5,15 +5,18 @@
 //! storage. An oversized, empty, or invalid body poisons the decoder; callers
 //! must discard it with the connection.
 
+use std::io::Write;
+use std::sync::Arc;
+
 use crate::codec::{
     decode_json, decode_msgpack, encode_json, encode_json_value, encode_msgpack,
     encode_msgpack_value,
 };
 use crate::frame::BorrowedEventFrame;
-use crate::{AttachmentId, CodecError, WireEncoding, WireFrame};
+use crate::{AttachmentId, CodecError, RequestId, WIRE_PROTOCOL_VERSION, WireEncoding, WireFrame};
 use haider_protocol::envelope::RawEnvelope;
 use haider_protocol::ids::SessionId;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 const PREFIX_LEN: usize = 4;
@@ -23,6 +26,254 @@ const PREFIX_LEN: usize = 4;
 pub struct ZeroizingEncodedFrame {
     prefix: [u8; PREFIX_LEN],
     body: Zeroizing<Vec<u8>>,
+}
+
+/// One `artifact.put` request encoded as small owned JSON/MessagePack
+/// bookends around the caller's stable base64 snapshot. The large string is
+/// never cloned into a serializer buffer, and every encoded segment is
+/// zeroized after the socket write.
+pub struct ZeroizingEncodedArtifactPutFrame {
+    prefix: [u8; PREFIX_LEN],
+    head: Zeroizing<Vec<u8>>,
+    data_base64: Arc<Zeroizing<String>>,
+    tail: Zeroizing<Vec<u8>>,
+}
+
+impl ZeroizingEncodedArtifactPutFrame {
+    pub fn framed_len(&self) -> usize {
+        PREFIX_LEN
+            .saturating_add(self.head.len())
+            .saturating_add(self.data_base64.len())
+            .saturating_add(self.tail.len())
+    }
+
+    pub fn prefix(&self) -> &[u8; PREFIX_LEN] {
+        &self.prefix
+    }
+
+    pub fn head(&self) -> &[u8] {
+        self.head.as_slice()
+    }
+
+    pub fn data_base64(&self) -> &[u8] {
+        self.data_base64.as_bytes()
+    }
+
+    pub fn tail(&self) -> &[u8] {
+        self.tail.as_slice()
+    }
+}
+
+#[derive(Serialize)]
+struct BorrowedArtifactPutBody<'a> {
+    method: &'static str,
+    data_base64: &'a str,
+}
+
+#[derive(Serialize)]
+struct BorrowedArtifactPutRequest<'a> {
+    #[serde(rename = "v")]
+    version: u32,
+    kind: &'static str,
+    request_id: &'a RequestId,
+    body: BorrowedArtifactPutBody<'a>,
+}
+
+struct CountingWriter {
+    len: usize,
+    frame_limit: usize,
+    exceeded: bool,
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let Some(next) = self.len.checked_add(bytes.len()) else {
+            self.exceeded = true;
+            return Err(std::io::Error::other("wire frame length overflow"));
+        };
+        if next > self.frame_limit {
+            self.exceeded = true;
+            return Err(std::io::Error::other("wire frame limit exceeded"));
+        }
+        self.len = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SegmentPhase {
+    Head,
+    Data,
+    Tail,
+}
+
+struct SegmentingWriter {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    data_start: usize,
+    data_len: usize,
+    data_written: usize,
+    overhead_limit: usize,
+    phase: SegmentPhase,
+    allocation_failed: Option<usize>,
+    invalid_data_write: bool,
+}
+
+impl SegmentingWriter {
+    fn append(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let Some(overhead) = self
+            .head
+            .len()
+            .checked_add(self.tail.len())
+            .and_then(|len| len.checked_add(bytes.len()))
+        else {
+            self.allocation_failed = Some(usize::MAX);
+            return Err(std::io::Error::other("wire frame allocation overflow"));
+        };
+        if overhead > self.overhead_limit {
+            self.invalid_data_write = true;
+            return Err(std::io::Error::other(
+                "serializer copied artifact data instead of borrowing it",
+            ));
+        }
+        let destination = match self.phase {
+            SegmentPhase::Head => &mut self.head,
+            SegmentPhase::Data | SegmentPhase::Tail => &mut self.tail,
+        };
+        if destination.try_reserve_exact(bytes.len()).is_err() {
+            self.allocation_failed = Some(overhead);
+            return Err(std::io::Error::other("wire frame allocation failed"));
+        }
+        destination.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+impl Write for SegmentingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let address = bytes.as_ptr() as usize;
+        let data_end = self.data_start.saturating_add(self.data_len);
+        let bytes_end = address.saturating_add(bytes.len());
+        if address >= self.data_start && bytes_end <= data_end {
+            let offset = address - self.data_start;
+            if self.phase == SegmentPhase::Tail || offset != self.data_written {
+                self.invalid_data_write = true;
+                return Err(std::io::Error::other(
+                    "serializer emitted artifact data out of order",
+                ));
+            }
+            self.phase = SegmentPhase::Data;
+            self.data_written = self.data_written.saturating_add(bytes.len());
+        } else {
+            if self.phase == SegmentPhase::Data {
+                self.phase = SegmentPhase::Tail;
+            }
+            self.append(bytes)?;
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_artifact_put<W: Write>(
+    value: &BorrowedArtifactPutRequest<'_>,
+    writer: &mut W,
+    encoding: WireEncoding,
+) -> Result<(), CodecError> {
+    match encoding {
+        WireEncoding::Json => serde_json::to_writer(writer, value).map_err(CodecError::Json),
+        WireEncoding::MessagePack => {
+            let mut serializer = rmp_serde::Serializer::new(writer).with_struct_map();
+            value
+                .serialize(&mut serializer)
+                .map_err(CodecError::MessagePackEncode)
+        }
+    }
+}
+
+/// Counts and then segment-serializes one `artifact.put` request. The first
+/// pass performs no allocation and establishes the exact announced body
+/// length before the four-byte prefix is constructed.
+pub fn encode_artifact_put_request_parts_with(
+    request_id: &RequestId,
+    data_base64: Arc<Zeroizing<String>>,
+    frame_limit: usize,
+    encoding: WireEncoding,
+) -> Result<ZeroizingEncodedArtifactPutFrame, CodecError> {
+    let value = BorrowedArtifactPutRequest {
+        version: WIRE_PROTOCOL_VERSION,
+        kind: "request",
+        request_id,
+        body: BorrowedArtifactPutBody {
+            method: "artifact.put",
+            data_base64: data_base64.as_str(),
+        },
+    };
+    let mut counter = CountingWriter {
+        len: 0,
+        frame_limit,
+        exceeded: false,
+    };
+    if let Err(error) = serialize_artifact_put(&value, &mut counter, encoding) {
+        if counter.exceeded {
+            return Err(CodecError::FrameLimitExceeded {
+                frame_limit,
+                announced_len: None,
+            });
+        }
+        return Err(error);
+    }
+    let body_len = u32::try_from(counter.len).map_err(|_| CodecError::LengthPrefixOverflow {
+        body_len: counter.len,
+    })?;
+    let overhead_limit =
+        counter
+            .len
+            .checked_sub(data_base64.len())
+            .ok_or(CodecError::LengthPrefixOverflow {
+                body_len: counter.len,
+            })?;
+    let mut writer = SegmentingWriter {
+        head: Vec::new(),
+        tail: Vec::new(),
+        data_start: data_base64.as_ptr() as usize,
+        data_len: data_base64.len(),
+        data_written: 0,
+        overhead_limit,
+        phase: SegmentPhase::Head,
+        allocation_failed: None,
+        invalid_data_write: false,
+    };
+    if let Err(error) = serialize_artifact_put(&value, &mut writer, encoding) {
+        if let Some(requested) = writer.allocation_failed {
+            return Err(CodecError::AllocationFailed { requested });
+        }
+        return Err(error);
+    }
+    if writer.invalid_data_write
+        || writer.data_written != data_base64.len()
+        || writer.head.len().saturating_add(writer.tail.len()) != overhead_limit
+    {
+        return Err(CodecError::AllocationFailed {
+            requested: counter.len,
+        });
+    }
+    Ok(ZeroizingEncodedArtifactPutFrame {
+        prefix: body_len.to_be_bytes(),
+        head: Zeroizing::new(writer.head),
+        data_base64,
+        tail: Zeroizing::new(writer.tail),
+    })
 }
 
 impl ZeroizingEncodedFrame {
@@ -208,6 +459,9 @@ enum DecodeState {
 pub struct DecodeBatch {
     /// Every valid frame completed before any terminal error in this chunk.
     pub frames: Vec<WireFrame>,
+    /// Valid `artifact.put` requests decoded in-place by the daemon-only
+    /// decoder mode.
+    pub artifact_puts: Vec<InPlaceArtifactPut>,
     /// The terminal error, if this chunk poisoned the decoder.
     pub error: Option<CodecError>,
 }
@@ -218,6 +472,9 @@ pub struct DecodeBatch {
 pub struct DecodeStep {
     /// The single frame completed by this step, if any.
     pub frame: Option<WireFrame>,
+    /// One daemon-bound `artifact.put` whose base64 bytes were decoded by
+    /// reusing the completed decoder allocation.
+    pub artifact_put: Option<InPlaceArtifactPut>,
     /// Exact bytes consumed from the supplied chunk.
     pub consumed: usize,
     /// The terminal error, if this step poisoned the decoder.
@@ -228,6 +485,7 @@ impl DecodeBatch {
     fn complete(frames: Vec<WireFrame>) -> Self {
         Self {
             frames,
+            artifact_puts: Vec::new(),
             error: None,
         }
     }
@@ -235,8 +493,175 @@ impl DecodeBatch {
     fn failed(frames: Vec<WireFrame>, error: CodecError) -> Self {
         Self {
             frames,
+            artifact_puts: Vec::new(),
             error: Some(error),
         }
+    }
+}
+
+/// A daemon-bound `artifact.put` parsed without materializing its base64
+/// field as a second owned `String`.
+pub struct InPlaceArtifactPut {
+    pub request_id: RequestId,
+    pub bytes: Zeroizing<Vec<u8>>,
+}
+
+impl std::fmt::Debug for InPlaceArtifactPut {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InPlaceArtifactPut")
+            .field("request_id", &self.request_id)
+            .field(
+                "bytes",
+                &format_args!("[REDACTED; {} bytes]", self.bytes.len()),
+            )
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
+struct BorrowedDecodedArtifactPutBody<'a> {
+    method: &'a str,
+    data_base64: &'a str,
+}
+
+#[derive(Deserialize)]
+struct BorrowedDecodedArtifactPutRequest<'a> {
+    #[serde(rename = "v")]
+    version: u32,
+    kind: &'a str,
+    request_id: &'a str,
+    #[serde(borrow)]
+    body: BorrowedDecodedArtifactPutBody<'a>,
+}
+
+fn decode_artifact_put_in_place(
+    body: &mut Vec<u8>,
+    encoding: WireEncoding,
+) -> Option<InPlaceArtifactPut> {
+    let (request_id, data_start, data_len, decoded_len) = {
+        let request = match encoding {
+            WireEncoding::Json => {
+                serde_json::from_slice::<BorrowedDecodedArtifactPutRequest<'_>>(body).ok()?
+            }
+            WireEncoding::MessagePack => {
+                rmp_serde::from_slice::<BorrowedDecodedArtifactPutRequest<'_>>(body).ok()?
+            }
+        };
+        if request.version != WIRE_PROTOCOL_VERSION
+            || request.kind != "request"
+            || request.body.method != "artifact.put"
+        {
+            return None;
+        }
+        let body_start = body.as_ptr() as usize;
+        let data_start = (request.body.data_base64.as_ptr() as usize).checked_sub(body_start)?;
+        let data_len = request.body.data_base64.len();
+        let data_end = data_start.checked_add(data_len)?;
+        if data_end > body.len() {
+            return None;
+        }
+        let decoded_len = validated_standard_base64_len(request.body.data_base64.as_bytes())?;
+        (
+            request.request_id.to_owned(),
+            data_start,
+            data_len,
+            decoded_len,
+        )
+    };
+
+    let mut input = data_start;
+    let input_end = data_start.checked_add(data_len)?;
+    let mut output = 0;
+    while input < input_end {
+        let first = standard_base64_value(body[input])?;
+        let second = standard_base64_value(body[input + 1])?;
+        let third_padding = body[input + 2] == b'=';
+        let fourth_padding = body[input + 3] == b'=';
+        let third = if third_padding {
+            0
+        } else {
+            standard_base64_value(body[input + 2])?
+        };
+        let fourth = if fourth_padding {
+            0
+        } else {
+            standard_base64_value(body[input + 3])?
+        };
+        body[output] = (first << 2) | (second >> 4);
+        output += 1;
+        if !third_padding {
+            body[output] = (second << 4) | (third >> 2);
+            output += 1;
+        }
+        if !fourth_padding {
+            body[output] = (third << 6) | fourth;
+            output += 1;
+        }
+        input += 4;
+    }
+    if output != decoded_len {
+        return None;
+    }
+    body[decoded_len..].zeroize();
+    body.truncate(decoded_len);
+    Some(InPlaceArtifactPut {
+        request_id: RequestId::new(request_id),
+        bytes: Zeroizing::new(std::mem::take(body)),
+    })
+}
+
+fn validated_standard_base64_len(encoded: &[u8]) -> Option<usize> {
+    if !encoded.len().is_multiple_of(4) {
+        return None;
+    }
+    let padding = encoded
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'=')
+        .count();
+    if padding > 2 {
+        return None;
+    }
+    let content_len = encoded.len().checked_sub(padding)?;
+    if encoded[..content_len]
+        .iter()
+        .any(|byte| standard_base64_value(*byte).is_none())
+        || encoded[..content_len].contains(&b'=')
+    {
+        return None;
+    }
+    if padding == 2
+        && encoded
+            .get(content_len.wrapping_sub(1))
+            .and_then(|byte| standard_base64_value(*byte))
+            .is_none_or(|value| value & 0x0f != 0)
+    {
+        return None;
+    }
+    if padding == 1
+        && encoded
+            .get(content_len.wrapping_sub(1))
+            .and_then(|byte| standard_base64_value(*byte))
+            .is_none_or(|value| value & 0x03 != 0)
+    {
+        return None;
+    }
+    encoded
+        .len()
+        .checked_div(4)?
+        .checked_mul(3)?
+        .checked_sub(padding)
+}
+
+fn standard_base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
     }
 }
 
@@ -250,6 +675,7 @@ pub struct Decoder {
     /// wire bytes do not linger in freed decoder memory.
     zeroize_bodies: bool,
     encoding: WireEncoding,
+    decode_artifact_put_in_place: bool,
 }
 
 impl Decoder {
@@ -263,6 +689,7 @@ impl Decoder {
             },
             zeroize_bodies: false,
             encoding: WireEncoding::Json,
+            decode_artifact_put_in_place: false,
         }
     }
 
@@ -271,6 +698,15 @@ impl Decoder {
     pub fn new_zeroizing(frame_limit: usize) -> Self {
         let mut decoder = Self::new(frame_limit);
         decoder.zeroize_bodies = true;
+        decoder
+    }
+
+    /// Creates the daemon's sensitive decoder. Valid JSON `artifact.put`
+    /// requests reuse the completed decoder body for base64 output; every
+    /// other frame retains the ordinary typed decode path.
+    pub fn new_zeroizing_artifact_put(frame_limit: usize) -> Self {
+        let mut decoder = Self::new_zeroizing(frame_limit);
+        decoder.decode_artifact_put_in_place = true;
         decoder
     }
 
@@ -321,6 +757,13 @@ impl Decoder {
             if let Some(frame) = step.frame {
                 frames.push(frame);
             }
+            if let Some(artifact_put) = step.artifact_put {
+                return DecodeBatch {
+                    frames,
+                    artifact_puts: vec![artifact_put],
+                    error: step.error,
+                };
+            }
             if let Some(error) = step.error {
                 return DecodeBatch::failed(frames, error);
             }
@@ -343,6 +786,7 @@ impl Decoder {
         if self.is_poisoned() {
             return DecodeStep {
                 frame: None,
+                artifact_put: None,
                 consumed: 0,
                 error: Some(CodecError::DecoderPoisoned),
             };
@@ -364,6 +808,7 @@ impl Decoder {
                         if let Err(error) = self.start_body(announced_len) {
                             return DecodeStep {
                                 frame: None,
+                                artifact_put: None,
                                 consumed,
                                 error: Some(error),
                             };
@@ -392,11 +837,24 @@ impl Decoder {
                                 self.poison();
                                 return DecodeStep {
                                     frame: None,
+                                    artifact_put: None,
                                     consumed,
                                     error: Some(CodecError::DecoderPoisoned),
                                 };
                             }
                         };
+                        let in_place = self
+                            .decode_artifact_put_in_place
+                            .then(|| decode_artifact_put_in_place(&mut body, self.encoding))
+                            .flatten();
+                        if let Some(artifact_put) = in_place {
+                            return DecodeStep {
+                                frame: None,
+                                artifact_put: Some(artifact_put),
+                                consumed,
+                                error: None,
+                            };
+                        }
                         let decoded = match self.encoding {
                             WireEncoding::Json => match std::str::from_utf8(&body) {
                                 Ok(_) => decode_json(&body, self.frame_limit),
@@ -411,6 +869,7 @@ impl Decoder {
                             Ok(frame) => {
                                 return DecodeStep {
                                     frame: Some(frame),
+                                    artifact_put: None,
                                     consumed,
                                     error: None,
                                 };
@@ -419,6 +878,7 @@ impl Decoder {
                                 self.poison();
                                 return DecodeStep {
                                     frame: None,
+                                    artifact_put: None,
                                     consumed,
                                     error: Some(error),
                                 };
@@ -429,6 +889,7 @@ impl Decoder {
                 DecodeState::Poisoned => {
                     return DecodeStep {
                         frame: None,
+                        artifact_put: None,
                         consumed,
                         error: Some(CodecError::DecoderPoisoned),
                     };
@@ -437,6 +898,7 @@ impl Decoder {
         }
         DecodeStep {
             frame: None,
+            artifact_put: None,
             consumed,
             error: None,
         }
