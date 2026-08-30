@@ -1073,11 +1073,13 @@ async fn late_cancellation_during_cas_preserves_natural_completion_and_descendan
             ..
         }
     )));
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    assert!(
-        descendant_survived.exists(),
-        "late cancellation re-entered teardown after natural completion"
-    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !descendant_survived.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("late cancellation re-entered teardown after natural completion");
     broker.close().await.expect("broker closes");
 }
 

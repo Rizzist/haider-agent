@@ -116,8 +116,9 @@ macOS with the release-gate environment. The following real-daemon scenarios
 pass:
 
 - `tool_calls_execute_and_continue_over_real_rpc`: an ignored `target/`
-  contains a 1 TiB sparse build artifact. Background-child output
-  (`leaderchild`), no output, 512 KiB, and 2 MiB all reach spawn.
+  contains a 1 TiB sparse build artifact. Foreground leader output (with
+  race-permitted descendant bytes), no output, 512 KiB, and 2 MiB all reach
+  spawn.
   The 2 MiB command returns the typed 1 MiB output-cap failure. `fs_write`,
   `fs_read`, `fs_edit`, and `fs_search` mutate/read the actual workspace, and
   every result is consumed by a second provider request before the run reaches
