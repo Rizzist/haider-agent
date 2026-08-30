@@ -2902,6 +2902,10 @@ impl SessionHub {
         rpc::session_summaries(self, &ids).await
     }
 
+    pub(crate) fn subscribe_peer_reconcile(&self) -> broadcast::Receiver<SessionId> {
+        self.inner.roster_publications.subscribe()
+    }
+
     pub(crate) fn peer_control_sessions(
         &self,
         connection_id: &str,
@@ -5570,7 +5574,8 @@ impl SessionHub {
             receiver,
         ));
         actor_tasks.push(task);
-        actors.insert(session_id, actor.clone());
+        actors.insert(session_id.clone(), actor.clone());
+        let _ = self.inner.roster_publications.send(session_id);
         Ok(actor)
     }
 
