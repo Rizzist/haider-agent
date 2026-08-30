@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use haider_client::{
     ClientCloseOutcome, DescendantView, ObserveClient, ObserveError, ProfileEnv, ResolvedProfile,
-    observe_stream_session, resolve_profile,
+    observe_stream_all, observe_stream_session, resolve_profile,
 };
 use haider_rpc::haider_protocol::envelope::{
     PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
@@ -16,13 +16,14 @@ use haider_rpc::haider_protocol::ids::{DeviceId, EventId, SessionId};
 use haider_rpc::{
     AttachMode, AttachState, AttachmentId, Capability, CapabilitySet, DEFAULT_FRAME_LIMIT,
     ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_NOT_FOUND, FEATURE_SESSION_DESCENDANT_STREAM_V1,
-    FEATURE_SESSION_FLEET_V1, FleetMetricsTotalsWire, FleetRollupWire, FleetStateCountsWire,
-    LifecyclePhase, RequestBody, RequestId, ResponseBody, SessionDescendantBaselineWire,
-    SessionFleetSnapshot, WIRE_PROTOCOL_VERSION, Welcome, WireFrame, uds_codec,
+    FEATURE_SESSION_FLEET_V1, FEATURE_SESSION_LIST_WATCH_V1, FleetMetricsTotalsWire,
+    FleetRollupWire, FleetStateCountsWire, LifecyclePhase, RequestBody, RequestId, ResponseBody,
+    SessionDescendantBaselineWire, SessionFleetSnapshot, SessionSummary, WIRE_PROTOCOL_VERSION,
+    Welcome, WireFrame, uds_codec,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 const LIMIT: usize = DEFAULT_FRAME_LIMIT;
 const BOUND: Duration = Duration::from_secs(5);
@@ -75,14 +76,17 @@ impl Peer {
     }
 
     async fn write_batch(&mut self, frames: &[WireFrame]) {
+        self.try_write_batch(frames)
+            .await
+            .expect("peer batch write");
+    }
+
+    async fn try_write_batch(&mut self, frames: &[WireFrame]) -> std::io::Result<()> {
         let mut bytes = Vec::new();
         for frame in frames {
             bytes.extend(uds_codec::encode(frame, LIMIT).expect("peer batch encode"));
         }
-        self.stream
-            .write_all(&bytes)
-            .await
-            .expect("peer batch write");
+        self.stream.write_all(&bytes).await
     }
 
     async fn respond(&mut self, request_id: RequestId, body: ResponseBody) {
@@ -174,6 +178,15 @@ fn raw(session_id: &SessionId, seq: u64, detail: &str) -> RawEnvelope {
             "additive": {"kept": true}
         }),
     }
+}
+
+fn summary(session_id: &SessionId, head_seq: u64) -> SessionSummary {
+    serde_json::from_value(serde_json::json!({
+        "session_id": session_id,
+        "head_seq": head_seq,
+        "worker_generation": 7,
+    }))
+    .expect("minimal session summary")
 }
 
 async fn accept_attach(
@@ -606,6 +619,176 @@ async fn watch_recovers_exactly_after_gap_and_forwards_additive_raw_envelopes() 
     );
     assert_eq!(envelopes[2].payload["type"], "future_observe_kind_v9");
     assert_eq!(envelopes[2].payload["additive"]["kept"], true);
+}
+
+/// MUTATION CHECK: restore one-second `session.list` polling for follow-all.
+/// Expected RUNTIME failure: the first discovery request is `session.list`
+/// instead of the subscribed-before-acknowledge watch, or a third discovery
+/// connection appears during the quiet interval.
+#[tokio::test]
+async fn follow_all_discovers_through_one_persistent_session_list_watch() {
+    let (_root, profile) = profile();
+    let listener = match UnixListener::bind(&profile.endpoint_path) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("bind follow-all peer: {error}"),
+    };
+    let session_id = SessionId::new("follow-all-watch-session");
+    let server_profile = profile.clone();
+    let server_session = session_id.clone();
+    let server = tokio::spawn(async move {
+        let mut advertised = welcome(&server_profile, "follow-all-watch-daemon");
+        advertised
+            .features
+            .insert(FEATURE_SESSION_LIST_WATCH_V1.into());
+        let mut discovery = accept_peer(&listener, advertised.clone()).await;
+        let (request_id, body) = discovery.request().await;
+        assert!(matches!(body, RequestBody::SessionListWatch {}));
+        discovery
+            .respond(
+                request_id,
+                ResponseBody::SessionListWatch { accepted: true },
+            )
+            .await;
+        discovery
+            .write(&WireFrame::SessionRosterDelta {
+                summaries: vec![summary(&server_session, 1)],
+            })
+            .await;
+
+        let mut shard = accept_peer(&listener, advertised).await;
+        let attachment =
+            accept_attach(&mut shard, &server_session, 0, "follow-all-attachment").await;
+        send_event(
+            &mut shard,
+            &attachment,
+            &server_session,
+            raw(&server_session, 1, "watch-discovered"),
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1_200), listener.accept())
+                .await
+                .is_err(),
+            "quiet follow-all must not open another discovery connection"
+        );
+    });
+
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let stream_profile = profile.clone();
+    let stream =
+        tokio::spawn(async move { observe_stream_all(&stream_profile, false, true, sender).await });
+    let envelope = tokio::time::timeout(BOUND, receiver.recv())
+        .await
+        .expect("follow-all event deadline")
+        .expect("follow-all event");
+    assert_eq!(envelope.session_id, session_id);
+    assert_eq!(envelope.seq, 1);
+    tokio::time::timeout(BOUND, server)
+        .await
+        .expect("follow-all peer deadline")
+        .expect("follow-all peer");
+    stream.abort();
+    let _ = stream.await;
+}
+
+/// MUTATION CHECK: sample the loss counter only after arming the roster watch,
+/// or wait only for another roster frame. Expected RUNTIME failure: the first
+/// connection's deliberately dropped delta is silent while its event lane
+/// remains ready, and the bounded output deadline expires instead of
+/// reconnecting to the watch baseline.
+#[tokio::test]
+async fn follow_all_repairs_a_dropped_roster_delta_by_rearming_the_watch() {
+    const OVERFLOW_FRAMES: usize = 400;
+
+    let (_root, profile) = profile();
+    let listener = match UnixListener::bind(&profile.endpoint_path) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("bind follow-all repair peer: {error}"),
+    };
+    let session_id = SessionId::new("follow-all-repair-session");
+    let server_profile = profile.clone();
+    let server_session = session_id.clone();
+    let (release_server, released) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut advertised = welcome(&server_profile, "follow-all-repair-daemon");
+        advertised
+            .features
+            .insert(FEATURE_SESSION_LIST_WATCH_V1.into());
+
+        let mut first = accept_peer(&listener, advertised.clone()).await;
+        let (request_id, body) = first.request().await;
+        assert!(matches!(body, RequestBody::SessionListWatch {}));
+        let mut overflow = vec![WireFrame::Unknown; OVERFLOW_FRAMES];
+        overflow.push(WireFrame::SessionRosterDelta {
+            summaries: vec![summary(&server_session, 1)],
+        });
+        overflow.push(WireFrame::Response {
+            request_id,
+            body: ResponseBody::SessionListWatch { accepted: true },
+        });
+        first.write_batch(&overflow).await;
+        let saturation = vec![WireFrame::Unknown; OVERFLOW_FRAMES];
+        let flood =
+            tokio::spawn(async move { while first.try_write_batch(&saturation).await.is_ok() {} });
+
+        let mut second = tokio::time::timeout(BOUND, accept_peer(&listener, advertised.clone()))
+            .await
+            .expect("saturated roster watch must reconnect without waiting for EOF");
+        flood.abort();
+        let _ = flood.await;
+        let (request_id, body) = second.request().await;
+        assert!(matches!(body, RequestBody::SessionListWatch {}));
+        second
+            .respond(
+                request_id,
+                ResponseBody::SessionListWatch { accepted: true },
+            )
+            .await;
+        second
+            .write(&WireFrame::SessionRosterDelta {
+                summaries: vec![summary(&server_session, 1)],
+            })
+            .await;
+
+        let mut shard = accept_peer(&listener, advertised).await;
+        let attachment = accept_attach(
+            &mut shard,
+            &server_session,
+            0,
+            "follow-all-repair-attachment",
+        )
+        .await;
+        send_event(
+            &mut shard,
+            &attachment,
+            &server_session,
+            raw(&server_session, 1, "watch-repaired"),
+        )
+        .await;
+        let _ = released.await;
+    });
+
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let stream_profile = profile.clone();
+    let stream =
+        tokio::spawn(async move { observe_stream_all(&stream_profile, false, true, sender).await });
+    let envelope = tokio::time::timeout(BOUND, receiver.recv())
+        .await
+        .expect("repaired follow-all event deadline")
+        .expect("repaired follow-all event");
+    assert_eq!(envelope.session_id, session_id);
+    assert_eq!(envelope.seq, 1);
+    release_server
+        .send(())
+        .expect("release follow-all repair peer");
+    tokio::time::timeout(BOUND, server)
+        .await
+        .expect("follow-all repair peer deadline")
+        .expect("follow-all repair peer");
+    stream.abort();
+    let _ = stream.await;
 }
 
 /// MUTATION CHECK: capture the replay-loss baseline after attach instead of

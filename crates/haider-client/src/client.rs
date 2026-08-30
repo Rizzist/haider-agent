@@ -414,6 +414,87 @@ pub enum ConnectionState {
     Disconnected(DisconnectReason),
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ClientHealthSnapshot {
+    pub(crate) state: ConnectionState,
+    pub(crate) lost_events: u64,
+}
+
+pub(crate) enum ClientHealthWait {
+    Changed(ClientHealthSnapshot),
+    RepairDue {
+        timeout: haider_platform::WaitTimeout,
+        snapshot: ClientHealthSnapshot,
+    },
+    Closed(ClientHealthSnapshot),
+}
+
+impl ClientHealthWait {
+    pub(crate) fn snapshot(&self) -> &ClientHealthSnapshot {
+        match self {
+            Self::Changed(snapshot) | Self::Closed(snapshot) => snapshot,
+            Self::RepairDue { snapshot, .. } => snapshot,
+        }
+    }
+
+    pub(crate) fn repair_timeout(&self) -> Option<haider_platform::WaitTimeout> {
+        match self {
+            Self::RepairDue { timeout, .. } => Some(*timeout),
+            Self::Changed(_) | Self::Closed(_) => None,
+        }
+    }
+
+    pub(crate) fn channel_closed(&self) -> bool {
+        matches!(self, Self::Closed(_))
+    }
+}
+
+pub(crate) struct ClientHealthWatch {
+    state: watch::Receiver<ConnectionState>,
+    lost_events: watch::Receiver<u64>,
+    initial: bool,
+}
+
+impl ClientHealthWatch {
+    fn snapshot(&self) -> ClientHealthSnapshot {
+        ClientHealthSnapshot {
+            state: self.state.borrow().clone(),
+            lost_events: *self.lost_events.borrow(),
+        }
+    }
+
+    /// Waits for either health signal while retaining a typed periodic repair
+    /// probe. Taking `self` keeps this one deadline armed even when the caller
+    /// is busy consuming unrelated protocol frames.
+    pub(crate) async fn wait(
+        mut self,
+        operation: &'static str,
+        repair_interval: Duration,
+    ) -> (Self, ClientHealthWait) {
+        if self.initial {
+            self.initial = false;
+            let snapshot = self.snapshot();
+            return (self, ClientHealthWait::Changed(snapshot));
+        }
+        let outcome = haider_platform::bounded_wait(operation, repair_interval, async {
+            tokio::select! {
+                changed = self.state.changed() => changed,
+                changed = self.lost_events.changed() => changed,
+            }
+        })
+        .await;
+        let snapshot = self.snapshot();
+        let outcome = match outcome {
+            haider_platform::BoundedWait::Completed(Ok(())) => ClientHealthWait::Changed(snapshot),
+            haider_platform::BoundedWait::Completed(Err(_)) => ClientHealthWait::Closed(snapshot),
+            haider_platform::BoundedWait::TimedOut(timeout) => {
+                ClientHealthWait::RepairDue { timeout, snapshot }
+            }
+        };
+        (self, outcome)
+    }
+}
+
 struct Shared {
     pending: StdMutex<HashMap<String, oneshot::Sender<ResponseBody>>>,
     next_request: AtomicU64,
@@ -423,7 +504,7 @@ struct Shared {
     /// traffic recovers by reattach (R9); an authoritative snapshot without
     /// a cursor instead fails the connection and recovers from its retained
     /// daemon baseline after reconnect.
-    lost_events: AtomicU64,
+    lost_events: watch::Sender<u64>,
     state: watch::Sender<ConnectionState>,
     /// A writer death observed while the reader may still be draining
     /// buffered peer frames. The READER promotes this to [`Self::fail`]
@@ -448,6 +529,11 @@ impl Shared {
         if let Ok(mut slot) = self.writer_failure.lock() {
             slot.get_or_insert(reason);
         }
+    }
+
+    fn record_lost_event(&self) {
+        self.lost_events
+            .send_modify(|lost| *lost = lost.saturating_add(1));
     }
 
     /// First disconnect reason wins; pending requests observe it by drop.
@@ -503,11 +589,12 @@ impl RpcClient {
     ) -> std::io::Result<Self> {
         let shutdown = haider_platform::shutdown_handle(&stream)?;
         let (state, _) = watch::channel(ConnectionState::Connected);
+        let (lost_events, _) = watch::channel(0);
         let shared = Arc::new(Shared {
             pending: StdMutex::new(HashMap::new()),
             next_request: AtomicU64::new(1),
             acked_pong: AtomicU64::new(0),
-            lost_events: AtomicU64::new(0),
+            lost_events,
             writer_failure: StdMutex::new(None),
             state,
         });
@@ -597,7 +684,15 @@ impl RpcClient {
 
     /// Number of uncorrelated frames dropped under event backpressure.
     pub fn lost_events(&self) -> u64 {
-        self.shared.lost_events.load(Ordering::Relaxed)
+        *self.shared.lost_events.borrow()
+    }
+
+    pub(crate) fn health_watch(&self) -> ClientHealthWatch {
+        ClientHealthWatch {
+            state: self.shared.state.subscribe(),
+            lost_events: self.shared.lost_events.subscribe(),
+            initial: true,
+        }
     }
 
     /// Takes the uncorrelated frame stream (events, caught-up markers,
@@ -940,7 +1035,7 @@ async fn route_frame(
             let fatal = error.fatal;
             let forwarded = WireFrame::ProtocolError(error.clone());
             if events.is_some_and(|events| events.try_send(forwarded).is_err()) {
-                shared.lost_events.fetch_add(1, Ordering::Relaxed);
+                shared.record_lost_event();
             }
             if fatal {
                 shared.fail(DisconnectReason::Fatal(error));
@@ -948,7 +1043,7 @@ async fn route_frame(
         }
         binding @ WireFrame::ResidentSessionBinding { .. } => {
             if events.is_some_and(|events| events.try_send(binding).is_err()) {
-                shared.lost_events.fetch_add(1, Ordering::Relaxed);
+                shared.record_lost_event();
                 shared.fail(DisconnectReason::Protocol(
                     "resident session binding could not reach the authoritative event channel"
                         .into(),
@@ -960,7 +1055,7 @@ async fn route_frame(
             // a full event channel drops the frame and the consumer's
             // seq-cursor reattach discipline recovers the gap.
             if events.is_some_and(|events| events.try_send(other).is_err()) {
-                shared.lost_events.fetch_add(1, Ordering::Relaxed);
+                shared.record_lost_event();
             }
         }
     }
@@ -1070,11 +1165,12 @@ mod tests {
     #[tokio::test]
     async fn resident_binding_event_overflow_disconnects_for_baseline_recovery() {
         let (state, _) = watch::channel(ConnectionState::Connected);
+        let (lost_events, _) = watch::channel(0);
         let shared = Arc::new(Shared {
             pending: StdMutex::new(HashMap::new()),
             next_request: AtomicU64::new(1),
             acked_pong: AtomicU64::new(0),
-            lost_events: AtomicU64::new(0),
+            lost_events,
             writer_failure: StdMutex::new(None),
             state,
         });
@@ -1098,12 +1194,46 @@ mod tests {
         )
         .await;
 
-        assert_eq!(shared.lost_events.load(Ordering::Relaxed), 1);
+        assert_eq!(*shared.lost_events.borrow(), 1);
         assert!(matches!(
             &*shared.state.borrow(),
             ConnectionState::Disconnected(DisconnectReason::Protocol(message))
                 if message.contains("resident session binding")
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn client_health_watch_is_event_primary_with_a_typed_repair_deadline() {
+        let (state, _) = watch::channel(ConnectionState::Connected);
+        let (lost_events, _) = watch::channel(0_u64);
+        let watcher = ClientHealthWatch {
+            state: state.subscribe(),
+            lost_events: lost_events.subscribe(),
+            initial: true,
+        };
+
+        let (watcher, initial) = watcher
+            .wait("client health fixture", Duration::from_secs(30))
+            .await;
+        assert!(matches!(initial, ClientHealthWait::Changed(_)));
+        assert_eq!(initial.snapshot().lost_events, 0);
+
+        lost_events.send_modify(|lost| *lost = 1);
+        let (watcher, changed) = watcher
+            .wait("client health fixture", Duration::from_secs(30))
+            .await;
+        assert_eq!(changed.snapshot().lost_events, 1);
+
+        let (_watcher, repair) = watcher
+            .wait("client health fixture", Duration::from_secs(30))
+            .await;
+        let timeout = repair
+            .repair_timeout()
+            .expect("quiet health watch reaches its typed repair deadline");
+        assert_eq!(timeout.operation(), "client health fixture");
+        assert_eq!(timeout.limit(), Duration::from_secs(30));
+        assert_eq!(repair.snapshot().state, ConnectionState::Connected);
+        assert_eq!(repair.snapshot().lost_events, 1);
     }
 
     #[tokio::test]

@@ -176,3 +176,24 @@ fn timed_out_child_wait_does_not_pin_runtime_shutdown() {
         "runtime shutdown waited for the detached child waiter"
     );
 }
+
+/// MUTATION CHECK: replace the armed kqueue wait with a 50 ms polling
+/// backoff. Expected RUNTIME failure: a five-millisecond command cannot be
+/// observed before this bound, producing the forbidden tenfold wall delay.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn armed_kqueue_observes_a_short_command_without_coarse_backoff() {
+    let mut child = tokio::process::Command::new("/bin/sleep")
+        .arg("0.005")
+        .spawn()
+        .expect("spawn short kqueue fixture");
+    let pid = super::process_id(child.id()).expect("short fixture pid");
+    tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        super::observe_process_leader_exit(pid),
+    )
+    .await
+    .expect("armed kqueue must beat a 50 ms replacement backoff")
+    .expect("observe short fixture exit");
+    child.wait().await.expect("reap short kqueue fixture");
+}
