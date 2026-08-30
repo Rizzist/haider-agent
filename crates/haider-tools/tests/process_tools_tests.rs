@@ -929,12 +929,26 @@ async fn hard_output_cap_terminates_the_process_group_and_reports_the_ledgered_l
 #[tokio::test(start_paused = true)]
 async fn wall_timeout_terminates_the_process_group_and_reports_the_ledgered_limit() {
     let workspace = tempfile::tempdir().expect("tempdir");
+    let descendant_started = workspace.path().join("timeout-descendant-started.log");
+    let descendant_survived = workspace.path().join("timeout-descendant-survived.log");
     let (mut broker, journal) = broker(workspace.path());
     let wall_timeout = Duration::from_secs(3);
     let kill_grace = Duration::from_secs(1);
     let execution = broker
         .process_exec(
-            &ProcessExec::new("wall-timeout", "trap '' TERM; while :; do :; done"),
+            &ProcessExec::new(
+                "wall-timeout",
+                concat!(
+                    "trap '' TERM; ",
+                    "/usr/bin/perl -e '$SIG{TERM}=q(IGNORE); ",
+                    "open $started, q(>), q(timeout-descendant-started.log); ",
+                    "print $started q(started); close $started; ",
+                    "select undef, undef, undef, 0.3; ",
+                    "open $survived, q(>), q(timeout-descendant-survived.log); ",
+                    "print $survived q(survived); close $survived; sleep 30' & ",
+                    "while :; do :; done",
+                ),
+            ),
             &process_policy(),
             RecordingCas::default(),
             RecordingOutput::default(),
@@ -947,7 +961,16 @@ async fn wall_timeout_terminates_the_process_group_and_reports_the_ledgered_limi
         )
         .await
         .expect("process starts");
-    settle().await;
+    for _ in 0..200 {
+        if descendant_started.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        descendant_started.exists(),
+        "owned descendant starts before the timeout"
+    );
     tokio::time::advance(wall_timeout).await;
     settle().await;
     tokio::time::advance(kill_grace).await;
@@ -960,6 +983,11 @@ async fn wall_timeout_terminates_the_process_group_and_reports_the_ledgered_limi
     assert_eq!(
         result.wall_timeout_ms,
         u64::try_from(wall_timeout.as_millis()).expect("test duration fits")
+    );
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        !descendant_survived.exists(),
+        "timeout must terminate every member of this invocation's group"
     );
     assert!(phases(&journal).iter().any(|phase| matches!(
         phase,
@@ -1077,19 +1105,33 @@ async fn cancellation_wins_over_output_sink_and_cas_failures() {
         .expect("non-leaked cancellation closes");
 }
 
+/// Lane 967-P1 owner decision: natural leader completion is the foreground
+/// ownership boundary. Unlike cancellation, bounds, and explicit teardown, it
+/// must not start TERM -> grace -> KILL for a descendant in this invocation's
+/// group.
 #[tokio::test]
-async fn shell_exit_sweeps_background_members_of_its_process_group() {
+async fn shell_exit_leaves_background_members_of_its_process_group_alone() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let (mut broker, _journal) = broker(workspace.path());
+    let output = RecordingOutput::default();
+    let output_observer = output.observer();
     let result = broker
         .process_exec(
             &ProcessExec::new(
                 "background",
-                "/usr/bin/perl -e '$pid = fork; exit 0 if $pid; sleep 30'",
+                concat!(
+                    "/usr/bin/perl -e '$pid = fork; ",
+                    "if ($pid) { while (!-e q(descendant-started.log)) { ",
+                    "select undef, undef, undef, 0.01 } print q(leader); exit 0 } ",
+                    "open $started, q(>), q(descendant-started.log); print $started q(started); ",
+                    "close $started; select undef, undef, undef, 0.5; ",
+                    "open $survived, q(>), q(descendant-survived.log); ",
+                    "print $survived q(survived); close $survived'",
+                ),
             ),
             &process_policy(),
             RecordingCas::default(),
-            RecordingOutput::default(),
+            output,
             ProcessBounds {
                 max_inline_bytes: 1024,
                 kill_grace: Duration::from_secs(1),
@@ -1100,8 +1142,21 @@ async fn shell_exit_sweeps_background_members_of_its_process_group() {
         .expect("process starts")
         .wait()
         .await
-        .expect("group sweep completes");
+        .expect("leader completion returns");
     assert_eq!(result.status, ToolStatus::Completed);
+    assert_eq!(
+        output_bytes(&output_observer.lock().expect("output observer")),
+        b"leader"
+    );
+    assert!(workspace.path().join("descendant-started.log").exists());
+    assert!(
+        result.lifecycle_events.iter().all(|event| !matches!(
+            event,
+            ProcessLifecycleEvent::GroupSweepStarted | ProcessLifecycleEvent::GroupSweepCompleted
+        )),
+        "normal completion must not enter group termination: {:?}",
+        result.lifecycle_events
+    );
     let event_index = |expected| {
         result
             .lifecycle_events
@@ -1111,15 +1166,21 @@ async fn shell_exit_sweeps_background_members_of_its_process_group() {
     };
     assert!(
         event_index(ProcessLifecycleEvent::LeaderExitObserved)
-            < event_index(ProcessLifecycleEvent::GroupSweepStarted)
-    );
-    assert!(
-        event_index(ProcessLifecycleEvent::GroupSweepCompleted)
             < event_index(ProcessLifecycleEvent::LeaderReaped)
     );
     assert!(
         event_index(ProcessLifecycleEvent::LeaderReaped)
+            < event_index(ProcessLifecycleEvent::NormalCompletionDetached)
+    );
+    assert!(
+        event_index(ProcessLifecycleEvent::NormalCompletionDetached)
             < event_index(ProcessLifecycleEvent::RegistryRemoved)
+    );
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("descendant-survived.log"))
+            .expect("unmanaged descendant survives normal leader completion"),
+        "survived"
     );
     broker.close().await.expect("broker closes");
 }
@@ -1284,6 +1345,10 @@ async fn stdin_process_control_is_a_second_effect_bound_to_the_live_execution() 
 #[tokio::test(start_paused = true)]
 async fn cancellation_waits_for_grace_then_kills_the_group_and_is_not_a_failure() {
     let workspace = tempfile::tempdir().expect("tempdir");
+    let mut unrelated = std::process::Command::new("/bin/sh")
+        .args(["-c", "sleep 10"])
+        .spawn()
+        .expect("spawn unrelated process outside the invocation group");
     let (mut broker, journal) = broker(workspace.path());
     let grace = Duration::from_secs(5);
     let output = RecordingOutput::default();
@@ -1326,6 +1391,15 @@ async fn cancellation_waits_for_grace_then_kills_the_group_and_is_not_a_failure(
     tokio::time::advance(Duration::from_millis(1)).await;
     let result = execution.wait().await.expect("cancelled result");
     assert_eq!(result.status, ToolStatus::Cancelled);
+    assert!(
+        unrelated
+            .try_wait()
+            .expect("probe unrelated process")
+            .is_none(),
+        "cancellation sweep escaped this invocation's process group"
+    );
+    unrelated.kill().expect("clean up unrelated process");
+    unrelated.wait().expect("reap unrelated process");
 
     let phases = phases(&journal);
     assert_eq!(phases.len(), 4);

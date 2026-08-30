@@ -490,14 +490,14 @@ pub struct BackgroundExitStatus {
 }
 
 /// Supervises one background child to its terminal observation: pipes tee
-/// into the bounded buffer, the leader exit is observed without reaping
-/// (`WNOWAIT`) so the zombie pins the pgid through the group sweep, the
-/// group is swept TERM → grace → KILL (on kill request AND on natural exit,
-/// so lingering descendants never outlive the task), and the leader is
-/// reaped last. This mirrors the foreground supervisor's ordering laws with
-/// the turn-scoped concerns (wall timeout, cancel watch, output-cap kill)
-/// deliberately absent: a background task has no wall clock and output
-/// beyond the cap is dropped, not fatal.
+/// into the bounded buffer and the leader exit is observed without reaping
+/// (`WNOWAIT`). A kill request sweeps the invocation's group TERM → grace →
+/// KILL while the zombie pins its pgid, then reaps the leader. Natural leader
+/// completion instead closes inherited output and relinquishes group authority,
+/// leaving any surviving descendants unmanaged. This mirrors the foreground
+/// supervisor's ownership boundary with the turn-scoped concerns (wall timeout,
+/// cancel watch, output-cap kill) deliberately absent: a background task has no
+/// wall clock and output beyond the cap is dropped, not fatal.
 pub async fn supervise_background(
     spawn: BackgroundSpawn,
     mut kill: watch::Receiver<bool>,
@@ -517,17 +517,25 @@ pub async fn supervise_background(
         workspace_receipt,
     } = spawn;
     let (captured_sender, mut captured) = mpsc::channel(1);
+    let (output_stop, stdout_stop) = watch::channel(false);
+    let (stdout_ready_sender, stdout_ready) = tokio::sync::oneshot::channel();
+    let (stderr_ready_sender, stderr_ready) = tokio::sync::oneshot::channel();
     tokio::spawn(read_output(
         stdout,
         OutputStream::Stdout,
         captured_sender.clone(),
+        Some(stdout_stop),
+        Some(stdout_ready_sender),
     ));
     tokio::spawn(read_output(
         stderr,
         OutputStream::Stderr,
         captured_sender.clone(),
+        Some(output_stop.subscribe()),
+        Some(stderr_ready_sender),
     ));
     drop(captured_sender);
+    let (_stdout_ready, _stderr_ready) = tokio::join!(stdout_ready, stderr_ready);
 
     let stdin = Arc::new(tokio::sync::Mutex::new(None));
     let mut fatal: Option<ToolError> = None;
@@ -540,6 +548,8 @@ pub async fn supervise_background(
     let mut leader_exit_observed = false;
     let mut leader_is_zombie = false;
     let mut leader_reaped = false;
+    #[cfg(windows)]
+    let mut normal_completion_relinquished = false;
     let mut kill_deadline: Option<Pin<Box<Sleep>>> = None;
     let mut pipe_drain_deadline: Option<Pin<Box<Sleep>>> = None;
     let mut exit_observation = Box::pin(observe_process_leader_exit(pid));
@@ -622,18 +632,6 @@ pub async fn supervise_background(
                     }
                 };
                 if kill_deadline.is_none() {
-                    begin_group_termination(
-                        group,
-                        pid,
-                        leader_is_zombie,
-                        grace,
-                        &mut kill_deadline,
-                        &mut fatal,
-                        &mut escalation_notes,
-                        &mut lifecycle_events,
-                    );
-                }
-                if kill_deadline.is_none() {
                     reap_process_leader(
                         &mut child,
                         &stdin,
@@ -644,8 +642,40 @@ pub async fn supervise_background(
                     )
                     .await;
                     leader_reaped = true;
-                    if output_open {
+                    if killed && output_open {
                         pipe_drain_deadline = Some(Box::pin(sleep(grace)));
+                    } else if !killed {
+                        // Preserve bytes whose pipe readiness raced the leader
+                        // exit observation, without waiting for descendants or
+                        // arming the teardown grace timer.
+                        tokio::task::yield_now().await;
+                        match haider_platform::detach_process_group(group) {
+                            Ok(()) => {
+                                #[cfg(windows)]
+                                {
+                                    normal_completion_relinquished = true;
+                                }
+                                output_stop.send_replace(true);
+                            }
+                            Err(error) => {
+                                fatal.get_or_insert_with(|| ToolError::Runtime {
+                                    message: format!(
+                                        "detach normally completed background process group {}: {error}",
+                                        pid.as_raw_nonzero()
+                                    ),
+                                });
+                                // A completed task does not become teardown
+                                // because the OS refused ownership detachment.
+                                // Abandon the exact fail-closed Job authority;
+                                // closing it here would itself kill descendants.
+                                haider_platform::abandon_process_group(group);
+                                #[cfg(windows)]
+                                {
+                                    normal_completion_relinquished = true;
+                                }
+                                output_stop.send_replace(true);
+                            }
+                        }
                     }
                 }
             }
@@ -710,7 +740,9 @@ pub async fn supervise_background(
         // KILL_ON_JOB_CLOSE is the final fail-safe and prevents an error path
         // from returning while descendants remain alive behind a retained
         // registry handle.
-        haider_platform::release_process_group(group);
+        if !normal_completion_relinquished {
+            haider_platform::release_process_group(group);
+        }
         if !leader_reaped {
             match tokio::time::timeout(grace, child.wait()).await {
                 Ok(Ok(status)) => {

@@ -1198,6 +1198,24 @@ fn every_advertised_tool_is_manual_described_and_wire_is_description_free() {
     // The whole-list-replace teaching that used to live on the todo_write wire
     // description now lives in the manual.
     assert!(manual.contains("REPLACE the whole todo list"));
+    // Lane 967-P1 owner decision: the model must see the foreground ownership
+    // boundary, both default bounds, and the durable background alternative.
+    let process = tool_manual_line("process_exec").expect("process_exec manual line");
+    for required in [
+        "60 s / 1 MiB",
+        "in either local mode, normal leader exit closes inherited output",
+        "descendants (including shell &) unmanaged",
+        "daemon shutdown will not reclaim them after ownership detaches",
+        "supervision failure while the leader is live",
+        "sweep only this invocation's group with TERM → 2 s grace → KILL",
+        "background=true",
+        "task_output/task_kill",
+    ] {
+        assert!(
+            process.contains(required),
+            "process_exec manual omitted `{required}`: {process}"
+        );
+    }
 }
 
 /// MUTATION CHECK: stop stubbing, stop emptying wire descriptions, move
@@ -1212,14 +1230,14 @@ fn instruct_pipe_shrinks_the_advertised_wire_pack() {
     // computer manifest description. Linux documents X11/Wayland (+49 bytes
     // over macOS), while Windows is one byte shorter than macOS.
     #[cfg(target_os = "linux")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 16_470;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 16_997;
     #[cfg(target_os = "macos")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 16_421;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 16_948;
     #[cfg(target_os = "windows")]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 16_420;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 16_947;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    const EXPECTED_FULL_PREFIX_BYTES: usize = 16_415;
-    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 10_783;
+    const EXPECTED_FULL_PREFIX_BYTES: usize = 16_942;
+    const EXPECTED_INSTRUCT_PIPE_BYTES: usize = 11_246;
 
     let factory: Arc<dyn TurnToolFactory> = Arc::new(BrokerToolFactory);
     let stubbed =

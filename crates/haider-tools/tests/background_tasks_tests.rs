@@ -13,6 +13,7 @@ use haider_tools::{
     ProcessExec, ToolError, ToolResult, default_task_name, probe_group_liveness, reap_orphan_group,
     shared_task_output, supervise_background, task_kill_channel,
 };
+use std::fs;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -270,16 +271,28 @@ async fn task_kill_ladder_kills_the_whole_process_group() {
     );
 }
 
-/// MUTATION CHECK (natural-exit hygiene): skip the group sweep after the
-/// leader exits. Expected RUNTIME failure: the backgrounded group member
-/// outlives the completed task and the group probe stays `Alive`.
+/// Lane 967-P1 owner decision: normal completion ends ownership in background
+/// mode too. `task_kill` still sweeps while the task leader is live, but a
+/// naturally completed leader leaves its descendants alone.
 #[tokio::test]
-async fn natural_exit_sweeps_lingering_group_members() {
+async fn natural_exit_leaves_lingering_group_members_alone() {
     let workspace = tempfile::tempdir().expect("workspace");
     let (mut broker, _observer) = broker(workspace.path());
     let spawn = broker
         .process_exec_background(
-            &background("bg-linger", "sleep 30 & exit 0"),
+            &background(
+                "bg-linger",
+                concat!(
+                    "/usr/bin/perl -e '$pid = fork; ",
+                    "if ($pid) { while (!-e q(started)) { select undef, undef, undef, 0.01 } ",
+                    "print q(leader); exit 0 } ",
+                    "open $started, q(>), q(started); print $started q(started); close $started; ",
+                    "select undef, undef, undef, 0.5; ",
+                    "open $survived, q(>), q(survived); print $survived q(survived); ",
+                    "close $survived; while (!-e q(cleanup)) { ",
+                    "select undef, undef, undef, 0.01 }'",
+                ),
+            ),
             &exec_policy(),
         )
         .await
@@ -287,14 +300,36 @@ async fn natural_exit_sweeps_lingering_group_members() {
     let pid = spawn.pid;
     let (_kill, kill_signal) = task_kill_channel();
     let output = shared_task_output(1024, 64);
+    let output_observer = Arc::clone(&output);
     let status = supervise_background(spawn, kill_signal, output, Duration::from_millis(200)).await;
     assert_eq!(status.exit_code, Some(0));
     assert!(!status.killed, "a natural exit is not a kill: {status:?}");
     assert_eq!(
-        probe_group_liveness(pid),
-        PidLiveness::Dead,
-        "lingering same-group members are swept when the task completes"
+        output_observer
+            .lock()
+            .expect("background output observer")
+            .retained(),
+        b"leader"
     );
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        probe_group_liveness(pid),
+        PidLiveness::Alive,
+        "lingering same-group members become unmanaged when the task completes"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("survived"))
+            .expect("unmanaged background descendant survives"),
+        "survived"
+    );
+    fs::write(workspace.path().join("cleanup"), b"stop").expect("release descendant fixture");
+    for _ in 0..200 {
+        if probe_group_liveness(pid) == PidLiveness::Dead {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("unmanaged background descendant did not exit after fixture cleanup");
 }
 
 /// MUTATION CHECK (LT6 seam): ignore the injected liveness probe, or skip
