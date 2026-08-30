@@ -85,8 +85,8 @@ fn haider() -> HaiderCommand {
         .env("HAIDER_PROFILE_DIR", &profile)
         // Lockdown and other machine-user-global subsystems must never escape
         // this nominally hermetic profile into the developer's real home.
-        .env("HOME", profile_root.path())
-        .env("USERPROFILE", profile_root.path())
+        // `configure_test_home` is also the one authority used by attached
+        // helper commands and parent-side endpoint resolution.
         .env_remove("HAIDER_MODEL")
         // Hermetic accounts: startup auto-adoption (A2) would otherwise read
         // the HOST machine's real codex/Claude credentials into this
@@ -101,9 +101,17 @@ fn haider() -> HaiderCommand {
 }
 
 fn configure_test_home(command: &mut Command, profile: &Path) {
-    let home = profile.parent().unwrap_or(profile).join("machine-home");
+    let home = test_home(profile);
     std::fs::create_dir_all(&home).expect("create isolated machine-user home");
-    command.env("HOME", &home).env("USERPROFILE", home);
+    command
+        .env("HOME", &home)
+        .env("USERPROFILE", home)
+        .env_remove("HAIDER_RUNTIME_DIR")
+        .env_remove("XDG_RUNTIME_DIR");
+}
+
+fn test_home(profile: &Path) -> PathBuf {
+    profile.parent().unwrap_or(profile).join("machine-home")
 }
 
 impl Drop for HaiderCommand {
@@ -298,7 +306,11 @@ fn wait_for_profile_lock(profile: &Path, should_be_free: bool) {
 fn configure_isolated_runtime(command: &mut HaiderCommand) -> PathBuf {
     let mut environment = haider_client::ProfileEnv::capture();
     environment.profile_dir = Some(command.profile.clone());
-    environment.home = None;
+    let home = test_home(&command.profile);
+    environment.home = Some(home.clone());
+    environment.user_profile = Some(home);
+    environment.runtime_dir = None;
+    environment.xdg_runtime_dir = None;
     haider_client::resolve_profile(&environment)
         .expect("resolve profile identity")
         .endpoint_path
@@ -966,7 +978,8 @@ fn replay_reports_provider_divergence_without_hiding_it() {
         .env(
             "HAIDER_TEST_FAKE_PROVIDER",
             r#"[{"step":"emit_text","text":"same"},{"step":"emit_usage","usage":{"input":2,"output":1,"reasoning":0,"cached":0,"source":"locally_exact"}},{"step":"finish","reason":"end_turn"}]"#,
-        );
+        )
+        .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "0");
     let original = output_with_boot_retry(&mut source);
     assert!(
         original.status.success(),
@@ -1003,7 +1016,8 @@ fn replay_reports_provider_divergence_without_hiding_it() {
         .env(
             "HAIDER_TEST_FAKE_PROVIDER",
             r#"[{"step":"emit_text","text":"same"},{"step":"emit_usage","usage":{"input":2,"output":1,"reasoning":0,"cached":0,"source":"estimated"}},{"step":"finish","reason":"end_turn"}]"#,
-        );
+        )
+        .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "0");
     let replay = output_with_boot_retry(&mut replay_command);
     assert!(
         replay.status.success(),
@@ -1147,6 +1161,7 @@ fn one_shot_reaps_only_the_daemon_it_spawned_on_success_and_bootstrap_failure() 
     let success_endpoint = configure_isolated_runtime(&mut success);
     success
         .env("HAIDER_TEST_FAKE_PROVIDER", delayed_fake)
+        .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .args(["run", "--provider", "fake", "--jsonl", "hello"]);
@@ -1181,6 +1196,7 @@ fn one_shot_reaps_only_the_daemon_it_spawned_on_success_and_bootstrap_failure() 
     let mut bootstrap_failure = haider();
     let failure_endpoint = configure_isolated_runtime(&mut bootstrap_failure);
     bootstrap_failure
+        .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .args(["run", "--jsonl", "hello"]);
@@ -1236,11 +1252,10 @@ fn staged_run_with_resident_daemon_has_two_steady_state_threads() {
 
     let workspace = resident._profile_root.path().join("workspace");
     let mut command = Command::new(&haider_binary);
+    configure_test_home(&mut command, &resident.profile);
     command
         .current_dir(workspace)
         .env("HAIDER_PROFILE_DIR", &resident.profile)
-        .env("HOME", resident._profile_root.path())
-        .env("USERPROFILE", resident._profile_root.path())
         .env("HAIDER_DISCOVERY_DISABLED", "1")
         .env("HAIDER_TEST_FAKE_PROVIDER", delayed_fake)
         .args(["run", "--provider", "fake", "--jsonl", "thread guard"])
@@ -1531,6 +1546,7 @@ fn anthropic_missing_credential_exits_65_without_network_access() {
     // with this test's explicit profile instead of leaking the real daemon
     // while trying to terminate the helper's unused throwaway profile.
     command.profile = profile.clone();
+    configure_test_home(&mut command, &profile);
     command
         .env("HAIDER_PROFILE_DIR", &profile)
         .args([
@@ -1557,9 +1573,9 @@ fn anthropic_missing_credential_exits_65_without_network_access() {
 
     assert_eq!(out.status.code(), Some(65));
     assert!(String::from_utf8_lossy(&out.stderr).contains("HAIDER_ANTHROPIC_API_KEY"));
-    // W9b migration: provider resolution belongs to the daemon after durable
-    // acceptance, so JSONL exposes the resulting Errored audit trail instead
-    // of performing a second client-side credential preflight.
+    // Provider resolution belongs to the daemon after durable acceptance, so
+    // JSONL exposes the credential-specific Errored audit trail instead of
+    // collapsing a missing credential into a provider transport failure.
     let envelopes = parse_jsonl(&out.stdout);
     assert_eq!(
         envelopes.last().map(typed),
@@ -1570,8 +1586,11 @@ fn anthropic_missing_credential_exits_65_without_network_access() {
         .filter(|envelope| envelope.payload.get("terminal_kind").is_some())
         .collect::<Vec<_>>();
     assert_eq!(terminals.len(), 1);
-    assert_eq!(terminals[0].payload["terminal_kind"], "provider_error");
-    assert_eq!(terminals[0].payload["error_code"], "provider_error");
+    assert_eq!(terminals[0].payload["terminal_kind"], "failure");
+    assert_eq!(terminals[0].payload["error_code"], "credential_missing");
+    assert!(envelopes.iter().any(|envelope| {
+        envelope.payload["type"] == "run_failed" && envelope.payload["code"] == "credential_missing"
+    }));
 }
 
 #[test]
@@ -1587,6 +1606,7 @@ fn sequential_ephemeral_cli_runs_advance_profile_owned_worker_generations() {
             .env("HAIDER_PROFILE_DIR", &profile)
             .env("HAIDER_DISCOVERY_DISABLED", "1")
             .env("HAIDER_TEST_FAKE_PROVIDER", DEFAULT_FAKE_SCRIPT)
+            .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "0")
             .output()
             .expect("binary runs")
     };

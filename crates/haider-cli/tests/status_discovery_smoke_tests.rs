@@ -81,7 +81,12 @@ fn built_status_json_completes_with_enabled_discovery() {
     let root = tempfile::tempdir().expect("fresh status smoke root");
     let profile = root.path().join("profile");
     let workspace = root.path().join("workspace");
+    #[cfg(unix)]
+    let machine_home = root.path().join("machine-home-").join("h".repeat(100));
+    #[cfg(not(unix))]
+    let machine_home = root.path().join("machine-home");
     std::fs::create_dir_all(&workspace).expect("smoke workspace");
+    std::fs::create_dir_all(&machine_home).expect("smoke machine-user home");
     let codex = root.path().join("codex-auth.json");
     std::fs::write(
         &codex,
@@ -111,8 +116,8 @@ fn built_status_json_completes_with_enabled_discovery() {
             // The daemon's lockdown ledger is machine-user global. Keep this
             // real-artifact smoke hermetic while discovery paths remain the
             // explicit fixtures below.
-            .env("HOME", root.path())
-            .env("USERPROFILE", root.path())
+            .env("HOME", &machine_home)
+            .env("USERPROFILE", &machine_home)
             .env_remove("HAIDER_DISCOVERY_DISABLED")
             .env_remove("HAIDER_DEVICE_DISCOVERY_DISABLED")
             .env("HAIDER_TEST_CLAUDE_CREDENTIAL_STORE", "unavailable")
@@ -163,6 +168,16 @@ fn built_status_json_completes_with_enabled_discovery() {
             .map(Path::new)
             .and_then(Path::parent),
         "socket and PID file must name the same resolved runtime directory"
+    );
+    assert_eq!(
+        Path::new(socket_path).parent(),
+        document["runtime_dir"].as_str().map(Path::new),
+        "status must report the runtime directory that owns the live socket"
+    );
+    #[cfg(unix)]
+    assert!(
+        !Path::new(socket_path).starts_with(&machine_home),
+        "an overlong HOME must report the live short fallback, not the rejected preferred path"
     );
     let discovery_deadline = Instant::now() + Duration::from_secs(10);
     loop {

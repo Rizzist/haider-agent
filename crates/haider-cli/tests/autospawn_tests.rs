@@ -84,10 +84,12 @@ fn warm_autospawn_binaries(haider: &Path, haiderd: &Path) {
 }
 
 fn resolved_for(store: &Path) -> ResolvedProfile {
+    let home = test_home(store);
+    std::fs::create_dir_all(&home).expect("create isolated machine-user home");
     resolve_profile(&ProfileEnv {
         profile_dir: Some(store.to_path_buf()),
-        home: None,
-        user_profile: None,
+        home: Some(home.clone()),
+        user_profile: Some(home),
         model: None,
         runtime_dir: None,
         xdg_runtime_dir: None,
@@ -118,9 +120,13 @@ fn haider_command(store: &Path) -> Command {
 }
 
 fn configure_test_home(command: &mut Command, store: &Path) {
-    let home = store.join("machine-home");
+    let home = test_home(store);
     std::fs::create_dir_all(&home).expect("create isolated machine-user home");
     command.env("HOME", &home).env("USERPROFILE", home);
+}
+
+fn test_home(store: &Path) -> PathBuf {
+    store.join("machine-home")
 }
 
 const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(15);

@@ -821,13 +821,13 @@ async fn unanswered_request_reaches_typed_continuous_deadline() {
 /// r2-precedented executing source guard on the ordering, beside the
 /// behavioral request-after-disconnect pin below.
 ///
-/// The correlation and ordering live in `begin_correlated_frame`;
-/// `begin_request` is the request-frame wrapper after W3c3 P1-3 split the
-/// ordered send from the concurrent wait. There is still exactly ONE copy of
-/// this ordering to guard.
+/// The correlation and ordering live in `begin_correlated_encoded`;
+/// `begin_request` and `begin_correlated_frame` are wrappers after lane PK
+/// added a segmented `artifact.put` encoding path. There is still exactly ONE
+/// copy of this ordering to guard.
 ///
 /// MUTATION CHECK: move the `ConnectionState::Disconnected` early-return in
-/// `RpcClient::begin_correlated_frame` back above the `pending.lock()`
+/// `RpcClient::begin_correlated_encoded` back above the `pending.lock()`
 /// acquisition. Expected failure: the position assertions below invert.
 #[test]
 fn request_disconnect_check_sits_inside_the_pending_lock() {
@@ -836,12 +836,12 @@ fn request_disconnect_check_sits_inside_the_pending_lock() {
     )
     .expect("client source");
     let function_start = source
-        .find("pub(crate) async fn begin_correlated_frame")
-        .expect("begin_correlated_frame fn");
+        .find("async fn begin_correlated_encoded")
+        .expect("begin_correlated_encoded fn");
     let open_brace = source[function_start..]
         .find('{')
         .map(|offset| function_start + offset)
-        .expect("begin_correlated_frame opening brace");
+        .expect("begin_correlated_encoded opening brace");
     let mut brace_depth = 0_usize;
     let function_end = source[open_brace..]
         .char_indices()
@@ -856,7 +856,7 @@ fn request_disconnect_check_sits_inside_the_pending_lock() {
             }
             _ => None,
         })
-        .expect("begin_correlated_frame closing brace");
+        .expect("begin_correlated_encoded closing brace");
     let body = &source[open_brace..function_end];
     let lock = body
         .find("self.shared.pending.lock()")
