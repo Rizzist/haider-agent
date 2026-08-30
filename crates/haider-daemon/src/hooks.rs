@@ -1939,7 +1939,7 @@ async fn flush_hook_dispatch_acks(service: &HookService, acks: Vec<(SessionId, u
     if acks.is_empty() {
         return true;
     }
-    if let Err(error) = service.inner.store.complete_hook_dispatches(acks).await {
+    if let Err(error) = service.inner.hub.complete_hook_dispatches(acks).await {
         tracing::warn!(target: "haider.hooks", ?error, "hook recovery outbox acknowledgement failed");
         return false;
     }
@@ -2073,8 +2073,8 @@ async fn handle_and_complete(
             let acknowledged = if handled {
                 match service
                     .inner
-                    .store
-                    .complete_hook_dispatch(&envelope.session_id, envelope.seq)
+                    .hub
+                    .complete_hook_dispatches(vec![(envelope.session_id.clone(), envelope.seq)])
                     .await
                 {
                     Ok(()) => true,

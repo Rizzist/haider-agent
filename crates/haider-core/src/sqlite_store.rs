@@ -29,15 +29,16 @@ use haider_store::{
     GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome, GraphInspectResult,
     GraphPinCommand, GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome,
     GraphSwitchCommand, GraphSwitchOutcome, HookTrustChange, HookTrustCommand, JournalAppendBatch,
-    MenuResolutionCommand, MenuResolutionOutcome, MonitorControlClaim, ProcessSignalCommand,
-    ProcessSignalOutcome, ProfileLease, QueueConsumeCommand, QueueConsumeOutcome,
-    QueuePromoteCommand, QueuePromoteOutcome, QueuePromotePreview, QueueRemoveCommand,
-    QueueRemoveOutcome, QueueSnapshot, RunRetryCommand, RunRetryOutcome, SessionCreateCommand,
-    SessionCreateOutcome, SessionForkCommand, SessionForkOutcome, SessionProjectionCheckpoint,
-    SessionPromptForkCommand, SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand,
-    SessionSeenOutcome, SessionSelectModelCommand, SessionSelectModelOutcome,
-    ShellExecAcceptCommand, ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome,
-    TurnCancelCommand, TurnCancelOutcome, TypedAgentInstallCas,
+    JournalCommitBatch, JournalCommitOutcome, MenuResolutionCommand, MenuResolutionOutcome,
+    MonitorControlClaim, ProcessSignalCommand, ProcessSignalOutcome, ProfileLease,
+    QueueConsumeCommand, QueueConsumeOutcome, QueuePromoteCommand, QueuePromoteOutcome,
+    QueuePromotePreview, QueueRemoveCommand, QueueRemoveOutcome, QueueSnapshot, RunRetryCommand,
+    RunRetryOutcome, SessionCreateCommand, SessionCreateOutcome, SessionForkCommand,
+    SessionForkOutcome, SessionProjectionCheckpoint, SessionPromptForkCommand,
+    SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome,
+    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
+    ShellExecAcceptOutcome, Store, TurnAcceptCommand, TurnAcceptOutcome, TurnCancelCommand,
+    TurnCancelOutcome, TypedAgentInstallCas,
 };
 use haider_tools::{CasSink, ToolResult};
 use std::path::{Path, PathBuf};
@@ -71,6 +72,30 @@ struct StoreOwner {
 pub struct AppendGroupBatch {
     pub envelopes: Vec<RawEnvelope>,
     pub validate_worker_transitions: bool,
+}
+
+/// One profile-global mutation admitted to the daemon's shared committer.
+pub enum CommitGroupBatch {
+    Append(AppendGroupBatch),
+    CreateSession {
+        command: SessionCreateCommand,
+        interaction_mode: haider_protocol::session::SessionInteractionModeV1,
+    },
+    AcceptTurn {
+        command: TurnAcceptCommand,
+        peer_message: Option<haider_protocol::peer::PeerMessage>,
+        auto_title: Option<String>,
+        validate_headless: bool,
+    },
+    HookAcks(Vec<(SessionId, u64)>),
+}
+
+/// Arrival-ordered result for one [`CommitGroupBatch`].
+pub enum CommitGroupOutcome {
+    Append(Vec<RawEnvelope>),
+    CreateSession(SessionCreateOutcome),
+    AcceptTurn(TurnAcceptOutcome),
+    HookAcks,
 }
 
 /// Out-of-band durable-store health. This deliberately does not use the
@@ -1817,38 +1842,118 @@ impl SqliteStoreHandle {
         &self,
         batches: Vec<AppendGroupBatch>,
     ) -> Result<Vec<Result<Vec<RawEnvelope>, HaiderError>>, HaiderError> {
+        self.commit_group(batches.into_iter().map(CommitGroupBatch::Append).collect())
+            .await
+            .map(|outcomes| {
+                outcomes
+                    .into_iter()
+                    .map(|outcome| {
+                        outcome.and_then(|outcome| match outcome {
+                            CommitGroupOutcome::Append(envelopes) => Ok(envelopes),
+                            CommitGroupOutcome::CreateSession(_)
+                            | CommitGroupOutcome::AcceptTurn(_)
+                            | CommitGroupOutcome::HookAcks => Err(commit_group_shape_error()),
+                        })
+                    })
+                    .collect()
+            })
+    }
+
+    /// Commits a mixed profile-global group while preserving each logical
+    /// request's original atomicity and result boundary.
+    pub async fn commit_group(
+        &self,
+        batches: Vec<CommitGroupBatch>,
+    ) -> Result<Vec<Result<CommitGroupOutcome, HaiderError>>, HaiderError> {
         let owner = Arc::clone(&self.owner);
-        let failed_write_ids = batches
-            .iter()
-            .flat_map(|batch| batch.envelopes.iter())
-            .map(|envelope| envelope.event_id.as_str().to_owned())
-            .collect::<Vec<_>>();
+        let mut failed_write_ids = Vec::new();
+        for batch in &batches {
+            match batch {
+                CommitGroupBatch::Append(batch) => failed_write_ids.extend(
+                    batch
+                        .envelopes
+                        .iter()
+                        .map(|envelope| envelope.event_id.as_str().to_owned()),
+                ),
+                CommitGroupBatch::CreateSession { command, .. } => {
+                    failed_write_ids.push(command.command_id.clone());
+                }
+                CommitGroupBatch::AcceptTurn { command, .. } => {
+                    failed_write_ids.push(command.command_id.clone());
+                }
+                CommitGroupBatch::HookAcks(_) => {}
+            }
+        }
         let result = run_blocking(move || {
             #[cfg(test)]
-            if batches
-                .iter()
-                .any(|batch| !batch.validate_worker_transitions)
-                && let Some(error) = owner
-                    .injected_append_error
-                    .lock()
-                    .map_err(|_| owner_lock_error())?
-                    .take()
+            if batches.iter().any(|batch| {
+                matches!(
+                    batch,
+                    CommitGroupBatch::Append(batch) if !batch.validate_worker_transitions
+                )
+            }) && let Some(error) = owner
+                .injected_append_error
+                .lock()
+                .map_err(|_| owner_lock_error())?
+                .take()
             {
                 return Err(error);
             }
             owner.with_store(|store| {
                 let mut batches = batches
                     .into_iter()
-                    .map(|batch| JournalAppendBatch {
-                        envelopes: batch.envelopes,
-                        validate_worker_transitions: batch.validate_worker_transitions,
+                    .map(|batch| match batch {
+                        CommitGroupBatch::Append(batch) => {
+                            JournalCommitBatch::Append(JournalAppendBatch {
+                                envelopes: batch.envelopes,
+                                validate_worker_transitions: batch.validate_worker_transitions,
+                            })
+                        }
+                        CommitGroupBatch::CreateSession {
+                            command,
+                            interaction_mode,
+                        } => JournalCommitBatch::CreateSession {
+                            command,
+                            interaction_mode,
+                        },
+                        CommitGroupBatch::AcceptTurn {
+                            command,
+                            peer_message,
+                            auto_title,
+                            validate_headless,
+                        } => JournalCommitBatch::AcceptTurn {
+                            command,
+                            peer_message,
+                            auto_title,
+                            validate_headless,
+                        },
+                        CommitGroupBatch::HookAcks(acks) => JournalCommitBatch::HookAcks(acks),
                     })
                     .collect::<Vec<_>>();
-                let outcomes = store.append_owned_group(&mut batches)?;
+                let outcomes = store.commit_group(&mut batches)?;
                 Ok(batches
                     .into_iter()
                     .zip(outcomes)
-                    .map(|(batch, outcome)| outcome.map(|_| batch.envelopes))
+                    .map(|(batch, outcome)| {
+                        outcome.and_then(|outcome| match (batch, outcome) {
+                            (
+                                JournalCommitBatch::Append(batch),
+                                JournalCommitOutcome::Append(_),
+                            ) => Ok(CommitGroupOutcome::Append(batch.envelopes)),
+                            (
+                                JournalCommitBatch::CreateSession { .. },
+                                JournalCommitOutcome::CreateSession(outcome),
+                            ) => Ok(CommitGroupOutcome::CreateSession(outcome)),
+                            (
+                                JournalCommitBatch::AcceptTurn { .. },
+                                JournalCommitOutcome::AcceptTurn(outcome),
+                            ) => Ok(CommitGroupOutcome::AcceptTurn(outcome)),
+                            (JournalCommitBatch::HookAcks(_), JournalCommitOutcome::HookAcks) => {
+                                Ok(CommitGroupOutcome::HookAcks)
+                            }
+                            _ => Err(commit_group_shape_error()),
+                        })
+                    })
                     .collect())
             })
         })
@@ -2662,6 +2767,14 @@ fn owner_lock_error() -> HaiderError {
     HaiderError::new(
         ErrorCode::Internal,
         "SQLite store owner lock is poisoned",
+        false,
+    )
+}
+
+fn commit_group_shape_error() -> HaiderError {
+    HaiderError::new(
+        ErrorCode::Internal,
+        "SQLite commit group returned a mismatched request outcome",
         false,
     )
 }

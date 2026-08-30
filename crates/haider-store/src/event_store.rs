@@ -87,7 +87,7 @@ use haider_protocol::project_instructions::ProjectInstructionsEventPayload;
 use haider_protocol::queue::{QueueChange, QueueDelta, QueueRow};
 use haider_protocol::retry::RunRetryEventPayload;
 use haider_protocol::session::{
-    EffortSelected, FastModeSelected, ModelSelected, SessionMetadataV1,
+    EffortSelected, FastModeSelected, ModelSelected, SessionInteractionModeV1, SessionMetadataV1,
     SessionPermissionOverridesV1,
 };
 use haider_protocol::session_fork::{
@@ -1863,6 +1863,36 @@ pub struct JournalAppendBatch {
     pub validate_worker_transitions: bool,
 }
 
+/// One logical profile mutation admitted to the shared commit transaction.
+///
+/// Receipt-backed session creation and turn acceptance participate without
+/// splitting a receipt from its accepted envelopes. Hook acknowledgements are
+/// idempotent sidecar work and may share the same outer commit as either
+/// mutation kind.
+pub enum JournalCommitBatch {
+    Append(JournalAppendBatch),
+    CreateSession {
+        command: SessionCreateCommand,
+        interaction_mode: SessionInteractionModeV1,
+    },
+    AcceptTurn {
+        command: TurnAcceptCommand,
+        peer_message: Option<PeerMessage>,
+        auto_title: Option<String>,
+        validate_headless: bool,
+    },
+    HookAcks(Vec<(SessionId, u64)>),
+}
+
+/// Per-request result from [`Store::commit_group`]. Results retain arrival
+/// order and become observable only after the shared outer transaction lands.
+pub enum JournalCommitOutcome {
+    Append(CommittedSeqRange),
+    CreateSession(SessionCreateOutcome),
+    AcceptTurn(TurnAcceptOutcome),
+    HookAcks,
+}
+
 /// Opaque ownership of the profile's OS-held lifetime lock.
 ///
 /// W3b1 seam (additive): daemon startup acquires this before opening SQLite
@@ -2054,10 +2084,11 @@ impl Store {
         )
     }
 
-    /// Fully fences provider-view CAS bytes, then publishes their index and
-    /// the request-attempt journal batch in one SQLite transaction. The full
-    /// CAS fence must precede the transaction: after commit, neither side can
-    /// exist durably without the other.
+    /// Ordering-fences provider-view CAS bytes, then publishes their index and
+    /// the request-attempt journal batch in one SQLite transaction. The CAS
+    /// barrier must precede the transaction: after power loss, a surviving
+    /// index cannot exist without its blocks, although neither phase is
+    /// independently guaranteed to survive merely because this call returned.
     pub fn persist_provider_view_and_append_owned(
         &self,
         session_id: &SessionId,
@@ -7299,9 +7330,10 @@ impl Store {
     /// including when the group contains one request.
     ///
     /// This method does not wait for more work. A singleton uses the ordinary
-    /// immediate append path. Receipt-backed mutations remain on their
-    /// method-specific transactions so their receipt and accepted envelopes
-    /// keep one indivisible durability boundary.
+    /// immediate append path. This compatibility wrapper admits only append
+    /// batches; [`Self::commit_group`] admits receipt-backed mutations while
+    /// keeping each receipt and its accepted envelopes indivisible inside the
+    /// shared outer transaction.
     pub fn append_group(
         &self,
         batches: &mut [JournalAppendBatch],
@@ -7391,6 +7423,153 @@ impl Store {
             }
         }
         Ok(results)
+    }
+
+    /// Commits an arrival-ordered mixture of actor appends, atomic turn
+    /// acceptances, and completed hook acknowledgements in one outer SQLite
+    /// transaction. A savepoint keeps a semantic failure local to its request;
+    /// fatal store failures reject the complete group.
+    ///
+    /// A singleton retains its existing direct transaction shape. In
+    /// particular, receipt and accepted envelopes remain indivisible even
+    /// when the receipt shares an outer commit with unrelated sessions.
+    pub fn commit_group(
+        &self,
+        batches: &mut [JournalCommitBatch],
+    ) -> StoreResult<Vec<StoreResult<JournalCommitOutcome>>> {
+        if batches.is_empty() {
+            return Err(store_error(
+                ErrorCode::InvalidArgument,
+                "cannot commit an empty journal group",
+                false,
+            ));
+        }
+        if let [batch] = batches {
+            return match self.commit_single_batch(batch) {
+                Ok(outcome) => Ok(vec![Ok(outcome)]),
+                Err(error) if isolatable_commit_error(&error) => Ok(vec![Err(error)]),
+                Err(error) => Err(error),
+            };
+        }
+
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let mut outcomes = Vec::with_capacity(batches.len());
+        for batch in batches.iter_mut() {
+            let savepoint = transaction.savepoint().map_err(map_sqlite_error)?;
+            match self.commit_batch_in_transaction(&savepoint, batch) {
+                Ok(outcome) => {
+                    savepoint.commit().map_err(map_sqlite_error)?;
+                    outcomes.push(Ok(outcome));
+                }
+                Err(error) if isolatable_commit_error(&error) => {
+                    savepoint.finish().map_err(map_sqlite_error)?;
+                    outcomes.push(Err(error));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        transaction.commit().map_err(map_sqlite_error)?;
+
+        for (batch, outcome) in batches.iter().zip(&outcomes) {
+            let (JournalCommitBatch::Append(batch), Ok(JournalCommitOutcome::Append(range))) =
+                (batch, outcome)
+            else {
+                continue;
+            };
+            update_append_caches(
+                self,
+                &connection,
+                &range.session_id,
+                &batch.envelopes,
+                batch
+                    .envelopes
+                    .iter()
+                    .any(|envelope| graph_reduction_event(&envelope.payload)),
+                batch
+                    .envelopes
+                    .iter()
+                    .any(|envelope| graph_telemetry_event(&envelope.payload)),
+            );
+        }
+        Ok(outcomes)
+    }
+
+    fn commit_single_batch(
+        &self,
+        batch: &mut JournalCommitBatch,
+    ) -> StoreResult<JournalCommitOutcome> {
+        match batch {
+            JournalCommitBatch::Append(batch) => append_owned_envelopes(
+                self,
+                &mut batch.envelopes,
+                batch.validate_worker_transitions,
+            )
+            .map(JournalCommitOutcome::Append),
+            JournalCommitBatch::CreateSession {
+                command,
+                interaction_mode,
+            } => self
+                .create_session_with_interaction_mode(command, *interaction_mode)
+                .map(JournalCommitOutcome::CreateSession),
+            JournalCommitBatch::AcceptTurn {
+                command,
+                peer_message,
+                auto_title,
+                validate_headless,
+            } => self
+                .accept_turn_with_peer_and_title(
+                    command,
+                    peer_message.as_ref(),
+                    auto_title.as_deref(),
+                    *validate_headless,
+                )
+                .map(JournalCommitOutcome::AcceptTurn),
+            JournalCommitBatch::HookAcks(acks) => self
+                .complete_hook_dispatches(acks)
+                .map(|()| JournalCommitOutcome::HookAcks),
+        }
+    }
+
+    fn commit_batch_in_transaction(
+        &self,
+        transaction: &Connection,
+        batch: &mut JournalCommitBatch,
+    ) -> StoreResult<JournalCommitOutcome> {
+        match batch {
+            JournalCommitBatch::Append(batch) => append_envelopes_in_transaction(
+                transaction,
+                &mut batch.envelopes,
+                batch.validate_worker_transitions,
+            )
+            .map(|outcome| JournalCommitOutcome::Append(outcome.range)),
+            JournalCommitBatch::CreateSession {
+                command,
+                interaction_mode,
+            } => self
+                .create_session_in_transaction(transaction, command, *interaction_mode)
+                .map(JournalCommitOutcome::CreateSession),
+            JournalCommitBatch::AcceptTurn {
+                command,
+                peer_message,
+                auto_title,
+                validate_headless,
+            } => self
+                .accept_turn_in_transaction(
+                    transaction,
+                    command,
+                    peer_message.as_ref(),
+                    auto_title.as_deref(),
+                    *validate_headless,
+                )
+                .map(JournalCommitOutcome::AcceptTurn),
+            JournalCommitBatch::HookAcks(acks) => {
+                complete_hook_dispatches_in_transaction(transaction, acks)?;
+                Ok(JournalCommitOutcome::HookAcks)
+            }
+        }
     }
 
     /// Claims the global command-id namespace for `session.compact` before
@@ -7601,10 +7780,7 @@ impl Store {
         &self,
         command: &SessionCreateCommand,
     ) -> StoreResult<SessionCreateOutcome> {
-        self.create_session_with_interaction_mode(
-            command,
-            haider_protocol::session::SessionInteractionModeV1::Interactive,
-        )
+        self.create_session_with_interaction_mode(command, SessionInteractionModeV1::Interactive)
     }
 
     /// Same atomic session creation transaction with an explicit durable
@@ -7613,7 +7789,23 @@ impl Store {
     pub fn create_session_with_interaction_mode(
         &self,
         command: &SessionCreateCommand,
-        interaction_mode: haider_protocol::session::SessionInteractionModeV1,
+        interaction_mode: SessionInteractionModeV1,
+    ) -> StoreResult<SessionCreateOutcome> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let outcome =
+            self.create_session_in_transaction(&transaction, command, interaction_mode)?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(outcome)
+    }
+
+    fn create_session_in_transaction(
+        &self,
+        transaction: &Connection,
+        command: &SessionCreateCommand,
+        interaction_mode: SessionInteractionModeV1,
     ) -> StoreResult<SessionCreateOutcome> {
         validate_command_identity(
             &command.command_id,
@@ -7631,24 +7823,19 @@ impl Store {
                 false,
             ));
         }
-        let mut connection = self.connection()?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(map_sqlite_error)?;
         if let Some(created) = lookup_session_create_receipt(
-            &transaction,
+            transaction,
             &command.command_id,
             &command.request_digest,
             &command.request_json,
         )? {
-            transaction.commit().map_err(map_sqlite_error)?;
             return Ok(SessionCreateOutcome::IdempotentReplay { created });
         }
 
         let created_at_ms = now_ms()?;
         let created_at_sql = to_sqlite_integer(created_at_ms)?;
         claim_pending_receipt(
-            &transaction,
+            transaction,
             &command.command_id,
             "session.create",
             &command.request_digest,
@@ -7742,7 +7929,7 @@ impl Store {
                 ],
             )
             .map_err(map_sqlite_error)?;
-        enqueue_hook_dispatch(&transaction, &envelope)?;
+        enqueue_hook_dispatch(transaction, &envelope)?;
         transaction
             .execute(
                 "INSERT INTO run_head_sessions(
@@ -7784,7 +7971,6 @@ impl Store {
                 "session-create command receipt was not pending at finalization",
             ));
         }
-        transaction.commit().map_err(map_sqlite_error)?;
         Ok(SessionCreateOutcome::Committed {
             created,
             envelope: Box::new(envelope),
@@ -10097,6 +10283,29 @@ impl Store {
         auto_title: Option<&str>,
         validate_headless: bool,
     ) -> StoreResult<TurnAcceptOutcome> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sqlite_error)?;
+        let outcome = self.accept_turn_in_transaction(
+            &transaction,
+            command,
+            peer_message,
+            auto_title,
+            validate_headless,
+        )?;
+        transaction.commit().map_err(map_sqlite_error)?;
+        Ok(outcome)
+    }
+
+    fn accept_turn_in_transaction(
+        &self,
+        transaction: &Connection,
+        command: &TurnAcceptCommand,
+        peer_message: Option<&PeerMessage>,
+        auto_title: Option<&str>,
+        validate_headless: bool,
+    ) -> StoreResult<TurnAcceptOutcome> {
         let mut command = command.clone();
         validate_command_identity(
             &command.command_id,
@@ -10121,12 +10330,8 @@ impl Store {
                 false,
             ));
         }
-        let mut connection = self.connection()?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(map_sqlite_error)?;
         if let Some(accepted) = lookup_turn_accept_receipt(
-            &transaction,
+            transaction,
             &command.command_id,
             &command.request_digest,
             &command.request_json,
@@ -10139,9 +10344,9 @@ impl Store {
             if accepted.first_user_turn
                 && let Some(title) = auto_title
             {
-                let mut metadata = typed_session_metadata(&transaction, &command.session_id)?;
+                let mut metadata = typed_session_metadata(transaction, &command.session_id)?;
                 if let Some(envelope) = auto_title_envelope_if_untitled(
-                    &transaction,
+                    transaction,
                     &mut metadata,
                     &command,
                     title,
@@ -10149,14 +10354,13 @@ impl Store {
                 )? {
                     repaired_envelopes.push(envelope);
                     append_transaction_envelopes(
-                        &transaction,
+                        transaction,
                         &command.session_id,
                         now_ms()?,
                         &mut repaired_envelopes,
                     )?;
                 }
             }
-            transaction.commit().map_err(map_sqlite_error)?;
             if !repaired_envelopes.is_empty() {
                 return Ok(TurnAcceptOutcome::Committed {
                     accepted,
@@ -10175,7 +10379,7 @@ impl Store {
                 self.worker_generation,
             ));
         }
-        let mut metadata = typed_session_metadata(&transaction, &command.session_id)?;
+        let mut metadata = typed_session_metadata(transaction, &command.session_id)?;
         let request =
             serde_json::from_str::<serde_json::Value>(&command.request_json).map_err(|error| {
                 store_error(
@@ -10208,7 +10412,7 @@ impl Store {
         if validate_headless && let Some(spec) = headless_spec.as_ref() {
             validate_headless_turn_admission(&metadata, spec)?;
         }
-        let expected_agent = lookup_delegation_by_child_session(&transaction, &command.session_id)?
+        let expected_agent = lookup_delegation_by_child_session(transaction, &command.session_id)?
             .map(|delegation| delegation.agent_id);
         if let Some(expected_agent) = expected_agent {
             if command
@@ -10228,7 +10432,7 @@ impl Store {
             .branch_id
             .as_ref()
             .map(|branch_id| {
-                branch_descriptor(&transaction, &command.session_id, branch_id)?.ok_or_else(|| {
+                branch_descriptor(transaction, &command.session_id, branch_id)?.ok_or_else(|| {
                     store_error(
                         ErrorCode::InvalidArgument,
                         format!("branch {branch_id} does not exist"),
@@ -10237,7 +10441,7 @@ impl Store {
                 })
             })
             .transpose()?;
-        let states = latest_run_states(&transaction, &command.session_id)?;
+        let states = latest_run_states(transaction, &command.session_id)?;
         // RPC submit does not carry a run id. For Subturn only, bind the
         // daemon-minted candidate to the newest actually-running response on
         // the requested branch inside this serialized transaction. Queue
@@ -10314,7 +10518,7 @@ impl Store {
         };
         let now = now_ms()?;
         claim_pending_receipt(
-            &transaction,
+            transaction,
             &command.command_id,
             "turn.submit",
             &command.request_digest,
@@ -10327,14 +10531,14 @@ impl Store {
                 .as_ref()
                 .map(|branch| branch.head_node_id.clone())
                 .or(latest_tree_head(
-                    &transaction,
+                    transaction,
                     &command.session_id,
                     None,
                     None,
                 )?)
         } else {
             latest_tree_head(
-                &transaction,
+                transaction,
                 &command.session_id,
                 command.branch_id.as_ref(),
                 command.agent_id.as_ref(),
@@ -10439,7 +10643,7 @@ impl Store {
             )?);
         }
         if disposition == TurnAdmissionDisposition::Queued {
-            let ordinal = u32::try_from(queue_entries(&transaction, &command.session_id)?.1.len())
+            let ordinal = u32::try_from(queue_entries(transaction, &command.session_id)?.1.len())
                 .map_err(|_| {
                     store_error(ErrorCode::Busy, "queue ordinal space is exhausted", true)
                 })?
@@ -10523,7 +10727,7 @@ impl Store {
             envelope.agent_id = command.agent_id.clone();
         }
         augment_workflow_graph_envelopes(
-            &transaction,
+            transaction,
             &self.cas,
             &command.session_id,
             &mut envelopes,
@@ -10531,7 +10735,7 @@ impl Store {
         if first_user_turn
             && let Some(title) = auto_title
             && let Some(envelope) = auto_title_envelope_if_untitled(
-                &transaction,
+                transaction,
                 &mut metadata,
                 &command,
                 title,
@@ -10540,7 +10744,7 @@ impl Store {
         {
             envelopes.push(envelope);
         }
-        append_transaction_envelopes(&transaction, &command.session_id, now, &mut envelopes)?;
+        append_transaction_envelopes(transaction, &command.session_id, now, &mut envelopes)?;
         let accepted_seq = if same_run_delivery {
             envelopes[0].seq
         } else {
@@ -10573,7 +10777,7 @@ impl Store {
                 .collect(),
         };
         finalize_command_receipt(
-            &transaction,
+            transaction,
             &command.command_id,
             command.session_id.as_str(),
             Some(command.run_id.as_str()),
@@ -10582,7 +10786,6 @@ impl Store {
             now,
             "turn-submit",
         )?;
-        transaction.commit().map_err(map_sqlite_error)?;
         Ok(TurnAcceptOutcome::Committed {
             accepted,
             envelopes,
@@ -11458,18 +11661,7 @@ impl Store {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite_error)?;
-        {
-            let mut statement = transaction
-                .prepare_cached(
-                    "DELETE FROM hook_dispatch_outbox WHERE session_id = ?1 AND seq = ?2",
-                )
-                .map_err(map_sqlite_error)?;
-            for (session_id, seq) in acks {
-                statement
-                    .execute(params![session_id.as_str(), to_sqlite_integer(*seq)?])
-                    .map_err(map_sqlite_error)?;
-            }
-        }
+        complete_hook_dispatches_in_transaction(&transaction, acks)?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(())
     }
@@ -13051,7 +13243,7 @@ fn validate_headless_turn_admission(
 }
 
 fn auto_title_envelope_if_untitled(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &Connection,
     metadata: &mut SessionMetadataV1,
     command: &TurnAcceptCommand,
     title: &str,
@@ -18503,7 +18695,7 @@ fn plan_terminal_workflow_rejections<S: serde::Serialize + ?Sized>(
 }
 
 fn append_transaction_envelopes(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     session_id: &SessionId,
     committed_at_ms: u64,
     envelopes: &mut [RawEnvelope],
@@ -18584,7 +18776,7 @@ fn append_transaction_envelopes(
 /// in-transaction receipt lookup; a different method/body was rejected by
 /// that lookup).
 fn claim_pending_receipt(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     command_id: &str,
     method: &str,
     request_digest: &str,
@@ -18620,7 +18812,7 @@ fn claim_pending_receipt(
 
 #[allow(clippy::too_many_arguments)]
 fn finalize_command_receipt<T: serde::Serialize>(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     command_id: &str,
     session_id: &str,
     run_id: Option<&str>,
@@ -19221,7 +19413,7 @@ fn enqueue_hook_dispatch(transaction: &Connection, envelope: &RawEnvelope) -> St
 }
 
 fn resolution_by_command(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     command_id: &str,
 ) -> StoreResult<Option<ResolutionRow>> {
     transaction
@@ -19673,6 +19865,21 @@ fn append_owned_envelopes(
     Ok(outcome.range)
 }
 
+fn complete_hook_dispatches_in_transaction(
+    transaction: &Connection,
+    acks: &[(SessionId, u64)],
+) -> StoreResult<()> {
+    let mut statement = transaction
+        .prepare_cached("DELETE FROM hook_dispatch_outbox WHERE session_id = ?1 AND seq = ?2")
+        .map_err(map_sqlite_error)?;
+    for (session_id, seq) in acks {
+        statement
+            .execute(params![session_id.as_str(), to_sqlite_integer(*seq)?])
+            .map_err(map_sqlite_error)?;
+    }
+    Ok(())
+}
+
 fn append_envelopes_in_transaction(
     transaction: &Connection,
     envelopes: &mut [RawEnvelope],
@@ -19781,7 +19988,7 @@ fn update_append_caches(
     }
 }
 
-fn isolatable_append_error(error: &HaiderError) -> bool {
+fn isolatable_commit_error(error: &HaiderError) -> bool {
     !matches!(
         error.code,
         ErrorCode::StoreCorrupt
@@ -19791,6 +19998,10 @@ fn isolatable_append_error(error: &HaiderError) -> bool {
             | ErrorCode::StoreUnavailable
             | ErrorCode::Internal
     )
+}
+
+fn isolatable_append_error(error: &HaiderError) -> bool {
+    isolatable_commit_error(error)
 }
 
 fn workspace_revision_for_seq(seq: u64) -> WorkspaceRevision {

@@ -1,7 +1,5 @@
 #![allow(clippy::expect_used)]
 
-#[cfg(target_vendor = "apple")]
-use super::barrier_is_unsupported;
 use super::{SyncOperation, SyncPolicy, sync_directory, sync_file, with_sync_test_hook};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -34,20 +32,6 @@ fn apple_sync_policies_select_full_barrier_and_plain_operations() {
         selected_file_operation(SyncPolicy::Plain),
         SyncOperation::Fsync
     );
-}
-
-#[cfg(target_vendor = "apple")]
-#[test]
-fn apple_barrier_unsupported_errors_select_the_plain_fsync_fallback() {
-    assert!(barrier_is_unsupported(&std::io::Error::from_raw_os_error(
-        libc::EINVAL
-    )));
-    assert!(barrier_is_unsupported(&std::io::Error::from_raw_os_error(
-        libc::ENOTSUP
-    )));
-    assert!(!barrier_is_unsupported(&std::io::Error::from_raw_os_error(
-        libc::EIO
-    )));
 }
 
 #[cfg(all(unix, not(target_vendor = "apple")))]

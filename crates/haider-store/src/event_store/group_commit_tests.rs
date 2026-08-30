@@ -39,6 +39,56 @@ fn batch(session: &SessionId, event_id: impl Into<String>) -> JournalAppendBatch
     }
 }
 
+fn session_create_command(session_id: &SessionId, suffix: &str) -> SessionCreateCommand {
+    SessionCreateCommand {
+        command_id: format!("create-{suffix}"),
+        request_digest: "create-digest".into(),
+        request_json: r#"{"cwd":"/tmp","max_tokens":4096,"model":"fake-v1","provider":"fake"}"#
+            .into(),
+        session_id: session_id.clone(),
+        cwd: "/tmp".into(),
+        provider: "fake".into(),
+        model: "fake-v1".into(),
+        max_tokens: 4_096,
+        permission_overrides: None,
+        effort: None,
+        fast: false,
+        cache_policy: Default::default(),
+        system_prompt_version: "group-commit-test-system".into(),
+        event_id: EventId::new(format!("created-{suffix}")),
+        device_id: DeviceId::new("group-commit-test-device"),
+    }
+}
+
+fn create_typed_session(store: &Store, session_id: &SessionId) {
+    store
+        .create_session(&session_create_command(session_id, session_id.as_str()))
+        .expect("create typed session");
+}
+
+fn turn_command(store: &Store, session_id: &SessionId, suffix: &str) -> TurnAcceptCommand {
+    TurnAcceptCommand {
+        command_id: format!("submit-{suffix}"),
+        request_digest: "submit-digest".into(),
+        request_json: format!(
+            r#"{{"attachments":[],"mode":"queue","session_id":"{session_id}","text":"hello","worker_generation":{}}}"#,
+            store.worker_generation()
+        ),
+        session_id: session_id.clone(),
+        worker_generation: store.worker_generation(),
+        run_id: RunId::new(format!("run-{suffix}")),
+        agent_id: None,
+        branch_id: None,
+        text: "hello".into(),
+        attachments: Vec::new(),
+        mode: DeliveryMode::Queue,
+        queued_event_id: EventId::new(format!("queued-{suffix}")),
+        user_event_id: EventId::new(format!("user-{suffix}")),
+        active_event_id: EventId::new(format!("active-{suffix}")),
+        device_id: DeviceId::new("group-commit-test-device"),
+    }
+}
+
 fn install_commit_counter(store: &Store) -> Arc<AtomicUsize> {
     let commits = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&commits);
@@ -340,4 +390,145 @@ fn singleton_semantic_failure_keeps_the_per_request_result_shape() {
     let error = outcomes[0].as_ref().expect_err("empty request is rejected");
     assert_eq!(error.code, ErrorCode::InvalidArgument);
     assert_eq!(store.latest_seq(&session).expect("empty head"), 0);
+}
+
+/// MUTATION CHECK: route either receipt kind or acknowledgements around the
+/// group, or split a receipt from accepted envelopes. Expected runtime
+/// failure: the commit count exceeds one, receipt/prefix truth disagrees, or
+/// the handled outbox row remains pending.
+#[test]
+fn receipts_append_and_hook_ack_share_one_outer_commit() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let accepted_session = SessionId::new("group-commit-receipt");
+    let appended_session = SessionId::new("group-commit-append");
+    let acknowledged_session = SessionId::new("group-commit-ack");
+    let created_session = SessionId::new("group-commit-created");
+    create_typed_session(&store, &accepted_session);
+    let mut acknowledged = [envelope(&acknowledged_session, "handled-before-group")];
+    store
+        .append(&mut acknowledged)
+        .expect("seed hook outbox row");
+    let commits = install_commit_counter(&store);
+
+    let mut batches = vec![
+        JournalCommitBatch::CreateSession {
+            command: session_create_command(&created_session, "grouped"),
+            interaction_mode: SessionInteractionModeV1::Interactive,
+        },
+        JournalCommitBatch::AcceptTurn {
+            command: turn_command(&store, &accepted_session, "grouped"),
+            peer_message: None,
+            auto_title: None,
+            validate_headless: false,
+        },
+        JournalCommitBatch::Append(batch(&appended_session, "grouped-append")),
+        JournalCommitBatch::HookAcks(vec![(acknowledged_session.clone(), acknowledged[0].seq)]),
+    ];
+    let outcomes = store
+        .commit_group(&mut batches)
+        .expect("mixed group commits");
+
+    assert_eq!(commits.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        outcomes[0].as_ref().expect("creation commits"),
+        JournalCommitOutcome::CreateSession(SessionCreateOutcome::Committed { .. })
+    ));
+    let accepted = match outcomes[1].as_ref().expect("acceptance commits") {
+        JournalCommitOutcome::AcceptTurn(TurnAcceptOutcome::Committed {
+            accepted,
+            envelopes,
+        }) => {
+            assert_eq!(envelopes.len(), 4);
+            accepted
+        }
+        _ => panic!("fresh acceptance returns its committed receipt and prefix"),
+    };
+    assert_eq!(accepted.accepted_seq, 3);
+    assert!(matches!(
+        outcomes[2].as_ref().expect("append commits"),
+        JournalCommitOutcome::Append(_)
+    ));
+    assert!(matches!(
+        outcomes[3].as_ref().expect("ack commits"),
+        JournalCommitOutcome::HookAcks
+    ));
+    assert!(
+        store
+            .session_create_receipt(
+                "create-grouped",
+                "create-digest",
+                &session_create_command(&created_session, "grouped").request_json,
+            )
+            .expect("create receipt lookup")
+            .is_some(),
+        "session-create receipt is durable with its Created event"
+    );
+    assert!(
+        store
+            .turn_accept_receipt(
+                "submit-grouped",
+                "submit-digest",
+                &turn_command(&store, &accepted_session, "grouped").request_json
+            )
+            .expect("receipt lookup")
+            .is_some(),
+        "receipt is durable with the accepted prefix"
+    );
+    assert!(
+        store
+            .pending_hook_dispatches(16)
+            .expect("pending hook work")
+            .iter()
+            .all(|envelope| envelope.event_id.as_str() != "handled-before-group"),
+        "the handled row is removed by the shared commit"
+    );
+}
+
+/// MUTATION CHECK: let one invalid receipt roll back the outer transaction,
+/// or leak its pending receipt while preserving adjacent appends. Expected
+/// runtime failure: valid neighbors disappear or an invalid receipt remains.
+#[test]
+fn invalid_receipt_is_savepoint_local_inside_a_mixed_group() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let receipt_session = SessionId::new("group-commit-invalid-receipt");
+    let append_session = SessionId::new("group-commit-valid-neighbors");
+    create_typed_session(&store, &receipt_session);
+    let mut invalid = turn_command(&store, &receipt_session, "invalid");
+    invalid.text.clear();
+    let commits = install_commit_counter(&store);
+    let mut batches = vec![
+        JournalCommitBatch::Append(batch(&append_session, "neighbor-before")),
+        JournalCommitBatch::AcceptTurn {
+            command: invalid,
+            peer_message: None,
+            auto_title: None,
+            validate_headless: false,
+        },
+        JournalCommitBatch::Append(batch(&append_session, "neighbor-after")),
+    ];
+
+    let outcomes = store
+        .commit_group(&mut batches)
+        .expect("outer group commits");
+    assert_eq!(commits.load(Ordering::SeqCst), 1);
+    assert!(outcomes[0].is_ok());
+    let Err(error) = &outcomes[1] else {
+        panic!("invalid receipt is local");
+    };
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert!(outcomes[2].is_ok());
+    assert_eq!(store.latest_seq(&append_session).expect("neighbor head"), 2);
+    assert!(
+        store
+            .turn_accept_receipt(
+                "submit-invalid",
+                "submit-digest",
+                &turn_command(&store, &receipt_session, "invalid").request_json,
+            )
+            .expect("invalid receipt lookup")
+            .is_none(),
+        "savepoint rollback removes the invalid pending receipt"
+    );
 }

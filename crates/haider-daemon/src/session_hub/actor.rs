@@ -382,8 +382,8 @@ pub(super) async fn run_session_actor(
                 // Same INV-1 shape as ordinary append: the complete metadata +
                 // Created + receipt transaction returns before publication,
                 // and no await separates that return from `publish`.
-                let result = store
-                    .create_session_with_interaction_mode(command, interaction_mode)
+                let result = append_committer
+                    .create_session(command, interaction_mode)
                     .await;
                 if let Ok(SessionCreateOutcome::Committed { envelope, .. }) = &result {
                     head = envelope.seq;
@@ -873,13 +873,9 @@ pub(super) async fn run_session_actor(
                 // MUTATION CHECK: publishing before this durable transaction
                 // returns makes live clients observe an acceptance a restart
                 // cannot recover; the live lost-response test must fail.
-                let result = match peer_message {
-                    Some(message) => store.accept_peer_turn(command, message).await,
-                    None => match auto_title {
-                        Some(title) => store.accept_turn_with_auto_title(command, title).await,
-                        None => store.accept_turn(command).await,
-                    },
-                };
+                let result = append_committer
+                    .accept_turn(command, peer_message, auto_title)
+                    .await;
                 if let Ok(TurnAcceptOutcome::Committed { envelopes, .. }) = &result {
                     if let Some(last) = envelopes.last() {
                         head = last.seq;
@@ -1234,9 +1230,10 @@ pub(super) async fn run_session_actor(
                     )));
                     continue;
                 }
-                // The CAS bytes reached their Full fence before the store's
-                // one transaction indexes them and appends this exact attempt
-                // batch. Publication remains synchronous after that commit.
+                // The CAS bytes crossed their ordering barrier before the
+                // store's one transaction indexes them and appends this exact
+                // attempt batch. Publication remains synchronous after that
+                // commit.
                 let result = store.persist_provider_view_and_append_owned(request).await;
                 match result {
                     Ok(outcome) => {
