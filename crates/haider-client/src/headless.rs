@@ -1600,7 +1600,12 @@ impl HeadlessEventOutput {
     }
 
     fn retain_envelope(&mut self, envelope: &RawEnvelope) {
-        self.ledger.record(envelope);
+        // The ledger is `Some` only for modes that retain a result set
+        // (`retains_result_ledger`). Without one, `finish` returns an empty
+        // run, so recording is correctly a no-op rather than an error.
+        if let Some(ledger) = self.ledger.as_mut() {
+            ledger.record(envelope);
+        }
     }
 
     fn finish(
