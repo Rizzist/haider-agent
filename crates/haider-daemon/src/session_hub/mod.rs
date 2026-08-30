@@ -97,7 +97,7 @@ pub(crate) mod rpc;
 pub(crate) use rpc::pdf_delivery_for_provider;
 
 use crate::DaemonError;
-use crate::worker::WorkerManagerHandle;
+use crate::worker::{TurnSetupReductionCache, WorkerManagerHandle};
 use actor::run_session_actor;
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -974,6 +974,10 @@ struct HubInner {
     /// Ephemeral compiled-prompt acceleration. Journal bytes remain the
     /// authority; the cache is discarded with this daemon generation.
     prompt_history: PromptHistoryCache,
+    /// Exact durable-head prefixes for the worker's fused turn-setup fold.
+    /// Like prompt history, this is daemon-lifetime only; restart rebuilds
+    /// from journal authority before installing a new revision.
+    turn_setup_reductions: TurnSetupReductionCache,
 }
 
 #[derive(Default)]
@@ -1961,6 +1965,7 @@ impl SessionHub {
             web_degrade: Mutex::new(HashMap::new()),
             lockdown_turns: Mutex::new(HashMap::new()),
             prompt_history: PromptHistoryCache::default(),
+            turn_setup_reductions: TurnSetupReductionCache::default(),
         });
         let hub = Self { inner };
         hub.spawn_shell_registry_events()?;
@@ -6938,6 +6943,10 @@ impl HubStoreHandle {
             current_run,
         )
         .await
+    }
+
+    pub(crate) fn turn_setup_reduction_cache(&self) -> &TurnSetupReductionCache {
+        &self.hub.inner.turn_setup_reductions
     }
 
     pub fn worker_generation(&self) -> u64 {

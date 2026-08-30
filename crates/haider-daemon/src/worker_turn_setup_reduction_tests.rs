@@ -2,6 +2,79 @@
 
 use super::*;
 
+#[derive(Clone)]
+struct CountingTurnSetupStore {
+    inner: haider_core::SqliteStoreHandle,
+    reducer_starts: Arc<StdMutex<Vec<u64>>>,
+}
+
+impl CountingTurnSetupStore {
+    fn new(inner: haider_core::SqliteStoreHandle) -> Self {
+        Self {
+            inner,
+            reducer_starts: Arc::new(StdMutex::new(Vec::new())),
+        }
+    }
+
+    fn take_reducer_starts(&self) -> Vec<u64> {
+        std::mem::take(&mut *self.reducer_starts.lock().expect("counting reducer lock"))
+    }
+}
+
+#[async_trait]
+impl StoreHandle for CountingTurnSetupStore {
+    async fn append(
+        &self,
+        envelopes: &mut [RawEnvelope],
+    ) -> Result<haider_core::CommittedRange, HaiderError> {
+        StoreHandle::append(&self.inner, envelopes).await
+    }
+
+    async fn read(
+        &self,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        StoreHandle::read(&self.inner, session_id, since_seq, limit).await
+    }
+
+    async fn read_reducer_page_with_boundary(
+        &self,
+        session_id: &SessionId,
+        since_seq: u64,
+        limit: usize,
+        byte_budget: usize,
+        payload_kinds: &'static [&'static str],
+    ) -> Result<haider_core::ReducerPage, HaiderError> {
+        self.reducer_starts
+            .lock()
+            .expect("counting reducer lock")
+            .push(since_seq);
+        StoreHandle::read_reducer_page_with_boundary(
+            &self.inner,
+            session_id,
+            since_seq,
+            limit,
+            byte_budget,
+            payload_kinds,
+        )
+        .await
+    }
+
+    async fn latest_seq(&self, session_id: &SessionId) -> Result<u64, HaiderError> {
+        StoreHandle::latest_seq(&self.inner, session_id).await
+    }
+
+    async fn branch_lineage(
+        &self,
+        session_id: &SessionId,
+        branch_id: Option<&BranchId>,
+    ) -> Result<Vec<haider_protocol::branch::BranchDescriptor>, HaiderError> {
+        StoreHandle::branch_lineage(&self.inner, session_id, branch_id).await
+    }
+}
+
 fn setup_reduction_envelope(
     seq: u64,
     run_id: Option<RunId>,
@@ -73,8 +146,8 @@ fn setup_reduction_usage(scope: UsageScope, history_message_count: u64) -> Usage
     }
 }
 
-#[test]
-fn fused_turn_setup_reduction_preserves_every_standalone_head() {
+#[tokio::test]
+async fn fused_turn_setup_reduction_preserves_every_standalone_head() {
     let current_run = RunId::new("setup-current");
     let current_branch = BranchId::new("setup-main");
     let selector = TurnSetupReductionSelector {
@@ -421,6 +494,162 @@ fn fused_turn_setup_reduction_preserves_every_standalone_head() {
         reduction.latest_instruction_fact,
         Some(appended_instructions)
     );
+
+    // The production SQLite seam samples the durable head and its event id
+    // under the same connection lock as the filtered suffix. Prove every
+    // paths: cold replay, exact hit, revision mismatch invalidation, suffix
+    // advance, and a real store close/reopen with a fresh daemon cache.
+    let root = tempfile::tempdir().expect("turn-setup cache profile");
+    let sqlite = haider_core::SqliteStoreHandle::open(root.path())
+        .await
+        .expect("turn-setup cache store");
+    let store = CountingTurnSetupStore::new(sqlite.clone());
+    let session_id = SessionId::new("setup-reduction-session");
+    let cached_branch = BranchId::new("setup-cache-branch");
+    let cached_selector = |run: &str| TurnSetupReductionSelector {
+        run_id: RunId::new(run),
+        branch_id: Some(cached_branch.clone()),
+        agent_id: None,
+        provider: "provider-a".into(),
+        model: "model-a".into(),
+        account_scope: None,
+        auth_scope: "api_key".into(),
+    };
+    let first_fact = ProjectInstructionsLoaded {
+        files: vec![
+            haider_protocol::project_instructions::ProjectInstructionFileFact {
+                path: "FIRST.md".into(),
+                digest: "first-digest".into(),
+                bytes: 5,
+                truncated: false,
+            },
+        ],
+    };
+    let mut first = [setup_reduction_envelope(
+        0,
+        Some(RunId::new("setup-cache-run-1")),
+        Some(cached_branch.clone()),
+        None,
+        1,
+        first_fact
+            .to_payload_value()
+            .expect("first instruction payload"),
+    )];
+    first[0].event_id = EventId::new("setup-cache-first");
+    first[0].worker_generation = sqlite.worker_generation();
+    StoreHandle::append(&store, &mut first)
+        .await
+        .expect("append first cache fact");
+
+    let cache = TurnSetupReductionCache::default();
+    let cold = reduce_turn_setup_journal_cached(
+        &store,
+        &session_id,
+        &cache,
+        cached_selector("setup-cache-run-1"),
+    )
+    .await
+    .expect("cold turn-setup replay");
+    assert_eq!(cold.same_run_instruction_fact, Some(first_fact.clone()));
+    assert_eq!(store.take_reducer_starts(), vec![0, 1]);
+
+    let retargeted = reduce_turn_setup_journal_cached(
+        &store,
+        &session_id,
+        &cache,
+        cached_selector("setup-cache-run-2"),
+    )
+    .await
+    .expect("exact turn-setup cache hit");
+    assert_eq!(retargeted.same_run_instruction_fact, None);
+    assert_eq!(retargeted.latest_instruction_fact, Some(first_fact.clone()));
+    assert_eq!(store.take_reducer_starts(), vec![1]);
+
+    let key = TurnSetupReductionKey::from(&cached_selector("setup-cache-run-2"));
+    cache
+        .entries
+        .lock()
+        .await
+        .reductions
+        .get_mut(&(session_id.clone(), key))
+        .expect("cached reduction")
+        .revision
+        .as_mut()
+        .expect("exact cached revision")
+        .head_event_id = EventId::new("forged-same-sequence-revision");
+    let repaired = reduce_turn_setup_journal_cached(
+        &store,
+        &session_id,
+        &cache,
+        cached_selector("setup-cache-run-2"),
+    )
+    .await
+    .expect("revision mismatch replays from zero");
+    assert_eq!(repaired.latest_instruction_fact, Some(first_fact));
+    assert_eq!(store.take_reducer_starts(), vec![1, 0, 1]);
+
+    let second_fact = ProjectInstructionsLoaded {
+        files: vec![
+            haider_protocol::project_instructions::ProjectInstructionFileFact {
+                path: "SECOND.md".into(),
+                digest: "second-digest".into(),
+                bytes: 6,
+                truncated: false,
+            },
+        ],
+    };
+    let mut second = [setup_reduction_envelope(
+        0,
+        Some(RunId::new("setup-cache-run-2")),
+        Some(cached_branch.clone()),
+        None,
+        2,
+        second_fact
+            .to_payload_value()
+            .expect("second instruction payload"),
+    )];
+    second[0].event_id = EventId::new("setup-cache-second");
+    second[0].worker_generation = sqlite.worker_generation();
+    StoreHandle::append(&store, &mut second)
+        .await
+        .expect("append cache suffix");
+    let advanced = reduce_turn_setup_journal_cached(
+        &store,
+        &session_id,
+        &cache,
+        cached_selector("setup-cache-run-2"),
+    )
+    .await
+    .expect("head advance replays suffix");
+    assert_eq!(
+        advanced.same_run_instruction_fact,
+        Some(second_fact.clone())
+    );
+    assert_eq!(advanced.latest_instruction_fact, Some(second_fact.clone()));
+    assert_eq!(store.take_reducer_starts(), vec![1, 2]);
+
+    drop(store);
+    sqlite.close().await.expect("close first daemon store");
+    let restarted_sqlite = haider_core::SqliteStoreHandle::open(root.path())
+        .await
+        .expect("reopen daemon store");
+    let restarted_store = CountingTurnSetupStore::new(restarted_sqlite.clone());
+    let restarted_cache = TurnSetupReductionCache::default();
+    let restarted = reduce_turn_setup_journal_cached(
+        &restarted_store,
+        &session_id,
+        &restarted_cache,
+        cached_selector("setup-cache-run-2"),
+    )
+    .await
+    .expect("restart replays durable authority");
+    assert_eq!(restarted.same_run_instruction_fact, Some(second_fact));
+    assert_eq!(restarted_store.take_reducer_starts(), vec![0, 2]);
+    drop(restarted_store);
+    restarted_sqlite
+        .close()
+        .await
+        .expect("close restarted daemon store");
 }
 
 #[test]

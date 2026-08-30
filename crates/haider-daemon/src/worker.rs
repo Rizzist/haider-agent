@@ -6978,6 +6978,7 @@ const TURN_SETUP_REDUCTION_PAYLOAD_KINDS: &[&str] = &[
     "session_forked",
 ];
 
+#[derive(Clone)]
 struct TurnSetupReductionSelector {
     run_id: RunId,
     branch_id: Option<BranchId>,
@@ -6988,14 +6989,143 @@ struct TurnSetupReductionSelector {
     auth_scope: String,
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TurnSetupReductionKey {
+    branch_id: Option<BranchId>,
+    agent_id: Option<AgentId>,
+    provider: String,
+    model: String,
+    account_scope: Option<haider_protocol::ids::CredentialAlias>,
+    auth_scope: String,
+}
+
+impl From<&TurnSetupReductionSelector> for TurnSetupReductionKey {
+    fn from(selector: &TurnSetupReductionSelector) -> Self {
+        Self {
+            branch_id: selector.branch_id.clone(),
+            agent_id: selector.agent_id.clone(),
+            provider: selector.provider.clone(),
+            model: selector.model.clone(),
+            account_scope: selector.account_scope.clone(),
+            auth_scope: selector.auth_scope.clone(),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct TurnSetupJournalRevision {
+    head_seq: u64,
+    head_event_id: EventId,
+}
+
+impl From<(u64, EventId)> for TurnSetupJournalRevision {
+    fn from((head_seq, head_event_id): (u64, EventId)) -> Self {
+        Self {
+            head_seq,
+            head_event_id,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CachedTurnSetupReduction {
+    last_touched: u64,
+    revision: Option<TurnSetupJournalRevision>,
+    reduction: TurnSetupReduction,
+}
+
+#[derive(Default)]
+struct TurnSetupReductionCacheEntries {
+    touch_clock: u64,
+    reductions: HashMap<(SessionId, TurnSetupReductionKey), CachedTurnSetupReduction>,
+}
+
+const TURN_SETUP_REDUCTION_CACHE_LIMIT: usize = 16;
+
+/// Daemon-lifetime exact journal-prefix cache for turn setup.
+///
+/// Every entry is anchored to the sampled durable `(head_seq, event_id)` and
+/// one complete branch/agent/provider/model/account/auth selector. A changed
+/// head replays only the suffix; a regressed or same-sequence/different-event
+/// revision discards the prefix and replays from zero. The cache itself is
+/// deliberately ephemeral: a daemon restart has no trusted in-memory prefix
+/// and therefore reconstructs from the durable journal.
+#[derive(Default)]
+pub(crate) struct TurnSetupReductionCache {
+    entries: tokio::sync::Mutex<TurnSetupReductionCacheEntries>,
+}
+
+impl TurnSetupReductionCache {
+    async fn take(
+        &self,
+        session_id: &SessionId,
+        key: &TurnSetupReductionKey,
+    ) -> Option<CachedTurnSetupReduction> {
+        self.entries
+            .lock()
+            .await
+            .reductions
+            .remove(&(session_id.clone(), key.clone()))
+    }
+
+    async fn install(
+        &self,
+        session_id: SessionId,
+        key: TurnSetupReductionKey,
+        mut candidate: CachedTurnSetupReduction,
+    ) {
+        let mut entries = self.entries.lock().await;
+        entries.touch_clock = entries.touch_clock.saturating_add(1);
+        candidate.last_touched = entries.touch_clock;
+        let cache_key = (session_id, key);
+        let replace = entries.reductions.get(&cache_key).is_none_or(|current| {
+            match (&candidate.revision, &current.revision) {
+                (Some(candidate), Some(current)) => {
+                    candidate.head_seq > current.head_seq || candidate == current
+                }
+                (Some(_), None) | (None, None) => true,
+                (None, Some(_)) => false,
+            }
+        });
+        if replace {
+            entries.reductions.insert(cache_key, candidate);
+        }
+        while entries.reductions.len() > TURN_SETUP_REDUCTION_CACHE_LIMIT {
+            let Some(evicted) = entries
+                .reductions
+                .iter()
+                .min_by_key(|(_, cached)| cached.last_touched)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            entries.reductions.remove(&evicted);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SequencedInstructionFact {
+    seq: u64,
+    fact: ProjectInstructionsLoaded,
+}
+
+#[derive(Clone)]
+struct CacheDomainRequestHead {
+    run_id: Option<RunId>,
+    committed_at_ms: u64,
+}
+
 /// The turn-start journal heads that used to be derived by independent full
 /// scans. One filtered decode pass feeds each reducer, while setup-authored
 /// instruction/cache facts are reflected here after their durable append so
 /// later heads preserve the old post-append ordering.
+#[derive(Clone)]
 struct TurnSetupReduction {
     selector: TurnSetupReductionSelector,
     latest_instruction_fact: Option<ProjectInstructionsLoaded>,
     same_run_instruction_fact: Option<ProjectInstructionsLoaded>,
+    instruction_facts: HashMap<(Option<RunId>, Option<BranchId>), SequencedInstructionFact>,
     durable_tools: DurableToolStateReduction,
     latest_main_usage_scope: Option<UsageScope>,
     latest_lane_usage_seq: u64,
@@ -7003,6 +7133,7 @@ struct TurnSetupReduction {
     previous_provider_view: Option<ProviderViewLedgerV1>,
     latest_deliberate_boundary: Option<(u64, CacheRewarmReasonV1)>,
     latest_cache_domain_request_ms: Option<u64>,
+    cache_domain_request_heads: Vec<CacheDomainRequestHead>,
     inherited_cache_segment: Option<ForkCacheSegmentV1>,
     fork_cache_boundary_seq: Option<u64>,
     previous_provider_view_seq: Option<u64>,
@@ -7016,6 +7147,7 @@ impl TurnSetupReduction {
             selector,
             latest_instruction_fact: None,
             same_run_instruction_fact: None,
+            instruction_facts: HashMap::new(),
             durable_tools: DurableToolStateReduction::default(),
             latest_main_usage_scope: None,
             latest_lane_usage_seq: 0,
@@ -7023,12 +7155,19 @@ impl TurnSetupReduction {
             previous_provider_view: None,
             latest_deliberate_boundary: None,
             latest_cache_domain_request_ms: None,
+            cache_domain_request_heads: Vec::new(),
             inherited_cache_segment: None,
             fork_cache_boundary_seq: None,
             previous_provider_view_seq: None,
             emitted_cache_transitions: HashSet::new(),
             latest_seq: 0,
         }
+    }
+
+    fn retarget(&mut self, selector: TurnSetupReductionSelector) {
+        self.selector = selector;
+        self.refresh_instruction_facts();
+        self.refresh_cache_domain_request();
     }
 
     fn observe_envelope(&mut self, envelope: RawEnvelope) -> Result<(), HaiderError> {
@@ -7040,6 +7179,7 @@ impl TurnSetupReduction {
         if payload_kind == Some("project_instructions_loaded") {
             if let Some(fact) = ProjectInstructionsLoaded::from_payload_value(&envelope.payload) {
                 self.observe_instruction_fact(
+                    envelope.seq,
                     envelope.run_id.as_ref(),
                     envelope.branch_id.as_ref(),
                     fact,
@@ -7109,17 +7249,35 @@ impl TurnSetupReduction {
 
     fn observe_instruction_fact(
         &mut self,
+        seq: u64,
         run_id: Option<&RunId>,
         branch_id: Option<&BranchId>,
         fact: ProjectInstructionsLoaded,
     ) {
-        if run_id == Some(&self.selector.run_id) {
-            if branch_id != self.selector.branch_id.as_ref() {
-                return;
-            }
-            self.same_run_instruction_fact = Some(fact.clone());
-        }
-        self.latest_instruction_fact = Some(fact);
+        self.instruction_facts.insert(
+            (run_id.cloned(), branch_id.cloned()),
+            SequencedInstructionFact { seq, fact },
+        );
+        self.refresh_instruction_facts();
+    }
+
+    fn refresh_instruction_facts(&mut self) {
+        self.same_run_instruction_fact = self
+            .instruction_facts
+            .get(&(
+                Some(self.selector.run_id.clone()),
+                self.selector.branch_id.clone(),
+            ))
+            .map(|sequenced| sequenced.fact.clone());
+        self.latest_instruction_fact = self
+            .instruction_facts
+            .iter()
+            .filter(|((run_id, branch_id), _)| {
+                run_id.as_ref() != Some(&self.selector.run_id)
+                    || branch_id.as_ref() == self.selector.branch_id.as_ref()
+            })
+            .max_by_key(|(_, sequenced)| sequenced.seq)
+            .map(|(_, sequenced)| sequenced.fact.clone());
     }
 
     fn observe_usage(
@@ -7156,15 +7314,38 @@ impl TurnSetupReduction {
                 })
             });
         }
-        if run_id != Some(&self.selector.run_id)
-            && scope.request_kind == UsageRequestKind::MainTurn
-            && self.scope_matches_lane(scope)
-        {
-            self.latest_cache_domain_request_ms = Some(
-                self.latest_cache_domain_request_ms
-                    .map_or(committed_at_ms, |timestamp| timestamp.max(committed_at_ms)),
-            );
+        if scope.request_kind == UsageRequestKind::MainTurn && self.scope_matches_lane(scope) {
+            self.record_cache_domain_request(run_id.cloned(), committed_at_ms);
         }
+    }
+
+    fn record_cache_domain_request(&mut self, run_id: Option<RunId>, committed_at_ms: u64) {
+        if let Some(existing) = self
+            .cache_domain_request_heads
+            .iter_mut()
+            .find(|head| head.run_id == run_id)
+        {
+            existing.committed_at_ms = existing.committed_at_ms.max(committed_at_ms);
+        } else {
+            self.cache_domain_request_heads
+                .push(CacheDomainRequestHead {
+                    run_id,
+                    committed_at_ms,
+                });
+        }
+        self.cache_domain_request_heads
+            .sort_unstable_by_key(|head| std::cmp::Reverse(head.committed_at_ms));
+        self.cache_domain_request_heads.truncate(2);
+        self.refresh_cache_domain_request();
+    }
+
+    fn refresh_cache_domain_request(&mut self) {
+        self.latest_cache_domain_request_ms = self
+            .cache_domain_request_heads
+            .iter()
+            .filter(|head| head.run_id.as_ref() != Some(&self.selector.run_id))
+            .map(|head| head.committed_at_ms)
+            .max();
     }
 
     fn scope_matches_lane(&self, scope: &UsageScope) -> bool {
@@ -7221,8 +7402,18 @@ impl TurnSetupReduction {
     }
 
     fn record_instruction_fact(&mut self, fact: ProjectInstructionsLoaded) {
-        self.same_run_instruction_fact = Some(fact.clone());
-        self.latest_instruction_fact = Some(fact);
+        self.latest_seq = self.latest_seq.saturating_add(1);
+        self.instruction_facts.insert(
+            (
+                Some(self.selector.run_id.clone()),
+                self.selector.branch_id.clone(),
+            ),
+            SequencedInstructionFact {
+                seq: self.latest_seq,
+                fact,
+            },
+        );
+        self.refresh_instruction_facts();
     }
 
     fn record_cache_transition(&mut self, transition: &CacheEpochTransitionV1) {
@@ -7304,24 +7495,86 @@ async fn reduce_turn_setup_journal(
     store: &HubStoreHandle,
     selector: TurnSetupReductionSelector,
 ) -> Result<TurnSetupReduction, HaiderError> {
-    let mut reduction = TurnSetupReduction::new(selector);
-    let mut cursor = 0_u64;
+    reduce_turn_setup_journal_cached(
+        store,
+        store.session_id(),
+        store.turn_setup_reduction_cache(),
+        selector,
+    )
+    .await
+}
+
+async fn reduce_turn_setup_journal_cached(
+    store: &dyn StoreHandle,
+    session_id: &SessionId,
+    cache: &TurnSetupReductionCache,
+    selector: TurnSetupReductionSelector,
+) -> Result<TurnSetupReduction, HaiderError> {
+    let key = TurnSetupReductionKey::from(&selector);
+    let mut cached =
+        cache
+            .take(session_id, &key)
+            .await
+            .unwrap_or_else(|| CachedTurnSetupReduction {
+                last_touched: 0,
+                revision: None,
+                reduction: TurnSetupReduction::new(selector.clone()),
+            });
+    if cached.revision.is_some() {
+        cached.reduction.retarget(selector.clone());
+    } else {
+        cached.reduction = TurnSetupReduction::new(selector);
+    }
+    let mut cursor = cached.revision.as_ref().map_or(0, |head| head.head_seq);
+    let mut expected_revision = cached.revision.take();
+    let mut final_revision = None;
+    let mut exact_boundary = true;
     loop {
-        let page = StoreHandle::read_reducer_page(
+        let page = StoreHandle::read_reducer_page_with_boundary(
             store,
-            store.session_id(),
+            session_id,
             cursor,
             256,
             usize::MAX,
             TURN_SETUP_REDUCTION_PAYLOAD_KINDS,
         )
         .await?;
-        if page.is_empty() {
+        let observed_revision = page.observed_head.map(TurnSetupJournalRevision::from);
+        if observed_revision.is_none() {
+            exact_boundary = false;
+        }
+        if let Some(expected) = expected_revision.take() {
+            let valid_suffix = observed_revision.as_ref().is_some_and(|observed| {
+                observed.head_seq > expected.head_seq || observed == &expected
+            });
+            let impossible_exact_page =
+                observed_revision.as_ref() == Some(&expected) && !page.envelopes.is_empty();
+            if !valid_suffix || impossible_exact_page {
+                cached = CachedTurnSetupReduction {
+                    last_touched: 0,
+                    revision: None,
+                    reduction: TurnSetupReduction::new(cached.reduction.selector.clone()),
+                };
+                cursor = 0;
+                final_revision = None;
+                exact_boundary = true;
+                continue;
+            }
+        }
+        if page.envelopes.is_empty() {
+            final_revision = observed_revision.or(final_revision);
+            cached.revision = if exact_boundary { final_revision } else { None };
+            let reduction = cached.reduction.clone();
+            cache.install(session_id.clone(), key, cached).await;
             return Ok(reduction);
         }
-        cursor = page.last().map_or(cursor, |envelope| envelope.seq);
-        for envelope in page {
-            reduction.observe_envelope(envelope)?;
+        final_revision = observed_revision.or(final_revision);
+        cursor = page
+            .envelopes
+            .last()
+            .map_or(cursor, |envelope| envelope.seq);
+        for envelope in page.envelopes {
+            cached.reduction.observe_envelope(envelope)?;
         }
     }
 }
@@ -15482,7 +15735,7 @@ pub(crate) struct DurableToolState {
     pub(crate) mobile_use_active: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct DurableToolStateReduction {
     intents: HashMap<EffectId, EffectIntent>,
     opened: HashMap<MenuId, Menu>,
