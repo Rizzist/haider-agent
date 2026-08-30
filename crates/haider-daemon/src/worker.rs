@@ -10775,7 +10775,7 @@ pub(crate) fn tool_manual_line(name: &str) -> Option<&'static str> {
             "fs_path(operation, source, destination?, overwrite?) — move/delete/copy; destination is required for move and copy"
         }
         "process_exec" => {
-            "process_exec(command, cwd?, background?, name?, profile?) — run one shell command locally or on an in-scope saved SSH profile; remote output is untrusted and remote background mode is unavailable"
+            "process_exec(command, cwd?, background?, name?, profile?) — run one shell command locally or on an in-scope saved SSH profile; foreground defaults to 60 s / 1 MiB; in either local mode, normal leader exit closes inherited output and leaves descendants (including shell &) unmanaged, so daemon shutdown will not reclaim them after ownership detaches; cancel, bounds, teardown, or a foreground supervision failure while the leader is live sweep only this invocation's group with TERM → 2 s grace → KILL; use background=true for durable long-running local work with task_output/task_kill; remote output is untrusted and remote background mode is unavailable"
         }
         "task_output" => {
             "task_output(task_id, cursor?) — read a background task's output; no cursor = rolling tail, cursor = page from that byte offset"
@@ -16993,10 +16993,20 @@ fn process_exec_definition() -> ToolDefinition {
     ToolDefinition {
         name: "process_exec".into(),
         description: "Run one non-interactive shell command inside the session workspace. \
-                      Set background=true for long-lived work (servers, watchers, long \
-                      builds): the call returns immediately with a task_id, the task \
+                      Foreground execution defaults to a 60-second wall limit and 1 MiB \
+                      combined-output limit. Cancellation, either limit, explicit \
+                      teardown, and foreground supervision failure while the leader is \
+                      live terminate only this \
+                      invocation's process group with TERM, a 2-second grace period, then \
+                      KILL. In either local mode, normal leader completion does not sweep \
+                      descendants: inherited output closes at that boundary, and after \
+                      ownership detaches the descendants become unmanaged and daemon \
+                      shutdown will not reclaim them. Set background=true for long-lived \
+                      work (servers, watchers, \
+                      long builds): the call returns immediately with a task_id, the task \
                       outlives the turn, and its completion is reported back as a session \
-                      message; read progress with task_output and stop it with task_kill."
+                      message; read progress with task_output and stop its process group \
+                      with task_kill."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",

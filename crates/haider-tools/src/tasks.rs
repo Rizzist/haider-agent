@@ -29,6 +29,7 @@ use haider_protocol::item::OutputStream;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::env;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -490,19 +491,32 @@ pub struct BackgroundExitStatus {
 }
 
 /// Supervises one background child to its terminal observation: pipes tee
-/// into the bounded buffer, the leader exit is observed without reaping
-/// (`WNOWAIT`) so the zombie pins the pgid through the group sweep, the
-/// group is swept TERM → grace → KILL (on kill request AND on natural exit,
-/// so lingering descendants never outlive the task), and the leader is
-/// reaped last. This mirrors the foreground supervisor's ordering laws with
-/// the turn-scoped concerns (wall timeout, cancel watch, output-cap kill)
-/// deliberately absent: a background task has no wall clock and output
-/// beyond the cap is dropped, not fatal.
+/// into the bounded buffer and the leader exit is observed without reaping
+/// (`WNOWAIT`). A kill request sweeps the invocation's group TERM → grace →
+/// KILL while the zombie pins its pgid, then reaps the leader. Natural leader
+/// completion instead closes inherited output and relinquishes group authority,
+/// leaving any surviving descendants unmanaged. This mirrors the foreground
+/// supervisor's ownership boundary with the turn-scoped concerns (wall timeout,
+/// cancel watch, output-cap kill) deliberately absent: a background task has no
+/// wall clock and output beyond the cap is dropped, not fatal.
 pub async fn supervise_background(
+    spawn: BackgroundSpawn,
+    kill: watch::Receiver<bool>,
+    output: SharedTaskOutput,
+    grace: Duration,
+) -> BackgroundExitStatus {
+    let exit_observation = Box::pin(observe_process_leader_exit(spawn.pid_handle));
+    supervise_background_with_exit_observation(spawn, kill, output, grace, exit_observation).await
+}
+
+type BackgroundLeaderExitObservation = Pin<Box<dyn Future<Output = ToolResult<()>> + Send>>;
+
+async fn supervise_background_with_exit_observation(
     spawn: BackgroundSpawn,
     mut kill: watch::Receiver<bool>,
     output: SharedTaskOutput,
     grace: Duration,
+    mut exit_observation: BackgroundLeaderExitObservation,
 ) -> BackgroundExitStatus {
     let BackgroundSpawn {
         call_id,
@@ -517,17 +531,25 @@ pub async fn supervise_background(
         workspace_receipt,
     } = spawn;
     let (captured_sender, mut captured) = mpsc::channel(1);
+    let (output_stop, stdout_stop) = watch::channel(false);
+    let (stdout_ready_sender, stdout_ready) = tokio::sync::oneshot::channel();
+    let (stderr_ready_sender, stderr_ready) = tokio::sync::oneshot::channel();
     tokio::spawn(read_output(
         stdout,
         OutputStream::Stdout,
         captured_sender.clone(),
+        Some(stdout_stop),
+        Some(stdout_ready_sender),
     ));
     tokio::spawn(read_output(
         stderr,
         OutputStream::Stderr,
         captured_sender.clone(),
+        Some(output_stop.subscribe()),
+        Some(stderr_ready_sender),
     ));
     drop(captured_sender);
+    let (_stdout_ready, _stderr_ready) = tokio::join!(stdout_ready, stderr_ready);
 
     let stdin = Arc::new(tokio::sync::Mutex::new(None));
     let mut fatal: Option<ToolError> = None;
@@ -540,10 +562,10 @@ pub async fn supervise_background(
     let mut leader_exit_observed = false;
     let mut leader_is_zombie = false;
     let mut leader_reaped = false;
+    #[cfg(windows)]
+    let mut normal_completion_relinquished = false;
     let mut kill_deadline: Option<Pin<Box<Sleep>>> = None;
     let mut pipe_drain_deadline: Option<Pin<Box<Sleep>>> = None;
-    let mut exit_observation = Box::pin(observe_process_leader_exit(pid));
-
     if *kill.borrow() {
         killed = true;
         begin_group_termination(
@@ -618,21 +640,20 @@ pub async fn supervise_background(
                     Ok(()) => true,
                     Err(error) => {
                         fatal.get_or_insert(error);
+                        killed = true;
+                        begin_group_termination(
+                            group,
+                            pid,
+                            false,
+                            grace,
+                            &mut kill_deadline,
+                            &mut fatal,
+                            &mut escalation_notes,
+                            &mut lifecycle_events,
+                        );
                         false
                     }
                 };
-                if kill_deadline.is_none() {
-                    begin_group_termination(
-                        group,
-                        pid,
-                        leader_is_zombie,
-                        grace,
-                        &mut kill_deadline,
-                        &mut fatal,
-                        &mut escalation_notes,
-                        &mut lifecycle_events,
-                    );
-                }
                 if kill_deadline.is_none() {
                     reap_process_leader(
                         &mut child,
@@ -644,8 +665,40 @@ pub async fn supervise_background(
                     )
                     .await;
                     leader_reaped = true;
-                    if output_open {
+                    if killed && output_open {
                         pipe_drain_deadline = Some(Box::pin(sleep(grace)));
+                    } else if !killed {
+                        // Preserve bytes whose pipe readiness raced the leader
+                        // exit observation, without waiting for descendants or
+                        // arming the teardown grace timer.
+                        tokio::task::yield_now().await;
+                        match haider_platform::detach_process_group(group) {
+                            Ok(()) => {
+                                #[cfg(windows)]
+                                {
+                                    normal_completion_relinquished = true;
+                                }
+                                output_stop.send_replace(true);
+                            }
+                            Err(error) => {
+                                fatal.get_or_insert_with(|| ToolError::Runtime {
+                                    message: format!(
+                                        "detach normally completed background process group {}: {error}",
+                                        pid.as_raw_nonzero()
+                                    ),
+                                });
+                                // A completed task does not become teardown
+                                // because the OS refused ownership detachment.
+                                // Abandon the exact fail-closed Job authority;
+                                // closing it here would itself kill descendants.
+                                haider_platform::abandon_process_group(group);
+                                #[cfg(windows)]
+                                {
+                                    normal_completion_relinquished = true;
+                                }
+                                output_stop.send_replace(true);
+                            }
+                        }
                     }
                 }
             }
@@ -710,7 +763,9 @@ pub async fn supervise_background(
         // KILL_ON_JOB_CLOSE is the final fail-safe and prevents an error path
         // from returning while descendants remain alive behind a retained
         // registry handle.
-        haider_platform::release_process_group(group);
+        if !normal_completion_relinquished {
+            haider_platform::release_process_group(group);
+        }
         if !leader_reaped {
             match tokio::time::timeout(grace, child.wait()).await {
                 Ok(Ok(status)) => {
@@ -759,6 +814,121 @@ pub async fn supervise_background(
         killed,
         fault: (!fault_parts.is_empty()).then(|| fault_parts.join("; ")),
         workspace_mutation,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod supervisor_tests {
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+    use crate::broker::JournalSink;
+    use async_trait::async_trait;
+    use haider_protocol::EventPayload;
+    use haider_protocol::effect::EffectClass;
+    use haider_protocol::ids::SessionId;
+
+    #[derive(Debug, Default)]
+    struct NoopJournal;
+
+    #[async_trait]
+    impl JournalSink for NoopJournal {
+        async fn append(&mut self, _payload: EventPayload) -> ToolResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A background exit-observer error while the leader is live is a
+    /// supervision failure, not a natural-completion detach boundary.
+    #[tokio::test]
+    async fn exit_observer_failure_sweeps_the_background_process_group() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let descendant_started = workspace.path().join("background-observer-started.log");
+        let descendant_survived = workspace.path().join("background-observer-survived.log");
+        let mut broker = EffectBroker::new_at(
+            Box::new(NoopJournal),
+            workspace.path(),
+            SessionId::new("background-observer-failure-session"),
+            1,
+            1_700_000_000_000,
+        )
+        .expect("create broker");
+        let mut policy = PermissionPolicy::default();
+        policy.allow(EffectClass::ProcessExec);
+        let operation = BackgroundExec::new(
+            ProcessExec::new(
+                "background-observer-failure",
+                concat!(
+                    "trap '' TERM; ",
+                    "/usr/bin/perl -e '$SIG{TERM}=q(IGNORE); ",
+                    "open $started, q(>), q(background-observer-started.log); ",
+                    "print $started q(started); close $started; ",
+                    "select undef, undef, undef, 0.3; ",
+                    "open $survived, q(>), q(background-observer-survived.log); ",
+                    "print $survived q(survived); close $survived; sleep 30' & ",
+                    "while :; do :; done",
+                ),
+            ),
+            "background-observer-failure",
+        )
+        .expect("valid background operation");
+        let spawn = broker
+            .process_exec_background(&operation, &policy)
+            .await
+            .expect("spawn background process");
+        let pid = spawn.pid;
+        let (_kill, kill_signal) = task_kill_channel();
+        let observer_started = descendant_started.clone();
+        let exit_observation: BackgroundLeaderExitObservation = Box::pin(async move {
+            for _ in 0..200 {
+                if observer_started.exists() {
+                    return Err(ToolError::Runtime {
+                        message: "injected background exit-observer failure".into(),
+                    });
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err(ToolError::Runtime {
+                message: "background descendant did not start before observer injection".into(),
+            })
+        });
+
+        let status = tokio::time::timeout(
+            Duration::from_secs(3),
+            supervise_background_with_exit_observation(
+                spawn,
+                kill_signal,
+                shared_task_output(1024, 64),
+                Duration::from_millis(100),
+                exit_observation,
+            ),
+        )
+        .await
+        .expect("observer-failure supervision remains bounded");
+
+        assert!(
+            status.killed,
+            "observer fault did not enter teardown: {status:?}"
+        );
+        assert!(
+            status
+                .fault
+                .as_deref()
+                .is_some_and(|fault| fault.contains("background exit-observer failure")),
+            "observer failure was not preserved: {status:?}"
+        );
+        assert!(descendant_started.exists(), "owned descendant starts");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !descendant_survived.exists(),
+            "background observer failure detached instead of sweeping the group"
+        );
+        assert_eq!(
+            probe_group_liveness(pid),
+            PidLiveness::Dead,
+            "background process group remains live after observer-failure teardown"
+        );
+        broker.close().await.expect("broker closes");
     }
 }
 

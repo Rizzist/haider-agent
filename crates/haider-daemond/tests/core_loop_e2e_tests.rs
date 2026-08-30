@@ -930,12 +930,12 @@ async fn tool_calls_execute_and_continue_over_real_rpc() {
     task.join().await.expect("daemon joins");
 }
 
-/// Historical regression name retained for the release gate. Foreground
-/// `process_exec` owns its process group, so leader exit must sweep descendants
-/// rather than let `server &` escape the tool's resource and sandbox boundary.
-/// Long-lived commands use the explicit background-process path instead.
+/// Lane 967-P1 owner decision: natural leader completion leaves descendants
+/// alone. Foreground capture closes at that boundary instead of waiting on an
+/// inherited pipe, so late descendant bytes are not part of the tool result;
+/// durable long-running output belongs on `background=true`.
 #[tokio::test]
-async fn process_exec_drains_output_from_child_that_outlives_leader() {
+async fn process_exec_normal_completion_leaves_outliving_descendant_alone() {
     let root = test_root("core-loop-outliving-pipe-");
     let workspace = root.path().join("workspace");
     fs::create_dir(&workspace).expect("workspace");
@@ -980,14 +980,14 @@ async fn process_exec_drains_output_from_child_that_outlives_leader() {
         "outliving-pipe-turn",
         session,
         generation,
-        "drain output after the leader exits",
+        "close capture when the leader exits",
     )
     .await;
     let events = events_until_terminal(&mut client, &run).await;
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     assert!(
-        !workspace.join("outliving-child-ran.log").exists(),
-        "foreground process_exec leaked a descendant after its leader exited"
+        workspace.join("outliving-child-ran.log").exists(),
+        "foreground process_exec swept a descendant after its leader exited"
     );
     assert_eq!(stdout_bytes(&events), b"leader");
     assert!(continuation_seen(&events, "continued-outliving-pipe"));

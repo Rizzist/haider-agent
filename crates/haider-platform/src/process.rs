@@ -274,8 +274,6 @@ pub fn register_process_group(pid: u32) -> std::io::Result<ProcessGroup> {
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject,
     };
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
@@ -296,21 +294,7 @@ pub fn register_process_group(pid: u32) -> std::io::Result<ProcessGroup> {
     // SAFETY: CreateJobObjectW returned a non-null newly owned handle, and
     // this is the unique transfer into the standard RAII owner.
     let job = WindowsJob(unsafe { OwnedHandle::from_raw_handle(raw_job.cast()) });
-    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    // SAFETY: `job` owns a live Job Object and `limits` is an initialized
-    // structure whose exact size is supplied for this information class.
-    let configured = unsafe {
-        SetInformationJobObject(
-            job.raw(),
-            JobObjectExtendedLimitInformation,
-            (&raw const limits).cast(),
-            std::mem::size_of_val(&limits) as u32,
-        )
-    };
-    if configured == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    set_windows_job_limit_flags(&job, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)?;
     // SAFETY: the access mask and validated nonzero PID are value arguments;
     // a non-null return is one newly owned process handle.
     let process = unsafe {
@@ -347,6 +331,33 @@ pub fn register_process_group(pid: u32) -> std::io::Result<ProcessGroup> {
     registry.by_pid.insert(pid, token);
     registry.by_token.insert(token, job);
     Ok(group)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn set_windows_job_limit_flags(job: &WindowsJob, flags: u32) -> std::io::Result<()> {
+    use windows_sys::Win32::System::JobObjects::{
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = flags;
+    // SAFETY: `job` owns a live Job Object and `limits` is an initialized
+    // structure whose exact size is supplied for this information class.
+    if unsafe {
+        SetInformationJobObject(
+            job.raw(),
+            JobObjectExtendedLimitInformation,
+            (&raw const limits).cast(),
+            std::mem::size_of_val(&limits) as u32,
+        )
+    } == 0
+    {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
@@ -796,6 +807,65 @@ pub fn release_process_group(group: ProcessGroup) {
     registry.by_token.remove(&group.token);
     if registry.by_pid.get(&group.pid) == Some(&group.token) {
         registry.by_pid.remove(&group.pid);
+    }
+}
+
+/// Relinquishes this invocation's process-group authority without terminating
+/// surviving descendants after the command leader completed normally.
+///
+/// Unix process groups need no owned kernel handle. On Windows the Job Object's
+/// kill-on-close policy must be cleared before its last handle is released;
+/// otherwise a normal completion would still kill every surviving member.
+#[cfg(unix)]
+pub fn detach_process_group(_group: ProcessGroup) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn detach_process_group(group: ProcessGroup) -> std::io::Result<()> {
+    let mut registry = windows_job_registry()
+        .lock()
+        .map_err(|_| std::io::Error::other("Windows job registry is poisoned"))?;
+    let job = registry.by_token.get(&group.token).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "Windows process group {} is no longer registered",
+                group.pid
+            ),
+        )
+    })?;
+    set_windows_job_limit_flags(job, 0)?;
+    registry.by_token.remove(&group.token);
+    if registry.by_pid.get(&group.pid) == Some(&group.token) {
+        registry.by_pid.remove(&group.pid);
+    }
+    Ok(())
+}
+
+/// Gives up userspace access to a group without closing its fail-closed kernel
+/// authority. This is only the last-resort normal-completion path when Windows
+/// refuses to clear `KILL_ON_JOB_CLOSE`: closing the handle would itself sweep
+/// descendants, contrary to the completed command's ownership boundary.
+///
+/// Unix has no owned group handle. Windows deliberately leaks the one exact Job
+/// handle after removing both lookup coordinates. The OS will close it when the
+/// daemon process exits; until then no later PID lookup or teardown can target
+/// the normally completed invocation through Haider.
+#[cfg(unix)]
+pub fn abandon_process_group(_group: ProcessGroup) {}
+
+#[cfg(windows)]
+pub fn abandon_process_group(group: ProcessGroup) {
+    let Ok(mut registry) = windows_job_registry().lock() else {
+        return;
+    };
+    let job = registry.by_token.remove(&group.token);
+    if registry.by_pid.get(&group.pid) == Some(&group.token) {
+        registry.by_pid.remove(&group.pid);
+    }
+    if let Some(job) = job {
+        std::mem::forget(job);
     }
 }
 
