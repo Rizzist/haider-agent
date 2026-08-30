@@ -631,6 +631,13 @@ impl PeerService {
         self.reconcile_count.load(Ordering::Relaxed)
     }
 
+    /// Waits until a reconciliation already observed by [`Self::reconcile_count`]
+    /// has left the serialized store/publication section.
+    #[cfg(test)]
+    pub(super) async fn wait_for_reconcile_idle(&self) {
+        let _serial = self.reconcile_serial.lock().await;
+    }
+
     #[cfg(test)]
     pub(super) fn heartbeat_count(&self) -> u64 {
         self.heartbeat_count.load(Ordering::Relaxed)
@@ -2250,6 +2257,10 @@ pub(super) fn write_manifest_blocking(
     file.write_all(&bytes)
         .and_then(|()| sync_manifest_file(&file, sync_policy))
         .map_err(|error| PeerError::io("persist peer manifest staging file", &temporary, error))?;
+    // Windows replacement APIs require the staged file to be closed before
+    // publication. Unix retains the same completed-file atomic rename, while
+    // Windows no longer asks ReplaceFileW to move our own live handle.
+    drop(file);
     replace_manifest_staging(&temporary, path)
         .map_err(|error| PeerError::io("publish peer manifest", path, error))?;
     sync_manifest_parent(path, sync_policy)

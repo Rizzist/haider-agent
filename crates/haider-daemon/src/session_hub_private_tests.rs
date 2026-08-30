@@ -90,7 +90,9 @@ fn attachment_receipt_replay_routes_through_fused_title_repair() {
         .expect("turn_submit source");
     let tail = &source[start..];
     let end = tail
-        .find("    #[allow(clippy::too_many_arguments)]\n    async fn shell_exec(")
+        // Do not couple a source-sensitive invariant to the checkout's line
+        // ending convention. Windows may materialize this source with CRLF.
+        .find("    async fn shell_exec(")
         .expect("next RPC handler boundary");
     let body = &tail[..end];
     let receipt = body

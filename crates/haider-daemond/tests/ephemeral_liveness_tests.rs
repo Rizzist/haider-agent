@@ -902,9 +902,12 @@ fn two_private_home_instances_are_self_contained_and_never_adopt_each_other() {
     let second = private_home_profile(&second_home);
     assert_ne!(first.profile_id, second.profile_id);
     assert_ne!(first.runtime_dir, second.runtime_dir);
+    assert_ne!(first.endpoint_path, second.endpoint_path);
 
+    #[cfg(unix)]
     let legacy_root =
         PathBuf::from("/tmp").join(format!("haider-{}", haider_client::effective_uid()));
+    #[cfg(unix)]
     for profile in [&first, &second] {
         let scope = profile
             .runtime_dir
@@ -950,7 +953,20 @@ fn two_private_home_instances_are_self_contained_and_never_adopt_each_other() {
         let canonical_home = home.canonicalize().expect("canonical private HOME");
         assert!(profile.store_dir.starts_with(canonical_home));
         assert!(profile.runtime_dir.starts_with(home));
+        assert_eq!(
+            profile.endpoint_path,
+            haider_client::endpoint_path_for(&profile.runtime_dir, &profile.profile_id),
+            "private-home endpoint must retain the shared profile scope"
+        );
+        #[cfg(unix)]
         assert!(profile.endpoint_path.starts_with(home));
+        #[cfg(windows)]
+        assert!(
+            profile
+                .endpoint_path
+                .to_string_lossy()
+                .starts_with(r"\\.\pipe\haider-")
+        );
         assert!(profile.store_dir.join("store.sqlite").is_file());
         assert!(profile.store_dir.join("lock").is_file());
         assert!(profile.store_dir.join("lock.owner").is_file());
@@ -968,14 +984,17 @@ fn two_private_home_instances_are_self_contained_and_never_adopt_each_other() {
             );
         }
 
-        let scope = profile
-            .runtime_dir
-            .file_name()
-            .expect("profile runtime scope");
-        assert!(
-            !legacy_root.join(scope).exists(),
-            "private HOME must never escape to the legacy runtime"
-        );
+        #[cfg(unix)]
+        {
+            let scope = profile
+                .runtime_dir
+                .file_name()
+                .expect("profile runtime scope");
+            assert!(
+                !legacy_root.join(scope).exists(),
+                "private HOME must never escape to the legacy runtime"
+            );
+        }
     }
 
     let first_daemon_pid = std::fs::read_to_string(pid_path(&first))

@@ -2133,12 +2133,16 @@ pub(crate) fn process_arguments(
 #[cfg(test)]
 mod supervisor_tests {
     use super::*;
+    #[cfg(unix)]
     use async_trait::async_trait;
+    #[cfg(unix)]
     use std::process::Stdio;
 
+    #[cfg(unix)]
     #[derive(Debug, Default)]
     struct NoopCas;
 
+    #[cfg(unix)]
     #[async_trait]
     impl CasSink for NoopCas {
         async fn put(&mut self, bytes: &[u8]) -> ToolResult<ArtifactRef> {
@@ -2152,9 +2156,11 @@ mod supervisor_tests {
         }
     }
 
+    #[cfg(unix)]
     #[derive(Debug, Default)]
     struct NoopOutput;
 
+    #[cfg(unix)]
     #[async_trait]
     impl CommandOutputSink for NoopOutput {
         async fn emit(&self, _call_id: &str, _delta: ItemDelta) -> ToolResult<()> {

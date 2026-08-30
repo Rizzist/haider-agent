@@ -161,18 +161,32 @@ fn built_status_json_completes_with_enabled_discovery() {
         .as_str()
         .expect("status socket_path string");
     assert!(Path::new(socket_path).is_absolute());
+    let resolved = haider_client::resolve_profile(&haider_client::ProfileEnv {
+        profile_dir: Some(profile.clone()),
+        home: Some(machine_home.clone()),
+        user_profile: Some(machine_home.clone()),
+        model: None,
+        runtime_dir: None,
+        xdg_runtime_dir: None,
+    })
+    .expect("resolve the status fixture profile");
     assert_eq!(
-        Path::new(socket_path).parent(),
+        Path::new(socket_path),
+        resolved.endpoint_path,
+        "status must report the shared platform rendezvous address"
+    );
+    assert_eq!(
         document["daemon"]["pid_file_path"]
             .as_str()
             .map(Path::new)
             .and_then(Path::parent),
-        "socket and PID file must name the same resolved runtime directory"
+        Some(resolved.runtime_dir.as_path()),
+        "the PID file must stay under the resolved filesystem runtime"
     );
     assert_eq!(
-        Path::new(socket_path).parent(),
         document["runtime_dir"].as_str().map(Path::new),
-        "status must report the runtime directory that owns the live socket"
+        Some(resolved.runtime_dir.as_path()),
+        "status must report the resolved filesystem runtime"
     );
     #[cfg(unix)]
     assert!(
