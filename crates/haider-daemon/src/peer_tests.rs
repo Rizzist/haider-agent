@@ -124,8 +124,8 @@ fn manifest_creation_stays_full_while_heartbeat_uses_plain_sync() {
     );
 }
 
-#[tokio::test]
-async fn idle_peer_ticks_do_not_reconcile_without_a_roster_wake() {
+#[tokio::test(start_paused = true)]
+async fn peer_maintenance_is_event_armed_with_heartbeat_and_audit_repair() {
     use super::peer::PeerService;
     use crate::session_hub::{SessionHub, SessionHubConfig};
     use haider_core::SqliteStoreHandle;
@@ -141,33 +141,67 @@ async fn idle_peer_ticks_do_not_reconcile_without_a_roster_wake() {
     let service = PeerService::start(runtime, &hub)
         .await
         .expect("start idle peer service");
+    tokio::task::yield_now().await;
     let initial = service.reconcile_count();
 
-    tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+    tokio::time::advance(std::time::Duration::from_millis(1_200)).await;
+    tokio::task::yield_now().await;
 
     assert_eq!(
         service.reconcile_count(),
         initial,
-        "two idle 500 ms ticks must not re-read the session roster"
+        "idle time before the audit must not re-read the session roster"
     );
-    assert!(
-        service.heartbeat_count() >= 2,
-        "idle maintenance ticks must retain manifest heartbeats"
+    assert_eq!(
+        service.heartbeat_count(),
+        0,
+        "the old idle 500 ms heartbeat tick must be absent"
+    );
+    tokio::time::advance(std::time::Duration::from_millis(3_799)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        service.heartbeat_count(),
+        0,
+        "manifest heartbeat must not fire before five seconds"
+    );
+    tokio::time::advance(std::time::Duration::from_millis(2)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        service.heartbeat_count(),
+        1,
+        "manifest heartbeat keeps its exact five-second cadence"
     );
     hub.notify_roster_session(haider_protocol::ids::SessionId::new(
         "session-peer-reconcile-wake",
     ));
-    tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        while service.reconcile_count() == initial {
-            tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_millis(499)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        service.reconcile_count(),
+        initial,
+        "roster publication must remain coalesced until the event-armed debounce"
+    );
+    tokio::time::advance(std::time::Duration::from_millis(1)).await;
+    for _ in 0..64 {
+        if service.reconcile_count() != initial {
+            break;
         }
-    })
-    .await
-    .expect("roster publication wakes peer reconciliation");
+        tokio::task::yield_now().await;
+    }
     assert_eq!(
         service.reconcile_count(),
         initial + 1,
         "one roster publication triggers one reconciliation"
+    );
+    tokio::time::advance(std::time::Duration::from_millis(24_500)).await;
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        service.reconcile_count(),
+        initial + 2,
+        "the thirty-second audit repairs a lost roster publication"
     );
     service.shutdown().await;
     hub.shutdown().await.expect("hub shutdown");

@@ -14,24 +14,24 @@ use haider_rpc::haider_protocol::ids::SessionId;
 use haider_rpc::{
     AttachMode, AttachmentId, Capability, CapabilitySet, ClientKind, DescendantReplayCursorWire,
     ERROR_CODE_NOT_FOUND, FEATURE_EFFECT_RECOVERY_V1, FEATURE_SESSION_DESCENDANT_STREAM_V1,
-    FEATURE_SESSION_FLEET_V1, FEATURE_SESSION_OBSERVE_BATCH_V1, FEATURE_SESSION_OBSERVE_V1,
-    LifecyclePhase, RequestBody, ResponseBody, SessionDescendantBaselineWire, SessionFleetSnapshot,
-    SessionObserveDigest, SessionSummary, Welcome, WireFrame,
+    FEATURE_SESSION_FLEET_V1, FEATURE_SESSION_LIST_WATCH_V1, FEATURE_SESSION_OBSERVE_BATCH_V1,
+    FEATURE_SESSION_OBSERVE_V1, LifecyclePhase, RequestBody, ResponseBody,
+    SessionDescendantBaselineWire, SessionFleetSnapshot, SessionObserveDigest, SessionSummary,
+    Welcome, WireFrame,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use crate::client::{
-    ClientCloseOutcome, ClientConfig, ClientError, ConnectError, ConnectionUsage, RpcClient,
-    connect,
+    ClientCloseOutcome, ClientConfig, ClientError, ClientHealthWait, ConnectError, ConnectionState,
+    ConnectionUsage, RpcClient, connect,
 };
 use crate::profile::ResolvedProfile;
 use crate::spawn::{EnsureError, EnsureOptions, ensure_daemon};
 
 const LIST_PAGE: u32 = 100;
 const EVENT_SHARD_SIZE: usize = 16;
-const STREAM_HEALTH_POLL: Duration = Duration::from_millis(25);
-const SESSION_DISCOVERY_POLL: Duration = Duration::from_secs(1);
+const STREAM_HEALTH_REPAIR_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Typed failure for the scriptable observation surface.
 #[derive(Debug)]
@@ -648,15 +648,16 @@ pub async fn observe_stream_session_after(
 }
 
 /// Streams every session, sharding view attachments at the daemon's default
-/// per-connection cap. Follow mode polls session.list so later sessions join.
+/// per-connection cap. Follow mode uses `session.list_watch`, whose daemon-side
+/// 30 s full-roster audit repairs a lost publication.
 pub async fn observe_stream_all(
     profile: &ResolvedProfile,
     spawn: bool,
     follow: bool,
     output: mpsc::UnboundedSender<RawEnvelope>,
 ) -> Result<(), ObserveError> {
-    let initial = list_session_ids(profile, spawn).await?;
     if !follow {
+        let initial = list_session_ids(profile, spawn).await?;
         for shard in initial.chunks(EVENT_SHARD_SIZE) {
             stream_shard(
                 profile.clone(),
@@ -671,52 +672,128 @@ pub async fn observe_stream_all(
         return Ok(());
     }
 
-    let mut known = initial
-        .iter()
-        .map(|session_id| session_id.as_str().to_owned())
-        .collect::<HashSet<_>>();
+    let mut known = HashSet::new();
     let mut streams = JoinSet::new();
-    for shard in initial.chunks(EVENT_SHARD_SIZE) {
-        streams.spawn(stream_shard(
-            profile.clone(),
-            spawn,
-            shard.to_vec(),
-            true,
-            output.clone(),
-            0,
-        ));
-    }
-    let mut discovery = tokio::time::interval(SESSION_DISCOVERY_POLL);
-    discovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        tokio::select! {
-            joined = streams.join_next(), if !streams.is_empty() => {
-                match joined {
-                    Some(Ok(Ok(()))) => {}
-                    Some(Ok(Err(error))) => return Err(error),
-                    Some(Err(error)) => return Err(ObserveError::StreamTask(error.to_string())),
-                    None => {}
+        let (watcher, mut roster_events, baseline_lost) =
+            open_session_list_watch(profile, spawn).await?;
+        let health = watcher.client.health_watch();
+        let mut health_wait =
+            Box::pin(health.wait("follow-all roster health", STREAM_HEALTH_REPAIR_INTERVAL));
+        loop {
+            tokio::select! {
+                biased;
+                joined = streams.join_next(), if !streams.is_empty() => {
+                    match joined {
+                        Some(Ok(Ok(()))) => {}
+                        Some(Ok(Err(error))) => return Err(error),
+                        Some(Err(error)) => {
+                            return Err(ObserveError::StreamTask(error.to_string()));
+                        }
+                        None => {}
+                    }
                 }
-            }
-            _ = discovery.tick() => {
-                let ids = list_session_ids(profile, spawn).await?;
-                let new = ids
-                    .into_iter()
-                    .filter(|session_id| known.insert(session_id.as_str().to_owned()))
-                    .collect::<Vec<_>>();
-                for shard in new.chunks(EVENT_SHARD_SIZE) {
-                    streams.spawn(stream_shard(
-                        profile.clone(),
-                        spawn,
-                        shard.to_vec(),
-                        true,
-                        output.clone(),
-                        0,
+                frame = roster_events.recv() => {
+                    match frame {
+                        Some(WireFrame::SessionRosterDelta { summaries }) => {
+                            let new = summaries
+                                .into_iter()
+                                .map(|summary| summary.session_id)
+                                .filter(|session_id| {
+                                    known.insert(session_id.as_str().to_owned())
+                                })
+                                .collect::<Vec<_>>();
+                            for shard in new.chunks(EVENT_SHARD_SIZE) {
+                                streams.spawn(stream_shard(
+                                    profile.clone(),
+                                    spawn,
+                                    shard.to_vec(),
+                                    true,
+                                    output.clone(),
+                                    0,
+                                ));
+                            }
+                        }
+                        Some(WireFrame::ServerDraining { .. }) | None => break,
+                        Some(_) => {}
+                    }
+                    // Roster frames retain priority so a final buffered delta
+                    // is not discarded on disconnect. Under saturation the
+                    // retained loss generation still forces repair after this
+                    // one consumed frame, so health cannot be starved.
+                    if watcher.client.lost_events() != baseline_lost {
+                        break;
+                    }
+                }
+                outcome = &mut health_wait => {
+                    let (health, outcome) = outcome;
+                    if health_requires_reconnect(&outcome, baseline_lost) {
+                        break;
+                    }
+                    health_wait = Box::pin(health.wait(
+                        "follow-all roster health",
+                        STREAM_HEALTH_REPAIR_INTERVAL,
                     ));
                 }
             }
         }
+        let _ = watcher.close();
     }
+}
+
+async fn open_session_list_watch(
+    profile: &ResolvedProfile,
+    spawn: bool,
+) -> Result<(ObserveClient, mpsc::Receiver<WireFrame>, u64), ObserveError> {
+    let watcher = ObserveClient::connect(profile, spawn).await?;
+    if !watcher
+        .welcome
+        .features
+        .contains(FEATURE_SESSION_LIST_WATCH_V1)
+    {
+        let _ = watcher.close();
+        return Err(ObserveError::MissingFeature(FEATURE_SESSION_LIST_WATCH_V1));
+    }
+    let Some(events) = watcher.client.take_events() else {
+        let _ = watcher.close();
+        return Err(ObserveError::Protocol(
+            "roster watch event stream was already taken",
+        ));
+    };
+    let baseline_lost = watcher.client.lost_events();
+    match watcher
+        .client
+        .request(RequestBody::SessionListWatch {})
+        .await?
+    {
+        ResponseBody::SessionListWatch { accepted: true } => {}
+        ResponseBody::SessionListWatch { accepted: false } => {
+            let _ = watcher.close();
+            return Err(ObserveError::Protocol(
+                "session.list_watch was not accepted",
+            ));
+        }
+        ResponseBody::Error {
+            code,
+            message,
+            retryable,
+            ..
+        } => {
+            let _ = watcher.close();
+            return Err(ObserveError::Rpc {
+                code,
+                message,
+                retryable,
+            });
+        }
+        _ => {
+            let _ = watcher.close();
+            return Err(ObserveError::Protocol(
+                "session.list_watch response method mismatch",
+            ));
+        }
+    }
+    Ok((watcher, events, baseline_lost))
 }
 
 async fn list_session_ids(
@@ -801,10 +878,12 @@ async fn stream_shard(
         }
 
         let mut caught_up = HashSet::new();
-        let mut health = tokio::time::interval(STREAM_HEALTH_POLL);
-        health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let health = observer.client.health_watch();
+        let mut health_wait =
+            Box::pin(health.wait("observation stream health", STREAM_HEALTH_REPAIR_INTERVAL));
         let reconnect = loop {
             tokio::select! {
+                biased;
                 frame = events.recv() => {
                     let Some(frame) = frame else { break true; };
                     match frame {
@@ -813,38 +892,46 @@ async fn stream_shard(
                             session_id,
                             envelope,
                         } => {
-                            let Some((_, expected_session)) = attachments.get(attachment_id.as_str()) else {
-                                continue;
-                            };
-                            if *expected_session != session_id || envelope.session_id != session_id {
-                                let _ = observer.close();
-                                return Err(ObserveError::Protocol("attachment event session mismatch"));
+                            if let Some((_, expected_session)) =
+                                attachments.get(attachment_id.as_str())
+                            {
+                                if *expected_session != session_id
+                                    || envelope.session_id != session_id
+                                {
+                                    let _ = observer.close();
+                                    return Err(ObserveError::Protocol(
+                                        "attachment event session mismatch",
+                                    ));
+                                }
+                                let cursor =
+                                    cursors.entry(session_id.as_str().to_owned()).or_default();
+                                if envelope.seq > *cursor {
+                                    if envelope.seq != cursor.saturating_add(1) {
+                                        break true;
+                                    }
+                                    let seq = envelope.seq;
+                                    output
+                                        .send(envelope)
+                                        .map_err(|_| ObserveError::OutputClosed)?;
+                                    *cursor = seq;
+                                }
                             }
-                            let cursor = cursors.entry(session_id.as_str().to_owned()).or_default();
-                            if envelope.seq <= *cursor {
-                                continue;
-                            }
-                            if envelope.seq != cursor.saturating_add(1) {
-                                break true;
-                            }
-                            let seq = envelope.seq;
-                            output.send(envelope).map_err(|_| ObserveError::OutputClosed)?;
-                            *cursor = seq;
                         }
                         WireFrame::AttachCaughtUp {
                             attachment_id,
                             high_water_seq,
                         } => {
-                            let Some((_, session_id)) = attachments.get(attachment_id.as_str()) else {
-                                continue;
-                            };
-                            if cursors.get(session_id.as_str()).copied().unwrap_or(0) < high_water_seq {
-                                break true;
-                            }
-                            caught_up.insert(session_id.as_str().to_owned());
-                            if !follow && caught_up.len() == sessions.len() {
-                                let _ = observer.close();
-                                return Ok(());
+                            if let Some((_, session_id)) = attachments.get(attachment_id.as_str()) {
+                                if cursors.get(session_id.as_str()).copied().unwrap_or(0)
+                                    < high_water_seq
+                                {
+                                    break true;
+                                }
+                                caught_up.insert(session_id.as_str().to_owned());
+                                if !follow && caught_up.len() == sessions.len() {
+                                    let _ = observer.close();
+                                    return Ok(());
+                                }
                             }
                         }
                         WireFrame::Lagged { attachment_id, .. }
@@ -852,11 +939,22 @@ async fn stream_shard(
                         WireFrame::ServerDraining { .. } => break true,
                         _ => {}
                     }
-                }
-                _ = health.tick() => {
+                    // A ready event lane precedes health to preserve buffered
+                    // terminal facts. Probe the latest loss generation after
+                    // each frame so an overloaded lane cannot starve recovery.
                     if observer.client.lost_events() != baseline_lost {
                         break true;
                     }
+                }
+                outcome = &mut health_wait => {
+                    let (health, outcome) = outcome;
+                    if health_requires_reconnect(&outcome, baseline_lost) {
+                        break true;
+                    }
+                    health_wait = Box::pin(health.wait(
+                        "observation stream health",
+                        STREAM_HEALTH_REPAIR_INTERVAL,
+                    ));
                 }
             }
         };
@@ -865,4 +963,15 @@ async fn stream_shard(
             return Ok(());
         }
     }
+}
+
+fn health_requires_reconnect(outcome: &ClientHealthWait, baseline_lost: u64) -> bool {
+    // A typed timeout is the explicit repair path: read the retained latest
+    // values even if a watch wake were lost. Ordinary changes use the same
+    // check, so protocol/reconnect semantics do not depend on the wake source.
+    let _repair_timeout = outcome.repair_timeout();
+    let health = outcome.snapshot();
+    outcome.channel_closed()
+        || health.lost_events != baseline_lost
+        || matches!(health.state, ConnectionState::Disconnected(_))
 }

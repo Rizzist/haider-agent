@@ -36,7 +36,9 @@ use haider_platform::{PeerEndpointKind, peer_endpoint_paths};
 
 const MESSAGE_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 const PEER_ADDRESS_MAX_BYTES: usize = PEER_ID_MAX_BYTES + PEER_NAME_MAX_BYTES + 3;
-const RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
+const RECONCILE_DEBOUNCE: Duration = Duration::from_millis(500);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const RECONCILE_AUDIT_INTERVAL: Duration = Duration::from_secs(30);
 const MANIFEST_HEARTBEAT_MS: u64 = 5_000;
 pub(super) const MANIFEST_CREATION_SYNC_POLICY: haider_platform::SyncPolicy =
     haider_platform::SyncPolicy::Full;
@@ -242,12 +244,14 @@ impl PeerService {
         service.recovering.store(false, Ordering::Release);
         let weak = Arc::downgrade(&service);
         let task = tokio::spawn(async move {
-            let mut maintenance_tick = tokio::time::interval(RECONCILE_INTERVAL);
-            maintenance_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // Consume `interval`'s immediate first tick: startup reconciliation
-            // already established the complete publication set above.
-            maintenance_tick.tick().await;
-            let mut roster_dirty = false;
+            let now = tokio::time::Instant::now();
+            let mut heartbeat =
+                tokio::time::interval_at(now + HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut audit =
+                tokio::time::interval_at(now + RECONCILE_AUDIT_INTERVAL, RECONCILE_AUDIT_INTERVAL);
+            audit.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut debounce = None;
             loop {
                 let Some(service) = weak.upgrade() else {
                     return;
@@ -257,16 +261,36 @@ impl PeerService {
                 }
                 let reconcile = tokio::select! {
                     biased;
-                    _ = maintenance_tick.tick() => std::mem::take(&mut roster_dirty),
-                    () = service.wake.notified() => true,
+                    () = service.wake.notified() => {
+                        debounce = None;
+                        true
+                    },
+                    () = async {
+                        if let Some(deadline) = debounce.as_mut() {
+                            deadline.await;
+                        }
+                    }, if debounce.is_some() => {
+                        debounce = None;
+                        true
+                    },
+                    _ = audit.tick() => {
+                        // Repair a publication that was lost before reaching
+                        // the broadcast receiver or while it was lagged.
+                        debounce = None;
+                        true
+                    },
+                    _ = heartbeat.tick() => false,
                     received = roster_changes.recv() => match received {
                         Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             // The roster publication stream is broader than
                             // peer descriptor state: every committed append
-                            // publishes. Coalesce that burst at the fixed tick
-                            // rather than turning one append into an N-session
-                            // store walk. Explicit `wake` remains immediate.
-                            roster_dirty = true;
+                            // publishes. Arm one debounce only after an event
+                            // so a quiet daemon has no 500 ms maintenance tick.
+                            // Ready deadlines precede this branch so an event
+                            // storm cannot starve the debounce or repair audit.
+                            debounce.get_or_insert_with(|| {
+                                Box::pin(tokio::time::sleep(RECONCILE_DEBOUNCE))
+                            });
                             continue;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
@@ -276,17 +300,18 @@ impl PeerService {
                     return;
                 }
                 let result = if reconcile {
-                    roster_dirty = false;
                     service.reconcile_once().await
                 } else {
-                    // The periodic tick is only a liveness heartbeat over the
-                    // cached publications. Store-backed roster reconciliation
-                    // is driven by an actual roster/wake publication.
+                    // The five-second timer is only a liveness heartbeat over
+                    // cached publications. Store-backed reconciliation is
+                    // event driven, with the 30-second audit as repair.
                     service.heartbeat_once().await
                 };
                 if let Err(error) = result {
                     if reconcile {
-                        roster_dirty = true;
+                        debounce.get_or_insert_with(|| {
+                            Box::pin(tokio::time::sleep(RECONCILE_DEBOUNCE))
+                        });
                     }
                     tracing::warn!(target: "haider.peer", %error, "peer maintenance failed");
                 }

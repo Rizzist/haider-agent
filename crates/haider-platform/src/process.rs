@@ -1034,6 +1034,15 @@ async fn observe_process_leader_exit_with_kqueue(pid: ProcessId) -> std::io::Res
     use nix::libc::timespec;
     use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 
+    const NOTIFICATION_REPAIR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+    // A leader can become waitable between the caller's probe and kqueue
+    // registration. Probe immediately before arming so an already-reaped
+    // registration failure cannot strand this wait.
+    if process_leader_exited(pid)? {
+        return Ok(true);
+    }
+
     let queue = Kqueue::new().map_err(std::io::Error::other)?;
     let event = KEvent::new(
         pid.id() as usize,
@@ -1054,15 +1063,34 @@ async fn observe_process_leader_exit_with_kqueue(pid: ProcessId) -> std::io::Res
     if registered.is_err() {
         return process_leader_exited(pid).map(|exited| exited.then_some(()).is_some());
     }
-    let (sender, receiver) = tokio::sync::oneshot::channel();
+
+    // Registration precedes this second probe. An exit racing the arm is
+    // therefore either visible here or retained by kqueue for the event wait.
+    if process_leader_exited(pid)? {
+        return Ok(true);
+    }
+
+    let (sender, mut receiver) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
         .name("haider-process-exit".into())
         .spawn(move || {
-            let mut events = [event];
-            let result = queue
-                .kevent(&[], &mut events, None)
-                .map(|count| count != 0)
-                .map_err(std::io::Error::other);
+            let timeout = timespec {
+                tv_sec: NOTIFICATION_REPAIR_INTERVAL.as_secs() as _,
+                tv_nsec: 0,
+            };
+            let result = loop {
+                let mut events = [event];
+                match queue.kevent(&[], &mut events, Some(timeout)) {
+                    Ok(count) if count != 0 => break Ok(true),
+                    Ok(_) => match process_leader_exited(pid) {
+                        Ok(true) => break Ok(true),
+                        Ok(false) if sender.is_closed() => return,
+                        Ok(false) => {}
+                        Err(error) => break Err(error),
+                    },
+                    Err(error) => break Err(std::io::Error::other(error)),
+                }
+            };
             let _ = sender.send(result);
         })
         .map_err(|error| {
@@ -1071,12 +1099,30 @@ async fn observe_process_leader_exit_with_kqueue(pid: ProcessId) -> std::io::Res
                 format!("could not start process-exit observer: {error}"),
             )
         })?;
-    tokio::select! {
-        result = receiver => result
-            .map_err(|error| std::io::Error::other(format!("process-exit observer stopped: {error}")))?,
-        result = observe_process_leader_exit_by_polling(pid) => {
-            result?;
-            Ok(true)
+    loop {
+        match crate::bounded_wait(
+            "macOS process-exit notification",
+            NOTIFICATION_REPAIR_INTERVAL,
+            &mut receiver,
+        )
+        .await
+        {
+            crate::BoundedWait::Completed(result) => {
+                return result.map_err(|error| {
+                    std::io::Error::other(format!("process-exit observer stopped: {error}"))
+                })?;
+            }
+            crate::BoundedWait::TimedOut(_timeout) => {
+                // A dropped/coalesced kernel notification cannot hang the
+                // observer: both the kernel wait and this typed deadline audit
+                // waitable state every 30 s. Callers' existing execution
+                // deadlines remain the faster cancellation bound, and a
+                // dropped caller closes the sender so the kernel thread stops
+                // no later than its next audit.
+                if process_leader_exited(pid)? {
+                    return Ok(true);
+                }
+            }
         }
     }
 }

@@ -50,7 +50,8 @@ use tokio::time::Instant;
 use std::os::unix::fs::OpenOptionsExt as _;
 
 use crate::client::{
-    ClientConfig, ClientError, ConnectionState, DisconnectReason, RpcClient, connect,
+    ClientConfig, ClientError, ClientHealthWait, ConnectionState, DisconnectReason, RpcClient,
+    connect,
 };
 use crate::profile::ResolvedProfile;
 #[cfg(unix)]
@@ -78,7 +79,7 @@ pub const ERROR_CODE_NO_ACTIVE_ACCOUNT: &str = "no_active_account";
 pub const ERROR_CODE_NO_DEFAULT_MODEL: &str = "no_default_model";
 
 const MAX_RECONNECTS: u8 = 3;
-const ATTACH_HEALTH_POLL: Duration = Duration::from_millis(10);
+const ATTACH_HEALTH_REPAIR_INTERVAL: Duration = Duration::from_secs(30);
 const EPHEMERAL_DRAIN_ALLOWANCE: Duration = Duration::from_secs(5);
 const EPHEMERAL_REAP_GRACE: Duration = Duration::from_millis(250);
 static COMMAND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -3475,21 +3476,28 @@ async fn attach_buffered_once(
     connection.attachment_id = Some(attachment_id.clone());
     connection.observed_lost_events = attach_loss_baseline;
 
-    let mut health = tokio::time::interval(ATTACH_HEALTH_POLL);
-    health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let health = connection.client.health_watch();
+    let mut health_wait = Box::pin(health.wait(
+        "headless buffered attach health",
+        ATTACH_HEALTH_REPAIR_INTERVAL,
+    ));
     loop {
         let frame = tokio::select! {
+            biased;
             frame = connection.events.recv() => frame,
-            _ = health.tick() => {
-                if connection.client.lost_events() != attach_loss_baseline {
+            outcome = &mut health_wait => {
+                let (health, outcome) = outcome;
+                if !attached_health_is_healthy(
+                    &outcome,
+                    attach_loss_baseline,
+                    "session.attach before submit retry",
+                )? {
                     return Ok(false);
                 }
-                if let ConnectionState::Disconnected(reason) = connection.client.state() {
-                    return Err(HeadlessRunError::Transport {
-                        stage: "session.attach before submit retry",
-                        reason,
-                    });
-                }
+                health_wait = Box::pin(health.wait(
+                    "headless buffered attach health",
+                    ATTACH_HEALTH_REPAIR_INTERVAL,
+                ));
                 continue;
             }
         };
@@ -3524,6 +3532,13 @@ async fn attach_buffered_once(
                 ));
             }
             _ => {}
+        }
+        // Frames stay ahead of health so a disconnect cannot hide a buffered
+        // terminal fact. A saturated frame lane can otherwise starve the
+        // health future itself, so probe the retained loss generation after
+        // every consumed frame and repair the gap immediately.
+        if connection.client.lost_events() != attach_loss_baseline {
+            return Ok(false);
         }
     }
 }
@@ -3568,21 +3583,25 @@ async fn attach_once(
     connection.attachment_id = Some(attachment_id.clone());
     connection.observed_lost_events = attach_loss_baseline;
 
-    let mut health = tokio::time::interval(ATTACH_HEALTH_POLL);
-    health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let health = connection.client.health_watch();
+    let mut health_wait =
+        Box::pin(health.wait("headless attach health", ATTACH_HEALTH_REPAIR_INTERVAL));
     loop {
         let frame = tokio::select! {
+            biased;
             frame = connection.events.recv() => frame,
-            _ = health.tick() => {
-                if connection.client.lost_events() != attach_loss_baseline {
+            outcome = &mut health_wait => {
+                let (health, outcome) = outcome;
+                if !attached_health_is_healthy(
+                    &outcome,
+                    attach_loss_baseline,
+                    "session.attach replay",
+                )? {
                     return Ok(false);
                 }
-                if let ConnectionState::Disconnected(reason) = connection.client.state() {
-                    return Err(HeadlessRunError::Transport {
-                        stage: "session.attach replay",
-                        reason,
-                    });
-                }
+                health_wait = Box::pin(
+                    health.wait("headless attach health", ATTACH_HEALTH_REPAIR_INTERVAL),
+                );
                 continue;
             }
         };
@@ -3618,6 +3637,40 @@ async fn attach_once(
             }
             _ => {}
         }
+        // Preserve queued-frame-first semantics while making overload
+        // bounded: even if `events.recv()` remains continuously ready, a
+        // dropped frame is observed after the next frame we do consume.
+        if connection.client.lost_events() != attach_loss_baseline {
+            return Ok(false);
+        }
+    }
+}
+
+fn attached_health_is_healthy(
+    outcome: &ClientHealthWait,
+    lost_events_baseline: u64,
+    stage: &'static str,
+) -> Result<bool, HeadlessRunError> {
+    // `RepairDue` carries the typed WaitTimeout that makes a lost watch wake a
+    // bounded condition. The same latest-value probes are authoritative for
+    // both a notification and the 30 s repair path.
+    let _repair_timeout = outcome.repair_timeout();
+    let health = outcome.snapshot();
+    if health.lost_events != lost_events_baseline {
+        return Ok(false);
+    }
+    match &health.state {
+        ConnectionState::Disconnected(reason) => Err(HeadlessRunError::Transport {
+            stage,
+            reason: reason.clone(),
+        }),
+        ConnectionState::Connected if outcome.channel_closed() => {
+            Err(HeadlessRunError::Transport {
+                stage,
+                reason: DisconnectReason::Closed,
+            })
+        }
+        ConnectionState::Connected => Ok(true),
     }
 }
 
