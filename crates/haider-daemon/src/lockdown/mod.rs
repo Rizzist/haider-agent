@@ -582,9 +582,9 @@ impl LockdownManager {
         operation: impl FnOnce(&mut QuotaLedger) -> Result<T, LockdownError>,
     ) -> Result<T, LockdownError> {
         self.with_global_lock(|| {
-            let mut ledger = self.load_ledger()?;
+            let (mut ledger, existing_bytes) = self.load_ledger()?;
             let value = operation(&mut ledger)?;
-            self.persist_ledger(&ledger)?;
+            self.persist_ledger_if_changed(&ledger, existing_bytes.as_deref())?;
             Ok(value)
         })
     }
@@ -611,7 +611,7 @@ impl LockdownManager {
         }
     }
 
-    fn load_ledger(&self) -> Result<QuotaLedger, LockdownError> {
+    fn load_ledger(&self) -> Result<(QuotaLedger, Option<Vec<u8>>), LockdownError> {
         let path = self.root.join(QUOTA_FILE);
         refuse_symlink(&path)?;
         match fs::read(&path) {
@@ -637,24 +637,34 @@ impl LockdownManager {
                         reason: format!("unsupported version {}", ledger.version),
                     });
                 }
-                Ok(ledger)
+                Ok((ledger, Some(bytes)))
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(QuotaLedger {
-                version: LEDGER_VERSION,
-                limit: DEFAULT_QUOTA_BYTES,
-                used: 0,
-                commands: Vec::new(),
-            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((
+                QuotaLedger {
+                    version: LEDGER_VERSION,
+                    limit: DEFAULT_QUOTA_BYTES,
+                    used: 0,
+                    commands: Vec::new(),
+                },
+                None,
+            )),
             Err(source) => Err(io_error("read", &path, source)),
         }
     }
 
-    fn persist_ledger(&self, ledger: &QuotaLedger) -> Result<(), LockdownError> {
+    fn persist_ledger_if_changed(
+        &self,
+        ledger: &QuotaLedger,
+        existing_bytes: Option<&[u8]>,
+    ) -> Result<(), LockdownError> {
         let bytes =
             serde_json::to_vec_pretty(ledger).map_err(|error| LockdownError::InvalidLedger {
                 path: self.root.join(QUOTA_FILE),
                 reason: error.to_string(),
             })?;
+        if existing_bytes == Some(bytes.as_slice()) {
+            return Ok(());
+        }
         atomic_write_named(&self.root, QUOTA_TEMP_FILE, QUOTA_FILE, &bytes)
     }
 

@@ -1159,7 +1159,13 @@ INSERT OR IGNORE INTO profile_meta(singleton, worker_generation) VALUES (1, 0);
 
 /// Brings a fresh or older-version database up to `CURRENT_SCHEMA_VERSION`.
 /// Idempotent: re-running on an up-to-date database applies nothing.
-pub(crate) fn migrate(connection: &mut Connection) -> StoreResult<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MigrationOutcome {
+    ExistingSchema,
+    BootstrappedFromZero,
+}
+
+pub(crate) fn migrate(connection: &mut Connection) -> StoreResult<MigrationOutcome> {
     let found: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(sqlite_error)?;
@@ -1174,13 +1180,16 @@ pub(crate) fn migrate(connection: &mut Connection) -> StoreResult<()> {
         ));
     }
 
-    if found == 0 && database_has_no_schema(connection)? {
+    let outcome = if found == 0 && database_has_no_schema(connection)? {
         bootstrap_latest(connection)?;
+        MigrationOutcome::BootstrappedFromZero
     } else {
         migrate_incrementally(connection, found)?;
-    }
+        MigrationOutcome::ExistingSchema
+    };
 
-    validate_registry(connection)
+    validate_registry(connection)?;
+    Ok(outcome)
 }
 
 fn database_has_no_schema(connection: &Connection) -> StoreResult<bool> {

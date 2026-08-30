@@ -3,7 +3,7 @@
 use rusqlite::Connection;
 
 use super::{
-    CURRENT_SCHEMA_VERSION, LATEST_SCHEMA_VERSION, bootstrap_latest, migrate,
+    CURRENT_SCHEMA_VERSION, LATEST_SCHEMA_VERSION, MigrationOutcome, bootstrap_latest, migrate,
     migrate_incrementally, validate_registry,
 };
 
@@ -53,7 +53,15 @@ fn fresh_database_bootstraps_directly_to_latest() {
     assert_eq!(LATEST_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION);
     let mut connection = memory_database();
 
-    migrate(&mut connection).expect("bootstrap latest schema through production entry point");
+    assert_eq!(
+        migrate(&mut connection).expect("bootstrap latest schema through production entry point"),
+        MigrationOutcome::BootstrappedFromZero
+    );
+    assert_eq!(
+        migrate(&mut connection).expect("reopen existing empty schema"),
+        MigrationOutcome::ExistingSchema,
+        "schema emptiness must never be inferred as a fresh-bootstrap proof"
+    );
     validate_registry(&connection).expect("validate bootstrap registry");
 
     let user_version: u32 = connection

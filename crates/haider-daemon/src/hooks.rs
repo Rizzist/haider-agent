@@ -832,7 +832,8 @@ impl HookEngine {
     ) -> Result<(HookService, Self), haider_protocol::error::HaiderError> {
         let hydration = HookStartupHydrator::prepare(&store).await?;
         let hydration = crate::runtime::finish_hook_hydration_for_test(&store, hydration).await?;
-        Self::start_with_state(profile_root, store, hub, hydration.into_state()).await
+        let (state, snapshot_dirty) = hydration.into_state();
+        Self::start_with_state(profile_root, store, hub, state, snapshot_dirty).await
     }
 
     pub(crate) async fn start_hydrated(
@@ -841,7 +842,8 @@ impl HookEngine {
         hub: SessionHub,
         hydration: HookStartupHydrator,
     ) -> Result<(HookService, Self), haider_protocol::error::HaiderError> {
-        Self::start_with_state(profile_root, store, hub, hydration.into_state()).await
+        let (state, snapshot_dirty) = hydration.into_state();
+        Self::start_with_state(profile_root, store, hub, state, snapshot_dirty).await
     }
 
     async fn start_with_state(
@@ -849,8 +851,13 @@ impl HookEngine {
         store: haider_core::SqliteStoreHandle,
         hub: SessionHub,
         state: EngineState,
+        snapshot_dirty: bool,
     ) -> Result<(HookService, Self), haider_protocol::error::HaiderError> {
-        let changes = store.hook_trust_changes().await?;
+        let changes = if store.schema_bootstrapped_from_zero() {
+            Vec::new()
+        } else {
+            store.hook_trust_changes().await?
+        };
         let mut pins = HashSet::new();
         let mut workspace_baselines = HashMap::new();
         for change in changes {
@@ -890,15 +897,13 @@ impl HookEngine {
                 discovery_stamp_count: AtomicU64::new(0),
             }),
         };
-        if let Err(error) = persist_service_snapshot(&service, &state).await {
-            tracing::warn!(target: "haider.hooks", %error, "hook-engine snapshot persistence failed; journal rebuild remains authoritative");
-        }
         let manager_service = service.clone();
         let task = tokio::spawn(run_engine(
             control_receiver,
             wake_receiver,
             manager_service,
             state,
+            snapshot_dirty,
         ));
         Ok((
             service.clone(),
@@ -1139,13 +1144,33 @@ struct HookEngineSnapshotFile {
 /// Runtime feeds it the same decoded pages as turn recovery.
 pub(crate) struct HookStartupHydrator {
     state: EngineState,
+    snapshot_dirty: bool,
 }
 
 impl HookStartupHydrator {
+    /// Constructs the only query-free hydration state: the store itself just
+    /// committed a complete schema bootstrap from zero while holding the
+    /// profile lock, so no authoritative hook events can exist.
+    pub(crate) fn schema_zero() -> Self {
+        Self {
+            state: EngineState {
+                sessions: HashMap::new(),
+                run_trust: HashSet::new(),
+                terminal_run_trust: HashSet::new(),
+                through_seq: HashMap::new(),
+                through_digest: HashMap::new(),
+                notice_dedup: HashSet::new(),
+                subscribers: HashMap::new(),
+            },
+            snapshot_dirty: false,
+        }
+    }
+
     pub(crate) async fn prepare(
         store: &haider_core::SqliteStoreHandle,
     ) -> Result<Self, haider_protocol::error::HaiderError> {
         let snapshot = load_engine_snapshot(store).await;
+        let snapshot_loaded = snapshot.is_some();
         let (sessions, run_trust, terminal_run_trust, through_seq, through_digest) = snapshot
             .map_or_else(
                 || {
@@ -1176,6 +1201,7 @@ impl HookStartupHydrator {
             notice_dedup: HashSet::new(),
             subscribers: HashMap::new(),
         };
+        let initial_counts = hook_snapshot_state_counts(&state);
         let session_ids = store.session_ids().await?;
         let current_sessions = session_ids.iter().cloned().collect::<HashSet<_>>();
         state
@@ -1231,7 +1257,12 @@ impl HookStartupHydrator {
                 clear_hook_session(&mut state, session_id);
             }
         }
-        Ok(Self { state })
+        let snapshot_dirty =
+            snapshot_loaded && hook_snapshot_state_counts(&state) != initial_counts;
+        Ok(Self {
+            state,
+            snapshot_dirty,
+        })
     }
 
     pub(crate) fn scan_start(&self, session_id: &SessionId) -> u64 {
@@ -1248,6 +1279,7 @@ impl HookStartupHydrator {
             advance_durable_cursor(&mut self.state, envelope);
             reduce_decoded_durable_state(&mut self.state, envelope, &payload);
             since_seq = envelope.seq;
+            self.snapshot_dirty = true;
         }
     }
 
@@ -1269,12 +1301,23 @@ impl HookStartupHydrator {
                 session_id.clone(),
                 hook_boundary_event_id_digest(boundary_event_id),
             );
+            self.snapshot_dirty = true;
         }
     }
 
-    fn into_state(self) -> EngineState {
-        self.state
+    fn into_state(self) -> (EngineState, bool) {
+        (self.state, self.snapshot_dirty)
     }
+}
+
+fn hook_snapshot_state_counts(state: &EngineState) -> (usize, usize, usize, usize, usize) {
+    (
+        state.sessions.len(),
+        state.run_trust.len(),
+        state.terminal_run_trust.len(),
+        state.through_seq.len(),
+        state.through_digest.len(),
+    )
 }
 
 #[derive(Debug)]
@@ -1509,9 +1552,9 @@ struct SnapshotSchedule {
 }
 
 impl SnapshotSchedule {
-    fn new(now: Instant) -> Self {
+    fn new(now: Instant, dirty: bool) -> Self {
         Self {
-            dirty: false,
+            dirty,
             last_commit: None,
             last_attempt: now,
         }
@@ -1566,6 +1609,9 @@ async fn attempt_scheduled_snapshot(
     state: &EngineState,
     schedule: &mut SnapshotSchedule,
 ) -> Result<(), HookSnapshotPersistError> {
+    if !schedule.dirty {
+        return Ok(());
+    }
     let result = persist_service_snapshot(service, state).await;
     schedule.note_attempt(Instant::now(), result.is_ok());
     result
@@ -1576,6 +1622,7 @@ async fn run_engine(
     mut committed_wake: watch::Receiver<Option<DurableHeadWake>>,
     service: HookService,
     mut state: EngineState,
+    mut snapshot_dirty: bool,
 ) {
     let mut jobs = JoinSet::new();
     let inflight_dispatches = Arc::new(Mutex::new(HookDispatchFlights::default()));
@@ -1585,8 +1632,10 @@ async fn run_engine(
         while jobs.join_next().await.is_some() {}
         return;
     }
+    let terminal_trust_before = state.terminal_run_trust.len();
     prune_terminal_run_trust(&mut state);
-    let mut snapshot_schedule = SnapshotSchedule::new(Instant::now());
+    snapshot_dirty |= terminal_trust_before != 0;
+    let mut snapshot_schedule = SnapshotSchedule::new(Instant::now(), snapshot_dirty);
     let mut blocked_run_acks = HashSet::new();
     loop {
         let snapshot_deadline = snapshot_schedule.deadline();
@@ -1676,6 +1725,7 @@ async fn run_engine(
                                 .as_ref()
                                 .is_none_or(|(candidate, _)| candidate != &session_id)
                         });
+                        snapshot_schedule.note_commit(Instant::now());
                         if let Err(error) = attempt_scheduled_snapshot(
                             &service,
                             &state,

@@ -177,7 +177,7 @@ struct WriterState {
 
 pub(crate) struct EffectDiagnostics {
     root: PathBuf,
-    writer: Mutex<WriterState>,
+    writer: Mutex<Option<WriterState>>,
 }
 
 impl EffectDiagnostics {
@@ -188,6 +188,15 @@ impl EffectDiagnostics {
     pub(crate) async fn open(
         store_dir: PathBuf,
     ) -> std::io::Result<(Arc<Self>, Vec<PriorUnexpectedExit>)> {
+        if !diagnostic_journal_exists(&store_dir)? {
+            return Ok((
+                Arc::new(Self {
+                    root: store_dir,
+                    writer: Mutex::new(None),
+                }),
+                Vec::new(),
+            ));
+        }
         tokio::task::spawn_blocking(move || Self::open_blocking(&store_dir))
             .await
             .map_err(|error| {
@@ -196,14 +205,11 @@ impl EffectDiagnostics {
     }
 
     fn open_blocking(store_dir: &Path) -> std::io::Result<(Arc<Self>, Vec<PriorUnexpectedExit>)> {
-        std::fs::create_dir_all(store_dir)?;
         let starts = scan_unreported_starts(store_dir);
-        let path = store_dir.join(EFFECT_DIAGNOSTIC_FILE);
-        let file = open_owner_append(&path)?;
-        let len = file.metadata()?.len();
+        let writer = Some(open_writer(store_dir)?);
         let diagnostics = Arc::new(Self {
             root: store_dir.to_path_buf(),
-            writer: Mutex::new(WriterState { file, len }),
+            writer: Mutex::new(writer),
         });
         let mut evidence = starts
             .values()
@@ -227,6 +233,11 @@ impl EffectDiagnostics {
                 diagnostics.append_locked(&mut writer, &DiagnosticRecord::surfaced(&orphan))?;
             }
             // Surfacing is a one-shot evidence boundary and retains full durability.
+            let Some(writer) = writer.as_ref() else {
+                return Err(std::io::Error::other(
+                    "effect diagnostic writer was not opened for surfaced evidence",
+                ));
+            };
             haider_platform::fs::sync_file(&writer.file, haider_platform::SyncPolicy::Full)
         })
         .await
@@ -272,12 +283,17 @@ impl EffectDiagnostics {
     ) -> std::io::Result<()> {
         let mut writer = self.lock_writer()?;
         self.append_locked(&mut writer, record)?;
+        let Some(writer) = writer.as_ref() else {
+            return Err(std::io::Error::other(
+                "effect diagnostic writer was not opened after append",
+            ));
+        };
         haider_platform::fs::sync_file(&writer.file, policy)
     }
 
     fn append_locked(
         &self,
-        writer: &mut WriterState,
+        writer: &mut Option<WriterState>,
         record: &DiagnosticRecord,
     ) -> std::io::Result<()> {
         let mut encoded = serde_json::to_vec(record)
@@ -289,9 +305,20 @@ impl EffectDiagnostics {
                 encoded.len()
             )));
         }
-        if writer.len.saturating_add(encoded.len() as u64) > SEGMENT_BYTES {
-            *writer = self.rotate()?;
+        if writer.is_none() {
+            *writer = Some(open_writer(&self.root)?);
         }
+        if writer
+            .as_ref()
+            .is_some_and(|writer| writer.len.saturating_add(encoded.len() as u64) > SEGMENT_BYTES)
+        {
+            *writer = Some(self.rotate()?);
+        }
+        let Some(writer) = writer.as_mut() else {
+            return Err(std::io::Error::other(
+                "effect diagnostic writer initialization did not produce a writer",
+            ));
+        };
         writer.file.write_all(&encoded)?;
         writer.len = writer.len.saturating_add(encoded.len() as u64);
         Ok(())
@@ -317,7 +344,7 @@ impl EffectDiagnostics {
         Ok(WriterState { file, len: 0 })
     }
 
-    fn lock_writer(&self) -> std::io::Result<std::sync::MutexGuard<'_, WriterState>> {
+    fn lock_writer(&self) -> std::io::Result<std::sync::MutexGuard<'_, Option<WriterState>>> {
         self.writer
             .lock()
             .map_err(|_| std::io::Error::other("effect diagnostic writer lock is poisoned"))
@@ -326,6 +353,17 @@ impl EffectDiagnostics {
     pub(crate) fn workspace_digest(path: &str) -> String {
         format!("blake3:{}", blake3::hash(path.as_bytes()).to_hex())
     }
+}
+
+fn diagnostic_journal_exists(root: &Path) -> std::io::Result<bool> {
+    for index in 0..RETAINED_SEGMENTS {
+        match std::fs::symlink_metadata(segment_path(root, index)) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
 }
 
 fn scan_unreported_starts(store_dir: &Path) -> HashMap<DiagnosticKey, DiagnosticRecord> {
@@ -372,6 +410,12 @@ fn open_owner_append(path: &Path) -> std::io::Result<File> {
         options.mode(0o600);
     }
     options.open(path)
+}
+
+fn open_writer(root: &Path) -> std::io::Result<WriterState> {
+    let file = open_owner_append(&root.join(EFFECT_DIAGNOSTIC_FILE))?;
+    let len = file.metadata()?.len();
+    Ok(WriterState { file, len })
 }
 
 fn safe_identifier(value: &str, maximum: usize) -> String {
@@ -423,6 +467,26 @@ mod tests {
             // malformed caller value rather than leak it.
             args_digest: secret.into(),
         }
+    }
+
+    #[tokio::test]
+    async fn fresh_open_is_lazy_until_the_first_diagnostic_record() {
+        let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let path = root.path().join(EFFECT_DIAGNOSTIC_FILE);
+        let (diagnostics, evidence) = EffectDiagnostics::open(root.path().to_path_buf())
+            .await
+            .unwrap_or_else(|error| panic!("open fresh diagnostics: {error}"));
+        assert!(evidence.is_empty());
+        assert!(!path.exists(), "opening an absent journal must remain lazy");
+
+        diagnostics
+            .record_start(breadcrumb("lazy-writer"))
+            .await
+            .unwrap_or_else(|error| panic!("write first diagnostic: {error}"));
+        assert!(
+            path.is_file(),
+            "first use must create the diagnostic journal"
+        );
     }
 
     #[tokio::test]
