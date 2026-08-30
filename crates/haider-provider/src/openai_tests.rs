@@ -332,21 +332,37 @@ async fn hanging_openai_fixture_times_out_only_the_idle_chunk_await() {
 }
 
 #[test]
-fn openai_transport_defaults_split_connect_open_and_idle_budgets() {
+fn openai_silent_phase_deadlines_precede_common_run_supervisors() {
     let config = OpenAiProvider::transport_config();
     assert_eq!(config.connect_timeout, Duration::from_secs(10));
-    assert_eq!(config.response_open_timeout, Duration::from_secs(60));
-    assert_eq!(config.chunk_idle_timeout, Duration::from_secs(90));
+    assert_eq!(config.response_open_timeout, Duration::from_secs(10));
+    assert_eq!(config.chunk_idle_timeout, Duration::from_secs(10));
+
+    let supervisor_deadline = Duration::from_secs(15);
+    for (phase, deadline) in [
+        ("connect", config.connect_timeout),
+        ("response-open", config.response_open_timeout),
+        ("chunk-idle", config.chunk_idle_timeout),
+    ] {
+        assert!(
+            deadline < supervisor_deadline,
+            "{phase} silence must terminalize before a common 15-second supervisor"
+        );
+    }
 
     let open =
         response_open_timeout_error(config.response_open_timeout, config.response_open_timeout);
     assert_eq!(open.kind, ProviderErrorKind::Transport);
     assert_eq!(open.presentation.subcode.as_str(), "provider-timeout");
     assert!(open.retryable, "response-open timeouts are transient");
-    assert_eq!(open.opened_within_ms, Some(60_000));
-    assert_eq!(open.budget_ms, Some(60_000));
-    assert_eq!(open.presentation.opened_within_ms, Some(60_000));
-    assert_eq!(open.presentation.budget_ms, Some(60_000));
+    assert_eq!(
+        open.timeout_reason,
+        Some(crate::ProviderTimeoutReason::ResponseOpen)
+    );
+    assert_eq!(open.opened_within_ms, Some(10_000));
+    assert_eq!(open.budget_ms, Some(10_000));
+    assert_eq!(open.presentation.opened_within_ms, Some(10_000));
+    assert_eq!(open.presentation.budget_ms, Some(10_000));
     let connect = connect_timeout_error(config.connect_timeout);
     assert_eq!(connect.kind, ProviderErrorKind::Transport);
     assert_eq!(connect.presentation.subcode.as_str(), "provider-timeout");
@@ -376,7 +392,7 @@ fn effective_request_budget_obeys_provider_and_run_deadlines() {
     assert_eq!(
         crate::effective_request_budget(Duration::from_secs(60), None, margin),
         Ok(Duration::from_secs(60)),
-        "interactive requests retain the provider's 60s default"
+        "an explicitly configured 60s provider budget remains available"
     );
     assert_eq!(
         crate::effective_request_budget(
@@ -509,14 +525,19 @@ async fn response_open_budget_accepts_a_mock_upstream_that_opens_at_twenty_secon
         "slow-open-model",
         &origin,
     )
-    .expect("construct loopback provider");
+    .expect("construct loopback provider")
+    .with_transport_config(OpenAiTransportConfig {
+        response_open_timeout: Duration::from_secs(30),
+        ..OPENAI_DEFAULT_TRANSPORT_CONFIG
+    })
+    .expect("raise the cold-provider response-open budget");
     let opening = tokio::spawn(async move {
         provider
             .capture_response(&probe_request("slow-open-model"))
             .await
     });
     // Real loopback I/O must complete before virtual time is paused. Starting
-    // paused lets Tokio auto-advance the 60-second transport timer while a
+    // paused lets Tokio auto-advance the transport timer while a
     // loaded macOS runner is still scheduling connect/read readiness.
     accepted_rx.await.expect("request reached slow upstream");
     tokio::time::pause();
@@ -529,7 +550,7 @@ async fn response_open_budget_accepts_a_mock_upstream_that_opens_at_twenty_secon
     let capture = opening
         .await
         .expect("open task exits")
-        .expect("20-second response opens under the default budget");
+        .expect("20-second response opens under the explicit 30-second budget");
     assert_eq!(capture.status, 200);
     assert_eq!(capture.body, b"{}");
 }
@@ -576,7 +597,12 @@ async fn response_open_budget_fails_typed_after_sixty_one_seconds() {
         "slow-open-model",
         &origin,
     )
-    .expect("construct loopback provider");
+    .expect("construct loopback provider")
+    .with_transport_config(OpenAiTransportConfig {
+        response_open_timeout: Duration::from_secs(60),
+        ..OPENAI_DEFAULT_TRANSPORT_CONFIG
+    })
+    .expect("raise the response-open budget for the timeout fixture");
     let opening = tokio::spawn(async move {
         provider
             .capture_response(&probe_request("slow-open-model"))
@@ -593,6 +619,10 @@ async fn response_open_budget_fails_typed_after_sixty_one_seconds() {
         .expect_err("the local request deadline fires");
     assert_eq!(error.kind, ProviderErrorKind::Transport);
     assert!(error.retryable);
+    assert_eq!(
+        error.timeout_reason,
+        Some(crate::ProviderTimeoutReason::ResponseOpen)
+    );
     assert_eq!(error.opened_within_ms, Some(60_000));
     assert_eq!(error.budget_ms, Some(60_000));
     assert_eq!(error.presentation.opened_within_ms, Some(60_000));

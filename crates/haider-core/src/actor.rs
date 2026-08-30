@@ -9254,6 +9254,13 @@ fn provider_error_allows_retry(
     {
         return false;
     }
+    // A locally bounded response-open wait is still retryable by the caller,
+    // but launching the same silent request again can outlive the process
+    // supervisors that wrap headless runs. Preserve the typed Retry action
+    // while terminalizing this attempt under Haider's own control.
+    if error.timeout_reason == Some(ProviderTimeoutReason::ResponseOpen) {
+        return false;
+    }
     let Some(deadline) = deadline else {
         return true;
     };

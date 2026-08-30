@@ -383,8 +383,8 @@ fn transport_config_disables_reqwest_retries_and_bounds_stream_waits() {
     assert_eq!(native, compatible);
     assert_eq!(native.retry_policy, OpenAiRetryPolicy::Never);
     assert_eq!(native.connect_timeout, Duration::from_secs(10));
-    assert_eq!(native.response_open_timeout, Duration::from_secs(60));
-    assert_eq!(native.chunk_idle_timeout, Duration::from_secs(90));
+    assert_eq!(native.response_open_timeout, Duration::from_secs(10));
+    assert_eq!(native.chunk_idle_timeout, Duration::from_secs(10));
 }
 
 #[test]

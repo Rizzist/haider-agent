@@ -136,8 +136,8 @@ const ERROR_BODY_LIMIT: usize = crate::HTTP_ERROR_BODY_LIMIT;
 pub const OPENAI_DEFAULT_TRANSPORT_CONFIG: OpenAiTransportConfig = OpenAiTransportConfig {
     retry_policy: OpenAiRetryPolicy::Never,
     connect_timeout: Duration::from_secs(10),
-    response_open_timeout: Duration::from_secs(60),
-    chunk_idle_timeout: Duration::from_secs(90),
+    response_open_timeout: Duration::from_secs(10),
+    chunk_idle_timeout: Duration::from_secs(10),
     semantic_progress_timeout: Duration::from_secs(5 * 60),
 };
 
@@ -294,10 +294,12 @@ pub struct OpenAiTransportConfig {
     pub retry_policy: OpenAiRetryPolicy,
     /// TCP/TLS connection establishment budget (10 seconds by default).
     pub connect_timeout: Duration,
-    /// Time from request execution to response headers (60 seconds by
-    /// default). The caller's run deadline remains the outer bound.
+    /// Time from request execution to response headers (10 seconds by
+    /// default). A provider profile may raise this for a known cold service;
+    /// the caller's run deadline remains the outer bound.
     pub response_open_timeout: Duration,
-    /// Maximum silence between response-body chunks (90 seconds by default).
+    /// Maximum silence between response-body chunks (10 seconds by default).
+    /// A provider profile may raise this for a known slow stream.
     pub chunk_idle_timeout: Duration,
     /// Maximum active-route time without model content, tool use, or usage.
     /// Raw SSE comments and heartbeats do not reset this five-minute clock.
@@ -6380,9 +6382,7 @@ fn request_phase_budget(configured: Duration) -> Result<Duration, ProviderError>
         crate::current_provider_deadline_remaining(),
         crate::PROVIDER_DEADLINE_SAFETY_MARGIN,
     )
-    .map_err(|crate::ProviderTimeoutReason::DeadlineExhausted| {
-        crate::deadline_exhausted_error(Duration::ZERO, Duration::ZERO)
-    })
+    .map_err(|_| crate::deadline_exhausted_error(Duration::ZERO, Duration::ZERO))
 }
 
 fn full_request_budget_fits(configured: Duration) -> bool {
@@ -6418,6 +6418,7 @@ fn response_open_timeout_error(timeout: Duration, elapsed: Duration) -> Provider
     )
     .with_presentation(crate::provider_timeout_presentation())
     .with_timeout_budget(opened_within_ms, budget_ms)
+    .with_timeout_reason(crate::ProviderTimeoutReason::ResponseOpen)
 }
 
 fn stream_idle_error(timeout: Duration) -> ProviderError {
