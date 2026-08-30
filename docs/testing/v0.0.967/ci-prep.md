@@ -238,8 +238,11 @@ list instead.
 
 - **#87 thread count is not a lifecycle phase fence** — observing a second
   thread proves only that some helper exists; it does not prove the JSONL
-  output adapter has crossed daemon adoption and run acceptance. A steady-state
-  thread guard must first observe a product-owned phase marker, then enforce its
-  exact count throughout the bounded plateau. The CLI guard now gives the
-  flushed `accepted` record a ten-second deadline before requiring main plus
-  one `tokio-rt-worker` in every sample; its expected count remains two.
+  output adapter has crossed daemon adoption and run acceptance. Gate round 2
+  incorrectly treated the first flushed `accepted` record as turn acceptance:
+  that record is emitted after `session.create`, before `session.attach` and
+  `turn.submit`; the later true-acceptance emission is deduplicated. A
+  steady-state guard must fence on the durable queued-run envelope from the
+  accepted `turn.submit`, then enforce its exact count throughout the bounded
+  plateau. The CLI guard requires main plus one output-adapter worker in every
+  sample; its expected count remains two.

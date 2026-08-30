@@ -618,6 +618,22 @@ fn daemon_logs(profile: &Path) -> String {
         .join("\n")
 }
 
+#[cfg(unix)]
+fn daemon_log_count(profile: &Path) -> usize {
+    std::fs::read_dir(profile.join("daemon-logs"))
+        .map(|entries| entries.filter_map(Result::ok).count())
+        .unwrap_or(0)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn is_durable_run_acceptance(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| {
+        value["run_id"].as_str().is_some()
+            && value["payload"]["type"] == "run_state"
+            && value["payload"]["state"] == "queued"
+    })
+}
+
 /// The real sibling daemon answers `account.list`; the CLI projection must
 /// never widen to descriptor Debug/serde fields when human or JSON evolves.
 #[test]
@@ -1221,8 +1237,9 @@ fn one_shot_reaps_only_the_daemon_it_spawned_on_success_and_bootstrap_failure() 
 /// Regression guard for the measured +1.04 ms cost of accidentally restoring
 /// a multi-threaded Tokio runtime to `haider run`. The daemon is already
 /// resident, so this observes only the staged CLI: main + its blocking JSONL
-/// adapter worker. The accepted record fences adoption/startup from the
-/// steady-state window; a cold owned-child waiter must never enter this path.
+/// adapter worker. The durable queued-run envelope fences `turn.submit`, not
+/// merely the earlier session-resolution announcement, from the steady-state
+/// window; a cold owned-child waiter must never enter this path.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn staged_run_with_resident_daemon_has_two_steady_state_threads() {
@@ -1241,15 +1258,49 @@ fn staged_run_with_resident_daemon_has_two_steady_state_threads() {
         r#"{"step":"finish","reason":"end_turn"}]"#,
     );
     let mut resident = haider();
+    let deep_home = resident
+        ._profile_root
+        .path()
+        .join("integration-style-home")
+        .join("h".repeat(100));
+    std::fs::create_dir_all(&deep_home).expect("create deep machine-user home");
+    let mut profile_env = haider_client::ProfileEnv::capture();
+    profile_env.profile_dir = Some(resident.profile.clone());
+    profile_env.home = Some(deep_home.clone());
+    profile_env.user_profile = Some(deep_home.clone());
+    profile_env.runtime_dir = None;
+    profile_env.xdg_runtime_dir = None;
+    let staged_profile = haider_client::resolve_profile(&profile_env)
+        .expect("resolve staged deep-HOME profile coordinate");
+    assert!(
+        !staged_profile.endpoint_path.starts_with(&deep_home),
+        "deep HOME must exercise the short endpoint fallback"
+    );
     resident
+        .env("HOME", &deep_home)
+        .env("USERPROFILE", &deep_home)
         .env("HAIDER_TEST_FAKE_PROVIDER", delayed_fake)
         .args(["status", "--json"]);
     let status = resident.output().expect("start resident daemon");
     assert!(
         status.status.success(),
-        "resident status failed: {}",
-        String::from_utf8_lossy(&status.stderr)
+        "resident status failed: {}; daemon logs: {}",
+        String::from_utf8_lossy(&status.stderr),
+        daemon_logs(&resident.profile)
     );
+    let status_document: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("resident status JSON");
+    let resident_pid = status_document["daemon"]["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .expect("resident daemon PID");
+    assert_eq!(
+        status_document["daemon"]["socket_path"].as_str(),
+        Some(staged_profile.endpoint_path.to_string_lossy().as_ref()),
+        "resident daemon and staged client must share one endpoint"
+    );
+    let resident_daemon_logs = daemon_log_count(&resident.profile);
+    assert_eq!(resident_daemon_logs, 1, "one resident daemon candidate");
 
     let workspace = resident._profile_root.path().join("workspace");
     let mut command = Command::new(&haider_binary);
@@ -1257,6 +1308,8 @@ fn staged_run_with_resident_daemon_has_two_steady_state_threads() {
     command
         .current_dir(workspace)
         .env("HAIDER_PROFILE_DIR", &resident.profile)
+        .env("HOME", &deep_home)
+        .env("USERPROFILE", &deep_home)
         .env("HAIDER_DISCOVERY_DISABLED", "1")
         .env("HAIDER_TEST_FAKE_PROVIDER", delayed_fake)
         .args(["run", "--provider", "fake", "--jsonl", "thread guard"])
@@ -1266,48 +1319,81 @@ fn staged_run_with_resident_daemon_has_two_steady_state_threads() {
     let mut child = command.spawn().expect("start staged run thread probe");
     let pid = child.id();
     let staged_stdout = child.stdout.take().expect("capture staged run stdout");
-    let (accepted_tx, accepted_rx) = std::sync::mpsc::sync_channel(1);
-    let accepted_reader = thread::Builder::new()
+    let (fence_tx, fence_rx) = std::sync::mpsc::sync_channel(1);
+    let fence_reader = thread::Builder::new()
         .name("staged-stdout-read".to_owned())
         .spawn(move || {
             let mut stdout = BufReader::new(staged_stdout);
             let mut accepted_line = String::new();
-            let accepted = match stdout.read_line(&mut accepted_line) {
-                Ok(0) => Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "staged run closed stdout before acceptance",
-                )),
-                Ok(_) => Ok((accepted_line, stdout)),
-                Err(error) => Err(error),
-            };
-            let _ = accepted_tx.send(accepted);
+            let fence = (|| {
+                match stdout.read_line(&mut accepted_line) {
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "staged run closed stdout before its session announcement",
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(error) => return Err(error),
+                }
+                loop {
+                    let mut line = String::new();
+                    match stdout.read_line(&mut line) {
+                        Ok(0) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "staged run closed stdout before durable run acceptance",
+                            ));
+                        }
+                        Ok(_) if is_durable_run_acceptance(&line) => {
+                            return Ok((accepted_line, line, stdout));
+                        }
+                        Ok(_) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            })();
+            let _ = fence_tx.send(fence);
         })
         .expect("start bounded acceptance reader");
-    let (accepted_line, mut stdout) = match accepted_rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(Ok(accepted)) => accepted,
-        Ok(Err(error)) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            accepted_reader
-                .join()
-                .expect("join failed staged acceptance reader");
-            panic!("staged run did not publish acceptance: {error}");
-        }
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            accepted_reader
-                .join()
-                .expect("join timed-out staged acceptance reader");
-            panic!("staged run acceptance deadline elapsed: {error}");
-        }
-    };
-    accepted_reader
-        .join()
-        .expect("join staged acceptance reader");
+    let (accepted_line, queued_line, mut stdout) =
+        match fence_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(fence)) => fence,
+            Ok(Err(error)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                fence_reader
+                    .join()
+                    .expect("join failed staged acceptance reader");
+                panic!("staged run did not cross its durable acceptance fence: {error}");
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                fence_reader
+                    .join()
+                    .expect("join timed-out staged acceptance reader");
+                panic!("staged run durable acceptance deadline elapsed: {error}");
+            }
+        };
+    fence_reader.join().expect("join staged acceptance reader");
     let accepted: serde_json::Value =
         serde_json::from_str(&accepted_line).expect("staged run acceptance JSON");
     assert_eq!(accepted["event"], "accepted");
+    assert!(
+        is_durable_run_acceptance(&queued_line),
+        "steady-state fence must be the durable queued-run envelope"
+    );
+    assert_eq!(
+        daemon_pid(&resident.profile),
+        Some(resident_pid),
+        "staged run must retain the exact resident daemon generation"
+    );
+    assert_eq!(
+        daemon_log_count(&resident.profile),
+        resident_daemon_logs,
+        "staged run must not launch a second daemon candidate"
+    );
     assert!(
         child
             .try_wait()
