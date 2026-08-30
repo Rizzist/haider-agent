@@ -332,6 +332,72 @@ fn assert_daemon_serves(profile: &ResolvedProfile) {
     });
 }
 
+fn process_exists(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Three real `haider run` processes on one profile must authenticate the
+/// same daemon PID. The bounded idle timer then proves that reuse does not
+/// trade one cold start per invocation for an indefinitely resident child.
+#[test]
+fn repeated_run_invocations_pay_one_cold_daemon_start_then_idle_exit() {
+    ensure_haiderd_built();
+    let store = tempfile::tempdir().expect("store dir");
+    let profile = resolved_for(store.path());
+    let guard = DaemonGuard {
+        store: store.path().to_path_buf(),
+    };
+    let fake_script = concat!(
+        r#"[{"step":"emit_text","text":"ok"},{"step":"finish","reason":"end_turn"},"#,
+        r#"{"step":"emit_text","text":"ok"},{"step":"finish","reason":"end_turn"},"#,
+        r#"{"step":"emit_text","text":"ok"},{"step":"finish","reason":"end_turn"}]"#,
+    );
+    let mut daemon_pids = Vec::new();
+    for invocation in 1..=3 {
+        let output = output_with_timeout(
+            haider_command(store.path())
+                .args(["run", "--provider", "fake", "--json", "-p", "hello"])
+                .env("HAIDER_TEST_FAKE_PROVIDER", fake_script)
+                .env("HAIDER_RUN_DAEMON_IDLE_TTL_MS", "5000"),
+            &format!("same-profile run invocation {invocation}"),
+        );
+        assert!(
+            output.status.success(),
+            "run {invocation} failed: status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        daemon_pids.push(guard.pid().expect("lingering daemon PID"));
+    }
+    assert!(
+        daemon_pids.windows(2).all(|pair| pair[0] == pair[1]),
+        "same-profile invocations must reuse one daemon: {daemon_pids:?}"
+    );
+
+    let daemon_pid = daemon_pids[0];
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while (process_exists(daemon_pid) || profile.endpoint_path.exists())
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        !process_exists(daemon_pid),
+        "daemon {daemon_pid} survived its bounded idle TTL"
+    );
+    assert!(
+        !profile.endpoint_path.exists(),
+        "idle exit must remove the profile endpoint"
+    );
+}
+
 // MUTATION CHECK: R8 concurrent-launch arbitration — the store lock elects
 // exactly one daemon, a losing candidate exits 75, and BOTH parents complete
 // a Ready handshake. Mutating ensure_daemon to treat exit 75 as fatal (or to

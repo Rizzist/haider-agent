@@ -18,6 +18,7 @@ const HELPER_ENV: &str = "HAIDER_EPHEMERAL_LIVENESS_HELPER";
 const HELPER_MARKER_ENV: &str = "HAIDER_EPHEMERAL_LIVENESS_MARKER";
 const HELPER_DAEMON_ENV: &str = "HAIDER_EPHEMERAL_LIVENESS_DAEMON";
 const HELPER_KILL_BEFORE_READY_ENV: &str = "HAIDER_EPHEMERAL_KILL_BEFORE_READY";
+const HELPER_IDLE_LINGER_MS_ENV: &str = "HAIDER_EPHEMERAL_IDLE_LINGER_MS";
 const DEADLINE: Duration = Duration::from_secs(20);
 const POLL: Duration = Duration::from_millis(20);
 
@@ -180,6 +181,7 @@ fn spawn_helper(
     profile: &ResolvedProfile,
     marker: &Path,
     kill_before_readiness: bool,
+    idle_linger: Option<Duration>,
 ) -> ChildGuard {
     let test_home = profile
         .store_dir
@@ -209,6 +211,12 @@ fn spawn_helper(
         .stderr(Stdio::null());
     if kill_before_readiness {
         command.env(HELPER_KILL_BEFORE_READY_ENV, "1");
+    }
+    if let Some(idle_linger) = idle_linger {
+        command.env(
+            HELPER_IDLE_LINGER_MS_ENV,
+            idle_linger.as_millis().to_string(),
+        );
     }
     let child = command.spawn().expect("spawn ephemeral client helper");
     ChildGuard::new(child)
@@ -476,7 +484,14 @@ fn ephemeral_client_process_helper() {
             &profile,
             EnsureOptions {
                 daemon_binary: Some(daemon),
-                daemon_lifetime: DaemonLifetime::EphemeralIfSpawned,
+                daemon_lifetime: std::env::var(HELPER_IDLE_LINGER_MS_ENV).map_or(
+                    DaemonLifetime::EphemeralIfSpawned,
+                    |millis| DaemonLifetime::LingerIfSpawned {
+                        idle_ttl: Duration::from_millis(
+                            millis.parse().expect("helper idle linger milliseconds"),
+                        ),
+                    },
+                ),
                 startup_deadline: DEADLINE,
                 ..EnsureOptions::default()
             },
@@ -499,7 +514,7 @@ fn killed_spawning_client_reaps_ephemeral_daemon_and_runtime_files() {
     let root = test_root();
     let profile = profile(&root.path().join("store"), &root.path().join("runtime"));
     let marker = root.path().join("client-ready");
-    let mut helper = spawn_helper(&profile, &marker, true);
+    let mut helper = spawn_helper(&profile, &marker, true, None);
     wait_for_helper(
         &runtime,
         &profile,
@@ -538,7 +553,7 @@ fn killed_ready_spawning_client_reaps_ephemeral_daemon_and_runtime_files() {
     let root = test_root();
     let profile = profile(&root.path().join("store"), &root.path().join("runtime"));
     let marker = root.path().join("client-ready");
-    let mut helper = spawn_helper(&profile, &marker, false);
+    let mut helper = spawn_helper(&profile, &marker, false, None);
     wait_for_helper(
         &runtime,
         &profile,
@@ -576,6 +591,53 @@ fn killed_ready_spawning_client_reaps_ephemeral_daemon_and_runtime_files() {
     wait_for_cleanup(&runtime, &profile, Some(&mut helper), Some(daemon_pid));
 }
 
+/// A linger timer lives in the daemon, not the launcher: SIGKILL of the
+/// launcher therefore cannot cancel the deadline or leave the child orphaned.
+#[test]
+fn killed_spawning_client_cannot_orphan_a_lingering_daemon() {
+    let _guard = process_test_guard();
+    let runtime = runtime();
+    let root = test_root();
+    let profile = profile(&root.path().join("store"), &root.path().join("runtime"));
+    let marker = root.path().join("client-ready");
+    let mut helper = spawn_helper(&profile, &marker, false, Some(Duration::from_millis(250)));
+    wait_for_helper(
+        &runtime,
+        &profile,
+        &marker,
+        &mut helper,
+        "ready lingering helper",
+    );
+    let daemon_pid = std::fs::read_to_string(pid_path(&profile))
+        .expect("PID file existed at Ready")
+        .trim()
+        .parse::<u32>()
+        .expect("PID file carries daemon process id");
+    let interactive = connect_until_ready(&runtime, &profile, Some(&mut helper), Some(daemon_pid));
+
+    kill_helper(&mut helper);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !process_has_exited(daemon_pid),
+        "an attached interactive client must suspend the idle TTL"
+    );
+    assert_close_started(interactive.client.close());
+    drop(interactive);
+    wait_until(
+        &runtime,
+        &profile,
+        "lingering daemon exit after launcher SIGKILL",
+        || process_has_exited(daemon_pid),
+        || {
+            process_snapshot(&profile, Some(&mut helper), Some(daemon_pid))
+                .observation("daemon_process_exited", process_has_exited(daemon_pid))
+                .observation("pid_file_exists", pid_path(&profile).exists())
+                .observation("runtime_dir_exists", profile.runtime_dir.exists())
+        },
+    );
+    wait_for_cleanup(&runtime, &profile, Some(&mut helper), Some(daemon_pid));
+}
+
 /// S3(b): an attaching client receives no liveness authority over a daemon it
 /// did not spawn, so killing that client cannot stop the incumbent.
 #[test]
@@ -590,7 +652,7 @@ fn killed_attached_client_does_not_stop_persistent_daemon() {
     drop(warmup);
 
     let marker = root.path().join("attached-ready");
-    let mut helper = spawn_helper(&profile, &marker, false);
+    let mut helper = spawn_helper(&profile, &marker, false, None);
     wait_for_helper(
         &runtime,
         &profile,
@@ -629,7 +691,7 @@ fn second_client_holds_ephemeral_daemon_until_its_disconnect() {
     let root = test_root();
     let profile = profile(&root.path().join("store"), &root.path().join("runtime"));
     let marker = root.path().join("client-ready");
-    let mut helper = spawn_helper(&profile, &marker, false);
+    let mut helper = spawn_helper(&profile, &marker, false, None);
     wait_for_helper(
         &runtime,
         &profile,
@@ -696,8 +758,8 @@ fn two_profiles_have_disjoint_runtime_trees_and_writes() {
 
     let first_marker = root.path().join("first-ready");
     let second_marker = root.path().join("second-ready");
-    let mut first_helper = spawn_helper(&first, &first_marker, false);
-    let mut second_helper = spawn_helper(&second, &second_marker, false);
+    let mut first_helper = spawn_helper(&first, &first_marker, false, None);
+    let mut second_helper = spawn_helper(&second, &second_marker, false, None);
     wait_for_helper(
         &runtime,
         &first,

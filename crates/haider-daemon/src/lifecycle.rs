@@ -7,6 +7,7 @@
 
 use haider_rpc::LifecyclePhase;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(test)]
 #[path = "lifecycle_tests.rs"]
@@ -159,6 +160,12 @@ pub(crate) enum ShutdownRequest {
     GracefulWhenIdle {
         reason: ShutdownReason,
     },
+    /// The launching client vanished, but this daemon may serve new clients
+    /// until it has had no attached client for the full bounded interval.
+    GracefulAfterIdle {
+        reason: ShutdownReason,
+        idle_ttl: Duration,
+    },
     Forced {
         reason: ShutdownReason,
     },
@@ -295,6 +302,20 @@ impl ShutdownHandle {
         self.inner
             .sender
             .send_replace(ShutdownRequest::GracefulWhenIdle { reason });
+        true
+    }
+
+    /// Records a bounded linger after launcher death. The daemon runtime owns
+    /// the timer, so abrupt launcher termination cannot cancel or bypass it.
+    pub(crate) fn request_after_idle(&self, reason: ShutdownReason, idle_ttl: Duration) -> bool {
+        let _transition = lock_transition(&self.inner);
+        if self.inner.requests.load(Ordering::Acquire) != 0 {
+            return false;
+        }
+        self.inner.requests.store(1, Ordering::Release);
+        self.inner
+            .sender
+            .send_replace(ShutdownRequest::GracefulAfterIdle { reason, idle_ttl });
         true
     }
 }

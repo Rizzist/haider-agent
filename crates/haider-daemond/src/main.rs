@@ -15,6 +15,7 @@ use haider_provider::FakeProvider;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 mod telemetry;
 
@@ -192,6 +193,7 @@ async fn dispatch(parsed: ParsedArgs) -> ExitCode {
         dependencies,
         parsed.readiness,
         parsed.liveness,
+        parsed.idle_linger,
     )
     .await
     {
@@ -292,6 +294,7 @@ struct ParsedArgs {
     config: DaemonConfig,
     readiness: Option<haider_platform::DaemonReadyNotifier>,
     liveness: Option<haider_platform::DaemonLivenessWatcher>,
+    idle_linger: Option<Duration>,
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<ParsedArgs, String> {
@@ -300,6 +303,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ParsedArgs, String> 
     let mut runtime_dir = None;
     let mut readiness = None;
     let mut liveness = None;
+    let mut idle_linger_ms = None;
     let mut args = args;
     while let Some(argument) = args.next() {
         let value = args
@@ -311,6 +315,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ParsedArgs, String> 
             "--runtime-dir" => runtime_dir = Some(PathBuf::from(value)),
             haider_platform::DAEMON_READINESS_ARG => readiness = Some(value),
             haider_platform::DAEMON_LIVENESS_ARG => liveness = Some(value),
+            haider_platform::DAEMON_IDLE_LINGER_ARG => idle_linger_ms = Some(value),
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -361,10 +366,28 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<ParsedArgs, String> 
         .map(|token| haider_platform::DaemonLivenessWatcher::from_spawn_token(&token))
         .transpose()
         .map_err(|error| format!("invalid launcher-liveness coordinate: {error}"))?;
+    let idle_linger = idle_linger_ms
+        .map(|value| {
+            let millis = value
+                .parse::<u64>()
+                .map_err(|_| "--idle-linger-ms requires a positive integer".to_owned())?;
+            if millis == 0 {
+                return Err("--idle-linger-ms must be greater than zero".to_owned());
+            }
+            if millis > 3_600_000 {
+                return Err("--idle-linger-ms must not exceed 3600000".to_owned());
+            }
+            Ok(Duration::from_millis(millis))
+        })
+        .transpose()?;
+    if idle_linger.is_some() && liveness.is_none() {
+        return Err("--idle-linger-ms requires --launcher-liveness".to_owned());
+    }
     Ok(ParsedArgs {
         config,
         readiness,
         liveness,
+        idle_linger,
     })
 }
 

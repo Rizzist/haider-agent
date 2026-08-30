@@ -1,5 +1,6 @@
 //! Manual `haider run` parser and daemon-backed output adapter.
 
+use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -36,6 +37,9 @@ const OUTPUT_BUFFER: usize = 64;
 const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const JSONL_FLUSH_INTERVAL: Duration = Duration::from_millis(3);
 const JSONL_FLUSH_ENVELOPES: usize = 8;
+const RUN_DAEMON_IDLE_TTL_ENV: &str = "HAIDER_RUN_DAEMON_IDLE_TTL_MS";
+const DEFAULT_RUN_DAEMON_IDLE_TTL_MS: u64 = 30_000;
+const MAX_RUN_DAEMON_IDLE_TTL_MS: u64 = 3_600_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunOutput {
@@ -480,6 +484,33 @@ fn parse_timeout(value: &str) -> Result<Duration, String> {
     Ok(duration)
 }
 
+fn run_daemon_lifetime(value: Option<&OsStr>) -> Result<DaemonLifetime, String> {
+    let value = match value {
+        Some(value) => value.to_str().ok_or_else(|| {
+            format!("{RUN_DAEMON_IDLE_TTL_ENV} must be a UTF-8 integer number of milliseconds")
+        })?,
+        None => {
+            return Ok(DaemonLifetime::LingerIfSpawned {
+                idle_ttl: Duration::from_millis(DEFAULT_RUN_DAEMON_IDLE_TTL_MS),
+            });
+        }
+    };
+    let millis = value.parse::<u64>().map_err(|_| {
+        format!("{RUN_DAEMON_IDLE_TTL_ENV} must be an integer number of milliseconds")
+    })?;
+    if millis == 0 {
+        return Ok(DaemonLifetime::EphemeralIfSpawned);
+    }
+    if millis > MAX_RUN_DAEMON_IDLE_TTL_MS {
+        return Err(format!(
+            "{RUN_DAEMON_IDLE_TTL_ENV} must not exceed {MAX_RUN_DAEMON_IDLE_TTL_MS}"
+        ));
+    }
+    Ok(DaemonLifetime::LingerIfSpawned {
+        idle_ttl: Duration::from_millis(millis),
+    })
+}
+
 pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
     let machine_output = requested_machine_output(rest);
     let parsed = match parse_run_options_with_config(rest) {
@@ -498,6 +529,24 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
     };
     let mut options = parsed.options;
     let mut session_config = parsed.session_config;
+    let daemon_lifetime = if options.action == RunAction::Start {
+        DaemonLifetime::Persistent
+    } else {
+        match run_daemon_lifetime(std::env::var_os(RUN_DAEMON_IDLE_TTL_ENV).as_deref()) {
+            Ok(lifetime) => lifetime,
+            Err(message) => {
+                let failure = ClassifiedRunError::bootstrap("invalid_argument", message.clone());
+                if let Err(error) =
+                    write_run_error(io::stdout().lock(), options.output, &failure, None, None)
+                {
+                    eprintln!("haider: stdout failed: {error}");
+                    return ExitCode::from(EX_IOERR);
+                }
+                eprintln!("haider run: {message}");
+                return ExitCode::from(EX_USAGE);
+            }
+        }
+    };
     if options.prompt_stdin {
         match tokio::task::spawn_blocking(read_stdin_prompt).await {
             Ok(Ok(prompt)) => options.prompt = prompt,
@@ -544,7 +593,7 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
         }
     };
     let lifecycle_ensure = EnsureOptions {
-        daemon_lifetime: DaemonLifetime::Persistent,
+        daemon_lifetime,
         ..EnsureOptions::default()
     };
     match options.action.clone() {
@@ -594,7 +643,7 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
     let mut request_max_tokens = profile.default_max_tokens;
     if let RunAction::Replay(source_run_id) = options.action.clone() {
         let replay_ensure = EnsureOptions {
-            daemon_lifetime: DaemonLifetime::EphemeralIfSpawned,
+            daemon_lifetime,
             ..EnsureOptions::default()
         };
         let status =
@@ -760,11 +809,7 @@ pub(crate) async fn run_command(rest: &[String]) -> ExitCode {
     let output_mode = options.output;
     let adapter = tokio::task::spawn_blocking(move || adapt_events(output_mode, receiver));
     let ensure = EnsureOptions {
-        daemon_lifetime: if options.action == RunAction::Start {
-            DaemonLifetime::Persistent
-        } else {
-            DaemonLifetime::EphemeralIfSpawned
-        },
+        daemon_lifetime,
         ..EnsureOptions::default()
     };
     let event_mode = match options.output {
@@ -1706,6 +1751,35 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             self.flushes = self.flushes.saturating_add(1);
             Ok(())
+        }
+    }
+
+    #[test]
+    fn run_daemon_linger_defaults_to_thirty_seconds_and_zero_restores_one_shot() {
+        assert_eq!(
+            run_daemon_lifetime(None).expect("default linger"),
+            DaemonLifetime::LingerIfSpawned {
+                idle_ttl: Duration::from_secs(30),
+            }
+        );
+        assert_eq!(
+            run_daemon_lifetime(Some(OsStr::new("0"))).expect("one-shot opt-out"),
+            DaemonLifetime::EphemeralIfSpawned
+        );
+        assert_eq!(
+            run_daemon_lifetime(Some(OsStr::new("1750"))).expect("custom linger"),
+            DaemonLifetime::LingerIfSpawned {
+                idle_ttl: Duration::from_millis(1_750),
+            }
+        );
+    }
+
+    #[test]
+    fn run_daemon_linger_rejects_unbounded_or_malformed_values() {
+        for value in ["forever", "3600001"] {
+            let error = run_daemon_lifetime(Some(OsStr::new(value)))
+                .expect_err("invalid idle TTL must be rejected");
+            assert!(error.contains(RUN_DAEMON_IDLE_TTL_ENV));
         }
     }
 
