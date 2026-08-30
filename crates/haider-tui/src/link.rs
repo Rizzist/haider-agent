@@ -649,6 +649,14 @@ pub fn command_required_features(command: &LiveCommand) -> &'static [&'static st
         LiveCommand::ShellList | LiveCommand::ShellClose { .. } => {
             &[haider_rpc::FEATURE_SHELL_REGISTRY_V1]
         }
+        // BOTH tokens: the method AND the additive prompt-selector shape.
+        // A daemon serving only the former would read this request as a
+        // fork with no coordinates at all, so the send-time gate refuses
+        // rather than letting the wire decide.
+        LiveCommand::SessionForkPrompt { .. } => &[
+            haider_rpc::FEATURE_SESSION_FORK_V1,
+            haider_rpc::FEATURE_SESSION_PROMPT_FORK_V1,
+        ],
         LiveCommand::MonitorList { .. } => &[haider_rpc::FEATURE_MONITOR_CONTROL_V1],
         LiveCommand::ProviderSetTrust { .. } | LiveCommand::LockdownStatus { .. } => {
             &[haider_rpc::FEATURE_PROVIDER_LOCKDOWN_V1]
@@ -1080,6 +1088,25 @@ pub fn request_body_for_features(
             fork_node_id,
             fork_seq,
             name,
+        },
+        LiveCommand::SessionForkPrompt {
+            command_id,
+            session,
+            worker_generation,
+            source_branch,
+            seq,
+        } => RequestBody::SessionFork {
+            command_id,
+            session_id: session,
+            worker_generation,
+            source_branch_id: source_branch,
+            // Both legacy exact-node fields stay absent: their presence is
+            // what marks a request as the shipped exact-node fork instead of
+            // this exclusive prompt cut.
+            fork_node_id: None,
+            fork_seq: None,
+            prompt: Some(haider_protocol::session_fork::SessionForkPromptSelector { seq }),
+            name: None,
         },
         LiveCommand::CheckpointList {
             session,
@@ -1781,6 +1808,31 @@ pub fn map_response(context: &CommandContext, body: ResponseBody) -> Vec<LiveRep
                 name,
             }]
         }),
+        // Projected through the client crate so this decode shares its
+        // absence discipline: a `session.fork` WITHOUT prompt provenance and
+        // an editable draft is the legacy exact-node shape and yields no
+        // reply here rather than an invented empty draft.
+        body @ ResponseBody::SessionFork { .. } => {
+            let Some(command_id) = context.command_id.clone() else {
+                return Vec::new();
+            };
+            match haider_client::prompt_fork_response(body) {
+                Ok(fork) => vec![LiveReply::PromptForked {
+                    command_id,
+                    source_session: fork.source_session_id,
+                    session: fork.session_id,
+                    worker_generation: fork.worker_generation,
+                    draft: fork.draft,
+                }],
+                Err(error) => vec![LiveReply::Failed {
+                    command_id: Some(command_id),
+                    code: haider_rpc::ERROR_CODE_INVALID_ARGUMENT.to_owned(),
+                    message: error.to_string(),
+                    retryable: false,
+                    presentation: None,
+                }],
+            }
+        }
         ResponseBody::CheckpointList { page } => context.checkpoint_list.clone().map_or_else(
             Vec::new,
             |(session, branch, rollback, runs)| {

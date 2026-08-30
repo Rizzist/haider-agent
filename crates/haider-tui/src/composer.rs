@@ -84,9 +84,20 @@ pub struct PendingAttachment {
     pub kind: PendingKind,
     /// Original byte length, retained as metadata after the upload payload
     /// leaves the process so a volatile input mirror can publish a safe ref.
-    pub bytes: u64,
+    /// `None` when this process never held the bytes — a fork draft's blocks
+    /// arrive already addressed in the CAS — and the mirror then publishes
+    /// NO ref rather than a fabricated zero.
+    pub bytes: Option<u64>,
     /// The daemon's verified CAS address, once the upload answers.
     pub artifact: Option<ArtifactRef>,
+    /// A complete wire block this chip carries VERBATIM.
+    ///
+    /// An uploaded chip leaves this `None` and lets [`Self::ready_block`]
+    /// build the block from the half known at issuance. A chip revived from
+    /// a `session.fork` draft sets it, because the daemon already recorded
+    /// facts the chip's own fields cannot express — image dimensions and a
+    /// PDF's delivery mode — and rebuilding would silently drop them.
+    pub carried: Option<AttachmentBlock>,
 }
 
 /// One large paste parked beside the draft (QoL pill, Claude Code
@@ -159,14 +170,93 @@ impl PendingAttachment {
         };
         Some(haider_protocol::hook::HookAttachmentMetadata {
             mime,
-            bytes: self.bytes,
+            // No fabricated size: a chip whose bytes this process never saw
+            // publishes nothing rather than a zero the mirror would show.
+            bytes: self.bytes?,
             artifact,
         })
     }
 
+    /// One chip for a block that already lives in the CAS — the editable
+    /// draft a prompt-oriented `session.fork` returns.
+    ///
+    /// The block travels VERBATIM in `carried`, so a resubmission keeps the
+    /// exact image dimensions, filename and PDF delivery mode the source
+    /// prompt carried. `upload` is client-side identity only; nothing is
+    /// uploaded, because the daemon already verified this address.
+    ///
+    /// `None` for a block this composer has no chip vocabulary for — today
+    /// only the reserved [`AttachmentBlock::Skill`], which carries no CAS
+    /// address at all. The caller must SAY so rather than drop it quietly.
+    #[must_use]
+    pub fn carrying(upload: u64, block: AttachmentBlock) -> Option<Self> {
+        let (artifact, kind, label) = match &block {
+            AttachmentBlock::Image {
+                artifact,
+                mime,
+                width,
+                height,
+            } => (
+                artifact.clone(),
+                PendingKind::Image { mime: mime.clone() },
+                match (width, height) {
+                    // Dimensions render only when the wire carried them.
+                    (Some(width), Some(height)) => format!("image · {width}×{height}"),
+                    _ => format!("image · {mime}"),
+                },
+            ),
+            AttachmentBlock::PastedText { artifact, lines } => (
+                artifact.clone(),
+                PendingKind::PastedText { lines: *lines },
+                format!("[Pasted {lines} lines]"),
+            ),
+            AttachmentBlock::File {
+                artifact,
+                name,
+                lines,
+            } => (
+                artifact.clone(),
+                PendingKind::File {
+                    name: name.clone(),
+                    lines: *lines,
+                },
+                format!("{name} · {lines} lines"),
+            ),
+            AttachmentBlock::Pdf {
+                artifact,
+                name,
+                pages,
+                ..
+            } => (
+                artifact.clone(),
+                PendingKind::Pdf {
+                    name: name.clone(),
+                    pages: *pages,
+                },
+                format!("{name} · {pages}p"),
+            ),
+            AttachmentBlock::Skill { .. } => return None,
+        };
+        Some(Self {
+            upload,
+            label,
+            kind,
+            bytes: None,
+            artifact: Some(artifact),
+            carried: Some(block),
+        })
+    }
+
     /// The wire block, once (and only once) the upload completed.
+    ///
+    /// A carried block wins outright: it is already the exact bytes the
+    /// daemon recorded, and re-deriving one here would drop the facts the
+    /// chip's own fields cannot hold.
     #[must_use]
     pub fn ready_block(&self) -> Option<AttachmentBlock> {
+        if let Some(block) = self.carried.clone() {
+            return Some(block);
+        }
         let artifact = self.artifact.clone()?;
         Some(match &self.kind {
             PendingKind::Image { mime } => AttachmentBlock::Image {

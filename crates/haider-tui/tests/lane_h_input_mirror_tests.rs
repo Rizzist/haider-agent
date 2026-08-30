@@ -82,7 +82,12 @@ fn remote_apply_replaces_through_the_reducer_without_recording_history() {
     let mut model = mirror_model("mirror-a");
     model.composer.set_text("local draft");
     model.composer.record_submitted("kept history");
-    model.prompt_history.push_front("journal prompt".to_owned());
+    model
+        .prompt_history
+        .push_front(haider_tui::session::PromptEntry::committed(
+            "journal prompt".to_owned(),
+            4,
+        ));
     let prompt_history = model.prompt_history.clone();
     let mut driver = LiveDriver::new("lane-h");
 

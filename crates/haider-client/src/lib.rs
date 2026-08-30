@@ -29,6 +29,7 @@ pub mod observe;
 pub mod peer;
 pub mod permission;
 pub mod profile;
+pub mod session_fork;
 pub mod shell;
 pub mod shell_registry;
 pub mod spawn;
@@ -87,6 +88,10 @@ pub use profile::{
     PROFILE_DIR_ENV, ProfileEnv, ProfileError, RUNTIME_DIR_ENV, ResolvedProfile, effective_uid,
     endpoint_path_for, resolve_default_model_for, resolve_profile,
 };
+pub use session_fork::{
+    FORKABLE_PROMPT_PAGE, ForkablePrompt, PromptFork, SessionForkClientError, fork_at_prompt,
+    forkable_prompts, forkable_prompts_in, prompt_fork_available, prompt_fork_response,
+};
 pub use shell::{
     AcceptedShellExec, CancelledShellExec, ShellExecError, ShellExecRequest, cancel_shell_exec,
     required_user_command_features, shell_exec,
@@ -125,6 +130,9 @@ pub const CRATE_NAME: &str = "haider-client";
 mod lockdown_tests;
 #[cfg(test)]
 mod peer_tests;
+#[cfg(test)]
+#[path = "session_fork_tests.rs"]
+mod session_fork_tests;
 #[cfg(test)]
 #[path = "shell_registry_tests.rs"]
 mod shell_registry_tests;

@@ -1834,6 +1834,9 @@ impl DemoDriver {
             // B2b live-only vocabulary: `/branch new` in demo mode flashes
             // its honest stub upstream — branches are daemon truth.
             | AppRequest::BranchCreate { .. }
+            // Esc-Esc `f` / `/fork <n>`: the child session is daemon-minted
+            // and the demo reducer refuses the verb upstream.
+            | AppRequest::ForkFromPrompt { .. }
             | AppRequest::Checkpoints { .. }
             | AppRequest::CheckpointUndo { .. }
             | AppRequest::CheckpointRedo { .. }

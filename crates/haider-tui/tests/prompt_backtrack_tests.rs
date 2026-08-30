@@ -80,6 +80,14 @@ fn open_backtrack(model: &mut AppModel, now: Instant) {
     );
 }
 
+fn prompts(model: &AppModel) -> Vec<String> {
+    model
+        .prompt_history
+        .iter()
+        .map(|entry| entry.text.clone())
+        .collect()
+}
+
 fn draw(model: &AppModel) -> String {
     let backend = TestBackend::new(96, 34);
     let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -104,17 +112,11 @@ fn draw(model: &AppModel) -> String {
 #[test]
 fn journal_replay_populates_per_session_history_newest_first() {
     let (mut model, session) = replayed_model();
-    assert_eq!(
-        model.prompt_history.iter().cloned().collect::<Vec<_>>(),
-        ["newest prompt", "oldest\nverbatim"]
-    );
+    assert_eq!(prompts(&model), ["newest prompt", "oldest\nverbatim"]);
     model.checkin();
     assert!(model.prompt_history.is_empty());
     model.open_session(&session);
-    assert_eq!(
-        model.prompt_history.iter().cloned().collect::<Vec<_>>(),
-        ["newest prompt", "oldest\nverbatim"]
-    );
+    assert_eq!(prompts(&model), ["newest prompt", "oldest\nverbatim"]);
 }
 
 /// LAW C2/C5: only idle + truly empty composer admits the double-Esc
@@ -179,9 +181,9 @@ fn repeated_escape_loads_verbatim_and_redo_appends_only_on_journal_echo() {
         RawOutcome::Applied
     );
     assert_eq!(model.prompt_history.len(), 3);
-    assert_eq!(model.prompt_history[0], "oldest\nverbatim");
-    assert_eq!(model.prompt_history[1], "newest prompt");
-    assert_eq!(model.prompt_history[2], "oldest\nverbatim");
+    assert_eq!(model.prompt_history[0].text, "oldest\nverbatim");
+    assert_eq!(model.prompt_history[1].text, "newest prompt");
+    assert_eq!(model.prompt_history[2].text, "oldest\nverbatim");
 }
 
 /// Plain/frontends parity: `/history` reaches the same durable list when a
@@ -204,5 +206,5 @@ fn backtrack_overlay_renders_compact_single_line_prompt_rows() {
     assert!(screen.contains("1. newest prompt"));
     assert!(screen.contains("2. oldest verbatim"));
     assert!(screen.contains("digits choose · ⏎ load · esc older / close"));
-    assert_eq!(model.prompt_history[1], "oldest\nverbatim");
+    assert_eq!(model.prompt_history[1].text, "oldest\nverbatim");
 }
