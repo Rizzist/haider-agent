@@ -35,8 +35,9 @@ use haider_accounts::{
 };
 use haider_core::{
     ACCOUNT_REMOVE_METHOD, ACCOUNT_SET_ACTIVE_METHOD, ACCOUNT_SET_DEFAULT_MODEL_METHOD,
-    AccountAddClaim, AccountAddReceiptResponse, LoginClaim, LoginReceiptFailure,
-    LoginReceiptResponse, ManagementClaim, PROVIDER_CONFIGURE_METHOD, PROVIDER_REMOVE_METHOD,
+    AccountAddClaim, AccountAddReceiptResponse, AccountAddReceiptRow, LoginClaim,
+    LoginReceiptFailure, LoginReceiptResponse, LoginReceiptRow, ManagementClaim,
+    ManagementReceiptRow, PROVIDER_CONFIGURE_METHOD, PROVIDER_REMOVE_METHOD,
     PROVIDER_SET_TRUST_METHOD,
 };
 use haider_core::{SqliteStoreHandle, StoreHandle};
@@ -9320,6 +9321,24 @@ struct DurableAccountHead {
     mutation: DurableAccountMutation,
 }
 
+struct DurableAccountReceiptRows {
+    login: Vec<LoginReceiptRow>,
+    oauth_add: Vec<AccountAddReceiptRow>,
+    remove: Vec<ManagementReceiptRow>,
+}
+
+impl DurableAccountReceiptRows {
+    async fn load(store: &SqliteStoreHandle) -> Result<Self, HaiderError> {
+        Ok(Self {
+            login: store.login_receipts().await?,
+            oauth_add: store.account_add_receipts().await?,
+            remove: store
+                .management_receipts(ACCOUNT_REMOVE_METHOD.to_owned())
+                .await?,
+        })
+    }
+}
+
 fn record_durable_account_head(
     heads: &mut HashMap<String, DurableAccountHead>,
     alias: String,
@@ -9359,8 +9378,16 @@ fn record_durable_account_head(
 async fn durable_account_heads(
     store: &SqliteStoreHandle,
 ) -> Result<HashMap<String, DurableAccountHead>, HaiderError> {
+    let rows = DurableAccountReceiptRows::load(store).await?;
+    durable_account_heads_from(store, &rows).await
+}
+
+async fn durable_account_heads_from(
+    store: &SqliteStoreHandle,
+    rows: &DurableAccountReceiptRows,
+) -> Result<HashMap<String, DurableAccountHead>, HaiderError> {
     let mut heads = HashMap::new();
-    for row in store.login_receipts().await? {
+    for row in &rows.login {
         if row.state != "committed" {
             continue;
         }
@@ -9389,13 +9416,13 @@ async fn durable_account_heads(
             &mut heads,
             identity.physical_alias,
             DurableAccountHead {
-                command_id: row.command_id,
+                command_id: row.command_id.clone(),
                 revision,
                 mutation: DurableAccountMutation::Add,
             },
         )?;
     }
-    for row in store.account_add_receipts().await? {
+    for row in &rows.oauth_add {
         if row.state != "committed" {
             continue;
         }
@@ -9425,16 +9452,13 @@ async fn durable_account_heads(
             &mut heads,
             identity.alias().to_owned(),
             DurableAccountHead {
-                command_id: row.command_id,
+                command_id: row.command_id.clone(),
                 revision,
                 mutation: DurableAccountMutation::Add,
             },
         )?;
     }
-    for row in store
-        .management_receipts(ACCOUNT_REMOVE_METHOD.to_owned())
-        .await?
-    {
+    for row in &rows.remove {
         if row.state != "committed" {
             continue;
         }
@@ -9484,7 +9508,7 @@ async fn durable_account_heads(
             &mut heads,
             identity.alias,
             DurableAccountHead {
-                command_id: row.command_id,
+                command_id: row.command_id.clone(),
                 revision,
                 mutation: DurableAccountMutation::Remove,
             },
@@ -9505,18 +9529,38 @@ async fn durable_account_heads(
 /// - pending + neither: LEAVE PENDING — the same command with a fresh stage
 ///   completes it later ("neither waits for the same command with a fresh
 ///   stage"); restart wiped the staged secret by construction.
+#[cfg(test)]
 pub(crate) async fn reconcile_login_receipts(
     store: &SqliteStoreHandle,
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: &VaultProvision,
 ) -> Result<(), HaiderError> {
-    let rows = store.login_receipts().await?;
-    let durable_heads = durable_account_heads(store).await?;
+    let rows = DurableAccountReceiptRows::load(store).await?;
+    let durable_heads = durable_account_heads_from(store, &rows).await?;
     let reserved = store
         .reserved_account_aliases()
         .await?
         .into_iter()
         .collect::<HashSet<_>>();
+    reconcile_login_receipts_from(
+        store,
+        accounts,
+        vault,
+        &rows.login,
+        &durable_heads,
+        &reserved,
+    )
+    .await
+}
+
+async fn reconcile_login_receipts_from(
+    store: &SqliteStoreHandle,
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: &VaultProvision,
+    rows: &[LoginReceiptRow],
+    durable_heads: &HashMap<String, DurableAccountHead>,
+    reserved: &HashSet<String>,
+) -> Result<(), HaiderError> {
     for row in rows {
         let identity: LoginIdentity = match serde_json::from_str(&row.request_json) {
             Ok(identity) => identity,
@@ -9606,18 +9650,39 @@ pub(crate) async fn reconcile_login_receipts(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn reconcile_oauth_add_receipts(
     store: &SqliteStoreHandle,
     accounts: &mut AccountStore<Box<dyn StoreLike>>,
     vault: &VaultProvision,
 ) -> Result<(), HaiderError> {
-    let durable_heads = durable_account_heads(store).await?;
+    let rows = DurableAccountReceiptRows::load(store).await?;
+    let durable_heads = durable_account_heads_from(store, &rows).await?;
     let reserved = store
         .reserved_account_aliases()
         .await?
         .into_iter()
         .collect::<HashSet<_>>();
-    for row in store.account_add_receipts().await? {
+    reconcile_oauth_add_receipts_from(
+        store,
+        accounts,
+        vault,
+        &rows.oauth_add,
+        &durable_heads,
+        &reserved,
+    )
+    .await
+}
+
+async fn reconcile_oauth_add_receipts_from(
+    store: &SqliteStoreHandle,
+    accounts: &mut AccountStore<Box<dyn StoreLike>>,
+    vault: &VaultProvision,
+    rows: &[AccountAddReceiptRow],
+    durable_heads: &HashMap<String, DurableAccountHead>,
+    reserved: &HashSet<String>,
+) -> Result<(), HaiderError> {
+    for row in rows {
         let identity: OAuthReceiptIdentity =
             serde_json::from_str(&row.request_json).map_err(|error| {
                 HaiderError::new(
@@ -10325,16 +10390,39 @@ impl AccountsRuntime {
             None => VaultProvision::Unsupported,
         };
         reconcile_remove_receipts(store, &mut accounts, &vault).await?;
-        reconcile_login_receipts(store, &mut accounts, &vault).await?;
-        reconcile_oauth_add_receipts(store, &mut accounts, &vault).await?;
-        reconcile_set_active_receipts(store, &mut accounts).await?;
-        reconcile_provider_receipts(store, &accounts, &mut providers).await?;
-        import_bedrock_env_bearer(&mut accounts, &vault);
+        // Removal reconciliation can finalize a reservation, so hydrate only
+        // after it completes. Login and OAuth then share one coherent receipt
+        // snapshot and the actor reuses the same post-removal alias fence.
+        // This is a single-writer pre-Ready window: no concurrent account
+        // command can invalidate the snapshot between these consumers.
+        let receipt_rows = DurableAccountReceiptRows::load(store).await?;
+        let durable_heads = durable_account_heads_from(store, &receipt_rows).await?;
         let reserved_aliases = store
             .reserved_account_aliases()
             .await?
             .into_iter()
             .collect::<HashSet<_>>();
+        reconcile_login_receipts_from(
+            store,
+            &mut accounts,
+            &vault,
+            &receipt_rows.login,
+            &durable_heads,
+            &reserved_aliases,
+        )
+        .await?;
+        reconcile_oauth_add_receipts_from(
+            store,
+            &mut accounts,
+            &vault,
+            &receipt_rows.oauth_add,
+            &durable_heads,
+            &reserved_aliases,
+        )
+        .await?;
+        reconcile_set_active_receipts(store, &mut accounts).await?;
+        reconcile_provider_receipts(store, &accounts, &mut providers).await?;
+        import_bedrock_env_bearer(&mut accounts, &vault);
         let snapshot: AccountsSnapshot = Arc::new(StdMutex::new(accounts.list().to_vec()));
         let management = ManagementSnapshot::new(
             store.management_revision().await?,

@@ -38,6 +38,10 @@ const MESSAGE_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 const PEER_ADDRESS_MAX_BYTES: usize = PEER_ID_MAX_BYTES + PEER_NAME_MAX_BYTES + 3;
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 const MANIFEST_HEARTBEAT_MS: u64 = 5_000;
+pub(super) const MANIFEST_CREATION_SYNC_POLICY: haider_platform::SyncPolicy =
+    haider_platform::SyncPolicy::Full;
+pub(super) const MANIFEST_HEARTBEAT_SYNC_POLICY: haider_platform::SyncPolicy =
+    haider_platform::SyncPolicy::Plain;
 const MANIFEST_SCALAR_MAX_BYTES: usize = 4_096;
 #[cfg(unix)]
 const WIRE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -206,6 +210,10 @@ pub(crate) struct PeerService {
     mailbox_serial: tokio::sync::Mutex<()>,
     publications: Mutex<HashMap<String, LocalPublication>>,
     background: Mutex<Option<JoinHandle<()>>>,
+    #[cfg(test)]
+    reconcile_count: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    heartbeat_count: std::sync::atomic::AtomicU64,
 }
 
 impl PeerService {
@@ -224,11 +232,22 @@ impl PeerService {
             mailbox_serial: tokio::sync::Mutex::new(()),
             publications: Mutex::new(HashMap::new()),
             background: Mutex::new(None),
+            #[cfg(test)]
+            reconcile_count: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            heartbeat_count: std::sync::atomic::AtomicU64::new(0),
         });
+        let mut roster_changes = hub.subscribe_peer_reconcile();
         service.reconcile_once().await?;
         service.recovering.store(false, Ordering::Release);
         let weak = Arc::downgrade(&service);
         let task = tokio::spawn(async move {
+            let mut maintenance_tick = tokio::time::interval(RECONCILE_INTERVAL);
+            maintenance_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Consume `interval`'s immediate first tick: startup reconciliation
+            // already established the complete publication set above.
+            maintenance_tick.tick().await;
+            let mut roster_dirty = false;
             loop {
                 let Some(service) = weak.upgrade() else {
                     return;
@@ -236,12 +255,40 @@ impl PeerService {
                 if service.draining.load(Ordering::Acquire) {
                     return;
                 }
-                if let Err(error) = service.reconcile_once().await {
-                    tracing::warn!(target: "haider.peer", %error, "peer reconciliation failed");
+                let reconcile = tokio::select! {
+                    biased;
+                    _ = maintenance_tick.tick() => std::mem::take(&mut roster_dirty),
+                    () = service.wake.notified() => true,
+                    received = roster_changes.recv() => match received {
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            // The roster publication stream is broader than
+                            // peer descriptor state: every committed append
+                            // publishes. Coalesce that burst at the fixed tick
+                            // rather than turning one append into an N-session
+                            // store walk. Explicit `wake` remains immediate.
+                            roster_dirty = true;
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    },
+                };
+                if service.draining.load(Ordering::Acquire) {
+                    return;
                 }
-                tokio::select! {
-                    () = tokio::time::sleep(RECONCILE_INTERVAL) => {}
-                    () = service.wake.notified() => {}
+                let result = if reconcile {
+                    roster_dirty = false;
+                    service.reconcile_once().await
+                } else {
+                    // The periodic tick is only a liveness heartbeat over the
+                    // cached publications. Store-backed roster reconciliation
+                    // is driven by an actual roster/wake publication.
+                    service.heartbeat_once().await
+                };
+                if let Err(error) = result {
+                    if reconcile {
+                        roster_dirty = true;
+                    }
+                    tracing::warn!(target: "haider.peer", %error, "peer maintenance failed");
                 }
             }
         });
@@ -434,6 +481,8 @@ impl PeerService {
         if self.draining.load(Ordering::Acquire) {
             return Ok(());
         }
+        #[cfg(test)]
+        self.reconcile_count.fetch_add(1, Ordering::Relaxed);
         let summaries = self.hub()?.peer_session_summaries().await?;
         let now = now_ms();
         let desired = summaries
@@ -455,7 +504,7 @@ impl PeerService {
 
         for (id, descriptor) in &desired {
             if existing.contains(id) {
-                let paths = {
+                let write = {
                     let mut publications =
                         self.publications
                             .lock()
@@ -473,13 +522,20 @@ impl PeerService {
                         >= MANIFEST_HEARTBEAT_MS;
                     if changed || heartbeat_due {
                         publication.descriptor = descriptor.clone();
-                        Some(publication.paths.clone())
+                        Some((
+                            publication.paths.clone(),
+                            if changed {
+                                MANIFEST_CREATION_SYNC_POLICY
+                            } else {
+                                MANIFEST_HEARTBEAT_SYNC_POLICY
+                            },
+                        ))
                     } else {
                         None
                     }
                 };
-                if let Some(paths) = paths {
-                    write_manifest(&paths, descriptor).await?;
+                if let Some((paths, policy)) = write {
+                    write_manifest(&paths, descriptor, policy).await?;
                 }
             } else {
                 let publication = self.publish_local(descriptor.clone()).await?;
@@ -517,6 +573,44 @@ impl PeerService {
         self.process_mailboxes().await
     }
 
+    async fn heartbeat_once(&self) -> Result<(), PeerError> {
+        #[cfg(test)]
+        self.heartbeat_count.fetch_add(1, Ordering::Relaxed);
+        let now = now_ms();
+        let due = {
+            let mut publications =
+                self.publications
+                    .lock()
+                    .map_err(|_| PeerError::Unavailable {
+                        message: "peer publication registry is poisoned".into(),
+                    })?;
+            publications
+                .values_mut()
+                .filter(|publication| {
+                    now.saturating_sub(publication.descriptor.last_seen) >= MANIFEST_HEARTBEAT_MS
+                })
+                .map(|publication| {
+                    publication.descriptor.last_seen = now;
+                    (publication.paths.clone(), publication.descriptor.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        for (paths, descriptor) in due {
+            write_manifest(&paths, &descriptor, MANIFEST_HEARTBEAT_SYNC_POLICY).await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn reconcile_count(&self) -> u64 {
+        self.reconcile_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(super) fn heartbeat_count(&self) -> u64 {
+        self.heartbeat_count.load(Ordering::Relaxed)
+    }
+
     async fn publish_local(
         self: &Arc<Self>,
         descriptor: PeerDescriptor,
@@ -527,7 +621,7 @@ impl PeerService {
         {
             let endpoint = Endpoint::from_address(paths.socket.clone());
             let bound = BoundEndpoint::bind(&endpoint, &self.runtime_dir).await?;
-            write_manifest(&paths, &descriptor).await?;
+            write_manifest(&paths, &descriptor, MANIFEST_CREATION_SYNC_POLICY).await?;
             let (cancel, cancelled) = watch::channel(false);
             let weak = Arc::downgrade(self);
             let target_id = descriptor.id.clone();
@@ -541,7 +635,7 @@ impl PeerService {
         }
         #[cfg(windows)]
         {
-            write_manifest(&paths, &descriptor).await?;
+            write_manifest(&paths, &descriptor, MANIFEST_CREATION_SYNC_POLICY).await?;
             Ok(LocalPublication { descriptor, paths })
         }
     }
@@ -2066,6 +2160,7 @@ fn is_mailbox_name(name: &str) -> bool {
 async fn write_manifest(
     paths: &haider_platform::PeerEndpointPaths,
     descriptor: &PeerDescriptor,
+    sync_policy: haider_platform::SyncPolicy,
 ) -> Result<(), PeerError> {
     let socket = paths
         .socket
@@ -2089,14 +2184,18 @@ async fn write_manifest(
         last_seen: descriptor.last_seen,
     };
     let target = paths.manifest.clone();
-    tokio::task::spawn_blocking(move || write_manifest_blocking(&target, &manifest))
+    tokio::task::spawn_blocking(move || write_manifest_blocking(&target, &manifest, sync_policy))
         .await
         .map_err(|error| PeerError::Unavailable {
             message: format!("peer manifest writer task failed: {error}"),
         })?
 }
 
-fn write_manifest_blocking(path: &Path, manifest: &PeerManifest) -> Result<(), PeerError> {
+pub(super) fn write_manifest_blocking(
+    path: &Path,
+    manifest: &PeerManifest,
+    sync_policy: haider_platform::SyncPolicy,
+) -> Result<(), PeerError> {
     ensure_peer_artifact_parent(path)?;
     let bytes = serde_json::to_vec(manifest).map_err(|error| PeerError::Invalid {
         message: format!("cannot encode peer manifest: {error}"),
@@ -2124,11 +2223,68 @@ fn write_manifest_blocking(path: &Path, manifest: &PeerManifest) -> Result<(), P
             })?;
     }
     file.write_all(&bytes)
-        .and_then(|()| file.sync_all())
+        .and_then(|()| sync_manifest_file(&file, sync_policy))
         .map_err(|error| PeerError::io("persist peer manifest staging file", &temporary, error))?;
     replace_manifest_staging(&temporary, path)
         .map_err(|error| PeerError::io("publish peer manifest", path, error))?;
-    sync_parent(path)
+    sync_manifest_parent(path, sync_policy)
+}
+
+#[cfg(test)]
+type ManifestSyncTestHook = Box<dyn FnMut(haider_platform::SyncPolicy)>;
+
+#[cfg(test)]
+std::thread_local! {
+    static MANIFEST_SYNC_TEST_HOOK: std::cell::RefCell<Option<ManifestSyncTestHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn with_manifest_sync_test_hook<T>(
+    hook: impl FnMut(haider_platform::SyncPolicy) + 'static,
+    action: impl FnOnce() -> T,
+) -> T {
+    let previous = MANIFEST_SYNC_TEST_HOOK.with(|slot| slot.replace(Some(Box::new(hook))));
+    let result = action();
+    MANIFEST_SYNC_TEST_HOOK.with(|slot| {
+        slot.replace(previous);
+    });
+    result
+}
+
+#[cfg(test)]
+fn intercept_manifest_sync_for_test(policy: haider_platform::SyncPolicy) -> bool {
+    MANIFEST_SYNC_TEST_HOOK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(hook) = slot.as_mut() else {
+            return false;
+        };
+        hook(policy);
+        true
+    })
+}
+
+fn sync_manifest_file(
+    file: &std::fs::File,
+    policy: haider_platform::SyncPolicy,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    if intercept_manifest_sync_for_test(policy) {
+        return Ok(());
+    }
+    haider_platform::fs::sync_file(file, policy)
+}
+
+fn sync_manifest_parent(path: &Path, policy: haider_platform::SyncPolicy) -> Result<(), PeerError> {
+    let parent = path.parent().ok_or_else(|| PeerError::Invalid {
+        message: format!("runtime artifact {} has no parent", path.display()),
+    })?;
+    #[cfg(test)]
+    if intercept_manifest_sync_for_test(policy) {
+        return Ok(());
+    }
+    haider_platform::fs::sync_directory(parent, policy)
+        .map_err(|error| PeerError::io("sync peer runtime directory", parent, error))
 }
 
 fn ensure_peer_artifact_parent(path: &Path) -> Result<(), PeerError> {

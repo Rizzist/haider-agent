@@ -1,22 +1,26 @@
 #![allow(clippy::expect_used)]
 
 use super::peer::{
-    MailboxRecord, append_record_blocking, deduplicate_agents, expiration_receipt,
-    load_pending_blocking, parse_qualified_address, peer_name_suffix, resolve_address,
+    MANIFEST_CREATION_SYNC_POLICY, MANIFEST_HEARTBEAT_SYNC_POLICY, MailboxRecord,
+    append_record_blocking, deduplicate_agents, expiration_receipt, load_pending_blocking,
+    parse_qualified_address, peer_name_suffix, resolve_address, with_manifest_sync_test_hook,
+    write_manifest_blocking,
 };
 #[cfg(unix)]
 use super::peer::{
     OutboundReceiptState, expire_outbound_blocking, journal_wire_receipt_blocking,
     load_outbound_receipts_blocking, wire_sender_from_descriptor,
 };
-#[cfg(unix)]
-use haider_protocol::peer::{PEER_WIRE_VERSION, PeerManifest, PeerWireBody, PeerWireFrame};
 use haider_protocol::peer::{
-    PeerDelivery, PeerDescriptor, PeerKind, PeerMessage, PeerReceipt, PeerSender, PeerState,
-    PeerTrust,
+    PEER_WIRE_VERSION, PeerDelivery, PeerDescriptor, PeerKind, PeerManifest, PeerMessage,
+    PeerReceipt, PeerSender, PeerState, PeerTrust,
 };
+#[cfg(unix)]
+use haider_protocol::peer::{PeerWireBody, PeerWireFrame};
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::io::Write as _;
+use std::rc::Rc;
 
 #[derive(Default)]
 struct PeerEventSink(std::sync::Mutex<Vec<haider_rpc::WireFrame>>);
@@ -78,6 +82,96 @@ fn accepted_turn() -> haider_core::AcceptedTurn {
         first_user_turn: false,
         pdf_attachments: Vec::new(),
     }
+}
+
+#[test]
+fn manifest_creation_stays_full_while_heartbeat_uses_plain_sync() {
+    let root = tempfile::tempdir().expect("temporary manifest profile");
+    let path = root.path().join("ph-0123456789ab.j");
+    let manifest = PeerManifest {
+        version: PEER_WIRE_VERSION,
+        id: "session-sync-policy".into(),
+        name: "sync-policy".into(),
+        kind: PeerKind::HaiderSession,
+        socket: "ph-0123456789ab.s".into(),
+        capabilities: vec!["deliver".into()],
+        workspace: "/workspace".into(),
+        model: "test-model".into(),
+        state: PeerState::Idle,
+        started_at: 1,
+        last_seen: 2,
+    };
+    let policies = Rc::new(RefCell::new(Vec::new()));
+    let observed = Rc::clone(&policies);
+    with_manifest_sync_test_hook(
+        move |policy| observed.borrow_mut().push(policy),
+        || {
+            write_manifest_blocking(&path, &manifest, MANIFEST_CREATION_SYNC_POLICY)
+                .expect("create manifest");
+            write_manifest_blocking(&path, &manifest, MANIFEST_HEARTBEAT_SYNC_POLICY)
+                .expect("heartbeat manifest");
+        },
+    );
+    assert_eq!(
+        *policies.borrow(),
+        [
+            haider_platform::SyncPolicy::Full,
+            haider_platform::SyncPolicy::Full,
+            haider_platform::SyncPolicy::Plain,
+            haider_platform::SyncPolicy::Plain,
+        ],
+        "each manifest replacement syncs its file and parent with one policy"
+    );
+}
+
+#[tokio::test]
+async fn idle_peer_ticks_do_not_reconcile_without_a_roster_wake() {
+    use super::peer::PeerService;
+    use crate::session_hub::{SessionHub, SessionHubConfig};
+    use haider_core::SqliteStoreHandle;
+
+    let root = tempfile::tempdir().expect("temporary idle peer profile");
+    let runtime = root.path().join("runtime");
+    std::fs::create_dir_all(&runtime).expect("create idle peer runtime");
+    let store = SqliteStoreHandle::open(root.path().join("store"))
+        .await
+        .expect("open idle peer store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default())
+        .expect("construct idle peer hub");
+    let service = PeerService::start(runtime, &hub)
+        .await
+        .expect("start idle peer service");
+    let initial = service.reconcile_count();
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+
+    assert_eq!(
+        service.reconcile_count(),
+        initial,
+        "two idle 500 ms ticks must not re-read the session roster"
+    );
+    assert!(
+        service.heartbeat_count() >= 2,
+        "idle maintenance ticks must retain manifest heartbeats"
+    );
+    hub.notify_roster_session(haider_protocol::ids::SessionId::new(
+        "session-peer-reconcile-wake",
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while service.reconcile_count() == initial {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("roster publication wakes peer reconciliation");
+    assert_eq!(
+        service.reconcile_count(),
+        initial + 1,
+        "one roster publication triggers one reconciliation"
+    );
+    service.shutdown().await;
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
 }
 
 #[test]

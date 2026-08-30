@@ -191,6 +191,9 @@ pub(crate) trait ProviderRegistryStoreLike: Send + Sync {
         })
     }
     fn save(&self, profiles: &[ProviderProfileV1]) -> Result<(), HaiderError>;
+    fn save_bootstrap(&self, profiles: &[ProviderProfileV1]) -> Result<(), HaiderError> {
+        self.save(profiles)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -226,18 +229,12 @@ impl JsonProviderRegistryStore {
                 )
             })
     }
-}
 
-impl ProviderRegistryStoreLike for JsonProviderRegistryStore {
-    fn load(&self) -> Result<Vec<ProviderProfileV1>, HaiderError> {
-        self.read_document().map(|document| document.providers)
-    }
-
-    fn load_document(&self) -> Result<ProviderRegistryDocumentV1, HaiderError> {
-        self.read_document()
-    }
-
-    fn save(&self, profiles: &[ProviderProfileV1]) -> Result<(), HaiderError> {
+    fn save_with_policy(
+        &self,
+        profiles: &[ProviderProfileV1],
+        policy: haider_platform::SyncPolicy,
+    ) -> Result<(), HaiderError> {
         let parent = self.path.parent().ok_or_else(|| {
             HaiderError::new(
                 ErrorCode::InvalidArgument,
@@ -276,15 +273,36 @@ impl ProviderRegistryStoreLike for JsonProviderRegistryStore {
             .open(&temporary)
             .map_err(|error| file_error("open temporary file for", &temporary, error))?;
         file.write_all(&bytes)
-            // A changed registry keeps its existing full-durability contract.
-            .and_then(|()| haider_platform::fs::sync_file(&file, haider_platform::SyncPolicy::Full))
+            .and_then(|()| haider_platform::fs::sync_file(&file, policy))
             .map_err(|error| file_error("write", &temporary, error))?;
         drop(file);
         haider_platform::replace_file(&temporary, &self.path)
             .map_err(|error| file_error("replace", &self.path, error))?;
-        // The replacement must survive whenever changed registry bytes were installed.
-        haider_platform::fs::sync_directory(parent, haider_platform::SyncPolicy::Full)
+        haider_platform::fs::sync_directory(parent, policy)
             .map_err(|error| file_error("sync parent directory of", &self.path, error))
+    }
+}
+
+impl ProviderRegistryStoreLike for JsonProviderRegistryStore {
+    fn load(&self) -> Result<Vec<ProviderProfileV1>, HaiderError> {
+        self.read_document().map(|document| document.providers)
+    }
+
+    fn load_document(&self) -> Result<ProviderRegistryDocumentV1, HaiderError> {
+        self.read_document()
+    }
+
+    fn save(&self, profiles: &[ProviderProfileV1]) -> Result<(), HaiderError> {
+        self.save_with_policy(profiles, haider_platform::SyncPolicy::Full)
+    }
+
+    fn save_bootstrap(&self, profiles: &[ProviderProfileV1]) -> Result<(), HaiderError> {
+        // Release-owned defaults and newly introduced built-ins are
+        // reconstructible on the next boot. Keep the atomic replacement and
+        // plain fsync ordering without paying Apple's device-wide full-cache
+        // flush twice on the readiness path. User-issued mutations continue
+        // through `save`, whose policy remains Full.
+        self.save_with_policy(profiles, haider_platform::SyncPolicy::Plain)
     }
 }
 
@@ -300,6 +318,10 @@ impl ProviderRegistryStoreLike for Arc<dyn ProviderRegistryStoreLike> {
     fn save(&self, profiles: &[ProviderProfileV1]) -> Result<(), HaiderError> {
         self.as_ref().save(profiles)
     }
+
+    fn save_bootstrap(&self, profiles: &[ProviderProfileV1]) -> Result<(), HaiderError> {
+        self.as_ref().save_bootstrap(profiles)
+    }
 }
 
 impl ProviderRegistryStoreLike for Box<dyn ProviderRegistryStoreLike> {
@@ -313,6 +335,10 @@ impl ProviderRegistryStoreLike for Box<dyn ProviderRegistryStoreLike> {
 
     fn save(&self, profiles: &[ProviderProfileV1]) -> Result<(), HaiderError> {
         self.as_ref().save(profiles)
+    }
+
+    fn save_bootstrap(&self, profiles: &[ProviderProfileV1]) -> Result<(), HaiderError> {
+        self.as_ref().save_bootstrap(profiles)
     }
 }
 
@@ -454,7 +480,7 @@ impl<S: ProviderRegistryStoreLike> ProviderRegistry<S> {
         };
         // Refuse invalid resilience configuration before rewriting the
         // registry projection during bootstrap/profile reconciliation.
-        store.save(&profiles)?;
+        store.save_bootstrap(&profiles)?;
         Ok(Self {
             store,
             profiles,
