@@ -2449,33 +2449,21 @@ async fn run_headless_inner(
         HeadlessConnection::open(profile, ensure.clone(), Arc::clone(&daemon_ownership)),
     )
     .await?;
-    let (explicit_provider, explicit_model, selected_provider) = before_acceptance_deadline(
-        timeout_deadline,
-        "model selector bootstrap",
-        resolve_run_model_selector(
-            profile,
-            &ensure,
-            &mut connection,
-            &mut reconnects,
-            request.provider.clone(),
-            request.model.clone(),
-            session_config.model.as_deref().or(request.model.as_deref()),
-        ),
-    )
-    .await?;
-    let (provider, model) = before_acceptance_deadline(
-        timeout_deadline,
-        "identity bootstrap",
-        resolve_run_identity(
-            profile,
-            &ensure,
-            &mut connection,
-            &mut reconnects,
-            explicit_provider,
-            explicit_model,
-        ),
-    )
-    .await?;
+    let (create_provider, create_model, resolve_provider, resolve_model) =
+        before_acceptance_deadline(
+            timeout_deadline,
+            "model selector bootstrap",
+            resolve_create_identity(
+                profile,
+                &ensure,
+                &mut connection,
+                &mut reconnects,
+                request.provider.clone(),
+                request.model.clone(),
+                session_config.model.as_deref().or(request.model.as_deref()),
+            ),
+        )
+        .await?;
     let (submit_attachments, attachment_refs) = before_acceptance_deadline(
         timeout_deadline,
         "artifact.put",
@@ -2506,14 +2494,18 @@ async fn run_headless_inner(
     let create_body = RequestBody::SessionCreateWithPermissionOverrides {
         command_id: CommandId::new(command_id("headless-create")),
         cwd: request.cwd.clone(),
-        provider: provider.clone(),
-        model: model.clone(),
+        provider: create_provider.clone(),
+        model: create_model.clone(),
         max_tokens: request.max_tokens,
         permission_overrides: (!request.permission_overrides.is_empty())
             .then_some(request.permission_overrides),
         cache_policy: None,
         interaction_mode: SessionInteractionModeV1::Autonomous,
         ssh_scope: session_config.ssh_scope.clone(),
+        resolve_provider,
+        resolve_model,
+        effort: session_config.effort.clone(),
+        fast: session_config.fast,
     };
 
     let (session_id, created_generation, created_seq, created_metadata) =
@@ -2543,6 +2535,17 @@ async fn run_headless_inner(
                                     .into(),
                             });
                         }
+                        if (!resolve_provider && metadata.provider != create_provider)
+                            || (!resolve_model && metadata.model != create_model)
+                            || metadata.effort != session_config.effort
+                            || metadata.fast != session_config.fast.unwrap_or(false)
+                        {
+                            return Err(HeadlessRunError::Protocol {
+                                stage: "session.create",
+                                message: "daemon did not persist the requested headless identity and tuning"
+                                    .into(),
+                            });
+                        }
                         break Ok((session_id, worker_generation, created_seq, metadata));
                     }
                     Ok(ResponseBody::Error {
@@ -2550,7 +2553,9 @@ async fn run_headless_inner(
                         message,
                         retryable,
                         ..
-                    }) => break Err(rpc_error("session.create", code, message, retryable)),
+                    }) => {
+                        break Err(session_create_error(code, message, retryable));
+                    }
                     Ok(_) => {
                         break Err(protocol_error(
                             "session.create",
@@ -2597,18 +2602,8 @@ async fn run_headless_inner(
     )
     .await?;
 
-    before_acceptance_deadline(
-        timeout_deadline,
-        "session config",
-        apply_headless_session_config(
-            &mut connection,
-            &session_id,
-            &model,
-            selected_provider,
-            &session_config,
-        ),
-    )
-    .await?;
+    let provider = created_metadata.provider.clone();
+    let model = created_metadata.model.clone();
 
     // This body is immutable across response-loss retries. In particular, its
     // original generation remains part of the durable command identity even if
@@ -3116,48 +3111,7 @@ fn encode_base64(bytes: &[u8]) -> String {
     encoded
 }
 
-async fn resolve_run_identity(
-    profile: &ResolvedProfile,
-    ensure: &EnsureOptions,
-    connection: &mut HeadlessConnection,
-    reconnects: &mut ReconnectBudget,
-    explicit_provider: Option<String>,
-    explicit_model: Option<String>,
-) -> Result<(String, String), HeadlessRunError> {
-    let provider_is_explicit = explicit_provider.is_some();
-    let provider = match explicit_provider {
-        Some(provider) => provider,
-        None => active_account_provider(profile, ensure, connection, reconnects).await?,
-    };
-    if let Some(model) = explicit_model {
-        return Ok((provider, model));
-    }
-
-    let summary = provider_summary(profile, ensure, connection, reconnects, &provider).await?;
-    match summary {
-        Some(summary) => summary
-            .default_model
-            .map(|model| (provider.clone(), model))
-            .ok_or_else(|| HeadlessRunError::Bootstrap {
-                stage: "provider.list",
-                code: ERROR_CODE_NO_DEFAULT_MODEL,
-                message: format!("provider `{provider}` publishes no default model"),
-                retryable: false,
-            }),
-        // An explicit unknown provider must reach session.create so the
-        // daemon remains the provider-name authority. Its provider check
-        // precedes the non-empty-model check, preserving the typed refusal.
-        None if provider_is_explicit => Ok((provider, String::new())),
-        None => Err(HeadlessRunError::Bootstrap {
-            stage: "provider.list",
-            code: ERROR_CODE_NO_DEFAULT_MODEL,
-            message: format!("active provider `{provider}` is absent from provider.list"),
-            retryable: false,
-        }),
-    }
-}
-
-async fn resolve_run_model_selector(
+async fn resolve_create_identity(
     profile: &ResolvedProfile,
     ensure: &EnsureOptions,
     connection: &mut HeadlessConnection,
@@ -3165,9 +3119,18 @@ async fn resolve_run_model_selector(
     explicit_provider: Option<String>,
     legacy_model: Option<String>,
     selector: Option<&str>,
-) -> Result<(Option<String>, Option<String>, Option<String>), HeadlessRunError> {
+) -> Result<(String, String, bool, bool), HeadlessRunError> {
+    let provider = explicit_provider;
+    let mut model = legacy_model;
     let Some(selector) = selector else {
-        return Ok((explicit_provider, legacy_model, None));
+        let resolve_provider = provider.is_none();
+        let resolve_model = model.is_none();
+        return Ok((
+            provider.unwrap_or_default(),
+            model.unwrap_or_default(),
+            resolve_provider,
+            resolve_model,
+        ));
     };
     if let Some((candidate, model)) = selector.split_once('/') {
         let registered = provider_summary(profile, ensure, connection, reconnects, candidate)
@@ -3182,7 +3145,7 @@ async fn resolve_run_model_selector(
                     retryable: false,
                 });
             }
-            if let Some(explicit_provider) = explicit_provider.as_ref()
+            if let Some(explicit_provider) = provider.as_ref()
                 && explicit_provider != candidate
             {
                 return Err(HeadlessRunError::Bootstrap {
@@ -3194,187 +3157,24 @@ async fn resolve_run_model_selector(
                     retryable: false,
                 });
             }
+            let resolve_provider = false;
+            let resolve_model = false;
             return Ok((
-                Some(candidate.to_owned()),
-                Some(model.to_owned()),
-                Some(candidate.to_owned()),
+                candidate.to_owned(),
+                model.to_owned(),
+                resolve_provider,
+                resolve_model,
             ));
         }
     }
-    Ok((explicit_provider, Some(selector.to_owned()), None))
-}
-
-async fn apply_headless_session_config(
-    connection: &mut HeadlessConnection,
-    session_id: &SessionId,
-    resolved_model: &str,
-    selected_provider: Option<String>,
-    config: &HeadlessSessionConfig,
-) -> Result<(), HeadlessRunError> {
-    if config.model.is_some() {
-        let response = connection
-            .client
-            .request(RequestBody::SessionSelectModel {
-                command_id: CommandId::new(command_id("headless-select-model")),
-                session_id: session_id.clone(),
-                worker_generation: connection.worker_generation,
-                model: resolved_model.to_owned(),
-                provider: selected_provider,
-                confirm_new_epoch: false,
-            })
-            .await
-            .map_err(|error| client_error_as_headless("session.select_model", error))?;
-        connection.worker_generation = headless_selection_generation(
-            response,
-            session_id,
-            HeadlessSelectionKind::Model,
-            "session.select_model",
-        )?;
-    }
-    if let Some(effort) = config.effort.as_ref() {
-        let response = connection
-            .client
-            .request(RequestBody::SessionSelectEffort {
-                command_id: CommandId::new(command_id("headless-select-effort")),
-                session_id: session_id.clone(),
-                worker_generation: connection.worker_generation,
-                effort: Some(effort.clone()),
-                confirm_new_epoch: false,
-            })
-            .await
-            .map_err(|error| client_error_as_headless("session.select_effort", error))?;
-        connection.worker_generation = headless_selection_generation(
-            response,
-            session_id,
-            HeadlessSelectionKind::Effort,
-            "session.select_effort",
-        )?;
-    }
-    if let Some(enabled) = config.fast {
-        let response = connection
-            .client
-            .request(RequestBody::SessionSelectFast {
-                command_id: CommandId::new(command_id("headless-select-fast")),
-                session_id: session_id.clone(),
-                worker_generation: connection.worker_generation,
-                enabled,
-                confirm_new_epoch: false,
-            })
-            .await
-            .map_err(|error| client_error_as_headless("session.select_fast", error))?;
-        connection.worker_generation = headless_selection_generation(
-            response,
-            session_id,
-            HeadlessSelectionKind::Fast,
-            "session.select_fast",
-        )?;
-    }
-    Ok(())
-}
-
-#[derive(Clone, Copy)]
-enum HeadlessSelectionKind {
-    Model,
-    Effort,
-    Fast,
-}
-
-fn headless_selection_generation(
-    response: ResponseBody,
-    expected_session: &SessionId,
-    kind: HeadlessSelectionKind,
-    stage: &'static str,
-) -> Result<u64, HeadlessRunError> {
-    match (kind, response) {
-        (
-            HeadlessSelectionKind::Model,
-            ResponseBody::SessionSelectModel {
-                session_id,
-                worker_generation,
-                ..
-            },
-        )
-        | (
-            HeadlessSelectionKind::Effort,
-            ResponseBody::SessionSelectEffort {
-                session_id,
-                worker_generation,
-                ..
-            },
-        )
-        | (
-            HeadlessSelectionKind::Fast,
-            ResponseBody::SessionSelectFast {
-                session_id,
-                worker_generation,
-                ..
-            },
-        ) if &session_id == expected_session => Ok(worker_generation),
-        (
-            _,
-            ResponseBody::Error {
-                code,
-                message,
-                retryable,
-                ..
-            },
-        ) => Err(rpc_error(stage, code, message, retryable)),
-        _ => Err(protocol_error(
-            stage,
-            "response method or session did not match request",
-        )),
-    }
-}
-
-async fn active_account_provider(
-    profile: &ResolvedProfile,
-    ensure: &EnsureOptions,
-    connection: &mut HeadlessConnection,
-    reconnects: &mut ReconnectBudget,
-) -> Result<String, HeadlessRunError> {
-    loop {
-        match connection
-            .client
-            .request(RequestBody::AccountList { provider: None })
-            .await
-        {
-            Ok(ResponseBody::AccountList { descriptors, .. }) => {
-                return descriptors
-                    .into_iter()
-                    .find(|descriptor| descriptor.active)
-                    .map(|descriptor| descriptor.provider)
-                    .ok_or_else(|| HeadlessRunError::Bootstrap {
-                        stage: "account.list",
-                        code: ERROR_CODE_NO_ACTIVE_ACCOUNT,
-                        message: "no active daemon account is configured".into(),
-                        retryable: false,
-                    });
-            }
-            Ok(ResponseBody::Error {
-                code,
-                message,
-                retryable,
-                ..
-            }) => return Err(rpc_error("account.list", code, message, retryable)),
-            Ok(_) => {
-                return Err(protocol_error(
-                    "account.list",
-                    "response method did not match request",
-                ));
-            }
-            Err(error) => {
-                reconnect_before_session(
-                    profile,
-                    ensure,
-                    connection,
-                    reconnects,
-                    "account.list",
-                    error,
-                )
-                .await?;
-            }
-        }
-    }
+    model = Some(selector.to_owned());
+    let resolve_provider = provider.is_none();
+    Ok((
+        provider.unwrap_or_default(),
+        model.unwrap_or_default(),
+        resolve_provider,
+        false,
+    ))
 }
 
 async fn provider_summary(
@@ -3434,6 +3234,9 @@ fn normalize_ensure_options(
     options
         .required_features
         .insert(FEATURE_AUTONOMOUS_INTERACTION_V1.to_owned());
+    options
+        .required_features
+        .insert(haider_rpc::FEATURE_SESSION_CREATE_ADMISSION_V1.to_owned());
     if !permission_overrides.is_empty() {
         options
             .required_features
@@ -4574,6 +4377,24 @@ fn rpc_error(
     }
 }
 
+fn session_create_error(code: String, message: String, retryable: bool) -> HeadlessRunError {
+    let bootstrap_code = match code.as_str() {
+        ERROR_CODE_NO_ACTIVE_ACCOUNT => Some(ERROR_CODE_NO_ACTIVE_ACCOUNT),
+        ERROR_CODE_NO_DEFAULT_MODEL => Some(ERROR_CODE_NO_DEFAULT_MODEL),
+        _ => None,
+    };
+    if let Some(code) = bootstrap_code {
+        HeadlessRunError::Bootstrap {
+            stage: "session.create",
+            code,
+            message,
+            retryable,
+        }
+    } else {
+        rpc_error("session.create", code, message, retryable)
+    }
+}
+
 fn protocol_error(stage: &'static str, message: &str) -> HeadlessRunError {
     HeadlessRunError::Protocol {
         stage,
@@ -4597,6 +4418,7 @@ pub fn required_headless_features(
 ) -> BTreeSet<String> {
     let mut features = required_live_features();
     features.insert(FEATURE_AUTONOMOUS_INTERACTION_V1.to_owned());
+    features.insert(haider_rpc::FEATURE_SESSION_CREATE_ADMISSION_V1.to_owned());
     if !permission_overrides.is_empty() {
         features.insert(FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned());
     }

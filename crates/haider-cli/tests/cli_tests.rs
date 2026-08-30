@@ -1062,7 +1062,7 @@ fn run_jsonl_bootstrap_failures_always_end_in_a_typed_error_record() {
         "invalid_argument"
     );
 
-    let accepted_then_refused = haider()
+    let atomic_create_refusal = haider()
         .args([
             "run",
             "--provider",
@@ -1075,9 +1075,9 @@ fn run_jsonl_bootstrap_failures_always_end_in_a_typed_error_record() {
             "hello",
         ])
         .output()
-        .expect("post-acceptance refusal executes");
-    let values = assert_terminal_jsonl_error(&accepted_then_refused);
-    assert_eq!(values[0]["event"], "accepted");
+        .expect("atomic create refusal executes");
+    let values = assert_terminal_jsonl_error(&atomic_create_refusal);
+    assert_eq!(values[0]["event"], "error");
     assert_eq!(
         values.last().expect("error")["error"]["code"],
         "effort_unsupported"

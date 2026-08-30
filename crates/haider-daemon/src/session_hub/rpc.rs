@@ -2392,6 +2392,10 @@ impl HubConnection {
                 cache_policy,
                 interaction_mode,
                 ssh_scope,
+                resolve_provider,
+                resolve_model,
+                effort,
+                fast,
             } => {
                 if let Err(message) = authorize(&self.capabilities, Operation::Control) {
                     return self.respond_error(
@@ -2413,6 +2417,10 @@ impl HubConnection {
                     cache_policy.unwrap_or_default(),
                     interaction_mode,
                     ssh_scope,
+                    resolve_provider,
+                    resolve_model,
+                    effort,
+                    fast,
                 )
                 .await
             }
@@ -2443,6 +2451,10 @@ impl HubConnection {
                     Default::default(),
                     haider_protocol::session::SessionInteractionModeV1::Interactive,
                     None,
+                    false,
+                    false,
+                    None,
+                    None,
                 )
                 .await
             }
@@ -2457,6 +2469,18 @@ impl HubConnection {
                     );
                 }
                 self.session_list(request_id, cursor, limit).await
+            }
+            RequestBody::StatusSnapshot {} => {
+                if let Err(message) = authorize(&self.capabilities, Operation::View) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                self.status_snapshot(request_id).await
             }
             RequestBody::AccountListWatch {} => {
                 if let Err(message) = authorize(&self.capabilities, Operation::View) {
@@ -13841,13 +13865,17 @@ impl HubConnection {
         request_id: RequestId,
         command_id: CommandId,
         cwd: String,
-        provider: String,
-        model: String,
+        mut provider: String,
+        mut model: String,
         max_tokens: u64,
         permission_overrides: Option<haider_protocol::session::SessionPermissionOverridesV1>,
         cache_policy: haider_protocol::cache::CachePolicySettingsV1,
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         ssh_scope: Option<haider_rpc::SshScopeWire>,
+        resolve_provider: bool,
+        resolve_model: bool,
+        effort: Option<String>,
+        fast: Option<bool>,
     ) -> Result<(), SessionHubError> {
         if command_id.as_str().is_empty() {
             return self.respond_error(
@@ -13864,6 +13892,18 @@ impl HubConnection {
             "model": &model,
             "max_tokens": max_tokens,
         });
+        if resolve_provider {
+            request_coordinates["resolve_provider"] = serde_json::Value::Bool(true);
+        }
+        if resolve_model {
+            request_coordinates["resolve_model"] = serde_json::Value::Bool(true);
+        }
+        if let Some(effort) = &effort {
+            request_coordinates["effort"] = serde_json::Value::String(effort.clone());
+        }
+        if let Some(fast) = fast {
+            request_coordinates["fast"] = serde_json::Value::Bool(fast);
+        }
         let ssh_scope = match ssh_scope {
             Some(scope) => match crate::ssh::SshScope::from_wire(scope) {
                 Ok(scope) => scope,
@@ -13928,6 +13968,88 @@ impl HubConnection {
                 );
             }
             Err(error) => return Err(error),
+        }
+
+        if resolve_provider {
+            if !provider.is_empty() {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    "session-create provider must be empty when daemon resolution is requested",
+                    false,
+                    None,
+                );
+            }
+            let Some(facade) = self.hub.accounts()? else {
+                return self.respond_error(
+                    request_id,
+                    "no_active_account",
+                    "no active daemon account is configured",
+                    false,
+                    None,
+                );
+            };
+            let Some(active_provider) = facade.management.inspect(|view| {
+                view.descriptors
+                    .iter()
+                    .find(|descriptor| descriptor.active)
+                    .map(|descriptor| descriptor.provider.clone())
+            }) else {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_DRAINING,
+                    "management snapshot is unavailable",
+                    true,
+                    None,
+                );
+            };
+            let Some(active_provider) = active_provider else {
+                return self.respond_error(
+                    request_id,
+                    "no_active_account",
+                    "no active daemon account is configured",
+                    false,
+                    None,
+                );
+            };
+            provider = active_provider;
+        }
+        if resolve_model {
+            if !model.is_empty() {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    "session-create model must be empty when daemon resolution is requested",
+                    false,
+                    None,
+                );
+            }
+            let provider_default = match self.hub.accounts()? {
+                Some(facade) => {
+                    let Some(provider_default) = facade.management.inspect(|view| {
+                        view.providers
+                            .iter()
+                            .find(|summary| summary.provider == provider)
+                            .map(|summary| summary.default_model.clone())
+                    }) else {
+                        return self.respond_error(
+                            request_id,
+                            ERROR_CODE_DRAINING,
+                            "management snapshot is unavailable",
+                            true,
+                            None,
+                        );
+                    };
+                    provider_default
+                }
+                None => None,
+            };
+            if let Some(Some(default_model)) = provider_default {
+                model = default_model;
+            } else if provider_default.is_some() || resolve_provider {
+                let message = format!("provider `{provider}` publishes no default model");
+                return self.respond_error(request_id, "no_default_model", &message, false, None);
+            }
         }
 
         // D3-5: the dependency configuration is the ONE authority on
@@ -14001,6 +14123,14 @@ impl HubConnection {
             Ok(selection) => selection,
             Err(refusal) => return self.respond_selection_refusal(request_id, &refusal),
         };
+        if let Err(refusal) = authority.validate_effort(&provider, &model, effort.as_deref()) {
+            return self.respond_tuning_refusal(request_id, &refusal);
+        }
+        if let Some(enabled) = fast
+            && let Err(refusal) = authority.validate_fast(&provider, &model, enabled)
+        {
+            return self.respond_tuning_refusal(request_id, &refusal);
+        }
         if matches!(
             validated.inventory_status,
             haider_rpc::ModelInventoryStatusWire::Unlisted
@@ -14036,8 +14166,8 @@ impl HubConnection {
             model,
             max_tokens,
             permission_overrides,
-            effort: None,
-            fast: false,
+            effort,
+            fast: fast.unwrap_or(false),
             cache_policy,
             system_prompt_version: crate::worker::SystemPromptBuilder::VERSION.into(),
             event_id: EventId::new(random_id("session-created")?),
@@ -14142,6 +14272,38 @@ impl HubConnection {
             body: ResponseBody::SessionList {
                 sessions,
                 next_cursor,
+            },
+        })
+    }
+
+    async fn status_snapshot(&self, request_id: RequestId) -> Result<(), SessionHubError> {
+        let (active_account, adoption_available) = match self.hub.accounts()? {
+            Some(facade) => {
+                let Some(active) = facade.management.inspect(|view| {
+                    view.descriptors
+                        .iter()
+                        .find(|descriptor| descriptor.active)
+                        .cloned()
+                }) else {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_DRAINING,
+                        "management snapshot is unavailable",
+                        true,
+                        None,
+                    );
+                };
+                (active, facade.status_adoption_snapshot())
+            }
+            None => (None, Vec::new()),
+        };
+        let session_count = self.hub.roster_session_count().await?;
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::StatusSnapshot {
+                active_account,
+                session_count,
+                adoption_available,
             },
         })
     }

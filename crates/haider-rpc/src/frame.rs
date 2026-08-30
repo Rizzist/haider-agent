@@ -429,6 +429,12 @@ pub const FEATURE_SESSION_FAST_SELECT_V1: &str = "session_fast_select_v1";
 /// effort, and speed configuration through the existing observation and
 /// receipted selection methods.
 pub const FEATURE_SESSION_CONFIG_V1: &str = "session_config_v1";
+/// Daemon resolves provider/default-model and validates initial effort/speed
+/// inside the durable `session.create` admission request.
+pub const FEATURE_SESSION_CREATE_ADMISSION_V1: &str = "session_create_admission_v1";
+/// Daemon serves the scalar-only `status.snapshot` request without account or
+/// session-summary collection materialization.
+pub const FEATURE_STATUS_SNAPSHOT_V1: &str = "status_snapshot_v1";
 /// Daemon vaults the profile transcription secret (the Deepgram API key)
 /// and serves `transcription.secret_get`/`transcription.secret_set` on
 /// authenticated same-UID local UDS connections only (T1).
@@ -3004,6 +3010,20 @@ pub enum RequestBody {
         /// v1 default (`all`) and the exact bytes of older clients.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ssh_scope: Option<SshScopeWire>,
+        /// Resolve the active provider inside the same authorized create
+        /// request. The empty `provider` input is then a deliberate sentinel.
+        #[serde(default, skip_serializing_if = "is_default")]
+        resolve_provider: bool,
+        /// Resolve the selected provider's default model inside create.
+        #[serde(default, skip_serializing_if = "is_default")]
+        resolve_model: bool,
+        /// Initial autonomous effort; avoids a redundant post-create
+        /// selection barrier for headless sessions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+        /// Initial speed selection for headless sessions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fast: Option<bool>,
     },
     /// Atomically creates typed session configuration, a `Created` event, and
     /// the durable command receipt that makes response-loss retries safe.
@@ -3033,6 +3053,11 @@ pub enum RequestBody {
         /// Maximum number of summaries to return.
         limit: u32,
     },
+    /// Reads only the scalar facts needed by the one-shot CLI status view.
+    /// The daemon remains the authorization/redaction boundary; this never
+    /// exposes journal rows or installs per-session observation state.
+    #[serde(rename = "status.snapshot")]
+    StatusSnapshot {},
     /// Starts a connection-scoped watch of changed/new session summaries.
     #[serde(rename = "session.list_watch")]
     SessionListWatch {},
@@ -4108,6 +4133,17 @@ pub enum ResponseBody {
         /// [`RequestBody::SessionList`] cursor.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         next_cursor: Option<String>,
+    },
+    /// Narrow, read-only daemon status projection.
+    #[serde(rename = "status.snapshot")]
+    StatusSnapshot {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_account: Option<haider_protocol::credential::CredentialDescriptor>,
+        session_count: u64,
+        /// Last completed metadata-only discovery. A cache miss schedules a
+        /// bounded refresh after this response rather than delaying it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        adoption_available: Vec<AccountAdoptionAvailable>,
     },
     /// Acknowledges a connection-scoped session roster watch.
     #[serde(rename = "session.list_watch")]

@@ -238,6 +238,10 @@ async fn create_and_attach(
             cache_policy: None,
             interaction_mode: SessionInteractionModeV1::Interactive,
             ssh_scope,
+            resolve_provider: false,
+            resolve_model: false,
+            effort: None,
+            fast: None,
         },
     )
     .await;

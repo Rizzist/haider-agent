@@ -1435,6 +1435,7 @@ async fn stale_oauth_fences_cannot_overwrite_or_expire_a_replaced_bundle() {
         validator: Arc::new(ProviderCredentialValidator),
         snapshot: Arc::clone(&snapshot),
         management: None,
+        device_discovery: DeviceDiscoverySnapshot::new(false),
         profile_id: "oauth-fence".into(),
         default_model: "gpt-test".into(),
         providers: test_provider_registry(),
@@ -1534,6 +1535,7 @@ async fn reserved_alias_fences_login_and_oauth_add_until_remove_finalizes() {
         validator: Arc::new(ProviderCredentialValidator),
         snapshot: Arc::clone(&snapshot),
         management: None,
+        device_discovery: DeviceDiscoverySnapshot::new(false),
         profile_id: "reserved-fence".into(),
         default_model: "claude-test".into(),
         providers: test_provider_registry(),
@@ -1682,6 +1684,7 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
         validator: Arc::new(ProviderCredentialValidator),
         snapshot: Arc::clone(&snapshot),
         management: None,
+        device_discovery: DeviceDiscoverySnapshot::new(false),
         profile_id: "wedged-store".into(),
         default_model: "gpt-test".into(),
         providers: test_provider_registry(),
@@ -2010,6 +2013,7 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
         validator: Arc::new(ProviderCredentialValidator),
         snapshot: Arc::clone(&snapshot),
         management: None,
+        device_discovery: DeviceDiscoverySnapshot::new(false),
         profile_id: "resolver-factory".into(),
         default_model: "gpt-test".into(),
         providers: test_provider_registry(),
@@ -3179,6 +3183,7 @@ fn start_oauth_import_test_actor(
         validator: Arc::new(ProviderCredentialValidator),
         snapshot: Arc::clone(&snapshot),
         management: Some(management.clone()),
+        device_discovery: DeviceDiscoverySnapshot::new(false),
         profile_id: "oauth-import-test".into(),
         default_model: "unused".into(),
         providers,
@@ -3236,6 +3241,7 @@ fn start_oauth_import_heal_test_actor_with_native(
             validator: Arc::new(ProviderCredentialValidator),
             snapshot: Arc::clone(&snapshot),
             management: Some(management),
+            device_discovery: DeviceDiscoverySnapshot::new(false),
             profile_id: "oauth-import-heal-test".into(),
             default_model: "unused".into(),
             providers,
@@ -3259,7 +3265,6 @@ fn start_oauth_import_heal_test_actor_with_native(
         Arc::new(ProductionProviderModelDiscoverer),
         Arc::new(UnreachableGcloud),
         claude_native,
-        None,
     )
     .expect("OAuth import heal actor");
     (actor, broker, snapshot, refresh_fences)
@@ -3385,6 +3390,7 @@ async fn login_publishes_only_after_receipt_and_revision_commit() {
         }),
         snapshot: Arc::clone(&snapshot),
         management: Some(management.clone()),
+        device_discovery: DeviceDiscoverySnapshot::new(false),
         profile_id: "publish-order".into(),
         default_model: "claude-test".into(),
         providers: test_provider_registry(),
@@ -3552,6 +3558,7 @@ async fn account_actor_answers_restage_required_after_the_pending_ttl() {
         validator: Arc::clone(&validator) as Arc<dyn CredentialValidator>,
         snapshot,
         management: None,
+        device_discovery: DeviceDiscoverySnapshot::new(false),
         profile_id: "profile-ttl-actor".into(),
         default_model: "claude-test".into(),
         providers: test_provider_registry(),
@@ -4099,6 +4106,7 @@ async fn oauth_account_add_never_exposes_initial_token_before_vault_persistence(
         validator: Arc::new(ProviderCredentialValidator),
         snapshot: Arc::clone(&snapshot),
         management: None,
+        device_discovery: DeviceDiscoverySnapshot::new(false),
         profile_id: "profile-initial-persist".into(),
         default_model: "unused".into(),
         providers: test_provider_registry(),
@@ -4219,6 +4227,7 @@ async fn oauth_account_add_actor_crash_after_vault_put_reconciles_production_rec
         validator: Arc::new(ProviderCredentialValidator),
         snapshot: Arc::clone(&snapshot),
         management: None,
+        device_discovery: DeviceDiscoverySnapshot::new(false),
         profile_id: "profile-oauth-crash".into(),
         default_model: "unused".into(),
         providers: test_provider_registry(),
@@ -5103,6 +5112,7 @@ async fn durable_remove_fences_late_refresh_across_same_alias_readd() {
         validator: Arc::new(ProviderCredentialValidator),
         snapshot: Arc::clone(&snapshot),
         management: Some(management.clone()),
+        device_discovery: DeviceDiscoverySnapshot::new(false),
         profile_id: "remove-refresh-fence".into(),
         default_model: "unused".into(),
         providers: test_provider_registry(),
@@ -5339,6 +5349,7 @@ async fn omitted_api_alias_is_stable_command_derived_and_secret_free() {
         validator: Arc::new(SuccessValidator),
         snapshot,
         management: None,
+        device_discovery: DeviceDiscoverySnapshot::new(false),
         profile_id: "omitted-alias".into(),
         default_model: "claude-test".into(),
         providers: test_provider_registry(),
@@ -5492,6 +5503,7 @@ async fn api_login_rekeys_an_existing_alias_in_place() {
         validator: Arc::new(RekeyValidator::default()),
         snapshot: Arc::clone(&snapshot),
         management: None,
+        device_discovery: DeviceDiscoverySnapshot::new(false),
         profile_id: "api-rekey".into(),
         default_model: "claude-test".into(),
         providers: test_provider_registry(),
@@ -5618,6 +5630,7 @@ async fn provider_mutations_replay_before_validation_and_publish_one_snapshot() 
         validator: Arc::new(ProviderCredentialValidator),
         snapshot,
         management: Some(management.clone()),
+        device_discovery: DeviceDiscoverySnapshot::new(false),
         profile_id: "provider-mutations".into(),
         default_model: "unused".into(),
         providers: test_provider_registry(),
@@ -5867,6 +5880,7 @@ async fn provider_trust_toggle_is_receipted_persisted_and_journaled_raw() {
         validator: Arc::new(ProviderCredentialValidator),
         snapshot: Arc::new(StdMutex::new(Vec::new())),
         management: Some(management.clone()),
+        device_discovery: DeviceDiscoverySnapshot::new(false),
         profile_id: "provider-trust".into(),
         default_model: "unused".into(),
         providers,
@@ -6113,6 +6127,7 @@ async fn custom_provider_origin_repoint_updates_stored_origin_and_revision() {
         validator: Arc::new(ProviderCredentialValidator),
         snapshot: Arc::new(StdMutex::new(Vec::new())),
         management: Some(management.clone()),
+        device_discovery: DeviceDiscoverySnapshot::new(false),
         profile_id: "endpoint-repoint".to_owned(),
         default_model: "unused".to_owned(),
         providers,
@@ -6203,6 +6218,7 @@ async fn stale_expected_revision_refuses_origin_only_repoint() {
         validator: Arc::new(ProviderCredentialValidator),
         snapshot: Arc::new(StdMutex::new(Vec::new())),
         management: Some(management),
+        device_discovery: DeviceDiscoverySnapshot::new(false),
         profile_id: "endpoint-repoint-stale".to_owned(),
         default_model: "unused".to_owned(),
         providers,
@@ -6312,6 +6328,7 @@ async fn custom_provider_origin_repoint_rejects_invalid_origin() {
         validator: Arc::new(ProviderCredentialValidator),
         snapshot: Arc::new(StdMutex::new(Vec::new())),
         management: Some(management),
+        device_discovery: DeviceDiscoverySnapshot::new(false),
         profile_id: "endpoint-repoint-invalid".to_owned(),
         default_model: "unused".to_owned(),
         providers,
@@ -6409,6 +6426,7 @@ async fn custom_provider_origin_repoint_same_origin_is_revision_noop() {
         validator: Arc::new(ProviderCredentialValidator),
         snapshot: Arc::new(StdMutex::new(Vec::new())),
         management: Some(management.clone()),
+        device_discovery: DeviceDiscoverySnapshot::new(false),
         profile_id: "endpoint-repoint-noop".to_owned(),
         default_model: "unused".to_owned(),
         providers,
@@ -6540,6 +6558,7 @@ async fn custom_provider_origin_create_semantics_remain_unchanged() {
         validator: Arc::new(ProviderCredentialValidator),
         snapshot: Arc::new(StdMutex::new(Vec::new())),
         management: Some(management),
+        device_discovery: DeviceDiscoverySnapshot::new(false),
         profile_id: "endpoint-create-regression".to_owned(),
         default_model: "unused".to_owned(),
         providers,
@@ -7361,6 +7380,7 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
             validator: Arc::new(ProviderCredentialValidator),
             snapshot: Arc::clone(&snapshot),
             management: Some(management),
+            device_discovery: DeviceDiscoverySnapshot::new(false),
             profile_id: "custom-refresh".to_owned(),
             default_model: "unused".to_owned(),
             providers,
@@ -7379,7 +7399,6 @@ async fn custom_provider_refresh_uses_stored_origin_and_publishes_discovered_slu
         discoverer_trait,
         Arc::new(UnreachableGcloud),
         Arc::new(PlatformClaudeNativeCredentialStore::default()),
-        None,
     )
     .expect("custom refresh actor");
 
@@ -7601,6 +7620,7 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
             validator: Arc::new(ProviderCredentialValidator),
             snapshot: Arc::clone(&snapshot),
             management: Some(management.clone()),
+            device_discovery: DeviceDiscoverySnapshot::new(false),
             profile_id: "model-refresh".to_owned(),
             default_model: "unused".to_owned(),
             providers,
@@ -7619,7 +7639,6 @@ async fn provider_model_refresh_does_not_block_actor_and_publishes_cache_provena
         discoverer_trait,
         Arc::new(UnreachableGcloud),
         Arc::new(PlatformClaudeNativeCredentialStore::default()),
-        None,
     )
     .expect("actor with broker");
 
@@ -9908,6 +9927,7 @@ async fn provider_remove_commits_replays_fences_and_beats_restart_resurrection()
         validator: Arc::new(ProviderCredentialValidator),
         snapshot: Arc::new(StdMutex::new(Vec::new())),
         management: Some(management.clone()),
+        device_discovery: DeviceDiscoverySnapshot::new(false),
         profile_id: "provider-remove".into(),
         default_model: "unused".into(),
         providers,
@@ -10107,6 +10127,7 @@ async fn provider_remove_refuses_release_owned_and_account_referenced_profiles()
         validator: Arc::new(ProviderCredentialValidator),
         snapshot: Arc::new(StdMutex::new(Vec::new())),
         management: Some(management.clone()),
+        device_discovery: DeviceDiscoverySnapshot::new(false),
         profile_id: "provider-remove-refusals".into(),
         default_model: "unused".into(),
         providers,
@@ -10406,17 +10427,18 @@ const GEMINI_DISCOVERY_FIXTURE: &[u8] = br#"{
   "expiry_date": 4102444800123
 }"#;
 
-/// Startup and repeated discovery detect Codex without ever copying it.
+/// Repeated explicit discovery detects Codex without ever copying it. Actor
+/// startup itself performs no native credential-store work.
 /// Only account.import_device may create roster/vault/receipt truth.
 #[tokio::test(flavor = "current_thread")]
-async fn startup_detects_codex_but_never_auto_imports() {
+async fn explicit_discovery_detects_codex_but_never_auto_imports() {
     let fixture_dir = test_store_dir();
     let codex_path = fixture_dir.path().join("codex-auth.json");
     std::fs::write(&codex_path, CODEX_IMPORT_FIXTURE_1).expect("write Codex fixture");
     let empty_home = fixture_dir.path().join("empty-home");
     std::fs::create_dir_all(&empty_home).expect("mkdir empty home");
     if run_oauth_import_env_child(
-        "accounts::accounts_tests::startup_detects_codex_but_never_auto_imports",
+        "accounts::accounts_tests::explicit_discovery_detects_codex_but_never_auto_imports",
         &[
             ("HAIDER_CODEX_AUTH_PATH", &codex_path),
             ("HOME", &empty_home),
@@ -10445,6 +10467,7 @@ async fn startup_detects_codex_but_never_auto_imports() {
             validator: Arc::new(ProviderCredentialValidator),
             snapshot: Arc::clone(&snapshot),
             management: Some(management.clone()),
+            device_discovery: DeviceDiscoverySnapshot::new(false),
             profile_id: "adoption-detection-test".to_owned(),
             default_model: "unused".to_owned(),
             providers,
@@ -10464,7 +10487,6 @@ async fn startup_detects_codex_but_never_auto_imports() {
         Arc::new(ProductionProviderModelDiscoverer),
         Arc::new(UnreachableGcloud),
         native.clone(),
-        Some(false),
     )
     .expect("discovery actor");
 
@@ -10517,9 +10539,8 @@ async fn startup_detects_codex_but_never_auto_imports() {
         [
             ClaudeNativeReadEvent::AdoptionDiscovery,
             ClaudeNativeReadEvent::AdoptionDiscovery,
-            ClaudeNativeReadEvent::AdoptionDiscovery,
         ],
-        "startup and every discovery remain metadata-only"
+        "startup is lazy and every explicit discovery remains metadata-only"
     );
 
     assert!(broker.shutdown().await);

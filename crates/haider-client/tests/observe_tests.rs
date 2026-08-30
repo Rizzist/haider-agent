@@ -109,6 +109,7 @@ fn profile() -> (tempfile::TempDir, ResolvedProfile) {
 }
 
 fn welcome(profile: &ResolvedProfile, instance: &str) -> Welcome {
+    let features = BTreeSet::from([haider_rpc::FEATURE_STATUS_SNAPSHOT_V1.to_owned()]);
     Welcome {
         protocol: WIRE_PROTOCOL_VERSION,
         instance_id: instance.into(),
@@ -118,7 +119,7 @@ fn welcome(profile: &ResolvedProfile, instance: &str) -> Welcome {
         daemon_version: "observe-test".into(),
         lifecycle_phase: LifecyclePhase::Ready,
         capabilities_granted: CapabilitySet::from([Capability::View]),
-        features: BTreeSet::new(),
+        features,
         user_command_withheld: false,
         encoding: None,
     }
@@ -244,6 +245,59 @@ fn drain_ended_stream(receiver: &mut mpsc::UnboundedReceiver<RawEnvelope>) -> Ve
             ),
         }
     }
+}
+
+/// MUTATION CHECK: implement status by composing account.list, session.list,
+/// or account.device_candidates. Expected runtime failure: the peer observes
+/// anything other than the single scalar status.snapshot request.
+#[tokio::test]
+async fn one_shot_status_is_exactly_one_scalar_rpc() {
+    let (_root, profile) = profile();
+    let listener = match UnixListener::bind(&profile.endpoint_path) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("bind status peer: {error}"),
+    };
+    let server_profile = profile.clone();
+    let server = tokio::spawn(async move {
+        let mut peer =
+            accept_peer(&listener, welcome(&server_profile, "status-scalar-daemon")).await;
+        peer.write(&WireFrame::ResidentSessionBinding {
+            session_id: None,
+            worker_generation: 1,
+            binding_token: None,
+        })
+        .await;
+        let (request_id, body) = peer.request().await;
+        assert_eq!(body, RequestBody::StatusSnapshot {});
+        peer.respond(
+            request_id,
+            ResponseBody::StatusSnapshot {
+                active_account: None,
+                session_count: 365,
+                adoption_available: vec![haider_rpc::AccountAdoptionAvailable {
+                    source: "codex".into(),
+                    email: Some("person@example.invalid".into()),
+                }],
+            },
+        )
+        .await;
+        let mut byte = [0_u8; 1];
+        let read = tokio::time::timeout(BOUND, peer.stream.read(&mut byte))
+            .await
+            .expect("one-shot client closes after its response")
+            .expect("read one-shot EOF");
+        assert_eq!(read, 0, "status sent unexpected post-response traffic");
+    });
+    let client = ObserveClient::connect_one_shot(&profile, false)
+        .await
+        .expect("connect one-shot observer");
+    let status = client.status_snapshot().await.expect("status snapshot");
+    assert_eq!(status.session_count, 365);
+    assert!(status.active_account.is_none());
+    assert_eq!(status.adoption_available.len(), 1);
+    assert_close_effective(client.close());
+    server.await.expect("status peer");
 }
 
 /// Fleet snapshot failures remain machine-distinct: feature skew is caught

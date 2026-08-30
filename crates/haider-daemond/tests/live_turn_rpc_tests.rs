@@ -6760,6 +6760,10 @@ async fn session_create_permission_overrides_are_digest_bound_and_persisted() {
         cache_policy: None,
         interaction_mode: haider_protocol::session::SessionInteractionModeV1::Interactive,
         ssh_scope: None,
+        resolve_provider: false,
+        resolve_model: false,
+        effort: None,
+        fast: None,
     };
 
     send_request(

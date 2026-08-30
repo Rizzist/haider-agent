@@ -66,7 +66,9 @@ fn assert_real_sibling_artifacts() -> (PathBuf, PathBuf) {
 /// profile. CI globally disables discovery for its other tests, so this child
 /// explicitly removes both disable switches. The native Claude store alone is
 /// a deterministic typed-unavailable seam; a file-backed Codex fixture must
-/// still be discovered and projected into status JSON.
+/// still be discovered and projected into a later status JSON response. The
+/// first status must not wait for the native platform calls: it schedules the
+/// bounded discovery and returns the last completed snapshot immediately.
 #[test]
 fn built_status_json_completes_with_enabled_discovery() {
     let (haider, _haiderd) = assert_real_sibling_artifacts();
@@ -91,33 +93,41 @@ fn built_status_json_completes_with_enabled_discovery() {
         profile: profile.clone(),
     };
 
-    let child = Command::new(haider)
-        .args(["status", "--json"])
-        .current_dir(&workspace)
-        .env("HAIDER_PROFILE_DIR", &profile)
-        // The daemon's lockdown ledger is machine-user global. Keep this
-        // real-artifact smoke hermetic while discovery paths remain the
-        // explicit fixtures below.
-        .env("HOME", root.path())
-        .env("USERPROFILE", root.path())
-        .env_remove("HAIDER_DISCOVERY_DISABLED")
-        .env_remove("HAIDER_DEVICE_DISCOVERY_DISABLED")
-        .env("HAIDER_TEST_CLAUDE_CREDENTIAL_STORE", "unavailable")
-        .env("HAIDER_CODEX_AUTH_PATH", &codex)
-        .env("HAIDER_CLAUDE_CREDS_PATH", &missing)
-        .env("HAIDER_CLAUDE_OAUTH_PATH", &missing)
-        .env("HAIDER_KIMI_CREDS_PATH", &missing)
-        .env("HAIDER_KIMI_DEVICE_ID_PATH", &missing)
-        .env("HAIDER_GROK_AUTH_PATH", &missing)
-        .env("HAIDER_GEMINI_CREDS_PATH", &missing)
-        .env("HAIDER_GCLOUD_CONFIG_DIR", &missing)
-        .env_remove("HAIDER_RUNTIME_DIR")
-        .env_remove("XDG_RUNTIME_DIR")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("start built haider status");
+    let start_status = |no_spawn: bool| {
+        let mut command = Command::new(&haider);
+        command.args(["status", "--json"]);
+        if no_spawn {
+            command.arg("--no-spawn");
+        }
+        command
+            .current_dir(&workspace)
+            .env("HAIDER_PROFILE_DIR", &profile)
+            // The daemon's lockdown ledger is machine-user global. Keep this
+            // real-artifact smoke hermetic while discovery paths remain the
+            // explicit fixtures below.
+            .env("HOME", root.path())
+            .env("USERPROFILE", root.path())
+            .env_remove("HAIDER_DISCOVERY_DISABLED")
+            .env_remove("HAIDER_DEVICE_DISCOVERY_DISABLED")
+            .env("HAIDER_TEST_CLAUDE_CREDENTIAL_STORE", "unavailable")
+            .env("HAIDER_CODEX_AUTH_PATH", &codex)
+            .env("HAIDER_CLAUDE_CREDS_PATH", &missing)
+            .env("HAIDER_CLAUDE_OAUTH_PATH", &missing)
+            .env("HAIDER_KIMI_CREDS_PATH", &missing)
+            .env("HAIDER_KIMI_DEVICE_ID_PATH", &missing)
+            .env("HAIDER_GROK_AUTH_PATH", &missing)
+            .env("HAIDER_GEMINI_CREDS_PATH", &missing)
+            .env("HAIDER_GCLOUD_CONFIG_DIR", &missing)
+            .env_remove("HAIDER_RUNTIME_DIR")
+            .env_remove("XDG_RUNTIME_DIR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start built haider status")
+    };
+
+    let child = start_status(false);
     let output = wait_for_output(child, STATUS_TIMEOUT);
     assert!(
         output.status.success(),
@@ -129,11 +139,27 @@ fn built_status_json_completes_with_enabled_discovery() {
         serde_json::from_slice(&output.stdout).expect("status stdout is one JSON document");
     assert_eq!(document["kind"], "status");
     assert_eq!(document["daemon"]["version"], env!("CARGO_PKG_VERSION"));
-    let adoption = document["account_adoption_available"]
-        .as_array()
-        .expect("enabled discovery projects the seeded candidate");
-    assert!(
-        adoption.iter().any(|notice| notice["source"] == "codex"),
-        "discovery was disabled or skipped: {document}"
-    );
+    let discovery_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let output = wait_for_output(start_status(true), STATUS_TIMEOUT);
+        assert!(
+            output.status.success(),
+            "follow-up status failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let document: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .expect("follow-up status stdout is one JSON document");
+        let discovered = document["account_adoption_available"]
+            .as_array()
+            .is_some_and(|adoption| adoption.iter().any(|notice| notice["source"] == "codex"));
+        if discovered {
+            break;
+        }
+        assert!(
+            Instant::now() < discovery_deadline,
+            "enabled lazy discovery never projected the seeded candidate: {document}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }

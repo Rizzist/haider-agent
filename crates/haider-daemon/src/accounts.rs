@@ -100,6 +100,9 @@ const ACTOR_CAPACITY: usize = 8;
 /// credential lookup. This is one continuous worker deadline; timing out a
 /// phase never grants the next phase a fresh budget.
 const DEVICE_DISCOVERY_WORKER_TIMEOUT: Duration = Duration::from_secs(5);
+/// Status reuses a completed metadata-only discovery briefly. Explicit
+/// account discovery remains an immediate bounded refresh.
+const STATUS_DEVICE_DISCOVERY_TTL: Duration = Duration::from_secs(30);
 
 // ───────────────────────────── transport class ─────────────────────────────
 
@@ -827,6 +830,10 @@ impl ManagementSnapshot {
         self.inner.lock().ok().map(|view| view.clone())
     }
 
+    pub(crate) fn inspect<T>(&self, read: impl FnOnce(&ManagementView) -> T) -> Option<T> {
+        self.inner.lock().ok().map(|view| read(&view))
+    }
+
     fn publish_accounts(&self, revision: u64, descriptors: Vec<CredentialDescriptor>) {
         if let Ok(mut view) = self.inner.lock() {
             view.revision = revision;
@@ -849,6 +856,69 @@ impl ManagementSnapshot {
             };
         }
         self.changes.send_replace(revision);
+    }
+}
+
+/// Lazy status-only projection of the last completed device discovery.
+#[derive(Clone)]
+pub(crate) struct DeviceDiscoverySnapshot {
+    inner: Arc<StdMutex<DeviceDiscoveryView>>,
+    disabled: bool,
+}
+
+struct DeviceDiscoveryView {
+    adoption_available: Vec<haider_rpc::AccountAdoptionAvailable>,
+    completed_at: Option<Instant>,
+    refreshing: bool,
+}
+
+impl DeviceDiscoverySnapshot {
+    pub(crate) fn new(disabled: bool) -> Self {
+        Self {
+            inner: Arc::new(StdMutex::new(DeviceDiscoveryView {
+                adoption_available: Vec::new(),
+                completed_at: None,
+                refreshing: false,
+            })),
+            disabled,
+        }
+    }
+
+    fn read_and_begin_refresh(&self) -> (Vec<haider_rpc::AccountAdoptionAvailable>, bool) {
+        let Ok(mut view) = self.inner.lock() else {
+            return (Vec::new(), false);
+        };
+        let stale = view
+            .completed_at
+            .is_none_or(|completed| completed.elapsed() >= STATUS_DEVICE_DISCOVERY_TTL);
+        let refresh = !self.disabled && stale && !view.refreshing;
+        if refresh {
+            view.refreshing = true;
+        }
+        (view.adoption_available.clone(), refresh)
+    }
+
+    fn cancel_refresh(&self) {
+        if let Ok(mut view) = self.inner.lock() {
+            view.refreshing = false;
+        }
+    }
+
+    fn publish(
+        &self,
+        result: Result<&[crate::device_discovery::DeviceCandidate], &HaiderError>,
+        accounts: &[CredentialDescriptor],
+    ) {
+        if let Ok(mut view) = self.inner.lock() {
+            if let Ok(discovered) = result {
+                view.adoption_available = discovered
+                    .iter()
+                    .filter_map(|candidate| adoption_notice(&candidate.wire, accounts))
+                    .collect();
+            }
+            view.completed_at = Some(Instant::now());
+            view.refreshing = false;
+        }
     }
 }
 
@@ -879,6 +949,7 @@ pub(crate) struct AccountsFacade {
     pub management: ManagementSnapshot,
     pub vault_supported: bool,
     pub discovery_disabled: bool,
+    pub device_discovery: DeviceDiscoverySnapshot,
     /// The profile-scoped vault itself, for the SMALL bounded-secret
     /// surfaces the connection task serves inline (T1: the transcription
     /// secret — one ≤512-byte file read/write, comparable to one store
@@ -887,6 +958,23 @@ pub(crate) struct AccountsFacade {
 }
 
 impl AccountsFacade {
+    pub(crate) fn status_adoption_snapshot(&self) -> Vec<haider_rpc::AccountAdoptionAvailable> {
+        let (cached, refresh) = self.device_discovery.read_and_begin_refresh();
+        if refresh {
+            let queued = self.login.as_ref().is_some_and(|commands| {
+                commands
+                    .try_send(AccountCommand::RefreshDeviceDiscovery {
+                        discovery_disabled: self.discovery_disabled,
+                    })
+                    .is_ok()
+            });
+            if !queued {
+                self.device_discovery.cancel_refresh();
+            }
+        }
+        cached
+    }
+
     pub(crate) async fn refresh_provider_models(
         &self,
         provider: String,
@@ -1125,6 +1213,9 @@ pub(crate) enum AccountCommand {
         discovery_disabled: bool,
         completed: LoginRoute,
     },
+    RefreshDeviceDiscovery {
+        discovery_disabled: bool,
+    },
     ImportDevice(Box<DeviceImportJob>),
     SetActive(Box<SetActiveJob>),
     SetLabel(Box<SetLabelJob>),
@@ -1251,6 +1342,7 @@ pub(crate) struct AccountActorConfig {
     pub validator: Arc<dyn CredentialValidator>,
     pub snapshot: AccountsSnapshot,
     pub management: Option<ManagementSnapshot>,
+    pub device_discovery: DeviceDiscoverySnapshot,
     pub profile_id: String,
     pub default_model: String,
     pub providers: ProviderRegistry<Box<dyn ProviderRegistryStoreLike>>,
@@ -1296,7 +1388,6 @@ pub(crate) fn start_account_actor(config: AccountActorConfig) -> AccountActorHan
         Arc::new(ProductionProviderModelDiscoverer),
         Arc::new(crate::gcloud::GcloudCli),
         Arc::new(PlatformClaudeNativeCredentialStore::default()),
-        None,
     )
 }
 
@@ -1306,7 +1397,6 @@ fn start_account_actor_with_services(
     model_discoverer: Arc<dyn ProviderModelDiscoverer>,
     gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
     claude_native: Arc<dyn ClaudeNativeCredentialStore>,
-    startup_discovery_disabled: Option<bool>,
 ) -> Result<(AccountActorHandle, CredentialBroker), HaiderError> {
     let (commands, receiver) = mpsc::channel(ACTOR_CAPACITY);
     let (force_stop, forced) = watch::channel(false);
@@ -1321,7 +1411,6 @@ fn start_account_actor_with_services(
         model_discoverer,
         gcloud,
         claude_native,
-        startup_discovery_disabled,
     );
     Ok((handle, broker))
 }
@@ -1337,7 +1426,6 @@ fn spawn_account_actor(
     model_discoverer: Arc<dyn ProviderModelDiscoverer>,
     gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
     claude_native: Arc<dyn ClaudeNativeCredentialStore>,
-    startup_discovery_disabled: Option<bool>,
 ) -> AccountActorHandle {
     let claude_native: Arc<dyn ClaudeNativeCredentialStore> =
         Arc::new(ClaudeNativeCredentialAccess::new(claude_native));
@@ -1350,7 +1438,6 @@ fn spawn_account_actor(
         model_discoverer,
         gcloud,
         claude_native,
-        startup_discovery_disabled,
     ));
     AccountActorHandle {
         commands,
@@ -1374,7 +1461,6 @@ async fn run_account_actor(
     model_discoverer: Arc<dyn ProviderModelDiscoverer>,
     gcloud: Arc<dyn crate::gcloud::GcloudAccessTokenSource>,
     claude_native: Arc<dyn ClaudeNativeCredentialStore>,
-    startup_discovery_disabled: Option<bool>,
 ) {
     let AccountActorConfig {
         store,
@@ -1383,6 +1469,7 @@ async fn run_account_actor(
         validator,
         snapshot,
         management,
+        device_discovery,
         profile_id,
         default_model,
         mut providers,
@@ -1394,6 +1481,9 @@ async fn run_account_actor(
     // SECRET_TTL; daemon restart wipes them by construction.
     let mut pending: HashMap<String, PendingSecret> = HashMap::new();
     let mut model_refreshes = JoinSet::new();
+    let mut device_discovery_refreshes: JoinSet<
+        Result<Vec<crate::device_discovery::DeviceCandidate>, HaiderError>,
+    > = JoinSet::new();
     let mut model_refresh_routes = HashMap::new();
     let mut refreshing_providers = HashSet::new();
     let mut draining = false;
@@ -1402,16 +1492,12 @@ async fn run_account_actor(
         let _ = publish_next_management_revision(&store, &snapshot, management.as_ref(), &accounts)
             .await;
     }
-    if let Some(discovery_disabled) = startup_discovery_disabled {
-        let _ = discover_candidates(
-            Arc::clone(&claude_native),
-            discovery_disabled,
-            ClaudeNativeReadEvent::AdoptionDiscovery,
-        )
-        .await;
-    }
     loop {
-        if draining && model_refreshes.is_empty() && refreshing_providers.is_empty() {
+        if draining
+            && model_refreshes.is_empty()
+            && refreshing_providers.is_empty()
+            && device_discovery_refreshes.is_empty()
+        {
             break;
         }
         let command = tokio::select! {
@@ -1451,6 +1537,19 @@ async fn run_account_actor(
                             }
                         }
                     }
+                }
+                continue;
+            }
+            completed = device_discovery_refreshes.join_next(), if !device_discovery_refreshes.is_empty() => {
+                match completed {
+                    Some(Ok(result)) => {
+                        device_discovery.publish(result.as_deref(), accounts.list());
+                    }
+                    Some(Err(_)) => {
+                        let error = device_discovery_worker_error("background worker was lost");
+                        device_discovery.publish(Err(&error), accounts.list());
+                    }
+                    None => {}
                 }
                 continue;
             }
@@ -1529,6 +1628,7 @@ async fn run_account_actor(
                 .await;
                 match discovered {
                     Ok(discovered) => {
+                        device_discovery.publish(Ok(&discovered), accounts.list());
                         let adoption_available = discovered
                             .iter()
                             .filter_map(|candidate| {
@@ -1550,7 +1650,23 @@ async fn run_account_actor(
                             },
                         );
                     }
-                    Err(error) => respond_management_error(&completed, &error),
+                    Err(error) => {
+                        device_discovery.publish(Err(&error), accounts.list());
+                        respond_management_error(&completed, &error);
+                    }
+                }
+            }
+            AccountCommand::RefreshDeviceDiscovery { discovery_disabled } => {
+                if device_discovery_refreshes.is_empty() {
+                    let claude_native = Arc::clone(&claude_native);
+                    device_discovery_refreshes.spawn(async move {
+                        discover_candidates(
+                            claude_native,
+                            discovery_disabled,
+                            ClaudeNativeReadEvent::AdoptionDiscovery,
+                        )
+                        .await
+                    });
                 }
             }
             AccountCommand::ImportDevice(job) => {
@@ -10429,6 +10545,7 @@ impl AccountsRuntime {
             accounts.list().to_vec(),
             providers.summaries(&provider_has_credential(&accounts)),
         );
+        let device_discovery = DeviceDiscoverySnapshot::new(discovery_disabled);
         let promotion_targets = management
             .read()
             .map(|view| {
@@ -10462,6 +10579,7 @@ impl AccountsRuntime {
             validator: Arc::clone(&dependencies.validator),
             snapshot: Arc::clone(&snapshot),
             management: Some(management.clone()),
+            device_discovery: device_discovery.clone(),
             profile_id: profile_id.to_owned(),
             default_model: default_model.to_owned(),
             providers,
@@ -10494,7 +10612,6 @@ impl AccountsRuntime {
                     Arc::new(ProductionProviderModelDiscoverer),
                     Arc::clone(&gcloud),
                     Arc::new(PlatformClaudeNativeCredentialStore::default()),
-                    Some(discovery_disabled),
                 )?;
                 let commands = actor.commands();
                 Ok(Self {
@@ -10505,6 +10622,7 @@ impl AccountsRuntime {
                         management,
                         vault_supported: true,
                         discovery_disabled,
+                        device_discovery,
                         vault: Some(Arc::clone(scoped)),
                     },
                     actor: Some(actor),
@@ -10528,6 +10646,7 @@ impl AccountsRuntime {
                         management,
                         vault_supported: false,
                         discovery_disabled,
+                        device_discovery,
                         vault: None,
                     },
                     actor: Some(actor),

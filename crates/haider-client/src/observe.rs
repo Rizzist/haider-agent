@@ -22,7 +22,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use crate::client::{
-    ClientCloseOutcome, ClientConfig, ClientError, ConnectError, RpcClient, connect,
+    ClientCloseOutcome, ClientConfig, ClientError, ConnectError, ConnectionUsage, RpcClient,
+    connect,
 };
 use crate::profile::ResolvedProfile;
 use crate::spawn::{EnsureError, EnsureOptions, ensure_daemon};
@@ -103,6 +104,13 @@ pub struct ObserveClient {
     welcome: Welcome,
 }
 
+/// Scalar-only snapshot used by short-lived status clients.
+pub struct ObserveStatusSnapshot {
+    pub active_account: Option<CredentialDescriptor>,
+    pub session_count: u64,
+    pub adoption_available: Vec<haider_rpc::AccountAdoptionAvailable>,
+}
+
 /// Feature-negotiated descendant view. `Snapshot` is deliberately a separate
 /// variant: it carries no event receiver and cannot be mistaken for live
 /// lineage when an older daemon omits `session_descendant_stream_v1`.
@@ -127,7 +135,26 @@ impl ObserveClient {
     /// Connects to the resolved profile, optionally using the standard safe
     /// connect-or-spawn path. `spawn == false` never unlinks or starts anything.
     pub async fn connect(profile: &ResolvedProfile, spawn: bool) -> Result<Self, ObserveError> {
-        let config = observe_client_config();
+        Self::connect_with_usage(profile, spawn, ConnectionUsage::LongLived).await
+    }
+
+    /// Connects without allocating an event queue or arming heartbeat work.
+    pub async fn connect_one_shot(
+        profile: &ResolvedProfile,
+        spawn: bool,
+    ) -> Result<Self, ObserveError> {
+        Self::connect_with_usage(profile, spawn, ConnectionUsage::OneShot).await
+    }
+
+    async fn connect_with_usage(
+        profile: &ResolvedProfile,
+        spawn: bool,
+        connection_usage: ConnectionUsage,
+    ) -> Result<Self, ObserveError> {
+        let config = ClientConfig {
+            connection_usage,
+            ..observe_client_config()
+        };
         let (client, welcome) = if spawn {
             let options = EnsureOptions {
                 required_features: BTreeSet::new(),
@@ -174,6 +201,44 @@ impl ObserveClient {
     #[must_use]
     pub fn lost_events(&self) -> u64 {
         self.client.lost_events()
+    }
+
+    /// Reads the daemon-authorized status scalars without materializing the
+    /// account roster or session summaries.
+    pub async fn status_snapshot(&self) -> Result<ObserveStatusSnapshot, ObserveError> {
+        if !self
+            .welcome
+            .features
+            .contains(haider_rpc::FEATURE_STATUS_SNAPSHOT_V1)
+        {
+            return Err(ObserveError::MissingFeature(
+                haider_rpc::FEATURE_STATUS_SNAPSHOT_V1,
+            ));
+        }
+        match self.client.request(RequestBody::StatusSnapshot {}).await? {
+            ResponseBody::StatusSnapshot {
+                active_account,
+                session_count,
+                adoption_available,
+            } => Ok(ObserveStatusSnapshot {
+                active_account,
+                session_count,
+                adoption_available,
+            }),
+            ResponseBody::Error {
+                code,
+                message,
+                retryable,
+                ..
+            } => Err(ObserveError::Rpc {
+                code,
+                message,
+                retryable,
+            }),
+            _ => Err(ObserveError::Protocol(
+                "status.snapshot response method mismatch",
+            )),
+        }
     }
 
     /// Lists every durable session in the daemon's stable byte order.

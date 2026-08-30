@@ -1256,6 +1256,167 @@ fn listed_sessions(sink: &CapturingFrameSink, request_id: &str) -> Vec<SessionSu
         .expect("session-list response")
 }
 
+/// MUTATION CHECK: derive status count by running session.list summaries or
+/// omit a durable row from the scalar query. Expected runtime failure: the
+/// narrow response is absent or its count differs from durable roster truth.
+#[tokio::test]
+async fn status_snapshot_counts_sessions_without_listing_summaries() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    for suffix in ["status-a", "status-b", "status-c"] {
+        let session_id = SessionId::new(suffix);
+        hub.create_internal_session(create_command(&session_id, suffix))
+            .await
+            .expect("create status fixture session");
+    }
+    let phantom = SessionId::new("status-uncommitted-fork-candidate");
+    let phantom_reservation = hub
+        .reserve_fork_candidate(&phantom)
+        .expect("reserve uncommitted fork candidate");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([haider_rpc::Capability::View]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("status observer");
+    sink.0.lock().expect("frames").clear();
+    connection
+        .request(
+            RequestId::new("status-scalars"),
+            RequestBody::StatusSnapshot {},
+        )
+        .await
+        .expect("status request");
+    let status = sink
+        .0
+        .lock()
+        .expect("status frame")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id,
+                body:
+                    ResponseBody::StatusSnapshot {
+                        active_account,
+                        session_count,
+                        adoption_available,
+                    },
+            } if request_id.as_str() == "status-scalars" => Some((
+                active_account.clone(),
+                *session_count,
+                adoption_available.clone(),
+            )),
+            _ => None,
+        })
+        .expect("status response");
+    assert_eq!(status, (None, 3, Vec::new()));
+
+    drop(phantom_reservation);
+    drop(connection);
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
+/// MUTATION CHECK: move active-provider/default-model resolution back into
+/// client-side collection RPCs. Expected runtime failure: the daemon refuses
+/// the empty sentinels instead of committing the resolved metadata atomically.
+#[tokio::test]
+async fn session_create_resolves_provider_and_model_inside_admission() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = SqliteStoreHandle::open(root.path()).await.expect("store");
+    let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let descriptor = haider_protocol::credential::CredentialDescriptor {
+        alias: haider_protocol::ids::CredentialAlias::new("active-fake"),
+        provider: "fake".into(),
+        base_url: None,
+        auth_method: haider_protocol::credential::AuthMethod::OAuth,
+        identity: "active@example.invalid".into(),
+        status: haider_protocol::credential::CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    };
+    let mut provider = provider_summary("fake");
+    provider.models = vec!["fake-v1".into()];
+    provider.default_model = Some("fake-v1".into());
+    hub.install_accounts(crate::accounts::AccountsFacade {
+        login: None,
+        oauth: None,
+        snapshot: Arc::new(Mutex::new(vec![descriptor.clone()])),
+        management: crate::accounts::ManagementSnapshot::new(0, vec![descriptor], vec![provider]),
+        vault_supported: false,
+        discovery_disabled: false,
+        device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
+        vault: None,
+    })
+    .expect("accounts install");
+    hub.install_creatable_providers(std::collections::BTreeSet::from(["fake".into()]))
+        .expect("creatable provider install");
+    let sink = Arc::new(CapturingFrameSink::default());
+    let connection = hub
+        .open_connection(
+            std::collections::BTreeSet::from([
+                haider_rpc::Capability::Control,
+                haider_rpc::Capability::View,
+            ]),
+            sink.clone(),
+            crate::accounts::ConnectionTransport::LocalSameUid,
+        )
+        .expect("create connection");
+    sink.0.lock().expect("frames").clear();
+    connection
+        .request(
+            RequestId::new("resolved-create"),
+            RequestBody::SessionCreateWithPermissionOverrides {
+                command_id: haider_rpc::CommandId::new("resolved-create-command"),
+                cwd: std::env::current_dir()
+                    .expect("cwd")
+                    .to_string_lossy()
+                    .into_owned(),
+                provider: String::new(),
+                model: String::new(),
+                max_tokens: 4_096,
+                permission_overrides: None,
+                cache_policy: None,
+                interaction_mode: haider_protocol::session::SessionInteractionModeV1::Autonomous,
+                ssh_scope: None,
+                resolve_provider: true,
+                resolve_model: true,
+                effort: None,
+                fast: None,
+            },
+        )
+        .await
+        .expect("resolved create request");
+    let metadata = sink
+        .0
+        .lock()
+        .expect("create frame")
+        .iter()
+        .find_map(|frame| match frame {
+            WireFrame::Response {
+                request_id,
+                body: ResponseBody::SessionCreate { metadata, .. },
+            } if request_id.as_str() == "resolved-create" => Some(metadata.clone()),
+            _ => None,
+        })
+        .expect("resolved create response");
+    assert_eq!(metadata.provider, "fake");
+    assert_eq!(metadata.model, "fake-v1");
+    assert_eq!(
+        metadata.interaction_mode,
+        haider_protocol::session::SessionInteractionModeV1::Autonomous
+    );
+
+    drop(connection);
+    hub.shutdown().await.expect("hub shutdown");
+    store.close().await.expect("store close");
+}
+
 /// The durable child row is not the roster linearization point. While a fork
 /// is paused immediately after commit, list observers see no child. Once the
 /// fork returns, the child has an actor, Pipe coverage through its full head,
@@ -2389,6 +2550,7 @@ async fn provider_command_distinguishes_known_absence_from_lookup_failure() {
         ),
         vault_supported: false,
         discovery_disabled: false,
+        device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
         vault: None,
     })
     .expect("accounts install");
@@ -3847,6 +4009,7 @@ async fn provider_models_refresh_requires_control_and_hands_off_correlation() {
         management: crate::accounts::ManagementSnapshot::new(0, Vec::new(), Vec::new()),
         vault_supported: true,
         discovery_disabled: false,
+        device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
         vault: Some(Arc::new(haider_accounts::MemoryVault::default())),
     })
     .expect("install accounts");
@@ -5899,6 +6062,7 @@ fn transcription_facade(vault: Arc<dyn haider_accounts::Vault>) -> crate::accoun
         management: crate::accounts::ManagementSnapshot::new(0, Vec::new(), Vec::new()),
         vault_supported: true,
         discovery_disabled: false,
+        device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
         vault: Some(vault),
     }
 }

@@ -242,6 +242,12 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(Store::session_ids)).await
     }
 
+    /// Counts durable sessions without allocating their identifiers.
+    pub async fn session_count(&self) -> Result<u64, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(Store::session_count)).await
+    }
+
     /// Deletes a session after the daemon has fenced new admission and
     /// stopped its actor.
     pub async fn delete_session(&self, session_id: SessionId) -> Result<(), HaiderError> {

@@ -159,6 +159,10 @@ impl DaemonMobileChatBridge {
                 cache_policy: None,
                 interaction_mode: SessionInteractionModeV1::Interactive,
                 ssh_scope: None,
+                resolve_provider: false,
+                resolve_model: false,
+                effort: None,
+                fast: None,
             })
             .await?;
         let (session_id, created_seq, worker_generation) = match created.body {
