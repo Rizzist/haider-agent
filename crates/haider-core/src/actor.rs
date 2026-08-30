@@ -318,11 +318,11 @@ pub struct HarnessConfig {
     /// selection. `None` leaves standalone embedders' packs untouched.
     pub provider_tool_base: Option<Vec<ToolDefinition>>,
     shared_provider_tool_base: Option<Arc<[ToolDefinition]>>,
-    shared_provider_tool_variants: HashMap<Vec<String>, (Arc<[ToolDefinition]>, String)>,
+    shared_provider_tool_variants: SharedToolPackVariants,
     /// Turn-authorized local web definitions within [`Self::provider_tool_base`].
     /// Non-web user and registry tools never enter this pool.
     pub provider_local_web_tools: Vec<ToolDefinition>,
-    shared_provider_local_web_tool_names: Vec<String>,
+    shared_provider_local_web_tool_names: Arc<[String]>,
     /// CAS-backed attachments resolved before crossing the provider boundary.
     pub attachments: Vec<ResolvedAttachment>,
     /// Whether the resolved provider/model accepts vision inputs. Unsupported
@@ -412,15 +412,18 @@ pub struct HarnessConfig {
     started_at_ms: Option<u64>,
 }
 
+/// Shared lookup table for provider-selected variants of one immutable pack.
+pub type SharedToolPackVariants = Arc<HashMap<Vec<String>, (Arc<[ToolDefinition]>, String)>>;
+
 /// Immutable daemon-cached tool packs installed together for one provider lane.
 #[derive(Debug, Clone)]
 pub struct SharedToolPacks {
     pub base: Arc<[ToolDefinition]>,
-    pub local_web_tool_names: Vec<String>,
+    pub local_web_tool_names: Arc<[String]>,
     pub current: Arc<[ToolDefinition]>,
     pub current_digest: String,
     pub fallback: Option<(Arc<[ToolDefinition]>, String)>,
-    pub variants: HashMap<Vec<String>, (Arc<[ToolDefinition]>, String)>,
+    pub variants: SharedToolPackVariants,
 }
 
 impl HarnessConfig {
@@ -458,9 +461,9 @@ impl HarnessConfig {
             provider_tool_fallback_digest: None,
             provider_tool_base: None,
             shared_provider_tool_base: None,
-            shared_provider_tool_variants: HashMap::new(),
+            shared_provider_tool_variants: Arc::default(),
             provider_local_web_tools: Vec::new(),
-            shared_provider_local_web_tool_names: Vec::new(),
+            shared_provider_local_web_tool_names: Arc::default(),
             attachments: Vec::new(),
             tool_result_images_supported: false,
             usage_account: None,
@@ -10735,11 +10738,11 @@ mod cu1_actor_tests {
         config.install_shared_tool_packs(
             SharedToolPacks {
                 base: Arc::clone(&base),
-                local_web_tool_names: Vec::new(),
+                local_web_tool_names: Arc::default(),
                 current: Arc::clone(&base),
                 current_digest: digest.clone(),
                 fallback: None,
-                variants,
+                variants: Arc::new(variants),
             },
             &initial,
         );

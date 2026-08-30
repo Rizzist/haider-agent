@@ -150,6 +150,7 @@ use haider_tools::{
     ToolError, ToolResult, TurnAttribution, WebFetch, WorkflowAuthor,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6490,82 +6491,21 @@ async fn start_turn(
         validate_grant(grant)?;
     }
     let provider_grant = loom_turn_grant.as_ref().or(delegation_grant.as_ref());
-    let provider_grant_scope = cache_grant_scope_digest(provider_grant)?;
-    let provider_tool_base = lockdown_tool_definition_pack(
-        authorized_tool_definition_pack(
-            &dependencies.tool_factory,
-            provider_grant,
+    let provider_grant_snapshot = ToolPackGrantSnapshot::new(provider_grant)?;
+    let provider_grant_scope = provider_grant_snapshot.cache_scope_digest()?;
+    let tool_registry_revision = dependencies.tool_factory.shared_definitions();
+    let shared_tool_packs = cached_turn_tool_packs(
+        turn_tool_pack_cache(),
+        TurnToolPackInputs {
+            provider_name: &resolved.provider_name,
+            provider_request_state: &provider_request_state,
+            grant: provider_grant_snapshot,
+            lockdown: lockdown.is_some(),
+            registry_revision: tool_registry_revision,
             mobile_use_active,
-        ),
-        lockdown.is_some(),
-    );
-    let provider_tools = lockdown_tool_definition_pack(
-        tool_definition_pack_for_web_names(
-            &dependencies.tool_factory,
-            provider_grant,
-            mobile_use_active,
-            &provider_request_state.local_web_tool_names,
-        ),
-        lockdown.is_some(),
-    );
-    let provider_fallback_tools = (!provider_request_state
-        .provider_fallback_local_web_tool_names
-        .is_empty())
-    .then(|| {
-        let pack = lockdown_tool_definition_pack(
-            tool_definition_pack_for_web_names(
-                &dependencies.tool_factory,
-                provider_grant,
-                mobile_use_active,
-                &provider_request_state.provider_fallback_local_web_tool_names,
-            ),
-            lockdown.is_some(),
-        );
-        (Arc::clone(&pack.definitions), pack.digest.clone())
-    });
-    let local_web_tool_names = provider_tool_base
-        .definitions
-        .iter()
-        .filter(|definition| is_local_web_tool(&definition.name))
-        .map(|definition| definition.name.clone())
-        .collect::<Vec<_>>();
-    let mut name_variants = vec![Vec::new()];
-    for name in &local_web_tool_names {
-        let additions = name_variants
-            .iter()
-            .cloned()
-            .map(|mut names| {
-                names.push(name.clone());
-                names
-            })
-            .collect::<Vec<_>>();
-        name_variants.extend(additions);
-    }
-    let mut provider_tool_variants = HashMap::new();
-    for mut names in name_variants {
-        names.sort_unstable();
-        let pack = lockdown_tool_definition_pack(
-            tool_definition_pack_for_web_names(
-                &dependencies.tool_factory,
-                provider_grant,
-                mobile_use_active,
-                &names,
-            ),
-            lockdown.is_some(),
-        );
-        provider_tool_variants.insert(names, (Arc::clone(&pack.definitions), pack.digest.clone()));
-    }
-    config.install_shared_tool_packs(
-        SharedToolPacks {
-            base: Arc::clone(&provider_tool_base.definitions),
-            local_web_tool_names,
-            current: Arc::clone(&provider_tools.definitions),
-            current_digest: provider_tools.digest.clone(),
-            fallback: provider_fallback_tools,
-            variants: provider_tool_variants,
         },
-        &provider_request_state,
     );
+    config.install_shared_tool_packs(shared_tool_packs.as_ref().clone(), &provider_request_state);
     // Cache prefix law: common policy + the manual for the exact advertised
     // schema pack are the complete system prompt. Session/task/identity state
     // follows as a volatile user message, after providers have rendered the
@@ -6891,34 +6831,7 @@ fn empty_tool_definitions_digest() -> &'static str {
 /// host-scoped network grants can expose the same schema while authorizing
 /// different destinations, and must therefore occupy different cache bases.
 pub(crate) fn cache_grant_scope_digest(grant: Option<&Grant>) -> Result<String, HaiderError> {
-    let Some(grant) = grant else {
-        return Ok(SystemPromptBuilder::UNSCOPED_GRANT_SCOPE.to_owned());
-    };
-    let mut tools = grant.tools.clone();
-    tools.sort();
-    tools.dedup();
-    let mut effects = grant
-        .effect_ceiling
-        .iter()
-        .map(serde_json::to_string)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| {
-            HaiderError::new(
-                ErrorCode::Internal,
-                format!("cache grant scope could not serialize an effect: {error}"),
-                false,
-            )
-        })?;
-    effects.sort();
-    effects.dedup();
-    let bytes = serde_json::to_vec(&(tools, effects)).map_err(|error| {
-        HaiderError::new(
-            ErrorCode::Internal,
-            format!("cache grant scope could not serialize: {error}"),
-            false,
-        )
-    })?;
-    Ok(blake3::hash(&bytes).to_hex().to_string())
+    ToolPackGrantRevision::from_grant(grant)?.cache_scope_digest()
 }
 
 fn usage_scope_for(
@@ -9594,6 +9507,168 @@ struct ToolDefinitionPack {
     digest: String,
 }
 
+/// The exact normalized capability boundary that can change an advertised
+/// tool pack. Keeping the full values in the cache key avoids treating a
+/// digest collision as permission equivalence.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum ToolPackGrantRevision {
+    Root,
+    Scoped {
+        tools: Vec<String>,
+        effects: Vec<String>,
+    },
+}
+
+impl ToolPackGrantRevision {
+    fn from_grant(grant: Option<&Grant>) -> Result<Self, HaiderError> {
+        let Some(grant) = grant else {
+            return Ok(Self::Root);
+        };
+        let mut tools = grant.tools.clone();
+        tools.sort();
+        tools.dedup();
+        let mut effects = grant
+            .effect_ceiling
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                HaiderError::new(
+                    ErrorCode::Internal,
+                    format!("cache grant scope could not serialize an effect: {error}"),
+                    false,
+                )
+            })?;
+        effects.sort();
+        effects.dedup();
+        Ok(Self::Scoped { tools, effects })
+    }
+
+    fn cache_scope_digest(&self) -> Result<String, HaiderError> {
+        let Self::Scoped { tools, effects } = self else {
+            return Ok(SystemPromptBuilder::UNSCOPED_GRANT_SCOPE.to_owned());
+        };
+        let bytes = serde_json::to_vec(&(tools, effects)).map_err(|error| {
+            HaiderError::new(
+                ErrorCode::Internal,
+                format!("cache grant scope could not serialize: {error}"),
+                false,
+            )
+        })?;
+        Ok(blake3::hash(&bytes).to_hex().to_string())
+    }
+}
+
+struct ToolPackGrantSnapshot<'a> {
+    grant: Option<&'a Grant>,
+    revision: ToolPackGrantRevision,
+}
+
+impl<'a> ToolPackGrantSnapshot<'a> {
+    fn new(grant: Option<&'a Grant>) -> Result<Self, HaiderError> {
+        Ok(Self {
+            grant,
+            revision: ToolPackGrantRevision::from_grant(grant)?,
+        })
+    }
+
+    fn cache_scope_digest(&self) -> Result<String, HaiderError> {
+        self.revision.cache_scope_digest()
+    }
+}
+
+/// Process-local identity of one immutable definition registry. The key owns
+/// an `Arc`, so an allocator cannot recycle the address while an older pack is
+/// cached and make a later registry compare equal accidentally.
+#[derive(Clone)]
+struct ToolRegistryRevision(Arc<[ToolDefinition]>);
+
+impl PartialEq for ToolRegistryRevision {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ToolRegistryRevision {}
+
+impl Hash for ToolRegistryRevision {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::ptr::hash(Arc::as_ptr(&self.0), state);
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ProviderToolPackRevision {
+    provider_name: String,
+    local_web_tool_names: Vec<String>,
+    fallback_local_web_tool_names: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum LockdownToolPackRevision {
+    Full,
+    Lockdown,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct ToolPackModeRevision {
+    mobile_use_active: bool,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TurnToolPackCacheKey {
+    provider: ProviderToolPackRevision,
+    grant: ToolPackGrantRevision,
+    lockdown: LockdownToolPackRevision,
+    registry: ToolRegistryRevision,
+    mode: ToolPackModeRevision,
+}
+
+const TURN_TOOL_PACK_CACHE_CAPACITY: usize = 128;
+
+struct TurnToolPackCache {
+    packs: HashMap<TurnToolPackCacheKey, Arc<SharedToolPacks>>,
+    insertion_order: VecDeque<TurnToolPackCacheKey>,
+}
+
+impl TurnToolPackCache {
+    fn new() -> Self {
+        Self {
+            packs: HashMap::new(),
+            insertion_order: VecDeque::new(),
+        }
+    }
+
+    fn get(&self, key: &TurnToolPackCacheKey) -> Option<Arc<SharedToolPacks>> {
+        self.packs.get(key).map(Arc::clone)
+    }
+
+    fn insert(
+        &mut self,
+        key: TurnToolPackCacheKey,
+        packs: Arc<SharedToolPacks>,
+    ) -> Arc<SharedToolPacks> {
+        if let Some(existing) = self.packs.get(&key) {
+            return Arc::clone(existing);
+        }
+        while self.packs.len() >= TURN_TOOL_PACK_CACHE_CAPACITY {
+            let Some(evicted) = self.insertion_order.pop_front() else {
+                self.packs.clear();
+                break;
+            };
+            self.packs.remove(&evicted);
+        }
+        self.insertion_order.push_back(key.clone());
+        self.packs.insert(key, Arc::clone(&packs));
+        packs
+    }
+}
+
+fn turn_tool_pack_cache() -> &'static StdMutex<TurnToolPackCache> {
+    static CACHE: OnceLock<StdMutex<TurnToolPackCache>> = OnceLock::new();
+    CACHE.get_or_init(|| StdMutex::new(TurnToolPackCache::new()))
+}
+
 const FILTERED_TOOL_PACK_CACHE_CAPACITY: usize = 128;
 
 struct FilteredToolPackCache {
@@ -10920,21 +10995,159 @@ fn advertised_tool_pack_for_mobile_state(
     web_degrade: WebCapabilityDegrade,
     mobile_use_active: bool,
 ) -> Arc<ToolDefinitionPack> {
-    let mut definitions = authorized_tool_definition_view(tool_factory, grant, mobile_use_active);
+    let mut definitions = authorized_tool_definition_view_for_registry(
+        tool_factory.shared_definitions(),
+        grant,
+        mobile_use_active,
+    );
     let (local_web_tool_names, _) = provider_web_tool_names(provider_name, web_degrade);
     retain_selected_local_web_tools(&mut definitions, &local_web_tool_names);
     definitions.into_pack()
 }
 
-fn tool_definition_pack_for_web_names(
-    tool_factory: &Arc<dyn TurnToolFactory>,
+fn tool_definition_pack_for_web_names_from_registry(
+    registry: Arc<[ToolDefinition]>,
     grant: Option<&Grant>,
     mobile_use_active: bool,
     local_web_tool_names: &[String],
 ) -> Arc<ToolDefinitionPack> {
-    let mut definitions = authorized_tool_definition_view(tool_factory, grant, mobile_use_active);
+    let mut definitions =
+        authorized_tool_definition_view_for_registry(registry, grant, mobile_use_active);
     retain_selected_local_web_tools(&mut definitions, local_web_tool_names);
     definitions.into_pack()
+}
+
+struct TurnToolPackInputs<'a> {
+    provider_name: &'a str,
+    provider_request_state: &'a ProviderDerivedRequestState,
+    grant: ToolPackGrantSnapshot<'a>,
+    lockdown: bool,
+    registry_revision: Arc<[ToolDefinition]>,
+    mobile_use_active: bool,
+}
+
+impl TurnToolPackInputs<'_> {
+    fn cache_key(&self) -> TurnToolPackCacheKey {
+        TurnToolPackCacheKey {
+            provider: ProviderToolPackRevision {
+                provider_name: self.provider_name.to_owned(),
+                local_web_tool_names: self.provider_request_state.local_web_tool_names.clone(),
+                fallback_local_web_tool_names: self
+                    .provider_request_state
+                    .provider_fallback_local_web_tool_names
+                    .clone(),
+            },
+            grant: self.grant.revision.clone(),
+            lockdown: if self.lockdown {
+                LockdownToolPackRevision::Lockdown
+            } else {
+                LockdownToolPackRevision::Full
+            },
+            registry: ToolRegistryRevision(Arc::clone(&self.registry_revision)),
+            mode: ToolPackModeRevision {
+                mobile_use_active: self.mobile_use_active,
+            },
+        }
+    }
+}
+
+fn cached_turn_tool_packs(
+    cache: &StdMutex<TurnToolPackCache>,
+    inputs: TurnToolPackInputs<'_>,
+) -> Arc<SharedToolPacks> {
+    let key = inputs.cache_key();
+    {
+        let cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(packs) = cache.get(&key) {
+            return packs;
+        }
+    }
+
+    let packs = Arc::new(build_turn_tool_packs(&inputs));
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key, packs)
+}
+
+fn build_turn_tool_packs(inputs: &TurnToolPackInputs<'_>) -> SharedToolPacks {
+    let provider_tool_base = lockdown_tool_definition_pack(
+        authorized_tool_definition_pack_for_registry(
+            Arc::clone(&inputs.registry_revision),
+            inputs.grant.grant,
+            inputs.mobile_use_active,
+        ),
+        inputs.lockdown,
+    );
+    let provider_tools = lockdown_tool_definition_pack(
+        tool_definition_pack_for_web_names_from_registry(
+            Arc::clone(&inputs.registry_revision),
+            inputs.grant.grant,
+            inputs.mobile_use_active,
+            &inputs.provider_request_state.local_web_tool_names,
+        ),
+        inputs.lockdown,
+    );
+    let provider_fallback_tools = (!inputs
+        .provider_request_state
+        .provider_fallback_local_web_tool_names
+        .is_empty())
+    .then(|| {
+        let pack = lockdown_tool_definition_pack(
+            tool_definition_pack_for_web_names_from_registry(
+                Arc::clone(&inputs.registry_revision),
+                inputs.grant.grant,
+                inputs.mobile_use_active,
+                &inputs
+                    .provider_request_state
+                    .provider_fallback_local_web_tool_names,
+            ),
+            inputs.lockdown,
+        );
+        (Arc::clone(&pack.definitions), pack.digest.clone())
+    });
+    let local_web_tool_names = provider_tool_base
+        .definitions
+        .iter()
+        .filter(|definition| is_local_web_tool(&definition.name))
+        .map(|definition| definition.name.clone())
+        .collect::<Vec<_>>();
+    let mut name_variants = vec![Vec::new()];
+    for name in &local_web_tool_names {
+        let additions = name_variants
+            .iter()
+            .cloned()
+            .map(|mut names| {
+                names.push(name.clone());
+                names
+            })
+            .collect::<Vec<_>>();
+        name_variants.extend(additions);
+    }
+    let mut provider_tool_variants = HashMap::new();
+    for mut names in name_variants {
+        names.sort_unstable();
+        let pack = lockdown_tool_definition_pack(
+            tool_definition_pack_for_web_names_from_registry(
+                Arc::clone(&inputs.registry_revision),
+                inputs.grant.grant,
+                inputs.mobile_use_active,
+                &names,
+            ),
+            inputs.lockdown,
+        );
+        provider_tool_variants.insert(names, (Arc::clone(&pack.definitions), pack.digest.clone()));
+    }
+    SharedToolPacks {
+        base: Arc::clone(&provider_tool_base.definitions),
+        local_web_tool_names: local_web_tool_names.into(),
+        current: Arc::clone(&provider_tools.definitions),
+        current_digest: provider_tools.digest.clone(),
+        fallback: provider_fallback_tools,
+        variants: Arc::new(provider_tool_variants),
+    }
 }
 
 fn retain_selected_local_web_tools(
@@ -10949,12 +11162,25 @@ fn retain_selected_local_web_tools(
     });
 }
 
+#[cfg(test)]
 fn authorized_tool_definition_pack(
     tool_factory: &Arc<dyn TurnToolFactory>,
     grant: Option<&Grant>,
     mobile_use_active: bool,
 ) -> Arc<ToolDefinitionPack> {
-    authorized_tool_definition_view(tool_factory, grant, mobile_use_active).into_pack()
+    authorized_tool_definition_pack_for_registry(
+        tool_factory.shared_definitions(),
+        grant,
+        mobile_use_active,
+    )
+}
+
+fn authorized_tool_definition_pack_for_registry(
+    registry: Arc<[ToolDefinition]>,
+    grant: Option<&Grant>,
+    mobile_use_active: bool,
+) -> Arc<ToolDefinitionPack> {
+    authorized_tool_definition_view_for_registry(registry, grant, mobile_use_active).into_pack()
 }
 
 fn lockdown_tool_definition_pack(
@@ -11078,12 +11304,12 @@ fn authorized_tool_definitions(
         .to_vec()
 }
 
-fn authorized_tool_definition_view(
-    tool_factory: &Arc<dyn TurnToolFactory>,
+fn authorized_tool_definition_view_for_registry(
+    registry: Arc<[ToolDefinition]>,
     grant: Option<&Grant>,
     mobile_use_active: bool,
 ) -> ToolDefinitionView {
-    let mut definitions = ToolDefinitionView::all(tool_factory.shared_definitions());
+    let mut definitions = ToolDefinitionView::all(registry);
     definitions.retain(|definition| mobile_use_active || definition.name != "mobile");
     if let Some(grant) = grant {
         definitions.retain(|definition| {
