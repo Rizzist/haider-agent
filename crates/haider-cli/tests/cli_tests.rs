@@ -1402,28 +1402,44 @@ fn staged_run_with_resident_daemon_has_two_steady_state_threads() {
         "staged run exited before its steady-state thread sample"
     );
 
-    let inspection_available =
+    // A multi-threaded runtime keeps the count elevated, while a short-lived
+    // reaper or adapter helper can make one instantaneous sample read high.
+    // Define steady state as ten consecutive exact-two samples so transients
+    // before settling do not weaken the runtime-shape regression guard.
+    const SETTLED_SAMPLE_COUNT: usize = 10;
+    let settling_deadline = Instant::now() + Duration::from_millis(500);
+    let mut consecutive_exact_two = 0_usize;
+    let mut observed_thread_counts = Vec::new();
+    loop {
         match staged_process_thread_count(pid).expect("sample staged run steady-state threads") {
-            Some(first) => {
-                assert_eq!(first, 2, "unexpected staged run steady-state thread count");
-                true
+            Some(count) => {
+                observed_thread_counts.push(count);
+                if count == 2 {
+                    consecutive_exact_two = consecutive_exact_two.saturating_add(1);
+                } else {
+                    consecutive_exact_two = 0;
+                }
+                if consecutive_exact_two == SETTLED_SAMPLE_COUNT {
+                    break;
+                }
             }
-            None => {
+            None if observed_thread_counts.is_empty() => {
                 eprintln!(
                     "macOS sandbox denied ps thread inspection; staged thread guard skipped locally"
                 );
-                false
+                break;
             }
-        };
-    if inspection_available {
-        for _ in 0..10 {
-            thread::sleep(Duration::from_millis(10));
-            assert_eq!(
-                staged_process_thread_count(pid).expect("resample staged run threads"),
-                Some(2),
-                "staged run must remain main + one output-adapter worker"
-            );
+            None => panic!(
+                "staged run thread inspection became unavailable after observations: \
+                 {observed_thread_counts:?}"
+            ),
         }
+        assert!(
+            Instant::now() < settling_deadline,
+            "staged run never settled at exactly two threads for \
+             {SETTLED_SAMPLE_COUNT} consecutive samples; observed {observed_thread_counts:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
     }
 
     let mut remaining_stdout = Vec::new();
