@@ -235,3 +235,11 @@ list instead.
   tests start TERM-ignoring descendants and require the typed observer error,
   no survival marker, and no remaining process group; the foreground form also
   pins its leaked/live flags.
+
+- **#87 thread count is not a lifecycle phase fence** — observing a second
+  thread proves only that some helper exists; it does not prove the JSONL
+  output adapter has crossed daemon adoption and run acceptance. A steady-state
+  thread guard must first observe a product-owned phase marker, then enforce its
+  exact count throughout the bounded plateau. The CLI guard now gives the
+  flushed `accepted` record a ten-second deadline before requiring main plus
+  one `tokio-rt-worker` in every sample; its expected count remains two.

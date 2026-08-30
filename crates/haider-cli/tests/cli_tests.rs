@@ -11,7 +11,7 @@ use haider_protocol::state::RunState;
 #[cfg(unix)]
 use std::fs::{OpenOptions, TryLockError};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::io;
+use std::io::{self, BufRead, BufReader};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::ops::{Deref, DerefMut};
@@ -1221,7 +1221,8 @@ fn one_shot_reaps_only_the_daemon_it_spawned_on_success_and_bootstrap_failure() 
 /// Regression guard for the measured +1.04 ms cost of accidentally restoring
 /// a multi-threaded Tokio runtime to `haider run`. The daemon is already
 /// resident, so this observes only the staged CLI: main + its blocking JSONL
-/// adapter worker, with no cold owned-child waiter in the steady-state window.
+/// adapter worker. The accepted record fences adoption/startup from the
+/// steady-state window; a cold owned-child waiter must never enter this path.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn staged_run_with_resident_daemon_has_two_steady_state_threads() {
@@ -1260,30 +1261,75 @@ fn staged_run_with_resident_daemon_has_two_steady_state_threads() {
         .env("HAIDER_TEST_FAKE_PROVIDER", delayed_fake)
         .args(["run", "--provider", "fake", "--jsonl", "thread guard"])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().expect("start staged run thread probe");
     let pid = child.id();
-    let observation_deadline = Instant::now() + Duration::from_secs(10);
-    let first_steady_sample = loop {
-        assert!(
-            child.try_wait().expect("poll staged run").is_none(),
-            "staged run exited before its steady-state thread sample"
-        );
-        match staged_process_thread_count(pid).expect("sample staged run threads") {
-            None => break None,
-            Some(1) => {}
-            Some(count) => break Some(count),
+    let staged_stdout = child.stdout.take().expect("capture staged run stdout");
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::sync_channel(1);
+    let accepted_reader = thread::Builder::new()
+        .name("staged-stdout-read".to_owned())
+        .spawn(move || {
+            let mut stdout = BufReader::new(staged_stdout);
+            let mut accepted_line = String::new();
+            let accepted = match stdout.read_line(&mut accepted_line) {
+                Ok(0) => Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "staged run closed stdout before acceptance",
+                )),
+                Ok(_) => Ok((accepted_line, stdout)),
+                Err(error) => Err(error),
+            };
+            let _ = accepted_tx.send(accepted);
+        })
+        .expect("start bounded acceptance reader");
+    let (accepted_line, mut stdout) = match accepted_rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(accepted)) => accepted,
+        Ok(Err(error)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            accepted_reader
+                .join()
+                .expect("join failed staged acceptance reader");
+            panic!("staged run did not publish acceptance: {error}");
         }
-        assert!(
-            Instant::now() < observation_deadline,
-            "staged run never started its output adapter thread"
-        );
-        thread::sleep(Duration::from_millis(10));
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            accepted_reader
+                .join()
+                .expect("join timed-out staged acceptance reader");
+            panic!("staged run acceptance deadline elapsed: {error}");
+        }
     };
+    accepted_reader
+        .join()
+        .expect("join staged acceptance reader");
+    let accepted: serde_json::Value =
+        serde_json::from_str(&accepted_line).expect("staged run acceptance JSON");
+    assert_eq!(accepted["event"], "accepted");
+    assert!(
+        child
+            .try_wait()
+            .expect("poll accepted staged run")
+            .is_none(),
+        "staged run exited before its steady-state thread sample"
+    );
 
-    if let Some(first) = first_steady_sample {
-        assert_eq!(first, 2, "unexpected staged run steady-state thread count");
+    let inspection_available =
+        match staged_process_thread_count(pid).expect("sample staged run steady-state threads") {
+            Some(first) => {
+                assert_eq!(first, 2, "unexpected staged run steady-state thread count");
+                true
+            }
+            None => {
+                eprintln!(
+                    "macOS sandbox denied ps thread inspection; staged thread guard skipped locally"
+                );
+                false
+            }
+        };
+    if inspection_available {
         for _ in 0..10 {
             thread::sleep(Duration::from_millis(10));
             assert_eq!(
@@ -1292,10 +1338,12 @@ fn staged_run_with_resident_daemon_has_two_steady_state_threads() {
                 "staged run must remain main + one output-adapter worker"
             );
         }
-    } else {
-        eprintln!("macOS sandbox denied ps thread inspection; staged thread guard skipped locally");
     }
 
+    let mut remaining_stdout = Vec::new();
+    stdout
+        .read_to_end(&mut remaining_stdout)
+        .expect("drain staged run stdout");
     let output = child.wait_with_output().expect("staged run exits");
     assert!(
         output.status.success(),
