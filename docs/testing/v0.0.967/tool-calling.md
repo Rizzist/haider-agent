@@ -13,8 +13,8 @@ The process-specific brief was re-audited on the merged tree:
 | A non-repository receipt costs exactly one stat | wrong literally | `detect_repo_root(root, root)` checks `start.is_dir()` and then metadata for `.git`. The important contract is correct: it returns `NotEnumerated`, with zero walked entries/content, and every unknown comparison reports `assumed_mutation=true`. |
 | `HAIDER_DAEMON_TRACE=1` is at telemetry line 13, installed from `main.rs:120`, and limited to store/recovery | citation drifted | `telemetry.rs:13-15` is exact. `main.rs:120` is the containing function; the install call is line 121. |
 | `CountingAllocator` is at provider lines 354-371 | correct as a containing range | The test module begins at 354, the type is line 367, and the global allocator is lines 369-370. |
-| Daemon library count is 828 passed / 3 ignored | drifted | W1 added five tests; the merged tree runs 833 passed / 3 ignored. |
-| RPC goldens are 180 frames | drifted | The v0.0.966 prefix is 180; current K1 adds two, and the fixture/pin are 182. The crate's 154 tests pass. |
+| Daemon library count is 828 passed / 3 ignored | drifted | The verified gate-8 tree runs 850 passed / 3 ignored. |
+| RPC goldens are 180 frames | drifted | The v0.0.966 prefix is 180; current K1 adds two, and the fixture/pin are 182. The crate's 155 tests pass. |
 | Journal commits issue `F_FULLFSYNC` | wrong | The event store uses WAL and configured `synchronous=NORMAL` by default; its own documentation explicitly notes that SQLite `FULL` still does not mean `F_FULLFSYNC`. |
 | `queue_wait_micros=269` measures mutex contention | wrong | The field is recorded around blocking-pool scheduling in `sqlite_store.rs`; it is not a mutex-wait metric. |
 | The armed process-exit path still polls at 1 kHz | wrong | Linux uses pidfd and macOS uses kqueue; only unsupported targets retain the bounded one-millisecond fallback. |
@@ -36,15 +36,17 @@ process group remains the already-documented containment escape.
 Natural completion now follows a different path:
 
 1. Close live `process_control` authority while the observed zombie still pins
-   the Unix PGID, then reap the leader (`haider-tools/src/process.rs:1374-1414`).
+   the Unix PGID, then reap the leader (`haider-tools/src/process.rs:1405-1437`).
 2. Give pipe reads already ready in that scheduler turn one chance to publish,
-   without a timer, close inherited output, and detach rather than terminate
-   (`process.rs:1415-1429`).
+   then close inherited output and detach rather than terminate. On Unix the
+   stop handler also drains the nonblocking kernel pipe directly to EOF or
+   `EAGAIN`, so reactor-delivery latency cannot discard boundary bytes
+   (`process.rs:1438-1468,1664-1735`).
 3. On Unix detach is a no-op. On Windows it clears
    `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` before removing the exact unique Job
-   token (`haider-platform/src/process.rs:813-846`).
+   token (`haider-platform/src/process.rs:813-844`).
 4. Background supervision uses the same natural-completion boundary
-   (`haider-tools/src/tasks.rs:494-502,627-680`). A live `task_kill` still runs
+   (`haider-tools/src/tasks.rs:493-502,637-700`). A live `task_kill` still runs
    the group kill ladder.
 
 There is one explicit exceptional residual. If Windows refuses to clear
@@ -52,7 +54,7 @@ There is one explicit exceptional residual. If Windows refuses to clear
 itself sweep the descendants. That error path therefore reports a typed runtime
 fault, removes both lookup coordinates, and deliberately abandons the one exact
 Job handle instead of converting completion into teardown
-(`haider-platform/src/process.rs:848-872`). Descendants survive while the daemon
+(`haider-platform/src/process.rs:846-870`). Descendants survive while the daemon
 process remains alive; when the OS ultimately closes the abandoned handle at
 daemon-process exit, the fail-closed Job policy can terminate them. This is not
 the successful-detachment contract described in the model manual, and it is
@@ -116,9 +118,9 @@ macOS with the release-gate environment. The following real-daemon scenarios
 pass:
 
 - `tool_calls_execute_and_continue_over_real_rpc`: an ignored `target/`
-  contains a 1 TiB sparse build artifact. Foreground leader output (with
-  race-permitted descendant bytes), no output, 512 KiB, and 2 MiB all reach
-  spawn.
+  contains a 1 TiB sparse build artifact. Foreground output from the leader and
+  its waited descendant is exact on Unix; Windows permits the descendant's
+  boundary bytes to be absent. No output, 512 KiB, and 2 MiB all reach spawn.
   The 2 MiB command returns the typed 1 MiB output-cap failure. `fs_write`,
   `fs_read`, `fs_edit`, and `fs_search` mutate/read the actual workspace, and
   every result is consumed by a second provider request before the run reaches

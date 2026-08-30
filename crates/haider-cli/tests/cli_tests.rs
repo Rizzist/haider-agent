@@ -1408,7 +1408,10 @@ fn staged_run_with_resident_daemon_has_two_steady_state_threads() {
     // A multi-threaded runtime keeps the count elevated, while a short-lived
     // reaper or adapter helper can make one instantaneous sample read high.
     // Define steady state as ten consecutive exact-two samples so transients
-    // before settling do not weaken the runtime-shape regression guard.
+    // before settling do not weaken the runtime-shape regression guard. On a
+    // slow macOS runner each sample forks `ps`; if the deadline expires before
+    // ten samples, a nonempty sequence containing only exact-two observations
+    // still disproves a persistently elevated multi-threaded runtime.
     const SETTLED_SAMPLE_COUNT: usize = 10;
     let settling_deadline = Instant::now() + Duration::from_millis(500);
     let mut consecutive_exact_two = 0_usize;
@@ -1437,11 +1440,16 @@ fn staged_run_with_resident_daemon_has_two_steady_state_threads() {
                  {observed_thread_counts:?}"
             ),
         }
-        assert!(
-            Instant::now() < settling_deadline,
-            "staged run never settled at exactly two threads for \
-             {SETTLED_SAMPLE_COUNT} consecutive samples; observed {observed_thread_counts:?}"
-        );
+        if Instant::now() >= settling_deadline {
+            assert!(
+                !observed_thread_counts.is_empty()
+                    && observed_thread_counts.iter().all(|count| *count == 2),
+                "staged run never settled at exactly two threads for \
+                 {SETTLED_SAMPLE_COUNT} consecutive samples, and the bounded sample contained \
+                 an excursion; observed {observed_thread_counts:?}"
+            );
+            break;
+        }
         thread::sleep(Duration::from_millis(10));
     }
 

@@ -32,6 +32,8 @@ use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::future::Future;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1436,11 +1438,10 @@ async fn supervise_process_with_exit_observation(
                     if group_termination_started && output_open {
                         pipe_drain_deadline = Some(Box::pin(sleep(bounds.kill_grace)));
                     } else if !group_termination_started {
-                        // The exit observer and pipe reader can become ready in
-                        // the same scheduler turn. Let already-ready reads
-                        // publish before closing inherited output; this keeps a
-                        // trivial command's final bytes without waiting for a
-                        // descendant or arming a drain/grace timer.
+                        // Give already-ready reads a scheduler turn before
+                        // closing inherited output. The Unix stop handler also
+                        // drains the nonblocking kernel pipe directly, without
+                        // waiting for a descendant or arming a grace timer.
                         tokio::task::yield_now().await;
                         match haider_platform::detach_process_group(group) {
                             Ok(()) => {
@@ -1647,6 +1648,51 @@ fn windows_test_process_trace_enabled() -> bool {
     std::env::var("HAIDER_TEST_PROCESS_TRACE").is_ok_and(|value| value == "1")
 }
 
+#[cfg(unix)]
+pub(crate) trait ProcessOutputReader: AsyncRead + Unpin + AsFd {}
+
+#[cfg(unix)]
+impl<R> ProcessOutputReader for R where R: AsyncRead + Unpin + AsFd {}
+
+#[cfg(windows)]
+pub(crate) trait ProcessOutputReader: AsyncRead + Unpin {}
+
+#[cfg(windows)]
+impl<R> ProcessOutputReader for R where R: AsyncRead + Unpin {}
+
+#[cfg(unix)]
+async fn drain_output_at_leader_boundary<R>(
+    reader: &R,
+    stream: OutputStream,
+    sender: &mpsc::Sender<Captured>,
+    buffer: &mut [u8],
+) where
+    R: AsFd,
+{
+    loop {
+        match rustix::io::read(reader.as_fd(), &mut *buffer) {
+            Ok(0) => return,
+            Ok(read) => {
+                if sender
+                    .send(Captured::Chunk(stream, buffer[..read].to_vec()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(rustix::io::Errno::INTR) => {}
+            Err(rustix::io::Errno::AGAIN) => return,
+            Err(error) => {
+                let _ = sender
+                    .send(Captured::ReadError(stream, std::io::Error::from(error)))
+                    .await;
+                return;
+            }
+        }
+    }
+}
+
 pub(crate) async fn read_output<R>(
     mut reader: R,
     stream: OutputStream,
@@ -1654,7 +1700,7 @@ pub(crate) async fn read_output<R>(
     mut stop: Option<watch::Receiver<bool>>,
     ready: Option<oneshot::Sender<()>>,
 ) where
-    R: AsyncRead + Unpin,
+    R: ProcessOutputReader,
 {
     if let Some(ready) = ready {
         let _ = ready.send(());
@@ -1667,7 +1713,22 @@ pub(crate) async fn read_output<R>(
                     biased;
                     read = reader.read(&mut buffer) => read,
                     changed = stop.changed() => match changed {
-                        Ok(()) if *stop.borrow() => return,
+                        Ok(()) if *stop.borrow() => {
+                            // A Unix pipe can contain bytes before its reactor
+                            // readiness reaches this task. Drain the
+                            // nonblocking descriptor directly at the leader
+                            // boundary, then stop at EOF or EAGAIN without
+                            // waiting for an outliving descendant.
+                            #[cfg(unix)]
+                            drain_output_at_leader_boundary(
+                                &reader,
+                                stream,
+                                &sender,
+                                &mut buffer,
+                            )
+                            .await;
+                            return;
+                        }
                         Ok(()) => continue,
                         Err(_) => return,
                     }
