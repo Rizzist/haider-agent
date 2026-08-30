@@ -1376,8 +1376,11 @@ async fn persist_engine_snapshot(
                 operation: "write",
                 source,
             })?;
-        // The snapshot is a restart accelerator, but unchanged sites retain full durability.
-        haider_platform::fs::sync_file(&file, haider_platform::SyncPolicy::Full).map_err(
+        // Plain fsync hands the complete temporary file to the device before
+        // rename. The one trailing directory Full below is the cache barrier
+        // for both these bytes and the installed name, so a second earlier
+        // whole-device flush would add latency without a stronger state.
+        haider_platform::fs::sync_file(&file, haider_platform::SyncPolicy::Plain).map_err(
             |source| HookSnapshotPersistError::Io {
                 operation: "file sync",
                 source,
@@ -1390,7 +1393,8 @@ async fn persist_engine_snapshot(
                 source,
             }
         })?;
-        // The rename remains fully durable until the cadence policy explicitly relaxes it.
+        // The snapshot remains fully durable at publication: this barrier is
+        // ordered after the file fsync and atomic rename.
         haider_platform::fs::sync_directory(&root, haider_platform::SyncPolicy::Full).map_err(
             |source| HookSnapshotPersistError::Io {
                 operation: "directory sync",

@@ -93,6 +93,42 @@ pub(crate) struct AccountView {
     pub alias: String,
 }
 
+#[derive(serde::Serialize)]
+struct StatusDocumentWire<'a> {
+    account: Option<StatusAccountWire<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_adoption_available: Option<&'a [haider_rpc::AccountAdoptionAvailable]>,
+    daemon: StatusDaemonWire<'a>,
+    features: &'a [String],
+    kind: &'static str,
+    profile_path: &'a str,
+    runtime_dir: &'a str,
+    schema: &'static str,
+    session_count: u64,
+    update: StatusUpdateWire<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct StatusDaemonWire<'a> {
+    generation: u64,
+    pipe_dir: String,
+    version: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct StatusUpdateWire<'a> {
+    current_version: &'a str,
+    error: Option<&'static str>,
+    latest_version: Option<&'a str>,
+    status: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct StatusAccountWire<'a> {
+    alias: &'a str,
+    provider: &'a str,
+}
+
 pub(crate) struct SessionsDocument {
     pub schema: &'static str,
     pub kind: &'static str,
@@ -519,8 +555,7 @@ pub(crate) async fn status_command(rest: &[String]) -> ExitCode {
         provider: descriptor.provider,
         alias: descriptor.alias.as_str().to_owned(),
     });
-    let welcome = observer.welcome().clone();
-    let _ = observer.close();
+    let welcome = observer.into_welcome();
     let update = stamp_update_view(&profile.store_dir);
     let document = StatusDocument {
         schema: OBSERVE_SCHEMA,
@@ -538,7 +573,7 @@ pub(crate) async fn status_command(rest: &[String]) -> ExitCode {
         adoption_available: snapshot.adoption_available,
     };
     if options.json {
-        write_document(&document)
+        write_status_document(&document)
     } else {
         write_status_human(&document)
     }
@@ -1092,9 +1127,45 @@ fn run_state_name(state: ObserveRunStateWire) -> &'static str {
 }
 
 fn write_document(document: &impl ObserveJson) -> ExitCode {
+    write_serializable(&document.json())
+}
+
+fn write_status_document(document: &StatusDocument) -> ExitCode {
+    let wire = StatusDocumentWire {
+        schema: document.schema,
+        kind: document.kind,
+        daemon: StatusDaemonWire {
+            version: &document.daemon.version,
+            generation: document.daemon.generation,
+            pipe_dir: std::path::Path::new(&document.profile_path)
+                .join("pipe")
+                .display()
+                .to_string(),
+        },
+        update: StatusUpdateWire {
+            status: document.update.status,
+            current_version: &document.update.current_version,
+            latest_version: document.update.latest_version.as_deref(),
+            error: document.update.error,
+        },
+        features: &document.features,
+        account: document.account.as_ref().map(|account| StatusAccountWire {
+            provider: &account.provider,
+            alias: &account.alias,
+        }),
+        session_count: document.session_count,
+        profile_path: &document.profile_path,
+        runtime_dir: &document.runtime_dir,
+        account_adoption_available: (!document.adoption_available.is_empty())
+            .then_some(document.adoption_available.as_slice()),
+    };
+    write_serializable(&wire)
+}
+
+fn write_serializable(document: &impl serde::Serialize) -> ExitCode {
     let stdout = io::stdout();
     let mut output = stdout.lock();
-    if let Err(error) = serde_json::to_writer(&mut output, &document.json())
+    if let Err(error) = serde_json::to_writer(&mut output, document)
         .map_err(io::Error::other)
         .and_then(|()| output.write_all(b"\n"))
         .and_then(|()| output.flush())

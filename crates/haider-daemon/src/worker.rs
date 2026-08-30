@@ -67,18 +67,18 @@ use haider_core::{
     GraphSwitchCommand, GraphSwitchOutcome, HarnessActor, HarnessConfig, PartialStreamCheckpoint,
     PreviousCacheRequest, ProcessSignalCommand, ProcessSignalOutcome, PromptHistoryCompiler,
     ProviderDeadlineGuard, ProviderDerivedRequestState, ProviderPairSwitch,
-    ProviderPairSwitchCommitter, RequestInputCheckpoint, SessionSelectModelCommand,
-    SessionSelectModelOutcome, SharedToolPacks, StoreHandle, SubmitCheckpointTurn,
-    SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn, ToolDispatchResult,
-    ToolDispatcher, TurnHandle, build_cache_request_diagnostic, classify_cache_request,
-    context_soft_threshold_tokens, effect_recovery_evidence,
+    ProviderPairSwitchCommitter, ProviderViewAppendRequest, RequestInputCheckpoint,
+    SessionSelectModelCommand, SessionSelectModelOutcome, SharedToolPacks, StoreHandle,
+    SubmitCheckpointTurn, SubmitChildWaitTurn, SubmitCommittedTurn, SubmitPartialStreamTurn,
+    ToolDispatchResult, ToolDispatcher, TurnHandle, build_cache_request_diagnostic,
+    classify_cache_request, context_soft_threshold_tokens, effect_recovery_evidence,
     estimate_provider_request_input_tokens, presentation_for_haider_error,
     sanitized_failure_message,
 };
 use haider_protocol::agent::Grant;
 use haider_protocol::cache::{
     CacheEpochTransitionReason, CacheEpochTransitionV1, CacheRequestAttemptV1,
-    ProviderViewAttemptV1, ProviderViewLedgerV1,
+    ProviderViewAttemptV1, ProviderViewBlobV1, ProviderViewLedgerV1,
 };
 use haider_protocol::context::{ContextFootprint, ContextFootprintTruth};
 use haider_protocol::effect::{
@@ -485,12 +485,12 @@ impl DaemonContextCompactor {
             .await
     }
 
-    async fn record_provider_view_attempt(
+    fn provider_view_attempt_envelopes(
         &self,
         run_id: &RunId,
         ordinal: u64,
         view: &ProviderViewLedgerV1,
-    ) -> Result<(), HaiderError> {
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
         let item = ProviderViewAttemptV1 {
             ordinal,
             view: view.clone(),
@@ -532,17 +532,15 @@ impl DaemonContextCompactor {
             envelope.agent_id = self.agent_id.clone();
             envelope.render.ui = false;
         }
-        StoreHandle::append(&self.store, &mut envelopes)
-            .await
-            .map(|_| ())
+        Ok(envelopes)
     }
 
-    async fn record_cache_request_attempt(
+    fn cache_request_attempt_envelopes(
         &self,
         run_id: &RunId,
         ordinal: u64,
         diagnostic: &haider_protocol::provider::CacheRequestDiagnosticV1,
-    ) -> Result<(), HaiderError> {
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
         let item = CacheRequestAttemptV1 {
             ordinal,
             diagnostic: diagnostic.clone(),
@@ -584,9 +582,41 @@ impl DaemonContextCompactor {
             envelope.agent_id = self.agent_id.clone();
             envelope.render.ui = false;
         }
-        StoreHandle::append(&self.store, &mut envelopes)
-            .await
-            .map(|_| ())
+        Ok(envelopes)
+    }
+
+    /// Commits the compaction request's provider index and both durable
+    /// attempt marker pairs as one publication. The store fences the CAS
+    /// bytes before its SQLite transaction; a provider request cannot begin
+    /// until this method returns.
+    async fn record_request_attempt(
+        &self,
+        run_id: &RunId,
+        ordinal: u64,
+        provider_view: Option<(ProviderViewLedgerV1, Vec<ProviderViewBlobV1>)>,
+        diagnostic: &haider_protocol::provider::CacheRequestDiagnosticV1,
+    ) -> Result<(), HaiderError> {
+        let Some((ledger, blobs)) = provider_view else {
+            let mut envelopes =
+                self.cache_request_attempt_envelopes(run_id, ordinal, diagnostic)?;
+            return StoreHandle::append(&self.store, &mut envelopes)
+                .await
+                .map(|_| ());
+        };
+        let mut envelopes = self.provider_view_attempt_envelopes(run_id, ordinal, &ledger)?;
+        envelopes.extend(self.cache_request_attempt_envelopes(run_id, ordinal, diagnostic)?);
+        StoreHandle::persist_provider_view_and_append_owned(
+            &self.store,
+            ProviderViewAppendRequest {
+                session_id: self.store.session_id().clone(),
+                ledger,
+                blobs,
+                attempt_ordinal: ordinal,
+                envelopes,
+            },
+        )
+        .await
+        .map(|_| ())
     }
 
     fn compaction_cache_metadata(
@@ -951,7 +981,7 @@ impl ContextCompactor for DaemonContextCompactor {
                 },
             )?;
         }
-        if let Some(provider_view_ledger) = prepared
+        let pending_provider_view = if let Some(provider_view_ledger) = prepared
             .as_ref()
             .and_then(|prepared| prepared.provider_view())
             .map(|provider_view| provider_view.ledger().clone())
@@ -960,20 +990,14 @@ impl ContextCompactor for DaemonContextCompactor {
                 .as_mut()
                 .map(haider_provider::PreparedTurn::take_provider_view_storage_blobs)
                 .unwrap_or_default();
-            let stored_provider_view = StoreHandle::persist_provider_view(
-                &self.store,
-                self.store.session_id(),
-                provider_view_ledger,
-                blobs,
-            )
-            .await?;
             cache_metadata
                 .header_epoch
-                .clone_from(&stored_provider_view.header_epoch);
+                .clone_from(&provider_view_ledger.header_epoch);
             request.cache_metadata = Some(cache_metadata.clone());
-            self.record_provider_view_attempt(run_id, 1, &stored_provider_view)
-                .await?;
-        }
+            Some((provider_view_ledger, blobs))
+        } else {
+            None
+        };
         let cache_control = prepared
             .as_ref()
             .map_or(CacheControlObservationV1::Unavailable, |prepared| {
@@ -993,7 +1017,7 @@ impl ContextCompactor for DaemonContextCompactor {
             cache_control,
             None,
         );
-        self.record_cache_request_attempt(run_id, 1, &replay_cache_diagnostic)
+        self.record_request_attempt(run_id, 1, pending_provider_view, &replay_cache_diagnostic)
             .await?;
         let replay_request_messages = request.messages.clone();
         let (
@@ -1108,7 +1132,7 @@ impl ContextCompactor for DaemonContextCompactor {
                     CacheControlObservationV1::Unavailable,
                     None,
                 );
-                self.record_cache_request_attempt(run_id, 2, &fallback_cache_diagnostic)
+                self.record_request_attempt(run_id, 2, None, &fallback_cache_diagnostic)
                     .await?;
                 let stream = match haider_provider::before_provider_request_deadline(
                     self.provider_deadline,

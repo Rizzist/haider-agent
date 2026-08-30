@@ -114,18 +114,18 @@ use haider_core::{
     GraphRunSetOpenOutcome, GraphSwitchCommand, GraphSwitchOutcome, HarnessHandle,
     MenuResolutionCommand, MenuResolutionOutcome, OpenedGraphRunSet, PinnedGraph,
     ProcessSignalCommand, ProcessSignalOutcome, ProfileStoreFault, PromptHistoryCache,
-    QueueConsumeCommand, QueueConsumeOutcome, QueuePromoteCommand, QueuePromoteOutcome,
-    QueueRemoveCommand, QueueRemoveOutcome, QueueSnapshot, RenamedSession, RunRetryCommand,
-    RunRetryOutcome, SeenSession, SelectedAgentType, SelectedEffort, SelectedFast, SelectedModel,
-    SessionCreateCommand, SessionCreateOutcome, SessionForkCommand, SessionForkOutcome,
-    SessionMetaforkCommit, SessionProjectionCheckpoint, SessionPromptForkCommand,
-    SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome,
-    SessionSelectAgentTypeCommand, SessionSelectAgentTypeOutcome, SessionSelectEffortCommand,
-    SessionSelectEffortOutcome, SessionSelectFastCommand, SessionSelectFastOutcome,
-    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
-    ShellExecAcceptOutcome, SqliteStoreHandle, StoreHandle, SwitchedGraph, TurnAcceptCommand,
-    TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome,
-    TurnCancellationStatus,
+    ProviderViewAppendOutcome, ProviderViewAppendRequest, QueueConsumeCommand, QueueConsumeOutcome,
+    QueuePromoteCommand, QueuePromoteOutcome, QueueRemoveCommand, QueueRemoveOutcome,
+    QueueSnapshot, RenamedSession, RunRetryCommand, RunRetryOutcome, SeenSession,
+    SelectedAgentType, SelectedEffort, SelectedFast, SelectedModel, SessionCreateCommand,
+    SessionCreateOutcome, SessionForkCommand, SessionForkOutcome, SessionMetaforkCommit,
+    SessionProjectionCheckpoint, SessionPromptForkCommand, SessionRenameCommand,
+    SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome, SessionSelectAgentTypeCommand,
+    SessionSelectAgentTypeOutcome, SessionSelectEffortCommand, SessionSelectEffortOutcome,
+    SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
+    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle,
+    StoreHandle, SwitchedGraph, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
+    TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::agent::AgentManifest;
@@ -1555,6 +1555,7 @@ enum ActorCommand {
     AcceptTurn {
         command: TurnAcceptCommand,
         peer_message: Option<haider_protocol::peer::PeerMessage>,
+        auto_title: Option<String>,
         completed: oneshot::Sender<Result<TurnAcceptOutcome, HaiderError>>,
     },
     QueueList {
@@ -1590,6 +1591,11 @@ enum ActorCommand {
         expected_head: Option<u64>,
         envelopes: Vec<RawEnvelope>,
         completed: oneshot::Sender<Result<Arc<[RawEnvelope]>, HaiderError>>,
+    },
+    WorkerProviderViewAppend {
+        lease_id: WorkerLeaseId,
+        request: ProviderViewAppendRequest,
+        completed: oneshot::Sender<Result<ProviderViewAppendOutcome, HaiderError>>,
     },
     WorkerSettleIdle {
         lease_id: WorkerLeaseId,
@@ -3010,6 +3016,7 @@ impl SessionHub {
             .send(ActorCommand::AcceptTurn {
                 command,
                 peer_message: Some(message.clone()),
+                auto_title: None,
                 completed,
             })
             .await
@@ -3419,23 +3426,14 @@ impl SessionHub {
         }
     }
 
-    /// Narrow daemon-internal turn acceptance used by local delegation.
+    /// Narrow daemon-internal turn acceptance used by local delegation. The
+    /// store transaction performs receipt replay before its current-state
+    /// fences, so a separate replay read would only add a blocking-pool and
+    /// SQLite boundary.
     pub(crate) async fn accept_internal_turn(
         &self,
         command: TurnAcceptCommand,
     ) -> Result<AcceptedTurn, HaiderError> {
-        if let Some(accepted) = self
-            .inner
-            .store
-            .turn_accept_receipt(
-                command.command_id.clone(),
-                command.request_digest.clone(),
-                command.request_json.clone(),
-            )
-            .await?
-        {
-            return Ok(accepted);
-        }
         match self
             .accept_turn(command)
             .await
@@ -4827,6 +4825,14 @@ impl SessionHub {
         &self,
         command: TurnAcceptCommand,
     ) -> Result<TurnAcceptOutcome, SessionHubError> {
+        self.accept_turn_with_auto_title(command, None).await
+    }
+
+    async fn accept_turn_with_auto_title(
+        &self,
+        command: TurnAcceptCommand,
+        auto_title: Option<String>,
+    ) -> Result<TurnAcceptOutcome, SessionHubError> {
         let actor = self.actor_for(command.session_id.clone()).await?;
         let _workflow_selection = self.lock_workflow_selection(&command.session_id).await;
         let (completed, result) = oneshot::channel();
@@ -4835,6 +4841,7 @@ impl SessionHub {
             .send(ActorCommand::AcceptTurn {
                 command,
                 peer_message: None,
+                auto_title,
                 completed,
             })
             .await
@@ -6680,6 +6687,41 @@ impl StoreHandle for HubStoreHandle {
             .store
             .persist_provider_view(session_id.clone(), ledger, blobs)
             .await
+    }
+
+    async fn persist_provider_view_and_append_owned(
+        &self,
+        request: ProviderViewAppendRequest,
+    ) -> Result<ProviderViewAppendOutcome, HaiderError> {
+        if request.session_id != self.session_id
+            || request.envelopes.is_empty()
+            || request.envelopes.iter().any(|envelope| {
+                envelope.session_id != self.session_id
+                    || envelope.worker_generation != self.worker_generation
+            })
+        {
+            return Err(HaiderError::new(
+                ErrorCode::SingleWriterViolation,
+                "provider-view append identity does not match its worker lease",
+                false,
+            ));
+        }
+        let actor = self
+            .hub
+            .existing_actor(&self.session_id)
+            .map_err(hub_error_as_store)?
+            .ok_or_else(hub_closed_store_error)?;
+        let (completed, response) = oneshot::channel();
+        actor
+            .commands
+            .send(ActorCommand::WorkerProviderViewAppend {
+                lease_id: self.lease_id.clone(),
+                request,
+                completed,
+            })
+            .await
+            .map_err(|_| hub_closed_store_error())?;
+        response.await.map_err(|_| hub_closed_store_error())?
     }
 
     async fn verify_provider_view(

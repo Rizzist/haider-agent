@@ -4,7 +4,10 @@
 //! runs on Tokio's blocking pool. The wrapped [`Store`] owns one connection and
 //! the profile lock until [`SqliteStoreHandle::close`] or final fallback drop.
 
-use crate::{ArtifactReader, CommittedRange, ReducerPage, StoreHandle};
+use crate::{
+    ArtifactReader, CommittedRange, ProviderViewAppendOutcome, ProviderViewAppendRequest,
+    ReducerPage, StoreHandle,
+};
 use async_trait::async_trait;
 use haider_protocol::agent::ChildReport;
 use haider_protocol::branch::BranchDescriptor;
@@ -1012,6 +1015,18 @@ impl SqliteStoreHandle {
     ) -> Result<TurnAcceptOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || owner.with_store(|store| store.accept_turn(&command))).await
+    }
+
+    pub async fn accept_turn_with_auto_title(
+        &self,
+        command: TurnAcceptCommand,
+        auto_title: String,
+    ) -> Result<TurnAcceptOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || {
+            owner.with_store(|store| store.accept_turn_with_auto_title(&command, &auto_title))
+        })
+        .await
     }
 
     /// Blocking-pool adapter for the typed peer-origin acceptance path.
@@ -2213,6 +2228,48 @@ impl SqliteStoreHandle {
         .await
     }
 
+    pub async fn persist_provider_view_and_append_owned(
+        &self,
+        request: ProviderViewAppendRequest,
+    ) -> Result<ProviderViewAppendOutcome, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        let failed_write_ids = request
+            .envelopes
+            .iter()
+            .map(|envelope| envelope.event_id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let result = run_blocking(move || {
+            let ProviderViewAppendRequest {
+                session_id,
+                ledger,
+                blobs,
+                attempt_ordinal,
+                mut envelopes,
+            } = request;
+            owner.with_store(|store| {
+                let ledger = store.persist_provider_view_and_append_owned(
+                    &session_id,
+                    ledger,
+                    blobs,
+                    attempt_ordinal,
+                    &mut envelopes,
+                )?;
+                Ok(ProviderViewAppendOutcome {
+                    ledger,
+                    envelopes: envelopes.into(),
+                })
+            })
+        })
+        .await;
+        match result {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => {
+                self.owner.note_failed_write(&error, failed_write_ids);
+                Err(error)
+            }
+        }
+    }
+
     pub async fn verify_provider_view(
         &self,
         ledger: ProviderViewLedgerV1,
@@ -2408,6 +2465,13 @@ impl StoreHandle for SqliteStoreHandle {
         blobs: Vec<ProviderViewBlobV1>,
     ) -> Result<ProviderViewLedgerV1, HaiderError> {
         SqliteStoreHandle::persist_provider_view(self, session_id.clone(), ledger, blobs).await
+    }
+
+    async fn persist_provider_view_and_append_owned(
+        &self,
+        request: ProviderViewAppendRequest,
+    ) -> Result<ProviderViewAppendOutcome, HaiderError> {
+        SqliteStoreHandle::persist_provider_view_and_append_owned(self, request).await
     }
 
     async fn verify_provider_view(&self, ledger: &ProviderViewLedgerV1) -> Result<(), HaiderError> {

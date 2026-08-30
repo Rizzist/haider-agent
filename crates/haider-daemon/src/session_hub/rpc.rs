@@ -11918,46 +11918,6 @@ impl HubConnection {
         self.respond_error(request_id, code, &error.message, error.retryable, None)
     }
 
-    /// G2 auto-title: on the FIRST main-timeline accept of an untitled
-    /// session, journal the same `session_renamed` fact through the same
-    /// actor/store lane with an INTERNAL per-session command id — the
-    /// receipt makes it at-most-once forever, and the store-side
-    /// `only_if_untitled` guard makes overwrite impossible even under an
-    /// explicit-rename race. Best-effort by design: a failed auto-title
-    /// must never fail the already-committed turn.
-    async fn maybe_auto_title(&self, session_id: &SessionId, slug: String) {
-        let Ok(Some(metadata)) = self.hub.session_metadata(session_id).await else {
-            return;
-        };
-        if metadata.title.is_some() {
-            return;
-        }
-        // Generation- and title-free coordinates: the SAME digest across
-        // retries and daemon restarts, so the receipt dedupes forever.
-        let Ok(request_json) = serde_json::to_string(&serde_json::json!({
-            "session_id": session_id,
-            "auto_title": true,
-        })) else {
-            return;
-        };
-        let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
-        let Ok(event_id) = random_id("auto-title") else {
-            return;
-        };
-        let command = SessionRenameCommand {
-            command_id: format!("auto-title-{session_id}"),
-            request_digest,
-            request_json,
-            session_id: session_id.clone(),
-            worker_generation: self.hub.inner.store.worker_generation(),
-            title: Some(slug),
-            only_if_untitled: true,
-            event_id: EventId::new(event_id),
-            device_id: self.hub.inner.device_id.clone(),
-        };
-        let _ = self.hub.rename_session(command).await;
-    }
-
     /// `session.select_effort` — receipted live-session effort selection
     /// (G3), the exact `session.select_model` law set: receipt replay
     /// precedes validation, the ONE authority in `crate::model_select`
@@ -12779,81 +12739,88 @@ impl HubConnection {
             SessionHubError::Task(format!("cannot encode turn-submit coordinates: {error}"))
         })?;
         let request_digest = blake3::hash(request_json.as_bytes()).to_hex().to_string();
-        match self
-            .hub
-            .turn_accept_receipt(&command_id, &request_digest, &request_json)
-            .await
-        {
-            Ok(Some(accepted)) => {
-                // G2: a replayed first-accept still gets its auto-title —
-                // the internal receipt makes the retry harmless, and a
-                // crash between the original accept and its auto-title
-                // would otherwise leave the session unnamed forever.
-                if accepted.first_user_turn {
-                    self.maybe_auto_title(&session_id, auto_title_slug(&text))
-                        .await;
-                }
-                if accepted.worker_generation == self.hub.inner.store.worker_generation() {
-                    let handoff = match accepted.disposition {
-                        TurnAdmissionDisposition::SteerPending => {
-                            self.hub
-                                .submit_internal_nudge(accepted.clone(), text.clone())
-                                .await
-                        }
-                        TurnAdmissionDisposition::SubturnPending => {
-                            self.hub
-                                .submit_internal_subturn(accepted.clone(), text.clone())
-                                .await
-                        }
-                        TurnAdmissionDisposition::Started | TurnAdmissionDisposition::Queued => {
-                            self.hub.worker_manager()?.submit(accepted.clone()).await
-                        }
+        let first_turn_slug = auto_title_slug(&text);
+        if !attachments.is_empty() {
+            match self
+                .hub
+                .turn_accept_receipt(&command_id, &request_digest, &request_json)
+                .await
+            {
+                Ok(Some(_)) => {
+                    // Receipt lookup must remain ahead of immutable attachment
+                    // validation, but it cannot bypass the fused transaction:
+                    // pre-fusion first-turn receipts may still need their
+                    // title repaired after the old acceptance->rename crash.
+                    let replay_user_event_id = replay_title_user_event_id(&command_id);
+                    let replay_command = TurnAcceptCommand {
+                        command_id: command_id.0.clone(),
+                        request_digest: request_digest.clone(),
+                        request_json: request_json.clone(),
+                        session_id: session_id.clone(),
+                        worker_generation,
+                        // These coordinates are unreachable after the durable
+                        // receipt match, so fixed typed sentinels avoid making
+                        // an idempotent replay depend on fresh entropy.
+                        run_id: haider_protocol::ids::RunId::new("receipt-replay"),
+                        agent_id: None,
+                        branch_id: branch_id.clone(),
+                        text: text.clone(),
+                        attachments: attachments.clone(),
+                        mode,
+                        queued_event_id: EventId::new("receipt-replay-queued"),
+                        // Unlike the other sentinels this ID is reachable:
+                        // title repair derives its globally unique envelope
+                        // ID from the user event. Bind it deterministically
+                        // to the receipt key so different legacy commands do
+                        // not collide while retries remain stable.
+                        user_event_id: replay_user_event_id,
+                        active_event_id: EventId::new("receipt-replay-active"),
+                        device_id: self.hub.inner.device_id.clone(),
                     };
-                    if let Err(error) = handoff {
-                        return self.respond_turn_error(request_id, error);
+                    let accepted = match self
+                        .hub
+                        .accept_turn_with_auto_title(replay_command, Some(first_turn_slug.clone()))
+                        .await
+                    {
+                        Ok(TurnAcceptOutcome::Committed { accepted, .. })
+                        | Ok(TurnAcceptOutcome::IdempotentReplay { accepted }) => accepted,
+                        Err(SessionHubError::Store(error)) => {
+                            return self.respond_turn_error(request_id, error);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if accepted.worker_generation == self.hub.inner.store.worker_generation() {
+                        let handoff = match accepted.disposition {
+                            TurnAdmissionDisposition::SteerPending => {
+                                self.hub
+                                    .submit_internal_nudge(accepted.clone(), text.clone())
+                                    .await
+                            }
+                            TurnAdmissionDisposition::SubturnPending => {
+                                self.hub
+                                    .submit_internal_subturn(accepted.clone(), text.clone())
+                                    .await
+                            }
+                            TurnAdmissionDisposition::Started
+                            | TurnAdmissionDisposition::Queued => {
+                                self.hub.worker_manager()?.submit(accepted.clone()).await
+                            }
+                        };
+                        if let Err(error) = handoff {
+                            return self.respond_turn_error(request_id, error);
+                        }
                     }
-                }
-                return self.respond_turn_accepted(request_id, accepted, headless_spec.is_some());
-            }
-            Ok(None) => {}
-            Err(SessionHubError::Store(error)) => {
-                return self.respond_turn_error(request_id, error);
-            }
-            Err(error) => return Err(error),
-        }
-        if let Some(spec) = headless_spec.as_ref() {
-            let metadata = match self.hub.session_metadata(&session_id).await {
-                Ok(Some(metadata)) => metadata,
-                Ok(None) => {
-                    return self.respond_error(
+                    return self.respond_turn_accepted(
                         request_id,
-                        ERROR_CODE_INVALID_ARGUMENT,
-                        "headless start requires typed session metadata",
-                        false,
-                        None,
+                        accepted,
+                        headless_spec.is_some(),
                     );
                 }
-                Err(error) => return self.respond_turn_error(request_id, error),
-            };
-            let expected_permissions =
-                (!spec.permission_overrides.is_empty()).then_some(spec.permission_overrides);
-            if metadata.cwd != spec.cwd
-                || metadata.provider != spec.provider
-                || metadata.model != spec.model
-                || metadata.max_tokens != spec.max_output_tokens
-                || metadata.effort != spec.effort
-                || metadata.fast != spec.fast
-                || metadata.permission_overrides != expected_permissions
-                || metadata.interaction_mode
-                    != haider_protocol::session::SessionInteractionModeV1::Autonomous
-            {
-                return self.respond_error(
-                    request_id,
-                    ERROR_CODE_INVALID_ARGUMENT,
-                    "headless execution pin does not match the resolved session configuration",
-                    false,
-                    None,
-                );
+                Ok(None) => {}
+                Err(SessionHubError::Store(error)) => {
+                    return self.respond_turn_error(request_id, error);
+                }
+                Err(error) => return Err(error),
             }
         }
         let pdf_delivery = if attachments.iter().any(|attachment| {
@@ -12897,21 +12864,7 @@ impl HubConnection {
                 );
             }
         };
-        // Captured before `text` moves into the acceptance command; only a
-        // committed FIRST accept consumes it (G2 auto-title).
-        let first_turn_slug = auto_title_slug(&text);
         let delivery_text = text.clone();
-        // A control client can submit another turn directly to a delegated
-        // child session. Keep that turn on the child's agent-scoped history;
-        // recording it as a root turn makes prompt reconstruction discard the
-        // committed user message when the queued run starts.
-        let agent_id = self
-            .hub
-            .inner
-            .store
-            .delegation_for_child_session(session_id.clone())
-            .await?
-            .map(|delegation| delegation.agent_id);
         let command = TurnAcceptCommand {
             command_id: command_id.0,
             request_digest,
@@ -12919,7 +12872,9 @@ impl HubConnection {
             session_id: session_id.clone(),
             worker_generation,
             run_id: haider_protocol::ids::RunId::new(random_id("run")?),
-            agent_id,
+            // The acceptance transaction resolves a delegated child session
+            // to its durable agent scope under the same SQLite writer order.
+            agent_id: None,
             branch_id,
             text,
             attachments,
@@ -12929,7 +12884,11 @@ impl HubConnection {
             active_event_id: EventId::new(random_id("session-active")?),
             device_id: self.hub.inner.device_id.clone(),
         };
-        let accepted = match self.hub.accept_turn(command).await {
+        let accepted = match self
+            .hub
+            .accept_turn_with_auto_title(command, Some(first_turn_slug))
+            .await
+        {
             Ok(TurnAcceptOutcome::Committed { accepted, .. })
             | Ok(TurnAcceptOutcome::IdempotentReplay { accepted }) => accepted,
             Err(SessionHubError::Store(error)) => {
@@ -12937,13 +12896,6 @@ impl HubConnection {
             }
             Err(error) => return Err(error),
         };
-        // G2 auto-title, between the committed acceptance and the worker
-        // handoff so the config fact lands ahead of any run movement (the
-        // F3 head-CAS tolerance covers a later interleave anyway).
-        if accepted.first_user_turn {
-            self.maybe_auto_title(&accepted.session_id, first_turn_slug)
-                .await;
-        }
         // Durable-before-provider: the manager sees this only after the actor
         // committed and synchronously published the acceptance transaction.
         let handoff = match accepted.disposition {
@@ -17111,6 +17063,21 @@ fn auto_title_slug(text: &str) -> String {
     } else {
         slug
     }
+}
+
+/// Stable, globally unique input for a legacy receipt's auto-title repair.
+///
+/// Receipt command IDs are globally unique inside a profile. Hashing that
+/// identity keeps the synthetic event ID bounded while preserving the same
+/// value on every replay.
+pub(super) fn replay_title_user_event_id(command_id: &CommandId) -> EventId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"haider.turn-title-replay.v1\0");
+    hasher.update(command_id.as_str().as_bytes());
+    EventId::new(format!(
+        "receipt-replay-user-{}",
+        hasher.finalize().to_hex()
+    ))
 }
 
 /// The capability→delivery JOIN: the single decision that turns a session

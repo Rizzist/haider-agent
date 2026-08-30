@@ -228,3 +228,51 @@ fn an_interleaved_known_filesystem_mutation_invalidates_a_live_process_compariso
 
     assert!(mutation.contains("reason=concurrent_or_interleaved_mutation"));
 }
+
+#[tokio::test]
+async fn unknown_before_receipt_skips_the_after_walk_and_assumes_mutation() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let tracker = WorkspaceReceiptTracker::default();
+    tracker.install_initial_receipt(super::WorkspaceStateReceipt::unknown(
+        WorkspaceReceiptStrategy::RepositoryWalk,
+        WorkspaceReceiptUnknownReason::ContentLimit,
+        12,
+        super::WORKSPACE_RECEIPT_CONTENT_BUDGET_BYTES,
+    ));
+    let lease = tracker.begin_foreground();
+    std::fs::remove_dir(workspace.path()).expect("remove receipt root");
+
+    let mutation = lease
+        .finish_for_root(workspace.path().to_path_buf())
+        .await
+        .expect("unknown coverage assumes mutation");
+
+    assert!(mutation.contains("reason=content_limit"));
+    assert!(mutation.contains("before_entries=12"));
+    assert!(mutation.contains("after_entries=12"));
+}
+
+#[tokio::test]
+async fn invalidated_complete_receipt_skips_the_after_walk_and_assumes_mutation() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let tracker = WorkspaceReceiptTracker::default();
+    let receipt = super::WorkspaceStateReceipt {
+        fingerprint: "blake3:known".into(),
+        coverage: WorkspaceReceiptCoverage::Complete,
+        strategy: WorkspaceReceiptStrategy::RepositoryWalk,
+        counts_known: true,
+        entries_visited: 1,
+        content_bytes_read: 1,
+    };
+    tracker.install_initial_receipt(receipt);
+    let lease = tracker.begin_foreground();
+    tracker.invalidate();
+    std::fs::remove_dir(workspace.path()).expect("remove receipt root");
+
+    let mutation = lease
+        .finish_for_root(workspace.path().to_path_buf())
+        .await
+        .expect("interleaving assumes mutation");
+
+    assert!(mutation.contains("reason=concurrent_or_interleaved_mutation"));
+}

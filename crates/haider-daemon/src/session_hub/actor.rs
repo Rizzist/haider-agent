@@ -867,6 +867,7 @@ pub(super) async fn run_session_actor(
             ActorCommand::AcceptTurn {
                 command,
                 peer_message,
+                auto_title,
                 completed,
             } => {
                 // MUTATION CHECK: publishing before this durable transaction
@@ -874,7 +875,10 @@ pub(super) async fn run_session_actor(
                 // cannot recover; the live lost-response test must fail.
                 let result = match peer_message {
                     Some(message) => store.accept_peer_turn(command, message).await,
-                    None => store.accept_turn(command).await,
+                    None => match auto_title {
+                        Some(title) => store.accept_turn_with_auto_title(command, title).await,
+                        None => store.accept_turn(command).await,
+                    },
                 };
                 if let Ok(TurnAcceptOutcome::Committed { envelopes, .. }) = &result {
                     if let Some(last) = envelopes.last() {
@@ -1210,6 +1214,54 @@ pub(super) async fn run_session_actor(
                             through_seq: head,
                         });
                         let _ = completed.send(Ok(envelopes));
+                    }
+                    Err(error) => {
+                        let _ = completed.send(Err(error));
+                    }
+                }
+            }
+            ActorCommand::WorkerProviderViewAppend {
+                lease_id,
+                request,
+                completed,
+            } => {
+                let current = worker.as_ref().map(|worker| &worker.lease_id);
+                if current != Some(&lease_id) {
+                    let _ = completed.send(Err(HaiderError::new(
+                        ErrorCode::SingleWriterViolation,
+                        "worker lease was superseded",
+                        false,
+                    )));
+                    continue;
+                }
+                // The CAS bytes reached their Full fence before the store's
+                // one transaction indexes them and appends this exact attempt
+                // batch. Publication remains synchronous after that commit.
+                let result = store.persist_provider_view_and_append_owned(request).await;
+                match result {
+                    Ok(outcome) => {
+                        let envelopes = &outcome.envelopes;
+                        head = envelopes.last().map_or(head, |envelope| envelope.seq);
+                        if let Some(last) = envelopes.last() {
+                            authority_epoch = last.authority_epoch;
+                        }
+                        observer.observe(HubObservation::Persisted {
+                            session_id: session_id.clone(),
+                            through_seq: head,
+                        });
+                        pipe_sidecar.enqueue(envelopes);
+                        publish_shared(
+                            &mut attachments,
+                            Arc::clone(envelopes),
+                            catch_up_byte_budget,
+                            &metrics,
+                            &hooks,
+                        );
+                        observer.observe(HubObservation::Published {
+                            session_id: session_id.clone(),
+                            through_seq: head,
+                        });
+                        let _ = completed.send(Ok(outcome));
                     }
                     Err(error) => {
                         let _ = completed.send(Err(error));

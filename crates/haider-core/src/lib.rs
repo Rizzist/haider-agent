@@ -88,9 +88,7 @@ pub use sqlite_store::{AppendGroupBatch, ProfileStoreFault, SqliteStoreHandle};
 
 use async_trait::async_trait;
 use haider_protocol::branch::BranchDescriptor;
-use haider_protocol::cache::{
-    ProviderViewBlobV1, ProviderViewBlockRefV1, ProviderViewLedgerV1, ProviderViewStorageV1,
-};
+use haider_protocol::cache::{ProviderViewBlobV1, ProviderViewBlockRefV1, ProviderViewLedgerV1};
 use haider_protocol::envelope::{RawEnvelope, envelope_weight_bytes};
 use haider_protocol::error::{ErrorCode, HaiderError};
 use haider_protocol::ids::{BranchId, SessionId};
@@ -105,6 +103,22 @@ pub const CRATE_NAME: &str = "haider-core";
 pub struct CommittedRange {
     pub first_seq: u64,
     pub last_seq: u64,
+}
+
+/// One provider-view CAS publication and the journal facts for the same
+/// request attempt. Durable stores commit the view index and envelopes in one
+/// database transaction after the CAS full fence.
+pub struct ProviderViewAppendRequest {
+    pub session_id: SessionId,
+    pub ledger: ProviderViewLedgerV1,
+    pub blobs: Vec<ProviderViewBlobV1>,
+    pub attempt_ordinal: u64,
+    pub envelopes: Vec<RawEnvelope>,
+}
+
+pub struct ProviderViewAppendOutcome {
+    pub ledger: ProviderViewLedgerV1,
+    pub envelopes: Arc<[RawEnvelope]>,
 }
 
 fn envelope_payload_kind(envelope: &RawEnvelope) -> &str {
@@ -256,14 +270,11 @@ pub trait StoreHandle: Send + Sync {
     /// transient bytes; the SQLite implementation owns durable CAS storage.
     async fn persist_provider_view(
         &self,
-        session_id: &SessionId,
-        mut ledger: ProviderViewLedgerV1,
+        _session_id: &SessionId,
+        ledger: ProviderViewLedgerV1,
         blobs: Vec<ProviderViewBlobV1>,
     ) -> Result<ProviderViewLedgerV1, HaiderError> {
         use std::collections::HashSet;
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static EPHEMERAL_REQUEST_ORDINAL: AtomicU64 = AtomicU64::new(1);
         let expected = std::iter::once(&ledger.system_block)
             .chain(std::iter::once(&ledger.tool_schema_block))
             .chain(ledger.history_blocks.iter())
@@ -289,12 +300,21 @@ pub trait StoreHandle: Send + Sync {
                 false,
             ));
         }
-        ledger.storage = Some(ProviderViewStorageV1 {
-            session_id: session_id.clone(),
-            request_ordinal: EPHEMERAL_REQUEST_ORDINAL.fetch_add(1, Ordering::Relaxed),
-            expires_at_ms: u64::MAX,
-        });
         Ok(ledger)
+    }
+
+    /// Publishes a provider-view index and the request-attempt journal facts.
+    /// A journal-only adapter cannot provide the required atomic publication,
+    /// so it must override this method or fail closed through this default.
+    async fn persist_provider_view_and_append_owned(
+        &self,
+        _request: ProviderViewAppendRequest,
+    ) -> Result<ProviderViewAppendOutcome, HaiderError> {
+        Err(HaiderError::new(
+            ErrorCode::Internal,
+            "store cannot atomically publish a provider view and its request attempt",
+            false,
+        ))
     }
 
     /// Verifies the on-disk content addresses for one prior request view.

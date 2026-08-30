@@ -1,8 +1,20 @@
 #![allow(clippy::expect_used)]
 
-use haider_protocol::cache::{ProviderViewBlobV1, ProviderViewBoundaryV1, ProviderViewLedgerV1};
-use haider_protocol::ids::SessionId;
-use haider_store::Store;
+use haider_protocol::EventPayload;
+use haider_protocol::cache::{
+    CacheRequestAttemptV1, ProviderViewAttemptV1, ProviderViewBlobV1, ProviderViewBoundaryV1,
+    ProviderViewLedgerV1,
+};
+use haider_protocol::envelope::{
+    EventEnvelope, PromptRender, RawEnvelope, RenderTargets, SCHEMA_VERSION,
+};
+use haider_protocol::ids::{DeviceId, EventId, ItemId, SessionId};
+use haider_protocol::item::ItemEvent;
+use haider_protocol::provider::{
+    CacheBreakpointHashesV1, CacheControlObservationV1, CachePrefixMatchV1,
+    CacheRequestDiagnosticV1,
+};
+use haider_store::{EventStore, Store};
 use rusqlite::{Connection, params};
 
 fn create_session(store: &Store, session_id: &SessionId) {
@@ -47,6 +59,154 @@ fn provider_view(
         storage: None,
     };
     (ledger, vec![system, tools, history])
+}
+
+fn provider_attempt_envelopes(
+    session_id: &SessionId,
+    ledger: &ProviderViewLedgerV1,
+) -> Vec<RawEnvelope> {
+    let item_id = ItemId::new("provider-view-attempt-item");
+    let item = ProviderViewAttemptV1 {
+        ordinal: 1,
+        view: ledger.clone(),
+    }
+    .extension_item()
+    .expect("provider-view attempt item");
+    [
+        ItemEvent::Started {
+            item_id: item_id.clone(),
+            item: item.clone(),
+        },
+        ItemEvent::Completed { item_id, item },
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, item)| EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new(format!("provider-view-attempt-{index}")),
+        seq: 0,
+        session_id: session_id.clone(),
+        branch_id: None,
+        run_id: None,
+        agent_id: None,
+        device_id: DeviceId::new("provider-view-attempt-device"),
+        authority_epoch: 1,
+        worker_generation: 1,
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: false,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::to_value(EventPayload::Item(item)).expect("item payload"),
+    })
+    .collect()
+}
+
+fn cache_attempt_envelopes(session_id: &SessionId) -> Vec<RawEnvelope> {
+    let item_id = ItemId::new("cache-request-attempt-item");
+    let item = CacheRequestAttemptV1 {
+        ordinal: 1,
+        diagnostic: CacheRequestDiagnosticV1 {
+            history_message_count: 1,
+            stable_prefix_tokens: 8,
+            breakpoint_hashes: CacheBreakpointHashesV1::default(),
+            cache_domain_hash: Some("domain".into()),
+            cache_domain_changed: None,
+            previous_breakpoint: None,
+            prefix_match: CachePrefixMatchV1::Unavailable,
+            control: CacheControlObservationV1::NotRequired,
+            cacheable_minimum_tokens: None,
+            reuse_gap_ms: None,
+            rewarm: None,
+            classification: None,
+        },
+    }
+    .extension_item()
+    .expect("cache request attempt item");
+    [
+        ItemEvent::Started {
+            item_id: item_id.clone(),
+            item: item.clone(),
+        },
+        ItemEvent::Completed { item_id, item },
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, item)| EventEnvelope {
+        schema_version: SCHEMA_VERSION,
+        event_id: EventId::new(format!("cache-request-attempt-{index}")),
+        seq: 0,
+        session_id: session_id.clone(),
+        branch_id: None,
+        run_id: None,
+        agent_id: None,
+        device_id: DeviceId::new("provider-view-attempt-device"),
+        authority_epoch: 1,
+        worker_generation: 1,
+        causation_id: None,
+        correlation_id: None,
+        committed_at_ms: 0,
+        render: RenderTargets {
+            ui: false,
+            durable: true,
+            prompt: PromptRender::Omit,
+        },
+        payload: serde_json::to_value(EventPayload::Item(item)).expect("item payload"),
+    })
+    .collect()
+}
+
+#[test]
+fn provider_view_index_and_full_attempt_batch_commit_or_rollback_together() {
+    let root = tempfile::tempdir().expect("profile");
+    let store = Store::open(root.path()).expect("store");
+    let session_id = SessionId::new("provider-view-fused-transaction");
+    create_session(&store, &session_id);
+
+    let (ledger, blobs) = provider_view("fused", 64);
+    let mut incomplete = provider_attempt_envelopes(&session_id, &ledger);
+    incomplete.pop();
+    incomplete.extend(cache_attempt_envelopes(&session_id));
+    store
+        .persist_provider_view_and_append_owned(&session_id, ledger, blobs, 1, &mut incomplete)
+        .expect_err("an incomplete attempt pair rolls the transaction back");
+
+    let connection = Connection::open(store.database_path()).expect("open test database");
+    let counts = connection
+        .query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM provider_view_requests),
+                 (SELECT COUNT(*) FROM events)",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .expect("count rolled-back rows");
+    assert_eq!(counts, (0, 0));
+
+    let (ledger, blobs) = provider_view("fused-success", 64);
+    let mut envelopes = provider_attempt_envelopes(&session_id, &ledger);
+    envelopes.extend(cache_attempt_envelopes(&session_id));
+    let stored = store
+        .persist_provider_view_and_append_owned(&session_id, ledger, blobs, 1, &mut envelopes)
+        .expect("fused provider-view attempt");
+    assert!(stored.storage.is_some());
+    assert_eq!(
+        envelopes
+            .iter()
+            .map(|envelope| envelope.seq)
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 4]
+    );
+    store
+        .verify_provider_view(&stored)
+        .expect("indexed CAS view");
+    assert_eq!(
+        store.read(&session_id, 0, 10).expect("attempt journal"),
+        envelopes
+    );
 }
 
 /// MEMORY ITEM 962: request/session growth may add only disk rows and small

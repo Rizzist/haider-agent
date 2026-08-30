@@ -20,9 +20,7 @@ use crate::process::{
     read_output, reap_process_leader, set_anchored_current_dir, shell_command, signal_group,
     signal_group_for_sweep, signal_platform_group_for_sweep,
 };
-use crate::workspace_receipt::{
-    WorkspaceReceiptLease, WorkspaceStateReceipt, workspace_state_receipt,
-};
+use crate::workspace_receipt::WorkspaceReceiptLease;
 use crate::{ToolError, ToolResult};
 use haider_platform::{ProcessGroup, ProcessId as Pid, ProcessSignal as Signal};
 use haider_protocol::effect::WorkspaceMutation;
@@ -743,14 +741,10 @@ pub async fn supervise_background(
     if let Some(error) = &fatal {
         fault_parts.push(error.to_string());
     }
-    let after_workspace_receipt =
-        match tokio::task::spawn_blocking(move || workspace_state_receipt(&workspace_root)).await {
-            Ok(receipt) => receipt,
-            Err(_) => WorkspaceStateReceipt::worker_failed(),
-        };
     let workspace_mutation =
         workspace_receipt
-            .finish(after_workspace_receipt)
+            .finish_for_root(workspace_root)
+            .await
             .map(|mutation_digest| WorkspaceMutation {
                 effect_id: effect,
                 mutation_digest,

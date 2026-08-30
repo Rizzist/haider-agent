@@ -192,6 +192,15 @@ impl ObserveClient {
         &self.welcome
     }
 
+    /// Consumes a one-shot observer without cloning its negotiated feature
+    /// set. Dropping the client half still performs the ordinary typed close.
+    #[must_use]
+    pub fn into_welcome(self) -> Welcome {
+        let Self { client, welcome } = self;
+        drop(client);
+        welcome
+    }
+
     pub fn close(&self) -> ClientCloseOutcome {
         self.client.close()
     }

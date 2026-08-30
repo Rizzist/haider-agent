@@ -36,6 +36,54 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::time::{Duration, timeout};
 
+/// The compaction provider request uses the same atomic provider-index plus
+/// request-attempt publication as an ordinary turn. The store integration
+/// test forces commit and rollback of the four-envelope batch; this pin keeps
+/// the production compactor routed through that operation.
+#[test]
+fn daemon_compactor_fuses_provider_view_and_cache_attempt_publication() {
+    let source = include_str!("worker.rs");
+    let impl_start = source
+        .find("impl DaemonContextCompactor {")
+        .expect("compactor helpers");
+    let compact_start = source
+        .find("impl ContextCompactor for DaemonContextCompactor {")
+        .expect("compactor implementation");
+    let helper_body = &source[impl_start..compact_start];
+    let compact_tail = &source[compact_start..];
+    let compact_end = compact_tail
+        .find("\nfn approximate_message_tokens(")
+        .expect("compactor implementation boundary");
+    let compact_body = &compact_tail[..compact_end];
+
+    assert!(
+        helper_body.contains("self.provider_view_attempt_envelopes(")
+            && helper_body.contains("self.cache_request_attempt_envelopes(")
+            && helper_body.contains("StoreHandle::persist_provider_view_and_append_owned("),
+        "one fused store operation must receive both compaction attempt marker pairs"
+    );
+    assert!(
+        !compact_body.contains("StoreHandle::persist_provider_view("),
+        "compaction must not publish the provider index in a separate transaction"
+    );
+    let pending = compact_body
+        .find("let pending_provider_view")
+        .expect("pending provider view");
+    let diagnostic = compact_body
+        .find("let replay_cache_diagnostic")
+        .expect("cache diagnostic");
+    let fused = compact_body
+        .find("self.record_request_attempt(run_id, 1, pending_provider_view")
+        .expect("fused request-attempt publication");
+    let provider_open = compact_body
+        .find("self.provider.stream_prepared_turn(request, prepared)")
+        .expect("provider request open");
+    assert!(
+        pending < diagnostic && diagnostic < fused && fused < provider_open,
+        "CAS/index/attempt publication must finish before the provider request opens"
+    );
+}
+
 fn png_fixture() -> Vec<u8> {
     let pixels = image::RgbaImage::from_pixel(1, 1, image::Rgba([17, 42, 91, 255]));
     let mut encoded = Cursor::new(Vec::new());

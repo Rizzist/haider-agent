@@ -972,6 +972,10 @@ impl WorkspaceReceiptTracker {
         comparison_precise
     }
 
+    fn comparison_still_precise(&self, epoch: u64, precise: bool) -> bool {
+        precise && epoch == self.lock().ambiguity_epoch
+    }
+
     fn abandon(&self) {
         let mut state = self.lock();
         state.active = state.active.saturating_sub(1);
@@ -993,6 +997,39 @@ pub(crate) struct WorkspaceReceiptLease {
 }
 
 impl WorkspaceReceiptLease {
+    /// Completes the receipt using an after-snapshot only while that snapshot
+    /// can still prove the workspace unchanged. If the before-snapshot was
+    /// unknown, or an interleaved mutation invalidated this lease, the safety
+    /// invariant has already selected "assume mutated"; another bounded walk
+    /// cannot change the boolean and is therefore skipped.
+    pub(crate) async fn finish_for_root(self, root: PathBuf) -> Option<String> {
+        if !self.requires_after_receipt() {
+            return self.finish_without_after_receipt();
+        }
+        let after = match tokio::task::spawn_blocking(move || workspace_state_receipt(&root)).await
+        {
+            Ok(receipt) => receipt,
+            Err(_) => WorkspaceStateReceipt::worker_failed(),
+        };
+        self.finish(after)
+    }
+
+    fn requires_after_receipt(&self) -> bool {
+        self.before.coverage == WorkspaceReceiptCoverage::Complete
+            && self
+                .tracker
+                .comparison_still_precise(self.epoch, self.precise)
+    }
+
+    fn finish_without_after_receipt(mut self) -> Option<String> {
+        // Reusing `before` here is diagnostic input only: `finish` is told
+        // whether the lease is still precise, and an unknown before-receipt
+        // independently forces `compare_receipts` to assume mutation.
+        let comparison_precise = self.tracker.finish(self.epoch, self.precise, &self.before);
+        self.completed = true;
+        compare_receipts(&self.before, &self.before, !comparison_precise)
+    }
+
     pub(crate) fn finish(mut self, after: WorkspaceStateReceipt) -> Option<String> {
         let comparison_precise = self.tracker.finish(self.epoch, self.precise, &after);
         self.completed = true;
