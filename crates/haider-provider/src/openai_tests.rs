@@ -332,23 +332,34 @@ async fn hanging_openai_fixture_times_out_only_the_idle_chunk_await() {
 }
 
 #[test]
-fn openai_silent_phase_deadlines_precede_common_run_supervisors() {
+fn openai_silent_phase_default_contract_is_deliberate_ordered_and_bounded() {
+    // The absolute-value pin is deliberate. 69800b3 widened these defaults
+    // while deleting the old guard; a future widening must be visible in test
+    // review. Supervisor-relative bounding and reconnect resume arrive in 968.
     let config = OpenAiProvider::transport_config();
     assert_eq!(config.connect_timeout, Duration::from_secs(10));
-    assert_eq!(config.response_open_timeout, Duration::from_secs(10));
-    assert_eq!(config.chunk_idle_timeout, Duration::from_secs(10));
+    assert_eq!(config.response_open_timeout, Duration::from_secs(60));
+    assert_eq!(config.chunk_idle_timeout, Duration::from_secs(90));
+    assert_eq!(
+        config.semantic_progress_timeout,
+        Duration::from_secs(5 * 60)
+    );
 
-    let supervisor_deadline = Duration::from_secs(15);
-    for (phase, deadline) in [
+    let phases = [
         ("connect", config.connect_timeout),
         ("response-open", config.response_open_timeout),
         ("chunk-idle", config.chunk_idle_timeout),
-    ] {
+        ("semantic-progress", config.semantic_progress_timeout),
+    ];
+    for (phase, deadline) in phases {
         assert!(
-            deadline < supervisor_deadline,
-            "{phase} silence must terminalize before a common 15-second supervisor"
+            !deadline.is_zero() && deadline != Duration::MAX,
+            "{phase} silence must have a finite, non-zero bound"
         );
     }
+    assert!(config.connect_timeout <= config.response_open_timeout);
+    assert!(config.response_open_timeout <= config.chunk_idle_timeout);
+    assert!(config.chunk_idle_timeout <= config.semantic_progress_timeout);
 
     let open =
         response_open_timeout_error(config.response_open_timeout, config.response_open_timeout);
@@ -359,10 +370,10 @@ fn openai_silent_phase_deadlines_precede_common_run_supervisors() {
         open.timeout_reason,
         Some(crate::ProviderTimeoutReason::ResponseOpen)
     );
-    assert_eq!(open.opened_within_ms, Some(10_000));
-    assert_eq!(open.budget_ms, Some(10_000));
-    assert_eq!(open.presentation.opened_within_ms, Some(10_000));
-    assert_eq!(open.presentation.budget_ms, Some(10_000));
+    assert_eq!(open.opened_within_ms, Some(60_000));
+    assert_eq!(open.budget_ms, Some(60_000));
+    assert_eq!(open.presentation.opened_within_ms, Some(60_000));
+    assert_eq!(open.presentation.budget_ms, Some(60_000));
     let connect = connect_timeout_error(config.connect_timeout);
     assert_eq!(connect.kind, ProviderErrorKind::Transport);
     assert_eq!(connect.presentation.subcode.as_str(), "provider-timeout");
@@ -451,15 +462,18 @@ async fn exhausted_run_deadline_is_an_immediate_terminal_provider_timeout() {
 }
 
 #[test]
-fn response_open_budget_is_a_typed_per_provider_override() {
+fn shorter_silent_phase_overrides_are_honored_for_every_openai_clock() {
     let vault = MemoryVault::new();
     let alias = CredentialAlias::new("transport-profile");
     vault
         .put(&alias, b"transport-profile-secret")
         .expect("store credential");
     let override_config = OpenAiTransportConfig {
-        response_open_timeout: Duration::from_secs(75),
-        ..OPENAI_DEFAULT_TRANSPORT_CONFIG
+        retry_policy: OpenAiRetryPolicy::Never,
+        connect_timeout: Duration::from_secs(1),
+        response_open_timeout: Duration::from_secs(2),
+        chunk_idle_timeout: Duration::from_secs(3),
+        semantic_progress_timeout: Duration::from_secs(4),
     };
     let provider = OpenAiProvider::new(
         vault.resolve(&alias).expect("resolve credential"),
@@ -481,6 +495,31 @@ fn response_open_budget_is_a_typed_per_provider_override() {
     .with_transport_config(override_config)
     .expect("apply compatible profile transport override");
     assert_eq!(compatible.http.transport_config, override_config);
+
+    assert_eq!(
+        connect_timeout_error(override_config.connect_timeout).budget_ms,
+        Some(1_000)
+    );
+    assert_eq!(
+        response_open_timeout_error(
+            override_config.response_open_timeout,
+            override_config.response_open_timeout,
+        )
+        .budget_ms,
+        Some(2_000)
+    );
+    assert_eq!(
+        stream_idle_error(override_config.chunk_idle_timeout).budget_ms,
+        Some(3_000)
+    );
+    assert_eq!(
+        crate::semantic_progress_timeout_error(
+            "OpenAI",
+            override_config.semantic_progress_timeout,
+        )
+        .budget_ms,
+        Some(4_000)
+    );
 }
 
 /// MUTATION CHECK: change the expected status or body below. Expected runtime
@@ -525,19 +564,14 @@ async fn response_open_budget_accepts_a_mock_upstream_that_opens_at_twenty_secon
         "slow-open-model",
         &origin,
     )
-    .expect("construct loopback provider")
-    .with_transport_config(OpenAiTransportConfig {
-        response_open_timeout: Duration::from_secs(30),
-        ..OPENAI_DEFAULT_TRANSPORT_CONFIG
-    })
-    .expect("raise the cold-provider response-open budget");
+    .expect("construct loopback provider");
     let opening = tokio::spawn(async move {
         provider
             .capture_response(&probe_request("slow-open-model"))
             .await
     });
     // Real loopback I/O must complete before virtual time is paused. Starting
-    // paused lets Tokio auto-advance the transport timer while a
+    // paused lets Tokio auto-advance the 60-second transport timer while a
     // loaded macOS runner is still scheduling connect/read readiness.
     accepted_rx.await.expect("request reached slow upstream");
     tokio::time::pause();
@@ -550,7 +584,7 @@ async fn response_open_budget_accepts_a_mock_upstream_that_opens_at_twenty_secon
     let capture = opening
         .await
         .expect("open task exits")
-        .expect("20-second response opens under the explicit 30-second budget");
+        .expect("20-second response opens under the default budget");
     assert_eq!(capture.status, 200);
     assert_eq!(capture.body, b"{}");
 }
@@ -597,12 +631,7 @@ async fn response_open_budget_fails_typed_after_sixty_one_seconds() {
         "slow-open-model",
         &origin,
     )
-    .expect("construct loopback provider")
-    .with_transport_config(OpenAiTransportConfig {
-        response_open_timeout: Duration::from_secs(60),
-        ..OPENAI_DEFAULT_TRANSPORT_CONFIG
-    })
-    .expect("raise the response-open budget for the timeout fixture");
+    .expect("construct loopback provider");
     let opening = tokio::spawn(async move {
         provider
             .capture_response(&probe_request("slow-open-model"))

@@ -282,7 +282,9 @@ fn provider_timeout_retry_requires_a_full_post_backoff_budget() {
             ErrorScope::Turn,
             [ErrorAction::Retry],
         ))
-        .with_timeout_budget(10_000, 10_000)
+        // The restored default can park for 60 seconds. With no outer
+        // deadline, only the typed reason prevents another identical wait.
+        .with_timeout_budget(60_000, 60_000)
         .with_timeout_reason(ProviderTimeoutReason::ResponseOpen);
 
     assert!(!provider_error_allows_retry(
