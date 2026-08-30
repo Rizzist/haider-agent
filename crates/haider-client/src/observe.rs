@@ -109,6 +109,12 @@ pub struct ObserveStatusSnapshot {
     pub active_account: Option<CredentialDescriptor>,
     pub session_count: u64,
     pub adoption_available: Vec<haider_rpc::AccountAdoptionAvailable>,
+    pub daemon_pid: Option<u32>,
+    pub socket_path: Option<String>,
+    pub pid_file_path: Option<String>,
+    /// The daemon's serving edge. For pre-feature daemons, a negotiated
+    /// Ready Welcome is the compatible source of the same lifecycle fact.
+    pub ready: bool,
 }
 
 /// Feature-negotiated descendant view. `Snapshot` is deliberately a separate
@@ -229,10 +235,26 @@ impl ObserveClient {
                 active_account,
                 session_count,
                 adoption_available,
+                daemon_pid,
+                socket_path,
+                pid_file_path,
+                ready,
             } => Ok(ObserveStatusSnapshot {
                 active_account,
                 session_count,
                 adoption_available,
+                daemon_pid,
+                socket_path,
+                pid_file_path,
+                ready: if self
+                    .welcome
+                    .features
+                    .contains(haider_rpc::FEATURE_STATUS_RUNTIME_V1)
+                {
+                    ready
+                } else {
+                    self.welcome.lifecycle_phase == haider_rpc::LifecyclePhase::Ready
+                },
             }),
             ResponseBody::Error {
                 code,

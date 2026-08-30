@@ -777,6 +777,12 @@ fn run_jsonl_announces_acceptance_before_lf_framed_envelopes() {
         envelopes.last().map(typed),
         Some(Some(EventPayload::RunState(RunState::Done)))
     );
+    let terminals = envelopes
+        .iter()
+        .filter(|envelope| envelope.payload.get("terminal_kind").is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(terminals[0].payload["terminal_kind"], "success");
     let response = envelopes
         .iter()
         .find_map(|envelope| match typed(envelope)? {
@@ -1559,6 +1565,13 @@ fn anthropic_missing_credential_exits_65_without_network_access() {
         envelopes.last().map(typed),
         Some(Some(EventPayload::RunState(RunState::Errored)))
     );
+    let terminals = envelopes
+        .iter()
+        .filter(|envelope| envelope.payload.get("terminal_kind").is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(terminals[0].payload["terminal_kind"], "provider_error");
+    assert_eq!(terminals[0].payload["error_code"], "provider_error");
 }
 
 #[test]
@@ -1756,6 +1769,44 @@ fn run_jsonl_cancelled_has_130_exit_and_terminal_envelope() {
         envelopes.last().map(typed),
         Some(Some(EventPayload::RunState(RunState::Cancelled)))
     );
+    let terminals = envelopes
+        .iter()
+        .filter(|envelope| envelope.payload.get("terminal_kind").is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(terminals[0].payload["terminal_kind"], "cancellation");
+}
+
+#[test]
+fn run_jsonl_timeout_has_one_distinct_timeout_terminal() {
+    let out = haider()
+        .args([
+            "run",
+            "--provider",
+            "fake",
+            "hello",
+            "--output",
+            "jsonl",
+            "--timeout",
+            "2s",
+        ])
+        .env("HAIDER_TEST_FAKE_PROVIDER", r#"[{"step":"hang"}]"#)
+        .output()
+        .expect("binary runs");
+    assert_eq!(out.status.code(), Some(124));
+    let envelopes = parse_jsonl(&out.stdout);
+    assert!(
+        envelopes
+            .windows(2)
+            .all(|pair| pair[1].seq == pair[0].seq + 1)
+    );
+    let terminals = envelopes
+        .iter()
+        .filter(|envelope| envelope.payload.get("terminal_kind").is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(terminals[0].payload["terminal_kind"], "timeout");
+    assert_eq!(terminals[0].payload["error_code"], "timeout");
 }
 
 /// MUTATION CHECK: let the later Cancelled terminal overwrite a wall-clock
@@ -1907,6 +1958,112 @@ fn run_nonpermission_input_rejects_without_guessing_and_continues() {
     assert_eq!(
         envelopes.last().map(typed),
         Some(Some(EventPayload::RunState(RunState::Done)))
+    );
+}
+
+/// MUTATION CHECK: allocate a second id while accumulating argument chunks,
+/// omit the provider call id from completion/result, or skip one cursor. The
+/// exact call/result join and the contiguous stream assertions then fail.
+#[test]
+fn run_jsonl_fragmented_tool_call_keeps_one_call_identity_and_cursor() {
+    let workspace = tempfile::tempdir().expect("fragmented tool workspace");
+    let script = r#"[
+        {"step":"emit_tool_call_start","call_id":"fragmented-call","name":"fs_write"},
+        {"step":"emit_tool_args_delta","call_id":"fragmented-call","fragment":"{\"path\":\"fragmented.txt\","},
+        {"step":"emit_tool_args_delta","call_id":"fragmented-call","fragment":"\"content\":\"ok\"}"},
+        {"step":"emit_tool_call_end","call_id":"fragmented-call"},
+        {"step":"finish","reason":"tool_use"},
+        {"step":"expect_tool_result","call_id":"fragmented-call"},
+        {"step":"emit_text","text":"fragmented call completed"},
+        {"step":"finish","reason":"end_turn"}
+    ]"#;
+    let out = haider()
+        .current_dir(workspace.path())
+        .args([
+            "run",
+            "--provider",
+            "fake",
+            "--allow-writes",
+            "--jsonl",
+            "fragmented tool",
+        ])
+        .env("HAIDER_TEST_FAKE_PROVIDER", script)
+        .output()
+        .expect("fragmented tool run");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelopes = parse_jsonl(&out.stdout);
+    assert!(
+        envelopes
+            .windows(2)
+            .all(|pair| pair[1].seq == pair[0].seq + 1)
+    );
+
+    let started = envelopes
+        .iter()
+        .find(|envelope| {
+            envelope.payload["type"] == "item"
+                && envelope.payload["event"] == "started"
+                && envelope.payload["item"]["item"] == "tool_call"
+        })
+        .expect("tool-call start");
+    let item_id = started.payload["item_id"]
+        .as_str()
+        .expect("started item id");
+    assert_eq!(started.payload["item"]["call_id"], "fragmented-call");
+
+    let deltas = envelopes
+        .iter()
+        .filter(|envelope| {
+            envelope.payload["type"] == "item"
+                && envelope.payload["event"] == "delta"
+                && envelope.payload["delta"]["delta"] == "tool_args"
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !deltas.is_empty(),
+        "fragmented provider arguments must retain an item-correlated delta"
+    );
+    assert!(
+        deltas
+            .iter()
+            .all(|delta| delta.payload["item_id"] == item_id)
+    );
+
+    let completed = envelopes
+        .iter()
+        .find(|envelope| {
+            envelope.payload["type"] == "item"
+                && envelope.payload["event"] == "completed"
+                && envelope.payload["item"]["item"] == "tool_call"
+        })
+        .expect("tool-call completion");
+    assert_eq!(completed.payload["item_id"], item_id);
+    assert_eq!(completed.payload["item"]["call_id"], "fragmented-call");
+    assert_eq!(
+        completed.payload["item"]["args"],
+        serde_json::json!({"path": "fragmented.txt", "content": "ok"})
+    );
+
+    let result = envelopes
+        .iter()
+        .find(|envelope| envelope.payload["type"] == "tool_result")
+        .expect("tool result");
+    assert_eq!(result.payload["call_id"], "fragmented-call");
+    assert_eq!(
+        envelopes
+            .iter()
+            .filter(|envelope| envelope.payload.get("terminal_kind").is_some())
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("fragmented.txt"))
+            .expect("tool wrote fragmented payload"),
+        "ok"
     );
 }
 

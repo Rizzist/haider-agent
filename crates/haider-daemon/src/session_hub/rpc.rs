@@ -2433,6 +2433,7 @@ impl HubConnection {
                 cache_policy,
                 interaction_mode,
                 ssh_scope,
+                account_alias,
                 resolve_provider,
                 resolve_model,
                 effort,
@@ -2458,6 +2459,7 @@ impl HubConnection {
                     cache_policy.unwrap_or_default(),
                     interaction_mode,
                     ssh_scope,
+                    account_alias,
                     resolve_provider,
                     resolve_model,
                     effort,
@@ -2491,6 +2493,7 @@ impl HubConnection {
                     None,
                     Default::default(),
                     haider_protocol::session::SessionInteractionModeV1::Interactive,
+                    None,
                     None,
                     false,
                     false,
@@ -6229,6 +6232,7 @@ impl HubConnection {
                 capabilities: self.capabilities.clone(),
                 sink,
                 transport: self.transport,
+                runtime_paths: None,
                 stages: Mutex::new(crate::accounts::StagedSecrets::default()),
                 roster_watch: Mutex::new(None),
                 accounts_watch: Mutex::new(None),
@@ -13865,6 +13869,7 @@ impl HubConnection {
         cache_policy: haider_protocol::cache::CachePolicySettingsV1,
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
         ssh_scope: Option<haider_rpc::SshScopeWire>,
+        account_alias: Option<CredentialAlias>,
         resolve_provider: bool,
         resolve_model: bool,
         effort: Option<String>,
@@ -13890,6 +13895,19 @@ impl HubConnection {
         }
         if resolve_model {
             request_coordinates["resolve_model"] = serde_json::Value::Bool(true);
+        }
+        if let Some(alias) = &account_alias {
+            if alias.as_str().trim().is_empty() {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_INVALID_ARGUMENT,
+                    "session-create account alias must not be empty",
+                    false,
+                    None,
+                );
+            }
+            request_coordinates["account_alias"] =
+                serde_json::Value::String(alias.as_str().to_owned());
         }
         if let Some(effort) = &effort {
             request_coordinates["effort"] = serde_json::Value::String(effort.clone());
@@ -13963,6 +13981,43 @@ impl HubConnection {
             Err(error) => return Err(error),
         }
 
+        let selected_account_provider = if let Some(alias) = account_alias.as_ref() {
+            let Some(facade) = self.hub.accounts()? else {
+                return self.respond_error(
+                    request_id,
+                    "account_not_found",
+                    "the selected account is not available",
+                    false,
+                    None,
+                );
+            };
+            let Some(selected) = facade.management.inspect(|view| {
+                view.descriptors
+                    .iter()
+                    .find(|descriptor| descriptor.alias == *alias)
+                    .cloned()
+            }) else {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_DRAINING,
+                    "management snapshot is unavailable",
+                    true,
+                    None,
+                );
+            };
+            let Some(selected) = selected else {
+                return self.respond_error(
+                    request_id,
+                    "account_not_found",
+                    "the selected account alias does not exist",
+                    false,
+                    None,
+                );
+            };
+            Some(selected.provider)
+        } else {
+            None
+        };
         if resolve_provider {
             if !provider.is_empty() {
                 return self.respond_error(
@@ -13973,39 +14028,53 @@ impl HubConnection {
                     None,
                 );
             }
-            let Some(facade) = self.hub.accounts()? else {
-                return self.respond_error(
-                    request_id,
-                    "no_active_account",
-                    "no active daemon account is configured",
-                    false,
-                    None,
-                );
-            };
-            let Some(active_provider) = facade.management.inspect(|view| {
-                view.descriptors
-                    .iter()
-                    .find(|descriptor| descriptor.active)
-                    .map(|descriptor| descriptor.provider.clone())
-            }) else {
-                return self.respond_error(
-                    request_id,
-                    ERROR_CODE_DRAINING,
-                    "management snapshot is unavailable",
-                    true,
-                    None,
-                );
-            };
-            let Some(active_provider) = active_provider else {
-                return self.respond_error(
-                    request_id,
-                    "no_active_account",
-                    "no active daemon account is configured",
-                    false,
-                    None,
-                );
-            };
-            provider = active_provider;
+            if let Some(selected_provider) = selected_account_provider.as_ref() {
+                provider.clone_from(selected_provider);
+            } else {
+                let Some(facade) = self.hub.accounts()? else {
+                    return self.respond_error(
+                        request_id,
+                        "no_active_account",
+                        "no active daemon account is configured",
+                        false,
+                        None,
+                    );
+                };
+                let Some(active_provider) = facade.management.inspect(|view| {
+                    view.descriptors
+                        .iter()
+                        .find(|descriptor| descriptor.active)
+                        .map(|descriptor| descriptor.provider.clone())
+                }) else {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_DRAINING,
+                        "management snapshot is unavailable",
+                        true,
+                        None,
+                    );
+                };
+                let Some(active_provider) = active_provider else {
+                    return self.respond_error(
+                        request_id,
+                        "no_active_account",
+                        "no active daemon account is configured",
+                        false,
+                        None,
+                    );
+                };
+                provider = active_provider;
+            }
+        } else if let Some(selected_provider) = selected_account_provider.as_ref()
+            && provider != *selected_provider
+        {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "session-create provider does not match the selected account",
+                false,
+                None,
+            );
         }
         if resolve_model {
             if !model.is_empty() {
@@ -14176,7 +14245,11 @@ impl HubConnection {
         self.hub.set_ssh_scope(session_id, ssh_scope.clone())?;
         match self
             .hub
-            .create_session_with_interaction_mode(command, interaction_mode)
+            .create_session_with_interaction_mode(
+                command,
+                interaction_mode,
+                account_alias.map(|alias| alias.as_str().to_owned()),
+            )
             .await
         {
             Ok(SessionCreateOutcome::Committed { created, .. })
@@ -14291,12 +14364,21 @@ impl HubConnection {
             None => (None, Vec::new()),
         };
         let session_count = self.hub.roster_session_count().await?;
+        let runtime = self.runtime_paths.as_ref();
         self.send(WireFrame::Response {
             request_id,
             body: ResponseBody::StatusSnapshot {
                 active_account,
                 session_count,
                 adoption_available,
+                daemon_pid: Some(std::process::id()),
+                socket_path: runtime.map(|(socket_path, _)| socket_path.display().to_string()),
+                pid_file_path: runtime
+                    .map(|(_, pid_file_path)| pid_file_path.display().to_string()),
+                // A request can reach this handler only after the runtime
+                // publishes Ready and starts the accept loop. The same edge
+                // drives DaemonReadyNotifier in runtime.rs.
+                ready: true,
             },
         })
     }
@@ -16676,6 +16758,9 @@ pub(crate) async fn session_summaries(
         // Keeping one source makes disagreement between the two locations
         // impossible.
         let provider = metadata.as_ref().map(|metadata| metadata.provider.clone());
+        let account_alias = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.account_alias.clone());
         let last_model = snapshot.last_model;
         let title = metadata
             .as_ref()
@@ -16736,7 +16821,7 @@ pub(crate) async fn session_summaries(
             agent_type: metadata_agent_type,
             effort,
             fast,
-            account_alias: None,
+            account_alias,
             forked_from,
         });
     }

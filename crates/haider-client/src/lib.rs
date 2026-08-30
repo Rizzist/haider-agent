@@ -59,10 +59,11 @@ pub use headless::{
     HeadlessFileAttachment, HeadlessImageAttachment, HeadlessOutcome, HeadlessPdfAttachment,
     HeadlessPermissionDenial, HeadlessRunError, HeadlessRunEventReader, HeadlessRunEvents,
     HeadlessRunFailure, HeadlessRunRequest, HeadlessRunResult, HeadlessRunStatus,
-    HeadlessRunStopResult, HeadlessSessionConfig, headless_run_events, headless_run_status,
-    load_attachment, load_image_attachment, load_pdf_attachment, load_text_attachment,
-    required_headless_features, required_headless_features_with_attachments,
-    required_headless_features_with_hook_trust, run_headless, run_headless_with_session_config,
+    HeadlessRunStopResult, HeadlessSessionConfig, HeadlessTerminalEvent, HeadlessTerminalKind,
+    headless_run_events, headless_run_status, load_attachment, load_image_attachment,
+    load_pdf_attachment, load_text_attachment, required_headless_features,
+    required_headless_features_with_attachments, required_headless_features_with_hook_trust,
+    run_headless, run_headless_with_session_config,
     run_headless_with_session_config_and_event_mode, stop_headless_run,
 };
 pub use lockdown::{

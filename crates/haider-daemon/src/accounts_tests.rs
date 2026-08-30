@@ -446,6 +446,7 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
     let metadata = |provider: &str, model: &str| haider_protocol::session::SessionMetadataV1 {
         cwd: "/tmp/haider-provider-dispatch".into(),
         provider: provider.into(),
+        account_alias: None,
         model: model.into(),
         max_tokens: 64,
         permission_overrides: None,
@@ -518,6 +519,42 @@ async fn production_account_factory_dispatches_native_api_key_providers() {
         compatible.account_alias.as_deref(),
         Some(compatible_alias.as_str())
     );
+}
+
+/// MUTATION CHECK: route a pinned session through `active_for_provider`.
+/// The mutable active alias then replaces the exact inactive alias below.
+#[test]
+fn selected_session_account_bypasses_mutable_active_account() {
+    let selected_alias = CredentialAlias::new("selected-openai");
+    let active_alias = CredentialAlias::new("active-openai");
+    let selected = CredentialDescriptor {
+        alias: selected_alias.clone(),
+        provider: OPENAI_PROVIDER_NAME.into(),
+        base_url: None,
+        auth_method: AuthMethod::ApiKey,
+        identity: "selected fixture".into(),
+        status: CredentialStatus::Ok,
+        active: false,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    };
+    let active = CredentialDescriptor {
+        alias: active_alias,
+        identity: "active fixture".into(),
+        active: true,
+        ..selected.clone()
+    };
+    let factory = AccountsProviderFactory::new(
+        Arc::new(StdMutex::new(vec![active, selected])),
+        VaultProvision::Available(Arc::new(MemoryVault::default()) as Arc<dyn Vault>),
+        Arc::new(ProductionAccountBuilder::default()),
+    );
+    let resolved = factory
+        .resolve_selected_account(OPENAI_PROVIDER_NAME, selected_alias.as_str())
+        .expect("selected account resolves");
+    assert_eq!(resolved.descriptor.alias, selected_alias);
+    assert!(resolved.rotation.is_none());
 }
 
 fn adapter_cache_profile(provider: &str, endpoint: &str) -> ProviderSummaryWire {
@@ -915,6 +952,7 @@ async fn custom_chat_completions_profile_routes_with_profile_origin_and_legacy_f
         .resolve_for_turn(&haider_protocol::session::SessionMetadataV1 {
             cwd: "/tmp/custom-family-dispatch".to_owned(),
             provider: provider.to_owned(),
+            account_alias: None,
             model: "llama-fixture".to_owned(),
             max_tokens: 64,
             permission_overrides: None,
@@ -984,6 +1022,7 @@ async fn compaction_promotion_factory_requires_signed_in_strictly_larger_same_pr
     let metadata = haider_protocol::session::SessionMetadataV1 {
         cwd: "/tmp/compaction-promotion".to_owned(),
         provider: provider.to_owned(),
+        account_alias: None,
         model: "model-small".to_owned(),
         max_tokens: 64,
         permission_overrides: None,
@@ -1127,6 +1166,7 @@ async fn lk1_keyless_profile_resolves_placeholder_and_stored_key_wins() {
     let metadata = haider_protocol::session::SessionMetadataV1 {
         cwd: "/tmp/keyless-dispatch".to_owned(),
         provider: provider.to_owned(),
+        account_alias: None,
         model: "llama3.1:8b".to_owned(),
         max_tokens: 64,
         permission_overrides: None,
@@ -1229,6 +1269,7 @@ async fn lk1_keyless_fallback_stays_scoped_to_enabled_auth_none_profiles() {
             .resolve_for_turn(&haider_protocol::session::SessionMetadataV1 {
                 cwd: "/tmp/keyless-scope".to_owned(),
                 provider: provider.clone(),
+                account_alias: None,
                 model: "llama3.1:8b".to_owned(),
                 max_tokens: 64,
                 permission_overrides: None,
@@ -1710,6 +1751,7 @@ async fn retryable_rotation_bookkeeping_failure_waits_instead_of_killing_the_tur
         haider_protocol::session::SessionMetadataV1 {
             cwd: "/tmp/wedged-store".into(),
             provider: OPENAI_PROVIDER_NAME.into(),
+            account_alias: None,
             model: "gpt-test".into(),
             max_tokens: 64,
             permission_overrides: None,
@@ -1810,6 +1852,7 @@ fn fallback_chain_resolver_fixture() -> (AccountsAttemptResolver, CredentialAlia
     let metadata = haider_protocol::session::SessionMetadataV1 {
         cwd: "/tmp/fallback-chain".into(),
         provider: ANTHROPIC_PROVIDER_NAME.into(),
+        account_alias: None,
         // The current provider, not an exact optional model entry, anchors
         // traversal. Manual model selection must not disable the chain.
         model: "claude-manual-selection".into(),
@@ -2038,6 +2081,7 @@ async fn factory_uses_checked_resolver_and_durably_selects_one_limited_alternate
         .resolve_for_turn(&haider_protocol::session::SessionMetadataV1 {
             cwd: "/tmp/resolver-factory".into(),
             provider: OPENAI_PROVIDER_NAME.into(),
+            account_alias: None,
             model: "gpt-test".into(),
             max_tokens: 64,
             permission_overrides: None,
@@ -2248,6 +2292,7 @@ async fn auth_aware_factory_routes_sanctioned_oauth_descriptors_to_subscription_
     let metadata = |provider: &str, model: &str| haider_protocol::session::SessionMetadataV1 {
         cwd: "/tmp/haider-oauth-dispatch".into(),
         provider: provider.into(),
+        account_alias: None,
         model: model.into(),
         max_tokens: 64,
         permission_overrides: None,
@@ -10919,6 +10964,7 @@ fn provider_tuning_derives_from_metadata_and_fast_gate_filters_stale_pairs() {
     let metadata = haider_protocol::session::SessionMetadataV1 {
         cwd: "/tmp".into(),
         provider: "anthropic-oauth".into(),
+        account_alias: None,
         model: "claude-opus-5".into(),
         max_tokens: 4096,
         system_prompt_version: None,
@@ -11126,6 +11172,7 @@ fn enterprise_metadata(provider: &str, model: &str) -> haider_protocol::session:
     haider_protocol::session::SessionMetadataV1 {
         cwd: "/tmp/enterprise-dispatch".to_owned(),
         provider: provider.to_owned(),
+        account_alias: None,
         model: model.to_owned(),
         max_tokens: 64,
         permission_overrides: None,
@@ -11862,6 +11909,7 @@ async fn anthropic_web_degrade_clears_the_native_declaration_for_anthropic_pairs
     let metadata = |provider: &str| haider_protocol::session::SessionMetadataV1 {
         cwd: "/tmp/haider-web-degrade".into(),
         provider: provider.into(),
+        account_alias: None,
         model: "web-test".into(),
         max_tokens: 64,
         permission_overrides: None,
@@ -12054,6 +12102,7 @@ async fn each_turn_resolves_the_currently_active_account() {
     let metadata = haider_protocol::session::SessionMetadataV1 {
         cwd: "/tmp/switch-fixture".to_owned(),
         provider: provider.to_owned(),
+        account_alias: None,
         model: "llama-fixture".to_owned(),
         max_tokens: 64,
         permission_overrides: None,

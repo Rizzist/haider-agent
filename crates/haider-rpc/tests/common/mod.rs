@@ -97,6 +97,7 @@ pub fn transcript() -> Vec<WireFrame> {
     let fork_metadata = SessionMetadataV1 {
         cwd: "/tmp/workspace".into(),
         provider: "anthropic".into(),
+        account_alias: None,
         model: "claude-test".into(),
         max_tokens: 4096,
         system_prompt_version: Some("fork-policy-v1".into()),
@@ -389,6 +390,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 cache_policy: None,
                 interaction_mode: haider_protocol::session::SessionInteractionModeV1::Interactive,
                 ssh_scope: None,
+                account_alias: None,
                 resolve_provider: false,
                 resolve_model: false,
                 effort: None,
@@ -404,6 +406,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 metadata: SessionMetadataV1 {
                     cwd: "/tmp/workspace".into(),
                     provider: "anthropic".into(),
+                    account_alias: None,
                     model: "claude-test".into(),
                     max_tokens: 4096,
                     permission_overrides: None,
@@ -1017,6 +1020,7 @@ pub fn transcript() -> Vec<WireFrame> {
                 cache_policy: None,
                 interaction_mode: haider_protocol::session::SessionInteractionModeV1::Interactive,
                 ssh_scope: None,
+                account_alias: None,
                 resolve_provider: false,
                 resolve_model: false,
                 effort: None,

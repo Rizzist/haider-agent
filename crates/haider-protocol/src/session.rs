@@ -84,6 +84,11 @@ pub struct SessionMetadataV1 {
     /// provider rides along as an attribute of the selected row and both may
     /// change together through `session.select_model`.
     pub provider: String,
+    /// Optional account alias pinned by an automation-created session. When
+    /// present, provider resolution uses this exact credential rather than
+    /// the provider's mutable active-account selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_alias: Option<String>,
     /// Full provider model identifier — the current model selection.
     pub model: String,
     /// Maximum output tokens for each provider request.

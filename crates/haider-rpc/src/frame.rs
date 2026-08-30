@@ -432,9 +432,15 @@ pub const FEATURE_SESSION_CONFIG_V1: &str = "session_config_v1";
 /// Daemon resolves provider/default-model and validates initial effort/speed
 /// inside the durable `session.create` admission request.
 pub const FEATURE_SESSION_CREATE_ADMISSION_V1: &str = "session_create_admission_v1";
+/// `session.create` accepts an exact account alias and durably pins provider
+/// resolution for the session to that credential.
+pub const FEATURE_SESSION_ACCOUNT_SELECT_V1: &str = "session_account_select_v1";
 /// Daemon serves the scalar-only `status.snapshot` request without account or
 /// session-summary collection materialization.
 pub const FEATURE_STATUS_SNAPSHOT_V1: &str = "status_snapshot_v1";
+/// `status.snapshot` publishes the serving daemon's process and rendezvous
+/// coordinates plus the readiness edge shared with launcher notification.
+pub const FEATURE_STATUS_RUNTIME_V1: &str = "status_runtime_v1";
 /// Daemon vaults the profile transcription secret (the Deepgram API key)
 /// and serves `transcription.secret_get`/`transcription.secret_set` on
 /// authenticated same-UID local UDS connections only (T1).
@@ -3010,6 +3016,10 @@ pub enum RequestBody {
         /// v1 default (`all`) and the exact bytes of older clients.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ssh_scope: Option<SshScopeWire>,
+        /// Exact account alias for this session. Provider/default-model
+        /// resolution is performed atomically from this account snapshot.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_alias: Option<CredentialAlias>,
         /// Resolve the active provider inside the same authorized create
         /// request. The empty `provider` input is then a deliberate sentinel.
         #[serde(default, skip_serializing_if = "is_default")]
@@ -4144,6 +4154,23 @@ pub enum ResponseBody {
         /// bounded refresh after this response rather than delaying it.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         adoption_available: Vec<AccountAdoptionAvailable>,
+        /// PID of the process that served this response. Absent only when
+        /// decoding a response from a daemon predating `status_runtime_v1`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        daemon_pid: Option<u32>,
+        /// Absolute daemon-owned rendezvous endpoint. This is the resolved
+        /// path used by the listener, never a client-side re-derivation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        socket_path: Option<String>,
+        /// Absolute path of the daemon PID publication file when the runtime
+        /// has one. Older daemons omit it rather than publishing a guess.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pid_file_path: Option<String>,
+        /// True exactly on the lifecycle edge which also releases the
+        /// launcher readiness notification. Missing on an older response is
+        /// false and is disambiguated by feature negotiation.
+        #[serde(default)]
+        ready: bool,
     },
     /// Acknowledges a connection-scoped session roster watch.
     #[serde(rename = "session.list_watch")]

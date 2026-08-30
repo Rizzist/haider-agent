@@ -3,10 +3,12 @@
 use super::{
     BufferedWireFrames, EnsureOptions, HEADLESS_EVENT_MEMORY_THRESHOLD_BYTES, HeadlessAttachment,
     HeadlessEvent, HeadlessEventLedgerWriter, HeadlessEventMode, HeadlessEventOutput,
-    HeadlessRunError, HeadlessRunEventStorage, HeadlessSessionConfig, headless_submit_body,
-    load_attachment, load_pdf_attachment, normalize_session_config_features,
+    HeadlessFailureCode, HeadlessOutcome, HeadlessRunError, HeadlessRunEventStorage,
+    HeadlessRunFailure, HeadlessSessionConfig, HeadlessTerminalKind, headless_submit_body,
+    load_attachment, load_pdf_attachment, normalize_session_config_features, terminal_kind,
 };
 use haider_rpc::haider_protocol::envelope::RawEnvelope;
+use haider_rpc::haider_protocol::error::ErrorCode;
 use haider_rpc::haider_protocol::ids::{RunId, SessionId};
 use haider_rpc::{CommandId, RequestBody};
 
@@ -183,31 +185,59 @@ fn empty_replay_buffer_is_lazy_even_when_read_or_cleared() {
     assert!(buffered.cleanup.is_none());
 }
 
-/// MUTATION CHECK: restore the client-only `session_account_select_v1`
-/// requirement and its bare `missing_feature` failure. This assertion then
-/// receives `Ok(())` instead of the actionable pre-connect error.
+/// MUTATION CHECK: omit the account-selection feature precondition. The
+/// daemon could then accept a run without understanding its routing pin.
 #[test]
-fn unsupported_account_selection_names_model_selector_workaround() {
+fn account_selection_requires_the_daemon_contract() {
     let mut ensure = EnsureOptions::default();
     let config = HeadlessSessionConfig {
         account: Some("work".into()),
         ..HeadlessSessionConfig::default()
     };
-    let error = normalize_session_config_features(&mut ensure, &config)
-        .expect_err("account selection is not a daemon capability");
-    assert!(matches!(
-        &error,
-        HeadlessRunError::Bootstrap {
-            stage: "session config",
-            code: haider_rpc::ERROR_CODE_INVALID_ARGUMENT,
-            retryable: false,
-            ..
-        }
-    ));
+    normalize_session_config_features(&mut ensure, &config).expect("account selection supported");
     assert!(
-        error.to_string().contains("--model provider/model"),
-        "the error must name the implemented routing control: {error}"
+        ensure
+            .required_features
+            .contains(haider_rpc::FEATURE_SESSION_ACCOUNT_SELECT_V1)
     );
+}
+
+/// MUTATION CHECK: collapse provider timeout into caller timeout, or merge a
+/// cancellation/failure into one generic terminal. The five stable kinds
+/// below then stop being distinct.
+#[test]
+fn terminal_kind_vocabulary_is_distinct_and_provider_timeout_stays_provider_owned() {
+    let failure = |code| HeadlessRunFailure {
+        code: HeadlessFailureCode::Run(code),
+        message: "fixture".into(),
+        retryable: false,
+        presentation: None,
+    };
+    assert_eq!(
+        terminal_kind(HeadlessOutcome::Done, None),
+        HeadlessTerminalKind::Success
+    );
+    assert_eq!(
+        terminal_kind(HeadlessOutcome::Cancelled, None),
+        HeadlessTerminalKind::Cancellation
+    );
+    assert_eq!(
+        terminal_kind(HeadlessOutcome::Timeout, None),
+        HeadlessTerminalKind::Timeout
+    );
+    assert_eq!(
+        terminal_kind(
+            HeadlessOutcome::Errored,
+            Some(&failure(ErrorCode::StoreFull))
+        ),
+        HeadlessTerminalKind::Failure
+    );
+    for code in [ErrorCode::ProviderError, ErrorCode::ProviderTimeout] {
+        assert_eq!(
+            terminal_kind(HeadlessOutcome::Errored, Some(&failure(code))),
+            HeadlessTerminalKind::ProviderError
+        );
+    }
 }
 
 /// MUTATION CHECK: ignore the run-scoped trust bit or change ordinary turn

@@ -8784,6 +8784,44 @@ impl AccountsProviderFactory {
         })
     }
 
+    fn resolve_selected_account(
+        &self,
+        provider: &str,
+        alias: &str,
+    ) -> Result<ResolvedAccount, HaiderError> {
+        let descriptor = self
+            .snapshot
+            .lock()
+            .map_err(|_| {
+                HaiderError::new(
+                    ErrorCode::ProviderError,
+                    "account snapshot is unavailable",
+                    true,
+                )
+            })?
+            .iter()
+            .find(|descriptor| descriptor.alias.as_str() == alias)
+            .cloned()
+            .ok_or_else(|| {
+                HaiderError::new(
+                    ErrorCode::CredentialMissing,
+                    format!("selected account `{alias}` is unavailable"),
+                    false,
+                )
+            })?;
+        if descriptor.provider != provider {
+            return Err(HaiderError::new(
+                ErrorCode::InvalidArgument,
+                "selected account does not belong to the session provider",
+                false,
+            ));
+        }
+        Ok(ResolvedAccount {
+            descriptor,
+            rotation: None,
+        })
+    }
+
     async fn resolve_secret(
         &self,
         descriptor: &CredentialDescriptor,
@@ -8813,13 +8851,20 @@ impl AccountsProviderFactory {
         metadata: &haider_protocol::session::SessionMetadataV1,
         tuning: &ProviderTuning,
     ) -> Result<(ResolvedAccount, Arc<dyn Provider>, Option<[u8; 32]>), HaiderError> {
-        let mut resolved = match self.resolve_account(&metadata.provider, None).await {
+        let selected = match metadata.account_alias.as_deref() {
+            Some(alias) => self.resolve_selected_account(&metadata.provider, alias),
+            None => self.resolve_account(&metadata.provider, None).await,
+        };
+        let mut resolved = match selected {
             Ok(resolved) => resolved,
             // G4a: no credential AT ALL for an auth-None custom profile is
             // the keyless case, not an error. Any other failure — including
             // CredentialMissing for a provider that DOES require auth —
             // propagates unchanged.
-            Err(error) if error.code == ErrorCode::CredentialMissing => {
+            Err(error)
+                if metadata.account_alias.is_none()
+                    && error.code == ErrorCode::CredentialMissing =>
+            {
                 let Some((resolved, credential)) = self.keyless_account(&metadata.provider) else {
                     return Err(error);
                 };
@@ -8832,6 +8877,9 @@ impl AccountsProviderFactory {
         let credential = match self.resolve_secret(&resolved.descriptor).await {
             Ok(credential) => credential,
             Err(error) => {
+                if metadata.account_alias.is_some() {
+                    return Err(error);
+                }
                 let Some(trigger) = rotation_trigger_from_error(&error) else {
                     return Err(error);
                 };
@@ -9140,6 +9188,9 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
                 return Ok(haider_core::ProviderAttemptDecision::Wait);
             }
         };
+        if self.metadata.account_alias.is_some() {
+            return Ok(haider_core::ProviderAttemptDecision::Wait);
+        }
         let resolved = match self
             .factory
             .resolve_account(
@@ -9192,6 +9243,9 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
         _current_account: &CredentialAlias,
         error: &haider_provider::ProviderError,
     ) -> Result<haider_core::ProviderAttemptDecision, HaiderError> {
+        if self.metadata.account_alias.is_some() {
+            return Ok(haider_core::ProviderAttemptDecision::Stop);
+        }
         if !matches!(
             error.kind,
             ProviderErrorKind::Authentication
@@ -9334,9 +9388,12 @@ impl AccountsProviderFactory {
             self.resolve_provider(metadata, &tuning).await?;
         let rotation_budget_consumed = resolved.rotation.is_some();
         let context_window = self.model_context_window(&metadata.provider, &metadata.model);
-        let compaction_promotion = self
-            .resolve_compaction_promotion_with_web(metadata, web_degrade)
-            .await;
+        let compaction_promotion = if metadata.account_alias.is_some() {
+            None
+        } else {
+            self.resolve_compaction_promotion_with_web(metadata, web_degrade)
+                .await
+        };
         Ok(crate::worker::ResolvedTurnProvider {
             provider,
             provider_name: metadata.provider.clone(),

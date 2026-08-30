@@ -307,6 +307,7 @@ async fn established_spawn_captures_parent_branch_and_replays_one_child() {
     let metadata = SessionMetadataV1 {
         cwd,
         provider: "fake".into(),
+        account_alias: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         system_prompt_version: Some(crate::worker::SystemPromptBuilder::VERSION.into()),
@@ -648,6 +649,7 @@ async fn message_subagent_steers_running_child_and_journals_bounded_parent_fact(
                 metadata: SessionMetadataV1 {
                     cwd: workspace_text.clone(),
                     provider: "fake".into(),
+                    account_alias: None,
                     model: "fake-model".into(),
                     max_tokens: 4096,
                     system_prompt_version: Some(crate::worker::SystemPromptBuilder::VERSION.into()),
@@ -895,6 +897,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
                 metadata: SessionMetadataV1 {
                     cwd: workspace.clone(),
                     provider: "fake".into(),
+                    account_alias: None,
                     model: "fake-model".into(),
                     max_tokens: 4096,
                     system_prompt_version: Some(crate::worker::SystemPromptBuilder::VERSION.into()),
@@ -942,6 +945,7 @@ async fn message_subagent_starts_an_idle_child_immediately() {
             metadata: SessionMetadataV1 {
                 cwd: workspace,
                 provider: "fake".into(),
+                account_alias: None,
                 model: "fake-model".into(),
                 max_tokens: 4096,
                 system_prompt_version: Some(crate::worker::SystemPromptBuilder::VERSION.into()),
@@ -1101,6 +1105,7 @@ async fn only_own_children_are_messageable_with_typed_error() {
                 metadata: SessionMetadataV1 {
                     cwd: workspace,
                     provider: "fake".into(),
+                    account_alias: None,
                     model: "fake-model".into(),
                     max_tokens: 4096,
                     system_prompt_version: Some(crate::worker::SystemPromptBuilder::VERSION.into()),
@@ -1985,6 +1990,7 @@ impl UdsControlClient {
             hub,
             shutdown: crate::lifecycle::ShutdownHandle::channel().0,
             endpoint_path: PathBuf::from("/tmp/w6d-child-control.sock"),
+            pid_file_path: PathBuf::from("/tmp/haiderd.pid"),
         };
         let (drain_sender, drain) = watch::channel(Option::<DrainNotice>::None);
         let serve_task = tokio::spawn(async move {

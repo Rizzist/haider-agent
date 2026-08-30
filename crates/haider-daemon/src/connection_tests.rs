@@ -354,8 +354,8 @@ fn staged_response(attachment: &AttachmentId, request: &str, bytes: &[u8]) -> Qu
 fn welcome_features_pin_served_management_families() {
     assert_eq!(
         welcome_features().len(),
-        105,
-        "102 v0.0.966 features plus agent_cancel_v1 and two v0.0.967 admission/status features"
+        107,
+        "102 v0.0.966 features plus agent_cancel_v1 and four v0.0.967 automation features"
     );
     assert_eq!(
         welcome_features(),
@@ -438,8 +438,10 @@ fn welcome_features_pin_served_management_families() {
             haider_rpc::FEATURE_SESSION_OBSERVE_V1.to_owned(),
             FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned(),
             haider_rpc::FEATURE_AUTONOMOUS_INTERACTION_V1.to_owned(),
+            haider_rpc::FEATURE_SESSION_ACCOUNT_SELECT_V1.to_owned(),
             haider_rpc::FEATURE_STATUS_SEGMENT_STRUCTURED_V1.to_owned(),
             haider_rpc::FEATURE_STATUS_SEGMENT_V1.to_owned(),
+            haider_rpc::FEATURE_STATUS_RUNTIME_V1.to_owned(),
             haider_rpc::FEATURE_STATUS_SNAPSHOT_V1.to_owned(),
             haider_rpc::FEATURE_STORE_HEALTH_V1.to_owned(),
             haider_rpc::FEATURE_SESSION_OBSERVE_BATCH_V1.to_owned(),
@@ -1462,6 +1464,7 @@ fn connection_context(
         hub,
         shutdown: crate::lifecycle::ShutdownHandle::channel().0,
         endpoint_path: std::path::PathBuf::from("/tmp/liveness-test.sock"),
+        pid_file_path: std::path::PathBuf::from("/tmp/haiderd.pid"),
     }
 }
 

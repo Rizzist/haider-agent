@@ -389,7 +389,7 @@
       "request_method": "status.snapshot",
       "response_method": "status.snapshot",
       "request": {"method":"status.snapshot"},
-      "response": {"method":"status.snapshot","session_count":365,"adoption_available":[{"source":"codex","email":"person@example.invalid"}]}
+      "response": {"method":"status.snapshot","session_count":365,"adoption_available":[{"source":"codex","email":"person@example.invalid"}],"daemon_pid":4242,"socket_path":"/tmp/haider-golden/h.sock","pid_file_path":"/tmp/haider-golden/haiderd.pid","ready":true}
     }
   ]
 }
