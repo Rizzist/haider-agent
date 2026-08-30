@@ -111,30 +111,62 @@ fn private_home_contains_store_runtime_and_endpoint() {
     assert!(profile.endpoint_path.starts_with(&private_home));
 }
 
-/// A deep private HOME must fail before bind with an actionable typed error;
-/// silently selecting `/tmp` would violate the caller's isolation boundary.
+/// A deep private HOME keeps the canonical store under HOME but moves the
+/// endpoint to the short owner/profile scope required by `sun_path`.
 #[test]
 #[cfg(unix)]
-fn overlong_private_home_is_a_typed_error_instead_of_a_tmp_escape() {
+fn overlong_private_home_falls_back_to_an_isolated_short_runtime() {
     let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
     let private_home = root.path().join("h".repeat(100));
     let env = ProfileEnv {
         profile_dir: None,
-        home: Some(private_home),
+        home: Some(private_home.clone()),
         user_profile: None,
         model: None,
         runtime_dir: None,
         xdg_runtime_dir: None,
     };
 
-    let error = resolve_profile(&env).expect_err("an overlong HOME endpoint must fail early");
-    assert!(matches!(
-        error,
-        ProfileError::RuntimeEndpoint {
-            source: haider_platform::EndpointError::AddressTooLong { .. }
-        }
-    ));
-    assert!(error.to_string().contains(RUNTIME_DIR_ENV));
+    let profile = resolve_profile(&env).unwrap_or_else(|error| panic!("{error}"));
+    let canonical_home = private_home
+        .canonicalize()
+        .unwrap_or_else(|error| panic!("canonicalize deep private HOME: {error}"));
+    let expected_owner_root = PathBuf::from("/tmp").join(format!("haider-{}", effective_uid()));
+    assert!(profile.store_dir.starts_with(&canonical_home));
+    assert!(profile.runtime_dir.starts_with(&expected_owner_root));
+    assert!(profile.endpoint_path.starts_with(&profile.runtime_dir));
+    assert!(!profile.runtime_dir.starts_with(&private_home));
+    use std::os::unix::ffi::OsStrExt as _;
+    assert!(
+        profile.endpoint_path.as_os_str().as_bytes().len()
+            <= haider_platform::UNIX_SOCKET_PATH_MAX_BYTES,
+        "fallback endpoint exceeds the portable Unix socket limit"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn overlong_homes_share_only_the_private_root_not_the_profile_scope() {
+    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let resolve = |name: &str| {
+        let private_home = root.path().join(format!("{}-{name}", "h".repeat(100)));
+        resolve_profile(&ProfileEnv {
+            profile_dir: None,
+            home: Some(private_home),
+            user_profile: None,
+            model: None,
+            runtime_dir: None,
+            xdg_runtime_dir: None,
+        })
+        .unwrap_or_else(|error| panic!("{error}"))
+    };
+
+    let first = resolve("first");
+    let second = resolve("second");
+    assert_ne!(first.profile_id, second.profile_id);
+    assert_ne!(first.runtime_dir, second.runtime_dir);
+    assert_ne!(first.endpoint_path, second.endpoint_path);
+    assert_eq!(first.runtime_dir.parent(), second.runtime_dir.parent());
 }
 
 #[test]

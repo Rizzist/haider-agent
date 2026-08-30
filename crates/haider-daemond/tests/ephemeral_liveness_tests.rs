@@ -35,6 +35,12 @@ struct ChildGuard {
     exit_status: Option<ExitStatus>,
 }
 
+#[derive(Clone, Copy)]
+enum HelperDaemonLifetime {
+    Ephemeral,
+    Linger(Duration),
+}
+
 impl ChildGuard {
     fn new(child: Child) -> Self {
         Self {
@@ -193,7 +199,7 @@ fn spawn_helper(
     profile: &ResolvedProfile,
     marker: &Path,
     kill_before_readiness: bool,
-    idle_linger: Option<Duration>,
+    daemon_lifetime: HelperDaemonLifetime,
 ) -> ChildGuard {
     let test_home = profile
         .store_dir
@@ -224,14 +230,19 @@ fn spawn_helper(
     if kill_before_readiness {
         command.env(HELPER_KILL_BEFORE_READY_ENV, "1");
     }
-    if let Some(idle_linger) = idle_linger {
-        command.env(
-            HELPER_IDLE_LINGER_MS_ENV,
-            idle_linger.as_millis().to_string(),
-        );
-    }
+    let idle_linger_ms = match daemon_lifetime {
+        HelperDaemonLifetime::Ephemeral => 0,
+        HelperDaemonLifetime::Linger(idle_linger) => idle_linger.as_millis(),
+    };
+    command.env(HELPER_IDLE_LINGER_MS_ENV, idle_linger_ms.to_string());
     let child = command.spawn().expect("spawn ephemeral client helper");
     ChildGuard::new(child)
+}
+
+fn publish_helper_marker(marker: &Path, contents: &str) {
+    let staging = marker.with_extension("pending");
+    std::fs::write(&staging, contents.as_bytes()).expect("write staged helper marker");
+    std::fs::rename(&staging, marker).expect("publish complete helper marker");
 }
 
 fn spawn_private_home_helper(home: &Path, marker: &Path) -> ChildGuard {
@@ -242,6 +253,7 @@ fn spawn_private_home_helper(home: &Path, marker: &Path) -> ChildGuard {
         .env(HELPER_ENV, "1")
         .env(HELPER_MARKER_ENV, marker)
         .env(HELPER_DAEMON_ENV, env!("CARGO_BIN_EXE_haiderd"))
+        .env(HELPER_IDLE_LINGER_MS_ENV, "0")
         .env_remove("HAIDER_PROFILE_DIR")
         .env_remove("HAIDER_RUNTIME_DIR")
         .env_remove("XDG_RUNTIME_DIR")
@@ -502,11 +514,7 @@ fn ephemeral_client_process_helper() {
                 },
             )
             .expect("spawn daemon without consuming readiness");
-            std::fs::write(
-                &marker,
-                format!("daemon_pid={}\n", spawned.child.id()).as_bytes(),
-            )
-            .expect("publish unready helper marker");
+            publish_helper_marker(&marker, &format!("daemon_pid={}\n", spawned.child.id()));
             let retained = (spawned, liveness);
             std::future::pending::<()>().await;
             drop(retained);
@@ -516,22 +524,23 @@ fn ephemeral_client_process_helper() {
             &profile,
             EnsureOptions {
                 daemon_binary: Some(daemon),
-                daemon_lifetime: std::env::var(HELPER_IDLE_LINGER_MS_ENV).map_or(
-                    DaemonLifetime::EphemeralIfSpawned,
-                    |millis| DaemonLifetime::LingerIfSpawned {
-                        idle_ttl: Duration::from_millis(
-                            millis.parse().expect("helper idle linger milliseconds"),
-                        ),
+                daemon_lifetime: match std::env::var(HELPER_IDLE_LINGER_MS_ENV)
+                    .expect("helper daemon lifetime milliseconds")
+                    .parse::<u64>()
+                    .expect("helper idle linger milliseconds")
+                {
+                    0 => DaemonLifetime::EphemeralIfSpawned,
+                    millis => DaemonLifetime::LingerIfSpawned {
+                        idle_ttl: Duration::from_millis(millis),
                     },
-                ),
+                },
                 startup_deadline: DEADLINE,
                 ..EnsureOptions::default()
             },
         )
         .await
         .expect("helper connect-or-spawn");
-        std::fs::write(&marker, format!("spawned={}\n", ensured.spawned).as_bytes())
-            .expect("publish helper readiness");
+        publish_helper_marker(&marker, &format!("spawned={}\n", ensured.spawned));
         std::future::pending::<()>().await;
         drop(ensured);
     });
@@ -546,7 +555,7 @@ fn killed_spawning_client_reaps_ephemeral_daemon_and_runtime_files() {
     let root = test_root();
     let profile = profile(&root.path().join("store"), &root.path().join("runtime"));
     let marker = root.path().join("client-ready");
-    let mut helper = spawn_helper(&profile, &marker, true, None);
+    let mut helper = spawn_helper(&profile, &marker, true, HelperDaemonLifetime::Ephemeral);
     wait_for_helper(
         &runtime,
         &profile,
@@ -576,8 +585,9 @@ fn killed_spawning_client_reaps_ephemeral_daemon_and_runtime_files() {
     wait_for_cleanup(&runtime, &profile, Some(&mut helper), Some(daemon_pid));
 }
 
-/// S3(a): once readiness has proved the endpoint and PID file existed, killing
-/// the sole spawning client still makes the daemon exit and remove both.
+/// S3(a): the fixture explicitly selects zero-TTL ephemeral lifetime. Once
+/// readiness has proved the endpoint and PID file existed, killing the sole
+/// spawning client still makes the daemon exit and remove both.
 #[test]
 fn killed_ready_spawning_client_reaps_ephemeral_daemon_and_runtime_files() {
     let _guard = process_test_guard();
@@ -585,7 +595,7 @@ fn killed_ready_spawning_client_reaps_ephemeral_daemon_and_runtime_files() {
     let root = test_root();
     let profile = profile(&root.path().join("store"), &root.path().join("runtime"));
     let marker = root.path().join("client-ready");
-    let mut helper = spawn_helper(&profile, &marker, false, None);
+    let mut helper = spawn_helper(&profile, &marker, false, HelperDaemonLifetime::Ephemeral);
     wait_for_helper(
         &runtime,
         &profile,
@@ -632,7 +642,12 @@ fn killed_spawning_client_cannot_orphan_a_lingering_daemon() {
     let root = test_root();
     let profile = profile(&root.path().join("store"), &root.path().join("runtime"));
     let marker = root.path().join("client-ready");
-    let mut helper = spawn_helper(&profile, &marker, false, Some(Duration::from_millis(250)));
+    let mut helper = spawn_helper(
+        &profile,
+        &marker,
+        false,
+        HelperDaemonLifetime::Linger(Duration::from_millis(250)),
+    );
     wait_for_helper(
         &runtime,
         &profile,
@@ -684,7 +699,7 @@ fn killed_attached_client_does_not_stop_persistent_daemon() {
     drop(warmup);
 
     let marker = root.path().join("attached-ready");
-    let mut helper = spawn_helper(&profile, &marker, false, None);
+    let mut helper = spawn_helper(&profile, &marker, false, HelperDaemonLifetime::Ephemeral);
     wait_for_helper(
         &runtime,
         &profile,
@@ -723,7 +738,7 @@ fn second_client_holds_ephemeral_daemon_until_its_disconnect() {
     let root = test_root();
     let profile = profile(&root.path().join("store"), &root.path().join("runtime"));
     let marker = root.path().join("client-ready");
-    let mut helper = spawn_helper(&profile, &marker, false, None);
+    let mut helper = spawn_helper(&profile, &marker, false, HelperDaemonLifetime::Ephemeral);
     wait_for_helper(
         &runtime,
         &profile,
@@ -790,8 +805,18 @@ fn two_profiles_have_disjoint_runtime_trees_and_writes() {
 
     let first_marker = root.path().join("first-ready");
     let second_marker = root.path().join("second-ready");
-    let mut first_helper = spawn_helper(&first, &first_marker, false, None);
-    let mut second_helper = spawn_helper(&second, &second_marker, false, None);
+    let mut first_helper = spawn_helper(
+        &first,
+        &first_marker,
+        false,
+        HelperDaemonLifetime::Ephemeral,
+    );
+    let mut second_helper = spawn_helper(
+        &second,
+        &second_marker,
+        false,
+        HelperDaemonLifetime::Ephemeral,
+    );
     wait_for_helper(
         &runtime,
         &first,

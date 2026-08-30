@@ -12,12 +12,11 @@
 //! - Every profile receives a distinct runtime directory. `HAIDER_RUNTIME_DIR`
 //!   selects the containing root for gates/CI; otherwise a verified
 //!   owner-private `XDG_RUNTIME_DIR` on Linux or the resolved user home
-//!   supplies the base. The short per-UID `/tmp` fallback is retained only
-//!   when an explicit store was supplied without any user home.
-//! - A home-selected runtime never silently escapes to a shorter temporary
-//!   path. The complete bind/staging path budget is checked during profile
-//!   resolution, with a typed error directing the operator to an explicit
-//!   short `HAIDER_RUNTIME_DIR` when necessary.
+//!   supplies the preferred base.
+//! - The complete bind/staging path budget is checked during profile
+//!   resolution. When the preferred path exceeds the platform IPC limit, the
+//!   resolver uses a short owner- and profile-scoped `/tmp` path. Other
+//!   endpoint failures remain typed and loud.
 //! - The default model is a release-owned FULL Anthropic model ID: profile
 //!   config (`config.json`) or `HAIDER_MODEL` may override the packaged
 //!   value; the TUI's short product labels never enter this seam.
@@ -142,8 +141,8 @@ pub enum ProfileError {
     /// loud, never silently ignored.
     InvalidConfig { path: PathBuf, message: String },
     /// The selected runtime cannot be represented by the platform IPC API.
-    /// This is checked before the daemon touches runtime state so a private
-    /// home never silently falls back to a shared location.
+    /// This remains loud after both the preferred location and the bounded
+    /// owner/profile fallback have been considered.
     RuntimeEndpoint {
         source: haider_platform::EndpointError,
     },
@@ -225,11 +224,7 @@ pub fn resolve_profile(env: &ProfileEnv) -> Result<ResolvedProfile, ProfileError
     hasher.update(store_text.as_bytes());
     let profile_id = hasher.finalize().to_hex().to_string();
 
-    let runtime_dir = runtime_dir(env, &RuntimeEnv::capture(), &profile_id);
-    let endpoint = haider_platform::Endpoint::new(&runtime_dir, &profile_id);
-    endpoint
-        .validate_for_bind(&runtime_dir)
-        .map_err(|source| ProfileError::RuntimeEndpoint { source })?;
+    let (runtime_dir, endpoint) = runtime_endpoint(env, &RuntimeEnv::capture(), &profile_id)?;
     let endpoint_path = endpoint.into_address();
     let default_model = resolve_default_model(&store_dir, env)?;
 
@@ -284,6 +279,27 @@ pub fn endpoint_path_for(runtime_dir: &Path, profile_id: &str) -> PathBuf {
     haider_platform::Endpoint::new(runtime_dir, profile_id).into_address()
 }
 
+fn runtime_endpoint(
+    env: &ProfileEnv,
+    runtime_env: &RuntimeEnv,
+    profile_id: &str,
+) -> Result<(PathBuf, haider_platform::Endpoint), ProfileError> {
+    let preferred_runtime_dir = runtime_dir(env, runtime_env, profile_id);
+    let preferred_endpoint = haider_platform::Endpoint::new(&preferred_runtime_dir, profile_id);
+    match preferred_endpoint.validate_for_bind(&preferred_runtime_dir) {
+        Ok(()) => return Ok((preferred_runtime_dir, preferred_endpoint)),
+        Err(haider_platform::EndpointError::AddressTooLong { .. }) => {}
+        Err(source) => return Err(ProfileError::RuntimeEndpoint { source }),
+    }
+
+    let fallback_runtime_dir = short_runtime_dir(profile_id);
+    let fallback_endpoint = haider_platform::Endpoint::new(&fallback_runtime_dir, profile_id);
+    fallback_endpoint
+        .validate_for_bind(&fallback_runtime_dir)
+        .map_err(|source| ProfileError::RuntimeEndpoint { source })?;
+    Ok((fallback_runtime_dir, fallback_endpoint))
+}
+
 /// Resolves the runtime directory from verified platform temp bases.
 fn runtime_dir(env: &ProfileEnv, runtime_env: &RuntimeEnv, profile_id: &str) -> PathBuf {
     let root = runtime_root(env, runtime_env);
@@ -292,6 +308,26 @@ fn runtime_dir(env: &ProfileEnv, runtime_env: &RuntimeEnv, profile_id: &str) -> 
         .take(RUNTIME_PROFILE_ID_CHARS)
         .collect::<String>();
     haider_platform::owner_scoped_runtime_directory(&root.join(scope))
+}
+
+#[cfg(unix)]
+fn short_runtime_dir(profile_id: &str) -> PathBuf {
+    let scope = profile_id
+        .chars()
+        .take(RUNTIME_PROFILE_ID_CHARS)
+        .collect::<String>();
+    PathBuf::from("/tmp")
+        .join(format!("haider-{}", effective_uid()))
+        .join(scope)
+}
+
+#[cfg(windows)]
+fn short_runtime_dir(profile_id: &str) -> PathBuf {
+    let scope = profile_id
+        .chars()
+        .take(RUNTIME_PROFILE_ID_CHARS)
+        .collect::<String>();
+    std::env::temp_dir().join("haider").join(scope)
 }
 
 fn runtime_root(env: &ProfileEnv, runtime_env: &RuntimeEnv) -> PathBuf {
