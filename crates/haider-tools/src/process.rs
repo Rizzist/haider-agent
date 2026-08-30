@@ -2130,19 +2130,15 @@ pub(crate) fn process_arguments(
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod supervisor_tests {
     use super::*;
-    #[cfg(unix)]
     use async_trait::async_trait;
-    #[cfg(unix)]
     use std::process::Stdio;
 
-    #[cfg(unix)]
     #[derive(Debug, Default)]
     struct NoopCas;
 
-    #[cfg(unix)]
     #[async_trait]
     impl CasSink for NoopCas {
         async fn put(&mut self, bytes: &[u8]) -> ToolResult<ArtifactRef> {
@@ -2156,11 +2152,9 @@ mod supervisor_tests {
         }
     }
 
-    #[cfg(unix)]
     #[derive(Debug, Default)]
     struct NoopOutput;
 
-    #[cfg(unix)]
     #[async_trait]
     impl CommandOutputSink for NoopOutput {
         async fn emit(&self, _call_id: &str, _delta: ItemDelta) -> ToolResult<()> {
@@ -2171,7 +2165,6 @@ mod supervisor_tests {
     /// A kernel exit-observer error while the leader is live is a supervision
     /// failure. It must enter the teardown ladder rather than the natural-exit
     /// detach path advertised to the model.
-    #[cfg(unix)]
     #[allow(clippy::expect_used)]
     #[tokio::test]
     async fn exit_observer_failure_sweeps_the_owned_process_group() {
