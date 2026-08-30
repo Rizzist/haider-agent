@@ -19,6 +19,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 haider-accounts = { path = "../haider-accounts" }

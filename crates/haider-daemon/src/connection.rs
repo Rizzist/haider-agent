@@ -1323,7 +1323,7 @@ where
 
     // Sensitive inbound path (R7): body buffers are zeroized after
     // deserialize so staged secrets never linger in freed decoder memory.
-    let mut decoder = uds_codec::Decoder::new_zeroizing(context.frame_limit);
+    let mut decoder = uds_codec::Decoder::new_zeroizing_artifact_put(context.frame_limit);
     let mut buffer = [0_u8; 16 * 1024];
     // Inbound capacity is deliberately one handler: bytes enter through this
     // fixed read buffer and bounded decoder, and every decoded command is
@@ -1452,6 +1452,28 @@ where
                     while cursor < read && !close {
                         let step = decoder.push_one(&buffer[cursor..read]);
                         cursor = cursor.saturating_add(step.consumed);
+                        if let Some(artifact_put) = step.artifact_put {
+                            let Some(connection) = hub_connection.as_ref() else {
+                                enqueue_fatal(
+                                    &lane,
+                                    "handshake_required",
+                                    "Hello must be the first frame",
+                                    outbound_limit,
+                                    WireEncoding::Json,
+                                )?;
+                                close = true;
+                                retirement_reason = ConnectionRetirementReason::Error;
+                                continue;
+                            };
+                            connection
+                                .request_decoded_artifact_put(
+                                    artifact_put.request_id,
+                                    artifact_put.bytes,
+                                )
+                                .await
+                                .map_err(DaemonError::from)?;
+                            decoder.set_encoding(encoding);
+                        }
                         if let Some(frame) = step.frame {
                             close = handle_frame(
                                 frame,

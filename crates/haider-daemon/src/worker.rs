@@ -920,7 +920,7 @@ impl ContextCompactor for DaemonContextCompactor {
         };
         let mut prepared = self
             .provider
-            .prepare_turn_with_tools(&request, &self.post_compaction_tools);
+            .prepare_turn_with_tools_owned(&mut request, &self.post_compaction_tools);
         if prepared
             .as_ref()
             .is_some_and(haider_provider::PreparedTurn::has_rendered_wire)

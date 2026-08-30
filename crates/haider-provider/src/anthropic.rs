@@ -1271,59 +1271,18 @@ fn payload_uses_cache_ttl(payload: &serde_json::Value, ttl: AnthropicCacheTtl) -
     }
 }
 
-#[async_trait]
-impl Provider for AnthropicProvider {
-    fn trusts_default_route_absence(&self) -> bool {
-        self.route_gating().enabled()
-    }
-
-    fn credential_surface(&self) -> crate::ProviderCredentialSurface {
-        match self.auth_mode {
-            AnthropicAuthMode::ApiKey => crate::ProviderCredentialSurface::ApiKey,
-            AnthropicAuthMode::None => crate::ProviderCredentialSurface::ApiKey,
-            AnthropicAuthMode::OAuthBearer => {
-                crate::ProviderCredentialSurface::OAuthSubscriptionBearer
-            }
-            AnthropicAuthMode::CloudBearer => crate::ProviderCredentialSurface::CloudBearer,
-        }
-    }
-
-    fn usage_lane_dimensions(&self) -> haider_protocol::provider::UsageLaneDimensions {
-        let speed = matches!(self.auth_mode, AnthropicAuthMode::OAuthBearer)
-            .then(|| {
-                crate::effort::anthropic_fast_mode_supported(&self.model)
-                    .then(|| if self.fast { "fast" } else { "standard" }.to_owned())
-            })
-            .flatten();
-        haider_protocol::provider::UsageLaneDimensions {
-            api_family: Some("anthropic_messages".into()),
-            effort: self.effort.clone(),
-            // API-key and cloud lanes deliberately have no speed tier in the
-            // usage contract, even if a future wire surface grows one.
-            speed,
-        }
-    }
-
-    fn rendered_cache_prefix_digests(
-        &self,
-        request: &TurnRequest,
-    ) -> Option<haider_protocol::provider::PrefixDigests> {
-        self.prepare_turn(request)
-            .map(|prepared| prepared.prefix_digests)
-    }
-
-    fn prepare_turn(&self, request: &TurnRequest) -> Option<crate::PreparedTurn> {
-        <Self as Provider>::prepare_turn_with_tools(self, request, &request.tools)
-    }
-
-    fn prepare_turn_with_tools(
+impl AnthropicProvider {
+    fn prepare_turn_with_tools_inner(
         &self,
         request: &TurnRequest,
         tools: &[crate::ToolDefinition],
+        attachment_moves: Option<&mut [crate::StagedAttachmentMove]>,
     ) -> Option<crate::PreparedTurn> {
         let boundary = request.cache_metadata.as_ref()?.cacheable_history_end();
         self.validate_model(request).ok()?;
-        let mut full_payload = self.render_payload(request, tools, None).ok()?;
+        let rendered_payload = self.render_payload(request, tools, None).ok()?;
+        let mut full_payload =
+            crate::AttachmentMovePayload::new(rendered_payload, attachment_moves);
         let metadata = request.cache_metadata.as_ref()?;
         let ledger_plan = crate::plan_inline_breakpoints(
             &metadata.provider,
@@ -1413,10 +1372,84 @@ impl Provider for AnthropicProvider {
             provider_view: Some(provider_view),
             provider_view_storage_blobs,
             wire: Some(crate::PreparedWire {
-                payload: full_payload,
+                payload: full_payload.commit(),
                 history_boundary: None,
             }),
         })
+    }
+}
+
+#[async_trait]
+impl Provider for AnthropicProvider {
+    fn trusts_default_route_absence(&self) -> bool {
+        self.route_gating().enabled()
+    }
+
+    fn credential_surface(&self) -> crate::ProviderCredentialSurface {
+        match self.auth_mode {
+            AnthropicAuthMode::ApiKey => crate::ProviderCredentialSurface::ApiKey,
+            AnthropicAuthMode::None => crate::ProviderCredentialSurface::ApiKey,
+            AnthropicAuthMode::OAuthBearer => {
+                crate::ProviderCredentialSurface::OAuthSubscriptionBearer
+            }
+            AnthropicAuthMode::CloudBearer => crate::ProviderCredentialSurface::CloudBearer,
+        }
+    }
+
+    fn usage_lane_dimensions(&self) -> haider_protocol::provider::UsageLaneDimensions {
+        let speed = matches!(self.auth_mode, AnthropicAuthMode::OAuthBearer)
+            .then(|| {
+                crate::effort::anthropic_fast_mode_supported(&self.model)
+                    .then(|| if self.fast { "fast" } else { "standard" }.to_owned())
+            })
+            .flatten();
+        haider_protocol::provider::UsageLaneDimensions {
+            api_family: Some("anthropic_messages".into()),
+            effort: self.effort.clone(),
+            // API-key and cloud lanes deliberately have no speed tier in the
+            // usage contract, even if a future wire surface grows one.
+            speed,
+        }
+    }
+
+    fn rendered_cache_prefix_digests(
+        &self,
+        request: &TurnRequest,
+    ) -> Option<haider_protocol::provider::PrefixDigests> {
+        self.prepare_turn(request)
+            .map(|prepared| prepared.prefix_digests)
+    }
+
+    fn prepare_turn(&self, request: &TurnRequest) -> Option<crate::PreparedTurn> {
+        <Self as Provider>::prepare_turn_with_tools(self, request, &request.tools)
+    }
+
+    fn prepare_turn_with_tools(
+        &self,
+        request: &TurnRequest,
+        tools: &[crate::ToolDefinition],
+    ) -> Option<crate::PreparedTurn> {
+        self.prepare_turn_with_tools_inner(request, tools, None)
+    }
+
+    fn prepare_turn_owned(&self, request: &mut TurnRequest) -> Option<crate::PreparedTurn> {
+        let tools = request.tools.clone();
+        <Self as Provider>::prepare_turn_with_tools_owned(self, request, &tools)
+    }
+
+    fn prepare_turn_with_tools_owned(
+        &self,
+        request: &mut TurnRequest,
+        tools: &[crate::ToolDefinition],
+    ) -> Option<crate::PreparedTurn> {
+        let mut attachment_moves = crate::stage_attachment_moves(request)?;
+        let prepared = self.prepare_turn_with_tools_inner(
+            request,
+            tools,
+            Some(attachment_moves.as_mut_slice()),
+        );
+        crate::restore_attachment_moves(request, &mut attachment_moves);
+        prepared
     }
 
     async fn prewarm(&self) {

@@ -10,8 +10,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use haider_accounts::{CredentialAlias, MemoryVault, Vault};
+use haider_protocol::ids::ArtifactRef;
 use haider_protocol::item::ToolStatus;
 use haider_protocol::provider::{Block, FinishReason, PrefixDigests, StreamEvent};
+use haider_protocol::tool::AttachmentBlock;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 
@@ -23,7 +25,7 @@ use crate::gemini::{
 use crate::origin::FixedDnsResolver;
 use crate::{
     GEMINI_PROVIDER_NAME, Message, PromptCacheMetadata, ProviderError, ProviderErrorKind,
-    ToolDefinition, TurnRequest, UserCommandRecord,
+    ResolvedAttachment, ToolDefinition, TurnRequest, UserCommandRecord,
 };
 
 struct StubFixedResolver {
@@ -419,6 +421,38 @@ fn prepared_gemini_wire_bytes_match_legacy_final_render() {
             .expect("prepared Gemini bytes"),
         serde_json::to_vec(&legacy).expect("legacy Gemini bytes")
     );
+
+    let mut owned_request = gemini_cache_request("gemini-2.5-flash");
+    let artifact = ArtifactRef::new("blake3:owned-gemini-attachment-move");
+    owned_request
+        .messages
+        .last_mut()
+        .expect("current user message")
+        .blocks
+        .push(Block::Attachment(AttachmentBlock::Image {
+            artifact: artifact.clone(),
+            mime: "image/png".into(),
+            width: None,
+            height: None,
+        }));
+    owned_request.attachments.push(ResolvedAttachment {
+        artifact,
+        data_base64: "A".repeat(1024 * 1024),
+    });
+    let legacy_owned = provider
+        .request_payload(&owned_request)
+        .expect("legacy attachment payload");
+    let original_pointer = owned_request.attachments[0].data_base64.as_ptr();
+    let owned_tools = std::mem::take(&mut owned_request.tools);
+    let owned =
+        crate::Provider::prepare_turn_with_tools_owned(&provider, &mut owned_request, &owned_tools)
+            .expect("ownership-aware prepared Gemini turn");
+    let owned_payload = &owned.wire.as_ref().expect("owned wire").payload;
+    let prepared_data = owned_payload["contents"][2]["parts"][1]["inlineData"]["data"]
+        .as_str()
+        .expect("prepared Gemini attachment data");
+    assert_eq!(prepared_data.as_ptr(), original_pointer);
+    assert_eq!(owned_payload, &legacy_owned);
 }
 
 #[test]

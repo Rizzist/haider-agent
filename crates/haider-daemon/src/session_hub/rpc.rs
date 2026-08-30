@@ -38,6 +38,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::{MissedTickBehavior, interval_at};
+use zeroize::Zeroizing;
 
 const MAX_ATTACHMENTS_PER_TURN: usize = 5;
 const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
@@ -2284,6 +2285,15 @@ impl HubConnection {
                 );
             }
         };
+        self.artifact_put_bytes(request_id, Zeroizing::new(bytes))
+            .await
+    }
+
+    async fn artifact_put_bytes(
+        &self,
+        request_id: RequestId,
+        bytes: Zeroizing<Vec<u8>>,
+    ) -> Result<(), SessionHubError> {
         if bytes.len() > ARTIFACT_PUT_MAX_BYTES {
             let actual_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
             return self.respond_error(
@@ -2300,7 +2310,7 @@ impl HubConnection {
             );
         }
         let byte_count = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        let artifact = match self.hub.inner.store.put(bytes).await {
+        let artifact = match self.hub.inner.store.put_zeroizing(bytes).await {
             Ok(artifact) => artifact,
             Err(error) => return self.respond_turn_error(request_id, error),
         };
@@ -2311,6 +2321,37 @@ impl HubConnection {
                 bytes: byte_count,
             },
         })
+    }
+
+    /// Completes a transport-decoded `artifact.put` while preserving the
+    /// ordinary request's closed/draining/capability checks.
+    pub(crate) async fn request_decoded_artifact_put(
+        &self,
+        request_id: RequestId,
+        bytes: Zeroizing<Vec<u8>>,
+    ) -> Result<(), SessionHubError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SessionHubError::Closed);
+        }
+        if self.hub.inner.draining.load(Ordering::Acquire) {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_DRAINING,
+                "daemon is draining",
+                true,
+                None,
+            );
+        }
+        if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_CAPABILITY_DENIED,
+                message,
+                false,
+                None,
+            );
+        }
+        self.artifact_put_bytes(request_id, bytes).await
     }
 
     /// Handles one request and enqueues its correlated response.

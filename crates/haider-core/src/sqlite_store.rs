@@ -2097,6 +2097,16 @@ impl SqliteStoreHandle {
         run_blocking(move || owner.with_store(|store| store.put(&bytes))).await
     }
 
+    /// Durably stores a sensitive artifact allocation and scrubs the reused
+    /// decoder storage as soon as the blocking write finishes.
+    pub async fn put_zeroizing(
+        &self,
+        bytes: zeroize::Zeroizing<Vec<u8>>,
+    ) -> Result<ArtifactRef, HaiderError> {
+        let owner = Arc::clone(&self.owner);
+        run_blocking(move || owner.with_store(|store| store.put(&bytes))).await
+    }
+
     /// Durably stores one artifact-reference group with a single trailing
     /// full device-cache flush on platforms that distinguish it.
     pub async fn put_batch(&self, blobs: Vec<Vec<u8>>) -> Result<Vec<ArtifactRef>, HaiderError> {
