@@ -808,6 +808,18 @@ fn large_output_command(bytes: usize) -> String {
     )
 }
 
+#[cfg(not(windows))]
+fn create_large_sparse_file(path: &Path, length: u64) -> std::io::Result<()> {
+    fs::File::create(path)?.set_len(length)
+}
+
+#[cfg(windows)]
+fn create_large_sparse_file(path: &Path, length: u64) -> std::io::Result<()> {
+    let file = fs::File::create(path)?;
+    haider_platform::fs::mark_file_sparse(&file)?;
+    file.set_len(length)
+}
+
 /// A1: one provider script forces every real tool result back through a
 /// second provider request. Removing the dispatcher, output stream, receipt
 /// bounds, background-child output, or terminal projection leaves a missing
@@ -819,10 +831,11 @@ async fn tool_calls_execute_and_continue_over_real_rpc() {
     fs::create_dir(&workspace).expect("workspace");
     fs::write(workspace.join(".gitignore"), "target/\n").expect("gitignore");
     fs::create_dir(workspace.join("target")).expect("ignored build directory");
-    fs::File::create(workspace.join("target/ignored-build.bin"))
-        .expect("ignored build file")
-        .set_len(1024 * 1024 * 1024 * 1024)
-        .expect("large sparse ignored build file");
+    create_large_sparse_file(
+        &workspace.join("target/ignored-build.bin"),
+        1024 * 1024 * 1024 * 1024,
+    )
+    .expect("large sparse ignored build file");
     init_git_workspace(&workspace);
 
     let calls = [

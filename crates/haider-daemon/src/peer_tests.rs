@@ -194,6 +194,12 @@ async fn peer_maintenance_is_event_armed_with_heartbeat_and_audit_repair() {
         initial + 1,
         "one roster publication triggers one reconciliation"
     );
+    // `reconcile_count` records entry so the assertion above can distinguish
+    // event arming from completion. Do not advance paused time while the
+    // platform store worker may still be completing that reconciliation: the
+    // background loop cannot poll its anchored audit interval until it exits.
+    service.wait_for_reconcile_idle().await;
+    tokio::task::yield_now().await;
     tokio::time::advance(std::time::Duration::from_millis(24_500)).await;
     for _ in 0..64 {
         tokio::task::yield_now().await;

@@ -30,6 +30,22 @@ fn home_test_root() -> tempfile::TempDir {
     }
 }
 
+fn assert_profile_scoped_endpoint(profile: &ResolvedProfile) {
+    assert_eq!(
+        profile.endpoint_path,
+        endpoint_path_for(&profile.runtime_dir, &profile.profile_id),
+        "the endpoint must come from the shared profile-scoped derivation"
+    );
+    #[cfg(unix)]
+    assert!(profile.endpoint_path.starts_with(&profile.runtime_dir));
+    #[cfg(windows)]
+    {
+        let endpoint = profile.endpoint_path.to_string_lossy();
+        assert!(endpoint.starts_with(r"\\.\pipe\haider-"));
+        assert_eq!(endpoint.len(), r"\\.\pipe\haider-".len() + 32);
+    }
+}
+
 // MUTATION CHECK (R8 one-resolver law): drop the version tag or the
 // canonicalization step from the profile-id derivation. Expected failure:
 // the determinism/path-scoping assertions below (two resolutions of one
@@ -83,12 +99,13 @@ fn default_home_store_dir_is_preserved() {
             .runtime_dir
             .starts_with(root.path().join(".haider/runtime"))
     );
-    assert!(profile.endpoint_path.starts_with(&profile.runtime_dir));
+    assert_profile_scoped_endpoint(&profile);
 }
 
 /// MUTATION CHECK (hermetic HOME law): restore a temporary-directory choice
-/// ahead of HOME. Expected failure: the runtime leaves the only directory the
-/// caller supplied as its machine-user home.
+/// ahead of HOME. Expected failure: the store/runtime leaves the only
+/// directory the caller supplied as its machine-user home. The rendezvous is
+/// a child socket on Unix and a profile-digested named pipe on Windows.
 #[test]
 fn private_home_contains_store_runtime_and_endpoint() {
     let root = home_test_root();
@@ -108,7 +125,7 @@ fn private_home_contains_store_runtime_and_endpoint() {
         .unwrap_or_else(|error| panic!("canonicalize private HOME: {error}"));
     assert!(profile.store_dir.starts_with(canonical_home));
     assert!(profile.runtime_dir.starts_with(&private_home));
-    assert!(profile.endpoint_path.starts_with(&private_home));
+    assert_profile_scoped_endpoint(&profile);
 }
 
 /// A deep private HOME keeps the canonical store under HOME but moves the

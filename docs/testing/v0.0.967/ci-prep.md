@@ -246,3 +246,40 @@ list instead.
   accepted `turn.submit`, then enforce its exact count throughout the bounded
   plateau. The CLI guard requires main plus one output-adapter worker in every
   sample; its expected count remains two.
+
+### §D additions — 967 gate 6 (2026-08-31)
+
+- **#88 Windows atomic replacement with a live staging handle** — Unix permits
+  renaming a completed staging file while that file is still open, but Windows
+  replacement can return `ERROR_SHARING_VIOLATION` for the publisher's own live
+  handle. Finish and sync the staging file, close that handle explicitly, then
+  publish it. This preserves completed-file atomic rename on Unix and makes the
+  same publication sequence legal on Windows.
+
+- **#89 a Windows rendezvous address has no filesystem runtime parent** — a
+  named pipe such as `\\.\pipe\haider-<profile digest>` is profile scoped but
+  is not a child of `HOME`, `USERPROFILE`, or the PID-file directory. Profile
+  isolation tests must assert the exact shared endpoint derivation and distinct
+  addresses; assert store, PID, and temporary state containment separately
+  under the filesystem runtime. Never compare `Path::parent()` of a named pipe
+  with a disk directory.
+
+- **#90 Windows `set_len` is not a portable sparse-file fixture** — extending a
+  test file to a huge logical length is ordinarily sparse on Unix, but can try
+  to reserve the full extent on Windows and fail with `ERROR_DISK_FULL`. Keep
+  the mutation-strengthening large logical file; on Windows, mark the file
+  sparse with `FSCTL_SET_SPARSE` before extending it.
+
+- **#91 source-sensitive pins coupled to LF checkout** — `include_str!` sees
+  the source bytes materialized by the checkout. A function-boundary search
+  containing a literal `\n` fails on a CRLF Windows checkout even when the
+  production invariant is intact. Search for syntax tokens that do not include
+  a line-ending convention, then preserve the same ordering assertions.
+
+- **#92 an entry counter is not serialized-work completion** — a paused-time
+  maintenance test observed the event-driven reconciliation's entry counter,
+  then advanced the audit interval while that reconciliation still held the
+  loop's serialized work section. The loop could not poll its anchored audit
+  timer, producing a Linux scheduler-dependent false miss. Fence on completion
+  of the already-observed serialized reconciliation before advancing time; do
+  not extend the audit interval or weaken the repair assertion.

@@ -24,30 +24,73 @@ pub fn available_space(path: &Path) -> std::io::Result<u64> {
 /// Bytes currently available to the calling user on the filesystem
 /// containing `path`.
 #[cfg(windows)]
-#[allow(unsafe_code)]
 pub fn available_space(path: &Path) -> std::io::Result<u64> {
-    use std::os::windows::ffi::OsStrExt as _;
+    windows_filesystem_operation(WindowsFilesystemOperation::AvailableSpace(path))
+}
 
-    let wide = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let mut available = 0_u64;
-    // SAFETY: `wide` is a live NUL-terminated UTF-16 path, `available` is a
-    // valid writable u64, and the two optional output pointers are null.
+/// Marks an open Windows file sparse before extending its logical length.
+///
+/// This is the Windows counterpart to Unix filesystems' ordinary sparse
+/// `ftruncate` behavior. The caller retains the file handle and chooses the
+/// final logical size.
+#[cfg(windows)]
+pub fn mark_file_sparse(file: &File) -> std::io::Result<()> {
+    windows_filesystem_operation(WindowsFilesystemOperation::MarkSparse(file)).map(|_| ())
+}
+
+#[cfg(windows)]
+enum WindowsFilesystemOperation<'a> {
+    AvailableSpace(&'a Path),
+    MarkSparse(&'a File),
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn windows_filesystem_operation(operation: WindowsFilesystemOperation<'_>) -> std::io::Result<u64> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+
+    let mut output = 0_u64;
+    // SAFETY: the available-space arm keeps its NUL-terminated UTF-16 path
+    // and writable output live for the call. The sparse arm holds a live
+    // synchronous file handle, accepts no input/output buffers, and supplies
+    // a writable returned-byte count as required by DeviceIoControl.
     let succeeded = unsafe {
-        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
-            wide.as_ptr(),
-            &mut available,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
+        match operation {
+            WindowsFilesystemOperation::AvailableSpace(path) => {
+                let wide = path
+                    .as_os_str()
+                    .encode_wide()
+                    .chain(std::iter::once(0))
+                    .collect::<Vec<_>>();
+                windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+                    wide.as_ptr(),
+                    &mut output,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            }
+            WindowsFilesystemOperation::MarkSparse(file) => {
+                let mut bytes_returned = 0_u32;
+                DeviceIoControl(
+                    file.as_raw_handle(),
+                    FSCTL_SET_SPARSE,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut bytes_returned,
+                    std::ptr::null_mut(),
+                )
+            }
+        }
     };
     if succeeded == 0 {
         Err(std::io::Error::last_os_error())
     } else {
-        Ok(available)
+        Ok(output)
     }
 }
 

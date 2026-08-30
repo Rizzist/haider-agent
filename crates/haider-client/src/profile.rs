@@ -14,9 +14,10 @@
 //!   owner-private `XDG_RUNTIME_DIR` on Linux or the resolved user home
 //!   supplies the preferred base.
 //! - The complete bind/staging path budget is checked during profile
-//!   resolution. When the preferred path exceeds the platform IPC limit, the
-//!   resolver uses a short owner- and profile-scoped `/tmp` path. Other
-//!   endpoint failures remain typed and loud.
+//!   resolution. Unix falls back to a short owner- and profile-scoped `/tmp`
+//!   path when the preferred socket path is too long. Windows uses a
+//!   profile-digested named pipe and keeps filesystem runtime state under the
+//!   selected root. Other endpoint failures remain typed and loud.
 //! - The default model is a release-owned FULL Anthropic model ID: profile
 //!   config (`config.json`) or `HAIDER_MODEL` may override the packaged
 //!   value; the TUI's short product labels never enter this seam.
@@ -111,9 +112,11 @@ pub struct ResolvedProfile {
     pub profile_id: String,
     /// Canonical absolute store directory (SQLite journal, lock, accounts).
     pub store_dir: PathBuf,
-    /// Owner-private runtime directory holding the rendezvous socket.
+    /// Owner-private runtime directory holding PID/temp state and, on Unix,
+    /// the rendezvous socket.
     pub runtime_dir: PathBuf,
-    /// Deterministic rendezvous socket path under `runtime_dir`.
+    /// Deterministic rendezvous address: a socket under `runtime_dir` on Unix,
+    /// or a profile-digested named-pipe address on Windows.
     pub endpoint_path: PathBuf,
     /// Default provider for new sessions.
     pub default_provider: String,
