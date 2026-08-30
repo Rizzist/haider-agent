@@ -81,6 +81,7 @@ pub enum CommitGroupBatch {
     CreateSession {
         command: SessionCreateCommand,
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
+        account_alias: Option<String>,
     },
     AcceptTurn {
         command: TurnAcceptCommand,
@@ -645,10 +646,20 @@ impl SqliteStoreHandle {
         command: SessionCreateCommand,
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
     ) -> Result<SessionCreateOutcome, HaiderError> {
+        self.create_session_with_configuration(command, interaction_mode, None)
+            .await
+    }
+
+    pub async fn create_session_with_configuration(
+        &self,
+        command: SessionCreateCommand,
+        interaction_mode: haider_protocol::session::SessionInteractionModeV1,
+        account_alias: Option<String>,
+    ) -> Result<SessionCreateOutcome, HaiderError> {
         let owner = Arc::clone(&self.owner);
         run_blocking(move || {
             owner.with_store(|store| {
-                store.create_session_with_interaction_mode(&command, interaction_mode)
+                store.create_session_with_configuration(&command, interaction_mode, account_alias)
             })
         })
         .await
@@ -1923,9 +1934,11 @@ impl SqliteStoreHandle {
                         CommitGroupBatch::CreateSession {
                             command,
                             interaction_mode,
+                            account_alias,
                         } => JournalCommitBatch::CreateSession {
                             command,
                             interaction_mode,
+                            account_alias,
                         },
                         CommitGroupBatch::AcceptTurn {
                             command,

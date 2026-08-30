@@ -139,6 +139,25 @@ fn built_status_json_completes_with_enabled_discovery() {
         serde_json::from_slice(&output.stdout).expect("status stdout is one JSON document");
     assert_eq!(document["kind"], "status");
     assert_eq!(document["daemon"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(document["daemon"]["ready"], true);
+    assert!(
+        document["daemon"]["pid"]
+            .as_u64()
+            .is_some_and(|pid| pid > 0),
+        "status did not expose the serving daemon PID: {document}"
+    );
+    let socket_path = document["daemon"]["socket_path"]
+        .as_str()
+        .expect("status socket_path string");
+    assert!(Path::new(socket_path).is_absolute());
+    assert_eq!(
+        Path::new(socket_path).parent(),
+        document["daemon"]["pid_file_path"]
+            .as_str()
+            .map(Path::new)
+            .and_then(Path::parent),
+        "socket and PID file must name the same resolved runtime directory"
+    );
     let discovery_deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let output = wait_for_output(start_status(true), STATUS_TIMEOUT);

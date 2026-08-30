@@ -79,6 +79,10 @@ pub(crate) struct StatusDocument {
 pub(crate) struct DaemonView {
     pub version: String,
     pub generation: u64,
+    pub pid: Option<u32>,
+    pub socket_path: String,
+    pub pid_file_path: Option<String>,
+    pub ready: bool,
 }
 
 pub(crate) struct UpdateView {
@@ -111,7 +115,11 @@ struct StatusDocumentWire<'a> {
 #[derive(serde::Serialize)]
 struct StatusDaemonWire<'a> {
     generation: u64,
+    pid: Option<u32>,
+    pid_file_path: Option<&'a str>,
     pipe_dir: String,
+    ready: bool,
+    socket_path: &'a str,
     version: &'a str,
 }
 
@@ -234,6 +242,10 @@ impl ObserveJson for StatusDocument {
             "daemon": {
                 "version": self.daemon.version,
                 "generation": self.daemon.generation,
+                "pid": self.daemon.pid,
+                "socket_path": self.daemon.socket_path,
+                "pid_file_path": self.daemon.pid_file_path,
+                "ready": self.daemon.ready,
                 "pipe_dir": std::path::Path::new(&self.profile_path)
                     .join("pipe")
                     .display()
@@ -555,6 +567,10 @@ pub(crate) async fn status_command(rest: &[String]) -> ExitCode {
         provider: descriptor.provider,
         alias: descriptor.alias.as_str().to_owned(),
     });
+    let socket_path = snapshot
+        .socket_path
+        .unwrap_or_else(|| profile.endpoint_path.display().to_string());
+    let pid_file_path = snapshot.pid_file_path;
     let welcome = observer.into_welcome();
     let update = stamp_update_view(&profile.store_dir);
     let document = StatusDocument {
@@ -563,6 +579,10 @@ pub(crate) async fn status_command(rest: &[String]) -> ExitCode {
         daemon: DaemonView {
             version: welcome.daemon_version,
             generation: welcome.daemon_generation,
+            pid: snapshot.daemon_pid,
+            socket_path,
+            pid_file_path,
+            ready: snapshot.ready,
         },
         update,
         features: welcome.features.into_iter().collect(),
@@ -1137,6 +1157,10 @@ fn write_status_document(document: &StatusDocument) -> ExitCode {
         daemon: StatusDaemonWire {
             version: &document.daemon.version,
             generation: document.daemon.generation,
+            pid: document.daemon.pid,
+            socket_path: &document.daemon.socket_path,
+            pid_file_path: document.daemon.pid_file_path.as_deref(),
+            ready: document.daemon.ready,
             pipe_dir: std::path::Path::new(&document.profile_path)
                 .join("pipe")
                 .display()
@@ -1200,9 +1224,20 @@ fn write_status_human(document: &StatusDocument) -> ExitCode {
         |version| format!("available ({version})"),
     );
     let mut text = format!(
-        "daemon {} (generation {})\nupdate: {update}\naccount: {account}\nsessions: {}\nprofile: {}\nruntime: {}\nfeatures: {}\n",
+        "daemon {} (generation {}, pid {}, ready {})\nsocket: {}\npid file: {}\nupdate: {update}\naccount: {account}\nsessions: {}\nprofile: {}\nruntime: {}\nfeatures: {}\n",
         document.daemon.version,
         document.daemon.generation,
+        document
+            .daemon
+            .pid
+            .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string()),
+        document.daemon.ready,
+        document.daemon.socket_path,
+        document
+            .daemon
+            .pid_file_path
+            .as_deref()
+            .unwrap_or("unknown"),
         document.session_count,
         document.profile_path,
         document.runtime_dir,

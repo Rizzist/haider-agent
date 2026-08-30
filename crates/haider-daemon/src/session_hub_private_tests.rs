@@ -1406,16 +1406,35 @@ async fn status_snapshot_counts_sessions_without_listing_summaries() {
                         active_account,
                         session_count,
                         adoption_available,
+                        daemon_pid,
+                        socket_path,
+                        pid_file_path,
+                        ready,
                     },
             } if request_id.as_str() == "status-scalars" => Some((
                 active_account.clone(),
                 *session_count,
                 adoption_available.clone(),
+                *daemon_pid,
+                socket_path.clone(),
+                pid_file_path.clone(),
+                *ready,
             )),
             _ => None,
         })
         .expect("status response");
-    assert_eq!(status, (None, 3, Vec::new()));
+    assert_eq!(
+        status,
+        (
+            None,
+            3,
+            Vec::new(),
+            Some(std::process::id()),
+            None,
+            None,
+            true
+        )
+    );
 
     drop(phantom_reservation);
     drop(connection);
@@ -1423,22 +1442,23 @@ async fn status_snapshot_counts_sessions_without_listing_summaries() {
     store.close().await.expect("store close");
 }
 
-/// MUTATION CHECK: move active-provider/default-model resolution back into
-/// client-side collection RPCs. Expected runtime failure: the daemon refuses
-/// the empty sentinels instead of committing the resolved metadata atomically.
+/// MUTATION CHECK: resolve the active account instead of the requested alias,
+/// or move provider/default-model lookup back into client collection RPCs.
+/// The inactive selected account must still win atomically.
 #[tokio::test]
 async fn session_create_resolves_provider_and_model_inside_admission() {
     let root = tempfile::tempdir().expect("profile");
     let store = SqliteStoreHandle::open(root.path()).await.expect("store");
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("hub");
+    let selected_alias = haider_protocol::ids::CredentialAlias::new("selected-fake");
     let descriptor = haider_protocol::credential::CredentialDescriptor {
-        alias: haider_protocol::ids::CredentialAlias::new("active-fake"),
+        alias: selected_alias.clone(),
         provider: "fake".into(),
         base_url: None,
         auth_method: haider_protocol::credential::AuthMethod::OAuth,
         identity: "active@example.invalid".into(),
         status: haider_protocol::credential::CredentialStatus::Ok,
-        active: true,
+        active: false,
         label: None,
         account_identity: None,
         created_at_ms: None,
@@ -1446,19 +1466,35 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
     let mut provider = provider_summary("fake");
     provider.models = vec!["fake-v1".into()];
     provider.default_model = Some("fake-v1".into());
+    let active_other = haider_protocol::credential::CredentialDescriptor {
+        alias: haider_protocol::ids::CredentialAlias::new("active-other"),
+        provider: "other".into(),
+        active: true,
+        ..descriptor.clone()
+    };
+    let mut other_provider = provider_summary("other");
+    other_provider.models = vec!["other-v1".into()];
+    other_provider.default_model = Some("other-v1".into());
     hub.install_accounts(crate::accounts::AccountsFacade {
         login: None,
         oauth: None,
-        snapshot: Arc::new(Mutex::new(vec![descriptor.clone()])),
-        management: crate::accounts::ManagementSnapshot::new(0, vec![descriptor], vec![provider]),
+        snapshot: Arc::new(Mutex::new(vec![descriptor.clone(), active_other.clone()])),
+        management: crate::accounts::ManagementSnapshot::new(
+            0,
+            vec![descriptor, active_other],
+            vec![provider, other_provider],
+        ),
         vault_supported: false,
         discovery_disabled: false,
         device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(false),
         vault: None,
     })
     .expect("accounts install");
-    hub.install_creatable_providers(std::collections::BTreeSet::from(["fake".into()]))
-        .expect("creatable provider install");
+    hub.install_creatable_providers(std::collections::BTreeSet::from([
+        "fake".into(),
+        "other".into(),
+    ]))
+    .expect("creatable provider install");
     let sink = Arc::new(CapturingFrameSink::default());
     let connection = hub
         .open_connection(
@@ -1487,6 +1523,7 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
                 cache_policy: None,
                 interaction_mode: haider_protocol::session::SessionInteractionModeV1::Autonomous,
                 ssh_scope: None,
+                account_alias: Some(selected_alias.clone()),
                 resolve_provider: true,
                 resolve_model: true,
                 effort: None,
@@ -1510,6 +1547,7 @@ async fn session_create_resolves_provider_and_model_inside_admission() {
         .expect("resolved create response");
     assert_eq!(metadata.provider, "fake");
     assert_eq!(metadata.model, "fake-v1");
+    assert_eq!(metadata.account_alias.as_deref(), Some("selected-fake"));
     assert_eq!(
         metadata.interaction_mode,
         haider_protocol::session::SessionInteractionModeV1::Autonomous

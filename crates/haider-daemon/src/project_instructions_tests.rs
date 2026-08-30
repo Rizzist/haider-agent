@@ -301,6 +301,7 @@ fn metadata(cwd: String) -> SessionMetadataV1 {
     SessionMetadataV1 {
         cwd,
         provider: "fake".into(),
+        account_alias: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         system_prompt_version: Some(SystemPromptBuilder::VERSION.into()),

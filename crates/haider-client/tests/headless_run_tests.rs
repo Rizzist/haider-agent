@@ -129,6 +129,7 @@ fn welcome(profile: &ResolvedProfile) -> Welcome {
     features.insert(haider_rpc::FEATURE_AUTONOMOUS_INTERACTION_V1.to_owned());
     features.insert(haider_rpc::FEATURE_SESSION_CONFIG_V1.to_owned());
     features.insert(haider_rpc::FEATURE_SESSION_CREATE_ADMISSION_V1.to_owned());
+    features.insert(haider_rpc::FEATURE_SESSION_ACCOUNT_SELECT_V1.to_owned());
     features.insert(haider_rpc::FEATURE_SESSION_EFFORT_SELECT_V1.to_owned());
     features.insert(haider_rpc::FEATURE_SESSION_FAST_SELECT_V1.to_owned());
     Welcome {
@@ -196,6 +197,16 @@ async fn respond_create_and_attach(
     provider: &str,
     model: &str,
 ) -> (SessionId, AttachmentId) {
+    respond_create_and_attach_with_account(peer, create_request, provider, model, None).await
+}
+
+async fn respond_create_and_attach_with_account(
+    peer: &mut Peer,
+    create_request: RequestId,
+    provider: &str,
+    model: &str,
+    account_alias: Option<&str>,
+) -> (SessionId, AttachmentId) {
     let session_id = SessionId::new("headless-session");
     peer.respond(
         create_request,
@@ -206,6 +217,7 @@ async fn respond_create_and_attach(
             metadata: SessionMetadataV1 {
                 cwd: "/tmp".into(),
                 provider: provider.into(),
+                account_alias: account_alias.map(Into::into),
                 model: model.into(),
                 max_tokens: 4096,
                 permission_overrides: None,
@@ -497,6 +509,86 @@ async fn flagless_bootstrap_creates_on_active_provider_and_published_default_mod
     peer.await.expect("peer");
     assert_eq!(result.provider, "openai-oauth");
     assert_eq!(result.model, "gpt-active-default");
+    assert_eq!(result.outcome, HeadlessOutcome::Done);
+}
+
+/// MUTATION CHECK: resolve the provider/model client-side, drop the exact
+/// alias, or accept metadata for a different account. The first atomic create
+/// body or the response validation then fails.
+#[tokio::test]
+async fn account_only_bootstrap_uses_that_accounts_daemon_default_model() {
+    let (_root, profile) = profile();
+    let peer = spawn_peer(&profile, |mut peer| async move {
+        let (create_request, create_body) = peer.request().await;
+        let RequestBody::SessionCreateWithPermissionOverrides {
+            provider,
+            model,
+            account_alias,
+            resolve_provider,
+            resolve_model,
+            ..
+        } = create_body
+        else {
+            panic!("account-only admission must begin with session.create");
+        };
+        assert!(provider.is_empty() && model.is_empty());
+        assert!(resolve_provider && resolve_model);
+        assert_eq!(
+            account_alias.as_ref().map(|alias| alias.as_str()),
+            Some("work")
+        );
+        let (session_id, attachment_id) = respond_create_and_attach_with_account(
+            &mut peer,
+            create_request,
+            "openai-oauth",
+            "gpt-work-default",
+            Some("work"),
+        )
+        .await;
+        let (submit_request, run_id) = accept_submit(&mut peer, &session_id).await;
+        peer.respond(
+            submit_request,
+            ResponseBody::TurnSubmit {
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                accepted_seq: 1,
+                worker_generation: 7,
+                disposition: SubmitDisposition::Started,
+            },
+        )
+        .await;
+        send_event(
+            &mut peer,
+            &attachment_id,
+            envelope(
+                &session_id,
+                &run_id,
+                1,
+                EventPayload::RunState(RunState::Done),
+            ),
+        )
+        .await;
+    });
+    let mut run = request(None);
+    run.provider = None;
+    run.model = None;
+    let (sender, mut receiver) = mpsc::channel(8);
+    let result = run_headless_with_session_config(
+        &profile,
+        EnsureOptions::default(),
+        run,
+        HeadlessSessionConfig {
+            account: Some("work".into()),
+            ..HeadlessSessionConfig::default()
+        },
+        sender,
+    )
+    .await
+    .expect("account-only run");
+    while receiver.recv().await.is_some() {}
+    peer.await.expect("peer");
+    assert_eq!(result.provider, "openai-oauth");
+    assert_eq!(result.model, "gpt-work-default");
     assert_eq!(result.outcome, HeadlessOutcome::Done);
 }
 
@@ -1382,6 +1474,7 @@ async fn duplicate_and_gap_replay_is_lossless_under_output_backpressure() {
         .into_iter()
         .filter_map(|event| match event {
             HeadlessEvent::Envelope(envelope) => Some(envelope.seq),
+            HeadlessEvent::Terminal(terminal) => Some(terminal.envelope.seq),
             HeadlessEvent::Accepted { .. } | HeadlessEvent::PermissionDenied(_) => None,
         })
         .collect::<Vec<_>>();
@@ -1499,6 +1592,7 @@ async fn lagged_pressure_recovers_every_durable_sequence() {
         .into_iter()
         .filter_map(|event| match event {
             HeadlessEvent::Envelope(envelope) => Some(envelope.seq),
+            HeadlessEvent::Terminal(terminal) => Some(terminal.envelope.seq),
             HeadlessEvent::Accepted { .. } | HeadlessEvent::PermissionDenied(_) => None,
         })
         .collect::<Vec<_>>();
@@ -2131,8 +2225,8 @@ async fn adjacent_store_failure_and_errored_terminal_return_without_hanging() {
     ));
     assert!(matches!(
         events.last(),
-        Some(HeadlessEvent::Envelope(envelope))
-            if serde_json::from_value::<EventPayload>(envelope.payload.clone())
+        Some(HeadlessEvent::Terminal(terminal))
+            if serde_json::from_value::<EventPayload>(terminal.envelope.payload.clone())
                 .is_ok_and(|payload| payload == EventPayload::RunState(RunState::Errored))
     ));
 }

@@ -288,6 +288,7 @@ fn session_permission_overrides_grant_only_their_named_effect_families() {
     let metadata = |permission_overrides| SessionMetadataV1 {
         cwd: "/tmp".into(),
         provider: "fake".into(),
+        account_alias: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         permission_overrides,
@@ -442,6 +443,7 @@ fn autonomous_effect_defaults_preserve_explicit_grant_precedence() {
     let metadata = |permission_overrides| SessionMetadataV1 {
         cwd: "/tmp".into(),
         provider: "fake".into(),
+        account_alias: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         permission_overrides,
@@ -503,6 +505,7 @@ fn auto_allow_promotes_every_ask_class_including_computer_and_fetch() {
     let metadata = |permission_overrides| SessionMetadataV1 {
         cwd: "/tmp".into(),
         provider: "fake".into(),
+        account_alias: None,
         model: "fake-model".into(),
         max_tokens: 4096,
         permission_overrides,

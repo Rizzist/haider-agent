@@ -1401,6 +1401,27 @@ fn adapt_events_to(
                         || last_stdout_flush.elapsed() >= JSONL_FLUSH_INTERVAL;
                 }
             }
+            HeadlessEvent::Terminal(terminal) => {
+                if output == RunOutput::Jsonl {
+                    let mut envelope = *terminal.envelope;
+                    let payload = envelope.payload.as_object_mut().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "terminal envelope payload is not an object",
+                        )
+                    })?;
+                    payload.insert(
+                        "terminal_kind".into(),
+                        serde_json::to_value(terminal.kind).map_err(io::Error::other)?,
+                    );
+                    if let Some(error_code) = terminal.error_code {
+                        payload.insert("error_code".into(), serde_json::Value::String(error_code));
+                    }
+                    serde_json::to_writer(&mut stdout, &envelope).map_err(io::Error::other)?;
+                    stdout.write_all(b"\n")?;
+                    stdout.flush()?;
+                }
+            }
             HeadlessEvent::PermissionDenied(denial) => {
                 writeln!(
                     stderr,

@@ -1410,6 +1410,7 @@ impl AppendCommitter {
         &self,
         command: SessionCreateCommand,
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
+        account_alias: Option<String>,
     ) -> Result<SessionCreateOutcome, HaiderError> {
         let byte_weight = command
             .request_json
@@ -1423,6 +1424,7 @@ impl AppendCommitter {
             CommitGroupBatch::CreateSession {
                 command,
                 interaction_mode,
+                account_alias,
             },
             byte_weight,
             AppendCommitCompletion::CreateSession(completed),
@@ -1689,6 +1691,7 @@ enum ActorCommand {
     CreateSession {
         command: SessionCreateCommand,
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
+        account_alias: Option<String>,
         completed: oneshot::Sender<Result<SessionCreateOutcome, HaiderError>>,
     },
     CreateBranch {
@@ -1870,6 +1873,9 @@ pub struct HubConnection {
     /// Which transport carried this connection: raw-secret staging is
     /// LocalSameUid-only (R7), independent of the capability grant.
     transport: crate::accounts::ConnectionTransport,
+    /// Listener and PID-publication paths carried by the negotiated runtime
+    /// connection. Test-only in-memory connections intentionally omit them.
+    runtime_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     /// Connection-scoped staged secrets (R7): wiped on close/disconnect.
     stages: Mutex<crate::accounts::StagedSecrets>,
     /// At most one connection-scoped roster ticker. The task owns no
@@ -3655,7 +3661,7 @@ impl SessionHub {
             return Ok(created);
         }
         match self
-            .create_session_with_interaction_mode(command, interaction_mode)
+            .create_session_with_interaction_mode(command, interaction_mode, None)
             .await
             .map_err(hub_error_as_store)?
         {
@@ -3949,6 +3955,16 @@ impl SessionHub {
         sink: Arc<dyn FrameSink>,
         transport: crate::accounts::ConnectionTransport,
     ) -> Result<HubConnection, SessionHubError> {
+        self.open_connection_with_runtime_paths(capabilities, sink, transport, None)
+    }
+
+    pub(crate) fn open_connection_with_runtime_paths(
+        &self,
+        capabilities: CapabilitySet,
+        sink: Arc<dyn FrameSink>,
+        transport: crate::accounts::ConnectionTransport,
+        runtime_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    ) -> Result<HubConnection, SessionHubError> {
         if self.inner.draining.load(Ordering::Acquire) {
             return Err(SessionHubError::Closed);
         }
@@ -4009,6 +4025,7 @@ impl SessionHub {
             capabilities,
             sink,
             transport,
+            runtime_paths,
             stages: Mutex::new(crate::accounts::StagedSecrets::default()),
             roster_watch: Mutex::new(None),
             accounts_watch: Mutex::new(None),
@@ -4085,6 +4102,7 @@ impl SessionHub {
         self.create_session_with_interaction_mode(
             command,
             haider_protocol::session::SessionInteractionModeV1::Interactive,
+            None,
         )
         .await
     }
@@ -4093,6 +4111,7 @@ impl SessionHub {
         &self,
         command: SessionCreateCommand,
         interaction_mode: haider_protocol::session::SessionInteractionModeV1,
+        account_alias: Option<String>,
     ) -> Result<SessionCreateOutcome, SessionHubError> {
         let actor = self.actor_for(command.session_id.clone()).await?;
         let (completed, result) = oneshot::channel();
@@ -4101,6 +4120,7 @@ impl SessionHub {
             .send(ActorCommand::CreateSession {
                 command,
                 interaction_mode,
+                account_alias,
                 completed,
             })
             .await

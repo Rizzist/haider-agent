@@ -1231,6 +1231,8 @@ pub(crate) struct ConnectionContext {
     pub(crate) shutdown: ShutdownHandle,
     /// For error context only; the stream is already accepted.
     pub(crate) endpoint_path: PathBuf,
+    /// Exact daemon-owned PID publication file for status automation.
+    pub(crate) pid_file_path: PathBuf,
 }
 
 /// Runs one client connection to completion: UID gate, framed read loop,
@@ -1810,10 +1812,11 @@ async fn handle_frame(
                     .hub
                     // UDS with the peer-UID gate already passed: the one
                     // transport allowed to stage raw secrets (R7).
-                    .open_connection(
+                    .open_connection_with_runtime_paths(
                         granted.capabilities.clone(),
                         sink,
                         crate::accounts::ConnectionTransport::LocalSameUid,
+                        Some((context.endpoint_path.clone(), context.pid_file_path.clone())),
                     )
                     .map_err(DaemonError::from)?,
             );
@@ -2225,8 +2228,10 @@ fn welcome_features() -> BTreeSet<String> {
         FEATURE_SESSION_OBSERVE_BATCH_V1.to_owned(),
         FEATURE_SESSION_PERMISSION_OVERRIDES_V1.to_owned(),
         FEATURE_AUTONOMOUS_INTERACTION_V1.to_owned(),
+        haider_rpc::FEATURE_SESSION_ACCOUNT_SELECT_V1.to_owned(),
         haider_rpc::FEATURE_STATUS_SEGMENT_STRUCTURED_V1.to_owned(),
         haider_rpc::FEATURE_STATUS_SEGMENT_V1.to_owned(),
+        haider_rpc::FEATURE_STATUS_RUNTIME_V1.to_owned(),
         haider_rpc::FEATURE_STATUS_SNAPSHOT_V1.to_owned(),
         haider_rpc::FEATURE_STORE_HEALTH_V1.to_owned(),
         haider_rpc::FEATURE_TUI_ATTACH_ANNOUNCE_V1.to_owned(),

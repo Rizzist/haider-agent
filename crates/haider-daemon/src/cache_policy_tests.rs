@@ -12,6 +12,7 @@ fn metadata(mode: CachePolicyMode, threshold: u64) -> SessionMetadataV1 {
     SessionMetadataV1 {
         cwd: "/tmp".into(),
         provider: "openai".into(),
+        account_alias: None,
         model: "gpt-5.6-terra".into(),
         max_tokens: 4096,
         system_prompt_version: Some("haider-system-v2".into()),

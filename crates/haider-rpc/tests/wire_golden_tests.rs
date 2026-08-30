@@ -51,6 +51,48 @@ fn availability_compat_fixture_path() -> PathBuf {
         .join("snapshot_availability_compat_v1.json")
 }
 
+/// MUTATION CHECK: remove defaults from an additive runtime field or make a
+/// legacy decoder reject unknown fields. Either direction of the rolling
+/// upgrade contract then fails here.
+#[test]
+fn status_runtime_fields_are_additive_in_both_client_directions() {
+    let old: ResponseBody = serde_json::from_value(serde_json::json!({
+        "method": "status.snapshot",
+        "session_count": 3
+    }))
+    .expect("new client decodes old status response");
+    assert!(matches!(
+        old,
+        ResponseBody::StatusSnapshot {
+            daemon_pid: None,
+            socket_path: None,
+            pid_file_path: None,
+            ready: false,
+            ..
+        }
+    ));
+
+    #[derive(Deserialize)]
+    struct LegacyStatusSnapshot {
+        method: String,
+        session_count: u64,
+    }
+    let current = serde_json::to_value(ResponseBody::StatusSnapshot {
+        active_account: None,
+        session_count: 3,
+        adoption_available: Vec::new(),
+        daemon_pid: Some(4242),
+        socket_path: Some("/tmp/haider/h.sock".into()),
+        pid_file_path: Some("/tmp/haider/haiderd.pid".into()),
+        ready: true,
+    })
+    .expect("encode current status response");
+    let legacy: LegacyStatusSnapshot =
+        serde_json::from_value(current).expect("old client ignores additive status fields");
+    assert_eq!(legacy.method, "status.snapshot");
+    assert_eq!(legacy.session_count, 3);
+}
+
 /// MUTATION CHECK: rename a checkpoint error kind/field or either public
 /// literal. Expected runtime failure: typed clients lose the coordinates
 /// needed to present freshness and cross-branch refusals without prose parsing.
@@ -1263,7 +1305,8 @@ fn compact_ws_bodies_and_length_prefixed_uds_streams_are_golden() {
     // prefix. K1 appends exactly one agent.cancel request/response pair:
     // 180 + 2 = 182. The 17 moved method pairs remain absent from the
     // supplemental fixture, so the two sources stay disjoint. K1 adds one
-    // request method: 123 + 1 = 124.
+    // request method: 123 + 1 = 124; the later status.snapshot method makes
+    // the current exhaustive request-method count 125.
     assert_eq!(expected_frames.len(), 182);
     let expected_bytes: Vec<GoldenWireBytes> = expected_frames
         .iter()
@@ -2038,6 +2081,7 @@ fn legacy_session_create_defaults_permission_overrides_to_none() {
                 cache_policy: None,
                 interaction_mode: haider_protocol::session::SessionInteractionModeV1::Interactive,
                 ssh_scope: None,
+                account_alias: None,
                 resolve_provider: false,
                 resolve_model: false,
                 effort: None,

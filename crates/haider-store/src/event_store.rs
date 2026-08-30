@@ -1874,6 +1874,7 @@ pub enum JournalCommitBatch {
     CreateSession {
         command: SessionCreateCommand,
         interaction_mode: SessionInteractionModeV1,
+        account_alias: Option<String>,
     },
     AcceptTurn {
         command: TurnAcceptCommand,
@@ -7525,8 +7526,13 @@ impl Store {
             JournalCommitBatch::CreateSession {
                 command,
                 interaction_mode,
+                account_alias,
             } => self
-                .create_session_with_interaction_mode(command, *interaction_mode)
+                .create_session_with_configuration(
+                    command,
+                    *interaction_mode,
+                    account_alias.clone(),
+                )
                 .map(JournalCommitOutcome::CreateSession),
             JournalCommitBatch::AcceptTurn {
                 command,
@@ -7562,8 +7568,14 @@ impl Store {
             JournalCommitBatch::CreateSession {
                 command,
                 interaction_mode,
+                account_alias,
             } => self
-                .create_session_in_transaction(transaction, command, *interaction_mode)
+                .create_session_in_transaction(
+                    transaction,
+                    command,
+                    *interaction_mode,
+                    account_alias.clone(),
+                )
                 .map(JournalCommitOutcome::CreateSession),
             JournalCommitBatch::AcceptTurn {
                 command,
@@ -7805,12 +7817,27 @@ impl Store {
         command: &SessionCreateCommand,
         interaction_mode: SessionInteractionModeV1,
     ) -> StoreResult<SessionCreateOutcome> {
+        self.create_session_with_configuration(command, interaction_mode, None)
+    }
+
+    /// Same atomic session creation transaction with an optional exact
+    /// account pin used by automation-created sessions.
+    pub fn create_session_with_configuration(
+        &self,
+        command: &SessionCreateCommand,
+        interaction_mode: SessionInteractionModeV1,
+        account_alias: Option<String>,
+    ) -> StoreResult<SessionCreateOutcome> {
         let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sqlite_error)?;
-        let outcome =
-            self.create_session_in_transaction(&transaction, command, interaction_mode)?;
+        let outcome = self.create_session_in_transaction(
+            &transaction,
+            command,
+            interaction_mode,
+            account_alias,
+        )?;
         transaction.commit().map_err(map_sqlite_error)?;
         Ok(outcome)
     }
@@ -7820,6 +7847,7 @@ impl Store {
         transaction: &Connection,
         command: &SessionCreateCommand,
         interaction_mode: SessionInteractionModeV1,
+        account_alias: Option<String>,
     ) -> StoreResult<SessionCreateOutcome> {
         validate_command_identity(
             &command.command_id,
@@ -7860,6 +7888,7 @@ impl Store {
         let metadata = SessionMetadataV1 {
             cwd: command.cwd.clone(),
             provider: command.provider.clone(),
+            account_alias,
             model: command.model.clone(),
             max_tokens: command.max_tokens,
             system_prompt_version: Some(command.system_prompt_version.clone()),

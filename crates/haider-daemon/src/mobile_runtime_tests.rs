@@ -315,6 +315,7 @@ async fn mobile_dispatcher_fixture_with_grant(
             metadata: SessionMetadataV1 {
                 cwd,
                 provider: "fake".into(),
+                account_alias: None,
                 model: "fake-model".into(),
                 max_tokens: 4096,
                 system_prompt_version: Some(SystemPromptBuilder::VERSION.into()),

@@ -1330,6 +1330,7 @@ async fn run_inner(
         hub: hub.clone(),
         shutdown: shutdown_handle,
         endpoint_path: endpoint.path().to_path_buf(),
+        pid_file_path: config.runtime_dir.join(crate::DAEMON_PID_FILE),
     };
     // Ready is published under the shutdown transition mutex, so a first
     // signal that races this point either wins (no Ready, drain from

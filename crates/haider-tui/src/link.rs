@@ -972,6 +972,7 @@ pub fn request_body_for_features(
             interaction_mode:
                 haider_rpc::haider_protocol::session::SessionInteractionModeV1::Interactive,
             ssh_scope: None,
+            account_alias: None,
             resolve_provider: false,
             resolve_model: false,
             effort: None,

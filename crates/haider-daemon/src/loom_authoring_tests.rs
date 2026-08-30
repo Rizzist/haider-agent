@@ -85,6 +85,7 @@ fn metadata() -> SessionMetadataV1 {
     SessionMetadataV1 {
         cwd: "/workspace".into(),
         provider: "fake".into(),
+        account_alias: None,
         model: "fake-model".into(),
         max_tokens: 4_096,
         system_prompt_version: Some("test-system".into()),

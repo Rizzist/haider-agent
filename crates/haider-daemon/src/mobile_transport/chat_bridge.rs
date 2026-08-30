@@ -159,6 +159,7 @@ impl DaemonMobileChatBridge {
                 cache_policy: None,
                 interaction_mode: SessionInteractionModeV1::Interactive,
                 ssh_scope: None,
+                account_alias: None,
                 resolve_provider: false,
                 resolve_model: false,
                 effort: None,

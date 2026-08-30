@@ -437,9 +437,8 @@ pub struct HeadlessSessionConfig {
     pub effort: Option<String>,
     /// `Some(true)` selects fast; `Some(false)` durably selects normal.
     pub fast: Option<bool>,
-    /// Reserved for a future per-session account selector. Current daemons
-    /// reject this before connecting and direct callers to a provider/model
-    /// selector, which is the implemented headless routing control.
+    /// Exact account alias for this session. When no model is supplied, the
+    /// daemon atomically selects this account's provider default.
     pub account: Option<String>,
     /// Launch-time model visibility for saved SSH profiles. `None` omits the
     /// additive field and therefore means the daemon's `All` default.
@@ -458,8 +457,32 @@ pub enum HeadlessEvent {
     /// One fully applied durable envelope. Duplicates and gap-crossing frames
     /// are never emitted.
     Envelope(Box<RawEnvelope>),
+    /// The run's one durable terminal envelope plus its stable automation
+    /// discriminator. This replaces, rather than duplicates, the ordinary
+    /// envelope event at the same cursor.
+    Terminal(HeadlessTerminalEvent),
     /// Observable fail-closed decision for a permission-gated effect.
     PermissionDenied(HeadlessPermissionDenial),
+}
+
+/// Stable terminal vocabulary for attached automation runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeadlessTerminalKind {
+    Success,
+    Failure,
+    Cancellation,
+    Timeout,
+    ProviderError,
+}
+
+/// One typed terminal carrying the original durable cursor and payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeadlessTerminalEvent {
+    pub envelope: Box<RawEnvelope>,
+    pub kind: HeadlessTerminalKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }
 
 /// Delivery/retention policy for a headless output adapter.
@@ -1576,6 +1599,10 @@ impl HeadlessEventOutput {
         }
     }
 
+    fn retain_envelope(&mut self, envelope: &RawEnvelope) {
+        self.ledger.record(envelope);
+    }
+
     fn finish(
         self,
         run_id: RunId,
@@ -1599,6 +1626,7 @@ struct HeadlessReducer {
     pending_run_failure: Option<(u64, HeadlessRunFailure)>,
     blocking_presentation: Option<ErrorPresentation>,
     terminal: Option<NaturalTerminal>,
+    terminal_envelope: Option<RawEnvelope>,
     menu_resolutions: BTreeMap<String, DurableMenuResolution>,
     cancel_observed: bool,
     actions: VecDeque<ReducerAction>,
@@ -1623,6 +1651,7 @@ impl HeadlessReducer {
             pending_run_failure: None,
             blocking_presentation: None,
             terminal: None,
+            terminal_envelope: None,
             menu_resolutions: BTreeMap::new(),
             cancel_observed: false,
             actions: VecDeque::new(),
@@ -1726,6 +1755,7 @@ impl HeadlessReducer {
             _ => false,
         };
         let mut denial_to_emit = None;
+        let mut is_terminal_envelope = false;
         if correlated
             && reduce_core_payload
             && let Ok(payload) = EventPayload::deserialize(&envelope.payload)
@@ -1781,7 +1811,9 @@ impl HeadlessReducer {
                         },
                     ));
                 }
-                EventPayload::RunState(state) => self.reduce_run_state(state, envelope.seq),
+                EventPayload::RunState(state) => {
+                    is_terminal_envelope = self.reduce_run_state(state, envelope.seq);
+                }
                 EventPayload::MenuOpened(menu) => match menu.kind {
                     MenuKind::Permission { effect_summary } => {
                         let selected =
@@ -1837,14 +1869,19 @@ impl HeadlessReducer {
                 _ => {}
             }
         }
-        self.output.emit_envelope(envelope, correlated);
+        if is_terminal_envelope {
+            self.output.retain_envelope(&envelope);
+            self.terminal_envelope = Some(envelope);
+        } else {
+            self.output.emit_envelope(envelope, correlated);
+        }
         if let Some(denial) = denial_to_emit {
             self.emit(HeadlessEvent::PermissionDenied(denial));
         }
         ApplyStatus::Applied
     }
 
-    fn reduce_run_state(&mut self, state: RunState, seq: u64) {
+    fn reduce_run_state(&mut self, state: RunState, seq: u64) -> bool {
         match state {
             RunState::Done => {
                 self.terminal = Some(NaturalTerminal {
@@ -1852,6 +1889,7 @@ impl HeadlessReducer {
                     failure: None,
                     seq,
                 });
+                true
             }
             RunState::Cancelled => {
                 self.cancel_observed = true;
@@ -1860,6 +1898,7 @@ impl HeadlessReducer {
                     failure: None,
                     seq,
                 });
+                true
             }
             RunState::Errored => {
                 let failure = self
@@ -1878,14 +1917,23 @@ impl HeadlessReducer {
                     failure: Some(failure),
                     seq,
                 });
+                true
             }
-            RunState::InputRequired { .. } => self
-                .actions
-                .push_back(ReducerAction::Block(HeadlessBlockingReason::InputRequired)),
-            RunState::EffectOutcomeUnknown => self.actions.push_back(ReducerAction::Block(
-                HeadlessBlockingReason::EffectOutcomeUnknown,
-            )),
-            RunState::Cancelling => self.cancel_observed = true,
+            RunState::InputRequired { .. } => {
+                self.actions
+                    .push_back(ReducerAction::Block(HeadlessBlockingReason::InputRequired));
+                false
+            }
+            RunState::EffectOutcomeUnknown => {
+                self.actions.push_back(ReducerAction::Block(
+                    HeadlessBlockingReason::EffectOutcomeUnknown,
+                ));
+                false
+            }
+            RunState::Cancelling => {
+                self.cancel_observed = true;
+                false
+            }
             RunState::Queued
             | RunState::Thinking
             | RunState::Streaming
@@ -1897,7 +1945,7 @@ impl HeadlessReducer {
             | RunState::PermissionRequired { .. }
             | RunState::Compacting
             | RunState::Verifying { .. }
-            | RunState::Concluding => {}
+            | RunState::Concluding => false,
         }
     }
 }
@@ -2589,6 +2637,10 @@ async fn run_headless_inner(
         cache_policy: None,
         interaction_mode: SessionInteractionModeV1::Autonomous,
         ssh_scope: session_config.ssh_scope.clone(),
+        account_alias: session_config
+            .account
+            .as_deref()
+            .map(haider_rpc::haider_protocol::ids::CredentialAlias::new),
         resolve_provider,
         resolve_model,
         effort: session_config.effort.clone(),
@@ -2624,6 +2676,7 @@ async fn run_headless_inner(
                         }
                         if (!resolve_provider && metadata.provider != create_provider)
                             || (!resolve_model && metadata.model != create_model)
+                            || metadata.account_alias != session_config.account
                             || metadata.effort != session_config.effort
                             || metadata.fast != session_config.fast.unwrap_or(false)
                         {
@@ -3358,13 +3411,9 @@ fn normalize_session_config_features(
     config: &HeadlessSessionConfig,
 ) -> Result<(), HeadlessRunError> {
     if config.account.is_some() {
-        return Err(HeadlessRunError::Bootstrap {
-            stage: "session config",
-            code: haider_rpc::ERROR_CODE_INVALID_ARGUMENT,
-            message: "per-session account selection is not implemented; use `--model provider/model` to select the provider/model pair for this run"
-                .into(),
-            retryable: false,
-        });
+        options
+            .required_features
+            .insert(haider_rpc::FEATURE_SESSION_ACCOUNT_SELECT_V1.to_owned());
     }
     if config.model.is_some() || config.effort.is_some() || config.fast.is_some() {
         options
@@ -4392,13 +4441,13 @@ fn finalize(
         permission_denials,
         blocking_presentation,
         terminal,
+        terminal_envelope,
         background_tasks,
         event_count,
         budget_exhausted,
-        output,
+        mut output,
         ..
     } = reducer;
-    let events = output.finish(run_id.clone(), event_count)?;
     let (outcome, failure, terminal_seq) = match forced {
         Some(ForcedOutcome::Timeout) => (
             HeadlessOutcome::Timeout,
@@ -4442,6 +4491,18 @@ fn finalize(
             |terminal| (terminal.outcome, terminal.failure, Some(terminal.seq)),
         ),
     };
+    if let Some(envelope) = terminal_envelope {
+        let kind = terminal_kind(outcome, failure.as_ref());
+        let error_code = failure
+            .as_ref()
+            .map(|failure| failure.code.as_str().to_owned());
+        output.emit(HeadlessEvent::Terminal(HeadlessTerminalEvent {
+            envelope: Box::new(envelope),
+            kind,
+            error_code,
+        }));
+    }
+    let events = output.finish(run_id.clone(), event_count)?;
     let background_tasks_running = background_tasks
         .iter()
         .filter(|(_, (_, running))| *running)
@@ -4467,6 +4528,29 @@ fn finalize(
         terminal_seq,
         background_tasks_running,
     })
+}
+
+fn terminal_kind(
+    outcome: HeadlessOutcome,
+    failure: Option<&HeadlessRunFailure>,
+) -> HeadlessTerminalKind {
+    match outcome {
+        HeadlessOutcome::Done => HeadlessTerminalKind::Success,
+        HeadlessOutcome::Cancelled => HeadlessTerminalKind::Cancellation,
+        HeadlessOutcome::Timeout => HeadlessTerminalKind::Timeout,
+        HeadlessOutcome::Errored | HeadlessOutcome::InputRequired | HeadlessOutcome::Started => {
+            if matches!(
+                failure.map(|failure| &failure.code),
+                Some(HeadlessFailureCode::Run(
+                    ErrorCode::ProviderError | ErrorCode::ProviderTimeout
+                ))
+            ) {
+                HeadlessTerminalKind::ProviderError
+            } else {
+                HeadlessTerminalKind::Failure
+            }
+        }
+    }
 }
 
 fn client_error(

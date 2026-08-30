@@ -88,6 +88,7 @@ fn digest(
         metadata: Some(SessionMetadataV1 {
             cwd: format!("/tmp/{id}"),
             provider: "openai".into(),
+            account_alias: None,
             model: "gpt-observe".into(),
             max_tokens: 4096,
             system_prompt_version: Some("v1".into()),
@@ -287,6 +288,10 @@ fn observe_json_schemas_are_goldened_and_secret_free() {
         daemon: DaemonView {
             version: "0.0.57".into(),
             generation: 9,
+            pid: Some(4242),
+            socket_path: "/tmp/haider-runtime/profile-a/h.sock".into(),
+            pid_file_path: Some("/tmp/haider-runtime/profile-a/haiderd.pid".into()),
+            ready: true,
         },
         update: UpdateView {
             status: "available",

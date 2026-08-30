@@ -292,6 +292,16 @@ async fn one_shot_status_is_exactly_one_scalar_rpc() {
                     source: "codex".into(),
                     email: Some("person@example.invalid".into()),
                 }],
+                daemon_pid: Some(42),
+                socket_path: Some(server_profile.endpoint_path.display().to_string()),
+                pid_file_path: Some(
+                    server_profile
+                        .runtime_dir
+                        .join("haiderd.pid")
+                        .display()
+                        .to_string(),
+                ),
+                ready: true,
             },
         )
         .await;
@@ -308,6 +318,12 @@ async fn one_shot_status_is_exactly_one_scalar_rpc() {
     let status = client.status_snapshot().await.expect("status snapshot");
     assert_eq!(status.session_count, 365);
     assert!(status.active_account.is_none());
+    assert_eq!(status.daemon_pid, Some(42));
+    assert_eq!(
+        status.socket_path.as_deref(),
+        Some(profile.endpoint_path.to_string_lossy().as_ref())
+    );
+    assert!(status.ready);
     assert_eq!(status.adoption_available.len(), 1);
     assert_close_effective(client.close());
     server.await.expect("status peer");
