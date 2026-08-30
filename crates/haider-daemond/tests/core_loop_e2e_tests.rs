@@ -980,14 +980,14 @@ async fn process_exec_normal_completion_leaves_outliving_descendant_alone() {
         "outliving-pipe-turn",
         session,
         generation,
-        "drain output after the leader exits",
+        "close capture when the leader exits",
     )
     .await;
     let events = events_until_terminal(&mut client, &run).await;
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     assert!(
-        !workspace.join("outliving-child-ran.log").exists(),
-        "foreground process_exec leaked a descendant after its leader exited"
+        workspace.join("outliving-child-ran.log").exists(),
+        "foreground process_exec swept a descendant after its leader exited"
     );
     assert_eq!(stdout_bytes(&events), b"leader");
     assert!(continuation_seen(&events, "continued-outliving-pipe"));

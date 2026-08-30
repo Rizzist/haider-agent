@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::env;
+use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -982,6 +983,8 @@ struct SupervisorCompletion {
     escalation_note: Option<String>,
 }
 
+type LeaderExitObservation = Pin<Box<dyn Future<Output = ToolResult<()>> + Send>>;
+
 #[derive(Debug)]
 pub(crate) enum Captured {
     Chunk(OutputStream, Vec<u8>),
@@ -1069,6 +1072,14 @@ impl TranscriptSpill {
 }
 
 async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
+    let exit_observation = Box::pin(observe_process_leader_exit(supervisor.pid));
+    supervise_process_with_exit_observation(supervisor, exit_observation).await
+}
+
+async fn supervise_process_with_exit_observation(
+    supervisor: Supervisor,
+    mut exit_observation: LeaderExitObservation,
+) -> SupervisorCompletion {
     let Supervisor {
         mut child,
         stdout,
@@ -1134,10 +1145,10 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
     let mut lifecycle_events = Vec::new();
     let mut group_leaked = false;
     let mut group_termination_started = false;
+    let mut natural_completion_won = false;
     let mut limit_reached = None;
     let mut wall_deadline = Box::pin(sleep(bounds.wall_timeout));
     let mut wall_deadline_open = true;
-    let mut exit_observation = Box::pin(observe_process_leader_exit(pid));
     #[cfg(windows)]
     let mut first_output_traced = false;
 
@@ -1374,11 +1385,28 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
                     }
                     Err(error) => {
                         fatal.get_or_insert(error);
+                        group_termination_started = true;
+                        begin_group_termination(
+                            group,
+                            pid,
+                            false,
+                            bounds.kill_grace,
+                            &mut kill_deadline,
+                            &mut fatal,
+                            &mut escalation_notes,
+                            &mut lifecycle_events,
+                        );
                         false
                     }
                 };
                 if kill_deadline.is_none() {
                     if !group_termination_started {
+                        // `tokio::select!` is biased toward cancellation. If
+                        // the leader-exit arm still wins, natural completion is
+                        // the ownership boundary: later cancellation (including
+                        // during CAS ingestion) cannot retroactively label an
+                        // already-detached descendant tree as Cancelled.
+                        natural_completion_won = true;
                         // Close direct process_control before reaping releases
                         // the Unix PGID. A control already inside the gate
                         // completes while the zombie still pins this exact
@@ -1508,7 +1536,9 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
         }
     }
 
-    cancelled |= *cancel.borrow();
+    if !natural_completion_won {
+        cancelled |= *cancel.borrow();
+    }
     if group_leaked {
         leaked.store(true, Ordering::Release);
     } else {
@@ -1525,9 +1555,13 @@ async fn supervise_process(supervisor: Supervisor) -> SupervisorCompletion {
     } else {
         Ok(None)
     };
-    // Cancellation is sticky through artifact ingestion: a request arriving
-    // while put_file is blocked owns both its success and failure arms.
-    cancelled |= *cancel.borrow();
+    // Cancellation remains sticky through artifact ingestion only while a
+    // teardown path won before leader completion. Once natural completion won
+    // and group authority detached, a late request cannot truthfully produce a
+    // Cancelled result without also sweeping the now-unmanaged descendants.
+    if !natural_completion_won {
+        cancelled |= *cancel.borrow();
+    }
     let artifact = match artifact_result {
         Ok(artifact) => artifact,
         Err(error) => {
@@ -1760,7 +1794,7 @@ pub(crate) fn signal_platform_group_for_sweep(
         // Darwin reports EPERM when a group contains only the caller's zombie
         // child. Since that zombie pins this exact PGID, no live member of the
         // original group remains signalable in this case.
-        Err(error) if leader_is_zombie && haider_platform::process_error_is_permission(&error) => {
+        Err(error) if sweep_permission_means_only_zombie(pid, leader_is_zombie, &error) => {
             Ok(false)
         }
         Err(error) => Err(ToolError::Runtime {
@@ -1769,6 +1803,32 @@ pub(crate) fn signal_platform_group_for_sweep(
                 pid.as_raw_nonzero()
             ),
         }),
+    }
+}
+
+fn sweep_permission_means_only_zombie(
+    pid: Pid,
+    leader_is_zombie: bool,
+    error: &std::io::Error,
+) -> bool {
+    if !haider_platform::process_error_is_permission(error) {
+        return false;
+    }
+    if leader_is_zombie {
+        return true;
+    }
+    // Darwin can report EPERM for a group containing only our unreaped zombie
+    // before the independently delivered kqueue notification reaches this
+    // supervisor. Confirm waitable state synchronously; EPERM for a live group
+    // remains an error and no other platform widens its permission handling.
+    #[cfg(target_os = "macos")]
+    {
+        haider_platform::process_leader_exited(pid).unwrap_or(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        false
     }
 }
 
@@ -1804,7 +1864,7 @@ fn platform_group_exists_for_sweep(
         // Darwin reports EPERM for a group containing only our zombie child.
         // The unreaped leader pins this exact PGID, so no live member of the
         // original group remains in that case.
-        Err(error) if leader_is_zombie && haider_platform::process_error_is_permission(&error) => {
+        Err(error) if sweep_permission_means_only_zombie(pid, leader_is_zombie, &error) => {
             Ok(false)
         }
         Err(error) => Err(ToolError::Runtime {
@@ -2068,6 +2128,140 @@ pub(crate) fn process_arguments(
         "cwd": cwd,
         "env_allowlist": env_allowlist,
     }))
+}
+
+#[cfg(test)]
+mod supervisor_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::process::Stdio;
+
+    #[derive(Debug, Default)]
+    struct NoopCas;
+
+    #[async_trait]
+    impl CasSink for NoopCas {
+        async fn put(&mut self, bytes: &[u8]) -> ToolResult<ArtifactRef> {
+            Ok(ArtifactRef::new(format!("blake3:{}", blake3::hash(bytes))))
+        }
+
+        async fn put_file(&mut self, path: &Path) -> ToolResult<ArtifactRef> {
+            let bytes = std::fs::read(path)
+                .map_err(|error| ToolError::cas(format!("read test artifact: {error}")))?;
+            self.put(&bytes).await
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct NoopOutput;
+
+    #[async_trait]
+    impl CommandOutputSink for NoopOutput {
+        async fn emit(&self, _call_id: &str, _delta: ItemDelta) -> ToolResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A kernel exit-observer error while the leader is live is a supervision
+    /// failure. It must enter the teardown ladder rather than the natural-exit
+    /// detach path advertised to the model.
+    #[cfg(unix)]
+    #[allow(clippy::expect_used)]
+    #[tokio::test]
+    async fn exit_observer_failure_sweeps_the_owned_process_group() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let descendant_started = workspace.path().join("observer-descendant-started.log");
+        let descendant_survived = workspace.path().join("observer-descendant-survived.log");
+        let mut command = shell_command(concat!(
+            "trap '' TERM; ",
+            "/usr/bin/perl -e '$SIG{TERM}=q(IGNORE); ",
+            "open $started, q(>), q(observer-descendant-started.log); ",
+            "print $started q(started); close $started; ",
+            "select undef, undef, undef, 0.3; ",
+            "open $survived, q(>), q(observer-descendant-survived.log); ",
+            "print $survived q(survived); close $survived; sleep 30' & ",
+            "while :; do :; done",
+        ));
+        command
+            .current_dir(workspace.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        haider_platform::configure_process_environment(&mut command);
+        haider_platform::configure_process_group(&mut command);
+        let mut child = command.spawn().expect("spawn supervised process");
+        let raw_pid = child.id().expect("child pid");
+        let group = haider_platform::register_process_group(raw_pid).expect("register group");
+        let pid = i32::try_from(raw_pid)
+            .ok()
+            .and_then(Pid::from_raw)
+            .expect("representable child pid");
+        let stdin = Arc::new(Mutex::new(child.stdin.take()));
+        let stdout = child.stdout.take().expect("stdout pipe");
+        let stderr = child.stderr.take().expect("stderr pipe");
+        let (_cancel_sender, cancel) = watch::channel(false);
+        let live = Arc::new(AtomicBool::new(true));
+        let leaked = Arc::new(AtomicBool::new(false));
+
+        let observer_started = descendant_started.clone();
+        let exit_observation: LeaderExitObservation = Box::pin(async move {
+            for _ in 0..200 {
+                if observer_started.exists() {
+                    return Err(ToolError::Runtime {
+                        message: "injected process-exit observer failure".into(),
+                    });
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err(ToolError::Runtime {
+                message: "descendant did not start before observer injection".into(),
+            })
+        });
+        let completion = supervise_process_with_exit_observation(
+            Supervisor {
+                child,
+                stdout,
+                stderr,
+                stdin,
+                pid,
+                group,
+                call_id: "observer-failure".into(),
+                effect: EffectId::new("effect-observer-failure"),
+                command_arg_digest: "blake3:test".into(),
+                workspace_revision: None,
+                cancel,
+                live: Arc::clone(&live),
+                leaked: Arc::clone(&leaked),
+                control_gate: Arc::new(StdMutex::new(())),
+                cas: Box::new(NoopCas),
+                output: Arc::new(NoopOutput),
+                bounds: ProcessBounds {
+                    kill_grace: Duration::from_millis(100),
+                    ..ProcessBounds::default()
+                },
+            },
+            exit_observation,
+        )
+        .await;
+
+        let error = completion
+            .result
+            .expect_err("observer failure remains typed");
+        assert!(error.to_string().contains("process-exit observer failure"));
+        assert!(!completion.leaked, "supervision failure leaked its group");
+        assert!(!leaked.load(Ordering::Acquire));
+        assert!(!live.load(Ordering::Acquire));
+        assert!(descendant_started.exists(), "owned descendant starts");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !descendant_survived.exists(),
+            "exit-observer failure detached instead of sweeping the group"
+        );
+        assert!(
+            !platform_group_exists(group, pid).expect("probe swept process group"),
+            "process group remains live after observer-failure teardown"
+        );
+    }
 }
 
 #[cfg(test)]

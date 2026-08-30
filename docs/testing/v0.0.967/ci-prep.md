@@ -3,38 +3,31 @@
 ## Gate results
 
 The repository guard passes with production unsafe count 188 and test unsafe
-count 15. The initial fail-without-fix characterization preceded that guard by
-mistake; every final verification phase restored the CI order. `git diff
---check`, conflict-marker inspection, and Rust 2024 formatting of every touched
-Rust file passed. There are no
-manifest, lockfile, workflow, contract-fixture, version, xtask, or baseline
-changes.
+count 15. `git diff --check`, conflict-marker inspection, and Rust 2024
+formatting of every touched Rust file pass. P1 has no manifest, lockfile,
+workflow, contract-fixture, version, xtask, or baseline change. JSON fixtures
+changed by the integrated base and all workflow YAML files parse successfully.
 
 The release-gate environment was used for every Cargo command; real-daemon
-fixtures and the final gates used temporary machine-user `HOME`/`USERPROFILE`
-roots and never set a nested `CARGO_HOME`. `df -m /` ran immediately before each
-Cargo command and never fell below the 700 MiB stop threshold; this continuation
-had roughly 40-56 GiB free. `cargo metadata --locked` passed, and `cargo tree -d
---locked` was reviewed; all duplicate major/version families predate this lane.
+fixtures use temporary machine-user `HOME`/`USERPROFILE` roots and never set a
+nested `CARGO_HOME`. `df -m /` preflights remained above 12 GiB free. `cargo
+metadata --locked` passed, and `cargo tree -d --locked` was reviewed; P1 changes
+no dependency edge.
 
 Verification results:
 
-- New end-to-end binary: the normal-completion descendant test passes in the
-  full binary and five additional direct repetitions; 9 tests pass and the
-  untouched class #80 child-settlement test remains red.
-- `haider-tools`: 76 library tests passed / 1 ignored, all 8 background-task
-  tests passed, all 27 process tests passed, and every other integration/doc
-  test passed.
-- `haider-daemon --lib`: 828 passed, 3 ignored; the brief's 826 pin had drifted.
-- `haider-daemond`: the required unfiltered suite fails only class #80. With
-  that one known red test filtered, every binary passes;
-  `ephemeral_liveness_tests` is 6/6 and `lifecycle_tests` is 37/37.
-- `haider-rpc`: all tests pass and the wire-golden frame count remains 180.
-- Prebuilt `haiderd` and `haider` are valid arm64 Mach-O files of 172 MiB and
-  96 MiB respectively; `haiderd` exceeds the 10 MiB guard.
-- The final post-repair workspace `cargo check --all-targets --locked` passes.
-- The final post-repair `cargo clippy --workspace --all-targets --locked -- -D
-  warnings` passes.
+- `haider-tools`: 215 passed / 1 ignored across the complete crate; its focused
+  background-task and process binaries are 8/8 and 28/28.
+- `haider-daemon --lib`: 833 passed / 3 ignored. W1 added five tests after the
+  brief's 828/3 correction was written.
+- `haider-daemond`: every binary passes (134 tests total), including the
+  unfiltered `core_loop_e2e_tests` at 10/10.
+- `haider-rpc`: 154 tests pass. The current wire fixture contains 182 frames:
+  180 is the frozen v0.0.966 prefix and K1 appends two frames.
+- `haider-cli --test status_discovery_smoke_tests`: 1/1 passes.
+- Prebuilt `haiderd` and `haider` are valid arm64 Mach-O files of 178,971,504
+  and 100,419,568 bytes respectively; `haiderd` exceeds the 10 MiB guard.
+- The workspace all-target `cargo check` and deny-warnings Clippy commands pass.
 
 The registry's referenced `$T/ci-prep.sh` is not present in this worktree and no
 `$T` value was supplied, so its applicable checks were run directly. A
@@ -44,30 +37,40 @@ list instead.
 
 ## Verify-until-SHIP
 
-1. Local verification iteration 1: `FIX`. The full tools suite exposed a
-   normal-exit race that lost an immediate four-byte output chunk; reader-start
-   acknowledgements and ready-read bias fixed that reproduction.
-2. Local verification iteration 2: `FIX`. The real-RPC outliving-child case
-   exposed the remaining same-scheduler-turn readiness race, losing `leader`.
-   A scheduler yield before stop—without a timer—fixed it; the exact test then
-   passed once through Cargo and five more direct repetitions.
-3. Requested verifier iteration 1: `FIX`. It identified that the first
-   normal-completion implementation could still sweep when Windows ownership
-   detachment failed.
-4. Requested verifier iteration 2: `FIX`. Excluding the unrelated class #80
-   failure did not change that process-contract finding.
-5. Focused verifier diagnostics isolated the issue: the ordinary detachment,
-   cancellation/timeout/`task_kill`, and model-manual clauses each returned
-   `SHIP`; only the normal-detach-error fallback returned `FIX`.
-6. The fallback now abandons the exact fail-closed Windows Job authority and
-   reports the fault, rather than invoking teardown.
-7. Requested final combined verifier iteration: `SHIP`. It reviewed the
-   post-repair, measured diff after workspace check and deny-warnings Clippy and
-   answered the exact three-clause contract question with `SHIP`.
-
-These verdicts assess the requested process contract. They do not override the
-release `NO_SHIP` caused by the one untouched production failure the suite
-exposes.
+1. Integration verification iteration 1: `FIX`. The rebased real-RPC test name
+   and comment described P1, but its body still asserted the old sweep contract;
+   the body was corrected. A direct broker-teardown descendant test was also
+   missing and was added.
+2. Integration verification iteration 2: `FIX`. Focused process tests exposed
+   paused-Tokio-time races with real child/kernel progress. The affected natural
+   completion and cancellation tests moved to real time, and Darwin's
+   zombie-only `EPERM` interpretation gained synchronous waitability proof.
+3. Integration verification iteration 3: `FIX`. The complete crate run found
+   two remaining paused cancellation/grace tests could auto-fire the unrelated
+   60-second wall bound and start a second sweep. Both now use bounded real time;
+   the two focused cases then passed 20/20 each and the full crate passed.
+4. Independent verifier iteration 1: `FIX`. It found that cancellation during
+   post-exit CAS ingestion could retroactively label an already-detached command
+   `Cancelled`, even though an unmanaged descendant could survive. Natural
+   leader completion now wins the classification boundary; a late cancel cannot
+   mask successful completion or a real CAS failure. A descendant + gated-CAS
+   regression pins the invariant.
+5. Independent verifier iteration 2: `FIX`. An injected exit-observer failure
+   could enter the normal-completion detach path while its leader and
+   descendants were still live. Observer failure now starts the same supervised
+   teardown ladder as other supervision faults, and a direct injected-failure
+   test proves the owned group is gone.
+6. CI-prep iteration: `FIX`. The final deny-warnings Clippy pass found the new
+   test's `expect` calls lacked the repository's test-only allowance. The
+   allowance is scoped to that one `#[cfg(test)]` function; the repeated
+   workspace Clippy pass is clean.
+7. Independent verifier iteration 3: `FIX`. It found the same exit-observer
+   error bug in the background supervisor: the error path could await a live
+   leader indefinitely and then detach because the pre-P1 unconditional sweep
+   had masked that branch. Background observer failure now enters teardown,
+   with its own injected-failure, TERM-ignoring descendant regression.
+8. Independent verifier iteration 4: `SHIP` after re-auditing the exact final
+   foreground/background supervision tree and the complete rerun evidence.
 
 ## §A–§D class audit
 
@@ -93,7 +96,7 @@ exposes.
 | 15 | checked | No `.last()` sweep or affected iterator. |
 | 16 | checked | No manual-range diagnostic. |
 | 17 | fixed | The process-control gate covers only the liveness/signal seam and is dropped before stdin awaits. |
-| 18 | checked | Test-only `expect` allow is singular; production remains unchanged. |
+| 18 | fixed | Observer-failure `expect` allowances are scoped to the foreground test function and background `#[cfg(test)]` module; production remains unchanged. |
 | 19 | checked | `rustfmt --edition 2024 --check` passes on every touched Rust file. |
 | 20 | checked | Existing tests were deliberately updated; no test-count baseline was changed. |
 | 21 | checked | Every test command used `RUST_MIN_STACK=8388608`. |
@@ -108,7 +111,7 @@ exposes.
 | 30 | fixed | The known infinite-settlement reproduction runs in an isolated test process with an 8 s kill boundary. |
 | 31 | checked | No Android change. |
 | 32 | checked | No release action. |
-| 33 | checked | Test-runner behavior is local to the new binary. |
+| 33 | fixed | Two real-process tests no longer pause Tokio time after E1 moved exit observation to an external kernel-notification thread. |
 | 34 | checked | No dependency module or Cargo feature introduced. |
 | 35 | checked | No ambiguous trait-method call. |
 | 36 | checked | No temporary reference is borrowed through `?`. |
@@ -119,7 +122,7 @@ exposes.
 | 41 | checked | Shared real-daemon support owns the platform endpoint; local macOS suite connects successfully. |
 | 42 | checked | No launch latency assertion; all waits are behavioral deadlines. |
 | 43 | checked | Real process spawning is exercised, but no descriptor-sweep implementation changed. |
-| 44 | gap | Local macOS IPC passed inside this lane; unsandboxed and other-kernel reruns belong to orchestration/CI. |
+| 44 | checked | Local macOS IPC is available in this sandbox and every required daemon binary passed; other kernels remain CI coverage. |
 | 45 | fixed | The Windows Job limit call was refactored under the smallest allowed function with its SAFETY comment; unsafe count stayed 188/15. |
 | 46 | checked | Shared daemon fixture creates and validates its own temporary runtime root. |
 | 47 | fixed | A real ignored `target/` containing a 1 TiB sparse artifact is exercised below the provider boundary. |
@@ -135,11 +138,11 @@ exposes.
 | 57 | checked | No UI pin/layout change. |
 | 58 | checked | No result-storage threshold change. |
 | 59 | checked | No roster rendering change. |
-| 60 | gap | Windows process/connection semantics require the Windows CI kernel. |
+| 60 | checked | No connection-liveness seam changed; the Windows Job ownership changes were audited separately from IPC connection retirement. |
 | 61 | checked | Every claimed behavior has an assertion; no unasserted benchmark guarantee. |
 | 62 | checked | The public process API addition did not change an existing return type; workspace call sites compile. |
 | 63 | checked | No platform archive tool. |
-| 64 | fixed | ENOSPC-truncated outputs were identified with `file`, removed exactly, rebuilt, and `haiderd` is now a valid 172 MiB Mach-O. |
+| 64 | checked | `file` identifies both prebuilt siblings as arm64 Mach-O; `haiderd` is 178,971,504 bytes. |
 | 65 | checked | Assertions use typed semantic outcomes, not raw errnos. |
 | 66 | checked | No STT surface. |
 | 67 | checked | `haiderd` and `haider` were prebuilt and every Cargo suite used the sibling-prebuilt flag. |
@@ -147,7 +150,7 @@ exposes.
 | 69 | checked | No Windows executable discovery. |
 | 70 | checked | No workflow trigger or dispatch. |
 | 71 | fixed | New tests drive a real daemon, IPC, tool execution, journal, projection, and client-visible terminal result. |
-| 72 | gap | The owner-mandated environment disables discovery; this suite does not claim the native credential path. |
+| 72 | checked | The owner-mandated environment disables discovery and P1 does not touch credential discovery; no claim is made about that separate path. |
 | 73 | checked | No fixed-window source scan. |
 | 74 | fixed | Every daemon/Cargo process uses one temporary machine-user home, not the developer home. |
 | 75 | checked | No actor shutdown implementation change. |
@@ -155,7 +158,7 @@ exposes.
 | 77 | fixed | The initial characterization-order miss was corrected; the guard ran first in final CI-prep and exited 0. |
 | 78 | checked | No release/tag dispatch. |
 
-## §D addition from lane 967-A2
+## §D additions during 967 integration
 
 - **#79 process completion terminates an outliving background descendant** —
   corrected by the lane 967-P1 owner decision. Natural leader completion now
@@ -165,15 +168,13 @@ exposes.
   `process_exec_normal_completion_leaves_outliving_descendant_alone` pin covers
   the real RPC path. Durable long-running output belongs to `background=true`.
 
-- **#80 terminal run completion coupled to aggregate session Idle** — a child run
-  can reach `Done` while another queued child run makes the session active.
-  `mirror_until_child_terminal` nevertheless requires a later aggregate `Idle`
-  fence before releasing the already-terminal report, so the parent waits
-  forever. Check: queue a second child turn through real RPC while run one is
-  active; require run one `Done` and parent continuation. The new
-  `terminal_child_run_without_session_idle_still_releases_parent` test fails in
-  a bounded isolated process. Production repair belongs to the concurrent
-  child-lifecycle lane; this lane does not edit `delegation.rs`.
+- **#80 terminal run completion coupled to aggregate session Idle** — the
+  earlier P1 `NO_SHIP` attribution was wrong. Lane C1 (`1cac39b`) proved the
+  original hang was a test client waiting through a correlated capability
+  error, then fixed the delegated-child identity defect exposed by the corrected
+  setup. On this merged base,
+  `terminal_child_run_without_session_idle_still_releases_parent` and the full
+  10/10 core-loop binary pass. P1 does not duplicate C1's repair.
 
 - **#81 normal-exit output stop outruns reader readiness** — closing foreground
   capture as soon as the leader exits can stop a newly spawned output-reader
@@ -202,3 +203,35 @@ exposes.
   process exit; never silently enter TERM/grace/KILL. The verifier's first two
   combined iterations found this class, and its focused clauses settled the
   repair boundary.
+
+- **#84 paused Tokio time races real OS process progress** — after E1 moved
+  process-exit observation to a kernel-notification thread, a test runtime with
+  `start_paused` can auto-advance a foreground command's 60-second Tokio wall
+  deadline before the independently scheduled OS child or notification thread
+  makes progress. The symptom is a false timeout and teardown sweep in a test
+  that is meant to exercise natural completion. Real-process integration tests
+  now use real time; paused time remains only where the test deliberately drives
+  the wall bound. On Darwin, the sweep probe also confirms the
+  leader's waitable state synchronously before interpreting `EPERM` as a
+  zombie-only process group; `EPERM` for a live group remains an error.
+
+- **#85 late cancellation retroactively relabels detached ownership** — a
+  foreground leader can complete naturally and detach its process-group
+  authority before output artifact ingestion finishes. If a later cancel or
+  broker close is allowed to overwrite the terminal classification, the result
+  becomes `Cancelled` even though an unmanaged descendant correctly survives;
+  that makes a cancellation-shaped sandbox escape. Natural leader exit is now
+  an explicit winning boundary: cancellation remains sticky only when teardown
+  won first. The gated-CAS regression requires successful completion, no sweep,
+  and descendant survival; its failure arm requires the real CAS error rather
+  than a masked cancellation.
+
+- **#86 exit-observer failure mistaken for natural leader completion** — an
+  error from the kernel exit observer is not evidence that the leader exited.
+  Falling through a foreground or background natural-completion branch can
+  detach a still-live group; the background form can first hang forever while
+  awaiting that live leader. Both error arms now begin the owned TERM → grace →
+  KILL ladder before completion handling. Separate injected-observer-failure
+  tests start TERM-ignoring descendants and require the typed observer error,
+  no survival marker, and no remaining process group; the foreground form also
+  pins its leaked/live flags.
