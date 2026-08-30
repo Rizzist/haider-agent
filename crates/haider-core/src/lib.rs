@@ -84,7 +84,9 @@ pub use prompt_history::{
     USER_COMMAND_OUTPUT_PREVIEW_BYTES, task_event_notice,
 };
 pub use recovery::{RecoveryReport, effect_recovery_evidence, reconcile_dispatched_effects};
-pub use sqlite_store::{AppendGroupBatch, ProfileStoreFault, SqliteStoreHandle};
+pub use sqlite_store::{
+    AppendGroupBatch, CommitGroupBatch, CommitGroupOutcome, ProfileStoreFault, SqliteStoreHandle,
+};
 
 use async_trait::async_trait;
 use haider_protocol::branch::BranchDescriptor;
@@ -107,7 +109,10 @@ pub struct CommittedRange {
 
 /// One provider-view CAS publication and the journal facts for the same
 /// request attempt. Durable stores commit the view index and envelopes in one
-/// database transaction after the CAS full fence.
+/// database transaction after the CAS ordering barrier. If that transaction
+/// survives power loss, the barrier guarantees its referenced CAS blocks were
+/// persisted first; the barrier does not promise either phase survives merely
+/// because the operation returned.
 pub struct ProviderViewAppendRequest {
     pub session_id: SessionId,
     pub ledger: ProviderViewLedgerV1,

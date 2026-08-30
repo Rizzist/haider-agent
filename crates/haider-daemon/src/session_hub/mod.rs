@@ -107,25 +107,26 @@ use haider_core::{
     BranchCreateCommand, BranchCreateOutcome, CacheDiagnosticKey, CancelledTurn,
     CheckpointCommitCommand, CheckpointCommitOutcome, ChildGraphAttachCommand,
     ChildGraphAttachOutcome, ChildTemplateCacheEntry, ChildTemplateObservation,
-    ChildTemplateObservationCommand, ComputerEvidenceCommand, ComputerEvidenceOutcome,
-    CreatedBranch, CreatedSession, CreatedSessionFork, GraphAbandonCommand, GraphAbandonOutcome,
-    GraphEvidenceCommand, GraphEvidenceOutcome, GraphFinalizationCommand, GraphFinalizationOutcome,
-    GraphInspectResult, GraphPinCommand, GraphPinOutcome, GraphRunSetOpenCommand,
-    GraphRunSetOpenOutcome, GraphSwitchCommand, GraphSwitchOutcome, HarnessHandle,
-    MenuResolutionCommand, MenuResolutionOutcome, OpenedGraphRunSet, PinnedGraph,
-    ProcessSignalCommand, ProcessSignalOutcome, ProfileStoreFault, PromptHistoryCache,
-    ProviderViewAppendOutcome, ProviderViewAppendRequest, QueueConsumeCommand, QueueConsumeOutcome,
-    QueuePromoteCommand, QueuePromoteOutcome, QueueRemoveCommand, QueueRemoveOutcome,
-    QueueSnapshot, RenamedSession, RunRetryCommand, RunRetryOutcome, SeenSession,
-    SelectedAgentType, SelectedEffort, SelectedFast, SelectedModel, SessionCreateCommand,
-    SessionCreateOutcome, SessionForkCommand, SessionForkOutcome, SessionMetaforkCommit,
-    SessionProjectionCheckpoint, SessionPromptForkCommand, SessionRenameCommand,
-    SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome, SessionSelectAgentTypeCommand,
-    SessionSelectAgentTypeOutcome, SessionSelectEffortCommand, SessionSelectEffortOutcome,
-    SessionSelectFastCommand, SessionSelectFastOutcome, SessionSelectModelCommand,
-    SessionSelectModelOutcome, ShellExecAcceptCommand, ShellExecAcceptOutcome, SqliteStoreHandle,
-    StoreHandle, SwitchedGraph, TurnAcceptCommand, TurnAcceptOutcome, TurnAdmissionDisposition,
-    TurnCancelCommand, TurnCancelOutcome, TurnCancellationStatus,
+    ChildTemplateObservationCommand, CommitGroupBatch, CommitGroupOutcome, ComputerEvidenceCommand,
+    ComputerEvidenceOutcome, CreatedBranch, CreatedSession, CreatedSessionFork,
+    GraphAbandonCommand, GraphAbandonOutcome, GraphEvidenceCommand, GraphEvidenceOutcome,
+    GraphFinalizationCommand, GraphFinalizationOutcome, GraphInspectResult, GraphPinCommand,
+    GraphPinOutcome, GraphRunSetOpenCommand, GraphRunSetOpenOutcome, GraphSwitchCommand,
+    GraphSwitchOutcome, HarnessHandle, MenuResolutionCommand, MenuResolutionOutcome,
+    OpenedGraphRunSet, PinnedGraph, ProcessSignalCommand, ProcessSignalOutcome, ProfileStoreFault,
+    PromptHistoryCache, ProviderViewAppendOutcome, ProviderViewAppendRequest, QueueConsumeCommand,
+    QueueConsumeOutcome, QueuePromoteCommand, QueuePromoteOutcome, QueueRemoveCommand,
+    QueueRemoveOutcome, QueueSnapshot, RenamedSession, RunRetryCommand, RunRetryOutcome,
+    SeenSession, SelectedAgentType, SelectedEffort, SelectedFast, SelectedModel,
+    SessionCreateCommand, SessionCreateOutcome, SessionForkCommand, SessionForkOutcome,
+    SessionMetaforkCommit, SessionProjectionCheckpoint, SessionPromptForkCommand,
+    SessionRenameCommand, SessionRenameOutcome, SessionSeenCommand, SessionSeenOutcome,
+    SessionSelectAgentTypeCommand, SessionSelectAgentTypeOutcome, SessionSelectEffortCommand,
+    SessionSelectEffortOutcome, SessionSelectFastCommand, SessionSelectFastOutcome,
+    SessionSelectModelCommand, SessionSelectModelOutcome, ShellExecAcceptCommand,
+    ShellExecAcceptOutcome, SqliteStoreHandle, StoreHandle, SwitchedGraph, TurnAcceptCommand,
+    TurnAcceptOutcome, TurnAdmissionDisposition, TurnCancelCommand, TurnCancelOutcome,
+    TurnCancellationStatus,
 };
 use haider_protocol::EventPayload;
 use haider_protocol::agent::AgentManifest;
@@ -1211,12 +1212,89 @@ enum AppendCommitKind {
     Worker,
 }
 
+enum AppendCommitCompletion {
+    Append(oneshot::Sender<Result<Vec<RawEnvelope>, HaiderError>>),
+    CreateSession(oneshot::Sender<Result<SessionCreateOutcome, HaiderError>>),
+    AcceptTurn(oneshot::Sender<Result<TurnAcceptOutcome, HaiderError>>),
+    HookAcks(oneshot::Sender<Result<(), HaiderError>>),
+}
+
+struct PendingCommitCompletion {
+    completed: AppendCommitCompletion,
+    _byte_permit: OwnedSemaphorePermit,
+}
+
+impl PendingCommitCompletion {
+    fn send(self, outcome: Result<CommitGroupOutcome, HaiderError>) {
+        match (self.completed, outcome) {
+            (AppendCommitCompletion::Append(completed), Ok(CommitGroupOutcome::Append(value))) => {
+                let _ = completed.send(Ok(value));
+            }
+            (
+                AppendCommitCompletion::CreateSession(completed),
+                Ok(CommitGroupOutcome::CreateSession(value)),
+            ) => {
+                let _ = completed.send(Ok(value));
+            }
+            (
+                AppendCommitCompletion::AcceptTurn(completed),
+                Ok(CommitGroupOutcome::AcceptTurn(value)),
+            ) => {
+                let _ = completed.send(Ok(value));
+            }
+            (AppendCommitCompletion::HookAcks(completed), Ok(CommitGroupOutcome::HookAcks)) => {
+                let _ = completed.send(Ok(()));
+            }
+            (AppendCommitCompletion::Append(completed), Err(error)) => {
+                let _ = completed.send(Err(error));
+            }
+            (AppendCommitCompletion::CreateSession(completed), Err(error)) => {
+                let _ = completed.send(Err(error));
+            }
+            (AppendCommitCompletion::AcceptTurn(completed), Err(error)) => {
+                let _ = completed.send(Err(error));
+            }
+            (AppendCommitCompletion::HookAcks(completed), Err(error)) => {
+                let _ = completed.send(Err(error));
+            }
+            (completed, Ok(_)) => {
+                let error = commit_group_shape_error();
+                match completed {
+                    AppendCommitCompletion::Append(completed) => {
+                        let _ = completed.send(Err(error));
+                    }
+                    AppendCommitCompletion::CreateSession(completed) => {
+                        let _ = completed.send(Err(error));
+                    }
+                    AppendCommitCompletion::AcceptTurn(completed) => {
+                        let _ = completed.send(Err(error));
+                    }
+                    AppendCommitCompletion::HookAcks(completed) => {
+                        let _ = completed.send(Err(error));
+                    }
+                }
+            }
+        }
+    }
+}
+
 struct AppendCommitRequest {
-    kind: AppendCommitKind,
-    envelopes: Vec<RawEnvelope>,
+    batch: CommitGroupBatch,
     byte_weight: usize,
     _byte_permit: OwnedSemaphorePermit,
-    completed: oneshot::Sender<Result<Vec<RawEnvelope>, HaiderError>>,
+    completed: AppendCommitCompletion,
+}
+
+impl AppendCommitRequest {
+    fn into_parts(self) -> (CommitGroupBatch, PendingCommitCompletion) {
+        (
+            self.batch,
+            PendingCommitCompletion {
+                completed: self.completed,
+                _byte_permit: self._byte_permit,
+            },
+        )
+    }
 }
 
 enum AppendCommitMessage {
@@ -1229,18 +1307,15 @@ enum AppendCommitMessage {
 struct AppendCommitter {
     requests: mpsc::Sender<AppendCommitMessage>,
     bytes: Arc<Semaphore>,
+    admitted: Arc<AtomicUsize>,
 }
 
 impl AppendCommitter {
-    async fn commit(
-        &self,
-        kind: AppendCommitKind,
-        envelopes: Vec<RawEnvelope>,
-    ) -> Result<Vec<RawEnvelope>, HaiderError> {
-        let byte_weight = envelopes
-            .iter()
-            .map(envelope_weight_bytes)
-            .fold(0_usize, usize::saturating_add);
+    fn has_admitted_mutation(&self) -> bool {
+        self.admitted.load(Ordering::Acquire) > 0
+    }
+
+    async fn admit(&self, byte_weight: usize) -> Result<OwnedSemaphorePermit, HaiderError> {
         // A request is indivisible. Charging an oversized request the entire
         // semaphore admits it alone while its existing producer-side limit
         // remains the absolute single-request ceiling.
@@ -1252,21 +1327,129 @@ impl AppendCommitter {
                 false,
             )
         })?;
-        let byte_permit = Arc::clone(&self.bytes)
+        Arc::clone(&self.bytes)
             .acquire_many_owned(permits)
             .await
-            .map_err(|_| hub_closed_store_error())?;
-        let (completed, result) = oneshot::channel();
-        self.requests
+            .map_err(|_| hub_closed_store_error())
+    }
+
+    async fn send(
+        &self,
+        batch: CommitGroupBatch,
+        byte_weight: usize,
+        completed: AppendCommitCompletion,
+    ) -> Result<(), HaiderError> {
+        let byte_permit = self.admit(byte_weight).await?;
+        self.admitted.fetch_add(1, Ordering::AcqRel);
+        let result = self
+            .requests
             .send(AppendCommitMessage::Commit(AppendCommitRequest {
-                kind,
-                envelopes,
+                batch,
                 byte_weight,
                 _byte_permit: byte_permit,
                 completed,
             }))
-            .await
-            .map_err(|_| hub_closed_store_error())?;
+            .await;
+        if result.is_err() {
+            self.admitted.fetch_sub(1, Ordering::AcqRel);
+            return Err(hub_closed_store_error());
+        }
+        Ok(())
+    }
+
+    async fn commit(
+        &self,
+        kind: AppendCommitKind,
+        envelopes: Vec<RawEnvelope>,
+    ) -> Result<Vec<RawEnvelope>, HaiderError> {
+        let byte_weight = envelopes
+            .iter()
+            .map(envelope_weight_bytes)
+            .fold(0_usize, usize::saturating_add);
+        let (completed, result) = oneshot::channel();
+        self.send(
+            CommitGroupBatch::Append(AppendGroupBatch {
+                envelopes,
+                validate_worker_transitions: matches!(kind, AppendCommitKind::Worker),
+            }),
+            byte_weight,
+            AppendCommitCompletion::Append(completed),
+        )
+        .await?;
+        result.await.map_err(|_| hub_closed_store_error())?
+    }
+
+    async fn accept_turn(
+        &self,
+        command: TurnAcceptCommand,
+        peer_message: Option<haider_protocol::peer::PeerMessage>,
+        auto_title: Option<String>,
+    ) -> Result<TurnAcceptOutcome, HaiderError> {
+        let byte_weight = command
+            .request_json
+            .len()
+            .saturating_add(command.text.len())
+            .saturating_add(std::mem::size_of::<TurnAcceptCommand>());
+        let validate_headless = peer_message.is_none() && auto_title.is_some();
+        let (completed, result) = oneshot::channel();
+        self.send(
+            CommitGroupBatch::AcceptTurn {
+                command,
+                peer_message,
+                auto_title,
+                validate_headless,
+            },
+            byte_weight,
+            AppendCommitCompletion::AcceptTurn(completed),
+        )
+        .await?;
+        result.await.map_err(|_| hub_closed_store_error())?
+    }
+
+    async fn create_session(
+        &self,
+        command: SessionCreateCommand,
+        interaction_mode: haider_protocol::session::SessionInteractionModeV1,
+    ) -> Result<SessionCreateOutcome, HaiderError> {
+        let byte_weight = command
+            .request_json
+            .len()
+            .saturating_add(command.cwd.len())
+            .saturating_add(command.provider.len())
+            .saturating_add(command.model.len())
+            .saturating_add(std::mem::size_of::<SessionCreateCommand>());
+        let (completed, result) = oneshot::channel();
+        self.send(
+            CommitGroupBatch::CreateSession {
+                command,
+                interaction_mode,
+            },
+            byte_weight,
+            AppendCommitCompletion::CreateSession(completed),
+        )
+        .await?;
+        result.await.map_err(|_| hub_closed_store_error())?
+    }
+
+    async fn complete_hook_dispatches(
+        &self,
+        acks: Vec<(SessionId, u64)>,
+    ) -> Result<(), HaiderError> {
+        if acks.is_empty() {
+            return Ok(());
+        }
+        let byte_weight = acks.iter().fold(0_usize, |weight, (session_id, _)| {
+            weight
+                .saturating_add(session_id.as_str().len())
+                .saturating_add(std::mem::size_of::<u64>())
+        });
+        let (completed, result) = oneshot::channel();
+        self.send(
+            CommitGroupBatch::HookAcks(acks),
+            byte_weight,
+            AppendCommitCompletion::HookAcks(completed),
+        )
+        .await?;
         result.await.map_err(|_| hub_closed_store_error())?
     }
 
@@ -1286,6 +1469,7 @@ impl AppendCommitter {
 async fn run_append_committer(
     store: SqliteStoreHandle,
     mut requests: mpsc::Receiver<AppendCommitMessage>,
+    admitted: Arc<AtomicUsize>,
 ) {
     let mut next_message = None;
     loop {
@@ -1310,49 +1494,74 @@ async fn run_append_committer(
             let Ok(message) = requests.try_recv() else {
                 break;
             };
-            match message {
-                AppendCommitMessage::Commit(request)
-                    if pending_bytes.saturating_add(request.byte_weight)
-                        > APPEND_GROUP_MAX_BYTES =>
-                {
-                    next_message = Some(AppendCommitMessage::Commit(request));
-                    break;
-                }
-                AppendCommitMessage::Commit(request) => {
-                    pending_bytes = pending_bytes.saturating_add(request.byte_weight);
-                    pending.push(request);
-                }
-                AppendCommitMessage::Shutdown(completed) => {
-                    shutdown = Some(completed);
-                    break;
-                }
+            if !push_append_commit_message(
+                message,
+                &mut pending,
+                &mut pending_bytes,
+                &mut next_message,
+                &mut shutdown,
+            ) {
+                break;
             }
         }
 
-        let batches = pending
-            .iter_mut()
-            .map(|request| AppendGroupBatch {
-                envelopes: std::mem::take(&mut request.envelopes),
-                validate_worker_transitions: matches!(request.kind, AppendCommitKind::Worker),
-            })
-            .collect::<Vec<_>>();
-        match store.append_group(batches).await {
+        let (batches, completions): (Vec<_>, Vec<_>) = pending
+            .into_iter()
+            .map(AppendCommitRequest::into_parts)
+            .unzip();
+        let completed_count = completions.len();
+        match store.commit_group(batches).await {
             Ok(outcomes) => {
-                for (request, outcome) in pending.into_iter().zip(outcomes) {
-                    let _ = request.completed.send(outcome);
+                for (completed, outcome) in completions.into_iter().zip(outcomes) {
+                    completed.send(outcome);
                 }
             }
             Err(error) => {
-                for request in pending {
-                    let _ = request.completed.send(Err(error.clone()));
+                for completed in completions {
+                    completed.send(Err(error.clone()));
                 }
             }
         }
+        admitted.fetch_sub(completed_count, Ordering::AcqRel);
         if let Some(completed) = shutdown {
             let _ = completed.send(());
             break;
         }
     }
+}
+
+fn push_append_commit_message(
+    message: AppendCommitMessage,
+    pending: &mut Vec<AppendCommitRequest>,
+    pending_bytes: &mut usize,
+    next_message: &mut Option<AppendCommitMessage>,
+    shutdown: &mut Option<oneshot::Sender<()>>,
+) -> bool {
+    match message {
+        AppendCommitMessage::Commit(request)
+            if pending_bytes.saturating_add(request.byte_weight) > APPEND_GROUP_MAX_BYTES =>
+        {
+            *next_message = Some(AppendCommitMessage::Commit(request));
+            false
+        }
+        AppendCommitMessage::Commit(request) => {
+            *pending_bytes = pending_bytes.saturating_add(request.byte_weight);
+            pending.push(request);
+            true
+        }
+        AppendCommitMessage::Shutdown(completed) => {
+            *shutdown = Some(completed);
+            false
+        }
+    }
+}
+
+fn commit_group_shape_error() -> HaiderError {
+    HaiderError::new(
+        ErrorCode::Internal,
+        "profile committer returned a mismatched request outcome",
+        false,
+    )
 }
 
 /// Opaque same-process worker authority. Store generation fences restarts;
@@ -1891,11 +2100,17 @@ impl SessionHub {
             })?;
         let device_id = DeviceId::new(format!("daemon-session-hub-{}", store.worker_generation()));
         let (append_requests, append_receiver) = mpsc::channel(APPEND_QUEUE_MAX_REQUESTS);
+        let admitted_commits = Arc::new(AtomicUsize::new(0));
         let append_committer = AppendCommitter {
             requests: append_requests,
             bytes: Arc::new(Semaphore::new(APPEND_QUEUE_MAX_BYTES)),
+            admitted: Arc::clone(&admitted_commits),
         };
-        let append_commit_task = tokio::spawn(run_append_committer(store.clone(), append_receiver));
+        let append_commit_task = tokio::spawn(run_append_committer(
+            store.clone(),
+            append_receiver,
+            admitted_commits,
+        ));
         let (surface_publications, _) = watch::channel(0_u64);
         let (roster_publications, _) = broadcast::channel(1_024);
         let (loom_registry_publications, _) = broadcast::channel(1_024);
@@ -2533,6 +2748,24 @@ impl SessionHub {
         Ok(lock(&self.inner.hooks)?
             .as_ref()
             .and_then(crate::hooks::WeakHookService::upgrade))
+    }
+
+    /// Opportunistically acknowledges completed durable hook work through the
+    /// profile committer while a mutation is already admitted. A standalone
+    /// acknowledgement retains its original direct transaction, so neither it
+    /// nor a lone interactive turn pays a speculative batching delay.
+    pub(crate) async fn complete_hook_dispatches(
+        &self,
+        acks: Vec<(SessionId, u64)>,
+    ) -> Result<(), HaiderError> {
+        if self.inner.append_committer.has_admitted_mutation() {
+            self.inner
+                .append_committer
+                .complete_hook_dispatches(acks)
+                .await
+        } else {
+            self.inner.store.complete_hook_dispatches(acks).await
+        }
     }
 
     /// Installs the account facade (actor route + descriptor snapshot),

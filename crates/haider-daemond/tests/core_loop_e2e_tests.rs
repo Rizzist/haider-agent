@@ -352,6 +352,29 @@ async fn events_until_terminal(client: &mut UdsClient, run_id: &RunId) -> Vec<Ev
     .expect("run reaches a terminal event")
 }
 
+async fn wait_for_session_idle(client: &mut UdsClient, session_id: &SessionId) {
+    tokio::time::timeout(support::DEADLINE, async {
+        loop {
+            let WireFrame::Event { envelope, .. } = client.next().await else {
+                continue;
+            };
+            if &envelope.session_id != session_id {
+                continue;
+            }
+            if serde_json::from_value::<EventPayload>(envelope.payload).is_ok_and(|payload| {
+                matches!(
+                    payload,
+                    EventPayload::SessionState(haider_protocol::state::SessionState::Idle { .. })
+                )
+            }) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("session reaches durable idle after its terminal run")
+}
+
 async fn cancel_and_collect_terminal(
     client: &mut UdsClient,
     config: &DaemonConfig,
@@ -855,9 +878,10 @@ async fn tool_calls_execute_and_continue_over_real_rpc() {
         .flat_map(|(call_id, name, args, marker)| tool_round(call_id, name, args.clone(), marker))
         .collect();
     let (dependencies, fake) = fake_dependencies(script);
+    let store_root = root.path().join("store");
     let config = DaemonConfig::new(
         "core-loop-tools",
-        root.path().join("store"),
+        store_root.clone(),
         root.path().join("runtime"),
     );
     let task = ready_with_dependencies(&config, dependencies).await;
@@ -1773,6 +1797,7 @@ async fn fork_from_prompt_preserves_source_cache_and_privilege_boundaries() {
     .await;
     let second_events = events_until_terminal(&mut client, &second_run).await;
     assert!(continuation_seen(&second_events, "second source answer"));
+    wait_for_session_idle(&mut client, &source).await;
     let source_before =
         read_session(&mut client, &config, source.clone(), "source-before-fork").await;
     let prompt_seq = source_before

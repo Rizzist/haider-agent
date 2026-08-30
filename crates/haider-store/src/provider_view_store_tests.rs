@@ -47,11 +47,11 @@ fn provider_view(seed: &str) -> (ProviderViewLedgerV1, Vec<ProviderViewBlobV1>) 
     (ledger, vec![system, tools, history])
 }
 
-/// MUTATION CHECK: restore per-blob full syncs, omit the trailing full sync,
-/// or move it below the SQLite transaction. Expected runtime failure: the
-/// count differs from one or the callback observes an indexed reference.
+/// MUTATION CHECK: restore per-blob full syncs, omit/downgrade the trailing
+/// barrier, or move it below the SQLite transaction. Expected runtime failure:
+/// the count differs from one or the callback observes an indexed reference.
 #[test]
-fn provider_view_persist_uses_one_trailing_full_sync_before_indexing() {
+fn provider_view_persist_uses_one_trailing_barrier_before_indexing() {
     for unique_blob_count in [1_usize, 3] {
         let root = tempfile::tempdir().expect("profile");
         let store = Store::open(root.path()).expect("store");
@@ -75,12 +75,12 @@ fn provider_view_persist_uses_one_trailing_full_sync_before_indexing() {
                     .lock()
                     .expect("CAS sync observation lock")
                     .push((policy, target));
-                if policy == haider_platform::SyncPolicy::Full {
+                if policy == haider_platform::SyncPolicy::Barrier {
                     let connection =
                         Connection::open(&database_path).expect("observe provider-view index");
                     connection
                         .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
-                        .expect("trailing full sync precedes the index write transaction");
+                        .expect("trailing barrier precedes the index write transaction");
                     let indexed: i64 = connection
                         .query_row("SELECT COUNT(*) FROM provider_view_requests", [], |row| {
                             row.get(0)
@@ -101,10 +101,18 @@ fn provider_view_persist_uses_one_trailing_full_sync_before_indexing() {
         assert_eq!(
             observations
                 .iter()
-                .filter(|(policy, _)| *policy == haider_platform::SyncPolicy::Full)
+                .filter(|(policy, _)| *policy == haider_platform::SyncPolicy::Barrier)
                 .count(),
             1,
-            "one full sync closes every persist regardless of blob count"
+            "one barrier closes every persist regardless of blob count"
+        );
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|(policy, _)| *policy == haider_platform::SyncPolicy::Full)
+                .count(),
+            0,
+            "provider-view persistence no longer drains volatile device caches"
         );
         assert_eq!(
             observations

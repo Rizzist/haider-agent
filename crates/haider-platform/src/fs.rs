@@ -57,8 +57,10 @@ pub enum SyncPolicy {
     /// Flushes through volatile device caches on Apple and uses `fsync`
     /// semantics on other platforms.
     Full,
-    /// Orders prior writes at the device on Apple and uses `fsync` semantics
-    /// where `F_BARRIERFSYNC` is unavailable.
+    /// Orders prior `fsync` writes at the device on Apple and uses `fsync`
+    /// semantics on other platforms. An Apple filesystem or device that does
+    /// not support `F_BARRIERFSYNC` returns an error; ordering callers must
+    /// never silently degrade to [`Self::Plain`].
     Barrier,
     /// Uses plain `fsync` without Apple's whole-device cache flush.
     Plain,
@@ -254,18 +256,7 @@ fn execute_file_sync(file: &File, operation: SyncOperation) -> std::io::Result<(
     if result == 0 {
         return Ok(());
     }
-    let error = std::io::Error::last_os_error();
-    if operation == SyncOperation::BarrierFsync && barrier_is_unsupported(&error) {
-        return plain_fsync(file);
-    }
-    Err(error)
-}
-
-#[cfg(target_vendor = "apple")]
-fn barrier_is_unsupported(error: &std::io::Error) -> bool {
-    error
-        .raw_os_error()
-        .is_some_and(|code| code == libc::EINVAL || code == libc::ENOTSUP)
+    Err(std::io::Error::last_os_error())
 }
 
 #[cfg(all(unix, not(target_vendor = "apple")))]

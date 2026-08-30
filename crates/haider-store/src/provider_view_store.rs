@@ -71,8 +71,11 @@ impl ProviderViewSweepSchedule {
 
 impl ProviderViewStore {
     pub(crate) fn open(profile_root: &Path) -> StoreResult<Self> {
+        let cas = FileCas::open_namespace(profile_root, "provider-view-cas")?;
+        #[cfg(target_vendor = "apple")]
+        ensure_provider_view_barrier_device(profile_root)?;
         Ok(Self {
-            cas: FileCas::open_namespace(profile_root, "provider-view-cas")?,
+            cas,
             hot_blocks: Mutex::new(HotBlockLru::new(PROVIDER_VIEW_HOT_BLOCK_CAP_BYTES)),
             sweep_schedule: Mutex::new(ProviderViewSweepSchedule::after_sweep(Instant::now())),
         })
@@ -95,9 +98,11 @@ impl ProviderViewStore {
         Ok(ledger)
     }
 
-    /// Validates and fully fences the immutable CAS bytes. No SQLite index
+    /// Validates and ordering-fences the immutable CAS bytes. No SQLite index
     /// reference is visible until a caller publishes [`PreparedProviderView`]
-    /// in its chosen transaction.
+    /// in its chosen transaction. The fence guarantees that a surviving index
+    /// cannot precede its blocks; it does not independently guarantee that the
+    /// blocks have reached persistent media when this method returns.
     pub(crate) fn prepare(
         &self,
         ledger: ProviderViewLedgerV1,
@@ -138,8 +143,9 @@ impl ProviderViewStore {
                 }
             }
         }
-        // Every blob is plain-fsynced before this one full flush and the index transaction.
-        self.cas.finish_batched_puts()?;
+        // Every blob is plain-fsynced before this one device barrier and the
+        // index transaction.
+        self.cas.finish_ordered_batched_puts()?;
 
         Ok(PreparedProviderView { ledger, expected })
     }
@@ -601,6 +607,50 @@ impl ProviderViewStore {
         }
         Ok(())
     }
+}
+
+/// `F_BARRIERFSYNC` orders only fsync'd I/O on its own device. The provider
+/// view CAS must therefore share a device with `store.sqlite`, which lives
+/// directly in `profile_root`. A pre-existing nested mount at the CAS
+/// namespace is rejected instead of silently weakening the power-loss
+/// referential-integrity guarantee.
+#[cfg(target_vendor = "apple")]
+fn ensure_provider_view_barrier_device(profile_root: &Path) -> StoreResult<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let profile_metadata = fs::metadata(profile_root).map_err(|error| {
+        store_error(
+            ErrorCode::Internal,
+            format!(
+                "cannot inspect provider-view profile device {}: {error}",
+                profile_root.display()
+            ),
+            false,
+        )
+    })?;
+    let cas_root = profile_root.join("provider-view-cas");
+    let cas_metadata = fs::metadata(&cas_root).map_err(|error| {
+        store_error(
+            ErrorCode::Internal,
+            format!(
+                "cannot inspect provider-view CAS device {}: {error}",
+                cas_root.display()
+            ),
+            false,
+        )
+    })?;
+    if profile_metadata.dev() != cas_metadata.dev() {
+        return Err(store_error(
+            ErrorCode::InvalidArgument,
+            format!(
+                "provider-view CAS {} must share a device with profile root {} for ordered persistence",
+                cas_root.display(),
+                profile_root.display()
+            ),
+            false,
+        ));
+    }
+    Ok(())
 }
 
 struct StoredBlock {

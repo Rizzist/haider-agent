@@ -3,6 +3,7 @@
 use super::*;
 use base64::Engine as _;
 use std::io::Cursor;
+use std::sync::{Arc, Mutex};
 
 fn png(width: u32, height: u32) -> Vec<u8> {
     let image = image::RgbaImage::from_pixel(width, height, image::Rgba([17, 42, 91, 255]));
@@ -34,6 +35,47 @@ impl Read for MutatingReader {
         }
         Ok(read)
     }
+}
+
+/// MUTATION CHECK: route generic `Cas::put_batch` through the provider-view
+/// ordering fence. Expected runtime failure: Full disappears or Barrier is
+/// observed, weakening checkpoint preimage persistence at return.
+#[test]
+fn generic_put_batch_retains_one_trailing_full_fence() {
+    let root = tempfile::tempdir().expect("CAS root");
+    let cas = FileCas::open(root.path()).expect("open CAS");
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&observations);
+
+    let artifacts = with_cas_sync_test_hook(
+        move |_path, policy, target| {
+            observed
+                .lock()
+                .expect("CAS sync observation lock")
+                .push((policy, target));
+        },
+        || Cas::put_batch(&cas, &[b"checkpoint-a".to_vec(), b"checkpoint-b".to_vec()]),
+    )
+    .expect("publish generic CAS batch");
+
+    assert_eq!(artifacts.len(), 2);
+    let observations = observations.lock().expect("CAS sync observations");
+    assert_eq!(
+        observations
+            .iter()
+            .filter(|(policy, _)| *policy == haider_platform::SyncPolicy::Full)
+            .count(),
+        1,
+        "generic CAS batches retain one full device-cache flush"
+    );
+    assert_eq!(
+        observations
+            .iter()
+            .filter(|(policy, _)| *policy == haider_platform::SyncPolicy::Barrier)
+            .count(),
+        0,
+        "provider-view ordering policy must not leak into generic CAS batches"
+    );
 }
 
 #[test]

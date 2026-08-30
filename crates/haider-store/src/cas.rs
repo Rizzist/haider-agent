@@ -259,16 +259,32 @@ impl FileCas {
     }
 
     /// Writes one member of a larger durability group. The caller must invoke
-    /// [`Self::finish_batched_puts`] before committing any durable reference.
+    /// either [`Self::finish_batched_puts`] or
+    /// [`Self::finish_ordered_batched_puts`] before committing any durable
+    /// reference, according to that reference's persistence contract.
     pub(crate) fn put_batched(&self, bytes: &[u8]) -> StoreResult<ArtifactRef> {
         self.put_bytes(bytes, haider_platform::SyncPolicy::Plain, true)
     }
 
-    /// Closes a durability group after every member received its plain file
-    /// and directory sync, and before references enter SQLite or the journal.
+    /// Closes a durability group with the generic CAS contract's full device
+    /// flush. Checkpoint preimages and other [`Cas::put_batch`] callers rely on
+    /// persistence at return, not only ordering before a later index write.
     pub(crate) fn finish_batched_puts(&self) -> StoreResult<()> {
-        // One full root flush closes the group and includes deferred shard creation.
         sync_directory(&self.root, haider_platform::SyncPolicy::Full)
+    }
+
+    /// Closes a provider-view durability group after every member received its
+    /// plain file and directory sync, and before references enter SQLite.
+    ///
+    /// On Apple, the barrier orders every phase-one file/directory `fsync`
+    /// before the phase-two SQLite writes without claiming that phase one is
+    /// already persistent when this call returns. Consequently, if any later
+    /// index write survives power loss, every referenced CAS object must have
+    /// survived first. Unsupported barriers fail rather than degrading to a
+    /// plain `fsync`, which cannot provide that cross-FD ordering.
+    pub(crate) fn finish_ordered_batched_puts(&self) -> StoreResult<()> {
+        // One device barrier closes the group and includes deferred shard creation.
+        sync_directory(&self.root, haider_platform::SyncPolicy::Barrier)
     }
 
     fn put_bytes(
