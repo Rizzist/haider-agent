@@ -1220,11 +1220,36 @@ pub enum ProviderTrustWire {
     Unknown,
 }
 
+/// Why the daemon is enforcing the lockdown envelope for one provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum LockdownActivationWire {
+    /// The provider was explicitly configured with lockdown trust.
+    Configured,
+    /// The active provider is an enabled custom no-auth endpoint and the
+    /// default automatic hermetic policy is active.
+    AutoHermetic,
+    /// This provider will enter automatic hermetic policy if selected, but
+    /// this provider-only status is not evidence that a session activated it.
+    AutoHermeticEligible,
+    #[serde(other)]
+    Unknown,
+}
+
 /// Self-sufficient lockdown state exposed to clients and child projections.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockdownStatusWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Absent for the machine-user global quota view and for a provider whose
+    /// full-trust envelope is in effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<LockdownActivationWire>,
+    /// Human- and driver-readable explanation of automatic activation or its
+    /// explicit override. This is additive so older clients remain valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools_allowed: Vec<String>,
     pub quota_used: u64,
@@ -2064,6 +2089,10 @@ pub struct ObserveSubagentWire {
     /// It is never serialized; `lockdown` is the public self-sufficient view.
     #[serde(skip)]
     pub lockdown_bound: Option<bool>,
+    /// Exact automatic-policy bit paired with `lockdown_bound`. It is folded
+    /// from the durable child manifest and never serialized separately.
+    #[serde(skip)]
+    pub lockdown_auto_hermetic_bound: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lockdown: Option<LockdownStatusWire>,
 }

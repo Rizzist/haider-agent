@@ -122,6 +122,8 @@ fn provider_show_json_golden_includes_the_fixed_envelope_and_quota() {
         provider,
         envelope: haider_rpc::LockdownStatusWire {
             provider: Some("research".into()),
+            activation: Some(haider_rpc::LockdownActivationWire::Configured),
+            reason: Some("the provider is explicitly configured for lockdown".into()),
             tools_allowed: vec!["fs_read".into(), "web_search".into()],
             quota_used: 4_096,
             quota_limit: 1_073_741_824,
@@ -130,6 +132,11 @@ fn provider_show_json_golden_includes_the_fixed_envelope_and_quota() {
     let value = serde_json::to_value(document).expect("provider show JSON");
     assert_eq!(value["provider"]["trust"], "lockdown");
     assert_eq!(value["envelope"]["provider"], "research");
+    assert_eq!(value["envelope"]["activation"], "configured");
+    assert_eq!(
+        value["envelope"]["reason"],
+        "the provider is explicitly configured for lockdown"
+    );
     assert_eq!(
         value["envelope"]["tools_allowed"],
         serde_json::json!(["fs_read", "web_search"])

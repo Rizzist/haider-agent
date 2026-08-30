@@ -16,6 +16,20 @@ fn env_for(dir: &Path) -> ProfileEnv {
     }
 }
 
+fn home_test_root() -> tempfile::TempDir {
+    #[cfg(unix)]
+    {
+        tempfile::Builder::new()
+            .prefix("haider-home-")
+            .tempdir_in("/tmp")
+            .unwrap_or_else(|error| panic!("short HOME tempdir: {error}"))
+    }
+    #[cfg(windows)]
+    {
+        tempfile::tempdir().unwrap_or_else(|error| panic!("HOME tempdir: {error}"))
+    }
+}
+
 // MUTATION CHECK (R8 one-resolver law): drop the version tag or the
 // canonicalization step from the profile-id derivation. Expected failure:
 // the determinism/path-scoping assertions below (two resolutions of one
@@ -52,7 +66,7 @@ fn profile_id_is_deterministic_and_path_scoped() {
 
 #[test]
 fn default_home_store_dir_is_preserved() {
-    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let root = home_test_root();
     let env = ProfileEnv {
         profile_dir: None,
         home: Some(root.path().to_path_buf()),
@@ -63,6 +77,64 @@ fn default_home_store_dir_is_preserved() {
     };
     let profile = resolve_profile(&env).unwrap_or_else(|error| panic!("{error}"));
     assert!(profile.store_dir.ends_with(".haider/dev-profile"));
+    assert!(profile.runtime_dir.starts_with(root.path()));
+    assert!(
+        profile
+            .runtime_dir
+            .starts_with(root.path().join(".haider/runtime"))
+    );
+    assert!(profile.endpoint_path.starts_with(&profile.runtime_dir));
+}
+
+/// MUTATION CHECK (hermetic HOME law): restore a temporary-directory choice
+/// ahead of HOME. Expected failure: the runtime leaves the only directory the
+/// caller supplied as its machine-user home.
+#[test]
+fn private_home_contains_store_runtime_and_endpoint() {
+    let root = home_test_root();
+    let private_home = root.path().join("private-home");
+    let env = ProfileEnv {
+        profile_dir: None,
+        home: Some(private_home.clone()),
+        user_profile: Some(private_home.clone()),
+        model: None,
+        runtime_dir: None,
+        xdg_runtime_dir: None,
+    };
+
+    let profile = resolve_profile(&env).unwrap_or_else(|error| panic!("{error}"));
+    let canonical_home = private_home
+        .canonicalize()
+        .unwrap_or_else(|error| panic!("canonicalize private HOME: {error}"));
+    assert!(profile.store_dir.starts_with(canonical_home));
+    assert!(profile.runtime_dir.starts_with(&private_home));
+    assert!(profile.endpoint_path.starts_with(&private_home));
+}
+
+/// A deep private HOME must fail before bind with an actionable typed error;
+/// silently selecting `/tmp` would violate the caller's isolation boundary.
+#[test]
+#[cfg(unix)]
+fn overlong_private_home_is_a_typed_error_instead_of_a_tmp_escape() {
+    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let private_home = root.path().join("h".repeat(100));
+    let env = ProfileEnv {
+        profile_dir: None,
+        home: Some(private_home),
+        user_profile: None,
+        model: None,
+        runtime_dir: None,
+        xdg_runtime_dir: None,
+    };
+
+    let error = resolve_profile(&env).expect_err("an overlong HOME endpoint must fail early");
+    assert!(matches!(
+        error,
+        ProfileError::RuntimeEndpoint {
+            source: haider_platform::EndpointError::AddressTooLong { .. }
+        }
+    ));
+    assert!(error.to_string().contains(RUNTIME_DIR_ENV));
 }
 
 #[test]
@@ -73,7 +145,7 @@ fn missing_store_dir_and_home_is_a_typed_error() {
 
 #[test]
 fn explicit_profile_dir_precedes_every_home_variable() {
-    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let root = home_test_root();
     let explicit = root.path().join("explicit");
     let mut env = env_for(&explicit);
     env.user_profile = Some(root.path().join("user-profile"));
@@ -139,7 +211,7 @@ fn userprofile_precedes_home_on_windows() {
 #[cfg(unix)]
 #[test]
 fn home_remains_authoritative_and_userprofile_is_ignored_on_unix() {
-    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let root = home_test_root();
     let home = root.path().join("home");
     let env = ProfileEnv {
         profile_dir: None,
@@ -340,7 +412,7 @@ fn runtime_dir_uses_a_verified_prefix_tmp_when_tmpdir_is_unavailable() {
 
 #[test]
 fn runtime_override_is_a_root_and_never_collapses_profiles() {
-    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let root = home_test_root();
     let runtime_root = root.path().join("gate-runtime");
     let mut first_env = env_for(&root.path().join("first"));
     first_env.runtime_dir = Some(runtime_root.clone());

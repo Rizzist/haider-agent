@@ -28,6 +28,8 @@ fn lockdown_cli_parses_status_quota_and_json_without_signed_sizes() {
 fn lockdown_status_json_golden_is_exact() {
     let status = haider_rpc::LockdownStatusWire {
         provider: None,
+        activation: None,
+        reason: None,
         tools_allowed: vec!["fs_read".into(), "web_search".into()],
         quota_used: 4_096,
         quota_limit: 1_073_741_824,

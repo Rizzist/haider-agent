@@ -30,7 +30,10 @@ use haider_protocol::ids::{ArtifactRef, DeviceId, EffectId, EventId, MenuId, Run
 use haider_protocol::menu::{AnswerVia, DecisionKind, Menu, MenuKind, MenuOption, MenuScope};
 use haider_protocol::state::RunState;
 use haider_protocol::tool::AttachmentBlock;
-use haider_rpc::{CommandId, HookTrustStateWire};
+use haider_rpc::{
+    CommandId, HookTrustStateWire, ModelInventoryAuthorityWire, ProviderApiFamilyWire,
+    ProviderAvailabilityWire, ProviderSummaryWire, ProviderTrustWire,
+};
 use haider_tools::{EffectBroker, JournalSink, PermissionPolicy, ProcessExec, ToolResult};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -784,6 +787,19 @@ impl EngineFixture {
         .await
     }
 
+    async fn start_unbound_user_message(command: &str) -> Self {
+        Self::start_with_event_trust_and_binding(
+            command,
+            USER_MESSAGE_CAPTURE_TIMEOUT_MS,
+            false,
+            "exec",
+            true,
+            "user_message",
+            false,
+        )
+        .await
+    }
+
     async fn start_untrusted(command: &str, timeout_ms: u64) -> Self {
         Self::start_with_trust(command, timeout_ms, false, "exec", false).await
     }
@@ -810,6 +826,21 @@ impl EngineFixture {
         kind: &str,
         trust: bool,
         event: &str,
+    ) -> Self {
+        Self::start_with_event_trust_and_binding(
+            command, timeout_ms, decision, kind, trust, event, true,
+        )
+        .await
+    }
+
+    async fn start_with_event_trust_and_binding(
+        command: &str,
+        timeout_ms: u64,
+        decision: bool,
+        kind: &str,
+        trust: bool,
+        event: &str,
+        bind_full: bool,
     ) -> Self {
         let workspace_guard = tempfile::tempdir().expect("workspace");
         let profile_guard = tempfile::tempdir().expect("profile");
@@ -852,6 +883,15 @@ impl EngineFixture {
         })
         .await
         .expect("create session");
+        if bind_full {
+            hub.bind_lockdown_turn(
+                &session_id,
+                &run_id,
+                "fake",
+                crate::auto_hermetic::ProviderLockdownPolicy::Full,
+            )
+            .expect("bind fixture provider boundary");
+        }
         if trust {
             let (_, _, hooks) = service.list(workspace.clone()).await.expect("list hooks");
             let digest = hooks.first().expect("discovered hook").digest.clone();
@@ -2177,18 +2217,30 @@ async fn lockdown_run_binding_suppresses_hooks_until_the_next_run() {
     let marker_dir = tempfile::tempdir().expect("marker dir");
     let marker = marker_dir.path().join("lockdown-hook-fired");
     let command = write_command("forbidden", &marker);
-    let fixture = EngineFixture::start_user_message(&command).await;
+    let fixture = EngineFixture::start_unbound_user_message(&command).await;
     assert!(
         fixture
             .hub
-            .bind_lockdown_turn(&fixture.session_id, &fixture.run_id, "fake", true)
+            .bind_lockdown_turn(
+                &fixture.session_id,
+                &fixture.run_id,
+                "fake",
+                crate::auto_hermetic::ProviderLockdownPolicy::Configured,
+            )
             .expect("bind lockdown turn")
+            .is_lockdown()
     );
     assert!(
         fixture
             .hub
-            .bind_lockdown_turn(&fixture.session_id, &fixture.run_id, "fake", false)
-            .expect("reuse lockdown turn"),
+            .bind_lockdown_turn(
+                &fixture.session_id,
+                &fixture.run_id,
+                "fake",
+                crate::auto_hermetic::ProviderLockdownPolicy::Full,
+            )
+            .expect("reuse lockdown turn")
+            .is_lockdown(),
         "a trust toggle must not widen the in-flight run"
     );
     fixture
@@ -2216,11 +2268,134 @@ async fn lockdown_run_binding_suppresses_hooks_until_the_next_run() {
                 &fixture.session_id,
                 &RunId::new("hooks-test-next-run"),
                 "fake",
-                false,
+                crate::auto_hermetic::ProviderLockdownPolicy::Full,
             )
-            .expect("bind next Full turn"),
+            .expect("bind next Full turn")
+            .is_lockdown(),
         "the changed policy takes effect at the next run boundary"
     );
+    fixture.close().await;
+}
+
+/// The account resolver freezes `active_no_auth` when it constructs the
+/// headerless adapter. A credential/profile publication can race after that
+/// point, before the hook engine observes the committed user message. Hooks
+/// must wait for the worker's frozen fact: the newer management projection is
+/// neither binding authority nor permission to execute a gateway hook.
+///
+/// MUTATION CHECK: restore hook-owned binding from
+/// `provider_lockdown_policy_detail`, or omit the worker-binding wait.
+/// Expected failure: the marker appears before the authoritative binding or
+/// the durable binding is not exact AutoHermetic.
+#[tokio::test]
+async fn keyless_resolution_survives_management_mutation_before_hook_binding() {
+    let marker_dir = tempfile::tempdir().expect("marker dir");
+    let marker = marker_dir.path().join("keyless-race-hook-fired");
+    let command = write_command("forbidden", &marker);
+    let fixture = EngineFixture::start_unbound_user_message(&command).await;
+
+    // Frozen result of the already-completed keyless adapter construction.
+    let active_no_auth = true;
+    let worker_policy = crate::auto_hermetic::provider_policy_for_active(None, active_no_auth);
+    assert!(worker_policy.is_auto_hermetic());
+
+    // Intervening management publication: a newly stored active credential
+    // makes a fresh live lookup say Full, but cannot rewrite the adapter the
+    // worker already selected.
+    let descriptor = haider_protocol::credential::CredentialDescriptor {
+        alias: haider_protocol::ids::CredentialAlias::new("late-fake-key"),
+        provider: "fake".to_owned(),
+        base_url: None,
+        auth_method: haider_protocol::credential::AuthMethod::ApiKey,
+        identity: "late-key".to_owned(),
+        status: haider_protocol::credential::CredentialStatus::Ok,
+        active: true,
+        label: None,
+        account_identity: None,
+        created_at_ms: None,
+    };
+    let provider = ProviderSummaryWire {
+        provider: "fake".to_owned(),
+        api_family: ProviderApiFamilyWire::OpenAiChatCompletions,
+        endpoint: Some("http://127.0.0.1:9/v1".to_owned()),
+        response_open_timeout_ms: None,
+        chunk_idle_timeout_ms: None,
+        semantic_progress_timeout_ms: None,
+        models: vec!["fake-model".to_owned()],
+        model_details: Vec::new(),
+        inventory_fetched_at_ms: None,
+        inventory_authority: ModelInventoryAuthorityWire::Unknown,
+        auth_methods: Vec::new(),
+        availability: ProviderAvailabilityWire::Available,
+        availability_reason: None,
+        default_model: Some("fake-model".to_owned()),
+        enabled: true,
+        trust: ProviderTrustWire::Full,
+    };
+    fixture
+        .hub
+        .install_accounts(crate::accounts::AccountsFacade {
+            login: None,
+            oauth: None,
+            snapshot: Arc::new(std::sync::Mutex::new(vec![descriptor.clone()])),
+            management: crate::accounts::ManagementSnapshot::new(
+                1,
+                vec![descriptor],
+                vec![provider],
+            ),
+            vault_supported: false,
+            discovery_disabled: true,
+            device_discovery: crate::accounts::DeviceDiscoverySnapshot::new(true),
+            vault: None,
+        })
+        .expect("install mutated account projection");
+    assert_eq!(
+        fixture
+            .hub
+            .provider_lockdown_policy_detail("fake")
+            .expect("live management policy"),
+        crate::auto_hermetic::ProviderLockdownPolicy::Full
+    );
+
+    let discovery_before = fixture.service.discovery_stamp_count();
+    fixture
+        .accept_user_message(
+            "keyless-race-hook",
+            "local only",
+            DeliveryMode::Steer,
+            Vec::new(),
+        )
+        .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fixture.service.discovery_stamp_count() <= discovery_before {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("hook reached the provider-binding barrier");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !marker.exists(),
+        "the mutable Full projection must not authorize a hook"
+    );
+
+    let bound = fixture
+        .hub
+        .bind_lockdown_turn(&fixture.session_id, &fixture.run_id, "fake", worker_policy)
+        .expect("publish authoritative keyless binding");
+    assert!(bound.is_auto_hermetic());
+    wait_for_hook_outbox_drain(&fixture.store).await;
+    assert!(!marker.exists());
+    assert!(fixture.events().await.iter().any(|event| {
+        matches!(
+            serde_json::from_value::<EventPayload>(event.payload.clone()),
+            Ok(EventPayload::LockdownRefused(refusal))
+                if refusal.provider == "fake"
+                    && refusal.tool == "hooks"
+                    && !refusal.tools_allowed.iter().any(|tool| tool == "process_exec")
+                    && !refusal.tools_allowed.iter().any(|tool| tool == "web_search")
+        )
+    }));
     fixture.close().await;
 }
 
@@ -2343,6 +2518,13 @@ async fn committed_fact_survives_crash_before_publish_and_fires_on_recovery() {
         .await
         .expect("reopen store");
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("reopen hub");
+    hub.bind_lockdown_turn(
+        &session_id,
+        &run_id,
+        "fake",
+        crate::auto_hermetic::ProviderLockdownPolicy::Full,
+    )
+    .expect("restore worker provider boundary");
     let (service, engine) = HookEngine::start(profile, store.clone(), hub.clone())
         .await
         .expect("recovery engine");
@@ -2465,6 +2647,13 @@ async fn recovery_replays_exactly_the_unacknowledged_rows() {
     );
 
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("reopen hub");
+    hub.bind_lockdown_turn(
+        &session_id,
+        &run_id,
+        "fake",
+        crate::auto_hermetic::ProviderLockdownPolicy::Full,
+    )
+    .expect("restore worker provider boundary");
     let (service, engine) = HookEngine::start(profile, store.clone(), hub.clone())
         .await
         .expect("recovery engine");
@@ -2584,6 +2773,13 @@ async fn run_scoped_hook_trust_is_reduced_before_recovery_dispatch() {
         .await
         .expect("reopen store");
     let hub = SessionHub::new(store.clone(), SessionHubConfig::default()).expect("reopen hub");
+    hub.bind_lockdown_turn(
+        &session_id,
+        &run_id,
+        "fake",
+        crate::auto_hermetic::ProviderLockdownPolicy::Full,
+    )
+    .expect("restore worker provider boundary");
     let (service, engine) = HookEngine::start(profile, store.clone(), hub.clone())
         .await
         .expect("engine");

@@ -24,6 +24,9 @@ untrusted content. Network access is limited to Haider's bounded web/search
 tools when those tools are otherwise present; no generic process, shell, MCP,
 or arbitrary command route is exposed.
 
+The automatic-hermetic specialization below is stricter than this configured
+envelope and exposes no web/search route.
+
 ## Fixed envelope
 
 | Capability | Lockdown v1 behavior |
@@ -70,7 +73,8 @@ Use `haider lockdown status`, `haider lockdown quota`, or
 Built-in providers are `Full`. A provider record written before the trust
 field existed also decodes as `Full`, including existing custom providers.
 New providers also default to `Full`; Lockdown is entered only through an
-explicit `--lockdown` create flag or a later trust toggle.
+explicit `--lockdown` create flag, a later trust toggle, or the precise
+automatic-hermetic policy below.
 
 Trust can be changed with:
 
@@ -84,6 +88,41 @@ provider turn begins. Changing trust does not alter an already advertised pack
 or an in-flight tool call. Every live session observes the new ceiling at its
 next turn boundary. Trust changes are revision-fenced and journaled as
 self-sufficient `provider.trust_changed` facts.
+
+## Automatic hermetic specialization
+
+The trigger is evaluated only for the provider active at a session/turn
+boundary. It is active exactly when that provider is non-built-in, enabled,
+has an injected endpoint, uses the Chat Completions or Anthropic Messages
+family, advertises no auth methods, and has no active stored credential. This
+last condition matters: if a stored key is active for an auth-optional profile,
+the account resolver gives that key priority and automatic hermetic policy does
+not activate. An unrelated configured no-auth provider never affects a turn.
+
+Automatic hermetic mode reuses the normal durable lockdown binding, sandbox,
+quota, fallback fence, schema reduction, and dispatch refusal. Its allowed
+tools are `fs_read`, `fs_glob`, `fs_search`, `fs_write`, `request_input`,
+`todo_write`, and `plan`. Web/search, peers, SSH, subagents, processes, and all
+other routes are absent. The selected injected provider endpoint is therefore
+the daemon's only inference egress for that turn.
+An explicit `Lockdown` trust setting composes with this floor and cannot weaken
+it to the ordinary configured-lockdown web allowance. Exact override remains
+the only way to remove the automatic specialization.
+
+Provider-only `lockdown.status(<provider>)` reports
+`activation: auto_hermetic_eligible` with a prospective reason; provider-show
+text renders `policy: auto-hermetic when active`. Active-session observation
+alone reports `activation: auto_hermetic` and reason
+`the active provider is an enabled custom no-auth endpoint`. Set exactly
+`HAIDER_AUTO_HERMETIC=0` in both launcher and daemon environment to disable the
+automatic branch; explicit configured lockdown still applies. Manual update
+checks remain available, while the CLI skips its automatic on-open check for
+an explicitly opened session that reports auto-hermetic or a new session whose
+active default provider reports auto-hermetic. A session picker with no active
+selection does not scan unrelated providers. Existing
+`HAIDER_NO_UPDATE_CHECK=1` remains an independent unconditional update-check
+disable. An unavailable policy lookup also suppresses the automatic check and
+prints an operator-visible reason instead of failing open to release discovery.
 
 ## Subagents
 
@@ -104,6 +143,7 @@ envelope and current global quota summary.
 Clients must negotiate `provider_lockdown_v1` before calling
 `provider.set_trust`, `lockdown.status`, or `lockdown.set_quota`. Session and
 subagent observation state may carry
-`lockdown: { provider, tools_allowed, quota_used, quota_limit }`. Raw Pipe
+`lockdown: { provider, activation, reason, tools_allowed, quota_used,
+quota_limit }`. Raw Pipe
 consumers receive self-sufficient `lockdown.refused`, `lockdown.quota`, and
 `provider.trust_changed` payloads and must not reconstruct them from prose.

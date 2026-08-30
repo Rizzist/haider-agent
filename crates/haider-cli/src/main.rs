@@ -168,7 +168,11 @@ fn run_cli(args: Vec<String>) -> ExitCode {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod runtime_tests {
-    use super::RuntimeProfile;
+    use super::{
+        AutoHermeticLookup, RuntimeProfile, StartupAutoHermeticTarget, auto_hermetic_status,
+        auto_hermetic_status_for_startup_target, startup_auto_hermetic_target,
+        suppress_automatic_update,
+    };
     use tokio::runtime::RuntimeFlavor;
 
     fn args(values: &[&str]) -> Vec<String> {
@@ -197,6 +201,61 @@ mod runtime_tests {
         assert_eq!(
             runtime_flavor(RuntimeProfile::Full),
             RuntimeFlavor::MultiThread
+        );
+    }
+
+    #[test]
+    fn only_auto_hermetic_lockdown_suppresses_the_automatic_update() {
+        let mut status = haider_rpc::LockdownStatusWire {
+            provider: Some("local".into()),
+            activation: Some(haider_rpc::LockdownActivationWire::AutoHermetic),
+            reason: Some("active local no-auth provider".into()),
+            tools_allowed: vec!["fs_read".into()],
+            quota_used: 0,
+            quota_limit: 1,
+        };
+        assert_eq!(
+            auto_hermetic_status(Some(&status)),
+            AutoHermeticLookup::Active
+        );
+        status.activation = Some(haider_rpc::LockdownActivationWire::AutoHermeticEligible);
+        assert_eq!(
+            auto_hermetic_status(Some(&status)),
+            AutoHermeticLookup::Active,
+            "an imminent new session treats prospective eligibility as applicable"
+        );
+        status.activation = Some(haider_rpc::LockdownActivationWire::Configured);
+        assert_eq!(
+            auto_hermetic_status(Some(&status)),
+            AutoHermeticLookup::Inactive
+        );
+        assert_eq!(auto_hermetic_status(None), AutoHermeticLookup::Unavailable);
+        assert!(suppress_automatic_update(AutoHermeticLookup::Active));
+        assert!(!suppress_automatic_update(AutoHermeticLookup::Inactive));
+        assert!(
+            suppress_automatic_update(AutoHermeticLookup::Unavailable),
+            "an unavailable policy lookup must fail closed before network discovery"
+        );
+    }
+
+    #[test]
+    fn startup_update_policy_checks_only_the_provider_this_door_activates() {
+        assert_eq!(
+            startup_auto_hermetic_target(Some("session-a"), Some("default-provider")),
+            StartupAutoHermeticTarget::Session("session-a")
+        );
+        assert_eq!(
+            startup_auto_hermetic_target(None, Some("local-default")),
+            StartupAutoHermeticTarget::Provider("local-default")
+        );
+        assert_eq!(
+            startup_auto_hermetic_target(None, None),
+            StartupAutoHermeticTarget::None
+        );
+        assert_eq!(
+            auto_hermetic_status_for_startup_target(StartupAutoHermeticTarget::None, None),
+            AutoHermeticLookup::Unavailable,
+            "the session picker must not arm egress before its active provider is known"
         );
     }
 }
@@ -498,13 +557,30 @@ async fn front_door_with_options(mode: FrontDoor, options: BareTuiOptions) -> Ex
                 let _ = ensured.client.close();
                 return ExitCode::SUCCESS;
             }
+            let new_session_provider =
+                (!browse_sessions).then_some(profile.default_provider.as_str());
+            let auto_hermetic = startup_auto_hermetic(
+                &ensured.client,
+                initial_session.as_deref(),
+                new_session_provider,
+            )
+            .await;
+            let suppress_update = suppress_automatic_update(auto_hermetic);
+            if matches!(auto_hermetic, AutoHermeticLookup::Unavailable) {
+                eprintln!(
+                    "haider: automatic update check suppressed because the active provider's \
+                     hermetic policy could not be established"
+                );
+            }
             let mut model = live_model(&profile);
             model.initial_session = initial_session.map(haider_protocol::ids::SessionId::new);
             if browse_sessions {
                 model.enter_sessions();
             }
-            let updates =
-                update::tui::live_update_bridge(profile.store_dir.clone(), no_update_check);
+            let updates = update::tui::live_update_bridge(
+                profile.store_dir.clone(),
+                no_update_check || suppress_update,
+            );
             match run_live(
                 model,
                 ensured.client,
@@ -543,6 +619,111 @@ async fn front_door_with_options(mode: FrontDoor, options: BareTuiOptions) -> Ex
             eprintln!("haider: {error}");
             ExitCode::from(front_door_exit_code(&error))
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoHermeticLookup {
+    Active,
+    Inactive,
+    Unavailable,
+}
+
+fn auto_hermetic_status(status: Option<&haider_rpc::LockdownStatusWire>) -> AutoHermeticLookup {
+    match status.map(|status| status.activation) {
+        Some(Some(
+            haider_rpc::LockdownActivationWire::AutoHermetic
+            | haider_rpc::LockdownActivationWire::AutoHermeticEligible,
+        )) => AutoHermeticLookup::Active,
+        Some(_) => AutoHermeticLookup::Inactive,
+        None => AutoHermeticLookup::Unavailable,
+    }
+}
+
+const fn suppress_automatic_update(lookup: AutoHermeticLookup) -> bool {
+    !matches!(lookup, AutoHermeticLookup::Inactive)
+}
+
+async fn provider_auto_hermetic(
+    client: &haider_client::RpcClient,
+    provider: &str,
+) -> AutoHermeticLookup {
+    match client
+        .request(haider_rpc::RequestBody::LockdownStatus {
+            provider: Some(provider.to_owned()),
+        })
+        .await
+    {
+        Ok(haider_rpc::ResponseBody::LockdownStatus { status }) => {
+            auto_hermetic_status(Some(&status))
+        }
+        _ => AutoHermeticLookup::Unavailable,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupAutoHermeticTarget<'a> {
+    Session(&'a str),
+    Provider(&'a str),
+    None,
+}
+
+fn auto_hermetic_status_for_startup_target(
+    target: StartupAutoHermeticTarget<'_>,
+    status: Option<&haider_rpc::LockdownStatusWire>,
+) -> AutoHermeticLookup {
+    match target {
+        StartupAutoHermeticTarget::Session(_) | StartupAutoHermeticTarget::Provider(_) => {
+            auto_hermetic_status(status)
+        }
+        StartupAutoHermeticTarget::None => AutoHermeticLookup::Unavailable,
+    }
+}
+
+fn startup_auto_hermetic_target<'a>(
+    initial_session: Option<&'a str>,
+    new_session_provider: Option<&'a str>,
+) -> StartupAutoHermeticTarget<'a> {
+    if let Some(session) = initial_session {
+        StartupAutoHermeticTarget::Session(session)
+    } else if let Some(provider) = new_session_provider {
+        StartupAutoHermeticTarget::Provider(provider)
+    } else {
+        StartupAutoHermeticTarget::None
+    }
+}
+
+/// Reads only the provider that this front door will actually open before
+/// arming the client-side startup update check. An explicit session's frozen
+/// observation wins. A new-session door evaluates the profile's default
+/// provider; the session picker passes no provider because it has no active
+/// selection yet.
+async fn startup_auto_hermetic(
+    client: &haider_client::RpcClient,
+    initial_session: Option<&str>,
+    new_session_provider: Option<&str>,
+) -> AutoHermeticLookup {
+    let target = startup_auto_hermetic_target(initial_session, new_session_provider);
+    match target {
+        StartupAutoHermeticTarget::Session(initial_session) => {
+            let response = client
+                .request(haider_rpc::RequestBody::SessionObserve {
+                    session_id: SessionId::new(initial_session),
+                    last_event_limit: 0,
+                    metadata_only: true,
+                })
+                .await;
+            match response {
+                Ok(haider_rpc::ResponseBody::SessionObserve { digest }) => {
+                    auto_hermetic_status_for_startup_target(target, digest.lockdown.as_ref())
+                }
+                _ => AutoHermeticLookup::Unavailable,
+            }
+        }
+        StartupAutoHermeticTarget::Provider(provider) => {
+            provider_auto_hermetic(client, provider).await
+        }
+        StartupAutoHermeticTarget::None => auto_hermetic_status_for_startup_target(target, None),
     }
 }
 

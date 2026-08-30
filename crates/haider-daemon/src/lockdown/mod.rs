@@ -191,6 +191,10 @@ struct DurableTurnBinding {
     run_id: String,
     provider: String,
     lockdown: bool,
+    /// Additive exact-policy bit. Old ledgers decode as ordinary configured
+    /// lockdown; new auto-hermetic bindings must remain strict after restart.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    auto_hermetic: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -263,14 +267,16 @@ impl LockdownManager {
         run_id: &str,
         provider: &str,
         proposed_lockdown: bool,
-    ) -> Result<(String, bool), LockdownError> {
+        proposed_auto_hermetic: bool,
+    ) -> Result<(String, bool, bool), LockdownError> {
         self.with_global_lock(|| {
             let mut ledger = self.load_turn_bindings()?;
-            if let Some(binding) = ledger.bindings.iter().find(|binding| {
+            if let Some(index) = ledger.bindings.iter().position(|binding| {
                 binding.profile_id == profile_id
                     && binding.session_id == session_id
                     && binding.run_id == run_id
             }) {
+                let binding = &mut ledger.bindings[index];
                 if binding.provider != provider {
                     return Err(LockdownError::TurnBindingConflict {
                         session_id: session_id.to_owned(),
@@ -279,7 +285,26 @@ impl LockdownManager {
                         requested_provider: provider.to_owned(),
                     });
                 }
-                return Ok((binding.provider.clone(), binding.lockdown));
+                // The exact active-account fact can arrive after an older
+                // manifest or observer installed ordinary lockdown. Allow
+                // only this monotonic narrowing; Full or Configured can
+                // never replace an already-auto-hermetic binding.
+                if proposed_auto_hermetic && !binding.auto_hermetic {
+                    binding.lockdown = true;
+                    binding.auto_hermetic = true;
+                    let result = (
+                        binding.provider.clone(),
+                        binding.lockdown,
+                        binding.auto_hermetic,
+                    );
+                    self.persist_turn_bindings(&ledger)?;
+                    return Ok(result);
+                }
+                return Ok((
+                    binding.provider.clone(),
+                    binding.lockdown,
+                    binding.auto_hermetic,
+                ));
             }
             ledger.bindings.push(DurableTurnBinding {
                 profile_id: profile_id.to_owned(),
@@ -287,9 +312,14 @@ impl LockdownManager {
                 run_id: run_id.to_owned(),
                 provider: provider.to_owned(),
                 lockdown: proposed_lockdown,
+                auto_hermetic: proposed_auto_hermetic,
             });
             self.persist_turn_bindings(&ledger)?;
-            Ok((provider.to_owned(), proposed_lockdown))
+            Ok((
+                provider.to_owned(),
+                proposed_lockdown,
+                proposed_auto_hermetic,
+            ))
         })
     }
 
@@ -298,7 +328,7 @@ impl LockdownManager {
         profile_id: &str,
         session_id: &str,
         run_id: &str,
-    ) -> Result<Option<(String, bool)>, LockdownError> {
+    ) -> Result<Option<(String, bool, bool)>, LockdownError> {
         self.with_global_lock(|| {
             Ok(self
                 .load_turn_bindings()?
@@ -309,7 +339,7 @@ impl LockdownManager {
                         && binding.session_id == session_id
                         && binding.run_id == run_id
                 })
-                .map(|binding| (binding.provider, binding.lockdown)))
+                .map(|binding| (binding.provider, binding.lockdown, binding.auto_hermetic)))
         })
     }
 
@@ -366,7 +396,7 @@ impl LockdownManager {
         &self,
         profile_id: &str,
         session_id: &str,
-    ) -> Result<Option<(String, String, bool)>, LockdownError> {
+    ) -> Result<Option<(String, String, bool, bool)>, LockdownError> {
         self.with_global_lock(|| {
             Ok(self
                 .load_turn_bindings()?
@@ -376,7 +406,14 @@ impl LockdownManager {
                 .find(|binding| {
                     binding.profile_id == profile_id && binding.session_id == session_id
                 })
-                .map(|binding| (binding.run_id, binding.provider, binding.lockdown)))
+                .map(|binding| {
+                    (
+                        binding.run_id,
+                        binding.provider,
+                        binding.lockdown,
+                        binding.auto_hermetic,
+                    )
+                }))
         })
     }
 

@@ -87,6 +87,7 @@ const HOOK_CONTROL_MAX_BYTES: usize = 64 * 1024;
 const HOOK_DRAIN_PAGE_MAX_REQUESTS: usize = 256;
 const HOOK_DRAIN_PAGE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const HOOK_CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+const HOOK_PROVIDER_BINDING_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 const ENV_ALLOWLIST: [&str; 5] = ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR"];
 // `cmd.exe` and Windows system tools need these bootstrap variables even
@@ -767,13 +768,14 @@ impl HookService {
         cause: &RawEnvelope,
         provider: &str,
         reason: &str,
+        tools_allowed: &[String],
     ) -> bool {
         let payload = match serde_json::to_value(EventPayload::LockdownRefused(
             haider_protocol::lockdown::LockdownRefused {
                 provider: provider.to_owned(),
                 tool: "hooks".to_owned(),
                 reason: reason.to_owned(),
-                tools_allowed: crate::lockdown::allowed_tool_names(),
+                tools_allowed: tools_allowed.to_vec(),
             },
         )) {
             Ok(payload) => payload,
@@ -2147,9 +2149,10 @@ async fn handle_committed(
         return true;
     }
 
-    // A headless acceptance journals its fully resolved provider immediately
-    // before the user-message fact in the same batch. Pin that actual model
-    // provider first; session metadata can deliberately name another pair.
+    // A headless acceptance journals its selected provider immediately before
+    // the user-message fact in the same batch. It is not account-resolution
+    // authority: the worker can still synthesize a keyless adapter after this
+    // event, so hooks wait for the worker's binding below.
     if let Some(HeadlessRunEventPayload::HeadlessRunConfigured(spec)) =
         HeadlessRunEventPayload::from_payload_value(&envelope.payload)
     {
@@ -2157,25 +2160,29 @@ async fn handle_committed(
             tracing::warn!(target: "haider.hooks", "headless provider fact has no run id");
             return false;
         };
-        let proposed = match service.inner.hub.provider_lockdown_policy(&spec.provider) {
-            Ok(lockdown) => lockdown,
+        let binding = match service
+            .inner
+            .hub
+            .bound_lockdown_run(&envelope.session_id, run_id)
+        {
+            Ok(binding) => binding,
             Err(error) => {
-                tracing::warn!(target: "haider.hooks", ?error, "headless provider trust lookup failed");
+                tracing::warn!(target: "haider.hooks", ?error, "headless turn-ceiling lookup failed");
                 return false;
             }
         };
-        return match service.inner.hub.bind_lockdown_turn(
-            &envelope.session_id,
-            run_id,
-            &spec.provider,
-            proposed,
-        ) {
-            Ok(_) => true,
-            Err(error) => {
-                tracing::warn!(target: "haider.hooks", ?error, "headless turn-ceiling bind failed");
-                false
-            }
-        };
+        if let Some((provider, _)) = binding
+            && provider != spec.provider
+        {
+            tracing::warn!(
+                target: "haider.hooks",
+                bound_provider = %provider,
+                configured_provider = %spec.provider,
+                "headless turn-ceiling provider mismatch"
+            );
+            return false;
+        }
+        return true;
     }
 
     let decision = reduce_decoded_durable_state(state, &envelope, &payload);
@@ -2253,17 +2260,26 @@ async fn handle_committed(
     // reconciliation still run below: configuration removal and malformed
     // definitions are observable even when this event matches no hook.
     let bound = match envelope.run_id.as_ref() {
-        Some(run_id) => match service
-            .inner
-            .hub
-            .bound_lockdown_run(&envelope.session_id, run_id)
-        {
-            Ok(bound) => bound,
-            Err(error) => {
-                tracing::warn!(target: "haider.hooks", ?error, "hook turn-ceiling lookup failed");
+        Some(run_id) => {
+            let mut shutdown = service.inner.shutdown.subscribe();
+            if *shutdown.borrow() {
                 return false;
             }
-        },
+            tokio::select! {
+                result = service.inner.hub.wait_bound_lockdown_run(
+                    &envelope.session_id,
+                    run_id,
+                    HOOK_PROVIDER_BINDING_TIMEOUT,
+                ) => match result {
+                    Ok(bound) => bound,
+                    Err(error) => {
+                        tracing::warn!(target: "haider.hooks", ?error, "hook turn-ceiling lookup failed");
+                        return false;
+                    }
+                },
+                _ = shutdown.changed() => return false,
+            }
+        }
         None => match service
             .inner
             .hub
@@ -2276,43 +2292,22 @@ async fn handle_committed(
             }
         },
     };
-    let (provider, lockdown) = match bound {
+    let (provider, policy) = match bound {
         Some(bound) => bound,
-        None => {
-            let proposed = match service
-                .inner
-                .hub
-                .provider_lockdown_policy(&metadata.provider)
-            {
-                Ok(lockdown) => lockdown,
-                Err(error) => {
-                    tracing::warn!(target: "haider.hooks", ?error, "hook provider trust lookup failed");
-                    return false;
-                }
-            };
-            let lockdown = match envelope.run_id.as_ref() {
-                Some(run_id) => match service.inner.hub.bind_lockdown_turn(
-                    &envelope.session_id,
-                    run_id,
-                    &metadata.provider,
-                    proposed,
-                ) {
-                    Ok(lockdown) => lockdown,
-                    Err(error) => {
-                        tracing::warn!(target: "haider.hooks", ?error, "hook turn-ceiling bind failed");
-                        return false;
-                    }
-                },
-                None => proposed,
-            };
-            (metadata.provider.clone(), lockdown)
-        }
+        // No worker supplied an exact account fact within the bounded wait.
+        // Fail closed for this dispatch without creating durable policy from
+        // the mutable management projection. A later event can use the
+        // worker's binding once it exists.
+        None => (
+            metadata.provider.clone(),
+            crate::auto_hermetic::ProviderLockdownPolicy::UnknownProvider,
+        ),
     };
     let any_match = discovery
         .hooks
         .values()
         .any(|definition| definition.matcher.matches(&envelope, &provider, &facts));
-    if lockdown {
+    if policy.is_lockdown() {
         let workspace = Path::new(&metadata.cwd);
         state
             .subscribers
@@ -2332,12 +2327,14 @@ async fn handle_committed(
         if !any_match {
             return true;
         }
+        let tools_allowed = crate::auto_hermetic::tools_for(policy);
         return journal_lockdown_refusal_once(
             service,
             state,
             &envelope,
             &provider,
             "automatic hooks cannot execute for a lockdown provider",
+            &tools_allowed,
         )
         .await;
     }
@@ -2687,6 +2684,7 @@ async fn journal_lockdown_refusal_once(
     cause: &RawEnvelope,
     provider: &str,
     reason: &str,
+    tools_allowed: &[String],
 ) -> bool {
     let key = format!(
         "lockdown\0{}\0{}\0{}\0{}",
@@ -2696,7 +2694,7 @@ async fn journal_lockdown_refusal_once(
         return true;
     }
     if service
-        .journal_lockdown_refusal(cause, provider, reason)
+        .journal_lockdown_refusal(cause, provider, reason, tools_allowed)
         .await
     {
         state.notice_dedup.insert(key);

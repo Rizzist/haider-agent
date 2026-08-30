@@ -8592,6 +8592,7 @@ impl AccountsProviderFactory {
             target_metadata,
             tuning,
             oauth_access_fingerprint,
+            false,
         )
         .with_web_degrade(web_degrade);
         Some(haider_core::ProviderPairSwitchTarget {
@@ -8812,7 +8813,7 @@ impl AccountsProviderFactory {
         &self,
         metadata: &haider_protocol::session::SessionMetadataV1,
         tuning: &ProviderTuning,
-    ) -> Result<(ResolvedAccount, Arc<dyn Provider>, Option<[u8; 32]>), HaiderError> {
+    ) -> Result<(ResolvedAccount, Arc<dyn Provider>, Option<[u8; 32]>, bool), HaiderError> {
         let mut resolved = match self.resolve_account(&metadata.provider, None).await {
             Ok(resolved) => resolved,
             // G4a: no credential AT ALL for an auth-None custom profile is
@@ -8825,7 +8826,7 @@ impl AccountsProviderFactory {
                 };
                 let provider =
                     self.build_provider(&resolved.descriptor, credential, metadata, tuning)?;
-                return Ok((resolved, provider, None));
+                return Ok((resolved, provider, None, true));
             }
             Err(error) => return Err(error),
         };
@@ -8853,7 +8854,7 @@ impl AccountsProviderFactory {
         ) && resolved.descriptor.auth_method == AuthMethod::OAuth)
             .then(|| *blake3::hash(credential.expose_secret()).as_bytes());
         let provider = self.build_provider(&resolved.descriptor, credential, metadata, tuning)?;
-        Ok((resolved, provider, oauth_access_fingerprint))
+        Ok((resolved, provider, oauth_access_fingerprint, false))
     }
 }
 
@@ -8996,10 +8997,16 @@ impl AccountsAttemptResolver {
         metadata: haider_protocol::session::SessionMetadataV1,
         tuning: ProviderTuning,
         oauth_access_fingerprint: Option<[u8; 32]>,
+        active_no_auth: bool,
     ) -> Self {
-        let lockdown = factory
-            .provider_profile(&metadata.provider)
-            .is_some_and(|profile| profile.trust != haider_rpc::ProviderTrustWire::Full);
+        let profile = factory.provider_profile(&metadata.provider);
+        let lockdown = if active_no_auth {
+            crate::auto_hermetic::provider_policy_for_active(profile.as_ref(), true).is_lockdown()
+        } else {
+            profile.as_ref().is_some_and(|profile| {
+                crate::auto_hermetic::provider_policy_for_active(Some(profile), false).is_lockdown()
+            })
+        };
         Self {
             factory,
             metadata,
@@ -9295,6 +9302,7 @@ impl haider_core::ProviderAttemptResolver for AccountsAttemptResolver {
                 metadata,
                 tuning,
                 oauth_access_fingerprint,
+                false,
             )
             .with_web_degrade(self.web_degrade)
             .at_fallback_cursor(index);
@@ -9330,7 +9338,7 @@ impl AccountsProviderFactory {
         tuning: ProviderTuning,
         web_degrade: crate::worker::WebCapabilityDegrade,
     ) -> Result<crate::worker::ResolvedTurnProvider, HaiderError> {
-        let (resolved, provider, oauth_access_fingerprint) =
+        let (resolved, provider, oauth_access_fingerprint, active_no_auth) =
             self.resolve_provider(metadata, &tuning).await?;
         let rotation_budget_consumed = resolved.rotation.is_some();
         let context_window = self.model_context_window(&metadata.provider, &metadata.model);
@@ -9343,6 +9351,7 @@ impl AccountsProviderFactory {
             model: metadata.model.clone(),
             context_window,
             account_alias: Some(resolved.descriptor.alias.as_str().to_owned()),
+            active_no_auth,
             initial_rotation: resolved.rotation,
             rotation_budget_consumed,
             attempt_resolver: self.broker.as_ref().map(|_| {
@@ -9352,6 +9361,7 @@ impl AccountsProviderFactory {
                         metadata.clone(),
                         tuning.clone(),
                         oauth_access_fingerprint,
+                        active_no_auth,
                     )
                     .with_web_degrade(web_degrade),
                 ) as Arc<dyn haider_core::ProviderAttemptResolver>

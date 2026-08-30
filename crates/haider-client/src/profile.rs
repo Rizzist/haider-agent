@@ -11,8 +11,13 @@
 //!   version tag plus the canonical store-path bytes.
 //! - Every profile receives a distinct runtime directory. `HAIDER_RUNTIME_DIR`
 //!   selects the containing root for gates/CI; otherwise a verified
-//!   owner-private `XDG_RUNTIME_DIR` on Linux, `TMPDIR`, or `$PREFIX/tmp`
-//!   supplies the base, with the short per-UID `/tmp` fallback retained.
+//!   owner-private `XDG_RUNTIME_DIR` on Linux or the resolved user home
+//!   supplies the base. The short per-UID `/tmp` fallback is retained only
+//!   when an explicit store was supplied without any user home.
+//! - A home-selected runtime never silently escapes to a shorter temporary
+//!   path. The complete bind/staging path budget is checked during profile
+//!   resolution, with a typed error directing the operator to an explicit
+//!   short `HAIDER_RUNTIME_DIR` when necessary.
 //! - The default model is a release-owned FULL Anthropic model ID: profile
 //!   config (`config.json`) or `HAIDER_MODEL` may override the packaged
 //!   value; the TUI's short product labels never enter this seam.
@@ -136,6 +141,12 @@ pub enum ProfileError {
     /// `config.json` exists but cannot be parsed; a malformed config must be
     /// loud, never silently ignored.
     InvalidConfig { path: PathBuf, message: String },
+    /// The selected runtime cannot be represented by the platform IPC API.
+    /// This is checked before the daemon touches runtime state so a private
+    /// home never silently falls back to a shared location.
+    RuntimeEndpoint {
+        source: haider_platform::EndpointError,
+    },
 }
 
 impl std::fmt::Display for ProfileError {
@@ -159,6 +170,10 @@ impl std::fmt::Display for ProfileError {
                     path.display()
                 )
             }
+            Self::RuntimeEndpoint { source } => write!(
+                formatter,
+                "profile runtime endpoint is not usable: {source}; set {RUNTIME_DIR_ENV} to a shorter owner-private directory"
+            ),
         }
     }
 }
@@ -167,6 +182,7 @@ impl std::error::Error for ProfileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
+            Self::RuntimeEndpoint { source } => Some(source),
             _ => None,
         }
     }
@@ -210,7 +226,11 @@ pub fn resolve_profile(env: &ProfileEnv) -> Result<ResolvedProfile, ProfileError
     let profile_id = hasher.finalize().to_hex().to_string();
 
     let runtime_dir = runtime_dir(env, &RuntimeEnv::capture(), &profile_id);
-    let endpoint_path = endpoint_path_for(&runtime_dir, &profile_id);
+    let endpoint = haider_platform::Endpoint::new(&runtime_dir, &profile_id);
+    endpoint
+        .validate_for_bind(&runtime_dir)
+        .map_err(|source| ProfileError::RuntimeEndpoint { source })?;
+    let endpoint_path = endpoint.into_address();
     let default_model = resolve_default_model(&store_dir, env)?;
 
     Ok(ResolvedProfile {
@@ -286,8 +306,9 @@ fn runtime_root(env: &ProfileEnv, runtime_env: &RuntimeEnv) -> PathBuf {
     {
         return xdg.join("haider");
     }
-    #[cfg(all(unix, not(target_os = "linux")))]
-    let _ = env;
+    if let Some(home) = profile_home(env) {
+        return home.join(".haider").join("runtime");
+    }
     #[cfg(unix)]
     {
         if let Some(tmpdir) = &runtime_env.tmpdir
@@ -305,7 +326,7 @@ fn runtime_root(env: &ProfileEnv, runtime_env: &RuntimeEnv) -> PathBuf {
     }
     #[cfg(windows)]
     {
-        let _ = (env, runtime_env);
+        let _ = runtime_env;
         std::env::temp_dir().join("haider")
     }
 }

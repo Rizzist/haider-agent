@@ -140,6 +140,7 @@ impl ProviderFactory for RoutingProviderFactory {
             account_alias: attempt_resolver
                 .as_ref()
                 .map(|_| "fake-a-account".to_owned()),
+            active_no_auth: false,
             initial_rotation: None,
             rotation_budget_consumed: false,
             attempt_resolver,

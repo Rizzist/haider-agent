@@ -99,7 +99,8 @@ fn shared_filtered_tool_view_preserves_legacy_wire_bytes() {
 #[test]
 fn lockdown_turn_advertises_only_the_fixed_reduced_pack() {
     let full = registered_tool_catalog().provider_definition_pack.clone();
-    let reduced = lockdown_tool_definition_pack(full, true);
+    let allowed = crate::lockdown::allowed_tool_names();
+    let reduced = lockdown_tool_definition_pack(full, Some(&allowed));
     let names = reduced
         .definitions
         .iter()
@@ -154,14 +155,42 @@ fn lockdown_turn_advertises_only_the_fixed_reduced_pack() {
     );
 }
 
+/// AUTO-HERMETIC: reuse the lockdown pack machinery with the stricter local
+/// no-auth envelope. No web/gateway-adjacent route may be advertised even
+/// though ordinary configured lockdown deliberately permits web tools.
+#[test]
+fn auto_hermetic_turn_advertises_no_egress_tools() {
+    let full = registered_tool_catalog().provider_definition_pack.clone();
+    let allowed =
+        crate::auto_hermetic::tools_for(crate::auto_hermetic::ProviderLockdownPolicy::AutoHermetic);
+    let reduced = lockdown_tool_definition_pack(full, Some(&allowed));
+    let names = reduced
+        .definitions
+        .iter()
+        .map(|definition| definition.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"fs_read"));
+    for egress in [
+        "web_search",
+        "web_fetch",
+        "peer_list",
+        "ssh_list",
+        "spawn_subagent",
+        "process_exec",
+    ] {
+        assert!(!names.contains(&egress), "advertised egress tool {egress}");
+    }
+}
+
 /// MUTATION CHECK: reuse a mutable provider-trust lookup from inside the
 /// dispatcher instead of the pack/context snapshot. Expected failure: the
 /// first pack changes when the simulated toggle constructs the next turn.
 #[test]
 fn trust_toggle_changes_only_the_next_turn_pack() {
     let full = registered_tool_catalog().provider_definition_pack.clone();
-    let in_flight = lockdown_tool_definition_pack(full.clone(), true);
-    let next_turn = lockdown_tool_definition_pack(full, false);
+    let allowed = crate::lockdown::allowed_tool_names();
+    let in_flight = lockdown_tool_definition_pack(full.clone(), Some(&allowed));
+    let next_turn = lockdown_tool_definition_pack(full, None);
 
     assert!(
         !in_flight
@@ -423,13 +452,14 @@ fn cached_pack_for_test(
         local_web_tool_names,
         provider_fallback_local_web_tool_names,
     };
+    let lockdown_tools = lockdown.then(crate::lockdown::allowed_tool_names);
     cached_turn_tool_packs(
         cache,
         TurnToolPackInputs {
             provider_name,
             provider_request_state: &provider_request_state,
             grant: ToolPackGrantSnapshot::new(grant).expect("grant revision"),
-            lockdown,
+            lockdown_tools: lockdown_tools.as_deref(),
             registry_revision,
             mobile_use_active,
         },

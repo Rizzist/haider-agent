@@ -924,22 +924,69 @@ pub(super) fn filter_provider_summaries(
         .collect()
 }
 
-fn lockdown_status_wire(status: crate::lockdown::LockdownStatus) -> haider_rpc::LockdownStatusWire {
+fn lockdown_status_wire(
+    mut status: crate::lockdown::LockdownStatus,
+    policy: Option<crate::auto_hermetic::ProviderLockdownPolicy>,
+    active: bool,
+) -> haider_rpc::LockdownStatusWire {
+    if let Some(policy) = policy
+        && policy.is_lockdown()
+    {
+        status.tools_allowed = crate::auto_hermetic::tools_for(policy);
+    }
     haider_rpc::LockdownStatusWire {
         provider: status.provider,
+        activation: policy.and_then(|policy| policy.activation(active)),
+        reason: policy
+            .and_then(|policy| policy.reason(active))
+            .map(str::to_owned),
         tools_allowed: status.tools_allowed,
         quota_used: status.quota_used,
         quota_limit: status.quota_limit,
     }
 }
 
-fn lockdown_refusal_error_data(provider: &str, tool: &str, reason: &str) -> haider_rpc::ErrorData {
+struct SessionLockdownEnvelope {
+    provider: String,
+    tools_allowed: Vec<String>,
+}
+
+impl std::fmt::Display for SessionLockdownEnvelope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.provider)
+    }
+}
+
+fn lockdown_refusal_error_data(
+    envelope: &SessionLockdownEnvelope,
+    tool: &str,
+    reason: &str,
+) -> haider_rpc::ErrorData {
     haider_rpc::ErrorData::RefusedByLockdown {
-        provider: provider.to_owned(),
+        provider: envelope.provider.clone(),
         tool: tool.to_owned(),
         reason: reason.to_owned(),
-        tools_allowed: crate::lockdown::allowed_tool_names(),
+        tools_allowed: envelope.tools_allowed.clone(),
     }
+}
+
+#[cfg(test)]
+#[test]
+fn auto_hermetic_refusal_data_never_advertises_an_egress_tool() {
+    let envelope = SessionLockdownEnvelope {
+        provider: "local".into(),
+        tools_allowed: crate::auto_hermetic::tools_for(
+            crate::auto_hermetic::ProviderLockdownPolicy::AutoHermetic,
+        ),
+    };
+    let haider_rpc::ErrorData::RefusedByLockdown { tools_allowed, .. } =
+        lockdown_refusal_error_data(&envelope, "web_fetch", "refused")
+    else {
+        panic!("lockdown refusal must retain its typed error data");
+    };
+    assert!(tools_allowed.iter().any(|tool| tool == "fs_read"));
+    assert!(!tools_allowed.iter().any(|tool| tool == "web_fetch"));
+    assert!(!tools_allowed.iter().any(|tool| tool == "peer_list"));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1488,11 +1535,27 @@ async fn session_observe_digest(
         .transpose()?
         .flatten();
     for subagent in &mut digest.subagents {
-        subagent.lockdown = match (subagent.provider.as_deref(), subagent.lockdown_bound) {
-            (Some(provider), Some(true)) => observed_lockdown_manager_status(provider)?,
-            (_, Some(false)) => None,
-            (Some(provider), None) => observed_lockdown_status(hub, None, provider)?,
-            (None, _) => None,
+        let active_child = hub.delegation(subagent.agent_id.clone()).await?;
+        if let (Some(provider), Some(child)) = (subagent.provider.as_deref(), active_child) {
+            subagent.lockdown =
+                observed_lockdown_status(hub, Some(&child.child_session_id), provider)?;
+            continue;
+        }
+        subagent.lockdown = match (
+            subagent.provider.as_deref(),
+            subagent.lockdown_bound,
+            subagent.lockdown_auto_hermetic_bound,
+        ) {
+            (Some(provider), Some(true), auto_hermetic) => observed_lockdown_manager_status(
+                provider,
+                crate::auto_hermetic::ProviderLockdownPolicy::from_binding(
+                    true,
+                    auto_hermetic.unwrap_or(false),
+                ),
+            )?,
+            (_, Some(false), _) => None,
+            (Some(provider), None, _) => observed_lockdown_status(hub, None, provider)?,
+            (None, _, _) => None,
         };
     }
     Ok(Some(digest))
@@ -1503,25 +1566,32 @@ fn observed_lockdown_status(
     session_id: Option<&SessionId>,
     provider: &str,
 ) -> Result<Option<haider_rpc::LockdownStatusWire>, SessionHubError> {
-    let (provider, lockdown) = match session_id {
+    let (provider, policy) = match session_id {
         Some(session_id) => {
             let active_binding = if crate::lockdown::global_if_initialized().is_some() {
                 hub.bound_session_lockdown(session_id)?
             } else {
                 None
             };
-            active_binding.unwrap_or((provider.to_owned(), hub.provider_lockdown_policy(provider)?))
+            active_binding.unwrap_or((
+                provider.to_owned(),
+                hub.provider_lockdown_policy_detail(provider)?,
+            ))
         }
-        None => (provider.to_owned(), hub.provider_lockdown_policy(provider)?),
+        None => (
+            provider.to_owned(),
+            hub.provider_lockdown_policy_detail(provider)?,
+        ),
     };
-    if !lockdown {
+    if !policy.is_lockdown() {
         return Ok(None);
     }
-    observed_lockdown_manager_status(&provider)
+    observed_lockdown_manager_status(&provider, policy)
 }
 
 fn observed_lockdown_manager_status(
     provider: &str,
+    policy: crate::auto_hermetic::ProviderLockdownPolicy,
 ) -> Result<Option<haider_rpc::LockdownStatusWire>, SessionHubError> {
     let Some(manager) = crate::lockdown::global_if_initialized() else {
         // The quota ledger is machine-user-global and may already contain
@@ -1531,7 +1601,7 @@ fn observed_lockdown_manager_status(
     };
     manager
         .status(Some(provider))
-        .map(lockdown_status_wire)
+        .map(|status| lockdown_status_wire(status, Some(policy), true))
         .map(Some)
         .map_err(|error| SessionHubError::Task(error.to_string()))
 }
@@ -1677,6 +1747,11 @@ impl ObserveProjection {
                     .as_ref()
                     .and_then(|coordinates| coordinates.get("lockdown"))
                     .and_then(serde_json::Value::as_bool);
+                let lockdown_auto_hermetic_bound = manifest
+                    .coordinates
+                    .as_ref()
+                    .and_then(|coordinates| coordinates.get("auto_hermetic"))
+                    .and_then(serde_json::Value::as_bool);
                 self.subagents.insert(
                     manifest.agent.as_str().to_owned(),
                     haider_rpc::ObserveSubagentWire {
@@ -1686,6 +1761,7 @@ impl ObserveProjection {
                         state: "thinking".into(),
                         provider,
                         lockdown_bound,
+                        lockdown_auto_hermetic_bound,
                         lockdown: None,
                     },
                 );
@@ -1702,6 +1778,7 @@ impl ObserveProjection {
                         state,
                         provider: None,
                         lockdown_bound: None,
+                        lockdown_auto_hermetic_bound: None,
                         lockdown: None,
                     });
             }
@@ -8022,11 +8099,26 @@ impl HubConnection {
         request_id: RequestId,
         provider: Option<&str>,
     ) -> Result<(), SessionHubError> {
+        let policy = match provider
+            .map(|provider| self.hub.provider_lockdown_policy_detail(provider))
+            .transpose()
+        {
+            Ok(policy) => policy,
+            Err(error) => {
+                return self.respond_error(
+                    request_id,
+                    haider_rpc::ERROR_CODE_PROVIDER_ERROR,
+                    &error.to_string(),
+                    false,
+                    None,
+                );
+            }
+        };
         match crate::lockdown::global().and_then(|manager| manager.status(provider)) {
             Ok(status) => self.send(WireFrame::Response {
                 request_id,
                 body: ResponseBody::LockdownStatus {
-                    status: lockdown_status_wire(status),
+                    status: lockdown_status_wire(status, policy, false),
                 },
             }),
             Err(error) => self.respond_error(
@@ -8042,34 +8134,38 @@ impl HubConnection {
     async fn session_lockdown_provider(
         &self,
         session_id: &SessionId,
-    ) -> Result<Option<String>, SessionHubError> {
+    ) -> Result<Option<SessionLockdownEnvelope>, SessionHubError> {
         let Some(metadata) = self.hub.session_metadata(session_id).await? else {
             return Ok(None);
         };
-        let (provider, lockdown) = self.hub.bound_session_lockdown(session_id)?.unwrap_or((
+        let (provider, policy) = self.hub.bound_session_lockdown(session_id)?.unwrap_or((
             metadata.provider.clone(),
-            self.hub.provider_lockdown_policy(&metadata.provider)?,
+            self.hub
+                .provider_lockdown_policy_detail(&metadata.provider)?,
         ));
-        Ok(lockdown.then_some(provider))
+        if !policy.is_lockdown() {
+            return Ok(None);
+        }
+        Ok(Some(SessionLockdownEnvelope {
+            provider,
+            tools_allowed: crate::auto_hermetic::tools_for(policy),
+        }))
     }
 
     async fn journal_session_lockdown_refusal(
         &self,
         session_id: &SessionId,
         command_id: &str,
-        provider: &str,
+        envelope: &SessionLockdownEnvelope,
         tool: &str,
         reason: &str,
     ) -> Result<(), SessionHubError> {
         let payload = serde_json::to_value(EventPayload::LockdownRefused(
             haider_protocol::lockdown::LockdownRefused {
-                provider: provider.to_owned(),
+                provider: envelope.provider.clone(),
                 tool: tool.to_owned(),
                 reason: reason.to_owned(),
-                tools_allowed: crate::lockdown::ALLOWED_TOOLS
-                    .iter()
-                    .map(|tool| (*tool).to_owned())
-                    .collect(),
+                tools_allowed: envelope.tools_allowed.clone(),
             },
         ))
         .map_err(|error| SessionHubError::Task(error.to_string()))?;
@@ -8151,7 +8247,7 @@ impl HubConnection {
                 self.send(WireFrame::Response {
                     request_id,
                     body: ResponseBody::LockdownSetQuota {
-                        status: lockdown_status_wire(status),
+                        status: lockdown_status_wire(status, None, false),
                     },
                 })
             }
@@ -8217,7 +8313,7 @@ impl HubConnection {
             };
             let lockdown = self.hub.bound_session_lockdown(&session_id)?.map_or_else(
                 || providers.contains(&metadata.provider),
-                |(_, lockdown)| lockdown,
+                |(_, policy)| policy.is_lockdown(),
             );
             if !lockdown {
                 continue;

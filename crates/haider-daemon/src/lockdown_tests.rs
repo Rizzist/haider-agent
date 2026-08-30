@@ -152,9 +152,9 @@ fn turn_binding_survives_restart_and_rejects_provider_mismatch() {
     let manager = LockdownManager::initialize(root.clone()).expect("manager");
     assert_eq!(
         manager
-            .bind_turn("profile", "session", "run", "research", true)
+            .bind_turn("profile", "session", "run", "research", true, true)
             .expect("first bind"),
-        ("research".to_owned(), true)
+        ("research".to_owned(), true, true)
     );
     assert_eq!(
         manager
@@ -169,13 +169,14 @@ fn turn_binding_survives_restart_and_rejects_provider_mismatch() {
     let restarted = LockdownManager::initialize(root).expect("restart");
     assert_eq!(
         restarted
-            .bind_turn("profile", "session", "run", "research", false)
-            .expect("durable bind wins over mutable trust"),
-        ("research".to_owned(), true)
+            .bind_turn("profile", "session", "run", "research", true, false)
+            .expect("durable exact policy wins over mutable trust"),
+        ("research".to_owned(), true, true),
+        "restart must not widen auto-hermetic into ordinary lockdown"
     );
     assert!(matches!(
         restarted
-            .bind_turn("profile", "session", "run", "other", false)
+            .bind_turn("profile", "session", "run", "other", false, false)
             .expect_err("same run cannot change provider"),
         LockdownError::TurnBindingConflict { .. }
     ));
@@ -189,7 +190,35 @@ fn turn_binding_survives_restart_and_rejects_provider_mismatch() {
         restarted
             .active_session_binding("profile", "session")
             .expect("active binding"),
-        Some(("run".to_owned(), "research".to_owned(), true))
+        Some(("run".to_owned(), "research".to_owned(), true, true))
+    );
+}
+
+/// A manifest or older observer can establish ordinary lockdown before the
+/// worker publishes the exact keyless-account fact. The durable transition
+/// may narrow Configured to AutoHermetic, but a later Full proposal can never
+/// widen it again.
+#[test]
+fn turn_binding_allows_only_exact_auto_hermetic_narrowing() {
+    let fixture = tempfile::tempdir().expect("fixture");
+    let manager = LockdownManager::initialize(fixture.path().join("lockdown")).expect("manager");
+    assert_eq!(
+        manager
+            .bind_turn("profile", "session", "run", "research", true, false)
+            .expect("ordinary lockdown bind"),
+        ("research".to_owned(), true, false)
+    );
+    assert_eq!(
+        manager
+            .bind_turn("profile", "session", "run", "research", true, true)
+            .expect("auto-hermetic narrowing"),
+        ("research".to_owned(), true, true)
+    );
+    assert_eq!(
+        manager
+            .bind_turn("profile", "session", "run", "research", false, false)
+            .expect("attempted widening"),
+        ("research".to_owned(), true, true)
     );
 }
 
