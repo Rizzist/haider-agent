@@ -1670,6 +1670,7 @@ impl ObserveProjection {
                 self.menus.remove(menu.as_str());
             }
             EventPayload::AgentSpawned(manifest) => {
+                let provider = manifest.provider().map(ToOwned::to_owned);
                 let lockdown_bound = manifest
                     .coordinates
                     .as_ref()
@@ -1682,12 +1683,7 @@ impl ObserveProjection {
                         callsign: manifest.callsign,
                         task: manifest.task,
                         state: "thinking".into(),
-                        provider: manifest
-                            .coordinates
-                            .as_ref()
-                            .and_then(|coordinates| coordinates.get("provider"))
-                            .and_then(serde_json::Value::as_str)
-                            .map(ToOwned::to_owned),
+                        provider,
                         lockdown_bound,
                         lockdown: None,
                     },
@@ -3015,6 +3011,36 @@ impl HubConnection {
                     text,
                 )
                 .await
+            }
+            RequestBody::AgentCancel {
+                command_id,
+                session_id,
+                worker_generation,
+                agent,
+            } => {
+                if let Err(message) = authorize(&self.capabilities, Operation::Control) {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        message,
+                        false,
+                        None,
+                    );
+                }
+                if !self
+                    .hub
+                    .holds_control_attachment(&self.connection_id, &session_id)?
+                {
+                    return self.respond_error(
+                        request_id,
+                        ERROR_CODE_CAPABILITY_DENIED,
+                        "agent cancellation requires a control attachment to the parent session",
+                        false,
+                        None,
+                    );
+                }
+                self.agent_cancel(request_id, command_id, session_id, worker_generation, agent)
+                    .await
             }
             RequestBody::TurnSubmitWithBranch {
                 command_id,
@@ -12409,6 +12435,135 @@ impl HubConnection {
         })
     }
 
+    /// Cancels an owned direct child through the same durable `turn.cancel`
+    /// transition used by ordinary run control. The target transition is
+    /// claimed before the descendant sweep so reusing one command id with
+    /// different semantics cannot mutate an unrelated subtree first.
+    async fn agent_cancel(
+        &self,
+        request_id: RequestId,
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        agent: AgentId,
+    ) -> Result<(), SessionHubError> {
+        if command_id.as_str().trim().is_empty() {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_INVALID_ARGUMENT,
+                "agent-cancel command id must not be empty",
+                false,
+                None,
+            );
+        }
+        let record = match self.hub.delegation(agent.clone()).await {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                return self.respond_error(
+                    request_id,
+                    ERROR_CODE_CAPABILITY_DENIED,
+                    "agent cancellation requires an owned direct child",
+                    false,
+                    None,
+                );
+            }
+            Err(error) => return self.respond_turn_error(request_id, error),
+        };
+        let parent_agent_id = match self
+            .hub
+            .delegation_for_child_session(session_id.clone())
+            .await
+        {
+            Ok(parent) => parent.map(|parent| parent.agent_id),
+            Err(error) => return self.respond_turn_error(request_id, error),
+        };
+        if record.parent_session_id != session_id || record.parent_agent_id != parent_agent_id {
+            return self.respond_error(
+                request_id,
+                ERROR_CODE_CAPABILITY_DENIED,
+                "agent cancellation requires an owned direct child",
+                false,
+                None,
+            );
+        }
+
+        let mut pending = vec![record.clone()];
+        let mut subtree = Vec::new();
+        while let Some(current) = pending.pop() {
+            match self
+                .hub
+                .delegations_for_parent_run(
+                    current.child_session_id.clone(),
+                    current.child_run_id.clone(),
+                )
+                .await
+            {
+                Ok(children) => pending.extend(children),
+                Err(error) => return self.respond_turn_error(request_id, error),
+            }
+            subtree.push(current);
+        }
+
+        let target_command = match agent_cancel_command(
+            &record,
+            command_id.as_str(),
+            "manual",
+            worker_generation,
+            self.hub.device_id(),
+        ) {
+            Ok(command) => command,
+            Err(error) => return self.respond_turn_error(request_id, error),
+        };
+        let cancelled = match self.hub.cancel_internal_turn(target_command).await {
+            Ok(cancelled) => cancelled,
+            Err(error) => return self.respond_turn_error(request_id, error),
+        };
+
+        if cancelled.status == TurnCancellationStatus::Accepted {
+            for descendant in subtree.into_iter().rev() {
+                if descendant.agent_id == record.agent_id {
+                    continue;
+                }
+                let descendant_command_id = format!(
+                    "{}-ancestor-{}",
+                    command_id.as_str(),
+                    descendant.agent_id.as_str()
+                );
+                let command = match agent_cancel_command(
+                    &descendant,
+                    &descendant_command_id,
+                    "manual_ancestor",
+                    worker_generation,
+                    self.hub.device_id(),
+                ) {
+                    Ok(command) => command,
+                    Err(error) => return self.respond_turn_error(request_id, error),
+                };
+                if let Err(error) = self.hub.cancel_internal_turn(command).await {
+                    tracing::warn!(
+                        agent = %descendant.agent_id,
+                        ?error,
+                        "manual child cancellation descendant sweep will be reconciled by the cancelled parent"
+                    );
+                }
+            }
+        }
+
+        self.send(WireFrame::Response {
+            request_id,
+            body: ResponseBody::AgentCancel {
+                agent: record.agent_id,
+                child_session_id: cancelled.session_id,
+                child_run_id: cancelled.run_id,
+                status: match cancelled.status {
+                    TurnCancellationStatus::Accepted => CancelStatus::Accepted,
+                    TurnCancellationStatus::AlreadyTerminal => CancelStatus::AlreadyTerminal,
+                },
+                terminal_seq: cancelled.terminal_seq,
+            },
+        })
+    }
+
     async fn queue_list(
         &self,
         request_id: RequestId,
@@ -17073,6 +17228,42 @@ fn authorize(capabilities: &CapabilitySet, operation: Operation) -> Result<(), &
     allowed.then_some(()).ok_or(match operation {
         Operation::View => "this method requires the view capability",
         Operation::Control => "this method requires the control capability",
+    })
+}
+
+fn agent_cancel_command(
+    record: &haider_core::DelegationRecord,
+    command_id: &str,
+    reason: &str,
+    worker_generation: u64,
+    device_id: DeviceId,
+) -> Result<TurnCancelCommand, HaiderError> {
+    let request_json = serde_json::to_string(&serde_json::json!({
+        "parent_session_id": record.parent_session_id,
+        "agent": record.agent_id,
+        "child_session_id": record.child_session_id,
+        "child_run_id": record.child_run_id,
+        "worker_generation": worker_generation,
+        "reason": reason,
+    }))
+    .map_err(|error| {
+        HaiderError::new(
+            ErrorCode::Internal,
+            format!("agent cancellation coordinates could not serialize: {error}"),
+            false,
+        )
+    })?;
+    let event_identity =
+        blake3::hash(format!("{command_id}:{}:{reason}", record.agent_id.as_str()).as_bytes());
+    Ok(TurnCancelCommand {
+        command_id: command_id.to_owned(),
+        request_digest: blake3::hash(request_json.as_bytes()).to_hex().to_string(),
+        request_json,
+        session_id: record.child_session_id.clone(),
+        worker_generation,
+        run_id: record.child_run_id.clone(),
+        cancelling_event_id: EventId::new(format!("agent-cancelling-{event_identity}")),
+        device_id,
     })
 }
 

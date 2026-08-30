@@ -392,6 +392,9 @@ pub const FEATURE_HOOKS_V1: &str = "hooks_v1";
 pub const FEATURE_HOOKS_SERVER_V1: &str = "hooks_server_v1";
 /// Daemon implements owned direct-child messaging for tools and chip composers.
 pub const FEATURE_AGENT_MESSAGE_V1: &str = "agent_message_v1";
+/// Daemon implements receipt-backed cancellation of an owned direct child.
+/// The child remains visible and reaches a durable terminal run state.
+pub const FEATURE_AGENT_CANCEL_V1: &str = "agent_cancel_v1";
 /// Daemon implements receipted live-session model selection
 /// (`session.select_model`), including cross-provider rows: the request's
 /// optional `provider` names the selected model row's provider attribute,
@@ -3281,6 +3284,15 @@ pub enum RequestBody {
         agent: AgentId,
         text: String,
     },
+    /// Cancel one direct child of the named parent session. The daemon owns
+    /// the child run coordinate and recursively stops its descendants.
+    #[serde(rename = "agent.cancel")]
+    AgentCancel {
+        command_id: CommandId,
+        session_id: SessionId,
+        worker_generation: u64,
+        agent: AgentId,
+    },
     /// Branch-capable decode form of `turn.submit`.
     #[serde(rename = "turn.submit")]
     TurnSubmitWithBranch {
@@ -4343,6 +4355,17 @@ pub enum ResponseBody {
     },
     #[serde(rename = "agent.message")]
     AgentMessage { receipt: AgentMessageReceipt },
+    /// Result of durably cancelling an owned direct child. `terminal_seq` is
+    /// present exactly when the target run was already terminal.
+    #[serde(rename = "agent.cancel")]
+    AgentCancel {
+        agent: AgentId,
+        child_session_id: SessionId,
+        child_run_id: RunId,
+        status: CancelStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_seq: Option<u64>,
+    },
     /// Durable acceptance coordinates of `turn.submit` (R3): `run_id` and
     /// the `UserMessage` sequence committed by the acceptance transaction.
     /// Socket order relative to that transaction's events is NOT promised —

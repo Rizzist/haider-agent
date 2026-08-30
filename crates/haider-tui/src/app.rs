@@ -2744,7 +2744,7 @@ impl LoginCard {
 /// | `enter_aura` (`/aura`, ◉ Aura row) | the aura stage | honest flash |
 /// | ◉ talk hold | local `listening` + demo timer | honest flash |
 /// | subagent submit | `ChipSubmit` (scripted beat) | `ChipSubmit` → `agent.message` (S3); feature-gated honest flash |
-/// | subagent close | `ChipClose` | honest flash |
+/// | subagent destroy | `ChipClose` | `AgentCancel` → `agent.cancel`; feature-gated honest flash |
 /// | shell builtins (`ls` · `cd` …) | the demo VFS | honest flash |
 /// | `/sessions` | honest stub (the sim's screen is unbuilt) | real listing + open |
 ///
@@ -3378,6 +3378,12 @@ pub enum AppRequest {
     ChipSubmit {
         agent: String,
         text: String,
+    },
+    /// Cancel one direct child through the daemon's durable agent-control
+    /// surface. The reducer captures the opaque agent id; the live driver
+    /// supplies parent-session and generation coordinates.
+    AgentCancel {
+        agent: String,
     },
     /// Close a chip (✕ / the docs-recovery close arm): lifecycle flags are
     /// the reducer's; the driver owns the 5 s removal + resume timers.
@@ -6684,7 +6690,7 @@ impl AppModel {
 
     /// The armed member's display name — the fleet's own callsign rule,
     /// which falls back to the opaque id rather than inventing a name.
-    fn fleet_member_label(&self, agent: &haider_protocol::ids::AgentId) -> String {
+    pub(crate) fn fleet_member_label(&self, agent: &haider_protocol::ids::AgentId) -> String {
         let fallback = || agent.as_str().to_owned();
         let Some(snapshot) = self.fleet.snapshot.as_ref() else {
             return fallback();
@@ -6715,28 +6721,32 @@ impl AppModel {
         self.fleet_kill_confirmed(&agent);
     }
 
-    /// A CONFIRMED destroy. The client may only act on a member that is one
-    /// of this session's own chips, and only where it is the fabricating
-    /// authority. A LIVE child is the daemon's to stop and the wire carries
-    /// no agent-scoped cancel, so the live lane says so plainly instead of
-    /// pretending to have killed something. Either way the member KEEPS its
+    /// A CONFIRMED destroy. Demo mode may only close one of its own locally
+    /// fabricated chips. Live mode delegates ownership validation and the
+    /// terminal transition to `agent.cancel`; the daemon checks the control
+    /// attachment and direct-child boundary. Either way the member KEEPS its
     /// row: a destroyed subagent reads `⊘ cancelled`, it never just vanishes.
     fn fleet_kill_confirmed(&mut self, agent: &haider_protocol::ids::AgentId) {
         let label = self.fleet_member_label(agent);
-        if find_chip(&self.chips, agent.as_str()).is_none() {
-            self.flash = Some(format!(
-                "· {label} runs on its own session — this view cannot destroy it"
-            ));
-            self.dirty = true;
-            return;
-        }
         if self.mode.fabricates_locally() {
+            if find_chip(&self.chips, agent.as_str()).is_none() {
+                self.flash = Some(format!(
+                    "· {label} runs on its own session — this view cannot destroy it"
+                ));
+                self.dirty = true;
+                return;
+            }
             self.requests.push(AppRequest::ChipClose {
                 agent: agent.as_str().to_owned(),
             });
             self.flash = Some(format!("· destroying {label} — its row reads ⊘ cancelled"));
+        } else if self.daemon_serves(haider_rpc::FEATURE_AGENT_CANCEL_V1) {
+            self.requests.push(AppRequest::AgentCancel {
+                agent: agent.as_str().to_owned(),
+            });
+            self.flash = Some(format!("· cancelling {label} — waiting for daemon truth"));
         } else {
-            self.refuse_demo_only("destroying a subagent");
+            self.flash = Some(self.stale_daemon_note("destroying a subagent"));
         }
         self.dirty = true;
     }

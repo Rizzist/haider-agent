@@ -8306,7 +8306,9 @@ fn render_fleet(
                         spans.push(Span::styled(metric, theme.dim_style()));
                     }
                 }
-                let line = hover_band(Line::from(spans), selected, area.width, theme);
+                let hovered = model.hovered.as_ref()
+                    == Some(&Hit::FleetNode(node.agent_id.as_str().to_owned()));
+                let line = hover_band(Line::from(spans), hovered, area.width, theme);
                 cell_hits.push((
                     lines.len(),
                     0,

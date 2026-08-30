@@ -36,22 +36,22 @@ use haider_rpc::{
     ERROR_CODE_CAPABILITY_DENIED, ERROR_CODE_CURSOR_AHEAD, ERROR_CODE_PROVIDER_REMOVE_REFUSED,
     ERROR_CODE_REVISION_CONFLICT, ErrorData, FEATURE_ACCOUNT_DEVICE_DISCOVERY_V1,
     FEATURE_ACCOUNT_LOGIN_API_V1, FEATURE_ACCOUNT_MANAGEMENT_V1, FEATURE_ACCOUNT_OAUTH_DEVICE_V1,
-    FEATURE_ACCOUNT_OAUTH_PKCE_V1, FEATURE_ACCOUNT_ROTATION_V1, FEATURE_ARTIFACT_PUT_V1,
-    FEATURE_BRANCH_CREATE_V1, FEATURE_PROVIDER_CONFIGURE_V1, FEATURE_PROVIDER_MANAGEMENT_V1,
-    FEATURE_PROVIDER_MODELS_V1, FEATURE_PROVIDER_REMOVE_V1, FEATURE_SESSION_FLEET_IDENTITY_V1,
-    FEATURE_SESSION_FLEET_V1, FEATURE_SESSION_FORK_V1, FEATURE_SESSION_MUTATION_V1,
-    FEATURE_SESSION_PROMPT_FORK_V1, FEATURE_SESSION_RENAME_V1, FEATURE_TURN_CONTROL_V1,
-    FEATURE_USAGE_REPORT_V1, FEATURE_VAULT_STAGE_V1, FleetAgentStateWire, FleetMetricsTotalsWire,
-    FleetNodeWire, FleetRollupWire, FleetStateCountsWire, Hello, HookSummaryWire,
-    HookTrustStateWire, LifecyclePhase, MenuInput, ModelDetailWire, MonitorActionWire,
-    MonitorDeliveryDedupeWire, MonitorDeliveryReportWire, MonitorEventPayloadWire,
-    MonitorEventWire, MonitorReportStatusWire, MonitorSourceKindWire, OAuthAuthorizationWire,
-    OAuthAvailabilityWire, OAuthFlowId, OAuthFlowStatusWire, OAuthReadyRefWire,
-    ObserveRunStateWire, ProtocolError, ProviderActiveWire, ProviderApiFamilyWire,
-    ProviderAuthRequirementWire, ProviderAvailabilityWire, ProviderDefaultWire,
-    ProviderRemoveRefusalReasonWire, ProviderSummaryWire, RequestBody, RequestId, ResponseBody,
-    SecretWire, SeqRange, SessionFleetSnapshot, SessionObserveDigest, SessionReadResult,
-    SessionSummary, StagePurpose, SubmitDisposition, Welcome, WireFrame,
+    FEATURE_ACCOUNT_OAUTH_PKCE_V1, FEATURE_ACCOUNT_ROTATION_V1, FEATURE_AGENT_CANCEL_V1,
+    FEATURE_ARTIFACT_PUT_V1, FEATURE_BRANCH_CREATE_V1, FEATURE_PROVIDER_CONFIGURE_V1,
+    FEATURE_PROVIDER_MANAGEMENT_V1, FEATURE_PROVIDER_MODELS_V1, FEATURE_PROVIDER_REMOVE_V1,
+    FEATURE_SESSION_FLEET_IDENTITY_V1, FEATURE_SESSION_FLEET_V1, FEATURE_SESSION_FORK_V1,
+    FEATURE_SESSION_MUTATION_V1, FEATURE_SESSION_PROMPT_FORK_V1, FEATURE_SESSION_RENAME_V1,
+    FEATURE_TURN_CONTROL_V1, FEATURE_USAGE_REPORT_V1, FEATURE_VAULT_STAGE_V1, FleetAgentStateWire,
+    FleetMetricsTotalsWire, FleetNodeWire, FleetRollupWire, FleetStateCountsWire, Hello,
+    HookSummaryWire, HookTrustStateWire, LifecyclePhase, MenuInput, ModelDetailWire,
+    MonitorActionWire, MonitorDeliveryDedupeWire, MonitorDeliveryReportWire,
+    MonitorEventPayloadWire, MonitorEventWire, MonitorReportStatusWire, MonitorSourceKindWire,
+    OAuthAuthorizationWire, OAuthAvailabilityWire, OAuthFlowId, OAuthFlowStatusWire,
+    OAuthReadyRefWire, ObserveRunStateWire, ProtocolError, ProviderActiveWire,
+    ProviderApiFamilyWire, ProviderAuthRequirementWire, ProviderAvailabilityWire,
+    ProviderDefaultWire, ProviderRemoveRefusalReasonWire, ProviderSummaryWire, RequestBody,
+    RequestId, ResponseBody, SecretWire, SeqRange, SessionFleetSnapshot, SessionObserveDigest,
+    SessionReadResult, SessionSummary, StagePurpose, SubmitDisposition, Welcome, WireFrame,
 };
 
 pub const TEST_FRAME_LIMIT: usize = 1024 * 1024;
@@ -2036,6 +2036,7 @@ pub fn transcript() -> Vec<WireFrame> {
     append_union_contract_tail(&mut frames);
     append_prompt_fork_contract_tail(&mut frames, fork_metadata);
     append_fleet_identity_contract_tail(&mut frames);
+    append_agent_cancel_contract_tail(&mut frames);
     frames
 }
 
@@ -2337,6 +2338,33 @@ fn append_fleet_identity_contract_tail(frames: &mut Vec<WireFrame>) {
             },
         },
     ]);
+}
+
+/// K1 appends one request/success pair for owned direct-child cancellation.
+/// Every preceding v0.0.966 frame remains byte-for-byte frozen.
+fn append_agent_cancel_contract_tail(frames: &mut Vec<WireFrame>) {
+    frames.extend([
+        WireFrame::Request {
+            request_id: RequestId::new("request-agent-cancel"),
+            body: RequestBody::AgentCancel {
+                command_id: CommandId::new("command-agent-cancel"),
+                session_id: SessionId::new("session-parent"),
+                worker_generation: 7,
+                agent: AgentId::new("agent-child-7"),
+            },
+        },
+        WireFrame::Response {
+            request_id: RequestId::new("request-agent-cancel"),
+            body: ResponseBody::AgentCancel {
+                agent: AgentId::new("agent-child-7"),
+                child_session_id: SessionId::new("session-child-7"),
+                child_run_id: RunId::new("run-child-7"),
+                status: CancelStatus::Accepted,
+                terminal_seq: None,
+            },
+        },
+    ]);
+    debug_assert_eq!(FEATURE_AGENT_CANCEL_V1, "agent_cancel_v1");
 }
 
 /// Golden credential descriptor: public global alias, verified display

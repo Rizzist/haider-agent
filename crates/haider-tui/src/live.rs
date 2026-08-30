@@ -334,6 +334,15 @@ pub enum LiveCommand {
         agent: String,
         text: String,
     },
+    /// `agent.cancel` — receipt-backed destruction of one owned direct
+    /// child. The daemon commits cancellation intent, terminates the child,
+    /// and reports the terminal child result back to the waiting parent.
+    AgentCancel {
+        command_id: CommandId,
+        session: SessionId,
+        worker_generation: u64,
+        agent: String,
+    },
     /// `shell.exec` — the W8b `!` escape: one exact user command for the
     /// session daemon's workspace, receipt-backed and PreAuthorized
     /// (UserTyped). Zero provider requests; the committed
@@ -1057,6 +1066,7 @@ impl LiveCommand {
             | Self::CheckpointRedo { command_id, .. }
             | Self::CheckpointRollbackTurn { command_id, .. }
             | Self::AgentMessage { command_id, .. }
+            | Self::AgentCancel { command_id, .. }
             | Self::ShellExec { command_id, .. }
             | Self::AccountRemove { command_id, .. }
             | Self::ProviderRemove { command_id, .. }
@@ -1354,6 +1364,14 @@ pub enum LiveReply {
     AgentMessaged {
         command_id: CommandId,
         receipt: haider_protocol::agent::AgentMessageReceipt,
+    },
+    /// `agent.cancel` was accepted or found the child already terminal.
+    /// Fleet/journal truth paints the state; this receipt only retires the
+    /// durable command and drives an immediate fleet refresh.
+    AgentCancelled {
+        command_id: CommandId,
+        agent: haider_protocol::ids::AgentId,
+        status: haider_rpc::CancelStatus,
     },
     /// `shell.exec` accepted; the `CommandExecution` events arrive on the
     /// attachment stream.
@@ -3582,6 +3600,25 @@ impl LiveDriver {
                 model.dirty = true;
                 Vec::new()
             }
+            LiveReply::AgentCancelled {
+                command_id,
+                agent,
+                status,
+            } => {
+                self.retire(&command_id);
+                let label = model.fleet_member_label(&agent);
+                model.flash = Some(match status {
+                    haider_rpc::CancelStatus::Accepted => {
+                        format!("· cancelling {label} — terminal state pending")
+                    }
+                    haider_rpc::CancelStatus::AlreadyTerminal => {
+                        format!("· {label} was already terminal")
+                    }
+                    _ => format!("· {label} cancellation status is pending daemon truth"),
+                });
+                model.dirty = true;
+                self.fleet_refresh(model)
+            }
             LiveReply::BranchForked {
                 command_id,
                 session,
@@ -5789,6 +5826,20 @@ impl LiveDriver {
                 }
                 None => Vec::new(),
             },
+            AppRequest::AgentCancel { agent } => match model.active_session.clone() {
+                Some(session) => {
+                    let command_id = self.mint();
+                    let worker_generation =
+                        self.generations.get(&session).copied().unwrap_or_default();
+                    vec![self.enqueue(LiveCommand::AgentCancel {
+                        command_id,
+                        session,
+                        worker_generation,
+                        agent,
+                    })]
+                }
+                None => Vec::new(),
+            },
             // B4b: the receipt-free upload — no mint, no outbox (see the
             // `LiveCommand::ArtifactPut` charter). The reducer already
             // chipped the draft; only the reply mutates it further.
@@ -6780,6 +6831,7 @@ const fn command_session(command: &LiveCommand) -> Option<&SessionId> {
         | LiveCommand::CheckpointRedo { session, .. }
         | LiveCommand::CheckpointRollbackTurn { session, .. }
         | LiveCommand::AgentMessage { session, .. }
+        | LiveCommand::AgentCancel { session, .. }
         | LiveCommand::ShellExec { session, .. }
         | LiveCommand::ToolsInventory { session }
         | LiveCommand::SshSetScope { session, .. }

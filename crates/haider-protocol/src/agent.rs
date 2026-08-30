@@ -45,6 +45,21 @@ pub struct AgentManifest {
     pub cli_scope: Option<Vec<String>>,
 }
 
+impl AgentManifest {
+    /// Spawn-time provider display coordinate carried by new delegation
+    /// manifests. The child session's typed metadata remains execution
+    /// authority; this accessor centralizes the additive legacy-coordinate
+    /// fallback used by journal projections without guessing from a parent.
+    #[must_use]
+    pub fn provider(&self) -> Option<&str> {
+        self.coordinates
+            .as_ref()
+            .and_then(|coordinates| coordinates.get("provider"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|provider| !provider.trim().is_empty())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
