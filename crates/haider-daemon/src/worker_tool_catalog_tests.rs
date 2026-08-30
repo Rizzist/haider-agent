@@ -408,6 +408,149 @@ fn filtered_tool_pack_cache_is_process_bounded() {
     assert!(cache.get(&[FILTERED_TOOL_PACK_CACHE_CAPACITY]).is_some());
 }
 
+fn cached_pack_for_test(
+    cache: &StdMutex<TurnToolPackCache>,
+    registry_revision: Arc<[ToolDefinition]>,
+    grant: Option<&Grant>,
+    provider_name: &str,
+    lockdown: bool,
+    mobile_use_active: bool,
+) -> Arc<SharedToolPacks> {
+    let (local_web_tool_names, provider_fallback_local_web_tool_names) =
+        provider_web_tool_names(provider_name, WebCapabilityDegrade::default());
+    let provider_request_state = ProviderDerivedRequestState {
+        tool_result_images_supported: false,
+        local_web_tool_names,
+        provider_fallback_local_web_tool_names,
+    };
+    cached_turn_tool_packs(
+        cache,
+        TurnToolPackInputs {
+            provider_name,
+            provider_request_state: &provider_request_state,
+            grant: ToolPackGrantSnapshot::new(grant).expect("grant revision"),
+            lockdown,
+            registry_revision,
+            mobile_use_active,
+        },
+    )
+}
+
+/// SECURITY MUTATION CHECK: remove the provider revision from the key.
+/// Expected failure: the Anthropic declaration reuses the generic provider's
+/// local-web pack instead of rebuilding it.
+#[test]
+fn turn_tool_pack_cache_rebuilds_when_provider_revision_changes() {
+    let cache = StdMutex::new(TurnToolPackCache::new());
+    let registry = registered_provider_definitions();
+    let initial = cached_pack_for_test(&cache, Arc::clone(&registry), None, "fake", false, false);
+    let repeated = cached_pack_for_test(&cache, Arc::clone(&registry), None, "fake", false, false);
+    let changed = cached_pack_for_test(
+        &cache,
+        registry,
+        None,
+        ANTHROPIC_PROVIDER_NAME,
+        false,
+        false,
+    );
+    assert!(Arc::ptr_eq(&initial, &repeated));
+    assert!(!Arc::ptr_eq(&initial, &changed));
+    assert_ne!(initial.current_digest, changed.current_digest);
+}
+
+/// SECURITY MUTATION CHECK: remove the normalized grant revision from the
+/// key. Expected failure: a delegated child receives the prior root pack.
+#[test]
+fn turn_tool_pack_cache_rebuilds_when_grant_revision_changes() {
+    let cache = StdMutex::new(TurnToolPackCache::new());
+    let registry = registered_provider_definitions();
+    let child_grant = default_child_grant();
+    let initial = cached_pack_for_test(&cache, Arc::clone(&registry), None, "fake", false, false);
+    let repeated = cached_pack_for_test(&cache, Arc::clone(&registry), None, "fake", false, false);
+    let changed = cached_pack_for_test(&cache, registry, Some(&child_grant), "fake", false, false);
+    assert!(Arc::ptr_eq(&initial, &repeated));
+    assert!(!Arc::ptr_eq(&initial, &changed));
+    assert_ne!(initial.current_digest, changed.current_digest);
+}
+
+/// SECURITY MUTATION CHECK: remove the frozen lockdown revision from the
+/// key. Expected failure: a newly locked-down turn retains `process_exec`.
+#[test]
+fn turn_tool_pack_cache_rebuilds_when_lockdown_revision_changes() {
+    let cache = StdMutex::new(TurnToolPackCache::new());
+    let registry = registered_provider_definitions();
+    let initial = cached_pack_for_test(&cache, Arc::clone(&registry), None, "fake", false, false);
+    let repeated = cached_pack_for_test(&cache, Arc::clone(&registry), None, "fake", false, false);
+    let changed = cached_pack_for_test(&cache, registry, None, "fake", true, false);
+    assert!(Arc::ptr_eq(&initial, &repeated));
+    assert!(!Arc::ptr_eq(&initial, &changed));
+    assert_ne!(initial.current_digest, changed.current_digest);
+    assert!(
+        initial
+            .current
+            .iter()
+            .any(|tool| tool.name == "process_exec")
+    );
+    assert!(
+        !changed
+            .current
+            .iter()
+            .any(|tool| tool.name == "process_exec")
+    );
+}
+
+/// SECURITY MUTATION CHECK: remove the immutable registry revision from the
+/// key. Expected failure: a replacement registry aliases an older pack even
+/// when its current bytes happen to match.
+#[test]
+fn turn_tool_pack_cache_rebuilds_when_registry_revision_changes() {
+    let cache = StdMutex::new(TurnToolPackCache::new());
+    let registry = registered_provider_definitions();
+    let replacement: Arc<[ToolDefinition]> = registry.as_ref().to_vec().into();
+    let initial = cached_pack_for_test(&cache, Arc::clone(&registry), None, "fake", false, false);
+    let repeated = cached_pack_for_test(&cache, registry, None, "fake", false, false);
+    let changed = cached_pack_for_test(&cache, replacement, None, "fake", false, false);
+    assert!(Arc::ptr_eq(&initial, &repeated));
+    assert!(!Arc::ptr_eq(&initial, &changed));
+    assert_eq!(initial.current_digest, changed.current_digest);
+}
+
+/// SECURITY MUTATION CHECK: remove the mobile-use mode revision from the
+/// key. Expected failure: activation cannot add the mobile tool next turn.
+#[test]
+fn turn_tool_pack_cache_rebuilds_when_mode_revision_changes() {
+    let cache = StdMutex::new(TurnToolPackCache::new());
+    let registry = registered_provider_definitions();
+    let initial = cached_pack_for_test(&cache, Arc::clone(&registry), None, "fake", false, false);
+    let repeated = cached_pack_for_test(&cache, Arc::clone(&registry), None, "fake", false, false);
+    let changed = cached_pack_for_test(&cache, registry, None, "fake", false, true);
+    assert!(Arc::ptr_eq(&initial, &repeated));
+    assert!(!Arc::ptr_eq(&initial, &changed));
+    assert_ne!(initial.current_digest, changed.current_digest);
+    assert!(!initial.current.iter().any(|tool| tool.name == "mobile"));
+    assert!(changed.current.iter().any(|tool| tool.name == "mobile"));
+}
+
+#[test]
+fn turn_tool_pack_cache_is_process_bounded() {
+    let cache = StdMutex::new(TurnToolPackCache::new());
+    let registry = registered_provider_definitions();
+    for index in 0..=TURN_TOOL_PACK_CACHE_CAPACITY {
+        let _ = cached_pack_for_test(
+            &cache,
+            Arc::clone(&registry),
+            None,
+            &format!("provider-{index}"),
+            false,
+            false,
+        );
+    }
+    assert_eq!(
+        cache.lock().expect("turn tool pack cache").packs.len(),
+        TURN_TOOL_PACK_CACHE_CAPACITY
+    );
+}
+
 /// MUTATION CHECK: the public peer schemas, routes, permission defaults, and
 /// provider-pack digest must move together. Changing either manifest requires
 /// an explicit update to the expected definitions below.
